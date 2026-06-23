@@ -1,0 +1,29 @@
+[package]
+name = "sentinel"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "AGPL-3.0-or-later"
+description = "Velstra Sentinel — a standalone firewall/router appliance built on the Velstra eBPF/XDP data plane."
+repository = "https://github.com/Velstra/sentinel"
+homepage = "https://github.com/Velstra/sentinel"
+publish = false # an appliance, not a library — not published to crates.io
+
+[[bin]]
+name = "sentinel"
+path = "src/main.rs"
+
+[dependencies]
+# The Velstra control-plane wire protocol, from crates.io. This is how Sentinel
+# talks to a Velstra controller / agent. The data-plane crates (velstra-common,
+# -config) join here once they leave the git-aya dependency behind.
+velstra-proto = "0.1"
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tonic = { version = "0.12", default-features = false, features = ["transport"] }
+
+# Room to grow: split into sentinel-daemon / -cli / -web as the appliance fills
+# out. For now a single binary keeps the skeleton honest.
+[workspace]
