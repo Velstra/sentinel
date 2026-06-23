@@ -18,7 +18,7 @@
 
 use serde::Serialize;
 
-use crate::config::{Action, Appliance, Zone};
+use crate::config::{Action, Appliance, Proto, Zone};
 
 /// The subset of Velstra's agent `FileConfig` we emit. Field names and the
 /// `policy`/`interface` array renames match Velstra's TOML schema exactly.
@@ -38,6 +38,16 @@ struct Policy {
     name: String,
     default_action: &'static str,
     stateful: bool,
+    // Scalars above, the array-of-tables below (TOML requires this order).
+    #[serde(rename = "port_rule", skip_serializing_if = "Vec::is_empty")]
+    port_rules: Vec<PortRule>,
+}
+
+#[derive(Debug, Serialize)]
+struct PortRule {
+    proto: &'static str,
+    port: u16,
+    action: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -71,6 +81,22 @@ fn zone_name(z: Zone) -> &'static str {
     }
 }
 
+fn proto_str(p: Proto) -> &'static str {
+    match p {
+        Proto::Tcp => "tcp",
+        Proto::Udp => "udp",
+    }
+}
+
+/// Map a Sentinel action to a Velstra action. Velstra has no `reject`, so it
+/// collapses to `drop` (silently dropped rather than actively refused).
+fn action_str(a: Action) -> &'static str {
+    match a {
+        Action::Accept => "pass",
+        Action::Drop | Action::Reject => "drop",
+    }
+}
+
 /// Compile a Sentinel appliance config into a Velstra agent config.
 pub fn compile(appliance: &Appliance) -> VelstraConfig {
     // The zones actually in use (a zone with no interface needs no policy).
@@ -81,16 +107,28 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
     let policies = zones
         .iter()
         .map(|&zone| {
-            // Ingress posture: pass if this zone is allowed to initiate, else drop.
+            // Posture comes from broad rules: pass if this zone may initiate.
             let initiates = appliance
                 .rules
                 .iter()
-                .any(|r| r.from == zone && r.action == Action::Accept);
+                .any(|r| r.from == zone && r.is_broad() && r.action == Action::Accept);
+            // Specific proto/port rules become Velstra port rules on this policy.
+            let port_rules = appliance
+                .rules
+                .iter()
+                .filter(|r| r.from == zone && r.is_port_rule())
+                .map(|r| PortRule {
+                    proto: proto_str(r.proto.unwrap()),
+                    port: r.port.unwrap(),
+                    action: action_str(r.action),
+                })
+                .collect();
             Policy {
                 id: zone_id(zone),
                 name: zone_name(zone).to_string(),
                 default_action: if initiates { "pass" } else { "drop" },
                 stateful: true,
+                port_rules,
             }
         })
         .collect();
@@ -132,14 +170,22 @@ mod tests {
         // A policy per used zone, with the right posture.
         let wan = cfg.policies.iter().find(|p| p.id == 1).unwrap();
         let lan = cfg.policies.iter().find(|p| p.id == 2).unwrap();
-        assert_eq!(wan.default_action, "drop"); // no accept-from-wan rule
+        assert_eq!(wan.default_action, "drop"); // no broad accept-from-wan rule
         assert_eq!(lan.default_action, "pass"); // lan-to-wan accept lets lan initiate
         assert!(wan.stateful && lan.stateful);
+
+        // The inbound-HTTPS port rule lands on the WAN policy as a pass for tcp/443.
+        assert_eq!(wan.port_rules.len(), 1);
+        assert_eq!(wan.port_rules[0].proto, "tcp");
+        assert_eq!(wan.port_rules[0].port, 443);
+        assert_eq!(wan.port_rules[0].action, "pass");
+        assert!(lan.port_rules.is_empty());
 
         // It renders to TOML the agent can load.
         let toml = cfg.to_toml().unwrap();
         assert!(toml.contains("[[interface]]"));
         assert!(toml.contains("[[policy]]"));
+        assert!(toml.contains("[[policy.port_rule]]"));
     }
 
     #[test]

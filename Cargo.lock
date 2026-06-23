@@ -1322,9 +1322,9 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "velstra-proto"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f4eb302800b1abafd2320585b3cc33d712bb32ef12b8b976163fcadf3e63e2f8"
+checksum = "79619a20e163ba1ba5bafbb2e9c0b7715819c0b02764872265897f7444fa2e07"
 dependencies = [
  "prost",
  "protoc-bin-vendored",

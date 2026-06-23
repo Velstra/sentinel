@@ -30,7 +30,7 @@ name = "lan0"
 role = "lan"
 address = "10.0.0.1/24"
 
-# Zone-to-zone firewall rules (action: accept | drop | reject).
+# Broad zone rules set a zone's posture (action: accept | drop | reject).
 [[rule]]
 name = "lan-to-wan"
 from = "lan"
@@ -42,6 +42,16 @@ name = "wan-to-lan"
 from = "wan"
 to = "lan"
 action = "drop"
+
+# Port rules open a specific proto/port even on a default-drop zone — here,
+# inbound HTTPS from the WAN.
+[[rule]]
+name = "allow-https-in"
+from = "wan"
+to = "lan"
+action = "accept"
+proto = "tcp"
+port = 443
 "#;
 
 /// The whole declarative appliance config.
@@ -84,12 +94,37 @@ pub enum Action {
     Reject,
 }
 
+/// L4 protocol for a port rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Proto {
+    Tcp,
+    Udp,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rule {
     pub name: String,
     pub from: Zone,
     pub to: Zone,
     pub action: Action,
+    /// With `port`, makes this a **port rule** (a specific proto/port);
+    /// without, it is a **broad** rule that sets the from-zone's posture.
+    #[serde(default)]
+    pub proto: Option<Proto>,
+    #[serde(default)]
+    pub port: Option<u16>,
+}
+
+impl Rule {
+    /// A broad zone rule (no proto/port) — sets the from-zone's default posture.
+    pub fn is_broad(&self) -> bool {
+        self.proto.is_none() && self.port.is_none()
+    }
+    /// A specific proto/port rule.
+    pub fn is_port_rule(&self) -> bool {
+        self.proto.is_some() && self.port.is_some()
+    }
 }
 
 impl Appliance {
@@ -157,6 +192,14 @@ impl Appliance {
                     );
                 }
             }
+            // proto and port are a pair: a port rule needs both, a broad rule
+            // neither.
+            if rule.proto.is_some() != rule.port.is_some() {
+                bail!(
+                    "rule {:?}: `proto` and `port` must be set together",
+                    rule.name
+                );
+            }
         }
         Ok(())
     }
@@ -175,12 +218,17 @@ impl Appliance {
         }
         out.push_str(&format!("rules ({}):\n", self.rules.len()));
         for r in &self.rules {
+            let proto_port = match (r.proto, r.port) {
+                (Some(p), Some(port)) => format!("  {}/{port}", proto_str(p)),
+                _ => String::new(),
+            };
             out.push_str(&format!(
-                "  {:<14} {} -> {}  {}\n",
+                "  {:<16} {} -> {}  {}{}\n",
                 r.name,
                 zone_str(r.from),
                 zone_str(r.to),
                 action_str(r.action),
+                proto_port,
             ));
         }
         out
@@ -222,6 +270,13 @@ fn action_str(a: Action) -> &'static str {
     }
 }
 
+fn proto_str(p: Proto) -> &'static str {
+    match p {
+        Proto::Tcp => "tcp",
+        Proto::Udp => "udp",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,7 +286,9 @@ mod tests {
         let a = Appliance::from_toml(EXAMPLE).expect("example must parse + validate");
         assert_eq!(a.system.hostname, "sentinel-fw");
         assert_eq!(a.interfaces.len(), 2);
-        assert_eq!(a.rules.len(), 2);
+        assert_eq!(a.rules.len(), 3); // 2 broad + 1 port rule
+        // The port rule has proto+port; the broad ones don't.
+        assert_eq!(a.rules.iter().filter(|r| r.is_port_rule()).count(), 1);
     }
 
     #[test]
