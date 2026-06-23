@@ -9,6 +9,7 @@
 //! and apply that document — and, via [`velstra_proto`] (from crates.io), talk to
 //! a running Velstra controller.
 
+mod compile;
 mod config;
 
 use std::path::PathBuf;
@@ -39,6 +40,11 @@ enum Command {
     Config {
         #[command(subcommand)]
         action: ConfigAction,
+    },
+    /// Compile the appliance config into a Velstra agent config (to stdout).
+    Compile {
+        /// Path to the appliance config (TOML or JSON).
+        file: PathBuf,
     },
     /// List the ports a Velstra controller currently knows about.
     Ports {
@@ -76,6 +82,11 @@ enum ConfigAction {
 async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Config { action } => config_cmd(action),
+        Command::Compile { file } => {
+            let appliance = Appliance::load(&file)?;
+            print!("{}", compile::compile(&appliance).to_toml()?);
+            Ok(())
+        }
         Command::Ports { controller } => ports(&controller).await,
     }
 }
