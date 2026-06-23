@@ -1,18 +1,30 @@
 //! # Velstra Sentinel
 //!
-//! A standalone firewall/router **appliance** built on the Velstra eBPF/XDP data
-//! plane — the VyOS/pfSense-shaped product where Velstra is the engine. Sentinel
-//! adds the appliance layer: turnkey config management, a control/admin surface,
-//! and (eventually) an OS image and HA.
+//! A standalone, **immutable** firewall/router appliance OS built on the Velstra
+//! eBPF/XDP data plane. Velstra is the engine; Sentinel is the product on top.
 //!
-//! This skeleton is the first slice: a CLI that speaks the Velstra control-plane
-//! protocol ([`velstra_proto`], from crates.io) to a Velstra controller. It
-//! proves the shared-protocol wiring across repos; real appliance features build
-//! out from here.
+//! Unlike a mutable, log-in-and-tweak box (VyOS), a Sentinel appliance is
+//! image-based and **declarative**: the whole box is described by one config
+//! document that the system reconciles to atomically. This CLI is how you author
+//! and apply that document — and, via [`velstra_proto`] (from crates.io), talk to
+//! a running Velstra controller.
+
+mod config;
+
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use velstra_proto::{ListPortsRequest, velstra_orchestrator_client::VelstraOrchestratorClient};
+
+use crate::config::Appliance;
+
+/// A config serialization format.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum Format {
+    Toml,
+    Json,
+}
 
 #[derive(Parser)]
 #[command(name = "sentinel", version, about, long_about = None)]
@@ -23,6 +35,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Author the declarative appliance config.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
     /// List the ports a Velstra controller currently knows about.
     Ports {
         /// The controller's orchestrator/admin endpoint.
@@ -31,10 +48,62 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Print a commented starter config to stdout.
+    Init,
+    /// Parse and validate a config file (exit non-zero if invalid).
+    Check {
+        /// Path to the appliance config (TOML).
+        file: PathBuf,
+    },
+    /// Parse a config file and print a normalized summary.
+    Show {
+        /// Path to the appliance config (TOML or JSON).
+        file: PathBuf,
+    },
+    /// Convert a config between TOML and JSON (format in is by extension).
+    Convert {
+        /// Path to the appliance config (`.json` → JSON, else TOML).
+        file: PathBuf,
+        /// Output format.
+        #[arg(long, value_enum)]
+        to: Format,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::Config { action } => config_cmd(action),
         Command::Ports { controller } => ports(&controller).await,
+    }
+}
+
+fn config_cmd(action: ConfigAction) -> Result<()> {
+    match action {
+        ConfigAction::Init => {
+            print!("{}", config::EXAMPLE);
+            Ok(())
+        }
+        ConfigAction::Check { file } => {
+            Appliance::load(&file)?;
+            println!("{} is valid", file.display());
+            Ok(())
+        }
+        ConfigAction::Show { file } => {
+            print!("{}", Appliance::load(&file)?.summary());
+            Ok(())
+        }
+        ConfigAction::Convert { file, to } => {
+            let appliance = Appliance::load(&file)?;
+            let out = match to {
+                Format::Toml => appliance.to_toml()?,
+                Format::Json => appliance.to_json()?,
+            };
+            print!("{out}");
+            Ok(())
+        }
     }
 }
 

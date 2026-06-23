@@ -1,28 +1,43 @@
 # Velstra Sentinel
 
-A standalone **firewall / router appliance** built on the
+A standalone, **immutable** firewall / router appliance OS, built on the
 [Velstra](https://github.com/Velstra/fabric) eBPF/XDP data plane.
 
 Where [`Velstra Fabric`](https://github.com/Velstra/fabric) is the engine — an
 XDP firewall, router, load balancer, and VXLAN/Geneve overlay with an HA control
-plane — **Sentinel is the product on top**: the turnkey appliance, in the shape
-of VyOS or pfSense but Rust-and-eBPF all the way down. The appliance layer is
-config management, an admin/control surface, an OS image, and box-level HA.
+plane — **Sentinel is the appliance on top**: an open-source firewall/router box,
+Rust-and-eBPF all the way down.
 
-> **Status: skeleton.** This repo is just getting started. The first slice is a
-> CLI that speaks the Velstra control-plane protocol
-> ([`velstra-proto`](https://crates.io/crates/velstra-proto)) to a controller —
-> proving the shared-protocol wiring across repos. Real appliance features build
-> out from here.
+**Not VyOS.** It is deliberately *not* a mutable system you SSH into and tweak.
+Sentinel is **image-based and immutable**: the running OS is read-only, and the
+whole box is described by one **declarative config** that the system reconciles
+to atomically (closer in spirit to Talos than to VyOS/pfSense). You change the
+appliance by changing its config and re-applying — never by editing live state.
+
+> **Status: skeleton.** First slice: the **programmable, declarative CLI** —
+> author/validate the appliance config, and talk to a Velstra controller over
+> [`velstra-proto`](https://crates.io/crates/velstra-proto). The immutable OS
+> image and the config→data-plane compiler build out from here.
 
 ## Try it
 
 ```shell
+# Author the declarative config.
+cargo run -- config init > appliance.toml          # commented starter
+cargo run -- config check appliance.toml           # parse + validate
+cargo run -- config show  appliance.toml           # normalized summary
+cargo run -- config convert appliance.toml --to json  # TOML <-> JSON
+
+# Talk to a running Velstra controller.
 cargo run -- ports --controller http://127.0.0.1:50052
 ```
 
-Point it at a running Velstra controller and it lists the fabric's ports over
-gRPC — the same wire types the Velstra agent and CNI use.
+The OS design — why NixOS, generations/rollback, the compile pipeline, security —
+is in [`docs/os.md`](docs/os.md).
+
+The config declares interfaces (with zone roles), addresses, and zone-to-zone
+firewall rules; `ports` lists a controller's fabric ports over gRPC — the same
+wire types the Velstra agent and CNI use.
 
 ## Architecture (intended)
 
