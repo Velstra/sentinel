@@ -46,6 +46,17 @@ enum Command {
         /// Path to the appliance config (TOML or JSON).
         file: PathBuf,
     },
+    /// Compile + install the Velstra agent config, then reload the data plane.
+    Apply {
+        /// Path to the appliance config (TOML or JSON).
+        file: PathBuf,
+        /// Where to write the compiled Velstra agent config.
+        #[arg(long, default_value = "/etc/sentinel/velstra.toml")]
+        out: PathBuf,
+        /// systemd unit to reload-or-restart after writing (skipped if unset).
+        #[arg(long)]
+        reload: Option<String>,
+    },
     /// List the ports a Velstra controller currently knows about.
     Ports {
         /// The controller's orchestrator/admin endpoint.
@@ -87,8 +98,38 @@ async fn main() -> Result<()> {
             print!("{}", compile::compile(&appliance).to_toml()?);
             Ok(())
         }
+        Command::Apply { file, out, reload } => apply(&file, &out, reload.as_deref()),
         Command::Ports { controller } => ports(&controller).await,
     }
+}
+
+/// Compile the appliance config, atomically install the Velstra agent config at
+/// `out`, and (if given) reload the systemd `unit` running the data plane.
+fn apply(file: &std::path::Path, out: &std::path::Path, reload: Option<&str>) -> Result<()> {
+    let appliance = Appliance::load(file)?;
+    let rendered = compile::compile(&appliance).to_toml()?;
+
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    // Atomic: write a temp file then rename, so the agent never reads a half file.
+    let tmp = out.with_extension("toml.tmp");
+    std::fs::write(&tmp, &rendered).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, out).with_context(|| format!("installing {}", out.display()))?;
+    println!("installed {}", out.display());
+
+    if let Some(unit) = reload {
+        let status = std::process::Command::new("systemctl")
+            .args(["reload-or-restart", unit])
+            .status()
+            .with_context(|| format!("running systemctl reload-or-restart {unit}"))?;
+        if !status.success() {
+            anyhow::bail!("systemctl reload-or-restart {unit} failed");
+        }
+        println!("reloaded {unit}");
+    }
+    Ok(())
 }
 
 fn config_cmd(action: ConfigAction) -> Result<()> {
