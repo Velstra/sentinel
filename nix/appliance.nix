@@ -35,6 +35,12 @@
   };
   security.sudo.wheelNeedsPassword = lib.mkDefault false;
 
+  # Test-VM convenience: a console login (SSH is key-only, so the QEMU console
+  # would otherwise be a dead end). INSECURE — for `build-vm` only; a real
+  # appliance image should drop these.
+  users.users.admin.initialPassword = lib.mkDefault "sentinel";
+  services.getty.autologinUser = lib.mkDefault "admin";
+
   # EFI + systemd-boot so generations are listed at boot (the rollback path).
   # `nixos-rebuild build-vm` overrides this for the throwaway VM.
   boot.loader.systemd-boot.enable = lib.mkDefault true;
@@ -47,5 +53,5 @@
     fsType = "ext4";
   };
 
-  system.stateVersion = "24.11";
+  system.stateVersion = "25.05";
 }
