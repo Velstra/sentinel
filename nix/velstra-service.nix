@@ -45,20 +45,47 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    # Compile appliance config -> agent config at build time (declarative,
-    # immutable). It lives in the read-only /etc of this generation.
-    environment.etc."sentinel/velstra.toml".source =
-      pkgs.runCommand "velstra.toml" { } ''
-        ${cfg.sentinel}/bin/sentinel compile ${cfg.appliance} > "$out"
+    # Seed the runtime firewall config at boot: compile the **active** appliance
+    # config (operator-edited /var/lib if present, else the factory default
+    # baked into the image) into the writable /run path the agent reads. This is
+    # the immutable-appliance model: the image is fixed; config is applied to the
+    # running system. `sentinel commit` rewrites /run/sentinel/velstra.toml live
+    # and reloads the agent — no rebuild.
+    systemd.services.sentinel-boot = {
+      description = "Seed Velstra config + hostname from the active appliance config";
+      wantedBy = [ "multi-user.target" ];
+      before = [ "velstra.service" ];
+      # `hostname` (nettools) on PATH for the live hostname apply.
+      path = [ pkgs.nettools ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+      };
+      script = ''
+        mkdir -p /run/sentinel /var/lib/sentinel
+        # Seed the editable config from the factory default on first boot, so
+        # `configure` edits the real config (not an empty draft).
+        if [ ! -f /var/lib/sentinel/appliance.toml ]; then
+          cp ${cfg.appliance} /var/lib/sentinel/appliance.toml
+        fi
+        # Set the hostname + write the agent config from the active config.
+        ${cfg.sentinel}/bin/sentinel apply-boot \
+          --config /var/lib/sentinel/appliance.toml \
+          --out /run/sentinel/velstra.toml
       '';
+    };
 
     systemd.services.velstra = {
       description = "Velstra eBPF/XDP data plane";
       wantedBy = [ "multi-user.target" ];
-      after = [ "network-pre.target" ];
+      after = [
+        "network-pre.target"
+        "sentinel-boot.service"
+      ];
+      requires = [ "sentinel-boot.service" ];
       before = [ "network.target" ];
       serviceConfig = {
-        ExecStart = "${cfg.package}/bin/velstra run --iface ${cfg.interface} --config /etc/sentinel/velstra.toml";
+        ExecStart = "${cfg.package}/bin/velstra run --iface ${cfg.interface} --config /run/sentinel/velstra.toml";
         Restart = "on-failure";
         RestartSec = 2;
         # Loading + attaching XDP/eBPF needs these capabilities.

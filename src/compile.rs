@@ -99,8 +99,10 @@ fn action_str(a: Action) -> &'static str {
 
 /// Compile a Sentinel appliance config into a Velstra agent config.
 pub fn compile(appliance: &Appliance) -> VelstraConfig {
-    // The zones actually in use (a zone with no interface needs no policy).
-    let mut zones: Vec<Zone> = appliance.interfaces.iter().map(|i| i.role).collect();
+    // The zones actually in use (a zone with no assigned interface needs no
+    // policy; interfaces the system provides but that aren't assigned a zone yet
+    // are simply not firewalled).
+    let mut zones: Vec<Zone> = appliance.interfaces.iter().filter_map(|i| i.role).collect();
     zones.sort_by_key(|z| zone_id(*z));
     zones.dedup();
 
@@ -136,9 +138,11 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
     let interfaces = appliance
         .interfaces
         .iter()
-        .map(|i| Interface {
-            name: i.name.clone(),
-            policy: zone_id(i.role),
+        .filter_map(|i| {
+            i.role.map(|role| Interface {
+                name: i.name.clone(),
+                policy: zone_id(role),
+            })
         })
         .collect();
 

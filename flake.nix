@@ -53,13 +53,31 @@
       # read ("Unknown attribute kind"). nixpkgs 25.05 ships at most LLVM 20, so
       # the toolchain must be from the LLVM-20 era. Replace fakeHash with the
       # value the first build reports.
-      nightly =
-        (fenix.packages.${system}.toolchainOf {
-          channel = "nightly";
-          date = "2025-06-15";
-          sha256 = "sha256-hMlbNn0xAaLK+EDwdxW/8ZlC8/GHLpFhqB2fhCoj/iU=";
-        }).withComponents
-          [ "cargo" "rustc" "rust-src" "rust-std" "clippy" "rustfmt" ];
+      nightlyDate = "2025-06-15";
+      nightlySha = "sha256-hMlbNn0xAaLK+EDwdxW/8ZlC8/GHLpFhqB2fhCoj/iU=";
+      nightlyProfile = fenix.packages.${system}.toolchainOf {
+        channel = "nightly";
+        date = nightlyDate;
+        sha256 = nightlySha;
+      };
+      # fenix reads this manifest at EVAL time (import-from-derivation) to build
+      # the toolchain — so an airgapped self-rebuild needs it in the store or even
+      # *evaluating* the flake fails offline. Re-fetch it here with the same hash:
+      # a fixed-output derivation is content-addressed, so this produces the exact
+      # same store path fenix's internal one does, and shipping it makes eval work
+      # offline. (Pure store-path reference, no `builtins.storePath` hardcoding.)
+      rustNightlyManifest = pkgs.fetchurl {
+        url = "https://static.rust-lang.org/dist/${nightlyDate}/channel-rust-nightly.toml";
+        sha256 = nightlySha;
+      };
+      nightly = nightlyProfile.withComponents [
+        "cargo"
+        "rustc"
+        "rust-src"
+        "rust-std"
+        "clippy"
+        "rustfmt"
+      ];
       rustPlatformNightly = pkgs.makeRustPlatform {
         cargo = nightly;
         rustc = nightly;
@@ -149,6 +167,14 @@
         # The workspace's tests need root (they load eBPF) — skip in the sandbox.
         doCheck = false;
       };
+
+      # The factory-default appliance config, baked into the image. At runtime the
+      # operator edits /var/lib/sentinel/appliance.toml; the sentinel-boot service
+      # compiles the active config (runtime file if present, else this factory
+      # default) into /run, and `sentinel commit` applies edits to the running
+      # system live (no rebuild). Pure eval — no runtime-path reads.
+      factoryAppliance = ./example-appliance.toml;
+      applianceData = builtins.fromTOML (builtins.readFile factoryAppliance);
     in
     {
       packages.${system} = {
@@ -157,9 +183,9 @@
       };
 
       # The appliance: the base config + the Velstra data-plane service. The
-      # firewall config is compiled from ./example-appliance.toml at build time
-      # and the velstra agent runs it as a systemd service — so the box actually
-      # filters, all as part of the immutable, rollback-able generation.
+      # velstra agent runs the build-time-compiled firewall config as a systemd
+      # service — so the box filters as part of the immutable, rollback-able
+      # generation.
       nixosModules.sentinel =
         { ... }:
         {
@@ -169,11 +195,18 @@
           ];
           environment.systemPackages = [ sentinel ];
 
+          # OS settings driven by the appliance config. The hostname comes from
+          # `[system] hostname` — so a `commit` that changes it actually changes
+          # the system hostname (the rest of the OS↔config mapping — interface
+          # addresses, etc. — builds out from here). Normal priority so it wins
+          # over module defaults (and the NixOS test framework's default).
+          networking.hostName = applianceData.system.hostname;
+
           services.velstra = {
             enable = true;
             package = velstra;
             inherit sentinel;
-            appliance = ./example-appliance.toml;
+            appliance = factoryAppliance;
             interface = "eth0";
           };
         };
@@ -181,6 +214,67 @@
       nixosConfigurations.appliance = nixpkgs.lib.nixosSystem {
         inherit system;
         modules = [ self.nixosModules.sentinel ];
+      };
+
+      # Boots the appliance and verifies `commit` applies config to the running
+      # system live — no rebuild, no reboot, fully airgapped (the VM has no
+      # network). Edits the hostname and asserts it changed via hostnamectl while
+      # the data plane stays up.
+      #   nix build .#checks.x86_64-linux.commit -L
+      checks.${system}.commit = pkgs.testers.runNixOSTest {
+        name = "sentinel-commit";
+        nodes.machine = {
+          imports = [ self.nixosModules.sentinel ];
+          virtualisation.memorySize = 2048;
+        };
+        testScript = ''
+          machine.wait_for_unit("multi-user.target")
+          # Boot seeded the editable config from the factory and brought the
+          # data plane up with it.
+          machine.wait_for_unit("sentinel-boot.service")
+          machine.wait_for_unit("velstra.service")
+          machine.succeed("test -f /var/lib/sentinel/appliance.toml")
+          machine.succeed("test -f /run/sentinel/velstra.toml")
+          # The system's real NIC (eth0) is discovered and shows up in the config,
+          # ready to assign — VyOS-style. (The minimal factory config has no
+          # interfaces of its own.)
+          machine.succeed("sentinel configure --no-apply <<< 'show' | grep -q eth0")
+
+          # Edit + commit AS THE ADMIN USER (not root) — exercises the real
+          # privilege path: admin writes the config (wheel-group), sentinel
+          # escalates hostname/reload via passwordless sudo. Assign the discovered
+          # NIC a zone and change the hostname; commit applies live (no reboot).
+          # VyOS semantics: `commit` applies to the running system (live);
+          # `save` persists to the boot config so it survives reboot.
+          machine.succeed(
+              "su admin -c \"printf '%s\\n' "
+              "'set system hostname fw-a' "
+              "'set interface eth0 role wan' 'set interface eth0 address dhcp' "
+              "commit save exit "
+              "| sentinel configure\""
+          )
+
+          # Hostname changed live.
+          machine.succeed("hostname | grep -x fw-a")
+          # Live visibility (the VyOS feel): a fresh shell's dynamic prompt
+          # mechanism ($(hostname)) yields the new name immediately — no relogin.
+          machine.succeed("su admin -c 'echo $(hostname)' | grep -x fw-a")
+          # commit applied live: the running firewall (/run) binds eth0.
+          machine.succeed("grep -q eth0 /run/sentinel/velstra.toml")
+          # save persisted to the boot config (/var/lib).
+          machine.succeed("grep -q eth0 /var/lib/sentinel/appliance.toml")
+          machine.wait_for_unit("velstra.service")
+
+          # Operational `show` (VyOS-style) works from the plain shell.
+          machine.succeed("sentinel show interfaces | grep -q eth0")
+          machine.succeed("sentinel show config | grep -q fw-a")
+
+          # Reboot persistence: re-running boot apply re-asserts the hostname from
+          # the persisted config (simulates a reboot without a full restart).
+          machine.succeed("hostname scratch")
+          machine.succeed("systemctl restart sentinel-boot.service")
+          machine.succeed("hostname | grep -x fw-a")
+        '';
       };
     };
 }

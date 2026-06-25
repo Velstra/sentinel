@@ -1,39 +1,9 @@
-# Velstra Sentinel — declarative appliance config.
-# Declare the whole box here; `sentinel config apply` reconciles to it.
+# Velstra Sentinel — factory-default appliance config.
+#
+# Minimal on purpose: the box discovers the network interfaces it actually has
+# and surfaces them in `configure` (unassigned). You then assign each a zone and
+# address and add firewall rules. `commit` applies changes to the running system
+# live (no reboot).
 
 [system]
 hostname = "sentinel-fw"
-
-# Interfaces carry a zone role (wan | lan | dmz). Address is "dhcp" or a CIDR.
-[[interface]]
-name = "wan0"
-role = "wan"
-address = "dhcp"
-
-[[interface]]
-name = "lan0"
-role = "lan"
-address = "10.0.0.1/24"
-
-# Broad zone rules set a zone's posture (action: accept | drop | reject).
-[[rule]]
-name = "lan-to-wan"
-from = "lan"
-to = "wan"
-action = "accept"
-
-[[rule]]
-name = "wan-to-lan"
-from = "wan"
-to = "lan"
-action = "drop"
-
-# Port rules open a specific proto/port even on a default-drop zone — here,
-# inbound HTTPS from the WAN.
-[[rule]]
-name = "allow-https-in"
-from = "wan"
-to = "lan"
-action = "accept"
-proto = "tcp"
-port = 443
