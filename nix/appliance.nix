@@ -70,6 +70,54 @@
     PS1='\[\e[1;32m\]\u@$(hostname)\[\e[0m\]:\w\$ '
   '';
 
+  # Operational-mode tab completion (vtysh-like): `show <Tab>` and
+  # `sentinel show <Tab>` offer the real subcommands instead of bash's default
+  # filename completion. Registered against the `show` alias name too.
+  programs.bash.interactiveShellInit = ''
+    _sentinel_show_kinds="status interfaces routes neighbors config log version"
+    # vtysh-style context: the `show` kind, then (for net views) the live NICs.
+    _sentinel_show_at() {
+      # $1 = index of the show KIND word; complete relative to it. (Separate
+      # `local` lines: a var isn't visible to a later RHS on the same `local`.)
+      local kind_i=$1
+      local cur="''${COMP_WORDS[COMP_CWORD]}"
+      local rel=$((COMP_CWORD - kind_i))
+      if [ "$rel" -eq 0 ]; then
+        COMPREPLY=( $(compgen -W "$_sentinel_show_kinds" -- "$cur") )
+      elif [ "$rel" -eq 1 ]; then
+        case "''${COMP_WORDS[kind_i]}" in
+          interfaces|routes|neighbors)
+            COMPREPLY=( $(compgen -W "$(ls /sys/class/net 2>/dev/null)" -- "$cur") ) ;;
+          *) COMPREPLY=() ;;
+        esac
+      else
+        COMPREPLY=()
+      fi
+    }
+    # `show <kind> [nic]` (the alias) — KIND is at word index 1.
+    _sentinel_show() { _sentinel_show_at 1; }
+    complete -F _sentinel_show show
+
+    _sentinel() {
+      if [ "$COMP_CWORD" -eq 1 ]; then
+        COMPREPLY=( $(compgen -W "configure show config compile apply apply-boot ports" -- "''${COMP_WORDS[COMP_CWORD]}") )
+      elif [ "''${COMP_WORDS[1]}" = "show" ]; then
+        # `sentinel show <kind> [nic]` — KIND is at word index 2.
+        _sentinel_show_at 2
+      else
+        COMPREPLY=()
+      fi
+    }
+    complete -F _sentinel sentinel
+  '';
+
+  # Handy for the operator at the plain shell; sentinel itself calls these by
+  # absolute path (wrapped), so it doesn't depend on this.
+  environment.systemPackages = with pkgs; [
+    iproute2
+    nettools
+  ];
+
   # A short greeting so it's clear how to start.
   users.motd = ''
     Velstra Sentinel appliance.
