@@ -276,6 +276,29 @@
           assert "sentinel" in machine.succeed("sentinel show version")
           machine.succeed("sentinel show log")
 
+          # `compare`: pending edits show as a -/+ diff against the saved config.
+          compared = machine.succeed(
+              "su admin -c \"printf '%s\\n' "
+              "'set system hostname fw-b' compare exit "
+              "| sentinel configure --no-apply\""
+          )
+          assert "-    hostname fw-a" in compared, compared
+          assert "+    hostname fw-b" in compared, compared
+
+          # Live L3 addressing via networkd: assign a static address to a spare
+          # link and verify networkd actually configured it — no reboot.
+          machine.succeed("ip link add dummy0 type dummy")
+          machine.succeed(
+              "su admin -c \"printf '%s\\n' "
+              "'set interface dummy0 address 10.9.9.1/24' "
+              "commit save exit "
+              "| sentinel configure\""
+          )
+          # The sentinel networkd unit was written ...
+          machine.succeed("test -f /run/systemd/network/10-sentinel-dummy0.network")
+          # ... and networkd applied the address to the live link.
+          machine.wait_until_succeeds("ip addr show dummy0 | grep -q 10.9.9.1", timeout=20)
+
           # Reboot persistence: re-running boot apply re-asserts the hostname from
           # the persisted config (simulates a reboot without a full restart).
           machine.succeed("hostname scratch")

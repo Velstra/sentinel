@@ -240,43 +240,25 @@ impl Session {
 
     /// Render the candidate in a readable, hierarchical (JunOS-curly) form.
     pub fn show(&self) -> String {
-        let mut out = String::new();
-        if let Some(h) = &self.draft.hostname {
-            out.push_str(&format!("system {{\n    hostname {h}\n}}\n"));
+        render_draft(&self.draft, false)
+    }
+
+    /// `compare` — a VyOS-style line diff of the candidate against the
+    /// **saved** config on disk (the last `save`d state). Empty when nothing
+    /// changed. System-provided but unconfigured interfaces (no role/address)
+    /// are excluded so they don't show up as spurious additions.
+    pub fn compare(&self) -> Result<String> {
+        let baseline = if self.path.exists() {
+            Draft::from_appliance(&Appliance::load(&self.path)?)
+        } else {
+            Draft::default()
+        };
+        let old = render_draft(&baseline, true);
+        let new = render_draft(&self.draft, true);
+        if old == new {
+            return Ok(String::new()); // unchanged — `unified` would echo context
         }
-        for (name, i) in &self.draft.interfaces {
-            out.push_str(&format!("interface {name} {{\n"));
-            if let Some(r) = i.role {
-                out.push_str(&format!("    role {}\n", zone_str(r)));
-            }
-            if let Some(a) = &i.address {
-                out.push_str(&format!("    address {a}\n"));
-            }
-            out.push_str("}\n");
-        }
-        for (name, r) in &self.draft.rules {
-            out.push_str(&format!("rule {name} {{\n"));
-            if let Some(z) = r.from {
-                out.push_str(&format!("    from {}\n", zone_str(z)));
-            }
-            if let Some(z) = r.to {
-                out.push_str(&format!("    to {}\n", zone_str(z)));
-            }
-            if let Some(a) = r.action {
-                out.push_str(&format!("    action {}\n", action_str(a)));
-            }
-            if let Some(p) = r.proto {
-                out.push_str(&format!("    proto {}\n", proto_str(p)));
-            }
-            if let Some(p) = r.port {
-                out.push_str(&format!("    port {p}\n"));
-            }
-            out.push_str("}\n");
-        }
-        if out.is_empty() {
-            out.push_str("(empty configuration)\n");
-        }
-        out
+        Ok(crate::diff::unified(&old, &new))
     }
 
     /// Build a validated [`Appliance`] from the candidate, reporting any
@@ -370,6 +352,52 @@ impl Session {
         self.dirty = false;
         Ok(())
     }
+}
+
+/// Render a draft in JunOS-curly form. When `skip_empty_ifaces` is set,
+/// interfaces with neither a role nor an address are omitted (used by
+/// `compare`, where system-provided placeholders aren't real configuration).
+fn render_draft(draft: &Draft, skip_empty_ifaces: bool) -> String {
+    let mut out = String::new();
+    if let Some(h) = &draft.hostname {
+        out.push_str(&format!("system {{\n    hostname {h}\n}}\n"));
+    }
+    for (name, i) in &draft.interfaces {
+        if skip_empty_ifaces && i.role.is_none() && i.address.is_none() {
+            continue;
+        }
+        out.push_str(&format!("interface {name} {{\n"));
+        if let Some(r) = i.role {
+            out.push_str(&format!("    role {}\n", zone_str(r)));
+        }
+        if let Some(a) = &i.address {
+            out.push_str(&format!("    address {a}\n"));
+        }
+        out.push_str("}\n");
+    }
+    for (name, r) in &draft.rules {
+        out.push_str(&format!("rule {name} {{\n"));
+        if let Some(z) = r.from {
+            out.push_str(&format!("    from {}\n", zone_str(z)));
+        }
+        if let Some(z) = r.to {
+            out.push_str(&format!("    to {}\n", zone_str(z)));
+        }
+        if let Some(a) = r.action {
+            out.push_str(&format!("    action {}\n", action_str(a)));
+        }
+        if let Some(p) = r.proto {
+            out.push_str(&format!("    proto {}\n", proto_str(p)));
+        }
+        if let Some(p) = r.port {
+            out.push_str(&format!("    port {p}\n"));
+        }
+        out.push_str("}\n");
+    }
+    if out.is_empty() && !skip_empty_ifaces {
+        out.push_str("(empty configuration)\n");
+    }
+    out
 }
 
 fn parse_zone(s: &str) -> Result<Zone> {
@@ -506,6 +534,30 @@ mod tests {
         assert!(run(&mut s, "set interface x address 10.0.0.1/33").is_err());
         assert!(run(&mut s, "set rule r port 70000").is_err());
         assert!(run(&mut s, "set bogus path here").is_err());
+    }
+
+    #[test]
+    fn compare_diffs_candidate_against_saved() {
+        let dir = std::env::temp_dir().join(format!("sentinel-cmp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.toml");
+
+        // Seed and save a baseline config.
+        let mut s = Session::load(&path).unwrap();
+        run(&mut s, "set system hostname fw1").unwrap();
+        s.save(None).unwrap();
+
+        // Reload: no edits yet ⇒ no diff.
+        let mut s = Session::load(&path).unwrap();
+        assert!(s.compare().unwrap().is_empty(), "fresh load has no changes");
+
+        // Edit the hostname ⇒ a -/+ pair.
+        run(&mut s, "set system hostname fw2").unwrap();
+        let diff = s.compare().unwrap();
+        assert!(diff.contains("-    hostname fw1"), "got:\n{diff}");
+        assert!(diff.contains("+    hostname fw2"), "got:\n{diff}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

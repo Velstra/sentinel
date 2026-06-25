@@ -54,7 +54,13 @@ in
     systemd.services.sentinel-boot = {
       description = "Seed Velstra config + hostname from the active appliance config";
       wantedBy = [ "multi-user.target" ];
-      before = [ "velstra.service" ];
+      # Before networkd so the `.network` units are in place when it starts
+      # (it reads /run/systemd/network on startup); before velstra so the agent
+      # sees the compiled firewall config.
+      before = [
+        "velstra.service"
+        "systemd-networkd.service"
+      ];
       # `hostname` (nettools) on PATH for the live hostname apply.
       path = [ pkgs.nettools ];
       serviceConfig = {
