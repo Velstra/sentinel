@@ -40,8 +40,30 @@
         version = "0.1.0";
         src = ./.;
         cargoLock.lockFile = ./Cargo.lock;
-        nativeBuildInputs = [ pkgs.protobuf ];
+        nativeBuildInputs = [
+          pkgs.protobuf
+          pkgs.makeWrapper
+        ];
         PROTOC = "${pkgs.protobuf}/bin/protoc";
+        # Pin every external tool sentinel shells out to (live hostname/addressing
+        # apply, operational `show`) to an absolute store path, and put the setuid
+        # `sudo` wrapper on PATH. Without this, a `commit` on a NixOS box can fail
+        # with "Failed to execute /run/current-system/sw/..." when a tool isn't on
+        # the admin's PATH or in sudo's secure_path. Resolved at build time → no
+        # PATH ambiguity at runtime, for both the admin and the boot service.
+        postInstall = ''
+          wrapProgram $out/bin/sentinel \
+            --set SENTINEL_HOSTNAME_BIN   ${pkgs.nettools}/bin/hostname \
+            --set SENTINEL_IP_BIN         ${pkgs.iproute2}/bin/ip \
+            --set SENTINEL_NETWORKCTL_BIN ${pkgs.systemd}/bin/networkctl \
+            --set SENTINEL_SYSTEMCTL_BIN  ${pkgs.systemd}/bin/systemctl \
+            --set SENTINEL_JOURNALCTL_BIN ${pkgs.systemd}/bin/journalctl \
+            --set SENTINEL_INSTALL_BIN    ${pkgs.coreutils}/bin/install \
+            --set SENTINEL_MKDIR_BIN      ${pkgs.coreutils}/bin/mkdir \
+            --set SENTINEL_RM_BIN         ${pkgs.coreutils}/bin/rm \
+            --set SENTINEL_UNAME_BIN      ${pkgs.coreutils}/bin/uname \
+            --prefix PATH : /run/wrappers/bin
+        '';
       };
 
       # --- the velstra eBPF/XDP agent (needs nightly + rust-src + bpf-linker) -
@@ -275,6 +297,9 @@
           machine.succeed("sentinel show neighbors")
           assert "sentinel" in machine.succeed("sentinel show version")
           machine.succeed("sentinel show log")
+          # A `show` view can be scoped to one interface (vtysh-style).
+          scoped = machine.succeed("sentinel show interfaces lo")
+          assert "lo" in scoped and "eth0" not in scoped, scoped
 
           # `compare`: pending edits show as a -/+ diff against the saved config.
           compared = machine.succeed(

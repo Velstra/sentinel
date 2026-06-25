@@ -148,6 +148,18 @@ impl Session {
         self.dirty
     }
 
+    /// The interface names currently in the candidate (system-discovered +
+    /// operator-added) — completion offers these for `set/delete interface …`.
+    pub fn interface_names(&self) -> Vec<String> {
+        self.draft.interfaces.iter().map(|(n, _)| n.clone()).collect()
+    }
+
+    /// The rule names currently in the candidate — completion offers these for
+    /// `set/delete rule …`.
+    pub fn rule_names(&self) -> Vec<String> {
+        self.draft.rules.iter().map(|(n, _)| n.clone()).collect()
+    }
+
     /// `set <path...> <value>` — set one config node.
     pub fn set(&mut self, args: &[&str]) -> Result<()> {
         match args {

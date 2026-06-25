@@ -117,12 +117,40 @@ pub fn networkctl_reload(ifaces: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a logical tool name to an absolute path. The Nix wrapper injects
+/// `SENTINEL_<TOOL>_BIN` env vars pointing at exact store paths, so neither the
+/// admin's `$PATH` nor sudo's `secure_path` can shadow or miss a tool (the cause
+/// of "Failed to execute /run/current-system/sw/..." on a `commit`). Off-box
+/// (dev, tests) the vars are unset and we fall back to the bare name on `$PATH`.
+pub fn bin(name: &str) -> String {
+    let var = match name {
+        "hostname" => "SENTINEL_HOSTNAME_BIN",
+        "ip" => "SENTINEL_IP_BIN",
+        "networkctl" => "SENTINEL_NETWORKCTL_BIN",
+        "systemctl" => "SENTINEL_SYSTEMCTL_BIN",
+        "journalctl" => "SENTINEL_JOURNALCTL_BIN",
+        "install" => "SENTINEL_INSTALL_BIN",
+        "mkdir" => "SENTINEL_MKDIR_BIN",
+        "rm" => "SENTINEL_RM_BIN",
+        "uname" => "SENTINEL_UNAME_BIN",
+        _ => "",
+    };
+    if !var.is_empty() {
+        if let Ok(path) = std::env::var(var) {
+            if !path.is_empty() {
+                return path;
+            }
+        }
+    }
+    name.to_string()
+}
+
 /// Run a command that needs root: try directly first (succeeds as root, e.g. the
 /// boot service) and fall back to `sudo` (the admin running `configure`). The
 /// direct probe is silenced so its expected "permission denied" doesn't reach
 /// the user.
 fn run_priv(cmd: &str, args: &[&str]) -> Result<()> {
-    let direct = Command::new(cmd)
+    let direct = Command::new(bin(cmd))
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -135,9 +163,11 @@ fn run_priv(cmd: &str, args: &[&str]) -> Result<()> {
 
 /// Run a privileged command via `sudo`, inheriting stdio. On the appliance the
 /// admin is passwordless-wheel, so this is seamless; `sudo` is a transparent
-/// passthrough when already root.
+/// passthrough when already root. The command itself is passed by absolute path
+/// so sudo execs it directly, bypassing `secure_path` lookup entirely.
 fn sudo(cmd: &str, args: &[&str]) -> Result<()> {
-    let mut all = vec![cmd];
+    let resolved = bin(cmd);
+    let mut all = vec![resolved.as_str()];
     all.extend_from_slice(args);
     let status = Command::new("sudo")
         .args(&all)
