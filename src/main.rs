@@ -11,6 +11,8 @@
 
 mod compile;
 mod config;
+mod diff;
+mod net;
 mod repl;
 mod session;
 mod system;
@@ -281,6 +283,9 @@ fn apply_boot(config: &std::path::Path, out: &std::path::Path) -> Result<()> {
     std::fs::write(out, &rendered).with_context(|| format!("writing {}", out.display()))?;
 
     system::set_hostname(&appliance.system.hostname)?;
+    // Re-assert interface addressing from the saved config (networkd units),
+    // so a reboot restores the live IPs the same way it restores the hostname.
+    net::apply(&appliance)?;
     Ok(())
 }
 
