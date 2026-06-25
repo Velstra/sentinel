@@ -80,6 +80,8 @@ enum Command {
     Show {
         #[arg(value_enum, default_value_t = ShowKind::Status)]
         what: ShowKind,
+        /// Optional interface to scope the output to (interfaces/routes/neighbors).
+        target: Option<String>,
     },
     /// Author the declarative appliance config (file-based helpers).
     Config {
@@ -158,7 +160,7 @@ async fn main() -> Result<()> {
 
     match Cli::parse().command {
         Command::Configure { config, no_apply } => configure(&config, no_apply),
-        Command::Show { what } => show_cmd(what),
+        Command::Show { what, target } => show_cmd(what, target.as_deref()),
         Command::Config { action } => config_cmd(action),
         Command::Compile { file } => {
             let appliance = Appliance::load(&file)?;
@@ -200,7 +202,7 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
             .build();
         let mut rl = rustyline::Editor::<repl::ConfigCompleter, _>::with_config(cfg)
             .context("starting the line editor")?;
-        rl.set_helper(Some(repl::ConfigCompleter));
+        rl.set_helper(Some(repl::ConfigCompleter::new()));
         // VyOS/vtysh `?`: list the candidates here without inserting a literal
         // `?`. Bound to the same completion the Tab key triggers.
         rl.bind_sequence(
@@ -209,6 +211,11 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
         );
         let user = std::env::var("USER").unwrap_or_else(|_| "admin".into());
         loop {
+            // Refresh the names the completer offers (interfaces/rules can change
+            // with each command) so `set interface <Tab>` lists the current NICs.
+            if let Some(h) = rl.helper() {
+                h.set_names(session.interface_names(), session.rule_names());
+            }
             // VyOS-style prompt, re-rendered each line: it reflects the LIVE
             // hostname (so a committed change shows immediately) and marks
             // uncommitted edits.
@@ -289,20 +296,38 @@ fn apply_boot(config: &std::path::Path, out: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Operational-mode `show`: live system state, VyOS-style.
-fn show_cmd(what: ShowKind) -> Result<()> {
+/// Operational-mode `show`: live system state, VyOS-style. `target` optionally
+/// scopes interface/route/neighbor output to one NIC.
+fn show_cmd(what: ShowKind, target: Option<&str>) -> Result<()> {
+    let ip = system::bin("ip");
     match what {
-        ShowKind::Interfaces => run_show("ip", &["-brief", "address", "show"]),
-        ShowKind::Routes => run_show("ip", &["route", "show"]),
-        ShowKind::Neighbors => run_show("ip", &["neighbor", "show"]),
+        ShowKind::Interfaces => {
+            let mut args = vec!["-brief", "address", "show"];
+            args.extend(target);
+            run_show(&ip, &args)
+        }
+        ShowKind::Routes => {
+            let mut args = vec!["route", "show"];
+            if let Some(dev) = target {
+                args.extend(["dev", dev]);
+            }
+            run_show(&ip, &args)
+        }
+        ShowKind::Neighbors => {
+            let mut args = vec!["neighbor", "show"];
+            if let Some(dev) = target {
+                args.extend(["dev", dev]);
+            }
+            run_show(&ip, &args)
+        }
         ShowKind::Log => run_show(
-            "journalctl",
+            &system::bin("journalctl"),
             &["-u", "velstra.service", "-n", "50", "--no-pager"],
         ),
         ShowKind::Version => {
             println!("sentinel:   {}", env!("CARGO_PKG_VERSION"));
             print!("kernel:     ");
-            run_show("uname", &["-sr"])
+            run_show(&system::bin("uname"), &["-sr"])
         }
         ShowKind::Config => {
             let path = std::path::Path::new(DEFAULT_CONFIG);
@@ -316,9 +341,9 @@ fn show_cmd(what: ShowKind) -> Result<()> {
         ShowKind::Status => {
             println!("hostname:   {}", system::current_hostname());
             print!("firewall:   ");
-            run_show("systemctl", &["is-active", "velstra.service"])?;
+            run_show(&system::bin("systemctl"), &["is-active", "velstra.service"])?;
             println!("interfaces:");
-            run_show("ip", &["-brief", "address", "show"])
+            run_show(&ip, &["-brief", "address", "show"])
         }
     }
 }

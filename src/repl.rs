@@ -212,8 +212,10 @@ const RULE_FIELDS: &[Cand] = &[
     ("port", "destination port"),
 ];
 
-/// Completion candidates for the token currently being typed, given the
-/// already-complete `tokens` before it.
+/// Static completion candidates for the token being typed, given the
+/// already-complete `tokens` before it. The interface/rule **name** positions
+/// (`set interface <name>`, `set rule <name>`) are filled dynamically from the
+/// live config — see [`dyn_candidates`].
 fn candidates(tokens: &[&str]) -> &'static [Cand] {
     match tokens {
         [] => COMMANDS,
@@ -230,9 +232,71 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
     }
 }
 
-/// rustyline helper providing tab-completion over the configure grammar. The
-/// hint/highlight/validate traits are no-ops; only completion is implemented.
-pub struct ConfigCompleter;
+/// Live config names the completer offers for the name positions, refreshed
+/// from the session after each command.
+#[derive(Default)]
+pub struct DynNames {
+    pub interfaces: Vec<String>,
+    pub rules: Vec<String>,
+}
+
+/// Candidates for `tokens`, splicing in the live interface/rule names at the
+/// name positions and falling back to the static grammar elsewhere. Returns
+/// owned `(keyword, description)` pairs.
+fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
+    let own = |slice: &[Cand]| -> Vec<(String, String)> {
+        slice.iter().map(|(k, d)| (k.to_string(), d.to_string())).collect()
+    };
+    match tokens {
+        // `set interface <Tab>` → the NICs already present (system-discovered or
+        // added), so you can pick one to keep configuring — VyOS-style.
+        ["set" | "delete", "interface"] => names
+            .interfaces
+            .iter()
+            .map(|n| (n.clone(), "interface".to_string()))
+            .collect(),
+        ["set" | "delete", "rule"] => names
+            .rules
+            .iter()
+            .map(|n| (n.clone(), "rule".to_string()))
+            .collect(),
+        _ => own(candidates(tokens)),
+    }
+}
+
+/// The terminal width (columns), so the completion menu can be laid out one
+/// candidate per line. Falls back to 80 when it can't be queried.
+fn term_width() -> usize {
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
+            return ws.ws_col as usize;
+        }
+    }
+    80
+}
+
+/// rustyline helper providing tab/`?` completion over the configure grammar,
+/// including the live interface/rule names. The hint/highlight/validate traits
+/// are no-ops; only completion is implemented.
+pub struct ConfigCompleter {
+    names: std::cell::RefCell<DynNames>,
+}
+
+impl ConfigCompleter {
+    pub fn new() -> Self {
+        Self {
+            names: std::cell::RefCell::new(DynNames::default()),
+        }
+    }
+
+    /// Refresh the interface/rule names offered at the name positions. Called
+    /// from the configure loop after every command so new interfaces/rules
+    /// become completable immediately.
+    pub fn set_names(&self, interfaces: Vec<String>, rules: Vec<String>) {
+        *self.names.borrow_mut() = DynNames { interfaces, rules };
+    }
+}
 
 impl Hinter for ConfigCompleter {
     type Hint = String;
@@ -259,14 +323,28 @@ impl Completer for ConfigCompleter {
         };
         let before: Vec<&str> = head[..start].split_whitespace().collect();
 
-        let matches = candidates(&before)
+        let names = self.names.borrow();
+        let all = dyn_candidates(&before, &names);
+        let matched: Vec<&(String, String)> =
+            all.iter().filter(|(kw, _)| kw.starts_with(prefix)).collect();
+
+        // Align the keyword column, then pad each row out to the terminal width
+        // so rustyline lists one candidate per line (keyword + description
+        // stacked vertically), vtysh-style, instead of a packed grid.
+        let kw_w = matched.iter().map(|(kw, _)| kw.len()).max().unwrap_or(0);
+        let row_w = term_width().saturating_sub(1);
+        let matches = matched
             .iter()
-            .filter(|(kw, _)| kw.starts_with(prefix))
-            .map(|(kw, desc)| Pair {
-                // `keyword          description` — the listing reads like VyOS's
-                // `?` help; only the keyword is inserted.
-                display: format!("{kw:<10}  {desc}"),
-                replacement: format!("{kw} "),
+            .map(|(kw, desc)| {
+                let body = if desc.is_empty() {
+                    kw.clone()
+                } else {
+                    format!("{kw:<kw_w$}  {desc}")
+                };
+                Pair {
+                    display: format!("{body:<row_w$}"),
+                    replacement: format!("{kw} "),
+                }
             })
             .collect();
         Ok((start, matches))
@@ -298,6 +376,23 @@ mod tests {
         assert_eq!(kw(&["set", "rule", "web", "from"]), ["wan", "lan", "dmz"]);
         // Unknown contexts complete nothing.
         assert!(candidates(&["bogus"]).is_empty());
+    }
+
+    #[test]
+    fn dynamic_candidates_offer_live_names() {
+        let names = DynNames {
+            interfaces: vec!["eth0".into(), "eth1".into()],
+            rules: vec!["web".into()],
+        };
+        let kws = |toks: &[&str]| -> Vec<String> {
+            dyn_candidates(toks, &names).into_iter().map(|(k, _)| k).collect()
+        };
+        // Name positions splice in the live interface/rule names.
+        assert_eq!(kws(&["set", "interface"]), ["eth0", "eth1"]);
+        assert_eq!(kws(&["delete", "rule"]), ["web"]);
+        // Other positions fall back to the static grammar.
+        assert_eq!(kws(&["set"]), ["system", "interface", "rule"]);
+        assert_eq!(kws(&["set", "interface", "eth0"]), ["role", "address"]);
     }
 
     #[test]
