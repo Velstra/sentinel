@@ -42,8 +42,16 @@ enum ShowKind {
     Status,
     /// Live network interfaces and their addresses.
     Interfaces,
+    /// The kernel routing table.
+    Routes,
+    /// The ARP / neighbor table.
+    Neighbors,
     /// The saved appliance configuration.
     Config,
+    /// Recent firewall (velstra) log lines.
+    Log,
+    /// Sentinel and kernel version.
+    Version,
 }
 
 #[derive(Parser)]
@@ -137,6 +145,15 @@ enum ConfigAction {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Restore default SIGPIPE handling so `sentinel show … | head`/`grep -q`
+    // exits quietly when the reader closes the pipe, instead of panicking on
+    // EPIPE (Rust ignores SIGPIPE by default, turning a closed pipe into a
+    // "failed printing to stdout" panic).
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     match Cli::parse().command {
         Command::Configure { config, no_apply } => configure(&config, no_apply),
         Command::Show { what } => show_cmd(what),
@@ -182,6 +199,12 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
         let mut rl = rustyline::Editor::<repl::ConfigCompleter, _>::with_config(cfg)
             .context("starting the line editor")?;
         rl.set_helper(Some(repl::ConfigCompleter));
+        // VyOS/vtysh `?`: list the candidates here without inserting a literal
+        // `?`. Bound to the same completion the Tab key triggers.
+        rl.bind_sequence(
+            rustyline::KeyEvent(rustyline::KeyCode::Char('?'), rustyline::Modifiers::NONE),
+            rustyline::Cmd::Complete,
+        );
         let user = std::env::var("USER").unwrap_or_else(|_| "admin".into());
         loop {
             // VyOS-style prompt, re-rendered each line: it reflects the LIVE
@@ -265,6 +288,17 @@ fn apply_boot(config: &std::path::Path, out: &std::path::Path) -> Result<()> {
 fn show_cmd(what: ShowKind) -> Result<()> {
     match what {
         ShowKind::Interfaces => run_show("ip", &["-brief", "address", "show"]),
+        ShowKind::Routes => run_show("ip", &["route", "show"]),
+        ShowKind::Neighbors => run_show("ip", &["neighbor", "show"]),
+        ShowKind::Log => run_show(
+            "journalctl",
+            &["-u", "velstra.service", "-n", "50", "--no-pager"],
+        ),
+        ShowKind::Version => {
+            println!("sentinel:   {}", env!("CARGO_PKG_VERSION"));
+            print!("kernel:     ");
+            run_show("uname", &["-sr"])
+        }
         ShowKind::Config => {
             let path = std::path::Path::new(DEFAULT_CONFIG);
             if path.exists() {

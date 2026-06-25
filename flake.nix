@@ -268,6 +268,13 @@
           # Operational `show` (VyOS-style) works from the plain shell.
           machine.succeed("sentinel show interfaces | grep -q eth0")
           machine.succeed("sentinel show config | grep -q fw-a")
+          # The richer operational subcommands resolve to real system state.
+          # (No `grep -q`: the test driver runs with pipefail, so an early pipe
+          # close would surface sentinel's correct SIGPIPE death as a failure.)
+          machine.succeed("sentinel show routes")
+          machine.succeed("sentinel show neighbors")
+          assert "sentinel" in machine.succeed("sentinel show version")
+          machine.succeed("sentinel show log")
 
           # Reboot persistence: re-running boot apply re-asserts the hostname from
           # the persisted config (simulates a reboot without a full restart).
