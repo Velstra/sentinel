@@ -81,9 +81,14 @@ pub enum Zone {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Interface {
     pub name: String,
-    pub role: Zone,
-    /// `"dhcp"` or a CIDR like `"10.0.0.1/24"`.
-    pub address: String,
+    /// The zone this interface belongs to. `None` for a NIC the system provides
+    /// but the operator hasn't assigned yet (it shows up in the config but is not
+    /// firewalled until a zone is set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<Zone>,
+    /// `"dhcp"` or a CIDR like `"10.0.0.1/24"`. `None` if not yet configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,13 +181,14 @@ impl Appliance {
             if !seen.insert(&iface.name) {
                 bail!("duplicate interface {:?}", iface.name);
             }
-            validate_address(&iface.address)
-                .with_context(|| format!("interface {:?}", iface.name))?;
+            if let Some(addr) = &iface.address {
+                validate_address(addr).with_context(|| format!("interface {:?}", iface.name))?;
+            }
         }
 
-        // Every rule's zones must be backed by at least one interface, else the
-        // rule can never match — a common, silent misconfiguration.
-        let zones: HashSet<Zone> = self.interfaces.iter().map(|i| i.role).collect();
+        // Every rule's zones must be backed by at least one *assigned* interface,
+        // else the rule can never match — a common, silent misconfiguration.
+        let zones: HashSet<Zone> = self.interfaces.iter().filter_map(|i| i.role).collect();
         for rule in &self.rules {
             for (which, zone) in [("from", rule.from), ("to", rule.to)] {
                 if !zones.contains(&zone) {
@@ -210,10 +216,10 @@ impl Appliance {
         out.push_str(&format!("interfaces ({}):\n", self.interfaces.len()));
         for i in &self.interfaces {
             out.push_str(&format!(
-                "  {:<8} {:<4} {}\n",
+                "  {:<8} {:<12} {}\n",
                 i.name,
-                zone_str(i.role),
-                i.address
+                i.role.map(zone_str).unwrap_or("(unassigned)"),
+                i.address.as_deref().unwrap_or("(auto)"),
             ));
         }
         out.push_str(&format!("rules ({}):\n", self.rules.len()));
