@@ -17,6 +17,16 @@
   # networking.hostName is set from the appliance config in flake.nix (so a
   # `commit` that changes the hostname changes the system), not here.
 
+  # systemd-networkd is the L3 backend: `sentinel commit` drops per-interface
+  # `.network` units into /run/systemd/network and reloads networkd, so
+  # `set interface eth0 address …` is applied live. The boot service re-renders
+  # them from the saved config each boot.
+  networking.useNetworkd = true;
+  networking.useDHCP = false;
+  # Don't block boot waiting for a routable link — an appliance may come up with
+  # all NICs down until the operator assigns addresses.
+  systemd.network.wait-online.enable = false;
+
   # SSH like VyOS — but declarative and key-only.
   services.openssh = {
     enable = true;

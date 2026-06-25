@@ -56,6 +56,13 @@ pub fn exec_line(session: &mut Session, act: &Apply, line: &str) -> bool {
             print!("{}", session.show());
             Ok(())
         }
+        "compare" => session.compare().map(|d| {
+            if d.is_empty() {
+                eprintln!("no changes (candidate matches the saved config)");
+            } else {
+                print!("{d}");
+            }
+        }),
         "commit" => return commit(session, act),
         "save" => {
             let to = rest.first().map(Path::new);
@@ -136,6 +143,8 @@ fn apply_live(appliance: &crate::config::Appliance, act: &Apply) -> Result<()> {
 
     // Hostname: set it live.
     system::set_hostname(&appliance.system.hostname)?;
+    // Interface addressing: render + apply networkd units live.
+    crate::net::apply(appliance)?;
     Ok(())
 }
 
@@ -151,6 +160,7 @@ commands:
                             set rule web port 443
   delete <path...>        remove a node or clear a field
   show                    show the candidate configuration
+  compare                 diff the candidate against the saved config
   commit                  apply the candidate to the RUNNING system (live)
   save [path]             persist the config so it survives a reboot
   discard                 drop edits, reload from disk
@@ -166,6 +176,7 @@ const COMMANDS: &[Cand] = &[
     ("set", "set a configuration value"),
     ("delete", "remove a node or clear a field"),
     ("show", "show the candidate configuration"),
+    ("compare", "diff the candidate against the saved config"),
     ("commit", "apply the candidate to the running system (live)"),
     ("save", "persist the configuration across reboot"),
     ("discard", "drop uncommitted edits"),
@@ -273,7 +284,10 @@ mod tests {
 
     #[test]
     fn completion_grammar_is_context_aware() {
-        assert_eq!(kw(&[]), ["set", "delete", "show", "commit", "save", "discard", "exit", "help"]);
+        assert_eq!(
+            kw(&[]),
+            ["set", "delete", "show", "compare", "commit", "save", "discard", "exit", "help"]
+        );
         assert_eq!(kw(&["set"]), ["system", "interface", "rule"]);
         assert_eq!(kw(&["set", "system"]), ["hostname"]);
         assert_eq!(kw(&["set", "interface", "wan0"]), ["role", "address"]);
