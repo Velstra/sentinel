@@ -155,26 +155,59 @@ commands:
   save [path]             persist the config so it survives a reboot
   discard                 drop edits, reload from disk
   exit | quit             leave configuration mode (Ctrl-C cancels a line)
-  (Tab completes commands, config keys, and value keywords.)
+  (Tab or `?` lists commands, config keys, and value keywords.)
 ";
 
-const COMMANDS: &[&str] = &[
-    "set", "delete", "show", "commit", "save", "discard", "exit", "help",
+/// A completion candidate: the keyword to insert plus a short description shown
+/// in the Tab/`?` listing (VyOS/vtysh style).
+pub type Cand = (&'static str, &'static str);
+
+const COMMANDS: &[Cand] = &[
+    ("set", "set a configuration value"),
+    ("delete", "remove a node or clear a field"),
+    ("show", "show the candidate configuration"),
+    ("commit", "apply the candidate to the running system (live)"),
+    ("save", "persist the configuration across reboot"),
+    ("discard", "drop uncommitted edits"),
+    ("exit", "leave configuration mode"),
+    ("help", "show command help"),
 ];
-const TOP: &[&str] = &["system", "interface", "rule"];
-const ZONES: &[&str] = &["wan", "lan", "dmz"];
-const ACTIONS: &[&str] = &["accept", "drop", "reject"];
-const PROTOS: &[&str] = &["tcp", "udp"];
-const IFACE_FIELDS: &[&str] = &["role", "address"];
-const RULE_FIELDS: &[&str] = &["from", "to", "action", "proto", "port"];
+const TOP: &[Cand] = &[
+    ("system", "host-wide settings (hostname, …)"),
+    ("interface", "per-NIC zone and address"),
+    ("rule", "firewall rule"),
+];
+const SYSTEM_FIELDS: &[Cand] = &[("hostname", "the appliance hostname")];
+const ZONES: &[Cand] = &[
+    ("wan", "untrusted / uplink zone"),
+    ("lan", "trusted / internal zone"),
+    ("dmz", "semi-trusted services zone"),
+];
+const ACTIONS: &[Cand] = &[
+    ("accept", "allow matching traffic"),
+    ("drop", "silently discard"),
+    ("reject", "discard with an ICMP error"),
+];
+const PROTOS: &[Cand] = &[("tcp", "TCP"), ("udp", "UDP")];
+const IFACE_FIELDS: &[Cand] = &[
+    ("role", "the zone this NIC belongs to"),
+    ("address", "static CIDR or `dhcp`"),
+];
+const RULE_FIELDS: &[Cand] = &[
+    ("from", "source zone"),
+    ("to", "destination zone"),
+    ("action", "accept / drop / reject"),
+    ("proto", "tcp / udp"),
+    ("port", "destination port"),
+];
 
 /// Completion candidates for the token currently being typed, given the
 /// already-complete `tokens` before it.
-fn candidates(tokens: &[&str]) -> &'static [&'static str] {
+fn candidates(tokens: &[&str]) -> &'static [Cand] {
     match tokens {
         [] => COMMANDS,
         ["set" | "delete"] => TOP,
-        ["set" | "delete", "system"] => &["hostname"],
+        ["set" | "delete", "system"] => SYSTEM_FIELDS,
         // `set interface <name> <field>` — name is freeform, then fields.
         ["set" | "delete", "interface", _name] => IFACE_FIELDS,
         ["set", "interface", _name, "role"] => ZONES,
@@ -217,10 +250,12 @@ impl Completer for ConfigCompleter {
 
         let matches = candidates(&before)
             .iter()
-            .filter(|c| c.starts_with(prefix))
-            .map(|c| Pair {
-                display: (*c).to_string(),
-                replacement: format!("{c} "),
+            .filter(|(kw, _)| kw.starts_with(prefix))
+            .map(|(kw, desc)| Pair {
+                // `keyword          description` — the listing reads like VyOS's
+                // `?` help; only the keyword is inserted.
+                display: format!("{kw:<10}  {desc}"),
+                replacement: format!("{kw} "),
             })
             .collect();
         Ok((start, matches))
@@ -231,17 +266,22 @@ impl Completer for ConfigCompleter {
 mod tests {
     use super::*;
 
+    /// The keywords offered for a context (drops the descriptions).
+    fn kw(tokens: &[&str]) -> Vec<&'static str> {
+        candidates(tokens).iter().map(|(k, _)| *k).collect()
+    }
+
     #[test]
     fn completion_grammar_is_context_aware() {
-        assert_eq!(candidates(&[]), COMMANDS);
-        assert_eq!(candidates(&["set"]), TOP);
-        assert_eq!(candidates(&["set", "system"]), &["hostname"]);
-        assert_eq!(candidates(&["set", "interface", "wan0"]), IFACE_FIELDS);
-        assert_eq!(candidates(&["set", "interface", "wan0", "role"]), ZONES);
-        assert_eq!(candidates(&["set", "rule", "web"]), RULE_FIELDS);
-        assert_eq!(candidates(&["set", "rule", "web", "action"]), ACTIONS);
-        assert_eq!(candidates(&["set", "rule", "web", "proto"]), PROTOS);
-        assert_eq!(candidates(&["set", "rule", "web", "from"]), ZONES);
+        assert_eq!(kw(&[]), ["set", "delete", "show", "commit", "save", "discard", "exit", "help"]);
+        assert_eq!(kw(&["set"]), ["system", "interface", "rule"]);
+        assert_eq!(kw(&["set", "system"]), ["hostname"]);
+        assert_eq!(kw(&["set", "interface", "wan0"]), ["role", "address"]);
+        assert_eq!(kw(&["set", "interface", "wan0", "role"]), ["wan", "lan", "dmz"]);
+        assert_eq!(kw(&["set", "rule", "web"]), ["from", "to", "action", "proto", "port"]);
+        assert_eq!(kw(&["set", "rule", "web", "action"]), ["accept", "drop", "reject"]);
+        assert_eq!(kw(&["set", "rule", "web", "proto"]), ["tcp", "udp"]);
+        assert_eq!(kw(&["set", "rule", "web", "from"]), ["wan", "lan", "dmz"]);
         // Unknown contexts complete nothing.
         assert!(candidates(&["bogus"]).is_empty());
     }

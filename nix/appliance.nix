@@ -63,8 +63,8 @@
   # A short greeting so it's clear how to start.
   users.motd = ''
     Velstra Sentinel appliance.
-      show          live status / interfaces / config
-      configure     edit the config; `commit` applies live, `save` persists
+      show <Tab>    live status / interfaces / routes / neighbors / log / version / config
+      configure     edit the config (Tab or `?` lists options); `commit` applies live, `save` persists
   '';
 
   # EFI + systemd-boot so generations are listed at boot (the rollback path).
