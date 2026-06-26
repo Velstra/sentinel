@@ -129,10 +129,23 @@ pub fn bin(name: &str) -> String {
         "networkctl" => "SENTINEL_NETWORKCTL_BIN",
         "systemctl" => "SENTINEL_SYSTEMCTL_BIN",
         "journalctl" => "SENTINEL_JOURNALCTL_BIN",
+        "lsblk" => "SENTINEL_LSBLK_BIN",
         "install" => "SENTINEL_INSTALL_BIN",
         "mkdir" => "SENTINEL_MKDIR_BIN",
         "rm" => "SENTINEL_RM_BIN",
         "uname" => "SENTINEL_UNAME_BIN",
+        // installer tools
+        "sgdisk" => "SENTINEL_SGDISK_BIN",
+        "wipefs" => "SENTINEL_WIPEFS_BIN",
+        "partprobe" => "SENTINEL_PARTPROBE_BIN",
+        "udevadm" => "SENTINEL_UDEVADM_BIN",
+        "dd" => "SENTINEL_DD_BIN",
+        "mkfs.ext4" => "SENTINEL_MKFS_EXT4_BIN",
+        "mdadm" => "SENTINEL_MDADM_BIN",
+        "losetup" => "SENTINEL_LOSETUP_BIN",
+        "mount" => "SENTINEL_MOUNT_BIN",
+        "umount" => "SENTINEL_UMOUNT_BIN",
+        "findmnt" => "SENTINEL_FINDMNT_BIN",
         _ => "",
     };
     if !var.is_empty() {
