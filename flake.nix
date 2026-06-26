@@ -140,7 +140,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-gVsUKVwPVbrnSH4GLjQ123oPpMhoN7/gNeo7I05hEa8=";
+      ebpfHash = "sha256-Lr30Kh34rlSLXymO/dusmWVQVwTI2AR8t+Z7HjpVVoc=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -415,8 +415,8 @@
           # correct end-to-end.
           machine.succeed(
               "su admin -c \"printf '%s\\n' "
-              "'set firewall stateful false' 'set firewall block-icmp true' "
-              "'set firewall block 10.6.6.0/24' "
+              "'set firewall global stateful false' 'set firewall global block-icmp true' "
+              "'set firewall global block 10.6.6.0/24' "
               "commit save exit "
               "| sentinel configure\""
           )
@@ -438,7 +438,7 @@
           # second link — that multi-interface path is exercised in Phase 2.)
           machine.succeed(
               "su admin -c \"printf '%s\\n' "
-              "'set firewall block-icmp false' 'set zone wan block-icmp true' "
+              "'set firewall global block-icmp false' 'set firewall zone wan block-icmp true' "
               "commit save exit "
               "| sentinel configure\""
           )
@@ -948,9 +948,9 @@
                 "su admin -c \"printf '%s\\n' "
                 "'set interface eth1 zone wan' "
                 "'set interface eth2 zone lan' "
-                "'set zone lan default-action accept' "
-                "'set port-forward web zone wan' 'set port-forward web proto tcp' "
-                "'set port-forward web port 8080' 'set port-forward web to 10.2.0.2:80' "
+                "'set firewall zone lan default-action accept' "
+                "'set nat destination web zone wan' 'set nat destination web proto tcp' "
+                "'set nat destination web port 8080' 'set nat destination web to 10.2.0.2:80' "
                 "commit save exit "
                 "| sentinel configure\""
             )
@@ -972,6 +972,209 @@
             client.wait_until_succeeds(
                 "curl -s --max-time 5 http://10.1.0.1:8080/ | grep -q hello-from-server",
                 timeout=40,
+            )
+          '';
+        };
+
+        # Masquerade (source NAT) in the eBPF datapath: a 3-node line
+        # client(LAN) — fw — server(WAN). A private LAN client reaches a WAN
+        # server through the fw; the fw SNATs the client's source to its WAN ip at
+        # the TC egress hook, so the server sees the fw — not the client — and its
+        # reply is un-NAT'd back to the client via conntrack. This is the classic
+        # router masquerade, done entirely in XDP/TC with no iptables.
+        masq = pkgs.testers.runNixOSTest {
+          name = "sentinel-masq";
+          nodes = {
+            # Private client on the LAN segment (vlan 2), default route via the fw.
+            client =
+              { pkgs, ... }:
+              {
+                virtualisation.vlans = [ 2 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                  interfaces.eth1.ipv4.addresses = [
+                    {
+                      address = "10.2.0.2";
+                      prefixLength = 24;
+                    }
+                  ];
+                  defaultGateway = {
+                    address = "10.2.0.1";
+                    interface = "eth1";
+                  };
+                };
+                environment.systemPackages = [ pkgs.curl ];
+              };
+            # Public server on the WAN segment (vlan 1). It has NO route to the LAN
+            # — masquerade is what makes the reply work: it only ever sees the fw's
+            # WAN ip, which is on its own subnet.
+            server =
+              { pkgs, ... }:
+              {
+                virtualisation.vlans = [ 1 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                  interfaces.eth1.ipv4.addresses = [
+                    {
+                      address = "10.1.0.2";
+                      prefixLength = 24;
+                    }
+                  ];
+                };
+                systemd.services.web = {
+                  wantedBy = [ "multi-user.target" ];
+                  after = [ "network-online.target" ];
+                  script = ''
+                    mkdir -p /srv/web && echo hello-from-server > /srv/web/index.html
+                    exec ${pkgs.python3}/bin/python3 -m http.server 80 --directory /srv/web
+                  '';
+                };
+              };
+            # The appliance: WAN = eth1 (vlan 1, masqueraded), LAN = eth2 (vlan 2).
+            fw =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "fw";
+                networking.firewall.enable = lib.mkForce false;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = "10.1.0.1";
+                    prefixLength = 24;
+                  }
+                ];
+                networking.interfaces.eth2.ipv4.addresses = [
+                  {
+                    address = "10.2.0.1";
+                    prefixLength = 24;
+                  }
+                ];
+                virtualisation.vlans = [
+                  1
+                  2
+                ];
+                virtualisation.memorySize = 2048;
+                boot.kernel.sysctl = {
+                  "net.ipv4.ip_forward" = 1;
+                  "net.ipv4.conf.all.rp_filter" = 0;
+                  "net.ipv4.conf.default.rp_filter" = 0;
+                  "net.ipv4.conf.all.accept_local" = 1;
+                  "net.ipv4.conf.all.log_martians" = 1;
+                };
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+          };
+          testScript = ''
+            start_all()
+            fw.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+            server.wait_for_unit("web.service")
+
+            # The fw's WAN ip must be live BEFORE we configure masquerade: the
+            # agent reads it to fill the MASQUERADE map at (re)start.
+            fw.wait_until_succeeds("ip addr show eth1 | grep -q 10.1.0.1", timeout=20)
+            fw.wait_until_succeeds("ip addr show eth2 | grep -q 10.2.0.1", timeout=20)
+
+            # Configure the appliance: zone both NICs, let the LAN initiate, and
+            # masquerade everything leaving the WAN zone.
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth1 zone wan' "
+                "'set interface eth2 zone lan' "
+                "'set firewall zone lan default-action accept' "
+                "'set nat source wan-masq zone wan' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            fw.wait_for_unit("velstra.service")
+            # The compiled config marks the WAN interface as masqueraded.
+            fw.succeed("grep -q 'masquerade = true' /run/sentinel/velstra.toml")
+
+            # The headline: the LAN client reaches the WAN server THROUGH the fw,
+            # SNAT'd to the fw's WAN ip on the way out and un-NAT'd on the reply.
+            client.wait_until_succeeds(
+                "curl -s --max-time 5 http://10.1.0.2:80/ | grep -q hello-from-server",
+                timeout=40,
+            )
+
+            # Proof of masquerade: the server logged the fw's WAN ip (10.1.0.1) as
+            # the client, and NEVER the client's real private ip (10.2.0.2).
+            server.succeed("journalctl -u web.service | grep -q '10.1.0.1 '")
+            server.fail("journalctl -u web.service | grep -q '10.2.0.2 '")
+          '';
+        };
+
+        # Reject in the eBPF datapath: a 2-node client — fw. The fw's WAN zone has
+        # a rule that REJECTS tcp/9999. A connection from the client must come
+        # back with an immediate TCP RST ("connection refused"/"reset") — proving
+        # the XDP reject path crafts and XDP_TX's a real RST — rather than hanging
+        # the way a silent drop would.
+        reject = pkgs.testers.runNixOSTest {
+          name = "sentinel-reject";
+          nodes = {
+            client =
+              { pkgs, ... }:
+              {
+                virtualisation.vlans = [ 1 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                  interfaces.eth1.ipv4.addresses = [
+                    {
+                      address = "10.1.0.2";
+                      prefixLength = 24;
+                    }
+                  ];
+                };
+                environment.systemPackages = [ pkgs.curl ];
+              };
+            fw =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "fw";
+                networking.firewall.enable = lib.mkForce false;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = "10.1.0.1";
+                    prefixLength = 24;
+                  }
+                ];
+                virtualisation.vlans = [ 1 ];
+                virtualisation.memorySize = 2048;
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+          };
+          testScript = ''
+            start_all()
+            fw.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+            fw.wait_until_succeeds("ip addr show eth1 | grep -q 10.1.0.1", timeout=20)
+
+            # Zone the WAN nic and add a reject rule for tcp/9999.
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth1 zone wan' "
+                "'set firewall rule refuse from wan to wan action reject proto tcp port 9999' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            fw.wait_for_unit("velstra.service")
+            # The compiled config carries the reject verdict.
+            fw.succeed("grep -q 'reject' /run/sentinel/velstra.toml")
+
+            # The headline: a connection to the rejected port comes back refused
+            # (a RST) fast, not a timeout. curl reports "Connection refused" or
+            # "Connection reset" on a RST; a silent drop would instead time out
+            # (then the grep fails and the test fails).
+            client.succeed(
+                "curl -sS --max-time 4 -o /dev/null http://10.1.0.1:9999/ 2>&1 "
+                "| grep -qiE 'refused|reset'"
             )
           '';
         };

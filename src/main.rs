@@ -276,7 +276,8 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
                     session.interface_names(),
                     session.rule_names(),
                     session.zone_names(),
-                    session.portforward_names(),
+                    session.nat_source_names(),
+                    session.nat_destination_names(),
                 );
             }
             // VyOS-style prompt, re-rendered each line: it reflects the LIVE

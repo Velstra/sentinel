@@ -8,7 +8,7 @@ candidate, `compare` it, then `commit` (apply live) and/or `save` (persist).
 ```text
 $ sentinel configure
 sentinel# set system hostname fw-a
-sentinel# set interface eth0 role wan
+sentinel# set interface eth0 zone wan
 sentinel# set interface eth0 address dhcp
 sentinel# compare
      system {
@@ -22,6 +22,29 @@ sentinel# exit
 - **`commit`** applies the candidate to the running system (live).
 - **`save`** persists it to `/var/lib/sentinel/appliance.toml`.
 - **`commit save`** does both. See [the commit model](../architecture/commit-model.md).
+
+## The config tree
+
+There are **four** top-level nodes, each a clear domain, so it's always obvious
+where a setting lives. Press **Tab** or **`?`** at any level to see what's
+available next (with a description for each), VyOS-style:
+
+```text
+system     hostname <name>
+interface  <name>   zone | address | parent | vlan
+firewall   global        stateful | block-icmp | default-action | log | block
+           zone <z>      stateful | block-icmp | default-action | log | block
+           rule <r>      from | to | action | proto | port
+nat        source <s>      zone
+           destination <d> zone | proto | port | to
+```
+
+The split is deliberate: **`firewall`** *filters* packets (zones, posture,
+zone-to-zone rules), while **`nat`** *translates* addresses — a different thing
+that happens at a different stage, so it's its own top-level node (as in VyOS),
+not buried under the firewall. `nat source` is masquerade (SNAT); `nat
+destination` is a port-forward (DNAT). `show` prints the candidate as this same
+nested tree.
 
 ## Zones, interfaces & VLANs
 
@@ -56,15 +79,14 @@ capabilities the Velstra data plane already enforces per policy (stateful flows,
 ICMP filtering, an LPM blocklist).
 
 ```text
-sentinel# set firewall stateful true          # global defaults …
-sentinel# set firewall block-icmp false
-sentinel# set firewall default-action drop
-sentinel# set firewall block 203.0.113.0/24    # global source denylist (repeatable)
+sentinel# set firewall global stateful true          # global defaults …
+sentinel# set firewall global block-icmp false
+sentinel# set firewall global default-action drop
+sentinel# set firewall global block 203.0.113.0/24    # global source denylist (repeatable)
 
-sentinel# set zone wan block-icmp true          # … overridden per zone
-sentinel# set zone wan masquerade true          # SNAT outbound (NAT — Phase 4)
-sentinel# set zone iot block-icmp true
-sentinel# set zone iot block 198.51.100.0/24    # per-zone source drop
+sentinel# set firewall zone wan block-icmp true          # … overridden per zone
+sentinel# set firewall zone iot block-icmp true
+sentinel# set firewall zone iot block 198.51.100.0/24    # per-zone source drop
 sentinel# commit save
 ```
 
@@ -74,31 +96,53 @@ Per-zone fields (each inherits the `[firewall]` default when unset):
 - **`block-icmp`** — drop inbound ICMP (ping/PMTU) on this zone.
 - **`default-action`** — `accept` / `drop` / `reject` ingress posture.
 - **`log`** — log this zone's matched traffic.
-- **`masquerade`** — SNAT outbound to the zone's egress IP (a WAN uplink).
-- **`block <IP|CIDR>`** — source denylist for this zone (`delete zone <name>
-  block <IP|CIDR>` to remove).
+- **`block <IP|CIDR>`** — source denylist for this zone (`delete firewall zone
+  <name> block <IP|CIDR>` to remove).
+
+(NAT — masquerading a zone's outbound traffic — is **not** a firewall-zone
+field; it lives under `nat source`, below.)
 
 `[firewall]` and any `[zone.*]` block are omitted from a saved config while they
 are exactly the default, so saved files stay clean.
 
-## NAT — port-forwards
+## NAT — its own top-level node
 
-Expose an internal service to a public (e.g. WAN) zone with an inbound DNAT
-port-forward. The data plane rewrites the destination to the internal host and
-SNATs the reply back automatically (connection-tracked), and the rule implicitly
-opens the firewall for that port:
+NAT *translates* addresses; the firewall *filters* packets. They're separate
+concerns at separate stages, so NAT is its own `nat` node (VyOS-style), split
+into `source` (SNAT/masquerade) and `destination` (DNAT/port-forward).
+
+### `nat source` — masquerade
+
+SNAT a zone's outbound traffic to that zone's egress IP — the classic WAN
+uplink, so a private LAN can reach the internet behind one public address:
 
 ```text
-sentinel# set port-forward web zone wan        # the public/ingress zone
-sentinel# set port-forward web proto tcp
-sentinel# set port-forward web port 8080        # public port hit from outside
-sentinel# set port-forward web to 10.0.0.10:8443   # internal host[:port]
+sentinel# set nat source wan-masq zone wan      # masquerade everything leaving wan
+sentinel# commit save
+```
+
+- **`zone`** — the egress (WAN) zone whose outbound traffic is masqueraded; must
+  be backed by an interface.
+- Remove one with `delete nat source <name>`.
+
+### `nat destination` — port-forward
+
+Expose an internal service to a public (e.g. WAN) zone with an inbound DNAT. The
+data plane rewrites the destination to the internal host and SNATs the reply
+back automatically (connection-tracked), and the rule implicitly opens the
+firewall for that port:
+
+```text
+sentinel# set nat destination web zone wan          # the public/ingress zone
+sentinel# set nat destination web proto tcp
+sentinel# set nat destination web port 8080          # public port hit from outside
+sentinel# set nat destination web to 10.0.0.10:8443  # internal host[:port]
 sentinel# commit save
 ```
 
 - **`zone`** — the ingress (public) zone; must be backed by an interface.
 - **`to`** — `"ip"` (keep the public port) or `"ip:port"` (remap).
-- Remove one with `delete port-forward <name>`.
+- Remove one with `delete nat destination <name>`.
 
 This enforcement lives in the eBPF datapath (reusing the load-balancer's NAT +
 connection-tracking machinery), so it works on real forwarded traffic with no
