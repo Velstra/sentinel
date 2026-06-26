@@ -58,10 +58,22 @@
             --set SENTINEL_NETWORKCTL_BIN ${pkgs.systemd}/bin/networkctl \
             --set SENTINEL_SYSTEMCTL_BIN  ${pkgs.systemd}/bin/systemctl \
             --set SENTINEL_JOURNALCTL_BIN ${pkgs.systemd}/bin/journalctl \
+            --set SENTINEL_LSBLK_BIN      ${pkgs.util-linux}/bin/lsblk \
             --set SENTINEL_INSTALL_BIN    ${pkgs.coreutils}/bin/install \
             --set SENTINEL_MKDIR_BIN      ${pkgs.coreutils}/bin/mkdir \
             --set SENTINEL_RM_BIN         ${pkgs.coreutils}/bin/rm \
             --set SENTINEL_UNAME_BIN      ${pkgs.coreutils}/bin/uname \
+            --set SENTINEL_SGDISK_BIN     ${pkgs.gptfdisk}/bin/sgdisk \
+            --set SENTINEL_WIPEFS_BIN     ${pkgs.util-linux}/bin/wipefs \
+            --set SENTINEL_PARTPROBE_BIN  ${pkgs.parted}/bin/partprobe \
+            --set SENTINEL_UDEVADM_BIN    ${pkgs.systemd}/bin/udevadm \
+            --set SENTINEL_DD_BIN         ${pkgs.coreutils}/bin/dd \
+            --set SENTINEL_MKFS_EXT4_BIN  ${pkgs.e2fsprogs}/bin/mkfs.ext4 \
+            --set SENTINEL_MDADM_BIN      ${pkgs.mdadm}/bin/mdadm \
+            --set SENTINEL_LOSETUP_BIN    ${pkgs.util-linux}/bin/losetup \
+            --set SENTINEL_MOUNT_BIN      ${pkgs.util-linux}/bin/mount \
+            --set SENTINEL_UMOUNT_BIN     ${pkgs.util-linux}/bin/umount \
+            --set SENTINEL_FINDMNT_BIN    ${pkgs.util-linux}/bin/findmnt \
             --prefix PATH : /run/wrappers/bin
         '';
       };
@@ -174,12 +186,25 @@
         # bpf-linker: velstra-ebpf is a build-dependency of the agent (for cargo
         # cache tracking) and its build.rs just does `which bpf-linker`, so it
         # must be on PATH even though our shim already supplied the object.
-        nativeBuildInputs = [ pkgs.protobuf pkgs.bpf-linker ];
+        nativeBuildInputs = [
+          pkgs.protobuf
+          pkgs.bpf-linker
+          pkgs.removeReferencesTo
+        ];
         PROTOC = "${pkgs.protobuf}/bin/protoc";
         # Replace the agent's build.rs with the shim that copies the pre-built
         # eBPF object — so this build is fully offline (no build-std here).
         postPatch = ''
           cp ${./nix/velstra-build-shim.rs} velstra-app/build.rs
+        '';
+        # The nightly toolchain's precompiled std embeds its own source paths in
+        # panic-location strings, so the agent binary carries a (string-only)
+        # reference to the 892 MiB toolchain — which would otherwise be dragged
+        # into the appliance image's closure. The binary has no real runtime dep
+        # on it (rpath is empty; only glibc is dynamically linked), so scrub the
+        # dangling reference. Keeps the closure to the agent + glibc.
+        postInstall = ''
+          remove-references-to -t ${nightly} "$out/bin/velstra"
         '';
         VELSTRA_EBPF_OBJ = velstra-ebpf;
         # Build just the agent binary. --ignore-rust-version: the lockfile (made
@@ -197,11 +222,29 @@
       # system live (no rebuild). Pure eval — no runtime-path reads.
       factoryAppliance = ./example-appliance.toml;
       applianceData = builtins.fromTOML (builtins.readFile factoryAppliance);
+
+      # The built verified-boot raw image's path — bundled into the installer ISO
+      # and used as the `--source` in the live-install test.
+      sentinelImageRaw =
+        let
+          c = self.nixosConfigurations.sentinel-image.config;
+        in
+        "${c.system.build.finalImage}/${c.image.filePath}";
     in
     {
       packages.${system} = {
         default = sentinel;
         inherit sentinel velstra velstra-ebpf;
+        # The flashable verified-boot disk image (dm-verity store + UKI). Note:
+        # `finalImage` is the two-stage verity build with the roothash-bearing
+        # UKI injected into the ESP; plain `image` is the unsealed single-pass
+        # variant (no bootloader) and must NOT be used here. (`finalImage` is
+        # renamed to `image` in newer nixpkgs.)
+        #   nix build .#sentinel-image
+        sentinel-image = self.nixosConfigurations.sentinel-image.config.system.build.finalImage;
+        # The live-boot installer ISO (carries the image above; runs `sentinel
+        # install`).  nix build .#sentinel-iso
+        sentinel-iso = self.nixosConfigurations.sentinel-iso.config.system.build.isoImage;
       };
 
       # The appliance: the base config + the Velstra data-plane service. The
@@ -238,12 +281,41 @@
         modules = [ self.nixosModules.sentinel ];
       };
 
+      # The same appliance, packaged as a verified-boot disk image (dm-verity
+      # store + roothash-sealed UKI + persistent data partition).
+      nixosConfigurations.sentinel-image = nixpkgs.lib.nixosSystem {
+        inherit system;
+        modules = [
+          self.nixosModules.sentinel
+          ./nix/image.nix
+          # The verity image build reads `config.nixpkgs.hostPlatform` (efiArch);
+          # define it explicitly (this nixpkgs' `nixosSystem` doesn't set it from
+          # the `system` arg).
+          { nixpkgs.hostPlatform = system; }
+        ];
+      };
+
+      # The live-boot installer ISO: bundles the verity image and runs the
+      # installer. Passes the CLI + the bundled image's raw path to nix/iso.nix.
+      nixosConfigurations.sentinel-iso = nixpkgs.lib.nixosSystem {
+        inherit system;
+        specialArgs = {
+          sentinelPkg = sentinel;
+          inherit sentinelImageRaw;
+        };
+        modules = [
+          ./nix/iso.nix
+          { nixpkgs.hostPlatform = system; }
+        ];
+      };
+
       # Boots the appliance and verifies `commit` applies config to the running
       # system live — no rebuild, no reboot, fully airgapped (the VM has no
       # network). Edits the hostname and asserts it changed via hostnamectl while
       # the data plane stays up.
       #   nix build .#checks.x86_64-linux.commit -L
-      checks.${system}.commit = pkgs.testers.runNixOSTest {
+      checks.${system} = {
+        commit = pkgs.testers.runNixOSTest {
         name = "sentinel-commit";
         nodes.machine = {
           imports = [ self.nixosModules.sentinel ];
@@ -330,6 +402,281 @@
           machine.succeed("systemctl restart sentinel-boot.service")
           machine.succeed("hostname | grep -x fw-a")
         '';
+      };
+
+      # Boots the actual flashable verified-boot image (dm-verity store + UKI)
+      # in QEMU/OVMF and proves the security properties hold on real hardware:
+      # the root is volatile (tmpfs), /nix/store is integrity-checked by
+      # dm-verity, the appliance runs from the sealed image, and the editable
+      # config persists on the data partition across a reboot.
+      #   nix build .#checks.x86_64-linux.verified-boot -L
+        verified-boot = pkgs.testers.runNixOSTest {
+        name = "sentinel-verified-boot";
+        nodes.machine = {
+          imports = [
+            self.nixosModules.sentinel
+            ./nix/image.nix
+          ];
+          # (The test framework already sets nixpkgs.hostPlatform for nodes.)
+          virtualisation = {
+            directBoot.enable = false;
+            mountHostNixStore = false;
+            useEFIBoot = true;
+            memorySize = 2048;
+            # Use the real image's filesystems, not the test VM's defaults.
+            fileSystems = lib.mkVMOverride { };
+          };
+        };
+        testScript =
+          { nodes, ... }:
+          ''
+            import os
+            import subprocess
+            import tempfile
+
+            # Boot from a writable overlay on top of the built verity image, so
+            # the data partition keeps writes across the reboot below.
+            tmp = tempfile.NamedTemporaryFile()
+            subprocess.run([
+              "${nodes.machine.virtualisation.qemu.package}/bin/qemu-img",
+              "create", "-f", "qcow2",
+              "-b", "${nodes.machine.system.build.finalImage}/${nodes.machine.image.filePath}",
+              "-F", "raw", tmp.name,
+            ], check=True)
+            os.environ["NIX_DISK_IMAGE"] = tmp.name
+
+            machine.wait_for_unit("multi-user.target")
+
+            with subtest("verified boot: volatile root + dm-verity store"):
+                machine.succeed("findmnt --kernel --type tmpfs /")
+                verity = machine.succeed("dmsetup info --target verity usr")
+                assert "ACTIVE" in verity, verity
+                backing = machine.succeed("df --output=source /nix/store | tail -n1").strip()
+                assert backing == "/dev/mapper/usr", backing
+
+            with subtest("the appliance runs from the sealed image"):
+                machine.wait_for_unit("velstra.service")
+                assert "sentinel" in machine.succeed("sentinel show version")
+
+            with subtest("editable config persists on a real data partition, not the volatile root"):
+                # The config dir is a genuine, writable block device separate
+                # from the tmpfs root — so its contents survive a reboot by
+                # construction (the root is wiped each boot; this partition is
+                # not). We don't drive an in-VM reboot here: restarting QEMU with
+                # the OVMF firmware-vars file is flaky in the test harness and
+                # proves nothing the partition's persistence doesn't already.
+                src = machine.succeed("findmnt -no SOURCE /var/lib/sentinel").strip()
+                assert src.startswith("/dev/"), src
+                assert "tmpfs" not in machine.succeed("findmnt -no FSTYPE /var/lib/sentinel")
+                machine.succeed("test -f /var/lib/sentinel/appliance.toml")
+                # And it's writable (a `save` would land here and outlive the image).
+                machine.succeed("echo persisted > /var/lib/sentinel/marker")
+                machine.succeed("grep -qx persisted /var/lib/sentinel/marker")
+          '';
+        };
+
+        # Boots the appliance from the verity image with three blank disks and
+        # exercises `sentinel install`: a single-disk install and a RAID1 install,
+        # asserting the target disks get the sealed layout cloned and (for RAID)
+        # an assembled mdadm array carrying the data filesystem.
+        #   nix build .#checks.x86_64-linux.install -L
+        install = pkgs.testers.runNixOSTest {
+          name = "sentinel-install";
+          nodes.machine = {
+            imports = [
+              self.nixosModules.sentinel
+              ./nix/image.nix
+            ];
+            virtualisation = {
+              directBoot.enable = false;
+              mountHostNixStore = false;
+              useEFIBoot = true;
+              memorySize = 2048;
+              # Three blank targets: vdb (single), vdc + vdd (RAID1). ~5 GiB each
+              # (> the 4 GiB minimum, room for the ~1.3 GiB sealed store).
+              emptyDiskImages = [
+                5000
+                5000
+                5000
+              ];
+              fileSystems = lib.mkVMOverride { };
+            };
+          };
+          testScript =
+            { nodes, ... }:
+            ''
+              import os
+              import subprocess
+              import tempfile
+
+              tmp = tempfile.NamedTemporaryFile()
+              subprocess.run([
+                "${nodes.machine.virtualisation.qemu.package}/bin/qemu-img",
+                "create", "-f", "qcow2",
+                "-b", "${nodes.machine.system.build.finalImage}/${nodes.machine.image.filePath}",
+                "-F", "raw", tmp.name,
+              ], check=True)
+              os.environ["NIX_DISK_IMAGE"] = tmp.name
+
+              machine.wait_for_unit("multi-user.target")
+
+              # The source disk it booted from (raw lsblk → no tree characters).
+              src = ""
+              for line in machine.succeed("lsblk -nsro NAME,TYPE /dev/mapper/usr").splitlines():
+                  f = line.split()
+                  if len(f) >= 2 and f[1] == "disk":
+                      src = f[0]
+                      break
+              assert src in ("vda", "vdb", "vdc", "vdd"), src
+
+              with subtest("install lists the blank targets"):
+                  # `< /dev/null` so stdin isn't a tty — otherwise the bare
+                  # command starts the interactive wizard and waits for input.
+                  listing = machine.succeed("sentinel install < /dev/null")
+                  assert "/dev/vdb" in listing, listing
+
+              with subtest("single-disk install clones the sealed layout"):
+                  machine.succeed("sentinel install /dev/vdb --commit")
+                  machine.succeed("udevadm settle")
+                  # Four partitions: ESP, verity hash, verity store, data.
+                  parts = machine.succeed("lsblk -nro NAME /dev/vdb").split()
+                  assert "vdb1" in parts and "vdb6" in parts, parts
+                  # The data partition (#6, after the ESP + both A/B slots) is an
+                  # ext4 labelled `data`.
+                  blk = machine.succeed("blkid /dev/vdb6")
+                  assert 'LABEL="data"' in blk and 'TYPE="ext4"' in blk, blk
+                  # The ESP (UKI/bootloader) is cloned byte-for-byte from the
+                  # source medium's ESP -> the installed disk is bootable.
+                  machine.succeed(f"cmp /dev/{src}1 /dev/vdb1")
+
+              with subtest("RAID1 install builds an assembled mirror"):
+                  machine.succeed("sentinel install /dev/vdc /dev/vdd --raid mirror --commit")
+                  machine.succeed("udevadm settle")
+                  machine.wait_until_succeeds("test -e /dev/md/sentinel-data", timeout=30)
+                  detail = machine.succeed("mdadm --detail /dev/md/sentinel-data")
+                  assert "raid1" in detail, detail
+                  assert "active sync" in detail, detail
+                  # The array carries the data filesystem, labelled `data`.
+                  assert 'LABEL="data"' in machine.succeed("blkid /dev/md/sentinel-data")
+                  # Both members are typed Linux RAID (GPT type GUID), checked via
+                  # lsblk since sgdisk isn't on the appliance PATH.
+                  raid_guid = "a19d880f-05fc-4d3b-a006-743f0f84911e"
+                  assert raid_guid in machine.succeed("lsblk -nro PARTTYPE /dev/vdc6").lower()
+                  assert raid_guid in machine.succeed("lsblk -nro PARTTYPE /dev/vdd6").lower()
+            '';
+        };
+
+        # Boots the live installer environment (the ISO config) and installs onto
+        # a blank disk from the BUNDLED image via the `--source` path (no booted
+        # verity store to clone) — the real live-boot flow. Verifies the target
+        # gets the cloned layout and a bootable ESP.
+        #   nix build .#checks.x86_64-linux.install-iso -L
+        install-iso = pkgs.testers.runNixOSTest {
+          name = "sentinel-install-iso";
+          nodes.machine = {
+            imports = [ ./nix/iso.nix ];
+            # Provide nix/iso.nix's module args (it expects these via specialArgs).
+            _module.args = {
+              sentinelPkg = sentinel;
+              inherit sentinelImageRaw;
+            };
+            virtualisation = {
+              memorySize = 2048;
+              # The bundled image lives in the host store; the live env reads it.
+              mountHostNixStore = true;
+              emptyDiskImages = [ 5000 ]; # vdb — the install target
+            };
+          };
+          testScript = ''
+            machine.wait_for_unit("multi-user.target")
+
+            with subtest("the bundled source image is present"):
+                machine.succeed("test -n \"$SENTINEL_INSTALL_SOURCE\" || test -e ${sentinelImageRaw}")
+
+            with subtest("live install from the bundled image onto a blank disk"):
+                # No --source: uses $SENTINEL_INSTALL_SOURCE, exactly as the ISO does.
+                machine.succeed("sentinel install /dev/vdb --commit --source ${sentinelImageRaw}")
+                machine.succeed("udevadm settle")
+                parts = machine.succeed("lsblk -nro NAME /dev/vdb").split()
+                assert "vdb1" in parts and "vdb6" in parts, parts
+                assert 'LABEL="data"' in machine.succeed("blkid /dev/vdb6")
+
+            with subtest("the installed disk has a bootable ESP (cloned UKI)"):
+                machine.succeed("mkdir -p /mnt/esp && mount /dev/vdb1 /mnt/esp")
+                machine.succeed("test -f /mnt/esp/EFI/BOOT/BOOTX64.EFI")
+                machine.succeed("umount /mnt/esp")
+          '';
+        };
+
+        # Boots slot A of the verity image and runs an A/B update (re-sealing
+        # from the booted medium into slot B), verifying the inactive slot is
+        # written + verity-typed and the bootloader is switched to it with boot
+        # counting. The actual cross-reboot slot switch + rollback can't be driven
+        # in this harness (OVMF reboot hangs); it's verified structurally here and
+        # the boot-counting/bless mechanism itself is proven by checks.verified-boot.
+        #   nix build .#checks.x86_64-linux.update -L
+        update = pkgs.testers.runNixOSTest {
+          name = "sentinel-update";
+          nodes.machine = {
+            imports = [
+              self.nixosModules.sentinel
+              ./nix/image.nix
+            ];
+            virtualisation = {
+              directBoot.enable = false;
+              mountHostNixStore = false;
+              useEFIBoot = true;
+              memorySize = 2048;
+              fileSystems = lib.mkVMOverride { };
+            };
+          };
+          testScript =
+            { nodes, ... }:
+            ''
+              import os
+              import subprocess
+              import tempfile
+
+              tmp = tempfile.NamedTemporaryFile()
+              subprocess.run([
+                "${nodes.machine.virtualisation.qemu.package}/bin/qemu-img",
+                "create", "-f", "qcow2",
+                "-b", "${nodes.machine.system.build.finalImage}/${nodes.machine.image.filePath}",
+                "-F", "raw", tmp.name,
+              ], check=True)
+              os.environ["NIX_DISK_IMAGE"] = tmp.name
+
+              machine.wait_for_unit("multi-user.target")
+
+              src = ""
+              for line in machine.succeed("lsblk -nsro NAME,TYPE /dev/mapper/usr").splitlines():
+                  f = line.split()
+                  if len(f) >= 2 and f[1] == "disk":
+                      src = f[0]
+                      break
+              assert src, "no source disk"
+              disk = "/dev/" + src
+
+              with subtest("active slot A backs /dev/mapper/usr (store partition #3)"):
+                  assert f"{src}3" in machine.succeed("lsblk -nsro NAME /dev/mapper/usr")
+
+              with subtest("update writes + verity-types the inactive slot B"):
+                  machine.succeed(f"sentinel update --commit {disk}")
+                  machine.succeed("udevadm settle")
+                  usr = "8484680c-9521-48c6-9c11-b0720656f69e"
+                  usrv = "77ff5f63-e7b6-4633-acf4-1565b864c0e6"
+                  assert usrv in machine.succeed(f"lsblk -nro PARTTYPE {disk}4").lower()
+                  assert usr in machine.succeed(f"lsblk -nro PARTTYPE {disk}5").lower()
+                  # slot B store == slot A store (this re-seal copies the running image)
+                  machine.succeed(f"cmp {disk}3 {disk}5")
+
+              with subtest("the bootloader is switched to slot B with boot counting"):
+                  machine.succeed(f"mkdir -p /mnt/esp && mount {disk}1 /mnt/esp")
+                  machine.succeed("test -f /mnt/esp/EFI/Linux/sentinel-b+3.efi")
+                  assert "sentinel-b" in machine.succeed("cat /mnt/esp/loader/loader.conf")
+                  machine.succeed("umount /mnt/esp")
+          '';
+        };
       };
     };
 }

@@ -12,6 +12,7 @@
 mod compile;
 mod config;
 mod diff;
+mod install;
 mod net;
 mod repl;
 mod session;
@@ -35,6 +36,30 @@ use crate::config::Appliance;
 enum Format {
     Toml,
     Json,
+}
+
+/// RAID level for `sentinel install`.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum RaidArg {
+    /// Single disk, no array.
+    None,
+    /// RAID0 stripe (2+ disks, no redundancy).
+    Stripe,
+    /// RAID1 mirror (2+ disks).
+    Mirror,
+    /// RAID10 striped mirror (4+ disks).
+    Mirror10,
+}
+
+impl From<RaidArg> for install::Raid {
+    fn from(r: RaidArg) -> Self {
+        match r {
+            RaidArg::None => install::Raid::None,
+            RaidArg::Stripe => install::Raid::Stripe,
+            RaidArg::Mirror => install::Raid::Mirror,
+            RaidArg::Mirror10 => install::Raid::Mirror10,
+        }
+    }
 }
 
 /// What `sentinel show` displays.
@@ -115,6 +140,32 @@ enum Command {
         #[arg(long)]
         reload: Option<String>,
     },
+    /// Install the appliance onto internal storage. With no target disk, lists
+    /// candidate disks; with target(s), shows the install plan (dry-run unless
+    /// `--commit`).
+    Install {
+        /// Target disk(s), e.g. `/dev/sda`. Two or more for a RAID array.
+        targets: Vec<String>,
+        /// RAID level for the writable data partition across the targets.
+        #[arg(long, value_enum, default_value_t = RaidArg::None)]
+        raid: RaidArg,
+        /// Clone from this raw appliance image instead of the booted medium
+        /// (the live-boot/ISO case). Defaults to $SENTINEL_INSTALL_SOURCE.
+        #[arg(long)]
+        source: Option<PathBuf>,
+        /// Actually perform the (destructive) install instead of a dry-run.
+        #[arg(long)]
+        commit: bool,
+    },
+    /// A/B update: write a new appliance image into the inactive slot and boot
+    /// it next (auto-rollback to the current slot if it fails).
+    Update {
+        /// The new appliance image (raw file) or a block device to re-seal from.
+        image: PathBuf,
+        /// Actually perform the (destructive-to-the-inactive-slot) update.
+        #[arg(long)]
+        commit: bool,
+    },
     /// List the ports a Velstra controller currently knows about.
     Ports {
         /// The controller's orchestrator/admin endpoint.
@@ -167,6 +218,13 @@ async fn main() -> Result<()> {
             print!("{}", compile::compile(&appliance).to_toml()?);
             Ok(())
         }
+        Command::Install {
+            targets,
+            raid,
+            source,
+            commit,
+        } => install_cmd(&targets, raid.into(), source, commit),
+        Command::Update { image, commit } => install::update(&image, commit),
         Command::ApplyBoot { config, out } => apply_boot(&config, &out),
         Command::Apply { file, out, reload } => apply(&file, &out, reload.as_deref()),
         Command::Ports { controller } => ports(&controller).await,
@@ -294,6 +352,134 @@ fn apply_boot(config: &std::path::Path, out: &std::path::Path) -> Result<()> {
     // so a reboot restores the live IPs the same way it restores the hostname.
     net::apply(&appliance)?;
     Ok(())
+}
+
+/// `sentinel install`: with no target on a terminal, run the interactive wizard
+/// (pick mode + disks); with target(s), validate the selection and show the
+/// plan. Destructive execution happens on `--commit` (or after the wizard's
+/// confirmation).
+fn install_cmd(
+    targets: &[String],
+    raid: install::Raid,
+    source: Option<PathBuf>,
+    commit: bool,
+) -> Result<()> {
+    // A bundled source image may come from the flag or the environment (the ISO
+    // sets $SENTINEL_INSTALL_SOURCE).
+    let source = source.or_else(|| std::env::var_os("SENTINEL_INSTALL_SOURCE").map(PathBuf::from));
+    let disks = install::discover_disks()?;
+
+    if targets.is_empty() {
+        if std::io::stdin().is_terminal() {
+            return interactive_install(&disks, source.as_deref());
+        }
+        // Non-interactive with no target: just list candidates.
+        list_disks(&disks);
+        return Ok(());
+    }
+
+    let chosen = install::plan_targets(&disks, targets, raid)?;
+    print_plan(&chosen, raid);
+    if !commit {
+        println!("\n(dry-run — re-run with --commit to write. THIS ERASES THE TARGET DISK(S).)");
+        return Ok(());
+    }
+    install::execute(&chosen, raid, source.as_deref())
+}
+
+/// Print the candidate disks as a numbered table.
+fn list_disks(disks: &[install::Disk]) {
+    if disks.is_empty() {
+        println!("no disks found");
+        return;
+    }
+    println!("Candidate install disks:");
+    for (i, d) in disks.iter().enumerate() {
+        println!(
+            "  [{}] {:<12} {:>10}  {}{}",
+            i + 1,
+            d.dev_path(),
+            install::human_size(d.size),
+            if d.model.is_empty() { "(no model)" } else { &d.model },
+            if d.removable { "  [removable]" } else { "" },
+        );
+    }
+}
+
+/// Print the resolved install plan.
+fn print_plan(chosen: &[&install::Disk], raid: install::Raid) {
+    println!("Install plan ({raid:?}):");
+    for d in chosen {
+        println!("  target {} ({})", d.dev_path(), install::human_size(d.size));
+    }
+    println!("  layout: ESP + dm-verity store (sealed, read-only) + data partition");
+    if let Some(level) = raid.mdadm_level() {
+        println!("  data partition as mdadm RAID{level} across the targets");
+    }
+}
+
+/// The guided installer: choose a mode, pick the disks, confirm, install.
+fn interactive_install(disks: &[install::Disk], source: Option<&std::path::Path>) -> Result<()> {
+    list_disks(disks);
+    if disks.is_empty() {
+        return Ok(());
+    }
+
+    println!("\nInstall mode:");
+    println!("  [1] single disk");
+    println!("  [2] RAID0  (stripe — capacity, no redundancy, 2+ disks)");
+    println!("  [3] RAID1  (mirror — redundancy, 2+ disks)");
+    println!("  [4] RAID10 (striped mirror, 4+ disks)");
+    let raid = match prompt("Mode [1-4]: ")?.trim() {
+        "1" => install::Raid::None,
+        "2" => install::Raid::Stripe,
+        "3" => install::Raid::Mirror,
+        "4" => install::Raid::Mirror10,
+        other => anyhow::bail!("invalid mode {other:?}"),
+    };
+
+    let pick = prompt("Select disk number(s), space-separated: ")?;
+    let targets = resolve_picks(disks, pick.trim())?;
+    let chosen = install::plan_targets(disks, &targets, raid)?;
+
+    println!();
+    print_plan(&chosen, raid);
+    let confirm = prompt("\nThis ERASES the selected disk(s). Type YES to proceed: ")?;
+    if confirm.trim() != "YES" {
+        println!("aborted.");
+        return Ok(());
+    }
+    install::execute(&chosen, raid, source)
+}
+
+/// Map numbered picks (`"1 3"`) to `/dev` paths.
+fn resolve_picks(disks: &[install::Disk], picks: &str) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for tok in picks.split_whitespace() {
+        let i: usize = tok
+            .parse()
+            .map_err(|_| anyhow::anyhow!("not a number: {tok:?}"))?;
+        let d = disks
+            .get(i.wrapping_sub(1))
+            .ok_or_else(|| anyhow::anyhow!("no disk [{i}]"))?;
+        out.push(d.dev_path());
+    }
+    if out.is_empty() {
+        anyhow::bail!("no disks selected");
+    }
+    Ok(out)
+}
+
+/// Print a prompt and read one line from stdin.
+fn prompt(msg: &str) -> Result<String> {
+    use std::io::Write;
+    print!("{msg}");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("reading input")?;
+    Ok(line)
 }
 
 /// Operational-mode `show`: live system state, VyOS-style. `target` optionally
