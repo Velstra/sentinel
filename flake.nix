@@ -223,13 +223,13 @@
       factoryAppliance = ./example-appliance.toml;
       applianceData = builtins.fromTOML (builtins.readFile factoryAppliance);
 
-      # The built verified-boot raw image's path — bundled into the installer ISO
-      # and used as the `--source` in the live-install test.
+      # The built, Secure-Boot-signed raw image's path — bundled into the
+      # installer ISO and used as the `--source` in the live-install test.
       sentinelImageRaw =
         let
           c = self.nixosConfigurations.sentinel-image.config;
         in
-        "${c.system.build.finalImage}/${c.image.filePath}";
+        "${c.system.build.finalImageSigned}/${c.image.filePath}";
     in
     {
       packages.${system} = {
@@ -241,7 +241,7 @@
         # variant (no bootloader) and must NOT be used here. (`finalImage` is
         # renamed to `image` in newer nixpkgs.)
         #   nix build .#sentinel-image
-        sentinel-image = self.nixosConfigurations.sentinel-image.config.system.build.finalImage;
+        sentinel-image = self.nixosConfigurations.sentinel-image.config.system.build.finalImageSigned;
         # The live-boot installer ISO (carries the image above; runs `sentinel
         # install`).  nix build .#sentinel-iso
         sentinel-iso = self.nixosConfigurations.sentinel-iso.config.system.build.isoImage;
@@ -677,6 +677,72 @@
                   machine.succeed("umount /mnt/esp")
           '';
         };
+
+        # Boots the SIGNED image in a Secure-Boot OVMF with our PK/KEK/db enrolled
+        # (built with virt-fw-vars). If the firmware verifies the signed
+        # systemd-boot + UKI against db and reaches multi-user, Secure Boot is
+        # enforcing and the chain is trusted — proven in a single boot (no reboot,
+        # which the OVMF harness can't drive).
+        #   nix build .#checks.x86_64-linux.secureboot -L
+        secureboot =
+          let
+            sb = self.nixosConfigurations.sentinel-image.config.system.build.sentinelSbKeys;
+            guid = "a5a5a5a5-1234-5678-9abc-def012345678";
+            ovmfVars =
+              pkgs.runCommand "ovmf-vars-sentinel-enrolled.fd"
+                { nativeBuildInputs = [ pkgs.python3Packages.virt-firmware ]; }
+                ''
+                  virt-fw-vars \
+                    --input ${(pkgs.OVMF.override { secureBoot = true; }).fd}/FV/OVMF_VARS.fd \
+                    --output $out \
+                    --set-pk ${guid} ${sb}/PK.crt \
+                    --add-kek ${guid} ${sb}/KEK.crt \
+                    --add-db ${guid} ${sb}/db.crt \
+                    --secure-boot
+                '';
+          in
+          pkgs.testers.runNixOSTest {
+            name = "sentinel-secureboot";
+            nodes.machine = {
+              imports = [
+                self.nixosModules.sentinel
+                ./nix/image.nix
+              ];
+              virtualisation = {
+                directBoot.enable = false;
+                mountHostNixStore = false;
+                useEFIBoot = true;
+                useSecureBoot = true;
+                efi.variables = ovmfVars;
+                memorySize = 2048;
+                fileSystems = lib.mkVMOverride { };
+              };
+            };
+            testScript =
+              { nodes, ... }:
+              ''
+                import os
+                import subprocess
+                import tempfile
+
+                tmp = tempfile.NamedTemporaryFile()
+                subprocess.run([
+                  "${nodes.machine.virtualisation.qemu.package}/bin/qemu-img",
+                  "create", "-f", "qcow2",
+                  "-b", "${nodes.machine.system.build.finalImageSigned}/${nodes.machine.image.filePath}",
+                  "-F", "raw", tmp.name,
+                ], check=True)
+                os.environ["NIX_DISK_IMAGE"] = tmp.name
+
+                # Reaching multi-user under an SB-enforcing firmware means the
+                # signed systemd-boot + UKI verified against our enrolled db key.
+                machine.wait_for_unit("multi-user.target")
+
+                with subtest("Secure Boot is enabled and enforcing"):
+                    status = machine.succeed("bootctl status")
+                    assert "Secure Boot: enabled" in status, status
+              '';
+          };
       };
     };
 }
