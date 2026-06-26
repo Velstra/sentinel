@@ -150,15 +150,17 @@ fn apply_live(appliance: &crate::config::Appliance, act: &Apply) -> Result<()> {
 
 pub const HELP: &str = "\
 commands:
-  set <path...> <value>   set a config node, e.g.
-                            set system hostname fw1
-                            set interface wan0 zone wan
-                            set interface wan0 address dhcp
-                            set zone wan block-icmp true
-                            set rule web from wan
-                            set rule web action accept
-                            set rule web proto tcp
-                            set rule web port 443
+  set <path...> <value>   set a config node. The tree (Tab/`?` explores it):
+                            system hostname <name>
+                            interface <n> zone|address|parent|vlan …
+                            firewall global  stateful|block-icmp|default-action|log|block …
+                            firewall zone <z>  stateful|block-icmp|default-action|log|block …
+                            firewall rule <r>  from|to|action|proto|port …
+                            nat source <s>  zone …
+                            nat destination <d>  zone|proto|port|to …
+                          e.g.  set firewall rule web from wan
+                                set nat source wan-masq zone wan
+                                set nat destination web to 10.0.0.10:8443
   delete <path...>        remove a node or clear a field
   show                    show the candidate configuration
   compare                 diff the candidate against the saved config
@@ -184,22 +186,28 @@ const COMMANDS: &[Cand] = &[
     ("exit", "leave configuration mode"),
     ("help", "show command help"),
 ];
+// Top level: four nodes, each a clear domain — host settings, the NICs, the
+// firewall (filtering), and NAT (address translation). NAT is deliberately NOT
+// under firewall: filtering and translation are different things.
 const TOP: &[Cand] = &[
     ("system", "host-wide settings (hostname, …)"),
-    ("firewall", "global firewall defaults (inherited by zones)"),
-    ("zone", "per-zone posture (ICMP, stateful, masquerade, …)"),
     ("interface", "per-NIC zone, address, VLAN"),
-    ("rule", "firewall rule"),
-    ("port-forward", "inbound DNAT (expose an internal service)"),
+    ("firewall", "packet filtering: global defaults, zones, rules"),
+    ("nat", "address translation: source (masquerade), destination (port-forward)"),
 ];
-const PORTFWD_FIELDS: &[Cand] = &[
-    ("zone", "ingress zone (public side)"),
-    ("proto", "tcp / udp"),
-    ("port", "public destination port"),
-    ("to", "internal target ip or ip:port"),
+// `firewall <Tab>` reveals the three firewall sub-trees (NAT lives at top level).
+const FIREWALL_NODES: &[Cand] = &[
+    ("global", "default posture inherited by every zone"),
+    ("zone", "per-zone overrides (ICMP, stateful, default-action, …)"),
+    ("rule", "zone-to-zone allow/deny rules"),
+];
+// `nat <Tab>` reveals the two NAT directions (VyOS-style).
+const NAT_NODES: &[Cand] = &[
+    ("source", "SNAT/masquerade a zone's outbound traffic"),
+    ("destination", "inbound DNAT port-forward to an internal host"),
 ];
 const SYSTEM_FIELDS: &[Cand] = &[("hostname", "the appliance hostname")];
-const FIREWALL_FIELDS: &[Cand] = &[
+const GLOBAL_FIELDS: &[Cand] = &[
     ("stateful", "track flows so return traffic is allowed (true|false)"),
     ("block-icmp", "drop inbound ICMP by default (true|false)"),
     ("default-action", "default ingress action (accept|drop|reject)"),
@@ -211,8 +219,14 @@ const ZONE_FIELDS: &[Cand] = &[
     ("block-icmp", "drop inbound ICMP on this zone (true|false)"),
     ("default-action", "ingress action for this zone (accept|drop|reject)"),
     ("log", "log this zone's traffic (true|false)"),
-    ("masquerade", "SNAT outbound to this zone's IP — NAT (true|false)"),
     ("block", "drop a source IP/CIDR on this zone"),
+];
+const NAT_SOURCE_FIELDS: &[Cand] = &[("zone", "egress (WAN) zone to masquerade")];
+const NAT_DEST_FIELDS: &[Cand] = &[
+    ("zone", "ingress zone (public side)"),
+    ("proto", "tcp / udp"),
+    ("port", "public destination port"),
+    ("to", "internal target ip or ip:port"),
 ];
 const BOOLS: &[Cand] = &[("true", "enabled"), ("false", "disabled")];
 const ACTIONS: &[Cand] = &[
@@ -236,7 +250,7 @@ const RULE_FIELDS: &[Cand] = &[
 ];
 
 /// Static completion candidates for the token being typed, given the
-/// already-complete `tokens` before it. The interface/rule/zone **name**
+/// already-complete `tokens` before it. The interface/rule/zone/nat **name**
 /// positions and the zone-value positions are filled dynamically from the live
 /// config — see [`dyn_candidates`].
 fn candidates(tokens: &[&str]) -> &'static [Cand] {
@@ -244,20 +258,26 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         [] => COMMANDS,
         ["set" | "delete"] => TOP,
         ["set" | "delete", "system"] => SYSTEM_FIELDS,
-        ["set" | "delete", "firewall"] => FIREWALL_FIELDS,
-        ["set", "firewall", "stateful" | "block-icmp" | "log"] => BOOLS,
-        ["set", "firewall", "default-action"] => ACTIONS,
-        // `set zone <name> <field>` — name is freeform, then fields.
-        ["set" | "delete", "zone", _name] => ZONE_FIELDS,
-        ["set", "zone", _name, "stateful" | "block-icmp" | "log" | "masquerade"] => BOOLS,
-        ["set", "zone", _name, "default-action"] => ACTIONS,
         // `set interface <name> <field>` — name is freeform, then fields.
         ["set" | "delete", "interface", _name] => IFACE_FIELDS,
-        ["set" | "delete", "rule", _name] => RULE_FIELDS,
-        ["set", "rule", _name, "action"] => ACTIONS,
-        ["set", "rule", _name, "proto"] => PROTOS,
-        ["set" | "delete", "port-forward", _name] => PORTFWD_FIELDS,
-        ["set", "port-forward", _name, "proto"] => PROTOS,
+
+        // The firewall sub-tree.
+        ["set" | "delete", "firewall"] => FIREWALL_NODES,
+        ["set" | "delete", "firewall", "global"] => GLOBAL_FIELDS,
+        ["set", "firewall", "global", "stateful" | "block-icmp" | "log"] => BOOLS,
+        ["set", "firewall", "global", "default-action"] => ACTIONS,
+        ["set" | "delete", "firewall", "zone", _name] => ZONE_FIELDS,
+        ["set", "firewall", "zone", _name, "stateful" | "block-icmp" | "log"] => BOOLS,
+        ["set", "firewall", "zone", _name, "default-action"] => ACTIONS,
+        ["set" | "delete", "firewall", "rule", _name] => RULE_FIELDS,
+        ["set", "firewall", "rule", _name, "action"] => ACTIONS,
+        ["set", "firewall", "rule", _name, "proto"] => PROTOS,
+
+        // The nat sub-tree (its own top-level node).
+        ["set" | "delete", "nat"] => NAT_NODES,
+        ["set" | "delete", "nat", "source", _name] => NAT_SOURCE_FIELDS,
+        ["set" | "delete", "nat", "destination", _name] => NAT_DEST_FIELDS,
+        ["set", "nat", "destination", _name, "proto"] => PROTOS,
         _ => &[],
     }
 }
@@ -269,7 +289,8 @@ pub struct DynNames {
     pub interfaces: Vec<String>,
     pub rules: Vec<String>,
     pub zones: Vec<String>,
-    pub port_forwards: Vec<String>,
+    pub nat_source: Vec<String>,
+    pub nat_destination: Vec<String>,
 }
 
 /// Candidates for `tokens`, splicing in the live interface/rule/zone names at the
@@ -290,21 +311,27 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
             .iter()
             .map(|n| (n.clone(), "interface".to_string()))
             .collect(),
-        ["set" | "delete", "rule"] => names
+        ["set" | "delete", "firewall", "rule"] => names
             .rules
             .iter()
             .map(|n| (n.clone(), "rule".to_string()))
             .collect(),
-        ["set" | "delete", "port-forward"] => names
-            .port_forwards
+        ["set" | "delete", "nat", "source"] => names
+            .nat_source
             .iter()
-            .map(|n| (n.clone(), "port-forward".to_string()))
+            .map(|n| (n.clone(), "nat source".to_string()))
+            .collect(),
+        ["set" | "delete", "nat", "destination"] => names
+            .nat_destination
+            .iter()
+            .map(|n| (n.clone(), "nat destination".to_string()))
             .collect(),
         // Zone-name positions splice in the known zones.
-        ["set" | "delete", "zone"] => zones("zone"),
+        ["set" | "delete", "firewall", "zone"] => zones("zone"),
         ["set", "interface", _name, "zone"] => zones("zone"),
-        ["set", "rule", _name, "from" | "to"] => zones("zone"),
-        ["set", "port-forward", _name, "zone"] => zones("zone"),
+        ["set", "firewall", "rule", _name, "from" | "to"] => zones("zone"),
+        ["set", "nat", "source", _name, "zone"] => zones("zone"),
+        ["set", "nat", "destination", _name, "zone"] => zones("zone"),
         _ => own(candidates(tokens)),
     }
 }
@@ -343,13 +370,15 @@ impl ConfigCompleter {
         interfaces: Vec<String>,
         rules: Vec<String>,
         zones: Vec<String>,
-        port_forwards: Vec<String>,
+        nat_source: Vec<String>,
+        nat_destination: Vec<String>,
     ) {
         *self.names.borrow_mut() = DynNames {
             interfaces,
             rules,
             zones,
-            port_forwards,
+            nat_source,
+            nat_destination,
         };
     }
 }
@@ -422,28 +451,41 @@ mod tests {
             kw(&[]),
             ["set", "delete", "show", "compare", "commit", "save", "discard", "exit", "help"]
         );
-        assert_eq!(kw(&["set"]), ["system", "firewall", "zone", "interface", "rule", "port-forward"]);
+        assert_eq!(kw(&["set"]), ["system", "interface", "firewall", "nat"]);
         assert_eq!(kw(&["set", "system"]), ["hostname"]);
-        assert_eq!(
-            kw(&["set", "firewall"]),
-            ["stateful", "block-icmp", "default-action", "log", "block"]
-        );
-        assert_eq!(kw(&["set", "firewall", "stateful"]), ["true", "false"]);
-        assert_eq!(kw(&["set", "firewall", "default-action"]), ["accept", "drop", "reject"]);
-        assert_eq!(
-            kw(&["set", "zone", "wan"]),
-            ["stateful", "block-icmp", "default-action", "log", "masquerade", "block"]
-        );
-        assert_eq!(kw(&["set", "zone", "wan", "masquerade"]), ["true", "false"]);
         assert_eq!(
             kw(&["set", "interface", "wan0"]),
             ["zone", "address", "parent", "vlan"]
         );
-        assert_eq!(kw(&["set", "rule", "web"]), ["from", "to", "action", "proto", "port"]);
-        assert_eq!(kw(&["set", "rule", "web", "action"]), ["accept", "drop", "reject"]);
-        assert_eq!(kw(&["set", "rule", "web", "proto"]), ["tcp", "udp"]);
+        // The firewall sub-tree is discoverable level by level (NAT is separate).
+        assert_eq!(kw(&["set", "firewall"]), ["global", "zone", "rule"]);
+        assert_eq!(
+            kw(&["set", "firewall", "global"]),
+            ["stateful", "block-icmp", "default-action", "log", "block"]
+        );
+        assert_eq!(kw(&["set", "firewall", "global", "stateful"]), ["true", "false"]);
+        assert_eq!(kw(&["set", "firewall", "global", "default-action"]), ["accept", "drop", "reject"]);
+        assert_eq!(
+            kw(&["set", "firewall", "zone", "wan"]),
+            ["stateful", "block-icmp", "default-action", "log", "block"]
+        );
+        assert_eq!(kw(&["set", "firewall", "zone", "wan", "block-icmp"]), ["true", "false"]);
+        assert_eq!(
+            kw(&["set", "firewall", "rule", "web"]),
+            ["from", "to", "action", "proto", "port"]
+        );
+        assert_eq!(kw(&["set", "firewall", "rule", "web", "action"]), ["accept", "drop", "reject"]);
+        assert_eq!(kw(&["set", "firewall", "rule", "web", "proto"]), ["tcp", "udp"]);
+        // The nat sub-tree: source (masquerade) + destination (port-forward).
+        assert_eq!(kw(&["set", "nat"]), ["source", "destination"]);
+        assert_eq!(kw(&["set", "nat", "source", "wan-masq"]), ["zone"]);
+        assert_eq!(
+            kw(&["set", "nat", "destination", "web"]),
+            ["zone", "proto", "port", "to"]
+        );
+        assert_eq!(kw(&["set", "nat", "destination", "web", "proto"]), ["tcp", "udp"]);
         // zone-value positions are dynamic now (see dynamic_candidates test).
-        assert!(kw(&["set", "rule", "web", "from"]).is_empty());
+        assert!(kw(&["set", "firewall", "rule", "web", "from"]).is_empty());
         assert!(kw(&["set", "interface", "wan0", "zone"]).is_empty());
         // Unknown contexts complete nothing.
         assert!(candidates(&["bogus"]).is_empty());
@@ -455,20 +497,25 @@ mod tests {
             interfaces: vec!["eth0".into(), "eth1".into()],
             rules: vec!["web".into()],
             zones: vec!["lan".into(), "wan".into()],
-            port_forwards: vec!["web-fwd".into()],
+            nat_source: vec!["wan-masq".into()],
+            nat_destination: vec!["web-fwd".into()],
         };
         let kws = |toks: &[&str]| -> Vec<String> {
             dyn_candidates(toks, &names).into_iter().map(|(k, _)| k).collect()
         };
-        // Name positions splice in the live interface/rule names.
+        // Name positions splice in the live interface/rule/zone/nat names.
         assert_eq!(kws(&["set", "interface"]), ["eth0", "eth1"]);
-        assert_eq!(kws(&["delete", "rule"]), ["web"]);
+        assert_eq!(kws(&["delete", "firewall", "rule"]), ["web"]);
+        assert_eq!(kws(&["set", "nat", "source"]), ["wan-masq"]);
+        assert_eq!(kws(&["set", "nat", "destination"]), ["web-fwd"]);
+        assert_eq!(kws(&["set", "firewall", "zone"]), ["lan", "wan"]);
         // Zone-value positions splice in the known zone names.
         assert_eq!(kws(&["set", "interface", "eth0", "zone"]), ["lan", "wan"]);
-        assert_eq!(kws(&["set", "rule", "web", "from"]), ["lan", "wan"]);
-        assert_eq!(kws(&["set", "zone"]), ["lan", "wan"]);
+        assert_eq!(kws(&["set", "firewall", "rule", "web", "from"]), ["lan", "wan"]);
+        assert_eq!(kws(&["set", "nat", "source", "wan-masq", "zone"]), ["lan", "wan"]);
+        assert_eq!(kws(&["set", "nat", "destination", "web-fwd", "zone"]), ["lan", "wan"]);
         // Other positions fall back to the static grammar.
-        assert_eq!(kws(&["set"]), ["system", "firewall", "zone", "interface", "rule", "port-forward"]);
+        assert_eq!(kws(&["set"]), ["system", "interface", "firewall", "nat"]);
         assert_eq!(
             kws(&["set", "interface", "eth0"]),
             ["zone", "address", "parent", "vlan"]
