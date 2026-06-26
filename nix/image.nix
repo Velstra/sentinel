@@ -35,6 +35,34 @@ let
   # GPT type GUIDs for the verity store pair (x86-64), used to re-type slot B.
   usrType = "8484680c-9521-48c6-9c11-b0720656f69e";
   usrVerityType = "77ff5f63-e7b6-4633-acf4-1565b864c0e6";
+
+  # --- Secure Boot ---------------------------------------------------------
+  # Self-signed PK/KEK/db keys. NOTE: generated at build time (cached, so stable
+  # across rebuilds) — a DEMO/default. A real deployment overrides these with the
+  # operator's own keys so updates stay signed by a key the firmware trusts.
+  sbKeys = pkgs.runCommand "sentinel-sb-keys" { nativeBuildInputs = [ pkgs.openssl ]; } ''
+    mkdir -p $out
+    for k in PK KEK db; do
+      openssl req -new -x509 -newkey rsa:2048 -nodes -days 7300 -sha256 \
+        -subj "/CN=Velstra Sentinel Secure Boot $k/" \
+        -keyout $out/$k.key -out $out/$k.crt
+    done
+  '';
+  # systemd-boot, signed with the db key (the firmware verifies it).
+  signedSdBoot =
+    pkgs.runCommand "sentinel-systemd-boot-signed.efi" { nativeBuildInputs = [ pkgs.sbsigntool ]; }
+      ''sbsign --key ${sbKeys}/db.key --cert ${sbKeys}/db.crt --output $out ${sdBoot}'';
+  # PK/KEK/db enrollment payloads for the operator (baked under /loader/keys).
+  sbGuid = "a5a5a5a5-1234-5678-9abc-def012345678";
+  sbAuth = pkgs.runCommand "sentinel-sb-auth" { nativeBuildInputs = [ pkgs.efitools ]; } ''
+    mkdir -p $out
+    cert-to-efi-sig-list -g ${sbGuid} ${sbKeys}/PK.crt  PK.esl
+    cert-to-efi-sig-list -g ${sbGuid} ${sbKeys}/KEK.crt KEK.esl
+    cert-to-efi-sig-list -g ${sbGuid} ${sbKeys}/db.crt  db.esl
+    sign-efi-sig-list -g ${sbGuid} -k ${sbKeys}/PK.key  -c ${sbKeys}/PK.crt  PK  PK.esl  $out/PK.auth
+    sign-efi-sig-list -g ${sbGuid} -k ${sbKeys}/PK.key  -c ${sbKeys}/PK.crt  KEK KEK.esl $out/KEK.auth
+    sign-efi-sig-list -g ${sbGuid} -k ${sbKeys}/KEK.key -c ${sbKeys}/KEK.crt db  db.esl  $out/db.auth
+  '';
 in
 {
   imports = [ "${modulesPath}/image/repart.nix" ];
@@ -51,6 +79,41 @@ in
   boot.uki.name = "sentinel-a";
   boot.uki.version = lib.mkForce null; # no `_<version>` infix; keep the name clean
   boot.uki.tries = 3;
+  # Secure Boot: the systemd-boot binary is signed in the ESP `contents` below;
+  # the roothash UKI is signed post-build (the verityStore rebuilds the UKI with
+  # an internal ukify call we can't hand a signtool to, and ukify+systemd-sbsign
+  # can't verify the inner kernel — so we sbsign the finished UKI in the ESP via
+  # mtools in `system.build.finalImageSigned`).
+
+  # Expose the Secure Boot keys so the test can build a firmware vars file with
+  # them enrolled (and an operator can find them).
+  system.build.sentinelSbKeys = sbKeys;
+
+  # The shipped, Secure-Boot-ready image: the verity image with its UKI signed
+  # by the db key in place. Signing doesn't touch the embedded roothash/cmdline,
+  # and boot-counting only renames the file, so the signature stays valid.
+  system.build.finalImageSigned =
+    pkgs.runCommand "velstra-sentinel-signed"
+      {
+        nativeBuildInputs = [
+          pkgs.mtools
+          pkgs.sbsigntool
+          pkgs.util-linux
+        ];
+      }
+      ''
+        mkdir -p "$(dirname "$out/${config.image.filePath}")"
+        img="$out/${config.image.filePath}"
+        cp ${config.system.build.finalImage}/${config.image.filePath} "$img"
+        chmod +w "$img"
+        # ESP is the first partition; mtools addresses it at its byte offset.
+        start=$(sfdisk -d "$img" | grep 'name="esp"' | grep -oE 'start=[[:space:]]*[0-9]+' | grep -oE '[0-9]+')
+        off=$(( start * 512 ))
+        mcopy -i "$img@@$off" "::/EFI/Linux/sentinel-a+3.efi" uki.efi
+        sbsign --key ${sbKeys}/db.key --cert ${sbKeys}/db.crt --output uki.signed.efi uki.efi
+        sbverify --cert ${sbKeys}/db.crt uki.signed.efi
+        mcopy -o -i "$img@@$off" uki.signed.efi "::/EFI/Linux/sentinel-a+3.efi"
+      '';
 
   # Automatic boot assessment: these upstream systemd units aren't NixOS
   # defaults. With them present, the bless generator marks a clean boot good
@@ -125,12 +188,17 @@ in
           Format = "vfat";
           SizeMinBytes = "128M";
         };
-        # Bake systemd-boot + its config into the ESP (the verityStore module
-        # injects the slot-A UKI on top of this via finalPartitions).
+        # Bake the **signed** systemd-boot + its config into the ESP (the
+        # verityStore module injects the signed slot-A UKI on top via
+        # finalPartitions). The PK/KEK/db enrollment payloads go under
+        # /loader/keys/sentinel so an operator can enroll them from the firmware.
         contents = {
-          "/EFI/BOOT/BOOT${lib.toUpper efiArch}.EFI".source = sdBoot;
-          "/EFI/systemd/systemd-boot${efiArch}.efi".source = sdBoot;
+          "/EFI/BOOT/BOOT${lib.toUpper efiArch}.EFI".source = signedSdBoot;
+          "/EFI/systemd/systemd-boot${efiArch}.efi".source = signedSdBoot;
           "/loader/loader.conf".source = loaderConf;
+          "/loader/keys/sentinel/PK.auth".source = "${sbAuth}/PK.auth";
+          "/loader/keys/sentinel/KEK.auth".source = "${sbAuth}/KEK.auth";
+          "/loader/keys/sentinel/db.auth".source = "${sbAuth}/db.auth";
         };
       };
       # Slot A (verity), sized to fit the closure + its hash tree. The module
