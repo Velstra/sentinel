@@ -16,9 +16,11 @@
 //! Velstra fills the rest with defaults (its schema is `deny_unknown_fields` +
 //! `default`, so the subset must use only known field names — it does).
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 
-use crate::config::{Action, Appliance, Proto, Zone};
+use crate::config::{Action, Appliance, Proto};
 
 /// The subset of Velstra's agent `FileConfig` we emit. Field names and the
 /// `policy`/`interface` array renames match Velstra's TOML schema exactly.
@@ -26,10 +28,18 @@ use crate::config::{Action, Appliance, Proto, Zone};
 pub struct VelstraConfig {
     default_action: &'static str,
     stateful: bool,
+    drop_icmp: bool,
+    log: bool,
+    // Inline array of strings — still a scalar for TOML ordering, so it must
+    // precede the `[[policy]]`/`[[interface]]` tables below.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    blocklist: Vec<String>,
     #[serde(rename = "policy")]
     policies: Vec<Policy>,
     #[serde(rename = "interface")]
     interfaces: Vec<Interface>,
+    #[serde(rename = "port_forward", skip_serializing_if = "Vec::is_empty")]
+    port_forwards: Vec<PortForwardOut>,
 }
 
 #[derive(Debug, Serialize)]
@@ -38,7 +48,11 @@ struct Policy {
     name: String,
     default_action: &'static str,
     stateful: bool,
+    drop_icmp: bool,
+    log: bool,
     // Scalars above, the array-of-tables below (TOML requires this order).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    blocklist: Vec<String>,
     #[serde(rename = "port_rule", skip_serializing_if = "Vec::is_empty")]
     port_rules: Vec<PortRule>,
 }
@@ -56,28 +70,20 @@ struct Interface {
     policy: u32,
 }
 
+#[derive(Debug, Serialize)]
+struct PortForwardOut {
+    policy: u32,
+    proto: &'static str,
+    port: u16,
+    dst_ip: String,
+    dst_port: u16,
+}
+
 impl VelstraConfig {
     /// Render as the TOML the Velstra agent loads with `--config`.
     pub fn to_toml(&self) -> anyhow::Result<String> {
         use anyhow::Context;
         toml::to_string_pretty(self).context("serializing the velstra config")
-    }
-}
-
-/// A stable policy id per zone, so recompiles are deterministic.
-fn zone_id(z: Zone) -> u32 {
-    match z {
-        Zone::Wan => 1,
-        Zone::Lan => 2,
-        Zone::Dmz => 3,
-    }
-}
-
-fn zone_name(z: Zone) -> &'static str {
-    match z {
-        Zone::Wan => "wan",
-        Zone::Lan => "lan",
-        Zone::Dmz => "dmz",
     }
 }
 
@@ -88,8 +94,9 @@ fn proto_str(p: Proto) -> &'static str {
     }
 }
 
-/// Map a Sentinel action to a Velstra action. Velstra has no `reject`, so it
-/// collapses to `drop` (silently dropped rather than actively refused).
+/// Map a Sentinel action to a Velstra action. Velstra has no `reject` yet, so it
+/// collapses to `drop` (silently dropped rather than actively refused). Phase 3
+/// will make reject real in the data plane.
 fn action_str(a: Action) -> &'static str {
     match a {
         Action::Accept => "pass",
@@ -97,23 +104,46 @@ fn action_str(a: Action) -> &'static str {
     }
 }
 
-/// Compile a Sentinel appliance config into a Velstra agent config.
+/// Compile a Sentinel appliance config into a Velstra agent config. Each named
+/// zone in use becomes one policy, carrying its resolved posture (zone override
+/// over the global `[firewall]` defaults). Policy ids are assigned by sorted zone
+/// name so recompiles are deterministic (stable conntrack/map keys).
 pub fn compile(appliance: &Appliance) -> VelstraConfig {
+    let fw = &appliance.firewall;
+
     // The zones actually in use (a zone with no assigned interface needs no
     // policy; interfaces the system provides but that aren't assigned a zone yet
-    // are simply not firewalled).
-    let mut zones: Vec<Zone> = appliance.interfaces.iter().filter_map(|i| i.role).collect();
-    zones.sort_by_key(|z| zone_id(*z));
-    zones.dedup();
+    // are simply not firewalled). Sorted + deduped → stable ids starting at 1.
+    let mut zone_names: Vec<&str> =
+        appliance.interfaces.iter().filter_map(|i| i.zone.as_deref()).collect();
+    zone_names.sort_unstable();
+    zone_names.dedup();
+    let ids: BTreeMap<&str, u32> = zone_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (*name, i as u32 + 1))
+        .collect();
 
-    let policies = zones
+    let policies = zone_names
         .iter()
         .map(|&zone| {
-            // Posture comes from broad rules: pass if this zone may initiate.
-            let initiates = appliance
-                .rules
-                .iter()
-                .any(|r| r.from == zone && r.is_broad() && r.action == Action::Accept);
+            let posture = appliance.zone_posture(zone);
+            // Default action: an explicit per-zone override wins; otherwise the
+            // posture comes from broad rules (pass if this zone may initiate),
+            // falling back to the global firewall default action.
+            let default_action = match posture.default_action {
+                Some(a) => action_str(a),
+                None => {
+                    let initiates = appliance.rules.iter().any(|r| {
+                        r.from == zone && r.is_broad() && r.action == Action::Accept
+                    });
+                    if initiates {
+                        "pass"
+                    } else {
+                        action_str(fw.default_action)
+                    }
+                }
+            };
             // Specific proto/port rules become Velstra port rules on this policy.
             let port_rules = appliance
                 .rules
@@ -126,10 +156,13 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                 })
                 .collect();
             Policy {
-                id: zone_id(zone),
-                name: zone_name(zone).to_string(),
-                default_action: if initiates { "pass" } else { "drop" },
-                stateful: true,
+                id: ids[zone],
+                name: zone.to_string(),
+                default_action,
+                stateful: posture.stateful,
+                drop_icmp: posture.block_icmp,
+                log: posture.log,
+                blocklist: posture.blocklist,
                 port_rules,
             }
         })
@@ -139,19 +172,41 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
         .interfaces
         .iter()
         .filter_map(|i| {
-            i.role.map(|role| Interface {
+            i.zone.as_deref().map(|zone| Interface {
                 name: i.name.clone(),
-                policy: zone_id(role),
+                policy: ids[zone],
+            })
+        })
+        .collect();
+
+    // Port-forwards bind to their ingress zone's policy; `to` splits into the
+    // internal ip:port (validated already, so a parse miss just drops the entry).
+    let port_forwards = appliance
+        .port_forwards
+        .iter()
+        .filter_map(|pf| {
+            let policy = *ids.get(pf.zone.as_str())?;
+            let (ip, port) = crate::config::parse_host_port(&pf.to).ok()?;
+            Some(PortForwardOut {
+                policy,
+                proto: proto_str(pf.proto),
+                port: pf.port,
+                dst_ip: ip.to_string(),
+                dst_port: port,
             })
         })
         .collect();
 
     VelstraConfig {
         // Deny by default; interfaces opt into their zone policy.
-        default_action: "drop",
-        stateful: true,
+        default_action: action_str(fw.default_action),
+        stateful: fw.stateful,
+        drop_icmp: fw.block_icmp,
+        log: fw.log,
+        blocklist: fw.blocklist.clone(),
         policies,
         interfaces,
+        port_forwards,
     }
 }
 
@@ -167,13 +222,17 @@ mod tests {
 
         // One interface binding per declared interface.
         assert_eq!(cfg.interfaces.len(), 2);
-        // wan0 -> policy 1, lan0 -> policy 2.
+        // Policy ids are assigned by sorted zone name: lan=1, wan=2.
+        let wan = cfg.policies.iter().find(|p| p.name == "wan").unwrap();
+        let lan = cfg.policies.iter().find(|p| p.name == "lan").unwrap();
+        assert_eq!((lan.id, wan.id), (1, 2));
         let wan_if = cfg.interfaces.iter().find(|i| i.name == "wan0").unwrap();
-        assert_eq!(wan_if.policy, 1);
+        assert_eq!(wan_if.policy, wan.id);
 
-        // A policy per used zone, with the right posture.
-        let wan = cfg.policies.iter().find(|p| p.id == 1).unwrap();
-        let lan = cfg.policies.iter().find(|p| p.id == 2).unwrap();
+        // Per-zone posture: WAN blocks ICMP (its [zone.wan] override), LAN
+        // inherits the firewall default (ICMP allowed).
+        assert!(wan.drop_icmp, "wan zone blocks icmp");
+        assert!(!lan.drop_icmp, "lan zone allows icmp");
         assert_eq!(wan.default_action, "drop"); // no broad accept-from-wan rule
         assert_eq!(lan.default_action, "pass"); // lan-to-wan accept lets lan initiate
         assert!(wan.stateful && lan.stateful);
@@ -190,6 +249,93 @@ mod tests {
         assert!(toml.contains("[[interface]]"));
         assert!(toml.contains("[[policy]]"));
         assert!(toml.contains("[[policy.port_rule]]"));
+    }
+
+    #[test]
+    fn firewall_settings_flow_into_top_level_and_each_policy() {
+        let cfg_toml = r#"
+[system]
+hostname = "fw"
+
+[firewall]
+stateful = false
+block_icmp = true
+blocklist = ["10.6.6.0/24", "192.0.2.5"]
+
+[[interface]]
+name = "wan0"
+zone = "wan"
+
+[[interface]]
+name = "lan0"
+zone = "lan"
+
+[[rule]]
+name = "lan-out"
+from = "lan"
+to = "wan"
+action = "accept"
+"#;
+        let appliance = Appliance::from_toml(cfg_toml).unwrap();
+        let cfg = compile(&appliance);
+
+        // Top-level posture reflects the [firewall] section.
+        assert!(!cfg.stateful);
+        assert!(cfg.drop_icmp);
+        assert_eq!(cfg.blocklist, ["10.6.6.0/24", "192.0.2.5"]);
+
+        // Every zone policy inherits the global posture + blocklist, so it
+        // applies to traffic on assigned interfaces (not just policy 0).
+        for p in &cfg.policies {
+            assert!(!p.stateful, "policy {} stateful", p.name);
+            assert!(p.drop_icmp, "policy {} drop_icmp", p.name);
+            assert_eq!(p.blocklist, ["10.6.6.0/24", "192.0.2.5"]);
+        }
+
+        // It renders with the fabric field names (deny_unknown_fields-safe).
+        let toml = cfg.to_toml().unwrap();
+        assert!(toml.contains("drop_icmp = true"));
+        assert!(toml.contains("blocklist = ["));
+    }
+
+    #[test]
+    fn default_firewall_keeps_stateful_on_and_omits_empty_blocklist() {
+        let appliance = Appliance::from_toml(crate::config::EXAMPLE).unwrap();
+        let cfg = compile(&appliance);
+        assert!(cfg.stateful);
+        assert!(!cfg.drop_icmp);
+        assert!(cfg.blocklist.is_empty());
+        // An empty blocklist is skipped, so the agent never sees `blocklist = []`.
+        assert!(!cfg.to_toml().unwrap().contains("blocklist"));
+    }
+
+    #[test]
+    fn port_forward_emits_zone_policy_and_split_target() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+[[interface]]
+name = "lan0"
+zone = "lan"
+[[port-forward]]
+name = "web"
+zone = "wan"
+proto = "tcp"
+port = 443
+to = "10.0.0.10:8443"
+"#;
+        let cfg = compile(&Appliance::from_toml(toml).unwrap());
+        assert_eq!(cfg.port_forwards.len(), 1);
+        let pf = &cfg.port_forwards[0];
+        assert_eq!(pf.policy, 2); // wan sorts after lan → id 2
+        assert_eq!((pf.proto, pf.port), ("tcp", 443));
+        assert_eq!((pf.dst_ip.as_str(), pf.dst_port), ("10.0.0.10", 8443));
+        let out = cfg.to_toml().unwrap();
+        assert!(out.contains("[[port_forward]]"), "{out}");
+        assert!(out.contains("dst_ip = \"10.0.0.10\""), "{out}");
     }
 
     #[test]
