@@ -98,12 +98,21 @@
     _sentinel_show() { _sentinel_show_at 1; }
     complete -F _sentinel_show show
 
+    # Block devices the installer/updater target (real disks, /dev-prefixed).
+    _sentinel_disks() { lsblk -dnro NAME 2>/dev/null | sed 's,^,/dev/,'; }
     _sentinel() {
+      local cur="''${COMP_WORDS[COMP_CWORD]}"
       if [ "$COMP_CWORD" -eq 1 ]; then
-        COMPREPLY=( $(compgen -W "configure show config compile apply apply-boot ports" -- "''${COMP_WORDS[COMP_CWORD]}") )
+        COMPREPLY=( $(compgen -W "configure show config compile apply apply-boot install update ports" -- "$cur") )
       elif [ "''${COMP_WORDS[1]}" = "show" ]; then
         # `sentinel show <kind> [nic]` — KIND is at word index 2.
         _sentinel_show_at 2
+      elif [ "''${COMP_WORDS[1]}" = "install" ]; then
+        # target disk(s) + flags; --source/image also takes a file path.
+        COMPREPLY=( $(compgen -W "$(_sentinel_disks) --raid --source --commit" -- "$cur") $(compgen -f -- "$cur") )
+      elif [ "''${COMP_WORDS[1]}" = "update" ]; then
+        # a new image (file) or the inactive-slot device, + --commit.
+        COMPREPLY=( $(compgen -W "$(_sentinel_disks) --commit" -- "$cur") $(compgen -f -- "$cur") )
       else
         COMPREPLY=()
       fi

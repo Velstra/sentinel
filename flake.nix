@@ -247,6 +247,17 @@
         sentinel-iso = self.nixosConfigurations.sentinel-iso.config.system.build.isoImage;
       };
 
+      # `nix run .#vm` — boot the appliance in a throwaway QEMU VM. The easy
+      # local-test path on ANY host (no NixOS / `nixos-rebuild` needed): it runs
+      # straight from the store, so there's no `result` symlink to juggle.
+      # NOTE: `.#sentinel-image` by contrast builds a raw DISK IMAGE (flashable,
+      # no run script) — that's why `./result/bin/run-*-vm` doesn't exist after
+      # building it. Use this app to *boot*; build the image to *flash*.
+      apps.${system}.vm = {
+        type = "app";
+        program = "${self.nixosConfigurations.appliance.config.system.build.vm}/bin/run-${applianceData.system.hostname}-vm";
+      };
+
       # The appliance: the base config + the Velstra data-plane service. The
       # velstra agent runs the build-time-compiled firewall config as a systemd
       # service — so the box filters as part of the immutable, rollback-able
