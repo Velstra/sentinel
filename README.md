@@ -32,8 +32,25 @@ cargo run -- config convert appliance.toml --to json  # TOML <-> JSON
 cargo run -- ports --controller http://127.0.0.1:50052
 ```
 
-The OS design — why NixOS, generations/rollback, the compile pipeline, security —
-is in [`docs/os.md`](docs/os.md).
+## Documentation
+
+The full handbook — **how to build the images**, the appliance model (verified
+boot, A/B updates, Secure Boot), and how to install/configure/update — lives in
+[`docs/`](docs/) as an [mdBook](https://rust-lang.github.io/mdBook/):
+
+```shell
+nix run nixpkgs#mdbook -- serve docs   # live preview at http://localhost:3000
+nix run nixpkgs#mdbook -- build docs   # static HTML in docs/book/
+
+# the two build commands the handbook is built around:
+nix build .#sentinel-image             # the flashable, signed appliance disk image
+nix build .#sentinel-iso               # the live-boot installer ISO
+```
+
+It is published to GitHub Pages on push (see `.github/workflows/docs.yml`).
+Historical design notes (the original `os.md` / `commit-model.md`) are preserved
+in the book's appendix; the architecture chapters are authoritative where they
+differ.
 
 The config declares interfaces (with zone roles), addresses, and zone-to-zone
 firewall rules; `ports` lists a controller's fabric ports over gRPC — the same

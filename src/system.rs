@@ -158,18 +158,27 @@ pub fn bin(name: &str) -> String {
     name.to_string()
 }
 
-/// Run a command that needs root: try directly first (succeeds as root, e.g. the
-/// boot service) and fall back to `sudo` (the admin running `configure`). The
-/// direct probe is silenced so its expected "permission denied" doesn't reach
-/// the user.
+/// Run a command that needs root: when already root (e.g. the boot service) run
+/// it directly; otherwise (the admin running `configure`) go straight to `sudo`.
+///
+/// We do **not** probe a direct non-root invocation first: a non-root
+/// `systemctl`/`networkctl` would try to authorize via polkit, which spawns
+/// `pkttyagent` on the controlling TTY. On the appliance that agent isn't
+/// installed, so it prints "Failed to execute /run/current-system/sw/.../
+/// pkttyagent: No such file or directory" straight to the terminal (bypassing
+/// our stdio redirect, since it writes to the tty) and fails. Running via `sudo`
+/// executes as root, which never touches polkit.
 fn run_priv(cmd: &str, args: &[&str]) -> Result<()> {
-    let direct = Command::new(bin(cmd))
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    if matches!(direct, Ok(s) if s.success()) {
-        return Ok(());
+    let is_root = unsafe { libc::geteuid() } == 0;
+    if is_root {
+        let direct = Command::new(bin(cmd))
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if matches!(direct, Ok(s) if s.success()) {
+            return Ok(());
+        }
     }
     sudo(cmd, args)
 }

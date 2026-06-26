@@ -1,3 +1,9 @@
+> **⚠️ Historical design note — superseded.**
+> This documents the **rebuild-on-commit** design, which was investigated and
+> **rejected**. The implemented `commit` applies config to the running system at
+> runtime — no rebuild, no reboot. For the current model see
+> [The commit model (runtime apply)](../architecture/commit-model.md).
+
 # The commit model — how `commit` activates config on an immutable appliance
 
 This is the design for making `sentinel configure` → `commit` actually change
