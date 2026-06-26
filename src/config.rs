@@ -35,7 +35,6 @@ blocklist = []
 # data-plane policy. Here ICMP is blocked on the WAN but allowed elsewhere.
 [zone.wan]
 block_icmp = true
-# masquerade = true   # SNAT outbound to the WAN IP (NAT) — enforced in Phase 4
 
 [zone.lan]
 block_icmp = false
@@ -82,6 +81,20 @@ to = "lan"
 action = "accept"
 proto = "tcp"
 port = 443
+
+# NAT is its own thing (address translation, not filtering). Source NAT
+# masquerades a zone's outbound traffic to its egress IP; destination NAT is an
+# inbound port-forward.
+# [[nat.source]]
+# name = "wan-masq"
+# zone = "wan"
+#
+# [[nat.destination]]
+# name = "web"
+# zone = "wan"
+# proto = "tcp"
+# port = 443
+# to = "10.0.0.10:8443"
 "#;
 
 /// The whole declarative appliance config.
@@ -103,17 +116,57 @@ pub struct Appliance {
     pub interfaces: Vec<Interface>,
     #[serde(default, rename = "rule")]
     pub rules: Vec<Rule>,
-    /// Inbound DNAT port-forwards (`[[port-forward]]`).
-    #[serde(default, rename = "port-forward", skip_serializing_if = "Vec::is_empty")]
-    pub port_forwards: Vec<PortForward>,
+    /// NAT — address translation, a top-level category distinct from the
+    /// firewall (which only *filters*). `[[nat.source]]` masquerades a zone's
+    /// outbound traffic; `[[nat.destination]]` is an inbound DNAT port-forward.
+    /// Omitted from saved configs when empty.
+    #[serde(default, skip_serializing_if = "Nat::is_empty")]
+    pub nat: Nat,
 }
 
-/// An inbound DNAT port-forward: traffic hitting `zone`'s public address on
-/// `proto`/`port` is rewritten to the internal host `to` (`"ip"` or `"ip:port"`).
-/// The reply is SNAT'd back automatically and the firewall is opened for it.
+/// NAT — Network Address Translation. Kept separate from [`Firewall`] because it
+/// *rewrites* addresses rather than *filtering* packets — a different thing that
+/// happens at a different stage. Split into source NAT (`[[nat.source]]`,
+/// masquerade) and destination NAT (`[[nat.destination]]`, port-forward),
+/// mirroring the VyOS `nat source` / `nat destination` model.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Nat {
+    /// Source NAT: masquerade traffic egressing a zone to that zone's egress IP
+    /// (the classic WAN uplink). Enforced in the data plane (Phase 4b).
+    #[serde(default, rename = "source", skip_serializing_if = "Vec::is_empty")]
+    pub source: Vec<NatSource>,
+    /// Destination NAT: inbound port-forwards.
+    #[serde(default, rename = "destination", skip_serializing_if = "Vec::is_empty")]
+    pub destination: Vec<NatDestination>,
+}
+
+impl Nat {
+    /// True when no NAT is configured — lets `[nat]` be omitted from a saved
+    /// config that never set any.
+    pub fn is_empty(&self) -> bool {
+        self.source.is_empty() && self.destination.is_empty()
+    }
+}
+
+/// A source-NAT (masquerade) rule: SNAT all traffic egressing `zone` to that
+/// zone's egress address. The classic WAN masquerade.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PortForward {
+pub struct NatSource {
+    pub name: String,
+    /// The egress (WAN) zone whose outbound traffic is masqueraded — must be
+    /// backed by an interface.
+    pub zone: String,
+}
+
+/// A destination-NAT (port-forward) rule: traffic hitting `zone`'s public
+/// address on `proto`/`port` is rewritten to the internal host `to` (`"ip"` or
+/// `"ip:port"`). The reply is SNAT'd back automatically and the firewall is
+/// opened for it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NatDestination {
     pub name: String,
     /// The ingress zone (the public side) — must be backed by an interface.
     pub zone: String,
@@ -214,10 +267,6 @@ pub struct ZoneCfg {
     /// Log matched traffic for this zone (inherits `[firewall] log`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<bool>,
-    /// SNAT/masquerade outbound traffic to this zone's egress IP (NAT). Used for
-    /// a WAN uplink. Enforced by the data plane (Phase 4).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub masquerade: Option<bool>,
 }
 
 /// A zone's posture after inheriting the global `[firewall]` defaults — the
@@ -231,9 +280,6 @@ pub struct ResolvedZone {
     /// the rule-derived posture (broad accept ⇒ pass) or the firewall default.
     pub default_action: Option<Action>,
     pub log: bool,
-    /// Read by the NAT compiler in Phase 4; resolved here so the schema is ready.
-    #[allow(dead_code)]
-    pub masquerade: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -410,17 +456,29 @@ impl Appliance {
             }
         }
 
-        // Port-forwards target a zone (must have an interface) and a valid host.
-        for pf in &self.port_forwards {
-            if !zones_in_use.contains(pf.zone.as_str()) {
+        // Source NAT (masquerade) targets a zone that must have an interface.
+        for src in &self.nat.source {
+            if !zones_in_use.contains(src.zone.as_str()) {
                 bail!(
-                    "port-forward {:?}: zone {:?} has no interface",
-                    pf.name,
-                    pf.zone
+                    "nat source {:?}: zone {:?} has no interface",
+                    src.name,
+                    src.zone
                 );
             }
-            parse_host_port(&pf.to)
-                .with_context(|| format!("port-forward {:?}", pf.name))?;
+        }
+
+        // Destination NAT (port-forward) targets a zone (must have an interface)
+        // and a valid internal host.
+        for dst in &self.nat.destination {
+            if !zones_in_use.contains(dst.zone.as_str()) {
+                bail!(
+                    "nat destination {:?}: zone {:?} has no interface",
+                    dst.name,
+                    dst.zone
+                );
+            }
+            parse_host_port(&dst.to)
+                .with_context(|| format!("nat destination {:?}", dst.name))?;
         }
         Ok(())
     }
@@ -440,7 +498,6 @@ impl Appliance {
             blocklist,
             default_action: z.and_then(|z| z.default_action),
             log: z.and_then(|z| z.log).unwrap_or(fw.log),
-            masquerade: z.and_then(|z| z.masquerade).unwrap_or(false),
         }
     }
 
@@ -601,6 +658,43 @@ mod tests {
         assert!(validate_address("not-an-ip").is_err());
         assert!(validate_address("dhcp").is_ok());
         assert!(validate_address("192.168.1.1/24").is_ok());
+    }
+
+    #[test]
+    fn nat_tables_round_trip_through_toml() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+[[interface]]
+name = "lan0"
+zone = "lan"
+address = "10.0.0.1/24"
+
+[[nat.source]]
+name = "wan-masq"
+zone = "wan"
+
+[[nat.destination]]
+name = "web"
+zone = "wan"
+proto = "tcp"
+port = 443
+to = "10.0.0.10:8443"
+"#;
+        let a = Appliance::from_toml(toml).expect("nat config parses + validates");
+        assert_eq!(a.nat.source.len(), 1);
+        assert_eq!(a.nat.destination.len(), 1);
+        // Serialize back out and reparse — the `[[nat.source]]`/`[[nat.destination]]`
+        // tables must survive a save→load cycle unchanged.
+        let out = a.to_toml().unwrap();
+        assert!(out.contains("[[nat.source]]"), "got:\n{out}");
+        assert!(out.contains("[[nat.destination]]"), "got:\n{out}");
+        let b = Appliance::from_toml(&out).expect("re-parses");
+        assert_eq!(b.nat.source[0].zone, "wan");
+        assert_eq!(b.nat.destination[0].to, "10.0.0.10:8443");
     }
 
     #[test]

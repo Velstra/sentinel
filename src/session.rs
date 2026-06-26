@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::config::{
-    Action, Appliance, Firewall, Interface, PortForward, Proto, Rule, System, ZoneCfg,
+    Action, Appliance, Firewall, Interface, Nat, NatDestination, NatSource, Proto, Rule, System,
+    ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -39,9 +40,15 @@ struct RuleDraft {
     port: Option<u16>,
 }
 
-/// A partially-specified inbound DNAT port-forward.
+/// A partially-specified source-NAT (masquerade) rule.
 #[derive(Debug, Clone, Default)]
-struct PortFwdDraft {
+struct NatSrcDraft {
+    zone: Option<String>,
+}
+
+/// A partially-specified destination-NAT (port-forward) rule.
+#[derive(Debug, Clone, Default)]
+struct NatDstDraft {
     zone: Option<String>,
     proto: Option<Proto>,
     port: Option<u16>,
@@ -56,7 +63,6 @@ struct ZoneDraft {
     blocklist: Vec<String>,
     default_action: Option<Action>,
     log: Option<bool>,
-    masquerade: Option<bool>,
 }
 
 /// The candidate's global firewall posture. `None` fields fall back to the
@@ -81,7 +87,8 @@ struct Draft {
     zones: BTreeMap<String, ZoneDraft>,
     interfaces: Vec<(String, IfaceDraft)>,
     rules: Vec<(String, RuleDraft)>,
-    port_forwards: Vec<(String, PortFwdDraft)>,
+    nat_source: Vec<(String, NatSrcDraft)>,
+    nat_destination: Vec<(String, NatDstDraft)>,
 }
 
 impl Draft {
@@ -106,13 +113,22 @@ impl Draft {
         self.zones.entry(name.to_string()).or_default()
     }
 
-    fn port_forward_mut(&mut self, name: &str) -> &mut PortFwdDraft {
-        if let Some(i) = self.port_forwards.iter().position(|(n, _)| n == name) {
-            return &mut self.port_forwards[i].1;
+    fn nat_source_mut(&mut self, name: &str) -> &mut NatSrcDraft {
+        if let Some(i) = self.nat_source.iter().position(|(n, _)| n == name) {
+            return &mut self.nat_source[i].1;
         }
-        self.port_forwards
-            .push((name.to_string(), PortFwdDraft::default()));
-        &mut self.port_forwards.last_mut().unwrap().1
+        self.nat_source
+            .push((name.to_string(), NatSrcDraft::default()));
+        &mut self.nat_source.last_mut().unwrap().1
+    }
+
+    fn nat_destination_mut(&mut self, name: &str) -> &mut NatDstDraft {
+        if let Some(i) = self.nat_destination.iter().position(|(n, _)| n == name) {
+            return &mut self.nat_destination[i].1;
+        }
+        self.nat_destination
+            .push((name.to_string(), NatDstDraft::default()));
+        &mut self.nat_destination.last_mut().unwrap().1
     }
 
     fn from_appliance(a: &Appliance) -> Self {
@@ -137,7 +153,6 @@ impl Draft {
                             blocklist: z.blocklist.clone(),
                             default_action: z.default_action,
                             log: z.log,
-                            masquerade: z.masquerade,
                         },
                     )
                 })
@@ -173,17 +188,24 @@ impl Draft {
                     )
                 })
                 .collect(),
-            port_forwards: a
-                .port_forwards
+            nat_source: a
+                .nat
+                .source
                 .iter()
-                .map(|pf| {
+                .map(|s| (s.name.clone(), NatSrcDraft { zone: Some(s.zone.clone()) }))
+                .collect(),
+            nat_destination: a
+                .nat
+                .destination
+                .iter()
+                .map(|d| {
                     (
-                        pf.name.clone(),
-                        PortFwdDraft {
-                            zone: Some(pf.zone.clone()),
-                            proto: Some(pf.proto),
-                            port: Some(pf.port),
-                            to: Some(pf.to.clone()),
+                        d.name.clone(),
+                        NatDstDraft {
+                            zone: Some(d.zone.clone()),
+                            proto: Some(d.proto),
+                            port: Some(d.port),
+                            to: Some(d.to.clone()),
                         },
                     )
                 })
@@ -254,10 +276,16 @@ impl Session {
         self.draft.rules.iter().map(|(n, _)| n.clone()).collect()
     }
 
-    /// The port-forward names in the candidate — completion offers these for
-    /// `set/delete port-forward …`.
-    pub fn portforward_names(&self) -> Vec<String> {
-        self.draft.port_forwards.iter().map(|(n, _)| n.clone()).collect()
+    /// The source-NAT (masquerade) rule names — completion offers these for
+    /// `set/delete nat source …`.
+    pub fn nat_source_names(&self) -> Vec<String> {
+        self.draft.nat_source.iter().map(|(n, _)| n.clone()).collect()
+    }
+
+    /// The destination-NAT (port-forward) rule names — completion offers these
+    /// for `set/delete nat destination …`.
+    pub fn nat_destination_names(&self) -> Vec<String> {
+        self.draft.nat_destination.iter().map(|(n, _)| n.clone()).collect()
     }
 
     /// The zone names known to the candidate — those referenced by an interface
@@ -279,38 +307,8 @@ impl Session {
     /// `set <path...> <value>` — set one config node.
     pub fn set(&mut self, args: &[&str]) -> Result<()> {
         match args {
+            // Host-wide settings.
             ["system", "hostname", v] => self.draft.hostname = Some((*v).to_string()),
-
-            // Global firewall defaults (inherited by every zone).
-            ["firewall", "stateful", v] => self.draft.firewall.stateful = Some(parse_bool(v)?),
-            ["firewall", "block-icmp", v] => {
-                self.draft.firewall.block_icmp = Some(parse_bool(v)?)
-            }
-            ["firewall", "default-action", v] => {
-                self.draft.firewall.default_action = Some(parse_action(v)?)
-            }
-            ["firewall", "log", v] => self.draft.firewall.log = Some(parse_bool(v)?),
-            ["firewall", "block", v] => {
-                validate_block_entry(v)?;
-                push_unique(&mut self.draft.firewall.blocklist, v);
-            }
-
-            // Per-zone posture overrides.
-            ["zone", name, "stateful", v] => self.draft.zone_mut(name).stateful = Some(parse_bool(v)?),
-            ["zone", name, "block-icmp", v] => {
-                self.draft.zone_mut(name).block_icmp = Some(parse_bool(v)?)
-            }
-            ["zone", name, "default-action", v] => {
-                self.draft.zone_mut(name).default_action = Some(parse_action(v)?)
-            }
-            ["zone", name, "log", v] => self.draft.zone_mut(name).log = Some(parse_bool(v)?),
-            ["zone", name, "masquerade", v] => {
-                self.draft.zone_mut(name).masquerade = Some(parse_bool(v)?)
-            }
-            ["zone", name, "block", v] => {
-                validate_block_entry(v)?;
-                push_unique(&mut self.draft.zone_mut(name).blocklist, v);
-            }
 
             // Interfaces (incl. VLAN subinterfaces).
             ["interface", name, "zone", v] => {
@@ -328,48 +326,99 @@ impl Session {
                     Some(v.parse().with_context(|| format!("invalid vlan id {v:?}"))?);
             }
 
-            // Firewall rules.
-            ["rule", name, "from", v] => self.draft.rule_mut(name).from = Some((*v).to_string()),
-            ["rule", name, "to", v] => self.draft.rule_mut(name).to = Some((*v).to_string()),
-            ["rule", name, "action", v] => {
+            // --- firewall { … } — everything firewall lives under this node ---
+
+            // firewall global: the defaults every zone inherits.
+            ["firewall", "global", "stateful", v] => {
+                self.draft.firewall.stateful = Some(parse_bool(v)?)
+            }
+            ["firewall", "global", "block-icmp", v] => {
+                self.draft.firewall.block_icmp = Some(parse_bool(v)?)
+            }
+            ["firewall", "global", "default-action", v] => {
+                self.draft.firewall.default_action = Some(parse_action(v)?)
+            }
+            ["firewall", "global", "log", v] => self.draft.firewall.log = Some(parse_bool(v)?),
+            ["firewall", "global", "block", v] => {
+                validate_block_entry(v)?;
+                push_unique(&mut self.draft.firewall.blocklist, v);
+            }
+
+            // firewall zone <name>: per-zone posture overrides.
+            ["firewall", "zone", name, "stateful", v] => {
+                self.draft.zone_mut(name).stateful = Some(parse_bool(v)?)
+            }
+            ["firewall", "zone", name, "block-icmp", v] => {
+                self.draft.zone_mut(name).block_icmp = Some(parse_bool(v)?)
+            }
+            ["firewall", "zone", name, "default-action", v] => {
+                self.draft.zone_mut(name).default_action = Some(parse_action(v)?)
+            }
+            ["firewall", "zone", name, "log", v] => {
+                self.draft.zone_mut(name).log = Some(parse_bool(v)?)
+            }
+            ["firewall", "zone", name, "block", v] => {
+                validate_block_entry(v)?;
+                push_unique(&mut self.draft.zone_mut(name).blocklist, v);
+            }
+
+            // firewall rule <name>: zone-to-zone rules.
+            ["firewall", "rule", name, "from", v] => {
+                self.draft.rule_mut(name).from = Some((*v).to_string())
+            }
+            ["firewall", "rule", name, "to", v] => {
+                self.draft.rule_mut(name).to = Some((*v).to_string())
+            }
+            ["firewall", "rule", name, "action", v] => {
                 self.draft.rule_mut(name).action = Some(parse_action(v)?)
             }
-            ["rule", name, "proto", v] => self.draft.rule_mut(name).proto = Some(parse_proto(v)?),
-            ["rule", name, "port", v] => {
+            ["firewall", "rule", name, "proto", v] => {
+                self.draft.rule_mut(name).proto = Some(parse_proto(v)?)
+            }
+            ["firewall", "rule", name, "port", v] => {
                 self.draft.rule_mut(name).port =
                     Some(v.parse().with_context(|| format!("invalid port {v:?}"))?);
             }
 
-            // Inbound DNAT port-forwards.
-            ["port-forward", name, "zone", v] => {
-                self.draft.port_forward_mut(name).zone = Some((*v).to_string())
+            // --- nat { … } — address translation, its own top-level node ---
+
+            // nat source <name>: masquerade (SNAT) a zone's outbound traffic.
+            ["nat", "source", name, "zone", v] => {
+                self.draft.nat_source_mut(name).zone = Some((*v).to_string())
             }
-            ["port-forward", name, "proto", v] => {
-                self.draft.port_forward_mut(name).proto = Some(parse_proto(v)?)
+
+            // nat destination <name>: inbound DNAT port-forward.
+            ["nat", "destination", name, "zone", v] => {
+                self.draft.nat_destination_mut(name).zone = Some((*v).to_string())
             }
-            ["port-forward", name, "port", v] => {
-                self.draft.port_forward_mut(name).port =
+            ["nat", "destination", name, "proto", v] => {
+                self.draft.nat_destination_mut(name).proto = Some(parse_proto(v)?)
+            }
+            ["nat", "destination", name, "port", v] => {
+                self.draft.nat_destination_mut(name).port =
                     Some(v.parse().with_context(|| format!("invalid port {v:?}"))?);
             }
-            ["port-forward", name, "to", v] => {
+            ["nat", "destination", name, "to", v] => {
                 crate::config::parse_host_port(v)?;
-                self.draft.port_forward_mut(name).to = Some((*v).to_string());
+                self.draft.nat_destination_mut(name).to = Some((*v).to_string());
             }
             _ => bail!(
-                "unknown set path. Try:\n  \
+                "unknown set path. The config tree (Tab/`?` explores each level):\n  \
                  set system hostname <name>\n  \
-                 set firewall <stateful|block-icmp|log> <true|false>\n  \
-                 set firewall default-action <accept|drop|reject>\n  \
-                 set firewall block <IP|CIDR>\n  \
-                 set zone <name> <stateful|block-icmp|log|masquerade> <true|false>\n  \
-                 set zone <name> default-action <accept|drop|reject>\n  \
-                 set zone <name> block <IP|CIDR>\n  \
                  set interface <name> zone <zone>\n  \
                  set interface <name> address <dhcp|CIDR>\n  \
                  set interface <name> <parent <iface> | vlan <id>>\n  \
-                 set rule <name> <from|to> <zone>\n  \
-                 set rule <name> action <accept|drop|reject>\n  \
-                 set rule <name> <proto tcp|udp | port <n>>"
+                 set firewall global <stateful|block-icmp|log> <true|false>\n  \
+                 set firewall global default-action <accept|drop|reject>\n  \
+                 set firewall global block <IP|CIDR>\n  \
+                 set firewall zone <name> <stateful|block-icmp|log> <true|false>\n  \
+                 set firewall zone <name> default-action <accept|drop|reject>\n  \
+                 set firewall zone <name> block <IP|CIDR>\n  \
+                 set firewall rule <name> <from|to> <zone>\n  \
+                 set firewall rule <name> action <accept|drop|reject>\n  \
+                 set firewall rule <name> <proto tcp|udp | port <n>>\n  \
+                 set nat source <name> zone <zone>\n  \
+                 set nat destination <name> <zone <z> | proto <p> | port <n> | to <ip[:port]>>"
             ),
         }
         self.dirty = true;
@@ -380,15 +429,7 @@ impl Session {
     pub fn delete(&mut self, args: &[&str]) -> Result<()> {
         match args {
             ["system", "hostname"] => self.draft.hostname = None,
-            ["firewall", "stateful"] => self.draft.firewall.stateful = None,
-            ["firewall", "block-icmp"] => self.draft.firewall.block_icmp = None,
-            ["firewall", "block", v] => {
-                let before = self.draft.firewall.blocklist.len();
-                self.draft.firewall.blocklist.retain(|e| e != v);
-                if self.draft.firewall.blocklist.len() == before {
-                    bail!("{v:?} is not in the blocklist");
-                }
-            }
+
             ["interface", name] => {
                 let before = self.draft.interfaces.len();
                 self.draft.interfaces.retain(|(n, _)| n != name);
@@ -400,14 +441,30 @@ impl Session {
             ["interface", name, "zone"] => self.iface(name)?.zone = None,
             ["interface", name, "parent"] => self.iface(name)?.parent = None,
             ["interface", name, "vlan"] => self.iface(name)?.vlan = None,
-            ["firewall", "default-action"] => self.draft.firewall.default_action = None,
-            ["firewall", "log"] => self.draft.firewall.log = None,
-            ["zone", name] => {
+
+            // firewall global …
+            ["firewall", "global", "block", v] => {
+                let before = self.draft.firewall.blocklist.len();
+                self.draft.firewall.blocklist.retain(|e| e != v);
+                if self.draft.firewall.blocklist.len() == before {
+                    bail!("{v:?} is not in the global blocklist");
+                }
+            }
+            ["firewall", "global", field] => match *field {
+                "stateful" => self.draft.firewall.stateful = None,
+                "block-icmp" => self.draft.firewall.block_icmp = None,
+                "default-action" => self.draft.firewall.default_action = None,
+                "log" => self.draft.firewall.log = None,
+                other => bail!("firewall global has no field {other:?}"),
+            },
+
+            // firewall zone <name> …
+            ["firewall", "zone", name] => {
                 if self.draft.zones.remove(*name).is_none() {
                     bail!("no zone overrides for {name:?}");
                 }
             }
-            ["zone", name, "block", v] => {
+            ["firewall", "zone", name, "block", v] => {
                 let z = self
                     .draft
                     .zones
@@ -419,7 +476,7 @@ impl Session {
                     bail!("{v:?} is not in zone {name:?} blocklist");
                 }
             }
-            ["zone", name, field] => {
+            ["firewall", "zone", name, field] => {
                 let z = self
                     .draft
                     .zones
@@ -430,18 +487,19 @@ impl Session {
                     "block-icmp" => z.block_icmp = None,
                     "default-action" => z.default_action = None,
                     "log" => z.log = None,
-                    "masquerade" => z.masquerade = None,
                     other => bail!("zone has no field {other:?}"),
                 }
             }
-            ["rule", name] => {
+
+            // firewall rule <name> …
+            ["firewall", "rule", name] => {
                 let before = self.draft.rules.len();
                 self.draft.rules.retain(|(n, _)| n != name);
                 if self.draft.rules.len() == before {
                     bail!("no rule {name:?}");
                 }
             }
-            ["rule", name, field] => {
+            ["firewall", "rule", name, field] => {
                 let r = self.rule(name)?;
                 match *field {
                     "from" => r.from = None,
@@ -452,11 +510,35 @@ impl Session {
                     other => bail!("rule has no field {other:?}"),
                 }
             }
-            ["port-forward", name] => {
-                let before = self.draft.port_forwards.len();
-                self.draft.port_forwards.retain(|(n, _)| n != name);
-                if self.draft.port_forwards.len() == before {
-                    bail!("no port-forward {name:?}");
+
+            // nat source <name>
+            ["nat", "source", name] => {
+                let before = self.draft.nat_source.len();
+                self.draft.nat_source.retain(|(n, _)| n != name);
+                if self.draft.nat_source.len() == before {
+                    bail!("no nat source {name:?}");
+                }
+            }
+            ["nat", "source", name, "zone"] => {
+                self.nat_source(name)?.zone = None;
+            }
+
+            // nat destination <name>
+            ["nat", "destination", name] => {
+                let before = self.draft.nat_destination.len();
+                self.draft.nat_destination.retain(|(n, _)| n != name);
+                if self.draft.nat_destination.len() == before {
+                    bail!("no nat destination {name:?}");
+                }
+            }
+            ["nat", "destination", name, field] => {
+                let d = self.nat_destination(name)?;
+                match *field {
+                    "zone" => d.zone = None,
+                    "proto" => d.proto = None,
+                    "port" => d.port = None,
+                    "to" => d.to = None,
+                    other => bail!("nat destination has no field {other:?}"),
                 }
             }
             _ => bail!("unknown delete path"),
@@ -481,6 +563,24 @@ impl Session {
             .find(|(n, _)| n == name)
             .map(|(_, d)| d)
             .ok_or_else(|| anyhow::anyhow!("no rule {name:?}"))
+    }
+
+    fn nat_source(&mut self, name: &str) -> Result<&mut NatSrcDraft> {
+        self.draft
+            .nat_source
+            .iter_mut()
+            .find(|(n, _)| n == name)
+            .map(|(_, d)| d)
+            .ok_or_else(|| anyhow::anyhow!("no nat source {name:?}"))
+    }
+
+    fn nat_destination(&mut self, name: &str) -> Result<&mut NatDstDraft> {
+        self.draft
+            .nat_destination
+            .iter_mut()
+            .find(|(n, _)| n == name)
+            .map(|(_, d)| d)
+            .ok_or_else(|| anyhow::anyhow!("no nat destination {name:?}"))
     }
 
     /// Render the candidate in a readable, hierarchical (JunOS-curly) form.
@@ -573,32 +673,45 @@ impl Session {
                         blocklist: z.blocklist.clone(),
                         default_action: z.default_action,
                         log: z.log,
-                        masquerade: z.masquerade,
                     },
                 )
             })
             .collect();
-        let port_forwards = self
+        let nat_source = self
             .draft
-            .port_forwards
+            .nat_source
             .iter()
             .map(|(name, d)| {
-                Ok(PortForward {
+                Ok(NatSource {
                     name: name.clone(),
                     zone: d
                         .zone
                         .clone()
-                        .ok_or_else(|| anyhow::anyhow!("port-forward {name:?}: zone not set"))?,
+                        .ok_or_else(|| anyhow::anyhow!("nat source {name:?}: zone not set"))?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let nat_destination = self
+            .draft
+            .nat_destination
+            .iter()
+            .map(|(name, d)| {
+                Ok(NatDestination {
+                    name: name.clone(),
+                    zone: d
+                        .zone
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("nat destination {name:?}: zone not set"))?,
                     proto: d
                         .proto
-                        .ok_or_else(|| anyhow::anyhow!("port-forward {name:?}: proto not set"))?,
+                        .ok_or_else(|| anyhow::anyhow!("nat destination {name:?}: proto not set"))?,
                     port: d
                         .port
-                        .ok_or_else(|| anyhow::anyhow!("port-forward {name:?}: port not set"))?,
+                        .ok_or_else(|| anyhow::anyhow!("nat destination {name:?}: port not set"))?,
                     to: d
                         .to
                         .clone()
-                        .ok_or_else(|| anyhow::anyhow!("port-forward {name:?}: to not set"))?,
+                        .ok_or_else(|| anyhow::anyhow!("nat destination {name:?}: to not set"))?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -608,7 +721,10 @@ impl Session {
             zones,
             interfaces,
             rules,
-            port_forwards,
+            nat: Nat {
+                source: nat_source,
+                destination: nat_destination,
+            },
         };
         appliance.validate()?;
         Ok(appliance)
@@ -663,53 +779,7 @@ fn render_draft(draft: &Draft, skip_empty_ifaces: bool) -> String {
     if let Some(h) = &draft.hostname {
         out.push_str(&format!("system {{\n    hostname {h}\n}}\n"));
     }
-    let fw = &draft.firewall;
-    if fw.stateful.is_some()
-        || fw.block_icmp.is_some()
-        || fw.default_action.is_some()
-        || fw.log.is_some()
-        || !fw.blocklist.is_empty()
-    {
-        out.push_str("firewall {\n");
-        if let Some(s) = fw.stateful {
-            out.push_str(&format!("    stateful {s}\n"));
-        }
-        if let Some(b) = fw.block_icmp {
-            out.push_str(&format!("    block-icmp {b}\n"));
-        }
-        if let Some(a) = fw.default_action {
-            out.push_str(&format!("    default-action {}\n", action_str(a)));
-        }
-        if let Some(l) = fw.log {
-            out.push_str(&format!("    log {l}\n"));
-        }
-        for e in &fw.blocklist {
-            out.push_str(&format!("    block {e}\n"));
-        }
-        out.push_str("}\n");
-    }
-    for (name, z) in &draft.zones {
-        out.push_str(&format!("zone {name} {{\n"));
-        if let Some(s) = z.stateful {
-            out.push_str(&format!("    stateful {s}\n"));
-        }
-        if let Some(b) = z.block_icmp {
-            out.push_str(&format!("    block-icmp {b}\n"));
-        }
-        if let Some(a) = z.default_action {
-            out.push_str(&format!("    default-action {}\n", action_str(a)));
-        }
-        if let Some(l) = z.log {
-            out.push_str(&format!("    log {l}\n"));
-        }
-        if let Some(m) = z.masquerade {
-            out.push_str(&format!("    masquerade {m}\n"));
-        }
-        for e in &z.blocklist {
-            out.push_str(&format!("    block {e}\n"));
-        }
-        out.push_str("}\n");
-    }
+    // Interfaces are top-level (like VyOS), between `system` and `firewall`.
     for (name, i) in &draft.interfaces {
         if skip_empty_ifaces
             && i.zone.is_none()
@@ -734,41 +804,112 @@ fn render_draft(draft: &Draft, skip_empty_ifaces: bool) -> String {
         }
         out.push_str("}\n");
     }
+
+    // The firewall (filtering) is nested under one `firewall { … }` node
+    // (VyOS-style): `global` (the defaults), then `zone` and `rule` sub-trees.
+    // NAT (translation) is rendered separately, below.
+    let mut fwi = String::new(); // inner body, indented one level
+    let fw = &draft.firewall;
+    if fw.stateful.is_some()
+        || fw.block_icmp.is_some()
+        || fw.default_action.is_some()
+        || fw.log.is_some()
+        || !fw.blocklist.is_empty()
+    {
+        fwi.push_str("    global {\n");
+        if let Some(s) = fw.stateful {
+            fwi.push_str(&format!("        stateful {s}\n"));
+        }
+        if let Some(b) = fw.block_icmp {
+            fwi.push_str(&format!("        block-icmp {b}\n"));
+        }
+        if let Some(a) = fw.default_action {
+            fwi.push_str(&format!("        default-action {}\n", action_str(a)));
+        }
+        if let Some(l) = fw.log {
+            fwi.push_str(&format!("        log {l}\n"));
+        }
+        for e in &fw.blocklist {
+            fwi.push_str(&format!("        block {e}\n"));
+        }
+        fwi.push_str("    }\n");
+    }
+    for (name, z) in &draft.zones {
+        fwi.push_str(&format!("    zone {name} {{\n"));
+        if let Some(s) = z.stateful {
+            fwi.push_str(&format!("        stateful {s}\n"));
+        }
+        if let Some(b) = z.block_icmp {
+            fwi.push_str(&format!("        block-icmp {b}\n"));
+        }
+        if let Some(a) = z.default_action {
+            fwi.push_str(&format!("        default-action {}\n", action_str(a)));
+        }
+        if let Some(l) = z.log {
+            fwi.push_str(&format!("        log {l}\n"));
+        }
+        for e in &z.blocklist {
+            fwi.push_str(&format!("        block {e}\n"));
+        }
+        fwi.push_str("    }\n");
+    }
     for (name, r) in &draft.rules {
-        out.push_str(&format!("rule {name} {{\n"));
+        fwi.push_str(&format!("    rule {name} {{\n"));
         if let Some(z) = &r.from {
-            out.push_str(&format!("    from {z}\n"));
+            fwi.push_str(&format!("        from {z}\n"));
         }
         if let Some(z) = &r.to {
-            out.push_str(&format!("    to {z}\n"));
+            fwi.push_str(&format!("        to {z}\n"));
         }
         if let Some(a) = r.action {
-            out.push_str(&format!("    action {}\n", action_str(a)));
+            fwi.push_str(&format!("        action {}\n", action_str(a)));
         }
         if let Some(p) = r.proto {
-            out.push_str(&format!("    proto {}\n", proto_str(p)));
+            fwi.push_str(&format!("        proto {}\n", proto_str(p)));
         }
         if let Some(p) = r.port {
-            out.push_str(&format!("    port {p}\n"));
+            fwi.push_str(&format!("        port {p}\n"));
         }
+        fwi.push_str("    }\n");
+    }
+    if !fwi.is_empty() {
+        out.push_str("firewall {\n");
+        out.push_str(&fwi);
         out.push_str("}\n");
     }
-    for (name, pf) in &draft.port_forwards {
-        out.push_str(&format!("port-forward {name} {{\n"));
-        if let Some(z) = &pf.zone {
-            out.push_str(&format!("    zone {z}\n"));
+
+    // NAT is its own top-level node (address translation, not filtering), split
+    // into `source` (masquerade) and `destination` (port-forward) sub-trees.
+    let mut nati = String::new();
+    for (name, s) in &draft.nat_source {
+        nati.push_str(&format!("    source {name} {{\n"));
+        if let Some(z) = &s.zone {
+            nati.push_str(&format!("        zone {z}\n"));
         }
-        if let Some(p) = pf.proto {
-            out.push_str(&format!("    proto {}\n", proto_str(p)));
+        nati.push_str("    }\n");
+    }
+    for (name, d) in &draft.nat_destination {
+        nati.push_str(&format!("    destination {name} {{\n"));
+        if let Some(z) = &d.zone {
+            nati.push_str(&format!("        zone {z}\n"));
         }
-        if let Some(p) = pf.port {
-            out.push_str(&format!("    port {p}\n"));
+        if let Some(p) = d.proto {
+            nati.push_str(&format!("        proto {}\n", proto_str(p)));
         }
-        if let Some(t) = &pf.to {
-            out.push_str(&format!("    to {t}\n"));
+        if let Some(p) = d.port {
+            nati.push_str(&format!("        port {p}\n"));
         }
+        if let Some(t) = &d.to {
+            nati.push_str(&format!("        to {t}\n"));
+        }
+        nati.push_str("    }\n");
+    }
+    if !nati.is_empty() {
+        out.push_str("nat {\n");
+        out.push_str(&nati);
         out.push_str("}\n");
     }
+
     if out.is_empty() && !skip_empty_ifaces {
         out.push_str("(empty configuration)\n");
     }
@@ -868,9 +1009,9 @@ mod tests {
             "set interface wan0 address dhcp",
             "set interface lan0 zone lan",
             "set interface lan0 address 10.0.0.1/24",
-            "set rule lan-out from lan",
-            "set rule lan-out to wan",
-            "set rule lan-out action accept",
+            "set firewall rule lan-out from lan",
+            "set firewall rule lan-out to wan",
+            "set firewall rule lan-out action accept",
         ] {
             run(&mut s, line).unwrap();
         }
@@ -903,7 +1044,7 @@ mod tests {
         run(&mut s, "set system hostname fw1").unwrap();
         assert!(s.commit().is_ok()); // no interfaces, just a hostname
         // Deleting something absent is an error.
-        assert!(run(&mut s, "delete rule nope").is_err());
+        assert!(run(&mut s, "delete firewall rule nope").is_err());
     }
 
     #[test]
@@ -911,7 +1052,7 @@ mod tests {
         let mut s = Session::empty();
         assert!(run(&mut s, "set interface x vlan notanumber").is_err());
         assert!(run(&mut s, "set interface x address 10.0.0.1/33").is_err());
-        assert!(run(&mut s, "set rule r port 70000").is_err());
+        assert!(run(&mut s, "set firewall rule r port 70000").is_err());
         assert!(run(&mut s, "set bogus path here").is_err());
     }
 
@@ -921,8 +1062,9 @@ mod tests {
         for line in [
             "set system hostname fw1",
             // per-zone ICMP: blocked on wan, allowed on iot's parent default
-            "set zone wan block-icmp true",
-            "set zone wan masquerade true",
+            "set firewall zone wan block-icmp true",
+            // masquerade is NAT, its own category now
+            "set nat source wan-masq zone wan",
             "set interface eth0 zone wan",
             "set interface eth0 address dhcp",
             "set interface eth1 zone lan",
@@ -937,7 +1079,8 @@ mod tests {
         }
         let a = s.commit().expect("multi-zone + vlan config commits");
         assert_eq!(a.zones.get("wan").unwrap().block_icmp, Some(true));
-        assert_eq!(a.zones.get("wan").unwrap().masquerade, Some(true));
+        assert_eq!(a.nat.source.len(), 1);
+        assert_eq!(a.nat.source[0].zone, "wan");
         let vlan = a.interfaces.iter().find(|i| i.name == "eth1.20").unwrap();
         assert_eq!((vlan.parent.as_deref(), vlan.vlan), (Some("eth1"), Some(20)));
         assert_eq!(vlan.zone.as_deref(), Some("iot"));
@@ -978,33 +1121,80 @@ mod tests {
     fn firewall_settings_set_delete_and_materialize() {
         let mut s = Session::empty();
         run(&mut s, "set system hostname fw1").unwrap();
-        run(&mut s, "set firewall stateful false").unwrap();
-        run(&mut s, "set firewall block-icmp true").unwrap();
-        run(&mut s, "set firewall block 10.6.6.0/24").unwrap();
-        run(&mut s, "set firewall block 192.0.2.5").unwrap();
+        run(&mut s, "set firewall global stateful false").unwrap();
+        run(&mut s, "set firewall global block-icmp true").unwrap();
+        run(&mut s, "set firewall global block 10.6.6.0/24").unwrap();
+        run(&mut s, "set firewall global block 192.0.2.5").unwrap();
         // Adding a duplicate is a no-op, not a second entry.
-        run(&mut s, "set firewall block 192.0.2.5").unwrap();
+        run(&mut s, "set firewall global block 192.0.2.5").unwrap();
 
         let a = s.commit().expect("valid firewall config commits");
         assert!(!a.firewall.stateful);
         assert!(a.firewall.block_icmp);
         assert_eq!(a.firewall.blocklist, ["10.6.6.0/24", "192.0.2.5"]);
 
-        // `show` renders the firewall block.
+        // `show` nests everything under one firewall { global { … } } block.
         let shown = s.show();
         assert!(shown.contains("firewall {"), "got:\n{shown}");
+        assert!(shown.contains("global {"), "got:\n{shown}");
         assert!(shown.contains("stateful false"));
         assert!(shown.contains("block 10.6.6.0/24"));
 
         // Delete a blocklist entry; removing an absent one errors.
-        run(&mut s, "delete firewall block 10.6.6.0/24").unwrap();
-        assert!(run(&mut s, "delete firewall block 10.6.6.0/24").is_err());
+        run(&mut s, "delete firewall global block 10.6.6.0/24").unwrap();
+        assert!(run(&mut s, "delete firewall global block 10.6.6.0/24").is_err());
         let a = s.commit().unwrap();
         assert_eq!(a.firewall.blocklist, ["192.0.2.5"]);
 
         // A bad blocklist entry is rejected at set time.
-        assert!(run(&mut s, "set firewall block not-an-ip").is_err());
-        assert!(run(&mut s, "set firewall stateful maybe").is_err());
+        assert!(run(&mut s, "set firewall global block not-an-ip").is_err());
+        assert!(run(&mut s, "set firewall global stateful maybe").is_err());
+    }
+
+    #[test]
+    fn nat_source_and_destination_set_render_and_materialize() {
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname fw1",
+            "set interface wan0 zone wan",
+            "set interface wan0 address dhcp",
+            "set interface lan0 zone lan",
+            "set interface lan0 address 10.0.0.1/24",
+            // SNAT (masquerade) is `nat source`, DNAT (port-forward) is `nat destination`.
+            "set nat source wan-masq zone wan",
+            "set nat destination web zone wan",
+            "set nat destination web proto tcp",
+            "set nat destination web port 443",
+            "set nat destination web to 10.0.0.10:8443",
+        ] {
+            run(&mut s, line).unwrap();
+        }
+
+        // `show` renders NAT as its own top-level node, not under firewall.
+        let shown = s.show();
+        assert!(shown.contains("nat {"), "got:\n{shown}");
+        assert!(shown.contains("source wan-masq {"), "got:\n{shown}");
+        assert!(shown.contains("destination web {"), "got:\n{shown}");
+        assert!(!shown.contains("port-forward"), "got:\n{shown}");
+
+        let a = s.commit().expect("nat config commits");
+        assert_eq!(a.nat.source.len(), 1);
+        assert_eq!((a.nat.source[0].name.as_str(), a.nat.source[0].zone.as_str()), ("wan-masq", "wan"));
+        assert_eq!(a.nat.destination.len(), 1);
+        let d = &a.nat.destination[0];
+        assert_eq!((d.zone.as_str(), d.port, d.to.as_str()), ("wan", 443, "10.0.0.10:8443"));
+
+        // Completion name helpers see the new rules.
+        assert_eq!(s.nat_source_names(), ["wan-masq"]);
+        assert_eq!(s.nat_destination_names(), ["web"]);
+
+        // Delete a field, then a whole rule; deleting an absent one errors.
+        run(&mut s, "delete nat destination web port").unwrap();
+        assert!(s.commit().is_err(), "port is required on a destination NAT");
+        run(&mut s, "set nat destination web port 443").unwrap();
+        run(&mut s, "delete nat source wan-masq").unwrap();
+        assert!(s.commit().is_ok());
+        assert!(run(&mut s, "delete nat destination nope").is_err());
     }
 
     #[test]

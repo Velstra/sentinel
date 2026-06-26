@@ -68,6 +68,14 @@ struct PortRule {
 struct Interface {
     name: String,
     policy: u32,
+    /// Source-NAT (masquerade) traffic leaving this interface — set when the
+    /// interface's zone has a `[[nat.source]]` rule. Omitted when false.
+    #[serde(skip_serializing_if = "is_false")]
+    masquerade: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Serialize)]
@@ -94,13 +102,14 @@ fn proto_str(p: Proto) -> &'static str {
     }
 }
 
-/// Map a Sentinel action to a Velstra action. Velstra has no `reject` yet, so it
-/// collapses to `drop` (silently dropped rather than actively refused). Phase 3
-/// will make reject real in the data plane.
+/// Map a Sentinel action to a Velstra action. Velstra now enforces `reject`
+/// directly (a TCP RST / drop), so it is emitted as-is rather than collapsing to
+/// `drop`.
 fn action_str(a: Action) -> &'static str {
     match a {
         Action::Accept => "pass",
-        Action::Drop | Action::Reject => "drop",
+        Action::Drop => "drop",
+        Action::Reject => "reject",
     }
 }
 
@@ -168,6 +177,11 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
         })
         .collect();
 
+    // Zones that have a source-NAT (masquerade) rule — their interfaces get
+    // `masquerade = true` so the data plane SNATs traffic leaving them.
+    let masq_zones: std::collections::HashSet<&str> =
+        appliance.nat.source.iter().map(|s| s.zone.as_str()).collect();
+
     let interfaces = appliance
         .interfaces
         .iter()
@@ -175,22 +189,25 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
             i.zone.as_deref().map(|zone| Interface {
                 name: i.name.clone(),
                 policy: ids[zone],
+                masquerade: masq_zones.contains(zone),
             })
         })
         .collect();
 
-    // Port-forwards bind to their ingress zone's policy; `to` splits into the
-    // internal ip:port (validated already, so a parse miss just drops the entry).
+    // Destination NAT (port-forwards) binds to its ingress zone's policy; `to`
+    // splits into the internal ip:port (validated already, so a parse miss just
+    // drops the entry). Source NAT (masquerade) is enforced in Phase 4b.
     let port_forwards = appliance
-        .port_forwards
+        .nat
+        .destination
         .iter()
-        .filter_map(|pf| {
-            let policy = *ids.get(pf.zone.as_str())?;
-            let (ip, port) = crate::config::parse_host_port(&pf.to).ok()?;
+        .filter_map(|dst| {
+            let policy = *ids.get(dst.zone.as_str())?;
+            let (ip, port) = crate::config::parse_host_port(&dst.to).ok()?;
             Some(PortForwardOut {
                 policy,
-                proto: proto_str(pf.proto),
-                port: pf.port,
+                proto: proto_str(dst.proto),
+                port: dst.port,
                 dst_ip: ip.to_string(),
                 dst_port: port,
             })
@@ -320,7 +337,7 @@ zone = "wan"
 [[interface]]
 name = "lan0"
 zone = "lan"
-[[port-forward]]
+[[nat.destination]]
 name = "web"
 zone = "wan"
 proto = "tcp"
@@ -336,6 +353,30 @@ to = "10.0.0.10:8443"
         let out = cfg.to_toml().unwrap();
         assert!(out.contains("[[port_forward]]"), "{out}");
         assert!(out.contains("dst_ip = \"10.0.0.10\""), "{out}");
+    }
+
+    #[test]
+    fn masquerade_zone_marks_its_interfaces() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+[[interface]]
+name = "lan0"
+zone = "lan"
+[[nat.source]]
+name = "wan-masq"
+zone = "wan"
+"#;
+        let cfg = compile(&Appliance::from_toml(toml).unwrap());
+        let wan_if = cfg.interfaces.iter().find(|i| i.name == "wan0").unwrap();
+        let lan_if = cfg.interfaces.iter().find(|i| i.name == "lan0").unwrap();
+        assert!(wan_if.masquerade, "wan zone has a nat source → masquerade");
+        assert!(!lan_if.masquerade, "lan has no nat source");
+        let out = cfg.to_toml().unwrap();
+        assert!(out.contains("masquerade = true"), "{out}");
     }
 
     #[test]
