@@ -1,3 +1,9 @@
+> **⚠️ Historical design note — superseded.**
+> This describes an earlier design that mixed NixOS *generations/rollback* into
+> the commit path. The implemented appliance uses a **fixed verified-boot image +
+> runtime config apply** (no self-rebuild). For the current architecture see
+> [The appliance model](../architecture/overview.md). Kept for context only.
+
 # Sentinel OS — architecture
 
 How Velstra Sentinel is built as an **immutable firewall/router appliance OS**.
