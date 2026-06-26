@@ -272,7 +272,12 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
             // Refresh the names the completer offers (interfaces/rules can change
             // with each command) so `set interface <Tab>` lists the current NICs.
             if let Some(h) = rl.helper() {
-                h.set_names(session.interface_names(), session.rule_names());
+                h.set_names(
+                    session.interface_names(),
+                    session.rule_names(),
+                    session.zone_names(),
+                    session.portforward_names(),
+                );
             }
             // VyOS-style prompt, re-rendered each line: it reflects the LIVE
             // hostname (so a committed change shows immediately) and marks
