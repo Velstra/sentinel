@@ -7,11 +7,14 @@
 //! fields can be set one at a time (so the draft holds optionals) and are
 //! materialized into a validated [`Appliance`] at commit/save time.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::{Action, Appliance, Interface, Proto, Rule, System, Zone};
+use crate::config::{
+    Action, Appliance, Firewall, Interface, PortForward, Proto, Rule, System, ZoneCfg,
+};
 
 /// Default on-disk location of the active appliance config. Writable and
 /// persistent (survives reboots); the flake reads it at rebuild time.
@@ -20,18 +23,52 @@ pub const DEFAULT_CONFIG: &str = "/var/lib/sentinel/appliance.toml";
 /// A partially-specified interface (fields filled in incrementally).
 #[derive(Debug, Clone, Default)]
 struct IfaceDraft {
-    role: Option<Zone>,
+    zone: Option<String>,
     address: Option<String>,
+    parent: Option<String>,
+    vlan: Option<u16>,
 }
 
 /// A partially-specified rule.
 #[derive(Debug, Clone, Default)]
 struct RuleDraft {
-    from: Option<Zone>,
-    to: Option<Zone>,
+    from: Option<String>,
+    to: Option<String>,
     action: Option<Action>,
     proto: Option<Proto>,
     port: Option<u16>,
+}
+
+/// A partially-specified inbound DNAT port-forward.
+#[derive(Debug, Clone, Default)]
+struct PortFwdDraft {
+    zone: Option<String>,
+    proto: Option<Proto>,
+    port: Option<u16>,
+    to: Option<String>,
+}
+
+/// A partially-specified per-zone posture override.
+#[derive(Debug, Clone, Default)]
+struct ZoneDraft {
+    stateful: Option<bool>,
+    block_icmp: Option<bool>,
+    blocklist: Vec<String>,
+    default_action: Option<Action>,
+    log: Option<bool>,
+    masquerade: Option<bool>,
+}
+
+/// The candidate's global firewall posture. `None` fields fall back to the
+/// [`Firewall`] defaults at materialize time; the blocklist is just a set of
+/// entries.
+#[derive(Debug, Clone, Default)]
+struct FirewallDraft {
+    stateful: Option<bool>,
+    block_icmp: Option<bool>,
+    blocklist: Vec<String>,
+    default_action: Option<Action>,
+    log: Option<bool>,
 }
 
 /// The candidate config — a draft with optional fields, keyed by name so list
@@ -40,8 +77,11 @@ struct RuleDraft {
 #[derive(Debug, Clone, Default)]
 struct Draft {
     hostname: Option<String>,
+    firewall: FirewallDraft,
+    zones: BTreeMap<String, ZoneDraft>,
     interfaces: Vec<(String, IfaceDraft)>,
     rules: Vec<(String, RuleDraft)>,
+    port_forwards: Vec<(String, PortFwdDraft)>,
 }
 
 impl Draft {
@@ -62,9 +102,46 @@ impl Draft {
         &mut self.rules.last_mut().unwrap().1
     }
 
+    fn zone_mut(&mut self, name: &str) -> &mut ZoneDraft {
+        self.zones.entry(name.to_string()).or_default()
+    }
+
+    fn port_forward_mut(&mut self, name: &str) -> &mut PortFwdDraft {
+        if let Some(i) = self.port_forwards.iter().position(|(n, _)| n == name) {
+            return &mut self.port_forwards[i].1;
+        }
+        self.port_forwards
+            .push((name.to_string(), PortFwdDraft::default()));
+        &mut self.port_forwards.last_mut().unwrap().1
+    }
+
     fn from_appliance(a: &Appliance) -> Self {
         Draft {
             hostname: Some(a.system.hostname.clone()),
+            firewall: FirewallDraft {
+                stateful: Some(a.firewall.stateful),
+                block_icmp: Some(a.firewall.block_icmp),
+                blocklist: a.firewall.blocklist.clone(),
+                default_action: Some(a.firewall.default_action),
+                log: Some(a.firewall.log),
+            },
+            zones: a
+                .zones
+                .iter()
+                .map(|(name, z)| {
+                    (
+                        name.clone(),
+                        ZoneDraft {
+                            stateful: z.stateful,
+                            block_icmp: z.block_icmp,
+                            blocklist: z.blocklist.clone(),
+                            default_action: z.default_action,
+                            log: z.log,
+                            masquerade: z.masquerade,
+                        },
+                    )
+                })
+                .collect(),
             interfaces: a
                 .interfaces
                 .iter()
@@ -72,8 +149,10 @@ impl Draft {
                     (
                         i.name.clone(),
                         IfaceDraft {
-                            role: i.role,
+                            zone: i.zone.clone(),
                             address: i.address.clone(),
+                            parent: i.parent.clone(),
+                            vlan: i.vlan,
                         },
                     )
                 })
@@ -85,11 +164,26 @@ impl Draft {
                     (
                         r.name.clone(),
                         RuleDraft {
-                            from: Some(r.from),
-                            to: Some(r.to),
+                            from: Some(r.from.clone()),
+                            to: Some(r.to.clone()),
                             action: Some(r.action),
                             proto: r.proto,
                             port: r.port,
+                        },
+                    )
+                })
+                .collect(),
+            port_forwards: a
+                .port_forwards
+                .iter()
+                .map(|pf| {
+                    (
+                        pf.name.clone(),
+                        PortFwdDraft {
+                            zone: Some(pf.zone.clone()),
+                            proto: Some(pf.proto),
+                            port: Some(pf.port),
+                            to: Some(pf.to.clone()),
                         },
                     )
                 })
@@ -160,19 +254,83 @@ impl Session {
         self.draft.rules.iter().map(|(n, _)| n.clone()).collect()
     }
 
+    /// The port-forward names in the candidate — completion offers these for
+    /// `set/delete port-forward …`.
+    pub fn portforward_names(&self) -> Vec<String> {
+        self.draft.port_forwards.iter().map(|(n, _)| n.clone()).collect()
+    }
+
+    /// The zone names known to the candidate — those referenced by an interface
+    /// plus those with an explicit `[zone.*]` override. Completion offers these
+    /// for `set interface <n> zone …` and `set rule <n> from/to …`.
+    pub fn zone_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .draft
+            .interfaces
+            .iter()
+            .filter_map(|(_, d)| d.zone.clone())
+            .chain(self.draft.zones.keys().cloned())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
     /// `set <path...> <value>` — set one config node.
     pub fn set(&mut self, args: &[&str]) -> Result<()> {
         match args {
             ["system", "hostname", v] => self.draft.hostname = Some((*v).to_string()),
-            ["interface", name, "role", v] => {
-                self.draft.iface_mut(name).role = Some(parse_zone(v)?)
+
+            // Global firewall defaults (inherited by every zone).
+            ["firewall", "stateful", v] => self.draft.firewall.stateful = Some(parse_bool(v)?),
+            ["firewall", "block-icmp", v] => {
+                self.draft.firewall.block_icmp = Some(parse_bool(v)?)
+            }
+            ["firewall", "default-action", v] => {
+                self.draft.firewall.default_action = Some(parse_action(v)?)
+            }
+            ["firewall", "log", v] => self.draft.firewall.log = Some(parse_bool(v)?),
+            ["firewall", "block", v] => {
+                validate_block_entry(v)?;
+                push_unique(&mut self.draft.firewall.blocklist, v);
+            }
+
+            // Per-zone posture overrides.
+            ["zone", name, "stateful", v] => self.draft.zone_mut(name).stateful = Some(parse_bool(v)?),
+            ["zone", name, "block-icmp", v] => {
+                self.draft.zone_mut(name).block_icmp = Some(parse_bool(v)?)
+            }
+            ["zone", name, "default-action", v] => {
+                self.draft.zone_mut(name).default_action = Some(parse_action(v)?)
+            }
+            ["zone", name, "log", v] => self.draft.zone_mut(name).log = Some(parse_bool(v)?),
+            ["zone", name, "masquerade", v] => {
+                self.draft.zone_mut(name).masquerade = Some(parse_bool(v)?)
+            }
+            ["zone", name, "block", v] => {
+                validate_block_entry(v)?;
+                push_unique(&mut self.draft.zone_mut(name).blocklist, v);
+            }
+
+            // Interfaces (incl. VLAN subinterfaces).
+            ["interface", name, "zone", v] => {
+                self.draft.iface_mut(name).zone = Some((*v).to_string())
             }
             ["interface", name, "address", v] => {
                 validate_address(v)?;
                 self.draft.iface_mut(name).address = Some((*v).to_string());
             }
-            ["rule", name, "from", v] => self.draft.rule_mut(name).from = Some(parse_zone(v)?),
-            ["rule", name, "to", v] => self.draft.rule_mut(name).to = Some(parse_zone(v)?),
+            ["interface", name, "parent", v] => {
+                self.draft.iface_mut(name).parent = Some((*v).to_string())
+            }
+            ["interface", name, "vlan", v] => {
+                self.draft.iface_mut(name).vlan =
+                    Some(v.parse().with_context(|| format!("invalid vlan id {v:?}"))?);
+            }
+
+            // Firewall rules.
+            ["rule", name, "from", v] => self.draft.rule_mut(name).from = Some((*v).to_string()),
+            ["rule", name, "to", v] => self.draft.rule_mut(name).to = Some((*v).to_string()),
             ["rule", name, "action", v] => {
                 self.draft.rule_mut(name).action = Some(parse_action(v)?)
             }
@@ -181,11 +339,34 @@ impl Session {
                 self.draft.rule_mut(name).port =
                     Some(v.parse().with_context(|| format!("invalid port {v:?}"))?);
             }
+
+            // Inbound DNAT port-forwards.
+            ["port-forward", name, "zone", v] => {
+                self.draft.port_forward_mut(name).zone = Some((*v).to_string())
+            }
+            ["port-forward", name, "proto", v] => {
+                self.draft.port_forward_mut(name).proto = Some(parse_proto(v)?)
+            }
+            ["port-forward", name, "port", v] => {
+                self.draft.port_forward_mut(name).port =
+                    Some(v.parse().with_context(|| format!("invalid port {v:?}"))?);
+            }
+            ["port-forward", name, "to", v] => {
+                crate::config::parse_host_port(v)?;
+                self.draft.port_forward_mut(name).to = Some((*v).to_string());
+            }
             _ => bail!(
                 "unknown set path. Try:\n  \
                  set system hostname <name>\n  \
-                 set interface <name> role <wan|lan|dmz>\n  \
+                 set firewall <stateful|block-icmp|log> <true|false>\n  \
+                 set firewall default-action <accept|drop|reject>\n  \
+                 set firewall block <IP|CIDR>\n  \
+                 set zone <name> <stateful|block-icmp|log|masquerade> <true|false>\n  \
+                 set zone <name> default-action <accept|drop|reject>\n  \
+                 set zone <name> block <IP|CIDR>\n  \
+                 set interface <name> zone <zone>\n  \
                  set interface <name> address <dhcp|CIDR>\n  \
+                 set interface <name> <parent <iface> | vlan <id>>\n  \
                  set rule <name> <from|to> <zone>\n  \
                  set rule <name> action <accept|drop|reject>\n  \
                  set rule <name> <proto tcp|udp | port <n>>"
@@ -199,6 +380,15 @@ impl Session {
     pub fn delete(&mut self, args: &[&str]) -> Result<()> {
         match args {
             ["system", "hostname"] => self.draft.hostname = None,
+            ["firewall", "stateful"] => self.draft.firewall.stateful = None,
+            ["firewall", "block-icmp"] => self.draft.firewall.block_icmp = None,
+            ["firewall", "block", v] => {
+                let before = self.draft.firewall.blocklist.len();
+                self.draft.firewall.blocklist.retain(|e| e != v);
+                if self.draft.firewall.blocklist.len() == before {
+                    bail!("{v:?} is not in the blocklist");
+                }
+            }
             ["interface", name] => {
                 let before = self.draft.interfaces.len();
                 self.draft.interfaces.retain(|(n, _)| n != name);
@@ -207,7 +397,43 @@ impl Session {
                 }
             }
             ["interface", name, "address"] => self.iface(name)?.address = None,
-            ["interface", name, "role"] => self.iface(name)?.role = None,
+            ["interface", name, "zone"] => self.iface(name)?.zone = None,
+            ["interface", name, "parent"] => self.iface(name)?.parent = None,
+            ["interface", name, "vlan"] => self.iface(name)?.vlan = None,
+            ["firewall", "default-action"] => self.draft.firewall.default_action = None,
+            ["firewall", "log"] => self.draft.firewall.log = None,
+            ["zone", name] => {
+                if self.draft.zones.remove(*name).is_none() {
+                    bail!("no zone overrides for {name:?}");
+                }
+            }
+            ["zone", name, "block", v] => {
+                let z = self
+                    .draft
+                    .zones
+                    .get_mut(*name)
+                    .ok_or_else(|| anyhow::anyhow!("no zone {name:?}"))?;
+                let before = z.blocklist.len();
+                z.blocklist.retain(|e| e != v);
+                if z.blocklist.len() == before {
+                    bail!("{v:?} is not in zone {name:?} blocklist");
+                }
+            }
+            ["zone", name, field] => {
+                let z = self
+                    .draft
+                    .zones
+                    .get_mut(*name)
+                    .ok_or_else(|| anyhow::anyhow!("no zone {name:?}"))?;
+                match *field {
+                    "stateful" => z.stateful = None,
+                    "block-icmp" => z.block_icmp = None,
+                    "default-action" => z.default_action = None,
+                    "log" => z.log = None,
+                    "masquerade" => z.masquerade = None,
+                    other => bail!("zone has no field {other:?}"),
+                }
+            }
             ["rule", name] => {
                 let before = self.draft.rules.len();
                 self.draft.rules.retain(|(n, _)| n != name);
@@ -224,6 +450,13 @@ impl Session {
                     "proto" => r.proto = None,
                     "port" => r.port = None,
                     other => bail!("rule has no field {other:?}"),
+                }
+            }
+            ["port-forward", name] => {
+                let before = self.draft.port_forwards.len();
+                self.draft.port_forwards.retain(|(n, _)| n != name);
+                if self.draft.port_forwards.len() == before {
+                    bail!("no port-forward {name:?}");
                 }
             }
             _ => bail!("unknown delete path"),
@@ -290,8 +523,10 @@ impl Session {
             .iter()
             .map(|(name, d)| Interface {
                 name: name.clone(),
-                role: d.role,
+                zone: d.zone.clone(),
                 address: d.address.clone(),
+                parent: d.parent.clone(),
+                vlan: d.vlan,
             })
             .collect();
         let rules = self
@@ -303,9 +538,11 @@ impl Session {
                     name: name.clone(),
                     from: d
                         .from
+                        .clone()
                         .ok_or_else(|| anyhow::anyhow!("rule {name:?}: from not set"))?,
                     to: d
                         .to
+                        .clone()
                         .ok_or_else(|| anyhow::anyhow!("rule {name:?}: to not set"))?,
                     action: d
                         .action
@@ -316,10 +553,62 @@ impl Session {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        let firewall = Firewall {
+            stateful: self.draft.firewall.stateful.unwrap_or(true),
+            block_icmp: self.draft.firewall.block_icmp.unwrap_or(false),
+            blocklist: self.draft.firewall.blocklist.clone(),
+            default_action: self.draft.firewall.default_action.unwrap_or(Action::Drop),
+            log: self.draft.firewall.log.unwrap_or(false),
+        };
+        let zones: BTreeMap<String, ZoneCfg> = self
+            .draft
+            .zones
+            .iter()
+            .map(|(name, z)| {
+                (
+                    name.clone(),
+                    ZoneCfg {
+                        stateful: z.stateful,
+                        block_icmp: z.block_icmp,
+                        blocklist: z.blocklist.clone(),
+                        default_action: z.default_action,
+                        log: z.log,
+                        masquerade: z.masquerade,
+                    },
+                )
+            })
+            .collect();
+        let port_forwards = self
+            .draft
+            .port_forwards
+            .iter()
+            .map(|(name, d)| {
+                Ok(PortForward {
+                    name: name.clone(),
+                    zone: d
+                        .zone
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("port-forward {name:?}: zone not set"))?,
+                    proto: d
+                        .proto
+                        .ok_or_else(|| anyhow::anyhow!("port-forward {name:?}: proto not set"))?,
+                    port: d
+                        .port
+                        .ok_or_else(|| anyhow::anyhow!("port-forward {name:?}: port not set"))?,
+                    to: d
+                        .to
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("port-forward {name:?}: to not set"))?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let appliance = Appliance {
             system: System { hostname },
+            firewall,
+            zones,
             interfaces,
             rules,
+            port_forwards,
         };
         appliance.validate()?;
         Ok(appliance)
@@ -374,26 +663,84 @@ fn render_draft(draft: &Draft, skip_empty_ifaces: bool) -> String {
     if let Some(h) = &draft.hostname {
         out.push_str(&format!("system {{\n    hostname {h}\n}}\n"));
     }
+    let fw = &draft.firewall;
+    if fw.stateful.is_some()
+        || fw.block_icmp.is_some()
+        || fw.default_action.is_some()
+        || fw.log.is_some()
+        || !fw.blocklist.is_empty()
+    {
+        out.push_str("firewall {\n");
+        if let Some(s) = fw.stateful {
+            out.push_str(&format!("    stateful {s}\n"));
+        }
+        if let Some(b) = fw.block_icmp {
+            out.push_str(&format!("    block-icmp {b}\n"));
+        }
+        if let Some(a) = fw.default_action {
+            out.push_str(&format!("    default-action {}\n", action_str(a)));
+        }
+        if let Some(l) = fw.log {
+            out.push_str(&format!("    log {l}\n"));
+        }
+        for e in &fw.blocklist {
+            out.push_str(&format!("    block {e}\n"));
+        }
+        out.push_str("}\n");
+    }
+    for (name, z) in &draft.zones {
+        out.push_str(&format!("zone {name} {{\n"));
+        if let Some(s) = z.stateful {
+            out.push_str(&format!("    stateful {s}\n"));
+        }
+        if let Some(b) = z.block_icmp {
+            out.push_str(&format!("    block-icmp {b}\n"));
+        }
+        if let Some(a) = z.default_action {
+            out.push_str(&format!("    default-action {}\n", action_str(a)));
+        }
+        if let Some(l) = z.log {
+            out.push_str(&format!("    log {l}\n"));
+        }
+        if let Some(m) = z.masquerade {
+            out.push_str(&format!("    masquerade {m}\n"));
+        }
+        for e in &z.blocklist {
+            out.push_str(&format!("    block {e}\n"));
+        }
+        out.push_str("}\n");
+    }
     for (name, i) in &draft.interfaces {
-        if skip_empty_ifaces && i.role.is_none() && i.address.is_none() {
+        if skip_empty_ifaces
+            && i.zone.is_none()
+            && i.address.is_none()
+            && i.parent.is_none()
+            && i.vlan.is_none()
+        {
             continue;
         }
         out.push_str(&format!("interface {name} {{\n"));
-        if let Some(r) = i.role {
-            out.push_str(&format!("    role {}\n", zone_str(r)));
+        if let Some(z) = &i.zone {
+            out.push_str(&format!("    zone {z}\n"));
         }
         if let Some(a) = &i.address {
             out.push_str(&format!("    address {a}\n"));
+        }
+        if let Some(p) = &i.parent {
+            out.push_str(&format!("    parent {p}\n"));
+        }
+        if let Some(v) = i.vlan {
+            out.push_str(&format!("    vlan {v}\n"));
         }
         out.push_str("}\n");
     }
     for (name, r) in &draft.rules {
         out.push_str(&format!("rule {name} {{\n"));
-        if let Some(z) = r.from {
-            out.push_str(&format!("    from {}\n", zone_str(z)));
+        if let Some(z) = &r.from {
+            out.push_str(&format!("    from {z}\n"));
         }
-        if let Some(z) = r.to {
-            out.push_str(&format!("    to {}\n", zone_str(z)));
+        if let Some(z) = &r.to {
+            out.push_str(&format!("    to {z}\n"));
         }
         if let Some(a) = r.action {
             out.push_str(&format!("    action {}\n", action_str(a)));
@@ -406,19 +753,33 @@ fn render_draft(draft: &Draft, skip_empty_ifaces: bool) -> String {
         }
         out.push_str("}\n");
     }
+    for (name, pf) in &draft.port_forwards {
+        out.push_str(&format!("port-forward {name} {{\n"));
+        if let Some(z) = &pf.zone {
+            out.push_str(&format!("    zone {z}\n"));
+        }
+        if let Some(p) = pf.proto {
+            out.push_str(&format!("    proto {}\n", proto_str(p)));
+        }
+        if let Some(p) = pf.port {
+            out.push_str(&format!("    port {p}\n"));
+        }
+        if let Some(t) = &pf.to {
+            out.push_str(&format!("    to {t}\n"));
+        }
+        out.push_str("}\n");
+    }
     if out.is_empty() && !skip_empty_ifaces {
         out.push_str("(empty configuration)\n");
     }
     out
 }
 
-fn parse_zone(s: &str) -> Result<Zone> {
-    Ok(match s {
-        "wan" => Zone::Wan,
-        "lan" => Zone::Lan,
-        "dmz" => Zone::Dmz,
-        _ => bail!("invalid zone {s:?} (expected wan|lan|dmz)"),
-    })
+/// Append `v` to `list` unless it's already present (idempotent `set … block`).
+fn push_unique(list: &mut Vec<String>, v: &str) {
+    if !list.iter().any(|e| e == v) {
+        list.push(v.to_string());
+    }
 }
 
 fn parse_action(s: &str) -> Result<Action> {
@@ -438,6 +799,20 @@ fn parse_proto(s: &str) -> Result<Proto> {
     })
 }
 
+fn parse_bool(s: &str) -> Result<bool> {
+    Ok(match s {
+        "true" | "on" | "yes" => true,
+        "false" | "off" | "no" => false,
+        _ => bail!("invalid boolean {s:?} (expected true|false)"),
+    })
+}
+
+/// A firewall blocklist entry: an IPv4 or IPv4 CIDR. Delegates to the config
+/// validator so set-time feedback matches commit-time validation.
+fn validate_block_entry(s: &str) -> Result<()> {
+    crate::config::validate_cidr_or_ip(s)
+}
+
 fn validate_address(addr: &str) -> Result<()> {
     if addr == "dhcp" {
         return Ok(());
@@ -454,14 +829,6 @@ fn validate_address(addr: &str) -> Result<()> {
         bail!("prefix /{prefix} exceeds /32");
     }
     Ok(())
-}
-
-fn zone_str(z: Zone) -> &'static str {
-    match z {
-        Zone::Wan => "wan",
-        Zone::Lan => "lan",
-        Zone::Dmz => "dmz",
-    }
 }
 
 fn action_str(a: Action) -> &'static str {
@@ -497,9 +864,9 @@ mod tests {
         let mut s = Session::empty();
         for line in [
             "set system hostname fw1",
-            "set interface wan0 role wan",
+            "set interface wan0 zone wan",
             "set interface wan0 address dhcp",
-            "set interface lan0 role lan",
+            "set interface lan0 zone lan",
             "set interface lan0 address 10.0.0.1/24",
             "set rule lan-out from lan",
             "set rule lan-out to wan",
@@ -518,7 +885,7 @@ mod tests {
     #[test]
     fn commit_reports_missing_required_fields() {
         let mut s = Session::empty();
-        run(&mut s, "set interface wan0 role wan").unwrap();
+        run(&mut s, "set interface wan0 zone wan").unwrap();
         // No hostname, and wan0 has no address yet.
         let err = s.commit().unwrap_err().to_string();
         assert!(err.contains("hostname"), "got: {err}");
@@ -528,7 +895,7 @@ mod tests {
     fn delete_removes_nodes_and_fields() {
         let mut s = Session::empty();
         run(&mut s, "set system hostname fw1").unwrap();
-        run(&mut s, "set interface wan0 role wan").unwrap();
+        run(&mut s, "set interface wan0 zone wan").unwrap();
         run(&mut s, "set interface wan0 address dhcp").unwrap();
         run(&mut s, "delete interface wan0 address").unwrap();
         assert!(s.commit().is_ok()); // address is optional (unconfigured NIC)
@@ -542,10 +909,45 @@ mod tests {
     #[test]
     fn rejects_invalid_values() {
         let mut s = Session::empty();
-        assert!(run(&mut s, "set interface x role wifi").is_err());
+        assert!(run(&mut s, "set interface x vlan notanumber").is_err());
         assert!(run(&mut s, "set interface x address 10.0.0.1/33").is_err());
         assert!(run(&mut s, "set rule r port 70000").is_err());
         assert!(run(&mut s, "set bogus path here").is_err());
+    }
+
+    #[test]
+    fn zones_and_vlans_set_and_commit() {
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname fw1",
+            // per-zone ICMP: blocked on wan, allowed on iot's parent default
+            "set zone wan block-icmp true",
+            "set zone wan masquerade true",
+            "set interface eth0 zone wan",
+            "set interface eth0 address dhcp",
+            "set interface eth1 zone lan",
+            "set interface eth1 address 10.0.0.1/24",
+            // a VLAN subinterface on eth1, in its own zone
+            "set interface eth1.20 parent eth1",
+            "set interface eth1.20 vlan 20",
+            "set interface eth1.20 zone iot",
+            "set interface eth1.20 address 10.0.20.1/24",
+        ] {
+            run(&mut s, line).unwrap();
+        }
+        let a = s.commit().expect("multi-zone + vlan config commits");
+        assert_eq!(a.zones.get("wan").unwrap().block_icmp, Some(true));
+        assert_eq!(a.zones.get("wan").unwrap().masquerade, Some(true));
+        let vlan = a.interfaces.iter().find(|i| i.name == "eth1.20").unwrap();
+        assert_eq!((vlan.parent.as_deref(), vlan.vlan), (Some("eth1"), Some(20)));
+        assert_eq!(vlan.zone.as_deref(), Some("iot"));
+        // zone_names offers every referenced/declared zone for completion.
+        assert_eq!(s.zone_names(), ["iot", "lan", "wan"]);
+
+        // A VLAN id out of range is rejected at commit.
+        run(&mut s, "set interface bad parent eth1").unwrap();
+        run(&mut s, "set interface bad vlan 9000").unwrap();
+        assert!(s.commit().is_err());
     }
 
     #[test]
@@ -573,13 +975,46 @@ mod tests {
     }
 
     #[test]
+    fn firewall_settings_set_delete_and_materialize() {
+        let mut s = Session::empty();
+        run(&mut s, "set system hostname fw1").unwrap();
+        run(&mut s, "set firewall stateful false").unwrap();
+        run(&mut s, "set firewall block-icmp true").unwrap();
+        run(&mut s, "set firewall block 10.6.6.0/24").unwrap();
+        run(&mut s, "set firewall block 192.0.2.5").unwrap();
+        // Adding a duplicate is a no-op, not a second entry.
+        run(&mut s, "set firewall block 192.0.2.5").unwrap();
+
+        let a = s.commit().expect("valid firewall config commits");
+        assert!(!a.firewall.stateful);
+        assert!(a.firewall.block_icmp);
+        assert_eq!(a.firewall.blocklist, ["10.6.6.0/24", "192.0.2.5"]);
+
+        // `show` renders the firewall block.
+        let shown = s.show();
+        assert!(shown.contains("firewall {"), "got:\n{shown}");
+        assert!(shown.contains("stateful false"));
+        assert!(shown.contains("block 10.6.6.0/24"));
+
+        // Delete a blocklist entry; removing an absent one errors.
+        run(&mut s, "delete firewall block 10.6.6.0/24").unwrap();
+        assert!(run(&mut s, "delete firewall block 10.6.6.0/24").is_err());
+        let a = s.commit().unwrap();
+        assert_eq!(a.firewall.blocklist, ["192.0.2.5"]);
+
+        // A bad blocklist entry is rejected at set time.
+        assert!(run(&mut s, "set firewall block not-an-ip").is_err());
+        assert!(run(&mut s, "set firewall stateful maybe").is_err());
+    }
+
+    #[test]
     fn show_renders_partial_drafts() {
         let mut s = Session::empty();
         run(&mut s, "set system hostname fw1").unwrap();
-        run(&mut s, "set interface wan0 role wan").unwrap();
+        run(&mut s, "set interface wan0 zone wan").unwrap();
         let shown = s.show();
         assert!(shown.contains("hostname fw1"));
         assert!(shown.contains("interface wan0"));
-        assert!(shown.contains("role wan"));
+        assert!(shown.contains("zone wan"));
     }
 }

@@ -140,7 +140,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-YikSvX+bth9aErTiwgUPQGEe7FyUTmxEDqJjT68/ixA=";
+      ebpfHash = "sha256-gVsUKVwPVbrnSH4GLjQ123oPpMhoN7/gNeo7I05hEa8=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -354,7 +354,7 @@
           machine.succeed(
               "su admin -c \"printf '%s\\n' "
               "'set system hostname fw-a' "
-              "'set interface eth0 role wan' 'set interface eth0 address dhcp' "
+              "'set interface eth0 zone wan' 'set interface eth0 address dhcp' "
               "commit save exit "
               "| sentinel configure\""
           )
@@ -406,6 +406,75 @@
           machine.succeed("test -f /run/systemd/network/10-sentinel-dummy0.network")
           # ... and networkd applied the address to the live link.
           machine.wait_until_succeeds("ip addr show dummy0 | grep -q 10.9.9.1", timeout=20)
+
+          # Firewall posture: stateful off + ICMP block + a source blocklist
+          # entry, committed live. The compiled agent config must carry the new
+          # fields under the names the data plane expects — and the agent must
+          # accept them (fabric's schema is deny_unknown_fields), so a forced
+          # restart on the firewall-laden config proves the compile wiring is
+          # correct end-to-end.
+          machine.succeed(
+              "su admin -c \"printf '%s\\n' "
+              "'set firewall stateful false' 'set firewall block-icmp true' "
+              "'set firewall block 10.6.6.0/24' "
+              "commit save exit "
+              "| sentinel configure\""
+          )
+          machine.succeed("grep -q 'drop_icmp = true' /run/sentinel/velstra.toml")
+          machine.succeed("grep -q 'stateful = false' /run/sentinel/velstra.toml")
+          machine.succeed("grep -q '10.6.6.0/24' /run/sentinel/velstra.toml")
+          # save persisted the [firewall] section.
+          machine.succeed("grep -q 'block_icmp = true' /var/lib/sentinel/appliance.toml")
+          # The agent parses the firewall-laden config from scratch and stays up.
+          machine.succeed("systemctl restart velstra.service")
+          machine.wait_for_unit("velstra.service")
+
+          # Per-zone posture (the whole point of named zones): flip the GLOBAL
+          # ICMP default back OFF, but override it ON for just the `wan` zone
+          # (eth0). The compiled config must then carry the top-level drop_icmp
+          # false AND the wan policy's drop_icmp true at the same time — a
+          # distinction a single global flag could never express. (We keep this to
+          # eth0's existing zone so the agent doesn't have to attach XDP to a
+          # second link — that multi-interface path is exercised in Phase 2.)
+          machine.succeed(
+              "su admin -c \"printf '%s\\n' "
+              "'set firewall block-icmp false' 'set zone wan block-icmp true' "
+              "commit save exit "
+              "| sentinel configure\""
+          )
+          velstra = machine.succeed("cat /run/sentinel/velstra.toml")
+          assert 'name = "wan"' in velstra, velstra
+          # Both postures coexist: global default off, wan override on.
+          assert "drop_icmp = false" in velstra and "drop_icmp = true" in velstra, velstra
+          # The saved config carries the per-zone override.
+          machine.succeed("grep -q 'block_icmp = true' /var/lib/sentinel/appliance.toml")
+          # The agent accepts the per-zone config from scratch.
+          machine.succeed("systemctl restart velstra.service")
+          machine.wait_for_unit("velstra.service")
+
+          # VLAN subinterface: declare a tagged link on eth0 in its own `iot`
+          # zone. Sentinel writes the .netdev; networkd creates the real 802.1Q
+          # link; the agent attaches XDP to it like any other zoned interface
+          # (its config-interface reconcile path) — so per-VLAN firewalling works
+          # with no eBPF VLAN decoding.
+          machine.succeed(
+              "su admin -c \"printf '%s\\n' "
+              "'set interface eth0.50 parent eth0' 'set interface eth0.50 vlan 50' "
+              "'set interface eth0.50 zone iot' 'set interface eth0.50 address 10.0.50.1/24' "
+              "commit save exit "
+              "| sentinel configure\""
+          )
+          # Sentinel wrote the VLAN netdev unit ...
+          machine.succeed("test -f /run/systemd/network/10-sentinel-eth0.50.netdev")
+          machine.succeed("grep -q 'Kind=vlan' /run/systemd/network/10-sentinel-eth0.50.netdev")
+          # ... and networkd created the real tagged link with id 50.
+          machine.wait_until_succeeds("ip -d link show eth0.50 | grep -q 'id 50'", timeout=20)
+          machine.wait_until_succeeds("ip addr show eth0.50 | grep -q 10.0.50.1", timeout=20)
+          # The compiled config binds the VLAN interface to the iot policy, and the
+          # agent (which attaches XDP to every config interface) accepts it.
+          machine.succeed("grep -q '\"eth0.50\"' /run/sentinel/velstra.toml")
+          machine.succeed("systemctl restart velstra.service")
+          machine.wait_for_unit("velstra.service")
 
           # Reboot persistence: re-running boot apply re-asserts the hostname from
           # the persisted config (simulates a reboot without a full restart).
@@ -754,6 +823,158 @@
                     assert "Secure Boot: enabled" in status, status
               '';
           };
+
+        # NAT in the eBPF datapath: a 3-node line client — fw — server. The fw
+        # runs the real velstra agent (XDP on both NICs) and a `[[port-forward]]`
+        # exposing the internal server on its WAN ip. A client connection to the
+        # WAN ip:8080 must be DNAT'd to the server:80 and its reply SNAT'd back —
+        # proving DNAT + conntrack-reverse SNAT work on real traffic through the
+        # appliance.
+        nat = pkgs.testers.runNixOSTest {
+          name = "sentinel-nat";
+          nodes = {
+            # External client on the WAN segment (vlan 1).
+            client =
+              { pkgs, ... }:
+              {
+                virtualisation.vlans = [ 1 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                  interfaces.eth1.ipv4.addresses = [
+                    {
+                      address = "10.1.0.2";
+                      prefixLength = 24;
+                    }
+                  ];
+                  defaultGateway = {
+                    address = "10.1.0.1";
+                    interface = "eth1";
+                  };
+                };
+                environment.systemPackages = [ pkgs.curl ];
+              };
+            # Internal server on the LAN segment (vlan 2), routing back via the fw.
+            server =
+              { pkgs, ... }:
+              {
+                virtualisation.vlans = [ 2 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                  interfaces.eth1.ipv4.addresses = [
+                    {
+                      address = "10.2.0.2";
+                      prefixLength = 24;
+                    }
+                  ];
+                  defaultGateway = {
+                    address = "10.2.0.1";
+                    interface = "eth1";
+                  };
+                };
+                systemd.services.web = {
+                  wantedBy = [ "multi-user.target" ];
+                  after = [ "network-online.target" ];
+                  script = ''
+                    mkdir -p /srv/web && echo hello-from-server > /srv/web/index.html
+                    exec ${pkgs.python3}/bin/python3 -m http.server 80 --directory /srv/web
+                  '';
+                };
+              };
+            # The appliance: WAN = eth1 (vlan 1), LAN = eth2 (vlan 2).
+            fw =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                # The sentinel module forces the hostname to the factory value;
+                # in a multi-node test the driver derives each machine's python
+                # variable from its hostname, so pin it back to the node name `fw`
+                # (runtime hostname is re-applied by sentinel-boot regardless).
+                networking.hostName = lib.mkForce "fw";
+                # Address the two segments at the NixOS level (boot-stable) rather
+                # than via `sentinel commit`'s networkd reload, which is flaky
+                # under this multi-NIC test harness; sentinel still owns the zones
+                # + port-forward (the velstra config). No NixOS iptables: velstra
+                # is the firewall.
+                networking.firewall.enable = lib.mkForce false;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = "10.1.0.1";
+                    prefixLength = 24;
+                  }
+                ];
+                networking.interfaces.eth2.ipv4.addresses = [
+                  {
+                    address = "10.2.0.1";
+                    prefixLength = 24;
+                  }
+                ];
+                virtualisation.vlans = [
+                  1
+                  2
+                ];
+                virtualisation.memorySize = 2048;
+                # Route between the two segments; velstra filters/NATs at XDP.
+                # rp_filter off: the reply's source is rewritten to the WAN ip
+                # (a local address) at XDP ingress on the LAN nic, which strict
+                # reverse-path filtering would otherwise treat as a martian.
+                boot.kernel.sysctl = {
+                  "net.ipv4.ip_forward" = 1;
+                  "net.ipv4.conf.all.rp_filter" = 0;
+                  "net.ipv4.conf.default.rp_filter" = 0;
+                  # The reply's source is rewritten to a local (WAN) address at
+                  # XDP ingress on the LAN nic; accept_local lets the kernel still
+                  # route/forward it. log_martians surfaces it if it doesn't.
+                  "net.ipv4.conf.all.accept_local" = 1;
+                  "net.ipv4.conf.all.log_martians" = 1;
+                };
+                # The agent's primary attach point (it also reconciles the config
+                # interfaces, so eth2 is attached once the config names it).
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+          };
+          testScript = ''
+            start_all()
+            fw.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+            server.wait_for_unit("web.service")
+
+            # Configure the appliance: zone both NICs, allow the LAN to forward
+            # replies, and expose the server on the WAN ip:8080 -> server:80.
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth1 zone wan' "
+                "'set interface eth2 zone lan' "
+                "'set zone lan default-action accept' "
+                "'set port-forward web zone wan' 'set port-forward web proto tcp' "
+                "'set port-forward web port 8080' 'set port-forward web to 10.2.0.2:80' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            fw.wait_for_unit("velstra.service")
+            # The compiled config carries the port-forward.
+            fw.succeed("grep -q '\\[\\[port_forward\\]\\]' /run/sentinel/velstra.toml")
+            # The fw's addresses are live on both segments (set at the NixOS level).
+            fw.wait_until_succeeds("ip addr show eth1 | grep -q 10.1.0.1", timeout=20)
+            fw.wait_until_succeeds("ip addr show eth2 | grep -q 10.2.0.1", timeout=20)
+
+            # Sanity: the fw itself reaches the server (LAN side + server up). A
+            # direct ping/connect to the fw's WAN ip is correctly dropped by the
+            # default-drop wan zone — only the port-forwarded port is open inbound.
+            fw.succeed("curl -s --max-time 5 http://10.2.0.2:80/ | grep -q hello-from-server")
+
+            # The headline: the client reaches the internal server THROUGH the
+            # appliance's WAN ip:8080 — DNAT'd in, conntrack-reverse SNAT'd out,
+            # all in the eBPF datapath.
+            client.wait_until_succeeds(
+                "curl -s --max-time 5 http://10.1.0.1:8080/ | grep -q hello-from-server",
+                timeout=40,
+            )
+          '';
+        };
       };
     };
 }

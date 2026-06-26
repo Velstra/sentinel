@@ -7,7 +7,11 @@
 //! module is the model + parser + validator the CLI is built on; compiling it
 //! down to the Velstra data-plane config is the next slice.
 
-use std::{collections::HashSet, net::Ipv4Addr, path::Path};
+use std::{
+    collections::{BTreeMap, HashSet},
+    net::Ipv4Addr,
+    path::Path,
+};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -19,16 +23,42 @@ pub const EXAMPLE: &str = r#"# Velstra Sentinel — declarative appliance config
 [system]
 hostname = "sentinel-fw"
 
-# Interfaces carry a zone role (wan | lan | dmz). Address is "dhcp" or a CIDR.
+# Global firewall defaults — every zone inherits these unless it overrides them.
+# stateful: allow return traffic for established flows (default true).
+# block_icmp: drop inbound ICMP (default false).  blocklist: global source drops.
+[firewall]
+stateful = true
+block_icmp = false
+blocklist = []
+
+# Per-zone posture overrides. Zones are arbitrary names; each becomes one
+# data-plane policy. Here ICMP is blocked on the WAN but allowed elsewhere.
+[zone.wan]
+block_icmp = true
+# masquerade = true   # SNAT outbound to the WAN IP (NAT) — enforced in Phase 4
+
+[zone.lan]
+block_icmp = false
+
+# Interfaces are assigned to a zone. Address is "dhcp" or a CIDR. A VLAN
+# subinterface adds `parent` + `vlan`.
 [[interface]]
 name = "wan0"
-role = "wan"
+zone = "wan"
 address = "dhcp"
 
 [[interface]]
 name = "lan0"
-role = "lan"
+zone = "lan"
 address = "10.0.0.1/24"
+
+# A VLAN subinterface on lan0, in its own zone:
+# [[interface]]
+# name = "lan0.20"
+# parent = "lan0"
+# vlan = 20
+# zone = "iot"
+# address = "10.0.20.1/24"
 
 # Broad zone rules set a zone's posture (action: accept | drop | reject).
 [[rule]]
@@ -58,10 +88,40 @@ port = 443
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Appliance {
     pub system: System,
+    /// Global firewall posture (stateful inspection, ICMP, source blocklist).
+    /// Omitted in older configs ⇒ defaults (stateful on, ICMP allowed, no
+    /// blocklist); skipped on output when it is exactly the default so saved
+    /// files stay clean.
+    #[serde(default, skip_serializing_if = "Firewall::is_default")]
+    pub firewall: Firewall,
+    /// Per-zone posture overrides, keyed by zone name (`[zone.wan]` …). A zone
+    /// need not appear here — referencing it from an interface is enough; this
+    /// table only carries non-default posture.
+    #[serde(default, rename = "zone", skip_serializing_if = "BTreeMap::is_empty")]
+    pub zones: BTreeMap<String, ZoneCfg>,
     #[serde(default, rename = "interface")]
     pub interfaces: Vec<Interface>,
     #[serde(default, rename = "rule")]
     pub rules: Vec<Rule>,
+    /// Inbound DNAT port-forwards (`[[port-forward]]`).
+    #[serde(default, rename = "port-forward", skip_serializing_if = "Vec::is_empty")]
+    pub port_forwards: Vec<PortForward>,
+}
+
+/// An inbound DNAT port-forward: traffic hitting `zone`'s public address on
+/// `proto`/`port` is rewritten to the internal host `to` (`"ip"` or `"ip:port"`).
+/// The reply is SNAT'd back automatically and the firewall is opened for it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortForward {
+    pub name: String,
+    /// The ingress zone (the public side) — must be backed by an interface.
+    pub zone: String,
+    pub proto: Proto,
+    /// Public destination port matched inbound.
+    pub port: u16,
+    /// Internal target, `"10.0.0.10"` or `"10.0.0.10:8443"`.
+    pub to: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,26 +129,132 @@ pub struct System {
     pub hostname: String,
 }
 
-/// A network zone — the trust boundary a firewall reasons about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Zone {
-    Wan,
-    Lan,
-    Dmz,
+/// Global firewall settings, applied to every firewalled (zoned) interface.
+/// These map onto Velstra's per-policy `stateful` / `drop_icmp` / `blocklist`
+/// — capabilities the data plane already enforces.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Firewall {
+    /// Stateful inspection: track allowed flows so return traffic comes back
+    /// without an explicit rule. On by default (a real firewall default).
+    #[serde(default = "default_true")]
+    pub stateful: bool,
+    /// Drop inbound ICMP at firewalled interfaces (echo, etc.). Off by default
+    /// — ICMP is useful (PMTU, ping); turn on to go quiet.
+    #[serde(default)]
+    pub block_icmp: bool,
+    /// Source IPs/CIDRs dropped outright on every firewalled interface — a
+    /// global denylist evaluated before any zone posture.
+    #[serde(default)]
+    pub blocklist: Vec<String>,
+    /// The default ingress action a zone inherits when it neither sets its own
+    /// `default_action` nor is opened by a broad accept rule. `drop` by default.
+    #[serde(default = "default_drop")]
+    pub default_action: Action,
+    /// Log matched traffic by default (zones inherit this). Off by default.
+    #[serde(default)]
+    pub log: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_drop() -> Action {
+    Action::Drop
+}
+
+impl Default for Firewall {
+    fn default() -> Self {
+        Firewall {
+            stateful: true,
+            block_icmp: false,
+            blocklist: Vec::new(),
+            default_action: Action::Drop,
+            log: false,
+        }
+    }
+}
+
+impl Firewall {
+    /// True when this is exactly the default posture — used to omit `[firewall]`
+    /// from saved configs that never touched it.
+    pub fn is_default(&self) -> bool {
+        self.stateful
+            && !self.block_icmp
+            && self.blocklist.is_empty()
+            && self.default_action == Action::Drop
+            && !self.log
+    }
+}
+
+/// A named network zone — the trust boundary a firewall reasons about. Zones are
+/// arbitrary (`wan`, `lan`, `dmz`, `guest`, `iot`, …); each becomes one Velstra
+/// policy. Per-zone posture fields are optional and inherit the global
+/// [`Firewall`] defaults when unset, so you can (for example) block ICMP on
+/// `wan` but allow it on `lan`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ZoneCfg {
+    /// Stateful inspection for this zone (inherits `[firewall] stateful`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stateful: Option<bool>,
+    /// Drop inbound ICMP on this zone (inherits `[firewall] block_icmp`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_icmp: Option<bool>,
+    /// Source IPs/CIDRs dropped on this zone's interfaces (added to the global
+    /// blocklist).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocklist: Vec<String>,
+    /// Ingress default action for this zone (inherits `[firewall]
+    /// default_action`, else `drop`). An explicit value overrides the
+    /// rule-derived posture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_action: Option<Action>,
+    /// Log matched traffic for this zone (inherits `[firewall] log`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log: Option<bool>,
+    /// SNAT/masquerade outbound traffic to this zone's egress IP (NAT). Used for
+    /// a WAN uplink. Enforced by the data plane (Phase 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub masquerade: Option<bool>,
+}
+
+/// A zone's posture after inheriting the global `[firewall]` defaults — the
+/// concrete values the compiler emits onto the zone's Velstra policy.
+#[derive(Debug, Clone)]
+pub struct ResolvedZone {
+    pub stateful: bool,
+    pub block_icmp: bool,
+    pub blocklist: Vec<String>,
+    /// An explicit per-zone default-action override; `None` ⇒ the compiler uses
+    /// the rule-derived posture (broad accept ⇒ pass) or the firewall default.
+    pub default_action: Option<Action>,
+    pub log: bool,
+    /// Read by the NAT compiler in Phase 4; resolved here so the schema is ready.
+    #[allow(dead_code)]
+    pub masquerade: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Interface {
     pub name: String,
-    /// The zone this interface belongs to. `None` for a NIC the system provides
-    /// but the operator hasn't assigned yet (it shows up in the config but is not
-    /// firewalled until a zone is set).
+    /// The zone this interface belongs to (a key in `[zone.*]` / referenced by
+    /// rules). `None` for a NIC the system provides but the operator hasn't
+    /// assigned yet (it shows up in the config but is not firewalled until a zone
+    /// is set).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role: Option<Zone>,
+    pub zone: Option<String>,
     /// `"dhcp"` or a CIDR like `"10.0.0.1/24"`. `None` if not yet configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
+    /// For an 802.1Q VLAN subinterface: the parent interface it rides on. Set
+    /// together with `vlan`. `None` for a physical NIC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// VLAN id (1–4094) for a subinterface. Set together with `parent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vlan: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,8 +276,10 @@ pub enum Proto {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rule {
     pub name: String,
-    pub from: Zone,
-    pub to: Zone,
+    /// Source zone name (must be a zone backed by at least one interface).
+    pub from: String,
+    /// Destination zone name.
+    pub to: String,
     pub action: Action,
     /// With `port`, makes this a **port rule** (a specific proto/port);
     /// without, it is a **broad** rule that sets the from-zone's posture.
@@ -176,6 +344,19 @@ impl Appliance {
             bail!("system.hostname must not be empty");
         }
 
+        // Every blocklist entry must be a valid IPv4 address or CIDR.
+        for entry in &self.firewall.blocklist {
+            validate_cidr_or_ip(entry).context("firewall.blocklist")?;
+        }
+
+        // Per-zone blocklists must also be valid.
+        for (name, z) in &self.zones {
+            for entry in &z.blocklist {
+                validate_cidr_or_ip(entry).with_context(|| format!("zone {name:?} blocklist"))?;
+            }
+        }
+
+        let names: HashSet<&str> = self.interfaces.iter().map(|i| i.name.as_str()).collect();
         let mut seen = HashSet::new();
         for iface in &self.interfaces {
             if !seen.insert(&iface.name) {
@@ -184,14 +365,35 @@ impl Appliance {
             if let Some(addr) = &iface.address {
                 validate_address(addr).with_context(|| format!("interface {:?}", iface.name))?;
             }
+            // VLAN subinterface: parent + vlan come as a pair; vlan in range; the
+            // parent must be a declared interface.
+            match (&iface.parent, iface.vlan) {
+                (Some(parent), Some(vlan)) => {
+                    if !(1..=4094).contains(&vlan) {
+                        bail!("interface {:?}: vlan {vlan} out of range (1–4094)", iface.name);
+                    }
+                    if !names.contains(parent.as_str()) {
+                        bail!(
+                            "interface {:?}: parent {parent:?} is not a declared interface",
+                            iface.name
+                        );
+                    }
+                }
+                (None, None) => {}
+                _ => bail!(
+                    "interface {:?}: `parent` and `vlan` must be set together",
+                    iface.name
+                ),
+            }
         }
 
         // Every rule's zones must be backed by at least one *assigned* interface,
         // else the rule can never match — a common, silent misconfiguration.
-        let zones: HashSet<Zone> = self.interfaces.iter().filter_map(|i| i.role).collect();
+        let zones_in_use: HashSet<&str> =
+            self.interfaces.iter().filter_map(|i| i.zone.as_deref()).collect();
         for rule in &self.rules {
-            for (which, zone) in [("from", rule.from), ("to", rule.to)] {
-                if !zones.contains(&zone) {
+            for (which, zone) in [("from", &rule.from), ("to", &rule.to)] {
+                if !zones_in_use.contains(zone.as_str()) {
                     bail!(
                         "rule {:?}: {which} zone {zone:?} has no interface",
                         rule.name
@@ -207,7 +409,39 @@ impl Appliance {
                 );
             }
         }
+
+        // Port-forwards target a zone (must have an interface) and a valid host.
+        for pf in &self.port_forwards {
+            if !zones_in_use.contains(pf.zone.as_str()) {
+                bail!(
+                    "port-forward {:?}: zone {:?} has no interface",
+                    pf.name,
+                    pf.zone
+                );
+            }
+            parse_host_port(&pf.to)
+                .with_context(|| format!("port-forward {:?}", pf.name))?;
+        }
         Ok(())
+    }
+
+    /// The resolved posture for a zone: the zone's own override (`[zone.<name>]`)
+    /// falling back to the global `[firewall]` defaults. Used by the compiler.
+    pub fn zone_posture(&self, zone: &str) -> ResolvedZone {
+        let z = self.zones.get(zone);
+        let fw = &self.firewall;
+        let mut blocklist = fw.blocklist.clone();
+        if let Some(z) = z {
+            blocklist.extend(z.blocklist.iter().cloned());
+        }
+        ResolvedZone {
+            stateful: z.and_then(|z| z.stateful).unwrap_or(fw.stateful),
+            block_icmp: z.and_then(|z| z.block_icmp).unwrap_or(fw.block_icmp),
+            blocklist,
+            default_action: z.and_then(|z| z.default_action),
+            log: z.and_then(|z| z.log).unwrap_or(fw.log),
+            masquerade: z.and_then(|z| z.masquerade).unwrap_or(false),
+        }
     }
 
     /// A human-readable summary for `config show`.
@@ -218,7 +452,7 @@ impl Appliance {
             out.push_str(&format!(
                 "  {:<8} {:<12} {}\n",
                 i.name,
-                i.role.map(zone_str).unwrap_or("(unassigned)"),
+                i.zone.as_deref().unwrap_or("(unassigned)"),
                 i.address.as_deref().unwrap_or("(auto)"),
             ));
         }
@@ -231,8 +465,8 @@ impl Appliance {
             out.push_str(&format!(
                 "  {:<16} {} -> {}  {}{}\n",
                 r.name,
-                zone_str(r.from),
-                zone_str(r.to),
+                r.from,
+                r.to,
                 action_str(r.action),
                 proto_port,
             ));
@@ -260,12 +494,40 @@ fn validate_address(addr: &str) -> Result<()> {
     Ok(())
 }
 
-fn zone_str(z: Zone) -> &'static str {
-    match z {
-        Zone::Wan => "wan",
-        Zone::Lan => "lan",
-        Zone::Dmz => "dmz",
+/// Parse a port-forward target `"ip"` or `"ip:port"` into an IPv4 + a port
+/// (`0` when omitted, meaning "keep the public port").
+pub(crate) fn parse_host_port(s: &str) -> Result<(Ipv4Addr, u16)> {
+    let (ip, port) = match s.rsplit_once(':') {
+        Some((ip, port)) => (
+            ip,
+            port.parse::<u16>()
+                .with_context(|| format!("invalid port in {s:?}"))?,
+        ),
+        None => (s, 0),
+    };
+    let ip = ip
+        .parse::<Ipv4Addr>()
+        .with_context(|| format!("invalid IPv4 in {s:?}"))?;
+    Ok((ip, port))
+}
+
+/// Validate a firewall blocklist entry: a bare IPv4 (`192.0.2.5`) or an IPv4
+/// CIDR (`10.6.6.0/24`).
+pub(crate) fn validate_cidr_or_ip(s: &str) -> Result<()> {
+    if let Some((ip, prefix)) = s.split_once('/') {
+        ip.parse::<Ipv4Addr>()
+            .with_context(|| format!("invalid IPv4 in {s:?}"))?;
+        let prefix: u8 = prefix
+            .parse()
+            .with_context(|| format!("invalid prefix in {s:?}"))?;
+        if prefix > 32 {
+            bail!("prefix /{prefix} in {s:?} exceeds /32");
+        }
+    } else {
+        s.parse::<Ipv4Addr>()
+            .with_context(|| format!("invalid IP/CIDR {s:?}"))?;
     }
+    Ok(())
 }
 
 fn action_str(a: Action) -> &'static str {
@@ -304,11 +566,11 @@ mod tests {
             hostname = "x"
             [[interface]]
             name = "eth0"
-            role = "wan"
+            zone = "wan"
             address = "dhcp"
             [[interface]]
             name = "eth0"
-            role = "lan"
+            zone = "lan"
             address = "10.0.0.1/24"
         "#;
         assert!(Appliance::from_toml(toml).is_err());
@@ -321,7 +583,7 @@ mod tests {
             hostname = "x"
             [[interface]]
             name = "eth0"
-            role = "lan"
+            zone = "lan"
             address = "10.0.0.1/24"
             [[rule]]
             name = "r"

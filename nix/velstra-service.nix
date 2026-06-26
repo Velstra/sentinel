@@ -90,6 +90,11 @@ in
       ];
       requires = [ "sentinel-boot.service" ];
       before = [ "network.target" ];
+      # Every `sentinel commit` reload-or-restarts the agent to pick up the new
+      # config. Those are INTENTIONAL restarts, so don't let a burst of commits
+      # trip systemd's start rate limiter and lock the data plane out
+      # (start-limit-hit). Restart=on-failure below still self-heals real crashes.
+      startLimitIntervalSec = 0;
       serviceConfig = {
         ExecStart = "${cfg.package}/bin/velstra run --iface ${cfg.interface} --config /run/sentinel/velstra.toml";
         Restart = "on-failure";
