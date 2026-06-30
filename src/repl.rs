@@ -246,7 +246,7 @@ const RULE_FIELDS: &[Cand] = &[
     ("to", "destination zone"),
     ("action", "accept / drop / reject"),
     ("proto", "tcp / udp"),
-    ("port", "destination port"),
+    ("port", "destination port or range (e.g. 443 or 8000-8100)"),
 ];
 
 /// Static completion candidates for the token being typed, given the

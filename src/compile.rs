@@ -154,14 +154,20 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                 }
             };
             // Specific proto/port rules become Velstra port rules on this policy.
+            // A port *range* expands to one data-plane rule per port (the data
+            // plane keys on a single `(proto, port)`); the range width is capped
+            // at validate time so this stays small.
             let port_rules = appliance
                 .rules
                 .iter()
                 .filter(|r| r.from == zone && r.is_port_rule())
-                .map(|r| PortRule {
-                    proto: proto_str(r.proto.unwrap()),
-                    port: r.port.unwrap(),
-                    action: action_str(r.action),
+                .flat_map(|r| {
+                    let proto = proto_str(r.proto.unwrap());
+                    let action = action_str(r.action);
+                    r.port
+                        .unwrap()
+                        .ports()
+                        .map(move |port| PortRule { proto, port, action })
                 })
                 .collect();
             Policy {
@@ -324,6 +330,33 @@ action = "accept"
         assert!(cfg.blocklist.is_empty());
         // An empty blocklist is skipped, so the agent never sees `blocklist = []`.
         assert!(!cfg.to_toml().unwrap().contains("blocklist"));
+    }
+
+    #[test]
+    fn port_range_expands_to_one_port_rule_per_port() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+[[interface]]
+name = "lan0"
+zone = "lan"
+[[rule]]
+name = "passive-ftp"
+from = "wan"
+to = "lan"
+action = "accept"
+proto = "tcp"
+port = "8000-8002"
+"#;
+        let cfg = compile(&Appliance::from_toml(toml).unwrap());
+        let wan = cfg.policies.iter().find(|p| p.name == "wan").unwrap();
+        // The 3-port range became three single-port rules.
+        let ports: Vec<u16> = wan.port_rules.iter().map(|r| r.port).collect();
+        assert_eq!(ports, vec![8000, 8001, 8002]);
+        assert!(wan.port_rules.iter().all(|r| r.proto == "tcp" && r.action == "pass"));
     }
 
     #[test]
