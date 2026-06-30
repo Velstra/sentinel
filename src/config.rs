@@ -319,6 +319,119 @@ pub enum Proto {
     Udp,
 }
 
+/// The widest port range a single rule may span (inclusive count). A range is
+/// expanded into one data-plane port rule per port at compile time, so this cap
+/// keeps a stray `1-65535` from blowing up the map.
+pub const MAX_PORT_RANGE: u32 = 1024;
+
+/// A rule's destination-port match: a single port (`443`) or an inclusive range
+/// (`"8000-8100"`). In TOML a single port stays a bare integer (`port = 443`) and
+/// a range is a string (`port = "8000-8100"`), so existing single-port configs
+/// are unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortSpec {
+    /// A single destination port.
+    Single(u16),
+    /// An inclusive `lo..=hi` range.
+    Range(u16, u16),
+}
+
+impl PortSpec {
+    /// Parse the CLI/text form: `"443"` or `"8000-8100"`.
+    pub fn parse(s: &str) -> Result<Self> {
+        let s = s.trim();
+        if let Some((lo, hi)) = s.split_once('-') {
+            let lo: u16 = lo
+                .trim()
+                .parse()
+                .with_context(|| format!("invalid port {lo:?}"))?;
+            let hi: u16 = hi
+                .trim()
+                .parse()
+                .with_context(|| format!("invalid port {hi:?}"))?;
+            Ok(PortSpec::Range(lo, hi))
+        } else {
+            let p: u16 = s.parse().with_context(|| format!("invalid port {s:?}"))?;
+            Ok(PortSpec::Single(p))
+        }
+    }
+
+    /// Inclusive `(lo, hi)` bounds.
+    pub fn bounds(self) -> (u16, u16) {
+        match self {
+            PortSpec::Single(p) => (p, p),
+            PortSpec::Range(lo, hi) => (lo, hi),
+        }
+    }
+
+    /// The ports this spec matches, expanded.
+    pub fn ports(self) -> std::ops::RangeInclusive<u16> {
+        let (lo, hi) = self.bounds();
+        lo..=hi
+    }
+
+    /// Reject a port 0, an inverted range, or a range wider than [`MAX_PORT_RANGE`].
+    pub fn validate(self) -> Result<()> {
+        let (lo, hi) = self.bounds();
+        if lo == 0 {
+            bail!("port 0 is not valid");
+        }
+        if lo > hi {
+            bail!("port range {lo}-{hi} is inverted (start > end)");
+        }
+        let count = hi as u32 - lo as u32 + 1;
+        if count > MAX_PORT_RANGE {
+            bail!("port range {lo}-{hi} spans {count} ports, over the {MAX_PORT_RANGE} cap");
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for PortSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PortSpec::Single(p) => write!(f, "{p}"),
+            PortSpec::Range(lo, hi) => write!(f, "{lo}-{hi}"),
+        }
+    }
+}
+
+impl Serialize for PortSpec {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            // A single port round-trips as a bare TOML integer; a range as a string.
+            PortSpec::Single(p) => s.serialize_u16(*p),
+            PortSpec::Range(lo, hi) => s.serialize_str(&format!("{lo}-{hi}")),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PortSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = PortSpec;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a port number or a \"lo-hi\" range string")
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> std::result::Result<PortSpec, E> {
+                u16::try_from(v)
+                    .map(PortSpec::Single)
+                    .map_err(|_| E::custom(format!("port {v} out of range (0–65535)")))
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> std::result::Result<PortSpec, E> {
+                u16::try_from(v)
+                    .map(PortSpec::Single)
+                    .map_err(|_| E::custom(format!("port {v} out of range (0–65535)")))
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<PortSpec, E> {
+                PortSpec::parse(v).map_err(|e| E::custom(e.to_string()))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rule {
     pub name: String,
@@ -331,8 +444,9 @@ pub struct Rule {
     /// without, it is a **broad** rule that sets the from-zone's posture.
     #[serde(default)]
     pub proto: Option<Proto>,
-    #[serde(default)]
-    pub port: Option<u16>,
+    /// A single port (`port = 443`) or an inclusive range (`port = "8000-8100"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<PortSpec>,
 }
 
 impl Rule {
@@ -453,6 +567,11 @@ impl Appliance {
                     "rule {:?}: `proto` and `port` must be set together",
                     rule.name
                 );
+            }
+            // A port (or range) must be in range and not inverted/too wide.
+            if let Some(port) = rule.port {
+                port.validate()
+                    .with_context(|| format!("rule {:?}", rule.name))?;
             }
         }
 
@@ -695,6 +814,96 @@ to = "10.0.0.10:8443"
         let b = Appliance::from_toml(&out).expect("re-parses");
         assert_eq!(b.nat.source[0].zone, "wan");
         assert_eq!(b.nat.destination[0].to, "10.0.0.10:8443");
+    }
+
+    #[test]
+    fn portspec_parses_single_and_range() {
+        assert_eq!(PortSpec::parse("443").unwrap(), PortSpec::Single(443));
+        assert_eq!(
+            PortSpec::parse("8000-8100").unwrap(),
+            PortSpec::Range(8000, 8100)
+        );
+        // Whitespace around the dash is tolerated.
+        assert_eq!(PortSpec::parse(" 100 - 200 ").unwrap(), PortSpec::Range(100, 200));
+        assert!(PortSpec::parse("not-a-port").is_err());
+        assert!(PortSpec::parse("70000").is_err()); // > u16
+    }
+
+    #[test]
+    fn portspec_rejects_inverted_zero_and_oversized() {
+        assert!(PortSpec::Single(0).validate().is_err());
+        assert!(PortSpec::Range(200, 100).validate().is_err()); // inverted
+        assert!(PortSpec::Range(443, 443).validate().is_ok());
+        // Exactly the cap is allowed; one past it is not.
+        let lo = 1000;
+        let hi = lo + MAX_PORT_RANGE as u16 - 1;
+        assert!(PortSpec::Range(lo, hi).validate().is_ok());
+        assert!(PortSpec::Range(lo, hi + 1).validate().is_err());
+    }
+
+    #[test]
+    fn portspec_single_is_integer_range_is_string_in_toml() {
+        // A single port stays a bare integer; a range becomes a string. Both
+        // survive a save→load cycle.
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+[[interface]]
+name = "lan0"
+zone = "lan"
+[[rule]]
+name = "https"
+from = "wan"
+to = "lan"
+action = "accept"
+proto = "tcp"
+port = 443
+[[rule]]
+name = "range"
+from = "wan"
+to = "lan"
+action = "accept"
+proto = "tcp"
+port = "8000-8100"
+"#;
+        let a = Appliance::from_toml(toml).expect("range config parses");
+        assert_eq!(a.rules[0].port, Some(PortSpec::Single(443)));
+        assert_eq!(a.rules[1].port, Some(PortSpec::Range(8000, 8100)));
+        let out = a.to_toml().unwrap();
+        assert!(out.contains("port = 443"), "single stays integer:\n{out}");
+        assert!(
+            out.contains("port = \"8000-8100\""),
+            "range stays string:\n{out}"
+        );
+        // Re-parse the saved form unchanged.
+        let b = Appliance::from_toml(&out).unwrap();
+        assert_eq!(b.rules[1].port, Some(PortSpec::Range(8000, 8100)));
+    }
+
+    #[test]
+    fn rejects_oversized_port_range_in_a_rule() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+[[interface]]
+name = "lan0"
+zone = "lan"
+[[rule]]
+name = "huge"
+from = "wan"
+to = "lan"
+action = "accept"
+proto = "tcp"
+port = "1-65535"
+"#;
+        // The range is far over the cap → validation rejects it.
+        assert!(Appliance::from_toml(toml).is_err());
     }
 
     #[test]
