@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::config::{
-    Action, Appliance, Firewall, Interface, Nat, NatDestination, NatSource, Proto, Rule, System,
-    ZoneCfg,
+    Action, Appliance, Firewall, Interface, Nat, NatDestination, NatSource, PortSpec, Proto, Rule,
+    System, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -37,7 +37,7 @@ struct RuleDraft {
     to: Option<String>,
     action: Option<Action>,
     proto: Option<Proto>,
-    port: Option<u16>,
+    port: Option<PortSpec>,
 }
 
 /// A partially-specified source-NAT (masquerade) rule.
@@ -376,8 +376,7 @@ impl Session {
                 self.draft.rule_mut(name).proto = Some(parse_proto(v)?)
             }
             ["firewall", "rule", name, "port", v] => {
-                self.draft.rule_mut(name).port =
-                    Some(v.parse().with_context(|| format!("invalid port {v:?}"))?);
+                self.draft.rule_mut(name).port = Some(PortSpec::parse(v)?);
             }
 
             // --- nat { … } — address translation, its own top-level node ---
@@ -416,7 +415,7 @@ impl Session {
                  set firewall zone <name> block <IP|CIDR>\n  \
                  set firewall rule <name> <from|to> <zone>\n  \
                  set firewall rule <name> action <accept|drop|reject>\n  \
-                 set firewall rule <name> <proto tcp|udp | port <n>>\n  \
+                 set firewall rule <name> <proto tcp|udp | port <n|lo-hi>>\n  \
                  set nat source <name> zone <zone>\n  \
                  set nat destination <name> <zone <z> | proto <p> | port <n> | to <ip[:port]>>"
             ),

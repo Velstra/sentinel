@@ -105,6 +105,40 @@ field; it lives under `nat source`, below.)
 `[firewall]` and any `[zone.*]` block are omitted from a saved config while they
 are exactly the default, so saved files stay clean.
 
+## Firewall rules — zone-to-zone & ports
+
+A **broad** rule (no `proto`/`port`) sets a from-zone's ingress posture: a
+`from = <zone>, action = accept` lets that zone initiate, so its policy passes by
+default. A **port** rule (`proto` + `port`) opens or blocks a specific service —
+e.g. inbound HTTPS even on a default-drop WAN:
+
+```text
+sentinel# set firewall rule lan-out from lan to wan action accept   # lan may initiate
+sentinel# set firewall rule https from wan to lan action accept
+sentinel# set firewall rule https proto tcp
+sentinel# set firewall rule https port 443
+sentinel# commit save
+```
+
+- **`from` / `to`** — source and destination zone (each must be backed by an
+  interface).
+- **`action`** — `accept` / `drop` / `reject` (a `reject` sends a TCP RST rather
+  than dropping silently).
+- **`proto` / `port`** — set together to make a port rule; omit both for a broad
+  rule.
+- **`port`** — a single port (`443`) **or an inclusive range** written as
+  `lo-hi`. A range opens a contiguous block of ports (e.g. passive-FTP data):
+
+  ```text
+  sentinel# set firewall rule ftp-data from wan to lan action accept
+  sentinel# set firewall rule ftp-data proto tcp
+  sentinel# set firewall rule ftp-data port 49152-50175
+  ```
+
+  A range expands to one data-plane rule per port, so it is capped at 1024 ports
+  — a wider span is rejected at commit time (split it, or open the zone).
+- Remove a rule with `delete firewall rule <name>`.
+
 ## NAT — its own top-level node
 
 NAT *translates* addresses; the firewall *filters* packets. They're separate
