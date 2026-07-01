@@ -39,6 +39,7 @@ struct RuleDraft {
     proto: Option<Proto>,
     port: Option<PortSpec>,
     log: Option<bool>,
+    source: Option<String>,
 }
 
 /// A partially-specified source-NAT (masquerade) rule.
@@ -186,6 +187,7 @@ impl Draft {
                             proto: r.proto,
                             port: r.port,
                             log: Some(r.log),
+                            source: r.source.clone(),
                         },
                     )
                 })
@@ -383,6 +385,9 @@ impl Session {
             ["firewall", "rule", name, "log", v] => {
                 self.draft.rule_mut(name).log = Some(parse_bool(v)?)
             }
+            ["firewall", "rule", name, "source", v] => {
+                self.draft.rule_mut(name).source = Some((*v).to_string())
+            }
 
             // --- nat { … } — address translation, its own top-level node ---
 
@@ -420,7 +425,7 @@ impl Session {
                  set firewall zone <name> block <IP|CIDR>\n  \
                  set firewall rule <name> <from|to> <zone>\n  \
                  set firewall rule <name> action <accept|drop|reject>\n  \
-                 set firewall rule <name> <proto tcp|udp | port <n|lo-hi> | log <true|false>>\n  \
+                 set firewall rule <name> <proto tcp|udp | port <n|lo-hi> | log <true|false> | source <cidr>>\n  \
                  set nat source <name> zone <zone>\n  \
                  set nat destination <name> <zone <z> | proto <p> | port <n> | to <ip[:port]>>"
             ),
@@ -512,6 +517,7 @@ impl Session {
                     "proto" => r.proto = None,
                     "port" => r.port = None,
                     "log" => r.log = None,
+                    "source" => r.source = None,
                     other => bail!("rule has no field {other:?}"),
                 }
             }
@@ -655,6 +661,7 @@ impl Session {
                     proto: d.proto,
                     port: d.port,
                     log: d.log.unwrap_or(false),
+                    source: d.source.clone(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -878,6 +885,9 @@ fn render_draft(draft: &Draft, skip_empty_ifaces: bool) -> String {
         }
         if let Some(l) = r.log {
             fwi.push_str(&format!("        log {l}\n"));
+        }
+        if let Some(s) = &r.source {
+            fwi.push_str(&format!("        source {s}\n"));
         }
         fwi.push_str("    }\n");
     }

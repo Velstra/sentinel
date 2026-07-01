@@ -155,7 +155,7 @@ commands:
                             interface <n> zone|address|parent|vlan …
                             firewall global  stateful|block-icmp|default-action|log|block …
                             firewall zone <z>  stateful|block-icmp|default-action|log|block …
-                            firewall rule <r>  from|to|action|proto|port|log …
+                            firewall rule <r>  from|to|action|proto|port|log|source …
                             nat source <s>  zone …
                             nat destination <d>  zone|proto|port|to …
                           e.g.  set firewall rule web from wan
@@ -248,6 +248,7 @@ const RULE_FIELDS: &[Cand] = &[
     ("proto", "tcp / udp"),
     ("port", "destination port or range (e.g. 443 or 8000-8100)"),
     ("log", "log packets matching this rule (true / false)"),
+    ("source", "source address/CIDR (e.g. 10.0.0.0/24); default any"),
 ];
 
 /// Static completion candidates for the token being typed, given the
@@ -474,7 +475,7 @@ mod tests {
         assert_eq!(kw(&["set", "firewall", "zone", "wan", "block-icmp"]), ["true", "false"]);
         assert_eq!(
             kw(&["set", "firewall", "rule", "web"]),
-            ["from", "to", "action", "proto", "port", "log"]
+            ["from", "to", "action", "proto", "port", "log", "source"]
         );
         assert_eq!(kw(&["set", "firewall", "rule", "web", "log"]), ["true", "false"]);
         assert_eq!(kw(&["set", "firewall", "rule", "web", "action"]), ["accept", "drop", "reject"]);
