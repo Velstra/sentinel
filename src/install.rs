@@ -343,12 +343,24 @@ pub fn execute(targets: &[&Disk], raid: Raid, source_image: Option<&std::path::P
 fn prepare_disk(source: &str, target: &str, raid: Raid) -> Result<()> {
     run("wipefs", &["-a", target])?;
     // Replicate the source GPT onto the target (`--replicate=<dest>` takes the
-    // DESTINATION; the source is the positional device), then give the copy
-    // fresh GUIDs and move the backup header to the end of the (larger) target.
-    // This also lays down the (empty) slot-B partition entries for later updates.
+    // DESTINATION; the source is the positional device), then move the backup
+    // header to the end of the (larger) target. This also lays down the (empty)
+    // slot-B partition entries for later updates.
     run("sgdisk", &[&format!("--replicate={target}"), source])?;
     run("sgdisk", &["--move-second-header", target])?;
-    run("sgdisk", &["--randomize-guids", target])?;
+    // Give the disk a fresh **disk** GUID so it doesn't collide with the source
+    // medium — but do NOT randomize the *partition* GUIDs. The dm-verity store
+    // relies on the systemd Discoverable Partitions convention: the verity and
+    // store partition UUIDs are derived from the roothash (no explicit
+    // `usrhash=` on the kernel cmdline), so systemd auto-binds `/dev/mapper/usr`
+    // by matching them at boot. `sgdisk --randomize-guids` would overwrite those
+    // roothash-derived UUIDs, so the installed system could never activate the
+    // verity device — it would time out waiting for `/dev/mapper/usr` and drop to
+    // emergency mode (while a directly-booted image, with the UUIDs intact, works
+    // fine). `--disk-guid=R` randomizes only the disk GUID and leaves every
+    // partition UUID as replicated. The data partition below is recreated and so
+    // gets its own fresh UUID regardless.
+    run("sgdisk", &["--disk-guid=R", target])?;
     // Recreate the data partition to fill the disk, typed for the install mode.
     let typecode = if raid.mdadm_level().is_some() {
         "FD00" // Linux RAID

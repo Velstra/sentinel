@@ -665,6 +665,24 @@
                   # The ESP (UKI/bootloader) is cloned byte-for-byte from the
                   # source medium's ESP -> the installed disk is bootable.
                   machine.succeed(f"cmp /dev/{src}1 /dev/vdb1")
+                  # The dm-verity hash + store partitions (#2, #3) MUST keep the
+                  # source's partition UUIDs: they are derived from the roothash,
+                  # and systemd auto-binds /dev/mapper/usr by matching them at boot
+                  # (there is NO explicit usrhash= on the kernel cmdline). If the
+                  # install randomized them, the installed system would time out
+                  # waiting for /dev/mapper/usr and drop to emergency mode. Assert
+                  # they are preserved (a `sgdisk --randomize-guids` would fail this).
+                  for p in (2, 3):
+                      srcuuid = machine.succeed(f"blkid -s PARTUUID -o value /dev/{src}{p}").strip()
+                      dstuuid = machine.succeed(f"blkid -s PARTUUID -o value /dev/vdb{p}").strip()
+                      assert srcuuid and srcuuid == dstuuid, (
+                          f"verity partition {p} UUID not preserved: {srcuuid!r} != {dstuuid!r}"
+                      )
+                  # But the *disk* GUID is freshened so it can't collide with the
+                  # source medium.
+                  srcdisk = machine.succeed(f"blkid -s PTUUID -o value /dev/{src}").strip()
+                  dstdisk = machine.succeed("blkid -s PTUUID -o value /dev/vdb").strip()
+                  assert srcdisk != dstdisk, f"disk GUID should differ: {srcdisk!r} == {dstdisk!r}"
 
               with subtest("RAID1 install builds an assembled mirror"):
                   machine.succeed("sentinel install /dev/vdc /dev/vdd --raid mirror --commit")
