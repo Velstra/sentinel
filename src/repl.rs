@@ -220,7 +220,19 @@ const TOP: &[Cand] = &[
 const PROTOCOLS_NODES: &[Cand] = &[
     ("router-id", "the 32-bit router id (an IPv4 address)"),
     ("static", "a static route (<prefix> via <ip> | dev <if>)"),
+    ("ospf", "OSPFv2: interfaces, area, redistribution"),
     ("bgp", "BGP-4: local-as, networks, neighbors"),
+];
+const OSPF_FIELDS: &[Cand] = &[
+    ("interface", "a NIC OSPF runs on"),
+    ("area", "the OSPF area id (dotted quad, e.g. 0.0.0.0)"),
+    ("cost", "output cost for these interfaces"),
+    ("network-type", "broadcast / point-to-point"),
+    ("redistribute", "inject a route source (static / connected / bgp)"),
+];
+const OSPF_NETWORK_TYPES: &[Cand] = &[
+    ("broadcast", "elect a designated router"),
+    ("point-to-point", "direct link, no DR"),
 ];
 const STATIC_FIELDS: &[Cand] = &[
     ("via", "next-hop gateway IP"),
@@ -330,6 +342,9 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "protocols", "static", _prefix] => STATIC_FIELDS,
         ["set" | "delete", "protocols", "bgp"] => BGP_FIELDS,
         ["set", "protocols", "bgp", "redistribute"] => REDIST,
+        ["set" | "delete", "protocols", "ospf"] => OSPF_FIELDS,
+        ["set", "protocols", "ospf", "redistribute"] => REDIST,
+        ["set", "protocols", "ospf", "network-type"] => OSPF_NETWORK_TYPES,
         _ => &[],
     }
 }

@@ -18,6 +18,8 @@ pub struct WrenConfig {
     #[serde(rename = "static", skip_serializing_if = "Vec::is_empty")]
     statics: Vec<WrenStatic>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    ospf: Option<WrenOspf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     bgp: Option<WrenBgp>,
 }
 
@@ -52,6 +54,21 @@ struct WrenNeighbor {
     address: String,
     #[serde(rename = "remote-as")]
     remote_as: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct WrenOspf {
+    enabled: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    interfaces: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    area: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost: Option<u16>,
+    #[serde(rename = "network-type", skip_serializing_if = "Option::is_none")]
+    network_type: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    redistribute: Vec<String>,
 }
 
 impl WrenConfig {
@@ -94,9 +111,19 @@ pub fn compile_wren(appliance: &Appliance) -> WrenConfig {
             .collect(),
     });
 
+    let ospf = p.ospf.as_ref().map(|o| WrenOspf {
+        enabled: true,
+        interfaces: o.interfaces.clone(),
+        area: o.area.clone(),
+        cost: o.cost,
+        network_type: o.network_type.clone(),
+        redistribute: o.redistribute.clone(),
+    });
+
     WrenConfig {
         router_id: p.router_id.clone(),
         statics,
+        ospf,
         bgp,
     }
 }
@@ -131,6 +158,29 @@ remote-as = 65002
         // The BGP router-id falls back to the global protocols router-id.
         let bgp_section = out.split("[bgp]").nth(1).unwrap();
         assert!(bgp_section.contains("router-id = \"10.0.0.1\""), "{out}");
+    }
+
+    #[test]
+    fn ospf_compiles_with_enabled_and_fields() {
+        let toml = r#"
+[system]
+hostname = "r1"
+[protocols]
+router-id = "10.0.0.1"
+[protocols.ospf]
+interfaces = ["eth1"]
+area = "0.0.0.0"
+network-type = "point-to-point"
+redistribute = ["static"]
+"#;
+        let appliance = Appliance::from_toml(toml).unwrap();
+        let out = compile_wren(&appliance).to_toml().unwrap();
+        assert!(out.contains("[ospf]"), "{out}");
+        let ospf = out.split("[ospf]").nth(1).unwrap();
+        assert!(ospf.contains("enabled = true"), "{out}");
+        assert!(ospf.contains("area = \"0.0.0.0\""), "{out}");
+        assert!(ospf.contains("network-type = \"point-to-point\""), "{out}");
+        assert!(ospf.contains("\"eth1\""), "{out}");
     }
 
     #[test]
