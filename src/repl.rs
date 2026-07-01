@@ -155,7 +155,7 @@ commands:
                             interface <n> zone|address|parent|vlan …
                             firewall global  stateful|block-icmp|default-action|log|block …
                             firewall zone <z>  stateful|block-icmp|default-action|log|block …
-                            firewall rule <r>  from|to|action|proto|port …
+                            firewall rule <r>  from|to|action|proto|port|log …
                             nat source <s>  zone …
                             nat destination <d>  zone|proto|port|to …
                           e.g.  set firewall rule web from wan
@@ -247,6 +247,7 @@ const RULE_FIELDS: &[Cand] = &[
     ("action", "accept / drop / reject"),
     ("proto", "tcp / udp"),
     ("port", "destination port or range (e.g. 443 or 8000-8100)"),
+    ("log", "log packets matching this rule (true / false)"),
 ];
 
 /// Static completion candidates for the token being typed, given the
@@ -272,6 +273,7 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "firewall", "rule", _name] => RULE_FIELDS,
         ["set", "firewall", "rule", _name, "action"] => ACTIONS,
         ["set", "firewall", "rule", _name, "proto"] => PROTOS,
+        ["set", "firewall", "rule", _name, "log"] => BOOLS,
 
         // The nat sub-tree (its own top-level node).
         ["set" | "delete", "nat"] => NAT_NODES,
@@ -472,8 +474,9 @@ mod tests {
         assert_eq!(kw(&["set", "firewall", "zone", "wan", "block-icmp"]), ["true", "false"]);
         assert_eq!(
             kw(&["set", "firewall", "rule", "web"]),
-            ["from", "to", "action", "proto", "port"]
+            ["from", "to", "action", "proto", "port", "log"]
         );
+        assert_eq!(kw(&["set", "firewall", "rule", "web", "log"]), ["true", "false"]);
         assert_eq!(kw(&["set", "firewall", "rule", "web", "action"]), ["accept", "drop", "reject"]);
         assert_eq!(kw(&["set", "firewall", "rule", "web", "proto"]), ["tcp", "udp"]);
         // The nat sub-tree: source (masquerade) + destination (port-forward).
