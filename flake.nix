@@ -140,7 +140,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-FrYEmhdXrtq+8C3Ck2kOUBnhjK9dZ4QH4eTLQSVl7mg=";
+      ebpfHash = "sha256-gNWOOF6CjDVITdQgLqIkqaBdo4Uwqk6xyJQgc8UWzTQ=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -1282,6 +1282,102 @@
 
             # The un-ruled default-dropped port produced no log line.
             fw.fail("journalctl -u velstra.service | grep -q 'dport=9998'")
+          '';
+        };
+
+        # Per-rule source-CIDR match in the eBPF datapath: the fw's WAN zone has
+        # two logged DROP rules on different ports — one whose `source` matches the
+        # client's address (10.1.0.2/32) and one whose source is a foreign block
+        # (10.9.9.9/32). Traffic from the client must trip only the matching rule:
+        # the eBPF LPM rule map keys on (policy, proto, dport, src prefix), so the
+        # foreign-source rule never fires and its port stays out of the journal.
+        srcfilter = pkgs.testers.runNixOSTest {
+          name = "sentinel-srcfilter";
+          nodes = {
+            client =
+              { pkgs, ... }:
+              {
+                virtualisation.vlans = [ 1 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                  interfaces.eth1.ipv4.addresses = [
+                    {
+                      address = "10.1.0.2";
+                      prefixLength = 24;
+                    }
+                  ];
+                };
+                environment.systemPackages = [ pkgs.curl ];
+              };
+            fw =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "fw";
+                networking.firewall.enable = lib.mkForce false;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = "10.1.0.1";
+                    prefixLength = 24;
+                  }
+                ];
+                virtualisation.vlans = [ 1 ];
+                virtualisation.memorySize = 2048;
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+          };
+          testScript = ''
+            start_all()
+            fw.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+            fw.wait_until_succeeds("ip addr show eth1 | grep -q 10.1.0.1", timeout=20)
+            client.wait_for_unit("multi-user.target")
+            client.wait_until_succeeds("ip addr show eth1 | grep -q 10.1.0.2", timeout=20)
+
+            # Zone the WAN nic; add a logged DROP tcp/9999 whose source MATCHES the
+            # client (10.1.0.2/32), and a logged DROP tcp/9997 whose source is a
+            # foreign block (10.9.9.9/32) the client can never match.
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth1 zone wan' "
+                "'set firewall rule match-src from wan' "
+                "'set firewall rule match-src to wan' "
+                "'set firewall rule match-src action drop' "
+                "'set firewall rule match-src proto tcp' "
+                "'set firewall rule match-src port 9999' "
+                "'set firewall rule match-src source 10.1.0.2/32' "
+                "'set firewall rule match-src log true' "
+                "'set firewall rule foreign-src from wan' "
+                "'set firewall rule foreign-src to wan' "
+                "'set firewall rule foreign-src action drop' "
+                "'set firewall rule foreign-src proto tcp' "
+                "'set firewall rule foreign-src port 9997' "
+                "'set firewall rule foreign-src source 10.9.9.9/32' "
+                "'set firewall rule foreign-src log true' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            fw.wait_for_unit("velstra.service")
+            # Both rules compiled, each carrying its own source CIDR.
+            fw.succeed("grep -q 'src = \"10.1.0.2/32\"' /run/sentinel/velstra.toml")
+            fw.succeed("grep -q 'src = \"10.9.9.9/32\"' /run/sentinel/velstra.toml")
+
+            # Generate traffic to both ports in a retry loop until the matching
+            # rule has logged. A single SYN can be lost in the reload window, so we
+            # re-send each attempt.
+            def hit(_):
+                client.execute("curl -s --max-time 2 -o /dev/null http://10.1.0.1:9999/ || true")
+                client.execute("curl -s --max-time 2 -o /dev/null http://10.1.0.1:9997/ || true")
+                return fw.execute("journalctl -u velstra.service | grep -qE 'DROP .*dport=9999'")[0] == 0
+
+            # The client's address matches the 9999 rule -> logged DROP.
+            retry(hit)
+
+            # The 9997 rule's source (10.9.9.9/32) never matches the client, so the
+            # LPM lookup misses it: no rule fires, nothing is logged for 9997.
+            fw.fail("journalctl -u velstra.service | grep -q 'dport=9997'")
           '';
         };
       };
