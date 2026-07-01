@@ -62,6 +62,9 @@ struct PortRule {
     proto: &'static str,
     port: u16,
     action: &'static str,
+    /// Log packets matching this rule. Omitted when false (the common case).
+    #[serde(skip_serializing_if = "is_false")]
+    log: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -164,10 +167,11 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                 .flat_map(|r| {
                     let proto = proto_str(r.proto.unwrap());
                     let action = action_str(r.action);
+                    let log = r.log;
                     r.port
                         .unwrap()
                         .ports()
-                        .map(move |port| PortRule { proto, port, action })
+                        .map(move |port| PortRule { proto, port, action, log })
                 })
                 .collect();
             Policy {
@@ -357,6 +361,34 @@ port = "8000-8002"
         let ports: Vec<u16> = wan.port_rules.iter().map(|r| r.port).collect();
         assert_eq!(ports, vec![8000, 8001, 8002]);
         assert!(wan.port_rules.iter().all(|r| r.proto == "tcp" && r.action == "pass"));
+    }
+
+    #[test]
+    fn rule_log_flag_flows_onto_the_port_rule() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+[[interface]]
+name = "lan0"
+zone = "lan"
+[[rule]]
+name = "ssh-watch"
+from = "wan"
+to = "lan"
+action = "accept"
+proto = "tcp"
+port = 22
+log = true
+"#;
+        let cfg = compile(&Appliance::from_toml(toml).unwrap());
+        let wan = cfg.policies.iter().find(|p| p.name == "wan").unwrap();
+        assert_eq!(wan.port_rules.len(), 1);
+        assert!(wan.port_rules[0].log, "log flag should carry onto the port rule");
+        let out = cfg.to_toml().unwrap();
+        assert!(out.contains("log = true"), "log emitted to velstra config:\n{out}");
     }
 
     #[test]
