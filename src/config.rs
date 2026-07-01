@@ -451,6 +451,11 @@ pub struct Rule {
     /// Off by default; only meaningful on a port rule.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub log: bool,
+    /// Optional source-address constraint — an IPv4 CIDR (`"10.0.0.0/24"`) or a
+    /// bare host (`"198.51.100.7"`). Absent means "from any source". Only
+    /// meaningful on a port rule; a more specific source wins over `from any`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 impl Rule {

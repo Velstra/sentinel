@@ -65,6 +65,9 @@ struct PortRule {
     /// Log packets matching this rule. Omitted when false (the common case).
     #[serde(skip_serializing_if = "is_false")]
     log: bool,
+    /// Optional source CIDR ("10.0.0.0/24"). Omitted when the rule is `from any`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    src: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -168,10 +171,14 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                     let proto = proto_str(r.proto.unwrap());
                     let action = action_str(r.action);
                     let log = r.log;
-                    r.port
-                        .unwrap()
-                        .ports()
-                        .map(move |port| PortRule { proto, port, action, log })
+                    let src = r.source.clone();
+                    r.port.unwrap().ports().map(move |port| PortRule {
+                        proto,
+                        port,
+                        action,
+                        log,
+                        src: src.clone(),
+                    })
                 })
                 .collect();
             Policy {
@@ -389,6 +396,37 @@ log = true
         assert!(wan.port_rules[0].log, "log flag should carry onto the port rule");
         let out = cfg.to_toml().unwrap();
         assert!(out.contains("log = true"), "log emitted to velstra config:\n{out}");
+    }
+
+    #[test]
+    fn rule_source_flows_onto_the_port_rule() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+[[interface]]
+name = "lan0"
+zone = "lan"
+[[rule]]
+name = "ssh-from-mgmt"
+from = "wan"
+to = "lan"
+action = "accept"
+proto = "tcp"
+port = 22
+source = "10.0.0.0/24"
+"#;
+        let cfg = compile(&Appliance::from_toml(toml).unwrap());
+        let wan = cfg.policies.iter().find(|p| p.name == "wan").unwrap();
+        assert_eq!(wan.port_rules.len(), 1);
+        assert_eq!(wan.port_rules[0].src.as_deref(), Some("10.0.0.0/24"));
+        let out = cfg.to_toml().unwrap();
+        assert!(
+            out.contains(r#"src = "10.0.0.0/24""#),
+            "source emitted to velstra config:\n{out}"
+        );
     }
 
     #[test]
