@@ -25,10 +25,18 @@
       url = "git+file:///home/mbrandt/01_repositories/velstra/fabric";
       flake = false;
     };
+    # The Wren routing daemon (BGP/OSPF/IS-IS/RIP/Babel/VRRP control plane).
+    # Source only — stable Rust, built with nixpkgs' rustc (no flake of its own).
+    # Local checkout while wren is developed alongside; switch to
+    # "github:Velstra/wren" once public. Uses wren's committed HEAD.
+    wren = {
+      url = "git+file:///home/mbrandt/01_repositories/wren";
+      flake = false;
+    };
   };
 
   outputs =
-    { self, nixpkgs, fenix, fabric }:
+    { self, nixpkgs, fenix, fabric, wren }:
     let
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
@@ -76,6 +84,26 @@
             --set SENTINEL_FINDMNT_BIN    ${pkgs.util-linux}/bin/findmnt \
             --prefix PATH : /run/wrappers/bin
         '';
+      };
+
+      # --- the Wren routing daemon (stable rustc; the `wren` binary) ----------
+      # Pure stable Rust, no codegen/build.rs, no git deps — a plain
+      # buildRustPackage over wren's committed source. The full daemon (all
+      # protocols) is built via the crate's default features. The resulting
+      # binary is named `wren` and serves both as the daemon and the `wren
+      # show …` client against its control socket.
+      wrenPkg = pkgs.rustPlatform.buildRustPackage {
+        pname = "wren";
+        version = "0.1.0";
+        src = wren;
+        cargoLock.lockFile = "${wren}/Cargo.lock";
+        cargoBuildFlags = [
+          "-p"
+          "wren-daemon"
+        ];
+        # Integration/live tests need root+netns; unit tests are pure. Keep the
+        # image build hermetic — the daemon is exercised by the checks.bgp VM.
+        doCheck = false;
       };
 
       # --- the velstra eBPF/XDP agent (needs nightly + rust-src + bpf-linker) -
@@ -140,7 +168,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-gNWOOF6CjDVITdQgLqIkqaBdo4Uwqk6xyJQgc8UWzTQ=";
+      ebpfHash = "sha256-MCO9Ffi1YM72dhyRFg7OSP3kDRr8nhoMBpJqaEzcTCo=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -235,6 +263,7 @@
       packages.${system} = {
         default = sentinel;
         inherit sentinel velstra velstra-ebpf;
+        wren = wrenPkg;
         # The flashable verified-boot disk image (dm-verity store + UKI). Note:
         # `finalImage` is the two-stage verity build with the roothash-bearing
         # UKI injected into the ESP; plain `image` is the unsealed single-pass
@@ -268,6 +297,7 @@
           imports = [
             ./nix/appliance.nix
             ./nix/velstra-service.nix
+            ./nix/wren-service.nix
           ];
           environment.systemPackages = [ sentinel ];
 
@@ -284,6 +314,13 @@
             inherit sentinel;
             appliance = factoryAppliance;
             interface = "eth0";
+          };
+
+          # The routing control plane. Config is compiled from the same appliance
+          # config by the sentinel-boot service (→ /run/sentinel/wren.toml).
+          services.wren = {
+            enable = true;
+            package = wrenPkg;
           };
         };
 
@@ -1155,12 +1192,18 @@
             fw.wait_for_unit("multi-user.target")
             fw.wait_for_unit("velstra.service")
             fw.wait_until_succeeds("ip addr show eth1 | grep -q 10.1.0.1", timeout=20)
+            client.wait_for_unit("multi-user.target")
+            client.wait_until_succeeds("ip addr show eth1 | grep -q 10.1.0.2", timeout=20)
 
             # Zone the WAN nic and add a reject rule for tcp/9999.
             fw.succeed(
                 "su admin -c \"printf '%s\\n' "
                 "'set interface eth1 zone wan' "
-                "'set firewall rule refuse from wan to wan action reject proto tcp port 9999' "
+                "'set firewall rule refuse from wan' "
+                "'set firewall rule refuse to wan' "
+                "'set firewall rule refuse action reject' "
+                "'set firewall rule refuse proto tcp' "
+                "'set firewall rule refuse port 9999' "
                 "commit save exit "
                 "| sentinel configure\""
             )
@@ -1170,12 +1213,15 @@
 
             # The headline: a connection to the rejected port comes back refused
             # (a RST) fast, not a timeout. curl reports "Connection refused" or
-            # "Connection reset" on a RST; a silent drop would instead time out
-            # (then the grep fails and the test fails).
-            client.succeed(
-                "curl -sS --max-time 4 -o /dev/null http://10.1.0.1:9999/ 2>&1 "
-                "| grep -qiE 'refused|reset'"
-            )
+            # "Connection reset" on a RST; a silent drop would instead time out.
+            # Retry so a SYN lost in the velstra reload window can't fail us.
+            def refused(_):
+                out = client.execute(
+                    "curl -sS --max-time 4 -o /dev/null http://10.1.0.1:9999/ 2>&1"
+                )[1].lower()
+                return "refused" in out or "reset" in out
+
+            retry(refused)
           '';
         };
 
@@ -1380,6 +1426,182 @@
             fw.fail("journalctl -u velstra.service | grep -q 'dport=9997'")
           '';
         };
+
+        # Non-TCP reject in the eBPF datapath: the fw's WAN zone REJECTs udp/9999.
+        # A UDP probe from the client must come back as an ICMP port-unreachable
+        # (type 3, code 3) — delivered to a connected UDP socket as ECONNREFUSED —
+        # proving the XDP path crafts and XDP_TX's a real ICMP error rather than
+        # black-holing the way a silent drop would (which would time out instead).
+        rejectudp = pkgs.testers.runNixOSTest {
+          name = "sentinel-rejectudp";
+          nodes = {
+            client =
+              { pkgs, ... }:
+              {
+                virtualisation.vlans = [ 1 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                  interfaces.eth1.ipv4.addresses = [
+                    {
+                      address = "10.1.0.2";
+                      prefixLength = 24;
+                    }
+                  ];
+                };
+                environment.systemPackages = [ pkgs.python3 ];
+              };
+            fw =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "fw";
+                networking.firewall.enable = lib.mkForce false;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = "10.1.0.1";
+                    prefixLength = 24;
+                  }
+                ];
+                virtualisation.vlans = [ 1 ];
+                virtualisation.memorySize = 2048;
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+          };
+          testScript = ''
+            start_all()
+            fw.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+            fw.wait_until_succeeds("ip addr show eth1 | grep -q 10.1.0.1", timeout=20)
+            client.wait_for_unit("multi-user.target")
+            client.wait_until_succeeds("ip addr show eth1 | grep -q 10.1.0.2", timeout=20)
+
+            # Zone the WAN nic and reject udp/9999.
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth1 zone wan' "
+                "'set firewall rule refuse-udp from wan' "
+                "'set firewall rule refuse-udp to wan' "
+                "'set firewall rule refuse-udp action reject' "
+                "'set firewall rule refuse-udp proto udp' "
+                "'set firewall rule refuse-udp port 9999' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            fw.wait_for_unit("velstra.service")
+            fw.succeed("grep -q reject /run/sentinel/velstra.toml")
+
+            # Probe: connect a UDP socket to the rejected port, send, then read. An
+            # ICMP port-unreachable is delivered to a connected UDP socket as
+            # ECONNREFUSED on the blocked recv; a silent drop would time out.
+            client.succeed(
+                "cat > /root/probe.py <<'PY'\n"
+                "import socket, sys\n"
+                "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"
+                "s.settimeout(3)\n"
+                "s.connect(('10.1.0.1', 9999))\n"
+                "s.send(b'x' * 40)\n"
+                "try:\n"
+                "    s.recv(200)\n"
+                "except ConnectionRefusedError:\n"
+                "    print('REFUSED'); sys.exit(0)\n"
+                "except OSError:\n"
+                "    print('TIMEOUT'); sys.exit(1)\n"
+                "sys.exit(1)\n"
+                "PY"
+            )
+
+            # The headline: the probe gets an ICMP-driven "connection refused". Re-run
+            # in a retry loop so a probe lost in the velstra reload window can't fail us.
+            def refused(_):
+                return "REFUSED" in client.execute("python3 /root/probe.py")[1]
+
+            retry(refused)
+          '';
+        };
+
+        # Routing: two Sentinel appliances peer eBGP and each learns the other's
+        # network — end-to-end proof that the Wren control plane is wired into the
+        # image (packaged, serviced, config-compiled from `set protocols …`) and
+        # programs the kernel FIB. bgp1 (AS 65001) originates 10.11.0.0/24, bgp2
+        # (AS 65002) originates 10.12.0.0/24; after the session establishes each
+        # installs the other's prefix `proto bgp` via the peer.
+        bgp =
+          let
+            node = hostname: addr: {
+              lib,
+              ...
+            }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce hostname;
+              networking.firewall.enable = lib.mkForce false;
+              networking.interfaces.eth1.ipv4.addresses = [
+                {
+                  address = addr;
+                  prefixLength = 24;
+                }
+              ];
+              virtualisation.vlans = [ 1 ];
+              virtualisation.memorySize = 2048;
+              services.velstra.interface = lib.mkForce "eth1";
+            };
+          in
+          pkgs.testers.runNixOSTest {
+            name = "sentinel-bgp";
+            nodes = {
+              bgp1 = node "bgp1" "10.10.0.1";
+              bgp2 = node "bgp2" "10.10.0.2";
+            };
+            testScript = ''
+              start_all()
+              for m in (bgp1, bgp2):
+                  m.wait_for_unit("multi-user.target")
+                  m.wait_for_unit("velstra.service")
+                  m.wait_for_unit("wren.service")
+              bgp1.wait_until_succeeds("ip addr show eth1 | grep -q 10.10.0.1", timeout=20)
+              bgp2.wait_until_succeeds("ip addr show eth1 | grep -q 10.10.0.2", timeout=20)
+
+              # Configure BGP on each node. default-action accept so the Velstra
+              # firewall (attached to eth1) passes the BGP session (tcp/179);
+              # zone eth1 so it is a proper firewalled interface.
+              def configure(m, myaddr, myas, mynet, peer, peeras):
+                  m.succeed(
+                      "su admin -c \"printf '%s\\n' "
+                      "'set firewall global default-action accept' "
+                      "'set interface eth1 zone wan' "
+                      f"'set protocols router-id {myaddr}' "
+                      f"'set protocols bgp local-as {myas}' "
+                      f"'set protocols bgp network {mynet}' "
+                      f"'set protocols bgp neighbor {peer} remote-as {peeras}' "
+                      "commit save exit "
+                      "| sentinel configure\""
+                  )
+                  m.wait_for_unit("wren.service")
+
+              configure(bgp1, "10.10.0.1", 65001, "10.11.0.0/24", "10.10.0.2", 65002)
+              configure(bgp2, "10.10.0.2", 65002, "10.12.0.0/24", "10.10.0.1", 65001)
+
+              # The compiled Wren config carries the BGP block.
+              bgp1.succeed("grep -q 'local-as = 65001' /run/sentinel/wren.toml")
+              bgp2.succeed("grep -q 'local-as = 65002' /run/sentinel/wren.toml")
+
+              # The headline: each router learns the OTHER's network over BGP and
+              # installs it into the kernel FIB (proto bgp) via the peer. BGP takes
+              # a little while to establish, so retry generously.
+              bgp1.wait_until_succeeds(
+                  "ip -4 route show proto bgp | grep -q '10.12.0.0/24'", timeout=90
+              )
+              bgp2.wait_until_succeeds(
+                  "ip -4 route show proto bgp | grep -q '10.11.0.0/24'", timeout=90
+              )
+
+              # And the operational `wren show` command works on the box, reporting
+              # the established session.
+              bgp1.succeed("wren show bgp neighbors | grep -qi established")
+            '';
+          };
       };
     };
 }
