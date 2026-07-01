@@ -122,6 +122,89 @@ pub struct Appliance {
     /// Omitted from saved configs when empty.
     #[serde(default, skip_serializing_if = "Nat::is_empty")]
     pub nat: Nat,
+    /// Dynamic routing (the Wren control plane): a router-id, static routes and
+    /// BGP. Compiled to `/run/sentinel/wren.toml` and served by `wren.service`;
+    /// operational state is inspected with `wren show …`. Omitted from saved
+    /// configs when nothing is configured.
+    #[serde(default, skip_serializing_if = "Protocols::is_empty")]
+    pub protocols: Protocols,
+}
+
+/// Dynamic routing configuration — the [`Protocols`] tree maps onto the Wren
+/// routing daemon's config (`router-id`, `[[static]]`, `[bgp]`). Kept as its own
+/// top-level category (like [`Nat`]) because routing is a distinct concern from
+/// filtering: Velstra moves/​filters packets, Wren computes the routes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Protocols {
+    /// The router id (a 32-bit id, written as an IPv4 address). Also the default
+    /// BGP router-id when `[protocols.bgp] router-id` is unset.
+    #[serde(default, rename = "router-id", skip_serializing_if = "Option::is_none")]
+    pub router_id: Option<String>,
+    /// Operator-configured static routes.
+    #[serde(default, rename = "static", skip_serializing_if = "Vec::is_empty")]
+    pub statics: Vec<StaticRoute>,
+    /// BGP-4 configuration, if the protocol is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bgp: Option<Bgp>,
+}
+
+impl Protocols {
+    /// True when no routing is configured — lets `[protocols]` be omitted.
+    pub fn is_empty(&self) -> bool {
+        self.router_id.is_none() && self.statics.is_empty() && self.bgp.is_none()
+    }
+}
+
+/// A static route: `prefix` reached `via` a gateway and/or out `dev` an
+/// interface, with an optional `metric`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StaticRoute {
+    /// Destination network in CIDR form (`"0.0.0.0/0"`, `"10.20.0.0/16"`).
+    pub prefix: String,
+    /// Next-hop gateway address. At least one of `via` / `dev` is required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
+    /// Outgoing interface for an on-link route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dev: Option<String>,
+    /// Route metric (lower wins). Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metric: Option<u32>,
+}
+
+/// BGP-4 configuration: the local AS, an optional router-id, originated
+/// networks, redistribution and the peer list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Bgp {
+    /// The local autonomous system number (32-bit / 4-octet ASN).
+    #[serde(rename = "local-as")]
+    pub local_as: u32,
+    /// BGP router-id; falls back to `[protocols] router-id` when unset.
+    #[serde(default, rename = "router-id", skip_serializing_if = "Option::is_none")]
+    pub router_id: Option<String>,
+    /// Prefixes originated into BGP (advertised to peers).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub network: Vec<String>,
+    /// Route sources redistributed into BGP (`"static"`, `"connected"`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redistribute: Vec<String>,
+    /// BGP peers.
+    #[serde(default, rename = "neighbor", skip_serializing_if = "Vec::is_empty")]
+    pub neighbors: Vec<BgpNeighbor>,
+}
+
+/// A BGP peer: its address and remote AS.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BgpNeighbor {
+    /// Peer IP address.
+    pub address: String,
+    /// The peer's autonomous system number.
+    #[serde(rename = "remote-as")]
+    pub remote_as: u32,
 }
 
 /// NAT — Network Address Translation. Kept separate from [`Firewall`] because it
@@ -608,6 +691,41 @@ impl Appliance {
             parse_host_port(&dst.to)
                 .with_context(|| format!("nat destination {:?}", dst.name))?;
         }
+
+        // Routing (Wren): validate router-id, static routes and BGP peers.
+        if let Some(rid) = &self.protocols.router_id {
+            validate_ipv4(rid).with_context(|| "protocols router-id")?;
+        }
+        for r in &self.protocols.statics {
+            validate_cidr_or_ip(&r.prefix)
+                .with_context(|| format!("protocols static route {:?}", r.prefix))?;
+            if r.via.is_none() && r.dev.is_none() {
+                bail!("protocols static route {:?}: needs a via <ip> or dev <if>", r.prefix);
+            }
+            if let Some(via) = &r.via {
+                validate_ipv4(via)
+                    .with_context(|| format!("protocols static route {:?} via", r.prefix))?;
+            }
+        }
+        if let Some(bgp) = &self.protocols.bgp {
+            if bgp.local_as == 0 {
+                bail!("protocols bgp: local-as must be non-zero");
+            }
+            if let Some(rid) = &bgp.router_id {
+                validate_ipv4(rid).with_context(|| "protocols bgp router-id")?;
+            }
+            for net in &bgp.network {
+                validate_cidr_or_ip(net)
+                    .with_context(|| format!("protocols bgp network {net:?}"))?;
+            }
+            for n in &bgp.neighbors {
+                validate_ipv4(&n.address)
+                    .with_context(|| format!("protocols bgp neighbor {:?}", n.address))?;
+                if n.remote_as == 0 {
+                    bail!("protocols bgp neighbor {:?}: remote-as must be non-zero", n.address);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -658,6 +776,13 @@ impl Appliance {
         }
         out
     }
+}
+
+/// Validate a bare IPv4 address (router-id, gateway, BGP peer — no prefix).
+fn validate_ipv4(s: &str) -> Result<()> {
+    s.parse::<Ipv4Addr>()
+        .with_context(|| format!("{s:?} is not an IPv4 address"))?;
+    Ok(())
 }
 
 /// Validate an interface address: `"dhcp"` or an IPv4 CIDR.

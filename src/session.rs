@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::config::{
-    Action, Appliance, Firewall, Interface, Nat, NatDestination, NatSource, PortSpec, Proto, Rule,
-    System, ZoneCfg,
+    Action, Appliance, Bgp, BgpNeighbor, Firewall, Interface, Nat, NatDestination, NatSource,
+    PortSpec, Proto, Protocols, Rule, StaticRoute, System, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -79,6 +79,36 @@ struct FirewallDraft {
     log: Option<bool>,
 }
 
+/// A partially-specified static route (keyed by its prefix).
+#[derive(Debug, Clone, Default)]
+struct StaticDraft {
+    via: Option<String>,
+    dev: Option<String>,
+    metric: Option<u32>,
+}
+
+/// The candidate's BGP configuration.
+#[derive(Debug, Clone, Default)]
+struct BgpDraft {
+    local_as: Option<u32>,
+    router_id: Option<String>,
+    network: Vec<String>,
+    redistribute: Vec<String>,
+    /// Peers, keyed by address → remote AS.
+    neighbors: Vec<(String, u32)>,
+}
+
+impl BgpDraft {
+    /// True when nothing has been set — lets `[protocols.bgp]` stay absent.
+    fn is_empty(&self) -> bool {
+        self.local_as.is_none()
+            && self.router_id.is_none()
+            && self.network.is_empty()
+            && self.redistribute.is_empty()
+            && self.neighbors.is_empty()
+    }
+}
+
 /// The candidate config — a draft with optional fields, keyed by name so list
 /// items (interfaces, rules) are addressable VyOS-"tag-node" style. Insertion
 /// order is preserved for stable `show` output.
@@ -91,6 +121,29 @@ struct Draft {
     rules: Vec<(String, RuleDraft)>,
     nat_source: Vec<(String, NatSrcDraft)>,
     nat_destination: Vec<(String, NatDstDraft)>,
+    router_id: Option<String>,
+    statics: Vec<(String, StaticDraft)>,
+    bgp: BgpDraft,
+}
+
+impl Draft {
+    /// Mutable access to the static route with `prefix`, inserting it if new.
+    fn static_mut(&mut self, prefix: &str) -> &mut StaticDraft {
+        if let Some(i) = self.statics.iter().position(|(p, _)| p == prefix) {
+            return &mut self.statics[i].1;
+        }
+        self.statics.push((prefix.to_string(), StaticDraft::default()));
+        &mut self.statics.last_mut().unwrap().1
+    }
+
+    /// Set the remote AS of the BGP peer `addr`, inserting it if new.
+    fn bgp_neighbor_set(&mut self, addr: &str, remote_as: u32) {
+        if let Some(i) = self.bgp.neighbors.iter().position(|(a, _)| a == addr) {
+            self.bgp.neighbors[i].1 = remote_as;
+        } else {
+            self.bgp.neighbors.push((addr.to_string(), remote_as));
+        }
+    }
 }
 
 impl Draft {
@@ -214,6 +267,38 @@ impl Draft {
                     )
                 })
                 .collect(),
+            router_id: a.protocols.router_id.clone(),
+            statics: a
+                .protocols
+                .statics
+                .iter()
+                .map(|s| {
+                    (
+                        s.prefix.clone(),
+                        StaticDraft {
+                            via: s.via.clone(),
+                            dev: s.dev.clone(),
+                            metric: s.metric,
+                        },
+                    )
+                })
+                .collect(),
+            bgp: a
+                .protocols
+                .bgp
+                .as_ref()
+                .map(|b| BgpDraft {
+                    local_as: Some(b.local_as),
+                    router_id: b.router_id.clone(),
+                    network: b.network.clone(),
+                    redistribute: b.redistribute.clone(),
+                    neighbors: b
+                        .neighbors
+                        .iter()
+                        .map(|n| (n.address.clone(), n.remote_as))
+                        .collect(),
+                })
+                .unwrap_or_default(),
         }
     }
 }
@@ -411,6 +496,44 @@ impl Session {
                 crate::config::parse_host_port(v)?;
                 self.draft.nat_destination_mut(name).to = Some((*v).to_string());
             }
+
+            // protocols: dynamic routing (the Wren control plane).
+            ["protocols", "router-id", v] => {
+                self.draft.router_id = Some((*v).to_string());
+            }
+            ["protocols", "static", prefix, "via", v] => {
+                self.draft.static_mut(prefix).via = Some((*v).to_string());
+            }
+            ["protocols", "static", prefix, "dev", v] => {
+                self.draft.static_mut(prefix).dev = Some((*v).to_string());
+            }
+            ["protocols", "static", prefix, "metric", v] => {
+                self.draft.static_mut(prefix).metric =
+                    Some(v.parse().with_context(|| format!("invalid metric {v:?}"))?);
+            }
+            ["protocols", "bgp", "local-as", v] => {
+                self.draft.bgp.local_as =
+                    Some(v.parse().with_context(|| format!("invalid AS {v:?}"))?);
+            }
+            ["protocols", "bgp", "router-id", v] => {
+                self.draft.bgp.router_id = Some((*v).to_string());
+            }
+            ["protocols", "bgp", "network", v] => {
+                let net = (*v).to_string();
+                if !self.draft.bgp.network.contains(&net) {
+                    self.draft.bgp.network.push(net);
+                }
+            }
+            ["protocols", "bgp", "redistribute", v] => {
+                let src = (*v).to_string();
+                if !self.draft.bgp.redistribute.contains(&src) {
+                    self.draft.bgp.redistribute.push(src);
+                }
+            }
+            ["protocols", "bgp", "neighbor", addr, "remote-as", v] => {
+                let remote_as = v.parse().with_context(|| format!("invalid AS {v:?}"))?;
+                self.draft.bgp_neighbor_set(addr, remote_as);
+            }
             _ => bail!(
                 "unknown set path. The config tree (Tab/`?` explores each level):\n  \
                  set system hostname <name>\n  \
@@ -427,7 +550,11 @@ impl Session {
                  set firewall rule <name> action <accept|drop|reject>\n  \
                  set firewall rule <name> <proto tcp|udp | port <n|lo-hi> | log <true|false> | source <cidr>>\n  \
                  set nat source <name> zone <zone>\n  \
-                 set nat destination <name> <zone <z> | proto <p> | port <n> | to <ip[:port]>>"
+                 set nat destination <name> <zone <z> | proto <p> | port <n> | to <ip[:port]>>\n  \
+                 set protocols router-id <ip>\n  \
+                 set protocols static <prefix> <via <ip> | dev <if> | metric <n>>\n  \
+                 set protocols bgp <local-as <n> | router-id <ip> | network <prefix> | redistribute <src>>\n  \
+                 set protocols bgp neighbor <ip> remote-as <n>"
             ),
         }
         self.dirty = true;
@@ -550,6 +677,35 @@ impl Session {
                     "port" => d.port = None,
                     "to" => d.to = None,
                     other => bail!("nat destination has no field {other:?}"),
+                }
+            }
+
+            // protocols: dynamic routing (Wren).
+            ["protocols"] => self.draft.router_id = None,
+            ["protocols", "router-id"] => self.draft.router_id = None,
+            ["protocols", "static", prefix] => {
+                let before = self.draft.statics.len();
+                self.draft.statics.retain(|(p, _)| p != prefix);
+                if self.draft.statics.len() == before {
+                    bail!("no static route {prefix:?}");
+                }
+            }
+            ["protocols", "bgp"] => self.draft.bgp = BgpDraft::default(),
+            ["protocols", "bgp", "neighbor", addr] => {
+                let before = self.draft.bgp.neighbors.len();
+                self.draft.bgp.neighbors.retain(|(a, _)| a != addr);
+                if self.draft.bgp.neighbors.len() == before {
+                    bail!("no bgp neighbor {addr:?}");
+                }
+            }
+            ["protocols", "bgp", field] => {
+                let b = &mut self.draft.bgp;
+                match *field {
+                    "local-as" => b.local_as = None,
+                    "router-id" => b.router_id = None,
+                    "network" => b.network.clear(),
+                    "redistribute" => b.redistribute.clear(),
+                    other => bail!("bgp has no field {other:?}"),
                 }
             }
             _ => bail!("unknown delete path"),
@@ -728,6 +884,48 @@ impl Session {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        // protocols: dynamic routing (Wren).
+        let statics = self
+            .draft
+            .statics
+            .iter()
+            .map(|(prefix, d)| StaticRoute {
+                prefix: prefix.clone(),
+                via: d.via.clone(),
+                dev: d.dev.clone(),
+                metric: d.metric,
+            })
+            .collect();
+        let bgp = if self.draft.bgp.is_empty() {
+            None
+        } else {
+            Some(Bgp {
+                local_as: self
+                    .draft
+                    .bgp
+                    .local_as
+                    .ok_or_else(|| anyhow::anyhow!("protocols bgp: local-as not set"))?,
+                router_id: self.draft.bgp.router_id.clone(),
+                network: self.draft.bgp.network.clone(),
+                redistribute: self.draft.bgp.redistribute.clone(),
+                neighbors: self
+                    .draft
+                    .bgp
+                    .neighbors
+                    .iter()
+                    .map(|(address, remote_as)| BgpNeighbor {
+                        address: address.clone(),
+                        remote_as: *remote_as,
+                    })
+                    .collect(),
+            })
+        };
+        let protocols = Protocols {
+            router_id: self.draft.router_id.clone(),
+            statics,
+            bgp,
+        };
+
         let appliance = Appliance {
             system: System { hostname },
             firewall,
@@ -738,6 +936,7 @@ impl Session {
                 source: nat_source,
                 destination: nat_destination,
             },
+            protocols,
         };
         appliance.validate()?;
         Ok(appliance)
@@ -926,6 +1125,49 @@ fn render_draft(draft: &Draft, skip_empty_ifaces: bool) -> String {
     if !nati.is_empty() {
         out.push_str("nat {\n");
         out.push_str(&nati);
+        out.push_str("}\n");
+    }
+
+    // protocols { … } — dynamic routing (Wren).
+    let mut proto = String::new();
+    if let Some(rid) = &draft.router_id {
+        proto.push_str(&format!("    router-id {rid}\n"));
+    }
+    for (prefix, s) in &draft.statics {
+        proto.push_str(&format!("    static {prefix} {{\n"));
+        if let Some(v) = &s.via {
+            proto.push_str(&format!("        via {v}\n"));
+        }
+        if let Some(d) = &s.dev {
+            proto.push_str(&format!("        dev {d}\n"));
+        }
+        if let Some(m) = s.metric {
+            proto.push_str(&format!("        metric {m}\n"));
+        }
+        proto.push_str("    }\n");
+    }
+    if !draft.bgp.is_empty() {
+        proto.push_str("    bgp {\n");
+        if let Some(a) = draft.bgp.local_as {
+            proto.push_str(&format!("        local-as {a}\n"));
+        }
+        if let Some(rid) = &draft.bgp.router_id {
+            proto.push_str(&format!("        router-id {rid}\n"));
+        }
+        for net in &draft.bgp.network {
+            proto.push_str(&format!("        network {net}\n"));
+        }
+        for src in &draft.bgp.redistribute {
+            proto.push_str(&format!("        redistribute {src}\n"));
+        }
+        for (addr, remote_as) in &draft.bgp.neighbors {
+            proto.push_str(&format!("        neighbor {addr} remote-as {remote_as}\n"));
+        }
+        proto.push_str("    }\n");
+    }
+    if !proto.is_empty() {
+        out.push_str("protocols {\n");
+        out.push_str(&proto);
         out.push_str("}\n");
     }
 
