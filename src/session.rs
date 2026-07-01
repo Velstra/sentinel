@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::{
     Action, Appliance, Bgp, BgpNeighbor, Firewall, Interface, Nat, NatDestination, NatSource,
-    PortSpec, Proto, Protocols, Rule, StaticRoute, System, ZoneCfg,
+    Ospf, PortSpec, Proto, Protocols, Rule, StaticRoute, System, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -109,6 +109,27 @@ impl BgpDraft {
     }
 }
 
+/// The candidate's OSPFv2 configuration.
+#[derive(Debug, Clone, Default)]
+struct OspfDraft {
+    interfaces: Vec<String>,
+    area: Option<String>,
+    cost: Option<u16>,
+    network_type: Option<String>,
+    redistribute: Vec<String>,
+}
+
+impl OspfDraft {
+    /// True when nothing has been set — lets `[protocols.ospf]` stay absent.
+    fn is_empty(&self) -> bool {
+        self.interfaces.is_empty()
+            && self.area.is_none()
+            && self.cost.is_none()
+            && self.network_type.is_none()
+            && self.redistribute.is_empty()
+    }
+}
+
 /// The candidate config — a draft with optional fields, keyed by name so list
 /// items (interfaces, rules) are addressable VyOS-"tag-node" style. Insertion
 /// order is preserved for stable `show` output.
@@ -123,6 +144,7 @@ struct Draft {
     nat_destination: Vec<(String, NatDstDraft)>,
     router_id: Option<String>,
     statics: Vec<(String, StaticDraft)>,
+    ospf: OspfDraft,
     bgp: BgpDraft,
 }
 
@@ -283,6 +305,18 @@ impl Draft {
                     )
                 })
                 .collect(),
+            ospf: a
+                .protocols
+                .ospf
+                .as_ref()
+                .map(|o| OspfDraft {
+                    interfaces: o.interfaces.clone(),
+                    area: o.area.clone(),
+                    cost: o.cost,
+                    network_type: o.network_type.clone(),
+                    redistribute: o.redistribute.clone(),
+                })
+                .unwrap_or_default(),
             bgp: a
                 .protocols
                 .bgp
@@ -534,6 +568,28 @@ impl Session {
                 let remote_as = v.parse().with_context(|| format!("invalid AS {v:?}"))?;
                 self.draft.bgp_neighbor_set(addr, remote_as);
             }
+            ["protocols", "ospf", "interface", v] => {
+                let iface = (*v).to_string();
+                if !self.draft.ospf.interfaces.contains(&iface) {
+                    self.draft.ospf.interfaces.push(iface);
+                }
+            }
+            ["protocols", "ospf", "area", v] => {
+                self.draft.ospf.area = Some((*v).to_string());
+            }
+            ["protocols", "ospf", "cost", v] => {
+                self.draft.ospf.cost =
+                    Some(v.parse().with_context(|| format!("invalid cost {v:?}"))?);
+            }
+            ["protocols", "ospf", "network-type", v] => {
+                self.draft.ospf.network_type = Some((*v).to_string());
+            }
+            ["protocols", "ospf", "redistribute", v] => {
+                let src = (*v).to_string();
+                if !self.draft.ospf.redistribute.contains(&src) {
+                    self.draft.ospf.redistribute.push(src);
+                }
+            }
             _ => bail!(
                 "unknown set path. The config tree (Tab/`?` explores each level):\n  \
                  set system hostname <name>\n  \
@@ -554,7 +610,8 @@ impl Session {
                  set protocols router-id <ip>\n  \
                  set protocols static <prefix> <via <ip> | dev <if> | metric <n>>\n  \
                  set protocols bgp <local-as <n> | router-id <ip> | network <prefix> | redistribute <src>>\n  \
-                 set protocols bgp neighbor <ip> remote-as <n>"
+                 set protocols bgp neighbor <ip> remote-as <n>\n  \
+                 set protocols ospf <interface <if> | area <id> | cost <n> | network-type <broadcast|point-to-point> | redistribute <src>>"
             ),
         }
         self.dirty = true;
@@ -706,6 +763,18 @@ impl Session {
                     "network" => b.network.clear(),
                     "redistribute" => b.redistribute.clear(),
                     other => bail!("bgp has no field {other:?}"),
+                }
+            }
+            ["protocols", "ospf"] => self.draft.ospf = OspfDraft::default(),
+            ["protocols", "ospf", field] => {
+                let o = &mut self.draft.ospf;
+                match *field {
+                    "interface" => o.interfaces.clear(),
+                    "area" => o.area = None,
+                    "cost" => o.cost = None,
+                    "network-type" => o.network_type = None,
+                    "redistribute" => o.redistribute.clear(),
+                    other => bail!("ospf has no field {other:?}"),
                 }
             }
             _ => bail!("unknown delete path"),
@@ -920,9 +989,21 @@ impl Session {
                     .collect(),
             })
         };
+        let ospf = if self.draft.ospf.is_empty() {
+            None
+        } else {
+            Some(Ospf {
+                interfaces: self.draft.ospf.interfaces.clone(),
+                area: self.draft.ospf.area.clone(),
+                cost: self.draft.ospf.cost,
+                network_type: self.draft.ospf.network_type.clone(),
+                redistribute: self.draft.ospf.redistribute.clone(),
+            })
+        };
         let protocols = Protocols {
             router_id: self.draft.router_id.clone(),
             statics,
+            ospf,
             bgp,
         };
 
@@ -1143,6 +1224,25 @@ fn render_draft(draft: &Draft, skip_empty_ifaces: bool) -> String {
         }
         if let Some(m) = s.metric {
             proto.push_str(&format!("        metric {m}\n"));
+        }
+        proto.push_str("    }\n");
+    }
+    if !draft.ospf.is_empty() {
+        proto.push_str("    ospf {\n");
+        if let Some(a) = &draft.ospf.area {
+            proto.push_str(&format!("        area {a}\n"));
+        }
+        for iface in &draft.ospf.interfaces {
+            proto.push_str(&format!("        interface {iface}\n"));
+        }
+        if let Some(c) = draft.ospf.cost {
+            proto.push_str(&format!("        cost {c}\n"));
+        }
+        if let Some(nt) = &draft.ospf.network_type {
+            proto.push_str(&format!("        network-type {nt}\n"));
+        }
+        for src in &draft.ospf.redistribute {
+            proto.push_str(&format!("        redistribute {src}\n"));
         }
         proto.push_str("    }\n");
     }

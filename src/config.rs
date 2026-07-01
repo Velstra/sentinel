@@ -144,6 +144,9 @@ pub struct Protocols {
     /// Operator-configured static routes.
     #[serde(default, rename = "static", skip_serializing_if = "Vec::is_empty")]
     pub statics: Vec<StaticRoute>,
+    /// OSPFv2 configuration, if the protocol is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ospf: Option<Ospf>,
     /// BGP-4 configuration, if the protocol is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bgp: Option<Bgp>,
@@ -152,8 +155,37 @@ pub struct Protocols {
 impl Protocols {
     /// True when no routing is configured — lets `[protocols]` be omitted.
     pub fn is_empty(&self) -> bool {
-        self.router_id.is_none() && self.statics.is_empty() && self.bgp.is_none()
+        self.router_id.is_none()
+            && self.statics.is_empty()
+            && self.ospf.is_none()
+            && self.bgp.is_none()
     }
+}
+
+/// OSPFv2 configuration: a single area whose interfaces run OSPF, with optional
+/// cost / network-type and redistribution. The router-id is the global
+/// `[protocols] router-id`. (Multi-area / stub / NSSA are supported by the Wren
+/// daemon but not yet surfaced here.)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Ospf {
+    /// Interfaces OSPF runs on (all in [`Ospf::area`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interfaces: Vec<String>,
+    /// The area these interfaces belong to (dotted quad, e.g. `"0.0.0.0"`).
+    /// Defaults to the backbone `0.0.0.0` when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub area: Option<String>,
+    /// The output cost advertised for these interfaces (lower is preferred).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<u16>,
+    /// Network type: `"broadcast"` (elects a DR) or `"point-to-point"`.
+    #[serde(default, rename = "network-type", skip_serializing_if = "Option::is_none")]
+    pub network_type: Option<String>,
+    /// Route sources redistributed into OSPF as AS-external LSAs (`"static"`,
+    /// `"connected"`, `"bgp"`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redistribute: Vec<String>,
 }
 
 /// A static route: `prefix` reached `via` a gateway and/or out `dev` an
@@ -723,6 +755,18 @@ impl Appliance {
                     .with_context(|| format!("protocols bgp neighbor {:?}", n.address))?;
                 if n.remote_as == 0 {
                     bail!("protocols bgp neighbor {:?}: remote-as must be non-zero", n.address);
+                }
+            }
+        }
+        if let Some(ospf) = &self.protocols.ospf {
+            if let Some(area) = &ospf.area {
+                validate_ipv4(area).with_context(|| "protocols ospf area (dotted quad)")?;
+            }
+            if let Some(nt) = &ospf.network_type {
+                if nt != "broadcast" && nt != "point-to-point" {
+                    bail!(
+                        "protocols ospf network-type {nt:?}: expected \"broadcast\" or \"point-to-point\""
+                    );
                 }
             }
         }
