@@ -1620,6 +1620,88 @@
               bgp1.succeed("wren show bgp neighbors | grep -qi established")
             '';
           };
+
+        # Routing: two Sentinel appliances form an OSPFv2 point-to-point adjacency
+        # and each learns the other's redistributed network — proof the Wren OSPF
+        # path is wired through the same `set protocols …` CLI. ospf1 originates
+        # 10.11.0.0/24 (a static, redistributed into OSPF), ospf2 originates
+        # 10.12.0.0/24; after the adjacency reaches Full each installs the other's
+        # prefix `proto ospf`.
+        ospf =
+          let
+            node = hostname: addr: {
+              lib,
+              ...
+            }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce hostname;
+              networking.firewall.enable = lib.mkForce false;
+              networking.interfaces.eth1.ipv4.addresses = [
+                {
+                  address = addr;
+                  prefixLength = 24;
+                }
+              ];
+              virtualisation.vlans = [ 1 ];
+              virtualisation.memorySize = 2048;
+              services.velstra.interface = lib.mkForce "eth1";
+            };
+          in
+          pkgs.testers.runNixOSTest {
+            name = "sentinel-ospf";
+            nodes = {
+              ospf1 = node "ospf1" "10.10.0.1";
+              ospf2 = node "ospf2" "10.10.0.2";
+            };
+            testScript = ''
+              start_all()
+              for m in (ospf1, ospf2):
+                  m.wait_for_unit("multi-user.target")
+                  m.wait_for_unit("velstra.service")
+                  m.wait_for_unit("wren.service")
+              ospf1.wait_until_succeeds("ip addr show eth1 | grep -q 10.10.0.1", timeout=20)
+              ospf2.wait_until_succeeds("ip addr show eth1 | grep -q 10.10.0.2", timeout=20)
+
+              # Configure OSPF on each node. default-action accept so the Velstra
+              # firewall passes OSPF's multicast (IP proto 89). Each originates a
+              # unique network as a static, redistributed into OSPF.
+              def configure(m, myaddr, mynet):
+                  m.succeed(
+                      "su admin -c \"printf '%s\\n' "
+                      "'set firewall global default-action accept' "
+                      "'set interface eth1 zone wan' "
+                      f"'set protocols router-id {myaddr}' "
+                      f"'set protocols static {mynet} dev lo' "
+                      "'set protocols ospf interface eth1' "
+                      "'set protocols ospf area 0.0.0.0' "
+                      "'set protocols ospf network-type point-to-point' "
+                      "'set protocols ospf redistribute static' "
+                      "commit save exit "
+                      "| sentinel configure\""
+                  )
+                  m.wait_for_unit("wren.service")
+
+              configure(ospf1, "10.10.0.1", "10.11.0.0/24")
+              configure(ospf2, "10.10.0.2", "10.12.0.0/24")
+
+              # The compiled Wren config carries the OSPF block.
+              ospf1.succeed("grep -q '\\[ospf\\]' /run/sentinel/wren.toml")
+
+              # The headline: each router learns the OTHER's network over OSPF and
+              # installs it into the kernel FIB (proto ospf). Adjacency + SPF take a
+              # little while, so retry generously.
+              ospf1.wait_until_succeeds(
+                  "ip -4 route show proto ospf | grep -q '10.12.0.0/24'", timeout=120
+              )
+              ospf2.wait_until_succeeds(
+                  "ip -4 route show proto ospf | grep -q '10.11.0.0/24'", timeout=120
+              )
+
+              # And the adjacency is Full.
+              ospf1.succeed("wren show ospf neighbors | grep -qi full")
+            '';
+          };
       };
     };
 }
