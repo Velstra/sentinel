@@ -447,6 +447,10 @@ pub struct Rule {
     /// A single port (`port = 443`) or an inclusive range (`port = "8000-8100"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<PortSpec>,
+    /// Log packets matching this (port) rule, independent of the zone's `log`.
+    /// Off by default; only meaningful on a port rule.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub log: bool,
 }
 
 impl Rule {

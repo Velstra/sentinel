@@ -38,6 +38,7 @@ struct RuleDraft {
     action: Option<Action>,
     proto: Option<Proto>,
     port: Option<PortSpec>,
+    log: Option<bool>,
 }
 
 /// A partially-specified source-NAT (masquerade) rule.
@@ -184,6 +185,7 @@ impl Draft {
                             action: Some(r.action),
                             proto: r.proto,
                             port: r.port,
+                            log: Some(r.log),
                         },
                     )
                 })
@@ -378,6 +380,9 @@ impl Session {
             ["firewall", "rule", name, "port", v] => {
                 self.draft.rule_mut(name).port = Some(PortSpec::parse(v)?);
             }
+            ["firewall", "rule", name, "log", v] => {
+                self.draft.rule_mut(name).log = Some(parse_bool(v)?)
+            }
 
             // --- nat { … } — address translation, its own top-level node ---
 
@@ -415,7 +420,7 @@ impl Session {
                  set firewall zone <name> block <IP|CIDR>\n  \
                  set firewall rule <name> <from|to> <zone>\n  \
                  set firewall rule <name> action <accept|drop|reject>\n  \
-                 set firewall rule <name> <proto tcp|udp | port <n|lo-hi>>\n  \
+                 set firewall rule <name> <proto tcp|udp | port <n|lo-hi> | log <true|false>>\n  \
                  set nat source <name> zone <zone>\n  \
                  set nat destination <name> <zone <z> | proto <p> | port <n> | to <ip[:port]>>"
             ),
@@ -506,6 +511,7 @@ impl Session {
                     "action" => r.action = None,
                     "proto" => r.proto = None,
                     "port" => r.port = None,
+                    "log" => r.log = None,
                     other => bail!("rule has no field {other:?}"),
                 }
             }
@@ -648,6 +654,7 @@ impl Session {
                         .ok_or_else(|| anyhow::anyhow!("rule {name:?}: action not set"))?,
                     proto: d.proto,
                     port: d.port,
+                    log: d.log.unwrap_or(false),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -868,6 +875,9 @@ fn render_draft(draft: &Draft, skip_empty_ifaces: bool) -> String {
         }
         if let Some(p) = r.port {
             fwi.push_str(&format!("        port {p}\n"));
+        }
+        if let Some(l) = r.log {
+            fwi.push_str(&format!("        log {l}\n"));
         }
         fwi.push_str("    }\n");
     }

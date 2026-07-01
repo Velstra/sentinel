@@ -140,7 +140,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-Lr30Kh34rlSLXymO/dusmWVQVwTI2AR8t+Z7HjpVVoc=";
+      ebpfHash = "sha256-FrYEmhdXrtq+8C3Ck2kOUBnhjK9dZ4QH4eTLQSVl7mg=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -1176,6 +1176,112 @@
                 "curl -sS --max-time 4 -o /dev/null http://10.1.0.1:9999/ 2>&1 "
                 "| grep -qiE 'refused|reset'"
             )
+          '';
+        };
+
+        # Per-rule logging in the eBPF datapath: a 2-node client — fw. The fw's
+        # WAN zone has TWO logged rules (a drop on tcp/9999, a pass on tcp/9997)
+        # while the policy-wide log is OFF. Traffic to those ports must appear in
+        # the agent's journal (DROP/ALLOW via aya-log), proving a rule's own log
+        # bit logs independently of the policy flag — and a default-dropped port
+        # with no rule (9998) must stay silent.
+        log = pkgs.testers.runNixOSTest {
+          name = "sentinel-log";
+          nodes = {
+            client =
+              { pkgs, ... }:
+              {
+                virtualisation.vlans = [ 1 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                  interfaces.eth1.ipv4.addresses = [
+                    {
+                      address = "10.1.0.2";
+                      prefixLength = 24;
+                    }
+                  ];
+                };
+                environment.systemPackages = [ pkgs.curl ];
+              };
+            fw =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "fw";
+                networking.firewall.enable = lib.mkForce false;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = "10.1.0.1";
+                    prefixLength = 24;
+                  }
+                ];
+                virtualisation.vlans = [ 1 ];
+                virtualisation.memorySize = 2048;
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+          };
+          testScript = ''
+            start_all()
+            fw.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+            fw.wait_until_succeeds("ip addr show eth1 | grep -q 10.1.0.1", timeout=20)
+
+            # The client must be network-ready before it can generate any traffic:
+            # a single fire-and-forget curl issued before its NIC is up sends
+            # nothing, so the eBPF would never see a packet to log.
+            client.wait_for_unit("multi-user.target")
+            client.wait_until_succeeds("ip addr show eth1 | grep -q 10.1.0.2", timeout=20)
+
+            # Zone the WAN nic; add a logged DROP on tcp/9999 and a logged PASS on
+            # tcp/9997. The policy-wide log is left off, so anything that appears
+            # in the journal got there via the rule's own log bit.
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth1 zone wan' "
+                "'set firewall rule watch-drop from wan' "
+                "'set firewall rule watch-drop to wan' "
+                "'set firewall rule watch-drop action drop' "
+                "'set firewall rule watch-drop proto tcp' "
+                "'set firewall rule watch-drop port 9999' "
+                "'set firewall rule watch-drop log true' "
+                "'set firewall rule watch-pass from wan' "
+                "'set firewall rule watch-pass to wan' "
+                "'set firewall rule watch-pass action accept' "
+                "'set firewall rule watch-pass proto tcp' "
+                "'set firewall rule watch-pass port 9997' "
+                "'set firewall rule watch-pass log true' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            fw.wait_for_unit("velstra.service")
+            # The compiled config carries the per-rule log flag.
+            fw.succeed("grep -q 'log = true' /run/sentinel/velstra.toml")
+
+            # Generate traffic the rules match, repeatedly, until the eBPF has
+            # logged both matches. Firing once is racy: the DROP'd SYN gets no
+            # reply (curl times out — expected), and a single SYN can be lost in
+            # the brief velstra reload/re-attach window, so we re-send on every
+            # retry. The PASS'd port reaches the closed local port and the kernel
+            # RSTs it; either way the eBPF logs the match via aya-log.
+            def hit(_):
+                client.execute("curl -s --max-time 2 -o /dev/null http://10.1.0.1:9999/ || true")
+                client.execute("curl -s --max-time 2 -o /dev/null http://10.1.0.1:9997/ || true")
+                # A default-dropped port with no rule: must stay silent.
+                client.execute("curl -s --max-time 2 -o /dev/null http://10.1.0.1:9998/ || true")
+                return (
+                    fw.execute("journalctl -u velstra.service | grep -qE 'DROP .*dport=9999'")[0] == 0
+                    and fw.execute("journalctl -u velstra.service | grep -qE 'ALLOW .*dport=9997'")[0] == 0
+                )
+
+            # The headline: the agent journal shows the logged DROP and ALLOW for
+            # the two rules' ports, via the eBPF aya-log path — proving a rule's
+            # own log bit logs independently of the (here-off) policy-wide flag.
+            retry(hit)
+
+            # The un-ruled default-dropped port produced no log line.
+            fw.fail("journalctl -u velstra.service | grep -q 'dport=9998'")
           '';
         };
       };
