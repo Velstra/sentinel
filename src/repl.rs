@@ -16,6 +16,10 @@ use crate::{compile, session::Session, system};
 pub const DEFAULT_VELSTRA_OUT: &str = "/run/sentinel/velstra.toml";
 /// The systemd unit running the data plane.
 pub const DEFAULT_UNIT: &str = "velstra.service";
+/// Where the Wren routing daemon reads its compiled config from.
+pub const DEFAULT_WREN_OUT: &str = "/run/sentinel/wren.toml";
+/// The systemd unit running the routing daemon.
+pub const DEFAULT_WREN_UNIT: &str = "wren.service";
 
 /// How `commit` applies the validated config to the running system.
 pub struct Apply {
@@ -23,6 +27,10 @@ pub struct Apply {
     pub velstra_out: PathBuf,
     /// The systemd unit running the data plane (reloaded after writing).
     pub unit: String,
+    /// Where to write the compiled Wren routing config.
+    pub wren_out: PathBuf,
+    /// The systemd unit running the routing daemon (reloaded after writing).
+    pub wren_unit: String,
     /// Whether to actually touch the live system. Off-box / in tests this is
     /// false: `commit` validates + saves only.
     pub enabled: bool,
@@ -35,6 +43,8 @@ impl Apply {
         Self {
             velstra_out: PathBuf::from(DEFAULT_VELSTRA_OUT),
             unit: DEFAULT_UNIT.to_string(),
+            wren_out: PathBuf::from(DEFAULT_WREN_OUT),
+            wren_unit: DEFAULT_WREN_UNIT.to_string(),
             enabled: false,
         }
     }
@@ -141,6 +151,16 @@ fn apply_live(appliance: &crate::config::Appliance, act: &Apply) -> Result<()> {
     std::fs::rename(&tmp, &act.velstra_out)?;
     system::reload_velstra(&act.unit)?;
 
+    // Routing: compile -> atomically install -> reload the Wren daemon.
+    let wren_rendered = crate::wren::compile_wren(appliance).to_toml()?;
+    if let Some(parent) = act.wren_out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let wren_tmp = act.wren_out.with_extension("toml.tmp");
+    std::fs::write(&wren_tmp, &wren_rendered)?;
+    std::fs::rename(&wren_tmp, &act.wren_out)?;
+    system::reload_velstra(&act.wren_unit)?;
+
     // Hostname: set it live.
     system::set_hostname(&appliance.system.hostname)?;
     // Interface addressing: render + apply networkd units live.
@@ -194,6 +214,29 @@ const TOP: &[Cand] = &[
     ("interface", "per-NIC zone, address, VLAN"),
     ("firewall", "packet filtering: global defaults, zones, rules"),
     ("nat", "address translation: source (masquerade), destination (port-forward)"),
+    ("protocols", "dynamic routing: router-id, static routes, BGP"),
+];
+// `protocols <Tab>` reveals the routing sub-tree (compiled to the Wren daemon).
+const PROTOCOLS_NODES: &[Cand] = &[
+    ("router-id", "the 32-bit router id (an IPv4 address)"),
+    ("static", "a static route (<prefix> via <ip> | dev <if>)"),
+    ("bgp", "BGP-4: local-as, networks, neighbors"),
+];
+const STATIC_FIELDS: &[Cand] = &[
+    ("via", "next-hop gateway IP"),
+    ("dev", "outgoing interface (on-link route)"),
+    ("metric", "route metric (lower wins)"),
+];
+const BGP_FIELDS: &[Cand] = &[
+    ("local-as", "this router's AS number"),
+    ("router-id", "BGP router-id (defaults to protocols router-id)"),
+    ("network", "a prefix to originate/advertise"),
+    ("redistribute", "inject a route source (static / connected)"),
+    ("neighbor", "a BGP peer (<ip> remote-as <n>)"),
+];
+const REDIST: &[Cand] = &[
+    ("static", "redistribute static routes"),
+    ("connected", "redistribute connected (interface) routes"),
 ];
 // `firewall <Tab>` reveals the three firewall sub-trees (NAT lives at top level).
 const FIREWALL_NODES: &[Cand] = &[
@@ -281,6 +324,12 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "nat", "source", _name] => NAT_SOURCE_FIELDS,
         ["set" | "delete", "nat", "destination", _name] => NAT_DEST_FIELDS,
         ["set", "nat", "destination", _name, "proto"] => PROTOS,
+
+        // The protocols (routing) sub-tree.
+        ["set" | "delete", "protocols"] => PROTOCOLS_NODES,
+        ["set" | "delete", "protocols", "static", _prefix] => STATIC_FIELDS,
+        ["set" | "delete", "protocols", "bgp"] => BGP_FIELDS,
+        ["set", "protocols", "bgp", "redistribute"] => REDIST,
         _ => &[],
     }
 }
@@ -454,7 +503,7 @@ mod tests {
             kw(&[]),
             ["set", "delete", "show", "compare", "commit", "save", "discard", "exit", "help"]
         );
-        assert_eq!(kw(&["set"]), ["system", "interface", "firewall", "nat"]);
+        assert_eq!(kw(&["set"]), ["system", "interface", "firewall", "nat", "protocols"]);
         assert_eq!(kw(&["set", "system"]), ["hostname"]);
         assert_eq!(
             kw(&["set", "interface", "wan0"]),
@@ -519,7 +568,7 @@ mod tests {
         assert_eq!(kws(&["set", "nat", "source", "wan-masq", "zone"]), ["lan", "wan"]);
         assert_eq!(kws(&["set", "nat", "destination", "web-fwd", "zone"]), ["lan", "wan"]);
         // Other positions fall back to the static grammar.
-        assert_eq!(kws(&["set"]), ["system", "interface", "firewall", "nat"]);
+        assert_eq!(kws(&["set"]), ["system", "interface", "firewall", "nat", "protocols"]);
         assert_eq!(
             kws(&["set", "interface", "eth0"]),
             ["zone", "address", "parent", "vlan"]

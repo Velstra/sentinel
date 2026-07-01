@@ -3,11 +3,11 @@
     "fabric": {
       "flake": false,
       "locked": {
-        "lastModified": 1782932536,
-        "narHash": "sha256-/NyN5yvYiVQDyFqh9D6tTcIpyXjevtA8FYYChVjoRSQ=",
+        "lastModified": 1782938393,
+        "narHash": "sha256-GUxhHott9vVCqDhkiCODWjS4VZu/eabpaulUJOjpYO8=",
         "ref": "refs/heads/main",
-        "rev": "ae3642af4140e08687acb96a8d9162ed22ecdba6",
-        "revCount": 20,
+        "rev": "60a79e54695d79d7709faf1192f2ba90bffd76b9",
+        "revCount": 21,
         "type": "git",
         "url": "file:///home/mbrandt/01_repositories/velstra/fabric"
       },
@@ -57,7 +57,8 @@
       "inputs": {
         "fabric": "fabric",
         "fenix": "fenix",
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "wren": "wren"
       }
     },
     "rust-analyzer-src": {
@@ -75,6 +76,22 @@
         "ref": "nightly",
         "repo": "rust-analyzer",
         "type": "github"
+      }
+    },
+    "wren": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1782854031,
+        "narHash": "sha256-YGVmmI1v5zbqk8ZVEa1vgocaKYijLCHYoNbKcpDDWuc=",
+        "ref": "refs/heads/main",
+        "rev": "2032600080c57ba486991d20463f41ecae14c6a5",
+        "revCount": 89,
+        "type": "git",
+        "url": "file:///home/mbrandt/01_repositories/wren"
+      },
+      "original": {
+        "type": "git",
+        "url": "file:///home/mbrandt/01_repositories/wren"
       }
     }
   },

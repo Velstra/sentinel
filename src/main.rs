@@ -17,6 +17,7 @@ mod net;
 mod repl;
 mod session;
 mod system;
+mod wren;
 
 use std::{
     io::{BufRead, IsTerminal},
@@ -128,6 +129,9 @@ enum Command {
         /// Where to write the compiled Velstra agent config.
         #[arg(long, default_value = repl::DEFAULT_VELSTRA_OUT)]
         out: PathBuf,
+        /// Where to write the compiled Wren routing config.
+        #[arg(long, default_value = repl::DEFAULT_WREN_OUT)]
+        wren_out: PathBuf,
     },
     /// Compile + install the Velstra agent config, then reload the data plane.
     Apply {
@@ -225,7 +229,11 @@ async fn main() -> Result<()> {
             commit,
         } => install_cmd(&targets, raid.into(), source, commit),
         Command::Update { image, commit } => install::update(&image, commit),
-        Command::ApplyBoot { config, out } => apply_boot(&config, &out),
+        Command::ApplyBoot {
+            config,
+            out,
+            wren_out,
+        } => apply_boot(&config, &out, &wren_out),
         Command::Apply { file, out, reload } => apply(&file, &out, reload.as_deref()),
         Command::Ports { controller } => ports(&controller).await,
     }
@@ -245,6 +253,8 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
     let act = repl::Apply {
         velstra_out: PathBuf::from(repl::DEFAULT_VELSTRA_OUT),
         unit: repl::DEFAULT_UNIT.to_string(),
+        wren_out: PathBuf::from(repl::DEFAULT_WREN_OUT),
+        wren_unit: repl::DEFAULT_WREN_UNIT.to_string(),
         enabled: !no_apply,
     };
 
@@ -343,7 +353,11 @@ fn apply(file: &std::path::Path, out: &std::path::Path, reload: Option<&str>) ->
 /// Seed the running system from the active config at boot: write the compiled
 /// agent config (the agent starts after, so no reload) and set the hostname so
 /// it persists across reboots.
-fn apply_boot(config: &std::path::Path, out: &std::path::Path) -> Result<()> {
+fn apply_boot(
+    config: &std::path::Path,
+    out: &std::path::Path,
+    wren_out: &std::path::Path,
+) -> Result<()> {
     let appliance = Appliance::load(config)?;
 
     let rendered = compile::compile(&appliance).to_toml()?;
@@ -352,6 +366,15 @@ fn apply_boot(config: &std::path::Path, out: &std::path::Path) -> Result<()> {
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     std::fs::write(out, &rendered).with_context(|| format!("writing {}", out.display()))?;
+
+    // Routing: seed the Wren config too (the daemon starts after, so no reload).
+    let wren_rendered = wren::compile_wren(&appliance).to_toml()?;
+    if let Some(parent) = wren_out.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(wren_out, &wren_rendered)
+        .with_context(|| format!("writing {}", wren_out.display()))?;
 
     system::set_hostname(&appliance.system.hostname)?;
     // Re-assert interface addressing from the saved config (networkd units),
