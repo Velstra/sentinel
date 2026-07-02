@@ -63,24 +63,6 @@ impl From<RaidArg> for install::Raid {
     }
 }
 
-/// What `sentinel show` displays.
-#[derive(Copy, Clone, Debug, ValueEnum)]
-enum ShowKind {
-    /// Hostname, firewall state, and interfaces (the default).
-    Status,
-    /// Live network interfaces and their addresses.
-    Interfaces,
-    /// The kernel routing table.
-    Routes,
-    /// The ARP / neighbor table.
-    Neighbors,
-    /// The saved appliance configuration.
-    Config,
-    /// Recent firewall (velstra) log lines.
-    Log,
-    /// Sentinel and kernel version.
-    Version,
-}
 
 #[derive(Parser)]
 #[command(name = "sentinel", version, about, long_about = None)]
@@ -102,12 +84,14 @@ enum Command {
         #[arg(long)]
         no_apply: bool,
     },
-    /// Show live system state (operational mode): status, interfaces, or config.
+    /// Show live system state (operational mode), vtysh/VyOS-style paths:
+    /// `show interfaces`, `show ip route [bgp|ospf|…]`, `show ip bgp summary`,
+    /// `show ip ospf neighbors`, `show isis`, `show vrrp`, `show firewall
+    /// statistics`, `show configuration`, `show log wren`, `show version`, …
     Show {
-        #[arg(value_enum, default_value_t = ShowKind::Status)]
-        what: ShowKind,
-        /// Optional interface to scope the output to (interfaces/routes/neighbors).
-        target: Option<String>,
+        /// The show path words (empty shows the system status).
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
     },
     /// Author the declarative appliance config (file-based helpers).
     Config {
@@ -215,7 +199,7 @@ async fn main() -> Result<()> {
 
     match Cli::parse().command {
         Command::Configure { config, no_apply } => configure(&config, no_apply),
-        Command::Show { what, target } => show_cmd(what, target.as_deref()),
+        Command::Show { args } => show_op(&args),
         Command::Config { action } => config_cmd(action),
         Command::Compile { file } => {
             let appliance = Appliance::load(&file)?;
@@ -278,9 +262,11 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
             rustyline::Cmd::Complete,
         );
         let user = std::env::var("USER").unwrap_or_else(|_| "admin".into());
+        let mut ctx: Vec<String> = Vec::new();
         loop {
             // Refresh the names the completer offers (interfaces/rules can change
-            // with each command) so `set interface <Tab>` lists the current NICs.
+            // with each command) so `set interface <Tab>` lists the current NICs,
+            // and the edit context so completion is relative to it.
             if let Some(h) = rl.helper() {
                 h.set_names(
                     session.interface_names(),
@@ -289,16 +275,22 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
                     session.nat_source_names(),
                     session.nat_destination_names(),
                 );
+                h.set_context(&ctx);
             }
             // VyOS-style prompt, re-rendered each line: it reflects the LIVE
-            // hostname (so a committed change shows immediately) and marks
-            // uncommitted edits.
+            // hostname (so a committed change shows immediately), marks
+            // uncommitted edits, and shows the `edit` context path.
             let edit = if session.dirty() { "[edit] " } else { "" };
-            let prompt = format!("{edit}{user}@{}# ", system::current_hostname());
+            let at = if ctx.is_empty() {
+                String::new()
+            } else {
+                format!(":{}", ctx.join("/"))
+            };
+            let prompt = format!("{edit}{user}@{}{at}# ", system::current_hostname());
             match rl.readline(&prompt) {
                 Ok(line) => {
                     let _ = rl.add_history_entry(line.as_str());
-                    if repl::exec_line(&mut session, &act, &line) {
+                    if repl::exec_line(&mut session, &act, &mut ctx, &line) {
                         break;
                     }
                 }
@@ -312,8 +304,9 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
         }
     } else {
         let stdin = std::io::stdin();
+        let mut ctx: Vec<String> = Vec::new();
         for line in stdin.lock().lines() {
-            if repl::exec_line(&mut session, &act, &line.context("reading stdin")?) {
+            if repl::exec_line(&mut session, &act, &mut ctx, &line.context("reading stdin")?) {
                 break;
             }
         }
@@ -513,38 +506,89 @@ fn prompt(msg: &str) -> Result<String> {
 
 /// Operational-mode `show`: live system state, VyOS-style. `target` optionally
 /// scopes interface/route/neighbor output to one NIC.
-fn show_cmd(what: ShowKind, target: Option<&str>) -> Result<()> {
+/// Operational-mode `show` — a vtysh/VyOS-style word tree. Routing state comes
+/// from the Wren daemon's control socket (`wren show …`); interface/ARP state
+/// from iproute2; firewall/agent state from the config + journal.
+fn show_op(args: &[String]) -> Result<()> {
     let ip = system::bin("ip");
-    match what {
-        ShowKind::Interfaces => {
-            let mut args = vec!["-brief", "address", "show"];
-            args.extend(target);
-            run_show(&ip, &args)
+    let v: Vec<&str> = args.iter().map(String::as_str).collect();
+    match v.as_slice() {
+        // System status (the bare default).
+        [] | ["system"] | ["status"] => {
+            println!("hostname:   {}", system::current_hostname());
+            print!("firewall:   ");
+            run_show(&system::bin("systemctl"), &["is-active", "velstra.service"])?;
+            print!("routing:    ");
+            run_show(&system::bin("systemctl"), &["is-active", "wren.service"])?;
+            println!("interfaces:");
+            run_show(&ip, &["-brief", "address", "show"])
         }
-        ShowKind::Routes => {
-            let mut args = vec!["route", "show"];
-            if let Some(dev) = target {
-                args.extend(["dev", dev]);
+        ["interfaces", rest @ ..] => {
+            let mut a = vec!["-brief", "address", "show"];
+            a.extend(rest);
+            run_show(&ip, &a)
+        }
+        ["arp", rest @ ..] | ["neighbors", rest @ ..] => {
+            let mut a = vec!["neighbor", "show"];
+            if let Some(dev) = rest.first() {
+                a.extend(["dev", dev]);
             }
-            run_show(&ip, &args)
+            run_show(&ip, &a)
         }
-        ShowKind::Neighbors => {
-            let mut args = vec!["neighbor", "show"];
-            if let Some(dev) = target {
-                args.extend(["dev", dev]);
+
+        // IPv4/IPv6 routing — served by Wren's RIB; the kernel FIB is the
+        // fallback when the daemon isn't reachable.
+        ["ip", "route"] => wren_show_or(&["routes"], &ip, &["route", "show"]),
+        ["ip", "route", proto] => {
+            wren_show_or(&["routes", proto], &ip, &["route", "show", "proto", proto])
+        }
+        ["ipv6", "route"] => run_show(&ip, &["-6", "route", "show"]),
+
+        // BGP: vtysh-flavoured spellings on top of wren's tree.
+        ["ip", "bgp"] | ["ip", "bgp", "routes"] => wren_show(&["bgp", "routes"]),
+        ["ip", "bgp", "summary"] | ["ip", "bgp", "neighbors"] => wren_show(&["bgp", "neighbors"]),
+        ["ip", "bgp", rest @ ..] => wren_show_words("bgp", rest),
+
+        // IGPs — proxied to the wren control socket.
+        ["ip", "ospf", rest @ ..] => wren_show_words("ospf", rest),
+        ["ipv6", "ospf3", rest @ ..] | ["ip", "ospf3", rest @ ..] => {
+            wren_show_words("ospf3", rest)
+        }
+        ["ip", "rip"] => wren_show(&["rip"]),
+        ["ipv6", "ripng"] => wren_show(&["ripng"]),
+        ["isis", rest @ ..] => wren_show_words("isis", rest),
+        ["babel", rest @ ..] => wren_show_words("babel", rest),
+        ["vrrp"] => wren_show(&["vrrp"]),
+        ["bfd", rest @ ..] => wren_show_words("bfd", rest),
+
+        // Firewall / NAT.
+        ["firewall"] => {
+            print!("agent:      ");
+            run_show(&system::bin("systemctl"), &["is-active", "velstra.service"])?;
+            let path = std::path::Path::new(DEFAULT_CONFIG);
+            if path.exists() {
+                print!("{}", Appliance::load(path)?.summary());
             }
-            run_show(&ip, &args)
+            Ok(())
         }
-        ShowKind::Log => run_show(
+        ["firewall", "statistics" | "stats"] => show_firewall_stats(),
+        ["firewall", "log"] => run_show(
             &system::bin("journalctl"),
             &["-u", "velstra.service", "-n", "50", "--no-pager"],
         ),
-        ShowKind::Version => {
-            println!("sentinel:   {}", env!("CARGO_PKG_VERSION"));
-            print!("kernel:     ");
-            run_show(&system::bin("uname"), &["-sr"])
+        ["nat"] => show_nat(),
+
+        // Configuration views.
+        ["configuration", ..] => {
+            let path = std::path::Path::new(DEFAULT_CONFIG);
+            if path.exists() {
+                print!("{}", session::render_appliance(&Appliance::load(path)?));
+            } else {
+                println!("no saved config at {DEFAULT_CONFIG} (run `configure` + `save`)");
+            }
+            Ok(())
         }
-        ShowKind::Config => {
+        ["config"] => {
             let path = std::path::Path::new(DEFAULT_CONFIG);
             if path.exists() {
                 print!("{}", Appliance::load(path)?.summary());
@@ -553,14 +597,151 @@ fn show_cmd(what: ShowKind, target: Option<&str>) -> Result<()> {
             }
             Ok(())
         }
-        ShowKind::Status => {
-            println!("hostname:   {}", system::current_hostname());
-            print!("firewall:   ");
-            run_show(&system::bin("systemctl"), &["is-active", "velstra.service"])?;
-            println!("interfaces:");
-            run_show(&ip, &["-brief", "address", "show"])
+
+        // Logs + versions.
+        ["log"] | ["log", "velstra"] => run_show(
+            &system::bin("journalctl"),
+            &["-u", "velstra.service", "-n", "50", "--no-pager"],
+        ),
+        ["log", "wren"] => run_show(
+            &system::bin("journalctl"),
+            &["-u", "wren.service", "-n", "50", "--no-pager"],
+        ),
+        ["version"] => {
+            println!("sentinel:   {}", env!("CARGO_PKG_VERSION"));
+            print!("wren:       ");
+            if run_checked(&system::bin("wren"), &["--version"]).is_err() {
+                println!("(not available)");
+            }
+            print!("kernel:     ");
+            run_show(&system::bin("uname"), &["-sr"])
+        }
+
+        // Back-compat spellings.
+        ["routes", rest @ ..] => {
+            let mut a = vec!["route", "show"];
+            if let Some(dev) = rest.first() {
+                a.extend(["dev", dev]);
+            }
+            run_show(&ip, &a)
+        }
+
+        other => anyhow::bail!(
+            "unknown show path {:?}. Available:\n  \
+             show [system]                     hostname, services, interfaces\n  \
+             show interfaces [<if>]            live interfaces and addresses\n  \
+             show arp [<if>]                   the ARP / neighbour table\n  \
+             show ip route [<protocol>]        the routing table (wren RIB)\n  \
+             show ipv6 route                   the IPv6 routing table\n  \
+             show ip bgp [summary|neighbors|routes]\n  \
+             show ip ospf [neighbors|interfaces|database]\n  \
+             show ipv6 ospf3 [neighbors|interfaces]\n  \
+             show ip rip | show ipv6 ripng\n  \
+             show isis [neighbors|interfaces|database]\n  \
+             show babel [neighbors|routes]\n  \
+             show vrrp | show bfd [sessions]\n  \
+             show firewall [statistics|log]    firewall summary / counters / log\n  \
+             show nat                          NAT configuration\n  \
+             show configuration                the saved config (config syntax)\n  \
+             show log [velstra|wren]           recent service log\n  \
+             show version",
+            other.join(" ")
+        ),
+    }
+}
+
+/// Run a command and fail (with its stderr) on a non-zero exit — unlike
+/// [`run_show`], which is best-effort display only.
+fn run_checked(cmd: &str, args: &[&str]) -> Result<()> {
+    let out = std::process::Command::new(cmd)
+        .args(args)
+        .output()
+        .with_context(|| format!("running {cmd}"))?;
+    print!("{}", String::from_utf8_lossy(&out.stdout));
+    if !out.status.success() {
+        anyhow::bail!("{cmd} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
+/// `wren show <words>` against the routing daemon's control socket.
+fn wren_show(words: &[&str]) -> Result<()> {
+    let wren = system::bin("wren");
+    let mut a = vec!["show"];
+    a.extend(words);
+    run_checked(&wren, &a)
+}
+
+/// `wren show <first> <rest…>` with vtysh-style plural aliases mapped onto
+/// wren's singular words (`neighbors` → `neighbors` is already wren's own).
+fn wren_show_words(first: &str, rest: &[&str]) -> Result<()> {
+    let mut words = vec![first];
+    words.extend(rest);
+    wren_show(&words)
+}
+
+/// Try Wren first (the richer view: RIB with protocol/metric detail); fall back
+/// to iproute2 when the daemon isn't reachable.
+fn wren_show_or(words: &[&str], fallback_cmd: &str, fallback_args: &[&str]) -> Result<()> {
+    if wren_show(words).is_err() {
+        eprintln!("(wren not reachable; showing the kernel table)");
+        run_show(fallback_cmd, fallback_args)?;
+    }
+    Ok(())
+}
+
+/// The latest counter table the velstra agent dumped to its journal — the
+/// firewall's live statistics (rx/pass/drop/reject/NAT counters + drop rate).
+fn show_firewall_stats() -> Result<()> {
+    let out = std::process::Command::new(system::bin("journalctl"))
+        .args(["-u", "velstra.service", "-n", "400", "--no-pager", "-o", "cat"])
+        .output()
+        .context("running journalctl")?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = text.lines().collect();
+    match lines.iter().rposition(|l| l.contains("rx_packets")) {
+        Some(start) => {
+            for l in &lines[start..] {
+                println!("{l}");
+                if l.contains("drop rate") {
+                    break;
+                }
+            }
+            Ok(())
+        }
+        None => {
+            println!("no counter dump in the recent agent log yet");
+            Ok(())
         }
     }
+}
+
+/// The NAT section of the saved config, summarized.
+fn show_nat() -> Result<()> {
+    let path = std::path::Path::new(DEFAULT_CONFIG);
+    if !path.exists() {
+        println!("no saved config at {DEFAULT_CONFIG} (run `configure` + `save`)");
+        return Ok(());
+    }
+    let a = Appliance::load(path)?;
+    if a.nat.is_empty() {
+        println!("no NAT configured");
+        return Ok(());
+    }
+    for s in &a.nat.source {
+        println!("source {}: masquerade zone {}", s.name, s.zone);
+    }
+    for d in &a.nat.destination {
+        println!(
+            "destination {}: {} {:?}/{} -> {}",
+            d.name,
+            d.zone,
+            d.proto,
+            d.port,
+            d.to
+        );
+    }
+    Ok(())
 }
 
 /// Run a command and print its stdout, ignoring the exit code (for read-only

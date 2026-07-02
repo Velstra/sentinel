@@ -66,6 +66,7 @@
             --set SENTINEL_NETWORKCTL_BIN ${pkgs.systemd}/bin/networkctl \
             --set SENTINEL_SYSTEMCTL_BIN  ${pkgs.systemd}/bin/systemctl \
             --set SENTINEL_JOURNALCTL_BIN ${pkgs.systemd}/bin/journalctl \
+            --set SENTINEL_WREN_BIN       ${wrenPkg}/bin/wren \
             --set SENTINEL_LSBLK_BIN      ${pkgs.util-linux}/bin/lsblk \
             --set SENTINEL_INSTALL_BIN    ${pkgs.coreutils}/bin/install \
             --set SENTINEL_MKDIR_BIN      ${pkgs.coreutils}/bin/mkdir \
@@ -518,6 +519,27 @@
           machine.succeed("hostname scratch")
           machine.succeed("systemctl restart sentinel-boot.service")
           machine.succeed("hostname | grep -x fw-a")
+
+          # --- vtysh/VyOS-style CLI ------------------------------------------
+          # Config mode: `edit` context makes set/delete/show relative (VyOS).
+          # `edit protocols` + `set router-id …` must land on the real path and
+          # compile into the wren config.
+          machine.succeed(
+              "su admin -c \"printf '%s\\n' "
+              "'edit protocols' 'set router-id 10.9.9.9' 'top' "
+              "commit save exit "
+              "| sentinel configure\""
+          )
+          machine.succeed("grep -q 'router-id = \\\"10.9.9.9\\\"' /run/sentinel/wren.toml")
+
+          # Operational mode: the word-tree show commands work — routing state
+          # proxied from the wren control socket, config in config syntax.
+          machine.succeed("sentinel show ip route")
+          machine.succeed("sentinel show configuration | grep -q 'router-id 10.9.9.9'")
+          # (plain grep, not -q: -q exits on the first match and SIGPIPEs the
+          # still-writing producer under pipefail)
+          machine.succeed("sentinel show version | grep wren")
+          machine.succeed("sentinel show firewall")
         '';
       };
 
@@ -1700,6 +1722,76 @@
 
               # And the adjacency is Full.
               ospf1.succeed("wren show ospf neighbors | grep -qi full")
+            '';
+          };
+
+        # Routing: RIPv2 (distance-vector) between two Sentinel appliances — a
+        # third protocol paradigm alongside BGP (path-vector) and OSPF (link-
+        # state), exercising the same `set protocols …` wiring. Each node
+        # redistributes a unique static into RIP; each learns the other's proto rip.
+        rip =
+          let
+            node = hostname: addr: {
+              lib,
+              ...
+            }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce hostname;
+              networking.firewall.enable = lib.mkForce false;
+              networking.interfaces.eth1.ipv4.addresses = [
+                {
+                  address = addr;
+                  prefixLength = 24;
+                }
+              ];
+              virtualisation.vlans = [ 1 ];
+              virtualisation.memorySize = 2048;
+              services.velstra.interface = lib.mkForce "eth1";
+            };
+          in
+          pkgs.testers.runNixOSTest {
+            name = "sentinel-rip";
+            nodes = {
+              rip1 = node "rip1" "10.10.0.1";
+              rip2 = node "rip2" "10.10.0.2";
+            };
+            testScript = ''
+              start_all()
+              for m in (rip1, rip2):
+                  m.wait_for_unit("multi-user.target")
+                  m.wait_for_unit("velstra.service")
+                  m.wait_for_unit("wren.service")
+              rip1.wait_until_succeeds("ip addr show eth1 | grep -q 10.10.0.1", timeout=20)
+              rip2.wait_until_succeeds("ip addr show eth1 | grep -q 10.10.0.2", timeout=20)
+
+              def configure(m, mynet):
+                  m.succeed(
+                      "su admin -c \"printf '%s\\n' "
+                      "'set firewall global default-action accept' "
+                      "'set interface eth1 zone wan' "
+                      f"'set protocols static {mynet} dev lo' "
+                      "'set protocols rip interface eth1' "
+                      "'set protocols rip redistribute static' "
+                      "commit save exit "
+                      "| sentinel configure\""
+                  )
+                  m.wait_for_unit("wren.service")
+
+              configure(rip1, "10.11.0.0/24")
+              configure(rip2, "10.12.0.0/24")
+
+              # The compiled Wren config carries the RIP block.
+              rip1.succeed("grep -q '\\[rip\\]' /run/sentinel/wren.toml")
+
+              # Each router learns the OTHER's network over RIP (proto rip). RIP's
+              # 30s update timer means convergence takes a while — retry generously.
+              rip1.wait_until_succeeds(
+                  "ip -4 route show proto rip | grep -q '10.12.0.0/24'", timeout=120
+              )
+              rip2.wait_until_succeeds(
+                  "ip -4 route show proto rip | grep -q '10.11.0.0/24'", timeout=120
+              )
             '';
           };
       };

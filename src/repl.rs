@@ -53,19 +53,79 @@ impl Apply {
 /// Run one command line against the session. Returns `true` when the session
 /// should exit (`exit`/`quit`). Errors are printed, not propagated, so the shell
 /// keeps running.
-pub fn exec_line(session: &mut Session, act: &Apply, line: &str) -> bool {
+pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line: &str) -> bool {
     let args: Vec<&str> = line.split_whitespace().collect();
     let Some((&cmd, rest)) = args.split_first() else {
         return false; // blank line
     };
 
+    // The `edit` context is an implicit path prefix for set/delete/show
+    // (VyOS-style): `edit firewall rule web` + `set action drop` ≡
+    // `set firewall rule web action drop`.
+    let with_ctx = |rest: &[&str]| -> Vec<String> {
+        ctx.iter().cloned().chain(rest.iter().map(|s| s.to_string())).collect()
+    };
+
     let result: Result<()> = match cmd {
-        "set" => session.set(rest),
-        "delete" | "del" => session.delete(rest),
+        "set" => {
+            let full = with_ctx(rest);
+            let view: Vec<&str> = full.iter().map(String::as_str).collect();
+            session.set(&view)
+        }
+        "delete" | "del" => {
+            let full = with_ctx(rest);
+            let view: Vec<&str> = full.iter().map(String::as_str).collect();
+            session.delete(&view)
+        }
         "show" => {
-            print!("{}", session.show());
+            let full = with_ctx(rest);
+            match full.first() {
+                None => print!("{}", session.show()),
+                Some(section) => print!("{}", session.show_only(section)),
+            }
             Ok(())
         }
+        "edit" => {
+            if rest.is_empty() {
+                Err(anyhow!("edit needs a path, e.g. `edit firewall rule web`"))
+            } else {
+                let full = with_ctx(rest);
+                if TOP.iter().any(|(k, _)| *k == full[0]) {
+                    *ctx = full;
+                    eprintln!("[edit {}]", ctx.join(" "));
+                    Ok(())
+                } else {
+                    Err(anyhow!(
+                        "unknown config node {:?} (system | interface | firewall | nat | protocols)",
+                        full[0]
+                    ))
+                }
+            }
+        }
+        "up" => {
+            ctx.pop();
+            match ctx.is_empty() {
+                true => eprintln!("[edit]"),
+                false => eprintln!("[edit {}]", ctx.join(" ")),
+            }
+            Ok(())
+        }
+        "top" => {
+            ctx.clear();
+            eprintln!("[edit]");
+            Ok(())
+        }
+        // vtysh/VyOS: run an operational command without leaving config mode.
+        "run" => match std::env::current_exe() {
+            Ok(exe) => {
+                let status = std::process::Command::new(exe).args(rest).status();
+                match status {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(anyhow!("running operational command: {e}")),
+                }
+            }
+            Err(e) => Err(anyhow!("resolving the sentinel binary: {e}")),
+        },
         "compare" => session.compare().map(|d| {
             if d.is_empty() {
                 eprintln!("no changes (candidate matches the saved config)");
@@ -82,6 +142,13 @@ pub fn exec_line(session: &mut Session, act: &Apply, line: &str) -> bool {
         }
         "discard" => session.discard().map(|()| eprintln!("discarded edits")),
         "exit" | "quit" => {
+            // VyOS: `exit` inside an edit context returns to the top of the
+            // config tree; at the top it leaves configuration mode.
+            if !ctx.is_empty() {
+                ctx.clear();
+                eprintln!("[edit]");
+                return false;
+            }
             if session.dirty() {
                 eprintln!("warning: uncommitted edits (use `commit`/`save`, or `discard`)");
             }
@@ -182,12 +249,18 @@ commands:
                                 set nat source wan-masq zone wan
                                 set nat destination web to 10.0.0.10:8443
   delete <path...>        remove a node or clear a field
-  show                    show the candidate configuration
+  show [section]          show the candidate config (all, or one section:
+                          system | interfaces | firewall | nat | protocols)
+  edit <path...>          descend into a subtree; set/delete/show become
+                          relative to it, e.g.  edit firewall rule web
+  up | top                move one level up / back to the top of the tree
+  run <op command>        run an operational command from config mode,
+                          e.g.  run show ip route   run show ip bgp summary
   compare                 diff the candidate against the saved config
   commit                  apply the candidate to the RUNNING system (live)
   save [path]             persist the config so it survives a reboot
   discard                 drop edits, reload from disk
-  exit | quit             leave configuration mode (Ctrl-C cancels a line)
+  exit | quit             leave the edit context / configuration mode
   (Tab or `?` lists commands, config keys, and value keywords.)
 ";
 
@@ -198,13 +271,47 @@ pub type Cand = (&'static str, &'static str);
 const COMMANDS: &[Cand] = &[
     ("set", "set a configuration value"),
     ("delete", "remove a node or clear a field"),
-    ("show", "show the candidate configuration"),
+    ("show", "show the candidate configuration (optionally a section)"),
+    ("edit", "descend into a config subtree (VyOS-style context)"),
+    ("up", "move one level up from the edit context"),
+    ("top", "return to the top of the config tree"),
+    ("run", "run an operational command (e.g. run show ip route)"),
     ("compare", "diff the candidate against the saved config"),
     ("commit", "apply the candidate to the running system (live)"),
     ("save", "persist the configuration across reboot"),
     ("discard", "drop uncommitted edits"),
-    ("exit", "leave configuration mode"),
+    ("exit", "leave the edit context / configuration mode"),
     ("help", "show command help"),
+];
+
+// `run <Tab>` — the operational commands reachable from config mode.
+const RUN_TOP: &[Cand] = &[("show", "operational show commands")];
+const OP_SHOW_TOP: &[Cand] = &[
+    ("interfaces", "live interfaces and addresses"),
+    ("ip", "IPv4: route / bgp / ospf / rip"),
+    ("ipv6", "IPv6: route / ospf3 / ripng"),
+    ("isis", "IS-IS adjacencies / interfaces / database"),
+    ("babel", "Babel neighbours / routes"),
+    ("vrrp", "VRRP virtual-router state"),
+    ("bfd", "BFD sessions"),
+    ("firewall", "firewall summary / statistics / log"),
+    ("nat", "NAT configuration summary"),
+    ("configuration", "the saved configuration (config syntax)"),
+    ("arp", "the ARP / neighbour table"),
+    ("system", "hostname, services, interfaces"),
+    ("log", "recent service log (velstra | wren)"),
+    ("version", "software versions"),
+];
+const OP_IP: &[Cand] = &[
+    ("route", "the routing table (via the wren RIB)"),
+    ("bgp", "BGP routes / summary / neighbors"),
+    ("ospf", "OSPF neighbors / interfaces / database"),
+    ("rip", "RIP state"),
+];
+const OP_IPV6: &[Cand] = &[
+    ("route", "the IPv6 routing table"),
+    ("ospf3", "OSPFv3 neighbors / interfaces"),
+    ("ripng", "RIPng state"),
 ];
 // Top level: four nodes, each a clear domain — host settings, the NICs, the
 // firewall (filtering), and NAT (address translation). NAT is deliberately NOT
@@ -221,7 +328,13 @@ const PROTOCOLS_NODES: &[Cand] = &[
     ("router-id", "the 32-bit router id (an IPv4 address)"),
     ("static", "a static route (<prefix> via <ip> | dev <if>)"),
     ("ospf", "OSPFv2: interfaces, area, redistribution"),
+    ("ospf3", "OSPFv3 (IPv6): interfaces, area, redistribution"),
+    ("rip", "RIPv2 (IPv4): interfaces, redistribution"),
+    ("ripng", "RIPng (IPv6): interfaces, redistribution"),
+    ("babel", "Babel (dual-stack): interfaces, redistribution"),
+    ("isis", "IS-IS: interfaces, system-id, area, level"),
     ("bgp", "BGP-4: local-as, networks, neighbors"),
+    ("vrrp", "VRRP virtual router (first-hop redundancy)"),
 ];
 const OSPF_FIELDS: &[Cand] = &[
     ("interface", "a NIC OSPF runs on"),
@@ -233,6 +346,27 @@ const OSPF_FIELDS: &[Cand] = &[
 const OSPF_NETWORK_TYPES: &[Cand] = &[
     ("broadcast", "elect a designated router"),
     ("point-to-point", "direct link, no DR"),
+];
+const RIP_FIELDS: &[Cand] = &[
+    ("interface", "a NIC this protocol runs on"),
+    ("redistribute", "inject a route source (static / connected / bgp)"),
+    ("redistribute-metric", "metric for redistributed routes"),
+];
+const ISIS_FIELDS: &[Cand] = &[
+    ("interface", "a NIC IS-IS runs on"),
+    ("system-id", "the 6-byte system id (0000.0000.0001)"),
+    ("area", "the area address (49.0001)"),
+    ("level", "1 / 2 / 1-2"),
+    ("network-type", "broadcast / point-to-point"),
+    ("redistribute", "inject a route source"),
+    ("redistribute-metric", "metric for redistributed routes"),
+];
+const ISIS_LEVELS: &[Cand] = &[("1", "level 1"), ("2", "level 2"), ("1-2", "both levels")];
+const VRRP_FIELDS: &[Cand] = &[
+    ("interface", "the NIC the virtual router runs on"),
+    ("vrid", "virtual router id (1-255)"),
+    ("priority", "election priority (higher wins)"),
+    ("virtual-address", "the shared virtual IP"),
 ];
 const STATIC_FIELDS: &[Cand] = &[
     ("via", "next-hop gateway IP"),
@@ -345,6 +479,22 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "protocols", "ospf"] => OSPF_FIELDS,
         ["set", "protocols", "ospf", "redistribute"] => REDIST,
         ["set", "protocols", "ospf", "network-type"] => OSPF_NETWORK_TYPES,
+        ["set" | "delete", "protocols", "ospf3"] => OSPF_FIELDS,
+        ["set", "protocols", "ospf3", "redistribute"] => REDIST,
+        ["set", "protocols", "ospf3", "network-type"] => OSPF_NETWORK_TYPES,
+        ["set" | "delete", "protocols", "rip" | "ripng" | "babel"] => RIP_FIELDS,
+        ["set", "protocols", "rip" | "ripng" | "babel", "redistribute"] => REDIST,
+        ["set" | "delete", "protocols", "isis"] => ISIS_FIELDS,
+        ["set", "protocols", "isis", "redistribute"] => REDIST,
+        ["set", "protocols", "isis", "network-type"] => OSPF_NETWORK_TYPES,
+        ["set", "protocols", "isis", "level"] => ISIS_LEVELS,
+        ["set" | "delete", "protocols", "vrrp", _name] => VRRP_FIELDS,
+
+        // `run` — operational commands from config mode (vtysh-style).
+        ["run"] => RUN_TOP,
+        ["run", "show"] => OP_SHOW_TOP,
+        ["run", "show", "ip"] => OP_IP,
+        ["run", "show", "ipv6"] => OP_IPV6,
         _ => &[],
     }
 }
@@ -418,15 +568,44 @@ fn term_width() -> usize {
 /// rustyline helper providing tab/`?` completion over the configure grammar,
 /// including the live interface/rule names. The hint/highlight/validate traits
 /// are no-ops; only completion is implemented.
+/// The tokens candidate lookup should see for a line being completed: the
+/// `edit` context is spliced in right after the command word for path commands,
+/// and `edit` / scoped `show` complete like `set` paths (same tree).
+fn effective_tokens(before: &[&str], ctx: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    match before.split_first() {
+        Some((&cmd, rest)) if matches!(cmd, "set" | "delete" | "edit" | "show") => {
+            out.push(if cmd == "edit" || cmd == "show" {
+                "set".to_string()
+            } else {
+                cmd.to_string()
+            });
+            out.extend(ctx.iter().cloned());
+            out.extend(rest.iter().map(|s| s.to_string()));
+        }
+        _ => out.extend(before.iter().map(|s| s.to_string())),
+    }
+    out
+}
+
 pub struct ConfigCompleter {
     names: std::cell::RefCell<DynNames>,
+    /// The `edit` context: tokens implicitly prefixed to set/delete/show paths.
+    context: std::cell::RefCell<Vec<String>>,
 }
 
 impl ConfigCompleter {
     pub fn new() -> Self {
         Self {
             names: std::cell::RefCell::new(DynNames::default()),
+            context: std::cell::RefCell::new(Vec::new()),
         }
+    }
+
+    /// Refresh the `edit` context so completion offers candidates relative to
+    /// it (`edit firewall` + `set <Tab>` lists the firewall sub-tree).
+    pub fn set_context(&self, ctx: &[String]) {
+        *self.context.borrow_mut() = ctx.to_vec();
     }
 
     /// Refresh the interface/rule/zone names offered at the name + zone-value
@@ -475,8 +654,11 @@ impl Completer for ConfigCompleter {
         };
         let before: Vec<&str> = head[..start].split_whitespace().collect();
 
+        let ctx = self.context.borrow();
+        let eff = effective_tokens(&before, &ctx);
+        let eff_view: Vec<&str> = eff.iter().map(String::as_str).collect();
         let names = self.names.borrow();
-        let all = dyn_candidates(&before, &names);
+        let all = dyn_candidates(&eff_view, &names);
         let matched: Vec<&(String, String)> =
             all.iter().filter(|(kw, _)| kw.starts_with(prefix)).collect();
 
@@ -516,7 +698,10 @@ mod tests {
     fn completion_grammar_is_context_aware() {
         assert_eq!(
             kw(&[]),
-            ["set", "delete", "show", "compare", "commit", "save", "discard", "exit", "help"]
+            [
+                "set", "delete", "show", "edit", "up", "top", "run", "compare", "commit", "save",
+                "discard", "exit", "help"
+            ]
         );
         assert_eq!(kw(&["set"]), ["system", "interface", "firewall", "nat", "protocols"]);
         assert_eq!(kw(&["set", "system"]), ["hostname"]);
@@ -599,17 +784,71 @@ mod tests {
         let mut s = Session::load(&path).unwrap();
         let act = Apply::off(); // no live apply in tests
 
-        assert!(!exec_line(&mut s, &act, "set system hostname fw1"));
-        assert!(!exec_line(&mut s, &act, "show"));
+        let mut ctx = Vec::new();
+        assert!(!exec_line(&mut s, &act, &mut ctx, "set system hostname fw1"));
+        assert!(!exec_line(&mut s, &act, &mut ctx, "show"));
         // commit validates (apply off ⇒ no live changes) but does NOT persist.
-        assert!(!exec_line(&mut s, &act, "commit"));
+        assert!(!exec_line(&mut s, &act, &mut ctx, "commit"));
         assert!(!path.exists(), "commit must not persist (VyOS: that's `save`)");
         // save persists the config to disk.
-        assert!(!exec_line(&mut s, &act, "save"));
+        assert!(!exec_line(&mut s, &act, &mut ctx, "save"));
         assert!(path.exists(), "save persisted the config");
         // exit returns true.
-        assert!(exec_line(&mut s, &act, "exit"));
+        assert!(exec_line(&mut s, &act, &mut ctx, "exit"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_context_makes_paths_relative_vyos_style() {
+        let dir = std::env::temp_dir().join(format!("sentinel-edit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.toml");
+        let mut s = Session::load(&path).unwrap();
+        let act = Apply::off();
+        let mut ctx = Vec::new();
+
+        // `edit protocols` + relative set ≡ `set protocols router-id …`.
+        assert!(!exec_line(&mut s, &act, &mut ctx, "set system hostname r1"));
+        assert!(!exec_line(&mut s, &act, &mut ctx, "edit protocols"));
+        assert_eq!(ctx, vec!["protocols"]);
+        assert!(!exec_line(&mut s, &act, &mut ctx, "set router-id 10.9.9.9"));
+        // `edit` deeper from within the context appends.
+        assert!(!exec_line(&mut s, &act, &mut ctx, "edit bgp"));
+        assert_eq!(ctx, vec!["protocols", "bgp"]);
+        assert!(!exec_line(&mut s, &act, &mut ctx, "set local-as 65001"));
+        assert!(!exec_line(&mut s, &act, &mut ctx, "up"));
+        assert_eq!(ctx, vec!["protocols"]);
+        // `exit` inside a context returns to top — it does NOT leave the session.
+        assert!(!exec_line(&mut s, &act, &mut ctx, "exit"));
+        assert!(ctx.is_empty());
+        // An unknown top-level node is rejected.
+        assert!(!exec_line(&mut s, &act, &mut ctx, "edit bogus"));
+        assert!(ctx.is_empty());
+
+        // The relative sets landed on the real paths.
+        let shown = s.show();
+        assert!(shown.contains("router-id 10.9.9.9"), "{shown}");
+        assert!(shown.contains("local-as 65001"), "{shown}");
+        // Scoped show: only the protocols section.
+        let scoped = s.show_only("protocols");
+        assert!(scoped.contains("router-id 10.9.9.9"), "{scoped}");
+        assert!(!scoped.contains("hostname"), "{scoped}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn completion_splices_the_edit_context() {
+        // With ctx = [firewall], `set <Tab>` must offer the firewall sub-tree.
+        let ctx = vec!["firewall".to_string()];
+        let eff = effective_tokens(&["set"], &ctx);
+        assert_eq!(eff, ["set", "firewall"]);
+        // `edit` completes like `set` paths.
+        let eff = effective_tokens(&["edit"], &[]);
+        assert_eq!(eff, ["set"]);
+        // Non-path commands pass through untouched.
+        let eff = effective_tokens(&["run", "show"], &ctx);
+        assert_eq!(eff, ["run", "show"]);
     }
 }
