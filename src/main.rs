@@ -331,7 +331,9 @@ fn apply(file: &std::path::Path, out: &std::path::Path, reload: Option<&str>) ->
     println!("installed {}", out.display());
 
     if let Some(unit) = reload {
-        let status = std::process::Command::new("systemctl")
+        // Use the pinned absolute path like the rest of the binary, so neither
+        // the admin's $PATH nor sudo's secure_path can shadow or miss systemctl.
+        let status = std::process::Command::new(system::bin("systemctl"))
             .args(["reload-or-restart", unit])
             .status()
             .with_context(|| format!("running systemctl reload-or-restart {unit}"))?;
