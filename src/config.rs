@@ -147,9 +147,27 @@ pub struct Protocols {
     /// OSPFv2 configuration, if the protocol is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ospf: Option<Ospf>,
+    /// OSPFv3 (IPv6) configuration, if the protocol is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ospf3: Option<Ospf3>,
+    /// RIPv2 (IPv4) configuration, if the protocol is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rip: Option<Rip>,
+    /// RIPng (IPv6) configuration, if the protocol is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ripng: Option<Rip>,
+    /// Babel (dual-stack) configuration, if the protocol is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub babel: Option<Rip>,
+    /// IS-IS configuration, if the protocol is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isis: Option<Isis>,
     /// BGP-4 configuration, if the protocol is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bgp: Option<Bgp>,
+    /// VRRP virtual routers (first-hop redundancy / firewall HA).
+    #[serde(default, rename = "vrrp", skip_serializing_if = "Vec::is_empty")]
+    pub vrrp: Vec<Vrrp>,
 }
 
 impl Protocols {
@@ -158,7 +176,13 @@ impl Protocols {
         self.router_id.is_none()
             && self.statics.is_empty()
             && self.ospf.is_none()
+            && self.ospf3.is_none()
+            && self.rip.is_none()
+            && self.ripng.is_none()
+            && self.babel.is_none()
+            && self.isis.is_none()
             && self.bgp.is_none()
+            && self.vrrp.is_empty()
     }
 }
 
@@ -186,6 +210,82 @@ pub struct Ospf {
     /// `"connected"`, `"bgp"`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub redistribute: Vec<String>,
+}
+
+/// OSPFv3 (IPv6) configuration — the IPv6 sibling of [`Ospf`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Ospf3 {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interfaces: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub area: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<u16>,
+    #[serde(default, rename = "network-type", skip_serializing_if = "Option::is_none")]
+    pub network_type: Option<String>,
+    /// Redistribute sources into OSPFv3 (only `"static"` is honoured by the
+    /// daemon's OSPFv3 externals).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redistribute: Vec<String>,
+}
+
+/// RIP-family configuration shared by RIPv2, RIPng and Babel (they take the same
+/// knobs: which interfaces to run on, and what to redistribute).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rip {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interfaces: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redistribute: Vec<String>,
+    #[serde(default, rename = "redistribute-metric", skip_serializing_if = "Option::is_none")]
+    pub redistribute_metric: Option<u32>,
+}
+
+/// IS-IS configuration: the interfaces, this router's identity (system-id / area)
+/// and level, with optional network-type and redistribution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Isis {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interfaces: Vec<String>,
+    /// The 6-byte IS-IS system id (`"0000.0000.0001"`).
+    #[serde(default, rename = "system-id", skip_serializing_if = "Option::is_none")]
+    pub system_id: Option<String>,
+    /// The area address (`"49.0001"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub area: Option<String>,
+    /// The IS-IS level: `"1"`, `"2"` or `"1-2"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+    /// Network type: `"broadcast"` or `"point-to-point"`.
+    #[serde(default, rename = "network-type", skip_serializing_if = "Option::is_none")]
+    pub network_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redistribute: Vec<String>,
+    #[serde(default, rename = "redistribute-metric", skip_serializing_if = "Option::is_none")]
+    pub redistribute_metric: Option<u32>,
+}
+
+/// A VRRP virtual router (RFC 5798) — first-hop redundancy / firewall HA: a
+/// group of routers share a virtual IP, the highest-priority one owning it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Vrrp {
+    /// A name addressing this virtual router in the CLI (tag-node); not passed to
+    /// the daemon, which keys on `interface`+`vrid`.
+    pub name: String,
+    /// The interface the virtual router runs on.
+    pub interface: String,
+    /// The virtual router id (1–255), shared by every member of the group.
+    pub vrid: u8,
+    /// This router's priority (higher wins; 255 = address owner). Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u8>,
+    /// The virtual IP address(es) the group presents as the gateway.
+    #[serde(rename = "virtual-address", skip_serializing_if = "Vec::is_empty", default)]
+    pub virtual_address: Vec<String>,
 }
 
 /// A static route: `prefix` reached `via` a gateway and/or out `dev` an
@@ -762,12 +862,35 @@ impl Appliance {
             if let Some(area) = &ospf.area {
                 validate_ipv4(area).with_context(|| "protocols ospf area (dotted quad)")?;
             }
-            if let Some(nt) = &ospf.network_type {
+            validate_ospf_network_type(ospf.network_type.as_deref(), "ospf")?;
+        }
+        if let Some(o) = &self.protocols.ospf3 {
+            if let Some(area) = &o.area {
+                validate_ipv4(area).with_context(|| "protocols ospf3 area (dotted quad)")?;
+            }
+            validate_ospf_network_type(o.network_type.as_deref(), "ospf3")?;
+        }
+        if let Some(isis) = &self.protocols.isis {
+            if let Some(lvl) = &isis.level {
+                if !matches!(lvl.as_str(), "1" | "2" | "1-2") {
+                    bail!("protocols isis level {lvl:?}: expected \"1\", \"2\" or \"1-2\"");
+                }
+            }
+            if let Some(nt) = &isis.network_type {
                 if nt != "broadcast" && nt != "point-to-point" {
                     bail!(
-                        "protocols ospf network-type {nt:?}: expected \"broadcast\" or \"point-to-point\""
+                        "protocols isis network-type {nt:?}: expected \"broadcast\" or \"point-to-point\""
                     );
                 }
+            }
+        }
+        for v in &self.protocols.vrrp {
+            if v.interface.is_empty() {
+                bail!("protocols vrrp: interface must be set");
+            }
+            for addr in &v.virtual_address {
+                validate_ipv4(addr)
+                    .with_context(|| format!("protocols vrrp vrid {} virtual-address", v.vrid))?;
             }
         }
         Ok(())
@@ -826,6 +949,18 @@ impl Appliance {
 fn validate_ipv4(s: &str) -> Result<()> {
     s.parse::<Ipv4Addr>()
         .with_context(|| format!("{s:?} is not an IPv4 address"))?;
+    Ok(())
+}
+
+/// Validate an OSPF/OSPFv3 `network-type` (`broadcast` / `point-to-point`).
+fn validate_ospf_network_type(nt: Option<&str>, proto: &str) -> Result<()> {
+    if let Some(nt) = nt {
+        if nt != "broadcast" && nt != "point-to-point" {
+            bail!(
+                "protocols {proto} network-type {nt:?}: expected \"broadcast\" or \"point-to-point\""
+            );
+        }
+    }
     Ok(())
 }
 

@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::config::{
-    Action, Appliance, Bgp, BgpNeighbor, Firewall, Interface, Nat, NatDestination, NatSource,
-    Ospf, PortSpec, Proto, Protocols, Rule, StaticRoute, System, ZoneCfg,
+    Action, Appliance, Bgp, BgpNeighbor, Firewall, Interface, Isis, Nat, NatDestination, NatSource,
+    Ospf, Ospf3, PortSpec, Proto, Protocols, Rip, Rule, StaticRoute, System, Vrrp, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -130,6 +130,62 @@ impl OspfDraft {
     }
 }
 
+/// A RIP-family draft (RIPv2 / RIPng / Babel — same knobs).
+#[derive(Debug, Clone, Default)]
+struct RipDraft {
+    interfaces: Vec<String>,
+    redistribute: Vec<String>,
+    redistribute_metric: Option<u32>,
+}
+
+impl RipDraft {
+    fn is_empty(&self) -> bool {
+        self.interfaces.is_empty() && self.redistribute.is_empty() && self.redistribute_metric.is_none()
+    }
+}
+
+/// Build a [`RipDraft`] from a saved RIP-family config section.
+fn rip_to_draft(r: &Rip) -> RipDraft {
+    RipDraft {
+        interfaces: r.interfaces.clone(),
+        redistribute: r.redistribute.clone(),
+        redistribute_metric: r.redistribute_metric,
+    }
+}
+
+/// An IS-IS draft.
+#[derive(Debug, Clone, Default)]
+struct IsisDraft {
+    interfaces: Vec<String>,
+    system_id: Option<String>,
+    area: Option<String>,
+    level: Option<String>,
+    network_type: Option<String>,
+    redistribute: Vec<String>,
+    redistribute_metric: Option<u32>,
+}
+
+impl IsisDraft {
+    fn is_empty(&self) -> bool {
+        self.interfaces.is_empty()
+            && self.system_id.is_none()
+            && self.area.is_none()
+            && self.level.is_none()
+            && self.network_type.is_none()
+            && self.redistribute.is_empty()
+            && self.redistribute_metric.is_none()
+    }
+}
+
+/// A VRRP virtual-router draft (keyed by a CLI name).
+#[derive(Debug, Clone, Default)]
+struct VrrpDraft {
+    interface: Option<String>,
+    vrid: Option<u8>,
+    priority: Option<u8>,
+    virtual_address: Vec<String>,
+}
+
 /// The candidate config — a draft with optional fields, keyed by name so list
 /// items (interfaces, rules) are addressable VyOS-"tag-node" style. Insertion
 /// order is preserved for stable `show` output.
@@ -145,7 +201,13 @@ struct Draft {
     router_id: Option<String>,
     statics: Vec<(String, StaticDraft)>,
     ospf: OspfDraft,
+    ospf3: OspfDraft,
+    rip: RipDraft,
+    ripng: RipDraft,
+    babel: RipDraft,
+    isis: IsisDraft,
     bgp: BgpDraft,
+    vrrp: Vec<(String, VrrpDraft)>,
 }
 
 impl Draft {
@@ -165,6 +227,24 @@ impl Draft {
         } else {
             self.bgp.neighbors.push((addr.to_string(), remote_as));
         }
+    }
+
+    /// The RIP-family draft (`rip` / `ripng` / `babel`) named by `proto`.
+    fn rip_family_mut(&mut self, proto: &str) -> &mut RipDraft {
+        match proto {
+            "rip" => &mut self.rip,
+            "ripng" => &mut self.ripng,
+            _ => &mut self.babel,
+        }
+    }
+
+    /// Mutable access to the VRRP instance `name`, inserting it if new.
+    fn vrrp_mut(&mut self, name: &str) -> &mut VrrpDraft {
+        if let Some(i) = self.vrrp.iter().position(|(n, _)| n == name) {
+            return &mut self.vrrp[i].1;
+        }
+        self.vrrp.push((name.to_string(), VrrpDraft::default()));
+        &mut self.vrrp.last_mut().unwrap().1
     }
 }
 
@@ -317,6 +397,51 @@ impl Draft {
                     redistribute: o.redistribute.clone(),
                 })
                 .unwrap_or_default(),
+            ospf3: a
+                .protocols
+                .ospf3
+                .as_ref()
+                .map(|o| OspfDraft {
+                    interfaces: o.interfaces.clone(),
+                    area: o.area.clone(),
+                    cost: o.cost,
+                    network_type: o.network_type.clone(),
+                    redistribute: o.redistribute.clone(),
+                })
+                .unwrap_or_default(),
+            rip: a.protocols.rip.as_ref().map(rip_to_draft).unwrap_or_default(),
+            ripng: a.protocols.ripng.as_ref().map(rip_to_draft).unwrap_or_default(),
+            babel: a.protocols.babel.as_ref().map(rip_to_draft).unwrap_or_default(),
+            isis: a
+                .protocols
+                .isis
+                .as_ref()
+                .map(|i| IsisDraft {
+                    interfaces: i.interfaces.clone(),
+                    system_id: i.system_id.clone(),
+                    area: i.area.clone(),
+                    level: i.level.clone(),
+                    network_type: i.network_type.clone(),
+                    redistribute: i.redistribute.clone(),
+                    redistribute_metric: i.redistribute_metric,
+                })
+                .unwrap_or_default(),
+            vrrp: a
+                .protocols
+                .vrrp
+                .iter()
+                .map(|v| {
+                    (
+                        v.name.clone(),
+                        VrrpDraft {
+                            interface: Some(v.interface.clone()),
+                            vrid: Some(v.vrid),
+                            priority: v.priority,
+                            virtual_address: v.virtual_address.clone(),
+                        },
+                    )
+                })
+                .collect(),
             bgp: a
                 .protocols
                 .bgp
@@ -590,6 +715,94 @@ impl Session {
                     self.draft.ospf.redistribute.push(src);
                 }
             }
+
+            // ospf3 (OSPFv3, IPv6) — same fields as ospf.
+            ["protocols", "ospf3", "interface", v] => {
+                let i = (*v).to_string();
+                if !self.draft.ospf3.interfaces.contains(&i) {
+                    self.draft.ospf3.interfaces.push(i);
+                }
+            }
+            ["protocols", "ospf3", "area", v] => self.draft.ospf3.area = Some((*v).to_string()),
+            ["protocols", "ospf3", "cost", v] => {
+                self.draft.ospf3.cost =
+                    Some(v.parse().with_context(|| format!("invalid cost {v:?}"))?);
+            }
+            ["protocols", "ospf3", "network-type", v] => {
+                self.draft.ospf3.network_type = Some((*v).to_string());
+            }
+            ["protocols", "ospf3", "redistribute", v] => {
+                let src = (*v).to_string();
+                if !self.draft.ospf3.redistribute.contains(&src) {
+                    self.draft.ospf3.redistribute.push(src);
+                }
+            }
+
+            // rip / ripng / babel — same knobs (RipDraft).
+            ["protocols", proto @ ("rip" | "ripng" | "babel"), "interface", v] => {
+                let d = self.draft.rip_family_mut(proto);
+                let i = (*v).to_string();
+                if !d.interfaces.contains(&i) {
+                    d.interfaces.push(i);
+                }
+            }
+            ["protocols", proto @ ("rip" | "ripng" | "babel"), "redistribute", v] => {
+                let d = self.draft.rip_family_mut(proto);
+                let s = (*v).to_string();
+                if !d.redistribute.contains(&s) {
+                    d.redistribute.push(s);
+                }
+            }
+            ["protocols", proto @ ("rip" | "ripng" | "babel"), "redistribute-metric", v] => {
+                self.draft.rip_family_mut(proto).redistribute_metric =
+                    Some(v.parse().with_context(|| format!("invalid metric {v:?}"))?);
+            }
+
+            // isis (IS-IS).
+            ["protocols", "isis", "interface", v] => {
+                let i = (*v).to_string();
+                if !self.draft.isis.interfaces.contains(&i) {
+                    self.draft.isis.interfaces.push(i);
+                }
+            }
+            ["protocols", "isis", "system-id", v] => {
+                self.draft.isis.system_id = Some((*v).to_string());
+            }
+            ["protocols", "isis", "area", v] => self.draft.isis.area = Some((*v).to_string()),
+            ["protocols", "isis", "level", v] => self.draft.isis.level = Some((*v).to_string()),
+            ["protocols", "isis", "network-type", v] => {
+                self.draft.isis.network_type = Some((*v).to_string());
+            }
+            ["protocols", "isis", "redistribute", v] => {
+                let s = (*v).to_string();
+                if !self.draft.isis.redistribute.contains(&s) {
+                    self.draft.isis.redistribute.push(s);
+                }
+            }
+            ["protocols", "isis", "redistribute-metric", v] => {
+                self.draft.isis.redistribute_metric =
+                    Some(v.parse().with_context(|| format!("invalid metric {v:?}"))?);
+            }
+
+            // vrrp (a named virtual router).
+            ["protocols", "vrrp", name, "interface", v] => {
+                self.draft.vrrp_mut(name).interface = Some((*v).to_string());
+            }
+            ["protocols", "vrrp", name, "vrid", v] => {
+                self.draft.vrrp_mut(name).vrid =
+                    Some(v.parse().with_context(|| format!("invalid vrid {v:?}"))?);
+            }
+            ["protocols", "vrrp", name, "priority", v] => {
+                self.draft.vrrp_mut(name).priority =
+                    Some(v.parse().with_context(|| format!("invalid priority {v:?}"))?);
+            }
+            ["protocols", "vrrp", name, "virtual-address", v] => {
+                let d = self.draft.vrrp_mut(name);
+                let a = (*v).to_string();
+                if !d.virtual_address.contains(&a) {
+                    d.virtual_address.push(a);
+                }
+            }
             _ => bail!(
                 "unknown set path. The config tree (Tab/`?` explores each level):\n  \
                  set system hostname <name>\n  \
@@ -611,7 +824,11 @@ impl Session {
                  set protocols static <prefix> <via <ip> | dev <if> | metric <n>>\n  \
                  set protocols bgp <local-as <n> | router-id <ip> | network <prefix> | redistribute <src>>\n  \
                  set protocols bgp neighbor <ip> remote-as <n>\n  \
-                 set protocols ospf <interface <if> | area <id> | cost <n> | network-type <broadcast|point-to-point> | redistribute <src>>"
+                 set protocols ospf <interface <if> | area <id> | cost <n> | network-type <broadcast|point-to-point> | redistribute <src>>\n  \
+                 set protocols ospf3 <interface <if> | area <id> | cost <n> | network-type <..> | redistribute <src>>\n  \
+                 set protocols <rip|ripng|babel> <interface <if> | redistribute <src> | redistribute-metric <n>>\n  \
+                 set protocols isis <interface <if> | system-id <id> | area <id> | level <1|2|1-2> | network-type <..> | redistribute <src>>\n  \
+                 set protocols vrrp <name> <interface <if> | vrid <n> | priority <n> | virtual-address <ip>>"
             ),
         }
         self.dirty = true;
@@ -619,6 +836,19 @@ impl Session {
     }
 
     /// `delete <path...>` — remove a node or clear a field.
+    /// Clear one field of an OSPF/OSPFv3 draft (both share [`OspfDraft`]).
+    fn del_ospf_field(o: &mut OspfDraft, field: &str) -> Result<()> {
+        match field {
+            "interface" => o.interfaces.clear(),
+            "area" => o.area = None,
+            "cost" => o.cost = None,
+            "network-type" => o.network_type = None,
+            "redistribute" => o.redistribute.clear(),
+            other => bail!("ospf has no field {other:?}"),
+        }
+        Ok(())
+    }
+
     pub fn delete(&mut self, args: &[&str]) -> Result<()> {
         match args {
             ["system", "hostname"] => self.draft.hostname = None,
@@ -766,15 +996,56 @@ impl Session {
                 }
             }
             ["protocols", "ospf"] => self.draft.ospf = OspfDraft::default(),
-            ["protocols", "ospf", field] => {
-                let o = &mut self.draft.ospf;
+            ["protocols", "ospf", field] => Self::del_ospf_field(&mut self.draft.ospf, field)?,
+            ["protocols", "ospf3"] => self.draft.ospf3 = OspfDraft::default(),
+            ["protocols", "ospf3", field] => Self::del_ospf_field(&mut self.draft.ospf3, field)?,
+            ["protocols", proto @ ("rip" | "ripng" | "babel")] => {
+                *self.draft.rip_family_mut(proto) = RipDraft::default()
+            }
+            ["protocols", proto @ ("rip" | "ripng" | "babel"), field] => {
+                let d = self.draft.rip_family_mut(proto);
                 match *field {
-                    "interface" => o.interfaces.clear(),
-                    "area" => o.area = None,
-                    "cost" => o.cost = None,
-                    "network-type" => o.network_type = None,
-                    "redistribute" => o.redistribute.clear(),
-                    other => bail!("ospf has no field {other:?}"),
+                    "interface" => d.interfaces.clear(),
+                    "redistribute" => d.redistribute.clear(),
+                    "redistribute-metric" => d.redistribute_metric = None,
+                    other => bail!("{proto} has no field {other:?}"),
+                }
+            }
+            ["protocols", "isis"] => self.draft.isis = IsisDraft::default(),
+            ["protocols", "isis", field] => {
+                let i = &mut self.draft.isis;
+                match *field {
+                    "interface" => i.interfaces.clear(),
+                    "system-id" => i.system_id = None,
+                    "area" => i.area = None,
+                    "level" => i.level = None,
+                    "network-type" => i.network_type = None,
+                    "redistribute" => i.redistribute.clear(),
+                    "redistribute-metric" => i.redistribute_metric = None,
+                    other => bail!("isis has no field {other:?}"),
+                }
+            }
+            ["protocols", "vrrp", name] => {
+                let before = self.draft.vrrp.len();
+                self.draft.vrrp.retain(|(n, _)| n != name);
+                if self.draft.vrrp.len() == before {
+                    bail!("no vrrp {name:?}");
+                }
+            }
+            ["protocols", "vrrp", name, field] => {
+                let d = self
+                    .draft
+                    .vrrp
+                    .iter_mut()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, d)| d)
+                    .ok_or_else(|| anyhow::anyhow!("no vrrp {name:?}"))?;
+                match *field {
+                    "interface" => d.interface = None,
+                    "vrid" => d.vrid = None,
+                    "priority" => d.priority = None,
+                    "virtual-address" => d.virtual_address.clear(),
+                    other => bail!("vrrp has no field {other:?}"),
                 }
             }
             _ => bail!("unknown delete path"),
@@ -822,6 +1093,22 @@ impl Session {
     /// Render the candidate in a readable, hierarchical (JunOS-curly) form.
     pub fn show(&self) -> String {
         render_draft(&self.draft, false)
+    }
+
+    /// Render the candidate scoped to one top-level section — the VyOS
+    /// `show <path>` view. Unknown sections yield an error line.
+    pub fn show_only(&self, section: &str) -> String {
+        match section {
+            "system" | "interface" | "interfaces" | "firewall" | "nat" | "protocols" => {
+                let out = render_draft_only(&self.draft, false, Some(section));
+                if out.is_empty() {
+                    format!("(no {section} configuration)\n")
+                } else {
+                    out
+                }
+            }
+            other => format!("error: unknown section {other:?} (system | interfaces | firewall | nat | protocols)\n"),
+        }
     }
 
     /// `compare` — a VyOS-style line diff of the candidate against the
@@ -1000,11 +1287,68 @@ impl Session {
                 redistribute: self.draft.ospf.redistribute.clone(),
             })
         };
+        let ospf3 = if self.draft.ospf3.is_empty() {
+            None
+        } else {
+            Some(Ospf3 {
+                interfaces: self.draft.ospf3.interfaces.clone(),
+                area: self.draft.ospf3.area.clone(),
+                cost: self.draft.ospf3.cost,
+                network_type: self.draft.ospf3.network_type.clone(),
+                redistribute: self.draft.ospf3.redistribute.clone(),
+            })
+        };
+        let rip_from = |d: &RipDraft| Rip {
+            interfaces: d.interfaces.clone(),
+            redistribute: d.redistribute.clone(),
+            redistribute_metric: d.redistribute_metric,
+        };
+        let rip = (!self.draft.rip.is_empty()).then(|| rip_from(&self.draft.rip));
+        let ripng = (!self.draft.ripng.is_empty()).then(|| rip_from(&self.draft.ripng));
+        let babel = (!self.draft.babel.is_empty()).then(|| rip_from(&self.draft.babel));
+        let isis = if self.draft.isis.is_empty() {
+            None
+        } else {
+            Some(Isis {
+                interfaces: self.draft.isis.interfaces.clone(),
+                system_id: self.draft.isis.system_id.clone(),
+                area: self.draft.isis.area.clone(),
+                level: self.draft.isis.level.clone(),
+                network_type: self.draft.isis.network_type.clone(),
+                redistribute: self.draft.isis.redistribute.clone(),
+                redistribute_metric: self.draft.isis.redistribute_metric,
+            })
+        };
+        let vrrp = self
+            .draft
+            .vrrp
+            .iter()
+            .map(|(name, d)| {
+                Ok(Vrrp {
+                    name: name.clone(),
+                    interface: d
+                        .interface
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("vrrp {name:?}: interface not set"))?,
+                    vrid: d
+                        .vrid
+                        .ok_or_else(|| anyhow::anyhow!("vrrp {name:?}: vrid not set"))?,
+                    priority: d.priority,
+                    virtual_address: d.virtual_address.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let protocols = Protocols {
             router_id: self.draft.router_id.clone(),
             statics,
             ospf,
+            ospf3,
+            rip,
+            ripng,
+            babel,
+            isis,
             bgp,
+            vrrp,
         };
 
         let appliance = Appliance {
@@ -1068,12 +1412,36 @@ impl Session {
 /// interfaces with neither a role nor an address are omitted (used by
 /// `compare`, where system-provided placeholders aren't real configuration).
 fn render_draft(draft: &Draft, skip_empty_ifaces: bool) -> String {
+    render_draft_only(draft, skip_empty_ifaces, None)
+}
+
+/// Render a saved appliance config in the hierarchical config syntax — the
+/// operational-mode `show configuration` view (VyOS-style).
+pub fn render_appliance(a: &Appliance) -> String {
+    render_draft_only(&Draft::from_appliance(a), true, None)
+}
+
+/// Render the draft in config syntax, optionally scoped to ONE top-level section
+/// (`system` / `interface` / `firewall` / `nat` / `protocols`) — the VyOS
+/// `show <path>` view. `None` renders everything.
+fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>) -> String {
+    // Which top-level section a filter token selects ("interfaces" ≡ "interface").
+    let want = |section: &str| match only {
+        None => true,
+        Some("interfaces") => section == "interface",
+        Some(o) => o == section,
+    };
     let mut out = String::new();
-    if let Some(h) = &draft.hostname {
-        out.push_str(&format!("system {{\n    hostname {h}\n}}\n"));
+    if want("system") {
+        if let Some(h) = &draft.hostname {
+            out.push_str(&format!("system {{\n    hostname {h}\n}}\n"));
+        }
     }
     // Interfaces are top-level (like VyOS), between `system` and `firewall`.
     for (name, i) in &draft.interfaces {
+        if !want("interface") {
+            break;
+        }
         if skip_empty_ifaces
             && i.zone.is_none()
             && i.address.is_none()
@@ -1171,7 +1539,7 @@ fn render_draft(draft: &Draft, skip_empty_ifaces: bool) -> String {
         }
         fwi.push_str("    }\n");
     }
-    if !fwi.is_empty() {
+    if want("firewall") && !fwi.is_empty() {
         out.push_str("firewall {\n");
         out.push_str(&fwi);
         out.push_str("}\n");
@@ -1203,7 +1571,7 @@ fn render_draft(draft: &Draft, skip_empty_ifaces: bool) -> String {
         }
         nati.push_str("    }\n");
     }
-    if !nati.is_empty() {
+    if want("nat") && !nati.is_empty() {
         out.push_str("nat {\n");
         out.push_str(&nati);
         out.push_str("}\n");
@@ -1246,6 +1614,82 @@ fn render_draft(draft: &Draft, skip_empty_ifaces: bool) -> String {
         }
         proto.push_str("    }\n");
     }
+    if !draft.ospf3.is_empty() {
+        proto.push_str("    ospf3 {\n");
+        if let Some(a) = &draft.ospf3.area {
+            proto.push_str(&format!("        area {a}\n"));
+        }
+        for iface in &draft.ospf3.interfaces {
+            proto.push_str(&format!("        interface {iface}\n"));
+        }
+        if let Some(c) = draft.ospf3.cost {
+            proto.push_str(&format!("        cost {c}\n"));
+        }
+        if let Some(nt) = &draft.ospf3.network_type {
+            proto.push_str(&format!("        network-type {nt}\n"));
+        }
+        for src in &draft.ospf3.redistribute {
+            proto.push_str(&format!("        redistribute {src}\n"));
+        }
+        proto.push_str("    }\n");
+    }
+    for (name, r) in [("rip", &draft.rip), ("ripng", &draft.ripng), ("babel", &draft.babel)] {
+        if r.is_empty() {
+            continue;
+        }
+        proto.push_str(&format!("    {name} {{\n"));
+        for iface in &r.interfaces {
+            proto.push_str(&format!("        interface {iface}\n"));
+        }
+        for src in &r.redistribute {
+            proto.push_str(&format!("        redistribute {src}\n"));
+        }
+        if let Some(m) = r.redistribute_metric {
+            proto.push_str(&format!("        redistribute-metric {m}\n"));
+        }
+        proto.push_str("    }\n");
+    }
+    if !draft.isis.is_empty() {
+        proto.push_str("    isis {\n");
+        if let Some(s) = &draft.isis.system_id {
+            proto.push_str(&format!("        system-id {s}\n"));
+        }
+        if let Some(a) = &draft.isis.area {
+            proto.push_str(&format!("        area {a}\n"));
+        }
+        if let Some(l) = &draft.isis.level {
+            proto.push_str(&format!("        level {l}\n"));
+        }
+        for iface in &draft.isis.interfaces {
+            proto.push_str(&format!("        interface {iface}\n"));
+        }
+        if let Some(nt) = &draft.isis.network_type {
+            proto.push_str(&format!("        network-type {nt}\n"));
+        }
+        for src in &draft.isis.redistribute {
+            proto.push_str(&format!("        redistribute {src}\n"));
+        }
+        if let Some(m) = draft.isis.redistribute_metric {
+            proto.push_str(&format!("        redistribute-metric {m}\n"));
+        }
+        proto.push_str("    }\n");
+    }
+    for (name, v) in &draft.vrrp {
+        proto.push_str(&format!("    vrrp {name} {{\n"));
+        if let Some(i) = &v.interface {
+            proto.push_str(&format!("        interface {i}\n"));
+        }
+        if let Some(id) = v.vrid {
+            proto.push_str(&format!("        vrid {id}\n"));
+        }
+        if let Some(p) = v.priority {
+            proto.push_str(&format!("        priority {p}\n"));
+        }
+        for a in &v.virtual_address {
+            proto.push_str(&format!("        virtual-address {a}\n"));
+        }
+        proto.push_str("    }\n");
+    }
     if !draft.bgp.is_empty() {
         proto.push_str("    bgp {\n");
         if let Some(a) = draft.bgp.local_as {
@@ -1265,7 +1709,7 @@ fn render_draft(draft: &Draft, skip_empty_ifaces: bool) -> String {
         }
         proto.push_str("    }\n");
     }
-    if !proto.is_empty() {
+    if want("protocols") && !proto.is_empty() {
         out.push_str("protocols {\n");
         out.push_str(&proto);
         out.push_str("}\n");

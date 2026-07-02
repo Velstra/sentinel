@@ -129,6 +129,7 @@ pub fn bin(name: &str) -> String {
         "networkctl" => "SENTINEL_NETWORKCTL_BIN",
         "systemctl" => "SENTINEL_SYSTEMCTL_BIN",
         "journalctl" => "SENTINEL_JOURNALCTL_BIN",
+        "wren" => "SENTINEL_WREN_BIN",
         "lsblk" => "SENTINEL_LSBLK_BIN",
         "install" => "SENTINEL_INSTALL_BIN",
         "mkdir" => "SENTINEL_MKDIR_BIN",
