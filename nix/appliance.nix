@@ -63,11 +63,13 @@
     show = "sentinel show";
   };
 
-  # Dynamic prompt: `$(hostname)` is re-evaluated each render (bash promptvars),
-  # so a committed hostname change shows up live in the running shell instead of
-  # only after a reboot/relogin (plain `\h` is cached at shell start).
+  # Prompt uses bash's `\h` hostname escape rather than a `$(hostname)` command
+  # substitution: embedding a live command substitution in PS1 (with promptvars
+  # on) is an unnecessary prompt-injection footgun for zero real benefit. The
+  # hostname is charset-validated at config time (see config::validate_hostname),
+  # and a committed change is picked up by the next login shell.
   programs.bash.promptInit = ''
-    PS1='\[\e[1;32m\]\u@$(hostname)\[\e[0m\]:\w\$ '
+    PS1='\[\e[1;32m\]\u@\h\[\e[0m\]:\w\$ '
   '';
 
   # Operational-mode tab completion (vtysh-like): `show <Tab>` and

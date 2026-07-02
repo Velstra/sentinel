@@ -968,7 +968,20 @@ impl Session {
             }
 
             // protocols: dynamic routing (Wren).
-            ["protocols"] => self.draft.router_id = None,
+            // Bare `delete protocols` clears the ENTIRE routing subtree, not just
+            // the router-id — otherwise a configured ospf/bgp/… silently survives.
+            ["protocols"] => {
+                self.draft.router_id = None;
+                self.draft.statics.clear();
+                self.draft.ospf = OspfDraft::default();
+                self.draft.ospf3 = OspfDraft::default();
+                self.draft.rip = RipDraft::default();
+                self.draft.ripng = RipDraft::default();
+                self.draft.babel = RipDraft::default();
+                self.draft.isis = IsisDraft::default();
+                self.draft.bgp = BgpDraft::default();
+                self.draft.vrrp.clear();
+            }
             ["protocols", "router-id"] => self.draft.router_id = None,
             ["protocols", "static", prefix] => {
                 let before = self.draft.statics.len();
