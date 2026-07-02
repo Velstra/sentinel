@@ -724,9 +724,7 @@ impl Appliance {
 
     /// Reject configs that parse but are not coherent.
     pub fn validate(&self) -> Result<()> {
-        if self.system.hostname.trim().is_empty() {
-            bail!("system.hostname must not be empty");
-        }
+        validate_hostname(&self.system.hostname)?;
 
         // Every blocklist entry must be a valid IPv4 address or CIDR.
         for entry in &self.firewall.blocklist {
@@ -743,6 +741,11 @@ impl Appliance {
         let names: HashSet<&str> = self.interfaces.iter().map(|i| i.name.as_str()).collect();
         let mut seen = HashSet::new();
         for iface in &self.interfaces {
+            validate_iface_name(&iface.name)?;
+            if let Some(parent) = &iface.parent {
+                validate_iface_name(parent)
+                    .with_context(|| format!("interface {:?} parent", iface.name))?;
+            }
             if !seen.insert(&iface.name) {
                 bail!("duplicate interface {:?}", iface.name);
             }
@@ -952,6 +955,48 @@ fn validate_ipv4(s: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate a system hostname to the RFC 1123 label charset. A security
+/// boundary as well as correctness: the hostname is rendered into the shell's
+/// `PS1`, systemd units and `/etc/hostname`, so it must not carry shell
+/// metacharacters, whitespace or other unexpected bytes.
+pub(crate) fn validate_hostname(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 63 {
+        bail!("system.hostname: must be 1–63 characters");
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        bail!("system.hostname {name:?}: only ASCII letters, digits and '-' are allowed");
+    }
+    if name.starts_with('-') || name.ends_with('-') {
+        bail!("system.hostname {name:?}: must not start or end with '-'");
+    }
+    Ok(())
+}
+
+/// Validate a network-interface name. This is a security boundary, not just
+/// cosmetics: interface names flow verbatim into hand-written systemd-networkd
+/// unit files and their filenames (`src/net.rs`). Without this check a name
+/// containing `/` or `..` escapes the runtime unit directory (path traversal)
+/// and a name containing a newline injects arbitrary `.network`/`.netdev`
+/// directives. Restrict to the kernel's `IFNAMSIZ` charset (Linux permits at
+/// most 15 bytes and forbids `/` and whitespace in link names anyway).
+pub(crate) fn validate_iface_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 15 {
+        bail!("interface name {name:?}: must be 1–15 characters");
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+    {
+        bail!(
+            "interface name {name:?}: only ASCII letters, digits, '.', '_' and '-' are allowed"
+        );
+    }
+    Ok(())
+}
+
 /// Validate an OSPF/OSPFv3 `network-type` (`broadcast` / `point-to-point`).
 fn validate_ospf_network_type(nt: Option<&str>, proto: &str) -> Result<()> {
     if let Some(nt) = nt {
@@ -1063,6 +1108,38 @@ mod tests {
             address = "10.0.0.1/24"
         "#;
         assert!(Appliance::from_toml(toml).is_err());
+    }
+
+    #[test]
+    fn rejects_interface_name_with_path_traversal() {
+        // A '/' (or '..') in an interface name would escape the networkd runtime
+        // unit directory when net.rs joins it onto a path.
+        let toml = r#"
+            [system]
+            hostname = "x"
+            [[interface]]
+            name = "../../etc/evil"
+            zone = "wan"
+            address = "dhcp"
+        "#;
+        assert!(Appliance::from_toml(toml).is_err());
+    }
+
+    #[test]
+    fn rejects_interface_name_with_newline_injection() {
+        // A newline would inject extra INI directives into the rendered .network
+        // file, which is line-oriented with no quoting.
+        let toml = "[system]\nhostname = \"x\"\n[[interface]]\nname = \"eth0\\n[Network]\\nIPForward=yes\"\nzone = \"wan\"\naddress = \"dhcp\"\n";
+        assert!(Appliance::from_toml(toml).is_err());
+    }
+
+    #[test]
+    fn accepts_ordinary_and_vlan_interface_names() {
+        assert!(validate_iface_name("eth0").is_ok());
+        assert!(validate_iface_name("eth1.20").is_ok());
+        assert!(validate_iface_name("wan-uplink_0").is_ok());
+        assert!(validate_iface_name("").is_err());
+        assert!(validate_iface_name("thisnameistoolong").is_err()); // > 15
     }
 
     #[test]
