@@ -20,7 +20,19 @@ pub struct WrenConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     ospf: Option<WrenOspf>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    ospf3: Option<WrenOspf3>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rip: Option<WrenRip>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ripng: Option<WrenRip>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    babel: Option<WrenRip>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    isis: Option<WrenIsis>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     bgp: Option<WrenBgp>,
+    #[serde(rename = "vrrp", skip_serializing_if = "Vec::is_empty")]
+    vrrp: Vec<WrenVrrp>,
 }
 
 #[derive(Debug, Serialize)]
@@ -69,6 +81,62 @@ struct WrenOspf {
     network_type: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     redistribute: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct WrenOspf3 {
+    enabled: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    interfaces: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    area: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost: Option<u16>,
+    #[serde(rename = "network-type", skip_serializing_if = "Option::is_none")]
+    network_type: Option<String>,
+    /// OSPFv3 only redistributes static externals (a bool in wren's schema).
+    #[serde(rename = "redistribute-static", skip_serializing_if = "std::ops::Not::not")]
+    redistribute_static: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct WrenRip {
+    enabled: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    interfaces: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    redistribute: Vec<String>,
+    #[serde(rename = "redistribute-metric", skip_serializing_if = "Option::is_none")]
+    redistribute_metric: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct WrenIsis {
+    enabled: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    interfaces: Vec<String>,
+    #[serde(rename = "system-id", skip_serializing_if = "Option::is_none")]
+    system_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    area: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    level: Option<String>,
+    #[serde(rename = "network-type", skip_serializing_if = "Option::is_none")]
+    network_type: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    redistribute: Vec<String>,
+    #[serde(rename = "redistribute-metric", skip_serializing_if = "Option::is_none")]
+    redistribute_metric: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct WrenVrrp {
+    interface: String,
+    vrid: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    priority: Option<u8>,
+    #[serde(rename = "virtual-address", skip_serializing_if = "Vec::is_empty")]
+    virtual_address: Vec<String>,
 }
 
 impl WrenConfig {
@@ -120,11 +188,60 @@ pub fn compile_wren(appliance: &Appliance) -> WrenConfig {
         redistribute: o.redistribute.clone(),
     });
 
+    let ospf3 = p.ospf3.as_ref().map(|o| WrenOspf3 {
+        enabled: true,
+        interfaces: o.interfaces.clone(),
+        area: o.area.clone(),
+        cost: o.cost,
+        network_type: o.network_type.clone(),
+        // OSPFv3 only redistributes static externals (bool in wren's schema).
+        redistribute_static: o.redistribute.iter().any(|s| s == "static"),
+    });
+
+    // RIP, RIPng and Babel share the appliance `Rip` shape.
+    let rip_like = |r: &crate::config::Rip| WrenRip {
+        enabled: true,
+        interfaces: r.interfaces.clone(),
+        redistribute: r.redistribute.clone(),
+        redistribute_metric: r.redistribute_metric,
+    };
+    let rip = p.rip.as_ref().map(rip_like);
+    let ripng = p.ripng.as_ref().map(rip_like);
+    let babel = p.babel.as_ref().map(rip_like);
+
+    let isis = p.isis.as_ref().map(|i| WrenIsis {
+        enabled: true,
+        interfaces: i.interfaces.clone(),
+        system_id: i.system_id.clone(),
+        area: i.area.clone(),
+        level: i.level.clone(),
+        network_type: i.network_type.clone(),
+        redistribute: i.redistribute.clone(),
+        redistribute_metric: i.redistribute_metric,
+    });
+
+    let vrrp = p
+        .vrrp
+        .iter()
+        .map(|v| WrenVrrp {
+            interface: v.interface.clone(),
+            vrid: v.vrid,
+            priority: v.priority,
+            virtual_address: v.virtual_address.clone(),
+        })
+        .collect();
+
     WrenConfig {
         router_id: p.router_id.clone(),
         statics,
         ospf,
+        ospf3,
+        rip,
+        ripng,
+        babel,
+        isis,
         bgp,
+        vrrp,
     }
 }
 
@@ -181,6 +298,50 @@ redistribute = ["static"]
         assert!(ospf.contains("area = \"0.0.0.0\""), "{out}");
         assert!(ospf.contains("network-type = \"point-to-point\""), "{out}");
         assert!(ospf.contains("\"eth1\""), "{out}");
+    }
+
+    #[test]
+    fn all_igps_and_vrrp_compile() {
+        let toml = r#"
+[system]
+hostname = "r1"
+[protocols]
+router-id = "10.0.0.1"
+[protocols.ospf3]
+interfaces = ["eth1"]
+redistribute = ["static"]
+[protocols.rip]
+interfaces = ["eth1"]
+redistribute = ["connected"]
+[protocols.ripng]
+interfaces = ["eth1"]
+[protocols.babel]
+interfaces = ["eth1"]
+[protocols.isis]
+interfaces = ["eth1"]
+system-id = "0000.0000.0001"
+area = "49.0001"
+level = "2"
+[[protocols.vrrp]]
+name = "gw"
+interface = "eth1"
+vrid = 10
+priority = 200
+virtual-address = ["10.0.0.254"]
+"#;
+        let appliance = Appliance::from_toml(toml).unwrap();
+        let out = compile_wren(&appliance).to_toml().unwrap();
+        assert!(out.contains("[ospf3]"), "{out}");
+        assert!(out.contains("redistribute-static = true"), "{out}");
+        assert!(out.contains("[rip]"), "{out}");
+        assert!(out.contains("[ripng]"), "{out}");
+        assert!(out.contains("[babel]"), "{out}");
+        assert!(out.contains("[isis]"), "{out}");
+        assert!(out.contains("system-id = \"0000.0000.0001\""), "{out}");
+        assert!(out.contains("[[vrrp]]"), "{out}");
+        assert!(out.contains("vrid = 10"), "{out}");
+        // Every enabled protocol carries `enabled = true`.
+        assert_eq!(out.matches("enabled = true").count(), 5, "{out}");
     }
 
     #[test]
