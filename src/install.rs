@@ -298,43 +298,80 @@ pub fn execute(targets: &[&Disk], raid: Raid, source_image: Option<&std::path::P
     };
     eprintln!("source (install medium): {source}");
 
+    // Pre-flight: reject any target that collides with the source medium BEFORE
+    // erasing anything. This check used to live inside the prepare loop, so with
+    // two targets disk 1 could be wiped before disk 2 was found to be the source
+    // — leaving a blank disk and no install (H8).
     for t in targets {
         let dev = t.dev_path();
         if dev == source {
             bail!("refusing to install onto the source medium {dev}");
         }
+    }
+
+    // From here on disks are being erased. Track which, so a mid-way failure
+    // reports exactly which disks are left blank (none are recoverable once
+    // wipefs has run — but the operator must know which to re-install).
+    let mut erased: Vec<String> = Vec::new();
+    for t in targets {
+        let dev = t.dev_path();
         eprintln!("preparing {dev} (ERASING) …");
-        prepare_disk(&source, &dev, raid)?;
+        erased.push(dev.clone());
+        if let Err(e) = prepare_disk(&source, &dev, raid) {
+            return Err(partial_install_error(e, &erased));
+        }
     }
 
     let data_parts: Vec<String> =
         targets.iter().map(|t| part_path(&t.dev_path(), DATA_PART)).collect();
-    match raid.mdadm_level() {
-        None => {
-            run("mkfs.ext4", &["-q", "-F", "-L", "data", &data_parts[0]])?;
+    // Build the data filesystem (or RAID array). A failure here leaves every
+    // erased disk partitioned but without a bootable system — report which.
+    let fs_result: Result<()> = (|| {
+        match raid.mdadm_level() {
+            None => {
+                run("mkfs.ext4", &["-q", "-F", "-L", "data", &data_parts[0]])?;
+            }
+            Some(level) => {
+                run("udevadm", &["settle"]).ok();
+                let n = data_parts.len().to_string();
+                let mut args = vec![
+                    "--create",
+                    "/dev/md/sentinel-data",
+                    "--level",
+                    level,
+                    "--raid-devices",
+                    &n,
+                    "--metadata=1.2",
+                    "--run",
+                    "--force",
+                ];
+                args.extend(data_parts.iter().map(String::as_str));
+                eprintln!("creating RAID{level} across {} disk(s) …", data_parts.len());
+                run("mdadm", &args)?;
+                run("mkfs.ext4", &["-q", "-F", "-L", "data", "/dev/md/sentinel-data"])?;
+            }
         }
-        Some(level) => {
-            run("udevadm", &["settle"]).ok();
-            let n = data_parts.len().to_string();
-            let mut args = vec![
-                "--create",
-                "/dev/md/sentinel-data",
-                "--level",
-                level,
-                "--raid-devices",
-                &n,
-                "--metadata=1.2",
-                "--run",
-                "--force",
-            ];
-            args.extend(data_parts.iter().map(String::as_str));
-            eprintln!("creating RAID{level} across {} disk(s) …", data_parts.len());
-            run("mdadm", &args)?;
-            run("mkfs.ext4", &["-q", "-F", "-L", "data", "/dev/md/sentinel-data"])?;
-        }
+        Ok(())
+    })();
+    if let Err(e) = fs_result {
+        return Err(partial_install_error(e, &erased));
     }
     eprintln!("install complete — remove the medium and reboot.");
     Ok(())
+}
+
+/// Wrap a destructive-phase failure with the list of disks already erased, so
+/// the operator knows exactly which disks are left blank. Disk contents are gone
+/// (wipefs ran) — this is a clear report, not a recovery: re-running the install
+/// finishes the job, since every listed disk is an intended target anyway.
+fn partial_install_error(cause: anyhow::Error, erased: &[String]) -> anyhow::Error {
+    anyhow::anyhow!(
+        "install failed after starting to erase {}: {cause}\n\
+         these disk(s) are now BLANK (partitioned but WITHOUT a complete, bootable \
+         system); re-run the install to finish, or restore them from backup. No \
+         disk outside this list was touched.",
+        erased.join(", ")
+    )
 }
 
 /// Lay the image's A/B partition layout onto `target` and clone the sealed
@@ -661,6 +698,21 @@ sr0       1073741824 rom  1
         assert_eq!(human_size(512), "512 B");
         assert_eq!(human_size(1024), "1.0 KiB");
         assert_eq!(human_size(500_107_862_016), "465.8 GiB");
+    }
+
+    #[test]
+    fn partial_install_error_names_the_erased_disks() {
+        let e = partial_install_error(
+            anyhow::anyhow!("mkfs failed"),
+            &["/dev/sda".into(), "/dev/sdb".into()],
+        );
+        let msg = format!("{e}");
+        // Names every erased disk and its underlying cause.
+        assert!(msg.contains("/dev/sda"), "{msg}");
+        assert!(msg.contains("/dev/sdb"), "{msg}");
+        assert!(msg.contains("mkfs failed"), "{msg}");
+        // Makes the blank/not-bootable state unambiguous.
+        assert!(msg.contains("BLANK"), "{msg}");
     }
 
     fn disk(name: &str, gib: u64, removable: bool) -> Disk {
