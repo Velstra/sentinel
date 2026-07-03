@@ -355,7 +355,16 @@ fn apply_boot(
 ) -> Result<()> {
     let appliance = Appliance::load(config)?;
 
-    let rendered = compile::compile(&appliance).to_toml()?;
+    // Compile BOTH configs before writing either, so a compile error can't leave
+    // a half-seeded system (velstra written, wren missing). Rendering is pure and
+    // has no side effects, so this is the cheap point to fail atomically.
+    let rendered = compile::compile(&appliance)
+        .to_toml()
+        .context("compiling firewall config")?;
+    let wren_rendered = wren::compile_wren(&appliance)
+        .to_toml()
+        .context("compiling routing config")?;
+
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -363,7 +372,6 @@ fn apply_boot(
     std::fs::write(out, &rendered).with_context(|| format!("writing {}", out.display()))?;
 
     // Routing: seed the Wren config too (the daemon starts after, so no reload).
-    let wren_rendered = wren::compile_wren(&appliance).to_toml()?;
     if let Some(parent) = wren_out.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
