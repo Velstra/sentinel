@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use rustyline::{
     Helper, completion::Completer, completion::Pair, highlight::Highlighter, hint::Hinter,
     validate::Validator,
@@ -205,33 +205,158 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
     false
 }
 
-/// Apply a validated appliance config to the running system: compile + install
-/// the firewall config and reload the agent, then set the hostname.
-fn apply_live(appliance: &crate::config::Appliance, act: &Apply) -> Result<()> {
-    // Firewall: compile -> atomically install -> reload the data plane.
-    let rendered = compile::compile(appliance).to_toml()?;
-    if let Some(parent) = act.velstra_out.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = act.velstra_out.with_extension("toml.tmp");
-    std::fs::write(&tmp, &rendered)?;
-    std::fs::rename(&tmp, &act.velstra_out)?;
-    system::reload_velstra(&act.unit)?;
+/// A stack of best-effort undo actions, run in reverse when a later apply stage
+/// fails, so a partial `commit` never leaves the running system in a state
+/// *worse* than "commit refused" (e.g. a new firewall live over stale routing).
+/// A named best-effort undo action.
+type UndoStep = (&'static str, Box<dyn FnOnce() -> Result<()>>);
 
-    // Routing: compile -> atomically install -> reload the Wren daemon.
-    let wren_rendered = crate::wren::compile_wren(appliance).to_toml()?;
-    if let Some(parent) = act.wren_out.parent() {
+struct Rollback {
+    steps: Vec<UndoStep>,
+}
+
+impl Rollback {
+    fn new() -> Self {
+        Self { steps: Vec::new() }
+    }
+
+    fn push(&mut self, what: &'static str, undo: impl FnOnce() -> Result<()> + 'static) {
+        self.steps.push((what, Box::new(undo)));
+    }
+
+    /// Run every recorded undo in reverse order. Returns the names of any that
+    /// themselves failed, so the operator learns exactly what is left
+    /// inconsistent (rather than a bare "commit failed").
+    fn unwind(self) -> Vec<String> {
+        let mut failures = Vec::new();
+        for (what, undo) in self.steps.into_iter().rev() {
+            if let Err(e) = undo() {
+                failures.push(format!("{what} ({e})"));
+            }
+        }
+        failures
+    }
+}
+
+/// Write `bytes` to `path` via a temp file + rename, so a reader never sees a
+/// half-written config.
+fn atomic_install(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let wren_tmp = act.wren_out.with_extension("toml.tmp");
-    std::fs::write(&wren_tmp, &wren_rendered)?;
-    std::fs::rename(&wren_tmp, &act.wren_out)?;
-    system::reload_velstra(&act.wren_unit)?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Restore a config file to a snapshot taken before the apply: rewrite the old
+/// contents, or remove the file if there was none.
+fn restore_file(path: &Path, prev: Option<&[u8]>) -> Result<()> {
+    match prev {
+        Some(bytes) => atomic_install(path, bytes),
+        None => {
+            let _ = std::fs::remove_file(path);
+            Ok(())
+        }
+    }
+}
+
+/// Install a compiled config file and reload its unit as one unit of work. On
+/// failure it restores the previous file (best-effort) and returns the error,
+/// having made no lasting change. On success it returns an undo that restores
+/// the previous file + reloads, so a *later* stage's failure can roll this back
+/// too. Returns the undo boxed for the rollback stack.
+fn apply_service(
+    out: &Path,
+    unit: &str,
+    new: &[u8],
+    prev: Option<&[u8]>,
+) -> Result<Box<dyn FnOnce() -> Result<()>>> {
+    atomic_install(out, new).with_context(|| format!("installing {}", out.display()))?;
+    if let Err(e) = system::reload_velstra(unit) {
+        // Reload failed: put the previous file back so we don't leave a new
+        // config staged under a daemon still running the old one.
+        let _ = restore_file(out, prev);
+        return Err(e).with_context(|| format!("reloading {unit}"));
+    }
+    let out = out.to_path_buf();
+    let unit = unit.to_string();
+    let prev = prev.map(<[u8]>::to_vec);
+    Ok(Box::new(move || {
+        restore_file(&out, prev.as_deref())?;
+        system::reload_velstra(&unit)
+    }))
+}
+
+/// Combine the original stage error with the rollback outcome into one report.
+fn unwind_err(rb: Rollback, cause: anyhow::Error, stage: &str) -> anyhow::Error {
+    let failures = rb.unwind();
+    if failures.is_empty() {
+        anyhow!("applying {stage} failed: {cause}\n  rolled back to the previous running config")
+    } else {
+        anyhow!(
+            "applying {stage} failed: {cause}\n  ROLLBACK INCOMPLETE — still inconsistent: {}",
+            failures.join("; ")
+        )
+    }
+}
+
+/// Apply a validated appliance config to the running system atomically: compile
+/// **everything** first (so a bad config is rejected before any live change),
+/// then apply firewall, routing, hostname and addressing in order — each stage
+/// recording how to undo itself. If a later stage fails, the completed stages
+/// are rolled back in reverse and a report of what changed is returned.
+fn apply_live(appliance: &crate::config::Appliance, act: &Apply) -> Result<()> {
+    // ---- Phase 1: prepare (fallible, NO live side effects) ----
+    let rendered = compile::compile(appliance)
+        .to_toml()
+        .context("compiling firewall config")?;
+    let wren_rendered = crate::wren::compile_wren(appliance)
+        .to_toml()
+        .context("compiling routing config")?;
+    // Snapshot the currently-installed configs so a later failure can restore
+    // them (None ⇒ there was no file, so rollback removes ours).
+    let velstra_prev = std::fs::read(&act.velstra_out).ok();
+    let wren_prev = std::fs::read(&act.wren_out).ok();
+    let old_host = system::current_hostname();
+
+    // ---- Phase 2: apply, each stage undoable on a later failure ----
+    let mut rb = Rollback::new();
+
+    // Firewall: install + reload. If this first stage fails nothing else was
+    // touched, so surface the error directly.
+    let undo = apply_service(
+        &act.velstra_out,
+        &act.unit,
+        rendered.as_bytes(),
+        velstra_prev.as_deref(),
+    )?;
+    rb.push("firewall", undo);
+
+    // Routing: install + reload the Wren daemon.
+    match apply_service(
+        &act.wren_out,
+        &act.wren_unit,
+        wren_rendered.as_bytes(),
+        wren_prev.as_deref(),
+    ) {
+        Ok(undo) => rb.push("routing", undo),
+        Err(e) => return Err(unwind_err(rb, e, "routing")),
+    }
 
     // Hostname: set it live.
-    system::set_hostname(&appliance.system.hostname)?;
-    // Interface addressing: render + apply networkd units live.
-    crate::net::apply(appliance)?;
+    if let Err(e) = system::set_hostname(&appliance.system.hostname) {
+        return Err(unwind_err(rb, e, "hostname"));
+    }
+    rb.push("hostname", move || system::set_hostname(&old_host));
+
+    // Interface addressing: render + apply networkd units live. Last stage, so
+    // its own partial failure doesn't cascade; failure still rolls back the
+    // firewall/routing/hostname above.
+    if let Err(e) = crate::net::apply(appliance) {
+        return Err(unwind_err(rb, e, "interface addressing"));
+    }
     Ok(())
 }
 
@@ -850,5 +975,52 @@ mod tests {
         // Non-path commands pass through untouched.
         let eff = effective_tokens(&["run", "show"], &ctx);
         assert_eq!(eff, ["run", "show"]);
+    }
+
+    #[test]
+    fn rollback_unwinds_in_reverse_and_reports_failures() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        // A shared log records the order undos run in.
+        let order = Rc::new(RefCell::new(Vec::<&'static str>::new()));
+        let mut rb = Rollback::new();
+        for name in ["first", "second", "third"] {
+            let order = order.clone();
+            rb.push(name, move || {
+                order.borrow_mut().push(name);
+                // "second" fails to undo; the others succeed.
+                if name == "second" {
+                    Err(anyhow!("boom"))
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let failures = rb.unwind();
+        // Undos run LIFO: third, second, first.
+        assert_eq!(*order.borrow(), ["third", "second", "first"]);
+        // Only the failing undo is reported, with its cause.
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("second"), "{:?}", failures);
+        assert!(failures[0].contains("boom"), "{:?}", failures);
+    }
+
+    #[test]
+    fn restore_file_rewrites_or_removes() {
+        let dir = std::env::temp_dir().join(format!("sentinel-restore-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("velstra.toml");
+
+        // Snapshot Some(old) restores the old contents even after an overwrite.
+        std::fs::write(&path, b"new").unwrap();
+        restore_file(&path, Some(b"old")).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+
+        // Snapshot None (no file existed) removes the file we wrote.
+        restore_file(&path, None).unwrap();
+        assert!(!path.exists(), "restore of a None snapshot removes the file");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
