@@ -587,6 +587,8 @@ const IFACE_FIELDS: &[Cand] = &[
     ("type", "make this a virtual L2 device: bridge | bond"),
     ("master", "enslave this NIC to a bridge/bond device"),
     ("bond-mode", "bonding mode (on a type=bond device)"),
+    ("mtu", "link MTU in bytes (e.g. 1492 PPPoE, 9000 jumbo)"),
+    ("mac", "override the link MAC (MAC cloning), e.g. 52:54:00:12:34:56"),
 ];
 const ADDRESS6_HINT: &[Cand] = &[
     ("auto", "accept Router Advertisements (SLAAC)"),
@@ -940,7 +942,9 @@ mod tests {
                 "router-advert",
                 "type",
                 "master",
-                "bond-mode"
+                "bond-mode",
+                "mtu",
+                "mac"
             ]
         );
         // The DHCP-server sub-tree of an interface is discoverable.
@@ -1037,7 +1041,9 @@ mod tests {
                 "router-advert",
                 "type",
                 "master",
-                "bond-mode"
+                "bond-mode",
+                "mtu",
+                "mac"
             ]
         );
     }

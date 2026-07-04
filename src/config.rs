@@ -696,6 +696,15 @@ pub struct Interface {
     /// defaults to `active-backup` when unset.
     #[serde(default, rename = "bond-mode", skip_serializing_if = "Option::is_none")]
     pub bond_mode: Option<String>,
+    /// Link MTU in bytes (e.g. `1492` for PPPoE, `9000` for jumbo frames).
+    /// `None` leaves the kernel/driver default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u16>,
+    /// Override the link's MAC address (`"52:54:00:12:34:56"`) — MAC cloning, as
+    /// some ISPs bind service to the CPE's original MAC. `None` keeps the NIC's
+    /// hardware address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
 }
 
 /// The kind of a **virtual L2 device** Sentinel creates: a bridge (switch) or a
@@ -1054,6 +1063,16 @@ impl Appliance {
                 }
             } else if iface.pd_subnet.is_some() {
                 bail!("interface {:?}: pd-subnet requires pd-from", iface.name);
+            }
+            // Link tunables: a sane MTU (IPv6 needs ≥1280; cap at jumbo) and a
+            // well-formed MAC when cloning one.
+            if let Some(mtu) = iface.mtu {
+                if !(68..=9216).contains(&mtu) {
+                    bail!("interface {:?}: mtu {mtu} out of range (68–9216)", iface.name);
+                }
+            }
+            if let Some(mac) = &iface.mac {
+                validate_mac(mac).with_context(|| format!("interface {:?} mac", iface.name))?;
             }
             // VLAN subinterface: parent + vlan come as a pair; vlan in range; the
             // parent must be a declared interface.
@@ -1425,6 +1444,17 @@ pub(crate) fn validate_ipv4(s: &str) -> Result<()> {
 pub(crate) fn validate_ipv6(s: &str) -> Result<()> {
     s.parse::<Ipv6Addr>()
         .with_context(|| format!("{s:?} is not an IPv6 address"))?;
+    Ok(())
+}
+
+/// Validate a MAC address: six colon-separated hex octets
+/// (`"52:54:00:12:34:56"`). A security boundary too — the value is rendered
+/// verbatim into a networkd unit, so it must not smuggle other characters.
+pub(crate) fn validate_mac(s: &str) -> Result<()> {
+    let octets: Vec<&str> = s.split(':').collect();
+    if octets.len() != 6 || !octets.iter().all(|o| o.len() == 2 && o.bytes().all(|b| b.is_ascii_hexdigit())) {
+        bail!("mac {s:?}: expected six colon-separated hex octets");
+    }
     Ok(())
 }
 
@@ -1896,6 +1926,36 @@ port = "1-65535"
 "#;
         // The range is far over the cap → validation rejects it.
         assert!(Appliance::from_toml(toml).is_err());
+    }
+
+    #[test]
+    fn mtu_and_mac_parse_and_validate() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+address = "dhcp"
+mtu = 1492
+mac = "52:54:00:12:34:56"
+"#;
+        let a = Appliance::from_toml(toml).expect("mtu/mac config validates");
+        assert_eq!(a.interfaces[0].mtu, Some(1492));
+        assert_eq!(a.interfaces[0].mac.as_deref(), Some("52:54:00:12:34:56"));
+        assert!(Appliance::from_toml(&a.to_toml().unwrap()).is_ok());
+        // A silly MTU and a malformed MAC are rejected.
+        assert!(validate_mac("52:54:00:12:34").is_err()); // 5 octets
+        assert!(validate_mac("zz:54:00:12:34:56").is_err()); // non-hex
+        let bad_mtu = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+mtu = 42
+"#;
+        assert!(Appliance::from_toml(bad_mtu).is_err());
     }
 
     #[test]
