@@ -2112,6 +2112,54 @@
           '';
         };
 
+        # Dual-stack addressing: an interface can carry both a static IPv4
+        # `address` and a static IPv6 `address6` (independent fields). Sentinel
+        # renders both as networkd `Address=` lines; the kernel binds both. One
+        # node, no traffic — pure addressing proof.
+        #   nix build .#checks.x86_64-linux.dualstack -L
+        dualstack = pkgs.testers.runNixOSTest {
+          name = "sentinel-dualstack";
+          nodes.fw =
+            { lib, ... }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce "fw";
+              networking.firewall.enable = lib.mkForce false;
+              virtualisation.vlans = [ 1 ];
+              virtualisation.memorySize = 2048;
+              services.velstra.interface = lib.mkForce "eth1";
+            };
+          testScript = ''
+            start_all()
+            fw.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+
+            # Give eth1 both a v4 and a v6 static address. ONE `set` per line.
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth1 zone lan' "
+                "'set interface eth1 address 10.0.0.1/24' "
+                "'set interface eth1 address6 2001:db8:1::1/64' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+
+            # Sentinel rendered both address families into eth1's .network.
+            fw.wait_until_succeeds(
+                "test -f /run/systemd/network/10-sentinel-eth1.network", timeout=20
+            )
+            netw = fw.succeed("cat /run/systemd/network/10-sentinel-eth1.network")
+            assert "Address=10.0.0.1/24" in netw, netw
+            assert "Address=2001:db8:1::1/64" in netw, netw
+
+            # The kernel bound both families on eth1.
+            fw.wait_until_succeeds("ip -4 addr show eth1 | grep -q '10.0.0.1'", timeout=30)
+            fw.wait_until_succeeds(
+                "ip -6 addr show eth1 | grep -qi '2001:db8:1::1'", timeout=30
+            )
+          '';
+        };
+
         # Routing: two Sentinel appliances peer eBGP and each learns the other's
         # network — end-to-end proof that the Wren control plane is wired into the
         # image (packaged, serviced, config-compiled from `set protocols …`) and

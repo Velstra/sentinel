@@ -51,6 +51,8 @@ address = "dhcp"
 name = "lan0"
 zone = "lan"
 address = "10.0.0.1/24"
+# Dual-stack: add a static IPv6 (or "auto" for SLAAC / accept-RA).
+# address6 = "2001:db8:1::1/64"
 
 # A VLAN subinterface on lan0, in its own zone:
 # [[interface]]
@@ -627,6 +629,12 @@ pub struct Interface {
     /// `"dhcp"` or a CIDR like `"10.0.0.1/24"`. `None` if not yet configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
+    /// The interface's IPv6 address — a static CIDR (`"2001:db8:1::1/64"`) or
+    /// `"auto"` (accept Router Advertisements / SLAAC). Independent of `address`,
+    /// so an interface can be dual-stack (a v4 `address` **and** a v6 `address6`).
+    /// `None` for a v4-only interface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address6: Option<String>,
     /// For an 802.1Q VLAN subinterface: the parent interface it rides on. Set
     /// together with `vlan`. `None` for a physical NIC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1017,6 +1025,10 @@ impl Appliance {
             }
             if let Some(addr) = &iface.address {
                 validate_address(addr).with_context(|| format!("interface {:?}", iface.name))?;
+            }
+            if let Some(addr6) = &iface.address6 {
+                validate_address6(addr6)
+                    .with_context(|| format!("interface {:?} address6", iface.name))?;
             }
             // VLAN subinterface: parent + vlan come as a pair; vlan in range; the
             // parent must be a declared interface.
@@ -1490,6 +1502,15 @@ fn validate_address(addr: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate an interface's IPv6 address: `"auto"` (SLAAC / accept-RA) or a
+/// static IPv6 CIDR (`"2001:db8:1::1/64"`).
+fn validate_address6(addr: &str) -> Result<()> {
+    if addr == "auto" {
+        return Ok(());
+    }
+    validate_ipv6_cidr(addr)
+}
+
 /// Parse a port-forward target `"ip"` or `"ip:port"` into an IPv4 + a port
 /// (`0` when omitted, meaning "keep the public port").
 pub(crate) fn parse_host_port(s: &str) -> Result<(Ipv4Addr, u16)> {
@@ -1801,6 +1822,41 @@ port = "1-65535"
 "#;
         // The range is far over the cap → validation rejects it.
         assert!(Appliance::from_toml(toml).is_err());
+    }
+
+    #[test]
+    fn dual_stack_address6_parses_and_validates() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "lan0"
+zone = "lan"
+address = "10.0.0.1/24"
+address6 = "2001:db8:1::1/64"
+[[interface]]
+name = "wan0"
+zone = "wan"
+address = "dhcp"
+address6 = "auto"
+"#;
+        let a = Appliance::from_toml(toml).expect("dual-stack config parses + validates");
+        assert_eq!(a.interfaces[0].address6.as_deref(), Some("2001:db8:1::1/64"));
+        assert_eq!(a.interfaces[1].address6.as_deref(), Some("auto"));
+        // Round-trips.
+        let out = a.to_toml().unwrap();
+        assert!(out.contains("address6 = \"2001:db8:1::1/64\""), "got:\n{out}");
+        assert!(Appliance::from_toml(&out).is_ok());
+        // An IPv4 CIDR in address6 is rejected (it must be v6 or "auto").
+        let bad = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "lan0"
+zone = "lan"
+address6 = "10.0.0.1/24"
+"#;
+        assert!(Appliance::from_toml(bad).is_err());
     }
 
     #[test]

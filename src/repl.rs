@@ -574,6 +574,7 @@ const PROTOS: &[Cand] = &[("tcp", "TCP"), ("udp", "UDP")];
 const IFACE_FIELDS: &[Cand] = &[
     ("zone", "the zone this NIC belongs to"),
     ("address", "static CIDR or `dhcp`"),
+    ("address6", "static IPv6 CIDR or `auto` (SLAAC)"),
     ("parent", "parent interface (for a VLAN subinterface)"),
     ("vlan", "802.1Q VLAN id 1–4094 (with `parent`)"),
     ("private-key", "WireGuard private key (or `generate`)"),
@@ -585,6 +586,7 @@ const IFACE_FIELDS: &[Cand] = &[
     ("master", "enslave this NIC to a bridge/bond device"),
     ("bond-mode", "bonding mode (on a type=bond device)"),
 ];
+const ADDRESS6_HINT: &[Cand] = &[("auto", "accept Router Advertisements (SLAAC)")];
 const IFACE_TYPES: &[Cand] = &[
     ("bridge", "an L2 switch; enslave NICs with `master`"),
     ("bond", "link aggregation; enslave NICs with `master`"),
@@ -646,6 +648,8 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         // WireGuard: `private-key` offers `generate`; a peer's fields follow its key.
         ["set", "interface", _name, "private-key"] => WG_KEY_GEN,
         ["set" | "delete", "interface", _name, "peer", _pk] => PEER_FIELDS,
+        // `address6 auto` completes the SLAAC keyword.
+        ["set", "interface", _name, "address6"] => ADDRESS6_HINT,
         // Bridge/bond value completions.
         ["set", "interface", _name, "type"] => IFACE_TYPES,
         ["set", "interface", _name, "bond-mode"] => BOND_MODES,
@@ -919,6 +923,7 @@ mod tests {
             [
                 "zone",
                 "address",
+                "address6",
                 "parent",
                 "vlan",
                 "private-key",
@@ -1013,6 +1018,7 @@ mod tests {
             [
                 "zone",
                 "address",
+                "address6",
                 "parent",
                 "vlan",
                 "private-key",
