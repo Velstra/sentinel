@@ -574,7 +574,9 @@ const PROTOS: &[Cand] = &[("tcp", "TCP"), ("udp", "UDP")];
 const IFACE_FIELDS: &[Cand] = &[
     ("zone", "the zone this NIC belongs to"),
     ("address", "static CIDR or `dhcp`"),
-    ("address6", "static IPv6 CIDR or `auto` (SLAAC)"),
+    ("address6", "static IPv6 CIDR, `auto` (SLAAC) or `dhcp` (DHCPv6)"),
+    ("pd-from", "request a delegated IPv6 prefix from this uplink (DHCPv6-PD)"),
+    ("pd-subnet", "which /64 of the delegated prefix to use (0-255)"),
     ("parent", "parent interface (for a VLAN subinterface)"),
     ("vlan", "802.1Q VLAN id 1–4094 (with `parent`)"),
     ("private-key", "WireGuard private key (or `generate`)"),
@@ -586,7 +588,10 @@ const IFACE_FIELDS: &[Cand] = &[
     ("master", "enslave this NIC to a bridge/bond device"),
     ("bond-mode", "bonding mode (on a type=bond device)"),
 ];
-const ADDRESS6_HINT: &[Cand] = &[("auto", "accept Router Advertisements (SLAAC)")];
+const ADDRESS6_HINT: &[Cand] = &[
+    ("auto", "accept Router Advertisements (SLAAC)"),
+    ("dhcp", "DHCPv6 client (WAN uplink; may request a delegated prefix)"),
+];
 const IFACE_TYPES: &[Cand] = &[
     ("bridge", "an L2 switch; enslave NICs with `master`"),
     ("bond", "link aggregation; enslave NICs with `master`"),
@@ -924,6 +929,8 @@ mod tests {
                 "zone",
                 "address",
                 "address6",
+                "pd-from",
+                "pd-subnet",
                 "parent",
                 "vlan",
                 "private-key",
@@ -1019,6 +1026,8 @@ mod tests {
                 "zone",
                 "address",
                 "address6",
+                "pd-from",
+                "pd-subnet",
                 "parent",
                 "vlan",
                 "private-key",

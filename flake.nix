@@ -2160,6 +2160,113 @@
           '';
         };
 
+        # DHCPv6-PD (the German-ISP WAN v6 model): an `upstream` kea-dhcp6 server
+        # delegates a /56 out of 2001:db8:d00::/40; the sentinel `fw` requests it
+        # on its WAN (`address6 = "dhcp"`) and carves subnet 0 of the delegated
+        # prefix onto its LAN (`pd-from`). Sentinel renders `DHCP=ipv6` +
+        # `[DHCPv6] WithoutRA=solicit` on the WAN and `DHCPPrefixDelegation` on the
+        # LAN. velstra runs on a third, uninvolved NIC so XDP never touches the PD
+        # exchange. Proof: the LAN interface binds an address from the delegated
+        # prefix.
+        #   nix build .#checks.x86_64-linux.dhcp6pd -L
+        dhcp6pd = pkgs.testers.runNixOSTest {
+          name = "sentinel-dhcp6pd";
+          nodes = {
+            upstream =
+              { ... }:
+              {
+                virtualisation.vlans = [ 1 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                  interfaces.eth1.ipv6.addresses = [
+                    {
+                      address = "2001:db8:0::1";
+                      prefixLength = 64;
+                    }
+                  ];
+                };
+                services.kea.dhcp6 = {
+                  enable = true;
+                  settings = {
+                    interfaces-config.interfaces = [ "eth1" ];
+                    lease-database = {
+                      type = "memfile";
+                      persist = false;
+                    };
+                    subnet6 = [
+                      {
+                        id = 1;
+                        subnet = "2001:db8:0::/64";
+                        interface = "eth1";
+                        pools = [ { pool = "2001:db8:0::100 - 2001:db8:0::1ff"; } ];
+                        pd-pools = [
+                          {
+                            prefix = "2001:db8:d00::";
+                            prefix-len = 40;
+                            delegated-len = 56;
+                          }
+                        ];
+                      }
+                    ];
+                  };
+                };
+              };
+            fw =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "fw";
+                networking.firewall.enable = lib.mkForce false;
+                virtualisation.vlans = [
+                  1
+                  2
+                  3
+                ];
+                virtualisation.memorySize = 2048;
+                services.velstra.interface = lib.mkForce "eth3";
+              };
+          };
+          testScript = ''
+            start_all()
+            upstream.wait_for_unit("kea-dhcp6-server.service")
+            fw.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+
+            # WAN = eth1 (DHCPv6 client requesting PD); LAN = eth2 (subnet 0 of the
+            # delegated prefix). ONE `set` per line.
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth1 zone wan' "
+                "'set interface eth1 address6 dhcp' "
+                "'set firewall zone wan default-action accept' "
+                "'set interface eth2 zone lan' "
+                "'set interface eth2 pd-from eth1' "
+                "'set interface eth2 pd-subnet 0' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+
+            # Sentinel rendered the DHCPv6 client + the delegation downstream.
+            fw.wait_until_succeeds(
+                "test -f /run/systemd/network/10-sentinel-eth2.network", timeout=20
+            )
+            wan = fw.succeed("cat /run/systemd/network/10-sentinel-eth1.network")
+            assert "DHCP=ipv6" in wan, wan
+            assert "WithoutRA=solicit" in wan, wan
+            lan = fw.succeed("cat /run/systemd/network/10-sentinel-eth2.network")
+            assert "DHCPPrefixDelegation=yes" in lan, lan
+            assert "UplinkInterface=eth1" in lan, lan
+
+            # The fw acquired the delegation and bound an address from it onto the
+            # LAN interface (proof the whole PD chain worked end to end).
+            fw.wait_until_succeeds(
+                "ip -6 addr show eth2 | grep -qi '2001:db8:d'", timeout=120
+            )
+          '';
+        };
+
         # Routing: two Sentinel appliances peer eBGP and each learns the other's
         # network — end-to-end proof that the Wren control plane is wired into the
         # image (packaged, serviced, config-compiled from `set protocols …`) and

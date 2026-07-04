@@ -28,6 +28,8 @@ struct IfaceDraft {
     zone: Option<String>,
     address: Option<String>,
     address6: Option<String>,
+    pd_from: Option<String>,
+    pd_subnet: Option<u8>,
     parent: Option<String>,
     vlan: Option<u16>,
     // WireGuard: a `private-key` makes this a WG tunnel; peers ride on it.
@@ -410,6 +412,8 @@ impl Draft {
                             zone: i.zone.clone(),
                             address: i.address.clone(),
                             address6: i.address6.clone(),
+                            pd_from: i.pd_from.clone(),
+                            pd_subnet: i.pd_subnet,
                             parent: i.parent.clone(),
                             vlan: i.vlan,
                             private_key: i.private_key.clone(),
@@ -696,10 +700,17 @@ impl Session {
                 self.draft.iface_mut(name).address = Some((*v).to_string());
             }
             ["interface", name, "address6", v] => {
-                if *v != "auto" {
+                if *v != "auto" && *v != "dhcp" {
                     crate::config::validate_ipv6_cidr(v)?;
                 }
                 self.draft.iface_mut(name).address6 = Some((*v).to_string());
+            }
+            ["interface", name, "pd-from", v] => {
+                self.draft.iface_mut(name).pd_from = Some((*v).to_string());
+            }
+            ["interface", name, "pd-subnet", v] => {
+                let id: u8 = v.parse().with_context(|| format!("invalid pd-subnet {v:?}"))?;
+                self.draft.iface_mut(name).pd_subnet = Some(id);
             }
             ["interface", name, "parent", v] => {
                 self.draft.iface_mut(name).parent = Some((*v).to_string())
@@ -1167,6 +1178,8 @@ impl Session {
             }
             ["interface", name, "address"] => self.iface(name)?.address = None,
             ["interface", name, "address6"] => self.iface(name)?.address6 = None,
+            ["interface", name, "pd-from"] => self.iface(name)?.pd_from = None,
+            ["interface", name, "pd-subnet"] => self.iface(name)?.pd_subnet = None,
             ["interface", name, "zone"] => self.iface(name)?.zone = None,
             ["interface", name, "parent"] => self.iface(name)?.parent = None,
             ["interface", name, "vlan"] => self.iface(name)?.vlan = None,
@@ -1550,6 +1563,8 @@ impl Session {
                 zone: d.zone.clone(),
                 address: d.address.clone(),
                 address6: d.address6.clone(),
+                pd_from: d.pd_from.clone(),
+                pd_subnet: d.pd_subnet,
                 parent: d.parent.clone(),
                 vlan: d.vlan,
                 private_key: d.private_key.clone(),
@@ -1888,6 +1903,8 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             && i.zone.is_none()
             && i.address.is_none()
             && i.address6.is_none()
+            && i.pd_from.is_none()
+            && i.pd_subnet.is_none()
             && i.parent.is_none()
             && i.vlan.is_none()
             && i.private_key.is_none()
@@ -1917,6 +1934,12 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         if let Some(a6) = &i.address6 {
             out.push_str(&format!("    address6 {a6}\n"));
+        }
+        if let Some(up) = &i.pd_from {
+            out.push_str(&format!("    pd-from {up}\n"));
+        }
+        if let Some(id) = i.pd_subnet {
+            out.push_str(&format!("    pd-subnet {id}\n"));
         }
         if let Some(m) = &i.master {
             out.push_str(&format!("    master {m}\n"));
