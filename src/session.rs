@@ -14,8 +14,8 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::{
     Action, Appliance, Bgp, BgpNeighbor, DhcpServer, Dns, Firewall, IfaceType, Interface, Isis, Nat,
-    NatDestination, NatSource, Ospf, Ospf3, PortSpec, Proto, Protocols, Rip, RouterAdvert, Rule,
-    Services, StaticRoute, System, Vrrp, WgPeer, ZoneCfg,
+    NatDestination, NatSource, Ntp, Ospf, Ospf3, PortSpec, Proto, Protocols, Rip, RouterAdvert,
+    Rule, Services, StaticRoute, System, Vrrp, WgPeer, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -277,14 +277,22 @@ struct Draft {
     bgp: BgpDraft,
     vrrp: Vec<(String, VrrpDraft)>,
     dns: DnsDraft,
+    ntp: NtpDraft,
 }
 
-/// A partially-specified DNS forwarder (the box-wide `[dns]` category).
+/// A partially-specified DNS forwarder (`[services.dns]`).
 #[derive(Debug, Clone, Default)]
 struct DnsDraft {
     upstream: Vec<String>,
     serve_on: Vec<String>,
     dnssec: Option<String>,
+}
+
+/// A partially-specified NTP server (`[services.ntp]`).
+#[derive(Debug, Clone, Default)]
+struct NtpDraft {
+    upstream: Vec<String>,
+    serve_on: Vec<String>,
 }
 
 impl Draft {
@@ -572,6 +580,10 @@ impl Draft {
                 upstream: a.services.dns.upstream.clone(),
                 serve_on: a.services.dns.serve_on.clone(),
                 dnssec: a.services.dns.dnssec.clone(),
+            },
+            ntp: NtpDraft {
+                upstream: a.services.ntp.upstream.clone(),
+                serve_on: a.services.ntp.serve_on.clone(),
             },
         }
     }
@@ -927,6 +939,18 @@ impl Session {
                     bail!("services dns dnssec {v:?}: expected \"yes\", \"no\" or \"allow-downgrade\"");
                 }
                 self.draft.dns.dnssec = Some((*v).to_string());
+            }
+
+            // services ntp: the box-wide LAN NTP server (chrony).
+            ["services", "ntp", "upstream", v] => {
+                let ups: Vec<String> = v.split(',').map(|s| s.trim().to_string()).collect();
+                for u in &ups {
+                    crate::config::validate_host(u)?;
+                }
+                self.draft.ntp.upstream = ups;
+            }
+            ["services", "ntp", "serve-on", v] => {
+                self.draft.ntp.serve_on = v.split(',').map(|s| s.trim().to_string()).collect();
             }
 
             // protocols: dynamic routing (the Wren control plane).
@@ -1297,8 +1321,11 @@ impl Session {
             }
 
             // services: box-wide offered services. Bare `delete services` clears
-            // them all; `delete services dns` turns off just the forwarder.
-            ["services"] => self.draft.dns = DnsDraft::default(),
+            // them all; `delete services dns`/`ntp` turns off just that one.
+            ["services"] => {
+                self.draft.dns = DnsDraft::default();
+                self.draft.ntp = NtpDraft::default();
+            }
             ["services", "dns"] => self.draft.dns = DnsDraft::default(),
             ["services", "dns", field] => {
                 let d = &mut self.draft.dns;
@@ -1307,6 +1334,15 @@ impl Session {
                     "serve-on" => d.serve_on.clear(),
                     "dnssec" => d.dnssec = None,
                     other => bail!("services dns has no field {other:?}"),
+                }
+            }
+            ["services", "ntp"] => self.draft.ntp = NtpDraft::default(),
+            ["services", "ntp", field] => {
+                let n = &mut self.draft.ntp;
+                match *field {
+                    "upstream" => n.upstream.clear(),
+                    "serve-on" => n.serve_on.clear(),
+                    other => bail!("services ntp has no field {other:?}"),
                 }
             }
 
@@ -1753,6 +1789,10 @@ impl Session {
                     serve_on: self.draft.dns.serve_on.clone(),
                     dnssec: self.draft.dns.dnssec.clone(),
                 },
+                ntp: Ntp {
+                    upstream: self.draft.ntp.upstream.clone(),
+                    serve_on: self.draft.ntp.serve_on.clone(),
+                },
             },
         };
         appliance.validate()?;
@@ -2189,21 +2229,36 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         out.push_str("}\n");
     }
 
-    // services: box-wide offered services (dns today), nested one level.
+    // services: box-wide offered services (dns, ntp), each nested one level.
     let d = &draft.dns;
-    if want("services") && !(d.upstream.is_empty() && d.serve_on.is_empty() && d.dnssec.is_none()) {
+    let n = &draft.ntp;
+    let dns_set = !(d.upstream.is_empty() && d.serve_on.is_empty() && d.dnssec.is_none());
+    let ntp_set = !(n.upstream.is_empty() && n.serve_on.is_empty());
+    if want("services") && (dns_set || ntp_set) {
         out.push_str("services {\n");
-        out.push_str("    dns {\n");
-        if !d.upstream.is_empty() {
-            out.push_str(&format!("        upstream {}\n", d.upstream.join(",")));
+        if dns_set {
+            out.push_str("    dns {\n");
+            if !d.upstream.is_empty() {
+                out.push_str(&format!("        upstream {}\n", d.upstream.join(",")));
+            }
+            if !d.serve_on.is_empty() {
+                out.push_str(&format!("        serve-on {}\n", d.serve_on.join(",")));
+            }
+            if let Some(mode) = &d.dnssec {
+                out.push_str(&format!("        dnssec {mode}\n"));
+            }
+            out.push_str("    }\n");
         }
-        if !d.serve_on.is_empty() {
-            out.push_str(&format!("        serve-on {}\n", d.serve_on.join(",")));
+        if ntp_set {
+            out.push_str("    ntp {\n");
+            if !n.upstream.is_empty() {
+                out.push_str(&format!("        upstream {}\n", n.upstream.join(",")));
+            }
+            if !n.serve_on.is_empty() {
+                out.push_str(&format!("        serve-on {}\n", n.serve_on.join(",")));
+            }
+            out.push_str("    }\n");
         }
-        if let Some(mode) = &d.dnssec {
-            out.push_str(&format!("        dnssec {mode}\n"));
-        }
-        out.push_str("    }\n");
         out.push_str("}\n");
     }
 

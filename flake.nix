@@ -323,6 +323,20 @@
             enable = true;
             package = wrenPkg;
           };
+
+          # NTP: the box always runs chrony to keep its own clock; the
+          # `[services.ntp]` config layers LAN-serving (`server`/`allow`) on top
+          # via a confdir drop-in that Sentinel renders to /run/sentinel/chrony.d
+          # and applies with a chrony restart. tmpfiles pre-creates the dir so
+          # chronyd can read it even before the first commit.
+          services.chrony = {
+            enable = true;
+            extraConfig = "confdir /run/sentinel/chrony.d";
+          };
+          systemd.tmpfiles.rules = [
+            "d /run/sentinel 0755 root root -"
+            "d /run/sentinel/chrony.d 0755 root root -"
+          ];
         };
 
       nixosConfigurations.appliance = nixpkgs.lib.nixosSystem {
@@ -1977,6 +1991,123 @@
             fw.wait_until_succeeds("ip link show eth2 | grep -q 'master bond0'", timeout=30)
             fw.wait_until_succeeds(
                 "grep -qi 'Bonding Mode: fault-tolerance' /proc/net/bonding/bond0", timeout=30
+            )
+          '';
+        };
+
+        # NTP server: a 3-node proof that the box serves time to the LAN. An
+        # `upstream` node is an authoritative source (chrony, local stratum 5);
+        # the sentinel `fw` syncs to it and serves the LAN; a `client` syncs to
+        # the fw. Sentinel renders `[services.ntp]` into a chrony confdir drop-in
+        # (`server <up> iburst` + `allow <subnet>`) layered on the image's chrony
+        # — no extra unit. The lan zone accepts so the XDP firewall passes udp/123.
+        #   nix build .#checks.x86_64-linux.ntp -L
+        ntp = pkgs.testers.runNixOSTest {
+          name = "sentinel-ntp";
+          nodes = {
+            upstream =
+              { ... }:
+              {
+                virtualisation.vlans = [ 1 ];
+                networking = {
+                  useDHCP = false;
+                  firewall.enable = false;
+                  interfaces.eth1.ipv4.addresses = [
+                    {
+                      address = "10.0.0.99";
+                      prefixLength = 24;
+                    }
+                  ];
+                };
+                # An authoritative source with no upstream: serve its own clock at
+                # stratum 5 and allow anyone to query.
+                services.chrony = {
+                  enable = true;
+                  servers = [ ];
+                  extraConfig = ''
+                    local stratum 5
+                    allow all
+                  '';
+                };
+              };
+            fw =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "fw";
+                networking.firewall.enable = lib.mkForce false;
+                virtualisation.vlans = [ 1 ];
+                virtualisation.memorySize = 2048;
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+            client =
+              { ... }:
+              {
+                virtualisation.vlans = [ 1 ];
+                networking = {
+                  useDHCP = false;
+                  firewall.enable = false;
+                  interfaces.eth1.ipv4.addresses = [
+                    {
+                      address = "10.0.0.50";
+                      prefixLength = 24;
+                    }
+                  ];
+                };
+                # Sync only to the fw; poll fast (iburst + low minpoll) and step
+                # the clock so the test converges quickly once the fw serves.
+                services.chrony = {
+                  enable = true;
+                  servers = [ ];
+                  extraConfig = ''
+                    server 10.0.0.1 iburst minpoll 0 maxpoll 4
+                    makestep 1 -1
+                  '';
+                };
+              };
+          };
+          testScript = ''
+            start_all()
+            upstream.wait_for_unit("chronyd.service")
+            fw.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+
+            # Turn on the LAN NTP server on eth1 (static addr + lan accept so XDP
+            # passes udp/123), syncing to the upstream node. ONE `set` per line.
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth1 address 10.0.0.1/24' "
+                "'set interface eth1 zone lan' "
+                "'set firewall zone lan default-action accept' "
+                "'set services ntp upstream 10.0.0.99' "
+                "'set services ntp serve-on eth1' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+
+            # Sentinel rendered the chrony confdir drop-in: sync to the upstream +
+            # allow the LAN subnet (the interface's network, not its host address).
+            fw.wait_until_succeeds(
+                "test -f /run/sentinel/chrony.d/sentinel.conf", timeout=20
+            )
+            conf = fw.succeed("cat /run/sentinel/chrony.d/sentinel.conf")
+            assert "server 10.0.0.99 iburst" in conf, conf
+            assert "allow 10.0.0.0/24" in conf, conf
+
+            # The fw synchronises to the upstream (its Reference ID becomes the
+            # upstream's IP) and opens the NTP server socket for the LAN.
+            fw.wait_until_succeeds("ip -4 addr show eth1 | grep -q '10.0.0.1'", timeout=30)
+            fw.wait_until_succeeds(
+                "chronyc -n tracking | grep -q '10.0.0.99'", timeout=120
+            )
+            fw.wait_until_succeeds("ss -uln | grep -q ':123'", timeout=10)
+
+            # The fw now serves time; (re)start the client's chrony so it bursts
+            # against the now-serving fw, then confirm it synchronises through it.
+            client.wait_for_unit("chronyd.service")
+            client.succeed("systemctl restart chronyd")
+            client.wait_until_succeeds(
+                "chronyc -n tracking | grep -q '10.0.0.1'", timeout=90
             )
           '';
         };

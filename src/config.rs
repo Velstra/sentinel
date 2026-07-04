@@ -114,6 +114,11 @@ port = 443
 # [services.dns]
 # upstream = ["9.9.9.9", "1.1.1.1"]
 # serve-on = ["lan0"]
+#
+# A LAN NTP server (built on chrony): sync to upstreams, serve lan0's subnet.
+# [services.ntp]
+# upstream = ["pool.ntp.org"]
+# serve-on = ["lan0"]
 
 # NAT is its own thing (address translation, not filtering). Source NAT
 # masquerades a zone's outbound traffic to its egress IP; destination NAT is an
@@ -180,12 +185,38 @@ pub struct Services {
     /// The LAN DNS forwarder (`[services.dns]`).
     #[serde(default, skip_serializing_if = "Dns::is_empty")]
     pub dns: Dns,
+    /// The LAN NTP server (`[services.ntp]`).
+    #[serde(default, skip_serializing_if = "Ntp::is_empty")]
+    pub ntp: Ntp,
 }
 
 impl Services {
     /// True when no service is configured — lets `[services]` be omitted.
     pub fn is_empty(&self) -> bool {
-        self.dns.is_empty()
+        self.dns.is_empty() && self.ntp.is_empty()
+    }
+}
+
+/// The box-wide NTP server (`[services.ntp]`) — a LAN time source built on the
+/// image's chrony (no extra unit): the box syncs to `upstream` time sources and
+/// serves clients on the subnets of the `serve-on` interfaces. Empty by default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Ntp {
+    /// Upstream NTP sources the box syncs to (IPs or hostnames, e.g.
+    /// `"pool.ntp.org"`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upstream: Vec<String>,
+    /// Interfaces whose subnet is allowed to query this NTP server. Each must be
+    /// a declared interface carrying a static address (its subnet is `allow`ed).
+    #[serde(default, rename = "serve-on", skip_serializing_if = "Vec::is_empty")]
+    pub serve_on: Vec<String>,
+}
+
+impl Ntp {
+    /// True when no NTP server is configured — lets `[services.ntp]` be omitted.
+    pub fn is_empty(&self) -> bool {
+        self.upstream.is_empty() && self.serve_on.is_empty()
     }
 }
 
@@ -1268,6 +1299,22 @@ impl Appliance {
                 bail!("services dns dnssec {mode:?}: expected \"yes\", \"no\" or \"allow-downgrade\"");
             }
         }
+
+        // NTP server: upstreams are IPs or hostnames; every serving interface
+        // must be declared and carry a static address (its subnet is `allow`ed).
+        let ntp = &self.services.ntp;
+        for up in &ntp.upstream {
+            validate_host(up).with_context(|| "services ntp upstream")?;
+        }
+        for iface in &ntp.serve_on {
+            match self.interfaces.iter().find(|i| &i.name == iface) {
+                Some(i) => match i.address.as_deref() {
+                    Some(addr) if addr != "dhcp" => {}
+                    _ => bail!("services ntp serve-on {iface:?}: interface needs a static address"),
+                },
+                None => bail!("services ntp serve-on {iface:?}: not a declared interface"),
+            }
+        }
         Ok(())
     }
 
@@ -1331,6 +1378,26 @@ pub(crate) fn validate_ipv4(s: &str) -> Result<()> {
 pub(crate) fn validate_ipv6(s: &str) -> Result<()> {
     s.parse::<Ipv6Addr>()
         .with_context(|| format!("{s:?} is not an IPv6 address"))?;
+    Ok(())
+}
+
+/// Validate a host that is either an IP literal (v4/v6) or a DNS hostname — used
+/// for an NTP upstream, which may be given by name (`pool.ntp.org`) or address.
+pub(crate) fn validate_host(s: &str) -> Result<()> {
+    if s.parse::<Ipv4Addr>().is_ok() || s.parse::<Ipv6Addr>().is_ok() {
+        return Ok(());
+    }
+    let ok = !s.is_empty()
+        && s.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        });
+    if !ok {
+        bail!("{s:?} is not a valid host (IP or hostname)");
+    }
     Ok(())
 }
 
@@ -1827,6 +1894,40 @@ dnssec = "no"
         assert!(out.contains("[services.dns]"), "got:\n{out}");
         let b = Appliance::from_toml(&out).expect("re-parses");
         assert_eq!(b.services.dns.upstream.len(), 2);
+    }
+
+    #[test]
+    fn ntp_server_parses_validates_and_round_trips() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "lan0"
+zone = "lan"
+address = "10.0.0.1/24"
+
+[services.ntp]
+upstream = ["pool.ntp.org", "10.0.0.99"]
+serve-on = ["lan0"]
+"#;
+        let a = Appliance::from_toml(toml).expect("ntp config parses + validates");
+        assert_eq!(a.services.ntp.upstream, vec!["pool.ntp.org", "10.0.0.99"]);
+        assert_eq!(a.services.ntp.serve_on, vec!["lan0"]);
+        let out = a.to_toml().unwrap();
+        assert!(out.contains("[services.ntp]"), "got:\n{out}");
+        assert!(Appliance::from_toml(&out).is_ok());
+        // serve-on an interface without a static address is rejected.
+        let bad = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+address = "dhcp"
+[services.ntp]
+serve-on = ["wan0"]
+"#;
+        assert!(Appliance::from_toml(bad).is_err());
     }
 
     #[test]
