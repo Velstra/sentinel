@@ -87,6 +87,11 @@ fn wireguard_netdev_body(iface: &Interface) -> String {
 /// Render a `.network` unit for `iface`: bind its `address` (if any) and declare
 /// any child VLAN links so networkd attaches them to this (parent) interface.
 /// `"dhcp"` asks networkd to run a DHCP client; anything else is a static CIDR.
+// A `.network` unit has many independent, orthogonal inputs (both address
+// families, VLAN children, DHCP-server, RA, bridge/bond master, prefix
+// delegation); passing them as discrete `Option`s keeps each render path
+// explicit and each caller's intent readable.
+#[allow(clippy::too_many_arguments)]
 fn network_body(
     iface: &str,
     address: Option<&str>,
@@ -95,19 +100,30 @@ fn network_body(
     dhcp: Option<&DhcpServer>,
     ra: Option<&RouterAdvert>,
     master: Option<&str>,
+    pd: Option<(&str, u8)>,
 ) -> String {
+    let v4dhcp = address == Some("dhcp");
+    let v6dhcp = address6 == Some("dhcp");
     let mut body = format!("[Match]\nName={iface}\n\n[Network]\n");
-    match address {
-        Some("dhcp") => body.push_str("DHCP=yes\n"),
+    // Static addresses (v4 then v6). "dhcp" is handled by the combined DHCP=
+    // directive below; "auto" (v6) accepts RAs (SLAAC).
+    if let Some(addr) = address {
+        if addr != "dhcp" {
+            body.push_str(&format!("Address={addr}\n"));
+        }
+    }
+    match address6 {
+        Some("auto") => body.push_str("IPv6AcceptRA=yes\n"),
+        Some("dhcp") => {}
         Some(addr) => body.push_str(&format!("Address={addr}\n")),
         None => {}
     }
-    // IPv6: `auto` accepts Router Advertisements (SLAAC); otherwise a static
-    // CIDR. Independent of the v4 address, so an interface can be dual-stack.
-    match address6 {
-        Some("auto") => body.push_str("IPv6AcceptRA=yes\n"),
-        Some(addr) => body.push_str(&format!("Address={addr}\n")),
-        None => {}
+    // One combined DHCP= directive covers both families (v4 `address = "dhcp"`
+    // keeps the historical `yes`; a v6-only DHCPv6 client is `ipv6`).
+    match (v4dhcp, v6dhcp) {
+        (true, _) => body.push_str("DHCP=yes\n"),
+        (false, true) => body.push_str("DHCP=ipv6\n"),
+        (false, false) => {}
     }
     // Enslavement to a bridge/bond master (`Bridge=br0` / `Bond=bond0`) — a
     // [Network] directive, so it goes here before any sub-section opens.
@@ -126,6 +142,25 @@ fn network_body(
     }
     if ra.is_some() {
         body.push_str("IPv6SendRA=yes\n");
+    }
+    // A DHCPv6-PD downstream requests a slice of the uplink's delegated prefix
+    // (the enabling directive stays in [Network]).
+    if pd.is_some() {
+        body.push_str("DHCPPrefixDelegation=yes\n");
+    }
+
+    // A DHCPv6 client (WAN uplink): solicit immediately rather than waiting for
+    // a Router Advertisement, so a prefix delegation is requested up front.
+    if v6dhcp {
+        body.push_str("\n[DHCPv6]\nWithoutRA=solicit\n");
+    }
+    // The prefix-delegation downstream: take subnet `id` out of the uplink's
+    // delegated prefix and advertise the resulting /64 to this interface's LAN.
+    if let Some((uplink, subnet)) = pd {
+        body.push_str("\n[DHCPPrefixDelegation]\n");
+        body.push_str(&format!("UplinkInterface={uplink}\n"));
+        body.push_str(&format!("SubnetId={subnet}\n"));
+        body.push_str("Announce=yes\n");
     }
 
     // A built-in DHCP server serving this interface's static subnet. `EmitDNS`
@@ -375,6 +410,7 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
                 || i.router_advert.is_some()
                 || i.is_virtual_l2()
                 || i.master.is_some()
+                || i.pd_from.is_some()
                 || children.contains_key(i.name.as_str())
         })
         .map(|i| {
@@ -390,6 +426,7 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
                     }
                 })
             });
+            let pd = i.pd_from.as_deref().map(|up| (up, i.pd_subnet.unwrap_or(0)));
             let name = network_name(&i.name);
             writes.push((
                 name.clone(),
@@ -401,6 +438,7 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
                     i.dhcp_server.as_ref(),
                     i.router_advert.as_ref(),
                     master.as_deref(),
+                    pd,
                 ),
             ));
             keep.insert(name);
@@ -454,14 +492,14 @@ mod tests {
 
     #[test]
     fn static_address_renders_address_directive() {
-        let u = network_body("eth0", Some("10.0.0.1/24"), None, &[], None, None, None);
+        let u = network_body("eth0", Some("10.0.0.1/24"), None, &[], None, None, None, None);
         assert!(u.contains("Name=eth0"));
         assert!(u.contains("Address=10.0.0.1/24"));
     }
 
     #[test]
     fn dhcp_address_renders_dhcp_directive() {
-        let u = network_body("eth0", Some("dhcp"), None, &[], None, None, None);
+        let u = network_body("eth0", Some("dhcp"), None, &[], None, None, None, None);
         assert!(u.contains("DHCP=yes"));
         assert!(!u.contains("Address="));
     }
@@ -485,6 +523,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(u.contains("VLAN=eth1.20"));
         assert!(u.contains("VLAN=eth1.30"));
@@ -503,7 +542,7 @@ mod tests {
             dns: vec!["10.0.0.1".into()],
             lease_time: Some(3600),
         };
-        let u = network_body("eth1", Some("10.0.0.1/24"), None, &[], Some(&dhcp), None, None);
+        let u = network_body("eth1", Some("10.0.0.1/24"), None, &[], Some(&dhcp), None, None, None);
         // The static subnet is still bound, and the server is switched on.
         assert!(u.contains("Address=10.0.0.1/24"));
         assert!(u.contains("DHCPServer=yes"));
@@ -524,7 +563,7 @@ mod tests {
             dns: vec![],
             lease_time: None,
         };
-        let u = network_body("eth1", Some("10.0.0.1/24"), None, &[], Some(&dhcp), None, None);
+        let u = network_body("eth1", Some("10.0.0.1/24"), None, &[], Some(&dhcp), None, None, None);
         assert!(u.contains("DHCPServer=yes"));
         assert!(u.contains("[DHCPServer]"));
         assert!(!u.contains("EmitDNS"));
@@ -552,6 +591,8 @@ mod tests {
             if_type: None,
             master: None,
             bond_mode: None,
+            pd_from: None,
+            pd_subnet: None,
         }];
         let body = chrony_conf_body(&ntp, &ifaces).expect("ntp configured");
         assert!(body.contains("server pool.ntp.org iburst"));
@@ -591,6 +632,8 @@ mod tests {
             if_type: None,
             master: None,
             bond_mode: None,
+            pd_from: None,
+            pd_subnet: None,
         }];
         let body = resolved_dropin_body(&dns, &ifaces).expect("forwarder configured");
         assert!(body.contains("[Resolve]"));
@@ -605,6 +648,35 @@ mod tests {
     }
 
     #[test]
+    fn dhcpv6_pd_renders_client_and_delegation() {
+        // WAN uplink: DHCPv6 client soliciting up front (no RA needed).
+        let wan = network_body("wan0", Some("dhcp"), Some("dhcp"), &[], None, None, None, None);
+        assert!(wan.contains("DHCP=yes")); // v4 dhcp + v6 dhcp
+        assert!(wan.contains("[DHCPv6]"));
+        assert!(wan.contains("WithoutRA=solicit"));
+        // A v6-only DHCPv6 client renders DHCP=ipv6, not yes.
+        let wan6 = network_body("wan0", None, Some("dhcp"), &[], None, None, None, None);
+        assert!(wan6.contains("DHCP=ipv6"));
+        // LAN downstream: request subnet 2 of the uplink's delegated prefix and
+        // advertise it.
+        let lan = network_body(
+            "lan0",
+            Some("10.0.0.1/24"),
+            None,
+            &[],
+            None,
+            None,
+            None,
+            Some(("wan0", 2)),
+        );
+        assert!(lan.contains("DHCPPrefixDelegation=yes"));
+        assert!(lan.contains("[DHCPPrefixDelegation]"));
+        assert!(lan.contains("UplinkInterface=wan0"));
+        assert!(lan.contains("SubnetId=2"));
+        assert!(lan.contains("Announce=yes"));
+    }
+
+    #[test]
     fn dual_stack_and_slaac_address6_render() {
         // A static dual-stack interface emits both an IPv4 and an IPv6 Address=.
         let u = network_body(
@@ -615,11 +687,12 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(u.contains("Address=10.0.0.1/24"));
         assert!(u.contains("Address=2001:db8:1::1/64"));
         // `auto` accepts RAs (SLAAC) instead of binding a static v6 address.
-        let a = network_body("wan0", Some("dhcp"), Some("auto"), &[], None, None, None);
+        let a = network_body("wan0", Some("dhcp"), Some("auto"), &[], None, None, None, None);
         assert!(a.contains("DHCP=yes"));
         assert!(a.contains("IPv6AcceptRA=yes"));
         assert!(!a.contains("Address=auto"));
@@ -642,13 +715,15 @@ mod tests {
             if_type: Some(IfaceType::Bridge),
             master: None,
             bond_mode: None,
+            pd_from: None,
+            pd_subnet: None,
         };
         let d = virtual_l2_netdev_body(&br);
         assert!(d.contains("Name=br0"));
         assert!(d.contains("Kind=bridge"));
         assert!(!d.contains("[Bond]"));
         // A member's .network carries the Bridge= enslavement in [Network].
-        let member = network_body("lan1", None, None, &[], None, None, Some("Bridge=br0"));
+        let member = network_body("lan1", None, None, &[], None, None, Some("Bridge=br0"), None);
         assert!(member.contains("[Network]"));
         assert!(member.contains("Bridge=br0"));
     }
@@ -670,6 +745,8 @@ mod tests {
             if_type: Some(IfaceType::Bond),
             master: None,
             bond_mode: Some("802.3ad".into()),
+            pd_from: None,
+            pd_subnet: None,
         };
         let d = virtual_l2_netdev_body(&bond);
         assert!(d.contains("Kind=bond"));
@@ -678,7 +755,7 @@ mod tests {
         let mut b2 = bond.clone();
         b2.bond_mode = None;
         assert!(virtual_l2_netdev_body(&b2).contains("Mode=active-backup"));
-        let member = network_body("lan2", None, None, &[], None, None, Some("Bond=bond0"));
+        let member = network_body("lan2", None, None, &[], None, None, Some("Bond=bond0"), None);
         assert!(member.contains("Bond=bond0"));
     }
 
@@ -691,7 +768,7 @@ mod tests {
             other_config: true,
             router_lifetime: Some(1800),
         };
-        let u = network_body("lan0", Some("10.0.0.1/24"), None, &[], None, Some(&ra), None);
+        let u = network_body("lan0", Some("10.0.0.1/24"), None, &[], None, Some(&ra), None, None);
         // The enabling directive stays in [Network]; the detail sections follow.
         assert!(u.contains("IPv6SendRA=yes"));
         assert!(u.contains("[IPv6SendRA]"));
@@ -723,7 +800,7 @@ mod tests {
             other_config: false,
             router_lifetime: None,
         };
-        let u = network_body("lan0", Some("10.0.0.1/24"), None, &[], Some(&dhcp), Some(&ra), None);
+        let u = network_body("lan0", Some("10.0.0.1/24"), None, &[], Some(&dhcp), Some(&ra), None, None);
         let network_hdr = u.find("[Network]").unwrap();
         let first_subsection = u.find("[DHCPServer]").unwrap();
         let dhcp_on = u.find("DHCPServer=yes").unwrap();
@@ -757,6 +834,8 @@ mod tests {
             if_type: None,
             master: None,
             bond_mode: None,
+            pd_from: None,
+            pd_subnet: None,
         };
         let d = wireguard_netdev_body(&iface);
         assert!(d.contains("Kind=wireguard"));
