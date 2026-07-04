@@ -2267,6 +2267,53 @@
           '';
         };
 
+        # Static IPv6 routes: `[[protocols.static]]` is dual-stack — a v6 prefix
+        # with a v6 nexthop compiles into wren.toml and wren programs the kernel
+        # IPv6 FIB, exactly like a v4 static. One node: eth1 holds a v6 subnet,
+        # and a static route to 2001:db8:beef::/48 via an on-link nexthop must
+        # appear in `ip -6 route`.
+        #   nix build .#checks.x86_64-linux.staticv6 -L
+        staticv6 = pkgs.testers.runNixOSTest {
+          name = "sentinel-staticv6";
+          nodes.fw =
+            { lib, ... }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce "fw";
+              networking.firewall.enable = lib.mkForce false;
+              virtualisation.vlans = [ 1 ];
+              virtualisation.memorySize = 2048;
+              services.velstra.interface = lib.mkForce "eth1";
+            };
+          testScript = ''
+            start_all()
+            fw.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+            fw.wait_for_unit("wren.service")
+
+            # eth1 gets a v6 subnet (so the nexthop is on-link), then a v6 static
+            # route. ONE `set` per line.
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth1 zone lan' "
+                "'set interface eth1 address6 2001:db8:0::1/64' "
+                "'set protocols static 2001:db8:beef::/48 via 2001:db8:0::2' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            fw.wait_for_unit("wren.service")
+
+            # Sentinel compiled the v6 route into wren's config.
+            fw.wait_until_succeeds(
+                "grep -q '2001:db8:beef::/48' /run/sentinel/wren.toml", timeout=20
+            )
+            # wren programmed the kernel IPv6 FIB with it.
+            fw.wait_until_succeeds(
+                "ip -6 route show | grep -q '2001:db8:beef::/48'", timeout=60
+            )
+          '';
+        };
+
         # Routing: two Sentinel appliances peer eBGP and each learns the other's
         # network — end-to-end proof that the Wren control plane is wired into the
         # image (packaged, serviced, config-compiled from `set protocols …`) and

@@ -1248,14 +1248,24 @@ impl Appliance {
             validate_ipv4(rid).with_context(|| "protocols router-id")?;
         }
         for r in &self.protocols.statics {
-            validate_cidr_or_ip(&r.prefix)
+            // A static route may be IPv4 or IPv6; wren installs either. The
+            // nexthop family must match the prefix (no v4 via for a v6 route).
+            let prefix_v6 = route_prefix_family(&r.prefix)
                 .with_context(|| format!("protocols static route {:?}", r.prefix))?;
             if r.via.is_none() && r.dev.is_none() {
                 bail!("protocols static route {:?}: needs a via <ip> or dev <if>", r.prefix);
             }
             if let Some(via) = &r.via {
-                validate_ipv4(via)
-                    .with_context(|| format!("protocols static route {:?} via", r.prefix))?;
+                let via_v6 = match ip_family(via) {
+                    Some(f) => f,
+                    None => bail!("protocols static route {:?} via {via:?}: not an IP", r.prefix),
+                };
+                if via_v6 != prefix_v6 {
+                    bail!(
+                        "protocols static route {:?}: via {via:?} family does not match the prefix",
+                        r.prefix
+                    );
+                }
             }
         }
         if let Some(bgp) = &self.protocols.bgp {
@@ -1416,6 +1426,45 @@ pub(crate) fn validate_ipv6(s: &str) -> Result<()> {
     s.parse::<Ipv6Addr>()
         .with_context(|| format!("{s:?} is not an IPv6 address"))?;
     Ok(())
+}
+
+/// The address family of a bare IP: `Some(true)` for IPv6, `Some(false)` for
+/// IPv4, `None` if it is neither. A `prefix/len` is reduced to its address part.
+pub(crate) fn ip_family(s: &str) -> Option<bool> {
+    let head = s.split('/').next().unwrap_or(s);
+    if head.parse::<Ipv4Addr>().is_ok() {
+        Some(false)
+    } else if head.parse::<Ipv6Addr>().is_ok() {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// Validate a static-route prefix (an IPv4 or IPv6 CIDR, or a bare host) and
+/// return its family (`true` = IPv6). Checks the prefix length is in range.
+pub(crate) fn route_prefix_family(s: &str) -> Result<bool> {
+    match s.split_once('/') {
+        Some((ip, pfx)) => {
+            let len: u16 = pfx
+                .parse()
+                .with_context(|| format!("invalid prefix length in {s:?}"))?;
+            if ip.parse::<Ipv4Addr>().is_ok() {
+                if len > 32 {
+                    bail!("prefix /{len} in {s:?} exceeds /32");
+                }
+                Ok(false)
+            } else if ip.parse::<Ipv6Addr>().is_ok() {
+                if len > 128 {
+                    bail!("prefix /{len} in {s:?} exceeds /128");
+                }
+                Ok(true)
+            } else {
+                bail!("invalid IP in {s:?}")
+            }
+        }
+        None => ip_family(s).with_context(|| format!("{s:?} is not an IP or CIDR")),
+    }
 }
 
 /// Validate a host that is either an IP literal (v4/v6) or a DNS hostname — used
@@ -1847,6 +1896,42 @@ port = "1-65535"
 "#;
         // The range is far over the cap → validation rejects it.
         assert!(Appliance::from_toml(toml).is_err());
+    }
+
+    #[test]
+    fn static_routes_are_dual_stack() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+address = "10.0.0.1/24"
+
+[[protocols.static]]
+prefix = "192.0.2.0/24"
+via = "10.0.0.254"
+
+[[protocols.static]]
+prefix = "2001:db8:beef::/48"
+via = "2001:db8:0::1"
+"#;
+        let a = Appliance::from_toml(toml).expect("dual-stack static routes validate");
+        assert_eq!(a.protocols.statics.len(), 2);
+        assert_eq!(a.protocols.statics[1].prefix, "2001:db8:beef::/48");
+        // A v4 nexthop for a v6 prefix is rejected (family mismatch).
+        let mismatch = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+address = "10.0.0.1/24"
+[[protocols.static]]
+prefix = "2001:db8:beef::/48"
+via = "10.0.0.254"
+"#;
+        assert!(Appliance::from_toml(mismatch).is_err());
     }
 
     #[test]
