@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::config::{
-    Action, Appliance, Bgp, BgpNeighbor, DhcpServer, Dns, Firewall, Interface, Isis, Nat,
+    Action, Appliance, Bgp, BgpNeighbor, DhcpServer, Dns, Firewall, IfaceType, Interface, Isis, Nat,
     NatDestination, NatSource, Ospf, Ospf3, PortSpec, Proto, Protocols, Rip, RouterAdvert, Rule,
     Services, StaticRoute, System, Vrrp, WgPeer, ZoneCfg,
 };
@@ -37,6 +37,11 @@ struct IfaceDraft {
     dhcp_server: Option<DhcpServerDraft>,
     // An IPv6 Router Advertiser (SLAAC) on this interface.
     router_advert: Option<RouterAdvertDraft>,
+    // Virtual L2 device kind (bridge/bond) + bond mode, and (for a member) the
+    // bridge/bond it is enslaved to.
+    if_type: Option<IfaceType>,
+    master: Option<String>,
+    bond_mode: Option<String>,
 }
 
 impl IfaceDraft {
@@ -427,6 +432,9 @@ impl Draft {
                                 other_config: r.other_config,
                                 router_lifetime: r.router_lifetime,
                             }),
+                            if_type: i.if_type,
+                            master: i.master.clone(),
+                            bond_mode: i.bond_mode.clone(),
                         },
                     )
                 })
@@ -796,6 +804,29 @@ impl Session {
                 self.draft.iface_mut(name).ra_mut().router_lifetime = Some(life);
             }
 
+            // Bridge / bond: `type` makes this a virtual L2 device, `master`
+            // enslaves it to one, `bond-mode` sets a bond's aggregation mode.
+            ["interface", name, "type", v] => {
+                let ty = match *v {
+                    "bridge" => IfaceType::Bridge,
+                    "bond" => IfaceType::Bond,
+                    other => bail!("interface type {other:?}: expected \"bridge\" or \"bond\""),
+                };
+                self.draft.iface_mut(name).if_type = Some(ty);
+            }
+            ["interface", name, "master", v] => {
+                self.draft.iface_mut(name).master = Some((*v).to_string());
+            }
+            ["interface", name, "bond-mode", v] => {
+                if !crate::config::BOND_MODES.contains(v) {
+                    bail!(
+                        "bond-mode {v:?}: expected one of {:?}",
+                        crate::config::BOND_MODES
+                    );
+                }
+                self.draft.iface_mut(name).bond_mode = Some((*v).to_string());
+            }
+
             // --- firewall { … } — everything firewall lives under this node ---
 
             // firewall global: the defaults every zone inherits.
@@ -1108,6 +1139,9 @@ impl Session {
             ["interface", name, "vlan"] => self.iface(name)?.vlan = None,
             ["interface", name, "private-key"] => self.iface(name)?.private_key = None,
             ["interface", name, "listen-port"] => self.iface(name)?.listen_port = None,
+            ["interface", name, "type"] => self.iface(name)?.if_type = None,
+            ["interface", name, "master"] => self.iface(name)?.master = None,
+            ["interface", name, "bond-mode"] => self.iface(name)?.bond_mode = None,
             ["interface", name, "peer", pk] => {
                 let i = self.iface(name)?;
                 let before = i.peers.len();
@@ -1498,6 +1532,9 @@ impl Session {
                     other_config: r.other_config,
                     router_lifetime: r.router_lifetime,
                 }),
+                if_type: d.if_type,
+                master: d.master.clone(),
+                bond_mode: d.bond_mode.clone(),
             })
             .collect();
         let rules = self
@@ -1807,15 +1844,31 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             && i.peers.is_empty()
             && i.dhcp_server.is_none()
             && i.router_advert.is_none()
+            && i.if_type.is_none()
+            && i.master.is_none()
+            && i.bond_mode.is_none()
         {
             continue;
         }
         out.push_str(&format!("interface {name} {{\n"));
+        if let Some(ty) = i.if_type {
+            let s = match ty {
+                IfaceType::Bridge => "bridge",
+                IfaceType::Bond => "bond",
+            };
+            out.push_str(&format!("    type {s}\n"));
+        }
         if let Some(z) = &i.zone {
             out.push_str(&format!("    zone {z}\n"));
         }
         if let Some(a) = &i.address {
             out.push_str(&format!("    address {a}\n"));
+        }
+        if let Some(m) = &i.master {
+            out.push_str(&format!("    master {m}\n"));
+        }
+        if let Some(mode) = &i.bond_mode {
+            out.push_str(&format!("    bond-mode {mode}\n"));
         }
         if let Some(p) = &i.parent {
             out.push_str(&format!("    parent {p}\n"));

@@ -16,7 +16,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::config::{Appliance, DhcpServer, Dns, Interface, RouterAdvert};
+use crate::config::{Appliance, DhcpServer, Dns, IfaceType, Interface, RouterAdvert};
 use crate::system::{self, NETWORKD_RUNTIME_DIR};
 
 /// Filename prefix for the units we own. The low number sorts ahead of the
@@ -35,6 +35,20 @@ fn netdev_name(iface: &str) -> String {
 /// The `.netdev` that creates an 802.1Q VLAN link `iface` with the given id.
 fn netdev_body(iface: &str, vlan: u16) -> String {
     format!("[NetDev]\nName={iface}\nKind=vlan\n\n[VLAN]\nId={vlan}\n")
+}
+
+/// The `.netdev` for a virtual L2 device: a bridge (`Kind=bridge`) or a bond
+/// (`Kind=bond` + `[Bond] Mode=`, default `active-backup`). Members attach via
+/// their own `.network` (`Bridge=`/`Bond=`), not here.
+fn virtual_l2_netdev_body(iface: &Interface) -> String {
+    match iface.if_type {
+        Some(IfaceType::Bridge) => format!("[NetDev]\nName={}\nKind=bridge\n", iface.name),
+        Some(IfaceType::Bond) => {
+            let mode = iface.bond_mode.as_deref().unwrap_or("active-backup");
+            format!("[NetDev]\nName={}\nKind=bond\n\n[Bond]\nMode={mode}\n", iface.name)
+        }
+        None => String::new(),
+    }
 }
 
 /// The `.netdev` that creates a WireGuard link: the `[WireGuard]` section
@@ -78,12 +92,18 @@ fn network_body(
     vlan_children: &[String],
     dhcp: Option<&DhcpServer>,
     ra: Option<&RouterAdvert>,
+    master: Option<&str>,
 ) -> String {
     let mut body = format!("[Match]\nName={iface}\n\n[Network]\n");
     match address {
         Some("dhcp") => body.push_str("DHCP=yes\n"),
         Some(addr) => body.push_str(&format!("Address={addr}\n")),
         None => {}
+    }
+    // Enslavement to a bridge/bond master (`Bridge=br0` / `Bond=bond0`) — a
+    // [Network] directive, so it goes here before any sub-section opens.
+    if let Some(m) = master {
+        body.push_str(&format!("{m}\n"));
     }
     for child in vlan_children {
         body.push_str(&format!("VLAN={child}\n"));
@@ -245,9 +265,19 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
         }
     }
 
+    // Bridge / bond .netdev units (virtual L2 devices this box synthesises).
+    for i in ifaces {
+        if i.is_virtual_l2() {
+            let name = netdev_name(&i.name);
+            writes.push((name.clone(), virtual_l2_netdev_body(i)));
+            keep.insert(name);
+        }
+    }
+
     // .network units: anything with an address, a VLAN of its own, child VLANs,
-    // or a WireGuard link (which needs a `.network` to be brought up even when it
-    // carries only AllowedIPs routes and no local address).
+    // a WireGuard link (which needs a `.network` to be brought up even when it
+    // carries only AllowedIPs routes and no local address), a bridge/bond device,
+    // or a member enslaved to one.
     let reloaded: Vec<String> = ifaces
         .iter()
         .filter(|i| {
@@ -255,10 +285,23 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
                 || (i.parent.is_some() && i.vlan.is_some())
                 || i.is_wireguard()
                 || i.router_advert.is_some()
+                || i.is_virtual_l2()
+                || i.master.is_some()
                 || children.contains_key(i.name.as_str())
         })
         .map(|i| {
             let kids = children.get(i.name.as_str()).map(Vec::as_slice).unwrap_or(&[]);
+            // Resolve a member's `master` to the right networkd directive
+            // (`Bridge=`/`Bond=`) by looking up the master's device type.
+            let master = i.master.as_deref().and_then(|m| {
+                ifaces.iter().find(|d| d.name == m).map(|d| {
+                    if d.is_bond() {
+                        format!("Bond={m}")
+                    } else {
+                        format!("Bridge={m}")
+                    }
+                })
+            });
             let name = network_name(&i.name);
             writes.push((
                 name.clone(),
@@ -268,6 +311,7 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
                     kids,
                     i.dhcp_server.as_ref(),
                     i.router_advert.as_ref(),
+                    master.as_deref(),
                 ),
             ));
             keep.insert(name);
@@ -318,14 +362,14 @@ mod tests {
 
     #[test]
     fn static_address_renders_address_directive() {
-        let u = network_body("eth0", Some("10.0.0.1/24"), &[], None, None);
+        let u = network_body("eth0", Some("10.0.0.1/24"), &[], None, None, None);
         assert!(u.contains("Name=eth0"));
         assert!(u.contains("Address=10.0.0.1/24"));
     }
 
     #[test]
     fn dhcp_address_renders_dhcp_directive() {
-        let u = network_body("eth0", Some("dhcp"), &[], None, None);
+        let u = network_body("eth0", Some("dhcp"), &[], None, None, None);
         assert!(u.contains("DHCP=yes"));
         assert!(!u.contains("Address="));
     }
@@ -347,6 +391,7 @@ mod tests {
             &["eth1.20".into(), "eth1.30".into()],
             None,
             None,
+            None,
         );
         assert!(u.contains("VLAN=eth1.20"));
         assert!(u.contains("VLAN=eth1.30"));
@@ -365,7 +410,7 @@ mod tests {
             dns: vec!["10.0.0.1".into()],
             lease_time: Some(3600),
         };
-        let u = network_body("eth1", Some("10.0.0.1/24"), &[], Some(&dhcp), None);
+        let u = network_body("eth1", Some("10.0.0.1/24"), &[], Some(&dhcp), None, None);
         // The static subnet is still bound, and the server is switched on.
         assert!(u.contains("Address=10.0.0.1/24"));
         assert!(u.contains("DHCPServer=yes"));
@@ -386,7 +431,7 @@ mod tests {
             dns: vec![],
             lease_time: None,
         };
-        let u = network_body("eth1", Some("10.0.0.1/24"), &[], Some(&dhcp), None);
+        let u = network_body("eth1", Some("10.0.0.1/24"), &[], Some(&dhcp), None, None);
         assert!(u.contains("DHCPServer=yes"));
         assert!(u.contains("[DHCPServer]"));
         assert!(!u.contains("EmitDNS"));
@@ -411,6 +456,9 @@ mod tests {
             peers: vec![],
             dhcp_server: None,
             router_advert: None,
+            if_type: None,
+            master: None,
+            bond_mode: None,
         }];
         let body = resolved_dropin_body(&dns, &ifaces).expect("forwarder configured");
         assert!(body.contains("[Resolve]"));
@@ -425,6 +473,61 @@ mod tests {
     }
 
     #[test]
+    fn bridge_netdev_and_member_enslavement_render() {
+        let br = Interface {
+            name: "br0".into(),
+            zone: Some("lan".into()),
+            address: Some("10.0.0.1/24".into()),
+            parent: None,
+            vlan: None,
+            private_key: None,
+            listen_port: None,
+            peers: vec![],
+            dhcp_server: None,
+            router_advert: None,
+            if_type: Some(IfaceType::Bridge),
+            master: None,
+            bond_mode: None,
+        };
+        let d = virtual_l2_netdev_body(&br);
+        assert!(d.contains("Name=br0"));
+        assert!(d.contains("Kind=bridge"));
+        assert!(!d.contains("[Bond]"));
+        // A member's .network carries the Bridge= enslavement in [Network].
+        let member = network_body("lan1", None, &[], None, None, Some("Bridge=br0"));
+        assert!(member.contains("[Network]"));
+        assert!(member.contains("Bridge=br0"));
+    }
+
+    #[test]
+    fn bond_netdev_renders_kind_and_mode() {
+        let bond = Interface {
+            name: "bond0".into(),
+            zone: None,
+            address: None,
+            parent: None,
+            vlan: None,
+            private_key: None,
+            listen_port: None,
+            peers: vec![],
+            dhcp_server: None,
+            router_advert: None,
+            if_type: Some(IfaceType::Bond),
+            master: None,
+            bond_mode: Some("802.3ad".into()),
+        };
+        let d = virtual_l2_netdev_body(&bond);
+        assert!(d.contains("Kind=bond"));
+        assert!(d.contains("[Bond]"));
+        assert!(d.contains("Mode=802.3ad"));
+        let mut b2 = bond.clone();
+        b2.bond_mode = None;
+        assert!(virtual_l2_netdev_body(&b2).contains("Mode=active-backup"));
+        let member = network_body("lan2", None, &[], None, None, Some("Bond=bond0"));
+        assert!(member.contains("Bond=bond0"));
+    }
+
+    #[test]
     fn router_advert_renders_send_ra_prefix_and_dns() {
         let ra = RouterAdvert {
             prefixes: vec!["2001:db8:1::/64".into()],
@@ -433,7 +536,7 @@ mod tests {
             other_config: true,
             router_lifetime: Some(1800),
         };
-        let u = network_body("lan0", Some("10.0.0.1/24"), &[], None, Some(&ra));
+        let u = network_body("lan0", Some("10.0.0.1/24"), &[], None, Some(&ra), None);
         // The enabling directive stays in [Network]; the detail sections follow.
         assert!(u.contains("IPv6SendRA=yes"));
         assert!(u.contains("[IPv6SendRA]"));
@@ -465,7 +568,7 @@ mod tests {
             other_config: false,
             router_lifetime: None,
         };
-        let u = network_body("lan0", Some("10.0.0.1/24"), &[], Some(&dhcp), Some(&ra));
+        let u = network_body("lan0", Some("10.0.0.1/24"), &[], Some(&dhcp), Some(&ra), None);
         let network_hdr = u.find("[Network]").unwrap();
         let first_subsection = u.find("[DHCPServer]").unwrap();
         let dhcp_on = u.find("DHCPServer=yes").unwrap();
@@ -495,6 +598,9 @@ mod tests {
             }],
             dhcp_server: None,
             router_advert: None,
+            if_type: None,
+            master: None,
+            bond_mode: None,
         };
         let d = wireguard_netdev_body(&iface);
         assert!(d.contains("Kind=wireguard"));

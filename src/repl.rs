@@ -573,6 +573,22 @@ const IFACE_FIELDS: &[Cand] = &[
     ("peer", "WireGuard peer (by public key)"),
     ("dhcp-server", "serve DHCP from this NIC's static subnet"),
     ("router-advert", "emit IPv6 Router Advertisements (SLAAC)"),
+    ("type", "make this a virtual L2 device: bridge | bond"),
+    ("master", "enslave this NIC to a bridge/bond device"),
+    ("bond-mode", "bonding mode (on a type=bond device)"),
+];
+const IFACE_TYPES: &[Cand] = &[
+    ("bridge", "an L2 switch; enslave NICs with `master`"),
+    ("bond", "link aggregation; enslave NICs with `master`"),
+];
+const BOND_MODES: &[Cand] = &[
+    ("active-backup", "one active link, the rest standby (no switch config)"),
+    ("802.3ad", "LACP link aggregation (needs switch support)"),
+    ("balance-rr", "round-robin across links"),
+    ("balance-xor", "hash-based load balancing"),
+    ("broadcast", "transmit on all links"),
+    ("balance-tlb", "adaptive transmit load balancing"),
+    ("balance-alb", "adaptive load balancing (tx+rx)"),
 ];
 const DHCP_SERVER_FIELDS: &[Cand] = &[
     ("enable", "turn the DHCP server on"),
@@ -622,6 +638,9 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         // WireGuard: `private-key` offers `generate`; a peer's fields follow its key.
         ["set", "interface", _name, "private-key"] => WG_KEY_GEN,
         ["set" | "delete", "interface", _name, "peer", _pk] => PEER_FIELDS,
+        // Bridge/bond value completions.
+        ["set", "interface", _name, "type"] => IFACE_TYPES,
+        ["set", "interface", _name, "bond-mode"] => BOND_MODES,
         // The DHCP-server sub-tree of an interface.
         ["set" | "delete", "interface", _name, "dhcp-server"] => DHCP_SERVER_FIELDS,
         // The IPv6 Router-Advertisement sub-tree of an interface.
@@ -897,7 +916,10 @@ mod tests {
                 "listen-port",
                 "peer",
                 "dhcp-server",
-                "router-advert"
+                "router-advert",
+                "type",
+                "master",
+                "bond-mode"
             ]
         );
         // The DHCP-server sub-tree of an interface is discoverable.
@@ -988,7 +1010,10 @@ mod tests {
                 "listen-port",
                 "peer",
                 "dhcp-server",
-                "router-advert"
+                "router-advert",
+                "type",
+                "master",
+                "bond-mode"
             ]
         );
     }
