@@ -28,6 +28,11 @@ rustyline = "14"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tonic = { version = "0.12", default-features = false, features = ["transport"] }
 libc = "0.2"
+# WireGuard key handling (C1): derive a public key from a private key, generate
+# fresh keypairs, and base64-encode/decode the 32-byte Curve25519 keys.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+base64 = "0.22"
+getrandom = "0.2"
 
 # Room to grow: split into sentinel-daemon / -cli / -web as the appliance fills
 # out. For now a single binary keeps the skeleton honest.
