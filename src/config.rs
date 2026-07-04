@@ -529,6 +529,30 @@ pub struct Interface {
     /// WireGuard peers reachable over this interface.
     #[serde(default, rename = "peer", skip_serializing_if = "Vec::is_empty")]
     pub peers: Vec<WgPeer>,
+    /// When set, networkd runs a built-in DHCP server on this interface, handing
+    /// out leases from the interface's own static subnet. Requires a static
+    /// `address` (the server needs a subnet to allocate from).
+    #[serde(default, rename = "dhcp-server", skip_serializing_if = "Option::is_none")]
+    pub dhcp_server: Option<DhcpServer>,
+}
+
+/// A built-in (systemd-networkd) DHCP server on an interface that carries a
+/// static address. All fields are optional refinements of networkd's defaults;
+/// the presence of the block is what turns the server on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DhcpServer {
+    /// Offset of the first pool address within the interface's subnet.
+    #[serde(default, rename = "pool-offset", skip_serializing_if = "Option::is_none")]
+    pub pool_offset: Option<u32>,
+    /// Number of addresses in the pool.
+    #[serde(default, rename = "pool-size", skip_serializing_if = "Option::is_none")]
+    pub pool_size: Option<u32>,
+    /// DNS servers advertised to clients (emitted only when non-empty).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns: Vec<String>,
+    /// Default lease time, in seconds.
+    #[serde(default, rename = "lease-time", skip_serializing_if = "Option::is_none")]
+    pub lease_time: Option<u32>,
 }
 
 /// A WireGuard peer: the far end of a tunnel on a `[[interface]]` that carries a
@@ -849,6 +873,20 @@ impl Appliance {
                     iface.name
                 );
             }
+
+            // DHCP server: needs the interface's own static subnet to hand out
+            // addresses, so a static CIDR `address` is mandatory. Any advertised
+            // DNS servers must be valid IPv4 addresses.
+            if let Some(dhcp) = &iface.dhcp_server {
+                match iface.address.as_deref() {
+                    Some(addr) if addr != "dhcp" => {}
+                    _ => bail!("dhcp-server requires a static address on {}", iface.name),
+                }
+                for dns in &dhcp.dns {
+                    validate_ipv4(dns)
+                        .with_context(|| format!("interface {:?} dhcp-server dns", iface.name))?;
+                }
+            }
         }
 
         // Every rule's zones must be backed by at least one *assigned* interface,
@@ -1026,7 +1064,7 @@ impl Appliance {
 }
 
 /// Validate a bare IPv4 address (router-id, gateway, BGP peer — no prefix).
-fn validate_ipv4(s: &str) -> Result<()> {
+pub(crate) fn validate_ipv4(s: &str) -> Result<()> {
     s.parse::<Ipv4Addr>()
         .with_context(|| format!("{s:?} is not an IPv4 address"))?;
     Ok(())

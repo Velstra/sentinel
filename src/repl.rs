@@ -557,6 +557,15 @@ const IFACE_FIELDS: &[Cand] = &[
     ("private-key", "WireGuard private key (or `generate`)"),
     ("listen-port", "WireGuard UDP listen port"),
     ("peer", "WireGuard peer (by public key)"),
+    ("dhcp-server", "serve DHCP from this NIC's static subnet"),
+];
+const DHCP_SERVER_FIELDS: &[Cand] = &[
+    ("enable", "turn the DHCP server on"),
+    ("disable", "turn the DHCP server off"),
+    ("pool-offset", "first pool address offset within the subnet"),
+    ("pool-size", "number of addresses in the pool"),
+    ("dns", "DNS servers to advertise (comma-separated)"),
+    ("lease-time", "default lease time in seconds"),
 ];
 const WG_KEY_GEN: &[Cand] = &[("generate", "generate a fresh WireGuard keypair")];
 const PEER_FIELDS: &[Cand] = &[
@@ -589,6 +598,8 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         // WireGuard: `private-key` offers `generate`; a peer's fields follow its key.
         ["set", "interface", _name, "private-key"] => WG_KEY_GEN,
         ["set" | "delete", "interface", _name, "peer", _pk] => PEER_FIELDS,
+        // The DHCP-server sub-tree of an interface.
+        ["set" | "delete", "interface", _name, "dhcp-server"] => DHCP_SERVER_FIELDS,
 
         // The firewall sub-tree.
         ["set" | "delete", "firewall"] => FIREWALL_NODES,
@@ -845,7 +856,21 @@ mod tests {
         assert_eq!(kw(&["set", "system"]), ["hostname"]);
         assert_eq!(
             kw(&["set", "interface", "wan0"]),
-            ["zone", "address", "parent", "vlan", "private-key", "listen-port", "peer"]
+            [
+                "zone",
+                "address",
+                "parent",
+                "vlan",
+                "private-key",
+                "listen-port",
+                "peer",
+                "dhcp-server"
+            ]
+        );
+        // The DHCP-server sub-tree of an interface is discoverable.
+        assert_eq!(
+            kw(&["set", "interface", "lan0", "dhcp-server"]),
+            ["enable", "disable", "pool-offset", "pool-size", "dns", "lease-time"]
         );
         // WireGuard completion: `private-key` offers `generate`; a peer's fields
         // follow after its public key.
@@ -916,7 +941,16 @@ mod tests {
         assert_eq!(kws(&["set"]), ["system", "interface", "firewall", "nat", "protocols"]);
         assert_eq!(
             kws(&["set", "interface", "eth0"]),
-            ["zone", "address", "parent", "vlan", "private-key", "listen-port", "peer"]
+            [
+                "zone",
+                "address",
+                "parent",
+                "vlan",
+                "private-key",
+                "listen-port",
+                "peer",
+                "dhcp-server"
+            ]
         );
     }
 
