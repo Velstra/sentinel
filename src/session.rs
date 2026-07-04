@@ -27,6 +27,7 @@ pub const DEFAULT_CONFIG: &str = "/var/lib/sentinel/appliance.toml";
 struct IfaceDraft {
     zone: Option<String>,
     address: Option<String>,
+    address6: Option<String>,
     parent: Option<String>,
     vlan: Option<u16>,
     // WireGuard: a `private-key` makes this a WG tunnel; peers ride on it.
@@ -408,6 +409,7 @@ impl Draft {
                         IfaceDraft {
                             zone: i.zone.clone(),
                             address: i.address.clone(),
+                            address6: i.address6.clone(),
                             parent: i.parent.clone(),
                             vlan: i.vlan,
                             private_key: i.private_key.clone(),
@@ -692,6 +694,12 @@ impl Session {
             ["interface", name, "address", v] => {
                 validate_address(v)?;
                 self.draft.iface_mut(name).address = Some((*v).to_string());
+            }
+            ["interface", name, "address6", v] => {
+                if *v != "auto" {
+                    crate::config::validate_ipv6_cidr(v)?;
+                }
+                self.draft.iface_mut(name).address6 = Some((*v).to_string());
             }
             ["interface", name, "parent", v] => {
                 self.draft.iface_mut(name).parent = Some((*v).to_string())
@@ -1158,6 +1166,7 @@ impl Session {
                 }
             }
             ["interface", name, "address"] => self.iface(name)?.address = None,
+            ["interface", name, "address6"] => self.iface(name)?.address6 = None,
             ["interface", name, "zone"] => self.iface(name)?.zone = None,
             ["interface", name, "parent"] => self.iface(name)?.parent = None,
             ["interface", name, "vlan"] => self.iface(name)?.vlan = None,
@@ -1540,6 +1549,7 @@ impl Session {
                 name: name.clone(),
                 zone: d.zone.clone(),
                 address: d.address.clone(),
+                address6: d.address6.clone(),
                 parent: d.parent.clone(),
                 vlan: d.vlan,
                 private_key: d.private_key.clone(),
@@ -1877,6 +1887,7 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         if skip_empty_ifaces
             && i.zone.is_none()
             && i.address.is_none()
+            && i.address6.is_none()
             && i.parent.is_none()
             && i.vlan.is_none()
             && i.private_key.is_none()
@@ -1903,6 +1914,9 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         if let Some(a) = &i.address {
             out.push_str(&format!("    address {a}\n"));
+        }
+        if let Some(a6) = &i.address6 {
+            out.push_str(&format!("    address6 {a6}\n"));
         }
         if let Some(m) = &i.master {
             out.push_str(&format!("    master {m}\n"));
