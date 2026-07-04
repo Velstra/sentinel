@@ -66,6 +66,25 @@ address = "10.0.0.1/24"
 # prefixes = ["2001:db8:1::/64"]
 # dns = ["2001:db8:1::1"]
 
+# A bridge (switch) that holds the LAN address, with NICs enslaved to it:
+# [[interface]]
+# name = "br0"
+# type = "bridge"
+# zone = "lan"
+# address = "10.0.0.1/24"
+# [[interface]]
+# name = "lan1"
+# master = "br0"
+#
+# A bond (link aggregation) — set the mode on the device, enslave with master:
+# [[interface]]
+# name = "bond0"
+# type = "bond"
+# bond-mode = "active-backup"
+# [[interface]]
+# name = "lan2"
+# master = "bond0"
+
 # Broad zone rules set a zone's posture (action: accept | drop | reject).
 [[rule]]
 name = "lan-to-wan"
@@ -608,7 +627,45 @@ pub struct Interface {
     /// address from each advertised prefix itself.
     #[serde(default, rename = "router-advert", skip_serializing_if = "Option::is_none")]
     pub router_advert: Option<RouterAdvert>,
+    /// For a **virtual L2 device** — a `bridge` or a `bond` this box creates
+    /// (rather than a physical NIC). The device is a networkd `.netdev`
+    /// (`Kind=bridge`/`bond`); member NICs point at it with `master`. A bridge
+    /// switches its members; a bond aggregates them (mode via `bond-mode`). Set
+    /// on the *device* interface, not its members.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub if_type: Option<IfaceType>,
+    /// Enslave this interface to a `bridge`/`bond` device named here (the inverse
+    /// of `if_type`): the member gets `Bridge=`/`Bond=` in its `.network`. The
+    /// master must be a declared `type = "bridge"`/`"bond"` interface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master: Option<String>,
+    /// Bonding mode for a `type = "bond"` device (`"active-backup"`,
+    /// `"802.3ad"`, `"balance-rr"`, …). Only meaningful on a bond device;
+    /// defaults to `active-backup` when unset.
+    #[serde(default, rename = "bond-mode", skip_serializing_if = "Option::is_none")]
+    pub bond_mode: Option<String>,
 }
+
+/// The kind of a **virtual L2 device** Sentinel creates: a bridge (switch) or a
+/// bond (link aggregation). Physical NICs and VLAN/WireGuard links carry no
+/// `type`; this only marks a device the box synthesises to enslave members.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IfaceType {
+    Bridge,
+    Bond,
+}
+
+/// The Linux bonding modes networkd accepts (`[Bond] Mode=`).
+pub const BOND_MODES: &[&str] = &[
+    "balance-rr",
+    "active-backup",
+    "balance-xor",
+    "broadcast",
+    "802.3ad",
+    "balance-tlb",
+    "balance-alb",
+];
 
 /// A built-in (systemd-networkd) IPv6 Router Advertiser on an interface — the
 /// IPv6 SLAAC counterpart of [`DhcpServer`]. The presence of the block turns RA
@@ -685,6 +742,14 @@ impl Interface {
     /// A WireGuard interface is any interface that carries a `private-key`.
     pub fn is_wireguard(&self) -> bool {
         self.private_key.is_some()
+    }
+    /// True for a bond device (`type = "bond"`).
+    pub fn is_bond(&self) -> bool {
+        self.if_type == Some(IfaceType::Bond)
+    }
+    /// True for a virtual L2 device (bridge or bond) this box synthesises.
+    pub fn is_virtual_l2(&self) -> bool {
+        self.if_type.is_some()
     }
 }
 
@@ -1010,6 +1075,49 @@ impl Appliance {
                     validate_ipv6(dns).with_context(|| {
                         format!("interface {:?} router-advert dns", iface.name)
                     })?;
+                }
+            }
+
+            // Bridge / bond: a `type` device cannot also be a VLAN or WireGuard;
+            // a `bond-mode` is only meaningful on a bond; a `master` must name a
+            // declared bridge/bond device (checked in a second pass below, once
+            // every interface's type is known).
+            if iface.is_virtual_l2() && (iface.parent.is_some() || iface.is_wireguard()) {
+                bail!(
+                    "interface {:?}: a bridge/bond device cannot also be a VLAN or WireGuard",
+                    iface.name
+                );
+            }
+            if let Some(mode) = &iface.bond_mode {
+                if !iface.is_bond() {
+                    bail!("interface {:?}: bond-mode is only valid on a type=bond", iface.name);
+                }
+                if !BOND_MODES.contains(&mode.as_str()) {
+                    bail!(
+                        "interface {:?}: bond-mode {mode:?} is not one of {BOND_MODES:?}",
+                        iface.name
+                    );
+                }
+            }
+        }
+
+        // Enslavement pass: every `master` must reference a declared bridge/bond
+        // device, and a device cannot enslave to itself.
+        for iface in &self.interfaces {
+            if let Some(master) = &iface.master {
+                match self.interfaces.iter().find(|i| &i.name == master) {
+                    Some(m) if m.is_virtual_l2() => {}
+                    Some(_) => bail!(
+                        "interface {:?}: master {master:?} is not a bridge/bond device",
+                        iface.name
+                    ),
+                    None => bail!(
+                        "interface {:?}: master {master:?} is not a declared interface",
+                        iface.name
+                    ),
+                }
+                if master == &iface.name {
+                    bail!("interface {:?}: cannot enslave to itself", iface.name);
                 }
             }
         }
@@ -1626,6 +1734,75 @@ port = "1-65535"
 "#;
         // The range is far over the cap → validation rejects it.
         assert!(Appliance::from_toml(toml).is_err());
+    }
+
+    #[test]
+    fn bridge_and_bond_parse_and_validate() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "br0"
+type = "bridge"
+zone = "lan"
+address = "10.0.0.1/24"
+[[interface]]
+name = "lan1"
+master = "br0"
+[[interface]]
+name = "bond0"
+type = "bond"
+bond-mode = "802.3ad"
+[[interface]]
+name = "lan2"
+master = "bond0"
+"#;
+        let a = Appliance::from_toml(toml).expect("bridge/bond config parses + validates");
+        assert_eq!(a.interfaces[0].if_type, Some(IfaceType::Bridge));
+        assert_eq!(a.interfaces[1].master.as_deref(), Some("br0"));
+        assert!(a.interfaces[2].is_bond());
+        assert_eq!(a.interfaces[2].bond_mode.as_deref(), Some("802.3ad"));
+        // Round-trips through TOML (type + master survive).
+        let out = a.to_toml().unwrap();
+        assert!(out.contains("type = \"bridge\""), "got:\n{out}");
+        assert!(out.contains("master = \"bond0\""), "got:\n{out}");
+        assert!(Appliance::from_toml(&out).is_ok());
+    }
+
+    #[test]
+    fn bridge_bond_reject_bad_master_mode_and_combos() {
+        // master pointing at a non-device interface is rejected.
+        let bad_master = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "eth0"
+zone = "lan"
+[[interface]]
+name = "eth1"
+master = "eth0"
+"#;
+        assert!(Appliance::from_toml(bad_master).is_err());
+        // bond-mode on a bridge is rejected.
+        let mode_on_bridge = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "br0"
+type = "bridge"
+bond-mode = "active-backup"
+"#;
+        assert!(Appliance::from_toml(mode_on_bridge).is_err());
+        // an unknown bonding mode is rejected.
+        let bad_mode = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "bond0"
+type = "bond"
+bond-mode = "round-robin"
+"#;
+        assert!(Appliance::from_toml(bad_mode).is_err());
     }
 
     #[test]

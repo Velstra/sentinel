@@ -1917,6 +1917,70 @@
           '';
         };
 
+        # L2 devices: a bridge and a bond, both synthesised by Sentinel from the
+        # same networkd-.netdev render path as VLANs. One fw node with three NICs:
+        # br0 (a bridge holding the LAN address) enslaves eth1; bond0 (active-
+        # backup) enslaves eth2; eth3 is left free for the velstra XDP attach so
+        # the data plane never touches the enslaved members. Proves the render →
+        # kernel path: the bridge/bond devices exist with the right kind/mode and
+        # their members are enslaved.
+        #   nix build .#checks.x86_64-linux.l2 -L
+        l2 = pkgs.testers.runNixOSTest {
+          name = "sentinel-l2";
+          nodes.fw =
+            { lib, ... }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce "fw";
+              networking.firewall.enable = lib.mkForce false;
+              virtualisation.vlans = [ 1 2 3 ];
+              virtualisation.memorySize = 2048;
+              services.velstra.interface = lib.mkForce "eth3";
+            };
+          testScript = ''
+            start_all()
+            fw.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+
+            # Build a bridge (br0 <- eth1, holding the LAN IP) and a bond (bond0
+            # <- eth2, active-backup). ONE `set` per line.
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface br0 type bridge' "
+                "'set interface br0 zone lan' "
+                "'set interface br0 address 10.0.0.1/24' "
+                "'set interface eth1 master br0' "
+                "'set interface bond0 type bond' "
+                "'set interface bond0 bond-mode active-backup' "
+                "'set interface eth2 master bond0' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+
+            # Sentinel rendered the netdevs + member enslavement.
+            fw.wait_until_succeeds(
+                "test -f /run/systemd/network/10-sentinel-br0.netdev", timeout=20
+            )
+            brdev = fw.succeed("cat /run/systemd/network/10-sentinel-br0.netdev")
+            assert "Kind=bridge" in brdev, brdev
+            bonddev = fw.succeed("cat /run/systemd/network/10-sentinel-bond0.netdev")
+            assert "Kind=bond" in bonddev, bonddev
+            assert "Mode=active-backup" in bonddev, bonddev
+            assert "Bridge=br0" in fw.succeed("cat /run/systemd/network/10-sentinel-eth1.network")
+            assert "Bond=bond0" in fw.succeed("cat /run/systemd/network/10-sentinel-eth2.network")
+
+            # networkd realised them in the kernel: the bridge holds the LAN
+            # address and switches eth1; the bond aggregates eth2 in active-backup.
+            fw.wait_until_succeeds("ip -d link show br0 | grep -q bridge", timeout=30)
+            fw.wait_until_succeeds("ip -4 addr show br0 | grep -q '10.0.0.1'", timeout=30)
+            fw.wait_until_succeeds("ip link show eth1 | grep -q 'master br0'", timeout=30)
+            fw.wait_until_succeeds("ip link show eth2 | grep -q 'master bond0'", timeout=30)
+            fw.wait_until_succeeds(
+                "grep -qi 'Bonding Mode: fault-tolerance' /proc/net/bonding/bond0", timeout=30
+            )
+          '';
+        };
+
         # Routing: two Sentinel appliances peer eBGP and each learns the other's
         # network — end-to-end proof that the Wren control plane is wired into the
         # image (packaged, serviced, config-compiled from `set protocols …`) and
