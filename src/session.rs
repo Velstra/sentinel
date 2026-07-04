@@ -14,8 +14,8 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::{
     Action, Appliance, Bgp, BgpNeighbor, DhcpServer, Firewall, Interface, Isis, Nat, NatDestination,
-    NatSource, Ospf, Ospf3, PortSpec, Proto, Protocols, Rip, Rule, StaticRoute, System, Vrrp,
-    WgPeer, ZoneCfg,
+    NatSource, Ospf, Ospf3, PortSpec, Proto, Protocols, Rip, RouterAdvert, Rule, StaticRoute,
+    System, Vrrp, WgPeer, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -35,6 +35,8 @@ struct IfaceDraft {
     peers: Vec<(String, PeerDraft)>,
     // A built-in DHCP server serving this interface's static subnet.
     dhcp_server: Option<DhcpServerDraft>,
+    // An IPv6 Router Advertiser (SLAAC) on this interface.
+    router_advert: Option<RouterAdvertDraft>,
 }
 
 impl IfaceDraft {
@@ -54,6 +56,13 @@ impl IfaceDraft {
     fn dhcp_mut(&mut self) -> &mut DhcpServerDraft {
         self.dhcp_server.get_or_insert_with(DhcpServerDraft::default)
     }
+
+    /// Mutable access to the RA sub-draft, enabling it (inserting a default) if
+    /// not yet present — the first `router-advert` field turns the advertiser
+    /// on, mirroring `dhcp_mut`.
+    fn ra_mut(&mut self) -> &mut RouterAdvertDraft {
+        self.router_advert.get_or_insert_with(RouterAdvertDraft::default)
+    }
 }
 
 /// A partially-specified DHCP server (fields filled in incrementally).
@@ -63,6 +72,16 @@ struct DhcpServerDraft {
     pool_size: Option<u32>,
     dns: Vec<String>,
     lease_time: Option<u32>,
+}
+
+/// A partially-specified IPv6 Router Advertiser (fields filled in incrementally).
+#[derive(Debug, Clone, Default)]
+struct RouterAdvertDraft {
+    prefixes: Vec<String>,
+    dns: Vec<String>,
+    managed: bool,
+    other_config: bool,
+    router_lifetime: Option<u32>,
 }
 
 /// A partially-specified WireGuard peer (keyed by its public key in the draft).
@@ -391,6 +410,13 @@ impl Draft {
                                 pool_size: d.pool_size,
                                 dns: d.dns.clone(),
                                 lease_time: d.lease_time,
+                            }),
+                            router_advert: i.router_advert.as_ref().map(|r| RouterAdvertDraft {
+                                prefixes: r.prefixes.clone(),
+                                dns: r.dns.clone(),
+                                managed: r.managed,
+                                other_config: r.other_config,
+                                router_lifetime: r.router_lifetime,
                             }),
                         },
                     )
@@ -721,6 +747,41 @@ impl Session {
                 self.draft.iface_mut(name).dhcp_mut().lease_time = Some(lease);
             }
 
+            // IPv6 Router Advertisements (SLAAC) on an interface. `enable` just
+            // switches it on; `prefix`/`dns` accept comma-separated lists.
+            ["interface", name, "router-advert", "enable"] => {
+                self.draft.iface_mut(name).ra_mut();
+            }
+            ["interface", name, "router-advert", "disable"] => {
+                self.draft.iface_mut(name).router_advert = None;
+            }
+            ["interface", name, "router-advert", "prefix", v] => {
+                let prefixes: Vec<String> = v.split(',').map(|s| s.trim().to_string()).collect();
+                for p in &prefixes {
+                    crate::config::validate_ipv6_cidr(p)?;
+                }
+                self.draft.iface_mut(name).ra_mut().prefixes = prefixes;
+            }
+            ["interface", name, "router-advert", "dns", v] => {
+                let servers: Vec<String> = v.split(',').map(|s| s.trim().to_string()).collect();
+                for s in &servers {
+                    validate_ipv6(s)?;
+                }
+                self.draft.iface_mut(name).ra_mut().dns = servers;
+            }
+            ["interface", name, "router-advert", "managed", v] => {
+                self.draft.iface_mut(name).ra_mut().managed = parse_bool(v)?;
+            }
+            ["interface", name, "router-advert", "other-config", v] => {
+                self.draft.iface_mut(name).ra_mut().other_config = parse_bool(v)?;
+            }
+            ["interface", name, "router-advert", "router-lifetime", v] => {
+                let life: u32 = v
+                    .parse()
+                    .with_context(|| format!("invalid router-lifetime {v:?}"))?;
+                self.draft.iface_mut(name).ra_mut().router_lifetime = Some(life);
+            }
+
             // --- firewall { … } — everything firewall lives under this node ---
 
             // firewall global: the defaults every zone inherits.
@@ -1049,6 +1110,21 @@ impl Session {
                     other => bail!("dhcp-server has no field {other:?}"),
                 }
             }
+            ["interface", name, "router-advert"] => self.iface(name)?.router_advert = None,
+            ["interface", name, "router-advert", field] => {
+                let i = self.iface(name)?;
+                let Some(r) = i.router_advert.as_mut() else {
+                    bail!("interface {name:?} has no router-advert");
+                };
+                match *field {
+                    "prefix" => r.prefixes.clear(),
+                    "dns" => r.dns.clear(),
+                    "managed" => r.managed = false,
+                    "other-config" => r.other_config = false,
+                    "router-lifetime" => r.router_lifetime = None,
+                    other => bail!("router-advert has no field {other:?}"),
+                }
+            }
 
             // firewall global …
             ["firewall", "global", "block", v] => {
@@ -1367,6 +1443,13 @@ impl Session {
                     dns: s.dns.clone(),
                     lease_time: s.lease_time,
                 }),
+                router_advert: d.router_advert.as_ref().map(|r| RouterAdvert {
+                    prefixes: r.prefixes.clone(),
+                    dns: r.dns.clone(),
+                    managed: r.managed,
+                    other_config: r.other_config,
+                    router_lifetime: r.router_lifetime,
+                }),
             })
             .collect();
         let rules = self
@@ -1668,6 +1751,7 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             && i.listen_port.is_none()
             && i.peers.is_empty()
             && i.dhcp_server.is_none()
+            && i.router_advert.is_none()
         {
             continue;
         }
@@ -1723,6 +1807,25 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             }
             if let Some(lease) = d.lease_time {
                 out.push_str(&format!("        lease-time {lease}\n"));
+            }
+            out.push_str("    }\n");
+        }
+        if let Some(r) = &i.router_advert {
+            out.push_str("    router-advert {\n");
+            if !r.prefixes.is_empty() {
+                out.push_str(&format!("        prefix {}\n", r.prefixes.join(",")));
+            }
+            if !r.dns.is_empty() {
+                out.push_str(&format!("        dns {}\n", r.dns.join(",")));
+            }
+            if r.managed {
+                out.push_str("        managed true\n");
+            }
+            if r.other_config {
+                out.push_str("        other-config true\n");
+            }
+            if let Some(life) = r.router_lifetime {
+                out.push_str(&format!("        router-lifetime {life}\n"));
             }
             out.push_str("    }\n");
         }
@@ -2037,6 +2140,12 @@ fn validate_endpoint(s: &str) -> Result<()> {
 /// config validator.
 fn validate_ipv4(s: &str) -> Result<()> {
     crate::config::validate_ipv4(s)
+}
+
+/// A bare IPv6 address (e.g. an RA-advertised RDNSS server). Delegates to the
+/// config validator.
+fn validate_ipv6(s: &str) -> Result<()> {
+    crate::config::validate_ipv6(s)
 }
 
 fn validate_address(addr: &str) -> Result<()> {
