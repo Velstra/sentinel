@@ -1629,6 +1629,97 @@
           '';
         };
 
+        # Built-in DHCP server: a 2-node client — fw. The fw gives eth1 a static
+        # subnet (10.0.0.1/24) and turns on `dhcp-server` (pool offset 100, size
+        # 50, advertising itself as DNS). Sentinel renders `DHCPServer=yes` + a
+        # `[DHCPServer]` section into the interface's networkd `.network`, so
+        # networkd runs the server — no extra daemon. The client is a plain NixOS
+        # DHCP client on the same segment; it must obtain a pool lease (10.0.0.x,
+        # offset >= 100, never the server's .1), proving the server handed out an
+        # address end to end. The lan zone is set to accept so the XDP firewall
+        # passes the client's DHCP request on eth1.
+        #   nix build .#checks.x86_64-linux.dhcp -L
+        dhcp = pkgs.testers.runNixOSTest {
+          name = "sentinel-dhcp";
+          nodes = {
+            client =
+              { ... }:
+              {
+                virtualisation.vlans = [ 1 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                };
+                # A DHCP client on eth1 — networkd keeps requesting until the fw's
+                # server answers.
+                systemd.network.networks."10-eth1" = {
+                  matchConfig.Name = "eth1";
+                  networkConfig.DHCP = "ipv4";
+                };
+              };
+            fw =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "fw";
+                networking.firewall.enable = lib.mkForce false;
+                # eth1's address + DHCP server are configured via sentinel, so the
+                # NIC is left unconfigured here (sentinel owns the .network unit).
+                virtualisation.vlans = [ 1 ];
+                virtualisation.memorySize = 2048;
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+          };
+          testScript = ''
+            start_all()
+            fw.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+
+            # Give eth1 a static subnet + a DHCP server serving a pool from it, on
+            # a lan zone set to accept so the XDP firewall passes DHCP on eth1.
+            # ONE `set` per line (the inline multi-field form does not parse).
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth1 address 10.0.0.1/24' "
+                "'set interface eth1 zone lan' "
+                "'set firewall zone lan default-action accept' "
+                "'set interface eth1 dhcp-server enable' "
+                "'set interface eth1 dhcp-server pool-offset 100' "
+                "'set interface eth1 dhcp-server pool-size 50' "
+                "'set interface eth1 dhcp-server dns 10.0.0.1' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            fw.wait_for_unit("velstra.service")
+
+            # Sentinel rendered the DHCP server into eth1's networkd .network.
+            fw.wait_until_succeeds(
+                "test -f /run/systemd/network/10-sentinel-eth1.network", timeout=20
+            )
+            netw = fw.succeed("cat /run/systemd/network/10-sentinel-eth1.network")
+            assert "DHCPServer=yes" in netw, netw
+            assert "[DHCPServer]" in netw, netw
+            assert "PoolOffset=100" in netw, netw
+            assert "PoolSize=50" in netw, netw
+            assert "EmitDNS=yes" in netw, netw
+            # networkd brought the server up on eth1 with the static address.
+            fw.wait_until_succeeds("ip -4 addr show eth1 | grep -q '10.0.0.1'", timeout=30)
+
+            # The client obtains a pool lease: some 10.0.0.x that isn't the
+            # server's .1 (the pool starts at offset 100). DHCP can take a few
+            # seconds, so retry with a generous timeout.
+            client.wait_for_unit("multi-user.target")
+            client.wait_until_succeeds(
+                "ip -4 addr show eth1 | grep -oE '10[.]0[.]0[.][0-9]+' | grep -qv '10.0.0.1'",
+                timeout=90,
+            )
+
+            # The server side saw the lease it handed out.
+            fw.succeed("networkctl status eth1")
+          '';
+        };
+
         # Routing: two Sentinel appliances peer eBGP and each learns the other's
         # network — end-to-end proof that the Wren control plane is wired into the
         # image (packaged, serviced, config-compiled from `set protocols …`) and
