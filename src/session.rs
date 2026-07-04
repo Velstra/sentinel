@@ -13,9 +13,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::config::{
-    Action, Appliance, Bgp, BgpNeighbor, DhcpServer, Firewall, Interface, Isis, Nat, NatDestination,
-    NatSource, Ospf, Ospf3, PortSpec, Proto, Protocols, Rip, RouterAdvert, Rule, StaticRoute,
-    System, Vrrp, WgPeer, ZoneCfg,
+    Action, Appliance, Bgp, BgpNeighbor, DhcpServer, Dns, Firewall, Interface, Isis, Nat,
+    NatDestination, NatSource, Ospf, Ospf3, PortSpec, Proto, Protocols, Rip, RouterAdvert, Rule,
+    Services, StaticRoute, System, Vrrp, WgPeer, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -271,6 +271,15 @@ struct Draft {
     isis: IsisDraft,
     bgp: BgpDraft,
     vrrp: Vec<(String, VrrpDraft)>,
+    dns: DnsDraft,
+}
+
+/// A partially-specified DNS forwarder (the box-wide `[dns]` category).
+#[derive(Debug, Clone, Default)]
+struct DnsDraft {
+    upstream: Vec<String>,
+    serve_on: Vec<String>,
+    dnssec: Option<String>,
 }
 
 impl Draft {
@@ -551,6 +560,11 @@ impl Draft {
                         .collect(),
                 })
                 .unwrap_or_default(),
+            dns: DnsDraft {
+                upstream: a.services.dns.upstream.clone(),
+                serve_on: a.services.dns.serve_on.clone(),
+                dnssec: a.services.dns.dnssec.clone(),
+            },
         }
     }
 }
@@ -862,6 +876,26 @@ impl Session {
             ["nat", "destination", name, "to", v] => {
                 crate::config::parse_host_port(v)?;
                 self.draft.nat_destination_mut(name).to = Some((*v).to_string());
+            }
+
+            // services dns: the box-wide LAN DNS forwarder (systemd-resolved).
+            ["services", "dns", "upstream", v] => {
+                let ups: Vec<String> = v.split(',').map(|s| s.trim().to_string()).collect();
+                for u in &ups {
+                    if validate_ipv4(u).is_err() && validate_ipv6(u).is_err() {
+                        bail!("services dns upstream {u:?}: not an IPv4 or IPv6 address");
+                    }
+                }
+                self.draft.dns.upstream = ups;
+            }
+            ["services", "dns", "serve-on", v] => {
+                self.draft.dns.serve_on = v.split(',').map(|s| s.trim().to_string()).collect();
+            }
+            ["services", "dns", "dnssec", v] => {
+                if !matches!(*v, "yes" | "no" | "allow-downgrade") {
+                    bail!("services dns dnssec {v:?}: expected \"yes\", \"no\" or \"allow-downgrade\"");
+                }
+                self.draft.dns.dnssec = Some((*v).to_string());
             }
 
             // protocols: dynamic routing (the Wren control plane).
@@ -1225,6 +1259,20 @@ impl Session {
                     "port" => d.port = None,
                     "to" => d.to = None,
                     other => bail!("nat destination has no field {other:?}"),
+                }
+            }
+
+            // services: box-wide offered services. Bare `delete services` clears
+            // them all; `delete services dns` turns off just the forwarder.
+            ["services"] => self.draft.dns = DnsDraft::default(),
+            ["services", "dns"] => self.draft.dns = DnsDraft::default(),
+            ["services", "dns", field] => {
+                let d = &mut self.draft.dns;
+                match *field {
+                    "upstream" => d.upstream.clear(),
+                    "serve-on" => d.serve_on.clear(),
+                    "dnssec" => d.dnssec = None,
+                    other => bail!("services dns has no field {other:?}"),
                 }
             }
 
@@ -1662,6 +1710,13 @@ impl Session {
                 destination: nat_destination,
             },
             protocols,
+            services: Services {
+                dns: Dns {
+                    upstream: self.draft.dns.upstream.clone(),
+                    serve_on: self.draft.dns.serve_on.clone(),
+                    dnssec: self.draft.dns.dnssec.clone(),
+                },
+            },
         };
         appliance.validate()?;
         Ok(appliance)
@@ -2078,6 +2133,24 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
     if want("protocols") && !proto.is_empty() {
         out.push_str("protocols {\n");
         out.push_str(&proto);
+        out.push_str("}\n");
+    }
+
+    // services: box-wide offered services (dns today), nested one level.
+    let d = &draft.dns;
+    if want("services") && !(d.upstream.is_empty() && d.serve_on.is_empty() && d.dnssec.is_none()) {
+        out.push_str("services {\n");
+        out.push_str("    dns {\n");
+        if !d.upstream.is_empty() {
+            out.push_str(&format!("        upstream {}\n", d.upstream.join(",")));
+        }
+        if !d.serve_on.is_empty() {
+            out.push_str(&format!("        serve-on {}\n", d.serve_on.join(",")));
+        }
+        if let Some(mode) = &d.dnssec {
+            out.push_str(&format!("        dnssec {mode}\n"));
+        }
+        out.push_str("    }\n");
         out.push_str("}\n");
     }
 
