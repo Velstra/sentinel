@@ -16,7 +16,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::config::{Appliance, Interface};
+use crate::config::{Appliance, DhcpServer, Interface};
 use crate::system::{self, NETWORKD_RUNTIME_DIR};
 
 /// Filename prefix for the units we own. The low number sorts ahead of the
@@ -40,7 +40,7 @@ fn netdev_body(iface: &str, vlan: u16) -> String {
 /// The `.netdev` that creates a WireGuard link: the `[WireGuard]` section
 /// carries the private key (and optional listen port), and one
 /// `[WireGuardPeer]` block per peer. The file is a secret (private key) and is
-/// installed mode 0600 by [`apply`].
+/// installed 0640 root:systemd-network by [`apply`].
 fn wireguard_netdev_body(iface: &Interface) -> String {
     let name = &iface.name;
     let mut body = format!("[NetDev]\nName={name}\nKind=wireguard\n\n[WireGuard]\n");
@@ -72,7 +72,12 @@ fn wireguard_netdev_body(iface: &Interface) -> String {
 /// Render a `.network` unit for `iface`: bind its `address` (if any) and declare
 /// any child VLAN links so networkd attaches them to this (parent) interface.
 /// `"dhcp"` asks networkd to run a DHCP client; anything else is a static CIDR.
-fn network_body(iface: &str, address: Option<&str>, vlan_children: &[String]) -> String {
+fn network_body(
+    iface: &str,
+    address: Option<&str>,
+    vlan_children: &[String],
+    dhcp: Option<&DhcpServer>,
+) -> String {
     let mut body = format!("[Match]\nName={iface}\n\n[Network]\n");
     match address {
         Some("dhcp") => body.push_str("DHCP=yes\n"),
@@ -81,6 +86,25 @@ fn network_body(iface: &str, address: Option<&str>, vlan_children: &[String]) ->
     }
     for child in vlan_children {
         body.push_str(&format!("VLAN={child}\n"));
+    }
+    // A built-in DHCP server serving this interface's static subnet. `EmitDNS`
+    // and `DNS=` are only written when DNS servers were configured.
+    if let Some(d) = dhcp {
+        body.push_str("DHCPServer=yes\n");
+        body.push_str("\n[DHCPServer]\n");
+        if let Some(off) = d.pool_offset {
+            body.push_str(&format!("PoolOffset={off}\n"));
+        }
+        if let Some(size) = d.pool_size {
+            body.push_str(&format!("PoolSize={size}\n"));
+        }
+        if let Some(lease) = d.lease_time {
+            body.push_str(&format!("DefaultLeaseTimeSec={lease}\n"));
+        }
+        if !d.dns.is_empty() {
+            body.push_str("EmitDNS=yes\n");
+            body.push_str(&format!("DNS={}\n", d.dns.join(" ")));
+        }
     }
     body
 }
@@ -105,7 +129,7 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
 
     let mut keep: HashSet<String> = HashSet::new();
     let mut writes: Vec<(String, String)> = Vec::new();
-    // Files that carry a secret (a WireGuard private key) and must be 0600.
+    // Files that carry a secret (a WireGuard private key): 0640 root:systemd-network.
     let mut secrets: HashSet<String> = HashSet::new();
 
     // VLAN .netdev units.
@@ -117,7 +141,7 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
         }
     }
 
-    // WireGuard .netdev units (secret — the private key lives here → 0600).
+    // WireGuard .netdev units (secret — the private key lives here → 0640).
     for i in ifaces {
         if i.is_wireguard() {
             let name = netdev_name(&i.name);
@@ -141,7 +165,10 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
         .map(|i| {
             let kids = children.get(i.name.as_str()).map(Vec::as_slice).unwrap_or(&[]);
             let name = network_name(&i.name);
-            writes.push((name.clone(), network_body(&i.name, i.address.as_deref(), kids)));
+            writes.push((
+                name.clone(),
+                network_body(&i.name, i.address.as_deref(), kids, i.dhcp_server.as_ref()),
+            ));
             keep.insert(name);
             i.name.clone()
         })
@@ -185,14 +212,14 @@ mod tests {
 
     #[test]
     fn static_address_renders_address_directive() {
-        let u = network_body("eth0", Some("10.0.0.1/24"), &[]);
+        let u = network_body("eth0", Some("10.0.0.1/24"), &[], None);
         assert!(u.contains("Name=eth0"));
         assert!(u.contains("Address=10.0.0.1/24"));
     }
 
     #[test]
     fn dhcp_address_renders_dhcp_directive() {
-        let u = network_body("eth0", Some("dhcp"), &[]);
+        let u = network_body("eth0", Some("dhcp"), &[], None);
         assert!(u.contains("DHCP=yes"));
         assert!(!u.contains("Address="));
     }
@@ -208,7 +235,12 @@ mod tests {
 
     #[test]
     fn parent_network_references_child_vlans() {
-        let u = network_body("eth1", Some("10.0.0.1/24"), &["eth1.20".into(), "eth1.30".into()]);
+        let u = network_body(
+            "eth1",
+            Some("10.0.0.1/24"),
+            &["eth1.20".into(), "eth1.30".into()],
+            None,
+        );
         assert!(u.contains("VLAN=eth1.20"));
         assert!(u.contains("VLAN=eth1.30"));
     }
@@ -216,6 +248,42 @@ mod tests {
     #[test]
     fn unit_name_is_prefixed_and_scoped() {
         assert_eq!(network_name("eth0"), "10-sentinel-eth0.network");
+    }
+
+    #[test]
+    fn dhcp_server_renders_pool_and_dns() {
+        let dhcp = DhcpServer {
+            pool_offset: Some(100),
+            pool_size: Some(50),
+            dns: vec!["10.0.0.1".into()],
+            lease_time: Some(3600),
+        };
+        let u = network_body("eth1", Some("10.0.0.1/24"), &[], Some(&dhcp));
+        // The static subnet is still bound, and the server is switched on.
+        assert!(u.contains("Address=10.0.0.1/24"));
+        assert!(u.contains("DHCPServer=yes"));
+        // The [DHCPServer] section carries the pool + lease + DNS refinements.
+        assert!(u.contains("[DHCPServer]"));
+        assert!(u.contains("PoolOffset=100"));
+        assert!(u.contains("PoolSize=50"));
+        assert!(u.contains("DefaultLeaseTimeSec=3600"));
+        assert!(u.contains("EmitDNS=yes"));
+        assert!(u.contains("DNS=10.0.0.1"));
+    }
+
+    #[test]
+    fn dhcp_server_without_dns_omits_emit_dns() {
+        let dhcp = DhcpServer {
+            pool_offset: None,
+            pool_size: None,
+            dns: vec![],
+            lease_time: None,
+        };
+        let u = network_body("eth1", Some("10.0.0.1/24"), &[], Some(&dhcp));
+        assert!(u.contains("DHCPServer=yes"));
+        assert!(u.contains("[DHCPServer]"));
+        assert!(!u.contains("EmitDNS"));
+        assert!(!u.contains("DNS="));
     }
 
     #[test]
@@ -236,6 +304,7 @@ mod tests {
                 persistent_keepalive: Some(25),
                 preshared_key: None,
             }],
+            dhcp_server: None,
         };
         let d = wireguard_netdev_body(&iface);
         assert!(d.contains("Kind=wireguard"));

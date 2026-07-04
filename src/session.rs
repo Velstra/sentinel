@@ -13,8 +13,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::config::{
-    Action, Appliance, Bgp, BgpNeighbor, Firewall, Interface, Isis, Nat, NatDestination, NatSource,
-    Ospf, Ospf3, PortSpec, Proto, Protocols, Rip, Rule, StaticRoute, System, Vrrp, WgPeer, ZoneCfg,
+    Action, Appliance, Bgp, BgpNeighbor, DhcpServer, Firewall, Interface, Isis, Nat, NatDestination,
+    NatSource, Ospf, Ospf3, PortSpec, Proto, Protocols, Rip, Rule, StaticRoute, System, Vrrp,
+    WgPeer, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -32,6 +33,8 @@ struct IfaceDraft {
     private_key: Option<String>,
     listen_port: Option<u16>,
     peers: Vec<(String, PeerDraft)>,
+    // A built-in DHCP server serving this interface's static subnet.
+    dhcp_server: Option<DhcpServerDraft>,
 }
 
 impl IfaceDraft {
@@ -44,6 +47,22 @@ impl IfaceDraft {
         self.peers.push((pk.to_string(), PeerDraft::default()));
         &mut self.peers.last_mut().unwrap().1
     }
+
+    /// Mutable access to the DHCP-server sub-draft, enabling it (inserting a
+    /// default) if not yet present. Setting any `dhcp-server` field first turns
+    /// the server on, mirroring how the first peer field creates the peer.
+    fn dhcp_mut(&mut self) -> &mut DhcpServerDraft {
+        self.dhcp_server.get_or_insert_with(DhcpServerDraft::default)
+    }
+}
+
+/// A partially-specified DHCP server (fields filled in incrementally).
+#[derive(Debug, Clone, Default)]
+struct DhcpServerDraft {
+    pool_offset: Option<u32>,
+    pool_size: Option<u32>,
+    dns: Vec<String>,
+    lease_time: Option<u32>,
 }
 
 /// A partially-specified WireGuard peer (keyed by its public key in the draft).
@@ -367,6 +386,12 @@ impl Draft {
                                     )
                                 })
                                 .collect(),
+                            dhcp_server: i.dhcp_server.as_ref().map(|d| DhcpServerDraft {
+                                pool_offset: d.pool_offset,
+                                pool_size: d.pool_size,
+                                dns: d.dns.clone(),
+                                lease_time: d.lease_time,
+                            }),
                         },
                     )
                 })
@@ -660,6 +685,40 @@ impl Session {
                 validate_wg_key(pk)?;
                 validate_wg_key(v)?;
                 self.draft.iface_mut(name).peer_mut(pk).preshared_key = Some((*v).to_string());
+            }
+
+            // Built-in DHCP server on an interface (needs a static address).
+            // `enable` just switches it on; the sub-fields refine the pool/DNS.
+            ["interface", name, "dhcp-server", "enable"] => {
+                self.draft.iface_mut(name).dhcp_mut();
+            }
+            ["interface", name, "dhcp-server", "disable"] => {
+                self.draft.iface_mut(name).dhcp_server = None;
+            }
+            ["interface", name, "dhcp-server", "pool-offset", v] => {
+                let off: u32 = v
+                    .parse()
+                    .with_context(|| format!("invalid pool-offset {v:?}"))?;
+                self.draft.iface_mut(name).dhcp_mut().pool_offset = Some(off);
+            }
+            ["interface", name, "dhcp-server", "pool-size", v] => {
+                let size: u32 = v
+                    .parse()
+                    .with_context(|| format!("invalid pool-size {v:?}"))?;
+                self.draft.iface_mut(name).dhcp_mut().pool_size = Some(size);
+            }
+            ["interface", name, "dhcp-server", "dns", v] => {
+                let servers: Vec<String> = v.split(',').map(|s| s.trim().to_string()).collect();
+                for s in &servers {
+                    validate_ipv4(s)?;
+                }
+                self.draft.iface_mut(name).dhcp_mut().dns = servers;
+            }
+            ["interface", name, "dhcp-server", "lease-time", v] => {
+                let lease: u32 = v
+                    .parse()
+                    .with_context(|| format!("invalid lease-time {v:?}"))?;
+                self.draft.iface_mut(name).dhcp_mut().lease_time = Some(lease);
             }
 
             // --- firewall { … } — everything firewall lives under this node ---
@@ -976,6 +1035,20 @@ impl Session {
                     other => bail!("peer has no field {other:?}"),
                 }
             }
+            ["interface", name, "dhcp-server"] => self.iface(name)?.dhcp_server = None,
+            ["interface", name, "dhcp-server", field] => {
+                let i = self.iface(name)?;
+                let Some(d) = i.dhcp_server.as_mut() else {
+                    bail!("interface {name:?} has no dhcp-server");
+                };
+                match *field {
+                    "pool-offset" => d.pool_offset = None,
+                    "pool-size" => d.pool_size = None,
+                    "dns" => d.dns.clear(),
+                    "lease-time" => d.lease_time = None,
+                    other => bail!("dhcp-server has no field {other:?}"),
+                }
+            }
 
             // firewall global …
             ["firewall", "global", "block", v] => {
@@ -1288,6 +1361,12 @@ impl Session {
                         preshared_key: p.preshared_key.clone(),
                     })
                     .collect(),
+                dhcp_server: d.dhcp_server.as_ref().map(|s| DhcpServer {
+                    pool_offset: s.pool_offset,
+                    pool_size: s.pool_size,
+                    dns: s.dns.clone(),
+                    lease_time: s.lease_time,
+                }),
             })
             .collect();
         let rules = self
@@ -1588,6 +1667,7 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             && i.private_key.is_none()
             && i.listen_port.is_none()
             && i.peers.is_empty()
+            && i.dhcp_server.is_none()
         {
             continue;
         }
@@ -1627,6 +1707,22 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             }
             if let Some(psk) = &p.preshared_key {
                 out.push_str(&format!("        preshared-key {psk}\n"));
+            }
+            out.push_str("    }\n");
+        }
+        if let Some(d) = &i.dhcp_server {
+            out.push_str("    dhcp-server {\n");
+            if let Some(off) = d.pool_offset {
+                out.push_str(&format!("        pool-offset {off}\n"));
+            }
+            if let Some(size) = d.pool_size {
+                out.push_str(&format!("        pool-size {size}\n"));
+            }
+            if !d.dns.is_empty() {
+                out.push_str(&format!("        dns {}\n", d.dns.join(",")));
+            }
+            if let Some(lease) = d.lease_time {
+                out.push_str(&format!("        lease-time {lease}\n"));
             }
             out.push_str("    }\n");
         }
@@ -1935,6 +2031,12 @@ fn validate_wg_key(s: &str) -> Result<()> {
 /// A WireGuard peer endpoint (`host:port`). Delegates to the config validator.
 fn validate_endpoint(s: &str) -> Result<()> {
     crate::config::validate_endpoint(s)
+}
+
+/// A bare IPv4 address (e.g. a DHCP-advertised DNS server). Delegates to the
+/// config validator.
+fn validate_ipv4(s: &str) -> Result<()> {
+    crate::config::validate_ipv4(s)
 }
 
 fn validate_address(addr: &str) -> Result<()> {
