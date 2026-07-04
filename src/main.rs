@@ -17,6 +17,7 @@ mod net;
 mod repl;
 mod session;
 mod system;
+mod wgkey;
 mod wren;
 
 use std::{

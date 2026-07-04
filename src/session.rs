@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::{
     Action, Appliance, Bgp, BgpNeighbor, Firewall, Interface, Isis, Nat, NatDestination, NatSource,
-    Ospf, Ospf3, PortSpec, Proto, Protocols, Rip, Rule, StaticRoute, System, Vrrp, ZoneCfg,
+    Ospf, Ospf3, PortSpec, Proto, Protocols, Rip, Rule, StaticRoute, System, Vrrp, WgPeer, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -28,6 +28,31 @@ struct IfaceDraft {
     address: Option<String>,
     parent: Option<String>,
     vlan: Option<u16>,
+    // WireGuard: a `private-key` makes this a WG tunnel; peers ride on it.
+    private_key: Option<String>,
+    listen_port: Option<u16>,
+    peers: Vec<(String, PeerDraft)>,
+}
+
+impl IfaceDraft {
+    /// Mutable access to the WireGuard peer keyed by public key `pk`, inserting
+    /// it if new (peers are identified by their public key).
+    fn peer_mut(&mut self, pk: &str) -> &mut PeerDraft {
+        if let Some(i) = self.peers.iter().position(|(k, _)| k == pk) {
+            return &mut self.peers[i].1;
+        }
+        self.peers.push((pk.to_string(), PeerDraft::default()));
+        &mut self.peers.last_mut().unwrap().1
+    }
+}
+
+/// A partially-specified WireGuard peer (keyed by its public key in the draft).
+#[derive(Debug, Clone, Default)]
+struct PeerDraft {
+    allowed_ips: Vec<String>,
+    endpoint: Option<String>,
+    persistent_keepalive: Option<u16>,
+    preshared_key: Option<String>,
 }
 
 /// A partially-specified rule.
@@ -325,6 +350,23 @@ impl Draft {
                             address: i.address.clone(),
                             parent: i.parent.clone(),
                             vlan: i.vlan,
+                            private_key: i.private_key.clone(),
+                            listen_port: i.listen_port,
+                            peers: i
+                                .peers
+                                .iter()
+                                .map(|p| {
+                                    (
+                                        p.public_key.clone(),
+                                        PeerDraft {
+                                            allowed_ips: p.allowed_ips.clone(),
+                                            endpoint: p.endpoint.clone(),
+                                            persistent_keepalive: p.persistent_keepalive,
+                                            preshared_key: p.preshared_key.clone(),
+                                        },
+                                    )
+                                })
+                                .collect(),
                         },
                     )
                 })
@@ -572,6 +614,52 @@ impl Session {
             ["interface", name, "vlan", v] => {
                 self.draft.iface_mut(name).vlan =
                     Some(v.parse().with_context(|| format!("invalid vlan id {v:?}"))?);
+            }
+
+            // WireGuard interface + peers.
+            ["interface", name, "private-key", "generate"] => {
+                let (private, public) = crate::wgkey::generate_keypair()?;
+                self.draft.iface_mut(name).private_key = Some(private);
+                // The operator needs the public key to hand to the far end.
+                println!("generated wireguard key for {name}; public key: {public}");
+            }
+            ["interface", name, "private-key", v] => {
+                validate_wg_key(v)?;
+                self.draft.iface_mut(name).private_key = Some((*v).to_string());
+            }
+            ["interface", name, "listen-port", v] => {
+                let port: u16 = v
+                    .parse()
+                    .with_context(|| format!("invalid listen-port {v:?}"))?;
+                if port == 0 {
+                    bail!("listen-port 0 is not valid");
+                }
+                self.draft.iface_mut(name).listen_port = Some(port);
+            }
+            ["interface", name, "peer", pk, "allowed-ips", v] => {
+                validate_wg_key(pk)?;
+                let ips: Vec<String> = v.split(',').map(|s| s.trim().to_string()).collect();
+                for ip in &ips {
+                    validate_block_entry(ip)?;
+                }
+                self.draft.iface_mut(name).peer_mut(pk).allowed_ips = ips;
+            }
+            ["interface", name, "peer", pk, "endpoint", v] => {
+                validate_wg_key(pk)?;
+                validate_endpoint(v)?;
+                self.draft.iface_mut(name).peer_mut(pk).endpoint = Some((*v).to_string());
+            }
+            ["interface", name, "peer", pk, "keepalive", v] => {
+                validate_wg_key(pk)?;
+                let k: u16 = v
+                    .parse()
+                    .with_context(|| format!("invalid keepalive {v:?}"))?;
+                self.draft.iface_mut(name).peer_mut(pk).persistent_keepalive = Some(k);
+            }
+            ["interface", name, "peer", pk, "preshared-key", v] => {
+                validate_wg_key(pk)?;
+                validate_wg_key(v)?;
+                self.draft.iface_mut(name).peer_mut(pk).preshared_key = Some((*v).to_string());
             }
 
             // --- firewall { … } — everything firewall lives under this node ---
@@ -864,6 +952,30 @@ impl Session {
             ["interface", name, "zone"] => self.iface(name)?.zone = None,
             ["interface", name, "parent"] => self.iface(name)?.parent = None,
             ["interface", name, "vlan"] => self.iface(name)?.vlan = None,
+            ["interface", name, "private-key"] => self.iface(name)?.private_key = None,
+            ["interface", name, "listen-port"] => self.iface(name)?.listen_port = None,
+            ["interface", name, "peer", pk] => {
+                let i = self.iface(name)?;
+                let before = i.peers.len();
+                i.peers.retain(|(k, _)| k != pk);
+                if i.peers.len() == before {
+                    bail!("interface {name:?} has no peer {pk:?}");
+                }
+            }
+            ["interface", name, "peer", pk, field] => {
+                let i = self.iface(name)?;
+                let Some(idx) = i.peers.iter().position(|(k, _)| k == pk) else {
+                    bail!("interface {name:?} has no peer {pk:?}");
+                };
+                let p = &mut i.peers[idx].1;
+                match *field {
+                    "allowed-ips" => p.allowed_ips.clear(),
+                    "endpoint" => p.endpoint = None,
+                    "keepalive" => p.persistent_keepalive = None,
+                    "preshared-key" => p.preshared_key = None,
+                    other => bail!("peer has no field {other:?}"),
+                }
+            }
 
             // firewall global …
             ["firewall", "global", "block", v] => {
@@ -1163,6 +1275,19 @@ impl Session {
                 address: d.address.clone(),
                 parent: d.parent.clone(),
                 vlan: d.vlan,
+                private_key: d.private_key.clone(),
+                listen_port: d.listen_port,
+                peers: d
+                    .peers
+                    .iter()
+                    .map(|(pk, p)| WgPeer {
+                        public_key: pk.clone(),
+                        allowed_ips: p.allowed_ips.clone(),
+                        endpoint: p.endpoint.clone(),
+                        persistent_keepalive: p.persistent_keepalive,
+                        preshared_key: p.preshared_key.clone(),
+                    })
+                    .collect(),
             })
             .collect();
         let rules = self
@@ -1460,6 +1585,9 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             && i.address.is_none()
             && i.parent.is_none()
             && i.vlan.is_none()
+            && i.private_key.is_none()
+            && i.listen_port.is_none()
+            && i.peers.is_empty()
         {
             continue;
         }
@@ -1475,6 +1603,32 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         if let Some(v) = i.vlan {
             out.push_str(&format!("    vlan {v}\n"));
+        }
+        if let Some(pk) = &i.private_key {
+            out.push_str(&format!("    private-key {pk}\n"));
+            // Operators need the derived public key to hand to the far end.
+            if let Ok(public) = crate::wgkey::public_from_private(pk) {
+                out.push_str(&format!("    # public-key {public}\n"));
+            }
+        }
+        if let Some(port) = i.listen_port {
+            out.push_str(&format!("    listen-port {port}\n"));
+        }
+        for (peer_pk, p) in &i.peers {
+            out.push_str(&format!("    peer {peer_pk} {{\n"));
+            if !p.allowed_ips.is_empty() {
+                out.push_str(&format!("        allowed-ips {}\n", p.allowed_ips.join(",")));
+            }
+            if let Some(ep) = &p.endpoint {
+                out.push_str(&format!("        endpoint {ep}\n"));
+            }
+            if let Some(k) = p.persistent_keepalive {
+                out.push_str(&format!("        keepalive {k}\n"));
+            }
+            if let Some(psk) = &p.preshared_key {
+                out.push_str(&format!("        preshared-key {psk}\n"));
+            }
+            out.push_str("    }\n");
         }
         out.push_str("}\n");
     }
@@ -1770,6 +1924,17 @@ fn parse_bool(s: &str) -> Result<bool> {
 /// validator so set-time feedback matches commit-time validation.
 fn validate_block_entry(s: &str) -> Result<()> {
     crate::config::validate_cidr_or_ip(s)
+}
+
+/// A WireGuard key (base64 of 32 bytes). Delegates to the config validator so
+/// set-time feedback matches commit-time validation.
+fn validate_wg_key(s: &str) -> Result<()> {
+    crate::config::validate_wg_key(s)
+}
+
+/// A WireGuard peer endpoint (`host:port`). Delegates to the config validator.
+fn validate_endpoint(s: &str) -> Result<()> {
+    crate::config::validate_endpoint(s)
 }
 
 fn validate_address(addr: &str) -> Result<()> {

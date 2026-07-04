@@ -543,6 +543,74 @@
         '';
       };
 
+      # WireGuard (roadmap C1): a `[[interface]]` that carries a `private-key`
+      # renders to a `Kind=wireguard` netdev (0640 root:systemd-network, since it
+      # embeds the key), participates in the firewall via its `zone`, and networkd
+      # + the kernel bring up a real `wg0` link with the declared peer.
+      #   nix build .#checks.x86_64-linux.wireguard -L
+      # The two fixed keys below were produced with the real `wg` tool:
+      #   wg genkey | tee /dev/stderr | wg pubkey
+      # wg0 private ICOioMTTlfQE/2NndOoEntortz+0tZ5Hll0AEM7tdmE=
+      #   → derived public 6gUqcU72dUQr2VqzOWxiON1qzkzIOQD7SkZjPjPFWXs=
+      # peer public ukF+iwo+aai/wm9k1nIlxCBFRnZ+bLPb2xIu4+4PvmQ= (a second genkey).
+      wireguard = pkgs.testers.runNixOSTest {
+        name = "sentinel-wireguard";
+        nodes.machine = {
+          imports = [ self.nixosModules.sentinel ];
+          virtualisation.memorySize = 2048;
+          # `wg show` needs the userspace tool; the kernel module ships with the
+          # test kernel. `ip -d link show` comes from iproute2 (already present).
+          environment.systemPackages = [ pkgs.wireguard-tools ];
+        };
+        testScript = ''
+          machine.wait_for_unit("multi-user.target")
+          machine.wait_for_unit("sentinel-boot.service")
+          machine.wait_for_unit("velstra.service")
+
+          # Declare a WireGuard tunnel AS THE ADMIN USER: a private key, a listen
+          # port, an address (so the link is zoned + brought up), a firewall zone,
+          # and one peer with allowed-ips + endpoint. commit applies live.
+          machine.succeed(
+              "su admin -c \"printf '%s\\n' "
+              "'set interface wg0 private-key ICOioMTTlfQE/2NndOoEntortz+0tZ5Hll0AEM7tdmE=' "
+              "'set interface wg0 listen-port 51820' "
+              "'set interface wg0 address 10.9.0.1/24' 'set interface wg0 zone lan' "
+              "'set interface wg0 peer ukF+iwo+aai/wm9k1nIlxCBFRnZ+bLPb2xIu4+4PvmQ= allowed-ips 10.9.0.2/32' "
+              "'set interface wg0 peer ukF+iwo+aai/wm9k1nIlxCBFRnZ+bLPb2xIu4+4PvmQ= endpoint 192.0.2.7:51820' "
+              "commit save exit "
+              "| sentinel configure\""
+          )
+
+          # Sentinel wrote the wireguard netdev. It holds the private key, so it is
+          # 0640 root:systemd-network — not world-readable, but readable by the
+          # systemd-network user networkd runs as (0600 root:root would deny it).
+          machine.succeed("test -f /run/systemd/network/10-sentinel-wg0.netdev")
+          netdev = machine.succeed("cat /run/systemd/network/10-sentinel-wg0.netdev")
+          assert "Kind=wireguard" in netdev, netdev
+          assert "PrivateKey=" in netdev, netdev
+          assert "[WireGuardPeer]" in netdev, netdev
+          assert "PublicKey=ukF+iwo+aai/wm9k1nIlxCBFRnZ+bLPb2xIu4+4PvmQ=" in netdev, netdev
+          assert "AllowedIPs=10.9.0.2/32" in netdev, netdev
+          assert "Endpoint=192.0.2.7:51820" in netdev, netdev
+          mode = machine.succeed("stat -c %a /run/systemd/network/10-sentinel-wg0.netdev").strip()
+          assert mode == "640", mode
+          group = machine.succeed("stat -c %G /run/systemd/network/10-sentinel-wg0.netdev").strip()
+          assert group == "systemd-network", group
+
+          # networkd + the kernel created a real wireguard link, and wg sees the peer.
+          machine.wait_until_succeeds("ip -d link show wg0 | grep -q wireguard", timeout=20)
+          machine.wait_until_succeeds("ip addr show wg0 | grep -q 10.9.0.1", timeout=20)
+          machine.wait_until_succeeds(
+              "wg show wg0 | grep -q ukF+iwo+aai/wm9k1nIlxCBFRnZ+bLPb2xIu4+4PvmQ=", timeout=20
+          )
+
+          # The zone binding compiled through: the firewall sees wg0.
+          machine.succeed("grep -q '\"wg0\"' /run/sentinel/velstra.toml")
+          # save persisted the wireguard interface (private key + peer).
+          machine.succeed("grep -q 'private-key' /var/lib/sentinel/appliance.toml")
+        '';
+      };
+
       # Boots the actual flashable verified-boot image (dm-verity store + UKI)
       # in QEMU/OVMF and proves the security properties hold on real hardware:
       # the root is volatile (tmpfs), /nix/store is integrity-checked by
