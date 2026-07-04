@@ -89,6 +89,13 @@ action = "accept"
 proto = "tcp"
 port = 443
 
+# Box-wide services live under [services.*]. A LAN-facing DNS forwarder (built
+# on systemd-resolved, no extra daemon) forwards client queries to upstream
+# resolvers and listens for them on lan0:
+# [services.dns]
+# upstream = ["9.9.9.9", "1.1.1.1"]
+# serve-on = ["lan0"]
+
 # NAT is its own thing (address translation, not filtering). Source NAT
 # masquerades a zone's outbound traffic to its egress IP; destination NAT is an
 # inbound port-forward.
@@ -135,6 +142,60 @@ pub struct Appliance {
     /// configs when nothing is configured.
     #[serde(default, skip_serializing_if = "Protocols::is_empty")]
     pub protocols: Protocols,
+    /// Box-wide network services the appliance *offers* (as opposed to filtering
+    /// or routing): the DNS forwarder today, NTP / mDNS / LLDP / SNMP / … as they
+    /// land. Grouped under one `[services.*]` category (the VyOS `service` model)
+    /// so the top level stays uncluttered as services multiply. Interface-scoped
+    /// services (a per-link DHCP server, Router Advertisements) stay on the
+    /// `[[interface]]` instead — those are one-per-link, not one-per-box. Omitted
+    /// from saved configs when nothing is configured.
+    #[serde(default, skip_serializing_if = "Services::is_empty")]
+    pub services: Services,
+}
+
+/// The box-wide services category (`[services.*]`). A thin grouping so DNS, NTP
+/// and the rest share one namespace instead of sprawling across the top level.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Services {
+    /// The LAN DNS forwarder (`[services.dns]`).
+    #[serde(default, skip_serializing_if = "Dns::is_empty")]
+    pub dns: Dns,
+}
+
+impl Services {
+    /// True when no service is configured — lets `[services]` be omitted.
+    pub fn is_empty(&self) -> bool {
+        self.dns.is_empty()
+    }
+}
+
+/// The box-wide DNS forwarder — rendered to a systemd-resolved drop-in. Empty by
+/// default (no forwarder); the presence of an upstream + a serving interface is
+/// what turns it on.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Dns {
+    /// Upstream resolvers the box forwards client queries to (IPv4 or IPv6).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upstream: Vec<String>,
+    /// Interfaces whose address the forwarder listens on for LAN client queries
+    /// (a resolved stub listener bound to each interface's static IP). Each must
+    /// be a declared interface carrying a static address.
+    #[serde(default, rename = "serve-on", skip_serializing_if = "Vec::is_empty")]
+    pub serve_on: Vec<String>,
+    /// DNSSEC validation mode: `"yes"`, `"no"` or `"allow-downgrade"`. Unset ⇒
+    /// the appliance default (`no`) — a forwarder trusts its upstream, and many
+    /// upstreams break strict validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dnssec: Option<String>,
+}
+
+impl Dns {
+    /// True when no forwarder is configured — lets `[dns]` be omitted.
+    pub fn is_empty(&self) -> bool {
+        self.upstream.is_empty() && self.serve_on.is_empty() && self.dnssec.is_none()
+    }
 }
 
 /// Dynamic routing configuration — the [`Protocols`] tree maps onto the Wren
@@ -1075,6 +1136,30 @@ impl Appliance {
                     .with_context(|| format!("protocols vrrp vrid {} virtual-address", v.vrid))?;
             }
         }
+
+        // DNS forwarder: upstreams are IPs (v4 or v6); every serving interface
+        // must be declared and carry a static address (the resolver binds its
+        // stub listener to that IP); DNSSEC mode is one of the resolved values.
+        let dns = &self.services.dns;
+        for up in &dns.upstream {
+            if validate_ipv4(up).is_err() && validate_ipv6(up).is_err() {
+                bail!("services dns upstream {up:?}: not an IPv4 or IPv6 address");
+            }
+        }
+        for iface in &dns.serve_on {
+            match self.interfaces.iter().find(|i| &i.name == iface) {
+                Some(i) => match i.address.as_deref() {
+                    Some(addr) if addr != "dhcp" => {}
+                    _ => bail!("services dns serve-on {iface:?}: interface needs a static address"),
+                },
+                None => bail!("services dns serve-on {iface:?}: not a declared interface"),
+            }
+        }
+        if let Some(mode) = &dns.dnssec {
+            if !matches!(mode.as_str(), "yes" | "no" | "allow-downgrade") {
+                bail!("services dns dnssec {mode:?}: expected \"yes\", \"no\" or \"allow-downgrade\"");
+            }
+        }
         Ok(())
     }
 
@@ -1541,6 +1626,59 @@ port = "1-65535"
 "#;
         // The range is far over the cap → validation rejects it.
         assert!(Appliance::from_toml(toml).is_err());
+    }
+
+    #[test]
+    fn dns_forwarder_parses_validates_and_round_trips() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "lan0"
+zone = "lan"
+address = "10.0.0.1/24"
+
+[services.dns]
+upstream = ["9.9.9.9", "2620:fe::fe"]
+serve-on = ["lan0"]
+dnssec = "no"
+"#;
+        let a = Appliance::from_toml(toml).expect("dns config parses + validates");
+        assert_eq!(a.services.dns.upstream, vec!["9.9.9.9", "2620:fe::fe"]);
+        assert_eq!(a.services.dns.serve_on, vec!["lan0"]);
+        let out = a.to_toml().unwrap();
+        assert!(out.contains("[services.dns]"), "got:\n{out}");
+        let b = Appliance::from_toml(&out).expect("re-parses");
+        assert_eq!(b.services.dns.upstream.len(), 2);
+    }
+
+    #[test]
+    fn dns_forwarder_rejects_bad_upstream_and_serve_on() {
+        // serve-on an interface with no static address is rejected.
+        let no_addr = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+address = "dhcp"
+[services.dns]
+serve-on = ["wan0"]
+"#;
+        assert!(Appliance::from_toml(no_addr).is_err());
+        // A non-IP upstream is rejected.
+        let bad_up = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "lan0"
+zone = "lan"
+address = "10.0.0.1/24"
+[services.dns]
+upstream = ["not-an-ip"]
+serve-on = ["lan0"]
+"#;
+        assert!(Appliance::from_toml(bad_up).is_err());
     }
 
     #[test]

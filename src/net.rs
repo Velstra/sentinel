@@ -16,7 +16,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::config::{Appliance, DhcpServer, Interface, RouterAdvert};
+use crate::config::{Appliance, DhcpServer, Dns, Interface, RouterAdvert};
 use crate::system::{self, NETWORKD_RUNTIME_DIR};
 
 /// Filename prefix for the units we own. The low number sorts ahead of the
@@ -145,6 +145,64 @@ fn network_body(
     body
 }
 
+/// systemd-resolved's runtime drop-in dir. A `.conf` here overrides the image
+/// `resolved.conf`, and (like the networkd units) it lives on tmpfs so it is
+/// re-asserted from the saved config each boot.
+const RESOLVED_DROPIN_DIR: &str = "/run/systemd/resolved.conf.d";
+const RESOLVED_DROPIN: &str = "10-sentinel-dns.conf";
+
+/// The IPv4 address of a static `address` CIDR (`"10.0.0.1/24"` → `"10.0.0.1"`).
+/// `None` for `dhcp`/unset — validation already forbids serving DNS on such an
+/// interface, so this only ever returns `None` defensively.
+fn iface_ipv4(iface: &Interface) -> Option<&str> {
+    match iface.address.as_deref() {
+        Some(addr) if addr != "dhcp" => addr.split('/').next(),
+        _ => None,
+    }
+}
+
+/// Render the systemd-resolved drop-in for the DNS forwarder, or `None` when no
+/// forwarder is configured. `DNS=` sets the upstreams the box forwards to and
+/// `DNSStubListenerExtra=` binds an extra stub listener on each serving
+/// interface's IP so LAN clients can use the box as their resolver.
+fn resolved_dropin_body(dns: &Dns, ifaces: &[Interface]) -> Option<String> {
+    if dns.is_empty() {
+        return None;
+    }
+    let mut body = String::from("[Resolve]\n");
+    if !dns.upstream.is_empty() {
+        body.push_str(&format!("DNS={}\n", dns.upstream.join(" ")));
+    }
+    for name in &dns.serve_on {
+        if let Some(ip) = ifaces.iter().find(|i| &i.name == name).and_then(iface_ipv4) {
+            body.push_str(&format!("DNSStubListenerExtra={ip}\n"));
+        }
+    }
+    // A forwarder trusts its upstream; default DNSSEC off so an unsigned or
+    // validation-breaking upstream still resolves. An explicit value overrides.
+    body.push_str(&format!("DNSSEC={}\n", dns.dnssec.as_deref().unwrap_or("no")));
+    Some(body)
+}
+
+/// Reconcile the systemd-resolved drop-in to `appliance.dns`: write it when a
+/// forwarder is configured, remove it otherwise, then restart resolved so the
+/// stub listener (re)binds. Best-effort restart (mirrors networkd): the drop-in
+/// is written regardless, so a boot-time resolved start still picks it up.
+fn apply_resolved(appliance: &Appliance) -> Result<()> {
+    let path = Path::new(RESOLVED_DROPIN_DIR).join(RESOLVED_DROPIN);
+    match resolved_dropin_body(&appliance.services.dns, &appliance.interfaces) {
+        Some(body) => {
+            system::ensure_dir(Path::new(RESOLVED_DROPIN_DIR))?;
+            system::install_file(&path, &body)?;
+        }
+        None => system::remove_file(&path)?,
+    }
+    if let Err(e) = system::reload_resolved() {
+        eprintln!("warning: restarting systemd-resolved failed (applies on next start): {e}");
+    }
+    Ok(())
+}
+
 /// Reconcile networkd units to match `appliance`: write a `.netdev` for every
 /// VLAN subinterface and a `.network` for every interface that needs one (it has
 /// an address, is a VLAN, or is a parent carrying VLANs), remove any stale
@@ -246,6 +304,11 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
     if let Err(e) = system::networkctl_reload(&reloaded) {
         eprintln!("warning: networkctl reload failed (networkd applies units on start): {e}");
     }
+
+    // The DNS forwarder (systemd-resolved) is reconciled the same way — its
+    // runtime drop-in tracks `[dns]`, and resolved is restarted to (re)bind the
+    // LAN stub listener.
+    apply_resolved(appliance)?;
     Ok(())
 }
 
@@ -328,6 +391,37 @@ mod tests {
         assert!(u.contains("[DHCPServer]"));
         assert!(!u.contains("EmitDNS"));
         assert!(!u.contains("DNS="));
+    }
+
+    #[test]
+    fn dns_forwarder_renders_resolved_dropin() {
+        let dns = Dns {
+            upstream: vec!["9.9.9.9".into(), "2620:fe::fe".into()],
+            serve_on: vec!["lan0".into()],
+            dnssec: None,
+        };
+        let ifaces = vec![Interface {
+            name: "lan0".into(),
+            zone: Some("lan".into()),
+            address: Some("10.0.0.1/24".into()),
+            parent: None,
+            vlan: None,
+            private_key: None,
+            listen_port: None,
+            peers: vec![],
+            dhcp_server: None,
+            router_advert: None,
+        }];
+        let body = resolved_dropin_body(&dns, &ifaces).expect("forwarder configured");
+        assert!(body.contains("[Resolve]"));
+        assert!(body.contains("DNS=9.9.9.9 2620:fe::fe"));
+        // The stub listener binds the serving interface's bare IP, not its CIDR.
+        assert!(body.contains("DNSStubListenerExtra=10.0.0.1"));
+        assert!(!body.contains("/24"));
+        // No explicit DNSSEC ⇒ the appliance default (off).
+        assert!(body.contains("DNSSEC=no"));
+        // An unconfigured forwarder renders nothing.
+        assert!(resolved_dropin_body(&Dns::default(), &ifaces).is_none());
     }
 
     #[test]
