@@ -450,7 +450,15 @@ const TOP: &[Cand] = &[
     ("services", "box-wide services: DNS forwarder (NTP, … to come)"),
 ];
 // `services <Tab>` reveals the box-wide services (compiled to their daemons' config).
-const SERVICES_NODES: &[Cand] = &[("dns", "LAN DNS forwarder: upstreams + interfaces to serve on")];
+const SERVICES_NODES: &[Cand] = &[
+    ("dns", "LAN DNS forwarder: upstreams + interfaces to serve on"),
+    ("ntp", "LAN NTP server: upstream sources + interfaces to serve on"),
+];
+// `services ntp <Tab>` reveals the NTP-server fields (a chrony confdir drop-in).
+const NTP_FIELDS: &[Cand] = &[
+    ("upstream", "upstream NTP sources (comma-separated IPs/hostnames)"),
+    ("serve-on", "interfaces whose subnet may query us (comma-separated)"),
+];
 // `services dns <Tab>` reveals the forwarder fields (a systemd-resolved drop-in).
 const DNS_FIELDS: &[Cand] = &[
     ("upstream", "upstream resolvers to forward to (comma-separated IPs)"),
@@ -651,6 +659,7 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "services"] => SERVICES_NODES,
         ["set" | "delete", "services", "dns"] => DNS_FIELDS,
         ["set", "services", "dns", "dnssec"] => DNSSEC_MODES,
+        ["set" | "delete", "services", "ntp"] => NTP_FIELDS,
 
         // The firewall sub-tree.
         ["set" | "delete", "firewall"] => FIREWALL_NODES,
