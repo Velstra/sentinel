@@ -101,6 +101,8 @@ fn network_body(
     ra: Option<&RouterAdvert>,
     master: Option<&str>,
     pd: Option<(&str, u8)>,
+    mtu: Option<u16>,
+    mac: Option<&str>,
 ) -> String {
     let v4dhcp = address == Some("dhcp");
     let v6dhcp = address6 == Some("dhcp");
@@ -204,6 +206,18 @@ fn network_body(
             body.push_str("\n[IPv6Prefix]\n");
             body.push_str(&format!("Prefix={prefix}\n"));
             body.push_str("Assign=yes\n");
+        }
+    }
+
+    // Link tunables (MTU / MAC cloning) — a `[Link]` section networkd applies to
+    // the interface. Emitted only when either is set.
+    if mtu.is_some() || mac.is_some() {
+        body.push_str("\n[Link]\n");
+        if let Some(m) = mtu {
+            body.push_str(&format!("MTUBytes={m}\n"));
+        }
+        if let Some(mac) = mac {
+            body.push_str(&format!("MACAddress={mac}\n"));
         }
     }
     body
@@ -411,6 +425,8 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
                 || i.is_virtual_l2()
                 || i.master.is_some()
                 || i.pd_from.is_some()
+                || i.mtu.is_some()
+                || i.mac.is_some()
                 || children.contains_key(i.name.as_str())
         })
         .map(|i| {
@@ -439,6 +455,8 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
                     i.router_advert.as_ref(),
                     master.as_deref(),
                     pd,
+                    i.mtu,
+                    i.mac.as_deref(),
                 ),
             ));
             keep.insert(name);
@@ -492,14 +510,14 @@ mod tests {
 
     #[test]
     fn static_address_renders_address_directive() {
-        let u = network_body("eth0", Some("10.0.0.1/24"), None, &[], None, None, None, None);
+        let u = network_body("eth0", Some("10.0.0.1/24"), None, &[], None, None, None, None, None, None);
         assert!(u.contains("Name=eth0"));
         assert!(u.contains("Address=10.0.0.1/24"));
     }
 
     #[test]
     fn dhcp_address_renders_dhcp_directive() {
-        let u = network_body("eth0", Some("dhcp"), None, &[], None, None, None, None);
+        let u = network_body("eth0", Some("dhcp"), None, &[], None, None, None, None, None, None);
         assert!(u.contains("DHCP=yes"));
         assert!(!u.contains("Address="));
     }
@@ -524,6 +542,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         );
         assert!(u.contains("VLAN=eth1.20"));
         assert!(u.contains("VLAN=eth1.30"));
@@ -542,7 +562,7 @@ mod tests {
             dns: vec!["10.0.0.1".into()],
             lease_time: Some(3600),
         };
-        let u = network_body("eth1", Some("10.0.0.1/24"), None, &[], Some(&dhcp), None, None, None);
+        let u = network_body("eth1", Some("10.0.0.1/24"), None, &[], Some(&dhcp), None, None, None, None, None);
         // The static subnet is still bound, and the server is switched on.
         assert!(u.contains("Address=10.0.0.1/24"));
         assert!(u.contains("DHCPServer=yes"));
@@ -563,7 +583,7 @@ mod tests {
             dns: vec![],
             lease_time: None,
         };
-        let u = network_body("eth1", Some("10.0.0.1/24"), None, &[], Some(&dhcp), None, None, None);
+        let u = network_body("eth1", Some("10.0.0.1/24"), None, &[], Some(&dhcp), None, None, None, None, None);
         assert!(u.contains("DHCPServer=yes"));
         assert!(u.contains("[DHCPServer]"));
         assert!(!u.contains("EmitDNS"));
@@ -593,6 +613,8 @@ mod tests {
             bond_mode: None,
             pd_from: None,
             pd_subnet: None,
+            mtu: None,
+            mac: None,
         }];
         let body = chrony_conf_body(&ntp, &ifaces).expect("ntp configured");
         assert!(body.contains("server pool.ntp.org iburst"));
@@ -634,6 +656,8 @@ mod tests {
             bond_mode: None,
             pd_from: None,
             pd_subnet: None,
+            mtu: None,
+            mac: None,
         }];
         let body = resolved_dropin_body(&dns, &ifaces).expect("forwarder configured");
         assert!(body.contains("[Resolve]"));
@@ -650,12 +674,12 @@ mod tests {
     #[test]
     fn dhcpv6_pd_renders_client_and_delegation() {
         // WAN uplink: DHCPv6 client soliciting up front (no RA needed).
-        let wan = network_body("wan0", Some("dhcp"), Some("dhcp"), &[], None, None, None, None);
+        let wan = network_body("wan0", Some("dhcp"), Some("dhcp"), &[], None, None, None, None, None, None);
         assert!(wan.contains("DHCP=yes")); // v4 dhcp + v6 dhcp
         assert!(wan.contains("[DHCPv6]"));
         assert!(wan.contains("WithoutRA=solicit"));
         // A v6-only DHCPv6 client renders DHCP=ipv6, not yes.
-        let wan6 = network_body("wan0", None, Some("dhcp"), &[], None, None, None, None);
+        let wan6 = network_body("wan0", None, Some("dhcp"), &[], None, None, None, None, None, None);
         assert!(wan6.contains("DHCP=ipv6"));
         // LAN downstream: request subnet 2 of the uplink's delegated prefix and
         // advertise it.
@@ -668,12 +692,36 @@ mod tests {
             None,
             None,
             Some(("wan0", 2)),
+            None,
+            None,
         );
         assert!(lan.contains("DHCPPrefixDelegation=yes"));
         assert!(lan.contains("[DHCPPrefixDelegation]"));
         assert!(lan.contains("UplinkInterface=wan0"));
         assert!(lan.contains("SubnetId=2"));
         assert!(lan.contains("Announce=yes"));
+    }
+
+    #[test]
+    fn mtu_and_mac_render_link_section() {
+        let u = network_body(
+            "wan0",
+            Some("dhcp"),
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+            Some(1492),
+            Some("52:54:00:12:34:56"),
+        );
+        assert!(u.contains("[Link]"));
+        assert!(u.contains("MTUBytes=1492"));
+        assert!(u.contains("MACAddress=52:54:00:12:34:56"));
+        let plain =
+            network_body("lan0", Some("10.0.0.1/24"), None, &[], None, None, None, None, None, None);
+        assert!(!plain.contains("[Link]"));
     }
 
     #[test]
@@ -688,11 +736,13 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         );
         assert!(u.contains("Address=10.0.0.1/24"));
         assert!(u.contains("Address=2001:db8:1::1/64"));
         // `auto` accepts RAs (SLAAC) instead of binding a static v6 address.
-        let a = network_body("wan0", Some("dhcp"), Some("auto"), &[], None, None, None, None);
+        let a = network_body("wan0", Some("dhcp"), Some("auto"), &[], None, None, None, None, None, None);
         assert!(a.contains("DHCP=yes"));
         assert!(a.contains("IPv6AcceptRA=yes"));
         assert!(!a.contains("Address=auto"));
@@ -717,13 +767,15 @@ mod tests {
             bond_mode: None,
             pd_from: None,
             pd_subnet: None,
+            mtu: None,
+            mac: None,
         };
         let d = virtual_l2_netdev_body(&br);
         assert!(d.contains("Name=br0"));
         assert!(d.contains("Kind=bridge"));
         assert!(!d.contains("[Bond]"));
         // A member's .network carries the Bridge= enslavement in [Network].
-        let member = network_body("lan1", None, None, &[], None, None, Some("Bridge=br0"), None);
+        let member = network_body("lan1", None, None, &[], None, None, Some("Bridge=br0"), None, None, None);
         assert!(member.contains("[Network]"));
         assert!(member.contains("Bridge=br0"));
     }
@@ -747,6 +799,8 @@ mod tests {
             bond_mode: Some("802.3ad".into()),
             pd_from: None,
             pd_subnet: None,
+            mtu: None,
+            mac: None,
         };
         let d = virtual_l2_netdev_body(&bond);
         assert!(d.contains("Kind=bond"));
@@ -755,7 +809,7 @@ mod tests {
         let mut b2 = bond.clone();
         b2.bond_mode = None;
         assert!(virtual_l2_netdev_body(&b2).contains("Mode=active-backup"));
-        let member = network_body("lan2", None, None, &[], None, None, Some("Bond=bond0"), None);
+        let member = network_body("lan2", None, None, &[], None, None, Some("Bond=bond0"), None, None, None);
         assert!(member.contains("Bond=bond0"));
     }
 
@@ -768,7 +822,7 @@ mod tests {
             other_config: true,
             router_lifetime: Some(1800),
         };
-        let u = network_body("lan0", Some("10.0.0.1/24"), None, &[], None, Some(&ra), None, None);
+        let u = network_body("lan0", Some("10.0.0.1/24"), None, &[], None, Some(&ra), None, None, None, None);
         // The enabling directive stays in [Network]; the detail sections follow.
         assert!(u.contains("IPv6SendRA=yes"));
         assert!(u.contains("[IPv6SendRA]"));
@@ -800,7 +854,7 @@ mod tests {
             other_config: false,
             router_lifetime: None,
         };
-        let u = network_body("lan0", Some("10.0.0.1/24"), None, &[], Some(&dhcp), Some(&ra), None, None);
+        let u = network_body("lan0", Some("10.0.0.1/24"), None, &[], Some(&dhcp), Some(&ra), None, None, None, None);
         let network_hdr = u.find("[Network]").unwrap();
         let first_subsection = u.find("[DHCPServer]").unwrap();
         let dhcp_on = u.find("DHCPServer=yes").unwrap();
@@ -836,6 +890,8 @@ mod tests {
             bond_mode: None,
             pd_from: None,
             pd_subnet: None,
+            mtu: None,
+            mac: None,
         };
         let d = wireguard_netdev_body(&iface);
         assert!(d.contains("Kind=wireguard"));

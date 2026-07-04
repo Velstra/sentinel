@@ -45,6 +45,9 @@ struct IfaceDraft {
     if_type: Option<IfaceType>,
     master: Option<String>,
     bond_mode: Option<String>,
+    // Link tunables.
+    mtu: Option<u16>,
+    mac: Option<String>,
 }
 
 impl IfaceDraft {
@@ -449,6 +452,8 @@ impl Draft {
                             if_type: i.if_type,
                             master: i.master.clone(),
                             bond_mode: i.bond_mode.clone(),
+                            mtu: i.mtu,
+                            mac: i.mac.clone(),
                         },
                     )
                 })
@@ -857,6 +862,14 @@ impl Session {
                 }
                 self.draft.iface_mut(name).bond_mode = Some((*v).to_string());
             }
+            ["interface", name, "mtu", v] => {
+                let mtu: u16 = v.parse().with_context(|| format!("invalid mtu {v:?}"))?;
+                self.draft.iface_mut(name).mtu = Some(mtu);
+            }
+            ["interface", name, "mac", v] => {
+                crate::config::validate_mac(v)?;
+                self.draft.iface_mut(name).mac = Some((*v).to_string());
+            }
 
             // --- firewall { … } — everything firewall lives under this node ---
 
@@ -1188,6 +1201,8 @@ impl Session {
             ["interface", name, "type"] => self.iface(name)?.if_type = None,
             ["interface", name, "master"] => self.iface(name)?.master = None,
             ["interface", name, "bond-mode"] => self.iface(name)?.bond_mode = None,
+            ["interface", name, "mtu"] => self.iface(name)?.mtu = None,
+            ["interface", name, "mac"] => self.iface(name)?.mac = None,
             ["interface", name, "peer", pk] => {
                 let i = self.iface(name)?;
                 let before = i.peers.len();
@@ -1596,6 +1611,8 @@ impl Session {
                 if_type: d.if_type,
                 master: d.master.clone(),
                 bond_mode: d.bond_mode.clone(),
+                mtu: d.mtu,
+                mac: d.mac.clone(),
             })
             .collect();
         let rules = self
@@ -1915,6 +1932,8 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             && i.if_type.is_none()
             && i.master.is_none()
             && i.bond_mode.is_none()
+            && i.mtu.is_none()
+            && i.mac.is_none()
         {
             continue;
         }
@@ -1946,6 +1965,12 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         if let Some(mode) = &i.bond_mode {
             out.push_str(&format!("    bond-mode {mode}\n"));
+        }
+        if let Some(mtu) = i.mtu {
+            out.push_str(&format!("    mtu {mtu}\n"));
+        }
+        if let Some(mac) = &i.mac {
+            out.push_str(&format!("    mac {mac}\n"));
         }
         if let Some(p) = &i.parent {
             out.push_str(&format!("    parent {p}\n"));

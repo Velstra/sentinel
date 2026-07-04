@@ -2314,6 +2314,53 @@
           '';
         };
 
+        # Per-interface link tunables: MTU (jumbo frames / PPPoE) and MAC cloning.
+        # Sentinel renders a [Link] section into the interface's .network; networkd
+        # applies both to the live link. One node — proof via `ip link`.
+        #   nix build .#checks.x86_64-linux.linkopts -L
+        linkopts = pkgs.testers.runNixOSTest {
+          name = "sentinel-linkopts";
+          nodes.fw =
+            { lib, ... }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce "fw";
+              networking.firewall.enable = lib.mkForce false;
+              virtualisation.vlans = [ 1 ];
+              virtualisation.memorySize = 2048;
+              services.velstra.interface = lib.mkForce "eth1";
+            };
+          testScript = ''
+            start_all()
+            fw.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+
+            # Set a jumbo MTU and clone a MAC on eth1. ONE `set` per line.
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth1 zone lan' "
+                "'set interface eth1 mtu 9000' "
+                "'set interface eth1 mac 52:54:00:aa:bb:cc' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+
+            # Sentinel rendered a [Link] section with both.
+            fw.wait_until_succeeds(
+                "test -f /run/systemd/network/10-sentinel-eth1.network", timeout=20
+            )
+            netw = fw.succeed("cat /run/systemd/network/10-sentinel-eth1.network")
+            assert "MTUBytes=9000" in netw, netw
+            assert "MACAddress=52:54:00:aa:bb:cc" in netw, netw
+
+            # networkd applied both to the live link.
+            fw.wait_until_succeeds("ip link show eth1 | grep -q 'mtu 9000'", timeout=30)
+            fw.wait_until_succeeds(
+                "ip link show eth1 | grep -qi '52:54:00:aa:bb:cc'", timeout=30
+            )
+          '';
+        };
+
         # Routing: two Sentinel appliances peer eBGP and each learns the other's
         # network — end-to-end proof that the Wren control plane is wired into the
         # image (packaged, serviced, config-compiled from `set protocols …`) and
