@@ -79,6 +79,35 @@ pub fn install_file(path: &Path, contents: &str) -> Result<()> {
     sudo("install", &["-m", "0644", tmp_s, dst_s])
 }
 
+/// Install a secret file `contents` at a (root-owned) `path` readable by
+/// systemd-networkd but no one else — mode **0640, group `systemd-network`**.
+/// A WireGuard `.netdev` carries an inline `PrivateKey=`, so it must not be
+/// world-readable; but systemd-networkd runs as the unprivileged
+/// `systemd-network` user and must still open it, so 0600 root:root would give
+/// it "Permission denied" and the link would never come up. We always route
+/// through `install -m 0640 -g systemd-network` (via [`sudo`], which runs
+/// directly when already root and via `sudo` otherwise) so the owning group is
+/// set in one atomic step in both the boot-service (root) and `configure`
+/// (admin) paths.
+pub fn install_secret_file(path: &Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    // Stage in /run/sentinel (wheel-writable) then install with the right
+    // mode+group. `install` resolves the group name and sets owner:group:mode
+    // atomically, so there is never a window where the private key is world- or
+    // wrong-group-readable.
+    let tmp = Path::new("/run/sentinel").join(".net-secret.tmp");
+    std::fs::write(&tmp, contents).with_context(|| format!("staging {}", tmp.display()))?;
+    let (Some(tmp_s), Some(dst_s)) = (tmp.to_str(), path.to_str()) else {
+        bail!("non-UTF-8 path");
+    };
+    sudo(
+        "install",
+        &["-m", "0640", "-g", "systemd-network", tmp_s, dst_s],
+    )
+}
+
 /// Remove a (possibly root-owned) file, tolerating an already-absent path.
 pub fn remove_file(path: &Path) -> Result<()> {
     if !path.exists() {

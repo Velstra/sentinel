@@ -16,7 +16,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::config::Appliance;
+use crate::config::{Appliance, Interface};
 use crate::system::{self, NETWORKD_RUNTIME_DIR};
 
 /// Filename prefix for the units we own. The low number sorts ahead of the
@@ -35,6 +35,38 @@ fn netdev_name(iface: &str) -> String {
 /// The `.netdev` that creates an 802.1Q VLAN link `iface` with the given id.
 fn netdev_body(iface: &str, vlan: u16) -> String {
     format!("[NetDev]\nName={iface}\nKind=vlan\n\n[VLAN]\nId={vlan}\n")
+}
+
+/// The `.netdev` that creates a WireGuard link: the `[WireGuard]` section
+/// carries the private key (and optional listen port), and one
+/// `[WireGuardPeer]` block per peer. The file is a secret (private key) and is
+/// installed mode 0600 by [`apply`].
+fn wireguard_netdev_body(iface: &Interface) -> String {
+    let name = &iface.name;
+    let mut body = format!("[NetDev]\nName={name}\nKind=wireguard\n\n[WireGuard]\n");
+    if let Some(pk) = &iface.private_key {
+        body.push_str(&format!("PrivateKey={pk}\n"));
+    }
+    if let Some(port) = iface.listen_port {
+        body.push_str(&format!("ListenPort={port}\n"));
+    }
+    for peer in &iface.peers {
+        body.push_str("\n[WireGuardPeer]\n");
+        body.push_str(&format!("PublicKey={}\n", peer.public_key));
+        if !peer.allowed_ips.is_empty() {
+            body.push_str(&format!("AllowedIPs={}\n", peer.allowed_ips.join(",")));
+        }
+        if let Some(ep) = &peer.endpoint {
+            body.push_str(&format!("Endpoint={ep}\n"));
+        }
+        if let Some(psk) = &peer.preshared_key {
+            body.push_str(&format!("PresharedKey={psk}\n"));
+        }
+        if let Some(k) = peer.persistent_keepalive {
+            body.push_str(&format!("PersistentKeepalive={k}\n"));
+        }
+    }
+    body
 }
 
 /// Render a `.network` unit for `iface`: bind its `address` (if any) and declare
@@ -73,6 +105,8 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
 
     let mut keep: HashSet<String> = HashSet::new();
     let mut writes: Vec<(String, String)> = Vec::new();
+    // Files that carry a secret (a WireGuard private key) and must be 0600.
+    let mut secrets: HashSet<String> = HashSet::new();
 
     // VLAN .netdev units.
     for i in ifaces {
@@ -83,12 +117,25 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
         }
     }
 
-    // .network units: anything with an address, a VLAN of its own, or child VLANs.
+    // WireGuard .netdev units (secret — the private key lives here → 0600).
+    for i in ifaces {
+        if i.is_wireguard() {
+            let name = netdev_name(&i.name);
+            writes.push((name.clone(), wireguard_netdev_body(i)));
+            secrets.insert(name.clone());
+            keep.insert(name);
+        }
+    }
+
+    // .network units: anything with an address, a VLAN of its own, child VLANs,
+    // or a WireGuard link (which needs a `.network` to be brought up even when it
+    // carries only AllowedIPs routes and no local address).
     let reloaded: Vec<String> = ifaces
         .iter()
         .filter(|i| {
             i.address.is_some()
                 || (i.parent.is_some() && i.vlan.is_some())
+                || i.is_wireguard()
                 || children.contains_key(i.name.as_str())
         })
         .map(|i| {
@@ -112,9 +159,16 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
         }
     }
 
-    // Write the wanted units.
+    // Write the wanted units. A WireGuard `.netdev` embeds the private key, so
+    // it is installed 0640 root:systemd-network (readable by networkd, not by
+    // ordinary users); everything else stays the default 0644.
     for (name, body) in &writes {
-        system::install_file(&Path::new(NETWORKD_RUNTIME_DIR).join(name), body)?;
+        let path = Path::new(NETWORKD_RUNTIME_DIR).join(name);
+        if secrets.contains(name) {
+            system::install_secret_file(&path, body)?;
+        } else {
+            system::install_file(&path, body)?;
+        }
     }
 
     // Re-apply live. Non-fatal: networkd may not be up yet at boot, in which
@@ -162,5 +216,35 @@ mod tests {
     #[test]
     fn unit_name_is_prefixed_and_scoped() {
         assert_eq!(network_name("eth0"), "10-sentinel-eth0.network");
+    }
+
+    #[test]
+    fn wireguard_netdev_renders_kind_key_and_peer() {
+        use crate::config::WgPeer;
+        let iface = Interface {
+            name: "wg0".into(),
+            zone: Some("lan".into()),
+            address: Some("10.9.0.1/24".into()),
+            parent: None,
+            vlan: None,
+            private_key: Some("ICOioMTTlfQE/2NndOoEntortz+0tZ5Hll0AEM7tdmE=".into()),
+            listen_port: Some(51820),
+            peers: vec![WgPeer {
+                public_key: "ukF+iwo+aai/wm9k1nIlxCBFRnZ+bLPb2xIu4+4PvmQ=".into(),
+                allowed_ips: vec!["10.9.0.2/32".into()],
+                endpoint: Some("192.0.2.7:51820".into()),
+                persistent_keepalive: Some(25),
+                preshared_key: None,
+            }],
+        };
+        let d = wireguard_netdev_body(&iface);
+        assert!(d.contains("Kind=wireguard"));
+        assert!(d.contains("PrivateKey=ICOioMTTlfQE/2NndOoEntortz+0tZ5Hll0AEM7tdmE="));
+        assert!(d.contains("ListenPort=51820"));
+        assert!(d.contains("[WireGuardPeer]"));
+        assert!(d.contains("PublicKey=ukF+iwo+aai/wm9k1nIlxCBFRnZ+bLPb2xIu4+4PvmQ="));
+        assert!(d.contains("AllowedIPs=10.9.0.2/32"));
+        assert!(d.contains("Endpoint=192.0.2.7:51820"));
+        assert!(d.contains("PersistentKeepalive=25"));
     }
 }

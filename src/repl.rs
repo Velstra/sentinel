@@ -554,6 +554,16 @@ const IFACE_FIELDS: &[Cand] = &[
     ("address", "static CIDR or `dhcp`"),
     ("parent", "parent interface (for a VLAN subinterface)"),
     ("vlan", "802.1Q VLAN id 1–4094 (with `parent`)"),
+    ("private-key", "WireGuard private key (or `generate`)"),
+    ("listen-port", "WireGuard UDP listen port"),
+    ("peer", "WireGuard peer (by public key)"),
+];
+const WG_KEY_GEN: &[Cand] = &[("generate", "generate a fresh WireGuard keypair")];
+const PEER_FIELDS: &[Cand] = &[
+    ("allowed-ips", "CIDRs routed to this peer (comma-separated)"),
+    ("endpoint", "peer's public host:port"),
+    ("keepalive", "persistent-keepalive seconds"),
+    ("preshared-key", "optional pre-shared key"),
 ];
 const RULE_FIELDS: &[Cand] = &[
     ("from", "source zone"),
@@ -576,6 +586,9 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "system"] => SYSTEM_FIELDS,
         // `set interface <name> <field>` — name is freeform, then fields.
         ["set" | "delete", "interface", _name] => IFACE_FIELDS,
+        // WireGuard: `private-key` offers `generate`; a peer's fields follow its key.
+        ["set", "interface", _name, "private-key"] => WG_KEY_GEN,
+        ["set" | "delete", "interface", _name, "peer", _pk] => PEER_FIELDS,
 
         // The firewall sub-tree.
         ["set" | "delete", "firewall"] => FIREWALL_NODES,
@@ -832,7 +845,14 @@ mod tests {
         assert_eq!(kw(&["set", "system"]), ["hostname"]);
         assert_eq!(
             kw(&["set", "interface", "wan0"]),
-            ["zone", "address", "parent", "vlan"]
+            ["zone", "address", "parent", "vlan", "private-key", "listen-port", "peer"]
+        );
+        // WireGuard completion: `private-key` offers `generate`; a peer's fields
+        // follow after its public key.
+        assert_eq!(kw(&["set", "interface", "wg0", "private-key"]), ["generate"]);
+        assert_eq!(
+            kw(&["set", "interface", "wg0", "peer", "PUBKEY"]),
+            ["allowed-ips", "endpoint", "keepalive", "preshared-key"]
         );
         // The firewall sub-tree is discoverable level by level (NAT is separate).
         assert_eq!(kw(&["set", "firewall"]), ["global", "zone", "rule"]);
@@ -896,7 +916,7 @@ mod tests {
         assert_eq!(kws(&["set"]), ["system", "interface", "firewall", "nat", "protocols"]);
         assert_eq!(
             kws(&["set", "interface", "eth0"]),
-            ["zone", "address", "parent", "vlan"]
+            ["zone", "address", "parent", "vlan", "private-key", "listen-port", "peer"]
         );
     }
 

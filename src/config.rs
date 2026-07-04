@@ -14,6 +14,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 
 /// A commented starting config, emitted by `sentinel config init`.
@@ -516,6 +517,41 @@ pub struct Interface {
     /// VLAN id (1–4094) for a subinterface. Set together with `parent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vlan: Option<u16>,
+    /// WireGuard private key (base64 of 32 raw bytes). Its presence makes this a
+    /// WireGuard interface (`Kind=wireguard`); the `.netdev` carrying it is a
+    /// secret and is written mode 0600.
+    #[serde(default, rename = "private-key", skip_serializing_if = "Option::is_none")]
+    pub private_key: Option<String>,
+    /// UDP port WireGuard listens on. Optional (an outbound-only tunnel needs
+    /// none); when set the peer can reach us at this port.
+    #[serde(default, rename = "listen-port", skip_serializing_if = "Option::is_none")]
+    pub listen_port: Option<u16>,
+    /// WireGuard peers reachable over this interface.
+    #[serde(default, rename = "peer", skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<WgPeer>,
+}
+
+/// A WireGuard peer: the far end of a tunnel on a `[[interface]]` that carries a
+/// `private-key`. Keys are the standard base64 encoding of 32 raw bytes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WgPeer {
+    #[serde(rename = "public-key")]
+    pub public_key: String,
+    #[serde(default, rename = "allowed-ips", skip_serializing_if = "Vec::is_empty")]
+    pub allowed_ips: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, rename = "persistent-keepalive", skip_serializing_if = "Option::is_none")]
+    pub persistent_keepalive: Option<u16>,
+    #[serde(default, rename = "preshared-key", skip_serializing_if = "Option::is_none")]
+    pub preshared_key: Option<String>,
+}
+
+impl Interface {
+    /// A WireGuard interface is any interface that carries a `private-key`.
+    pub fn is_wireguard(&self) -> bool {
+        self.private_key.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -771,6 +807,47 @@ impl Appliance {
                     "interface {:?}: `parent` and `vlan` must be set together",
                     iface.name
                 ),
+            }
+
+            // WireGuard: a `private-key` turns an interface into a WG tunnel.
+            if iface.is_wireguard() {
+                if iface.parent.is_some() || iface.vlan.is_some() {
+                    bail!(
+                        "interface {:?}: a wireguard interface cannot also be a VLAN",
+                        iface.name
+                    );
+                }
+                let key = iface.private_key.as_deref().unwrap();
+                validate_wg_key(key)
+                    .with_context(|| format!("interface {:?} private-key", iface.name))?;
+                if let Some(port) = iface.listen_port {
+                    if port == 0 {
+                        bail!("interface {:?}: listen-port 0 is not valid", iface.name);
+                    }
+                }
+                for peer in &iface.peers {
+                    validate_wg_key(&peer.public_key)
+                        .with_context(|| format!("interface {:?} peer public-key", iface.name))?;
+                    for cidr in &peer.allowed_ips {
+                        validate_cidr_or_ip(cidr).with_context(|| {
+                            format!("interface {:?} peer allowed-ips", iface.name)
+                        })?;
+                    }
+                    if let Some(ep) = &peer.endpoint {
+                        validate_endpoint(ep)
+                            .with_context(|| format!("interface {:?} peer endpoint", iface.name))?;
+                    }
+                    if let Some(psk) = &peer.preshared_key {
+                        validate_wg_key(psk).with_context(|| {
+                            format!("interface {:?} peer preshared-key", iface.name)
+                        })?;
+                    }
+                }
+            } else if iface.listen_port.is_some() || !iface.peers.is_empty() {
+                bail!(
+                    "interface {:?}: listen-port/peer require private-key",
+                    iface.name
+                );
             }
         }
 
@@ -1060,6 +1137,51 @@ pub(crate) fn validate_cidr_or_ip(s: &str) -> Result<()> {
     } else {
         s.parse::<Ipv4Addr>()
             .with_context(|| format!("invalid IP/CIDR {s:?}"))?;
+    }
+    Ok(())
+}
+
+/// Validate a WireGuard key (private, peer public, or preshared): the standard
+/// base64 encoding of exactly 32 raw bytes — the `wg` tool's format.
+pub(crate) fn validate_wg_key(s: &str) -> Result<()> {
+    let raw = STANDARD
+        .decode(s)
+        .with_context(|| format!("wireguard key {s:?} is not valid base64"))?;
+    if raw.len() != 32 {
+        bail!("wireguard key {s:?} decodes to {} bytes, expected 32", raw.len());
+    }
+    Ok(())
+}
+
+/// Validate a WireGuard peer endpoint `host:port`: the host is an IPv4 literal
+/// or a DNS hostname, the port is 1..=65535.
+pub(crate) fn validate_endpoint(s: &str) -> Result<()> {
+    let (host, port) = s
+        .rsplit_once(':')
+        .with_context(|| format!("endpoint {s:?} must be host:port"))?;
+    let port: u16 = port
+        .parse()
+        .with_context(|| format!("invalid port in endpoint {s:?}"))?;
+    if port == 0 {
+        bail!("endpoint {s:?}: port 0 is not valid");
+    }
+    if host.is_empty() {
+        bail!("endpoint {s:?}: host is empty");
+    }
+    // An IPv4 literal is fine; otherwise require a plausible DNS hostname (labels
+    // of alphanumerics/hyphen, dot-separated) so we don't smuggle an INI newline.
+    if host.parse::<Ipv4Addr>().is_ok() {
+        return Ok(());
+    }
+    let ok = host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    });
+    if !ok {
+        bail!("endpoint {s:?}: host is not a valid IPv4 or hostname");
     }
     Ok(())
 }
