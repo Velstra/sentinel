@@ -558,6 +558,7 @@ const IFACE_FIELDS: &[Cand] = &[
     ("listen-port", "WireGuard UDP listen port"),
     ("peer", "WireGuard peer (by public key)"),
     ("dhcp-server", "serve DHCP from this NIC's static subnet"),
+    ("router-advert", "emit IPv6 Router Advertisements (SLAAC)"),
 ];
 const DHCP_SERVER_FIELDS: &[Cand] = &[
     ("enable", "turn the DHCP server on"),
@@ -566,6 +567,15 @@ const DHCP_SERVER_FIELDS: &[Cand] = &[
     ("pool-size", "number of addresses in the pool"),
     ("dns", "DNS servers to advertise (comma-separated)"),
     ("lease-time", "default lease time in seconds"),
+];
+const RA_FIELDS: &[Cand] = &[
+    ("enable", "turn the RA sender on"),
+    ("disable", "turn the RA sender off"),
+    ("prefix", "IPv6 /64 prefixes to advertise (comma-separated)"),
+    ("dns", "IPv6 DNS servers to advertise (comma-separated)"),
+    ("managed", "set the Managed (M) flag (true / false)"),
+    ("other-config", "set the Other-config (O) flag (true / false)"),
+    ("router-lifetime", "router lifetime seconds (0 = not a default router)"),
 ];
 const WG_KEY_GEN: &[Cand] = &[("generate", "generate a fresh WireGuard keypair")];
 const PEER_FIELDS: &[Cand] = &[
@@ -600,6 +610,9 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "interface", _name, "peer", _pk] => PEER_FIELDS,
         // The DHCP-server sub-tree of an interface.
         ["set" | "delete", "interface", _name, "dhcp-server"] => DHCP_SERVER_FIELDS,
+        // The IPv6 Router-Advertisement sub-tree of an interface.
+        ["set" | "delete", "interface", _name, "router-advert"] => RA_FIELDS,
+        ["set", "interface", _name, "router-advert", "managed" | "other-config"] => BOOLS,
 
         // The firewall sub-tree.
         ["set" | "delete", "firewall"] => FIREWALL_NODES,
@@ -864,13 +877,19 @@ mod tests {
                 "private-key",
                 "listen-port",
                 "peer",
-                "dhcp-server"
+                "dhcp-server",
+                "router-advert"
             ]
         );
         // The DHCP-server sub-tree of an interface is discoverable.
         assert_eq!(
             kw(&["set", "interface", "lan0", "dhcp-server"]),
             ["enable", "disable", "pool-offset", "pool-size", "dns", "lease-time"]
+        );
+        // The router-advert sub-tree of an interface is discoverable too.
+        assert_eq!(
+            kw(&["set", "interface", "lan0", "router-advert"]),
+            ["enable", "disable", "prefix", "dns", "managed", "other-config", "router-lifetime"]
         );
         // WireGuard completion: `private-key` offers `generate`; a peer's fields
         // follow after its public key.
@@ -949,7 +968,8 @@ mod tests {
                 "private-key",
                 "listen-port",
                 "peer",
-                "dhcp-server"
+                "dhcp-server",
+                "router-advert"
             ]
         );
     }
