@@ -63,6 +63,13 @@ pub fn reload_resolved() -> Result<()> {
     run_priv("systemctl", &["restart", "systemd-resolved"])
 }
 
+/// Restart chrony so a freshly written confdir drop-in takes effect. A restart
+/// (not reload) is used because chrony only reloads *sources* live; `server` /
+/// `allow` directives in a confdir file are applied on start.
+pub fn reload_chrony() -> Result<()> {
+    run_priv("systemctl", &["restart", "chronyd"])
+}
+
 /// systemd-networkd's runtime drop-in dir (tmpfs, re-seeded each boot). We place
 /// per-interface `.network` units here so addressing is applied live and is gone
 /// on reboot unless re-asserted from the saved config by the boot service.

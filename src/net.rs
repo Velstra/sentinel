@@ -12,11 +12,12 @@
 //! both ways.
 
 use std::collections::{BTreeMap, HashSet};
+use std::net::Ipv4Addr;
 use std::path::Path;
 
 use anyhow::Result;
 
-use crate::config::{Appliance, DhcpServer, Dns, IfaceType, Interface, RouterAdvert};
+use crate::config::{Appliance, DhcpServer, Dns, IfaceType, Interface, Ntp, RouterAdvert};
 use crate::system::{self, NETWORKD_RUNTIME_DIR};
 
 /// Filename prefix for the units we own. The low number sorts ahead of the
@@ -204,6 +205,84 @@ fn resolved_dropin_body(dns: &Dns, ifaces: &[Interface]) -> Option<String> {
     Some(body)
 }
 
+/// chrony's runtime confdir (the image enables `services.chrony` and includes
+/// this dir). A `.conf` here layers the LAN NTP-server config onto the base
+/// chrony config, re-asserted from the saved config each boot like the rest.
+const CHRONY_CONFDIR: &str = "/run/sentinel/chrony.d";
+const CHRONY_CONF: &str = "sentinel.conf";
+
+/// The IPv4 network of a static CIDR (`"10.0.0.1/24"` → `"10.0.0.0/24"`) — the
+/// subnet chrony `allow`s for a serving interface. `None` for a non-IPv4/`dhcp`
+/// address (validation forbids serving NTP on such an interface).
+fn ipv4_network(cidr: &str) -> Option<String> {
+    let (ip, prefix) = cidr.split_once('/')?;
+    let ip: Ipv4Addr = ip.parse().ok()?;
+    let prefix: u8 = prefix.parse().ok()?;
+    if prefix > 32 {
+        return None;
+    }
+    let mask: u32 = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    let net = u32::from(ip) & mask;
+    Some(format!("{}/{prefix}", Ipv4Addr::from(net)))
+}
+
+/// Render chrony's confdir drop-in for the NTP server, or `None` when none is
+/// configured. `server <up> iburst` syncs the box to each upstream; `allow
+/// <subnet>` lets each serving interface's subnet query the box for time.
+fn chrony_conf_body(ntp: &Ntp, ifaces: &[Interface]) -> Option<String> {
+    if ntp.is_empty() {
+        return None;
+    }
+    let mut body = String::new();
+    for up in &ntp.upstream {
+        body.push_str(&format!("server {up} iburst\n"));
+    }
+    for name in &ntp.serve_on {
+        if let Some(net) = ifaces
+            .iter()
+            .find(|i| &i.name == name)
+            .and_then(|i| i.address.as_deref())
+            .and_then(ipv4_network)
+        {
+            body.push_str(&format!("allow {net}\n"));
+        }
+    }
+    Some(body)
+}
+
+/// Reconcile the chrony confdir drop-in to `appliance.services.ntp`: write it
+/// when an NTP server is configured, remove it otherwise, and restart chrony —
+/// but only when the desired config actually changed, so a non-NTP commit never
+/// disturbs the box's timekeeping.
+fn apply_chrony(appliance: &Appliance) -> Result<()> {
+    let path = Path::new(CHRONY_CONFDIR).join(CHRONY_CONF);
+    match chrony_conf_body(&appliance.services.ntp, &appliance.interfaces) {
+        Some(body) => {
+            let changed = std::fs::read_to_string(&path).map(|c| c != body).unwrap_or(true);
+            system::ensure_dir(Path::new(CHRONY_CONFDIR))?;
+            system::install_file(&path, &body)?;
+            if changed {
+                restart_chrony();
+            }
+        }
+        None => {
+            if path.exists() {
+                system::remove_file(&path)?;
+                restart_chrony();
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Restart chrony best-effort (mirrors the resolved reconcile): the confdir file
+/// is written regardless, so a boot-time chrony start still picks it up.
+fn restart_chrony() {
+    if let Err(e) = system::reload_chrony() {
+        eprintln!("warning: restarting chrony failed (applies on next start): {e}");
+    }
+}
+
 /// Reconcile the systemd-resolved drop-in to `appliance.dns`: write it when a
 /// forwarder is configured, remove it otherwise, then restart resolved so the
 /// stub listener (re)binds. Best-effort restart (mirrors networkd): the drop-in
@@ -350,9 +429,12 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
     }
 
     // The DNS forwarder (systemd-resolved) is reconciled the same way — its
-    // runtime drop-in tracks `[dns]`, and resolved is restarted to (re)bind the
-    // LAN stub listener.
+    // runtime drop-in tracks `[services.dns]`, and resolved is restarted to
+    // (re)bind the LAN stub listener.
     apply_resolved(appliance)?;
+    // The NTP server (chrony) likewise — its confdir drop-in tracks
+    // `[services.ntp]`, and chrony is restarted only when that changed.
+    apply_chrony(appliance)?;
     Ok(())
 }
 
@@ -436,6 +518,43 @@ mod tests {
         assert!(u.contains("[DHCPServer]"));
         assert!(!u.contains("EmitDNS"));
         assert!(!u.contains("DNS="));
+    }
+
+    #[test]
+    fn ntp_server_renders_chrony_confdir() {
+        let ntp = Ntp {
+            upstream: vec!["pool.ntp.org".into(), "10.0.0.99".into()],
+            serve_on: vec!["lan0".into()],
+        };
+        let ifaces = vec![Interface {
+            name: "lan0".into(),
+            zone: Some("lan".into()),
+            address: Some("10.0.0.1/24".into()),
+            parent: None,
+            vlan: None,
+            private_key: None,
+            listen_port: None,
+            peers: vec![],
+            dhcp_server: None,
+            router_advert: None,
+            if_type: None,
+            master: None,
+            bond_mode: None,
+        }];
+        let body = chrony_conf_body(&ntp, &ifaces).expect("ntp configured");
+        assert!(body.contains("server pool.ntp.org iburst"));
+        assert!(body.contains("server 10.0.0.99 iburst"));
+        // The serving interface's *subnet* is allowed, not its host address.
+        assert!(body.contains("allow 10.0.0.0/24"), "got:\n{body}");
+        assert!(chrony_conf_body(&Ntp::default(), &ifaces).is_none());
+    }
+
+    #[test]
+    fn ipv4_network_masks_host_bits() {
+        assert_eq!(ipv4_network("10.0.0.1/24").as_deref(), Some("10.0.0.0/24"));
+        assert_eq!(ipv4_network("192.168.5.130/26").as_deref(), Some("192.168.5.128/26"));
+        assert_eq!(ipv4_network("10.9.9.9/8").as_deref(), Some("10.0.0.0/8"));
+        assert_eq!(ipv4_network("dhcp"), None);
     }
 
     #[test]
