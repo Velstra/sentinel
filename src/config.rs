@@ -629,12 +629,25 @@ pub struct Interface {
     /// `"dhcp"` or a CIDR like `"10.0.0.1/24"`. `None` if not yet configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
-    /// The interface's IPv6 address — a static CIDR (`"2001:db8:1::1/64"`) or
-    /// `"auto"` (accept Router Advertisements / SLAAC). Independent of `address`,
-    /// so an interface can be dual-stack (a v4 `address` **and** a v6 `address6`).
+    /// The interface's IPv6 address — a static CIDR (`"2001:db8:1::1/64"`),
+    /// `"auto"` (accept Router Advertisements / SLAAC), or `"dhcp"` (DHCPv6
+    /// client — the typical WAN uplink, which can also request a delegated
+    /// prefix). Independent of `address`, so an interface can be dual-stack.
     /// `None` for a v4-only interface.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address6: Option<String>,
+    /// Request a delegated IPv6 prefix (DHCPv6-PD) from the uplink interface
+    /// named here — the German-ISP WAN model: the WAN (`address6 = "dhcp"`) gets
+    /// a prefix from the ISP, and each `pd-from` interface carves a /64 out of it
+    /// and advertises it to its LAN. `None` for an interface that is not a PD
+    /// downstream.
+    #[serde(default, rename = "pd-from", skip_serializing_if = "Option::is_none")]
+    pub pd_from: Option<String>,
+    /// The subnet id (0-255) this downstream takes within the delegated prefix —
+    /// which /64 of the ISP's block it uses. Defaults to `0`. Set together with
+    /// `pd-from`.
+    #[serde(default, rename = "pd-subnet", skip_serializing_if = "Option::is_none")]
+    pub pd_subnet: Option<u8>,
     /// For an 802.1Q VLAN subinterface: the parent interface it rides on. Set
     /// together with `vlan`. `None` for a physical NIC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1029,6 +1042,18 @@ impl Appliance {
             if let Some(addr6) = &iface.address6 {
                 validate_address6(addr6)
                     .with_context(|| format!("interface {:?} address6", iface.name))?;
+            }
+            // DHCPv6-PD downstream: the uplink must be a declared interface (and
+            // a different one). `pd-subnet` without `pd-from` is meaningless.
+            if let Some(up) = &iface.pd_from {
+                if !self.interfaces.iter().any(|i| &i.name == up) {
+                    bail!("interface {:?}: pd-from {up:?} is not a declared interface", iface.name);
+                }
+                if up == &iface.name {
+                    bail!("interface {:?}: pd-from cannot be itself", iface.name);
+                }
+            } else if iface.pd_subnet.is_some() {
+                bail!("interface {:?}: pd-subnet requires pd-from", iface.name);
             }
             // VLAN subinterface: parent + vlan come as a pair; vlan in range; the
             // parent must be a declared interface.
@@ -1502,10 +1527,10 @@ fn validate_address(addr: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate an interface's IPv6 address: `"auto"` (SLAAC / accept-RA) or a
-/// static IPv6 CIDR (`"2001:db8:1::1/64"`).
+/// Validate an interface's IPv6 address: `"auto"` (SLAAC / accept-RA), `"dhcp"`
+/// (DHCPv6 client) or a static IPv6 CIDR (`"2001:db8:1::1/64"`).
 fn validate_address6(addr: &str) -> Result<()> {
-    if addr == "auto" {
+    if addr == "auto" || addr == "dhcp" {
         return Ok(());
     }
     validate_ipv6_cidr(addr)
@@ -1822,6 +1847,43 @@ port = "1-65535"
 "#;
         // The range is far over the cap → validation rejects it.
         assert!(Appliance::from_toml(toml).is_err());
+    }
+
+    #[test]
+    fn dhcpv6_pd_parses_and_validates() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+address = "dhcp"
+address6 = "dhcp"
+[[interface]]
+name = "lan0"
+zone = "lan"
+address = "10.0.0.1/24"
+pd-from = "wan0"
+pd-subnet = 1
+"#;
+        let a = Appliance::from_toml(toml).expect("DHCPv6-PD config parses + validates");
+        assert_eq!(a.interfaces[0].address6.as_deref(), Some("dhcp"));
+        assert_eq!(a.interfaces[1].pd_from.as_deref(), Some("wan0"));
+        assert_eq!(a.interfaces[1].pd_subnet, Some(1));
+        let out = a.to_toml().unwrap();
+        assert!(out.contains("pd-from = \"wan0\""), "got:\n{out}");
+        assert!(Appliance::from_toml(&out).is_ok());
+        // pd-from pointing at an undeclared interface is rejected.
+        let bad = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "lan0"
+zone = "lan"
+address = "10.0.0.1/24"
+pd-from = "nope0"
+"#;
+        assert!(Appliance::from_toml(bad).is_err());
     }
 
     #[test]
