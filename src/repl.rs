@@ -447,6 +447,20 @@ const TOP: &[Cand] = &[
     ("firewall", "packet filtering: global defaults, zones, rules"),
     ("nat", "address translation: source (masquerade), destination (port-forward)"),
     ("protocols", "dynamic routing: router-id, static routes, BGP"),
+    ("services", "box-wide services: DNS forwarder (NTP, … to come)"),
+];
+// `services <Tab>` reveals the box-wide services (compiled to their daemons' config).
+const SERVICES_NODES: &[Cand] = &[("dns", "LAN DNS forwarder: upstreams + interfaces to serve on")];
+// `services dns <Tab>` reveals the forwarder fields (a systemd-resolved drop-in).
+const DNS_FIELDS: &[Cand] = &[
+    ("upstream", "upstream resolvers to forward to (comma-separated IPs)"),
+    ("serve-on", "interfaces to listen on for LAN queries (comma-separated)"),
+    ("dnssec", "DNSSEC mode: yes / no / allow-downgrade"),
+];
+const DNSSEC_MODES: &[Cand] = &[
+    ("yes", "validate"),
+    ("no", "do not validate (appliance default)"),
+    ("allow-downgrade", "validate, but tolerate non-DNSSEC upstreams"),
 ];
 // `protocols <Tab>` reveals the routing sub-tree (compiled to the Wren daemon).
 const PROTOCOLS_NODES: &[Cand] = &[
@@ -613,6 +627,11 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         // The IPv6 Router-Advertisement sub-tree of an interface.
         ["set" | "delete", "interface", _name, "router-advert"] => RA_FIELDS,
         ["set", "interface", _name, "router-advert", "managed" | "other-config"] => BOOLS,
+
+        // The box-wide services sub-tree, and the DNS forwarder within it.
+        ["set" | "delete", "services"] => SERVICES_NODES,
+        ["set" | "delete", "services", "dns"] => DNS_FIELDS,
+        ["set", "services", "dns", "dnssec"] => DNSSEC_MODES,
 
         // The firewall sub-tree.
         ["set" | "delete", "firewall"] => FIREWALL_NODES,
@@ -865,7 +884,7 @@ mod tests {
                 "discard", "exit", "help"
             ]
         );
-        assert_eq!(kw(&["set"]), ["system", "interface", "firewall", "nat", "protocols"]);
+        assert_eq!(kw(&["set"]), ["system", "interface", "firewall", "nat", "protocols", "services"]);
         assert_eq!(kw(&["set", "system"]), ["hostname"]);
         assert_eq!(
             kw(&["set", "interface", "wan0"]),
@@ -957,7 +976,7 @@ mod tests {
         assert_eq!(kws(&["set", "nat", "source", "wan-masq", "zone"]), ["lan", "wan"]);
         assert_eq!(kws(&["set", "nat", "destination", "web-fwd", "zone"]), ["lan", "wan"]);
         // Other positions fall back to the static grammar.
-        assert_eq!(kws(&["set"]), ["system", "interface", "firewall", "nat", "protocols"]);
+        assert_eq!(kws(&["set"]), ["system", "interface", "firewall", "nat", "protocols", "services"]);
         assert_eq!(
             kws(&["set", "interface", "eth0"]),
             [

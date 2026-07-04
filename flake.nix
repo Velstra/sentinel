@@ -1811,6 +1811,112 @@
           '';
         };
 
+        # DNS forwarder: a 3-node proof that the box resolves for the LAN. An
+        # `upstream` node is authoritative for sentinel.test -> 10.9.9.9
+        # (dnsmasq); the sentinel `fw` forwards to it and serves the LAN on
+        # eth1's IP; a `client` queries the fw and must get the upstream answer.
+        # Sentinel renders `[services.dns]` into a systemd-resolved drop-in
+        # (`DNS=<upstream>` + `DNSStubListenerExtra=<lan-ip>`) — no extra daemon.
+        # The lan zone accepts so the XDP firewall passes the client's query and
+        # the fw's forwarded lookup on eth1.
+        #   nix build .#checks.x86_64-linux.dns -L
+        dns = pkgs.testers.runNixOSTest {
+          name = "sentinel-dns";
+          nodes = {
+            upstream =
+              { ... }:
+              {
+                virtualisation.vlans = [ 1 ];
+                networking = {
+                  useDHCP = false;
+                  firewall.enable = false;
+                  interfaces.eth1.ipv4.addresses = [
+                    {
+                      address = "10.0.0.99";
+                      prefixLength = 24;
+                    }
+                  ];
+                };
+                # Authoritative for the test name; bound to eth1 only so it does
+                # not fight resolved for 127.0.0.53.
+                services.resolved.enable = false;
+                services.dnsmasq = {
+                  enable = true;
+                  settings = {
+                    bind-interfaces = true;
+                    interface = "eth1";
+                    address = "/sentinel.test/10.9.9.9";
+                  };
+                };
+              };
+            fw =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "fw";
+                networking.firewall.enable = lib.mkForce false;
+                virtualisation.vlans = [ 1 ];
+                virtualisation.memorySize = 2048;
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+            client =
+              { pkgs, ... }:
+              {
+                virtualisation.vlans = [ 1 ];
+                networking = {
+                  useDHCP = false;
+                  firewall.enable = false;
+                  interfaces.eth1.ipv4.addresses = [
+                    {
+                      address = "10.0.0.50";
+                      prefixLength = 24;
+                    }
+                  ];
+                };
+                environment.systemPackages = [ pkgs.dnsutils ];
+              };
+          };
+          testScript = ''
+            start_all()
+            upstream.wait_for_unit("dnsmasq.service")
+            fw.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+
+            # Turn on the LAN DNS forwarder on eth1 (static addr + lan accept so
+            # the XDP firewall passes DNS), forwarding to the upstream node.
+            # ONE `set` per line (the inline multi-field form does not parse).
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth1 address 10.0.0.1/24' "
+                "'set interface eth1 zone lan' "
+                "'set firewall zone lan default-action accept' "
+                "'set services dns upstream 10.0.0.99' "
+                "'set services dns serve-on eth1' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            fw.wait_for_unit("velstra.service")
+
+            # Sentinel rendered the resolved drop-in with the upstream + the LAN
+            # stub listener bound to eth1's IP.
+            fw.wait_until_succeeds(
+                "test -f /run/systemd/resolved.conf.d/10-sentinel-dns.conf", timeout=20
+            )
+            conf = fw.succeed("cat /run/systemd/resolved.conf.d/10-sentinel-dns.conf")
+            assert "DNS=10.0.0.99" in conf, conf
+            assert "DNSStubListenerExtra=10.0.0.1" in conf, conf
+            fw.wait_until_succeeds("ip -4 addr show eth1 | grep -q '10.0.0.1'", timeout=30)
+
+            # The client resolves the upstream-only name THROUGH the fw: proof the
+            # box forwards LAN queries to its configured upstream end to end.
+            client.wait_for_unit("multi-user.target")
+            client.wait_until_succeeds(
+                "dig +short +tries=2 +time=3 @10.0.0.1 sentinel.test | grep -q '10.9.9.9'",
+                timeout=90,
+            )
+          '';
+        };
+
         # Routing: two Sentinel appliances peer eBGP and each learns the other's
         # network — end-to-end proof that the Wren control plane is wired into the
         # image (packaged, serviced, config-compiled from `set protocols …`) and

@@ -55,6 +55,14 @@ pub fn reload_velstra(unit: &str) -> Result<()> {
     run_priv("systemctl", &["reload-or-restart", unit])
 }
 
+/// Restart systemd-resolved so a freshly written drop-in takes effect. A plain
+/// `restart` (not reload) is used deliberately: adding/removing a
+/// `DNSStubListenerExtra=` listener requires resolved to re-bind its sockets,
+/// which a reload (SIGHUP) does not do.
+pub fn reload_resolved() -> Result<()> {
+    run_priv("systemctl", &["restart", "systemd-resolved"])
+}
+
 /// systemd-networkd's runtime drop-in dir (tmpfs, re-seeded each boot). We place
 /// per-interface `.network` units here so addressing is applied live and is gone
 /// on reboot unless re-asserted from the saved config by the boot service.
