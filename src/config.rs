@@ -9,7 +9,7 @@
 
 use std::{
     collections::{BTreeMap, HashSet},
-    net::Ipv4Addr,
+    net::{Ipv4Addr, Ipv6Addr},
     path::Path,
 };
 
@@ -59,6 +59,12 @@ address = "10.0.0.1/24"
 # vlan = 20
 # zone = "iot"
 # address = "10.0.20.1/24"
+
+# IPv6 on the LAN by SLAAC: advertise a /64 and hosts autoconfigure. The router
+# also binds its own address from the prefix, so no separate v6 address needed.
+# [interface.router-advert]
+# prefixes = ["2001:db8:1::/64"]
+# dns = ["2001:db8:1::1"]
 
 # Broad zone rules set a zone's posture (action: accept | drop | reject).
 [[rule]]
@@ -534,6 +540,49 @@ pub struct Interface {
     /// `address` (the server needs a subnet to allocate from).
     #[serde(default, rename = "dhcp-server", skip_serializing_if = "Option::is_none")]
     pub dhcp_server: Option<DhcpServer>,
+    /// When set, networkd emits IPv6 Router Advertisements on this interface —
+    /// the IPv6 counterpart of the DHCP server. LAN hosts autoconfigure (SLAAC)
+    /// an address from each advertised prefix and learn this box as their default
+    /// router (and, optionally, DNS). Needs no IPv4 address; the router binds an
+    /// address from each advertised prefix itself.
+    #[serde(default, rename = "router-advert", skip_serializing_if = "Option::is_none")]
+    pub router_advert: Option<RouterAdvert>,
+}
+
+/// A built-in (systemd-networkd) IPv6 Router Advertiser on an interface — the
+/// IPv6 SLAAC counterpart of [`DhcpServer`]. The presence of the block turns RA
+/// on; every field refines networkd's defaults. Advertising a prefix lets hosts
+/// on the link autoconfigure a global address without any DHCP.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouterAdvert {
+    /// IPv6 prefixes advertised for SLAAC — each should be a `/64` (the width
+    /// stateless autoconfiguration requires). Hosts on the link form an address
+    /// in each; the router also binds one from each prefix to this interface
+    /// (`Assign=yes`), so no separate IPv6 address is needed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prefixes: Vec<String>,
+    /// IPv6 DNS servers advertised to clients in the RA (RDNSS). Emitted only
+    /// when non-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns: Vec<String>,
+    /// Set the "Managed address configuration" (M) flag: clients should obtain
+    /// their address via DHCPv6 rather than SLAAC. Off by default (pure SLAAC).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub managed: bool,
+    /// Set the "Other configuration" (O) flag: clients get other settings (DNS,
+    /// NTP …) via DHCPv6 while still forming their address by SLAAC. Off by
+    /// default.
+    #[serde(
+        default,
+        rename = "other-config",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub other_config: bool,
+    /// Router lifetime, in seconds. `0` advertises this box as *not* a default
+    /// router (prefix/DNS only — useful for a pure address/DNS advertiser).
+    /// Unset ⇒ networkd's default (a sane nonzero lifetime).
+    #[serde(default, rename = "router-lifetime", skip_serializing_if = "Option::is_none")]
+    pub router_lifetime: Option<u32>,
 }
 
 /// A built-in (systemd-networkd) DHCP server on an interface that carries a
@@ -887,6 +936,21 @@ impl Appliance {
                         .with_context(|| format!("interface {:?} dhcp-server dns", iface.name))?;
                 }
             }
+
+            // Router Advertisements: advertised prefixes must be IPv6 CIDRs (a
+            // /64 for SLAAC) and any advertised DNS must be IPv6 addresses.
+            if let Some(ra) = &iface.router_advert {
+                for prefix in &ra.prefixes {
+                    validate_ipv6_cidr(prefix).with_context(|| {
+                        format!("interface {:?} router-advert prefix", iface.name)
+                    })?;
+                }
+                for dns in &ra.dns {
+                    validate_ipv6(dns).with_context(|| {
+                        format!("interface {:?} router-advert dns", iface.name)
+                    })?;
+                }
+            }
         }
 
         // Every rule's zones must be backed by at least one *assigned* interface,
@@ -1067,6 +1131,29 @@ impl Appliance {
 pub(crate) fn validate_ipv4(s: &str) -> Result<()> {
     s.parse::<Ipv4Addr>()
         .with_context(|| format!("{s:?} is not an IPv4 address"))?;
+    Ok(())
+}
+
+/// Validate a bare IPv6 address (an advertised RDNSS server — no prefix).
+pub(crate) fn validate_ipv6(s: &str) -> Result<()> {
+    s.parse::<Ipv6Addr>()
+        .with_context(|| format!("{s:?} is not an IPv6 address"))?;
+    Ok(())
+}
+
+/// Validate an IPv6 CIDR such as an advertised RA prefix (`2001:db8:1::/64`).
+pub(crate) fn validate_ipv6_cidr(s: &str) -> Result<()> {
+    let (ip, prefix) = s
+        .split_once('/')
+        .with_context(|| format!("prefix {s:?} must be an IPv6 CIDR like \"2001:db8:1::/64\""))?;
+    ip.parse::<Ipv6Addr>()
+        .with_context(|| format!("invalid IPv6 in {s:?}"))?;
+    let prefix: u8 = prefix
+        .parse()
+        .with_context(|| format!("invalid prefix in {s:?}"))?;
+    if prefix > 128 {
+        bail!("prefix /{prefix} in {s:?} exceeds /128");
+    }
     Ok(())
 }
 
@@ -1454,6 +1541,62 @@ port = "1-65535"
 "#;
         // The range is far over the cap → validation rejects it.
         assert!(Appliance::from_toml(toml).is_err());
+    }
+
+    #[test]
+    fn router_advert_parses_and_round_trips() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "lan0"
+zone = "lan"
+address = "10.0.0.1/24"
+
+[interface.router-advert]
+prefixes = ["2001:db8:1::/64"]
+dns = ["2001:db8:1::1"]
+other-config = true
+router-lifetime = 1800
+"#;
+        let a = Appliance::from_toml(toml).expect("RA config parses + validates");
+        let ra = a.interfaces[0].router_advert.as_ref().expect("has RA");
+        assert_eq!(ra.prefixes, vec!["2001:db8:1::/64"]);
+        assert_eq!(ra.dns, vec!["2001:db8:1::1"]);
+        assert!(ra.other_config && !ra.managed);
+        assert_eq!(ra.router_lifetime, Some(1800));
+        // Survives a save → load cycle.
+        let out = a.to_toml().unwrap();
+        assert!(out.contains("[interface.router-advert]"), "got:\n{out}");
+        let b = Appliance::from_toml(&out).expect("re-parses");
+        assert_eq!(b.interfaces[0].router_advert.as_ref().unwrap().prefixes.len(), 1);
+    }
+
+    #[test]
+    fn router_advert_rejects_bad_prefix_and_dns() {
+        // A non-/64-shaped but syntactically bad prefix (IPv4) is rejected.
+        let bad_prefix = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "lan0"
+zone = "lan"
+[interface.router-advert]
+prefixes = ["10.0.0.0/24"]
+"#;
+        assert!(Appliance::from_toml(bad_prefix).is_err());
+        // An IPv4 RDNSS in an IPv6 RA is rejected.
+        let bad_dns = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "lan0"
+zone = "lan"
+[interface.router-advert]
+prefixes = ["2001:db8:1::/64"]
+dns = ["10.0.0.1"]
+"#;
+        assert!(Appliance::from_toml(bad_dns).is_err());
     }
 
     #[test]

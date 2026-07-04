@@ -16,7 +16,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::config::{Appliance, DhcpServer, Interface};
+use crate::config::{Appliance, DhcpServer, Interface, RouterAdvert};
 use crate::system::{self, NETWORKD_RUNTIME_DIR};
 
 /// Filename prefix for the units we own. The low number sorts ahead of the
@@ -77,6 +77,7 @@ fn network_body(
     address: Option<&str>,
     vlan_children: &[String],
     dhcp: Option<&DhcpServer>,
+    ra: Option<&RouterAdvert>,
 ) -> String {
     let mut body = format!("[Match]\nName={iface}\n\n[Network]\n");
     match address {
@@ -87,10 +88,20 @@ fn network_body(
     for child in vlan_children {
         body.push_str(&format!("VLAN={child}\n"));
     }
+    // Both the DHCP server and the RA sender are switched on by a directive in
+    // [Network]; their detailed [DHCPServer] / [IPv6SendRA] / [IPv6Prefix]
+    // sections follow. The enabling directives must be emitted here, before we
+    // open any sub-section, or they would land in the wrong section.
+    if dhcp.is_some() {
+        body.push_str("DHCPServer=yes\n");
+    }
+    if ra.is_some() {
+        body.push_str("IPv6SendRA=yes\n");
+    }
+
     // A built-in DHCP server serving this interface's static subnet. `EmitDNS`
     // and `DNS=` are only written when DNS servers were configured.
     if let Some(d) = dhcp {
-        body.push_str("DHCPServer=yes\n");
         body.push_str("\n[DHCPServer]\n");
         if let Some(off) = d.pool_offset {
             body.push_str(&format!("PoolOffset={off}\n"));
@@ -104,6 +115,31 @@ fn network_body(
         if !d.dns.is_empty() {
             body.push_str("EmitDNS=yes\n");
             body.push_str(&format!("DNS={}\n", d.dns.join(" ")));
+        }
+    }
+
+    // IPv6 Router Advertisements: the [IPv6SendRA] flags/DNS, then one
+    // [IPv6Prefix] per advertised prefix (`Assign=yes` so the router also binds
+    // an address from each prefix to this interface — no separate v6 address).
+    if let Some(r) = ra {
+        body.push_str("\n[IPv6SendRA]\n");
+        if r.managed {
+            body.push_str("Managed=yes\n");
+        }
+        if r.other_config {
+            body.push_str("OtherInformation=yes\n");
+        }
+        if let Some(life) = r.router_lifetime {
+            body.push_str(&format!("RouterLifetimeSec={life}\n"));
+        }
+        if !r.dns.is_empty() {
+            body.push_str("EmitDNS=yes\n");
+            body.push_str(&format!("DNS={}\n", r.dns.join(" ")));
+        }
+        for prefix in &r.prefixes {
+            body.push_str("\n[IPv6Prefix]\n");
+            body.push_str(&format!("Prefix={prefix}\n"));
+            body.push_str("Assign=yes\n");
         }
     }
     body
@@ -160,6 +196,7 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
             i.address.is_some()
                 || (i.parent.is_some() && i.vlan.is_some())
                 || i.is_wireguard()
+                || i.router_advert.is_some()
                 || children.contains_key(i.name.as_str())
         })
         .map(|i| {
@@ -167,7 +204,13 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
             let name = network_name(&i.name);
             writes.push((
                 name.clone(),
-                network_body(&i.name, i.address.as_deref(), kids, i.dhcp_server.as_ref()),
+                network_body(
+                    &i.name,
+                    i.address.as_deref(),
+                    kids,
+                    i.dhcp_server.as_ref(),
+                    i.router_advert.as_ref(),
+                ),
             ));
             keep.insert(name);
             i.name.clone()
@@ -212,14 +255,14 @@ mod tests {
 
     #[test]
     fn static_address_renders_address_directive() {
-        let u = network_body("eth0", Some("10.0.0.1/24"), &[], None);
+        let u = network_body("eth0", Some("10.0.0.1/24"), &[], None, None);
         assert!(u.contains("Name=eth0"));
         assert!(u.contains("Address=10.0.0.1/24"));
     }
 
     #[test]
     fn dhcp_address_renders_dhcp_directive() {
-        let u = network_body("eth0", Some("dhcp"), &[], None);
+        let u = network_body("eth0", Some("dhcp"), &[], None, None);
         assert!(u.contains("DHCP=yes"));
         assert!(!u.contains("Address="));
     }
@@ -240,6 +283,7 @@ mod tests {
             Some("10.0.0.1/24"),
             &["eth1.20".into(), "eth1.30".into()],
             None,
+            None,
         );
         assert!(u.contains("VLAN=eth1.20"));
         assert!(u.contains("VLAN=eth1.30"));
@@ -258,7 +302,7 @@ mod tests {
             dns: vec!["10.0.0.1".into()],
             lease_time: Some(3600),
         };
-        let u = network_body("eth1", Some("10.0.0.1/24"), &[], Some(&dhcp));
+        let u = network_body("eth1", Some("10.0.0.1/24"), &[], Some(&dhcp), None);
         // The static subnet is still bound, and the server is switched on.
         assert!(u.contains("Address=10.0.0.1/24"));
         assert!(u.contains("DHCPServer=yes"));
@@ -279,11 +323,62 @@ mod tests {
             dns: vec![],
             lease_time: None,
         };
-        let u = network_body("eth1", Some("10.0.0.1/24"), &[], Some(&dhcp));
+        let u = network_body("eth1", Some("10.0.0.1/24"), &[], Some(&dhcp), None);
         assert!(u.contains("DHCPServer=yes"));
         assert!(u.contains("[DHCPServer]"));
         assert!(!u.contains("EmitDNS"));
         assert!(!u.contains("DNS="));
+    }
+
+    #[test]
+    fn router_advert_renders_send_ra_prefix_and_dns() {
+        let ra = RouterAdvert {
+            prefixes: vec!["2001:db8:1::/64".into()],
+            dns: vec!["2001:db8:1::1".into()],
+            managed: false,
+            other_config: true,
+            router_lifetime: Some(1800),
+        };
+        let u = network_body("lan0", Some("10.0.0.1/24"), &[], None, Some(&ra));
+        // The enabling directive stays in [Network]; the detail sections follow.
+        assert!(u.contains("IPv6SendRA=yes"));
+        assert!(u.contains("[IPv6SendRA]"));
+        assert!(u.contains("OtherInformation=yes"));
+        assert!(u.contains("RouterLifetimeSec=1800"));
+        assert!(u.contains("EmitDNS=yes"));
+        assert!(u.contains("DNS=2001:db8:1::1"));
+        assert!(u.contains("[IPv6Prefix]"));
+        assert!(u.contains("Prefix=2001:db8:1::/64"));
+        assert!(u.contains("Assign=yes"));
+        assert!(!u.contains("Managed=yes"));
+    }
+
+    #[test]
+    fn dhcp_and_ra_enabling_directives_both_land_in_network_section() {
+        // When an interface runs both a DHCP server and RA, both `DHCPServer=yes`
+        // and `IPv6SendRA=yes` must appear before any sub-section opens, else one
+        // would be swallowed into the other's section.
+        let dhcp = DhcpServer {
+            pool_offset: Some(100),
+            pool_size: Some(10),
+            dns: vec![],
+            lease_time: None,
+        };
+        let ra = RouterAdvert {
+            prefixes: vec!["2001:db8:9::/64".into()],
+            dns: vec![],
+            managed: false,
+            other_config: false,
+            router_lifetime: None,
+        };
+        let u = network_body("lan0", Some("10.0.0.1/24"), &[], Some(&dhcp), Some(&ra));
+        let network_hdr = u.find("[Network]").unwrap();
+        let first_subsection = u.find("[DHCPServer]").unwrap();
+        let dhcp_on = u.find("DHCPServer=yes").unwrap();
+        let ra_on = u.find("IPv6SendRA=yes").unwrap();
+        // Both enabling directives sit inside [Network], above the first section.
+        assert!(network_hdr < dhcp_on && dhcp_on < first_subsection);
+        assert!(network_hdr < ra_on && ra_on < first_subsection);
     }
 
     #[test]
@@ -305,6 +400,7 @@ mod tests {
                 preshared_key: None,
             }],
             dhcp_server: None,
+            router_advert: None,
         };
         let d = wireguard_netdev_body(&iface);
         assert!(d.contains("Kind=wireguard"));

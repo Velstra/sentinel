@@ -1720,6 +1720,97 @@
           '';
         };
 
+        # IPv6 Router Advertisements (SLAAC): the v6 counterpart of the DHCP
+        # check. The fw turns on `router-advert` on eth1, advertising the
+        # 2001:db8:1::/64 prefix (and itself as v6 DNS). Sentinel renders
+        # `IPv6SendRA=yes` + `[IPv6SendRA]`/`[IPv6Prefix]` into the interface's
+        # networkd `.network`, so networkd emits RAs — no radvd. The client is a
+        # plain networkd node accepting RAs; it must autoconfigure a global
+        # 2001:db8:1: address by SLAAC, proving the advertiser works end to end.
+        # `Assign=yes` also binds the router its own address from the prefix, so
+        # no separate IPv6 addressing is needed. The lan zone is set to accept so
+        # the XDP firewall passes the client's Router Solicitation on eth1 (the
+        # fw answers it with a solicited RA immediately).
+        #   nix build .#checks.x86_64-linux.ra -L
+        ra = pkgs.testers.runNixOSTest {
+          name = "sentinel-ra";
+          nodes = {
+            client =
+              { ... }:
+              {
+                virtualisation.vlans = [ 1 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                };
+                # Accept RAs on eth1 and form a SLAAC address from the advertised
+                # prefix.
+                systemd.network.networks."10-eth1" = {
+                  matchConfig.Name = "eth1";
+                  networkConfig.IPv6AcceptRA = true;
+                };
+              };
+            fw =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "fw";
+                networking.firewall.enable = lib.mkForce false;
+                # eth1's addressing + RA are configured via sentinel (it owns the
+                # .network unit); Assign=yes gives the router its v6 address.
+                virtualisation.vlans = [ 1 ];
+                virtualisation.memorySize = 2048;
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+          };
+          testScript = ''
+            start_all()
+            fw.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+
+            # Turn on RA (SLAAC) for the 2001:db8:1::/64 prefix on eth1, on a lan
+            # zone set to accept so the XDP firewall passes the client's Router
+            # Solicitation. ONE `set` per line (the inline multi-field form does
+            # not parse).
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth1 zone lan' "
+                "'set firewall zone lan default-action accept' "
+                "'set interface eth1 router-advert enable' "
+                "'set interface eth1 router-advert prefix 2001:db8:1::/64' "
+                "'set interface eth1 router-advert dns 2001:db8:1::1' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            fw.wait_for_unit("velstra.service")
+
+            # Sentinel rendered the RA sender into eth1's networkd .network.
+            fw.wait_until_succeeds(
+                "test -f /run/systemd/network/10-sentinel-eth1.network", timeout=20
+            )
+            netw = fw.succeed("cat /run/systemd/network/10-sentinel-eth1.network")
+            assert "IPv6SendRA=yes" in netw, netw
+            assert "[IPv6SendRA]" in netw, netw
+            assert "[IPv6Prefix]" in netw, netw
+            assert "Prefix=2001:db8:1::/64" in netw, netw
+            assert "Assign=yes" in netw, netw
+
+            # The router bound its own address from the advertised prefix.
+            fw.wait_until_succeeds(
+                "ip -6 addr show eth1 | grep -qi '2001:db8:1:'", timeout=30
+            )
+
+            # The client autoconfigures a global 2001:db8:1: address by SLAAC.
+            # A solicited RA answers the client's RS near-instantly; allow a
+            # generous timeout for boot + the exchange.
+            client.wait_for_unit("multi-user.target")
+            client.wait_until_succeeds(
+                "ip -6 addr show eth1 | grep -qi '2001:db8:1:'", timeout=90
+            )
+          '';
+        };
+
         # Routing: two Sentinel appliances peer eBGP and each learns the other's
         # network — end-to-end proof that the Wren control plane is wired into the
         # image (packaged, serviced, config-compiled from `set protocols …`) and
