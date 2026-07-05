@@ -126,13 +126,7 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
             }
             Err(e) => Err(anyhow!("resolving the sentinel binary: {e}")),
         },
-        "compare" => session.compare().map(|d| {
-            if d.is_empty() {
-                eprintln!("no changes (candidate matches the saved config)");
-            } else {
-                print!("{d}");
-            }
-        }),
+        "compare" => do_compare(session, rest),
         "commit" => return commit(session, act),
         "commit-confirm" => return commit_confirm_line(session, act, rest),
         "confirm" => crate::confirm::confirm(act),
@@ -226,6 +220,29 @@ fn commit_confirm_line(session: &mut Session, act: &Apply, rest: &[&str]) -> boo
         eprintln!("error: {e}");
     }
     false
+}
+
+/// `compare [<N> [<M>]]`: diff the candidate against the saved config (no args),
+/// against archived revision N (one arg), or revision N against revision M (two
+/// args) — the VyOS `compare` spellings. Prints the diff or a "no differences"
+/// note.
+fn do_compare(session: &Session, rest: &[&str]) -> Result<()> {
+    let rev = |s: &str| -> Result<usize> {
+        s.parse::<usize>()
+            .map_err(|_| anyhow!("compare: {s:?} is not a revision number (see `run show system commit`)"))
+    };
+    let diff = match rest {
+        [] => session.compare()?,
+        [n] => session.compare_revision(rev(n)?)?,
+        [n, m] => session.compare_revisions(rev(n)?, rev(m)?)?,
+        _ => return Err(anyhow!("compare [<rev> [<rev>]] — 0, 1 or 2 revision numbers")),
+    };
+    if diff.is_empty() {
+        eprintln!("no differences");
+    } else {
+        print!("{diff}");
+    }
+    Ok(())
 }
 
 /// `rollback <N>`: revert the running system to archived revision N (0 = newest)
@@ -420,7 +437,9 @@ commands:
   up | top                move one level up / back to the top of the tree
   run <op command>        run an operational command from config mode,
                           e.g.  run show ip route   run show ip bgp summary
-  compare                 diff the candidate against the saved config
+  compare [<N> [<M>]]     diff the candidate vs the saved config (no args),
+                          vs archived revision N, or revision N vs revision M
+                          (list revisions with `run show system commit`)
   commit                  apply the candidate to the RUNNING system (live)
   commit-confirm [mins]   apply live, then auto-revert to the saved config after
                           `mins` (default 10) unless you `confirm` — the safety
@@ -446,7 +465,7 @@ const COMMANDS: &[Cand] = &[
     ("up", "move one level up from the edit context"),
     ("top", "return to the top of the config tree"),
     ("run", "run an operational command (e.g. run show ip route)"),
-    ("compare", "diff the candidate against the saved config"),
+    ("compare", "diff the candidate vs saved, or vs/between archived revisions"),
     ("commit", "apply the candidate to the running system (live)"),
     ("commit-confirm", "apply live with an auto-rollback timer (default 10 min)"),
     ("confirm", "keep a commit-confirm change (cancel the auto-rollback)"),
