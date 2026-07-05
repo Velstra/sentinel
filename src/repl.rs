@@ -136,6 +136,7 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
         "commit" => return commit(session, act),
         "commit-confirm" => return commit_confirm_line(session, act, rest),
         "confirm" => crate::confirm::confirm(act),
+        "rollback" => return rollback_line(session, act, rest),
         "save" => {
             let to = rest.first().map(Path::new);
             session
@@ -223,6 +224,21 @@ fn commit_confirm_line(session: &mut Session, act: &Apply, rest: &[&str]) -> boo
     };
     if let Err(e) = crate::confirm::commit_confirm(session, act, minutes) {
         eprintln!("error: {e}");
+    }
+    false
+}
+
+/// `rollback <N>`: revert the running system to archived revision N (0 = newest)
+/// — the config-history counterpart to `commit-confirm` (roadmap C21). Never
+/// exits the shell. Returns `false`.
+fn rollback_line(session: &mut Session, act: &Apply, rest: &[&str]) -> bool {
+    let Some(n) = rest.first().and_then(|s| s.parse::<usize>().ok()) else {
+        eprintln!("error: rollback <N> needs a revision number (see `run show system commit`)");
+        return false;
+    };
+    match crate::archive::rollback(session, act, n) {
+        Ok(()) => eprintln!("rolled back to revision {n} (applied live + saved)."),
+        Err(e) => eprintln!("error: {e}"),
     }
     false
 }
@@ -410,6 +426,8 @@ commands:
                           net for editing a firewall over its own link
   confirm                 keep a commit-confirm change (cancel the auto-revert)
   save [path]             persist the config so it survives a reboot
+  rollback <N>            revert to archived revision N (0 = newest); list them
+                          with `run show system commit`
   discard                 drop edits, reload from disk
   exit | quit             leave the edit context / configuration mode
   (Tab or `?` lists commands, config keys, and value keywords.)
@@ -432,6 +450,7 @@ const COMMANDS: &[Cand] = &[
     ("commit-confirm", "apply live with an auto-rollback timer (default 10 min)"),
     ("confirm", "keep a commit-confirm change (cancel the auto-rollback)"),
     ("save", "persist the configuration across reboot"),
+    ("rollback", "revert to an archived config revision (N; 0 = newest)"),
     ("discard", "drop uncommitted edits"),
     ("exit", "leave the edit context / configuration mode"),
     ("help", "show command help"),
@@ -959,6 +978,7 @@ mod tests {
                 "commit-confirm",
                 "confirm",
                 "save",
+                "rollback",
                 "discard",
                 "exit",
                 "help"

@@ -1867,12 +1867,20 @@ impl Session {
         // directory (the admin has it via the wheel group), so this replaces a
         // root-owned/read-only seed file cleanly — and the agent never sees a
         // half-written config.
+        let toml = appliance.to_toml()?;
         let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, appliance.to_toml()?)
-            .with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::write(&tmp, &toml).with_context(|| format!("writing {}", tmp.display()))?;
         std::fs::rename(&tmp, &path)
             .with_context(|| format!("installing {}", path.display()))?;
         self.dirty = false;
+        // Archive this revision (only when saving the box's own config, not an
+        // ad-hoc `save <path>` export). Best-effort — a failed archive must never
+        // fail the save that already landed.
+        if to.is_none() {
+            if let Err(e) = crate::archive::archive_config(&path, &toml) {
+                eprintln!("warning: could not archive this config revision: {e}");
+            }
+        }
         Ok(path)
     }
 
