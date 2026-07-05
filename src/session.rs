@@ -14,9 +14,9 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::{
     Action, Appliance, Bgp, BgpNeighbor, DhcpServer, Dns, Firewall, Groups, HealthCheck, IfaceType,
-    Interface, Isis, MultiWan, Nat, NatDestination, NatSource, Ntp, Ospf, Ospf3, PortSpec, Pppoe,
-    Proto, Protocols, Qos, QosDiscipline, Rip, RouterAdvert, Rule, Services, StaticRoute, System,
-    Vrrp, WanMode, WanUplink, WgPeer, ZoneCfg,
+    Interface, IpsecConnection, Isis, MultiWan, Nat, NatDestination, NatSource, Ntp, Ospf, Ospf3,
+    PortSpec, Pppoe, Proto, Protocols, Qos, QosDiscipline, Rip, RouterAdvert, Rule, Services,
+    StaticRoute, System, Vpn, Vrrp, WanMode, WanUplink, WgPeer, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -339,6 +339,9 @@ struct Draft {
     /// interface in configuration order.
     multiwan_mode: Option<WanMode>,
     uplinks: Vec<(String, UplinkDraft)>,
+    /// IPsec tunnels (roadmap C2): IKEv2 site-to-site connections, keyed by name
+    /// in configuration order.
+    ipsec: Vec<(String, IpsecDraft)>,
 }
 
 /// A partially-specified DNS forwarder (`[services.dns]`).
@@ -373,6 +376,25 @@ struct UplinkDraft {
     timeout: Option<u32>,
     fail: Option<u32>,
     rise: Option<u32>,
+}
+
+/// A partially-specified IPsec connection (`[[vpn.ipsec]]`), keyed by its name in
+/// the draft. The required fields (endpoints, subnets, psk) are `Option` here and
+/// checked at materialize/validate time so the CLI can build a connection up
+/// incrementally.
+#[derive(Debug, Clone, Default)]
+struct IpsecDraft {
+    local: Option<String>,
+    remote: Option<String>,
+    local_subnet: Option<String>,
+    remote_subnet: Option<String>,
+    psk: Option<String>,
+    ike_version: Option<u8>,
+    ike_proposal: Option<String>,
+    esp_proposal: Option<String>,
+    local_id: Option<String>,
+    remote_id: Option<String>,
+    start_action: Option<String>,
 }
 
 impl Draft {
@@ -422,6 +444,16 @@ impl Draft {
         self.uplinks
             .push((iface.to_string(), UplinkDraft::default()));
         &mut self.uplinks.last_mut().unwrap().1
+    }
+
+    /// Mutable access to the IPsec connection `name`, inserting it if new (IPsec
+    /// connections are keyed by their name in configuration order).
+    fn ipsec_mut(&mut self, name: &str) -> &mut IpsecDraft {
+        if let Some(i) = self.ipsec.iter().position(|(n, _)| n == name) {
+            return &mut self.ipsec[i].1;
+        }
+        self.ipsec.push((name.to_string(), IpsecDraft::default()));
+        &mut self.ipsec.last_mut().unwrap().1
     }
 }
 
@@ -745,6 +777,29 @@ impl Draft {
                             timeout: u.check.timeout,
                             fail: u.check.fail,
                             rise: u.check.rise,
+                        },
+                    )
+                })
+                .collect(),
+            ipsec: a
+                .vpn
+                .ipsec
+                .iter()
+                .map(|c| {
+                    (
+                        c.name.clone(),
+                        IpsecDraft {
+                            local: Some(c.local.clone()),
+                            remote: Some(c.remote.clone()),
+                            local_subnet: Some(c.local_subnet.clone()),
+                            remote_subnet: Some(c.remote_subnet.clone()),
+                            psk: Some(c.psk.clone()),
+                            ike_version: c.ike_version,
+                            ike_proposal: c.ike_proposal.clone(),
+                            esp_proposal: c.esp_proposal.clone(),
+                            local_id: c.local_id.clone(),
+                            remote_id: c.remote_id.clone(),
+                            start_action: c.start_action.clone(),
                         },
                     )
                 })
@@ -1513,6 +1568,59 @@ impl Session {
                         .with_context(|| format!("invalid rise count {v:?}"))?,
                 );
             }
+
+            // vpn ipsec (roadmap C2): IKEv2 site-to-site tunnels, keyed by name.
+            ["vpn", "ipsec", name, "local", v] => {
+                validate_ipv4(v)?;
+                self.draft.ipsec_mut(name).local = Some((*v).to_string());
+            }
+            ["vpn", "ipsec", name, "remote", v] => {
+                validate_ipv4(v)?;
+                self.draft.ipsec_mut(name).remote = Some((*v).to_string());
+            }
+            ["vpn", "ipsec", name, "local-subnet", v] => {
+                crate::config::validate_cidr_or_ip(v)?;
+                self.draft.ipsec_mut(name).local_subnet = Some((*v).to_string());
+            }
+            ["vpn", "ipsec", name, "remote-subnet", v] => {
+                crate::config::validate_cidr_or_ip(v)?;
+                self.draft.ipsec_mut(name).remote_subnet = Some((*v).to_string());
+            }
+            ["vpn", "ipsec", name, "psk", v] => {
+                self.draft.ipsec_mut(name).psk = Some((*v).to_string());
+            }
+            ["vpn", "ipsec", name, "ike-version", v] => {
+                let n: u8 = v
+                    .parse()
+                    .with_context(|| format!("invalid ike-version {v:?}"))?;
+                if n != 1 && n != 2 {
+                    bail!("ike-version {n} must be 1 or 2");
+                }
+                self.draft.ipsec_mut(name).ike_version = Some(n);
+            }
+            ["vpn", "ipsec", name, "ike-proposal", v] => {
+                crate::config::validate_ipsec_proposal(v)?;
+                self.draft.ipsec_mut(name).ike_proposal = Some((*v).to_string());
+            }
+            ["vpn", "ipsec", name, "esp-proposal", v] => {
+                crate::config::validate_ipsec_proposal(v)?;
+                self.draft.ipsec_mut(name).esp_proposal = Some((*v).to_string());
+            }
+            ["vpn", "ipsec", name, "local-id", v] => {
+                crate::config::validate_ipsec_id(v)?;
+                self.draft.ipsec_mut(name).local_id = Some((*v).to_string());
+            }
+            ["vpn", "ipsec", name, "remote-id", v] => {
+                crate::config::validate_ipsec_id(v)?;
+                self.draft.ipsec_mut(name).remote_id = Some((*v).to_string());
+            }
+            ["vpn", "ipsec", name, "start-action", v] => {
+                if !matches!(*v, "start" | "trap" | "none") {
+                    bail!("invalid start-action {v:?} (expected start|trap|none)");
+                }
+                self.draft.ipsec_mut(name).start_action = Some((*v).to_string());
+            }
+
             _ => bail!(
                 "unknown set path. The config tree (Tab/`?` explores each level):\n  \
                  set system hostname <name>\n  \
@@ -1541,7 +1649,9 @@ impl Session {
                  set protocols vrrp <name> <interface <if> | vrid <n> | priority <n> | virtual-address <ip>>\n  \
                  set multiwan mode <failover|load-balance>\n  \
                  set multiwan uplink <if> <priority <n> | weight <n> | table <n> | gateway <ip|dhcp>>\n  \
-                 set multiwan uplink <if> check <target <ip> | interval <n> | timeout <n> | fail <n> | rise <n>>"
+                 set multiwan uplink <if> check <target <ip> | interval <n> | timeout <n> | fail <n> | rise <n>>\n  \
+                 set vpn ipsec <name> <local <ip> | remote <ip> | local-subnet <cidr> | remote-subnet <cidr> | psk <key>>\n  \
+                 set vpn ipsec <name> <ike-version <1|2> | ike-proposal <p> | esp-proposal <p> | local-id <id> | remote-id <id> | start-action <start|trap|none>>"
             ),
         }
         self.dirty = true;
@@ -1980,6 +2090,36 @@ impl Session {
                     other => bail!("multiwan uplink has no field {other:?}"),
                 }
             }
+
+            // vpn ipsec (roadmap C2). Bare `delete vpn` clears every tunnel; the
+            // rest clear one connection or one of its optional fields (the
+            // required endpoints/subnets/psk can only be replaced, not cleared —
+            // delete the whole connection to remove them).
+            ["vpn"] => self.draft.ipsec.clear(),
+            ["vpn", "ipsec"] => self.draft.ipsec.clear(),
+            ["vpn", "ipsec", name] => {
+                let before = self.draft.ipsec.len();
+                self.draft.ipsec.retain(|(n, _)| n != name);
+                if self.draft.ipsec.len() == before {
+                    bail!("no vpn ipsec connection {name:?}");
+                }
+            }
+            ["vpn", "ipsec", name, field] => {
+                let d = self.ipsec(name)?;
+                match *field {
+                    "ike-version" => d.ike_version = None,
+                    "ike-proposal" => d.ike_proposal = None,
+                    "esp-proposal" => d.esp_proposal = None,
+                    "local-id" => d.local_id = None,
+                    "remote-id" => d.remote_id = None,
+                    "start-action" => d.start_action = None,
+                    "local" | "remote" | "local-subnet" | "remote-subnet" | "psk" => bail!(
+                        "vpn ipsec {name:?}: {field} is required — delete the whole connection \
+                         (`delete vpn ipsec {name}`) to remove it"
+                    ),
+                    other => bail!("vpn ipsec connection has no field {other:?}"),
+                }
+            }
             _ => bail!("unknown delete path"),
         }
         self.dirty = true;
@@ -2031,6 +2171,15 @@ impl Session {
             .ok_or_else(|| anyhow::anyhow!("no multiwan uplink {iface:?}"))
     }
 
+    fn ipsec(&mut self, name: &str) -> Result<&mut IpsecDraft> {
+        self.draft
+            .ipsec
+            .iter_mut()
+            .find(|(n, _)| n == name)
+            .map(|(_, d)| d)
+            .ok_or_else(|| anyhow::anyhow!("no vpn ipsec connection {name:?}"))
+    }
+
     /// Render the candidate in a readable, hierarchical (JunOS-curly) form.
     pub fn show(&self) -> String {
         render_draft(&self.draft, false)
@@ -2041,7 +2190,7 @@ impl Session {
     pub fn show_only(&self, section: &str) -> String {
         match section {
             "system" | "interface" | "interfaces" | "firewall" | "nat" | "protocols"
-            | "services" | "multiwan" => {
+            | "services" | "multiwan" | "vpn" => {
                 let out = render_draft_only(&self.draft, false, Some(section));
                 if out.is_empty() {
                     format!("(no {section} configuration)\n")
@@ -2050,7 +2199,7 @@ impl Session {
                 }
             }
             other => format!(
-                "error: unknown section {other:?} (system | interfaces | firewall | nat | protocols | services | multiwan)\n"
+                "error: unknown section {other:?} (system | interfaces | firewall | nat | protocols | services | multiwan | vpn)\n"
             ),
         }
     }
@@ -2414,6 +2563,32 @@ impl Session {
                 .collect(),
         };
 
+        // vpn ipsec (roadmap C2): the IKEv2 site-to-site tunnels. Required fields
+        // fall back to empty strings so validation surfaces a clear "X is
+        // required" / "not an IPv4" message rather than silently dropping a
+        // half-specified connection.
+        let vpn = Vpn {
+            ipsec: self
+                .draft
+                .ipsec
+                .iter()
+                .map(|(name, d)| IpsecConnection {
+                    name: name.clone(),
+                    local: d.local.clone().unwrap_or_default(),
+                    remote: d.remote.clone().unwrap_or_default(),
+                    local_subnet: d.local_subnet.clone().unwrap_or_default(),
+                    remote_subnet: d.remote_subnet.clone().unwrap_or_default(),
+                    psk: d.psk.clone().unwrap_or_default(),
+                    ike_version: d.ike_version,
+                    ike_proposal: d.ike_proposal.clone(),
+                    esp_proposal: d.esp_proposal.clone(),
+                    local_id: d.local_id.clone(),
+                    remote_id: d.remote_id.clone(),
+                    start_action: d.start_action.clone(),
+                })
+                .collect(),
+        };
+
         let appliance = Appliance {
             system: System { hostname },
             firewall,
@@ -2439,6 +2614,7 @@ impl Session {
                 },
             },
             multiwan,
+            vpn,
         };
         appliance.validate()?;
         Ok(appliance)
@@ -3092,6 +3268,49 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         out.push_str("}\n");
     }
 
+    // vpn { ipsec <name> { … } } — IKEv2 site-to-site IPsec (roadmap C2).
+    if want("vpn") && !draft.ipsec.is_empty() {
+        out.push_str("vpn {\n");
+        for (name, c) in &draft.ipsec {
+            out.push_str(&format!("    ipsec {name} {{\n"));
+            if let Some(v) = &c.local {
+                out.push_str(&format!("        local {v}\n"));
+            }
+            if let Some(v) = &c.remote {
+                out.push_str(&format!("        remote {v}\n"));
+            }
+            if let Some(v) = &c.local_subnet {
+                out.push_str(&format!("        local-subnet {v}\n"));
+            }
+            if let Some(v) = &c.remote_subnet {
+                out.push_str(&format!("        remote-subnet {v}\n"));
+            }
+            if let Some(v) = &c.psk {
+                out.push_str(&format!("        psk {v}\n"));
+            }
+            if let Some(v) = c.ike_version {
+                out.push_str(&format!("        ike-version {v}\n"));
+            }
+            if let Some(v) = &c.ike_proposal {
+                out.push_str(&format!("        ike-proposal {v}\n"));
+            }
+            if let Some(v) = &c.esp_proposal {
+                out.push_str(&format!("        esp-proposal {v}\n"));
+            }
+            if let Some(v) = &c.local_id {
+                out.push_str(&format!("        local-id {v}\n"));
+            }
+            if let Some(v) = &c.remote_id {
+                out.push_str(&format!("        remote-id {v}\n"));
+            }
+            if let Some(v) = &c.start_action {
+                out.push_str(&format!("        start-action {v}\n"));
+            }
+            out.push_str("    }\n");
+        }
+        out.push_str("}\n");
+    }
+
     if out.is_empty() && !skip_empty_ifaces {
         out.push_str("(empty configuration)\n");
     }
@@ -3292,6 +3511,62 @@ mod tests {
         // wan9 isn't a declared interface → commit-time validation rejects it.
         let err = s.commit().unwrap_err().to_string();
         assert!(err.contains("not a declared interface"), "got: {err}");
+    }
+
+    #[test]
+    fn ipsec_cli_builds_shows_commits_and_deletes() {
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname gw",
+            "set vpn ipsec site local 203.0.113.1",
+            "set vpn ipsec site remote 198.51.100.1",
+            "set vpn ipsec site local-subnet 10.0.0.0/24",
+            "set vpn ipsec site remote-subnet 10.1.0.0/24",
+            "set vpn ipsec site psk super-secret-key",
+            "set vpn ipsec site start-action trap",
+        ] {
+            run(&mut s, line).unwrap();
+        }
+        // The show block round-trips the connection + its fields.
+        let shown = s.show_only("vpn");
+        assert!(shown.contains("vpn {"), "got:\n{shown}");
+        assert!(shown.contains("ipsec site {"), "got:\n{shown}");
+        assert!(shown.contains("local 203.0.113.1"), "got:\n{shown}");
+        assert!(shown.contains("remote-subnet 10.1.0.0/24"), "got:\n{shown}");
+        assert!(shown.contains("start-action trap"), "got:\n{shown}");
+
+        let a = s.commit().expect("valid ipsec commits");
+        assert_eq!(a.vpn.ipsec.len(), 1);
+        let c = &a.vpn.ipsec[0];
+        assert_eq!(c.name, "site");
+        assert_eq!(c.local, "203.0.113.1");
+        assert_eq!(c.remote_subnet, "10.1.0.0/24");
+        assert_eq!(c.psk, "super-secret-key");
+        assert_eq!(c.start_action.as_deref(), Some("trap"));
+
+        // Deleting an optional field, then the whole connection.
+        run(&mut s, "delete vpn ipsec site start-action").unwrap();
+        let b = s.commit().expect("still valid after field delete");
+        assert!(b.vpn.ipsec[0].start_action.is_none());
+        run(&mut s, "delete vpn ipsec site").unwrap();
+        let d = s.commit().expect("still valid after connection delete");
+        assert!(d.vpn.ipsec.is_empty());
+    }
+
+    #[test]
+    fn ipsec_requires_a_psk_and_valid_endpoints() {
+        let mut s = Session::empty();
+        run(&mut s, "set system hostname gw").unwrap();
+        run(&mut s, "set vpn ipsec site local 203.0.113.1").unwrap();
+        run(&mut s, "set vpn ipsec site remote 198.51.100.1").unwrap();
+        run(&mut s, "set vpn ipsec site local-subnet 10.0.0.0/24").unwrap();
+        run(&mut s, "set vpn ipsec site remote-subnet 10.1.0.0/24").unwrap();
+        // No psk yet → commit-time validation rejects it.
+        let err = s.commit().unwrap_err().to_string();
+        assert!(err.contains("psk is required"), "got: {err}");
+        // A bad endpoint is rejected at set time.
+        let bad = run(&mut s, "set vpn ipsec site remote not-an-ip").unwrap_err();
+        assert!(bad.to_string().contains("IPv4"), "got: {bad}");
     }
 
     #[test]

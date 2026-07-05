@@ -147,6 +147,57 @@ pub fn ip_route_flush_table(table: u32) -> Result<()> {
     run_priv("ip", &["route", "flush", "table", &table.to_string()])
 }
 
+/// Load a rendered strongSwan swanctl config into the running `charon` daemon
+/// (roadmap C2 IPsec): `swanctl --load-all --file <path> --noprompt`. `--load-all`
+/// reconciles connections, children and secrets to exactly what the file
+/// declares (unloading anything removed), so a re-load after a config change
+/// applies adds and removals in one step; `--noprompt` never blocks on a missing
+/// credential. Only invoked (by [`crate::ipsec`]) when the rendered config
+/// changed, or to (re)assert a tunnel at boot.
+pub fn swanctl_load(path: &Path) -> Result<()> {
+    let Some(p) = path.to_str() else {
+        bail!("non-UTF-8 path");
+    };
+    run_priv("swanctl", &["--load-all", "--file", p, "--noprompt"])
+}
+
+/// Run a read-only `swanctl` query and return its stdout (for `show vpn` — the
+/// SA / connection state). charon's vici control socket is root-only, so this
+/// must run privileged: directly when already root, else via `sudo` (the admin
+/// is passwordless-wheel on the appliance). The exit code is ignored, like the
+/// other `show` paths, so an empty/inactive daemon still prints cleanly.
+pub fn swanctl_show(args: &[&str]) -> Result<String> {
+    let is_root = unsafe { libc::geteuid() } == 0;
+    let swanctl = bin("swanctl");
+    let output = if is_root {
+        Command::new(&swanctl).args(args).output()
+    } else {
+        let mut all = vec![swanctl.as_str()];
+        all.extend_from_slice(args);
+        Command::new("sudo").args(&all).output()
+    };
+    let out = output.with_context(|| "running swanctl")?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Install a strongSwan PSK secrets file at a root-owned `path`, mode **0600
+/// root:root**. `charon` runs as root, so the pre-shared key never needs to leave
+/// root — 0600 is the tightest mode that still works. Staged in `/run/sentinel`
+/// (wheel-writable) then `install`-ed atomically, so there is never a window
+/// where the key is group- or world-readable, in both the boot-service (root) and
+/// `configure` (admin) paths.
+pub fn install_ipsec_secret(path: &Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    let tmp = Path::new("/run/sentinel").join(".ipsec-secret.tmp");
+    std::fs::write(&tmp, contents).with_context(|| format!("staging {}", tmp.display()))?;
+    let (Some(tmp_s), Some(dst_s)) = (tmp.to_str(), path.to_str()) else {
+        bail!("non-UTF-8 path");
+    };
+    sudo("install", &["-m", "0600", tmp_s, dst_s])
+}
+
 /// The transient systemd unit base name for the `commit-confirm` auto-rollback.
 /// `systemd-run --unit=<this>` creates `<this>.timer` + `<this>.service`.
 pub const CONFIRM_UNIT: &str = "sentinel-confirm";
@@ -333,6 +384,7 @@ pub fn bin(name: &str) -> String {
         "wren" => "SENTINEL_WREN_BIN",
         "nft" => "SENTINEL_NFT_BIN",
         "tc" => "SENTINEL_TC_BIN",
+        "swanctl" => "SENTINEL_SWANCTL_BIN",
         "lsblk" => "SENTINEL_LSBLK_BIN",
         "install" => "SENTINEL_INSTALL_BIN",
         "mkdir" => "SENTINEL_MKDIR_BIN",

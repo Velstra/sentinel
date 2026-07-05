@@ -160,6 +160,14 @@ port = 443
 # gateway = "198.51.100.1"
 # [multiwan.uplink.health-check]
 # targets = ["1.0.0.1"]
+#
+# [[vpn.ipsec]]
+# name = "site-a"
+# local = "203.0.113.1"
+# remote = "198.51.100.1"
+# local-subnet = "10.0.0.0/24"
+# remote-subnet = "10.1.0.0/24"
+# psk = "change-me-to-a-strong-shared-secret"
 "#;
 
 /// The whole declarative appliance config.
@@ -209,6 +217,12 @@ pub struct Appliance {
     /// saved configs when no uplink is declared.
     #[serde(default, skip_serializing_if = "MultiWan::is_empty")]
     pub multiwan: MultiWan,
+    /// VPN services (roadmap C2): IKEv2 site-to-site IPsec today (strongSwan);
+    /// OpenVPN / road-warrior land here later. A distinct top-level category
+    /// grouped like [`Services`] so VPN types share one namespace. Omitted from
+    /// saved configs when no tunnel is declared.
+    #[serde(default, skip_serializing_if = "Vpn::is_empty")]
+    pub vpn: Vpn,
 }
 
 /// The box-wide services category (`[services.*]`). A thin grouping so DNS, NTP
@@ -717,6 +731,102 @@ impl HealthCheck {
             && self.fail.is_none()
             && self.rise.is_none()
     }
+}
+
+/// VPN services (roadmap C2). Currently IKEv2 site-to-site IPsec (strongSwan);
+/// OpenVPN / road-warrior responders land here later. Grouped like [`Services`]
+/// so VPN types share one `[vpn.*]` namespace instead of sprawling across the
+/// top level. Empty by default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Vpn {
+    /// IKEv2 site-to-site IPsec connections (`[[vpn.ipsec]]`), rendered to a
+    /// strongSwan swanctl.conf + a 0600 PSK secrets file.
+    #[serde(default, rename = "ipsec", skip_serializing_if = "Vec::is_empty")]
+    pub ipsec: Vec<IpsecConnection>,
+}
+
+impl Vpn {
+    /// True when no VPN is configured — lets `[vpn]` be omitted from output.
+    pub fn is_empty(&self) -> bool {
+        self.ipsec.is_empty()
+    }
+}
+
+/// Default IKE (phase-1) proposal when none is given: AES-256 / SHA-256 with a
+/// 2048-bit MODP DH group — a strong, near-universally-interoperable baseline.
+pub const DEFAULT_IKE_PROPOSAL: &str = "aes256-sha256-modp2048";
+/// Default ESP (phase-2) proposal when none is given — the same suite, so the
+/// child SA gets PFS from the modp2048 group.
+pub const DEFAULT_ESP_PROPOSAL: &str = "aes256-sha256-modp2048";
+/// Default child-SA start action: initiate the tunnel as soon as the config is
+/// loaded (the friendly default for a site-to-site that should come up now).
+pub const DEFAULT_IPSEC_START_ACTION: &str = "start";
+
+/// One IKEv2 site-to-site IPsec connection (`[[vpn.ipsec]]`) — a policy-based
+/// tunnel between two endpoints authenticated with a pre-shared key. Compiled to
+/// a strongSwan swanctl `connections`/`children` block plus a 0600 `secrets`
+/// entry for the PSK (never written into the world-readable swanctl.conf).
+/// Route-based (XFRM-interface) mode with a firewall zone, road-warrior
+/// responders (`%any` remotes + EAP) and certificate auth are follow-ups.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IpsecConnection {
+    /// Connection name — the swanctl connection id and the secrets tag. Required;
+    /// restricted to `[A-Za-z0-9_-]` since it is rendered as a config section key.
+    pub name: String,
+    /// This box's IKE endpoint address (`local_addrs`). Required — an IPv4.
+    pub local: String,
+    /// The peer's IKE endpoint address (`remote_addrs`). Required — an IPv4.
+    pub remote: String,
+    /// The local protected subnet — the child SA's `local_ts` traffic selector.
+    /// Required — an IPv4 CIDR (or host).
+    #[serde(rename = "local-subnet")]
+    pub local_subnet: String,
+    /// The remote protected subnet — the child SA's `remote_ts`. Required — an
+    /// IPv4 CIDR (or host).
+    #[serde(rename = "remote-subnet")]
+    pub remote_subnet: String,
+    /// The pre-shared key. Secret — rendered to a 0600 secrets file, never into
+    /// the swanctl.conf. Required.
+    pub psk: String,
+    /// IKE major version: `2` (IKEv2, the default) or `1` (IKEv1). Unset ⇒ 2.
+    #[serde(
+        default,
+        rename = "ike-version",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ike_version: Option<u8>,
+    /// IKE (phase-1) cipher proposal (`aes256-sha256-modp2048`, …). Unset ⇒
+    /// [`DEFAULT_IKE_PROPOSAL`].
+    #[serde(
+        default,
+        rename = "ike-proposal",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ike_proposal: Option<String>,
+    /// ESP (phase-2) cipher proposal. Unset ⇒ [`DEFAULT_ESP_PROPOSAL`].
+    #[serde(
+        default,
+        rename = "esp-proposal",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub esp_proposal: Option<String>,
+    /// The local IKE identity (`local.id`). Unset ⇒ the `local` address.
+    #[serde(default, rename = "local-id", skip_serializing_if = "Option::is_none")]
+    pub local_id: Option<String>,
+    /// The remote IKE identity (`remote.id`). Unset ⇒ the `remote` address.
+    #[serde(default, rename = "remote-id", skip_serializing_if = "Option::is_none")]
+    pub remote_id: Option<String>,
+    /// Child-SA start action: `start` (initiate on load — the default), `trap`
+    /// (install a policy and initiate on first matching packet) or `none` (wait
+    /// for the peer — a responder). Unset ⇒ [`DEFAULT_IPSEC_START_ACTION`].
+    #[serde(
+        default,
+        rename = "start-action",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub start_action: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2074,6 +2184,78 @@ impl Appliance {
                 })?;
             }
         }
+
+        // VPN / IPsec (roadmap C2): a policy-based IKEv2 site-to-site tunnel.
+        // Names are unique + section-key-safe; endpoints are IPv4; the traffic
+        // selectors are IPv4 CIDRs; a PSK is mandatory; the IKE version,
+        // start-action and proposals come from the accepted sets/charset (all
+        // three are rendered verbatim into swanctl.conf, so they are a security
+        // boundary — a value must not smuggle a config line).
+        let mut seen_vpn: HashSet<&str> = HashSet::new();
+        for c in &self.vpn.ipsec {
+            if c.name.is_empty() {
+                bail!("vpn ipsec: a connection name must not be empty");
+            }
+            if !c
+                .name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            {
+                bail!(
+                    "vpn ipsec {:?}: name may only contain letters, digits, '-' and '_'",
+                    c.name
+                );
+            }
+            if !seen_vpn.insert(c.name.as_str()) {
+                bail!("vpn ipsec: duplicate connection {:?}", c.name);
+            }
+            validate_ipv4(&c.local).with_context(|| format!("vpn ipsec {:?} local", c.name))?;
+            validate_ipv4(&c.remote).with_context(|| format!("vpn ipsec {:?} remote", c.name))?;
+            validate_cidr_or_ip(&c.local_subnet)
+                .with_context(|| format!("vpn ipsec {:?} local-subnet", c.name))?;
+            validate_cidr_or_ip(&c.remote_subnet)
+                .with_context(|| format!("vpn ipsec {:?} remote-subnet", c.name))?;
+            if c.psk.is_empty() {
+                bail!("vpn ipsec {:?}: psk is required", c.name);
+            }
+            // The PSK is rendered inside double quotes in the secrets file — a
+            // quote or a newline would break out of it.
+            if c.psk.bytes().any(|b| b == b'"' || b == b'\n' || b == b'\r') {
+                bail!(
+                    "vpn ipsec {:?}: psk must not contain a quote or newline",
+                    c.name
+                );
+            }
+            if let Some(v) = c.ike_version {
+                if v != 1 && v != 2 {
+                    bail!("vpn ipsec {:?}: ike-version {v} must be 1 or 2", c.name);
+                }
+            }
+            if let Some(sa) = &c.start_action {
+                if !matches!(sa.as_str(), "start" | "trap" | "none") {
+                    bail!(
+                        "vpn ipsec {:?}: start-action {sa:?} must be start|trap|none",
+                        c.name
+                    );
+                }
+            }
+            if let Some(p) = &c.ike_proposal {
+                validate_ipsec_proposal(p)
+                    .with_context(|| format!("vpn ipsec {:?} ike-proposal", c.name))?;
+            }
+            if let Some(p) = &c.esp_proposal {
+                validate_ipsec_proposal(p)
+                    .with_context(|| format!("vpn ipsec {:?} esp-proposal", c.name))?;
+            }
+            if let Some(id) = &c.local_id {
+                validate_ipsec_id(id)
+                    .with_context(|| format!("vpn ipsec {:?} local-id", c.name))?;
+            }
+            if let Some(id) = &c.remote_id {
+                validate_ipsec_id(id)
+                    .with_context(|| format!("vpn ipsec {:?} remote-id", c.name))?;
+            }
+        }
         Ok(())
     }
 
@@ -2447,6 +2629,44 @@ pub(crate) fn validate_wg_key(s: &str) -> Result<()> {
         bail!(
             "wireguard key {s:?} decodes to {} bytes, expected 32",
             raw.len()
+        );
+    }
+    Ok(())
+}
+
+/// Validate an IPsec cipher proposal token (`aes256-sha256-modp2048`, or
+/// comma-separated alternatives). Rendered verbatim into swanctl.conf, so it must
+/// carry only the charon proposal charset — no whitespace, quotes or newlines
+/// that could smuggle another config directive.
+pub(crate) fn validate_ipsec_proposal(s: &str) -> Result<()> {
+    if s.is_empty() {
+        bail!("ipsec proposal is empty");
+    }
+    if !s
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b',')
+    {
+        bail!("ipsec proposal {s:?}: only letters, digits, '-' and ',' are allowed");
+    }
+    Ok(())
+}
+
+/// Validate an IPsec IKE identity (`local-id`/`remote-id`) — an IP, an FQDN, a
+/// user-FQDN (`user@example.com`) or a `%any` wildcard. Rendered verbatim into
+/// swanctl.conf, so it is a security boundary: restrict it to a safe charset that
+/// still covers the common identity forms, and forbid anything that could break
+/// out of the `id = <value>` line.
+pub(crate) fn validate_ipsec_id(s: &str) -> Result<()> {
+    if s.is_empty() {
+        bail!("ipsec id is empty");
+    }
+    if !s
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'@' | b':' | b'%'))
+    {
+        bail!(
+            "ipsec id {s:?}: only letters, digits and '.-_@:%' are allowed \
+             (use an IP, FQDN, user@fqdn or %any)"
         );
     }
     Ok(())

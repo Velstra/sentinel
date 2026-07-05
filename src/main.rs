@@ -15,6 +15,7 @@ mod config;
 mod confirm;
 mod diff;
 mod install;
+mod ipsec;
 mod net;
 mod repl;
 mod session;
@@ -630,6 +631,18 @@ fn show_op(args: &[String]) -> Result<()> {
             &["-u", "velstra.service", "-n", "50", "--no-pager"],
         ),
         ["nat"] => show_nat(),
+
+        // IPsec VPN (roadmap C2): the security-association / connection state,
+        // proxied to strongSwan's swanctl (run privileged — charon's vici socket
+        // is root-only).
+        ["vpn"] | ["vpn", "ipsec"] | ["vpn", "ipsec", "sas"] | ["vpn", "sas"] => {
+            print!("{}", system::swanctl_show(&["--list-sas"])?);
+            Ok(())
+        }
+        ["vpn", "ipsec", "connections" | "conns"] | ["vpn", "connections" | "conns"] => {
+            print!("{}", system::swanctl_show(&["--list-conns"])?);
+            Ok(())
+        }
 
         // Configuration views.
         ["configuration", ..] => {

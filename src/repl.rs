@@ -436,13 +436,14 @@ commands:
                             nat destination <d>  zone|proto|port|to …
                             multiwan mode failover|load-balance
                             multiwan uplink <if>  priority|weight|table|gateway|check …
+                            vpn ipsec <name>  local|remote|local-subnet|remote-subnet|psk|…
                           e.g.  set firewall rule web from wan
                                 set nat source wan-masq zone wan
                                 set nat destination web to 10.0.0.10:8443
   delete <path...>        remove a node or clear a field
   show [section]          show the candidate config (all, or one section:
                           system | interfaces | firewall | nat | protocols |
-                          services | multiwan)
+                          services | multiwan | vpn)
   edit <path...>          descend into a subtree; set/delete/show become
                           relative to it, e.g.  edit firewall rule web
   up | top                move one level up / back to the top of the tree
@@ -514,6 +515,7 @@ const OP_SHOW_TOP: &[Cand] = &[
     ("bfd", "BFD sessions"),
     ("firewall", "firewall summary / statistics / log"),
     ("nat", "NAT configuration summary"),
+    ("vpn", "IPsec VPN: security associations / connections"),
     ("configuration", "the saved configuration (config syntax)"),
     ("arp", "the ARP / neighbour table"),
     ("system", "hostname, services, interfaces"),
@@ -530,6 +532,14 @@ const OP_IPV6: &[Cand] = &[
     ("route", "the IPv6 routing table"),
     ("ospf3", "OSPFv3 neighbors / interfaces"),
     ("ripng", "RIPng state"),
+];
+const OP_VPN: &[Cand] = &[
+    ("ipsec", "IPsec security associations (swanctl --list-sas)"),
+    ("sas", "IPsec security associations"),
+    (
+        "connections",
+        "loaded IPsec connections (swanctl --list-conns)",
+    ),
 ];
 // Top level: four nodes, each a clear domain — host settings, the NICs, the
 // firewall (filtering), and NAT (address translation). NAT is deliberately NOT
@@ -557,6 +567,7 @@ const TOP: &[Cand] = &[
         "multiwan",
         "WAN uplinks: failover / load-balance + health checks",
     ),
+    ("vpn", "site-to-site VPN: IKEv2 IPsec tunnels (strongSwan)"),
 ];
 // `multiwan <Tab>` reveals the mode + the uplinks (each keyed by interface).
 const MULTIWAN_NODES: &[Cand] = &[
@@ -600,6 +611,40 @@ const CHECK_FIELDS: &[Cand] = &[
     ("timeout", "per-ping timeout seconds (default 2)"),
     ("fail", "consecutive losses to mark down (default 3)"),
     ("rise", "consecutive successes to mark up (default 3)"),
+];
+// `vpn <Tab>` reveals the VPN types (IPsec today; OpenVPN/road-warrior later).
+const VPN_NODES: &[Cand] = &[("ipsec", "an IKEv2 site-to-site IPsec tunnel (by name)")];
+// `vpn ipsec <name> <Tab>` reveals the per-connection fields.
+const IPSEC_FIELDS: &[Cand] = &[
+    ("local", "this box's IKE endpoint (IPv4)"),
+    ("remote", "the peer's IKE endpoint (IPv4)"),
+    ("local-subnet", "local protected subnet (IPv4 CIDR)"),
+    ("remote-subnet", "remote protected subnet (IPv4 CIDR)"),
+    ("psk", "pre-shared key (secret)"),
+    ("ike-version", "IKE version 1 or 2 (default 2)"),
+    (
+        "ike-proposal",
+        "IKE cipher proposal (default aes256-sha256-modp2048)",
+    ),
+    (
+        "esp-proposal",
+        "ESP cipher proposal (default aes256-sha256-modp2048)",
+    ),
+    ("local-id", "local IKE identity (default = local address)"),
+    (
+        "remote-id",
+        "remote IKE identity (default = remote address)",
+    ),
+    ("start-action", "start | trap | none (default start)"),
+];
+// `vpn ipsec <name> start-action <Tab>` reveals the child-SA start actions.
+const IPSEC_START_ACTIONS: &[Cand] = &[
+    ("start", "initiate the tunnel as soon as the config loads"),
+    (
+        "trap",
+        "install a policy; initiate on first matching packet",
+    ),
+    ("none", "wait for the peer to initiate (a responder)"),
 ];
 // `services <Tab>` reveals the box-wide services (compiled to their daemons' config).
 const SERVICES_NODES: &[Cand] = &[
@@ -1088,11 +1133,17 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "multiwan", "uplink", _iface] => UPLINK_FIELDS,
         ["set" | "delete", "multiwan", "uplink", _iface, "check"] => CHECK_FIELDS,
 
+        // The vpn (IKEv2 site-to-site IPsec) sub-tree.
+        ["set" | "delete", "vpn"] => VPN_NODES,
+        ["set" | "delete", "vpn", "ipsec", _name] => IPSEC_FIELDS,
+        ["set", "vpn", "ipsec", _name, "start-action"] => IPSEC_START_ACTIONS,
+
         // `run` — operational commands from config mode (vtysh-style).
         ["run"] => RUN_TOP,
         ["run", "show"] => OP_SHOW_TOP,
         ["run", "show", "ip"] => OP_IP,
         ["run", "show", "ipv6"] => OP_IPV6,
+        ["run", "show", "vpn"] => OP_VPN,
         _ => &[],
     }
 }
@@ -1360,7 +1411,8 @@ mod tests {
                 "nat",
                 "protocols",
                 "services",
-                "multiwan"
+                "multiwan",
+                "vpn"
             ]
         );
         assert_eq!(kw(&["set", "system"]), ["hostname"]);
@@ -1594,7 +1646,8 @@ mod tests {
                 "nat",
                 "protocols",
                 "services",
-                "multiwan"
+                "multiwan",
+                "vpn"
             ]
         );
         assert_eq!(

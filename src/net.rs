@@ -1171,6 +1171,9 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
     // Multi-WAN failover daemon (roadmap C6) — rendered + (re)started last, after
     // the uplinks it steers are addressed/up.
     apply_multiwan(appliance)?;
+    // IPsec tunnels (roadmap C2) — rendered swanctl config loaded into charon,
+    // after the underlay uplinks the tunnels ride on are up.
+    crate::ipsec::apply(appliance)?;
     Ok(())
 }
 
