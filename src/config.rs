@@ -9,7 +9,7 @@
 
 use std::{
     collections::{BTreeMap, HashSet},
-    net::{Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::Path,
 };
 
@@ -1072,6 +1072,27 @@ pub struct Interface {
     /// hardware address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac: Option<String>,
+    /// For a **kernel tunnel** (`type = "gre"|"ipip"|"gretap"`, roadmap C3): the
+    /// local endpoint address — the underlay source the tunnel packets leave from
+    /// (an address configured on this box). Required on a tunnel; `None` on any
+    /// other interface. Must be the same family as `remote`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<String>,
+    /// For a kernel tunnel: the remote endpoint address — the far end's underlay
+    /// address the tunnel packets are sent to. Required on a tunnel; `None`
+    /// otherwise. Must be the same family as `local`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
+    /// Optional GRE key (`type = "gre"|"gretap"`) — a 32-bit tag that demultiplexes
+    /// several tunnels sharing the same `local`/`remote` pair; both ends must
+    /// agree. Not valid on an `ipip` tunnel (IPIP carries no key). `None` for an
+    /// unkeyed tunnel.
+    #[serde(default, rename = "key", skip_serializing_if = "Option::is_none")]
+    pub tunnel_key: Option<u32>,
+    /// Outer TTL for a kernel tunnel's encapsulating packets (`1`–`255`); `0`
+    /// inherits the inner packet's TTL. `None` leaves the kernel default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<u8>,
     /// Egress traffic shaping / queue management on this interface (roadmap C8) —
     /// a `cake` shaper+AQM (the bufferbloat killer for a WAN uplink) or a
     /// `fq_codel` AQM. `None` leaves the kernel default qdisc. Declared as a
@@ -1090,14 +1111,24 @@ pub struct Interface {
 
 /// The `type` of a synthesised or client interface. `bridge`/`bond` are
 /// **virtual L2 devices** Sentinel creates to enslave members; `pppoe` is a
-/// PPPoE **client** session brought up over a raw uplink NIC (`parent`). Physical
-/// NICs and VLAN/WireGuard links carry no `type`.
+/// PPPoE **client** session brought up over a raw uplink NIC (`parent`);
+/// `gre`/`ipip`/`gretap` are **kernel point-to-point tunnels** (roadmap C3) built
+/// between two endpoint addresses (`local`/`remote`). Physical NICs and
+/// VLAN/WireGuard links carry no `type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IfaceType {
     Bridge,
     Bond,
     Pppoe,
+    /// A GRE (Generic Routing Encapsulation) L3 tunnel — carries IP, supports an
+    /// optional 32-bit `key` to demultiplex several tunnels between the same pair.
+    Gre,
+    /// An IPIP (IPv4-in-IPv4) L3 tunnel — the simplest encapsulation; no `key`.
+    Ipip,
+    /// A GRETAP L2 tunnel — GRE carrying Ethernet frames (a virtual bridge port
+    /// over GRE); like `gre` but the link is a broadcast-capable L2 device.
+    Gretap,
 }
 
 /// PPPoE client parameters (a `type = "pppoe"` interface). The session is
@@ -1139,6 +1170,23 @@ pub const BOND_MODES: &[&str] = &[
     "802.3ad",
     "balance-tlb",
     "balance-alb",
+];
+
+/// The kernel's fallback tunnel devices — each tunnel module auto-creates one of
+/// these when it loads (`ip_gre` → `gre0`/`gretap0`, `ipip` → `tunl0`, …). Naming
+/// a configured tunnel after a fallback collides with it (networkd reports
+/// "Failed to create netdev: File exists"), leaving the unconfigured catch-all in
+/// place — which has no `remote`, so it silently black-holes traffic. Reject these
+/// names on a tunnel interface and point the operator at a distinct name.
+pub const RESERVED_TUNNEL_DEVICES: &[&str] = &[
+    "gre0",
+    "gretap0",
+    "tunl0",
+    "erspan0",
+    "sit0",
+    "ip6tnl0",
+    "ip6gre0",
+    "ip6gretap0",
 ];
 
 /// A built-in (systemd-networkd) IPv6 Router Advertiser on an interface — the
@@ -1339,6 +1387,17 @@ impl Interface {
     /// True for a PPPoE client interface (`type = "pppoe"`).
     pub fn is_pppoe(&self) -> bool {
         self.if_type == Some(IfaceType::Pppoe)
+    }
+    /// True for a kernel point-to-point tunnel (`gre`/`ipip`/`gretap`, roadmap C3).
+    pub fn is_tunnel(&self) -> bool {
+        matches!(
+            self.if_type,
+            Some(IfaceType::Gre) | Some(IfaceType::Ipip) | Some(IfaceType::Gretap)
+        )
+    }
+    /// True for a tunnel type that carries a GRE key (`gre`/`gretap`); IPIP does not.
+    pub fn tunnel_supports_key(&self) -> bool {
+        matches!(self.if_type, Some(IfaceType::Gre) | Some(IfaceType::Gretap))
     }
 }
 
@@ -1792,6 +1851,76 @@ impl Appliance {
             } else if iface.listen_port.is_some() || !iface.peers.is_empty() {
                 bail!(
                     "interface {:?}: listen-port/peer require private-key",
+                    iface.name
+                );
+            }
+
+            // Kernel tunnel (`type = gre|ipip|gretap`, roadmap C3): a point-to-point
+            // link between two endpoint addresses. Requires `local` + `remote` of the
+            // same family; the GRE `key` is only valid on gre/gretap; and a tunnel
+            // cannot double as a VLAN / WireGuard / bridge/bond / member. Endpoint
+            // addresses are a security boundary too — they are rendered verbatim into
+            // a networkd `[Tunnel]` section.
+            if iface.is_tunnel() {
+                if RESERVED_TUNNEL_DEVICES.contains(&iface.name.as_str()) {
+                    bail!(
+                        "interface {:?}: name collides with the kernel's fallback tunnel device \
+                         (the tunnel module auto-creates it) — use a distinct name like \"tun0\"",
+                        iface.name
+                    );
+                }
+                let (Some(local), Some(remote)) = (&iface.local, &iface.remote) else {
+                    bail!(
+                        "interface {:?}: a tunnel requires both `local` and `remote` endpoint addresses",
+                        iface.name
+                    );
+                };
+                let lip = local.parse::<IpAddr>().map_err(|_| {
+                    anyhow::anyhow!(
+                        "interface {:?}: local {local:?} is not an IP address",
+                        iface.name
+                    )
+                })?;
+                let rip = remote.parse::<IpAddr>().map_err(|_| {
+                    anyhow::anyhow!(
+                        "interface {:?}: remote {remote:?} is not an IP address",
+                        iface.name
+                    )
+                })?;
+                if lip.is_ipv4() != rip.is_ipv4() {
+                    bail!(
+                        "interface {:?}: local {local:?} and remote {remote:?} must be the same IP family",
+                        iface.name
+                    );
+                }
+                if iface.tunnel_key.is_some() && !iface.tunnel_supports_key() {
+                    bail!(
+                        "interface {:?}: a `key` is only valid on a gre/gretap tunnel (ipip carries none)",
+                        iface.name
+                    );
+                }
+                if iface.parent.is_some() || iface.vlan.is_some() {
+                    bail!("interface {:?}: a tunnel cannot also be a VLAN", iface.name);
+                }
+                if iface.is_wireguard() {
+                    bail!(
+                        "interface {:?}: a tunnel cannot also be WireGuard",
+                        iface.name
+                    );
+                }
+                if iface.master.is_some() {
+                    bail!(
+                        "interface {:?}: a tunnel cannot be enslaved to a bridge/bond",
+                        iface.name
+                    );
+                }
+            } else if iface.local.is_some()
+                || iface.remote.is_some()
+                || iface.tunnel_key.is_some()
+                || iface.ttl.is_some()
+            {
+                bail!(
+                    "interface {:?}: local/remote/key/ttl require `type = \"gre\"|\"ipip\"|\"gretap\"`",
                     iface.name
                 );
             }
@@ -3505,6 +3634,92 @@ type = "bond"
 bond-mode = "round-robin"
 "#;
         assert!(Appliance::from_toml(bad_mode).is_err());
+    }
+
+    #[test]
+    fn tunnel_parses_validates_and_round_trips() {
+        // A well-formed keyed GRE tunnel parses, validates and survives a
+        // TOML round-trip (endpoints, key, ttl, zone + inner address preserved).
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "tun0"
+type = "gre"
+zone = "vpn"
+address = "172.16.0.1/30"
+local = "10.0.0.1"
+remote = "10.0.0.2"
+key = 42
+ttl = 64
+"#;
+        let a = Appliance::from_toml(toml).expect("gre tunnel parses + validates");
+        let gre = a.interfaces.iter().find(|i| i.name == "tun0").unwrap();
+        assert_eq!(gre.if_type, Some(IfaceType::Gre));
+        assert_eq!(gre.local.as_deref(), Some("10.0.0.1"));
+        assert_eq!(gre.remote.as_deref(), Some("10.0.0.2"));
+        assert_eq!(gre.tunnel_key, Some(42));
+        assert_eq!(gre.ttl, Some(64));
+        let out = a.to_toml().expect("serialises");
+        Appliance::from_toml(&out).expect("re-parses");
+    }
+
+    #[test]
+    fn tunnel_rejects_bad_combos() {
+        // A tunnel without endpoints is rejected.
+        let no_endpoints = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "tun0"
+type = "gre"
+"#;
+        assert!(Appliance::from_toml(no_endpoints).is_err());
+        // Mismatched endpoint families (v4 local, v6 remote) are rejected.
+        let mixed = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "tun0"
+type = "gre"
+local = "10.0.0.1"
+remote = "2001:db8::2"
+"#;
+        assert!(Appliance::from_toml(mixed).is_err());
+        // A key on an IPIP tunnel (which carries none) is rejected.
+        let ipip_key = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "ipip0"
+type = "ipip"
+local = "10.0.0.1"
+remote = "10.0.0.2"
+key = 7
+"#;
+        assert!(Appliance::from_toml(ipip_key).is_err());
+        // local/remote without a tunnel `type` is rejected.
+        let orphan = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "eth0"
+local = "10.0.0.1"
+remote = "10.0.0.2"
+"#;
+        assert!(Appliance::from_toml(orphan).is_err());
+        // A tunnel named after the kernel's fallback device (`gre0`) is rejected:
+        // it would collide with the module's auto-created catch-all and black-hole.
+        let fallback_name = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "gre0"
+type = "gre"
+local = "10.0.0.1"
+remote = "10.0.0.2"
+"#;
+        assert!(Appliance::from_toml(fallback_name).is_err());
     }
 
     #[test]

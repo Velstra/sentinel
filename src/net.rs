@@ -56,9 +56,45 @@ fn virtual_l2_netdev_body(iface: &Interface) -> String {
         }
         // A PPPoE client is brought up by `pppd` over its parent NIC, not by a
         // networkd netdev — `apply_pppoe` owns it, so there is nothing to render
-        // here (same as an interface with no type).
-        None | Some(IfaceType::Pppoe) => String::new(),
+        // here (same as an interface with no type). Kernel tunnels are handled by
+        // `tunnel_netdev_body`, not this virtual-L2 renderer.
+        None | Some(IfaceType::Pppoe | IfaceType::Gre | IfaceType::Ipip | IfaceType::Gretap) => {
+            String::new()
+        }
     }
+}
+
+/// The `.netdev` for a kernel point-to-point tunnel (roadmap C3): `Kind=gre`,
+/// `ipip` or `gretap`, plus a `[Tunnel]` section carrying the `Local`/`Remote`
+/// endpoint addresses and the optional `Key`/`TTL`. `Independent=yes` makes the
+/// tunnel a standalone device (created from its endpoint addresses, not stacked
+/// on a named base `.network`). The GRE `Key` is only emitted for gre/gretap —
+/// validation rejects a key on ipip, so this never drops a meaningful value.
+fn tunnel_netdev_body(iface: &Interface) -> String {
+    let kind = match iface.if_type {
+        Some(IfaceType::Gre) => "gre",
+        Some(IfaceType::Ipip) => "ipip",
+        Some(IfaceType::Gretap) => "gretap",
+        // Non-tunnel types never reach here (apply only calls this for tunnels).
+        _ => return String::new(),
+    };
+    let mut body = format!("[NetDev]\nName={}\nKind={kind}\n\n[Tunnel]\n", iface.name);
+    if let Some(local) = &iface.local {
+        body.push_str(&format!("Local={local}\n"));
+    }
+    if let Some(remote) = &iface.remote {
+        body.push_str(&format!("Remote={remote}\n"));
+    }
+    if iface.tunnel_supports_key() {
+        if let Some(key) = iface.tunnel_key {
+            body.push_str(&format!("Key={key}\n"));
+        }
+    }
+    if let Some(ttl) = iface.ttl {
+        body.push_str(&format!("TTL={ttl}\n"));
+    }
+    body.push_str("Independent=yes\n");
+    body
 }
 
 /// The `.netdev` that creates a WireGuard link: the `[WireGuard]` section
@@ -1060,6 +1096,15 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
         }
     }
 
+    // Kernel tunnel .netdev units (GRE / IPIP / GRETAP point-to-point, roadmap C3).
+    for i in ifaces {
+        if i.is_tunnel() {
+            let name = netdev_name(&i.name);
+            writes.push((name.clone(), tunnel_netdev_body(i)));
+            keep.insert(name);
+        }
+    }
+
     // .network units: anything with an address, a VLAN of its own, child VLANs,
     // a WireGuard link (which needs a `.network` to be brought up even when it
     // carries only AllowedIPs routes and no local address), a bridge/bond device,
@@ -1076,6 +1121,7 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
                     || i.is_wireguard()
                     || i.router_advert.is_some()
                     || i.is_virtual_l2()
+                    || i.is_tunnel()
                     || i.master.is_some()
                     || i.pd_from.is_some()
                     || i.mtu.is_some()
@@ -1289,6 +1335,56 @@ mod tests {
     }
 
     #[test]
+    fn tunnel_netdev_renders_kind_endpoints_key_and_ttl() {
+        // A keyed GRE tunnel emits Kind=gre + a [Tunnel] with Local/Remote/Key/TTL
+        // and Independent=yes (a standalone device from its endpoint addresses).
+        let gre = Interface {
+            name: "gre0".into(),
+            zone: Some("vpn".into()),
+            address: Some("172.16.0.1/30".into()),
+            address6: None,
+            parent: None,
+            vlan: None,
+            private_key: None,
+            listen_port: None,
+            peers: vec![],
+            dhcp_server: None,
+            router_advert: None,
+            if_type: Some(IfaceType::Gre),
+            master: None,
+            bond_mode: None,
+            pd_from: None,
+            pd_subnet: None,
+            mtu: None,
+            mac: None,
+            local: Some("10.0.0.1".into()),
+            remote: Some("10.0.0.2".into()),
+            tunnel_key: Some(42),
+            ttl: Some(64),
+            qos: None,
+            pppoe: None,
+        };
+        let d = tunnel_netdev_body(&gre);
+        assert!(d.contains("Name=gre0"), "{d}");
+        assert!(d.contains("Kind=gre"), "{d}");
+        assert!(d.contains("Local=10.0.0.1"), "{d}");
+        assert!(d.contains("Remote=10.0.0.2"), "{d}");
+        assert!(d.contains("Key=42"), "{d}");
+        assert!(d.contains("TTL=64"), "{d}");
+        assert!(d.contains("Independent=yes"), "{d}");
+
+        // IPIP carries no key: the same struct rendered as ipip drops Key= even if
+        // one is set (validation forbids it upstream; the renderer is defensive).
+        let ipip = Interface {
+            if_type: Some(IfaceType::Ipip),
+            ..gre.clone()
+        };
+        let d = tunnel_netdev_body(&ipip);
+        assert!(d.contains("Kind=ipip"), "{d}");
+        assert!(!d.contains("Key="), "{d}");
+    }
+
+    #[test]
     fn parent_network_references_child_vlans() {
         let u = network_body(
             "eth1",
@@ -1394,6 +1490,10 @@ mod tests {
             pd_subnet: None,
             mtu: None,
             mac: None,
+            local: None,
+            remote: None,
+            tunnel_key: None,
+            ttl: None,
             qos: None,
             pppoe: None,
         }];
@@ -1595,6 +1695,10 @@ mod tests {
             pd_subnet: None,
             mtu: None,
             mac: None,
+            local: None,
+            remote: None,
+            tunnel_key: None,
+            ttl: None,
             qos: None,
             pppoe: None,
         };
@@ -1640,6 +1744,10 @@ mod tests {
             pd_subnet: None,
             mtu: None,
             mac: None,
+            local: None,
+            remote: None,
+            tunnel_key: None,
+            ttl: None,
             qos: None,
             pppoe: None,
         };
@@ -1766,6 +1874,10 @@ mod tests {
             pd_subnet: None,
             mtu: None,
             mac: None,
+            local: None,
+            remote: None,
+            tunnel_key: None,
+            ttl: None,
             qos: None,
             pppoe: None,
         };
@@ -1802,6 +1914,10 @@ mod tests {
             bond_mode: None,
             mtu: Some(1492),
             mac: None,
+            local: None,
+            remote: None,
+            tunnel_key: None,
+            ttl: None,
             qos: None,
             pppoe: Some(Pppoe {
                 username: username.into(),

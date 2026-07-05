@@ -49,6 +49,11 @@ struct IfaceDraft {
     // Link tunables.
     mtu: Option<u16>,
     mac: Option<String>,
+    // Kernel tunnel (type = gre/ipip/gretap): endpoint addresses + GRE key + TTL.
+    local: Option<String>,
+    remote: Option<String>,
+    tunnel_key: Option<u32>,
+    ttl: Option<u8>,
     // Egress traffic shaping (cake / fq_codel).
     qos: Option<QosDraft>,
     // PPPoE client (a `type = pppoe` uplink): credentials + tunables.
@@ -573,6 +578,10 @@ impl Draft {
                             bond_mode: i.bond_mode.clone(),
                             mtu: i.mtu,
                             mac: i.mac.clone(),
+                            local: i.local.clone(),
+                            remote: i.remote.clone(),
+                            tunnel_key: i.tunnel_key,
+                            ttl: i.ttl,
                             qos: i.qos.as_ref().map(|q| QosDraft {
                                 discipline: Some(q.discipline),
                                 bandwidth: q.bandwidth.clone(),
@@ -1087,9 +1096,12 @@ impl Session {
                     "bridge" => IfaceType::Bridge,
                     "bond" => IfaceType::Bond,
                     "pppoe" => IfaceType::Pppoe,
+                    "gre" => IfaceType::Gre,
+                    "ipip" => IfaceType::Ipip,
+                    "gretap" => IfaceType::Gretap,
                     other => {
                         bail!(
-                            "interface type {other:?}: expected \"bridge\", \"bond\" or \"pppoe\""
+                            "interface type {other:?}: expected \"bridge\", \"bond\", \"pppoe\", \"gre\", \"ipip\" or \"gretap\""
                         )
                     }
                 };
@@ -1114,6 +1126,34 @@ impl Session {
             ["interface", name, "mac", v] => {
                 crate::config::validate_mac(v)?;
                 self.draft.iface_mut(name).mac = Some((*v).to_string());
+            }
+
+            // Kernel tunnel endpoints/tunables (a `type = gre|ipip|gretap` link,
+            // roadmap C3). `local`/`remote` are bare endpoint IPs; `key` is the
+            // optional GRE key; `ttl` is the outer TTL. Cross-type consistency
+            // (both endpoints, same family, key only on gre/gretap) is checked at
+            // commit by `validate`.
+            ["interface", name, "local", v] => {
+                v.parse::<std::net::IpAddr>()
+                    .with_context(|| format!("invalid tunnel local endpoint {v:?}"))?;
+                self.draft.iface_mut(name).local = Some((*v).to_string());
+            }
+            ["interface", name, "remote", v] => {
+                v.parse::<std::net::IpAddr>()
+                    .with_context(|| format!("invalid tunnel remote endpoint {v:?}"))?;
+                self.draft.iface_mut(name).remote = Some((*v).to_string());
+            }
+            ["interface", name, "key", v] => {
+                let key: u32 = v
+                    .parse()
+                    .with_context(|| format!("invalid tunnel key {v:?} (0–4294967295)"))?;
+                self.draft.iface_mut(name).tunnel_key = Some(key);
+            }
+            ["interface", name, "ttl", v] => {
+                let ttl: u8 = v
+                    .parse()
+                    .with_context(|| format!("invalid tunnel ttl {v:?} (0–255)"))?;
+                self.draft.iface_mut(name).ttl = Some(ttl);
             }
 
             // PPPoE client credentials/tunables (a `type = pppoe` uplink). The
@@ -1627,6 +1667,7 @@ impl Session {
                  set interface <name> zone <zone>\n  \
                  set interface <name> address <dhcp|CIDR>\n  \
                  set interface <name> <parent <iface> | vlan <id>>\n  \
+                 set interface <name> type <gre|ipip|gretap> local <ip> remote <ip> [key <n>] [ttl <n>]\n  \
                  set firewall global <stateful|block-icmp|log> <true|false>\n  \
                  set firewall global default-action <accept|drop|reject>\n  \
                  set firewall global block <IP|CIDR>\n  \
@@ -1697,6 +1738,10 @@ impl Session {
             ["interface", name, "bond-mode"] => self.iface(name)?.bond_mode = None,
             ["interface", name, "mtu"] => self.iface(name)?.mtu = None,
             ["interface", name, "mac"] => self.iface(name)?.mac = None,
+            ["interface", name, "local"] => self.iface(name)?.local = None,
+            ["interface", name, "remote"] => self.iface(name)?.remote = None,
+            ["interface", name, "key"] => self.iface(name)?.tunnel_key = None,
+            ["interface", name, "ttl"] => self.iface(name)?.ttl = None,
             ["interface", name, "qos"] => self.iface(name)?.qos = None,
             ["interface", name, "qos", field] => {
                 let i = self.iface(name)?;
@@ -2313,6 +2358,10 @@ impl Session {
                 bond_mode: d.bond_mode.clone(),
                 mtu: d.mtu,
                 mac: d.mac.clone(),
+                local: d.local.clone(),
+                remote: d.remote.clone(),
+                tunnel_key: d.tunnel_key,
+                ttl: d.ttl,
                 qos: d.qos.as_ref().map(|q| Qos {
                     // Discipline presence is guaranteed by the pre-check above.
                     discipline: q.discipline.expect("qos discipline set (checked above)"),
@@ -2730,6 +2779,10 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             && i.bond_mode.is_none()
             && i.mtu.is_none()
             && i.mac.is_none()
+            && i.local.is_none()
+            && i.remote.is_none()
+            && i.tunnel_key.is_none()
+            && i.ttl.is_none()
             && i.qos.is_none()
             && i.pppoe.is_none()
         {
@@ -2741,6 +2794,9 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
                 IfaceType::Bridge => "bridge",
                 IfaceType::Bond => "bond",
                 IfaceType::Pppoe => "pppoe",
+                IfaceType::Gre => "gre",
+                IfaceType::Ipip => "ipip",
+                IfaceType::Gretap => "gretap",
             };
             out.push_str(&format!("    type {s}\n"));
         }
@@ -2770,6 +2826,18 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         if let Some(mac) = &i.mac {
             out.push_str(&format!("    mac {mac}\n"));
+        }
+        if let Some(local) = &i.local {
+            out.push_str(&format!("    local {local}\n"));
+        }
+        if let Some(remote) = &i.remote {
+            out.push_str(&format!("    remote {remote}\n"));
+        }
+        if let Some(key) = i.tunnel_key {
+            out.push_str(&format!("    key {key}\n"));
+        }
+        if let Some(ttl) = i.ttl {
+            out.push_str(&format!("    ttl {ttl}\n"));
         }
         if let Some(p) = &i.parent {
             out.push_str(&format!("    parent {p}\n"));
@@ -3827,6 +3895,44 @@ mod tests {
         assert!(!s.show().contains("mru 1492"));
         run(&mut s, "delete interface ppp0 pppoe").unwrap();
         assert!(!s.show().contains("pppoe {"));
+    }
+
+    #[test]
+    fn gre_tunnel_sets_renders_commits_and_deletes() {
+        let mut s = Session::empty();
+        run(&mut s, "set system hostname fw1").unwrap();
+        run(&mut s, "set interface eth0 address 10.0.0.1/24").unwrap();
+        run(&mut s, "set interface tun0 type gre").unwrap();
+        run(&mut s, "set interface tun0 local 10.0.0.1").unwrap();
+        run(&mut s, "set interface tun0 remote 10.0.0.2").unwrap();
+        run(&mut s, "set interface tun0 address 172.16.0.1/30").unwrap();
+        run(&mut s, "set interface tun0 zone vpn").unwrap();
+        run(&mut s, "set interface tun0 key 42").unwrap();
+        run(&mut s, "set interface tun0 ttl 64").unwrap();
+
+        // The config view renders the tunnel scalars round-trippably.
+        let shown = s.show();
+        assert!(shown.contains("interface tun0"), "got:\n{shown}");
+        assert!(shown.contains("type gre"), "got:\n{shown}");
+        assert!(shown.contains("local 10.0.0.1"), "got:\n{shown}");
+        assert!(shown.contains("remote 10.0.0.2"), "got:\n{shown}");
+        assert!(shown.contains("key 42"), "got:\n{shown}");
+        assert!(shown.contains("ttl 64"), "got:\n{shown}");
+
+        // It validates + materializes into an Appliance.
+        let a = s.commit().expect("gre tunnel config commits");
+        let gre = a.interfaces.iter().find(|i| i.name == "tun0").unwrap();
+        assert!(gre.is_tunnel());
+        assert_eq!(gre.local.as_deref(), Some("10.0.0.1"));
+        assert_eq!(gre.remote.as_deref(), Some("10.0.0.2"));
+        assert_eq!(gre.tunnel_key, Some(42));
+        assert_eq!(gre.ttl, Some(64));
+
+        // A bogus endpoint is rejected at set time; a key on ipip at commit time.
+        assert!(run(&mut s, "set interface tun0 remote not-an-ip").is_err());
+        // Deleting the key drops it from the view.
+        run(&mut s, "delete interface tun0 key").unwrap();
+        assert!(!s.show().contains("key 42"));
     }
 
     #[test]
