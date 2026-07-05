@@ -134,6 +134,8 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
             }
         }),
         "commit" => return commit(session, act),
+        "commit-confirm" => return commit_confirm_line(session, act, rest),
+        "confirm" => crate::confirm::confirm(act),
         "save" => {
             let to = rest.first().map(Path::new);
             session
@@ -202,6 +204,26 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
         eprintln!("  hostname: {old_host} -> {}", appliance.system.hostname);
     }
     eprintln!("commit ok: applied live (not persisted — `save` to keep across reboot)");
+    false
+}
+
+/// `commit-confirm [minutes]`: apply live + arm the auto-rollback timer (roadmap
+/// C21). Parses the optional window (default [`crate::confirm::
+/// DEFAULT_CONFIRM_MINUTES`]) and never exits the shell. Returns `false`.
+fn commit_confirm_line(session: &mut Session, act: &Apply, rest: &[&str]) -> bool {
+    let minutes = match rest.first() {
+        None => crate::confirm::DEFAULT_CONFIRM_MINUTES,
+        Some(s) => match s.parse::<u32>() {
+            Ok(m) if m >= 1 => m,
+            _ => {
+                eprintln!("error: commit-confirm <minutes> must be a positive integer");
+                return false;
+            }
+        },
+    };
+    if let Err(e) = crate::confirm::commit_confirm(session, act, minutes) {
+        eprintln!("error: {e}");
+    }
     false
 }
 
@@ -307,7 +329,7 @@ fn unwind_err(rb: Rollback, cause: anyhow::Error, stage: &str) -> anyhow::Error 
 /// then apply firewall, routing, hostname and addressing in order — each stage
 /// recording how to undo itself. If a later stage fails, the completed stages
 /// are rolled back in reverse and a report of what changed is returned.
-fn apply_live(appliance: &crate::config::Appliance, act: &Apply) -> Result<()> {
+pub(crate) fn apply_live(appliance: &crate::config::Appliance, act: &Apply) -> Result<()> {
     // ---- Phase 1: prepare (fallible, NO live side effects) ----
     let rendered = compile::compile(appliance)
         .to_toml()
@@ -383,6 +405,10 @@ commands:
                           e.g.  run show ip route   run show ip bgp summary
   compare                 diff the candidate against the saved config
   commit                  apply the candidate to the RUNNING system (live)
+  commit-confirm [mins]   apply live, then auto-revert to the saved config after
+                          `mins` (default 10) unless you `confirm` — the safety
+                          net for editing a firewall over its own link
+  confirm                 keep a commit-confirm change (cancel the auto-revert)
   save [path]             persist the config so it survives a reboot
   discard                 drop edits, reload from disk
   exit | quit             leave the edit context / configuration mode
@@ -403,6 +429,8 @@ const COMMANDS: &[Cand] = &[
     ("run", "run an operational command (e.g. run show ip route)"),
     ("compare", "diff the candidate against the saved config"),
     ("commit", "apply the candidate to the running system (live)"),
+    ("commit-confirm", "apply live with an auto-rollback timer (default 10 min)"),
+    ("confirm", "keep a commit-confirm change (cancel the auto-rollback)"),
     ("save", "persist the configuration across reboot"),
     ("discard", "drop uncommitted edits"),
     ("exit", "leave the edit context / configuration mode"),
@@ -919,8 +947,21 @@ mod tests {
         assert_eq!(
             kw(&[]),
             [
-                "set", "delete", "show", "edit", "up", "top", "run", "compare", "commit", "save",
-                "discard", "exit", "help"
+                "set",
+                "delete",
+                "show",
+                "edit",
+                "up",
+                "top",
+                "run",
+                "compare",
+                "commit",
+                "commit-confirm",
+                "confirm",
+                "save",
+                "discard",
+                "exit",
+                "help"
             ]
         );
         assert_eq!(kw(&["set"]), ["system", "interface", "firewall", "nat", "protocols", "services"]);

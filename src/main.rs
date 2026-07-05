@@ -11,6 +11,7 @@
 
 mod compile;
 mod config;
+mod confirm;
 mod diff;
 mod install;
 mod net;
@@ -155,6 +156,14 @@ enum Command {
         #[arg(long)]
         commit: bool,
     },
+    /// Revert the running system to the saved config. Invoked by the
+    /// `commit-confirm` auto-rollback timer when its window expires; can also be
+    /// run manually to drop an un-confirmed change immediately.
+    ConfirmRollback {
+        /// The saved config to revert to (the running/boot baseline).
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    },
     /// List the ports a Velstra controller currently knows about.
     Ports {
         /// The controller's orchestrator/admin endpoint.
@@ -220,8 +229,30 @@ async fn main() -> Result<()> {
             wren_out,
         } => apply_boot(&config, &out, &wren_out),
         Command::Apply { file, out, reload } => apply(&file, &out, reload.as_deref()),
+        Command::ConfirmRollback { config } => confirm_rollback(&config),
         Command::Ports { controller } => ports(&controller).await,
     }
+}
+
+/// The live-apply target for `commit`/`commit-confirm`/`confirm-rollback`: the
+/// runtime config paths + units. `enabled` off (off-box / `--no-apply`)
+/// validates + saves only, touching no running service.
+fn live_apply(enabled: bool) -> repl::Apply {
+    repl::Apply {
+        velstra_out: PathBuf::from(repl::DEFAULT_VELSTRA_OUT),
+        unit: repl::DEFAULT_UNIT.to_string(),
+        wren_out: PathBuf::from(repl::DEFAULT_WREN_OUT),
+        wren_unit: repl::DEFAULT_WREN_UNIT.to_string(),
+        enabled,
+    }
+}
+
+/// `sentinel confirm-rollback`: revert the running system to the saved config.
+/// The `commit-confirm` timer runs this when its window expires; an operator can
+/// also run it (or `run confirm-rollback` from config mode) to drop an
+/// un-confirmed change at once.
+fn confirm_rollback(config: &std::path::Path) -> Result<()> {
+    confirm::rollback(&live_apply(true), config)
 }
 
 /// The interactive configuration session — a VyOS/JunOS-style edit context.
@@ -235,13 +266,7 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
 
     // Apply on commit unless told not to (off-box editing). The live apply uses
     // hostnamectl/systemctl, which only work on the box.
-    let act = repl::Apply {
-        velstra_out: PathBuf::from(repl::DEFAULT_VELSTRA_OUT),
-        unit: repl::DEFAULT_UNIT.to_string(),
-        wren_out: PathBuf::from(repl::DEFAULT_WREN_OUT),
-        wren_unit: repl::DEFAULT_WREN_UNIT.to_string(),
-        enabled: !no_apply,
-    };
+    let act = live_apply(!no_apply);
 
     if std::io::stdin().is_terminal() {
         eprintln!("Entering configuration mode. `help` for commands, `exit` to leave.");
