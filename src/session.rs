@@ -1619,6 +1619,29 @@ impl Session {
         Ok(crate::diff::unified(&old, &new))
     }
 
+    /// `compare <N>` — diff the candidate against archived revision `N`
+    /// (0 = newest). The config-history counterpart to plain `compare` (roadmap
+    /// C21: "archive/history with diff").
+    pub fn compare_revision(&self, n: usize) -> Result<String> {
+        let rev = self.revision_draft(n)?;
+        let old = render_draft(&rev, true);
+        let new = render_draft(&self.draft, true);
+        Ok(diff_or_empty(&old, &new))
+    }
+
+    /// `compare <N> <M>` — diff archived revision `N` against revision `M`.
+    pub fn compare_revisions(&self, n: usize, m: usize) -> Result<String> {
+        let old = render_draft(&self.revision_draft(n)?, true);
+        let new = render_draft(&self.revision_draft(m)?, true);
+        Ok(diff_or_empty(&old, &new))
+    }
+
+    /// Load archived revision `n` as a draft (for `compare`).
+    fn revision_draft(&self, n: usize) -> Result<Draft> {
+        let toml = crate::archive::read_revision(&self.path, n)?;
+        Ok(Draft::from_appliance(&Appliance::from_toml(&toml)?))
+    }
+
     /// Build a validated [`Appliance`] from the candidate, reporting any
     /// required field that hasn't been set.
     fn materialize(&self) -> Result<Appliance> {
@@ -1951,6 +1974,16 @@ impl Session {
         };
         self.dirty = false;
         Ok(())
+    }
+}
+
+/// Diff two rendered configs, returning empty when identical (so `compare`
+/// reports "no differences" rather than echoing the whole config as context).
+fn diff_or_empty(old: &str, new: &str) -> String {
+    if old == new {
+        String::new()
+    } else {
+        crate::diff::unified(old, new)
     }
 }
 
@@ -2647,6 +2680,37 @@ mod tests {
         let diff = s.compare().unwrap();
         assert!(diff.contains("-    hostname fw1"), "got:\n{diff}");
         assert!(diff.contains("+    hostname fw2"), "got:\n{diff}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compare_against_archived_revisions() {
+        let dir = std::env::temp_dir().join(format!("sentinel-cmprev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.toml");
+
+        // Two saved revisions: h1 then h2. Each `save` archives one.
+        let mut s = Session::load(&path).unwrap();
+        run(&mut s, "set system hostname h1").unwrap();
+        s.save(None).unwrap();
+        run(&mut s, "set system hostname h2").unwrap();
+        s.save(None).unwrap();
+
+        // Reload so the candidate is the saved config (how `compare` is really
+        // used — a fresh session, then diff against history). The candidate is h2
+        // and revision 0 is the just-saved h2 → no diff; revision 1 is h1.
+        let s = Session::load(&path).unwrap();
+        assert!(s.compare_revision(0).unwrap().is_empty(), "candidate matches newest revision");
+        let d = s.compare_revision(1).unwrap();
+        assert!(d.contains("h1") && d.contains("h2"), "candidate vs older revision:\n{d}");
+        // revision 1 (h1) vs revision 0 (h2).
+        let d2 = s.compare_revisions(1, 0).unwrap();
+        assert!(d2.contains("-    hostname h1"), "got:\n{d2}");
+        assert!(d2.contains("+    hostname h2"), "got:\n{d2}");
+        // An out-of-range revision errors.
+        assert!(s.compare_revision(9).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
