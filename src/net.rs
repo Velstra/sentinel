@@ -48,7 +48,10 @@ fn virtual_l2_netdev_body(iface: &Interface) -> String {
             let mode = iface.bond_mode.as_deref().unwrap_or("active-backup");
             format!("[NetDev]\nName={}\nKind=bond\n\n[Bond]\nMode={mode}\n", iface.name)
         }
-        None => String::new(),
+        // A PPPoE client is brought up by `pppd` over its parent NIC, not by a
+        // networkd netdev — `apply_pppoe` owns it, so there is nothing to render
+        // here (same as an interface with no type).
+        None | Some(IfaceType::Pppoe) => String::new(),
     }
 }
 
@@ -418,6 +421,197 @@ fn apply_dnsmasq(appliance: &Appliance) -> Result<()> {
     Ok(())
 }
 
+// --- PPPoE client (roadmap C5) ---------------------------------------------
+//
+// A `type = "pppoe"` interface is brought up by `pppd` (not networkd) over the
+// raw uplink NIC in `parent`, using the `rp-pppoe` plugin. Sentinel renders the
+// pppd peer options to `/run/sentinel/ppp/peers/<name>` and the ISP credentials
+// to a 0600 `chap-secrets`/`pap-secrets` (symlinked from pppd's `/etc/ppp`
+// lookup paths by the appliance module), then (re)starts one `sentinel-pppoe@`
+// systemd instance per session. On a PPPoE (and generally tunnel) egress the
+// TCP MSS must be clamped to the path MTU, or large-segment TCP wedges behind
+// the smaller PPPoE MTU; we render an nftables ruleset that clamps MSS to PMTU
+// on each ppp interface (the VyOS/`--clamp-mss-to-pmtu` equivalent) and load it
+// with `nft`. All render+reload paths follow the same change-detect model the
+// DNS/NTP drop-ins use.
+
+/// The runtime dir for all PPPoE render artifacts (peer options, secrets, the
+/// MSS ruleset). tmpfs; re-seeded from the saved config each boot.
+const PPPOE_RUNTIME_DIR: &str = "/run/sentinel/ppp";
+/// pppd peer-option files, one per session — `pppd file <this>` reads them.
+const PPPOE_PEERS_DIR: &str = "/run/sentinel/ppp/peers";
+/// The credential files (both CHAP and PAP forms — pppd picks whichever the ISP
+/// negotiates). 0600 root:root; the appliance module symlinks pppd's standard
+/// `/etc/ppp/{chap,pap}-secrets` lookup paths here.
+const PPP_CHAP_SECRETS: &str = "/run/sentinel/ppp/chap-secrets";
+const PPP_PAP_SECRETS: &str = "/run/sentinel/ppp/pap-secrets";
+/// The rendered TCP-MSS-clamp nftables ruleset (loaded with `nft -f`).
+const PPPOE_MSS_NFT: &str = "/run/sentinel/ppp/mss.nft";
+
+/// Render a pppd peer-options file for a PPPoE client interface. pppd's bundled
+/// `pppoe.so` plugin rides on `parent` (the raw uplink NIC, given as `nic-<if>`);
+/// `ifname` pins the resulting link name; `defaultroute`/`usepeerdns` take the
+/// WAN default route + DNS from the ISP; `persist` re-dials on drop. The password
+/// is NOT here — it lives in the 0600 secrets file, matched by `user`.
+///
+/// The plugin is `pppoe.so` (ppp ≥ 2.5), and the uplink is selected with the
+/// `nic-<iface>` option rather than the legacy `plugin rp-pppoe.so <iface>`
+/// positional form (removed in ppp 2.5). The `rp_pppoe_service`/`rp_pppoe_ac`
+/// options are still accepted as legacy aliases by that plugin.
+fn pppoe_peer_body(iface: &Interface) -> String {
+    let p = iface
+        .pppoe
+        .as_ref()
+        .expect("pppoe_peer_body on a non-pppoe interface");
+    let parent = iface.parent.as_deref().unwrap_or_default();
+    // PPPoE over 1500-byte Ethernet leaves 1492 after the 8-byte PPPoE header —
+    // the classic default. An explicit `mtu` overrides; `mru` defaults to it.
+    let mtu = iface.mtu.unwrap_or(1492);
+    let mru = p.mru.unwrap_or(mtu);
+    let mut body = format!("# rendered by sentinel — PPPoE client {}\n", iface.name);
+    body.push_str(&format!("plugin pppoe.so\nnic-{parent}\n"));
+    body.push_str(&format!("ifname {}\n", iface.name));
+    body.push_str(&format!("user \"{}\"\n", p.username));
+    body.push_str(&format!("mtu {mtu}\nmru {mru}\n"));
+    if let Some(sn) = &p.service_name {
+        body.push_str(&format!("rp_pppoe_service {sn}\n"));
+    }
+    if let Some(ac) = &p.ac_name {
+        body.push_str(&format!("rp_pppoe_ac {ac}\n"));
+    }
+    // noipdefault: take our address from the peer (IPCP). noauth: don't require
+    // the ISP to authenticate to us (we authenticate to it). LCP echoes detect a
+    // dead session so `persist` re-dials.
+    body.push_str(
+        "noipdefault\ndefaultroute\npersist\nusepeerdns\nnoauth\nlcp-echo-interval 20\nlcp-echo-failure 3\n",
+    );
+    body
+}
+
+/// Render the shared PPPoE secrets file (`<user> * <password> *`, one line per
+/// PPPoE interface). The same body is written to both the CHAP and PAP paths, so
+/// whichever auth the ISP negotiates finds the credential. `None` when no PPPoE
+/// interface is configured.
+fn ppp_secrets_body(ifaces: &[Interface]) -> Option<String> {
+    let ppp: Vec<&Interface> = ifaces.iter().filter(|i| i.is_pppoe()).collect();
+    if ppp.is_empty() {
+        return None;
+    }
+    let mut body = String::from("# rendered by sentinel — PPPoE credentials\n# client\tserver\tsecret\tIP\n");
+    for i in ppp {
+        if let Some(p) = &i.pppoe {
+            body.push_str(&format!("\"{}\"\t*\t\"{}\"\t*\n", p.username, p.password));
+        }
+    }
+    Some(body)
+}
+
+/// Render the nftables ruleset that clamps TCP MSS to the path MTU on every
+/// PPPoE interface's egress — the `--clamp-mss-to-pmtu` equivalent, in the
+/// `inet sentinel-mss` table so it never collides with any other firewall. The
+/// leading `table`/`delete table` is the standard idempotent flush: re-loading
+/// this file replaces our table wholesale, and with no PPPoE interface it just
+/// removes it.
+fn pppoe_mss_body(ifaces: &[Interface]) -> String {
+    let ppp: Vec<&Interface> = ifaces.iter().filter(|i| i.is_pppoe()).collect();
+    let mut body =
+        String::from("# rendered by sentinel — PPPoE TCP MSS clamp (clamp-mss-to-pmtu)\n");
+    body.push_str("table inet sentinel-mss\ndelete table inet sentinel-mss\n");
+    if ppp.is_empty() {
+        return body;
+    }
+    body.push_str("table inet sentinel-mss {\n\tchain clamp {\n");
+    body.push_str("\t\ttype filter hook forward priority mangle; policy accept;\n");
+    for i in &ppp {
+        body.push_str(&format!(
+            "\t\toifname \"{}\" tcp flags syn tcp option maxseg size set rt mtu\n",
+            i.name
+        ));
+    }
+    body.push_str("\t}\n}\n");
+    body
+}
+
+/// Whether writing `body` to `path` would change what is already there (or the
+/// file is absent) — the same change-detect the DNS/NTP drop-ins use.
+fn file_changed(path: &Path, body: &str) -> bool {
+    std::fs::read_to_string(path).map(|c| c != body).unwrap_or(true)
+}
+
+/// Reconcile the PPPoE clients to `appliance`: render each session's pppd peer
+/// options + the shared secrets, load the MSS-clamp ruleset, and (re)start /
+/// stop the `sentinel-pppoe@` instances — restarting only sessions whose
+/// rendered config changed, so an unrelated commit never drops a live WAN link.
+fn apply_pppoe(appliance: &Appliance) -> Result<()> {
+    let ifaces = &appliance.interfaces;
+    let ppp: Vec<&Interface> = ifaces.iter().filter(|i| i.is_pppoe()).collect();
+
+    system::ensure_dir(Path::new(PPPOE_PEERS_DIR))?;
+
+    // Peer-option files: write each wanted one, note which changed (→ restart).
+    let mut desired: HashSet<String> = HashSet::new();
+    let mut restart: HashSet<String> = HashSet::new();
+    for i in &ppp {
+        let path = Path::new(PPPOE_PEERS_DIR).join(&i.name);
+        let body = pppoe_peer_body(i);
+        if file_changed(&path, &body) {
+            restart.insert(i.name.clone());
+        }
+        system::install_file(&path, &body)?;
+        desired.insert(i.name.clone());
+    }
+    // Stop + remove sessions no longer configured.
+    if let Ok(entries) = std::fs::read_dir(PPPOE_PEERS_DIR) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !desired.contains(&name) {
+                if let Err(err) = system::pppoe_stop(&name) {
+                    eprintln!("warning: stopping pppoe session {name}: {err}");
+                }
+                system::remove_file(&e.path())?;
+            }
+        }
+    }
+
+    // Credentials (CHAP + PAP). A change re-dials every session (any could use
+    // the changed line). Removed when no PPPoE interface remains.
+    match ppp_secrets_body(ifaces) {
+        Some(body) => {
+            let changed = file_changed(Path::new(PPP_CHAP_SECRETS), &body);
+            system::install_ppp_secret(Path::new(PPP_CHAP_SECRETS), &body)?;
+            system::install_ppp_secret(Path::new(PPP_PAP_SECRETS), &body)?;
+            if changed {
+                restart.extend(ppp.iter().map(|i| i.name.clone()));
+            }
+        }
+        None => {
+            system::remove_file(Path::new(PPP_CHAP_SECRETS))?;
+            system::remove_file(Path::new(PPP_PAP_SECRETS))?;
+        }
+    }
+
+    // MSS clamp: render + load. Load when the ruleset changed, or whenever any
+    // PPPoE interface exists (so a fresh boot re-asserts the kernel table even
+    // if the file on tmpfs happens to match).
+    let mss_body = pppoe_mss_body(ifaces);
+    let mss_changed = file_changed(Path::new(PPPOE_MSS_NFT), &mss_body);
+    system::ensure_dir(Path::new(PPPOE_RUNTIME_DIR))?;
+    system::install_file(Path::new(PPPOE_MSS_NFT), &mss_body)?;
+    if mss_changed || !ppp.is_empty() {
+        if let Err(e) = system::nft_load(Path::new(PPPOE_MSS_NFT)) {
+            eprintln!("warning: loading PPPoE MSS-clamp nftables ruleset failed: {e}");
+        }
+    }
+
+    // (Re)start the changed/new sessions.
+    for name in &restart {
+        if let Err(e) = system::pppoe_restart(name) {
+            eprintln!("warning: (re)starting pppoe session {name} failed (applies on next start): {e}");
+        }
+    }
+    Ok(())
+}
+
 /// Reconcile networkd units to match `appliance`: write a `.netdev` for every
 /// VLAN subinterface and a `.network` for every interface that needs one (it has
 /// an address, is a VLAN, or is a parent carrying VLANs), remove any stale
@@ -425,6 +619,15 @@ fn apply_dnsmasq(appliance: &Appliance) -> Result<()> {
 /// the reload is best-effort (at early boot networkd reads the files on start).
 pub fn apply(appliance: &Appliance) -> Result<()> {
     let ifaces = &appliance.interfaces;
+
+    // A PPPoE client's raw uplink NIC (`parent`) must be link-up for pppd's
+    // discovery to run, but carries no address itself — so it still needs a bare
+    // networkd `.network` to be managed/brought up.
+    let pppoe_parents: HashSet<&str> = ifaces
+        .iter()
+        .filter(|i| i.is_pppoe())
+        .filter_map(|i| i.parent.as_deref())
+        .collect();
 
     // Map each parent interface to the VLAN child links riding on it.
     let mut children: BTreeMap<&str, Vec<String>> = BTreeMap::new();
@@ -476,17 +679,21 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
     let reloaded: Vec<String> = ifaces
         .iter()
         .filter(|i| {
-            i.address.is_some()
-                || i.address6.is_some()
-                || (i.parent.is_some() && i.vlan.is_some())
-                || i.is_wireguard()
-                || i.router_advert.is_some()
-                || i.is_virtual_l2()
-                || i.master.is_some()
-                || i.pd_from.is_some()
-                || i.mtu.is_some()
-                || i.mac.is_some()
-                || children.contains_key(i.name.as_str())
+            // A PPPoE client (ppp0) is owned by pppd, not networkd — never render
+            // a unit for it (even if it carries an `mtu`).
+            !i.is_pppoe()
+                && (i.address.is_some()
+                    || i.address6.is_some()
+                    || (i.parent.is_some() && i.vlan.is_some())
+                    || i.is_wireguard()
+                    || i.router_advert.is_some()
+                    || i.is_virtual_l2()
+                    || i.master.is_some()
+                    || i.pd_from.is_some()
+                    || i.mtu.is_some()
+                    || i.mac.is_some()
+                    || children.contains_key(i.name.as_str())
+                    || pppoe_parents.contains(i.name.as_str()))
         })
         .map(|i| {
             let kids = children.get(i.name.as_str()).map(Vec::as_slice).unwrap_or(&[]);
@@ -561,12 +768,15 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
     // The NTP server (chrony) likewise — its confdir drop-in tracks
     // `[services.ntp]`, and chrony is restarted only when that changed.
     apply_chrony(appliance)?;
+    // PPPoE clients (pppd peer options + secrets + the MSS-clamp ruleset).
+    apply_pppoe(appliance)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Pppoe;
 
     #[test]
     fn static_address_renders_address_directive() {
@@ -675,6 +885,7 @@ mod tests {
             pd_subnet: None,
             mtu: None,
             mac: None,
+            pppoe: None,
         }];
         let body = chrony_conf_body(&ntp, &ifaces).expect("ntp configured");
         assert!(body.contains("server pool.ntp.org iburst"));
@@ -819,6 +1030,7 @@ mod tests {
             pd_subnet: None,
             mtu: None,
             mac: None,
+            pppoe: None,
         };
         let d = virtual_l2_netdev_body(&br);
         assert!(d.contains("Name=br0"));
@@ -851,6 +1063,7 @@ mod tests {
             pd_subnet: None,
             mtu: None,
             mac: None,
+            pppoe: None,
         };
         let d = virtual_l2_netdev_body(&bond);
         assert!(d.contains("Kind=bond"));
@@ -942,6 +1155,7 @@ mod tests {
             pd_subnet: None,
             mtu: None,
             mac: None,
+            pppoe: None,
         };
         let d = wireguard_netdev_body(&iface);
         assert!(d.contains("Kind=wireguard"));
@@ -952,5 +1166,79 @@ mod tests {
         assert!(d.contains("AllowedIPs=10.9.0.2/32"));
         assert!(d.contains("Endpoint=192.0.2.7:51820"));
         assert!(d.contains("PersistentKeepalive=25"));
+    }
+
+    /// A PPPoE client interface `ppp0` over uplink `parent`, with the given
+    /// credentials — for the render tests below.
+    fn pppoe_iface(parent: &str, username: &str, password: &str) -> Interface {
+        Interface {
+            name: "ppp0".into(),
+            zone: Some("wan".into()),
+            address: None,
+            address6: None,
+            pd_from: None,
+            pd_subnet: None,
+            parent: Some(parent.into()),
+            vlan: None,
+            private_key: None,
+            listen_port: None,
+            peers: vec![],
+            dhcp_server: None,
+            router_advert: None,
+            if_type: Some(IfaceType::Pppoe),
+            master: None,
+            bond_mode: None,
+            mtu: Some(1492),
+            mac: None,
+            pppoe: Some(Pppoe {
+                username: username.into(),
+                password: password.into(),
+                service_name: Some("internet".into()),
+                ac_name: None,
+                mru: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn pppoe_peer_body_has_plugin_user_and_mtu() {
+        let iface = pppoe_iface("eth0", "user@isp.de", "s3cret");
+        let body = pppoe_peer_body(&iface);
+        assert!(body.contains("plugin pppoe.so"), "got:\n{body}");
+        assert!(body.contains("nic-eth0"), "got:\n{body}");
+        assert!(body.contains("ifname ppp0"), "got:\n{body}");
+        assert!(body.contains("user \"user@isp.de\""), "got:\n{body}");
+        assert!(body.contains("mtu 1492"), "got:\n{body}");
+        assert!(body.contains("mru 1492"), "got:\n{body}");
+        assert!(body.contains("rp_pppoe_service internet"), "got:\n{body}");
+        assert!(body.contains("defaultroute"), "got:\n{body}");
+        assert!(body.contains("usepeerdns"), "got:\n{body}");
+        assert!(body.contains("persist"), "got:\n{body}");
+        // The password NEVER appears in the world-readable peer options.
+        assert!(!body.contains("s3cret"), "peer options must not carry the password:\n{body}");
+    }
+
+    #[test]
+    fn ppp_secrets_body_lists_credentials_only_for_pppoe() {
+        let ifaces = vec![pppoe_iface("eth0", "user@isp.de", "s3cret")];
+        let body = ppp_secrets_body(&ifaces).expect("a pppoe interface yields secrets");
+        assert!(body.contains("\"user@isp.de\"\t*\t\"s3cret\"\t*"), "got:\n{body}");
+        // No PPPoE interface → no secrets file at all.
+        assert!(ppp_secrets_body(&[]).is_none());
+    }
+
+    #[test]
+    fn pppoe_mss_body_clamps_to_pmtu_on_the_ppp_link() {
+        let ifaces = vec![pppoe_iface("eth0", "u", "p")];
+        let body = pppoe_mss_body(&ifaces);
+        assert!(body.contains("table inet sentinel-mss {"), "got:\n{body}");
+        assert!(
+            body.contains("oifname \"ppp0\" tcp flags syn tcp option maxseg size set rt mtu"),
+            "got:\n{body}"
+        );
+        // With no PPPoE interface the ruleset only flushes/removes the table.
+        let empty = pppoe_mss_body(&[]);
+        assert!(empty.contains("delete table inet sentinel-mss"), "got:\n{empty}");
+        assert!(!empty.contains("maxseg"), "got:\n{empty}");
     }
 }
