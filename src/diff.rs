@@ -66,6 +66,9 @@ mod tests {
         assert!(diff.contains("-b\n"), "got:\n{diff}");
         assert!(diff.contains("+B\n"), "got:\n{diff}");
         assert!(diff.contains("+d\n"), "got:\n{diff}");
-        assert!(diff.contains(" a\n"), "unchanged lines keep context: {diff}");
+        assert!(
+            diff.contains(" a\n"),
+            "unchanged lines keep context: {diff}"
+        );
     }
 }

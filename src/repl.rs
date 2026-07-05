@@ -63,7 +63,10 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
     // (VyOS-style): `edit firewall rule web` + `set action drop` ≡
     // `set firewall rule web action drop`.
     let with_ctx = |rest: &[&str]| -> Vec<String> {
-        ctx.iter().cloned().chain(rest.iter().map(|s| s.to_string())).collect()
+        ctx.iter()
+            .cloned()
+            .chain(rest.iter().map(|s| s.to_string()))
+            .collect()
     };
 
     let result: Result<()> = match cmd {
@@ -228,14 +231,19 @@ fn commit_confirm_line(session: &mut Session, act: &Apply, rest: &[&str]) -> boo
 /// note.
 fn do_compare(session: &Session, rest: &[&str]) -> Result<()> {
     let rev = |s: &str| -> Result<usize> {
-        s.parse::<usize>()
-            .map_err(|_| anyhow!("compare: {s:?} is not a revision number (see `run show system commit`)"))
+        s.parse::<usize>().map_err(|_| {
+            anyhow!("compare: {s:?} is not a revision number (see `run show system commit`)")
+        })
     };
     let diff = match rest {
         [] => session.compare()?,
         [n] => session.compare_revision(rev(n)?)?,
         [n, m] => session.compare_revisions(rev(n)?, rev(m)?)?,
-        _ => return Err(anyhow!("compare [<rev> [<rev>]] — 0, 1 or 2 revision numbers")),
+        _ => {
+            return Err(anyhow!(
+                "compare [<rev> [<rev>]] — 0, 1 or 2 revision numbers"
+            ));
+        }
     };
     if diff.is_empty() {
         eprintln!("no differences");
@@ -426,12 +434,15 @@ commands:
                             firewall group  address-group <n> address <csv> | port-group <n> port <csv>
                             nat source <s>  zone …
                             nat destination <d>  zone|proto|port|to …
+                            multiwan mode failover|load-balance
+                            multiwan uplink <if>  priority|weight|table|gateway|check …
                           e.g.  set firewall rule web from wan
                                 set nat source wan-masq zone wan
                                 set nat destination web to 10.0.0.10:8443
   delete <path...>        remove a node or clear a field
   show [section]          show the candidate config (all, or one section:
-                          system | interfaces | firewall | nat | protocols)
+                          system | interfaces | firewall | nat | protocols |
+                          services | multiwan)
   edit <path...>          descend into a subtree; set/delete/show become
                           relative to it, e.g.  edit firewall rule web
   up | top                move one level up / back to the top of the tree
@@ -460,17 +471,32 @@ pub type Cand = (&'static str, &'static str);
 const COMMANDS: &[Cand] = &[
     ("set", "set a configuration value"),
     ("delete", "remove a node or clear a field"),
-    ("show", "show the candidate configuration (optionally a section)"),
+    (
+        "show",
+        "show the candidate configuration (optionally a section)",
+    ),
     ("edit", "descend into a config subtree (VyOS-style context)"),
     ("up", "move one level up from the edit context"),
     ("top", "return to the top of the config tree"),
     ("run", "run an operational command (e.g. run show ip route)"),
-    ("compare", "diff the candidate vs saved, or vs/between archived revisions"),
+    (
+        "compare",
+        "diff the candidate vs saved, or vs/between archived revisions",
+    ),
     ("commit", "apply the candidate to the running system (live)"),
-    ("commit-confirm", "apply live with an auto-rollback timer (default 10 min)"),
-    ("confirm", "keep a commit-confirm change (cancel the auto-rollback)"),
+    (
+        "commit-confirm",
+        "apply live with an auto-rollback timer (default 10 min)",
+    ),
+    (
+        "confirm",
+        "keep a commit-confirm change (cancel the auto-rollback)",
+    ),
     ("save", "persist the configuration across reboot"),
-    ("rollback", "revert to an archived config revision (N; 0 = newest)"),
+    (
+        "rollback",
+        "revert to an archived config revision (N; 0 = newest)",
+    ),
     ("discard", "drop uncommitted edits"),
     ("exit", "leave the edit context / configuration mode"),
     ("help", "show command help"),
@@ -511,33 +537,119 @@ const OP_IPV6: &[Cand] = &[
 const TOP: &[Cand] = &[
     ("system", "host-wide settings (hostname, …)"),
     ("interface", "per-NIC zone, address, VLAN"),
-    ("firewall", "packet filtering: global defaults, zones, rules"),
-    ("nat", "address translation: source (masquerade), destination (port-forward)"),
-    ("protocols", "dynamic routing: router-id, static routes, BGP"),
-    ("services", "box-wide services: DNS forwarder (NTP, … to come)"),
+    (
+        "firewall",
+        "packet filtering: global defaults, zones, rules",
+    ),
+    (
+        "nat",
+        "address translation: source (masquerade), destination (port-forward)",
+    ),
+    (
+        "protocols",
+        "dynamic routing: router-id, static routes, BGP",
+    ),
+    (
+        "services",
+        "box-wide services: DNS forwarder (NTP, … to come)",
+    ),
+    (
+        "multiwan",
+        "WAN uplinks: failover / load-balance + health checks",
+    ),
+];
+// `multiwan <Tab>` reveals the mode + the uplinks (each keyed by interface).
+const MULTIWAN_NODES: &[Cand] = &[
+    ("mode", "failover (primary/backup) or load-balance"),
+    (
+        "uplink",
+        "a WAN uplink (by interface): priority, gateway, health-check",
+    ),
+];
+const WAN_MODES: &[Cand] = &[
+    (
+        "failover",
+        "one active uplink; fail over to the next on loss",
+    ),
+    (
+        "load-balance",
+        "spread flows across all healthy uplinks by weight",
+    ),
+];
+// `multiwan uplink <if> <Tab>` reveals the per-uplink fields.
+const UPLINK_FIELDS: &[Cand] = &[
+    (
+        "priority",
+        "failover order (lower = preferred; default by config order)",
+    ),
+    ("weight", "load-balance share (default 1)"),
+    ("table", "policy-routing table id (default 200 + index)"),
+    (
+        "gateway",
+        "next-hop IPv4, or `dhcp` (resolve from the lease)",
+    ),
+    (
+        "check",
+        "health check: targets + interval/timeout/fail/rise",
+    ),
+];
+// `multiwan uplink <if> check <Tab>` reveals the health-check fields.
+const CHECK_FIELDS: &[Cand] = &[
+    ("target", "an IPv4 to ping out this uplink (repeatable)"),
+    ("interval", "seconds between probe rounds (default 5)"),
+    ("timeout", "per-ping timeout seconds (default 2)"),
+    ("fail", "consecutive losses to mark down (default 3)"),
+    ("rise", "consecutive successes to mark up (default 3)"),
 ];
 // `services <Tab>` reveals the box-wide services (compiled to their daemons' config).
 const SERVICES_NODES: &[Cand] = &[
-    ("dns", "LAN DNS forwarder: upstreams + interfaces to serve on"),
-    ("ntp", "LAN NTP server: upstream sources + interfaces to serve on"),
+    (
+        "dns",
+        "LAN DNS forwarder: upstreams + interfaces to serve on",
+    ),
+    (
+        "ntp",
+        "LAN NTP server: upstream sources + interfaces to serve on",
+    ),
 ];
 // `services ntp <Tab>` reveals the NTP-server fields (a chrony confdir drop-in).
 const NTP_FIELDS: &[Cand] = &[
-    ("upstream", "upstream NTP sources (comma-separated IPs/hostnames)"),
-    ("serve-on", "interfaces whose subnet may query us (comma-separated)"),
+    (
+        "upstream",
+        "upstream NTP sources (comma-separated IPs/hostnames)",
+    ),
+    (
+        "serve-on",
+        "interfaces whose subnet may query us (comma-separated)",
+    ),
 ];
 // `services dns <Tab>` reveals the forwarder fields (a systemd-resolved drop-in).
 const DNS_FIELDS: &[Cand] = &[
-    ("upstream", "upstream resolvers to forward to (comma-separated IPs)"),
-    ("serve-on", "interfaces to listen on for LAN queries (comma-separated)"),
-    ("host-override", "a local DNS record: <name> <ip> (split-horizon)"),
-    ("blocklist", "sinkhole a domain (ad/tracker/malware blocking)"),
+    (
+        "upstream",
+        "upstream resolvers to forward to (comma-separated IPs)",
+    ),
+    (
+        "serve-on",
+        "interfaces to listen on for LAN queries (comma-separated)",
+    ),
+    (
+        "host-override",
+        "a local DNS record: <name> <ip> (split-horizon)",
+    ),
+    (
+        "blocklist",
+        "sinkhole a domain (ad/tracker/malware blocking)",
+    ),
     ("dnssec", "DNSSEC mode: yes / no / allow-downgrade"),
 ];
 const DNSSEC_MODES: &[Cand] = &[
     ("yes", "validate"),
     ("no", "do not validate (appliance default)"),
-    ("allow-downgrade", "validate, but tolerate non-DNSSEC upstreams"),
+    (
+        "allow-downgrade",
+        "validate, but tolerate non-DNSSEC upstreams",
+    ),
 ];
 // `protocols <Tab>` reveals the routing sub-tree (compiled to the Wren daemon).
 const PROTOCOLS_NODES: &[Cand] = &[
@@ -557,7 +669,10 @@ const OSPF_FIELDS: &[Cand] = &[
     ("area", "the OSPF area id (dotted quad, e.g. 0.0.0.0)"),
     ("cost", "output cost for these interfaces"),
     ("network-type", "broadcast / point-to-point"),
-    ("redistribute", "inject a route source (static / connected / bgp)"),
+    (
+        "redistribute",
+        "inject a route source (static / connected / bgp)",
+    ),
 ];
 const OSPF_NETWORK_TYPES: &[Cand] = &[
     ("broadcast", "elect a designated router"),
@@ -565,7 +680,10 @@ const OSPF_NETWORK_TYPES: &[Cand] = &[
 ];
 const RIP_FIELDS: &[Cand] = &[
     ("interface", "a NIC this protocol runs on"),
-    ("redistribute", "inject a route source (static / connected / bgp)"),
+    (
+        "redistribute",
+        "inject a route source (static / connected / bgp)",
+    ),
     ("redistribute-metric", "metric for redistributed routes"),
 ];
 const ISIS_FIELDS: &[Cand] = &[
@@ -591,7 +709,10 @@ const STATIC_FIELDS: &[Cand] = &[
 ];
 const BGP_FIELDS: &[Cand] = &[
     ("local-as", "this router's AS number"),
-    ("router-id", "BGP router-id (defaults to protocols router-id)"),
+    (
+        "router-id",
+        "BGP router-id (defaults to protocols router-id)",
+    ),
     ("network", "a prefix to originate/advertise"),
     ("redistribute", "inject a route source (static / connected)"),
     ("neighbor", "a BGP peer (<ip> remote-as <n>)"),
@@ -603,36 +724,61 @@ const REDIST: &[Cand] = &[
 // `firewall <Tab>` reveals the three firewall sub-trees (NAT lives at top level).
 const FIREWALL_NODES: &[Cand] = &[
     ("global", "default posture inherited by every zone"),
-    ("zone", "per-zone overrides (ICMP, stateful, default-action, …)"),
+    (
+        "zone",
+        "per-zone overrides (ICMP, stateful, default-action, …)",
+    ),
     ("rule", "zone-to-zone allow/deny rules"),
     ("group", "named address/port aliases referenced by rules"),
 ];
 // `firewall group <Tab>` reveals the alias kinds.
 const GROUP_NODES: &[Cand] = &[
-    ("address-group", "a reusable set of hosts/CIDRs (rule source-group)"),
-    ("port-group", "a reusable set of ports/ranges (rule port-group)"),
+    (
+        "address-group",
+        "a reusable set of hosts/CIDRs (rule source-group)",
+    ),
+    (
+        "port-group",
+        "a reusable set of ports/ranges (rule port-group)",
+    ),
 ];
-const ADDRESS_GROUP_FIELDS: &[Cand] =
-    &[("address", "members: hosts/CIDRs, comma-separated (replaces the set)")];
-const PORT_GROUP_FIELDS: &[Cand] =
-    &[("port", "members: ports/ranges, comma-separated (replaces the set)")];
+const ADDRESS_GROUP_FIELDS: &[Cand] = &[(
+    "address",
+    "members: hosts/CIDRs, comma-separated (replaces the set)",
+)];
+const PORT_GROUP_FIELDS: &[Cand] = &[(
+    "port",
+    "members: ports/ranges, comma-separated (replaces the set)",
+)];
 // `nat <Tab>` reveals the two NAT directions (VyOS-style).
 const NAT_NODES: &[Cand] = &[
     ("source", "SNAT/masquerade a zone's outbound traffic"),
-    ("destination", "inbound DNAT port-forward to an internal host"),
+    (
+        "destination",
+        "inbound DNAT port-forward to an internal host",
+    ),
 ];
 const SYSTEM_FIELDS: &[Cand] = &[("hostname", "the appliance hostname")];
 const GLOBAL_FIELDS: &[Cand] = &[
-    ("stateful", "track flows so return traffic is allowed (true|false)"),
+    (
+        "stateful",
+        "track flows so return traffic is allowed (true|false)",
+    ),
     ("block-icmp", "drop inbound ICMP by default (true|false)"),
-    ("default-action", "default ingress action (accept|drop|reject)"),
+    (
+        "default-action",
+        "default ingress action (accept|drop|reject)",
+    ),
     ("log", "log matched traffic by default (true|false)"),
     ("block", "drop a source IP/CIDR everywhere"),
 ];
 const ZONE_FIELDS: &[Cand] = &[
     ("stateful", "stateful inspection for this zone (true|false)"),
     ("block-icmp", "drop inbound ICMP on this zone (true|false)"),
-    ("default-action", "ingress action for this zone (accept|drop|reject)"),
+    (
+        "default-action",
+        "ingress action for this zone (accept|drop|reject)",
+    ),
     ("log", "log this zone's traffic (true|false)"),
     ("block", "drop a source IP/CIDR on this zone"),
 ];
@@ -653,9 +799,18 @@ const PROTOS: &[Cand] = &[("tcp", "TCP"), ("udp", "UDP")];
 const IFACE_FIELDS: &[Cand] = &[
     ("zone", "the zone this NIC belongs to"),
     ("address", "static CIDR or `dhcp`"),
-    ("address6", "static IPv6 CIDR, `auto` (SLAAC) or `dhcp` (DHCPv6)"),
-    ("pd-from", "request a delegated IPv6 prefix from this uplink (DHCPv6-PD)"),
-    ("pd-subnet", "which /64 of the delegated prefix to use (0-255)"),
+    (
+        "address6",
+        "static IPv6 CIDR, `auto` (SLAAC) or `dhcp` (DHCPv6)",
+    ),
+    (
+        "pd-from",
+        "request a delegated IPv6 prefix from this uplink (DHCPv6-PD)",
+    ),
+    (
+        "pd-subnet",
+        "which /64 of the delegated prefix to use (0-255)",
+    ),
     ("parent", "parent interface (for a VLAN subinterface)"),
     ("vlan", "802.1Q VLAN id 1–4094 (with `parent`)"),
     ("private-key", "WireGuard private key (or `generate`)"),
@@ -667,39 +822,75 @@ const IFACE_FIELDS: &[Cand] = &[
     ("master", "enslave this NIC to a bridge/bond device"),
     ("bond-mode", "bonding mode (on a type=bond device)"),
     ("mtu", "link MTU in bytes (e.g. 1492 PPPoE, 9000 jumbo)"),
-    ("mac", "override the link MAC (MAC cloning), e.g. 52:54:00:12:34:56"),
-    ("qos", "egress traffic shaping (cake / fq_codel — bufferbloat)"),
+    (
+        "mac",
+        "override the link MAC (MAC cloning), e.g. 52:54:00:12:34:56",
+    ),
+    (
+        "qos",
+        "egress traffic shaping (cake / fq_codel — bufferbloat)",
+    ),
     ("pppoe", "PPPoE client credentials (on a type=pppoe uplink)"),
 ];
 const ADDRESS6_HINT: &[Cand] = &[
     ("auto", "accept Router Advertisements (SLAAC)"),
-    ("dhcp", "DHCPv6 client (WAN uplink; may request a delegated prefix)"),
+    (
+        "dhcp",
+        "DHCPv6 client (WAN uplink; may request a delegated prefix)",
+    ),
 ];
 const IFACE_TYPES: &[Cand] = &[
     ("bridge", "an L2 switch; enslave NICs with `master`"),
     ("bond", "link aggregation; enslave NICs with `master`"),
-    ("pppoe", "a PPPoE client over a raw uplink NIC (VDSL/fibre WAN)"),
+    (
+        "pppoe",
+        "a PPPoE client over a raw uplink NIC (VDSL/fibre WAN)",
+    ),
 ];
 const PPPOE_FIELDS: &[Cand] = &[
     ("username", "ISP login (PPPoE/PAP/CHAP username)"),
-    ("password", "ISP password (stored 0600, rendered to chap/pap-secrets)"),
-    ("service-name", "optional PPPoE service name (rp_pppoe_service)"),
-    ("ac-name", "optional PPPoE access-concentrator name (rp_pppoe_ac)"),
+    (
+        "password",
+        "ISP password (stored 0600, rendered to chap/pap-secrets)",
+    ),
+    (
+        "service-name",
+        "optional PPPoE service name (rp_pppoe_service)",
+    ),
+    (
+        "ac-name",
+        "optional PPPoE access-concentrator name (rp_pppoe_ac)",
+    ),
     ("mru", "PPP MRU in bytes (default = mtu or 1492)"),
 ];
 const QOS_FIELDS: &[Cand] = &[
     ("discipline", "cake (shaper+AQM) or fq_codel (AQM only)"),
-    ("bandwidth", "CAKE shaping rate, e.g. 100mbit (or `unlimited`)"),
-    ("rtt", "CAKE path RTT, a time (100ms) or keyword (internet/lan/…)"),
+    (
+        "bandwidth",
+        "CAKE shaping rate, e.g. 100mbit (or `unlimited`)",
+    ),
+    (
+        "rtt",
+        "CAKE path RTT, a time (100ms) or keyword (internet/lan/…)",
+    ),
     ("nat", "CAKE: per-host fairness through NAT (true / false)"),
-    ("ack-filter", "CAKE: thin redundant ACKs on an asymmetric link (true/false)"),
-    ("diffserv", "CAKE tin mode (besteffort/diffserv3/diffserv4/diffserv8)"),
+    (
+        "ack-filter",
+        "CAKE: thin redundant ACKs on an asymmetric link (true/false)",
+    ),
+    (
+        "diffserv",
+        "CAKE tin mode (besteffort/diffserv3/diffserv4/diffserv8)",
+    ),
     ("target", "fq_codel target delay, e.g. 5ms"),
     ("interval", "fq_codel interval, e.g. 100ms"),
     ("limit", "fq_codel backlog packet limit"),
 ];
 const QOS_DISCIPLINES: &[Cand] = &[
-    ("cake", "combined shaper + AQM + fairness (WAN uplink default)"),
+    (
+        "cake",
+        "combined shaper + AQM + fairness (WAN uplink default)",
+    ),
     ("fq_codel", "flow-queuing CoDel AQM (no built-in shaper)"),
 ];
 const QOS_RTT: &[Cand] = &[
@@ -720,7 +911,10 @@ const QOS_DIFFSERV: &[Cand] = &[
     ("diffserv8", "8 tins"),
 ];
 const BOND_MODES: &[Cand] = &[
-    ("active-backup", "one active link, the rest standby (no switch config)"),
+    (
+        "active-backup",
+        "one active link, the rest standby (no switch config)",
+    ),
     ("802.3ad", "LACP link aggregation (needs switch support)"),
     ("balance-rr", "round-robin across links"),
     ("balance-xor", "hash-based load balancing"),
@@ -742,8 +936,14 @@ const RA_FIELDS: &[Cand] = &[
     ("prefix", "IPv6 /64 prefixes to advertise (comma-separated)"),
     ("dns", "IPv6 DNS servers to advertise (comma-separated)"),
     ("managed", "set the Managed (M) flag (true / false)"),
-    ("other-config", "set the Other-config (O) flag (true / false)"),
-    ("router-lifetime", "router lifetime seconds (0 = not a default router)"),
+    (
+        "other-config",
+        "set the Other-config (O) flag (true / false)",
+    ),
+    (
+        "router-lifetime",
+        "router lifetime seconds (0 = not a default router)",
+    ),
 ];
 const WG_KEY_GEN: &[Cand] = &[("generate", "generate a fresh WireGuard keypair")];
 const PEER_FIELDS: &[Cand] = &[
@@ -759,9 +959,18 @@ const RULE_FIELDS: &[Cand] = &[
     ("proto", "tcp / udp"),
     ("port", "destination port or range (e.g. 443 or 8000-8100)"),
     ("log", "log packets matching this rule (true / false)"),
-    ("source", "source address/CIDR (e.g. 10.0.0.0/24); default any"),
-    ("source-group", "match an address-group (alias) as the source"),
-    ("port-group", "match a port-group (alias) instead of a single port"),
+    (
+        "source",
+        "source address/CIDR (e.g. 10.0.0.0/24); default any",
+    ),
+    (
+        "source-group",
+        "match an address-group (alias) as the source",
+    ),
+    (
+        "port-group",
+        "match a port-group (alias) instead of a single port",
+    ),
 ];
 
 /// Static completion candidates for the token being typed, given the
@@ -795,7 +1004,13 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "interface", _name, "dhcp-server"] => DHCP_SERVER_FIELDS,
         // The IPv6 Router-Advertisement sub-tree of an interface.
         ["set" | "delete", "interface", _name, "router-advert"] => RA_FIELDS,
-        ["set", "interface", _name, "router-advert", "managed" | "other-config"] => BOOLS,
+        [
+            "set",
+            "interface",
+            _name,
+            "router-advert",
+            "managed" | "other-config",
+        ] => BOOLS,
 
         // The box-wide services sub-tree, and the DNS forwarder within it.
         ["set" | "delete", "services"] => SERVICES_NODES,
@@ -807,13 +1022,30 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "firewall"] => FIREWALL_NODES,
         // firewall group: the alias kinds + their member fields.
         ["set" | "delete", "firewall", "group"] => GROUP_NODES,
-        ["set" | "delete", "firewall", "group", "address-group", _name] => ADDRESS_GROUP_FIELDS,
+        [
+            "set" | "delete",
+            "firewall",
+            "group",
+            "address-group",
+            _name,
+        ] => ADDRESS_GROUP_FIELDS,
         ["set" | "delete", "firewall", "group", "port-group", _name] => PORT_GROUP_FIELDS,
         ["set" | "delete", "firewall", "global"] => GLOBAL_FIELDS,
-        ["set", "firewall", "global", "stateful" | "block-icmp" | "log"] => BOOLS,
+        [
+            "set",
+            "firewall",
+            "global",
+            "stateful" | "block-icmp" | "log",
+        ] => BOOLS,
         ["set", "firewall", "global", "default-action"] => ACTIONS,
         ["set" | "delete", "firewall", "zone", _name] => ZONE_FIELDS,
-        ["set", "firewall", "zone", _name, "stateful" | "block-icmp" | "log"] => BOOLS,
+        [
+            "set",
+            "firewall",
+            "zone",
+            _name,
+            "stateful" | "block-icmp" | "log",
+        ] => BOOLS,
         ["set", "firewall", "zone", _name, "default-action"] => ACTIONS,
         ["set" | "delete", "firewall", "rule", _name] => RULE_FIELDS,
         ["set", "firewall", "rule", _name, "action"] => ACTIONS,
@@ -838,12 +1070,23 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set", "protocols", "ospf3", "redistribute"] => REDIST,
         ["set", "protocols", "ospf3", "network-type"] => OSPF_NETWORK_TYPES,
         ["set" | "delete", "protocols", "rip" | "ripng" | "babel"] => RIP_FIELDS,
-        ["set", "protocols", "rip" | "ripng" | "babel", "redistribute"] => REDIST,
+        [
+            "set",
+            "protocols",
+            "rip" | "ripng" | "babel",
+            "redistribute",
+        ] => REDIST,
         ["set" | "delete", "protocols", "isis"] => ISIS_FIELDS,
         ["set", "protocols", "isis", "redistribute"] => REDIST,
         ["set", "protocols", "isis", "network-type"] => OSPF_NETWORK_TYPES,
         ["set", "protocols", "isis", "level"] => ISIS_LEVELS,
         ["set" | "delete", "protocols", "vrrp", _name] => VRRP_FIELDS,
+
+        // The multiwan (Multi-WAN failover / load-balance) sub-tree.
+        ["set" | "delete", "multiwan"] => MULTIWAN_NODES,
+        ["set", "multiwan", "mode"] => WAN_MODES,
+        ["set" | "delete", "multiwan", "uplink", _iface] => UPLINK_FIELDS,
+        ["set" | "delete", "multiwan", "uplink", _iface, "check"] => CHECK_FIELDS,
 
         // `run` — operational commands from config mode (vtysh-style).
         ["run"] => RUN_TOP,
@@ -872,10 +1115,17 @@ pub struct DynNames {
 /// Returns owned `(keyword, description)` pairs.
 fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
     let own = |slice: &[Cand]| -> Vec<(String, String)> {
-        slice.iter().map(|(k, d)| (k.to_string(), d.to_string())).collect()
+        slice
+            .iter()
+            .map(|(k, d)| (k.to_string(), d.to_string()))
+            .collect()
     };
     let zones = |label: &'static str| -> Vec<(String, String)> {
-        names.zones.iter().map(|z| (z.clone(), label.to_string())).collect()
+        names
+            .zones
+            .iter()
+            .map(|z| (z.clone(), label.to_string()))
+            .collect()
     };
     match tokens {
         // `set interface <Tab>` → the NICs already present (system-discovered or
@@ -899,6 +1149,12 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
             .nat_destination
             .iter()
             .map(|n| (n.clone(), "nat destination".to_string()))
+            .collect(),
+        // `multiwan uplink <Tab>` → the NICs, so you pick one to make an uplink.
+        ["set" | "delete", "multiwan", "uplink"] => names
+            .interfaces
+            .iter()
+            .map(|n| (n.clone(), "interface".to_string()))
             .collect(),
         // Zone-name positions splice in the known zones.
         ["set" | "delete", "firewall", "zone"] => zones("zone"),
@@ -1035,8 +1291,10 @@ impl Completer for ConfigCompleter {
         let eff_view: Vec<&str> = eff.iter().map(String::as_str).collect();
         let names = self.names.borrow();
         let all = dyn_candidates(&eff_view, &names);
-        let matched: Vec<&(String, String)> =
-            all.iter().filter(|(kw, _)| kw.starts_with(prefix)).collect();
+        let matched: Vec<&(String, String)> = all
+            .iter()
+            .filter(|(kw, _)| kw.starts_with(prefix))
+            .collect();
 
         // Align the keyword column, then pad each row out to the terminal width
         // so rustyline lists one candidate per line (keyword + description
@@ -1093,7 +1351,18 @@ mod tests {
                 "help"
             ]
         );
-        assert_eq!(kw(&["set"]), ["system", "interface", "firewall", "nat", "protocols", "services"]);
+        assert_eq!(
+            kw(&["set"]),
+            [
+                "system",
+                "interface",
+                "firewall",
+                "nat",
+                "protocols",
+                "services",
+                "multiwan"
+            ]
+        );
         assert_eq!(kw(&["set", "system"]), ["hostname"]);
         assert_eq!(
             kw(&["set", "interface", "wan0"]),
@@ -1134,16 +1403,34 @@ mod tests {
                 "limit"
             ]
         );
-        assert_eq!(kw(&["set", "interface", "wan0", "qos", "discipline"]), ["cake", "fq_codel"]);
+        assert_eq!(
+            kw(&["set", "interface", "wan0", "qos", "discipline"]),
+            ["cake", "fq_codel"]
+        );
         // The DHCP-server sub-tree of an interface is discoverable.
         assert_eq!(
             kw(&["set", "interface", "lan0", "dhcp-server"]),
-            ["enable", "disable", "pool-offset", "pool-size", "dns", "lease-time"]
+            [
+                "enable",
+                "disable",
+                "pool-offset",
+                "pool-size",
+                "dns",
+                "lease-time"
+            ]
         );
         // The router-advert sub-tree of an interface is discoverable too.
         assert_eq!(
             kw(&["set", "interface", "lan0", "router-advert"]),
-            ["enable", "disable", "prefix", "dns", "managed", "other-config", "router-lifetime"]
+            [
+                "enable",
+                "disable",
+                "prefix",
+                "dns",
+                "managed",
+                "other-config",
+                "router-lifetime"
+            ]
         );
         // The PPPoE-client sub-tree of an interface is discoverable.
         assert_eq!(
@@ -1152,35 +1439,78 @@ mod tests {
         );
         // WireGuard completion: `private-key` offers `generate`; a peer's fields
         // follow after its public key.
-        assert_eq!(kw(&["set", "interface", "wg0", "private-key"]), ["generate"]);
+        assert_eq!(
+            kw(&["set", "interface", "wg0", "private-key"]),
+            ["generate"]
+        );
         assert_eq!(
             kw(&["set", "interface", "wg0", "peer", "PUBKEY"]),
             ["allowed-ips", "endpoint", "keepalive", "preshared-key"]
         );
         // The firewall sub-tree is discoverable level by level (NAT is separate).
-        assert_eq!(kw(&["set", "firewall"]), ["global", "zone", "rule", "group"]);
+        assert_eq!(
+            kw(&["set", "firewall"]),
+            ["global", "zone", "rule", "group"]
+        );
         // The group sub-tree: alias kinds and their member fields.
-        assert_eq!(kw(&["set", "firewall", "group"]), ["address-group", "port-group"]);
-        assert_eq!(kw(&["set", "firewall", "group", "address-group", "mgmt"]), ["address"]);
-        assert_eq!(kw(&["set", "firewall", "group", "port-group", "web"]), ["port"]);
+        assert_eq!(
+            kw(&["set", "firewall", "group"]),
+            ["address-group", "port-group"]
+        );
+        assert_eq!(
+            kw(&["set", "firewall", "group", "address-group", "mgmt"]),
+            ["address"]
+        );
+        assert_eq!(
+            kw(&["set", "firewall", "group", "port-group", "web"]),
+            ["port"]
+        );
         assert_eq!(
             kw(&["set", "firewall", "global"]),
             ["stateful", "block-icmp", "default-action", "log", "block"]
         );
-        assert_eq!(kw(&["set", "firewall", "global", "stateful"]), ["true", "false"]);
-        assert_eq!(kw(&["set", "firewall", "global", "default-action"]), ["accept", "drop", "reject"]);
+        assert_eq!(
+            kw(&["set", "firewall", "global", "stateful"]),
+            ["true", "false"]
+        );
+        assert_eq!(
+            kw(&["set", "firewall", "global", "default-action"]),
+            ["accept", "drop", "reject"]
+        );
         assert_eq!(
             kw(&["set", "firewall", "zone", "wan"]),
             ["stateful", "block-icmp", "default-action", "log", "block"]
         );
-        assert_eq!(kw(&["set", "firewall", "zone", "wan", "block-icmp"]), ["true", "false"]);
+        assert_eq!(
+            kw(&["set", "firewall", "zone", "wan", "block-icmp"]),
+            ["true", "false"]
+        );
         assert_eq!(
             kw(&["set", "firewall", "rule", "web"]),
-            ["from", "to", "action", "proto", "port", "log", "source", "source-group", "port-group"]
+            [
+                "from",
+                "to",
+                "action",
+                "proto",
+                "port",
+                "log",
+                "source",
+                "source-group",
+                "port-group"
+            ]
         );
-        assert_eq!(kw(&["set", "firewall", "rule", "web", "log"]), ["true", "false"]);
-        assert_eq!(kw(&["set", "firewall", "rule", "web", "action"]), ["accept", "drop", "reject"]);
-        assert_eq!(kw(&["set", "firewall", "rule", "web", "proto"]), ["tcp", "udp"]);
+        assert_eq!(
+            kw(&["set", "firewall", "rule", "web", "log"]),
+            ["true", "false"]
+        );
+        assert_eq!(
+            kw(&["set", "firewall", "rule", "web", "action"]),
+            ["accept", "drop", "reject"]
+        );
+        assert_eq!(
+            kw(&["set", "firewall", "rule", "web", "proto"]),
+            ["tcp", "udp"]
+        );
         // The nat sub-tree: source (masquerade) + destination (port-forward).
         assert_eq!(kw(&["set", "nat"]), ["source", "destination"]);
         assert_eq!(kw(&["set", "nat", "source", "wan-masq"]), ["zone"]);
@@ -1188,7 +1518,10 @@ mod tests {
             kw(&["set", "nat", "destination", "web"]),
             ["zone", "proto", "port", "to"]
         );
-        assert_eq!(kw(&["set", "nat", "destination", "web", "proto"]), ["tcp", "udp"]);
+        assert_eq!(
+            kw(&["set", "nat", "destination", "web", "proto"]),
+            ["tcp", "udp"]
+        );
         // zone-value positions are dynamic now (see dynamic_candidates test).
         assert!(kw(&["set", "firewall", "rule", "web", "from"]).is_empty());
         assert!(kw(&["set", "interface", "wan0", "zone"]).is_empty());
@@ -1208,7 +1541,10 @@ mod tests {
             port_groups: vec!["webports".into()],
         };
         let kws = |toks: &[&str]| -> Vec<String> {
-            dyn_candidates(toks, &names).into_iter().map(|(k, _)| k).collect()
+            dyn_candidates(toks, &names)
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect()
         };
         // Name positions splice in the live interface/rule/zone/nat names.
         assert_eq!(kws(&["set", "interface"]), ["eth0", "eth1"]);
@@ -1218,17 +1554,49 @@ mod tests {
         assert_eq!(kws(&["set", "firewall", "zone"]), ["lan", "wan"]);
         // Zone-value positions splice in the known zone names.
         assert_eq!(kws(&["set", "interface", "eth0", "zone"]), ["lan", "wan"]);
-        assert_eq!(kws(&["set", "firewall", "rule", "web", "from"]), ["lan", "wan"]);
-        assert_eq!(kws(&["set", "nat", "source", "wan-masq", "zone"]), ["lan", "wan"]);
-        assert_eq!(kws(&["set", "nat", "destination", "web-fwd", "zone"]), ["lan", "wan"]);
+        assert_eq!(
+            kws(&["set", "firewall", "rule", "web", "from"]),
+            ["lan", "wan"]
+        );
+        assert_eq!(
+            kws(&["set", "nat", "source", "wan-masq", "zone"]),
+            ["lan", "wan"]
+        );
+        assert_eq!(
+            kws(&["set", "nat", "destination", "web-fwd", "zone"]),
+            ["lan", "wan"]
+        );
         // Group-name positions splice in the declared alias names (both when
         // editing a group and when a rule references one).
-        assert_eq!(kws(&["set", "firewall", "group", "address-group"]), ["mgmt"]);
-        assert_eq!(kws(&["set", "firewall", "group", "port-group"]), ["webports"]);
-        assert_eq!(kws(&["set", "firewall", "rule", "web", "source-group"]), ["mgmt"]);
-        assert_eq!(kws(&["set", "firewall", "rule", "web", "port-group"]), ["webports"]);
+        assert_eq!(
+            kws(&["set", "firewall", "group", "address-group"]),
+            ["mgmt"]
+        );
+        assert_eq!(
+            kws(&["set", "firewall", "group", "port-group"]),
+            ["webports"]
+        );
+        assert_eq!(
+            kws(&["set", "firewall", "rule", "web", "source-group"]),
+            ["mgmt"]
+        );
+        assert_eq!(
+            kws(&["set", "firewall", "rule", "web", "port-group"]),
+            ["webports"]
+        );
         // Other positions fall back to the static grammar.
-        assert_eq!(kws(&["set"]), ["system", "interface", "firewall", "nat", "protocols", "services"]);
+        assert_eq!(
+            kws(&["set"]),
+            [
+                "system",
+                "interface",
+                "firewall",
+                "nat",
+                "protocols",
+                "services",
+                "multiwan"
+            ]
+        );
         assert_eq!(
             kws(&["set", "interface", "eth0"]),
             [
@@ -1265,11 +1633,19 @@ mod tests {
         let act = Apply::off(); // no live apply in tests
 
         let mut ctx = Vec::new();
-        assert!(!exec_line(&mut s, &act, &mut ctx, "set system hostname fw1"));
+        assert!(!exec_line(
+            &mut s,
+            &act,
+            &mut ctx,
+            "set system hostname fw1"
+        ));
         assert!(!exec_line(&mut s, &act, &mut ctx, "show"));
         // commit validates (apply off ⇒ no live changes) but does NOT persist.
         assert!(!exec_line(&mut s, &act, &mut ctx, "commit"));
-        assert!(!path.exists(), "commit must not persist (VyOS: that's `save`)");
+        assert!(
+            !path.exists(),
+            "commit must not persist (VyOS: that's `save`)"
+        );
         // save persists the config to disk.
         assert!(!exec_line(&mut s, &act, &mut ctx, "save"));
         assert!(path.exists(), "save persisted the config");
@@ -1374,7 +1750,10 @@ mod tests {
 
         // Snapshot None (no file existed) removes the file we wrote.
         restore_file(&path, None).unwrap();
-        assert!(!path.exists(), "restore of a None snapshot removes the file");
+        assert!(
+            !path.exists(),
+            "restore of a None snapshot removes the file"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

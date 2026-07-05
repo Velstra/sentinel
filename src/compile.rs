@@ -129,8 +129,11 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
     // The zones actually in use (a zone with no assigned interface needs no
     // policy; interfaces the system provides but that aren't assigned a zone yet
     // are simply not firewalled). Sorted + deduped → stable ids starting at 1.
-    let mut zone_names: Vec<&str> =
-        appliance.interfaces.iter().filter_map(|i| i.zone.as_deref()).collect();
+    let mut zone_names: Vec<&str> = appliance
+        .interfaces
+        .iter()
+        .filter_map(|i| i.zone.as_deref())
+        .collect();
     zone_names.sort_unstable();
     zone_names.dedup();
     let ids: BTreeMap<&str, u32> = zone_names
@@ -149,9 +152,10 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
             let default_action = match posture.default_action {
                 Some(a) => action_str(a),
                 None => {
-                    let initiates = appliance.rules.iter().any(|r| {
-                        r.from == zone && r.is_broad() && r.action == Action::Accept
-                    });
+                    let initiates = appliance
+                        .rules
+                        .iter()
+                        .any(|r| r.from == zone && r.is_broad() && r.action == Action::Accept);
                     if initiates {
                         "pass"
                     } else {
@@ -206,8 +210,12 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
 
     // Zones that have a source-NAT (masquerade) rule — their interfaces get
     // `masquerade = true` so the data plane SNATs traffic leaving them.
-    let masq_zones: std::collections::HashSet<&str> =
-        appliance.nat.source.iter().map(|s| s.zone.as_str()).collect();
+    let masq_zones: std::collections::HashSet<&str> = appliance
+        .nat
+        .source
+        .iter()
+        .map(|s| s.zone.as_str())
+        .collect();
 
     let interfaces = appliance
         .interfaces
@@ -377,7 +385,11 @@ port = "8000-8002"
         // The 3-port range became three single-port rules.
         let ports: Vec<u16> = wan.port_rules.iter().map(|r| r.port).collect();
         assert_eq!(ports, vec![8000, 8001, 8002]);
-        assert!(wan.port_rules.iter().all(|r| r.proto == "tcp" && r.action == "pass"));
+        assert!(
+            wan.port_rules
+                .iter()
+                .all(|r| r.proto == "tcp" && r.action == "pass")
+        );
     }
 
     #[test]
@@ -403,9 +415,15 @@ log = true
         let cfg = compile(&Appliance::from_toml(toml).unwrap());
         let wan = cfg.policies.iter().find(|p| p.name == "wan").unwrap();
         assert_eq!(wan.port_rules.len(), 1);
-        assert!(wan.port_rules[0].log, "log flag should carry onto the port rule");
+        assert!(
+            wan.port_rules[0].log,
+            "log flag should carry onto the port rule"
+        );
         let out = cfg.to_toml().unwrap();
-        assert!(out.contains("log = true"), "log emitted to velstra config:\n{out}");
+        assert!(
+            out.contains("log = true"),
+            "log emitted to velstra config:\n{out}"
+        );
     }
 
     #[test]
@@ -486,7 +504,11 @@ port_group = "web"
                 ("192.0.2.5".into(), 8080),
             ]
         );
-        assert!(wan.port_rules.iter().all(|r| r.proto == "tcp" && r.action == "pass"));
+        assert!(
+            wan.port_rules
+                .iter()
+                .all(|r| r.proto == "tcp" && r.action == "pass")
+        );
     }
 
     #[test]

@@ -135,6 +135,31 @@ port = 443
 # proto = "tcp"
 # port = 443
 # to = "10.0.0.10:8443"
+
+# Multi-WAN (roadmap C6): two uplinks with health-checked failover. The lowest
+# `priority` is the primary; if its health check fails, the default route swings
+# to the backup and swings back on recovery. Each uplink also gets its own
+# policy-routing table (default route via its gateway). Set mode = "load-balance"
+# to spread flows across both uplinks by `weight` instead.
+# [multiwan]
+# mode = "failover"
+#
+# [[multiwan.uplink]]
+# interface = "wan0"
+# priority = 10
+# gateway = "192.0.2.1"
+# [multiwan.uplink.health-check]
+# targets = ["1.1.1.1", "8.8.8.8"]
+# interval = 5
+# fail = 3
+# rise = 3
+#
+# [[multiwan.uplink]]
+# interface = "wan1"
+# priority = 20
+# gateway = "198.51.100.1"
+# [multiwan.uplink.health-check]
+# targets = ["1.0.0.1"]
 "#;
 
 /// The whole declarative appliance config.
@@ -177,6 +202,13 @@ pub struct Appliance {
     /// from saved configs when nothing is configured.
     #[serde(default, skip_serializing_if = "Services::is_empty")]
     pub services: Services,
+    /// Multi-WAN (roadmap C6): several WAN uplinks with health-checked failover
+    /// or load-balancing + policy-based routing. A distinct top-level category
+    /// (like [`Nat`]) because it *steers* packets across links — neither pure
+    /// filtering (`firewall`) nor route computation (`protocols`). Omitted from
+    /// saved configs when no uplink is declared.
+    #[serde(default, skip_serializing_if = "MultiWan::is_empty")]
+    pub multiwan: MultiWan,
 }
 
 /// The box-wide services category (`[services.*]`). A thin grouping so DNS, NTP
@@ -343,7 +375,11 @@ pub struct Ospf {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<u16>,
     /// Network type: `"broadcast"` (elects a DR) or `"point-to-point"`.
-    #[serde(default, rename = "network-type", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "network-type",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub network_type: Option<String>,
     /// Route sources redistributed into OSPF as AS-external LSAs (`"static"`,
     /// `"connected"`, `"bgp"`).
@@ -361,7 +397,11 @@ pub struct Ospf3 {
     pub area: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<u16>,
-    #[serde(default, rename = "network-type", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "network-type",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub network_type: Option<String>,
     /// Redistribute sources into OSPFv3 (only `"static"` is honoured by the
     /// daemon's OSPFv3 externals).
@@ -378,7 +418,11 @@ pub struct Rip {
     pub interfaces: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub redistribute: Vec<String>,
-    #[serde(default, rename = "redistribute-metric", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "redistribute-metric",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub redistribute_metric: Option<u32>,
 }
 
@@ -399,11 +443,19 @@ pub struct Isis {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level: Option<String>,
     /// Network type: `"broadcast"` or `"point-to-point"`.
-    #[serde(default, rename = "network-type", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "network-type",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub network_type: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub redistribute: Vec<String>,
-    #[serde(default, rename = "redistribute-metric", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "redistribute-metric",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub redistribute_metric: Option<u32>,
 }
 
@@ -423,7 +475,11 @@ pub struct Vrrp {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<u8>,
     /// The virtual IP address(es) the group presents as the gateway.
-    #[serde(rename = "virtual-address", skip_serializing_if = "Vec::is_empty", default)]
+    #[serde(
+        rename = "virtual-address",
+        skip_serializing_if = "Vec::is_empty",
+        default
+    )]
     pub virtual_address: Vec<String>,
 }
 
@@ -529,6 +585,138 @@ pub struct NatDestination {
     pub port: u16,
     /// Internal target, `"10.0.0.10"` or `"10.0.0.10:8443"`.
     pub to: String,
+}
+
+/// Multi-WAN (roadmap C6) — several WAN uplinks reconciled into failover or
+/// load-balancing with per-uplink health checks and policy-based routing. The
+/// model mirrors VyOS `wan-load-balance`: each uplink owns a routing table (a
+/// default route via its gateway), a small daemon pings the uplink's targets,
+/// and the winning uplink(s) become the `main`-table default. Empty by default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MultiWan {
+    /// `failover` (one active uplink, the rest standby — the lowest `priority`
+    /// number wins) or `load-balance` (spread flows across every healthy uplink
+    /// by `weight`). Defaults to `failover`; skipped on output when default.
+    #[serde(default, skip_serializing_if = "WanMode::is_default")]
+    pub mode: WanMode,
+    /// The WAN uplinks, in configuration order.
+    #[serde(default, rename = "uplink", skip_serializing_if = "Vec::is_empty")]
+    pub uplinks: Vec<WanUplink>,
+}
+
+/// How a [`MultiWan`] group reconciles its uplinks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WanMode {
+    /// One active uplink at a time; on its failure the next-preferred healthy
+    /// uplink takes the default route (primary/backup).
+    #[default]
+    Failover,
+    /// Spread outbound flows across all healthy uplinks, weighted (a multipath
+    /// default route).
+    LoadBalance,
+}
+
+impl WanMode {
+    /// True for the default (`failover`) — lets `mode` be omitted from output.
+    pub fn is_default(&self) -> bool {
+        matches!(self, WanMode::Failover)
+    }
+}
+
+/// The base routing-table id Multi-WAN uplinks are numbered from when no
+/// explicit `table` is given: uplink `idx` owns `WAN_TABLE_BASE + idx`.
+pub const WAN_TABLE_BASE: u32 = 200;
+/// Default health-check ping interval (seconds).
+pub const WAN_CHECK_INTERVAL: u32 = 5;
+/// Default per-ping timeout (seconds).
+pub const WAN_CHECK_TIMEOUT: u32 = 2;
+/// Default consecutive failures before an uplink is marked down.
+pub const WAN_CHECK_FAIL: u32 = 3;
+/// Default consecutive successes before a down uplink is marked back up.
+pub const WAN_CHECK_RISE: u32 = 3;
+
+impl MultiWan {
+    /// True when no uplink is configured — lets `[multiwan]` be omitted.
+    pub fn is_empty(&self) -> bool {
+        self.uplinks.is_empty()
+    }
+
+    /// The routing-table id uplink `u` at index `idx` owns: its explicit
+    /// `table`, else the derived `WAN_TABLE_BASE + idx`.
+    pub fn table_for(&self, idx: usize, u: &WanUplink) -> u32 {
+        u.table.unwrap_or(WAN_TABLE_BASE + idx as u32)
+    }
+}
+
+/// One WAN uplink in a [`MultiWan`] group.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WanUplink {
+    /// The egress interface (a declared `[[interface]]`).
+    pub interface: String,
+    /// Failover ordering — the lowest number is the preferred (primary) uplink.
+    /// Unset ⇒ derived from configuration order (`10 * idx`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u32>,
+    /// Relative share under `load-balance` (a multipath nexthop weight). Unset ⇒
+    /// `1`. Ignored in `failover` mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<u32>,
+    /// The policy-routing table id this uplink owns. Unset ⇒ `WAN_TABLE_BASE +
+    /// idx` (see [`MultiWan::table_for`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table: Option<u32>,
+    /// The next-hop gateway for this uplink's default route — an IPv4 address, or
+    /// `"dhcp"` (the default) to resolve it from the link's DHCP lease at runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<String>,
+    /// The health check that decides whether this uplink is up. Declared last so
+    /// its TOML sub-table serialises after the scalar keys.
+    #[serde(
+        default,
+        rename = "health-check",
+        skip_serializing_if = "HealthCheck::is_default"
+    )]
+    pub check: HealthCheck,
+}
+
+/// A per-uplink health check (roadmap C6): the daemon pings each of `targets`
+/// out the uplink every `interval` seconds; `fail` consecutive losses mark the
+/// uplink down and `rise` consecutive successes mark it back up. Empty `targets`
+/// ⇒ the uplink is assumed up whenever its link is (no active probing).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HealthCheck {
+    /// IPv4 addresses pinged out the uplink (any one reachable ⇒ up).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<String>,
+    /// Seconds between probe rounds (default [`WAN_CHECK_INTERVAL`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval: Option<u32>,
+    /// Per-ping timeout in seconds (default [`WAN_CHECK_TIMEOUT`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u32>,
+    /// Consecutive failures before marking the uplink down (default
+    /// [`WAN_CHECK_FAIL`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fail: Option<u32>,
+    /// Consecutive successes before marking a down uplink up (default
+    /// [`WAN_CHECK_RISE`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rise: Option<u32>,
+}
+
+impl HealthCheck {
+    /// True when nothing is set — lets `health-check` be omitted from output.
+    pub fn is_default(&self) -> bool {
+        self.targets.is_empty()
+            && self.interval.is_none()
+            && self.timeout.is_none()
+            && self.fail.is_none()
+            && self.rise.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -711,11 +899,19 @@ pub struct Interface {
     /// WireGuard private key (base64 of 32 raw bytes). Its presence makes this a
     /// WireGuard interface (`Kind=wireguard`); the `.netdev` carrying it is a
     /// secret and is written mode 0600.
-    #[serde(default, rename = "private-key", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "private-key",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub private_key: Option<String>,
     /// UDP port WireGuard listens on. Optional (an outbound-only tunnel needs
     /// none); when set the peer can reach us at this port.
-    #[serde(default, rename = "listen-port", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "listen-port",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub listen_port: Option<u16>,
     /// WireGuard peers reachable over this interface.
     #[serde(default, rename = "peer", skip_serializing_if = "Vec::is_empty")]
@@ -723,14 +919,22 @@ pub struct Interface {
     /// When set, networkd runs a built-in DHCP server on this interface, handing
     /// out leases from the interface's own static subnet. Requires a static
     /// `address` (the server needs a subnet to allocate from).
-    #[serde(default, rename = "dhcp-server", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "dhcp-server",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub dhcp_server: Option<DhcpServer>,
     /// When set, networkd emits IPv6 Router Advertisements on this interface —
     /// the IPv6 counterpart of the DHCP server. LAN hosts autoconfigure (SLAAC)
     /// an address from each advertised prefix and learn this box as their default
     /// router (and, optionally, DNS). Needs no IPv4 address; the router binds an
     /// address from each advertised prefix itself.
-    #[serde(default, rename = "router-advert", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "router-advert",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub router_advert: Option<RouterAdvert>,
     /// For a **virtual L2 device** — a `bridge` or a `bond` this box creates
     /// (rather than a physical NIC). The device is a networkd `.netdev`
@@ -800,7 +1004,11 @@ pub struct Pppoe {
     /// the world-readable peer options. Required.
     pub password: String,
     /// Optional PPPoE service name (`rp_pppoe_service`); most ISPs need none.
-    #[serde(default, rename = "service-name", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "service-name",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub service_name: Option<String>,
     /// Optional PPPoE access-concentrator name (`rp_pppoe_ac`) to pin the
     /// session to a specific AC; most ISPs need none.
@@ -855,7 +1063,11 @@ pub struct RouterAdvert {
     /// Router lifetime, in seconds. `0` advertises this box as *not* a default
     /// router (prefix/DNS only — useful for a pure address/DNS advertiser).
     /// Unset ⇒ networkd's default (a sane nonzero lifetime).
-    #[serde(default, rename = "router-lifetime", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "router-lifetime",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub router_lifetime: Option<u32>,
 }
 
@@ -865,7 +1077,11 @@ pub struct RouterAdvert {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DhcpServer {
     /// Offset of the first pool address within the interface's subnet.
-    #[serde(default, rename = "pool-offset", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "pool-offset",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub pool_offset: Option<u32>,
     /// Number of addresses in the pool.
     #[serde(default, rename = "pool-size", skip_serializing_if = "Option::is_none")]
@@ -874,7 +1090,11 @@ pub struct DhcpServer {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dns: Vec<String>,
     /// Default lease time, in seconds.
-    #[serde(default, rename = "lease-time", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "lease-time",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub lease_time: Option<u32>,
 }
 
@@ -974,9 +1194,17 @@ pub struct WgPeer {
     pub allowed_ips: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
-    #[serde(default, rename = "persistent-keepalive", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "persistent-keepalive",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub persistent_keepalive: Option<u16>,
-    #[serde(default, rename = "preshared-key", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "preshared-key",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub preshared_key: Option<String>,
 }
 
@@ -993,7 +1221,10 @@ impl Interface {
     /// `pppoe` client is NOT an L2 device (it has no netdev and enslaves no
     /// members), so it is excluded here.
     pub fn is_virtual_l2(&self) -> bool {
-        matches!(self.if_type, Some(IfaceType::Bridge) | Some(IfaceType::Bond))
+        matches!(
+            self.if_type,
+            Some(IfaceType::Bridge) | Some(IfaceType::Bond)
+        )
     }
     /// True for a PPPoE client interface (`type = "pppoe"`).
     pub fn is_pppoe(&self) -> bool {
@@ -1284,7 +1515,10 @@ impl Appliance {
             // a different one). `pd-subnet` without `pd-from` is meaningless.
             if let Some(up) = &iface.pd_from {
                 if !self.interfaces.iter().any(|i| &i.name == up) {
-                    bail!("interface {:?}: pd-from {up:?} is not a declared interface", iface.name);
+                    bail!(
+                        "interface {:?}: pd-from {up:?} is not a declared interface",
+                        iface.name
+                    );
                 }
                 if up == &iface.name {
                     bail!("interface {:?}: pd-from cannot be itself", iface.name);
@@ -1296,7 +1530,10 @@ impl Appliance {
             // well-formed MAC when cloning one.
             if let Some(mtu) = iface.mtu {
                 if !(68..=9216).contains(&mtu) {
-                    bail!("interface {:?}: mtu {mtu} out of range (68–9216)", iface.name);
+                    bail!(
+                        "interface {:?}: mtu {mtu} out of range (68–9216)",
+                        iface.name
+                    );
                 }
             }
             if let Some(mac) = &iface.mac {
@@ -1306,8 +1543,7 @@ impl Appliance {
             // that belong to the chosen discipline are set (cross-discipline knobs
             // are a config error, not a silent no-op).
             if let Some(qos) = &iface.qos {
-                validate_qos(qos)
-                    .with_context(|| format!("interface {:?} qos", iface.name))?;
+                validate_qos(qos).with_context(|| format!("interface {:?} qos", iface.name))?;
             }
             // VLAN subinterface: parent + vlan come as a pair; vlan in range; the
             // parent must be a declared interface. A PPPoE client also carries a
@@ -1317,7 +1553,10 @@ impl Appliance {
                 match (&iface.parent, iface.vlan) {
                     (Some(parent), Some(vlan)) => {
                         if !(1..=4094).contains(&vlan) {
-                            bail!("interface {:?}: vlan {vlan} out of range (1–4094)", iface.name);
+                            bail!(
+                                "interface {:?}: vlan {vlan} out of range (1–4094)",
+                                iface.name
+                            );
                         }
                         if !names.contains(parent.as_str()) {
                             bail!(
@@ -1374,10 +1613,16 @@ impl Appliance {
                     ),
                 }
                 if iface.vlan.is_some() {
-                    bail!("interface {:?}: a pppoe interface cannot also be a VLAN", iface.name);
+                    bail!(
+                        "interface {:?}: a pppoe interface cannot also be a VLAN",
+                        iface.name
+                    );
                 }
                 if iface.is_wireguard() {
-                    bail!("interface {:?}: a pppoe interface cannot also be WireGuard", iface.name);
+                    bail!(
+                        "interface {:?}: a pppoe interface cannot also be WireGuard",
+                        iface.name
+                    );
                 }
                 if iface.address.is_some() || iface.address6.is_some() {
                     bail!(
@@ -1387,7 +1632,10 @@ impl Appliance {
                 }
                 if let Some(mru) = p.mru {
                     if !(68..=9216).contains(&mru) {
-                        bail!("interface {:?}: pppoe mru {mru} out of range (68–9216)", iface.name);
+                        bail!(
+                            "interface {:?}: pppoe mru {mru} out of range (68–9216)",
+                            iface.name
+                        );
                     }
                 }
             } else if iface.pppoe.is_some() {
@@ -1461,9 +1709,8 @@ impl Appliance {
                     })?;
                 }
                 for dns in &ra.dns {
-                    validate_ipv6(dns).with_context(|| {
-                        format!("interface {:?} router-advert dns", iface.name)
-                    })?;
+                    validate_ipv6(dns)
+                        .with_context(|| format!("interface {:?} router-advert dns", iface.name))?;
                 }
             }
 
@@ -1479,7 +1726,10 @@ impl Appliance {
             }
             if let Some(mode) = &iface.bond_mode {
                 if !iface.is_bond() {
-                    bail!("interface {:?}: bond-mode is only valid on a type=bond", iface.name);
+                    bail!(
+                        "interface {:?}: bond-mode is only valid on a type=bond",
+                        iface.name
+                    );
                 }
                 if !BOND_MODES.contains(&mode.as_str()) {
                     bail!(
@@ -1532,8 +1782,11 @@ impl Appliance {
 
         // Every rule's zones must be backed by at least one *assigned* interface,
         // else the rule can never match — a common, silent misconfiguration.
-        let zones_in_use: HashSet<&str> =
-            self.interfaces.iter().filter_map(|i| i.zone.as_deref()).collect();
+        let zones_in_use: HashSet<&str> = self
+            .interfaces
+            .iter()
+            .filter_map(|i| i.zone.as_deref())
+            .collect();
         for rule in &self.rules {
             for (which, zone) in [("from", &rule.from), ("to", &rule.to)] {
                 if !zones_in_use.contains(zone.as_str()) {
@@ -1550,7 +1803,10 @@ impl Appliance {
                 bail!("rule {:?}: set `port` or `port-group`, not both", rule.name);
             }
             if rule.source.is_some() && rule.source_group.is_some() {
-                bail!("rule {:?}: set `source` or `source-group`, not both", rule.name);
+                bail!(
+                    "rule {:?}: set `source` or `source-group`, not both",
+                    rule.name
+                );
             }
             let has_port = rule.port.is_some() || rule.port_group.is_some();
             if rule.proto.is_some() != has_port {
@@ -1575,7 +1831,10 @@ impl Appliance {
             }
             if let Some(g) = &rule.port_group {
                 if !self.firewall.group.port.contains_key(g) {
-                    bail!("rule {:?}: port-group {g:?} is not a declared port group", rule.name);
+                    bail!(
+                        "rule {:?}: port-group {g:?} is not a declared port group",
+                        rule.name
+                    );
                 }
             }
             // Bound the compile-time expansion (sources × ports) so a rule
@@ -1614,8 +1873,7 @@ impl Appliance {
                     dst.zone
                 );
             }
-            parse_host_port(&dst.to)
-                .with_context(|| format!("nat destination {:?}", dst.name))?;
+            parse_host_port(&dst.to).with_context(|| format!("nat destination {:?}", dst.name))?;
         }
 
         // Routing (Wren): validate router-id, static routes and BGP peers.
@@ -1628,12 +1886,18 @@ impl Appliance {
             let prefix_v6 = route_prefix_family(&r.prefix)
                 .with_context(|| format!("protocols static route {:?}", r.prefix))?;
             if r.via.is_none() && r.dev.is_none() {
-                bail!("protocols static route {:?}: needs a via <ip> or dev <if>", r.prefix);
+                bail!(
+                    "protocols static route {:?}: needs a via <ip> or dev <if>",
+                    r.prefix
+                );
             }
             if let Some(via) = &r.via {
                 let via_v6 = match ip_family(via) {
                     Some(f) => f,
-                    None => bail!("protocols static route {:?} via {via:?}: not an IP", r.prefix),
+                    None => bail!(
+                        "protocols static route {:?} via {via:?}: not an IP",
+                        r.prefix
+                    ),
                 };
                 if via_v6 != prefix_v6 {
                     bail!(
@@ -1658,7 +1922,10 @@ impl Appliance {
                 validate_ipv4(&n.address)
                     .with_context(|| format!("protocols bgp neighbor {:?}", n.address))?;
                 if n.remote_as == 0 {
-                    bail!("protocols bgp neighbor {:?}: remote-as must be non-zero", n.address);
+                    bail!(
+                        "protocols bgp neighbor {:?}: remote-as must be non-zero",
+                        n.address
+                    );
                 }
             }
         }
@@ -1718,7 +1985,9 @@ impl Appliance {
         }
         if let Some(mode) = &dns.dnssec {
             if !matches!(mode.as_str(), "yes" | "no" | "allow-downgrade") {
-                bail!("services dns dnssec {mode:?}: expected \"yes\", \"no\" or \"allow-downgrade\"");
+                bail!(
+                    "services dns dnssec {mode:?}: expected \"yes\", \"no\" or \"allow-downgrade\""
+                );
             }
         }
         // Host-overrides map a name to a literal IP (v4 or v6); blocklist entries
@@ -1750,6 +2019,59 @@ impl Appliance {
                     _ => bail!("services ntp serve-on {iface:?}: interface needs a static address"),
                 },
                 None => bail!("services ntp serve-on {iface:?}: not a declared interface"),
+            }
+        }
+
+        // Multi-WAN (roadmap C6): every uplink must name a declared interface,
+        // no interface or routing-table id may be shared between uplinks, table
+        // ids must avoid the kernel's reserved tables, gateways are IPv4 (or
+        // `dhcp`) and health-check targets are IPv4. A single uplink is allowed
+        // (it just has nothing to fail over to) — no artificial floor.
+        let mw = &self.multiwan;
+        let mut seen_if: HashSet<&str> = HashSet::new();
+        let mut seen_tbl: HashSet<u32> = HashSet::new();
+        for (idx, u) in mw.uplinks.iter().enumerate() {
+            if !self.interfaces.iter().any(|i| i.name == u.interface) {
+                bail!(
+                    "multiwan uplink {:?}: not a declared interface",
+                    u.interface
+                );
+            }
+            if !seen_if.insert(u.interface.as_str()) {
+                bail!(
+                    "multiwan uplink {:?}: an interface may back only one uplink",
+                    u.interface
+                );
+            }
+            let tbl = mw.table_for(idx, u);
+            // 0 = unspec, 253 = default, 254 = main, 255 = local — kernel-reserved.
+            if matches!(tbl, 0 | 253 | 254 | 255) {
+                bail!(
+                    "multiwan uplink {:?}: table {tbl} is reserved (local/main/default)",
+                    u.interface
+                );
+            }
+            if !seen_tbl.insert(tbl) {
+                bail!(
+                    "multiwan uplink {:?}: routing-table {tbl} is used by more than one uplink",
+                    u.interface
+                );
+            }
+            if let Some(w) = u.weight {
+                if w == 0 {
+                    bail!("multiwan uplink {:?}: weight must be non-zero", u.interface);
+                }
+            }
+            if let Some(gw) = &u.gateway {
+                if gw != "dhcp" {
+                    validate_ipv4(gw)
+                        .with_context(|| format!("multiwan uplink {:?} gateway", u.interface))?;
+                }
+            }
+            for t in &u.check.targets {
+                validate_ipv4(t).with_context(|| {
+                    format!("multiwan uplink {:?} health-check target", u.interface)
+                })?;
             }
         }
         Ok(())
@@ -1823,7 +2145,11 @@ pub(crate) fn validate_ipv6(s: &str) -> Result<()> {
 /// verbatim into a networkd unit, so it must not smuggle other characters.
 pub(crate) fn validate_mac(s: &str) -> Result<()> {
     let octets: Vec<&str> = s.split(':').collect();
-    if octets.len() != 6 || !octets.iter().all(|o| o.len() == 2 && o.bytes().all(|b| b.is_ascii_hexdigit())) {
+    if octets.len() != 6
+        || !octets
+            .iter()
+            .all(|o| o.len() == 2 && o.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
         bail!("mac {s:?}: expected six colon-separated hex octets");
     }
     Ok(())
@@ -2006,10 +2332,7 @@ pub(crate) fn validate_hostname(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 63 {
         bail!("system.hostname: must be 1–63 characters");
     }
-    if !name
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    {
+    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
         bail!("system.hostname {name:?}: only ASCII letters, digits and '-' are allowed");
     }
     if name.starts_with('-') || name.ends_with('-') {
@@ -2033,9 +2356,7 @@ pub(crate) fn validate_iface_name(name: &str) -> Result<()> {
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
     {
-        bail!(
-            "interface name {name:?}: only ASCII letters, digits, '.', '_' and '-' are allowed"
-        );
+        bail!("interface name {name:?}: only ASCII letters, digits, '.', '_' and '-' are allowed");
     }
     Ok(())
 }
@@ -2123,7 +2444,10 @@ pub(crate) fn validate_wg_key(s: &str) -> Result<()> {
         .decode(s)
         .with_context(|| format!("wireguard key {s:?} is not valid base64"))?;
     if raw.len() != 32 {
-        bail!("wireguard key {s:?} decodes to {} bytes, expected 32", raw.len());
+        bail!(
+            "wireguard key {s:?} decodes to {} bytes, expected 32",
+            raw.len()
+        );
     }
     Ok(())
 }
@@ -2304,6 +2628,98 @@ to = "10.0.0.10:8443"
     }
 
     #[test]
+    fn multiwan_round_trips_and_validates() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+address = "dhcp"
+[[interface]]
+name = "wan1"
+zone = "wan"
+address = "dhcp"
+
+[multiwan]
+mode = "load-balance"
+
+[[multiwan.uplink]]
+interface = "wan0"
+priority = 10
+gateway = "192.0.2.1"
+[multiwan.uplink.health-check]
+targets = ["1.1.1.1"]
+interval = 5
+
+[[multiwan.uplink]]
+interface = "wan1"
+priority = 20
+"#;
+        let a = Appliance::from_toml(toml).expect("multiwan config parses + validates");
+        assert_eq!(a.multiwan.mode, WanMode::LoadBalance);
+        assert_eq!(a.multiwan.uplinks.len(), 2);
+        // Derived table ids: no explicit `table` ⇒ WAN_TABLE_BASE + idx.
+        assert_eq!(a.multiwan.table_for(0, &a.multiwan.uplinks[0]), 200);
+        assert_eq!(a.multiwan.table_for(1, &a.multiwan.uplinks[1]), 201);
+        // Round-trips through TOML unchanged.
+        let out = a.to_toml().unwrap();
+        assert!(out.contains("[[multiwan.uplink]]"), "got:\n{out}");
+        assert!(out.contains("mode = \"load-balance\""), "got:\n{out}");
+        let b = Appliance::from_toml(&out).expect("re-parses");
+        assert_eq!(b.multiwan.uplinks[0].gateway.as_deref(), Some("192.0.2.1"));
+        assert_eq!(
+            b.multiwan.uplinks[0].check.targets,
+            vec!["1.1.1.1".to_string()]
+        );
+    }
+
+    #[test]
+    fn multiwan_rejects_unknown_interface_and_dup_table() {
+        // An uplink naming an interface that isn't declared is rejected.
+        let bad_if = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+[[multiwan.uplink]]
+interface = "nope0"
+"#;
+        assert!(Appliance::from_toml(bad_if).is_err());
+        // Two uplinks pinned to the same routing table collide.
+        let dup_tbl = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+[[interface]]
+name = "wan1"
+zone = "wan"
+[[multiwan.uplink]]
+interface = "wan0"
+table = 201
+[[multiwan.uplink]]
+interface = "wan1"
+table = 201
+"#;
+        assert!(Appliance::from_toml(dup_tbl).is_err());
+        // The main table (254) is reserved.
+        let reserved = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+[[multiwan.uplink]]
+interface = "wan0"
+table = 254
+"#;
+        assert!(Appliance::from_toml(reserved).is_err());
+    }
+
+    #[test]
     fn portspec_parses_single_and_range() {
         assert_eq!(PortSpec::parse("443").unwrap(), PortSpec::Single(443));
         assert_eq!(
@@ -2311,7 +2727,10 @@ to = "10.0.0.10:8443"
             PortSpec::Range(8000, 8100)
         );
         // Whitespace around the dash is tolerated.
-        assert_eq!(PortSpec::parse(" 100 - 200 ").unwrap(), PortSpec::Range(100, 200));
+        assert_eq!(
+            PortSpec::parse(" 100 - 200 ").unwrap(),
+            PortSpec::Range(100, 200)
+        );
         assert!(PortSpec::parse("not-a-port").is_err());
         assert!(PortSpec::parse("70000").is_err()); // > u16
     }
@@ -2421,7 +2840,9 @@ proto = "tcp"
             )
         };
         // A rule referencing declared groups is accepted.
-        assert!(Appliance::from_toml(&base("source_group = \"mgmt\"\nport_group = \"web\"")).is_ok());
+        assert!(
+            Appliance::from_toml(&base("source_group = \"mgmt\"\nport_group = \"web\"")).is_ok()
+        );
         // An unknown group is rejected.
         assert!(Appliance::from_toml(&base("port_group = \"nope\"")).is_err());
         assert!(
@@ -2572,11 +2993,17 @@ address = "dhcp"
 address6 = "auto"
 "#;
         let a = Appliance::from_toml(toml).expect("dual-stack config parses + validates");
-        assert_eq!(a.interfaces[0].address6.as_deref(), Some("2001:db8:1::1/64"));
+        assert_eq!(
+            a.interfaces[0].address6.as_deref(),
+            Some("2001:db8:1::1/64")
+        );
         assert_eq!(a.interfaces[1].address6.as_deref(), Some("auto"));
         // Round-trips.
         let out = a.to_toml().unwrap();
-        assert!(out.contains("address6 = \"2001:db8:1::1/64\""), "got:\n{out}");
+        assert!(
+            out.contains("address6 = \"2001:db8:1::1/64\""),
+            "got:\n{out}"
+        );
         assert!(Appliance::from_toml(&out).is_ok());
         // An IPv4 CIDR in address6 is rejected (it must be v6 or "auto").
         let bad = r#"
@@ -2793,13 +3220,17 @@ limit = 1200
         assert!(Appliance::from_toml(&base("discipline = \"cake\"\ntarget = \"5ms\"\n")).is_err());
         // cake knobs on an fq_codel qdisc are rejected (fq_codel doesn't shape).
         assert!(
-            Appliance::from_toml(&base("discipline = \"fq_codel\"\nbandwidth = \"100mbit\"\n"))
-                .is_err()
+            Appliance::from_toml(&base(
+                "discipline = \"fq_codel\"\nbandwidth = \"100mbit\"\n"
+            ))
+            .is_err()
         );
         // A malformed tc rate is rejected.
         assert!(
-            Appliance::from_toml(&base("discipline = \"cake\"\nbandwidth = \"100furlongs\"\n"))
-                .is_err()
+            Appliance::from_toml(&base(
+                "discipline = \"cake\"\nbandwidth = \"100furlongs\"\n"
+            ))
+            .is_err()
         );
         // A malformed tc time is rejected.
         assert!(
@@ -2969,7 +3400,15 @@ router-lifetime = 1800
         let out = a.to_toml().unwrap();
         assert!(out.contains("[interface.router-advert]"), "got:\n{out}");
         let b = Appliance::from_toml(&out).expect("re-parses");
-        assert_eq!(b.interfaces[0].router_advert.as_ref().unwrap().prefixes.len(), 1);
+        assert_eq!(
+            b.interfaces[0]
+                .router_advert
+                .as_ref()
+                .unwrap()
+                .prefixes
+                .len(),
+            1
+        );
     }
 
     #[test]

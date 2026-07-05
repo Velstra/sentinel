@@ -154,7 +154,9 @@ pub fn rollback(session: &mut Session, act: &Apply, n: usize) -> Result<()> {
     std::fs::write(&tmp, &content).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, &cfg).with_context(|| format!("installing {}", cfg.display()))?;
     archive_config(&cfg, &content)?;
-    session.discard().context("reloading the rolled-back config")?;
+    session
+        .discard()
+        .context("reloading the rolled-back config")?;
     Ok(())
 }
 
@@ -203,7 +205,10 @@ mod tests {
 
     #[test]
     fn parse_revision_nanos_accepts_only_our_names() {
-        assert_eq!(parse_revision_nanos("config-00000000000001700000000.toml"), Some(1_700_000_000));
+        assert_eq!(
+            parse_revision_nanos("config-00000000000001700000000.toml"),
+            Some(1_700_000_000)
+        );
         assert!(parse_revision_nanos("config-.toml").is_none());
         assert!(parse_revision_nanos("appliance.toml").is_none());
         assert!(parse_revision_nanos(".config-123.toml.tmp").is_none());
@@ -219,8 +224,16 @@ mod tests {
         // the clock; here we drive the naming directly to stay deterministic).
         let adir = archive_dir(&cfg);
         std::fs::create_dir_all(&adir).unwrap();
-        std::fs::write(adir.join("config-00000000000000000000001.toml"), "hostname = \"old\"").unwrap();
-        std::fs::write(adir.join("config-00000000000000000000002.toml"), "hostname = \"new\"").unwrap();
+        std::fs::write(
+            adir.join("config-00000000000000000000001.toml"),
+            "hostname = \"old\"",
+        )
+        .unwrap();
+        std::fs::write(
+            adir.join("config-00000000000000000000002.toml"),
+            "hostname = \"new\"",
+        )
+        .unwrap();
 
         let revs = list_revisions(&cfg);
         assert_eq!(revs.len(), 2);

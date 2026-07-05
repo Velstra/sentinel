@@ -84,14 +84,20 @@ pub fn reload_dnsmasq() -> Result<()> {
 /// config actually changed are restarted (by [`crate::net`]), so an unrelated
 /// commit never drops a live WAN link.
 pub fn pppoe_restart(name: &str) -> Result<()> {
-    run_priv("systemctl", &["restart", &format!("sentinel-pppoe@{name}.service")])
+    run_priv(
+        "systemctl",
+        &["restart", &format!("sentinel-pppoe@{name}.service")],
+    )
 }
 
 /// Stop and disband the `sentinel-pppoe@<name>` session (a PPPoE interface that
 /// is no longer configured). Best-effort at the call site — a stop that fails
 /// because the unit was never up must not abort the reconcile.
 pub fn pppoe_stop(name: &str) -> Result<()> {
-    run_priv("systemctl", &["stop", &format!("sentinel-pppoe@{name}.service")])
+    run_priv(
+        "systemctl",
+        &["stop", &format!("sentinel-pppoe@{name}.service")],
+    )
 }
 
 /// Load an nftables ruleset file into the running kernel (`nft -f <path>`). Used
@@ -118,6 +124,27 @@ pub fn tc_qdisc_replace(dev: &str, spec: &[&str]) -> Result<()> {
 /// interface no longer declares QoS. Best-effort at the call site.
 pub fn tc_qdisc_del(dev: &str) -> Result<()> {
     run_priv("tc", &["qdisc", "del", "dev", dev, "root"])
+}
+
+/// (Re)start the `sentinel-multiwan` daemon that health-checks the WAN uplinks
+/// and programs the failover default route (roadmap C6). A `restart` re-reads the
+/// freshly rendered health script and starts the daemon if it wasn't running;
+/// only invoked (by [`crate::net`]) when the rendered config changed.
+pub fn multiwan_restart() -> Result<()> {
+    run_priv("systemctl", &["restart", "sentinel-multiwan.service"])
+}
+
+/// Stop the `sentinel-multiwan` daemon (no uplink configured any more).
+/// Best-effort at the call site — a stop that fails because the unit was never up
+/// must not abort the reconcile.
+pub fn multiwan_stop() -> Result<()> {
+    run_priv("systemctl", &["stop", "sentinel-multiwan.service"])
+}
+
+/// Flush a policy-routing table (`ip route flush table <n>`) — used to tear down
+/// the routes a removed Multi-WAN uplink owned so no stale default lingers.
+pub fn ip_route_flush_table(table: u32) -> Result<()> {
+    run_priv("ip", &["route", "flush", "table", &table.to_string()])
 }
 
 /// The transient systemd unit base name for the `commit-confirm` auto-rollback.

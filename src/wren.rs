@@ -95,7 +95,10 @@ struct WrenOspf3 {
     #[serde(rename = "network-type", skip_serializing_if = "Option::is_none")]
     network_type: Option<String>,
     /// OSPFv3 only redistributes static externals (a bool in wren's schema).
-    #[serde(rename = "redistribute-static", skip_serializing_if = "std::ops::Not::not")]
+    #[serde(
+        rename = "redistribute-static",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
     redistribute_static: bool,
 }
 
@@ -106,7 +109,10 @@ struct WrenRip {
     interfaces: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     redistribute: Vec<String>,
-    #[serde(rename = "redistribute-metric", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "redistribute-metric",
+        skip_serializing_if = "Option::is_none"
+    )]
     redistribute_metric: Option<u32>,
 }
 
@@ -125,7 +131,10 @@ struct WrenIsis {
     network_type: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     redistribute: Vec<String>,
-    #[serde(rename = "redistribute-metric", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "redistribute-metric",
+        skip_serializing_if = "Option::is_none"
+    )]
     redistribute_metric: Option<u32>,
 }
 
