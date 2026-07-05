@@ -2725,6 +2725,17 @@
             rev1 = machine.succeed("sentinel show system commit 1")
             assert "rev-b" in rev1, rev1
 
+            # `compare` against history: the candidate (rev-c) vs revision 1
+            # (rev-b) shows the hostname change; revision 0 vs revision 2 too.
+            cmp = machine.succeed(
+                "su admin -c \"printf '%s\\n' 'compare 1' exit | sentinel configure\" 2>&1"
+            )
+            assert "rev-b" in cmp and "rev-c" in cmp, cmp
+            cmp2 = machine.succeed(
+                "su admin -c \"printf '%s\\n' 'compare 0 2' exit | sentinel configure\" 2>&1"
+            )
+            assert "rev-a" in cmp2 and "rev-c" in cmp2, cmp2
+
             # rollback 1 reverts the RUNNING system to rev-b (applied live) and
             # re-saves it — the headline.
             machine.succeed(
