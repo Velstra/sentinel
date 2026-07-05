@@ -17,7 +17,9 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::config::{Appliance, DhcpServer, Dns, IfaceType, Interface, Ntp, RouterAdvert};
+use crate::config::{
+    Appliance, DhcpServer, Dns, IfaceType, Interface, Ntp, Qos, QosDiscipline, RouterAdvert,
+};
 use crate::system::{self, NETWORKD_RUNTIME_DIR};
 
 /// Filename prefix for the units we own. The low number sorts ahead of the
@@ -612,6 +614,117 @@ fn apply_pppoe(appliance: &Appliance) -> Result<()> {
     Ok(())
 }
 
+// --- QoS / traffic shaping (roadmap C8) ------------------------------------
+//
+// A `[interface.qos]` block attaches a root egress qdisc — `cake` (a combined
+// shaper + AQM that kills bufferbloat on a WAN uplink with one `bandwidth` knob)
+// or `fq_codel` (a pure flow-queuing AQM). Unlike addressing (networkd) this is
+// applied directly with `tc`, so it takes effect the instant a commit lands and
+// is re-asserted each boot. Each shaped interface's rendered qdisc spec is
+// stamped under `/run/sentinel/qos/<name>`; we only (re)run `tc` when that spec
+// changed, so an unrelated commit never disturbs a live queue.
+
+/// Runtime dir of per-interface qdisc-spec stamps (tmpfs; re-seeded each boot).
+const QOS_RUNTIME_DIR: &str = "/run/sentinel/qos";
+
+/// Build the `tc qdisc` argument vector for a QoS block — everything AFTER
+/// `tc qdisc replace dev <name> root`. The field order is fixed so the joined
+/// spec is a canonical change-detect stamp.
+fn qos_qdisc_args(qos: &Qos) -> Vec<String> {
+    let mut a: Vec<String> = Vec::new();
+    match qos.discipline {
+        QosDiscipline::Cake => {
+            a.push("cake".into());
+            // CAKE always takes a shaping rate; absent ⇒ `unlimited` (AQM only).
+            match &qos.bandwidth {
+                Some(bw) => {
+                    a.push("bandwidth".into());
+                    a.push(bw.clone());
+                }
+                None => a.push("unlimited".into()),
+            }
+            // A CAKE RTT preset (`internet`, `lan`, …) is a bare keyword; an
+            // explicit time is given as `rtt <time>`.
+            if let Some(rtt) = &qos.rtt {
+                if crate::config::CAKE_RTT_KEYWORDS.contains(&rtt.as_str()) {
+                    a.push(rtt.clone());
+                } else {
+                    a.push("rtt".into());
+                    a.push(rtt.clone());
+                }
+            }
+            // diffserv mode is a standalone keyword (`diffserv4`, `besteffort`, …).
+            if let Some(ds) = &qos.diffserv {
+                a.push(ds.clone());
+            }
+            if qos.nat {
+                a.push("nat".into());
+            }
+            if qos.ack_filter {
+                a.push("ack-filter".into());
+            }
+        }
+        QosDiscipline::FqCodel => {
+            a.push("fq_codel".into());
+            if let Some(t) = &qos.target {
+                a.push("target".into());
+                a.push(t.clone());
+            }
+            if let Some(i) = &qos.interval {
+                a.push("interval".into());
+                a.push(i.clone());
+            }
+            if let Some(l) = qos.limit {
+                a.push("limit".into());
+                a.push(l.to_string());
+            }
+        }
+    }
+    a
+}
+
+/// Reconcile per-interface QoS to `appliance`: attach/refresh a root qdisc on
+/// each shaped interface (only when its spec changed) and strip shaping from any
+/// interface that no longer declares it. All `tc` calls are best-effort — a
+/// device that isn't up yet (a PPPoE `ppp0`, a late VLAN) re-applies on the next
+/// commit/boot rather than failing the whole reconcile.
+fn apply_qos(appliance: &Appliance) -> Result<()> {
+    let shaped: Vec<&Interface> = appliance.interfaces.iter().filter(|i| i.qos.is_some()).collect();
+    system::ensure_dir(Path::new(QOS_RUNTIME_DIR))?;
+
+    let mut desired: HashSet<String> = HashSet::new();
+    for i in &shaped {
+        let qos = i.qos.as_ref().expect("filtered to qos-carrying interfaces");
+        let args = qos_qdisc_args(qos);
+        let spec = args.join(" ");
+        let path = Path::new(QOS_RUNTIME_DIR).join(&i.name);
+        if file_changed(&path, &spec) {
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            if let Err(e) = system::tc_qdisc_replace(&i.name, &refs) {
+                eprintln!(
+                    "warning: applying qos on {} failed (applies on next commit/boot): {e}",
+                    i.name
+                );
+            }
+        }
+        system::install_file(&path, &spec)?;
+        desired.insert(i.name.clone());
+    }
+    // Strip shaping from interfaces that no longer declare qos.
+    if let Ok(entries) = std::fs::read_dir(QOS_RUNTIME_DIR) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !desired.contains(&name) {
+                if let Err(err) = system::tc_qdisc_del(&name) {
+                    eprintln!("warning: clearing qos on {name}: {err}");
+                }
+                system::remove_file(&e.path())?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reconcile networkd units to match `appliance`: write a `.netdev` for every
 /// VLAN subinterface and a `.network` for every interface that needs one (it has
 /// an address, is a VLAN, or is a parent carrying VLANs), remove any stale
@@ -692,6 +805,7 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
                     || i.pd_from.is_some()
                     || i.mtu.is_some()
                     || i.mac.is_some()
+                    || i.qos.is_some()
                     || children.contains_key(i.name.as_str())
                     || pppoe_parents.contains(i.name.as_str()))
         })
@@ -770,13 +884,77 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
     apply_chrony(appliance)?;
     // PPPoE clients (pppd peer options + secrets + the MSS-clamp ruleset).
     apply_pppoe(appliance)?;
+    // Egress traffic shaping (tc qdiscs) — applied directly, after the links are
+    // (re)configured so the target devices exist.
+    apply_qos(appliance)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Pppoe;
+    use crate::config::{Pppoe, Qos, QosDiscipline};
+
+    #[test]
+    fn qos_qdisc_args_renders_cake_and_fq_codel() {
+        // CAKE with the full knob set — order is fixed (canonical stamp).
+        let cake = Qos {
+            discipline: QosDiscipline::Cake,
+            bandwidth: Some("100mbit".into()),
+            rtt: Some("internet".into()),
+            nat: true,
+            ack_filter: true,
+            diffserv: Some("diffserv4".into()),
+            target: None,
+            interval: None,
+            limit: None,
+        };
+        assert_eq!(
+            qos_qdisc_args(&cake).join(" "),
+            "cake bandwidth 100mbit internet diffserv4 nat ack-filter"
+        );
+
+        // An explicit RTT time is prefixed with `rtt` (vs a bare preset keyword).
+        let explicit = Qos {
+            rtt: Some("50ms".into()),
+            ..cake.clone()
+        };
+        assert_eq!(
+            qos_qdisc_args(&explicit).join(" "),
+            "cake bandwidth 100mbit rtt 50ms diffserv4 nat ack-filter"
+        );
+
+        // CAKE with no bandwidth ⇒ `unlimited` (AQM only, no shaper).
+        let bare = Qos {
+            discipline: QosDiscipline::Cake,
+            bandwidth: None,
+            rtt: None,
+            nat: false,
+            ack_filter: false,
+            diffserv: None,
+            target: None,
+            interval: None,
+            limit: None,
+        };
+        assert_eq!(qos_qdisc_args(&bare).join(" "), "cake unlimited");
+
+        // fq_codel with its own knobs.
+        let fq = Qos {
+            discipline: QosDiscipline::FqCodel,
+            bandwidth: None,
+            rtt: None,
+            nat: false,
+            ack_filter: false,
+            diffserv: None,
+            target: Some("5ms".into()),
+            interval: Some("100ms".into()),
+            limit: Some(1200),
+        };
+        assert_eq!(
+            qos_qdisc_args(&fq).join(" "),
+            "fq_codel target 5ms interval 100ms limit 1200"
+        );
+    }
 
     #[test]
     fn static_address_renders_address_directive() {
@@ -885,6 +1063,7 @@ mod tests {
             pd_subnet: None,
             mtu: None,
             mac: None,
+            qos: None,
             pppoe: None,
         }];
         let body = chrony_conf_body(&ntp, &ifaces).expect("ntp configured");
@@ -1030,6 +1209,7 @@ mod tests {
             pd_subnet: None,
             mtu: None,
             mac: None,
+            qos: None,
             pppoe: None,
         };
         let d = virtual_l2_netdev_body(&br);
@@ -1063,6 +1243,7 @@ mod tests {
             pd_subnet: None,
             mtu: None,
             mac: None,
+            qos: None,
             pppoe: None,
         };
         let d = virtual_l2_netdev_body(&bond);
@@ -1155,6 +1336,7 @@ mod tests {
             pd_subnet: None,
             mtu: None,
             mac: None,
+            qos: None,
             pppoe: None,
         };
         let d = wireguard_netdev_body(&iface);
@@ -1190,6 +1372,7 @@ mod tests {
             bond_mode: None,
             mtu: Some(1492),
             mac: None,
+            qos: None,
             pppoe: Some(Pppoe {
                 username: username.into(),
                 password: password.into(),

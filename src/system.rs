@@ -104,6 +104,22 @@ pub fn nft_load(path: &Path) -> Result<()> {
     run_priv("nft", &["-f", p])
 }
 
+/// (Re)attach a root egress qdisc to `dev`: `tc qdisc replace dev <dev> root
+/// <spec…>` (roadmap C8 traffic shaping). `replace` is idempotent — it installs
+/// the qdisc if absent or swaps it in place without dropping the link, so a
+/// re-apply of the same spec never blips a live queue.
+pub fn tc_qdisc_replace(dev: &str, spec: &[&str]) -> Result<()> {
+    let mut args: Vec<&str> = vec!["qdisc", "replace", "dev", dev, "root"];
+    args.extend_from_slice(spec);
+    run_priv("tc", &args)
+}
+
+/// Remove `dev`'s root qdisc, reverting it to the kernel default — used when an
+/// interface no longer declares QoS. Best-effort at the call site.
+pub fn tc_qdisc_del(dev: &str) -> Result<()> {
+    run_priv("tc", &["qdisc", "del", "dev", dev, "root"])
+}
+
 /// The transient systemd unit base name for the `commit-confirm` auto-rollback.
 /// `systemd-run --unit=<this>` creates `<this>.timer` + `<this>.service`.
 pub const CONFIRM_UNIT: &str = "sentinel-confirm";
@@ -289,6 +305,7 @@ pub fn bin(name: &str) -> String {
         "journalctl" => "SENTINEL_JOURNALCTL_BIN",
         "wren" => "SENTINEL_WREN_BIN",
         "nft" => "SENTINEL_NFT_BIN",
+        "tc" => "SENTINEL_TC_BIN",
         "lsblk" => "SENTINEL_LSBLK_BIN",
         "install" => "SENTINEL_INSTALL_BIN",
         "mkdir" => "SENTINEL_MKDIR_BIN",
