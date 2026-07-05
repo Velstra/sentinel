@@ -542,6 +542,9 @@ pub struct Firewall {
     /// Log matched traffic by default (zones inherit this). Off by default.
     #[serde(default)]
     pub log: bool,
+    /// Named address/port groups (aliases) that rules reference by name.
+    #[serde(default, skip_serializing_if = "Groups::is_empty")]
+    pub group: Groups,
 }
 
 fn default_true() -> bool {
@@ -560,6 +563,7 @@ impl Default for Firewall {
             blocklist: Vec::new(),
             default_action: Action::Drop,
             log: false,
+            group: Groups::default(),
         }
     }
 }
@@ -573,8 +577,38 @@ impl Firewall {
             && self.blocklist.is_empty()
             && self.default_action == Action::Drop
             && !self.log
+            && self.group.is_empty()
     }
 }
+
+/// Named firewall groups (aliases): reusable sets of addresses and ports that
+/// rules reference by name instead of repeating literals — the VyOS/pfSense
+/// "group"/"alias" ergonomic. A rule referencing a group expands at compile time
+/// to one data-plane rule per member (addresses stay as CIDRs — a `/24` is one
+/// LPM entry, not 256 hosts), so groups cost nothing extra in the data plane.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Groups {
+    /// Address groups: name → hosts/CIDRs. Referenced by a rule's `source_group`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub address: BTreeMap<String, Vec<String>>,
+    /// Port groups: name → ports/ranges. Referenced by a rule's `port_group`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub port: BTreeMap<String, Vec<PortSpec>>,
+}
+
+impl Groups {
+    /// No groups defined (lets `[firewall]` be omitted when untouched).
+    pub fn is_empty(&self) -> bool {
+        self.address.is_empty() && self.port.is_empty()
+    }
+}
+
+/// The widest expansion (sources × ports) a single grouped rule may produce —
+/// keeps a rule that crosses a big address group with a big port group from
+/// flooding the data-plane rule map. Addresses stay as CIDRs, so this is
+/// members-times-ports, not hosts-times-ports.
+pub const MAX_RULE_EXPANSION: usize = 4096;
 
 /// A named network zone — the trust boundary a firewall reasons about. Zones are
 /// arbitrary (`wan`, `lan`, `dmz`, `guest`, `iot`, …); each becomes one Velstra
@@ -967,16 +1001,57 @@ pub struct Rule {
     /// meaningful on a port rule; a more specific source wins over `from any`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Reference an address group (`[firewall.group.address]`) as the source
+    /// constraint instead of an inline `source` — mutually exclusive with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_group: Option<String>,
+    /// Reference a port group (`[firewall.group.port]`) instead of an inline
+    /// `port`/range — mutually exclusive with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port_group: Option<String>,
 }
 
 impl Rule {
     /// A broad zone rule (no proto/port) — sets the from-zone's default posture.
     pub fn is_broad(&self) -> bool {
-        self.proto.is_none() && self.port.is_none()
+        self.proto.is_none() && self.port.is_none() && self.port_group.is_none()
     }
-    /// A specific proto/port rule.
+    /// A specific proto/port rule (a literal port/range or a port group).
     pub fn is_port_rule(&self) -> bool {
-        self.proto.is_some() && self.port.is_some()
+        self.proto.is_some() && (self.port.is_some() || self.port_group.is_some())
+    }
+
+    /// The source constraints this rule matches, expanding a `source_group`
+    /// (each member becomes its own data-plane rule). `None` means "from any";
+    /// an unknown group name resolves to nothing (validation rejects it first).
+    pub fn resolved_sources(&self, groups: &Groups) -> Vec<Option<String>> {
+        if let Some(g) = &self.source_group {
+            groups
+                .address
+                .get(g)
+                .map(|m| m.iter().cloned().map(Some).collect())
+                .unwrap_or_default()
+        } else if let Some(s) = &self.source {
+            vec![Some(s.clone())]
+        } else {
+            vec![None]
+        }
+    }
+
+    /// The ports this rule matches, expanding a `port_group` or a single
+    /// spec/range into concrete ports.
+    pub fn resolved_ports(&self, groups: &Groups) -> Vec<u16> {
+        if let Some(g) = &self.port_group {
+            groups
+                .port
+                .get(g)
+                .map(|specs| specs.iter().flat_map(|p| p.ports()).collect())
+                .unwrap_or_default()
+        } else if let Some(p) = &self.port {
+            p.ports().collect()
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -1209,6 +1284,25 @@ impl Appliance {
             }
         }
 
+        // Firewall groups (aliases): address members must be IPv4 hosts or CIDRs
+        // (the data plane matches sources by longest prefix, so a hostname can't
+        // apply); port members must be valid ports/ranges.
+        for (name, members) in &self.firewall.group.address {
+            for m in members {
+                if validate_ipv4(m).is_err() && validate_address(m).is_err() {
+                    bail!(
+                        "firewall group address-group {name:?}: {m:?} is not an IPv4 host or CIDR"
+                    );
+                }
+            }
+        }
+        for (name, specs) in &self.firewall.group.port {
+            for s in specs {
+                s.validate()
+                    .with_context(|| format!("firewall group port-group {name:?}"))?;
+            }
+        }
+
         // Every rule's zones must be backed by at least one *assigned* interface,
         // else the rule can never match — a common, silent misconfiguration.
         let zones_in_use: HashSet<&str> =
@@ -1222,18 +1316,53 @@ impl Appliance {
                     );
                 }
             }
-            // proto and port are a pair: a port rule needs both, a broad rule
-            // neither.
-            if rule.proto.is_some() != rule.port.is_some() {
+            // A port match is an inline `port`/range OR a `port-group`, never
+            // both; likewise a `source` OR a `source-group`. And a port rule
+            // needs a proto paired with a port (either form).
+            if rule.port.is_some() && rule.port_group.is_some() {
+                bail!("rule {:?}: set `port` or `port-group`, not both", rule.name);
+            }
+            if rule.source.is_some() && rule.source_group.is_some() {
+                bail!("rule {:?}: set `source` or `source-group`, not both", rule.name);
+            }
+            let has_port = rule.port.is_some() || rule.port_group.is_some();
+            if rule.proto.is_some() != has_port {
                 bail!(
-                    "rule {:?}: `proto` and `port` must be set together",
+                    "rule {:?}: `proto` and a port (`port` or `port-group`) must be set together",
                     rule.name
                 );
             }
-            // A port (or range) must be in range and not inverted/too wide.
+            // A literal port (or range) must be in range and not inverted/too wide.
             if let Some(port) = rule.port {
                 port.validate()
                     .with_context(|| format!("rule {:?}", rule.name))?;
+            }
+            // A referenced group must be declared.
+            if let Some(g) = &rule.source_group {
+                if !self.firewall.group.address.contains_key(g) {
+                    bail!(
+                        "rule {:?}: source-group {g:?} is not a declared address group",
+                        rule.name
+                    );
+                }
+            }
+            if let Some(g) = &rule.port_group {
+                if !self.firewall.group.port.contains_key(g) {
+                    bail!("rule {:?}: port-group {g:?} is not a declared port group", rule.name);
+                }
+            }
+            // Bound the compile-time expansion (sources × ports) so a rule
+            // crossing two big groups can't flood the data-plane rule map.
+            if rule.is_port_rule() {
+                let expansion = rule.resolved_sources(&self.firewall.group).len()
+                    * rule.resolved_ports(&self.firewall.group).len();
+                if expansion > MAX_RULE_EXPANSION {
+                    bail!(
+                        "rule {:?}: expands to {expansion} data-plane rules, over the \
+                         {MAX_RULE_EXPANSION} cap (shrink the address/port group)",
+                        rule.name
+                    );
+                }
             }
         }
 
@@ -1926,6 +2055,65 @@ port = "1-65535"
 "#;
         // The range is far over the cap → validation rejects it.
         assert!(Appliance::from_toml(toml).is_err());
+    }
+
+    #[test]
+    fn firewall_groups_validate_references_and_exclusivity() {
+        let base = |rule: &str| {
+            format!(
+                r#"
+[system]
+hostname = "fw"
+[firewall.group.address]
+mgmt = ["10.0.0.0/24"]
+[firewall.group.port]
+web = [80, 443]
+[[interface]]
+name = "wan0"
+zone = "wan"
+[[interface]]
+name = "lan0"
+zone = "lan"
+[[rule]]
+name = "r"
+from = "wan"
+to = "lan"
+action = "accept"
+proto = "tcp"
+{rule}
+"#
+            )
+        };
+        // A rule referencing declared groups is accepted.
+        assert!(Appliance::from_toml(&base("source_group = \"mgmt\"\nport_group = \"web\"")).is_ok());
+        // An unknown group is rejected.
+        assert!(Appliance::from_toml(&base("port_group = \"nope\"")).is_err());
+        assert!(
+            Appliance::from_toml(&base("source_group = \"nope\"\nport_group = \"web\"")).is_err()
+        );
+        // A literal and a group on the same axis is rejected (ambiguous).
+        assert!(
+            Appliance::from_toml(&base("port = 22\nport_group = \"web\"")).is_err(),
+            "port and port-group are mutually exclusive"
+        );
+        assert!(
+            Appliance::from_toml(&base(
+                "source = \"10.1.0.0/24\"\nsource_group = \"mgmt\"\nport_group = \"web\""
+            ))
+            .is_err(),
+            "source and source-group are mutually exclusive"
+        );
+        // A bad address-group member (a hostname, not an IP/CIDR) is rejected.
+        let bad = r#"
+[system]
+hostname = "fw"
+[firewall.group.address]
+mgmt = ["not-an-ip"]
+[[interface]]
+name = "wan0"
+zone = "wan"
+"#;
+        assert!(Appliance::from_toml(bad).is_err());
     }
 
     #[test]

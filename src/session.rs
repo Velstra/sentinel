@@ -13,9 +13,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::config::{
-    Action, Appliance, Bgp, BgpNeighbor, DhcpServer, Dns, Firewall, IfaceType, Interface, Isis, Nat,
-    NatDestination, NatSource, Ntp, Ospf, Ospf3, PortSpec, Proto, Protocols, Rip, RouterAdvert,
-    Rule, Services, StaticRoute, System, Vrrp, WgPeer, ZoneCfg,
+    Action, Appliance, Bgp, BgpNeighbor, DhcpServer, Dns, Firewall, Groups, IfaceType, Interface,
+    Isis, Nat, NatDestination, NatSource, Ntp, Ospf, Ospf3, PortSpec, Proto, Protocols, Rip,
+    RouterAdvert, Rule, Services, StaticRoute, System, Vrrp, WgPeer, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -114,6 +114,8 @@ struct RuleDraft {
     port: Option<PortSpec>,
     log: Option<bool>,
     source: Option<String>,
+    source_group: Option<String>,
+    port_group: Option<String>,
 }
 
 /// A partially-specified source-NAT (masquerade) rule.
@@ -267,6 +269,8 @@ struct VrrpDraft {
 struct Draft {
     hostname: Option<String>,
     firewall: FirewallDraft,
+    /// Named firewall groups (aliases) — address + port sets referenced by rules.
+    groups: Groups,
     zones: BTreeMap<String, ZoneDraft>,
     interfaces: Vec<(String, IfaceDraft)>,
     rules: Vec<(String, RuleDraft)>,
@@ -389,6 +393,7 @@ impl Draft {
                 default_action: Some(a.firewall.default_action),
                 log: Some(a.firewall.log),
             },
+            groups: a.firewall.group.clone(),
             zones: a
                 .zones
                 .iter()
@@ -472,6 +477,8 @@ impl Draft {
                             port: r.port,
                             log: Some(r.log),
                             source: r.source.clone(),
+                            source_group: r.source_group.clone(),
+                            port_group: r.port_group.clone(),
                         },
                     )
                 })
@@ -678,6 +685,18 @@ impl Session {
     /// for `set/delete nat destination …`.
     pub fn nat_destination_names(&self) -> Vec<String> {
         self.draft.nat_destination.iter().map(|(n, _)| n.clone()).collect()
+    }
+
+    /// The declared address-group names — completion offers these for a rule's
+    /// `source-group` value and `delete firewall group address-group …`.
+    pub fn address_group_names(&self) -> Vec<String> {
+        self.draft.groups.address.keys().cloned().collect()
+    }
+
+    /// The declared port-group names — completion offers these for a rule's
+    /// `port-group` value and `delete firewall group port-group …`.
+    pub fn port_group_names(&self) -> Vec<String> {
+        self.draft.groups.port.keys().cloned().collect()
     }
 
     /// The zone names known to the candidate — those referenced by an interface
@@ -934,6 +953,28 @@ impl Session {
             }
             ["firewall", "rule", name, "source", v] => {
                 self.draft.rule_mut(name).source = Some((*v).to_string())
+            }
+            ["firewall", "rule", name, "source-group", v] => {
+                self.draft.rule_mut(name).source_group = Some((*v).to_string())
+            }
+            ["firewall", "rule", name, "port-group", v] => {
+                self.draft.rule_mut(name).port_group = Some((*v).to_string())
+            }
+
+            // firewall group <kind> <name>: named aliases (address/port sets)
+            // referenced by a rule's source-group / port-group. Members are a
+            // comma-separated list and replace the group's contents.
+            ["firewall", "group", "address-group", name, "address", v] => {
+                let members: Vec<String> =
+                    v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
+                self.draft.groups.address.insert((*name).to_string(), members);
+            }
+            ["firewall", "group", "port-group", name, "port", v] => {
+                let mut specs = Vec::new();
+                for tok in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    specs.push(PortSpec::parse(tok)?);
+                }
+                self.draft.groups.port.insert((*name).to_string(), specs);
             }
 
             // --- nat { … } — address translation, its own top-level node ---
@@ -1328,7 +1369,21 @@ impl Session {
                     "port" => r.port = None,
                     "log" => r.log = None,
                     "source" => r.source = None,
+                    "source-group" => r.source_group = None,
+                    "port-group" => r.port_group = None,
                     other => bail!("rule has no field {other:?}"),
+                }
+            }
+
+            // firewall group <kind> <name>: remove a whole named alias.
+            ["firewall", "group", "address-group", name] => {
+                if self.draft.groups.address.remove(*name).is_none() {
+                    bail!("no address-group {name:?}");
+                }
+            }
+            ["firewall", "group", "port-group", name] => {
+                if self.draft.groups.port.remove(*name).is_none() {
+                    bail!("no port-group {name:?}");
                 }
             }
 
@@ -1643,6 +1698,8 @@ impl Session {
                     port: d.port,
                     log: d.log.unwrap_or(false),
                     source: d.source.clone(),
+                    source_group: d.source_group.clone(),
+                    port_group: d.port_group.clone(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1653,6 +1710,7 @@ impl Session {
             blocklist: self.draft.firewall.blocklist.clone(),
             default_action: self.draft.firewall.default_action.unwrap_or(Action::Drop),
             log: self.draft.firewall.log.unwrap_or(false),
+            group: self.draft.groups.clone(),
         };
         let zones: BTreeMap<String, ZoneCfg> = self
             .draft
@@ -2104,6 +2162,25 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         fwi.push_str("    }\n");
     }
+    if !draft.groups.address.is_empty() || !draft.groups.port.is_empty() {
+        fwi.push_str("    group {\n");
+        for (name, members) in &draft.groups.address {
+            fwi.push_str(&format!("        address-group {name} {{\n"));
+            if !members.is_empty() {
+                fwi.push_str(&format!("            address {}\n", members.join(",")));
+            }
+            fwi.push_str("        }\n");
+        }
+        for (name, specs) in &draft.groups.port {
+            fwi.push_str(&format!("        port-group {name} {{\n"));
+            if !specs.is_empty() {
+                let ports: Vec<String> = specs.iter().map(PortSpec::to_string).collect();
+                fwi.push_str(&format!("            port {}\n", ports.join(",")));
+            }
+            fwi.push_str("        }\n");
+        }
+        fwi.push_str("    }\n");
+    }
     for (name, r) in &draft.rules {
         fwi.push_str(&format!("    rule {name} {{\n"));
         if let Some(z) = &r.from {
@@ -2126,6 +2203,12 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         if let Some(s) = &r.source {
             fwi.push_str(&format!("        source {s}\n"));
+        }
+        if let Some(g) = &r.source_group {
+            fwi.push_str(&format!("        source-group {g}\n"));
+        }
+        if let Some(g) = &r.port_group {
+            fwi.push_str(&format!("        port-group {g}\n"));
         }
         fwi.push_str("    }\n");
     }

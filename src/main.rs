@@ -301,6 +301,8 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
                     session.zone_names(),
                     session.nat_source_names(),
                     session.nat_destination_names(),
+                    session.address_group_names(),
+                    session.port_group_names(),
                 );
                 h.set_context(&ctx);
             }

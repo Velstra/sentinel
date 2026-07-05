@@ -160,9 +160,12 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                 }
             };
             // Specific proto/port rules become Velstra port rules on this policy.
-            // A port *range* expands to one data-plane rule per port (the data
-            // plane keys on a single `(proto, port)`); the range width is capped
+            // A port *range* or a `port-group` expands to one data-plane rule per
+            // port, and a `source-group` fans out over its member CIDRs — so a
+            // grouped rule emits the full (sources × ports) product here (the data
+            // plane keys on a single `(proto, port[, src])`). The width is capped
             // at validate time so this stays small.
+            let groups = &appliance.firewall.group;
             let port_rules = appliance
                 .rules
                 .iter()
@@ -171,14 +174,21 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                     let proto = proto_str(r.proto.unwrap());
                     let action = action_str(r.action);
                     let log = r.log;
-                    let src = r.source.clone();
-                    r.port.unwrap().ports().map(move |port| PortRule {
-                        proto,
-                        port,
-                        action,
-                        log,
-                        src: src.clone(),
-                    })
+                    let sources = r.resolved_sources(groups);
+                    let ports = r.resolved_ports(groups);
+                    let mut out = Vec::with_capacity(sources.len() * ports.len());
+                    for src in &sources {
+                        for &port in &ports {
+                            out.push(PortRule {
+                                proto,
+                                port,
+                                action,
+                                log,
+                                src: src.clone(),
+                            });
+                        }
+                    }
+                    out
                 })
                 .collect();
             Policy {
@@ -427,6 +437,56 @@ source = "10.0.0.0/24"
             out.contains(r#"src = "10.0.0.0/24""#),
             "source emitted to velstra config:\n{out}"
         );
+    }
+
+    #[test]
+    fn rule_groups_expand_to_the_cartesian_product() {
+        // An address-group of 2 CIDRs × a port-group of 3 ports → 6 port rules
+        // on the wan policy, one per (source, port).
+        let toml = r#"
+[system]
+hostname = "fw"
+[firewall.group.address]
+mgmt = ["10.0.0.0/24", "192.0.2.5"]
+[firewall.group.port]
+web = [80, 443, "8080-8080"]
+[[interface]]
+name = "wan0"
+zone = "wan"
+[[interface]]
+name = "lan0"
+zone = "lan"
+[[rule]]
+name = "grouped"
+from = "wan"
+to = "lan"
+action = "accept"
+proto = "tcp"
+source_group = "mgmt"
+port_group = "web"
+"#;
+        let cfg = compile(&Appliance::from_toml(toml).unwrap());
+        let wan = cfg.policies.iter().find(|p| p.name == "wan").unwrap();
+        assert_eq!(wan.port_rules.len(), 6, "2 sources × 3 ports");
+        // Every source CIDR is present, paired with every port.
+        let mut seen: Vec<(String, u16)> = wan
+            .port_rules
+            .iter()
+            .map(|r| (r.src.clone().unwrap(), r.port))
+            .collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                ("10.0.0.0/24".into(), 80),
+                ("10.0.0.0/24".into(), 443),
+                ("10.0.0.0/24".into(), 8080),
+                ("192.0.2.5".into(), 80),
+                ("192.0.2.5".into(), 443),
+                ("192.0.2.5".into(), 8080),
+            ]
+        );
+        assert!(wan.port_rules.iter().all(|r| r.proto == "tcp" && r.action == "pass"));
     }
 
     #[test]
