@@ -2422,6 +2422,114 @@
           '';
         };
 
+        # Kernel tunnels (roadmap C3): two Sentinel appliances (`left`/`right`) on
+        # a shared segment (eth1, static underlay addresses), each configuring a GRE
+        # tunnel to the other with an inner /30. Sentinel renders a networkd tunnel
+        # `.netdev` (Kind=gre + [Tunnel] Local/Remote/Key/TTL + Independent=yes) and
+        # a `.network` binding the inner address; the test proves (1) networkd
+        # realises a real gre link in the kernel and (2) traffic flows through it —
+        # a ping across the inner subnet reaches the far end via the tunnel.
+        #   nix build .#checks.x86_64-linux.tunnel -L
+        tunnel = pkgs.testers.runNixOSTest {
+          name = "sentinel-tunnel";
+          nodes =
+            let
+              # One Sentinel tunnel endpoint. `wanAddr` is its underlay address on
+              # the shared segment; set at the NixOS level (boot-stable, like the
+              # nat/ipsec tests) so the tunnel config is the only thing `commit`
+              # drives. The XDP firewall lives on the default `eth0`, so GRE (IP
+              # proto 47) on eth1 is never filtered.
+              gw =
+                { wanAddr }:
+                { lib, ... }:
+                {
+                  imports = [ self.nixosModules.sentinel ];
+                  networking.hostName = lib.mkForce (
+                    if wanAddr == "10.0.0.1" then "left" else "right"
+                  );
+                  networking.firewall.enable = lib.mkForce false;
+                  virtualisation.vlans = [ 1 ];
+                  virtualisation.memorySize = 2048;
+                  networking.interfaces.eth1.ipv4.addresses = [
+                    {
+                      address = wanAddr;
+                      prefixLength = 24;
+                    }
+                  ];
+                  # A decapsulated inner packet arrives on tun0 with an inner source
+                  # that strict reverse-path filtering would treat as a martian.
+                  boot.kernel.sysctl = {
+                    "net.ipv4.conf.all.rp_filter" = 2;
+                    "net.ipv4.conf.default.rp_filter" = 2;
+                  };
+                };
+            in
+            {
+              left = gw { wanAddr = "10.0.0.1"; };
+              right = gw { wanAddr = "10.0.0.2"; };
+            };
+          testScript = ''
+            start_all()
+            for m in (left, right):
+                m.wait_for_unit("multi-user.target")
+                m.wait_for_unit("sentinel-boot.service")
+                m.wait_for_unit("velstra.service")
+
+            # The underlay is up on both ends (set at the NixOS level).
+            left.wait_until_succeeds("ip addr show eth1 | grep -q 10.0.0.1", timeout=30)
+            right.wait_until_succeeds("ip addr show eth1 | grep -q 10.0.0.2", timeout=30)
+            left.wait_until_succeeds("ping -c1 -W2 10.0.0.2", timeout=30)
+
+            # Each end configures a keyed GRE tunnel to the other with an inner /30.
+            # The tunnel is NOT named `gre0` — that collides with the kernel's
+            # fallback GRE device — but `tun0`. A permissive default posture lets the
+            # decapsulated inner traffic through: velstra attaches a (generic) XDP
+            # hook to the zoned tunnel, so the vpn zone must accept. ONE `set` per
+            # line, committed + saved as the admin user.
+            def configure(node, local, remote, inner):
+                node.succeed(
+                    "su admin -c \"printf '%s\\n' "
+                    "'set firewall global default-action accept' "
+                    "'set interface tun0 type gre' "
+                    f"'set interface tun0 local {local}' "
+                    f"'set interface tun0 remote {remote}' "
+                    f"'set interface tun0 address {inner}' "
+                    "'set interface tun0 zone vpn' "
+                    "'set interface tun0 key 42' "
+                    "'set interface tun0 ttl 64' "
+                    "commit save exit "
+                    "| sentinel configure\""
+                )
+
+            configure(left, "10.0.0.1", "10.0.0.2", "172.16.0.1/30")
+            configure(right, "10.0.0.2", "10.0.0.1", "172.16.0.2/30")
+
+            # Sentinel rendered the tunnel netdev with the endpoints, key and TTL.
+            for m in (left, right):
+                m.wait_until_succeeds(
+                    "test -f /run/systemd/network/10-sentinel-tun0.netdev", timeout=20
+                )
+                dev = m.succeed("cat /run/systemd/network/10-sentinel-tun0.netdev")
+                assert "Kind=gre" in dev, dev
+                assert "Key=42" in dev, dev
+                assert "TTL=64" in dev, dev
+                assert "Independent=yes" in dev, dev
+                # The zone binding compiled through: the firewall sees tun0.
+                m.succeed("grep -q '\"tun0\"' /run/sentinel/velstra.toml")
+
+            # networkd + the kernel created a real gre link holding the inner address.
+            left.wait_until_succeeds("ip -d link show tun0 | grep -q gre", timeout=30)
+            right.wait_until_succeeds("ip -d link show tun0 | grep -q gre", timeout=30)
+            left.wait_until_succeeds("ip -4 addr show tun0 | grep -q 172.16.0.1", timeout=30)
+            right.wait_until_succeeds("ip -4 addr show tun0 | grep -q 172.16.0.2", timeout=30)
+
+            # Traffic flows THROUGH the tunnel: each end reaches the other's inner
+            # address across the GRE link (not the underlay).
+            left.wait_until_succeeds("ping -c2 -W2 172.16.0.2", timeout=30)
+            right.wait_until_succeeds("ping -c2 -W2 172.16.0.1", timeout=30)
+          '';
+        };
+
         # NTP server: a 3-node proof that the box serves time to the LAN. An
         # `upstream` node is an authoritative source (chrony, local stratum 5);
         # the sentinel `fw` syncs to it and serves the LAN; a `client` syncs to
