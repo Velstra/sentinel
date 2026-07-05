@@ -405,7 +405,8 @@ commands:
                             interface <n> zone|address|parent|vlan …
                             firewall global  stateful|block-icmp|default-action|log|block …
                             firewall zone <z>  stateful|block-icmp|default-action|log|block …
-                            firewall rule <r>  from|to|action|proto|port|log|source …
+                            firewall rule <r>  from|to|action|proto|port|log|source|source-group|port-group …
+                            firewall group  address-group <n> address <csv> | port-group <n> port <csv>
                             nat source <s>  zone …
                             nat destination <d>  zone|proto|port|to …
                           e.g.  set firewall rule web from wan
@@ -583,7 +584,17 @@ const FIREWALL_NODES: &[Cand] = &[
     ("global", "default posture inherited by every zone"),
     ("zone", "per-zone overrides (ICMP, stateful, default-action, …)"),
     ("rule", "zone-to-zone allow/deny rules"),
+    ("group", "named address/port aliases referenced by rules"),
 ];
+// `firewall group <Tab>` reveals the alias kinds.
+const GROUP_NODES: &[Cand] = &[
+    ("address-group", "a reusable set of hosts/CIDRs (rule source-group)"),
+    ("port-group", "a reusable set of ports/ranges (rule port-group)"),
+];
+const ADDRESS_GROUP_FIELDS: &[Cand] =
+    &[("address", "members: hosts/CIDRs, comma-separated (replaces the set)")];
+const PORT_GROUP_FIELDS: &[Cand] =
+    &[("port", "members: ports/ranges, comma-separated (replaces the set)")];
 // `nat <Tab>` reveals the two NAT directions (VyOS-style).
 const NAT_NODES: &[Cand] = &[
     ("source", "SNAT/masquerade a zone's outbound traffic"),
@@ -686,6 +697,8 @@ const RULE_FIELDS: &[Cand] = &[
     ("port", "destination port or range (e.g. 443 or 8000-8100)"),
     ("log", "log packets matching this rule (true / false)"),
     ("source", "source address/CIDR (e.g. 10.0.0.0/24); default any"),
+    ("source-group", "match an address-group (alias) as the source"),
+    ("port-group", "match a port-group (alias) instead of a single port"),
 ];
 
 /// Static completion candidates for the token being typed, given the
@@ -721,6 +734,10 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
 
         // The firewall sub-tree.
         ["set" | "delete", "firewall"] => FIREWALL_NODES,
+        // firewall group: the alias kinds + their member fields.
+        ["set" | "delete", "firewall", "group"] => GROUP_NODES,
+        ["set" | "delete", "firewall", "group", "address-group", _name] => ADDRESS_GROUP_FIELDS,
+        ["set" | "delete", "firewall", "group", "port-group", _name] => PORT_GROUP_FIELDS,
         ["set" | "delete", "firewall", "global"] => GLOBAL_FIELDS,
         ["set", "firewall", "global", "stateful" | "block-icmp" | "log"] => BOOLS,
         ["set", "firewall", "global", "default-action"] => ACTIONS,
@@ -775,6 +792,8 @@ pub struct DynNames {
     pub zones: Vec<String>,
     pub nat_source: Vec<String>,
     pub nat_destination: Vec<String>,
+    pub address_groups: Vec<String>,
+    pub port_groups: Vec<String>,
 }
 
 /// Candidates for `tokens`, splicing in the live interface/rule/zone names at the
@@ -816,6 +835,20 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
         ["set", "firewall", "rule", _name, "from" | "to"] => zones("zone"),
         ["set", "nat", "source", _name, "zone"] => zones("zone"),
         ["set", "nat", "destination", _name, "zone"] => zones("zone"),
+        // Group-name positions splice in the declared alias names — both when
+        // editing/deleting a group and when a rule references one.
+        ["set" | "delete", "firewall", "group", "address-group"]
+        | ["set", "firewall", "rule", _, "source-group"] => names
+            .address_groups
+            .iter()
+            .map(|n| (n.clone(), "address-group".to_string()))
+            .collect(),
+        ["set" | "delete", "firewall", "group", "port-group"]
+        | ["set", "firewall", "rule", _, "port-group"] => names
+            .port_groups
+            .iter()
+            .map(|n| (n.clone(), "port-group".to_string()))
+            .collect(),
         _ => own(candidates(tokens)),
     }
 }
@@ -878,6 +911,7 @@ impl ConfigCompleter {
     /// Refresh the interface/rule/zone names offered at the name + zone-value
     /// positions. Called from the configure loop after every command so new
     /// interfaces/rules/zones become completable immediately.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_names(
         &self,
         interfaces: Vec<String>,
@@ -885,6 +919,8 @@ impl ConfigCompleter {
         zones: Vec<String>,
         nat_source: Vec<String>,
         nat_destination: Vec<String>,
+        address_groups: Vec<String>,
+        port_groups: Vec<String>,
     ) {
         *self.names.borrow_mut() = DynNames {
             interfaces,
@@ -892,6 +928,8 @@ impl ConfigCompleter {
             zones,
             nat_source,
             nat_destination,
+            address_groups,
+            port_groups,
         };
     }
 }
@@ -1026,7 +1064,11 @@ mod tests {
             ["allowed-ips", "endpoint", "keepalive", "preshared-key"]
         );
         // The firewall sub-tree is discoverable level by level (NAT is separate).
-        assert_eq!(kw(&["set", "firewall"]), ["global", "zone", "rule"]);
+        assert_eq!(kw(&["set", "firewall"]), ["global", "zone", "rule", "group"]);
+        // The group sub-tree: alias kinds and their member fields.
+        assert_eq!(kw(&["set", "firewall", "group"]), ["address-group", "port-group"]);
+        assert_eq!(kw(&["set", "firewall", "group", "address-group", "mgmt"]), ["address"]);
+        assert_eq!(kw(&["set", "firewall", "group", "port-group", "web"]), ["port"]);
         assert_eq!(
             kw(&["set", "firewall", "global"]),
             ["stateful", "block-icmp", "default-action", "log", "block"]
@@ -1040,7 +1082,7 @@ mod tests {
         assert_eq!(kw(&["set", "firewall", "zone", "wan", "block-icmp"]), ["true", "false"]);
         assert_eq!(
             kw(&["set", "firewall", "rule", "web"]),
-            ["from", "to", "action", "proto", "port", "log", "source"]
+            ["from", "to", "action", "proto", "port", "log", "source", "source-group", "port-group"]
         );
         assert_eq!(kw(&["set", "firewall", "rule", "web", "log"]), ["true", "false"]);
         assert_eq!(kw(&["set", "firewall", "rule", "web", "action"]), ["accept", "drop", "reject"]);
@@ -1068,6 +1110,8 @@ mod tests {
             zones: vec!["lan".into(), "wan".into()],
             nat_source: vec!["wan-masq".into()],
             nat_destination: vec!["web-fwd".into()],
+            address_groups: vec!["mgmt".into()],
+            port_groups: vec!["webports".into()],
         };
         let kws = |toks: &[&str]| -> Vec<String> {
             dyn_candidates(toks, &names).into_iter().map(|(k, _)| k).collect()
@@ -1083,6 +1127,12 @@ mod tests {
         assert_eq!(kws(&["set", "firewall", "rule", "web", "from"]), ["lan", "wan"]);
         assert_eq!(kws(&["set", "nat", "source", "wan-masq", "zone"]), ["lan", "wan"]);
         assert_eq!(kws(&["set", "nat", "destination", "web-fwd", "zone"]), ["lan", "wan"]);
+        // Group-name positions splice in the declared alias names (both when
+        // editing a group and when a rule references one).
+        assert_eq!(kws(&["set", "firewall", "group", "address-group"]), ["mgmt"]);
+        assert_eq!(kws(&["set", "firewall", "group", "port-group"]), ["webports"]);
+        assert_eq!(kws(&["set", "firewall", "rule", "web", "source-group"]), ["mgmt"]);
+        assert_eq!(kws(&["set", "firewall", "rule", "web", "port-group"]), ["webports"]);
         // Other positions fall back to the static grammar.
         assert_eq!(kws(&["set"]), ["system", "interface", "firewall", "nat", "protocols", "services"]);
         assert_eq!(
