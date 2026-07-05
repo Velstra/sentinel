@@ -70,6 +70,65 @@ pub fn reload_chrony() -> Result<()> {
     run_priv("systemctl", &["restart", "chronyd"])
 }
 
+/// The transient systemd unit base name for the `commit-confirm` auto-rollback.
+/// `systemd-run --unit=<this>` creates `<this>.timer` + `<this>.service`.
+pub const CONFIRM_UNIT: &str = "sentinel-confirm";
+
+/// Arm the `commit-confirm` auto-rollback: a one-shot transient timer that runs
+/// `sentinel confirm-rollback --config <cfg>` after `minutes`, reverting the box
+/// to its saved config unless `confirm` disarms it first.
+///
+/// The timer runs the CURRENT binary (`current_exe`) with the whole `SENTINEL_*`
+/// tool environment forwarded via `--setenv`, so the systemd-spawned process
+/// resolves `systemctl`/`hostname`/`ip`/… to the exact store paths the
+/// interactive session uses (the wrapper's env isn't inherited by a transient
+/// unit otherwise). `--collect` GCs the unit after it fires, even on failure, so
+/// re-arming later never trips over a lingering unit.
+pub fn arm_confirm(minutes: u32, cfg: &Path) -> Result<()> {
+    let exe = std::env::current_exe().context("resolving the sentinel binary")?;
+    let (Some(exe_s), Some(cfg_s)) = (exe.to_str(), cfg.to_str()) else {
+        bail!("non-UTF-8 path");
+    };
+    let mut args: Vec<String> = vec![
+        format!("--unit={CONFIRM_UNIT}"),
+        format!("--on-active={minutes}min"),
+        "--timer-property=AccuracySec=1s".into(),
+        "--collect".into(),
+    ];
+    for (k, v) in std::env::vars() {
+        if k.starts_with("SENTINEL_") {
+            args.push(format!("--setenv={k}={v}"));
+        }
+    }
+    // Everything after the options is the command to run when the timer fires.
+    args.push(exe_s.to_string());
+    args.push("confirm-rollback".into());
+    args.push("--config".into());
+    args.push(cfg_s.to_string());
+    let argref: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_priv("systemd-run", &argref)
+}
+
+/// Disarm the `commit-confirm` timer (best-effort). Only the **timer** is
+/// stopped — never the `.service`, since a manual/auto `confirm-rollback` may be
+/// the very unit calling this. `reset-failed` clears any leftover transient
+/// state (it does not stop a running unit) so the next `arm_confirm` is clean.
+pub fn disarm_confirm() {
+    let timer = format!("{CONFIRM_UNIT}.timer");
+    let service = format!("{CONFIRM_UNIT}.service");
+    let _ = run_priv("systemctl", &["stop", &timer]);
+    let _ = run_priv("systemctl", &["reset-failed", &timer, &service]);
+}
+
+/// Whether a `commit-confirm` window is currently pending (its timer armed).
+/// `systemctl is-active` needs no privilege, so this is a plain read.
+pub fn confirm_pending() -> bool {
+    let out = Command::new(bin("systemctl"))
+        .args(["is-active", &format!("{CONFIRM_UNIT}.timer")])
+        .output();
+    matches!(out, Ok(o) if String::from_utf8_lossy(&o.stdout).trim() == "active")
+}
+
 /// systemd-networkd's runtime drop-in dir (tmpfs, re-seeded each boot). We place
 /// per-interface `.network` units here so addressing is applied live and is gone
 /// on reboot unless re-asserted from the saved config by the boot service.
@@ -172,6 +231,7 @@ pub fn bin(name: &str) -> String {
         "ip" => "SENTINEL_IP_BIN",
         "networkctl" => "SENTINEL_NETWORKCTL_BIN",
         "systemctl" => "SENTINEL_SYSTEMCTL_BIN",
+        "systemd-run" => "SENTINEL_SYSTEMD_RUN_BIN",
         "journalctl" => "SENTINEL_JOURNALCTL_BIN",
         "wren" => "SENTINEL_WREN_BIN",
         "lsblk" => "SENTINEL_LSBLK_BIN",

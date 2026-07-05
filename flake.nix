@@ -65,6 +65,7 @@
             --set SENTINEL_IP_BIN         ${pkgs.iproute2}/bin/ip \
             --set SENTINEL_NETWORKCTL_BIN ${pkgs.systemd}/bin/networkctl \
             --set SENTINEL_SYSTEMCTL_BIN  ${pkgs.systemd}/bin/systemctl \
+            --set SENTINEL_SYSTEMD_RUN_BIN ${pkgs.systemd}/bin/systemd-run \
             --set SENTINEL_JOURNALCTL_BIN ${pkgs.systemd}/bin/journalctl \
             --set SENTINEL_WREN_BIN       ${wrenPkg}/bin/wren \
             --set SENTINEL_LSBLK_BIN      ${pkgs.util-linux}/bin/lsblk \
@@ -2594,6 +2595,85 @@
               )
             '';
           };
+
+        # commit-confirm (roadmap C21): apply a change live under a timer that
+        # auto-reverts to the saved config unless `confirm`ed — the safety net for
+        # editing a firewall over its own link. One node; the hostname is the
+        # observable (applied live by apply_live, reverted by the timer).
+        #   nix build .#checks.x86_64-linux.commitconfirm -L
+        commitconfirm = pkgs.testers.runNixOSTest {
+          name = "sentinel-commitconfirm";
+          nodes.machine = {
+            imports = [ self.nixosModules.sentinel ];
+            virtualisation.memorySize = 2048;
+          };
+          testScript = ''
+            machine.wait_for_unit("multi-user.target")
+            machine.wait_for_unit("sentinel-boot.service")
+            machine.wait_for_unit("velstra.service")
+
+            # Baseline: a valid config with a known hostname, SAVED so
+            # commit-confirm has a known-good config to revert to. Everything but
+            # the hostname stays constant across the test, so the hostname alone
+            # is the observable of "applied" vs "reverted".
+            machine.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set firewall global default-action accept' "
+                "'set interface eth0 zone wan' 'set interface eth0 address dhcp' "
+                "'set system hostname fw-base' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            machine.succeed("hostname | grep -x fw-base")
+            machine.succeed("grep -q 'fw-base' /var/lib/sentinel/appliance.toml")
+
+            # --- commit-confirm + confirm (keep the change) ---------------------
+            # A 10-minute window: the new hostname is applied live AND the
+            # auto-rollback timer is armed.
+            machine.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set system hostname fw-c1' 'commit-confirm 10' exit "
+                "| sentinel configure\""
+            )
+            machine.succeed("hostname | grep -x fw-c1")
+            machine.succeed("systemctl is-active sentinel-confirm.timer")
+            # `confirm` cancels the timer; the change stays live.
+            machine.succeed(
+                "su admin -c \"printf '%s\\n' confirm exit | sentinel configure\""
+            )
+            machine.wait_until_fails("systemctl is-active sentinel-confirm.timer", timeout=20)
+            machine.succeed("hostname | grep -x fw-c1")
+            # commit-confirm never persists: the saved baseline is untouched.
+            machine.succeed("grep -q 'fw-base' /var/lib/sentinel/appliance.toml")
+
+            # --- commit-confirm + manual confirm-rollback (revert now) ----------
+            machine.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set system hostname fw-c2' 'commit-confirm 10' exit "
+                "| sentinel configure\""
+            )
+            machine.succeed("hostname | grep -x fw-c2")
+            machine.succeed("systemctl is-active sentinel-confirm.timer")
+            # Forcing the revert (the exact command the timer runs) restores the
+            # saved config and disarms the timer.
+            machine.succeed("sentinel confirm-rollback")
+            machine.succeed("hostname | grep -x fw-base")
+            machine.wait_until_fails("systemctl is-active sentinel-confirm.timer", timeout=20)
+
+            # --- the real timer fires and auto-reverts (the headline) -----------
+            # A 1-minute window with NO confirm: the transient systemd timer runs
+            # `sentinel confirm-rollback` on its own and the box returns to the
+            # saved config — the lock-yourself-out safety net, proven end to end.
+            machine.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set system hostname fw-c3' 'commit-confirm 1' exit "
+                "| sentinel configure\""
+            )
+            machine.succeed("hostname | grep -x fw-c3")
+            machine.succeed("systemctl is-active sentinel-confirm.timer")
+            machine.wait_until_succeeds("hostname | grep -x fw-base", timeout=120)
+          '';
+        };
       };
     };
 }

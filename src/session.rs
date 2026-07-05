@@ -650,6 +650,12 @@ impl Session {
         self.dirty
     }
 
+    /// The backing config file (where `save` writes and the running/boot config
+    /// lives) — `commit-confirm` reverts to it.
+    pub fn config_path(&self) -> &Path {
+        &self.path
+    }
+
     /// The interface names currently in the candidate (system-discovered +
     /// operator-added) — completion offers these for `set/delete interface …`.
     pub fn interface_names(&self) -> Vec<String> {
