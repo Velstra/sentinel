@@ -2744,6 +2744,79 @@
             machine.succeed("hostname | grep -x rev-b")
           '';
         };
+
+        # Firewall groups / aliases (roadmap C15): a rule referencing an
+        # address-group and a port-group expands at compile time to the full
+        # (sources × ports) product of data-plane rules. One node; proof is the
+        # compiled velstra.toml + the agent accepting it + the config render.
+        #   nix build .#checks.x86_64-linux.fwgroups -L
+        fwgroups = pkgs.testers.runNixOSTest {
+          name = "sentinel-fwgroups";
+          nodes.machine = {
+            imports = [ self.nixosModules.sentinel ];
+            virtualisation.memorySize = 2048;
+          };
+          testScript = ''
+            machine.wait_for_unit("multi-user.target")
+            machine.wait_for_unit("sentinel-boot.service")
+            machine.wait_for_unit("velstra.service")
+
+            # Define an address-group (2 CIDRs) and a port-group (2 ports), then a
+            # single rule that references both.
+            machine.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set firewall global default-action accept' "
+                "'set interface eth0 zone wan' 'set interface eth0 address dhcp' "
+                "'set firewall group address-group mgmt address 10.0.0.0/24,192.0.2.5' "
+                "'set firewall group port-group webports port 80,443' "
+                "'set firewall rule web from wan' 'set firewall rule web to wan' "
+                "'set firewall rule web action accept' 'set firewall rule web proto tcp' "
+                "'set firewall rule web source-group mgmt' "
+                "'set firewall rule web port-group webports' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+
+            # The compiled config carries the expanded product: 2 sources × 2
+            # ports = 4 data-plane port rules, each with its src CIDR and a port.
+            velstra = machine.succeed("cat /run/sentinel/velstra.toml")
+            assert velstra.count("[[policy.port_rule]]") == 4, velstra
+            assert 'src = "10.0.0.0/24"' in velstra, velstra
+            assert 'src = "192.0.2.5"' in velstra, velstra
+            assert "port = 80" in velstra and "port = 443" in velstra, velstra
+            # The agent parses the grouped/expanded config from scratch and stays up.
+            machine.succeed("systemctl restart velstra.service")
+            machine.wait_for_unit("velstra.service")
+
+            # The saved config + `show configuration` render the aliases and the
+            # rule's references to them.
+            machine.succeed("grep -q 'mgmt' /var/lib/sentinel/appliance.toml")
+            shown = machine.succeed("sentinel show configuration")
+            assert "address-group mgmt" in shown, shown
+            assert "port-group webports" in shown, shown
+            assert "source-group mgmt" in shown, shown
+
+            # A group still referenced by a rule can't be committed away — the rule
+            # would dangle, and validation catches it.
+            out = machine.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'delete firewall group address-group mgmt' commit exit "
+                "| sentinel configure\" 2>&1"
+            )
+            assert "not a declared address group" in out, out
+
+            # Dropping the rule first, then the groups, commits cleanly.
+            machine.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'delete firewall rule web' "
+                "'delete firewall group address-group mgmt' "
+                "'delete firewall group port-group webports' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            machine.succeed("! grep -q 'mgmt' /var/lib/sentinel/appliance.toml")
+          '';
+        };
       };
     };
 }
