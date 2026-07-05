@@ -863,7 +863,14 @@ const IFACE_FIELDS: &[Cand] = &[
     ("peer", "WireGuard peer (by public key)"),
     ("dhcp-server", "serve DHCP from this NIC's static subnet"),
     ("router-advert", "emit IPv6 Router Advertisements (SLAAC)"),
-    ("type", "make this a bridge | bond | pppoe interface"),
+    (
+        "type",
+        "make this a bridge | bond | pppoe | gre | ipip | gretap interface",
+    ),
+    ("local", "tunnel local endpoint IP (type gre/ipip/gretap)"),
+    ("remote", "tunnel remote endpoint IP (type gre/ipip/gretap)"),
+    ("key", "GRE key (type gre/gretap) — demultiplexes tunnels"),
+    ("ttl", "tunnel outer TTL 0–255 (0 = inherit inner)"),
     ("master", "enslave this NIC to a bridge/bond device"),
     ("bond-mode", "bonding mode (on a type=bond device)"),
     ("mtu", "link MTU in bytes (e.g. 1492 PPPoE, 9000 jumbo)"),
@@ -890,6 +897,15 @@ const IFACE_TYPES: &[Cand] = &[
     (
         "pppoe",
         "a PPPoE client over a raw uplink NIC (VDSL/fibre WAN)",
+    ),
+    (
+        "gre",
+        "a GRE L3 tunnel (local/remote endpoints, optional key)",
+    ),
+    ("ipip", "an IPIP (IPv4-in-IPv4) L3 tunnel (no key)"),
+    (
+        "gretap",
+        "a GRETAP L2 tunnel (GRE carrying Ethernet frames)",
     ),
 ];
 const PPPOE_FIELDS: &[Cand] = &[
@@ -1432,6 +1448,10 @@ mod tests {
                 "dhcp-server",
                 "router-advert",
                 "type",
+                "local",
+                "remote",
+                "key",
+                "ttl",
                 "master",
                 "bond-mode",
                 "mtu",
@@ -1666,6 +1686,10 @@ mod tests {
                 "dhcp-server",
                 "router-advert",
                 "type",
+                "local",
+                "remote",
+                "key",
+                "ttl",
                 "master",
                 "bond-mode",
                 "mtu",
