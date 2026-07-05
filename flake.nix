@@ -334,9 +334,26 @@
             enable = true;
             extraConfig = "confdir /run/sentinel/chrony.d";
           };
+
+          # DNS: systemd-resolved stays the box's own resolver (127.0.0.53);
+          # dnsmasq is the LAN-facing resolver that `[services.dns]` drives via a
+          # conf-dir drop-in Sentinel renders to /run/sentinel/dnsmasq.d. The base
+          # config binds dnsmasq to loopback only (bind-interfaces + interface=lo)
+          # so with no drop-in it never fights resolved for :53 on a real link;
+          # the drop-in adds `interface=<serve-on>` to serve the LAN.
+          services.dnsmasq = {
+            enable = true;
+            resolveLocalQueries = false;
+            settings = {
+              bind-interfaces = true;
+              interface = "lo";
+              conf-dir = "/run/sentinel/dnsmasq.d/,*.conf";
+            };
+          };
           systemd.tmpfiles.rules = [
             "d /run/sentinel 0755 root root -"
             "d /run/sentinel/chrony.d 0755 root root -"
+            "d /run/sentinel/dnsmasq.d 0755 root root -"
           ];
         };
 
@@ -1912,22 +1929,51 @@
             )
             fw.wait_for_unit("velstra.service")
 
-            # Sentinel rendered the resolved drop-in with the upstream + the LAN
-            # stub listener bound to eth1's IP.
+            # Sentinel rendered the dnsmasq drop-in (the LAN resolver): the
+            # upstream forwarder + the serving interface. resolved (the box's own
+            # resolver) gets the upstream but NO LAN stub listener anymore.
             fw.wait_until_succeeds(
-                "test -f /run/systemd/resolved.conf.d/10-sentinel-dns.conf", timeout=20
+                "test -f /run/sentinel/dnsmasq.d/sentinel.conf", timeout=20
             )
-            conf = fw.succeed("cat /run/systemd/resolved.conf.d/10-sentinel-dns.conf")
-            assert "DNS=10.0.0.99" in conf, conf
-            assert "DNSStubListenerExtra=10.0.0.1" in conf, conf
+            conf = fw.succeed("cat /run/sentinel/dnsmasq.d/sentinel.conf")
+            assert "server=10.0.0.99" in conf, conf
+            assert "interface=eth1" in conf, conf
+            rconf = fw.succeed("cat /run/systemd/resolved.conf.d/10-sentinel-dns.conf")
+            assert "DNS=10.0.0.99" in rconf and "DNSStubListenerExtra" not in rconf, rconf
             fw.wait_until_succeeds("ip -4 addr show eth1 | grep -q '10.0.0.1'", timeout=30)
+            fw.wait_for_unit("dnsmasq.service")
 
             # The client resolves the upstream-only name THROUGH the fw: proof the
-            # box forwards LAN queries to its configured upstream end to end.
+            # box (dnsmasq) forwards LAN queries to its configured upstream.
             client.wait_for_unit("multi-user.target")
             client.wait_until_succeeds(
                 "dig +short +tries=2 +time=3 @10.0.0.1 sentinel.test | grep -q '10.9.9.9'",
                 timeout=90,
+            )
+
+            # Host-override + blocklist (the pfBlocker/split-horizon differentiator):
+            # a local record answered authoritatively, and a sinkholed domain.
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set services dns host-override nas.lan 10.0.0.5' "
+                "'set services dns blocklist ads.example' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            fw.wait_until_succeeds(
+                "grep -q 'address=/nas.lan/10.0.0.5' /run/sentinel/dnsmasq.d/sentinel.conf",
+                timeout=20,
+            )
+            fw.wait_for_unit("dnsmasq.service")
+            # The client sees the local override ...
+            client.wait_until_succeeds(
+                "dig +short +tries=2 +time=3 @10.0.0.1 nas.lan | grep -q '10.0.0.5'",
+                timeout=60,
+            )
+            # ... and the blocked domain is sinkholed to 0.0.0.0.
+            client.wait_until_succeeds(
+                "dig +short +tries=2 +time=3 @10.0.0.1 ads.example | grep -qx '0.0.0.0'",
+                timeout=60,
             )
           '';
         };

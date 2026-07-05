@@ -229,36 +229,55 @@ fn network_body(
 const RESOLVED_DROPIN_DIR: &str = "/run/systemd/resolved.conf.d";
 const RESOLVED_DROPIN: &str = "10-sentinel-dns.conf";
 
-/// The IPv4 address of a static `address` CIDR (`"10.0.0.1/24"` → `"10.0.0.1"`).
-/// `None` for `dhcp`/unset — validation already forbids serving DNS on such an
-/// interface, so this only ever returns `None` defensively.
-fn iface_ipv4(iface: &Interface) -> Option<&str> {
-    match iface.address.as_deref() {
-        Some(addr) if addr != "dhcp" => addr.split('/').next(),
-        _ => None,
-    }
-}
-
-/// Render the systemd-resolved drop-in for the DNS forwarder, or `None` when no
-/// forwarder is configured. `DNS=` sets the upstreams the box forwards to and
-/// `DNSStubListenerExtra=` binds an extra stub listener on each serving
-/// interface's IP so LAN clients can use the box as their resolver.
-fn resolved_dropin_body(dns: &Dns, ifaces: &[Interface]) -> Option<String> {
-    if dns.is_empty() {
+/// Render the systemd-resolved drop-in — the **box's own** resolver, which
+/// forwards the appliance's queries to the configured upstreams. `None` when no
+/// upstream is set. LAN serving, host-overrides and blocklists are dnsmasq's job
+/// ([`dnsmasq_conf_body`]), so this no longer binds LAN stub listeners.
+fn resolved_dropin_body(dns: &Dns) -> Option<String> {
+    if dns.upstream.is_empty() {
         return None;
     }
     let mut body = String::from("[Resolve]\n");
-    if !dns.upstream.is_empty() {
-        body.push_str(&format!("DNS={}\n", dns.upstream.join(" ")));
-    }
-    for name in &dns.serve_on {
-        if let Some(ip) = ifaces.iter().find(|i| &i.name == name).and_then(iface_ipv4) {
-            body.push_str(&format!("DNSStubListenerExtra={ip}\n"));
-        }
-    }
+    body.push_str(&format!("DNS={}\n", dns.upstream.join(" ")));
     // A forwarder trusts its upstream; default DNSSEC off so an unsigned or
     // validation-breaking upstream still resolves. An explicit value overrides.
     body.push_str(&format!("DNSSEC={}\n", dns.dnssec.as_deref().unwrap_or("no")));
+    Some(body)
+}
+
+/// dnsmasq's runtime confdir (the image enables `services.dnsmasq` with a
+/// `conf-dir` pointing here). A `.conf` here turns the box into a LAN resolver:
+/// forwarding, host-overrides and DNS blocklists, bound to the serving links.
+const DNSMASQ_CONFDIR: &str = "/run/sentinel/dnsmasq.d";
+const DNSMASQ_CONF: &str = "sentinel.conf";
+
+/// Render the dnsmasq drop-in for the LAN resolver, or `None` when no interface
+/// serves DNS. `interface=`/`bind-interfaces` (base config) restrict dnsmasq to
+/// exactly the serving links (so it never fights resolved for 127.0.0.53);
+/// `server=` sets the upstreams, `address=/name/ip` is a host-override, and
+/// `address=/domain/0.0.0.0` (+`::`) sinkholes a blocked domain.
+fn dnsmasq_conf_body(dns: &Dns) -> Option<String> {
+    if dns.serve_on.is_empty() {
+        return None;
+    }
+    let mut body = String::from("# rendered by sentinel — LAN DNS (dnsmasq)\nno-resolv\n");
+    for up in &dns.upstream {
+        body.push_str(&format!("server={up}\n"));
+    }
+    for name in &dns.serve_on {
+        body.push_str(&format!("interface={name}\n"));
+    }
+    for (host, ip) in &dns.host_override {
+        body.push_str(&format!("address=/{host}/{ip}\n"));
+    }
+    for domain in &dns.blocklist {
+        // Sinkhole to a dead address (v4 and v6), the pfBlocker/pi-hole convention.
+        body.push_str(&format!("address=/{domain}/0.0.0.0\n"));
+        body.push_str(&format!("address=/{domain}/::\n"));
+    }
+    if dns.dnssec.as_deref() == Some("yes") {
+        body.push_str("dnssec\n");
+    }
     Some(body)
 }
 
@@ -346,15 +365,55 @@ fn restart_chrony() {
 /// is written regardless, so a boot-time resolved start still picks it up.
 fn apply_resolved(appliance: &Appliance) -> Result<()> {
     let path = Path::new(RESOLVED_DROPIN_DIR).join(RESOLVED_DROPIN);
-    match resolved_dropin_body(&appliance.services.dns, &appliance.interfaces) {
+    let changed = match resolved_dropin_body(&appliance.services.dns) {
         Some(body) => {
+            let changed = std::fs::read_to_string(&path).map(|c| c != body).unwrap_or(true);
             system::ensure_dir(Path::new(RESOLVED_DROPIN_DIR))?;
             system::install_file(&path, &body)?;
+            changed
         }
-        None => system::remove_file(&path)?,
+        None => {
+            let existed = path.exists();
+            if existed {
+                system::remove_file(&path)?;
+            }
+            existed
+        }
+    };
+    if changed {
+        if let Err(e) = system::reload_resolved() {
+            eprintln!("warning: restarting systemd-resolved failed (applies on next start): {e}");
+        }
     }
-    if let Err(e) = system::reload_resolved() {
-        eprintln!("warning: restarting systemd-resolved failed (applies on next start): {e}");
+    Ok(())
+}
+
+/// Reconcile the dnsmasq drop-in to the LAN DNS config: write it when an
+/// interface serves DNS, remove it otherwise, and restart dnsmasq — but only
+/// when the desired config changed, so a non-DNS commit never disturbs the LAN
+/// resolver. Best-effort restart (the drop-in is written regardless, so a
+/// boot-time dnsmasq start still picks it up).
+fn apply_dnsmasq(appliance: &Appliance) -> Result<()> {
+    let path = Path::new(DNSMASQ_CONFDIR).join(DNSMASQ_CONF);
+    let changed = match dnsmasq_conf_body(&appliance.services.dns) {
+        Some(body) => {
+            let changed = std::fs::read_to_string(&path).map(|c| c != body).unwrap_or(true);
+            system::ensure_dir(Path::new(DNSMASQ_CONFDIR))?;
+            system::install_file(&path, &body)?;
+            changed
+        }
+        None => {
+            let existed = path.exists();
+            if existed {
+                system::remove_file(&path)?;
+            }
+            existed
+        }
+    };
+    if changed {
+        if let Err(e) = system::reload_dnsmasq() {
+            eprintln!("warning: restarting dnsmasq failed (applies on next start): {e}");
+        }
     }
     Ok(())
 }
@@ -494,10 +553,11 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
         eprintln!("warning: networkctl reload failed (networkd applies units on start): {e}");
     }
 
-    // The DNS forwarder (systemd-resolved) is reconciled the same way — its
-    // runtime drop-in tracks `[services.dns]`, and resolved is restarted to
-    // (re)bind the LAN stub listener.
+    // DNS: resolved is the box's own forwarder (`[services.dns] upstream`),
+    // dnsmasq is the LAN resolver (`serve-on` + host-overrides + blocklists).
+    // Both track `[services.dns]` and restart only when their config changed.
     apply_resolved(appliance)?;
+    apply_dnsmasq(appliance)?;
     // The NTP server (chrony) likewise — its confdir drop-in tracks
     // `[services.ntp]`, and chrony is restarted only when that changed.
     apply_chrony(appliance)?;
@@ -633,42 +693,32 @@ mod tests {
     }
 
     #[test]
-    fn dns_forwarder_renders_resolved_dropin() {
+    fn dns_renders_box_resolver_and_lan_dnsmasq() {
+        let mut host_override = std::collections::BTreeMap::new();
+        host_override.insert("nas.lan".to_string(), "10.0.0.5".to_string());
         let dns = Dns {
             upstream: vec!["9.9.9.9".into(), "2620:fe::fe".into()],
             serve_on: vec!["lan0".into()],
+            host_override,
+            blocklist: vec!["ads.example".into()],
             dnssec: None,
         };
-        let ifaces = vec![Interface {
-            name: "lan0".into(),
-            zone: Some("lan".into()),
-            address: Some("10.0.0.1/24".into()),
-            address6: None,
-            parent: None,
-            vlan: None,
-            private_key: None,
-            listen_port: None,
-            peers: vec![],
-            dhcp_server: None,
-            router_advert: None,
-            if_type: None,
-            master: None,
-            bond_mode: None,
-            pd_from: None,
-            pd_subnet: None,
-            mtu: None,
-            mac: None,
-        }];
-        let body = resolved_dropin_body(&dns, &ifaces).expect("forwarder configured");
-        assert!(body.contains("[Resolve]"));
-        assert!(body.contains("DNS=9.9.9.9 2620:fe::fe"));
-        // The stub listener binds the serving interface's bare IP, not its CIDR.
-        assert!(body.contains("DNSStubListenerExtra=10.0.0.1"));
-        assert!(!body.contains("/24"));
-        // No explicit DNSSEC ⇒ the appliance default (off).
-        assert!(body.contains("DNSSEC=no"));
-        // An unconfigured forwarder renders nothing.
-        assert!(resolved_dropin_body(&Dns::default(), &ifaces).is_none());
+        // resolved is the box's own forwarder: upstreams + DNSSEC, NO LAN stub.
+        let r = resolved_dropin_body(&dns).expect("box forwarder configured");
+        assert!(r.contains("[Resolve]"));
+        assert!(r.contains("DNS=9.9.9.9 2620:fe::fe"));
+        assert!(!r.contains("DNSStubListenerExtra"), "LAN serving is dnsmasq's job");
+        assert!(r.contains("DNSSEC=no"));
+        // dnsmasq is the LAN resolver: forward, serve on the link, override + block.
+        let d = dnsmasq_conf_body(&dns).expect("LAN resolver configured");
+        assert!(d.contains("server=9.9.9.9"), "got:\n{d}");
+        assert!(d.contains("interface=lan0"), "got:\n{d}");
+        assert!(d.contains("address=/nas.lan/10.0.0.5"), "host override:\n{d}");
+        assert!(d.contains("address=/ads.example/0.0.0.0"), "blocklist v4:\n{d}");
+        assert!(d.contains("address=/ads.example/::"), "blocklist v6:\n{d}");
+        // No upstream ⇒ no box forwarder; no serve-on ⇒ no LAN resolver.
+        assert!(resolved_dropin_body(&Dns::default()).is_none());
+        assert!(dnsmasq_conf_body(&Dns::default()).is_none());
     }
 
     #[test]
