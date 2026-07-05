@@ -67,6 +67,7 @@
             --set SENTINEL_NETWORKCTL_BIN ${pkgs.systemd}/bin/networkctl \
             --set SENTINEL_SYSTEMCTL_BIN  ${pkgs.systemd}/bin/systemctl \
             --set SENTINEL_NFT_BIN        ${pkgs.nftables}/bin/nft \
+            --set SENTINEL_SWANCTL_BIN    ${pkgs.strongswan}/bin/swanctl \
             --set SENTINEL_SYSTEMD_RUN_BIN ${pkgs.systemd}/bin/systemd-run \
             --set SENTINEL_JOURNALCTL_BIN ${pkgs.systemd}/bin/journalctl \
             --set SENTINEL_WREN_BIN       ${wrenPkg}/bin/wren \
@@ -310,6 +311,10 @@
           environment.systemPackages = [
             sentinel
             pkgs.ppp
+            # `swanctl` for IPsec (roadmap C2): the CLI resolves the loader via
+            # SENTINEL_SWANCTL_BIN, but keep it on PATH for `run show vpn` + manual
+            # inspection.
+            pkgs.strongswan
           ];
 
           # Egress traffic shaping (roadmap C8) needs the CAKE + fq_codel queue
@@ -415,6 +420,12 @@
               RestartSec = "5s";
             };
           };
+          # IPsec (roadmap C2): strongSwan's charon (charon-systemd) is always up
+          # so a `commit` can `swanctl --load-all` the rendered site-to-site
+          # tunnels into it. Its own /etc/swanctl config stays empty — Sentinel
+          # loads the appliance's connections from /run/sentinel/swanctl via the
+          # loader's `--file`, so the immutable /etc never needs to change.
+          services.strongswan-swanctl.enable = true;
           systemd.tmpfiles.rules = [
             "d /run/sentinel 0755 root root -"
             "d /run/sentinel/chrony.d 0755 root root -"
@@ -424,6 +435,9 @@
             "d /run/sentinel/ppp/peers 0755 root root -"
             # Multi-WAN daemon runtime dir (rendered health script + state).
             "d /run/sentinel/multiwan 0755 root root -"
+            # IPsec runtime dir holds the rendered swanctl.conf + the 0600 PSK
+            # secrets file (root only).
+            "d /run/sentinel/swanctl 0700 root root -"
             # pppd's fixed credential lookup paths → Sentinel's rendered secrets.
             "d /etc/ppp 0755 root root -"
             "L+ /etc/ppp/chap-secrets - - - - /run/sentinel/ppp/chap-secrets"
@@ -714,6 +728,150 @@
           machine.succeed("grep -q '\"wg0\"' /run/sentinel/velstra.toml")
           # save persisted the wireguard interface (private key + peer).
           machine.succeed("grep -q 'private-key' /var/lib/sentinel/appliance.toml")
+        '';
+      };
+
+      # IPsec site-to-site (roadmap C2): two Sentinel appliances (`left`/`right`)
+      # on a shared WAN segment, each with a protected subnet behind it (a `dummy`
+      # `proto0` carrying its LAN address). Both commit a matching `[[vpn.ipsec]]`
+      # PSK connection; Sentinel renders swanctl.conf + a 0600 secrets file and
+      # loads them into charon. The test proves (1) the IKEv2 SA establishes on
+      # both ends and (2) real traffic flows across the protected subnets — a ping
+      # from behind `left` reaches behind `right` through the tunnel.
+      #   nix build .#checks.x86_64-linux.ipsec -L
+      ipsec = pkgs.testers.runNixOSTest {
+        name = "sentinel-ipsec";
+        nodes =
+          let
+            # One Sentinel IPsec gateway. `wanAddr` is its WAN (underlay) address
+            # on the shared segment; `protoAddr` is the address of the protected
+            # subnet behind it (on a local `dummy` interface). Both are set at the
+            # NixOS level (boot-stable) — like the nat/masq tests — so the tunnel
+            # config is the only thing `sentinel commit` drives.
+            gw =
+              { wanAddr, protoAddr }:
+              { lib, pkgs, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                # Pin the runtime hostname to the node name so the test driver's
+                # per-machine python variable resolves (sentinel forces the factory
+                # hostname otherwise; sentinel-boot re-applies it regardless).
+                networking.hostName = lib.mkForce (
+                  if wanAddr == "10.0.0.1" then "left" else "right"
+                );
+                # velstra is the firewall; no NixOS iptables dropping IKE/ESP.
+                networking.firewall.enable = lib.mkForce false;
+                virtualisation.vlans = [ 1 ];
+                virtualisation.memorySize = 2048;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = wanAddr;
+                    prefixLength = 24;
+                  }
+                ];
+                # Loose reverse-path filtering: a packet decrypted out of the
+                # tunnel arrives on eth1 with an inner (protected-subnet) source
+                # that strict rp_filter would treat as a martian.
+                boot.kernel.sysctl = {
+                  "net.ipv4.conf.all.rp_filter" = 2;
+                  "net.ipv4.conf.default.rp_filter" = 2;
+                };
+                boot.kernelModules = [ "dummy" ];
+                # The protected subnet behind this gateway, on a dummy interface —
+                # the "host behind the firewall" the tunnel carries. Brought up
+                # before charon so the local traffic-selector address exists when
+                # the SA installs.
+                systemd.services.protosubnet = {
+                  wantedBy = [ "multi-user.target" ];
+                  before = [ "strongswan-swanctl.service" ];
+                  after = [ "network-pre.target" ];
+                  path = [ pkgs.iproute2 ];
+                  serviceConfig = {
+                    Type = "oneshot";
+                    RemainAfterExit = true;
+                  };
+                  script = ''
+                    ip link add proto0 type dummy 2>/dev/null || true
+                    ip addr add ${protoAddr}/24 dev proto0 2>/dev/null || true
+                    ip link set proto0 up
+                  '';
+                };
+              };
+          in
+          {
+            left = gw {
+              wanAddr = "10.0.0.1";
+              protoAddr = "10.100.1.1";
+            };
+            right = gw {
+              wanAddr = "10.0.0.2";
+              protoAddr = "10.100.2.1";
+            };
+          };
+        testScript = ''
+          start_all()
+          for m in (left, right):
+              m.wait_for_unit("multi-user.target")
+              m.wait_for_unit("sentinel-boot.service")
+              m.wait_for_unit("strongswan-swanctl.service")
+              m.wait_until_succeeds("ip addr show proto0 | grep -q 10.100", timeout=30)
+
+          # The WAN underlay is up on both ends (set at the NixOS level).
+          left.wait_until_succeeds("ip addr show eth1 | grep -q 10.0.0.1", timeout=30)
+          right.wait_until_succeeds("ip addr show eth1 | grep -q 10.0.0.2", timeout=30)
+          left.wait_until_succeeds("ping -c1 -W2 10.0.0.2", timeout=30)
+
+          psk = "velstra-ipsec-shared-secret"
+
+          def configure(node, local, remote, lnet, rnet):
+              node.succeed(
+                  "su admin -c \"printf '%s\\n' "
+                  f"'set vpn ipsec site local {local}' "
+                  f"'set vpn ipsec site remote {remote}' "
+                  f"'set vpn ipsec site local-subnet {lnet}' "
+                  f"'set vpn ipsec site remote-subnet {rnet}' "
+                  f"'set vpn ipsec site psk {psk}' "
+                  "commit save exit "
+                  "| sentinel configure\""
+              )
+
+          # Both gateways commit the mirror-image connection.
+          configure(left, "10.0.0.1", "10.0.0.2", "10.100.1.0/24", "10.100.2.0/24")
+          configure(right, "10.0.0.2", "10.0.0.1", "10.100.2.0/24", "10.100.1.0/24")
+
+          # Sentinel rendered swanctl.conf (no PSK in it) + a 0600 secrets file.
+          for m in (left, right):
+              conf = m.succeed("cat /run/sentinel/swanctl/swanctl.conf")
+              assert "conn-site {" in conf, conf
+              assert psk not in conf, "psk leaked into swanctl.conf"
+              m.succeed("grep -q 'version = 2' /run/sentinel/swanctl/swanctl.conf")
+              mode = m.succeed("stat -c %a /run/sentinel/swanctl/secrets.conf").strip()
+              assert mode == "600", mode
+              m.succeed(f"grep -q '{psk}' /run/sentinel/swanctl/secrets.conf")
+              # save persisted the tunnel (with the PSK) to the editable config.
+              m.succeed("grep -q 'ipsec' /var/lib/sentinel/appliance.toml")
+
+          # Kick a fresh negotiation now that BOTH ends are loaded (avoids a race
+          # where the first commit initiates before the peer has any config).
+          left.succeed("swanctl --initiate --child site 2>&1 || true")
+
+          # (1) The IKEv2 SA establishes on both ends.
+          left.wait_until_succeeds("swanctl --list-sas | grep -q ESTABLISHED", timeout=90)
+          right.wait_until_succeeds("swanctl --list-sas | grep -q ESTABLISHED", timeout=90)
+
+          # (2) Traffic flows across the protected subnets: a ping sourced from
+          # behind `left` reaches the address behind `right`, through the tunnel.
+          left.wait_until_succeeds(
+              "ping -c1 -W2 -I 10.100.1.1 10.100.2.1", timeout=90
+          )
+          right.wait_until_succeeds(
+              "ping -c1 -W2 -I 10.100.2.1 10.100.1.1", timeout=90
+          )
+
+          # `sentinel show vpn ipsec` (operational mode) proxies to
+          # swanctl --list-sas.
+          out = left.succeed("su admin -c 'sentinel show vpn ipsec'")
+          assert "ESTABLISHED" in out, out
         '';
       };
 
