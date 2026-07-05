@@ -530,6 +530,8 @@ const NTP_FIELDS: &[Cand] = &[
 const DNS_FIELDS: &[Cand] = &[
     ("upstream", "upstream resolvers to forward to (comma-separated IPs)"),
     ("serve-on", "interfaces to listen on for LAN queries (comma-separated)"),
+    ("host-override", "a local DNS record: <name> <ip> (split-horizon)"),
+    ("blocklist", "sinkhole a domain (ad/tracker/malware blocking)"),
     ("dnssec", "DNSSEC mode: yes / no / allow-downgrade"),
 ];
 const DNSSEC_MODES: &[Cand] = &[
