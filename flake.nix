@@ -2674,6 +2674,76 @@
             machine.wait_until_succeeds("hostname | grep -x fw-base", timeout=120)
           '';
         };
+
+        # Config archive + rollback-N (roadmap C21): each `save` archives a
+        # timestamped revision; `show system commit` lists them (newest = 0);
+        # `rollback <N>` reverts the running system to revision N. One node; the
+        # hostname is the observable across three saved revisions.
+        #   nix build .#checks.x86_64-linux.confighistory -L
+        confighistory = pkgs.testers.runNixOSTest {
+          name = "sentinel-confighistory";
+          nodes.machine = {
+            imports = [ self.nixosModules.sentinel ];
+            virtualisation.memorySize = 2048;
+          };
+          testScript = ''
+            machine.wait_for_unit("multi-user.target")
+            machine.wait_for_unit("sentinel-boot.service")
+            machine.wait_for_unit("velstra.service")
+
+            # Three saved revisions, each changing only the hostname (the baseline
+            # is set once and retained by the loaded draft). commit+save so the
+            # live hostname tracks the saved one and each save archives a revision.
+            machine.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set firewall global default-action accept' "
+                "'set interface eth0 zone wan' 'set interface eth0 address dhcp' "
+                "'set system hostname rev-a' commit save exit "
+                "| sentinel configure\""
+            )
+            machine.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set system hostname rev-b' commit save exit | sentinel configure\""
+            )
+            machine.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set system hostname rev-c' commit save exit | sentinel configure\""
+            )
+            machine.succeed("hostname | grep -x rev-c")
+
+            # The archive holds >=3 revisions; `show system commit` lists them
+            # newest-first (one 'UTC' timestamp per revision row).
+            listing = machine.succeed("sentinel show system commit")
+            assert listing.count("UTC") >= 3, listing
+            machine.succeed(
+                "test $(ls /var/lib/sentinel/archive/config-*.toml | wc -l) -ge 3"
+            )
+
+            # Revision 0 (newest) is rev-c; revision 1 is the previous save rev-b.
+            rev0 = machine.succeed("sentinel show system commit 0")
+            assert "rev-c" in rev0, rev0
+            rev1 = machine.succeed("sentinel show system commit 1")
+            assert "rev-b" in rev1, rev1
+
+            # rollback 1 reverts the RUNNING system to rev-b (applied live) and
+            # re-saves it — the headline.
+            machine.succeed(
+                "su admin -c \"printf '%s\\n' 'rollback 1' exit | sentinel configure\""
+            )
+            machine.succeed("hostname | grep -x rev-b")
+            machine.succeed("grep -q 'rev-b' /var/lib/sentinel/appliance.toml")
+            # The rollback itself archived a new newest revision (rev-b again).
+            rev0b = machine.succeed("sentinel show system commit 0")
+            assert "rev-b" in rev0b, rev0b
+
+            # An out-of-range rollback is refused cleanly; nothing changes.
+            out = machine.succeed(
+                "su admin -c \"printf '%s\\n' 'rollback 999' exit | sentinel configure\" 2>&1"
+            )
+            assert "no revision 999" in out, out
+            machine.succeed("hostname | grep -x rev-b")
+          '';
+        };
       };
     };
 }

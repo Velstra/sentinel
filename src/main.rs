@@ -9,6 +9,7 @@
 //! and apply that document — and, via [`velstra_proto`] (from crates.io), talk to
 //! a running Velstra controller.
 
+mod archive;
 mod compile;
 mod config;
 mod confirm;
@@ -559,6 +560,10 @@ fn show_op(args: &[String]) -> Result<()> {
             println!("interfaces:");
             run_show(&ip, &["-brief", "address", "show"])
         }
+        // Config revision history (roadmap C21): `show system commit` lists the
+        // archived revisions; `show system commit <N>` shows one in config syntax.
+        ["system", "commit"] => show_revisions(),
+        ["system", "commit", n] => show_revision(n),
         ["interfaces", rest @ ..] => {
             let mut a = vec!["-brief", "address", "show"];
             a.extend(rest);
@@ -750,6 +755,32 @@ fn show_firewall_stats() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// `show system commit`: the archived config revisions, newest first.
+fn show_revisions() -> Result<()> {
+    let revs = archive::list_revisions(std::path::Path::new(DEFAULT_CONFIG));
+    if revs.is_empty() {
+        println!("no archived revisions yet (a revision is saved on each `save`)");
+        return Ok(());
+    }
+    println!("{:>3}  saved", "rev");
+    for r in &revs {
+        println!("{:>3}  {}", r.index, r.timestamp());
+    }
+    println!("\n`show system commit <rev>` shows one; `rollback <rev>` reverts to it.");
+    Ok(())
+}
+
+/// `show system commit <N>`: revision N rendered in config syntax.
+fn show_revision(n: &str) -> Result<()> {
+    let n: usize = n
+        .parse()
+        .map_err(|_| anyhow::anyhow!("revision must be a number (see `show system commit`)"))?;
+    let toml = archive::read_revision(std::path::Path::new(DEFAULT_CONFIG), n)?;
+    let appliance = Appliance::from_toml(&toml)?;
+    print!("{}", session::render_appliance(&appliance));
+    Ok(())
 }
 
 /// The NAT section of the saved config, summarized.
