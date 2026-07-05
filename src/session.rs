@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::{
     Action, Appliance, Bgp, BgpNeighbor, DhcpServer, Dns, Firewall, Groups, IfaceType, Interface,
-    Isis, Nat, NatDestination, NatSource, Ntp, Ospf, Ospf3, PortSpec, Proto, Protocols, Rip,
+    Isis, Nat, NatDestination, NatSource, Ntp, Ospf, Ospf3, PortSpec, Pppoe, Proto, Protocols, Rip,
     RouterAdvert, Rule, Services, StaticRoute, System, Vrrp, WgPeer, ZoneCfg,
 };
 
@@ -48,6 +48,8 @@ struct IfaceDraft {
     // Link tunables.
     mtu: Option<u16>,
     mac: Option<String>,
+    // PPPoE client (a `type = pppoe` uplink): credentials + tunables.
+    pppoe: Option<PppoeDraft>,
 }
 
 impl IfaceDraft {
@@ -74,6 +76,22 @@ impl IfaceDraft {
     fn ra_mut(&mut self) -> &mut RouterAdvertDraft {
         self.router_advert.get_or_insert_with(RouterAdvertDraft::default)
     }
+
+    /// Mutable access to the PPPoE sub-draft, inserting a default if not yet
+    /// present — the first `pppoe` field creates it, mirroring `dhcp_mut`.
+    fn pppoe_mut(&mut self) -> &mut PppoeDraft {
+        self.pppoe.get_or_insert_with(PppoeDraft::default)
+    }
+}
+
+/// A partially-specified PPPoE client (fields filled in incrementally).
+#[derive(Debug, Clone, Default)]
+struct PppoeDraft {
+    username: Option<String>,
+    password: Option<String>,
+    service_name: Option<String>,
+    ac_name: Option<String>,
+    mru: Option<u16>,
 }
 
 /// A partially-specified DHCP server (fields filled in incrementally).
@@ -461,6 +479,13 @@ impl Draft {
                             bond_mode: i.bond_mode.clone(),
                             mtu: i.mtu,
                             mac: i.mac.clone(),
+                            pppoe: i.pppoe.as_ref().map(|p| PppoeDraft {
+                                username: Some(p.username.clone()),
+                                password: Some(p.password.clone()),
+                                service_name: p.service_name.clone(),
+                                ac_name: p.ac_name.clone(),
+                                mru: p.mru,
+                            }),
                         },
                     )
                 })
@@ -875,7 +900,10 @@ impl Session {
                 let ty = match *v {
                     "bridge" => IfaceType::Bridge,
                     "bond" => IfaceType::Bond,
-                    other => bail!("interface type {other:?}: expected \"bridge\" or \"bond\""),
+                    "pppoe" => IfaceType::Pppoe,
+                    other => {
+                        bail!("interface type {other:?}: expected \"bridge\", \"bond\" or \"pppoe\"")
+                    }
                 };
                 self.draft.iface_mut(name).if_type = Some(ty);
             }
@@ -898,6 +926,26 @@ impl Session {
             ["interface", name, "mac", v] => {
                 crate::config::validate_mac(v)?;
                 self.draft.iface_mut(name).mac = Some((*v).to_string());
+            }
+
+            // PPPoE client credentials/tunables (a `type = pppoe` uplink). The
+            // password is stored here and rendered to a 0600 secrets file, never
+            // into the world-readable peer options.
+            ["interface", name, "pppoe", "username", v] => {
+                self.draft.iface_mut(name).pppoe_mut().username = Some((*v).to_string());
+            }
+            ["interface", name, "pppoe", "password", v] => {
+                self.draft.iface_mut(name).pppoe_mut().password = Some((*v).to_string());
+            }
+            ["interface", name, "pppoe", "service-name", v] => {
+                self.draft.iface_mut(name).pppoe_mut().service_name = Some((*v).to_string());
+            }
+            ["interface", name, "pppoe", "ac-name", v] => {
+                self.draft.iface_mut(name).pppoe_mut().ac_name = Some((*v).to_string());
+            }
+            ["interface", name, "pppoe", "mru", v] => {
+                let mru: u16 = v.parse().with_context(|| format!("invalid mru {v:?}"))?;
+                self.draft.iface_mut(name).pppoe_mut().mru = Some(mru);
             }
 
             // --- firewall { … } — everything firewall lives under this node ---
@@ -1265,6 +1313,22 @@ impl Session {
             ["interface", name, "bond-mode"] => self.iface(name)?.bond_mode = None,
             ["interface", name, "mtu"] => self.iface(name)?.mtu = None,
             ["interface", name, "mac"] => self.iface(name)?.mac = None,
+            ["interface", name, "pppoe"] => self.iface(name)?.pppoe = None,
+            ["interface", name, "pppoe", field] => {
+                let i = self.iface(name)?;
+                let Some(p) = i.pppoe.as_mut() else {
+                    bail!("interface {name:?} has no pppoe config");
+                };
+                match *field {
+                    "service-name" => p.service_name = None,
+                    "ac-name" => p.ac_name = None,
+                    "mru" => p.mru = None,
+                    "username" | "password" => bail!(
+                        "pppoe {field} is required; `delete interface {name} pppoe` removes the whole client"
+                    ),
+                    other => bail!("pppoe has no field {other:?}"),
+                }
+            }
             ["interface", name, "peer", pk] => {
                 let i = self.iface(name)?;
                 let before = i.peers.len();
@@ -1727,6 +1791,16 @@ impl Session {
                 bond_mode: d.bond_mode.clone(),
                 mtu: d.mtu,
                 mac: d.mac.clone(),
+                // Missing username/password become empty strings that `validate`
+                // rejects with a clear "required" error (mirrors how a missing
+                // WireGuard key is caught there, not here).
+                pppoe: d.pppoe.as_ref().map(|p| Pppoe {
+                    username: p.username.clone().unwrap_or_default(),
+                    password: p.password.clone().unwrap_or_default(),
+                    service_name: p.service_name.clone(),
+                    ac_name: p.ac_name.clone(),
+                    mru: p.mru,
+                }),
             })
             .collect();
         let rules = self
@@ -2071,6 +2145,7 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             && i.bond_mode.is_none()
             && i.mtu.is_none()
             && i.mac.is_none()
+            && i.pppoe.is_none()
         {
             continue;
         }
@@ -2079,6 +2154,7 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             let s = match ty {
                 IfaceType::Bridge => "bridge",
                 IfaceType::Bond => "bond",
+                IfaceType::Pppoe => "pppoe",
             };
             out.push_str(&format!("    type {s}\n"));
         }
@@ -2138,6 +2214,25 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             }
             if let Some(psk) = &p.preshared_key {
                 out.push_str(&format!("        preshared-key {psk}\n"));
+            }
+            out.push_str("    }\n");
+        }
+        if let Some(p) = &i.pppoe {
+            out.push_str("    pppoe {\n");
+            if let Some(u) = &p.username {
+                out.push_str(&format!("        username {u}\n"));
+            }
+            if let Some(pw) = &p.password {
+                out.push_str(&format!("        password {pw}\n"));
+            }
+            if let Some(sn) = &p.service_name {
+                out.push_str(&format!("        service-name {sn}\n"));
+            }
+            if let Some(ac) = &p.ac_name {
+                out.push_str(&format!("        ac-name {ac}\n"));
+            }
+            if let Some(mru) = p.mru {
+                out.push_str(&format!("        mru {mru}\n"));
             }
             out.push_str("    }\n");
         }
@@ -2835,6 +2930,46 @@ mod tests {
         run(&mut s, "delete nat source wan-masq").unwrap();
         assert!(s.commit().is_ok());
         assert!(run(&mut s, "delete nat destination nope").is_err());
+    }
+
+    #[test]
+    fn pppoe_client_sets_renders_and_commits() {
+        let mut s = Session::empty();
+        run(&mut s, "set system hostname fw1").unwrap();
+        run(&mut s, "set interface eth0 zone wan").unwrap();
+        run(&mut s, "set interface ppp0 type pppoe").unwrap();
+        run(&mut s, "set interface ppp0 parent eth0").unwrap();
+        run(&mut s, "set interface ppp0 zone wan").unwrap();
+        run(&mut s, "set interface ppp0 pppoe username user@isp.de").unwrap();
+        run(&mut s, "set interface ppp0 pppoe password s3cret").unwrap();
+        run(&mut s, "set interface ppp0 pppoe service-name internet").unwrap();
+        run(&mut s, "set interface ppp0 pppoe mru 1492").unwrap();
+
+        // The config view renders the pppoe sub-block round-trippably.
+        let shown = s.show();
+        assert!(shown.contains("interface ppp0"), "got:\n{shown}");
+        assert!(shown.contains("type pppoe"), "got:\n{shown}");
+        assert!(shown.contains("pppoe {"), "got:\n{shown}");
+        assert!(shown.contains("username user@isp.de"), "got:\n{shown}");
+        assert!(shown.contains("password s3cret"), "got:\n{shown}");
+        assert!(shown.contains("service-name internet"), "got:\n{shown}");
+        assert!(shown.contains("mru 1492"), "got:\n{shown}");
+
+        // It validates + materializes into an Appliance.
+        let a = s.commit().expect("pppoe config commits");
+        let ppp = a.interfaces.iter().find(|i| i.name == "ppp0").unwrap();
+        assert!(ppp.is_pppoe());
+        let p = ppp.pppoe.as_ref().unwrap();
+        assert_eq!(p.username, "user@isp.de");
+        assert_eq!(p.password, "s3cret");
+        assert_eq!(p.service_name.as_deref(), Some("internet"));
+        assert_eq!(p.mru, Some(1492));
+
+        // Deleting a single pppoe field, then the whole client.
+        run(&mut s, "delete interface ppp0 pppoe mru").unwrap();
+        assert!(!s.show().contains("mru 1492"));
+        run(&mut s, "delete interface ppp0 pppoe").unwrap();
+        assert!(!s.show().contains("pppoe {"));
     }
 
     #[test]

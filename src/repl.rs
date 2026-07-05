@@ -419,7 +419,7 @@ pub const HELP: &str = "\
 commands:
   set <path...> <value>   set a config node. The tree (Tab/`?` explores it):
                             system hostname <name>
-                            interface <n> zone|address|parent|vlan …
+                            interface <n> zone|address|parent|vlan|type|pppoe …
                             firewall global  stateful|block-icmp|default-action|log|block …
                             firewall zone <z>  stateful|block-icmp|default-action|log|block …
                             firewall rule <r>  from|to|action|proto|port|log|source|source-group|port-group …
@@ -663,11 +663,12 @@ const IFACE_FIELDS: &[Cand] = &[
     ("peer", "WireGuard peer (by public key)"),
     ("dhcp-server", "serve DHCP from this NIC's static subnet"),
     ("router-advert", "emit IPv6 Router Advertisements (SLAAC)"),
-    ("type", "make this a virtual L2 device: bridge | bond"),
+    ("type", "make this a bridge | bond | pppoe interface"),
     ("master", "enslave this NIC to a bridge/bond device"),
     ("bond-mode", "bonding mode (on a type=bond device)"),
     ("mtu", "link MTU in bytes (e.g. 1492 PPPoE, 9000 jumbo)"),
     ("mac", "override the link MAC (MAC cloning), e.g. 52:54:00:12:34:56"),
+    ("pppoe", "PPPoE client credentials (on a type=pppoe uplink)"),
 ];
 const ADDRESS6_HINT: &[Cand] = &[
     ("auto", "accept Router Advertisements (SLAAC)"),
@@ -676,6 +677,14 @@ const ADDRESS6_HINT: &[Cand] = &[
 const IFACE_TYPES: &[Cand] = &[
     ("bridge", "an L2 switch; enslave NICs with `master`"),
     ("bond", "link aggregation; enslave NICs with `master`"),
+    ("pppoe", "a PPPoE client over a raw uplink NIC (VDSL/fibre WAN)"),
+];
+const PPPOE_FIELDS: &[Cand] = &[
+    ("username", "ISP login (PPPoE/PAP/CHAP username)"),
+    ("password", "ISP password (stored 0600, rendered to chap/pap-secrets)"),
+    ("service-name", "optional PPPoE service name (rp_pppoe_service)"),
+    ("ac-name", "optional PPPoE access-concentrator name (rp_pppoe_ac)"),
+    ("mru", "PPP MRU in bytes (default = mtu or 1492)"),
 ];
 const BOND_MODES: &[Cand] = &[
     ("active-backup", "one active link, the rest standby (no switch config)"),
@@ -741,6 +750,8 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         // Bridge/bond value completions.
         ["set", "interface", _name, "type"] => IFACE_TYPES,
         ["set", "interface", _name, "bond-mode"] => BOND_MODES,
+        // The PPPoE-client sub-tree of an interface.
+        ["set" | "delete", "interface", _name, "pppoe"] => PPPOE_FIELDS,
         // The DHCP-server sub-tree of an interface.
         ["set" | "delete", "interface", _name, "dhcp-server"] => DHCP_SERVER_FIELDS,
         // The IPv6 Router-Advertisement sub-tree of an interface.
@@ -1064,7 +1075,8 @@ mod tests {
                 "master",
                 "bond-mode",
                 "mtu",
-                "mac"
+                "mac",
+                "pppoe"
             ]
         );
         // The DHCP-server sub-tree of an interface is discoverable.
@@ -1076,6 +1088,11 @@ mod tests {
         assert_eq!(
             kw(&["set", "interface", "lan0", "router-advert"]),
             ["enable", "disable", "prefix", "dns", "managed", "other-config", "router-lifetime"]
+        );
+        // The PPPoE-client sub-tree of an interface is discoverable.
+        assert_eq!(
+            kw(&["set", "interface", "ppp0", "pppoe"]),
+            ["username", "password", "service-name", "ac-name", "mru"]
         );
         // WireGuard completion: `private-key` offers `generate`; a peer's fields
         // follow after its public key.
@@ -1175,7 +1192,8 @@ mod tests {
                 "master",
                 "bond-mode",
                 "mtu",
-                "mac"
+                "mac",
+                "pppoe"
             ]
         );
     }

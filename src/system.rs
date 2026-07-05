@@ -77,6 +77,33 @@ pub fn reload_dnsmasq() -> Result<()> {
     run_priv("systemctl", &["restart", "dnsmasq"])
 }
 
+/// (Re)start the `sentinel-pppoe@<name>` templated unit that runs `pppd` for one
+/// PPPoE session. A `restart` (re-dial) is used deliberately: it applies fresh
+/// peer options / credentials by tearing the old `pppd` down and dialling again,
+/// and starts the session if it wasn't running. Only sessions whose rendered
+/// config actually changed are restarted (by [`crate::net`]), so an unrelated
+/// commit never drops a live WAN link.
+pub fn pppoe_restart(name: &str) -> Result<()> {
+    run_priv("systemctl", &["restart", &format!("sentinel-pppoe@{name}.service")])
+}
+
+/// Stop and disband the `sentinel-pppoe@<name>` session (a PPPoE interface that
+/// is no longer configured). Best-effort at the call site — a stop that fails
+/// because the unit was never up must not abort the reconcile.
+pub fn pppoe_stop(name: &str) -> Result<()> {
+    run_priv("systemctl", &["stop", &format!("sentinel-pppoe@{name}.service")])
+}
+
+/// Load an nftables ruleset file into the running kernel (`nft -f <path>`). Used
+/// for the PPPoE TCP-MSS-clamp table; the file's leading `table`/`delete table`
+/// makes the load idempotent (it replaces our table wholesale each time).
+pub fn nft_load(path: &Path) -> Result<()> {
+    let Some(p) = path.to_str() else {
+        bail!("non-UTF-8 path");
+    };
+    run_priv("nft", &["-f", p])
+}
+
 /// The transient systemd unit base name for the `commit-confirm` auto-rollback.
 /// `systemd-run --unit=<this>` creates `<this>.timer` + `<this>.service`.
 pub const CONFIRM_UNIT: &str = "sentinel-confirm";
@@ -189,6 +216,26 @@ pub fn install_secret_file(path: &Path, contents: &str) -> Result<()> {
     )
 }
 
+/// Install a PPPoE credentials file (`chap-secrets`/`pap-secrets`) at a
+/// root-owned `path`, mode **0600 root:root**. Unlike a WireGuard `.netdev`
+/// (which an unprivileged `systemd-network` must read, hence 0640), `pppd` runs
+/// as root, so the ISP password never needs to leave root — 0600 is the tightest
+/// mode that still works. We stage in `/run/sentinel` (wheel-writable) then
+/// `install -m 0600` atomically, so there is never a window where the password
+/// is group- or world-readable, in both the boot-service (root) and `configure`
+/// (admin) paths.
+pub fn install_ppp_secret(path: &Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    let tmp = Path::new("/run/sentinel").join(".ppp-secret.tmp");
+    std::fs::write(&tmp, contents).with_context(|| format!("staging {}", tmp.display()))?;
+    let (Some(tmp_s), Some(dst_s)) = (tmp.to_str(), path.to_str()) else {
+        bail!("non-UTF-8 path");
+    };
+    sudo("install", &["-m", "0600", tmp_s, dst_s])
+}
+
 /// Remove a (possibly root-owned) file, tolerating an already-absent path.
 pub fn remove_file(path: &Path) -> Result<()> {
     if !path.exists() {
@@ -241,6 +288,7 @@ pub fn bin(name: &str) -> String {
         "systemd-run" => "SENTINEL_SYSTEMD_RUN_BIN",
         "journalctl" => "SENTINEL_JOURNALCTL_BIN",
         "wren" => "SENTINEL_WREN_BIN",
+        "nft" => "SENTINEL_NFT_BIN",
         "lsblk" => "SENTINEL_LSBLK_BIN",
         "install" => "SENTINEL_INSTALL_BIN",
         "mkdir" => "SENTINEL_MKDIR_BIN",
