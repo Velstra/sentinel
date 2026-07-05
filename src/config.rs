@@ -758,16 +758,52 @@ pub struct Interface {
     /// hardware address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac: Option<String>,
+    /// PPPoE client parameters for a `type = "pppoe"` interface — the German
+    /// VDSL/fibre WAN model. The session rides over the raw uplink NIC named in
+    /// `parent`; `pppoe.username`/`pppoe.password` are the ISP login (the
+    /// password is a secret, rendered to a 0600 `chap-secrets`/`pap-secrets`).
+    /// `None` for any non-PPPoE interface. Declared last so its TOML sub-table
+    /// serialises after every scalar interface key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pppoe: Option<Pppoe>,
 }
 
-/// The kind of a **virtual L2 device** Sentinel creates: a bridge (switch) or a
-/// bond (link aggregation). Physical NICs and VLAN/WireGuard links carry no
-/// `type`; this only marks a device the box synthesises to enslave members.
+/// The `type` of a synthesised or client interface. `bridge`/`bond` are
+/// **virtual L2 devices** Sentinel creates to enslave members; `pppoe` is a
+/// PPPoE **client** session brought up over a raw uplink NIC (`parent`). Physical
+/// NICs and VLAN/WireGuard links carry no `type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IfaceType {
     Bridge,
     Bond,
+    Pppoe,
+}
+
+/// PPPoE client parameters (a `type = "pppoe"` interface). The session is
+/// established by `pppd` over the raw uplink NIC (`parent`) with the `rp-pppoe`
+/// plugin; the box's WAN address, default route and DNS come from the peer
+/// (IPCP). Credentials are the ISP login — the `password` is a secret rendered
+/// to a 0600 `chap-secrets`/`pap-secrets`, never world-readable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Pppoe {
+    /// The PPPoE/PAP/CHAP username (the ISP login, e.g. a German Telekom
+    /// `anschlusskennung...@t-online.de`). Required.
+    pub username: String,
+    /// The PPPoE password. Secret — rendered to a 0600 secrets file, never into
+    /// the world-readable peer options. Required.
+    pub password: String,
+    /// Optional PPPoE service name (`rp_pppoe_service`); most ISPs need none.
+    #[serde(default, rename = "service-name", skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
+    /// Optional PPPoE access-concentrator name (`rp_pppoe_ac`) to pin the
+    /// session to a specific AC; most ISPs need none.
+    #[serde(default, rename = "ac-name", skip_serializing_if = "Option::is_none")]
+    pub ac_name: Option<String>,
+    /// PPP MRU in bytes. Defaults to the interface `mtu` (or 1492 — the classic
+    /// PPPoE-over-1500 value, 8 bytes of PPPoE overhead) when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mru: Option<u16>,
 }
 
 /// The Linux bonding modes networkd accepts (`[Bond] Mode=`).
@@ -861,9 +897,15 @@ impl Interface {
     pub fn is_bond(&self) -> bool {
         self.if_type == Some(IfaceType::Bond)
     }
-    /// True for a virtual L2 device (bridge or bond) this box synthesises.
+    /// True for a virtual L2 device (bridge or bond) this box synthesises. A
+    /// `pppoe` client is NOT an L2 device (it has no netdev and enslaves no
+    /// members), so it is excluded here.
     pub fn is_virtual_l2(&self) -> bool {
-        self.if_type.is_some()
+        matches!(self.if_type, Some(IfaceType::Bridge) | Some(IfaceType::Bond))
+    }
+    /// True for a PPPoE client interface (`type = "pppoe"`).
+    pub fn is_pppoe(&self) -> bool {
+        self.if_type == Some(IfaceType::Pppoe)
     }
 }
 
@@ -1169,24 +1211,91 @@ impl Appliance {
                 validate_mac(mac).with_context(|| format!("interface {:?} mac", iface.name))?;
             }
             // VLAN subinterface: parent + vlan come as a pair; vlan in range; the
-            // parent must be a declared interface.
-            match (&iface.parent, iface.vlan) {
-                (Some(parent), Some(vlan)) => {
-                    if !(1..=4094).contains(&vlan) {
-                        bail!("interface {:?}: vlan {vlan} out of range (1–4094)", iface.name);
+            // parent must be a declared interface. A PPPoE client also carries a
+            // `parent` (its raw uplink NIC) but no `vlan`, so it is validated
+            // separately below — skip the pairing rule for it.
+            if !iface.is_pppoe() {
+                match (&iface.parent, iface.vlan) {
+                    (Some(parent), Some(vlan)) => {
+                        if !(1..=4094).contains(&vlan) {
+                            bail!("interface {:?}: vlan {vlan} out of range (1–4094)", iface.name);
+                        }
+                        if !names.contains(parent.as_str()) {
+                            bail!(
+                                "interface {:?}: parent {parent:?} is not a declared interface",
+                                iface.name
+                            );
+                        }
                     }
-                    if !names.contains(parent.as_str()) {
-                        bail!(
-                            "interface {:?}: parent {parent:?} is not a declared interface",
-                            iface.name
-                        );
+                    (None, None) => {}
+                    _ => bail!(
+                        "interface {:?}: `parent` and `vlan` must be set together",
+                        iface.name
+                    ),
+                }
+            }
+
+            // PPPoE client (`type = "pppoe"`): a session `pppd` brings up over the
+            // raw uplink NIC named in `parent`. Requires credentials and a declared
+            // parent; the box's address comes from the peer (IPCP), so a static
+            // `address`/`address6` on it is a misconfiguration. Cannot also be a
+            // VLAN / WireGuard / bridge/bond.
+            if iface.is_pppoe() {
+                if !iface.name.starts_with("ppp") {
+                    bail!(
+                        "interface {:?}: a pppoe interface must be named `ppp*` (e.g. ppp0)",
+                        iface.name
+                    );
+                }
+                let Some(p) = &iface.pppoe else {
+                    bail!(
+                        "interface {:?}: type=pppoe requires `pppoe` credentials (username/password)",
+                        iface.name
+                    );
+                };
+                if p.username.is_empty() {
+                    bail!("interface {:?}: pppoe username is required", iface.name);
+                }
+                if p.password.is_empty() {
+                    bail!("interface {:?}: pppoe password is required", iface.name);
+                }
+                match &iface.parent {
+                    Some(parent) if names.contains(parent.as_str()) => {
+                        if parent == &iface.name {
+                            bail!("interface {:?}: pppoe parent cannot be itself", iface.name);
+                        }
+                    }
+                    Some(parent) => bail!(
+                        "interface {:?}: pppoe parent {parent:?} is not a declared interface",
+                        iface.name
+                    ),
+                    None => bail!(
+                        "interface {:?}: type=pppoe requires a `parent` uplink interface",
+                        iface.name
+                    ),
+                }
+                if iface.vlan.is_some() {
+                    bail!("interface {:?}: a pppoe interface cannot also be a VLAN", iface.name);
+                }
+                if iface.is_wireguard() {
+                    bail!("interface {:?}: a pppoe interface cannot also be WireGuard", iface.name);
+                }
+                if iface.address.is_some() || iface.address6.is_some() {
+                    bail!(
+                        "interface {:?}: a pppoe interface gets its address from the peer — do not set `address`",
+                        iface.name
+                    );
+                }
+                if let Some(mru) = p.mru {
+                    if !(68..=9216).contains(&mru) {
+                        bail!("interface {:?}: pppoe mru {mru} out of range (68–9216)", iface.name);
                     }
                 }
-                (None, None) => {}
-                _ => bail!(
-                    "interface {:?}: `parent` and `vlan` must be set together",
+            } else if iface.pppoe.is_some() {
+                bail!(
+                    "interface {:?}: `pppoe` credentials require `type = \"pppoe\"`",
                     iface.name
-                ),
+                );
             }
 
             // WireGuard: a `private-key` turns an interface into a WG tunnel.
@@ -2319,6 +2428,113 @@ master = "bond0"
         assert!(out.contains("type = \"bridge\""), "got:\n{out}");
         assert!(out.contains("master = \"bond0\""), "got:\n{out}");
         assert!(Appliance::from_toml(&out).is_ok());
+    }
+
+    #[test]
+    fn pppoe_client_parses_validates_and_round_trips() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "eth0"
+[[interface]]
+name = "ppp0"
+type = "pppoe"
+parent = "eth0"
+zone = "wan"
+mtu = 1492
+[interface.pppoe]
+username = "user@isp.de"
+password = "s3cret"
+service-name = "internet"
+mru = 1492
+"#;
+        let a = Appliance::from_toml(toml).expect("pppoe config parses + validates");
+        let ppp = &a.interfaces[1];
+        assert!(ppp.is_pppoe());
+        assert!(!ppp.is_virtual_l2(), "pppoe is not an L2 device");
+        assert_eq!(ppp.parent.as_deref(), Some("eth0"));
+        let p = ppp.pppoe.as_ref().unwrap();
+        assert_eq!(p.username, "user@isp.de");
+        assert_eq!(p.password, "s3cret");
+        assert_eq!(p.service_name.as_deref(), Some("internet"));
+        // Round-trips (type + credentials survive TOML).
+        let out = a.to_toml().unwrap();
+        assert!(out.contains("type = \"pppoe\""), "got:\n{out}");
+        assert!(out.contains("username = \"user@isp.de\""), "got:\n{out}");
+        assert!(Appliance::from_toml(&out).is_ok());
+    }
+
+    #[test]
+    fn pppoe_rejects_bad_configs() {
+        // type=pppoe without credentials is rejected.
+        let no_creds = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "eth0"
+[[interface]]
+name = "ppp0"
+type = "pppoe"
+parent = "eth0"
+"#;
+        assert!(Appliance::from_toml(no_creds).is_err());
+        // A pppoe parent that isn't a declared interface is rejected.
+        let bad_parent = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "ppp0"
+type = "pppoe"
+parent = "eth9"
+[interface.pppoe]
+username = "u"
+password = "p"
+"#;
+        assert!(Appliance::from_toml(bad_parent).is_err());
+        // A non-`ppp*` name for a pppoe interface is rejected.
+        let bad_name = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "eth0"
+[[interface]]
+name = "wan0"
+type = "pppoe"
+parent = "eth0"
+[interface.pppoe]
+username = "u"
+password = "p"
+"#;
+        assert!(Appliance::from_toml(bad_name).is_err());
+        // A static address on a pppoe interface (its address comes from the peer)
+        // is rejected.
+        let with_addr = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "eth0"
+[[interface]]
+name = "ppp0"
+type = "pppoe"
+parent = "eth0"
+address = "10.0.0.1/24"
+[interface.pppoe]
+username = "u"
+password = "p"
+"#;
+        assert!(Appliance::from_toml(with_addr).is_err());
+        // `pppoe` credentials without type=pppoe are rejected.
+        let creds_no_type = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "eth0"
+[interface.pppoe]
+username = "u"
+password = "p"
+"#;
+        assert!(Appliance::from_toml(creds_no_type).is_err());
     }
 
     #[test]

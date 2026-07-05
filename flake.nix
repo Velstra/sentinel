@@ -65,6 +65,7 @@
             --set SENTINEL_IP_BIN         ${pkgs.iproute2}/bin/ip \
             --set SENTINEL_NETWORKCTL_BIN ${pkgs.systemd}/bin/networkctl \
             --set SENTINEL_SYSTEMCTL_BIN  ${pkgs.systemd}/bin/systemctl \
+            --set SENTINEL_NFT_BIN        ${pkgs.nftables}/bin/nft \
             --set SENTINEL_SYSTEMD_RUN_BIN ${pkgs.systemd}/bin/systemd-run \
             --set SENTINEL_JOURNALCTL_BIN ${pkgs.systemd}/bin/journalctl \
             --set SENTINEL_WREN_BIN       ${wrenPkg}/bin/wren \
@@ -294,14 +295,21 @@
       # service — so the box filters as part of the immutable, rollback-able
       # generation.
       nixosModules.sentinel =
-        { ... }:
+        { pkgs, ... }:
         {
           imports = [
             ./nix/appliance.nix
             ./nix/velstra-service.nix
             ./nix/wren-service.nix
           ];
-          environment.systemPackages = [ sentinel ];
+          # `sentinel` is the CLI; `ppp` provides `pppd` + its bundled `pppoe.so`
+          # plugin for `type = pppoe` uplinks (roadmap C5). The plugin dir is
+          # compiled into pppd's store path, so `plugin pppoe.so` resolves without
+          # any search-path wiring.
+          environment.systemPackages = [
+            sentinel
+            pkgs.ppp
+          ];
 
           # OS settings driven by the appliance config. The hostname comes from
           # `[system] hostname` — so a `commit` that changes it actually changes
@@ -350,10 +358,38 @@
               conf-dir = "/run/sentinel/dnsmasq.d/,*.conf";
             };
           };
+          # PPPoE client (roadmap C5): one templated `pppd` per `type = pppoe`
+          # session. Sentinel renders the peer options to
+          # /run/sentinel/ppp/peers/<name> and (re)starts `sentinel-pppoe@<name>`;
+          # `%i` is the session (= the ppp link name). `pppd` runs in the
+          # foreground (`nodetach`) so systemd owns its lifecycle; the rendered
+          # `persist` re-dials within pppd, and `Restart=on-failure` covers a hard
+          # exit. It reads the ISP credentials from /etc/ppp/{chap,pap}-secrets,
+          # which the symlinks below point at Sentinel's 0600 rendered files.
+          systemd.services."sentinel-pppoe@" = {
+            description = "PPPoE client session %i (pppd)";
+            after = [
+              "network.target"
+              "sentinel-boot.service"
+            ];
+            serviceConfig = {
+              Type = "exec";
+              ExecStart = "${pkgs.ppp}/bin/pppd file /run/sentinel/ppp/peers/%i nodetach";
+              Restart = "on-failure";
+              RestartSec = "5s";
+            };
+          };
           systemd.tmpfiles.rules = [
             "d /run/sentinel 0755 root root -"
             "d /run/sentinel/chrony.d 0755 root root -"
             "d /run/sentinel/dnsmasq.d 0755 root root -"
+            # PPPoE runtime dir holds the 0600 secrets + peer options (root only).
+            "d /run/sentinel/ppp 0700 root root -"
+            "d /run/sentinel/ppp/peers 0755 root root -"
+            # pppd's fixed credential lookup paths → Sentinel's rendered secrets.
+            "d /etc/ppp 0755 root root -"
+            "L+ /etc/ppp/chap-secrets - - - - /run/sentinel/ppp/chap-secrets"
+            "L+ /etc/ppp/pap-secrets - - - - /run/sentinel/ppp/pap-secrets"
           ];
         };
 
@@ -1749,6 +1785,154 @@
 
             # The server side saw the lease it handed out.
             fw.succeed("networkctl status eth1")
+          '';
+        };
+
+        # PPPoE client + MSS clamping (roadmap C5). Two nodes on the WAN segment
+        # (vlan 2): a `concentrator` runs rp-pppoe's `pppoe-server` (its own
+        # self-contained pppd + rp-pppoe.so plugin, require-CHAP), and the sentinel
+        # `fw` dials it as a PPPoE client on its uplink NIC (eth2). The fw's velstra
+        # XDP attaches to an isolated eth1 (vlan 1) so it never sees the raw PPPoE
+        # frames on eth2. We assert Sentinel rendered the pppd peer options +
+        # 0600 chap-secrets byte-correctly, the `sentinel-pppoe@ppp0` unit is up,
+        # `ppp0` negotiates an address from the concentrator's pool, AND the
+        # TCP-MSS-clamp nftables table (the `--clamp-mss-to-pmtu` equivalent) is
+        # loaded into the kernel.
+        #   nix build .#checks.x86_64-linux.pppoe -L
+        pppoe = pkgs.testers.runNixOSTest {
+          name = "sentinel-pppoe";
+          nodes = {
+            # The ISP-side PPPoE access concentrator, on the WAN segment (vlan 2).
+            concentrator =
+              { pkgs, ... }:
+              {
+                virtualisation.vlans = [ 2 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                };
+                # eth1 is the raw PPPoE segment — link-up only, no L3 address
+                # (PPPoE discovery/session are L2). networkd manages it up.
+                systemd.network.networks."10-eth1" = {
+                  matchConfig.Name = "eth1";
+                  networkConfig.LinkLocalAddressing = "no";
+                  linkConfig.RequiredForOnline = false;
+                };
+                # pppd options the concentrator hands its per-client pppd: require
+                # CHAP (so the client's credentials are actually exercised) and push
+                # a DNS the client can `usepeerdns` into.
+                environment.etc."ppp/pppoe-server-options".text = ''
+                  require-chap
+                  lcp-echo-interval 10
+                  lcp-echo-failure 2
+                  ms-dns 10.0.0.1
+                  noipdefault
+                '';
+                # The credential the concentrator checks the client against.
+                environment.etc."ppp/chap-secrets" = {
+                  mode = "0600";
+                  text = ''
+                    "testuser"	*	"testpass"	*
+                  '';
+                };
+                systemd.services.pppoe-server = {
+                  wantedBy = [ "multi-user.target" ];
+                  after = [ "systemd-networkd.service" ];
+                  # pppoe-server bakes in its pppd path + rp-pppoe.so plugin, but
+                  # still needs them resolvable for exec.
+                  path = [
+                    pkgs.ppp
+                    pkgs.rpPPPoE
+                  ];
+                  serviceConfig = {
+                    ExecStartPre = "${pkgs.iproute2}/bin/ip link set eth1 up";
+                    # -F: foreground (systemd owns it). -I: raw NIC. -L/-R: local +
+                    # remote-pool addresses. -N: max sessions. -O: our options file.
+                    ExecStart =
+                      "${pkgs.rpPPPoE}/bin/pppoe-server -F -I eth1 "
+                      + "-L 10.0.0.1 -R 10.0.0.100 -N 10 -O /etc/ppp/pppoe-server-options";
+                    Restart = "on-failure";
+                    RestartSec = "2s";
+                  };
+                };
+              };
+            # The appliance: velstra on the isolated eth1 (vlan 1); the PPPoE uplink
+            # is eth2 (vlan 2), the same segment as the concentrator.
+            fw =
+              { lib, pkgs, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "fw";
+                networking.firewall.enable = lib.mkForce false;
+                virtualisation.vlans = [
+                  1
+                  2
+                ];
+                virtualisation.memorySize = 2048;
+                services.velstra.interface = lib.mkForce "eth1";
+                # `nft` for the MSS-clamp assertion below (sentinel itself uses a
+                # wrapped absolute path, so it isn't otherwise on the admin PATH).
+                environment.systemPackages = [ pkgs.nftables ];
+              };
+          };
+          testScript = ''
+            start_all()
+            concentrator.wait_for_unit("pppoe-server.service")
+            fw.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+
+            # Dial the concentrator: declare the uplink NIC (eth2) as the pppoe
+            # parent and configure the ppp0 client with the ISP credentials. ONE
+            # `set` per line (the inline multi-field form does not parse).
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth2 zone wan' "
+                "'set interface ppp0 type pppoe' "
+                "'set interface ppp0 parent eth2' "
+                "'set interface ppp0 zone wan' "
+                "'set interface ppp0 pppoe username testuser' "
+                "'set interface ppp0 pppoe password testpass' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+
+            # Sentinel rendered the pppd peer options for the session (pppoe.so
+            # plugin on the parent NIC, pinned link name, the ISP username — but
+            # NOT the password, which lives only in the 0600 secrets file).
+            fw.wait_until_succeeds("test -f /run/sentinel/ppp/peers/ppp0", timeout=20)
+            peer = fw.succeed("cat /run/sentinel/ppp/peers/ppp0")
+            assert "plugin pppoe.so" in peer, peer
+            assert "nic-eth2" in peer, peer
+            assert "ifname ppp0" in peer, peer
+            assert 'user "testuser"' in peer, peer
+            assert "testpass" not in peer, peer
+
+            # The credentials landed in the 0600 chap-secrets, reachable via pppd's
+            # fixed /etc/ppp lookup path (the module symlinks it into place).
+            secret = fw.succeed("cat /etc/ppp/chap-secrets")
+            assert '"testuser"' in secret and '"testpass"' in secret, secret
+            mode = fw.succeed(
+                "stat -L -c '%a' /etc/ppp/chap-secrets"
+            ).strip()
+            assert mode == "600", mode
+
+            # The templated pppd unit is running for this session.
+            fw.wait_for_unit("sentinel-pppoe@ppp0.service")
+
+            # ppp0 negotiates up and takes an address from the concentrator's pool
+            # (10.0.0.100+). PPPoE discovery + LCP/CHAP/IPCP takes a few seconds.
+            fw.wait_until_succeeds(
+                "ip -4 addr show ppp0 | grep -q 'inet 10[.]0[.]0[.]'", timeout=90
+            )
+
+            # The MSS clamp is live in the kernel: our `inet sentinel-mss` table
+            # clamps TCP MSS to the path MTU (`maxseg ... set rt mtu`) on ppp0's
+            # egress — the VyOS `clamp-mss-to-pmtu` equivalent.
+            rules = fw.succeed("nft list ruleset")
+            assert "sentinel-mss" in rules, rules
+            assert "maxseg" in rules, rules
+            assert 'oifname "ppp0"' in rules, rules
           '';
         };
 
