@@ -66,7 +66,6 @@ impl From<RaidArg> for install::Raid {
     }
 }
 
-
 #[derive(Parser)]
 #[command(name = "sentinel", version, about, long_about = None)]
 struct Cli {
@@ -335,7 +334,12 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
         let stdin = std::io::stdin();
         let mut ctx: Vec<String> = Vec::new();
         for line in stdin.lock().lines() {
-            if repl::exec_line(&mut session, &act, &mut ctx, &line.context("reading stdin")?) {
+            if repl::exec_line(
+                &mut session,
+                &act,
+                &mut ctx,
+                &line.context("reading stdin")?,
+            ) {
                 break;
             }
         }
@@ -461,7 +465,11 @@ fn list_disks(disks: &[install::Disk]) {
             i + 1,
             d.dev_path(),
             install::human_size(d.size),
-            if d.model.is_empty() { "(no model)" } else { &d.model },
+            if d.model.is_empty() {
+                "(no model)"
+            } else {
+                &d.model
+            },
             if d.removable { "  [removable]" } else { "" },
         );
     }
@@ -471,7 +479,11 @@ fn list_disks(disks: &[install::Disk]) {
 fn print_plan(chosen: &[&install::Disk], raid: install::Raid) {
     println!("Install plan ({raid:?}):");
     for d in chosen {
-        println!("  target {} ({})", d.dev_path(), install::human_size(d.size));
+        println!(
+            "  target {} ({})",
+            d.dev_path(),
+            install::human_size(d.size)
+        );
     }
     println!("  layout: ESP + dm-verity store (sealed, read-only) + data partition");
     if let Some(level) = raid.mdadm_level() {
@@ -594,9 +606,7 @@ fn show_op(args: &[String]) -> Result<()> {
 
         // IGPs — proxied to the wren control socket.
         ["ip", "ospf", rest @ ..] => wren_show_words("ospf", rest),
-        ["ipv6", "ospf3", rest @ ..] | ["ip", "ospf3", rest @ ..] => {
-            wren_show_words("ospf3", rest)
-        }
+        ["ipv6", "ospf3", rest @ ..] | ["ip", "ospf3", rest @ ..] => wren_show_words("ospf3", rest),
         ["ip", "rip"] => wren_show(&["rip"]),
         ["ipv6", "ripng"] => wren_show(&["ripng"]),
         ["isis", rest @ ..] => wren_show_words("isis", rest),
@@ -702,7 +712,10 @@ fn run_checked(cmd: &str, args: &[&str]) -> Result<()> {
         .with_context(|| format!("running {cmd}"))?;
     print!("{}", String::from_utf8_lossy(&out.stdout));
     if !out.status.success() {
-        anyhow::bail!("{cmd} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        anyhow::bail!(
+            "{cmd} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(())
 }
@@ -737,7 +750,15 @@ fn wren_show_or(words: &[&str], fallback_cmd: &str, fallback_args: &[&str]) -> R
 /// firewall's live statistics (rx/pass/drop/reject/NAT counters + drop rate).
 fn show_firewall_stats() -> Result<()> {
     let out = std::process::Command::new(system::bin("journalctl"))
-        .args(["-u", "velstra.service", "-n", "400", "--no-pager", "-o", "cat"])
+        .args([
+            "-u",
+            "velstra.service",
+            "-n",
+            "400",
+            "--no-pager",
+            "-o",
+            "cat",
+        ])
         .output()
         .context("running journalctl")?;
     let text = String::from_utf8_lossy(&out.stdout);
@@ -803,11 +824,7 @@ fn show_nat() -> Result<()> {
     for d in &a.nat.destination {
         println!(
             "destination {}: {} {:?}/{} -> {}",
-            d.name,
-            d.zone,
-            d.proto,
-            d.port,
-            d.to
+            d.name, d.zone, d.proto, d.port, d.to
         );
     }
     Ok(())

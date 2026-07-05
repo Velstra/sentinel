@@ -222,7 +222,11 @@ fn run(cmd: &str, args: &[&str]) -> Result<()> {
         .status()
         .with_context(|| format!("running {cmd}"))?;
     if !status.success() {
-        bail!("`{cmd} {}` failed (exit {:?})", args.join(" "), status.code());
+        bail!(
+            "`{cmd} {}` failed (exit {:?})",
+            args.join(" "),
+            status.code()
+        );
     }
     Ok(())
 }
@@ -256,13 +260,17 @@ fn find_source_disk() -> Result<String> {
 struct LoopGuard(String);
 impl Drop for LoopGuard {
     fn drop(&mut self) {
-        let _ = Command::new(system::bin("losetup")).args(["-d", &self.0]).status();
+        let _ = Command::new(system::bin("losetup"))
+            .args(["-d", &self.0])
+            .status();
     }
 }
 
 /// Attach a raw image file as a partitioned loop device, returning its path.
 fn losetup_attach(image: &std::path::Path) -> Result<String> {
-    let img = image.to_str().ok_or_else(|| anyhow::anyhow!("non-UTF-8 image path"))?;
+    let img = image
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("non-UTF-8 image path"))?;
     let out = Command::new(system::bin("losetup"))
         .args(["-P", "-f", "--show", img])
         .output()
@@ -283,7 +291,11 @@ fn losetup_attach(image: &std::path::Path) -> Result<String> {
 ///
 /// `source_image` is a raw appliance image to clone from (the ISO/live-boot
 /// case); when `None`, the source is the booted verity medium itself.
-pub fn execute(targets: &[&Disk], raid: Raid, source_image: Option<&std::path::Path>) -> Result<()> {
+pub fn execute(
+    targets: &[&Disk],
+    raid: Raid,
+    source_image: Option<&std::path::Path>,
+) -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         bail!("install must run as root (try `sudo sentinel install …`)");
     }
@@ -322,8 +334,10 @@ pub fn execute(targets: &[&Disk], raid: Raid, source_image: Option<&std::path::P
         }
     }
 
-    let data_parts: Vec<String> =
-        targets.iter().map(|t| part_path(&t.dev_path(), DATA_PART)).collect();
+    let data_parts: Vec<String> = targets
+        .iter()
+        .map(|t| part_path(&t.dev_path(), DATA_PART))
+        .collect();
     // Build the data filesystem (or RAID array). A failure here leaves every
     // erased disk partitioned but without a bootable system — report which.
     let fs_result: Result<()> = (|| {
@@ -348,7 +362,10 @@ pub fn execute(targets: &[&Disk], raid: Raid, source_image: Option<&std::path::P
                 args.extend(data_parts.iter().map(String::as_str));
                 eprintln!("creating RAID{level} across {} disk(s) …", data_parts.len());
                 run("mdadm", &args)?;
-                run("mkfs.ext4", &["-q", "-F", "-L", "data", "/dev/md/sentinel-data"])?;
+                run(
+                    "mkfs.ext4",
+                    &["-q", "-F", "-L", "data", "/dev/md/sentinel-data"],
+                )?;
             }
         }
         Ok(())
@@ -441,8 +458,16 @@ struct Slot {
     verity_part: u32,
     store_part: u32,
 }
-const SLOT_A: Slot = Slot { name: "sentinel-a", verity_part: 2, store_part: 3 };
-const SLOT_B: Slot = Slot { name: "sentinel-b", verity_part: 4, store_part: 5 };
+const SLOT_A: Slot = Slot {
+    name: "sentinel-a",
+    verity_part: 2,
+    store_part: 3,
+};
+const SLOT_B: Slot = Slot {
+    name: "sentinel-b",
+    verity_part: 4,
+    store_part: 5,
+};
 
 // systemd GPT type GUIDs for the verity store pair (x86-64) — used to re-type
 // slot B (reserved generic at build) once it holds a real verity image.
@@ -497,7 +522,11 @@ pub fn update(image: &std::path::Path, commit: bool) -> Result<()> {
     }
     let disk = find_source_disk()?;
     let active = active_slot(&disk)?;
-    let inactive = if active.name == SLOT_A.name { &SLOT_B } else { &SLOT_A };
+    let inactive = if active.name == SLOT_A.name {
+        &SLOT_B
+    } else {
+        &SLOT_A
+    };
     eprintln!(
         "active slot: {} — updating inactive slot {} on {disk}",
         active.name, inactive.name
@@ -597,20 +626,28 @@ fn switch_boot(disk: &str, srcdev: &str, active: &Slot, inactive: &Slot) -> Resu
     } else {
         let p = std::path::PathBuf::from("/run/sentinel/upd-src");
         std::fs::create_dir_all(&p)?;
-        run("mount", &["-o", "ro", &part_path(srcdev, 1), p.to_str().unwrap()])?;
+        run(
+            "mount",
+            &["-o", "ro", &part_path(srcdev, 1), p.to_str().unwrap()],
+        )?;
         (p.clone(), Some(MountGuard(p)))
     };
 
     // The source UKI: for a self-reseal pick the active slot's entry; for a
     // separate image there's exactly one UKI in its /EFI/Linux.
-    let want = if srcdev == disk { Some(active.name) } else { None };
+    let want = if srcdev == disk {
+        Some(active.name)
+    } else {
+        None
+    };
     let uki = std::fs::read_dir(src.join("EFI/Linux"))?
         .flatten()
         .map(|e| e.path())
         .find(|p| {
             p.extension().is_some_and(|x| x == "efi")
                 && want.is_none_or(|n| {
-                    p.file_name().is_some_and(|f| f.to_string_lossy().starts_with(n))
+                    p.file_name()
+                        .is_some_and(|f| f.to_string_lossy().starts_with(n))
                 })
         })
         .ok_or_else(|| anyhow::anyhow!("no UKI in the source ESP"))?;

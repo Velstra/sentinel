@@ -67,12 +67,11 @@ pub fn commit_confirm(session: &mut Session, act: &Apply, minutes: u32) -> Resul
     // Arm the auto-rollback. If arming fails we must NOT leave the new config
     // live without protection — revert immediately and surface the failure.
     if let Err(e) = system::arm_confirm(minutes, &cfg_path) {
-        let revert = Appliance::load(&cfg_path)
-            .and_then(|prev| apply_live(&prev, act));
+        let revert = Appliance::load(&cfg_path).and_then(|prev| apply_live(&prev, act));
         return match revert {
-            Ok(()) => Err(e).context(
-                "arming the rollback timer failed; reverted to the saved config",
-            ),
+            Ok(()) => {
+                Err(e).context("arming the rollback timer failed; reverted to the saved config")
+            }
             Err(re) => Err(e).context(format!(
                 "arming the rollback timer failed AND the immediate revert failed ({re}) \
                  — the box may be on the un-confirmed config with no timer"
@@ -107,7 +106,10 @@ pub fn confirm(_act: &Apply) -> Result<()> {
 /// live is always safe.
 pub fn rollback(act: &Apply, cfg_path: &Path) -> Result<()> {
     if !cfg_path.exists() {
-        eprintln!("no saved config at {} — nothing to revert to.", cfg_path.display());
+        eprintln!(
+            "no saved config at {} — nothing to revert to.",
+            cfg_path.display()
+        );
         return Ok(());
     }
     let appliance = Appliance::load(cfg_path)
