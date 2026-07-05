@@ -295,6 +295,8 @@ struct Draft {
 struct DnsDraft {
     upstream: Vec<String>,
     serve_on: Vec<String>,
+    host_override: BTreeMap<String, String>,
+    blocklist: Vec<String>,
     dnssec: Option<String>,
 }
 
@@ -597,6 +599,8 @@ impl Draft {
             dns: DnsDraft {
                 upstream: a.services.dns.upstream.clone(),
                 serve_on: a.services.dns.serve_on.clone(),
+                host_override: a.services.dns.host_override.clone(),
+                blocklist: a.services.dns.blocklist.clone(),
                 dnssec: a.services.dns.dnssec.clone(),
             },
             ntp: NtpDraft {
@@ -1013,6 +1017,17 @@ impl Session {
             ["services", "dns", "serve-on", v] => {
                 self.draft.dns.serve_on = v.split(',').map(|s| s.trim().to_string()).collect();
             }
+            // A local DNS record: `host-override <name> <ip>` (split-horizon).
+            ["services", "dns", "host-override", name, ip] => {
+                if validate_ipv4(ip).is_err() && validate_ipv6(ip).is_err() {
+                    bail!("services dns host-override {name:?}: {ip:?} is not an IP");
+                }
+                self.draft.dns.host_override.insert((*name).to_string(), (*ip).to_string());
+            }
+            // A sinkholed domain: `blocklist <domain>` (append, deduped).
+            ["services", "dns", "blocklist", v] => {
+                push_unique(&mut self.draft.dns.blocklist, v);
+            }
             ["services", "dns", "dnssec", v] => {
                 if !matches!(*v, "yes" | "no" | "allow-downgrade") {
                     bail!("services dns dnssec {v:?}: expected \"yes\", \"no\" or \"allow-downgrade\"");
@@ -1425,11 +1440,26 @@ impl Session {
                 self.draft.ntp = NtpDraft::default();
             }
             ["services", "dns"] => self.draft.dns = DnsDraft::default(),
+            // Remove one host-override by name, or one blocklist entry by value.
+            ["services", "dns", "host-override", name] => {
+                if self.draft.dns.host_override.remove(*name).is_none() {
+                    bail!("no host-override {name:?}");
+                }
+            }
+            ["services", "dns", "blocklist", v] => {
+                let before = self.draft.dns.blocklist.len();
+                self.draft.dns.blocklist.retain(|e| e != v);
+                if self.draft.dns.blocklist.len() == before {
+                    bail!("{v:?} is not in the dns blocklist");
+                }
+            }
             ["services", "dns", field] => {
                 let d = &mut self.draft.dns;
                 match *field {
                     "upstream" => d.upstream.clear(),
                     "serve-on" => d.serve_on.clear(),
+                    "host-override" => d.host_override.clear(),
+                    "blocklist" => d.blocklist.clear(),
                     "dnssec" => d.dnssec = None,
                     other => bail!("services dns has no field {other:?}"),
                 }
@@ -1916,6 +1946,8 @@ impl Session {
                 dns: Dns {
                     upstream: self.draft.dns.upstream.clone(),
                     serve_on: self.draft.dns.serve_on.clone(),
+                    host_override: self.draft.dns.host_override.clone(),
+                    blocklist: self.draft.dns.blocklist.clone(),
                     dnssec: self.draft.dns.dnssec.clone(),
                 },
                 ntp: Ntp {
@@ -2424,7 +2456,11 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
     // services: box-wide offered services (dns, ntp), each nested one level.
     let d = &draft.dns;
     let n = &draft.ntp;
-    let dns_set = !(d.upstream.is_empty() && d.serve_on.is_empty() && d.dnssec.is_none());
+    let dns_set = !(d.upstream.is_empty()
+        && d.serve_on.is_empty()
+        && d.host_override.is_empty()
+        && d.blocklist.is_empty()
+        && d.dnssec.is_none());
     let ntp_set = !(n.upstream.is_empty() && n.serve_on.is_empty());
     if want("services") && (dns_set || ntp_set) {
         out.push_str("services {\n");
@@ -2435,6 +2471,12 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             }
             if !d.serve_on.is_empty() {
                 out.push_str(&format!("        serve-on {}\n", d.serve_on.join(",")));
+            }
+            for (name, ip) in &d.host_override {
+                out.push_str(&format!("        host-override {name} {ip}\n"));
+            }
+            for domain in &d.blocklist {
+                out.push_str(&format!("        blocklist {domain}\n"));
             }
             if let Some(mode) = &d.dnssec {
                 out.push_str(&format!("        dnssec {mode}\n"));

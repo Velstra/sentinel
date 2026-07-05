@@ -70,6 +70,13 @@ pub fn reload_chrony() -> Result<()> {
     run_priv("systemctl", &["restart", "chronyd"])
 }
 
+/// Restart dnsmasq so a freshly written conf-dir drop-in takes effect (new
+/// `interface=`/`server=`/`address=` lines need a re-read + re-bind, which a
+/// SIGHUP does not fully do for interface bindings).
+pub fn reload_dnsmasq() -> Result<()> {
+    run_priv("systemctl", &["restart", "dnsmasq"])
+}
+
 /// The transient systemd unit base name for the `commit-confirm` auto-rollback.
 /// `systemd-run --unit=<this>` creates `<this>.timer` + `<this>.service`.
 pub const CONFIRM_UNIT: &str = "sentinel-confirm";

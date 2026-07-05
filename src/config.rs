@@ -231,11 +231,26 @@ pub struct Dns {
     /// Upstream resolvers the box forwards client queries to (IPv4 or IPv6).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub upstream: Vec<String>,
-    /// Interfaces whose address the forwarder listens on for LAN client queries
-    /// (a resolved stub listener bound to each interface's static IP). Each must
-    /// be a declared interface carrying a static address.
+    /// Interfaces the LAN resolver (dnsmasq) listens on for client queries. Each
+    /// must be a declared interface carrying a static address. Serving turns on
+    /// dnsmasq (forwarding + host-overrides + blocklists); the box's own
+    /// resolution stays on systemd-resolved.
     #[serde(default, rename = "serve-on", skip_serializing_if = "Vec::is_empty")]
     pub serve_on: Vec<String>,
+    /// Local DNS records: name → IP (v4 or v6). A LAN query for the name is
+    /// answered authoritatively with the address instead of being forwarded —
+    /// the pfSense "host override" / split-horizon convenience.
+    #[serde(
+        default,
+        rename = "host-override",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub host_override: BTreeMap<String, String>,
+    /// Domains to sinkhole: a LAN query for the domain (or any subdomain) is
+    /// answered with `0.0.0.0` / `::` instead of being forwarded — the
+    /// pfBlocker/pi-hole DNS-blocklist convention (ad/tracker/malware blocking).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocklist: Vec<String>,
     /// DNSSEC validation mode: `"yes"`, `"no"` or `"allow-downgrade"`. Unset ⇒
     /// the appliance default (`no`) — a forwarder trusts its upstream, and many
     /// upstreams break strict validation.
@@ -244,9 +259,13 @@ pub struct Dns {
 }
 
 impl Dns {
-    /// True when no forwarder is configured — lets `[dns]` be omitted.
+    /// True when no DNS service is configured — lets `[services.dns]` be omitted.
     pub fn is_empty(&self) -> bool {
-        self.upstream.is_empty() && self.serve_on.is_empty() && self.dnssec.is_none()
+        self.upstream.is_empty()
+            && self.serve_on.is_empty()
+            && self.host_override.is_empty()
+            && self.blocklist.is_empty()
+            && self.dnssec.is_none()
     }
 }
 
@@ -1493,6 +1512,21 @@ impl Appliance {
             if !matches!(mode.as_str(), "yes" | "no" | "allow-downgrade") {
                 bail!("services dns dnssec {mode:?}: expected \"yes\", \"no\" or \"allow-downgrade\"");
             }
+        }
+        // Host-overrides map a name to a literal IP (v4 or v6); blocklist entries
+        // are domain names. Serving overrides/blocklists needs a serve-on iface
+        // (dnsmasq must have somewhere to listen).
+        for (name, ip) in &dns.host_override {
+            validate_host(name).with_context(|| "services dns host-override name")?;
+            if validate_ipv4(ip).is_err() && validate_ipv6(ip).is_err() {
+                bail!("services dns host-override {name:?}: {ip:?} is not an IPv4/IPv6 address");
+            }
+        }
+        for domain in &dns.blocklist {
+            validate_host(domain).with_context(|| "services dns blocklist")?;
+        }
+        if (!dns.host_override.is_empty() || !dns.blocklist.is_empty()) && dns.serve_on.is_empty() {
+            bail!("services dns host-override/blocklist need at least one `serve-on` interface");
         }
 
         // NTP server: upstreams are IPs or hostnames; every serving interface
