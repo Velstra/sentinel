@@ -390,6 +390,31 @@
               RestartSec = "5s";
             };
           };
+          # Multi-WAN (roadmap C6): the health-check + failover daemon. Sentinel
+          # renders the loop to /run/sentinel/multiwan/health.sh and (re)starts
+          # this unit when the config changes; the daemon needs `ip` (iproute2)
+          # and `ping` (iputils) on PATH. `bash` runs the rendered arrays+logic.
+          systemd.services."sentinel-multiwan" = {
+            description = "Multi-WAN health check + failover (sentinel)";
+            after = [
+              "network.target"
+              "sentinel-boot.service"
+            ];
+            # `ip` (iproute2), `ping` (iputils), plus `awk`/`cut`/`head`
+            # (gawk + coreutils) the daemon uses to parse addresses/gateways.
+            path = [
+              pkgs.iproute2
+              pkgs.iputils
+              pkgs.gawk
+              pkgs.coreutils
+            ];
+            serviceConfig = {
+              Type = "exec";
+              ExecStart = "${pkgs.bash}/bin/bash /run/sentinel/multiwan/health.sh";
+              Restart = "on-failure";
+              RestartSec = "5s";
+            };
+          };
           systemd.tmpfiles.rules = [
             "d /run/sentinel 0755 root root -"
             "d /run/sentinel/chrony.d 0755 root root -"
@@ -397,6 +422,8 @@
             # PPPoE runtime dir holds the 0600 secrets + peer options (root only).
             "d /run/sentinel/ppp 0700 root root -"
             "d /run/sentinel/ppp/peers 0755 root root -"
+            # Multi-WAN daemon runtime dir (rendered health script + state).
+            "d /run/sentinel/multiwan 0755 root root -"
             # pppd's fixed credential lookup paths → Sentinel's rendered secrets.
             "d /etc/ppp 0755 root root -"
             "L+ /etc/ppp/chap-secrets - - - - /run/sentinel/ppp/chap-secrets"
@@ -3136,6 +3163,166 @@
                 "| sentinel configure\""
             )
             machine.succeed("! grep -q 'mgmt' /var/lib/sentinel/appliance.toml")
+          '';
+        };
+
+        # Multi-WAN (roadmap C6): health-checked uplink failover + policy routing.
+        # A 3-node topology — fw with two upstreams (up1 on vlan 1, up2 on vlan 2)
+        # each acting as a gateway the fw pings. Both up → the primary (eth1,
+        # priority 10) owns the main default route and each uplink gets its own
+        # policy-routing table. Kill the primary upstream's link → the health
+        # daemon fails the default route over to the backup (eth2); bring it back
+        # → it fails back. Proves the rendered per-uplink tables + `ip rule`s and
+        # the failover daemon actually swing the kernel default route on loss and
+        # recovery (not just that the config compiles).
+        #   nix build .#checks.x86_64-linux.multiwan -L
+        multiwan = pkgs.testers.runNixOSTest {
+          name = "sentinel-multiwan";
+          nodes = {
+            # Upstream gateway on WAN segment 1 (the primary uplink's next hop).
+            up1 = {
+              virtualisation.vlans = [ 1 ];
+              networking = {
+                useNetworkd = true;
+                useDHCP = false;
+                firewall.enable = false;
+                interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = "10.1.0.254";
+                    prefixLength = 24;
+                  }
+                ];
+              };
+            };
+            # Upstream gateway on WAN segment 2 (the backup uplink's next hop).
+            up2 = {
+              virtualisation.vlans = [ 2 ];
+              networking = {
+                useNetworkd = true;
+                useDHCP = false;
+                firewall.enable = false;
+                interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = "10.2.0.254";
+                    prefixLength = 24;
+                  }
+                ];
+              };
+            };
+            # The appliance: WAN1 = eth1 (vlan 1), WAN2 = eth2 (vlan 2). Addresses
+            # are set at the NixOS level (boot-stable) as the other multi-NIC tests
+            # do; sentinel owns the multiwan config (uplinks + health checks).
+            fw =
+              { lib, pkgs, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "fw";
+                networking.firewall.enable = lib.mkForce false;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = "10.1.0.1";
+                    prefixLength = 24;
+                  }
+                ];
+                networking.interfaces.eth2.ipv4.addresses = [
+                  {
+                    address = "10.2.0.1";
+                    prefixLength = 24;
+                  }
+                ];
+                virtualisation.vlans = [
+                  1
+                  2
+                ];
+                virtualisation.memorySize = 2048;
+                # Reply traffic to the box's own ping arrives on the WAN nics; keep
+                # reverse-path filtering permissive so the health probes are not
+                # dropped as the default route swings between uplinks.
+                boot.kernel.sysctl = {
+                  "net.ipv4.conf.all.rp_filter" = 0;
+                  "net.ipv4.conf.default.rp_filter" = 0;
+                };
+                services.velstra.interface = lib.mkForce "eth1";
+                environment.systemPackages = [ pkgs.iproute2 ];
+              };
+          };
+          testScript = ''
+            start_all()
+            for m in (up1, up2):
+                m.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+            # The fw's WAN addresses are live on both segments.
+            fw.wait_until_succeeds("ip addr show eth1 | grep -q 10.1.0.1", timeout=20)
+            fw.wait_until_succeeds("ip addr show eth2 | grep -q 10.2.0.1", timeout=20)
+
+            # Configure two uplinks: eth1 primary (priority 10), eth2 backup (20),
+            # each health-checking its own gateway. default-action accept so the
+            # Velstra firewall passes the ICMP probes + their replies. ONE `set`
+            # per line.
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set firewall global default-action accept' "
+                "'set interface eth1 zone wan' "
+                "'set interface eth2 zone wan' "
+                "'set multiwan mode failover' "
+                "'set multiwan uplink eth1 priority 10' "
+                "'set multiwan uplink eth1 gateway 10.1.0.254' "
+                "'set multiwan uplink eth1 check target 10.1.0.254' "
+                "'set multiwan uplink eth1 check interval 2' "
+                "'set multiwan uplink eth1 check timeout 1' "
+                "'set multiwan uplink eth1 check fail 2' "
+                "'set multiwan uplink eth1 check rise 2' "
+                "'set multiwan uplink eth2 priority 20' "
+                "'set multiwan uplink eth2 gateway 10.2.0.254' "
+                "'set multiwan uplink eth2 check target 10.2.0.254' "
+                "'set multiwan uplink eth2 check interval 2' "
+                "'set multiwan uplink eth2 check timeout 1' "
+                "'set multiwan uplink eth2 check fail 2' "
+                "'set multiwan uplink eth2 check rise 2' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+
+            # Sentinel rendered the daemon script and started the unit.
+            fw.wait_until_succeeds("test -f /run/sentinel/multiwan/health.sh", timeout=20)
+            fw.wait_for_unit("sentinel-multiwan.service")
+            fw.succeed("grep -q 'MODE=\"failover\"' /run/sentinel/multiwan/health.sh")
+            fw.succeed("grep -q eth1 /run/sentinel/multiwan/health.sh")
+
+            # With the firewall now accepting, both upstream gateways answer the
+            # health probes (so an uplink that is up stays up).
+            fw.wait_until_succeeds("ping -c1 -W2 10.1.0.254", timeout=30)
+            fw.wait_until_succeeds("ping -c1 -W2 10.2.0.254", timeout=30)
+
+            # Each uplink owns a policy-routing table with a default route via its
+            # gateway (the PBR substrate).
+            fw.wait_until_succeeds(
+                "ip route show table 200 | grep -q 'default via 10.1.0.254 dev eth1'", timeout=30
+            )
+            fw.wait_until_succeeds(
+                "ip route show table 201 | grep -q 'default via 10.2.0.254 dev eth2'", timeout=30
+            )
+            # Source-based `ip rule`s steer each uplink's own traffic to its table.
+            fw.wait_until_succeeds("ip rule show | grep -q 'lookup 200'", timeout=30)
+
+            # Headline 1 — both up: the primary (eth1) owns the main default route.
+            fw.wait_until_succeeds(
+                "ip route show default | grep -q 'via 10.1.0.254 dev eth1'", timeout=40
+            )
+
+            # Headline 2 — kill the primary upstream's link: the health check fails
+            # and the daemon swings the default route over to the backup (eth2).
+            up1.succeed("ip link set eth1 down")
+            fw.wait_until_succeeds(
+                "ip route show default | grep -q 'via 10.2.0.254 dev eth2'", timeout=60
+            )
+
+            # Headline 3 — recover the primary: the daemon fails back to eth1.
+            up1.succeed("ip link set eth1 up")
+            fw.wait_until_succeeds(
+                "ip route show default | grep -q 'via 10.1.0.254 dev eth1'", timeout=60
+            )
           '';
         };
       };

@@ -13,9 +13,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::config::{
-    Action, Appliance, Bgp, BgpNeighbor, DhcpServer, Dns, Firewall, Groups, IfaceType, Interface,
-    Isis, Nat, NatDestination, NatSource, Ntp, Ospf, Ospf3, PortSpec, Pppoe, Proto, Protocols, Qos,
-    QosDiscipline, Rip, RouterAdvert, Rule, Services, StaticRoute, System, Vrrp, WgPeer, ZoneCfg,
+    Action, Appliance, Bgp, BgpNeighbor, DhcpServer, Dns, Firewall, Groups, HealthCheck, IfaceType,
+    Interface, Isis, MultiWan, Nat, NatDestination, NatSource, Ntp, Ospf, Ospf3, PortSpec, Pppoe,
+    Proto, Protocols, Qos, QosDiscipline, Rip, RouterAdvert, Rule, Services, StaticRoute, System,
+    Vrrp, WanMode, WanUplink, WgPeer, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -69,14 +70,16 @@ impl IfaceDraft {
     /// default) if not yet present. Setting any `dhcp-server` field first turns
     /// the server on, mirroring how the first peer field creates the peer.
     fn dhcp_mut(&mut self) -> &mut DhcpServerDraft {
-        self.dhcp_server.get_or_insert_with(DhcpServerDraft::default)
+        self.dhcp_server
+            .get_or_insert_with(DhcpServerDraft::default)
     }
 
     /// Mutable access to the RA sub-draft, enabling it (inserting a default) if
     /// not yet present — the first `router-advert` field turns the advertiser
     /// on, mirroring `dhcp_mut`.
     fn ra_mut(&mut self) -> &mut RouterAdvertDraft {
-        self.router_advert.get_or_insert_with(RouterAdvertDraft::default)
+        self.router_advert
+            .get_or_insert_with(RouterAdvertDraft::default)
     }
 
     /// Mutable access to the PPPoE sub-draft, inserting a default if not yet
@@ -258,7 +261,9 @@ struct RipDraft {
 
 impl RipDraft {
     fn is_empty(&self) -> bool {
-        self.interfaces.is_empty() && self.redistribute.is_empty() && self.redistribute_metric.is_none()
+        self.interfaces.is_empty()
+            && self.redistribute.is_empty()
+            && self.redistribute_metric.is_none()
     }
 }
 
@@ -330,6 +335,10 @@ struct Draft {
     vrrp: Vec<(String, VrrpDraft)>,
     dns: DnsDraft,
     ntp: NtpDraft,
+    /// Multi-WAN (roadmap C6): failover/load-balance mode + the uplinks, keyed by
+    /// interface in configuration order.
+    multiwan_mode: Option<WanMode>,
+    uplinks: Vec<(String, UplinkDraft)>,
 }
 
 /// A partially-specified DNS forwarder (`[services.dns]`).
@@ -349,13 +358,31 @@ struct NtpDraft {
     serve_on: Vec<String>,
 }
 
+/// A partially-specified Multi-WAN uplink (`[[multiwan.uplink]]`), keyed by its
+/// interface in the draft. The health-check fields are flattened in here (the
+/// CLI addresses them as `… check <field>`) and split back into a
+/// [`HealthCheck`] at materialize time.
+#[derive(Debug, Clone, Default)]
+struct UplinkDraft {
+    priority: Option<u32>,
+    weight: Option<u32>,
+    table: Option<u32>,
+    gateway: Option<String>,
+    targets: Vec<String>,
+    interval: Option<u32>,
+    timeout: Option<u32>,
+    fail: Option<u32>,
+    rise: Option<u32>,
+}
+
 impl Draft {
     /// Mutable access to the static route with `prefix`, inserting it if new.
     fn static_mut(&mut self, prefix: &str) -> &mut StaticDraft {
         if let Some(i) = self.statics.iter().position(|(p, _)| p == prefix) {
             return &mut self.statics[i].1;
         }
-        self.statics.push((prefix.to_string(), StaticDraft::default()));
+        self.statics
+            .push((prefix.to_string(), StaticDraft::default()));
         &mut self.statics.last_mut().unwrap().1
     }
 
@@ -384,6 +411,17 @@ impl Draft {
         }
         self.vrrp.push((name.to_string(), VrrpDraft::default()));
         &mut self.vrrp.last_mut().unwrap().1
+    }
+
+    /// Mutable access to the Multi-WAN uplink on interface `iface`, inserting it
+    /// if new (uplinks are keyed by their interface).
+    fn uplink_mut(&mut self, iface: &str) -> &mut UplinkDraft {
+        if let Some(i) = self.uplinks.iter().position(|(n, _)| n == iface) {
+            return &mut self.uplinks[i].1;
+        }
+        self.uplinks
+            .push((iface.to_string(), UplinkDraft::default()));
+        &mut self.uplinks.last_mut().unwrap().1
     }
 }
 
@@ -549,7 +587,14 @@ impl Draft {
                 .nat
                 .source
                 .iter()
-                .map(|s| (s.name.clone(), NatSrcDraft { zone: Some(s.zone.clone()) }))
+                .map(|s| {
+                    (
+                        s.name.clone(),
+                        NatSrcDraft {
+                            zone: Some(s.zone.clone()),
+                        },
+                    )
+                })
                 .collect(),
             nat_destination: a
                 .nat
@@ -607,9 +652,24 @@ impl Draft {
                     redistribute: o.redistribute.clone(),
                 })
                 .unwrap_or_default(),
-            rip: a.protocols.rip.as_ref().map(rip_to_draft).unwrap_or_default(),
-            ripng: a.protocols.ripng.as_ref().map(rip_to_draft).unwrap_or_default(),
-            babel: a.protocols.babel.as_ref().map(rip_to_draft).unwrap_or_default(),
+            rip: a
+                .protocols
+                .rip
+                .as_ref()
+                .map(rip_to_draft)
+                .unwrap_or_default(),
+            ripng: a
+                .protocols
+                .ripng
+                .as_ref()
+                .map(rip_to_draft)
+                .unwrap_or_default(),
+            babel: a
+                .protocols
+                .babel
+                .as_ref()
+                .map(rip_to_draft)
+                .unwrap_or_default(),
             isis: a
                 .protocols
                 .isis
@@ -667,6 +727,28 @@ impl Draft {
                 upstream: a.services.ntp.upstream.clone(),
                 serve_on: a.services.ntp.serve_on.clone(),
             },
+            multiwan_mode: (!a.multiwan.mode.is_default()).then_some(a.multiwan.mode),
+            uplinks: a
+                .multiwan
+                .uplinks
+                .iter()
+                .map(|u| {
+                    (
+                        u.interface.clone(),
+                        UplinkDraft {
+                            priority: u.priority,
+                            weight: u.weight,
+                            table: u.table,
+                            gateway: u.gateway.clone(),
+                            targets: u.check.targets.clone(),
+                            interval: u.check.interval,
+                            timeout: u.check.timeout,
+                            fail: u.check.fail,
+                            rise: u.check.rise,
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 }
@@ -700,9 +782,7 @@ impl Session {
     pub fn merge_discovered(&mut self, names: Vec<String>) {
         for name in names {
             if !self.draft.interfaces.iter().any(|(n, _)| n == &name) {
-                self.draft
-                    .interfaces
-                    .push((name, IfaceDraft::default()));
+                self.draft.interfaces.push((name, IfaceDraft::default()));
             }
         }
     }
@@ -730,7 +810,11 @@ impl Session {
     /// The interface names currently in the candidate (system-discovered +
     /// operator-added) — completion offers these for `set/delete interface …`.
     pub fn interface_names(&self) -> Vec<String> {
-        self.draft.interfaces.iter().map(|(n, _)| n.clone()).collect()
+        self.draft
+            .interfaces
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect()
     }
 
     /// The rule names currently in the candidate — completion offers these for
@@ -742,13 +826,21 @@ impl Session {
     /// The source-NAT (masquerade) rule names — completion offers these for
     /// `set/delete nat source …`.
     pub fn nat_source_names(&self) -> Vec<String> {
-        self.draft.nat_source.iter().map(|(n, _)| n.clone()).collect()
+        self.draft
+            .nat_source
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect()
     }
 
     /// The destination-NAT (port-forward) rule names — completion offers these
     /// for `set/delete nat destination …`.
     pub fn nat_destination_names(&self) -> Vec<String> {
-        self.draft.nat_destination.iter().map(|(n, _)| n.clone()).collect()
+        self.draft
+            .nat_destination
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect()
     }
 
     /// The declared address-group names — completion offers these for a rule's
@@ -803,15 +895,19 @@ impl Session {
                 self.draft.iface_mut(name).pd_from = Some((*v).to_string());
             }
             ["interface", name, "pd-subnet", v] => {
-                let id: u8 = v.parse().with_context(|| format!("invalid pd-subnet {v:?}"))?;
+                let id: u8 = v
+                    .parse()
+                    .with_context(|| format!("invalid pd-subnet {v:?}"))?;
                 self.draft.iface_mut(name).pd_subnet = Some(id);
             }
             ["interface", name, "parent", v] => {
                 self.draft.iface_mut(name).parent = Some((*v).to_string())
             }
             ["interface", name, "vlan", v] => {
-                self.draft.iface_mut(name).vlan =
-                    Some(v.parse().with_context(|| format!("invalid vlan id {v:?}"))?);
+                self.draft.iface_mut(name).vlan = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid vlan id {v:?}"))?,
+                );
             }
 
             // WireGuard interface + peers.
@@ -937,7 +1033,9 @@ impl Session {
                     "bond" => IfaceType::Bond,
                     "pppoe" => IfaceType::Pppoe,
                     other => {
-                        bail!("interface type {other:?}: expected \"bridge\", \"bond\" or \"pppoe\"")
+                        bail!(
+                            "interface type {other:?}: expected \"bridge\", \"bond\" or \"pppoe\""
+                        )
                     }
                 };
                 self.draft.iface_mut(name).if_type = Some(ty);
@@ -1028,7 +1126,9 @@ impl Session {
                 self.draft.iface_mut(name).qos_mut().interval = Some((*v).to_string());
             }
             ["interface", name, "qos", "limit", v] => {
-                let limit: u32 = v.parse().with_context(|| format!("invalid qos limit {v:?}"))?;
+                let limit: u32 = v
+                    .parse()
+                    .with_context(|| format!("invalid qos limit {v:?}"))?;
                 self.draft.iface_mut(name).qos_mut().limit = Some(limit);
             }
 
@@ -1101,9 +1201,16 @@ impl Session {
             // referenced by a rule's source-group / port-group. Members are a
             // comma-separated list and replace the group's contents.
             ["firewall", "group", "address-group", name, "address", v] => {
-                let members: Vec<String> =
-                    v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
-                self.draft.groups.address.insert((*name).to_string(), members);
+                let members: Vec<String> = v
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect();
+                self.draft
+                    .groups
+                    .address
+                    .insert((*name).to_string(), members);
             }
             ["firewall", "group", "port-group", name, "port", v] => {
                 let mut specs = Vec::new();
@@ -1154,7 +1261,10 @@ impl Session {
                 if validate_ipv4(ip).is_err() && validate_ipv6(ip).is_err() {
                     bail!("services dns host-override {name:?}: {ip:?} is not an IP");
                 }
-                self.draft.dns.host_override.insert((*name).to_string(), (*ip).to_string());
+                self.draft
+                    .dns
+                    .host_override
+                    .insert((*name).to_string(), (*ip).to_string());
             }
             // A sinkholed domain: `blocklist <domain>` (append, deduped).
             ["services", "dns", "blocklist", v] => {
@@ -1162,7 +1272,9 @@ impl Session {
             }
             ["services", "dns", "dnssec", v] => {
                 if !matches!(*v, "yes" | "no" | "allow-downgrade") {
-                    bail!("services dns dnssec {v:?}: expected \"yes\", \"no\" or \"allow-downgrade\"");
+                    bail!(
+                        "services dns dnssec {v:?}: expected \"yes\", \"no\" or \"allow-downgrade\""
+                    );
                 }
                 self.draft.dns.dnssec = Some((*v).to_string());
             }
@@ -1262,21 +1374,36 @@ impl Session {
             }
 
             // rip / ripng / babel — same knobs (RipDraft).
-            ["protocols", proto @ ("rip" | "ripng" | "babel"), "interface", v] => {
+            [
+                "protocols",
+                proto @ ("rip" | "ripng" | "babel"),
+                "interface",
+                v,
+            ] => {
                 let d = self.draft.rip_family_mut(proto);
                 let i = (*v).to_string();
                 if !d.interfaces.contains(&i) {
                     d.interfaces.push(i);
                 }
             }
-            ["protocols", proto @ ("rip" | "ripng" | "babel"), "redistribute", v] => {
+            [
+                "protocols",
+                proto @ ("rip" | "ripng" | "babel"),
+                "redistribute",
+                v,
+            ] => {
                 let d = self.draft.rip_family_mut(proto);
                 let s = (*v).to_string();
                 if !d.redistribute.contains(&s) {
                     d.redistribute.push(s);
                 }
             }
-            ["protocols", proto @ ("rip" | "ripng" | "babel"), "redistribute-metric", v] => {
+            [
+                "protocols",
+                proto @ ("rip" | "ripng" | "babel"),
+                "redistribute-metric",
+                v,
+            ] => {
                 self.draft.rip_family_mut(proto).redistribute_metric =
                     Some(v.parse().with_context(|| format!("invalid metric {v:?}"))?);
             }
@@ -1316,8 +1443,10 @@ impl Session {
                     Some(v.parse().with_context(|| format!("invalid vrid {v:?}"))?);
             }
             ["protocols", "vrrp", name, "priority", v] => {
-                self.draft.vrrp_mut(name).priority =
-                    Some(v.parse().with_context(|| format!("invalid priority {v:?}"))?);
+                self.draft.vrrp_mut(name).priority = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid priority {v:?}"))?,
+                );
             }
             ["protocols", "vrrp", name, "virtual-address", v] => {
                 let d = self.draft.vrrp_mut(name);
@@ -1325,6 +1454,64 @@ impl Session {
                 if !d.virtual_address.contains(&a) {
                     d.virtual_address.push(a);
                 }
+            }
+
+            // multiwan (roadmap C6): failover/load-balance mode + per-uplink
+            // policy-routing and health checks. Uplinks are keyed by interface.
+            ["multiwan", "mode", v] => {
+                self.draft.multiwan_mode = Some(parse_wan_mode(v)?);
+            }
+            ["multiwan", "uplink", iface, "priority", v] => {
+                self.draft.uplink_mut(iface).priority = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid priority {v:?}"))?,
+                );
+            }
+            ["multiwan", "uplink", iface, "weight", v] => {
+                self.draft.uplink_mut(iface).weight =
+                    Some(v.parse().with_context(|| format!("invalid weight {v:?}"))?);
+            }
+            ["multiwan", "uplink", iface, "table", v] => {
+                self.draft.uplink_mut(iface).table =
+                    Some(v.parse().with_context(|| format!("invalid table {v:?}"))?);
+            }
+            ["multiwan", "uplink", iface, "gateway", v] => {
+                if *v != "dhcp" {
+                    validate_ipv4(v)?;
+                }
+                self.draft.uplink_mut(iface).gateway = Some((*v).to_string());
+            }
+            ["multiwan", "uplink", iface, "check", "target", v] => {
+                validate_ipv4(v)?;
+                let d = self.draft.uplink_mut(iface);
+                let t = (*v).to_string();
+                if !d.targets.contains(&t) {
+                    d.targets.push(t);
+                }
+            }
+            ["multiwan", "uplink", iface, "check", "interval", v] => {
+                self.draft.uplink_mut(iface).interval = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid interval {v:?}"))?,
+                );
+            }
+            ["multiwan", "uplink", iface, "check", "timeout", v] => {
+                self.draft.uplink_mut(iface).timeout = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid timeout {v:?}"))?,
+                );
+            }
+            ["multiwan", "uplink", iface, "check", "fail", v] => {
+                self.draft.uplink_mut(iface).fail = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid fail count {v:?}"))?,
+                );
+            }
+            ["multiwan", "uplink", iface, "check", "rise", v] => {
+                self.draft.uplink_mut(iface).rise = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid rise count {v:?}"))?,
+                );
             }
             _ => bail!(
                 "unknown set path. The config tree (Tab/`?` explores each level):\n  \
@@ -1351,7 +1538,10 @@ impl Session {
                  set protocols ospf3 <interface <if> | area <id> | cost <n> | network-type <..> | redistribute <src>>\n  \
                  set protocols <rip|ripng|babel> <interface <if> | redistribute <src> | redistribute-metric <n>>\n  \
                  set protocols isis <interface <if> | system-id <id> | area <id> | level <1|2|1-2> | network-type <..> | redistribute <src>>\n  \
-                 set protocols vrrp <name> <interface <if> | vrid <n> | priority <n> | virtual-address <ip>>"
+                 set protocols vrrp <name> <interface <if> | vrid <n> | priority <n> | virtual-address <ip>>\n  \
+                 set multiwan mode <failover|load-balance>\n  \
+                 set multiwan uplink <if> <priority <n> | weight <n> | table <n> | gateway <ip|dhcp>>\n  \
+                 set multiwan uplink <if> check <target <ip> | interval <n> | timeout <n> | fail <n> | rise <n>>"
             ),
         }
         self.dirty = true;
@@ -1737,6 +1927,59 @@ impl Session {
                     other => bail!("vrrp has no field {other:?}"),
                 }
             }
+
+            // multiwan (roadmap C6). Bare `delete multiwan` clears the whole
+            // group; the rest clear a single uplink, one of its fields, or the
+            // health check.
+            ["multiwan"] => {
+                self.draft.multiwan_mode = None;
+                self.draft.uplinks.clear();
+            }
+            ["multiwan", "mode"] => self.draft.multiwan_mode = None,
+            ["multiwan", "uplink", iface] => {
+                let before = self.draft.uplinks.len();
+                self.draft.uplinks.retain(|(n, _)| n != iface);
+                if self.draft.uplinks.len() == before {
+                    bail!("no multiwan uplink {iface:?}");
+                }
+            }
+            ["multiwan", "uplink", iface, "check"] => {
+                let d = self.uplink(iface)?;
+                d.targets.clear();
+                d.interval = None;
+                d.timeout = None;
+                d.fail = None;
+                d.rise = None;
+            }
+            ["multiwan", "uplink", iface, "check", "target", v] => {
+                let d = self.uplink(iface)?;
+                let before = d.targets.len();
+                d.targets.retain(|t| t != v);
+                if d.targets.len() == before {
+                    bail!("{v:?} is not a health-check target of uplink {iface:?}");
+                }
+            }
+            ["multiwan", "uplink", iface, "check", field] => {
+                let d = self.uplink(iface)?;
+                match *field {
+                    "target" => d.targets.clear(),
+                    "interval" => d.interval = None,
+                    "timeout" => d.timeout = None,
+                    "fail" => d.fail = None,
+                    "rise" => d.rise = None,
+                    other => bail!("multiwan health-check has no field {other:?}"),
+                }
+            }
+            ["multiwan", "uplink", iface, field] => {
+                let d = self.uplink(iface)?;
+                match *field {
+                    "priority" => d.priority = None,
+                    "weight" => d.weight = None,
+                    "table" => d.table = None,
+                    "gateway" => d.gateway = None,
+                    other => bail!("multiwan uplink has no field {other:?}"),
+                }
+            }
             _ => bail!("unknown delete path"),
         }
         self.dirty = true;
@@ -1779,6 +2022,15 @@ impl Session {
             .ok_or_else(|| anyhow::anyhow!("no nat destination {name:?}"))
     }
 
+    fn uplink(&mut self, iface: &str) -> Result<&mut UplinkDraft> {
+        self.draft
+            .uplinks
+            .iter_mut()
+            .find(|(n, _)| n == iface)
+            .map(|(_, d)| d)
+            .ok_or_else(|| anyhow::anyhow!("no multiwan uplink {iface:?}"))
+    }
+
     /// Render the candidate in a readable, hierarchical (JunOS-curly) form.
     pub fn show(&self) -> String {
         render_draft(&self.draft, false)
@@ -1788,7 +2040,8 @@ impl Session {
     /// `show <path>` view. Unknown sections yield an error line.
     pub fn show_only(&self, section: &str) -> String {
         match section {
-            "system" | "interface" | "interfaces" | "firewall" | "nat" | "protocols" => {
+            "system" | "interface" | "interfaces" | "firewall" | "nat" | "protocols"
+            | "services" | "multiwan" => {
                 let out = render_draft_only(&self.draft, false, Some(section));
                 if out.is_empty() {
                     format!("(no {section} configuration)\n")
@@ -1796,7 +2049,9 @@ impl Session {
                     out
                 }
             }
-            other => format!("error: unknown section {other:?} (system | interfaces | firewall | nat | protocols)\n"),
+            other => format!(
+                "error: unknown section {other:?} (system | interfaces | firewall | nat | protocols | services | multiwan)\n"
+            ),
         }
     }
 
@@ -2000,30 +2255,28 @@ impl Session {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let nat_destination = self
-            .draft
-            .nat_destination
-            .iter()
-            .map(|(name, d)| {
-                Ok(NatDestination {
-                    name: name.clone(),
-                    zone: d
-                        .zone
-                        .clone()
-                        .ok_or_else(|| anyhow::anyhow!("nat destination {name:?}: zone not set"))?,
-                    proto: d
-                        .proto
-                        .ok_or_else(|| anyhow::anyhow!("nat destination {name:?}: proto not set"))?,
-                    port: d
-                        .port
-                        .ok_or_else(|| anyhow::anyhow!("nat destination {name:?}: port not set"))?,
-                    to: d
-                        .to
-                        .clone()
-                        .ok_or_else(|| anyhow::anyhow!("nat destination {name:?}: to not set"))?,
+        let nat_destination =
+            self.draft
+                .nat_destination
+                .iter()
+                .map(|(name, d)| {
+                    Ok(NatDestination {
+                        name: name.clone(),
+                        zone: d.zone.clone().ok_or_else(|| {
+                            anyhow::anyhow!("nat destination {name:?}: zone not set")
+                        })?,
+                        proto: d.proto.ok_or_else(|| {
+                            anyhow::anyhow!("nat destination {name:?}: proto not set")
+                        })?,
+                        port: d.port.ok_or_else(|| {
+                            anyhow::anyhow!("nat destination {name:?}: port not set")
+                        })?,
+                        to: d.to.clone().ok_or_else(|| {
+                            anyhow::anyhow!("nat destination {name:?}: to not set")
+                        })?,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
+                .collect::<Result<Vec<_>>>()?;
         // protocols: dynamic routing (Wren).
         let statics = self
             .draft
@@ -2135,6 +2388,32 @@ impl Session {
             vrrp,
         };
 
+        // multiwan (roadmap C6): the failover/load-balance uplinks. Health-check
+        // fields split back out into a HealthCheck; validation checks each uplink
+        // names a declared interface + tables/interfaces are unique.
+        let multiwan = MultiWan {
+            mode: self.draft.multiwan_mode.unwrap_or_default(),
+            uplinks: self
+                .draft
+                .uplinks
+                .iter()
+                .map(|(iface, d)| WanUplink {
+                    interface: iface.clone(),
+                    priority: d.priority,
+                    weight: d.weight,
+                    table: d.table,
+                    gateway: d.gateway.clone(),
+                    check: HealthCheck {
+                        targets: d.targets.clone(),
+                        interval: d.interval,
+                        timeout: d.timeout,
+                        fail: d.fail,
+                        rise: d.rise,
+                    },
+                })
+                .collect(),
+        };
+
         let appliance = Appliance {
             system: System { hostname },
             firewall,
@@ -2159,6 +2438,7 @@ impl Session {
                     serve_on: self.draft.ntp.serve_on.clone(),
                 },
             },
+            multiwan,
         };
         appliance.validate()?;
         Ok(appliance)
@@ -2187,8 +2467,7 @@ impl Session {
         let toml = appliance.to_toml()?;
         let tmp = path.with_extension("toml.tmp");
         std::fs::write(&tmp, &toml).with_context(|| format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, &path)
-            .with_context(|| format!("installing {}", path.display()))?;
+        std::fs::rename(&tmp, &path).with_context(|| format!("installing {}", path.display()))?;
         self.dirty = false;
         // Archive this revision (only when saving the box's own config, not an
         // ad-hoc `save <path>` export). Best-effort — a failed archive must never
@@ -2335,7 +2614,10 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         for (peer_pk, p) in &i.peers {
             out.push_str(&format!("    peer {peer_pk} {{\n"));
             if !p.allowed_ips.is_empty() {
-                out.push_str(&format!("        allowed-ips {}\n", p.allowed_ips.join(",")));
+                out.push_str(&format!(
+                    "        allowed-ips {}\n",
+                    p.allowed_ips.join(",")
+                ));
             }
             if let Some(ep) = &p.endpoint {
                 out.push_str(&format!("        endpoint {ep}\n"));
@@ -2632,7 +2914,11 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         proto.push_str("    }\n");
     }
-    for (name, r) in [("rip", &draft.rip), ("ripng", &draft.ripng), ("babel", &draft.babel)] {
+    for (name, r) in [
+        ("rip", &draft.rip),
+        ("ripng", &draft.ripng),
+        ("babel", &draft.babel),
+    ] {
         if r.is_empty() {
             continue;
         }
@@ -2757,6 +3043,55 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         out.push_str("}\n");
     }
 
+    // multiwan { … } — WAN uplinks with failover/load-balance + health checks.
+    if want("multiwan") && !draft.uplinks.is_empty() {
+        out.push_str("multiwan {\n");
+        if let Some(mode) = draft.multiwan_mode {
+            out.push_str(&format!("    mode {}\n", wan_mode_str(mode)));
+        }
+        for (iface, u) in &draft.uplinks {
+            out.push_str(&format!("    uplink {iface} {{\n"));
+            if let Some(p) = u.priority {
+                out.push_str(&format!("        priority {p}\n"));
+            }
+            if let Some(w) = u.weight {
+                out.push_str(&format!("        weight {w}\n"));
+            }
+            if let Some(t) = u.table {
+                out.push_str(&format!("        table {t}\n"));
+            }
+            if let Some(gw) = &u.gateway {
+                out.push_str(&format!("        gateway {gw}\n"));
+            }
+            let check_set = !u.targets.is_empty()
+                || u.interval.is_some()
+                || u.timeout.is_some()
+                || u.fail.is_some()
+                || u.rise.is_some();
+            if check_set {
+                out.push_str("        check {\n");
+                for t in &u.targets {
+                    out.push_str(&format!("            target {t}\n"));
+                }
+                if let Some(v) = u.interval {
+                    out.push_str(&format!("            interval {v}\n"));
+                }
+                if let Some(v) = u.timeout {
+                    out.push_str(&format!("            timeout {v}\n"));
+                }
+                if let Some(v) = u.fail {
+                    out.push_str(&format!("            fail {v}\n"));
+                }
+                if let Some(v) = u.rise {
+                    out.push_str(&format!("            rise {v}\n"));
+                }
+                out.push_str("        }\n");
+            }
+            out.push_str("    }\n");
+        }
+        out.push_str("}\n");
+    }
+
     if out.is_empty() && !skip_empty_ifaces {
         out.push_str("(empty configuration)\n");
     }
@@ -2793,6 +3128,22 @@ fn parse_bool(s: &str) -> Result<bool> {
         "false" | "off" | "no" => false,
         _ => bail!("invalid boolean {s:?} (expected true|false)"),
     })
+}
+
+fn parse_wan_mode(s: &str) -> Result<WanMode> {
+    Ok(match s {
+        "failover" => WanMode::Failover,
+        "load-balance" => WanMode::LoadBalance,
+        _ => bail!("invalid multiwan mode {s:?} (expected failover|load-balance)"),
+    })
+}
+
+/// The rendered keyword for a Multi-WAN mode (the inverse of [`parse_wan_mode`]).
+fn wan_mode_str(m: WanMode) -> &'static str {
+    match m {
+        WanMode::Failover => "failover",
+        WanMode::LoadBalance => "load-balance",
+    }
 }
 
 /// A firewall blocklist entry: an IPv4 or IPv4 CIDR. Delegates to the config
@@ -2894,6 +3245,56 @@ mod tests {
     }
 
     #[test]
+    fn multiwan_cli_builds_uplinks_shows_and_commits() {
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname fw",
+            "set interface wan0 zone wan",
+            "set interface wan1 zone wan",
+            "set multiwan mode failover",
+            "set multiwan uplink wan0 priority 10",
+            "set multiwan uplink wan0 gateway 10.1.0.254",
+            "set multiwan uplink wan0 check target 1.1.1.1",
+            "set multiwan uplink wan0 check interval 2",
+            "set multiwan uplink wan0 check fail 2",
+            "set multiwan uplink wan1 priority 20",
+            "set multiwan uplink wan1 gateway 10.2.0.254",
+        ] {
+            run(&mut s, line).unwrap();
+        }
+        // The show block round-trips the uplinks + the nested health check.
+        let shown = s.show_only("multiwan");
+        assert!(shown.contains("multiwan {"), "got:\n{shown}");
+        assert!(shown.contains("uplink wan0 {"), "got:\n{shown}");
+        assert!(shown.contains("gateway 10.1.0.254"), "got:\n{shown}");
+        assert!(shown.contains("check {"), "got:\n{shown}");
+        assert!(shown.contains("target 1.1.1.1"), "got:\n{shown}");
+
+        let a = s.commit().expect("valid multiwan commits");
+        assert_eq!(a.multiwan.mode, WanMode::Failover);
+        assert_eq!(a.multiwan.uplinks.len(), 2);
+        assert_eq!(a.multiwan.uplinks[0].priority, Some(10));
+        assert_eq!(a.multiwan.uplinks[0].check.fail, Some(2));
+
+        // Deleting one field, one target, and a whole uplink all work.
+        run(&mut s, "delete multiwan uplink wan0 check target 1.1.1.1").unwrap();
+        run(&mut s, "delete multiwan uplink wan1").unwrap();
+        let b = s.commit().expect("still valid after deletes");
+        assert_eq!(b.multiwan.uplinks.len(), 1);
+        assert!(b.multiwan.uplinks[0].check.targets.is_empty());
+    }
+
+    #[test]
+    fn multiwan_uplink_needs_a_declared_interface() {
+        let mut s = Session::empty();
+        run(&mut s, "set system hostname fw").unwrap();
+        run(&mut s, "set multiwan uplink wan9 priority 10").unwrap();
+        // wan9 isn't a declared interface → commit-time validation rejects it.
+        let err = s.commit().unwrap_err().to_string();
+        assert!(err.contains("not a declared interface"), "got: {err}");
+    }
+
+    #[test]
     fn commit_reports_missing_required_fields() {
         let mut s = Session::empty();
         run(&mut s, "set interface wan0 zone wan").unwrap();
@@ -2952,7 +3353,10 @@ mod tests {
         assert_eq!(a.nat.source.len(), 1);
         assert_eq!(a.nat.source[0].zone, "wan");
         let vlan = a.interfaces.iter().find(|i| i.name == "eth1.20").unwrap();
-        assert_eq!((vlan.parent.as_deref(), vlan.vlan), (Some("eth1"), Some(20)));
+        assert_eq!(
+            (vlan.parent.as_deref(), vlan.vlan),
+            (Some("eth1"), Some(20))
+        );
         assert_eq!(vlan.zone.as_deref(), Some("iot"));
         // zone_names offers every referenced/declared zone for completion.
         assert_eq!(s.zone_names(), ["iot", "lan", "wan"]);
@@ -3005,9 +3409,15 @@ mod tests {
         // used — a fresh session, then diff against history). The candidate is h2
         // and revision 0 is the just-saved h2 → no diff; revision 1 is h1.
         let s = Session::load(&path).unwrap();
-        assert!(s.compare_revision(0).unwrap().is_empty(), "candidate matches newest revision");
+        assert!(
+            s.compare_revision(0).unwrap().is_empty(),
+            "candidate matches newest revision"
+        );
         let d = s.compare_revision(1).unwrap();
-        assert!(d.contains("h1") && d.contains("h2"), "candidate vs older revision:\n{d}");
+        assert!(
+            d.contains("h1") && d.contains("h2"),
+            "candidate vs older revision:\n{d}"
+        );
         // revision 1 (h1) vs revision 0 (h2).
         let d2 = s.compare_revisions(1, 0).unwrap();
         assert!(d2.contains("-    hostname h1"), "got:\n{d2}");
@@ -3080,10 +3490,16 @@ mod tests {
 
         let a = s.commit().expect("nat config commits");
         assert_eq!(a.nat.source.len(), 1);
-        assert_eq!((a.nat.source[0].name.as_str(), a.nat.source[0].zone.as_str()), ("wan-masq", "wan"));
+        assert_eq!(
+            (a.nat.source[0].name.as_str(), a.nat.source[0].zone.as_str()),
+            ("wan-masq", "wan")
+        );
         assert_eq!(a.nat.destination.len(), 1);
         let d = &a.nat.destination[0];
-        assert_eq!((d.zone.as_str(), d.port, d.to.as_str()), ("wan", 443, "10.0.0.10:8443"));
+        assert_eq!(
+            (d.zone.as_str(), d.port, d.to.as_str()),
+            ("wan", 443, "10.0.0.10:8443")
+        );
 
         // Completion name helpers see the new rules.
         assert_eq!(s.nat_source_names(), ["wan-masq"]);
@@ -3158,7 +3574,14 @@ mod tests {
         assert!(shown.contains("diffserv diffserv4"), "got:\n{shown}");
 
         let a = s.commit().expect("qos config commits");
-        let q = a.interfaces.iter().find(|i| i.name == "eth0").unwrap().qos.as_ref().unwrap();
+        let q = a
+            .interfaces
+            .iter()
+            .find(|i| i.name == "eth0")
+            .unwrap()
+            .qos
+            .as_ref()
+            .unwrap();
         assert!(q.is_cake());
         assert_eq!(q.bandwidth.as_deref(), Some("100mbit"));
         assert!(q.nat);
@@ -3166,7 +3589,10 @@ mod tests {
         // A cake knob is rejected under fq_codel — reload, switch, expect a
         // commit error (cross-discipline knob).
         run(&mut s, "set interface eth0 qos discipline fq_codel").unwrap();
-        assert!(s.commit().is_err(), "bandwidth is a cake knob; must fail on fq_codel");
+        assert!(
+            s.commit().is_err(),
+            "bandwidth is a cake knob; must fail on fq_codel"
+        );
 
         // Deleting one field, then the whole block.
         run(&mut s, "delete interface eth0 qos bandwidth").unwrap();

@@ -18,7 +18,8 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::config::{
-    Appliance, DhcpServer, Dns, IfaceType, Interface, Ntp, Qos, QosDiscipline, RouterAdvert,
+    Appliance, DhcpServer, Dns, IfaceType, Interface, MultiWan, Ntp, Qos, QosDiscipline,
+    RouterAdvert, WAN_CHECK_FAIL, WAN_CHECK_INTERVAL, WAN_CHECK_RISE, WAN_CHECK_TIMEOUT, WanMode,
 };
 use crate::system::{self, NETWORKD_RUNTIME_DIR};
 
@@ -48,7 +49,10 @@ fn virtual_l2_netdev_body(iface: &Interface) -> String {
         Some(IfaceType::Bridge) => format!("[NetDev]\nName={}\nKind=bridge\n", iface.name),
         Some(IfaceType::Bond) => {
             let mode = iface.bond_mode.as_deref().unwrap_or("active-backup");
-            format!("[NetDev]\nName={}\nKind=bond\n\n[Bond]\nMode={mode}\n", iface.name)
+            format!(
+                "[NetDev]\nName={}\nKind=bond\n\n[Bond]\nMode={mode}\n",
+                iface.name
+            )
         }
         // A PPPoE client is brought up by `pppd` over its parent NIC, not by a
         // networkd netdev — `apply_pppoe` owns it, so there is nothing to render
@@ -246,7 +250,10 @@ fn resolved_dropin_body(dns: &Dns) -> Option<String> {
     body.push_str(&format!("DNS={}\n", dns.upstream.join(" ")));
     // A forwarder trusts its upstream; default DNSSEC off so an unsigned or
     // validation-breaking upstream still resolves. An explicit value overrides.
-    body.push_str(&format!("DNSSEC={}\n", dns.dnssec.as_deref().unwrap_or("no")));
+    body.push_str(&format!(
+        "DNSSEC={}\n",
+        dns.dnssec.as_deref().unwrap_or("no")
+    ));
     Some(body)
 }
 
@@ -302,7 +309,11 @@ fn ipv4_network(cidr: &str) -> Option<String> {
     if prefix > 32 {
         return None;
     }
-    let mask: u32 = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    let mask: u32 = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
     let net = u32::from(ip) & mask;
     Some(format!("{}/{prefix}", Ipv4Addr::from(net)))
 }
@@ -339,7 +350,9 @@ fn apply_chrony(appliance: &Appliance) -> Result<()> {
     let path = Path::new(CHRONY_CONFDIR).join(CHRONY_CONF);
     match chrony_conf_body(&appliance.services.ntp, &appliance.interfaces) {
         Some(body) => {
-            let changed = std::fs::read_to_string(&path).map(|c| c != body).unwrap_or(true);
+            let changed = std::fs::read_to_string(&path)
+                .map(|c| c != body)
+                .unwrap_or(true);
             system::ensure_dir(Path::new(CHRONY_CONFDIR))?;
             system::install_file(&path, &body)?;
             if changed {
@@ -372,7 +385,9 @@ fn apply_resolved(appliance: &Appliance) -> Result<()> {
     let path = Path::new(RESOLVED_DROPIN_DIR).join(RESOLVED_DROPIN);
     let changed = match resolved_dropin_body(&appliance.services.dns) {
         Some(body) => {
-            let changed = std::fs::read_to_string(&path).map(|c| c != body).unwrap_or(true);
+            let changed = std::fs::read_to_string(&path)
+                .map(|c| c != body)
+                .unwrap_or(true);
             system::ensure_dir(Path::new(RESOLVED_DROPIN_DIR))?;
             system::install_file(&path, &body)?;
             changed
@@ -402,7 +417,9 @@ fn apply_dnsmasq(appliance: &Appliance) -> Result<()> {
     let path = Path::new(DNSMASQ_CONFDIR).join(DNSMASQ_CONF);
     let changed = match dnsmasq_conf_body(&appliance.services.dns) {
         Some(body) => {
-            let changed = std::fs::read_to_string(&path).map(|c| c != body).unwrap_or(true);
+            let changed = std::fs::read_to_string(&path)
+                .map(|c| c != body)
+                .unwrap_or(true);
             system::ensure_dir(Path::new(DNSMASQ_CONFDIR))?;
             system::install_file(&path, &body)?;
             changed
@@ -499,7 +516,8 @@ fn ppp_secrets_body(ifaces: &[Interface]) -> Option<String> {
     if ppp.is_empty() {
         return None;
     }
-    let mut body = String::from("# rendered by sentinel — PPPoE credentials\n# client\tserver\tsecret\tIP\n");
+    let mut body =
+        String::from("# rendered by sentinel — PPPoE credentials\n# client\tserver\tsecret\tIP\n");
     for i in ppp {
         if let Some(p) = &i.pppoe {
             body.push_str(&format!("\"{}\"\t*\t\"{}\"\t*\n", p.username, p.password));
@@ -537,7 +555,9 @@ fn pppoe_mss_body(ifaces: &[Interface]) -> String {
 /// Whether writing `body` to `path` would change what is already there (or the
 /// file is absent) — the same change-detect the DNS/NTP drop-ins use.
 fn file_changed(path: &Path, body: &str) -> bool {
-    std::fs::read_to_string(path).map(|c| c != body).unwrap_or(true)
+    std::fs::read_to_string(path)
+        .map(|c| c != body)
+        .unwrap_or(true)
 }
 
 /// Reconcile the PPPoE clients to `appliance`: render each session's pppd peer
@@ -608,7 +628,9 @@ fn apply_pppoe(appliance: &Appliance) -> Result<()> {
     // (Re)start the changed/new sessions.
     for name in &restart {
         if let Err(e) = system::pppoe_restart(name) {
-            eprintln!("warning: (re)starting pppoe session {name} failed (applies on next start): {e}");
+            eprintln!(
+                "warning: (re)starting pppoe session {name} failed (applies on next start): {e}"
+            );
         }
     }
     Ok(())
@@ -689,7 +711,11 @@ fn qos_qdisc_args(qos: &Qos) -> Vec<String> {
 /// device that isn't up yet (a PPPoE `ppp0`, a late VLAN) re-applies on the next
 /// commit/boot rather than failing the whole reconcile.
 fn apply_qos(appliance: &Appliance) -> Result<()> {
-    let shaped: Vec<&Interface> = appliance.interfaces.iter().filter(|i| i.qos.is_some()).collect();
+    let shaped: Vec<&Interface> = appliance
+        .interfaces
+        .iter()
+        .filter(|i| i.qos.is_some())
+        .collect();
     system::ensure_dir(Path::new(QOS_RUNTIME_DIR))?;
 
     let mut desired: HashSet<String> = HashSet::new();
@@ -725,6 +751,252 @@ fn apply_qos(appliance: &Appliance) -> Result<()> {
     Ok(())
 }
 
+// --- Multi-WAN (roadmap C6) ------------------------------------------------
+//
+// Several WAN uplinks reconciled into failover or load-balancing with per-uplink
+// health checks and policy-based routing — the VyOS `wan-load-balance` model.
+// Each uplink owns a routing table (a default route via its gateway); a small
+// rendered daemon pings every uplink's targets and programs the `main`-table
+// default from the healthy uplinks (the lowest-`priority` one in failover, a
+// weighted multipath across all of them in load-balance). Sentinel renders the
+// daemon shell script + a change-detect stamp and (re)starts the
+// `sentinel-multiwan` unit only when the rendered config changed; when no uplink
+// is configured it stops the daemon and flushes the tables it owned. The tables
+// managed on the last apply are recorded so a later teardown can flush them.
+
+/// Runtime dir for the Multi-WAN daemon script + state (tmpfs; re-seeded each
+/// boot from the saved config, like the other render artifacts).
+const MULTIWAN_RUNTIME_DIR: &str = "/run/sentinel/multiwan";
+/// The rendered health-check + failover daemon (run by `sentinel-multiwan`).
+const MULTIWAN_SCRIPT: &str = "/run/sentinel/multiwan/health.sh";
+/// The routing-table ids the daemon owns on the current apply — read on the next
+/// reconcile so a removed uplink's table can be flushed.
+const MULTIWAN_TABLES: &str = "/run/sentinel/multiwan/tables";
+
+/// A shell-quoted single-token value: only the charset our validators already
+/// allow (IPv4 / interface names) reaches here, so plain double-quotes suffice
+/// and there is nothing to escape — but quote anyway so an empty gateway can't
+/// splice the array.
+fn shq(s: &str) -> String {
+    format!("\"{s}\"")
+}
+
+/// Render the Multi-WAN health-check + failover daemon for `mw`. The script sets
+/// up each uplink's routing table + a source-based `ip rule`, then loops probing
+/// the uplinks and reprogramming the `main` default route on any up/down change.
+/// The per-uplink parameters are unrolled into parallel bash arrays; the control
+/// logic below them is fixed. `None` when no uplink is configured.
+fn multiwan_script_body(mw: &MultiWan) -> Option<String> {
+    if mw.uplinks.is_empty() {
+        return None;
+    }
+    // Per-uplink parallel arrays, in configuration order.
+    let mut ifs = Vec::new();
+    let mut gws = Vec::new();
+    let mut tbs = Vec::new();
+    let mut wts = Vec::new();
+    let mut prs = Vec::new();
+    let mut tgts = Vec::new();
+    let mut tmos = Vec::new();
+    let mut failn = Vec::new();
+    let mut risen = Vec::new();
+    let mut min_interval = u32::MAX;
+    for (idx, u) in mw.uplinks.iter().enumerate() {
+        ifs.push(shq(&u.interface));
+        // A `dhcp` (or unset) gateway is resolved at runtime from the link's
+        // learned default route; an empty token signals that to the daemon.
+        let gw = match u.gateway.as_deref() {
+            Some("dhcp") | None => "",
+            Some(g) => g,
+        };
+        gws.push(shq(gw));
+        tbs.push(mw.table_for(idx, u).to_string());
+        wts.push(u.weight.unwrap_or(1).to_string());
+        // Default priority follows configuration order (10, 20, …) so uplinks
+        // fail over in the order declared unless overridden.
+        prs.push(u.priority.unwrap_or((idx as u32 + 1) * 10).to_string());
+        tgts.push(shq(&u.check.targets.join(" ")));
+        tmos.push(u.check.timeout.unwrap_or(WAN_CHECK_TIMEOUT).to_string());
+        failn.push(u.check.fail.unwrap_or(WAN_CHECK_FAIL).to_string());
+        risen.push(u.check.rise.unwrap_or(WAN_CHECK_RISE).to_string());
+        let iv = u.check.interval.unwrap_or(WAN_CHECK_INTERVAL);
+        min_interval = min_interval.min(iv);
+    }
+    if min_interval == u32::MAX {
+        min_interval = WAN_CHECK_INTERVAL;
+    }
+    let mode = match mw.mode {
+        WanMode::Failover => "failover",
+        WanMode::LoadBalance => "load-balance",
+    };
+
+    let mut s = String::new();
+    s.push_str("#!/usr/bin/env bash\n");
+    s.push_str("# rendered by sentinel — Multi-WAN health check + failover (roadmap C6)\n");
+    s.push_str("set -u\n");
+    s.push_str(&format!("MODE={}\n", shq(mode)));
+    s.push_str(&format!("INTERVAL={min_interval}\n"));
+    s.push_str(&format!("IF=({})\n", ifs.join(" ")));
+    s.push_str(&format!("GW=({})\n", gws.join(" ")));
+    s.push_str(&format!("TB=({})\n", tbs.join(" ")));
+    s.push_str(&format!("WT=({})\n", wts.join(" ")));
+    s.push_str(&format!("PR=({})\n", prs.join(" ")));
+    s.push_str(&format!("TGT=({})\n", tgts.join(" ")));
+    s.push_str(&format!("TMO=({})\n", tmos.join(" ")));
+    s.push_str(&format!("FAILN=({})\n", failn.join(" ")));
+    s.push_str(&format!("RISEN=({})\n", risen.join(" ")));
+    // The fixed control logic. Kept as a raw block so the daemon reads clearly;
+    // every dynamic value is already baked into the arrays above.
+    s.push_str(MULTIWAN_LOGIC);
+    Some(s)
+}
+
+/// The Multi-WAN daemon's fixed logic, appended after the per-uplink arrays.
+/// `gw_of` resolves a runtime (DHCP) gateway from the link's learned default
+/// route; `setup` programs each uplink's table + a source `ip rule`; `apply`
+/// rebuilds the `main` default from the healthy uplinks; the loop probes and
+/// reprograms on any state change.
+const MULTIWAN_LOGIC: &str = r#"
+N=${#IF[@]}
+declare -a UP FAILC RISEC
+for ((i=0;i<N;i++)); do UP[i]=1; FAILC[i]=0; RISEC[i]=0; done
+
+gw_of() { # echo the gateway for uplink $1 (static, or learned from the link)
+  local i=$1
+  if [ -n "${GW[i]}" ]; then echo "${GW[i]}"; return; fi
+  ip -4 route show default dev "${IF[i]}" 2>/dev/null | awk '/via/{print $3; exit}'
+}
+
+setup() {
+  for ((i=0;i<N;i++)); do
+    local gw src
+    gw=$(gw_of "$i")
+    if [ -n "$gw" ]; then
+      ip route replace default via "$gw" dev "${IF[i]}" table "${TB[i]}" 2>/dev/null || true
+    fi
+    # Source-based PBR: traffic from this uplink's own address egresses via its
+    # table, so a reply to an inbound connection returns out the same uplink.
+    src=$(ip -4 -o addr show dev "${IF[i]}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
+    if [ -n "$src" ]; then
+      ip rule del from "$src" lookup "${TB[i]}" 2>/dev/null || true
+      ip rule add from "$src" lookup "${TB[i]}" priority $((1000 + i)) 2>/dev/null || true
+    fi
+  done
+}
+
+check() { # $1 = uplink index; 0 = healthy
+  local i=$1 t
+  [ -z "${TGT[i]}" ] && return 0   # no targets ⇒ link-state only, assume up
+  for t in ${TGT[i]}; do
+    ping -I "${IF[i]}" -c1 -W "${TMO[i]}" "$t" >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
+
+apply() {
+  if [ "$MODE" = "load-balance" ]; then
+    local args=() gw
+    for ((i=0;i<N;i++)); do
+      [ "${UP[i]}" = 1 ] || continue
+      gw=$(gw_of "$i"); [ -n "$gw" ] || continue
+      args+=(nexthop via "$gw" dev "${IF[i]}" weight "${WT[i]}")
+    done
+    if [ ${#args[@]} -gt 0 ]; then ip route replace default "${args[@]}" 2>/dev/null || true; fi
+  else
+    local best=-1 bestpr=2147483647 gw
+    for ((i=0;i<N;i++)); do
+      [ "${UP[i]}" = 1 ] || continue
+      if [ "${PR[i]}" -lt "$bestpr" ]; then best=$i; bestpr=${PR[i]}; fi
+    done
+    if [ "$best" -ge 0 ]; then
+      gw=$(gw_of "$best")
+      if [ -n "$gw" ]; then
+        ip route replace default via "$gw" dev "${IF[best]}" 2>/dev/null || true
+      fi
+      echo "$best" > /run/sentinel/multiwan/active 2>/dev/null || true
+    fi
+  fi
+}
+
+setup
+apply
+while true; do
+  # Re-assert each uplink's table + source rule every tick: idempotent (`route
+  # replace` / `rule del`+`add`), so this self-heals an uplink whose address
+  # appears after the daemon starts, without ever blipping a live table.
+  setup
+  changed=0
+  for ((i=0;i<N;i++)); do
+    if check "$i"; then
+      RISEC[i]=$(( RISEC[i] + 1 )); FAILC[i]=0
+      if [ "${UP[i]}" = 0 ] && [ "${RISEC[i]}" -ge "${RISEN[i]}" ]; then UP[i]=1; changed=1; fi
+    else
+      FAILC[i]=$(( FAILC[i] + 1 )); RISEC[i]=0
+      if [ "${UP[i]}" = 1 ] && [ "${FAILC[i]}" -ge "${FAILN[i]}" ]; then UP[i]=0; changed=1; fi
+    fi
+  done
+  [ "$changed" = 1 ] && apply
+  sleep "$INTERVAL"
+done
+"#;
+
+/// Reconcile the Multi-WAN daemon to `appliance.multiwan`: render the health
+/// script + record the tables it owns, then (re)start `sentinel-multiwan` when
+/// the script changed. When no uplink is configured, stop the daemon and flush
+/// any routing tables a previous apply owned (so a removed uplink leaves no stale
+/// policy route). Restarts are gated on a real change, so an unrelated commit
+/// never disturbs a live failover daemon.
+fn apply_multiwan(appliance: &Appliance) -> Result<()> {
+    let mw = &appliance.multiwan;
+    system::ensure_dir(Path::new(MULTIWAN_RUNTIME_DIR))?;
+    let tables_path = Path::new(MULTIWAN_TABLES);
+    let script_path = Path::new(MULTIWAN_SCRIPT);
+
+    match multiwan_script_body(mw) {
+        Some(body) => {
+            let changed = file_changed(script_path, &body);
+            system::install_file(script_path, &body)?;
+            // Record the tables we own (newline-separated) for a future teardown.
+            let tables: Vec<String> = mw
+                .uplinks
+                .iter()
+                .enumerate()
+                .map(|(idx, u)| mw.table_for(idx, u).to_string())
+                .collect();
+            system::install_file(tables_path, &format!("{}\n", tables.join("\n")))?;
+            if changed {
+                if let Err(e) = system::multiwan_restart() {
+                    eprintln!(
+                        "warning: (re)starting the multiwan daemon failed (applies on next start): {e}"
+                    );
+                }
+            }
+        }
+        None => {
+            // No uplink configured: stop the daemon and flush the tables it owned
+            // (recorded on the last apply), then drop the runtime artifacts.
+            if script_path.exists() {
+                if let Err(e) = system::multiwan_stop() {
+                    eprintln!("warning: stopping the multiwan daemon: {e}");
+                }
+            }
+            if let Ok(list) = std::fs::read_to_string(tables_path) {
+                for t in list.split_whitespace() {
+                    if let Ok(table) = t.parse::<u32>() {
+                        if let Err(e) = system::ip_route_flush_table(table) {
+                            eprintln!("warning: flushing multiwan table {table}: {e}");
+                        }
+                    }
+                }
+            }
+            system::remove_file(script_path)?;
+            system::remove_file(tables_path)?;
+            system::remove_file(&Path::new(MULTIWAN_RUNTIME_DIR).join("active"))?;
+        }
+    }
+    Ok(())
+}
+
 /// Reconcile networkd units to match `appliance`: write a `.netdev` for every
 /// VLAN subinterface and a `.network` for every interface that needs one (it has
 /// an address, is a VLAN, or is a parent carrying VLANs), remove any stale
@@ -746,7 +1018,10 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
     let mut children: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for i in ifaces {
         if let (Some(parent), Some(_)) = (&i.parent, i.vlan) {
-            children.entry(parent.as_str()).or_default().push(i.name.clone());
+            children
+                .entry(parent.as_str())
+                .or_default()
+                .push(i.name.clone());
         }
     }
 
@@ -810,7 +1085,10 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
                     || pppoe_parents.contains(i.name.as_str()))
         })
         .map(|i| {
-            let kids = children.get(i.name.as_str()).map(Vec::as_slice).unwrap_or(&[]);
+            let kids = children
+                .get(i.name.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
             // Resolve a member's `master` to the right networkd directive
             // (`Bridge=`/`Bond=`) by looking up the master's device type.
             let master = i.master.as_deref().and_then(|m| {
@@ -822,7 +1100,10 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
                     }
                 })
             });
-            let pd = i.pd_from.as_deref().map(|up| (up, i.pd_subnet.unwrap_or(0)));
+            let pd = i
+                .pd_from
+                .as_deref()
+                .map(|up| (up, i.pd_subnet.unwrap_or(0)));
             let name = network_name(&i.name);
             writes.push((
                 name.clone(),
@@ -887,6 +1168,9 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
     // Egress traffic shaping (tc qdiscs) — applied directly, after the links are
     // (re)configured so the target devices exist.
     apply_qos(appliance)?;
+    // Multi-WAN failover daemon (roadmap C6) — rendered + (re)started last, after
+    // the uplinks it steers are addressed/up.
+    apply_multiwan(appliance)?;
     Ok(())
 }
 
@@ -958,14 +1242,36 @@ mod tests {
 
     #[test]
     fn static_address_renders_address_directive() {
-        let u = network_body("eth0", Some("10.0.0.1/24"), None, &[], None, None, None, None, None, None);
+        let u = network_body(
+            "eth0",
+            Some("10.0.0.1/24"),
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(u.contains("Name=eth0"));
         assert!(u.contains("Address=10.0.0.1/24"));
     }
 
     #[test]
     fn dhcp_address_renders_dhcp_directive() {
-        let u = network_body("eth0", Some("dhcp"), None, &[], None, None, None, None, None, None);
+        let u = network_body(
+            "eth0",
+            Some("dhcp"),
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(u.contains("DHCP=yes"));
         assert!(!u.contains("Address="));
     }
@@ -1010,7 +1316,18 @@ mod tests {
             dns: vec!["10.0.0.1".into()],
             lease_time: Some(3600),
         };
-        let u = network_body("eth1", Some("10.0.0.1/24"), None, &[], Some(&dhcp), None, None, None, None, None);
+        let u = network_body(
+            "eth1",
+            Some("10.0.0.1/24"),
+            None,
+            &[],
+            Some(&dhcp),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         // The static subnet is still bound, and the server is switched on.
         assert!(u.contains("Address=10.0.0.1/24"));
         assert!(u.contains("DHCPServer=yes"));
@@ -1031,7 +1348,18 @@ mod tests {
             dns: vec![],
             lease_time: None,
         };
-        let u = network_body("eth1", Some("10.0.0.1/24"), None, &[], Some(&dhcp), None, None, None, None, None);
+        let u = network_body(
+            "eth1",
+            Some("10.0.0.1/24"),
+            None,
+            &[],
+            Some(&dhcp),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(u.contains("DHCPServer=yes"));
         assert!(u.contains("[DHCPServer]"));
         assert!(!u.contains("EmitDNS"));
@@ -1077,7 +1405,10 @@ mod tests {
     #[test]
     fn ipv4_network_masks_host_bits() {
         assert_eq!(ipv4_network("10.0.0.1/24").as_deref(), Some("10.0.0.0/24"));
-        assert_eq!(ipv4_network("192.168.5.130/26").as_deref(), Some("192.168.5.128/26"));
+        assert_eq!(
+            ipv4_network("192.168.5.130/26").as_deref(),
+            Some("192.168.5.128/26")
+        );
         assert_eq!(ipv4_network("10.9.9.9/8").as_deref(), Some("10.0.0.0/8"));
         assert_eq!(ipv4_network("dhcp"), None);
     }
@@ -1097,14 +1428,23 @@ mod tests {
         let r = resolved_dropin_body(&dns).expect("box forwarder configured");
         assert!(r.contains("[Resolve]"));
         assert!(r.contains("DNS=9.9.9.9 2620:fe::fe"));
-        assert!(!r.contains("DNSStubListenerExtra"), "LAN serving is dnsmasq's job");
+        assert!(
+            !r.contains("DNSStubListenerExtra"),
+            "LAN serving is dnsmasq's job"
+        );
         assert!(r.contains("DNSSEC=no"));
         // dnsmasq is the LAN resolver: forward, serve on the link, override + block.
         let d = dnsmasq_conf_body(&dns).expect("LAN resolver configured");
         assert!(d.contains("server=9.9.9.9"), "got:\n{d}");
         assert!(d.contains("interface=lan0"), "got:\n{d}");
-        assert!(d.contains("address=/nas.lan/10.0.0.5"), "host override:\n{d}");
-        assert!(d.contains("address=/ads.example/0.0.0.0"), "blocklist v4:\n{d}");
+        assert!(
+            d.contains("address=/nas.lan/10.0.0.5"),
+            "host override:\n{d}"
+        );
+        assert!(
+            d.contains("address=/ads.example/0.0.0.0"),
+            "blocklist v4:\n{d}"
+        );
         assert!(d.contains("address=/ads.example/::"), "blocklist v6:\n{d}");
         // No upstream ⇒ no box forwarder; no serve-on ⇒ no LAN resolver.
         assert!(resolved_dropin_body(&Dns::default()).is_none());
@@ -1114,12 +1454,34 @@ mod tests {
     #[test]
     fn dhcpv6_pd_renders_client_and_delegation() {
         // WAN uplink: DHCPv6 client soliciting up front (no RA needed).
-        let wan = network_body("wan0", Some("dhcp"), Some("dhcp"), &[], None, None, None, None, None, None);
+        let wan = network_body(
+            "wan0",
+            Some("dhcp"),
+            Some("dhcp"),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(wan.contains("DHCP=yes")); // v4 dhcp + v6 dhcp
         assert!(wan.contains("[DHCPv6]"));
         assert!(wan.contains("WithoutRA=solicit"));
         // A v6-only DHCPv6 client renders DHCP=ipv6, not yes.
-        let wan6 = network_body("wan0", None, Some("dhcp"), &[], None, None, None, None, None, None);
+        let wan6 = network_body(
+            "wan0",
+            None,
+            Some("dhcp"),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(wan6.contains("DHCP=ipv6"));
         // LAN downstream: request subnet 2 of the uplink's delegated prefix and
         // advertise it.
@@ -1159,8 +1521,18 @@ mod tests {
         assert!(u.contains("[Link]"));
         assert!(u.contains("MTUBytes=1492"));
         assert!(u.contains("MACAddress=52:54:00:12:34:56"));
-        let plain =
-            network_body("lan0", Some("10.0.0.1/24"), None, &[], None, None, None, None, None, None);
+        let plain = network_body(
+            "lan0",
+            Some("10.0.0.1/24"),
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(!plain.contains("[Link]"));
     }
 
@@ -1182,7 +1554,18 @@ mod tests {
         assert!(u.contains("Address=10.0.0.1/24"));
         assert!(u.contains("Address=2001:db8:1::1/64"));
         // `auto` accepts RAs (SLAAC) instead of binding a static v6 address.
-        let a = network_body("wan0", Some("dhcp"), Some("auto"), &[], None, None, None, None, None, None);
+        let a = network_body(
+            "wan0",
+            Some("dhcp"),
+            Some("auto"),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(a.contains("DHCP=yes"));
         assert!(a.contains("IPv6AcceptRA=yes"));
         assert!(!a.contains("Address=auto"));
@@ -1217,7 +1600,18 @@ mod tests {
         assert!(d.contains("Kind=bridge"));
         assert!(!d.contains("[Bond]"));
         // A member's .network carries the Bridge= enslavement in [Network].
-        let member = network_body("lan1", None, None, &[], None, None, Some("Bridge=br0"), None, None, None);
+        let member = network_body(
+            "lan1",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            Some("Bridge=br0"),
+            None,
+            None,
+            None,
+        );
         assert!(member.contains("[Network]"));
         assert!(member.contains("Bridge=br0"));
     }
@@ -1253,7 +1647,18 @@ mod tests {
         let mut b2 = bond.clone();
         b2.bond_mode = None;
         assert!(virtual_l2_netdev_body(&b2).contains("Mode=active-backup"));
-        let member = network_body("lan2", None, None, &[], None, None, Some("Bond=bond0"), None, None, None);
+        let member = network_body(
+            "lan2",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            Some("Bond=bond0"),
+            None,
+            None,
+            None,
+        );
         assert!(member.contains("Bond=bond0"));
     }
 
@@ -1266,7 +1671,18 @@ mod tests {
             other_config: true,
             router_lifetime: Some(1800),
         };
-        let u = network_body("lan0", Some("10.0.0.1/24"), None, &[], None, Some(&ra), None, None, None, None);
+        let u = network_body(
+            "lan0",
+            Some("10.0.0.1/24"),
+            None,
+            &[],
+            None,
+            Some(&ra),
+            None,
+            None,
+            None,
+            None,
+        );
         // The enabling directive stays in [Network]; the detail sections follow.
         assert!(u.contains("IPv6SendRA=yes"));
         assert!(u.contains("[IPv6SendRA]"));
@@ -1298,7 +1714,18 @@ mod tests {
             other_config: false,
             router_lifetime: None,
         };
-        let u = network_body("lan0", Some("10.0.0.1/24"), None, &[], Some(&dhcp), Some(&ra), None, None, None, None);
+        let u = network_body(
+            "lan0",
+            Some("10.0.0.1/24"),
+            None,
+            &[],
+            Some(&dhcp),
+            Some(&ra),
+            None,
+            None,
+            None,
+            None,
+        );
         let network_hdr = u.find("[Network]").unwrap();
         let first_subsection = u.find("[DHCPServer]").unwrap();
         let dhcp_on = u.find("DHCPServer=yes").unwrap();
@@ -1398,14 +1825,20 @@ mod tests {
         assert!(body.contains("usepeerdns"), "got:\n{body}");
         assert!(body.contains("persist"), "got:\n{body}");
         // The password NEVER appears in the world-readable peer options.
-        assert!(!body.contains("s3cret"), "peer options must not carry the password:\n{body}");
+        assert!(
+            !body.contains("s3cret"),
+            "peer options must not carry the password:\n{body}"
+        );
     }
 
     #[test]
     fn ppp_secrets_body_lists_credentials_only_for_pppoe() {
         let ifaces = vec![pppoe_iface("eth0", "user@isp.de", "s3cret")];
         let body = ppp_secrets_body(&ifaces).expect("a pppoe interface yields secrets");
-        assert!(body.contains("\"user@isp.de\"\t*\t\"s3cret\"\t*"), "got:\n{body}");
+        assert!(
+            body.contains("\"user@isp.de\"\t*\t\"s3cret\"\t*"),
+            "got:\n{body}"
+        );
         // No PPPoE interface → no secrets file at all.
         assert!(ppp_secrets_body(&[]).is_none());
     }
@@ -1421,7 +1854,103 @@ mod tests {
         );
         // With no PPPoE interface the ruleset only flushes/removes the table.
         let empty = pppoe_mss_body(&[]);
-        assert!(empty.contains("delete table inet sentinel-mss"), "got:\n{empty}");
+        assert!(
+            empty.contains("delete table inet sentinel-mss"),
+            "got:\n{empty}"
+        );
         assert!(!empty.contains("maxseg"), "got:\n{empty}");
+    }
+
+    #[test]
+    fn multiwan_script_renders_arrays_tables_and_failover() {
+        use crate::config::{HealthCheck, MultiWan, WanMode, WanUplink};
+        let mw = MultiWan {
+            mode: WanMode::Failover,
+            uplinks: vec![
+                WanUplink {
+                    interface: "wan0".into(),
+                    priority: Some(10),
+                    weight: None,
+                    table: None,
+                    gateway: Some("10.1.0.254".into()),
+                    check: HealthCheck {
+                        targets: vec!["1.1.1.1".into()],
+                        interval: Some(2),
+                        timeout: Some(1),
+                        fail: Some(2),
+                        rise: Some(2),
+                    },
+                },
+                WanUplink {
+                    interface: "wan1".into(),
+                    priority: Some(20),
+                    weight: None,
+                    table: None,
+                    gateway: Some("10.2.0.254".into()),
+                    check: HealthCheck::default(),
+                },
+            ],
+        };
+        let s = multiwan_script_body(&mw).expect("uplinks configured");
+        // Per-uplink arrays are unrolled with the config values.
+        assert!(s.contains("MODE=\"failover\""), "got:\n{s}");
+        assert!(s.contains("IF=(\"wan0\" \"wan1\")"), "got:\n{s}");
+        assert!(
+            s.contains("GW=(\"10.1.0.254\" \"10.2.0.254\")"),
+            "got:\n{s}"
+        );
+        // Derived table ids (WAN_TABLE_BASE + idx).
+        assert!(s.contains("TB=(200 201)"), "got:\n{s}");
+        assert!(s.contains("PR=(10 20)"), "got:\n{s}");
+        // The loop tick is the smallest configured interval.
+        assert!(s.contains("INTERVAL=2"), "got:\n{s}");
+        // The fixed logic sets up per-uplink tables + programs the main default.
+        assert!(
+            s.contains("ip route replace default via \"$gw\" dev \"${IF[i]}\" table \"${TB[i]}\""),
+            "got:\n{s}"
+        );
+        assert!(
+            s.contains("ip rule add from \"$src\" lookup \"${TB[i]}\""),
+            "got:\n{s}"
+        );
+        // No uplink ⇒ no script.
+        assert!(multiwan_script_body(&MultiWan::default()).is_none());
+    }
+
+    #[test]
+    fn multiwan_load_balance_mode_renders() {
+        use crate::config::{HealthCheck, MultiWan, WanMode, WanUplink};
+        let mw = MultiWan {
+            mode: WanMode::LoadBalance,
+            uplinks: vec![
+                WanUplink {
+                    interface: "wan0".into(),
+                    priority: None,
+                    weight: Some(3),
+                    table: Some(210),
+                    gateway: None, // dhcp ⇒ resolved at runtime (empty token)
+                    check: HealthCheck::default(),
+                },
+                WanUplink {
+                    interface: "wan1".into(),
+                    priority: None,
+                    weight: Some(1),
+                    table: Some(211),
+                    gateway: Some("10.2.0.254".into()),
+                    check: HealthCheck::default(),
+                },
+            ],
+        };
+        let s = multiwan_script_body(&mw).expect("uplinks configured");
+        assert!(s.contains("MODE=\"load-balance\""), "got:\n{s}");
+        // A dhcp/unset gateway renders an empty token (resolved at runtime).
+        assert!(s.contains("GW=(\"\" \"10.2.0.254\")"), "got:\n{s}");
+        assert!(s.contains("WT=(3 1)"), "got:\n{s}");
+        assert!(s.contains("TB=(210 211)"), "got:\n{s}");
+        // The multipath default is built from healthy uplinks by weight.
+        assert!(
+            s.contains("nexthop via \"$gw\" dev \"${IF[i]}\" weight \"${WT[i]}\""),
+            "got:\n{s}"
+        );
     }
 }
