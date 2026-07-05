@@ -63,6 +63,7 @@
           wrapProgram $out/bin/sentinel \
             --set SENTINEL_HOSTNAME_BIN   ${pkgs.nettools}/bin/hostname \
             --set SENTINEL_IP_BIN         ${pkgs.iproute2}/bin/ip \
+            --set SENTINEL_TC_BIN         ${pkgs.iproute2}/bin/tc \
             --set SENTINEL_NETWORKCTL_BIN ${pkgs.systemd}/bin/networkctl \
             --set SENTINEL_SYSTEMCTL_BIN  ${pkgs.systemd}/bin/systemctl \
             --set SENTINEL_NFT_BIN        ${pkgs.nftables}/bin/nft \
@@ -309,6 +310,16 @@
           environment.systemPackages = [
             sentinel
             pkgs.ppp
+          ];
+
+          # Egress traffic shaping (roadmap C8) needs the CAKE + fq_codel queue
+          # disciplines. Both ship as modules in the default kernel; load them at
+          # boot so `tc qdisc add … cake` on a `[interface.qos]` never races module
+          # autoload. `tc` itself comes from iproute2 (already in the base system;
+          # the sentinel CLI resolves it via SENTINEL_TC_BIN).
+          boot.kernelModules = [
+            "sch_cake"
+            "sch_fq_codel"
           ];
 
           # OS settings driven by the appliance config. The hostname comes from
@@ -2589,6 +2600,75 @@
             fw.wait_until_succeeds(
                 "ip link show eth1 | grep -qi '52:54:00:aa:bb:cc'", timeout=30
             )
+          '';
+        };
+
+        # QoS / traffic shaping (roadmap C8): commit a CAKE shaper on eth1 and
+        # assert the qdisc is live in the kernel with the configured bandwidth.
+        # Sentinel applies the qdisc directly with `tc` (not networkd), so this
+        # is proof the whole config→tc path lands. One node — proof via `tc`.
+        #   nix build .#checks.x86_64-linux.qos -L
+        qos = pkgs.testers.runNixOSTest {
+          name = "sentinel-qos";
+          nodes.fw =
+            { lib, pkgs, ... }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce "fw";
+              networking.firewall.enable = lib.mkForce false;
+              virtualisation.vlans = [ 1 ];
+              virtualisation.memorySize = 2048;
+              services.velstra.interface = lib.mkForce "eth1";
+              # `tc` for the assertions below (iproute2; the sentinel CLI itself
+              # resolves it via SENTINEL_TC_BIN).
+              environment.systemPackages = [ pkgs.iproute2 ];
+            };
+          testScript = ''
+            start_all()
+            fw.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+            # The CAKE qdisc module is available (loaded at boot by the module).
+            fw.succeed("test -d /sys/module/sch_cake")
+
+            # Shape eth1's egress with CAKE at 100mbit. ONE `set` per line.
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth1 zone lan' "
+                "'set interface eth1 address 10.0.0.1/24' "
+                "'set interface eth1 qos discipline cake' "
+                "'set interface eth1 qos bandwidth 100mbit' "
+                "'set interface eth1 qos rtt internet' "
+                "'set interface eth1 qos nat true' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+
+            # Sentinel wrote the change-detect stamp with the rendered spec.
+            fw.wait_until_succeeds("test -f /run/sentinel/qos/eth1", timeout=20)
+            spec = fw.succeed("cat /run/sentinel/qos/eth1")
+            assert "cake" in spec and "bandwidth 100mbit" in spec and "nat" in spec, spec
+
+            # The qdisc is live in the kernel: `tc qdisc show` reports cake as the
+            # root qdisc on eth1, at the configured bandwidth, with nat on.
+            rules = fw.wait_until_succeeds(
+                "tc qdisc show dev eth1 root | grep cake", timeout=30
+            )
+            assert "cake" in rules, rules
+            assert "100Mbit" in rules, rules
+            assert "nat" in rules, rules
+
+            # Removing the qos block strips the qdisc (reverts to the kernel
+            # default — no cake).
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'delete interface eth1 qos' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            fw.wait_until_succeeds(
+                "! tc qdisc show dev eth1 root | grep -q cake", timeout=30
+            )
+            fw.succeed("! test -f /run/sentinel/qos/eth1")
           '';
         };
 

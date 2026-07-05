@@ -14,8 +14,8 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::{
     Action, Appliance, Bgp, BgpNeighbor, DhcpServer, Dns, Firewall, Groups, IfaceType, Interface,
-    Isis, Nat, NatDestination, NatSource, Ntp, Ospf, Ospf3, PortSpec, Pppoe, Proto, Protocols, Rip,
-    RouterAdvert, Rule, Services, StaticRoute, System, Vrrp, WgPeer, ZoneCfg,
+    Isis, Nat, NatDestination, NatSource, Ntp, Ospf, Ospf3, PortSpec, Pppoe, Proto, Protocols, Qos,
+    QosDiscipline, Rip, RouterAdvert, Rule, Services, StaticRoute, System, Vrrp, WgPeer, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -48,6 +48,8 @@ struct IfaceDraft {
     // Link tunables.
     mtu: Option<u16>,
     mac: Option<String>,
+    // Egress traffic shaping (cake / fq_codel).
+    qos: Option<QosDraft>,
     // PPPoE client (a `type = pppoe` uplink): credentials + tunables.
     pppoe: Option<PppoeDraft>,
 }
@@ -82,6 +84,28 @@ impl IfaceDraft {
     fn pppoe_mut(&mut self) -> &mut PppoeDraft {
         self.pppoe.get_or_insert_with(PppoeDraft::default)
     }
+
+    /// Mutable access to the QoS sub-draft, inserting a default if not yet
+    /// present — the first `qos` field creates it, mirroring `pppoe_mut`.
+    fn qos_mut(&mut self) -> &mut QosDraft {
+        self.qos.get_or_insert_with(QosDraft::default)
+    }
+}
+
+/// A partially-specified QoS block (fields filled in incrementally). The
+/// discipline is required at commit; the rest are per-discipline knobs validated
+/// at materialize time by [`crate::config::validate_qos`].
+#[derive(Debug, Clone, Default)]
+struct QosDraft {
+    discipline: Option<QosDiscipline>,
+    bandwidth: Option<String>,
+    rtt: Option<String>,
+    nat: bool,
+    ack_filter: bool,
+    diffserv: Option<String>,
+    target: Option<String>,
+    interval: Option<String>,
+    limit: Option<u32>,
 }
 
 /// A partially-specified PPPoE client (fields filled in incrementally).
@@ -479,6 +503,17 @@ impl Draft {
                             bond_mode: i.bond_mode.clone(),
                             mtu: i.mtu,
                             mac: i.mac.clone(),
+                            qos: i.qos.as_ref().map(|q| QosDraft {
+                                discipline: Some(q.discipline),
+                                bandwidth: q.bandwidth.clone(),
+                                rtt: q.rtt.clone(),
+                                nat: q.nat,
+                                ack_filter: q.ack_filter,
+                                diffserv: q.diffserv.clone(),
+                                target: q.target.clone(),
+                                interval: q.interval.clone(),
+                                limit: q.limit,
+                            }),
                             pppoe: i.pppoe.as_ref().map(|p| PppoeDraft {
                                 username: Some(p.username.clone()),
                                 password: Some(p.password.clone()),
@@ -948,6 +983,55 @@ impl Session {
                 self.draft.iface_mut(name).pppoe_mut().mru = Some(mru);
             }
 
+            // QoS / traffic shaping (roadmap C8). The first `qos` field creates
+            // the block; `discipline` picks cake or fq_codel. Values are format-
+            // validated here (tc rate/time) and cross-discipline-checked at commit.
+            ["interface", name, "qos", "discipline", v] => {
+                let d = match *v {
+                    "cake" => QosDiscipline::Cake,
+                    "fq_codel" | "fq-codel" => QosDiscipline::FqCodel,
+                    other => bail!("qos discipline {other:?}: expected \"cake\" or \"fq_codel\""),
+                };
+                self.draft.iface_mut(name).qos_mut().discipline = Some(d);
+            }
+            ["interface", name, "qos", "bandwidth", v] => {
+                crate::config::validate_tc_rate(v)?;
+                self.draft.iface_mut(name).qos_mut().bandwidth = Some((*v).to_string());
+            }
+            ["interface", name, "qos", "rtt", v] => {
+                if !crate::config::CAKE_RTT_KEYWORDS.contains(v) {
+                    crate::config::validate_tc_time(v)?;
+                }
+                self.draft.iface_mut(name).qos_mut().rtt = Some((*v).to_string());
+            }
+            ["interface", name, "qos", "nat", v] => {
+                self.draft.iface_mut(name).qos_mut().nat = parse_bool(v)?;
+            }
+            ["interface", name, "qos", "ack-filter", v] => {
+                self.draft.iface_mut(name).qos_mut().ack_filter = parse_bool(v)?;
+            }
+            ["interface", name, "qos", "diffserv", v] => {
+                if !crate::config::CAKE_DIFFSERV_MODES.contains(v) {
+                    bail!(
+                        "qos diffserv {v:?}: expected one of {:?}",
+                        crate::config::CAKE_DIFFSERV_MODES
+                    );
+                }
+                self.draft.iface_mut(name).qos_mut().diffserv = Some((*v).to_string());
+            }
+            ["interface", name, "qos", "target", v] => {
+                crate::config::validate_tc_time(v)?;
+                self.draft.iface_mut(name).qos_mut().target = Some((*v).to_string());
+            }
+            ["interface", name, "qos", "interval", v] => {
+                crate::config::validate_tc_time(v)?;
+                self.draft.iface_mut(name).qos_mut().interval = Some((*v).to_string());
+            }
+            ["interface", name, "qos", "limit", v] => {
+                let limit: u32 = v.parse().with_context(|| format!("invalid qos limit {v:?}"))?;
+                self.draft.iface_mut(name).qos_mut().limit = Some(limit);
+            }
+
             // --- firewall { … } — everything firewall lives under this node ---
 
             // firewall global: the defaults every zone inherits.
@@ -1313,6 +1397,27 @@ impl Session {
             ["interface", name, "bond-mode"] => self.iface(name)?.bond_mode = None,
             ["interface", name, "mtu"] => self.iface(name)?.mtu = None,
             ["interface", name, "mac"] => self.iface(name)?.mac = None,
+            ["interface", name, "qos"] => self.iface(name)?.qos = None,
+            ["interface", name, "qos", field] => {
+                let i = self.iface(name)?;
+                let Some(q) = i.qos.as_mut() else {
+                    bail!("interface {name:?} has no qos config");
+                };
+                match *field {
+                    "bandwidth" => q.bandwidth = None,
+                    "rtt" => q.rtt = None,
+                    "nat" => q.nat = false,
+                    "ack-filter" => q.ack_filter = false,
+                    "diffserv" => q.diffserv = None,
+                    "target" => q.target = None,
+                    "interval" => q.interval = None,
+                    "limit" => q.limit = None,
+                    "discipline" => bail!(
+                        "qos discipline is required; `delete interface {name} qos` removes the whole block"
+                    ),
+                    other => bail!("qos has no field {other:?}"),
+                }
+            }
             ["interface", name, "pppoe"] => self.iface(name)?.pppoe = None,
             ["interface", name, "pppoe", field] => {
                 let i = self.iface(name)?;
@@ -1744,6 +1849,19 @@ impl Session {
             .hostname
             .clone()
             .ok_or_else(|| anyhow::anyhow!("system hostname is not set"))?;
+        // A QoS block needs a discipline before it can materialize (the config
+        // `Qos.discipline` is not optional). Catch a `qos` set without one here,
+        // with a clear message, before the infallible interface map below.
+        for (name, d) in &self.draft.interfaces {
+            if let Some(q) = &d.qos {
+                if q.discipline.is_none() {
+                    bail!(
+                        "interface {name:?}: qos requires a discipline \
+                         (set interface {name} qos discipline cake|fq_codel)"
+                    );
+                }
+            }
+        }
         // Interfaces may be unassigned (a NIC the system provides that the
         // operator hasn't given a zone/address yet) — they stay in the config but
         // aren't firewalled, so role/address are optional here.
@@ -1791,6 +1909,18 @@ impl Session {
                 bond_mode: d.bond_mode.clone(),
                 mtu: d.mtu,
                 mac: d.mac.clone(),
+                qos: d.qos.as_ref().map(|q| Qos {
+                    // Discipline presence is guaranteed by the pre-check above.
+                    discipline: q.discipline.expect("qos discipline set (checked above)"),
+                    bandwidth: q.bandwidth.clone(),
+                    rtt: q.rtt.clone(),
+                    nat: q.nat,
+                    ack_filter: q.ack_filter,
+                    diffserv: q.diffserv.clone(),
+                    target: q.target.clone(),
+                    interval: q.interval.clone(),
+                    limit: q.limit,
+                }),
                 // Missing username/password become empty strings that `validate`
                 // rejects with a clear "required" error (mirrors how a missing
                 // WireGuard key is caught there, not here).
@@ -2145,6 +2275,7 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             && i.bond_mode.is_none()
             && i.mtu.is_none()
             && i.mac.is_none()
+            && i.qos.is_none()
             && i.pppoe.is_none()
         {
             continue;
@@ -2214,6 +2345,41 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             }
             if let Some(psk) = &p.preshared_key {
                 out.push_str(&format!("        preshared-key {psk}\n"));
+            }
+            out.push_str("    }\n");
+        }
+        if let Some(q) = &i.qos {
+            out.push_str("    qos {\n");
+            if let Some(d) = q.discipline {
+                let s = match d {
+                    QosDiscipline::Cake => "cake",
+                    QosDiscipline::FqCodel => "fq_codel",
+                };
+                out.push_str(&format!("        discipline {s}\n"));
+            }
+            if let Some(bw) = &q.bandwidth {
+                out.push_str(&format!("        bandwidth {bw}\n"));
+            }
+            if let Some(rtt) = &q.rtt {
+                out.push_str(&format!("        rtt {rtt}\n"));
+            }
+            if q.nat {
+                out.push_str("        nat true\n");
+            }
+            if q.ack_filter {
+                out.push_str("        ack-filter true\n");
+            }
+            if let Some(ds) = &q.diffserv {
+                out.push_str(&format!("        diffserv {ds}\n"));
+            }
+            if let Some(t) = &q.target {
+                out.push_str(&format!("        target {t}\n"));
+            }
+            if let Some(iv) = &q.interval {
+                out.push_str(&format!("        interval {iv}\n"));
+            }
+            if let Some(l) = q.limit {
+                out.push_str(&format!("        limit {l}\n"));
             }
             out.push_str("    }\n");
         }
@@ -2970,6 +3136,46 @@ mod tests {
         assert!(!s.show().contains("mru 1492"));
         run(&mut s, "delete interface ppp0 pppoe").unwrap();
         assert!(!s.show().contains("pppoe {"));
+    }
+
+    #[test]
+    fn qos_sets_renders_commits_and_deletes() {
+        let mut s = Session::empty();
+        run(&mut s, "set system hostname fw1").unwrap();
+        run(&mut s, "set interface eth0 address 10.0.0.1/24").unwrap();
+        run(&mut s, "set interface eth0 qos discipline cake").unwrap();
+        run(&mut s, "set interface eth0 qos bandwidth 100mbit").unwrap();
+        run(&mut s, "set interface eth0 qos rtt internet").unwrap();
+        run(&mut s, "set interface eth0 qos nat true").unwrap();
+        run(&mut s, "set interface eth0 qos diffserv diffserv4").unwrap();
+
+        let shown = s.show();
+        assert!(shown.contains("qos {"), "got:\n{shown}");
+        assert!(shown.contains("discipline cake"), "got:\n{shown}");
+        assert!(shown.contains("bandwidth 100mbit"), "got:\n{shown}");
+        assert!(shown.contains("rtt internet"), "got:\n{shown}");
+        assert!(shown.contains("nat true"), "got:\n{shown}");
+        assert!(shown.contains("diffserv diffserv4"), "got:\n{shown}");
+
+        let a = s.commit().expect("qos config commits");
+        let q = a.interfaces.iter().find(|i| i.name == "eth0").unwrap().qos.as_ref().unwrap();
+        assert!(q.is_cake());
+        assert_eq!(q.bandwidth.as_deref(), Some("100mbit"));
+        assert!(q.nat);
+
+        // A cake knob is rejected under fq_codel — reload, switch, expect a
+        // commit error (cross-discipline knob).
+        run(&mut s, "set interface eth0 qos discipline fq_codel").unwrap();
+        assert!(s.commit().is_err(), "bandwidth is a cake knob; must fail on fq_codel");
+
+        // Deleting one field, then the whole block.
+        run(&mut s, "delete interface eth0 qos bandwidth").unwrap();
+        run(&mut s, "delete interface eth0 qos nat").unwrap();
+        run(&mut s, "delete interface eth0 qos diffserv").unwrap();
+        run(&mut s, "delete interface eth0 qos rtt").unwrap();
+        assert!(s.commit().is_ok(), "fq_codel with no cake knobs commits");
+        run(&mut s, "delete interface eth0 qos").unwrap();
+        assert!(!s.show().contains("qos {"));
     }
 
     #[test]

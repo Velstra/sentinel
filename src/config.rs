@@ -758,6 +758,12 @@ pub struct Interface {
     /// hardware address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac: Option<String>,
+    /// Egress traffic shaping / queue management on this interface (roadmap C8) —
+    /// a `cake` shaper+AQM (the bufferbloat killer for a WAN uplink) or a
+    /// `fq_codel` AQM. `None` leaves the kernel default qdisc. Declared as a
+    /// sub-table before `pppoe` so it serialises after every scalar interface key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qos: Option<Qos>,
     /// PPPoE client parameters for a `type = "pppoe"` interface — the German
     /// VDSL/fibre WAN model. The session rides over the raw uplink NIC named in
     /// `parent`; `pppoe.username`/`pppoe.password` are the ISP login (the
@@ -870,6 +876,92 @@ pub struct DhcpServer {
     /// Default lease time, in seconds.
     #[serde(default, rename = "lease-time", skip_serializing_if = "Option::is_none")]
     pub lease_time: Option<u32>,
+}
+
+/// A traffic-shaping / queue-management discipline attached to an interface's
+/// egress (roadmap C8). `cake` is a combined shaper + AQM + fairness qdisc (the
+/// right default for a WAN uplink — one `bandwidth` knob kills bufferbloat);
+/// `fq_codel` is a pure flow-queuing AQM with no built-in shaper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QosDiscipline {
+    Cake,
+    FqCodel,
+}
+
+/// CAKE path-RTT keywords (`rtt <kw>`) — presets that tune CoDel's target for a
+/// link class instead of an explicit time.
+pub const CAKE_RTT_KEYWORDS: &[&str] = &[
+    "datacentre",
+    "lan",
+    "metro",
+    "regional",
+    "internet",
+    "oceanic",
+    "satellite",
+    "interplanetary",
+];
+
+/// CAKE diffserv/tin modes (`diffserv <mode>`) — how many priority tins CAKE
+/// splits traffic into by DSCP.
+pub const CAKE_DIFFSERV_MODES: &[&str] = &[
+    "besteffort",
+    "precedence",
+    "diffserv3",
+    "diffserv4",
+    "diffserv8",
+];
+
+/// Per-interface QoS (roadmap C8). The presence of the block attaches a root
+/// qdisc to the interface's egress; which fields are meaningful depends on
+/// `discipline` (CAKE shapes + classifies; fq_codel only AQMs). Cross-discipline
+/// fields are rejected at validation so a config never silently drops a knob.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Qos {
+    /// The queue discipline: `cake` (shaper + AQM, wants `bandwidth`) or
+    /// `fq_codel` (AQM only — shape it with an outer qdisc or run at line rate).
+    pub discipline: QosDiscipline,
+    /// Shaping rate — a tc rate like `"100mbit"` / `"20gbit"` (or `"unlimited"`).
+    /// **CAKE only** (CAKE's built-in shaper); set it a few % under the link's
+    /// true rate so the queue lives here, not in the modem. fq_codel does not
+    /// shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bandwidth: Option<String>,
+    /// CAKE path-RTT hint — a time like `"100ms"` or a keyword
+    /// (`internet`, `lan`, …). **CAKE only.**
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt: Option<String>,
+    /// CAKE `nat`: look through NAT so per-host fairness keys on the inside (LAN)
+    /// address. **CAKE only.**
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub nat: bool,
+    /// CAKE `ack-filter`: thin redundant TCP ACKs on an asymmetric link (rescues
+    /// the tiny upload of an ADSL/VDSL). **CAKE only.**
+    #[serde(
+        default,
+        rename = "ack-filter",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub ack_filter: bool,
+    /// CAKE diffserv/tin mode (`besteffort`/`diffserv3`/…). **CAKE only.**
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diffserv: Option<String>,
+    /// fq_codel target delay — a time like `"5ms"`. **fq_codel only.**
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// fq_codel interval — a time like `"100ms"`. **fq_codel only.**
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval: Option<String>,
+    /// fq_codel backlog packet limit. **fq_codel only.**
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+impl Qos {
+    /// True for a `cake` qdisc.
+    pub fn is_cake(&self) -> bool {
+        self.discipline == QosDiscipline::Cake
+    }
 }
 
 /// A WireGuard peer: the far end of a tunnel on a `[[interface]]` that carries a
@@ -1209,6 +1301,13 @@ impl Appliance {
             }
             if let Some(mac) = &iface.mac {
                 validate_mac(mac).with_context(|| format!("interface {:?} mac", iface.name))?;
+            }
+            // QoS: validate the shaping parameters and enforce that only knobs
+            // that belong to the chosen discipline are set (cross-discipline knobs
+            // are a config error, not a silent no-op).
+            if let Some(qos) = &iface.qos {
+                validate_qos(qos)
+                    .with_context(|| format!("interface {:?} qos", iface.name))?;
             }
             // VLAN subinterface: parent + vlan come as a pair; vlan in range; the
             // parent must be a declared interface. A PPPoE client also carries a
@@ -1726,6 +1825,100 @@ pub(crate) fn validate_mac(s: &str) -> Result<()> {
     let octets: Vec<&str> = s.split(':').collect();
     if octets.len() != 6 || !octets.iter().all(|o| o.len() == 2 && o.bytes().all(|b| b.is_ascii_hexdigit())) {
         bail!("mac {s:?}: expected six colon-separated hex octets");
+    }
+    Ok(())
+}
+
+/// tc rate units accepted for a QoS `bandwidth` (case as tc prints them).
+const TC_RATE_UNITS: &[&str] = &[
+    "bit", "kbit", "mbit", "gbit", "tbit", "kibit", "mibit", "gibit", "tibit", "bps", "kbps",
+    "mbps", "gbps", "tbps",
+];
+
+/// tc time units accepted for a QoS `rtt`/`target`/`interval`.
+const TC_TIME_UNITS: &[&str] = &["s", "sec", "secs", "ms", "msec", "us", "usec"];
+
+/// Split a `<number><unit>` token into its numeric head and unit tail. The head
+/// is the leading run of digits and at most one decimal point.
+fn split_number_unit(s: &str) -> (&str, &str) {
+    let end = s
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(s.len());
+    s.split_at(end)
+}
+
+/// Validate a tc rate (`"100mbit"`, `"20gbit"`, a bare number = bytes/sec, or
+/// the literal `"unlimited"`). Also an injection guard — only a number plus a
+/// known unit ever reaches the `tc` command line.
+pub(crate) fn validate_tc_rate(s: &str) -> Result<()> {
+    if s == "unlimited" {
+        return Ok(());
+    }
+    let (num, unit) = split_number_unit(s);
+    if num.is_empty() || num.parse::<f64>().is_err() {
+        bail!("invalid rate {s:?}: expected a number like \"100mbit\" or \"unlimited\"");
+    }
+    if !unit.is_empty() && !TC_RATE_UNITS.contains(&unit) {
+        bail!("invalid rate unit in {s:?}: use bit/kbit/mbit/gbit/tbit or bps/kbps/mbps/gbps");
+    }
+    Ok(())
+}
+
+/// Validate a tc time (`"5ms"`, `"100ms"`, `"1s"`, or a bare number = seconds).
+pub(crate) fn validate_tc_time(s: &str) -> Result<()> {
+    let (num, unit) = split_number_unit(s);
+    if num.is_empty() || num.parse::<f64>().is_err() {
+        bail!("invalid time {s:?}: expected a number like \"5ms\" or \"100ms\"");
+    }
+    if !unit.is_empty() && !TC_TIME_UNITS.contains(&unit) {
+        bail!("invalid time unit in {s:?}: use s/ms/us");
+    }
+    Ok(())
+}
+
+/// Validate a per-interface QoS block: check every set value is well-formed and
+/// enforce that only the knobs belonging to the chosen discipline are present
+/// (a CAKE knob on an fq_codel qdisc — or vice versa — is a config error).
+pub(crate) fn validate_qos(qos: &Qos) -> Result<()> {
+    if let Some(bw) = &qos.bandwidth {
+        validate_tc_rate(bw).context("bandwidth")?;
+    }
+    if let Some(rtt) = &qos.rtt {
+        // rtt is a time OR one of CAKE's link-class keywords.
+        if !CAKE_RTT_KEYWORDS.contains(&rtt.as_str()) {
+            validate_tc_time(rtt)
+                .with_context(|| format!("rtt {rtt:?}: expected a time or a CAKE keyword"))?;
+        }
+    }
+    if let Some(ds) = &qos.diffserv {
+        if !CAKE_DIFFSERV_MODES.contains(&ds.as_str()) {
+            bail!("invalid diffserv mode {ds:?}: use besteffort/diffserv3/diffserv4/diffserv8");
+        }
+    }
+    if let Some(t) = &qos.target {
+        validate_tc_time(t).context("target")?;
+    }
+    if let Some(i) = &qos.interval {
+        validate_tc_time(i).context("interval")?;
+    }
+    // Cross-discipline knobs: reject rather than silently ignore.
+    if qos.is_cake() {
+        if qos.target.is_some() || qos.interval.is_some() || qos.limit.is_some() {
+            bail!("target/interval/limit are fq_codel knobs — not valid on a cake qdisc");
+        }
+    } else {
+        // fq_codel: no built-in shaper or CAKE-specific classification.
+        if qos.bandwidth.is_some()
+            || qos.rtt.is_some()
+            || qos.nat
+            || qos.ack_filter
+            || qos.diffserv.is_some()
+        {
+            bail!(
+                "bandwidth/rtt/nat/ack-filter/diffserv are cake knobs — \
+                 not valid on an fq_codel qdisc (fq_codel does not shape)"
+            );
+        }
     }
     Ok(())
 }
@@ -2535,6 +2728,96 @@ username = "u"
 password = "p"
 "#;
         assert!(Appliance::from_toml(creds_no_type).is_err());
+    }
+
+    #[test]
+    fn qos_parses_validates_and_round_trips() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "eth0"
+address = "10.0.0.1/24"
+[interface.qos]
+discipline = "cake"
+bandwidth = "100mbit"
+rtt = "internet"
+nat = true
+ack-filter = true
+diffserv = "diffserv4"
+"#;
+        let a = Appliance::from_toml(toml).expect("cake qos parses + validates");
+        let q = a.interfaces[0].qos.as_ref().unwrap();
+        assert!(q.is_cake());
+        assert_eq!(q.bandwidth.as_deref(), Some("100mbit"));
+        assert_eq!(q.diffserv.as_deref(), Some("diffserv4"));
+        assert!(q.nat && q.ack_filter);
+        // Round-trips: the sub-table survives serialize→parse.
+        let out = a.to_toml().unwrap();
+        assert!(out.contains("[interface.qos]"), "got:\n{out}");
+        assert!(out.contains("discipline = \"cake\""), "got:\n{out}");
+        let a2 = Appliance::from_toml(&out).expect("qos re-parses");
+        assert_eq!(
+            a2.interfaces[0].qos.as_ref().unwrap().bandwidth.as_deref(),
+            Some("100mbit")
+        );
+
+        // fq_codel with its own knobs.
+        let fq = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "eth0"
+address = "10.0.0.1/24"
+[interface.qos]
+discipline = "fq_codel"
+target = "5ms"
+interval = "100ms"
+limit = 1200
+"#;
+        let a = Appliance::from_toml(fq).expect("fq_codel qos parses");
+        let q = a.interfaces[0].qos.as_ref().unwrap();
+        assert!(!q.is_cake());
+        assert_eq!(q.target.as_deref(), Some("5ms"));
+        assert_eq!(q.limit, Some(1200));
+    }
+
+    #[test]
+    fn qos_rejects_bad_and_cross_discipline_configs() {
+        let base = |block: &str| {
+            format!(
+                "[system]\nhostname = \"fw\"\n[[interface]]\nname = \"eth0\"\naddress = \"10.0.0.1/24\"\n[interface.qos]\n{block}"
+            )
+        };
+        // fq_codel knobs on a cake qdisc are rejected.
+        assert!(Appliance::from_toml(&base("discipline = \"cake\"\ntarget = \"5ms\"\n")).is_err());
+        // cake knobs on an fq_codel qdisc are rejected (fq_codel doesn't shape).
+        assert!(
+            Appliance::from_toml(&base("discipline = \"fq_codel\"\nbandwidth = \"100mbit\"\n"))
+                .is_err()
+        );
+        // A malformed tc rate is rejected.
+        assert!(
+            Appliance::from_toml(&base("discipline = \"cake\"\nbandwidth = \"100furlongs\"\n"))
+                .is_err()
+        );
+        // A malformed tc time is rejected.
+        assert!(
+            Appliance::from_toml(&base("discipline = \"fq_codel\"\ntarget = \"soon\"\n")).is_err()
+        );
+        // An unknown diffserv mode is rejected.
+        assert!(
+            Appliance::from_toml(&base("discipline = \"cake\"\ndiffserv = \"diffserv5\"\n"))
+                .is_err()
+        );
+        // Direct validator checks.
+        assert!(validate_tc_rate("100mbit").is_ok());
+        assert!(validate_tc_rate("unlimited").is_ok());
+        assert!(validate_tc_rate("20gbit").is_ok());
+        assert!(validate_tc_rate("100furlongs").is_err());
+        assert!(validate_tc_time("5ms").is_ok());
+        assert!(validate_tc_time("1s").is_ok());
+        assert!(validate_tc_time("nope").is_err());
     }
 
     #[test]

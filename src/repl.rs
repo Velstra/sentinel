@@ -419,7 +419,7 @@ pub const HELP: &str = "\
 commands:
   set <path...> <value>   set a config node. The tree (Tab/`?` explores it):
                             system hostname <name>
-                            interface <n> zone|address|parent|vlan|type|pppoe …
+                            interface <n> zone|address|parent|vlan|type|qos|pppoe …
                             firewall global  stateful|block-icmp|default-action|log|block …
                             firewall zone <z>  stateful|block-icmp|default-action|log|block …
                             firewall rule <r>  from|to|action|proto|port|log|source|source-group|port-group …
@@ -668,6 +668,7 @@ const IFACE_FIELDS: &[Cand] = &[
     ("bond-mode", "bonding mode (on a type=bond device)"),
     ("mtu", "link MTU in bytes (e.g. 1492 PPPoE, 9000 jumbo)"),
     ("mac", "override the link MAC (MAC cloning), e.g. 52:54:00:12:34:56"),
+    ("qos", "egress traffic shaping (cake / fq_codel — bufferbloat)"),
     ("pppoe", "PPPoE client credentials (on a type=pppoe uplink)"),
 ];
 const ADDRESS6_HINT: &[Cand] = &[
@@ -685,6 +686,38 @@ const PPPOE_FIELDS: &[Cand] = &[
     ("service-name", "optional PPPoE service name (rp_pppoe_service)"),
     ("ac-name", "optional PPPoE access-concentrator name (rp_pppoe_ac)"),
     ("mru", "PPP MRU in bytes (default = mtu or 1492)"),
+];
+const QOS_FIELDS: &[Cand] = &[
+    ("discipline", "cake (shaper+AQM) or fq_codel (AQM only)"),
+    ("bandwidth", "CAKE shaping rate, e.g. 100mbit (or `unlimited`)"),
+    ("rtt", "CAKE path RTT, a time (100ms) or keyword (internet/lan/…)"),
+    ("nat", "CAKE: per-host fairness through NAT (true / false)"),
+    ("ack-filter", "CAKE: thin redundant ACKs on an asymmetric link (true/false)"),
+    ("diffserv", "CAKE tin mode (besteffort/diffserv3/diffserv4/diffserv8)"),
+    ("target", "fq_codel target delay, e.g. 5ms"),
+    ("interval", "fq_codel interval, e.g. 100ms"),
+    ("limit", "fq_codel backlog packet limit"),
+];
+const QOS_DISCIPLINES: &[Cand] = &[
+    ("cake", "combined shaper + AQM + fairness (WAN uplink default)"),
+    ("fq_codel", "flow-queuing CoDel AQM (no built-in shaper)"),
+];
+const QOS_RTT: &[Cand] = &[
+    ("datacentre", "~100us — same rack"),
+    ("lan", "~1ms — local network"),
+    ("metro", "~10ms — metropolitan"),
+    ("regional", "~30ms"),
+    ("internet", "~100ms — the default WAN preset"),
+    ("oceanic", "~300ms"),
+    ("satellite", "~1000ms"),
+    ("interplanetary", "very high"),
+];
+const QOS_DIFFSERV: &[Cand] = &[
+    ("besteffort", "one tin (no DSCP prioritisation)"),
+    ("precedence", "legacy IP precedence"),
+    ("diffserv3", "3 tins (bulk / best-effort / voice)"),
+    ("diffserv4", "4 tins (bulk / best-effort / video / voice)"),
+    ("diffserv8", "8 tins"),
 ];
 const BOND_MODES: &[Cand] = &[
     ("active-backup", "one active link, the rest standby (no switch config)"),
@@ -752,6 +785,12 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set", "interface", _name, "bond-mode"] => BOND_MODES,
         // The PPPoE-client sub-tree of an interface.
         ["set" | "delete", "interface", _name, "pppoe"] => PPPOE_FIELDS,
+        // The QoS / traffic-shaping sub-tree of an interface.
+        ["set" | "delete", "interface", _name, "qos"] => QOS_FIELDS,
+        ["set", "interface", _name, "qos", "discipline"] => QOS_DISCIPLINES,
+        ["set", "interface", _name, "qos", "rtt"] => QOS_RTT,
+        ["set", "interface", _name, "qos", "diffserv"] => QOS_DIFFSERV,
+        ["set", "interface", _name, "qos", "nat" | "ack-filter"] => BOOLS,
         // The DHCP-server sub-tree of an interface.
         ["set" | "delete", "interface", _name, "dhcp-server"] => DHCP_SERVER_FIELDS,
         // The IPv6 Router-Advertisement sub-tree of an interface.
@@ -1076,9 +1115,26 @@ mod tests {
                 "bond-mode",
                 "mtu",
                 "mac",
+                "qos",
                 "pppoe"
             ]
         );
+        // The QoS sub-tree of an interface is discoverable.
+        assert_eq!(
+            kw(&["set", "interface", "wan0", "qos"]),
+            [
+                "discipline",
+                "bandwidth",
+                "rtt",
+                "nat",
+                "ack-filter",
+                "diffserv",
+                "target",
+                "interval",
+                "limit"
+            ]
+        );
+        assert_eq!(kw(&["set", "interface", "wan0", "qos", "discipline"]), ["cake", "fq_codel"]);
         // The DHCP-server sub-tree of an interface is discoverable.
         assert_eq!(
             kw(&["set", "interface", "lan0", "dhcp-server"]),
@@ -1193,6 +1249,7 @@ mod tests {
                 "bond-mode",
                 "mtu",
                 "mac",
+                "qos",
                 "pppoe"
             ]
         );
