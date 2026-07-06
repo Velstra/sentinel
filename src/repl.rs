@@ -115,7 +115,17 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
             } else {
                 let full = with_ctx(rest);
                 let view: Vec<&str> = full.iter().map(String::as_str).collect();
-                session.delete(&view)
+                match session.delete(&view) {
+                    Ok(()) => Ok(()),
+                    // Same absolute fallback as the implicit-set arm below:
+                    // `no interface eth1 …` from inside another context deletes
+                    // by the absolute path (Cisco mode-switch feel).
+                    Err(del_err) if !ctx.is_empty() => {
+                        let abs: Vec<&str> = rest.to_vec();
+                        session.delete(&abs).map_err(|_| del_err)
+                    }
+                    Err(e) => Err(e),
+                }
             }
         }
         "up" => {
@@ -191,6 +201,27 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
                 let view: Vec<&str> = full.iter().map(String::as_str).collect();
                 match session.set(&view) {
                     Ok(()) => Ok(()),
+                    // Cisco mode-switch: a line that resolves to nothing inside
+                    // the current context may be an ABSOLUTE path — on IOS,
+                    // typing `interface eth1` from (config-if-eth0) switches
+                    // contexts rather than erroring. Only tried with an active
+                    // context; at the top, relative and absolute are the same.
+                    Err(set_err) if !ctx.is_empty() => {
+                        let abs: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+                        if is_interior_node(&abs) {
+                            *ctx = abs;
+                            eprintln!("[edit {}]", ctx.join(" "));
+                            Ok(())
+                        } else if session.set(&args).is_ok() {
+                            Ok(())
+                        } else {
+                            Err(anyhow!(
+                                "unknown command or config path {:?}: {set_err} \
+                                 (Tab/? lists what's valid here)",
+                                line.trim()
+                            ))
+                        }
+                    }
                     Err(set_err) => Err(anyhow!(
                         "unknown command or config path {:?}: {set_err} \
                          (Tab/? lists what's valid here)",
@@ -2586,6 +2617,35 @@ mod tests {
         for needle in ["eth0", "10.0.0.1/24", "web", "accept", "65001", "65002"] {
             assert!(shown.contains(needle), "missing {needle:?} in:\n{shown}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn absolute_path_mode_switches_from_inside_a_context() {
+        let (mut s, _p, dir) = scratch_session("modeswitch");
+        let act = Apply::off();
+        let mut ctx = Vec::new();
+        // IOS feel: from (config-if-eth0), an absolute `firewall rule web` line
+        // switches contexts instead of erroring; an absolute set applies; and
+        // `no` deletes by absolute path from an unrelated context.
+        for line in [
+            "interface eth0",
+            "zone lan",
+            "firewall rule web", // absolute — switches out of the interface ctx
+            "from lan",
+            "system hostname sw1", // absolute set from (config-firewall-rule-web)
+            "no interface eth0 zone", // absolute delete from the same ctx
+        ] {
+            assert!(!exec_line(&mut s, &act, &mut ctx, line), "line: {line}");
+        }
+        assert_eq!(
+            ctx,
+            vec!["firewall".to_string(), "rule".into(), "web".into()]
+        );
+        let shown = s.show();
+        assert!(shown.contains("from lan"), "{shown}");
+        assert!(shown.contains("hostname sw1"), "{shown}");
+        assert!(!shown.contains("zone lan"), "zone not deleted:\n{shown}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -55,26 +55,51 @@ pub fn reload_velstra(unit: &str) -> Result<()> {
     run_priv("systemctl", &["reload-or-restart", unit])
 }
 
+/// Whether `unit` is currently running. `systemctl is-active` needs no
+/// privilege, so this is a plain read.
+pub fn unit_active(unit: &str) -> bool {
+    let out = Command::new(bin("systemctl"))
+        .args(["is-active", unit])
+        .output();
+    matches!(out, Ok(o) if String::from_utf8_lossy(&o.stdout).trim() == "active")
+}
+
+/// Restart `unit` to pick up a freshly written drop-in — but ONLY when it is
+/// already running. These are always-enabled co-services (resolved/chrony/
+/// dnsmasq): at boot the sentinel-boot service writes their drop-in and they
+/// read it on their own (later) start, so no restart is needed there. And a
+/// synchronous `systemctl restart` issued from the early sentinel-boot (which is
+/// ordered Before systemd-networkd) would DEADLOCK — the restart job waits for
+/// the network the service orders after, which waits for networkd, which waits
+/// for sentinel-boot to finish. `commit` runs with the service up, so it
+/// restarts live exactly as before.
+fn restart_if_active(unit: &str) -> Result<()> {
+    if !unit_active(unit) {
+        return Ok(());
+    }
+    run_priv("systemctl", &["restart", unit])
+}
+
 /// Restart systemd-resolved so a freshly written drop-in takes effect. A plain
 /// `restart` (not reload) is used deliberately: adding/removing a
 /// `DNSStubListenerExtra=` listener requires resolved to re-bind its sockets,
 /// which a reload (SIGHUP) does not do.
 pub fn reload_resolved() -> Result<()> {
-    run_priv("systemctl", &["restart", "systemd-resolved"])
+    restart_if_active("systemd-resolved.service")
 }
 
 /// Restart chrony so a freshly written confdir drop-in takes effect. A restart
 /// (not reload) is used because chrony only reloads *sources* live; `server` /
 /// `allow` directives in a confdir file are applied on start.
 pub fn reload_chrony() -> Result<()> {
-    run_priv("systemctl", &["restart", "chronyd"])
+    restart_if_active("chronyd.service")
 }
 
 /// Restart dnsmasq so a freshly written conf-dir drop-in takes effect (new
 /// `interface=`/`server=`/`address=` lines need a re-read + re-bind, which a
 /// SIGHUP does not fully do for interface bindings).
 pub fn reload_dnsmasq() -> Result<()> {
-    run_priv("systemctl", &["restart", "dnsmasq"])
+    restart_if_active("dnsmasq.service")
 }
 
 /// (Re)start the `sentinel-pppoe@<name>` templated unit that runs `pppd` for one
@@ -361,6 +386,17 @@ pub fn ensure_dir(dir: &Path) -> Result<()> {
 /// Best-effort: at early boot networkd may not be up yet (it reads the files on
 /// start anyway), so failures are reported by the caller, not fatal here.
 pub fn networkctl_reload(ifaces: &[String]) -> Result<()> {
+    // `networkctl reload`/`reconfigure` talk to networkd over D-Bus, which would
+    // *activate* it on demand if it is down. At early boot the sentinel-boot
+    // service writes the `.network` units and is ordered **Before**
+    // systemd-networkd, which then reads them when it starts — so no reload is
+    // needed. Worse, an on-demand activation here deadlocks against that Before
+    // ordering (networkd's start job waits for sentinel-boot to finish, while
+    // sentinel-boot blocks on the D-Bus call to networkd) and wedges the whole
+    // boot. So only reload when networkd is already up; `commit` runs with it up.
+    if !unit_active("systemd-networkd.service") {
+        return Ok(());
+    }
     run_priv("networkctl", &["reload"])?;
     for iface in ifaces {
         run_priv("networkctl", &["reconfigure", iface])?;
