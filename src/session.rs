@@ -13,11 +13,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::config::{
-    Action, Appliance, Bgp, BgpAggregate, BgpNeighbor, BgpRoa, BgpRtr, DhcpServer, Dns, Filter,
-    FilterRule, Firewall, Groups, HealthCheck, IfaceType, Interface, IpsecConnection, Isis,
-    MultiWan, Nat, NatDestination, NatSource, Ntp, Ospf, Ospf3, PortSpec, Pppoe, Proto, Protocols,
-    Qos, QosDiscipline, Rip, RouterAdvert, Rule, Services, StaticRoute, System, Vpn, Vrrp, WanMode,
-    WanUplink, WgPeer, ZoneCfg,
+    Action, Appliance, Bfd, Bgp, BgpAggregate, BgpNeighbor, BgpRoa, BgpRtr, DhcpServer, Dns,
+    Export, Filter, FilterRule, Firewall, Groups, HealthCheck, IfaceType, Interface,
+    IpsecConnection, Isis, MultiWan, Multicast, MulticastInterface, Nat, NatDestination, NatSource,
+    Ntp, Ospf, Ospf3, OspfInterface, PortSpec, Pppoe, Proto, Protocols, Qos, QosDiscipline, Rip,
+    RouterAdvert, Rule, Services, StaticRoute, System, Vpn, VrfDef, Vrrp, WanMode, WanUplink,
+    WgPeer, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -212,6 +213,7 @@ struct StaticDraft {
     via: Option<String>,
     dev: Option<String>,
     metric: Option<u32>,
+    vrf: Option<String>,
 }
 
 /// The candidate's BGP configuration — the full surface Wren's `[bgp]` accepts.
@@ -231,6 +233,7 @@ struct BgpDraft {
     multipath: Option<usize>,
     rpki_reject_invalid: bool,
     ebgp_require_policy: bool,
+    vrf: Option<String>,
     /// The RTR validating cache (`server`, `refresh`), if set.
     rtr: RtrDraft,
     /// Address aggregates, keyed by prefix.
@@ -306,6 +309,7 @@ impl BgpDraft {
             && self.multipath.is_none()
             && !self.rpki_reject_invalid
             && !self.ebgp_require_policy
+            && self.vrf.is_none()
             && self.rtr.is_empty()
             && self.aggregate.is_empty()
             && self.roa.is_empty()
@@ -354,33 +358,94 @@ impl FilterDraft {
     }
 }
 
-/// The candidate's OSPFv2 configuration.
+/// The candidate's OSPFv2/OSPFv3 configuration. A superset draft shared by both
+/// (`ospf` / `ospf3`); the CLI grammar only offers each protocol its own valid
+/// fields (e.g. auth / stub-areas / timers / vrf are OSPFv2-only, `instance-id`
+/// is OSPFv3-only), and materialize/emission read only the relevant subset.
 #[derive(Debug, Clone, Default)]
 struct OspfDraft {
     interfaces: Vec<String>,
+    /// Per-interface areas, keyed by interface name (`interface <name> area <id>`).
+    interface_areas: Vec<(String, Option<String>)>,
     area: Option<String>,
+    router_priority: Option<u8>,
     cost: Option<u16>,
     network_type: Option<String>,
+    passive_interfaces: Vec<String>,
     redistribute: Vec<String>,
+    redistribute_metric: Option<u32>,
+    stub_areas: Vec<String>,
+    stub_default_cost: Option<u32>,
+    nssa_areas: Vec<String>,
+    totally_stubby_areas: Vec<String>,
+    totally_nssa_areas: Vec<String>,
+    nssa_default_areas: Vec<String>,
+    auth_type: Option<String>,
+    auth_key: Option<String>,
+    auth_key_id: Option<u8>,
+    auth_replay_protection: Option<bool>,
+    hello_interval: Option<u16>,
+    dead_interval: Option<u32>,
+    graceful_restart: bool,
+    graceful_restart_period: Option<u32>,
+    instance_id: Option<u8>,
+    bfd: bool,
+    vrf: Option<String>,
 }
 
 impl OspfDraft {
     /// True when nothing has been set — lets `[protocols.ospf]` stay absent.
     fn is_empty(&self) -> bool {
         self.interfaces.is_empty()
+            && self.interface_areas.is_empty()
             && self.area.is_none()
+            && self.router_priority.is_none()
             && self.cost.is_none()
             && self.network_type.is_none()
+            && self.passive_interfaces.is_empty()
             && self.redistribute.is_empty()
+            && self.redistribute_metric.is_none()
+            && self.stub_areas.is_empty()
+            && self.stub_default_cost.is_none()
+            && self.nssa_areas.is_empty()
+            && self.totally_stubby_areas.is_empty()
+            && self.totally_nssa_areas.is_empty()
+            && self.nssa_default_areas.is_empty()
+            && self.auth_type.is_none()
+            && self.auth_key.is_none()
+            && self.auth_key_id.is_none()
+            && self.auth_replay_protection.is_none()
+            && self.hello_interval.is_none()
+            && self.dead_interval.is_none()
+            && !self.graceful_restart
+            && self.graceful_restart_period.is_none()
+            && self.instance_id.is_none()
+            && !self.bfd
+            && self.vrf.is_none()
+    }
+
+    /// Mutable access to the per-interface area entry for `name`, inserting it.
+    fn interface_area_mut(&mut self, name: &str) -> &mut Option<String> {
+        if let Some(i) = self.interface_areas.iter().position(|(n, _)| n == name) {
+            return &mut self.interface_areas[i].1;
+        }
+        self.interface_areas.push((name.to_string(), None));
+        &mut self.interface_areas.last_mut().unwrap().1
     }
 }
 
-/// A RIP-family draft (RIPv2 / RIPng / Babel — same knobs).
+/// A RIP-family draft (RIPv2 / RIPng / Babel — same knobs). `network` /
+/// `router_id` are Babel-only and `bfd` / `vrf` are RIP+Babel-only; the CLI
+/// grammar restricts them and emission only writes what the target accepts.
 #[derive(Debug, Clone, Default)]
 struct RipDraft {
     interfaces: Vec<String>,
     redistribute: Vec<String>,
     redistribute_metric: Option<u32>,
+    network: Vec<String>,
+    router_id: Option<String>,
+    bfd: bool,
+    vrf: Option<String>,
 }
 
 impl RipDraft {
@@ -388,6 +453,10 @@ impl RipDraft {
         self.interfaces.is_empty()
             && self.redistribute.is_empty()
             && self.redistribute_metric.is_none()
+            && self.network.is_empty()
+            && self.router_id.is_none()
+            && !self.bfd
+            && self.vrf.is_none()
     }
 }
 
@@ -397,6 +466,67 @@ fn rip_to_draft(r: &Rip) -> RipDraft {
         interfaces: r.interfaces.clone(),
         redistribute: r.redistribute.clone(),
         redistribute_metric: r.redistribute_metric,
+        network: r.network.clone(),
+        router_id: r.router_id.clone(),
+        bfd: r.bfd,
+        vrf: r.vrf.clone(),
+    }
+}
+
+/// Build an [`OspfDraft`] from a saved `[protocols.ospf]` (OSPFv2) section.
+fn ospf_to_draft(o: &Ospf) -> OspfDraft {
+    OspfDraft {
+        interfaces: o.interfaces.clone(),
+        interface_areas: o
+            .interface
+            .iter()
+            .map(|i| (i.name.clone(), i.area.clone()))
+            .collect(),
+        area: o.area.clone(),
+        router_priority: o.router_priority,
+        cost: o.cost,
+        network_type: o.network_type.clone(),
+        passive_interfaces: o.passive_interfaces.clone(),
+        redistribute: o.redistribute.clone(),
+        redistribute_metric: o.redistribute_metric,
+        stub_areas: o.stub_areas.clone(),
+        stub_default_cost: o.stub_default_cost,
+        nssa_areas: o.nssa_areas.clone(),
+        totally_stubby_areas: o.totally_stubby_areas.clone(),
+        totally_nssa_areas: o.totally_nssa_areas.clone(),
+        nssa_default_areas: o.nssa_default_areas.clone(),
+        auth_type: o.auth_type.clone(),
+        auth_key: o.auth_key.clone(),
+        auth_key_id: o.auth_key_id,
+        auth_replay_protection: o.auth_replay_protection,
+        hello_interval: o.hello_interval,
+        dead_interval: o.dead_interval,
+        graceful_restart: o.graceful_restart,
+        graceful_restart_period: o.graceful_restart_period,
+        instance_id: None,
+        bfd: o.bfd,
+        vrf: o.vrf.clone(),
+    }
+}
+
+/// Build an [`OspfDraft`] from a saved `[protocols.ospf3]` (OSPFv3) section.
+fn ospf3_to_draft(o: &Ospf3) -> OspfDraft {
+    OspfDraft {
+        interfaces: o.interfaces.clone(),
+        interface_areas: o
+            .interface
+            .iter()
+            .map(|i| (i.name.clone(), i.area.clone()))
+            .collect(),
+        area: o.area.clone(),
+        router_priority: o.router_priority,
+        cost: o.cost,
+        network_type: o.network_type.clone(),
+        redistribute: o.redistribute.clone(),
+        redistribute_metric: o.redistribute_metric,
+        instance_id: o.instance_id,
+        bfd: o.bfd,
+        ..OspfDraft::default()
     }
 }
 
@@ -417,6 +547,7 @@ fn bgp_to_draft(b: &Bgp) -> BgpDraft {
         multipath: b.multipath,
         rpki_reject_invalid: b.rpki_reject_invalid,
         ebgp_require_policy: b.ebgp_require_policy,
+        vrf: b.vrf.clone(),
         rtr: b.rtr.as_ref().map_or_else(RtrDraft::default, |r| RtrDraft {
             server: Some(r.server.clone()),
             refresh: r.refresh,
@@ -553,6 +684,7 @@ fn bgp_from_draft(d: &BgpDraft) -> Result<Bgp> {
         }),
         rpki_reject_invalid: d.rpki_reject_invalid,
         ebgp_require_policy: d.ebgp_require_policy,
+        vrf: d.vrf.clone(),
         neighbors: d
             .neighbors
             .iter()
@@ -633,9 +765,15 @@ struct IsisDraft {
     system_id: Option<String>,
     area: Option<String>,
     level: Option<String>,
+    priority: Option<u8>,
+    metric: Option<u32>,
+    hello_interval: Option<u64>,
     network_type: Option<String>,
     redistribute: Vec<String>,
     redistribute_metric: Option<u32>,
+    l2_to_l1_leaking: bool,
+    bfd: bool,
+    vrf: Option<String>,
 }
 
 impl IsisDraft {
@@ -644,9 +782,15 @@ impl IsisDraft {
             && self.system_id.is_none()
             && self.area.is_none()
             && self.level.is_none()
+            && self.priority.is_none()
+            && self.metric.is_none()
+            && self.hello_interval.is_none()
             && self.network_type.is_none()
             && self.redistribute.is_empty()
             && self.redistribute_metric.is_none()
+            && !self.l2_to_l1_leaking
+            && !self.bfd
+            && self.vrf.is_none()
     }
 }
 
@@ -656,7 +800,116 @@ struct VrrpDraft {
     interface: Option<String>,
     vrid: Option<u8>,
     priority: Option<u8>,
+    advert_interval: Option<u32>,
+    preempt: Option<bool>,
+    prefix_length: Option<u8>,
+    track_interfaces: Vec<String>,
+    priority_decrement: Option<u8>,
     virtual_address: Vec<String>,
+}
+
+/// The candidate's global BFD timing / authentication defaults (`[protocols.bfd]`).
+#[derive(Debug, Clone, Default)]
+struct BfdDraft {
+    min_tx: Option<u32>,
+    min_rx: Option<u32>,
+    detect_mult: Option<u8>,
+    auth_type: Option<String>,
+    auth_key_id: Option<u8>,
+    auth_key: Option<String>,
+    echo: bool,
+    echo_interval: Option<u32>,
+}
+
+impl BfdDraft {
+    fn is_empty(&self) -> bool {
+        self.min_tx.is_none()
+            && self.min_rx.is_none()
+            && self.detect_mult.is_none()
+            && self.auth_type.is_none()
+            && self.auth_key_id.is_none()
+            && self.auth_key.is_none()
+            && !self.echo
+            && self.echo_interval.is_none()
+    }
+}
+
+/// The candidate's multicast configuration (`[protocols.multicast]`).
+#[derive(Debug, Clone, Default)]
+struct MulticastDraft {
+    enabled: bool,
+    igmp: Option<bool>,
+    mld: Option<bool>,
+    igmp_version: Option<u8>,
+    robustness: Option<u8>,
+    query_interval: Option<u32>,
+    query_response_interval: Option<u32>,
+    /// Interfaces keyed by name (role + optional per-interface igmp-version).
+    interfaces: Vec<(String, MulticastIfaceDraft)>,
+}
+
+impl MulticastDraft {
+    fn is_empty(&self) -> bool {
+        !self.enabled
+            && self.igmp.is_none()
+            && self.mld.is_none()
+            && self.igmp_version.is_none()
+            && self.robustness.is_none()
+            && self.query_interval.is_none()
+            && self.query_response_interval.is_none()
+            && self.interfaces.is_empty()
+    }
+
+    /// Mutable access to the multicast interface `name`, inserting it if new.
+    fn interface_mut(&mut self, name: &str) -> &mut MulticastIfaceDraft {
+        if let Some(i) = self.interfaces.iter().position(|(n, _)| n == name) {
+            return &mut self.interfaces[i].1;
+        }
+        self.interfaces
+            .push((name.to_string(), MulticastIfaceDraft::default()));
+        &mut self.interfaces.last_mut().unwrap().1
+    }
+}
+
+/// One multicast interface's fields (keyed by name in [`MulticastDraft`]).
+#[derive(Debug, Clone, Default)]
+struct MulticastIfaceDraft {
+    role: Option<String>,
+    igmp_version: Option<u8>,
+}
+
+/// A VRF draft (keyed by name in [`Draft::vrfs`]).
+#[derive(Debug, Clone, Default)]
+struct VrfDraft {
+    table: Option<u32>,
+    rd: Option<String>,
+    interfaces: Vec<String>,
+    import: Option<String>,
+    export: Option<String>,
+}
+
+/// The candidate's global export redistribution filters (`[protocols.export]`).
+#[derive(Debug, Clone, Default)]
+struct ExportDraft {
+    kernel: Option<String>,
+    bgp: Option<String>,
+    ospf: Option<String>,
+    rip: Option<String>,
+    ripng: Option<String>,
+    babel: Option<String>,
+    isis: Option<String>,
+}
+
+impl ExportDraft {
+    fn is_empty(&self) -> bool {
+        self.kernel.is_none()
+            && self.bgp.is_none()
+            && self.ospf.is_none()
+            && self.rip.is_none()
+            && self.ripng.is_none()
+            && self.babel.is_none()
+            && self.isis.is_none()
+    }
 }
 
 /// The candidate config — a draft with optional fields, keyed by name so list
@@ -683,8 +936,18 @@ struct Draft {
     isis: IsisDraft,
     bgp: BgpDraft,
     vrrp: Vec<(String, VrrpDraft)>,
+    /// VRF instances, keyed by name in configuration order.
+    vrfs: Vec<(String, VrfDraft)>,
+    /// Global BFD timing / authentication defaults (`[protocols.bfd]`).
+    bfd: BfdDraft,
+    /// Multicast (IGMP/MLD querier + RFC 4605 proxy).
+    multicast: MulticastDraft,
     /// Named route filters (import/export policy), keyed by name.
     filters: Vec<(String, FilterDraft)>,
+    /// Per-protocol import filters (protocol → filter name).
+    import: BTreeMap<String, String>,
+    /// Global export redistribution filters (`[protocols.export]`).
+    export: ExportDraft,
     dns: DnsDraft,
     ntp: NtpDraft,
     /// Multi-WAN (roadmap C6): failover/load-balance mode + the uplinks, keyed by
@@ -809,6 +1072,14 @@ impl Draft {
         }
     }
 
+    /// The OSPF-family draft (`ospf` / `ospf3`) named by `proto`.
+    fn ospf_family_mut(&mut self, proto: &str) -> &mut OspfDraft {
+        match proto {
+            "ospf3" => &mut self.ospf3,
+            _ => &mut self.ospf,
+        }
+    }
+
     /// Mutable access to the VRRP instance `name`, inserting it if new.
     fn vrrp_mut(&mut self, name: &str) -> &mut VrrpDraft {
         if let Some(i) = self.vrrp.iter().position(|(n, _)| n == name) {
@@ -816,6 +1087,15 @@ impl Draft {
         }
         self.vrrp.push((name.to_string(), VrrpDraft::default()));
         &mut self.vrrp.last_mut().unwrap().1
+    }
+
+    /// Mutable access to the VRF `name`, inserting it if new.
+    fn vrf_mut(&mut self, name: &str) -> &mut VrfDraft {
+        if let Some(i) = self.vrfs.iter().position(|(n, _)| n == name) {
+            return &mut self.vrfs[i].1;
+        }
+        self.vrfs.push((name.to_string(), VrfDraft::default()));
+        &mut self.vrfs.last_mut().unwrap().1
     }
 
     /// Mutable access to the Multi-WAN uplink on interface `iface`, inserting it
@@ -1043,6 +1323,7 @@ impl Draft {
                             via: s.via.clone(),
                             dev: s.dev.clone(),
                             metric: s.metric,
+                            vrf: s.vrf.clone(),
                         },
                     )
                 })
@@ -1051,25 +1332,13 @@ impl Draft {
                 .protocols
                 .ospf
                 .as_ref()
-                .map(|o| OspfDraft {
-                    interfaces: o.interfaces.clone(),
-                    area: o.area.clone(),
-                    cost: o.cost,
-                    network_type: o.network_type.clone(),
-                    redistribute: o.redistribute.clone(),
-                })
+                .map(ospf_to_draft)
                 .unwrap_or_default(),
             ospf3: a
                 .protocols
                 .ospf3
                 .as_ref()
-                .map(|o| OspfDraft {
-                    interfaces: o.interfaces.clone(),
-                    area: o.area.clone(),
-                    cost: o.cost,
-                    network_type: o.network_type.clone(),
-                    redistribute: o.redistribute.clone(),
-                })
+                .map(ospf3_to_draft)
                 .unwrap_or_default(),
             rip: a
                 .protocols
@@ -1098,9 +1367,15 @@ impl Draft {
                     system_id: i.system_id.clone(),
                     area: i.area.clone(),
                     level: i.level.clone(),
+                    priority: i.priority,
+                    metric: i.metric,
+                    hello_interval: i.hello_interval,
                     network_type: i.network_type.clone(),
                     redistribute: i.redistribute.clone(),
                     redistribute_metric: i.redistribute_metric,
+                    l2_to_l1_leaking: i.l2_to_l1_leaking,
+                    bfd: i.bfd,
+                    vrf: i.vrf.clone(),
                 })
                 .unwrap_or_default(),
             vrrp: a
@@ -1114,11 +1389,75 @@ impl Draft {
                             interface: Some(v.interface.clone()),
                             vrid: Some(v.vrid),
                             priority: v.priority,
+                            advert_interval: v.advert_interval,
+                            preempt: v.preempt,
+                            prefix_length: v.prefix_length,
+                            track_interfaces: v.track_interfaces.clone(),
+                            priority_decrement: v.priority_decrement,
                             virtual_address: v.virtual_address.clone(),
                         },
                     )
                 })
                 .collect(),
+            vrfs: a
+                .protocols
+                .vrfs
+                .iter()
+                .map(|v| {
+                    (
+                        v.name.clone(),
+                        VrfDraft {
+                            table: Some(v.table),
+                            rd: v.rd.clone(),
+                            interfaces: v.interfaces.clone(),
+                            import: v.import.clone(),
+                            export: v.export.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            bfd: a
+                .protocols
+                .bfd
+                .as_ref()
+                .map(|b| BfdDraft {
+                    min_tx: b.min_tx,
+                    min_rx: b.min_rx,
+                    detect_mult: b.detect_mult,
+                    auth_type: b.auth_type.clone(),
+                    auth_key_id: b.auth_key_id,
+                    auth_key: b.auth_key.clone(),
+                    echo: b.echo,
+                    echo_interval: b.echo_interval,
+                })
+                .unwrap_or_default(),
+            multicast: a
+                .protocols
+                .multicast
+                .as_ref()
+                .map(|m| MulticastDraft {
+                    enabled: m.enabled,
+                    igmp: m.igmp,
+                    mld: m.mld,
+                    igmp_version: m.igmp_version,
+                    robustness: m.robustness,
+                    query_interval: m.query_interval,
+                    query_response_interval: m.query_response_interval,
+                    interfaces: m
+                        .interfaces
+                        .iter()
+                        .map(|i| {
+                            (
+                                i.name.clone(),
+                                MulticastIfaceDraft {
+                                    role: i.role.clone(),
+                                    igmp_version: i.igmp_version,
+                                },
+                            )
+                        })
+                        .collect(),
+                })
+                .unwrap_or_default(),
             bgp: a
                 .protocols
                 .bgp
@@ -1131,6 +1470,21 @@ impl Draft {
                 .iter()
                 .map(|f| (f.name.clone(), filter_to_draft(f)))
                 .collect(),
+            import: a.protocols.import.clone(),
+            export: a
+                .protocols
+                .export
+                .as_ref()
+                .map(|e| ExportDraft {
+                    kernel: e.kernel.clone(),
+                    bgp: e.bgp.clone(),
+                    ospf: e.ospf.clone(),
+                    rip: e.rip.clone(),
+                    ripng: e.ripng.clone(),
+                    babel: e.babel.clone(),
+                    isis: e.isis.clone(),
+                })
+                .unwrap_or_default(),
             dns: DnsDraft {
                 upstream: a.services.dns.upstream.clone(),
                 serve_on: a.services.dns.serve_on.clone(),
@@ -2007,6 +2361,326 @@ impl Session {
                 }
             }
 
+            // static route VRF placement.
+            ["protocols", "static", prefix, "vrf", v] => {
+                self.draft.static_mut(prefix).vrf = Some((*v).to_string());
+            }
+
+            // bgp VRF placement.
+            ["protocols", "bgp", "vrf", v] => {
+                self.draft.bgp.vrf = Some((*v).to_string());
+            }
+
+            // ospf / ospf3 additional fields (per-interface areas, timers, auth,
+            // area types, graceful-restart, bfd, vrf). `proto` selects the draft.
+            [
+                "protocols",
+                proto @ ("ospf" | "ospf3"),
+                "interface",
+                name,
+                "area",
+                id,
+            ] => {
+                *self.draft.ospf_family_mut(proto).interface_area_mut(name) =
+                    Some((*id).to_string());
+            }
+            [
+                "protocols",
+                proto @ ("ospf" | "ospf3"),
+                "router-priority",
+                v,
+            ] => {
+                self.draft.ospf_family_mut(proto).router_priority = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid priority {v:?}"))?,
+                );
+            }
+            [
+                "protocols",
+                proto @ ("ospf" | "ospf3"),
+                "redistribute-metric",
+                v,
+            ] => {
+                self.draft.ospf_family_mut(proto).redistribute_metric =
+                    Some(v.parse().with_context(|| format!("invalid metric {v:?}"))?);
+            }
+            ["protocols", proto @ ("ospf" | "ospf3"), "bfd", v] => {
+                self.draft.ospf_family_mut(proto).bfd = parse_bool(v)?;
+            }
+            ["protocols", "ospf3", "instance-id", v] => {
+                self.draft.ospf3.instance_id = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid instance-id {v:?}"))?,
+                );
+            }
+            ["protocols", "ospf", "passive-interface", v] => {
+                let d = &mut self.draft.ospf;
+                let i = (*v).to_string();
+                if !d.passive_interfaces.contains(&i) {
+                    d.passive_interfaces.push(i);
+                }
+            }
+            [
+                "protocols",
+                "ospf",
+                field @ ("stub-area"
+                | "nssa-area"
+                | "totally-stubby-area"
+                | "totally-nssa-area"
+                | "nssa-default-area"),
+                v,
+            ] => {
+                let d = &mut self.draft.ospf;
+                let set = match *field {
+                    "stub-area" => &mut d.stub_areas,
+                    "nssa-area" => &mut d.nssa_areas,
+                    "totally-stubby-area" => &mut d.totally_stubby_areas,
+                    "totally-nssa-area" => &mut d.totally_nssa_areas,
+                    _ => &mut d.nssa_default_areas,
+                };
+                let a = (*v).to_string();
+                if !set.contains(&a) {
+                    set.push(a);
+                }
+            }
+            ["protocols", "ospf", "stub-default-cost", v] => {
+                self.draft.ospf.stub_default_cost =
+                    Some(v.parse().with_context(|| format!("invalid cost {v:?}"))?);
+            }
+            ["protocols", "ospf", "auth-type", v] => {
+                self.draft.ospf.auth_type = Some((*v).to_string());
+            }
+            ["protocols", "ospf", "auth-key", v] => {
+                self.draft.ospf.auth_key = Some((*v).to_string());
+            }
+            ["protocols", "ospf", "auth-key-id", v] => {
+                self.draft.ospf.auth_key_id =
+                    Some(v.parse().with_context(|| format!("invalid key-id {v:?}"))?);
+            }
+            ["protocols", "ospf", "auth-replay-protection", v] => {
+                self.draft.ospf.auth_replay_protection = Some(parse_bool(v)?);
+            }
+            ["protocols", "ospf", "hello-interval", v] => {
+                self.draft.ospf.hello_interval = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid hello-interval {v:?}"))?,
+                );
+            }
+            ["protocols", "ospf", "dead-interval", v] => {
+                self.draft.ospf.dead_interval = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid dead-interval {v:?}"))?,
+                );
+            }
+            ["protocols", "ospf", "graceful-restart", v] => {
+                self.draft.ospf.graceful_restart = parse_bool(v)?;
+            }
+            ["protocols", "ospf", "graceful-restart-period", v] => {
+                self.draft.ospf.graceful_restart_period =
+                    Some(v.parse().with_context(|| format!("invalid period {v:?}"))?);
+            }
+            ["protocols", "ospf", "vrf", v] => {
+                self.draft.ospf.vrf = Some((*v).to_string());
+            }
+
+            // rip / babel extras (bfd, vrf); babel-only network / router-id.
+            ["protocols", proto @ ("rip" | "babel"), "bfd", v] => {
+                self.draft.rip_family_mut(proto).bfd = parse_bool(v)?;
+            }
+            ["protocols", proto @ ("rip" | "babel"), "vrf", v] => {
+                self.draft.rip_family_mut(proto).vrf = Some((*v).to_string());
+            }
+            ["protocols", "babel", "network", v] => {
+                let d = self.draft.rip_family_mut("babel");
+                let n = (*v).to_string();
+                if !d.network.contains(&n) {
+                    d.network.push(n);
+                }
+            }
+            ["protocols", "babel", "router-id", v] => {
+                self.draft.rip_family_mut("babel").router_id = Some((*v).to_string());
+            }
+
+            // isis additional fields.
+            ["protocols", "isis", "priority", v] => {
+                self.draft.isis.priority = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid priority {v:?}"))?,
+                );
+            }
+            ["protocols", "isis", "metric", v] => {
+                self.draft.isis.metric =
+                    Some(v.parse().with_context(|| format!("invalid metric {v:?}"))?);
+            }
+            ["protocols", "isis", "hello-interval", v] => {
+                self.draft.isis.hello_interval = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid hello-interval {v:?}"))?,
+                );
+            }
+            ["protocols", "isis", "l2-to-l1-leaking", v] => {
+                self.draft.isis.l2_to_l1_leaking = parse_bool(v)?;
+            }
+            ["protocols", "isis", "bfd", v] => {
+                self.draft.isis.bfd = parse_bool(v)?;
+            }
+            ["protocols", "isis", "vrf", v] => {
+                self.draft.isis.vrf = Some((*v).to_string());
+            }
+
+            // vrrp additional fields.
+            ["protocols", "vrrp", name, "advert-interval", v] => {
+                self.draft.vrrp_mut(name).advert_interval = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid advert-interval {v:?}"))?,
+                );
+            }
+            ["protocols", "vrrp", name, "preempt", v] => {
+                self.draft.vrrp_mut(name).preempt = Some(parse_bool(v)?);
+            }
+            ["protocols", "vrrp", name, "prefix-length", v] => {
+                self.draft.vrrp_mut(name).prefix_length = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid prefix-length {v:?}"))?,
+                );
+            }
+            ["protocols", "vrrp", name, "track-interface", v] => {
+                let d = self.draft.vrrp_mut(name);
+                let i = (*v).to_string();
+                if !d.track_interfaces.contains(&i) {
+                    d.track_interfaces.push(i);
+                }
+            }
+            ["protocols", "vrrp", name, "priority-decrement", v] => {
+                self.draft.vrrp_mut(name).priority_decrement = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid priority-decrement {v:?}"))?,
+                );
+            }
+
+            // bfd (global timing / authentication defaults).
+            ["protocols", "bfd", field, v] => {
+                let b = &mut self.draft.bfd;
+                match *field {
+                    "min-tx" => {
+                        b.min_tx = Some(v.parse().with_context(|| format!("invalid ms {v:?}"))?)
+                    }
+                    "min-rx" => {
+                        b.min_rx = Some(v.parse().with_context(|| format!("invalid ms {v:?}"))?)
+                    }
+                    "detect-mult" => {
+                        b.detect_mult =
+                            Some(v.parse().with_context(|| format!("invalid mult {v:?}"))?)
+                    }
+                    "auth-type" => b.auth_type = Some((*v).to_string()),
+                    "auth-key-id" => {
+                        b.auth_key_id =
+                            Some(v.parse().with_context(|| format!("invalid key-id {v:?}"))?)
+                    }
+                    "auth-key" => b.auth_key = Some((*v).to_string()),
+                    "echo" => b.echo = parse_bool(v)?,
+                    "echo-interval" => {
+                        b.echo_interval =
+                            Some(v.parse().with_context(|| format!("invalid ms {v:?}"))?)
+                    }
+                    other => bail!("protocols bfd has no field {other:?}"),
+                }
+            }
+
+            // multicast (IGMP/MLD querier + RFC 4605 proxy).
+            ["protocols", "multicast", "interface", name, "role", v] => {
+                self.draft.multicast.interface_mut(name).role = Some((*v).to_string());
+            }
+            [
+                "protocols",
+                "multicast",
+                "interface",
+                name,
+                "igmp-version",
+                v,
+            ] => {
+                self.draft.multicast.interface_mut(name).igmp_version = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid igmp-version {v:?}"))?,
+                );
+            }
+            ["protocols", "multicast", field, v] => {
+                let m = &mut self.draft.multicast;
+                match *field {
+                    "enabled" => m.enabled = parse_bool(v)?,
+                    "igmp" => m.igmp = Some(parse_bool(v)?),
+                    "mld" => m.mld = Some(parse_bool(v)?),
+                    "igmp-version" => {
+                        m.igmp_version = Some(
+                            v.parse()
+                                .with_context(|| format!("invalid version {v:?}"))?,
+                        )
+                    }
+                    "robustness" => {
+                        m.robustness = Some(
+                            v.parse()
+                                .with_context(|| format!("invalid robustness {v:?}"))?,
+                        )
+                    }
+                    "query-interval" => {
+                        m.query_interval = Some(
+                            v.parse()
+                                .with_context(|| format!("invalid interval {v:?}"))?,
+                        )
+                    }
+                    "query-response-interval" => {
+                        m.query_response_interval = Some(
+                            v.parse()
+                                .with_context(|| format!("invalid interval {v:?}"))?,
+                        )
+                    }
+                    other => bail!("protocols multicast has no field {other:?}"),
+                }
+            }
+
+            // vrf (a named isolated routing table, keyed by name).
+            ["protocols", "vrf", name, "interface", v] => {
+                let d = self.draft.vrf_mut(name);
+                let i = (*v).to_string();
+                if !d.interfaces.contains(&i) {
+                    d.interfaces.push(i);
+                }
+            }
+            ["protocols", "vrf", name, field, v] => {
+                let d = self.draft.vrf_mut(name);
+                match *field {
+                    "table" => {
+                        d.table = Some(v.parse().with_context(|| format!("invalid table {v:?}"))?)
+                    }
+                    "rd" => d.rd = Some((*v).to_string()),
+                    "import" => d.import = Some((*v).to_string()),
+                    "export" => d.export = Some((*v).to_string()),
+                    other => bail!("protocols vrf has no field {other:?}"),
+                }
+            }
+
+            // global export redistribution filters (per consumer protocol).
+            ["protocols", "export", proto, v] => {
+                let e = &mut self.draft.export;
+                let name = Some((*v).to_string());
+                match *proto {
+                    "kernel" => e.kernel = name,
+                    "bgp" => e.bgp = name,
+                    "ospf" => e.ospf = name,
+                    "rip" => e.rip = name,
+                    "ripng" => e.ripng = name,
+                    "babel" => e.babel = name,
+                    "isis" => e.isis = name,
+                    other => bail!("protocols export has no protocol {other:?}"),
+                }
+            }
+            // global per-protocol import filters (protocol → filter name).
+            ["protocols", "import", proto, v] => {
+                self.draft
+                    .import
+                    .insert((*proto).to_string(), (*v).to_string());
+            }
+
             // multiwan (roadmap C6): failover/load-balance mode + per-uplink
             // policy-routing and health checks. Uplinks are keyed by interface.
             ["multiwan", "mode", v] => {
@@ -2143,11 +2817,19 @@ impl Session {
                  set protocols bgp neighbor <ip> <remote-as <n> | passive <bool> | route-reflector-client <bool> | password <k> | ttl-security <n> | max-prefix <n> | role <r> | import <f> | export <f> | bfd <bool> | ...>\n  \
                  set protocols filter <name> default <accept|reject>\n  \
                  set protocols filter <name> rule <n> <prefix <p> | protocol <p> | metric-le <n> | set-metric <n> | set-community <c> | action <accept|reject> | ...>\n  \
-                 set protocols ospf <interface <if> | area <id> | cost <n> | network-type <broadcast|point-to-point> | redistribute <src>>\n  \
-                 set protocols ospf3 <interface <if> | area <id> | cost <n> | network-type <..> | redistribute <src>>\n  \
-                 set protocols <rip|ripng|babel> <interface <if> | redistribute <src> | redistribute-metric <n>>\n  \
-                 set protocols isis <interface <if> | system-id <id> | area <id> | level <1|2|1-2> | network-type <..> | redistribute <src>>\n  \
-                 set protocols vrrp <name> <interface <if> | vrid <n> | priority <n> | virtual-address <ip>>\n  \
+                 set protocols ospf <interface <if> [area <id>] | area <id> | router-priority <n> | cost <n> | network-type <..> | passive-interface <if> | redistribute <src> | redistribute-metric <n> | stub-area <id> | nssa-area <id> | auth-type <none|text|md5> | auth-key <k> | hello-interval <n> | dead-interval <n> | graceful-restart <bool> | bfd <bool> | vrf <name>>\n  \
+                 set protocols ospf3 <interface <if> [area <id>] | area <id> | router-priority <n> | cost <n> | network-type <..> | instance-id <n> | redistribute <src> | redistribute-metric <n> | bfd <bool>>\n  \
+                 set protocols <rip|babel> <interface <if> | redistribute <src> | redistribute-metric <n> | bfd <bool> | vrf <name>>; babel also network <p> | router-id <ip>\n  \
+                 set protocols ripng <interface <if> | redistribute <src> | redistribute-metric <n>>\n  \
+                 set protocols isis <interface <if> | system-id <id> | area <id> | level <1|2|1-2> | priority <n> | metric <n> | hello-interval <n> | network-type <..> | redistribute <src> | l2-to-l1-leaking <bool> | bfd <bool> | vrf <name>>\n  \
+                 set protocols vrrp <name> <interface <if> | vrid <n> | priority <n> | advert-interval <ms> | preempt <bool> | prefix-length <n> | track-interface <if> | priority-decrement <n> | virtual-address <ip>>\n  \
+                 set protocols vrf <name> <table <n> | rd <v> | interface <if> | import <filter> | export <filter>>\n  \
+                 set protocols bfd <min-tx <ms> | min-rx <ms> | detect-mult <n> | auth-type <t> | auth-key-id <n> | auth-key <k> | echo <bool> | echo-interval <ms>>\n  \
+                 set protocols multicast <enabled <bool> | igmp <bool> | mld <bool> | igmp-version <2|3> | robustness <n> | query-interval <n> | query-response-interval <n> | interface <name> <role <querier|upstream|downstream> | igmp-version <n>>>\n  \
+                 set protocols export <kernel|bgp|ospf|rip|ripng|babel|isis> <filter>\n  \
+                 set protocols import <proto> <filter>\n  \
+                 set protocols static <prefix> vrf <name>\n  \
+                 set protocols bgp vrf <name>\n  \
                  set multiwan mode <failover|load-balance>\n  \
                  set multiwan uplink <if> <priority <n> | weight <n> | table <n> | gateway <ip|dhcp>>\n  \
                  set multiwan uplink <if> check <target <ip> | interval <n> | timeout <n> | fail <n> | rise <n>>\n  \
@@ -2163,11 +2845,34 @@ impl Session {
     /// Clear one field of an OSPF/OSPFv3 draft (both share [`OspfDraft`]).
     fn del_ospf_field(o: &mut OspfDraft, field: &str) -> Result<()> {
         match field {
-            "interface" => o.interfaces.clear(),
+            "interface" => {
+                o.interfaces.clear();
+                o.interface_areas.clear();
+            }
             "area" => o.area = None,
+            "router-priority" => o.router_priority = None,
             "cost" => o.cost = None,
             "network-type" => o.network_type = None,
+            "passive-interface" => o.passive_interfaces.clear(),
             "redistribute" => o.redistribute.clear(),
+            "redistribute-metric" => o.redistribute_metric = None,
+            "stub-area" => o.stub_areas.clear(),
+            "stub-default-cost" => o.stub_default_cost = None,
+            "nssa-area" => o.nssa_areas.clear(),
+            "totally-stubby-area" => o.totally_stubby_areas.clear(),
+            "totally-nssa-area" => o.totally_nssa_areas.clear(),
+            "nssa-default-area" => o.nssa_default_areas.clear(),
+            "auth-type" => o.auth_type = None,
+            "auth-key" => o.auth_key = None,
+            "auth-key-id" => o.auth_key_id = None,
+            "auth-replay-protection" => o.auth_replay_protection = None,
+            "hello-interval" => o.hello_interval = None,
+            "dead-interval" => o.dead_interval = None,
+            "graceful-restart" => o.graceful_restart = false,
+            "graceful-restart-period" => o.graceful_restart_period = None,
+            "instance-id" => o.instance_id = None,
+            "bfd" => o.bfd = false,
+            "vrf" => o.vrf = None,
             other => bail!("ospf has no field {other:?}"),
         }
         Ok(())
@@ -2606,7 +3311,12 @@ impl Session {
                 self.draft.isis = IsisDraft::default();
                 self.draft.bgp = BgpDraft::default();
                 self.draft.vrrp.clear();
+                self.draft.vrfs.clear();
+                self.draft.bfd = BfdDraft::default();
+                self.draft.multicast = MulticastDraft::default();
                 self.draft.filters.clear();
+                self.draft.import.clear();
+                self.draft.export = ExportDraft::default();
             }
             ["protocols", "router-id"] => self.draft.router_id = None,
             ["protocols", "static", prefix] => {
@@ -2696,6 +3406,7 @@ impl Session {
                     "large-community" => b.large_community.clear(),
                     "ext-community" => b.ext_community.clear(),
                     "ebgp-require-policy" => b.ebgp_require_policy = false,
+                    "vrf" => b.vrf = None,
                     other => bail!("bgp has no field {other:?}"),
                 }
             }
@@ -2752,6 +3463,10 @@ impl Session {
                     "interface" => d.interfaces.clear(),
                     "redistribute" => d.redistribute.clear(),
                     "redistribute-metric" => d.redistribute_metric = None,
+                    "network" => d.network.clear(),
+                    "router-id" => d.router_id = None,
+                    "bfd" => d.bfd = false,
+                    "vrf" => d.vrf = None,
                     other => bail!("{proto} has no field {other:?}"),
                 }
             }
@@ -2763,9 +3478,15 @@ impl Session {
                     "system-id" => i.system_id = None,
                     "area" => i.area = None,
                     "level" => i.level = None,
+                    "priority" => i.priority = None,
+                    "metric" => i.metric = None,
+                    "hello-interval" => i.hello_interval = None,
                     "network-type" => i.network_type = None,
                     "redistribute" => i.redistribute.clear(),
                     "redistribute-metric" => i.redistribute_metric = None,
+                    "l2-to-l1-leaking" => i.l2_to_l1_leaking = false,
+                    "bfd" => i.bfd = false,
+                    "vrf" => i.vrf = None,
                     other => bail!("isis has no field {other:?}"),
                 }
             }
@@ -2788,8 +3509,116 @@ impl Session {
                     "interface" => d.interface = None,
                     "vrid" => d.vrid = None,
                     "priority" => d.priority = None,
+                    "advert-interval" => d.advert_interval = None,
+                    "preempt" => d.preempt = None,
+                    "prefix-length" => d.prefix_length = None,
+                    "track-interface" => d.track_interfaces.clear(),
+                    "priority-decrement" => d.priority_decrement = None,
                     "virtual-address" => d.virtual_address.clear(),
                     other => bail!("vrrp has no field {other:?}"),
+                }
+            }
+            // static route per-field delete (currently only `vrf`).
+            ["protocols", "static", prefix, "vrf"] => {
+                match self.draft.statics.iter_mut().find(|(p, _)| p == prefix) {
+                    Some((_, d)) => d.vrf = None,
+                    None => bail!("no static route {prefix:?}"),
+                }
+            }
+            // bfd global defaults.
+            ["protocols", "bfd"] => self.draft.bfd = BfdDraft::default(),
+            ["protocols", "bfd", field] => {
+                let b = &mut self.draft.bfd;
+                match *field {
+                    "min-tx" => b.min_tx = None,
+                    "min-rx" => b.min_rx = None,
+                    "detect-mult" => b.detect_mult = None,
+                    "auth-type" => b.auth_type = None,
+                    "auth-key-id" => b.auth_key_id = None,
+                    "auth-key" => b.auth_key = None,
+                    "echo" => b.echo = false,
+                    "echo-interval" => b.echo_interval = None,
+                    other => bail!("protocols bfd has no field {other:?}"),
+                }
+            }
+            // multicast.
+            ["protocols", "multicast"] => self.draft.multicast = MulticastDraft::default(),
+            ["protocols", "multicast", "interface", name] => {
+                let before = self.draft.multicast.interfaces.len();
+                self.draft.multicast.interfaces.retain(|(n, _)| n != name);
+                if self.draft.multicast.interfaces.len() == before {
+                    bail!("no multicast interface {name:?}");
+                }
+            }
+            ["protocols", "multicast", "interface", name, field] => {
+                match self
+                    .draft
+                    .multicast
+                    .interfaces
+                    .iter_mut()
+                    .find(|(n, _)| n == name)
+                {
+                    Some((_, d)) => match *field {
+                        "role" => d.role = None,
+                        "igmp-version" => d.igmp_version = None,
+                        other => bail!("multicast interface has no field {other:?}"),
+                    },
+                    None => bail!("no multicast interface {name:?}"),
+                }
+            }
+            ["protocols", "multicast", field] => {
+                let m = &mut self.draft.multicast;
+                match *field {
+                    "enabled" => m.enabled = false,
+                    "igmp" => m.igmp = None,
+                    "mld" => m.mld = None,
+                    "igmp-version" => m.igmp_version = None,
+                    "robustness" => m.robustness = None,
+                    "query-interval" => m.query_interval = None,
+                    "query-response-interval" => m.query_response_interval = None,
+                    other => bail!("protocols multicast has no field {other:?}"),
+                }
+            }
+            // vrf instances.
+            ["protocols", "vrf", name] => {
+                let before = self.draft.vrfs.len();
+                self.draft.vrfs.retain(|(n, _)| n != name);
+                if self.draft.vrfs.len() == before {
+                    bail!("no vrf {name:?}");
+                }
+            }
+            ["protocols", "vrf", name, field] => {
+                match self.draft.vrfs.iter_mut().find(|(n, _)| n == name) {
+                    Some((_, d)) => match *field {
+                        "table" => d.table = None,
+                        "rd" => d.rd = None,
+                        "interface" => d.interfaces.clear(),
+                        "import" => d.import = None,
+                        "export" => d.export = None,
+                        other => bail!("protocols vrf has no field {other:?}"),
+                    },
+                    None => bail!("no vrf {name:?}"),
+                }
+            }
+            // global export / import redistribution filters.
+            ["protocols", "export"] => self.draft.export = ExportDraft::default(),
+            ["protocols", "export", proto] => {
+                let e = &mut self.draft.export;
+                match *proto {
+                    "kernel" => e.kernel = None,
+                    "bgp" => e.bgp = None,
+                    "ospf" => e.ospf = None,
+                    "rip" => e.rip = None,
+                    "ripng" => e.ripng = None,
+                    "babel" => e.babel = None,
+                    "isis" => e.isis = None,
+                    other => bail!("protocols export has no protocol {other:?}"),
+                }
+            }
+            ["protocols", "import"] => self.draft.import.clear(),
+            ["protocols", "import", proto] => {
+                if self.draft.import.remove(*proto).is_none() {
+                    bail!("no import filter for {proto:?}");
                 }
             }
 
@@ -3195,6 +4024,7 @@ impl Session {
                 via: d.via.clone(),
                 dev: d.dev.clone(),
                 metric: d.metric,
+                vrf: d.vrf.clone(),
             })
             .collect();
         let bgp = if self.draft.bgp.is_empty() {
@@ -3202,32 +4032,72 @@ impl Session {
         } else {
             Some(bgp_from_draft(&self.draft.bgp)?)
         };
+        let ospf_interfaces = |o: &OspfDraft| {
+            o.interface_areas
+                .iter()
+                .map(|(name, area)| OspfInterface {
+                    name: name.clone(),
+                    area: area.clone(),
+                })
+                .collect::<Vec<_>>()
+        };
         let ospf = if self.draft.ospf.is_empty() {
             None
         } else {
+            let o = &self.draft.ospf;
             Some(Ospf {
-                interfaces: self.draft.ospf.interfaces.clone(),
-                area: self.draft.ospf.area.clone(),
-                cost: self.draft.ospf.cost,
-                network_type: self.draft.ospf.network_type.clone(),
-                redistribute: self.draft.ospf.redistribute.clone(),
+                interfaces: o.interfaces.clone(),
+                interface: ospf_interfaces(o),
+                area: o.area.clone(),
+                router_priority: o.router_priority,
+                cost: o.cost,
+                network_type: o.network_type.clone(),
+                passive_interfaces: o.passive_interfaces.clone(),
+                redistribute: o.redistribute.clone(),
+                redistribute_metric: o.redistribute_metric,
+                stub_areas: o.stub_areas.clone(),
+                stub_default_cost: o.stub_default_cost,
+                nssa_areas: o.nssa_areas.clone(),
+                totally_stubby_areas: o.totally_stubby_areas.clone(),
+                totally_nssa_areas: o.totally_nssa_areas.clone(),
+                nssa_default_areas: o.nssa_default_areas.clone(),
+                auth_type: o.auth_type.clone(),
+                auth_key: o.auth_key.clone(),
+                auth_key_id: o.auth_key_id,
+                auth_replay_protection: o.auth_replay_protection,
+                hello_interval: o.hello_interval,
+                dead_interval: o.dead_interval,
+                graceful_restart: o.graceful_restart,
+                graceful_restart_period: o.graceful_restart_period,
+                bfd: o.bfd,
+                vrf: o.vrf.clone(),
             })
         };
         let ospf3 = if self.draft.ospf3.is_empty() {
             None
         } else {
+            let o = &self.draft.ospf3;
             Some(Ospf3 {
-                interfaces: self.draft.ospf3.interfaces.clone(),
-                area: self.draft.ospf3.area.clone(),
-                cost: self.draft.ospf3.cost,
-                network_type: self.draft.ospf3.network_type.clone(),
-                redistribute: self.draft.ospf3.redistribute.clone(),
+                interfaces: o.interfaces.clone(),
+                interface: ospf_interfaces(o),
+                area: o.area.clone(),
+                router_priority: o.router_priority,
+                cost: o.cost,
+                network_type: o.network_type.clone(),
+                instance_id: o.instance_id,
+                redistribute: o.redistribute.clone(),
+                redistribute_metric: o.redistribute_metric,
+                bfd: o.bfd,
             })
         };
         let rip_from = |d: &RipDraft| Rip {
             interfaces: d.interfaces.clone(),
             redistribute: d.redistribute.clone(),
             redistribute_metric: d.redistribute_metric,
+            network: d.network.clone(),
+            router_id: d.router_id.clone(),
+            bfd: d.bfd,
+            vrf: d.vrf.clone(),
         };
         let rip = (!self.draft.rip.is_empty()).then(|| rip_from(&self.draft.rip));
         let ripng = (!self.draft.ripng.is_empty()).then(|| rip_from(&self.draft.ripng));
@@ -3235,14 +4105,21 @@ impl Session {
         let isis = if self.draft.isis.is_empty() {
             None
         } else {
+            let i = &self.draft.isis;
             Some(Isis {
-                interfaces: self.draft.isis.interfaces.clone(),
-                system_id: self.draft.isis.system_id.clone(),
-                area: self.draft.isis.area.clone(),
-                level: self.draft.isis.level.clone(),
-                network_type: self.draft.isis.network_type.clone(),
-                redistribute: self.draft.isis.redistribute.clone(),
-                redistribute_metric: self.draft.isis.redistribute_metric,
+                interfaces: i.interfaces.clone(),
+                system_id: i.system_id.clone(),
+                area: i.area.clone(),
+                level: i.level.clone(),
+                priority: i.priority,
+                metric: i.metric,
+                hello_interval: i.hello_interval,
+                network_type: i.network_type.clone(),
+                redistribute: i.redistribute.clone(),
+                redistribute_metric: i.redistribute_metric,
+                l2_to_l1_leaking: i.l2_to_l1_leaking,
+                bfd: i.bfd,
+                vrf: i.vrf.clone(),
             })
         };
         let vrrp = self
@@ -3260,16 +4137,84 @@ impl Session {
                         .vrid
                         .ok_or_else(|| anyhow::anyhow!("vrrp {name:?}: vrid not set"))?,
                     priority: d.priority,
+                    advert_interval: d.advert_interval,
+                    preempt: d.preempt,
+                    prefix_length: d.prefix_length,
+                    track_interfaces: d.track_interfaces.clone(),
+                    priority_decrement: d.priority_decrement,
                     virtual_address: d.virtual_address.clone(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let vrfs = self
+            .draft
+            .vrfs
+            .iter()
+            .map(|(name, d)| {
+                Ok(VrfDef {
+                    name: name.clone(),
+                    table: d
+                        .table
+                        .ok_or_else(|| anyhow::anyhow!("vrf {name:?}: table not set"))?,
+                    rd: d.rd.clone(),
+                    interfaces: d.interfaces.clone(),
+                    import: d.import.clone(),
+                    export: d.export.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let bfd = (!self.draft.bfd.is_empty()).then(|| {
+            let b = &self.draft.bfd;
+            Bfd {
+                min_tx: b.min_tx,
+                min_rx: b.min_rx,
+                detect_mult: b.detect_mult,
+                auth_type: b.auth_type.clone(),
+                auth_key_id: b.auth_key_id,
+                auth_key: b.auth_key.clone(),
+                echo: b.echo,
+                echo_interval: b.echo_interval,
+            }
+        });
+        let multicast = (!self.draft.multicast.is_empty()).then(|| {
+            let m = &self.draft.multicast;
+            Multicast {
+                enabled: m.enabled,
+                igmp: m.igmp,
+                mld: m.mld,
+                igmp_version: m.igmp_version,
+                robustness: m.robustness,
+                query_interval: m.query_interval,
+                query_response_interval: m.query_response_interval,
+                interfaces: m
+                    .interfaces
+                    .iter()
+                    .map(|(name, d)| MulticastInterface {
+                        name: name.clone(),
+                        role: d.role.clone(),
+                        igmp_version: d.igmp_version,
+                    })
+                    .collect(),
+            }
+        });
         let filters = self
             .draft
             .filters
             .iter()
             .map(|(name, d)| filter_from_draft(name, d))
             .collect::<Result<Vec<_>>>()?;
+        let export = (!self.draft.export.is_empty()).then(|| {
+            let e = &self.draft.export;
+            Export {
+                kernel: e.kernel.clone(),
+                bgp: e.bgp.clone(),
+                ospf: e.ospf.clone(),
+                rip: e.rip.clone(),
+                ripng: e.ripng.clone(),
+                babel: e.babel.clone(),
+                isis: e.isis.clone(),
+            }
+        });
         let protocols = Protocols {
             router_id: self.draft.router_id.clone(),
             statics,
@@ -3281,7 +4226,12 @@ impl Session {
             isis,
             bgp,
             vrrp,
+            vrfs,
+            bfd,
+            multicast,
             filters,
+            import: self.draft.import.clone(),
+            export,
         };
 
         // multiwan (roadmap C6): the failover/load-balance uplinks. Health-check
@@ -3816,44 +4766,19 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         if let Some(m) = s.metric {
             proto.push_str(&format!("        metric {m}\n"));
         }
+        if let Some(vrf) = &s.vrf {
+            proto.push_str(&format!("        vrf {vrf}\n"));
+        }
         proto.push_str("    }\n");
     }
     if !draft.ospf.is_empty() {
         proto.push_str("    ospf {\n");
-        if let Some(a) = &draft.ospf.area {
-            proto.push_str(&format!("        area {a}\n"));
-        }
-        for iface in &draft.ospf.interfaces {
-            proto.push_str(&format!("        interface {iface}\n"));
-        }
-        if let Some(c) = draft.ospf.cost {
-            proto.push_str(&format!("        cost {c}\n"));
-        }
-        if let Some(nt) = &draft.ospf.network_type {
-            proto.push_str(&format!("        network-type {nt}\n"));
-        }
-        for src in &draft.ospf.redistribute {
-            proto.push_str(&format!("        redistribute {src}\n"));
-        }
+        render_ospf_body(&mut proto, &draft.ospf, false);
         proto.push_str("    }\n");
     }
     if !draft.ospf3.is_empty() {
         proto.push_str("    ospf3 {\n");
-        if let Some(a) = &draft.ospf3.area {
-            proto.push_str(&format!("        area {a}\n"));
-        }
-        for iface in &draft.ospf3.interfaces {
-            proto.push_str(&format!("        interface {iface}\n"));
-        }
-        if let Some(c) = draft.ospf3.cost {
-            proto.push_str(&format!("        cost {c}\n"));
-        }
-        if let Some(nt) = &draft.ospf3.network_type {
-            proto.push_str(&format!("        network-type {nt}\n"));
-        }
-        for src in &draft.ospf3.redistribute {
-            proto.push_str(&format!("        redistribute {src}\n"));
-        }
+        render_ospf_body(&mut proto, &draft.ospf3, true);
         proto.push_str("    }\n");
     }
     for (name, r) in [
@@ -3868,36 +4793,67 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         for iface in &r.interfaces {
             proto.push_str(&format!("        interface {iface}\n"));
         }
+        for net in &r.network {
+            proto.push_str(&format!("        network {net}\n"));
+        }
+        if let Some(rid) = &r.router_id {
+            proto.push_str(&format!("        router-id {rid}\n"));
+        }
         for src in &r.redistribute {
             proto.push_str(&format!("        redistribute {src}\n"));
         }
         if let Some(m) = r.redistribute_metric {
             proto.push_str(&format!("        redistribute-metric {m}\n"));
         }
+        if r.bfd {
+            proto.push_str("        bfd true\n");
+        }
+        if let Some(vrf) = &r.vrf {
+            proto.push_str(&format!("        vrf {vrf}\n"));
+        }
         proto.push_str("    }\n");
     }
     if !draft.isis.is_empty() {
+        let i = &draft.isis;
         proto.push_str("    isis {\n");
-        if let Some(s) = &draft.isis.system_id {
+        if let Some(s) = &i.system_id {
             proto.push_str(&format!("        system-id {s}\n"));
         }
-        if let Some(a) = &draft.isis.area {
+        if let Some(a) = &i.area {
             proto.push_str(&format!("        area {a}\n"));
         }
-        if let Some(l) = &draft.isis.level {
+        if let Some(l) = &i.level {
             proto.push_str(&format!("        level {l}\n"));
         }
-        for iface in &draft.isis.interfaces {
+        for iface in &i.interfaces {
             proto.push_str(&format!("        interface {iface}\n"));
         }
-        if let Some(nt) = &draft.isis.network_type {
+        if let Some(p) = i.priority {
+            proto.push_str(&format!("        priority {p}\n"));
+        }
+        if let Some(m) = i.metric {
+            proto.push_str(&format!("        metric {m}\n"));
+        }
+        if let Some(h) = i.hello_interval {
+            proto.push_str(&format!("        hello-interval {h}\n"));
+        }
+        if let Some(nt) = &i.network_type {
             proto.push_str(&format!("        network-type {nt}\n"));
         }
-        for src in &draft.isis.redistribute {
+        for src in &i.redistribute {
             proto.push_str(&format!("        redistribute {src}\n"));
         }
-        if let Some(m) = draft.isis.redistribute_metric {
+        if let Some(m) = i.redistribute_metric {
             proto.push_str(&format!("        redistribute-metric {m}\n"));
+        }
+        if i.l2_to_l1_leaking {
+            proto.push_str("        l2-to-l1-leaking true\n");
+        }
+        if i.bfd {
+            proto.push_str("        bfd true\n");
+        }
+        if let Some(vrf) = &i.vrf {
+            proto.push_str(&format!("        vrf {vrf}\n"));
         }
         proto.push_str("    }\n");
     }
@@ -3912,10 +4868,130 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         if let Some(p) = v.priority {
             proto.push_str(&format!("        priority {p}\n"));
         }
+        if let Some(a) = v.advert_interval {
+            proto.push_str(&format!("        advert-interval {a}\n"));
+        }
+        if let Some(p) = v.preempt {
+            proto.push_str(&format!("        preempt {p}\n"));
+        }
+        if let Some(pl) = v.prefix_length {
+            proto.push_str(&format!("        prefix-length {pl}\n"));
+        }
+        for t in &v.track_interfaces {
+            proto.push_str(&format!("        track-interface {t}\n"));
+        }
+        if let Some(pd) = v.priority_decrement {
+            proto.push_str(&format!("        priority-decrement {pd}\n"));
+        }
         for a in &v.virtual_address {
             proto.push_str(&format!("        virtual-address {a}\n"));
         }
         proto.push_str("    }\n");
+    }
+    if !draft.bfd.is_empty() {
+        let b = &draft.bfd;
+        proto.push_str("    bfd {\n");
+        if let Some(v) = b.min_tx {
+            proto.push_str(&format!("        min-tx {v}\n"));
+        }
+        if let Some(v) = b.min_rx {
+            proto.push_str(&format!("        min-rx {v}\n"));
+        }
+        if let Some(v) = b.detect_mult {
+            proto.push_str(&format!("        detect-mult {v}\n"));
+        }
+        if let Some(v) = &b.auth_type {
+            proto.push_str(&format!("        auth-type {v}\n"));
+        }
+        if let Some(v) = b.auth_key_id {
+            proto.push_str(&format!("        auth-key-id {v}\n"));
+        }
+        if let Some(v) = &b.auth_key {
+            proto.push_str(&format!("        auth-key {v}\n"));
+        }
+        if b.echo {
+            proto.push_str("        echo true\n");
+        }
+        if let Some(v) = b.echo_interval {
+            proto.push_str(&format!("        echo-interval {v}\n"));
+        }
+        proto.push_str("    }\n");
+    }
+    if !draft.multicast.is_empty() {
+        let m = &draft.multicast;
+        proto.push_str("    multicast {\n");
+        if m.enabled {
+            proto.push_str("        enabled true\n");
+        }
+        if let Some(v) = m.igmp {
+            proto.push_str(&format!("        igmp {v}\n"));
+        }
+        if let Some(v) = m.mld {
+            proto.push_str(&format!("        mld {v}\n"));
+        }
+        if let Some(v) = m.igmp_version {
+            proto.push_str(&format!("        igmp-version {v}\n"));
+        }
+        if let Some(v) = m.robustness {
+            proto.push_str(&format!("        robustness {v}\n"));
+        }
+        if let Some(v) = m.query_interval {
+            proto.push_str(&format!("        query-interval {v}\n"));
+        }
+        if let Some(v) = m.query_response_interval {
+            proto.push_str(&format!("        query-response-interval {v}\n"));
+        }
+        for (name, d) in &m.interfaces {
+            proto.push_str(&format!("        interface {name} {{\n"));
+            if let Some(role) = &d.role {
+                proto.push_str(&format!("            role {role}\n"));
+            }
+            if let Some(v) = d.igmp_version {
+                proto.push_str(&format!("            igmp-version {v}\n"));
+            }
+            proto.push_str("        }\n");
+        }
+        proto.push_str("    }\n");
+    }
+    for (name, v) in &draft.vrfs {
+        proto.push_str(&format!("    vrf {name} {{\n"));
+        if let Some(t) = v.table {
+            proto.push_str(&format!("        table {t}\n"));
+        }
+        if let Some(rd) = &v.rd {
+            proto.push_str(&format!("        rd {rd}\n"));
+        }
+        for iface in &v.interfaces {
+            proto.push_str(&format!("        interface {iface}\n"));
+        }
+        if let Some(f) = &v.import {
+            proto.push_str(&format!("        import {f}\n"));
+        }
+        if let Some(f) = &v.export {
+            proto.push_str(&format!("        export {f}\n"));
+        }
+        proto.push_str("    }\n");
+    }
+    if !draft.export.is_empty() {
+        let e = &draft.export;
+        proto.push_str("    export {\n");
+        for (proto_name, name) in [
+            ("kernel", &e.kernel),
+            ("bgp", &e.bgp),
+            ("ospf", &e.ospf),
+            ("rip", &e.rip),
+            ("ripng", &e.ripng),
+            ("babel", &e.babel),
+            ("isis", &e.isis),
+        ] {
+            if let Some(name) = name {
+                proto.push_str(&format!("        {proto_name} {name}\n"));
+            }
+        }
+        proto.push_str("    }\n");
+    }
+    for (proto_name, name) in &draft.import {
+        proto.push_str(&format!("    import {proto_name} {name}\n"));
     }
     if !draft.bgp.is_empty() {
         let b = &draft.bgp;
@@ -3967,6 +5043,9 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         if b.ebgp_require_policy {
             proto.push_str("        ebgp-require-policy true\n");
+        }
+        if let Some(vrf) = &b.vrf {
+            proto.push_str(&format!("        vrf {vrf}\n"));
         }
         for (prefix, summary_only) in &b.aggregate {
             proto.push_str(&format!("        aggregate {prefix} {{\n"));
@@ -4173,6 +5252,95 @@ fn push_field(out: &mut String, key: &str, val: Option<String>) {
 
 /// Render one BGP neighbour as a nested `neighbor <addr> { … }` block (8-space
 /// header, 12-space fields). Booleans print only when set; options when present.
+/// Render the body of an `ospf { … }` / `ospf3 { … }` block (fields at 8 spaces).
+/// `is_v3` selects the OSPFv3-only knobs (`instance-id`) versus the OSPFv2-only
+/// ones (auth / stub areas / timers / graceful-restart / vrf).
+fn render_ospf_body(out: &mut String, o: &OspfDraft, is_v3: bool) {
+    if let Some(a) = &o.area {
+        out.push_str(&format!("        area {a}\n"));
+    }
+    for iface in &o.interfaces {
+        out.push_str(&format!("        interface {iface}\n"));
+    }
+    for (name, area) in &o.interface_areas {
+        match area {
+            Some(a) => out.push_str(&format!("        interface {name} area {a}\n")),
+            None => out.push_str(&format!("        interface {name}\n")),
+        }
+    }
+    if let Some(p) = o.router_priority {
+        out.push_str(&format!("        router-priority {p}\n"));
+    }
+    if let Some(c) = o.cost {
+        out.push_str(&format!("        cost {c}\n"));
+    }
+    if let Some(nt) = &o.network_type {
+        out.push_str(&format!("        network-type {nt}\n"));
+    }
+    if is_v3 {
+        if let Some(id) = o.instance_id {
+            out.push_str(&format!("        instance-id {id}\n"));
+        }
+    }
+    for iface in &o.passive_interfaces {
+        out.push_str(&format!("        passive-interface {iface}\n"));
+    }
+    for src in &o.redistribute {
+        out.push_str(&format!("        redistribute {src}\n"));
+    }
+    if let Some(m) = o.redistribute_metric {
+        out.push_str(&format!("        redistribute-metric {m}\n"));
+    }
+    if !is_v3 {
+        for (field, areas) in [
+            ("stub-area", &o.stub_areas),
+            ("nssa-area", &o.nssa_areas),
+            ("totally-stubby-area", &o.totally_stubby_areas),
+            ("totally-nssa-area", &o.totally_nssa_areas),
+            ("nssa-default-area", &o.nssa_default_areas),
+        ] {
+            for a in areas {
+                out.push_str(&format!("        {field} {a}\n"));
+            }
+        }
+        if let Some(c) = o.stub_default_cost {
+            out.push_str(&format!("        stub-default-cost {c}\n"));
+        }
+        if let Some(v) = &o.auth_type {
+            out.push_str(&format!("        auth-type {v}\n"));
+        }
+        if let Some(v) = &o.auth_key {
+            out.push_str(&format!("        auth-key {v}\n"));
+        }
+        if let Some(v) = o.auth_key_id {
+            out.push_str(&format!("        auth-key-id {v}\n"));
+        }
+        if let Some(v) = o.auth_replay_protection {
+            out.push_str(&format!("        auth-replay-protection {v}\n"));
+        }
+        if let Some(v) = o.hello_interval {
+            out.push_str(&format!("        hello-interval {v}\n"));
+        }
+        if let Some(v) = o.dead_interval {
+            out.push_str(&format!("        dead-interval {v}\n"));
+        }
+        if o.graceful_restart {
+            out.push_str("        graceful-restart true\n");
+        }
+        if let Some(v) = o.graceful_restart_period {
+            out.push_str(&format!("        graceful-restart-period {v}\n"));
+        }
+    }
+    if o.bfd {
+        out.push_str("        bfd true\n");
+    }
+    if !is_v3 {
+        if let Some(vrf) = &o.vrf {
+            out.push_str(&format!("        vrf {vrf}\n"));
+        }
+    }
+}
+
 fn render_neighbor(out: &mut String, addr: &str, n: &NeighborDraft) {
     out.push_str(&format!("        neighbor {addr} {{\n"));
     push_field(out, "remote-as", n.remote_as.map(|a| a.to_string()));
@@ -4930,5 +6098,225 @@ mod tests {
         run(&mut s, "delete protocols filter from-peer rule 10").unwrap();
         assert!(!s.show().contains("rule 10 {"));
         assert!(run(&mut s, "delete protocols filter nope").is_err());
+    }
+
+    #[test]
+    fn igp_full_surface_set_show_commit_round_trip() {
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname r1",
+            "set protocols router-id 10.0.0.1",
+            // VRFs first, so per-protocol / static references resolve.
+            "set protocols vrf blue table 100",
+            "set protocols vrf blue rd 65000:1",
+            "set protocols vrf blue interface eth3",
+            "set protocols vrf blue import from-peer",
+            "set protocols vrf blue export from-peer",
+            "set protocols filter from-peer default reject",
+            "set protocols static 10.9.0.0/24 via 10.0.0.2",
+            "set protocols static 10.9.0.0/24 vrf blue",
+            // OSPFv2 full surface.
+            "set protocols ospf interface eth0",
+            "set protocols ospf interface eth1 area 0.0.0.1",
+            "set protocols ospf area 0.0.0.0",
+            "set protocols ospf router-priority 5",
+            "set protocols ospf cost 15",
+            "set protocols ospf network-type point-to-point",
+            "set protocols ospf passive-interface eth2",
+            "set protocols ospf redistribute static",
+            "set protocols ospf redistribute-metric 40",
+            "set protocols ospf stub-area 0.0.0.2",
+            "set protocols ospf stub-default-cost 5",
+            "set protocols ospf nssa-area 0.0.0.3",
+            "set protocols ospf totally-stubby-area 0.0.0.4",
+            "set protocols ospf totally-nssa-area 0.0.0.5",
+            "set protocols ospf nssa-default-area 0.0.0.6",
+            "set protocols ospf auth-type md5",
+            "set protocols ospf auth-key s3cret",
+            "set protocols ospf auth-key-id 7",
+            "set protocols ospf auth-replay-protection true",
+            "set protocols ospf hello-interval 5",
+            "set protocols ospf dead-interval 20",
+            "set protocols ospf graceful-restart true",
+            "set protocols ospf graceful-restart-period 90",
+            "set protocols ospf bfd true",
+            "set protocols ospf vrf blue",
+            // OSPFv3.
+            "set protocols ospf3 interface eth0",
+            "set protocols ospf3 interface eth1 area 0.0.0.1",
+            "set protocols ospf3 router-priority 3",
+            "set protocols ospf3 instance-id 2",
+            "set protocols ospf3 redistribute static",
+            "set protocols ospf3 redistribute-metric 30",
+            "set protocols ospf3 bfd true",
+            // RIP + RIPng + Babel.
+            "set protocols rip interface eth0",
+            "set protocols rip bfd true",
+            "set protocols rip vrf blue",
+            "set protocols ripng interface eth0",
+            "set protocols babel interface eth0",
+            "set protocols babel network 2001:db8::/64",
+            "set protocols babel router-id 10.0.0.1",
+            "set protocols babel bfd true",
+            "set protocols babel vrf blue",
+            // IS-IS.
+            "set protocols isis interface eth0",
+            "set protocols isis system-id 1921.6800.1001",
+            "set protocols isis area 49.0001",
+            "set protocols isis level 1-2",
+            "set protocols isis priority 100",
+            "set protocols isis metric 20",
+            "set protocols isis hello-interval 3",
+            "set protocols isis l2-to-l1-leaking true",
+            "set protocols isis bfd true",
+            "set protocols isis vrf blue",
+            // BGP vrf.
+            "set protocols bgp local-as 65001",
+            "set protocols bgp vrf blue",
+            // VRRP full.
+            "set protocols vrrp v1 interface eth0",
+            "set protocols vrrp v1 vrid 10",
+            "set protocols vrrp v1 priority 200",
+            "set protocols vrrp v1 advert-interval 500",
+            "set protocols vrrp v1 preempt false",
+            "set protocols vrrp v1 prefix-length 24",
+            "set protocols vrrp v1 track-interface eth1",
+            "set protocols vrrp v1 priority-decrement 30",
+            "set protocols vrrp v1 virtual-address 10.0.0.254",
+            // BFD global.
+            "set protocols bfd min-tx 250",
+            "set protocols bfd min-rx 250",
+            "set protocols bfd detect-mult 4",
+            "set protocols bfd auth-type meticulous-sha1",
+            "set protocols bfd auth-key-id 1",
+            "set protocols bfd auth-key bfdsecret",
+            "set protocols bfd echo true",
+            "set protocols bfd echo-interval 100",
+            // Multicast.
+            "set protocols multicast enabled true",
+            "set protocols multicast mld true",
+            "set protocols multicast robustness 2",
+            "set protocols multicast query-interval 30",
+            "set protocols multicast interface lan0 role querier",
+            "set protocols multicast interface wan0 role upstream",
+            "set protocols multicast interface wan0 igmp-version 3",
+            "set protocols multicast interface lan1 role downstream",
+            // Global export / import filters.
+            "set protocols export kernel from-peer",
+            "set protocols export bgp from-peer",
+            "set protocols import static from-peer",
+            "set protocols import connected from-peer",
+        ] {
+            run(&mut s, line).unwrap();
+        }
+
+        let shown = s.show();
+        for needle in [
+            "interface eth1 area 0.0.0.1",
+            "router-priority 5",
+            "passive-interface eth2",
+            "stub-area 0.0.0.2",
+            "auth-type md5",
+            "hello-interval 5",
+            "graceful-restart true",
+            "instance-id 2",
+            "l2-to-l1-leaking true",
+            "advert-interval 500",
+            "preempt false",
+            "track-interface eth1",
+            "bfd {",
+            "multicast {",
+            "role upstream",
+            "vrf blue {",
+            "table 100",
+            "export {",
+            "import static from-peer",
+        ] {
+            assert!(shown.contains(needle), "missing {needle:?} in:\n{shown}");
+        }
+
+        // Materializes into a validated Appliance carrying the new fields.
+        let a = s.commit().expect("full IGP config commits");
+        let p = &a.protocols;
+        let ospf = p.ospf.as_ref().unwrap();
+        assert_eq!(ospf.router_priority, Some(5));
+        assert_eq!(ospf.interface[0].area.as_deref(), Some("0.0.0.1"));
+        assert_eq!(ospf.stub_areas, ["0.0.0.2"]);
+        assert_eq!(ospf.auth_type.as_deref(), Some("md5"));
+        assert!(ospf.graceful_restart && ospf.bfd);
+        assert_eq!(ospf.vrf.as_deref(), Some("blue"));
+        assert_eq!(p.ospf3.as_ref().unwrap().instance_id, Some(2));
+        assert!(p.rip.as_ref().unwrap().bfd);
+        let babel = p.babel.as_ref().unwrap();
+        assert_eq!(babel.network, ["2001:db8::/64"]);
+        assert_eq!(babel.router_id.as_deref(), Some("10.0.0.1"));
+        let isis = p.isis.as_ref().unwrap();
+        assert_eq!(isis.priority, Some(100));
+        assert!(isis.l2_to_l1_leaking);
+        let v = &p.vrrp[0];
+        assert_eq!(v.advert_interval, Some(500));
+        assert_eq!(v.preempt, Some(false));
+        assert_eq!(v.track_interfaces, ["eth1"]);
+        assert_eq!(p.bgp.as_ref().unwrap().vrf.as_deref(), Some("blue"));
+        let bfd = p.bfd.as_ref().unwrap();
+        assert_eq!(bfd.min_tx, Some(250));
+        assert!(bfd.echo);
+        let mc = p.multicast.as_ref().unwrap();
+        assert!(mc.enabled);
+        assert_eq!(mc.interfaces.len(), 3);
+        assert_eq!(mc.interfaces[1].role.as_deref(), Some("upstream"));
+        assert_eq!(p.vrfs[0].table, 100);
+        assert_eq!(p.vrfs[0].import.as_deref(), Some("from-peer"));
+        assert_eq!(p.statics[0].vrf.as_deref(), Some("blue"));
+        assert_eq!(
+            p.export.as_ref().unwrap().kernel.as_deref(),
+            Some("from-peer")
+        );
+        assert_eq!(
+            p.import.get("static").map(String::as_str),
+            Some("from-peer")
+        );
+
+        // Full round-trip: the materialized config re-parses + re-validates, and
+        // reloading it renders the same view.
+        let toml = a.to_toml().unwrap();
+        let a2 = Appliance::from_toml(&toml).expect("re-parses");
+        a2.validate().expect("re-validates");
+        let reloaded = render_appliance(&a2);
+        for needle in [
+            "interface eth1 area 0.0.0.1",
+            "auth-type md5",
+            "instance-id 2",
+            "l2-to-l1-leaking true",
+            "advert-interval 500",
+            "multicast {",
+            "vrf blue {",
+        ] {
+            assert!(
+                reloaded.contains(needle),
+                "reload missing {needle:?} in:\n{reloaded}"
+            );
+        }
+
+        // Deletes work for a representative set of new fields.
+        run(&mut s, "delete protocols ospf graceful-restart").unwrap();
+        assert!(!s.show().contains("graceful-restart true"));
+        run(&mut s, "delete protocols bfd").unwrap();
+        assert!(!s.show().contains("bfd {"));
+        run(&mut s, "delete protocols multicast interface wan0").unwrap();
+        assert!(!s.show().contains("interface wan0"));
+        run(&mut s, "delete protocols vrf blue interface").unwrap();
+        run(&mut s, "delete protocols import static").unwrap();
+        assert!(!s.show().contains("import static from-peer"));
+    }
+
+    #[test]
+    fn ripng_rejects_unsupported_extras_via_grammar() {
+        let mut s = Session::empty();
+        run(&mut s, "set system hostname r1").unwrap();
+        // The grammar offers no `bfd` / `vrf` / `network` / `router-id` on ripng.
+        assert!(run(&mut s, "set protocols ripng bfd true").is_err());
+        assert!(run(&mut s, "set protocols ripng vrf blue").is_err());
+        assert!(run(&mut s, "set protocols ripng network 10.0.0.0/8").is_err());
     }
 }

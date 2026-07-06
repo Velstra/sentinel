@@ -841,21 +841,77 @@ const PROTOCOLS_NODES: &[Cand] = &[
     ("isis", "IS-IS: interfaces, system-id, area, level"),
     ("bgp", "BGP-4: local-as, networks, neighbors"),
     ("vrrp", "VRRP virtual router (first-hop redundancy)"),
+    ("vrf", "a VRF (named isolated routing table)"),
+    ("bfd", "global BFD timing / authentication defaults"),
+    ("multicast", "IGMP/MLD querier + RFC 4605 proxy"),
     ("filter", "a named route filter (import/export policy)"),
+    ("import", "per-protocol import filter (<proto> <filter>)"),
+    ("export", "redistribution export filter (<proto> <filter>)"),
 ];
 const OSPF_FIELDS: &[Cand] = &[
-    ("interface", "a NIC OSPF runs on"),
+    (
+        "interface",
+        "a NIC OSPF runs on (add `area <id>` for its area)",
+    ),
     ("area", "the OSPF area id (dotted quad, e.g. 0.0.0.0)"),
+    ("router-priority", "DR-election priority (0 = never DR)"),
     ("cost", "output cost for these interfaces"),
     ("network-type", "broadcast / point-to-point"),
+    (
+        "passive-interface",
+        "advertise the subnet, form no adjacency",
+    ),
     (
         "redistribute",
         "inject a route source (static / connected / bgp)",
     ),
+    ("redistribute-metric", "metric for redistributed routes"),
+    ("stub-area", "an area with no AS-external LSAs"),
+    ("stub-default-cost", "metric of the injected stub default"),
+    ("nssa-area", "a not-so-stubby area (RFC 3101)"),
+    ("totally-stubby-area", "a no-summary stub area"),
+    ("totally-nssa-area", "a no-summary NSSA"),
+    (
+        "nssa-default-area",
+        "an NSSA with an injected type-7 default",
+    ),
+    ("auth-type", "packet auth: none / text / md5"),
+    ("auth-key", "the shared authentication key"),
+    ("auth-key-id", "the MD5 key identifier"),
+    ("auth-replay-protection", "MD5 anti-replay (true/false)"),
+    ("hello-interval", "seconds between Hellos"),
+    ("dead-interval", "seconds before a neighbour is dead"),
+    (
+        "graceful-restart",
+        "act as a GR restarting router (true/false)",
+    ),
+    (
+        "graceful-restart-period",
+        "the advertised grace period (seconds)",
+    ),
+    ("bfd", "run a BFD session to each neighbour (true/false)"),
+    ("vrf", "the VRF this instance runs in"),
 ];
+const OSPF3_FIELDS: &[Cand] = &[
+    ("interface", "a NIC OSPFv3 runs on (add `area <id>`)"),
+    ("area", "the OSPFv3 area id (dotted quad)"),
+    ("router-priority", "DR-election priority (0 = never DR)"),
+    ("cost", "output cost for these interfaces"),
+    ("network-type", "broadcast / point-to-point"),
+    ("instance-id", "the OSPFv3 Instance ID"),
+    ("redistribute", "inject a route source (static)"),
+    ("redistribute-metric", "metric for redistributed routes"),
+    ("bfd", "run a BFD session to each neighbour (true/false)"),
+];
+const OSPF_IFACE_FIELDS: &[Cand] = &[("area", "the area this interface belongs to (dotted quad)")];
 const OSPF_NETWORK_TYPES: &[Cand] = &[
     ("broadcast", "elect a designated router"),
     ("point-to-point", "direct link, no DR"),
+];
+const OSPF_AUTH_TYPES: &[Cand] = &[
+    ("none", "no authentication"),
+    ("text", "cleartext password"),
+    ("md5", "keyed-MD5 digest"),
 ];
 const RIP_FIELDS: &[Cand] = &[
     ("interface", "a NIC this protocol runs on"),
@@ -864,27 +920,119 @@ const RIP_FIELDS: &[Cand] = &[
         "inject a route source (static / connected / bgp)",
     ),
     ("redistribute-metric", "metric for redistributed routes"),
+    ("bfd", "run BFD to each neighbour (true/false)"),
+    ("vrf", "the VRF this instance runs in"),
+];
+const RIPNG_FIELDS: &[Cand] = &[
+    ("interface", "a NIC RIPng runs on"),
+    ("redistribute", "inject a route source"),
+    ("redistribute-metric", "metric for redistributed routes"),
+];
+const BABEL_FIELDS: &[Cand] = &[
+    ("interface", "a NIC Babel runs on"),
+    ("network", "a prefix to originate"),
+    ("router-id", "the Babel Router-ID (dotted quad)"),
+    ("redistribute", "inject a route source"),
+    ("redistribute-metric", "metric for redistributed routes"),
+    ("bfd", "run BFD to each neighbour (true/false)"),
+    ("vrf", "the VRF this instance runs in"),
 ];
 const ISIS_FIELDS: &[Cand] = &[
     ("interface", "a NIC IS-IS runs on"),
     ("system-id", "the 6-byte system id (0000.0000.0001)"),
     ("area", "the area address (49.0001)"),
     ("level", "1 / 2 / 1-2"),
+    ("priority", "DIS-election priority (0-127)"),
+    ("metric", "the metric advertised for each interface"),
+    ("hello-interval", "HelloInterval in seconds"),
     ("network-type", "broadcast / point-to-point"),
     ("redistribute", "inject a route source"),
     ("redistribute-metric", "metric for redistributed routes"),
+    ("l2-to-l1-leaking", "leak L2 prefixes into L1 (true/false)"),
+    ("bfd", "run BFD to each neighbour (true/false)"),
+    ("vrf", "the VRF this instance runs in"),
 ];
 const ISIS_LEVELS: &[Cand] = &[("1", "level 1"), ("2", "level 2"), ("1-2", "both levels")];
 const VRRP_FIELDS: &[Cand] = &[
     ("interface", "the NIC the virtual router runs on"),
     ("vrid", "virtual router id (1-255)"),
     ("priority", "election priority (higher wins)"),
+    ("advert-interval", "advertisement interval (milliseconds)"),
+    ("preempt", "preempt a lower-priority master (true/false)"),
+    (
+        "prefix-length",
+        "the prefix length for each virtual address",
+    ),
+    ("track-interface", "track an interface; if down, demote"),
+    (
+        "priority-decrement",
+        "priority drop while a tracked NIC is down",
+    ),
     ("virtual-address", "the shared virtual IP"),
+];
+const BFD_FIELDS: &[Cand] = &[
+    ("min-tx", "Desired Min TX Interval (ms)"),
+    ("min-rx", "Required Min RX Interval (ms)"),
+    ("detect-mult", "Detect Mult (missed intervals to fail)"),
+    ("auth-type", "authentication type"),
+    ("auth-key-id", "the wire key id"),
+    ("auth-key", "the shared secret"),
+    ("echo", "enable the Echo function (true/false)"),
+    ("echo-interval", "interval between Echo packets (ms)"),
+];
+const MULTICAST_FIELDS: &[Cand] = &[
+    ("enabled", "enable multicast IGMP/MLD (true/false)"),
+    ("igmp", "run the IGMP querier/proxy (true/false)"),
+    ("mld", "run the MLDv2 querier/proxy (true/false)"),
+    ("igmp-version", "default IGMP version (2 or 3)"),
+    ("robustness", "the Robustness Variable (QRV)"),
+    ("query-interval", "the Query Interval (seconds)"),
+    (
+        "query-response-interval",
+        "the Query Response Interval (seconds)",
+    ),
+    ("interface", "a NIC and its multicast role (<name> role …)"),
+];
+const MULTICAST_IFACE_FIELDS: &[Cand] = &[
+    ("role", "querier / upstream / downstream"),
+    ("igmp-version", "IGMP version for this interface (2 or 3)"),
+];
+const MULTICAST_ROLES: &[Cand] = &[
+    ("querier", "act as the IGMP querier on this LAN"),
+    ("upstream", "RFC 4605 proxy upstream (pull streams)"),
+    ("downstream", "RFC 4605 proxy downstream (membership)"),
+];
+const VRF_FIELDS: &[Cand] = &[
+    ("table", "the kernel routing table id"),
+    ("rd", "the Route Distinguisher (e.g. 65000:1)"),
+    ("interface", "an interface bound to this VRF"),
+    ("import", "a filter applied to routes entering the VRF"),
+    ("export", "a filter applied to routes leaving the VRF"),
+];
+const EXPORT_PROTOS: &[Cand] = &[
+    ("kernel", "filter routes before the kernel FIB"),
+    ("bgp", "filter routes redistributed into BGP"),
+    ("ospf", "filter routes redistributed into OSPF"),
+    ("rip", "filter routes redistributed into RIP"),
+    ("ripng", "filter routes redistributed into RIPng"),
+    ("babel", "filter routes redistributed into Babel"),
+    ("isis", "filter routes redistributed into IS-IS"),
+];
+const IMPORT_PROTOS: &[Cand] = &[
+    ("connected", "filter connected routes on import"),
+    ("static", "filter static routes on import"),
+    ("kernel", "filter kernel routes on import"),
+    ("rip", "filter RIP routes on import"),
+    ("ospf", "filter OSPF routes on import"),
+    ("bgp", "filter BGP routes on import"),
+    ("isis", "filter IS-IS routes on import"),
+    ("babel", "filter Babel routes on import"),
 ];
 const STATIC_FIELDS: &[Cand] = &[
     ("via", "next-hop gateway IP"),
     ("dev", "outgoing interface (on-link route)"),
     ("metric", "route metric (lower wins)"),
+    ("vrf", "the VRF this route belongs to"),
 ];
 const BGP_FIELDS: &[Cand] = &[
     ("local-as", "this router's AS number"),
@@ -905,6 +1053,7 @@ const BGP_FIELDS: &[Cand] = &[
     ("roa", "a static RPKI ROA (<prefix> origin-as <n>)"),
     ("rpki", "RPKI: reject-invalid, rtr cache"),
     ("ebgp-require-policy", "require a policy on every eBGP peer"),
+    ("vrf", "the VRF this BGP instance runs in"),
     ("neighbor", "a BGP peer (<ip> remote-as <n> ...)"),
 ];
 // A BGP neighbour's per-peer policy surface.
@@ -1397,21 +1546,62 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "protocols", "ospf"] => OSPF_FIELDS,
         ["set", "protocols", "ospf", "redistribute"] => REDIST,
         ["set", "protocols", "ospf", "network-type"] => OSPF_NETWORK_TYPES,
-        ["set" | "delete", "protocols", "ospf3"] => OSPF_FIELDS,
+        ["set", "protocols", "ospf", "auth-type"] => OSPF_AUTH_TYPES,
+        [
+            "set",
+            "protocols",
+            "ospf",
+            "auth-replay-protection" | "graceful-restart" | "bfd",
+        ] => BOOLS,
+        // A per-interface area: `ospf interface <name> area <id>`.
+        [
+            "set" | "delete",
+            "protocols",
+            "ospf" | "ospf3",
+            "interface",
+            _name,
+        ] => OSPF_IFACE_FIELDS,
+        ["set" | "delete", "protocols", "ospf3"] => OSPF3_FIELDS,
         ["set", "protocols", "ospf3", "redistribute"] => REDIST,
         ["set", "protocols", "ospf3", "network-type"] => OSPF_NETWORK_TYPES,
-        ["set" | "delete", "protocols", "rip" | "ripng" | "babel"] => RIP_FIELDS,
+        ["set", "protocols", "ospf3", "bfd"] => BOOLS,
+        ["set" | "delete", "protocols", "rip"] => RIP_FIELDS,
+        ["set" | "delete", "protocols", "ripng"] => RIPNG_FIELDS,
+        ["set" | "delete", "protocols", "babel"] => BABEL_FIELDS,
         [
             "set",
             "protocols",
             "rip" | "ripng" | "babel",
             "redistribute",
         ] => REDIST,
+        ["set", "protocols", "rip" | "babel", "bfd"] => BOOLS,
         ["set" | "delete", "protocols", "isis"] => ISIS_FIELDS,
         ["set", "protocols", "isis", "redistribute"] => REDIST,
         ["set", "protocols", "isis", "network-type"] => OSPF_NETWORK_TYPES,
         ["set", "protocols", "isis", "level"] => ISIS_LEVELS,
+        ["set", "protocols", "isis", "l2-to-l1-leaking" | "bfd"] => BOOLS,
         ["set" | "delete", "protocols", "vrrp", _name] => VRRP_FIELDS,
+        ["set", "protocols", "vrrp", _name, "preempt"] => BOOLS,
+        // Global BFD timing / authentication defaults.
+        ["set" | "delete", "protocols", "bfd"] => BFD_FIELDS,
+        ["set", "protocols", "bfd", "auth-type"] => BFD_AUTH_TYPES,
+        ["set", "protocols", "bfd", "echo"] => BOOLS,
+        // Multicast (IGMP/MLD querier + proxy).
+        ["set" | "delete", "protocols", "multicast"] => MULTICAST_FIELDS,
+        ["set", "protocols", "multicast", "enabled" | "igmp" | "mld"] => BOOLS,
+        [
+            "set" | "delete",
+            "protocols",
+            "multicast",
+            "interface",
+            _name,
+        ] => MULTICAST_IFACE_FIELDS,
+        ["set", "protocols", "multicast", "interface", _name, "role"] => MULTICAST_ROLES,
+        // VRF instances.
+        ["set" | "delete", "protocols", "vrf", _name] => VRF_FIELDS,
+        // Global redistribution filters.
+        ["set" | "delete", "protocols", "export"] => EXPORT_PROTOS,
+        ["set" | "delete", "protocols", "import"] => IMPORT_PROTOS,
 
         // The multiwan (Multi-WAN failover / load-balance) sub-tree.
         ["set" | "delete", "multiwan"] => MULTIWAN_NODES,
@@ -2134,6 +2324,48 @@ mod tests {
         assert!(scoped.contains("router-id 10.9.9.9"), "{scoped}");
         assert!(!scoped.contains("hostname"), "{scoped}");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cisco_context_enters_new_protocol_subtrees_and_sets_fields() {
+        let dir = std::env::temp_dir().join(format!("sentinel-ctx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.toml");
+        let mut s = Session::load(&path).unwrap();
+        let act = Apply::off();
+        let mut ctx = Vec::new();
+
+        exec_line(&mut s, &act, &mut ctx, "set system hostname r1");
+        // Cisco shorthand: a bare path descends into the OSPF context, then bare
+        // fields set relative to it.
+        exec_line(&mut s, &act, &mut ctx, "protocols ospf");
+        assert_eq!(ctx, vec!["protocols", "ospf"]);
+        exec_line(&mut s, &act, &mut ctx, "area 0.0.0.0");
+        exec_line(&mut s, &act, &mut ctx, "hello-interval 5");
+        exec_line(&mut s, &act, &mut ctx, "bfd true");
+        exec_line(&mut s, &act, &mut ctx, "top");
+        assert!(ctx.is_empty());
+        // A named VRF context.
+        exec_line(&mut s, &act, &mut ctx, "protocols vrf blue");
+        assert_eq!(ctx, vec!["protocols", "vrf", "blue"]);
+        exec_line(&mut s, &act, &mut ctx, "table 100");
+        exec_line(&mut s, &act, &mut ctx, "top");
+        // A multicast interface context (keyed node).
+        exec_line(&mut s, &act, &mut ctx, "protocols multicast");
+        exec_line(&mut s, &act, &mut ctx, "enabled true");
+        exec_line(&mut s, &act, &mut ctx, "interface lan0");
+        assert_eq!(ctx, vec!["protocols", "multicast", "interface", "lan0"]);
+        exec_line(&mut s, &act, &mut ctx, "role querier");
+        exec_line(&mut s, &act, &mut ctx, "top");
+
+        let shown = s.show();
+        assert!(shown.contains("hello-interval 5"), "{shown}");
+        assert!(shown.contains("bfd true"), "{shown}");
+        assert!(shown.contains("vrf blue {"), "{shown}");
+        assert!(shown.contains("table 100"), "{shown}");
+        assert!(shown.contains("multicast {"), "{shown}");
+        assert!(shown.contains("role querier"), "{shown}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -207,6 +207,48 @@ port = 443
 # prefix = ["10.0.0.0/8+"]
 # set-metric = 100
 # action = "accept"
+#
+# OSPFv2 with an area border interface, authentication, timers and a stub area.
+# [protocols.ospf]
+# interfaces = ["eth0"]
+# area = "0.0.0.0"
+# router-priority = 5
+# passive-interfaces = ["eth2"]
+# auth-type = "md5"
+# auth-key = "s3cret"
+# hello-interval = 5
+# dead-interval = 20
+# graceful-restart = true
+# bfd = true
+# vrf = "blue"
+# [[protocols.ospf.interface]]
+# name = "eth1"
+# area = "0.0.0.1"
+#
+# A VRF (isolated routing table), a static route placed in it, and BGP bound to it.
+# [[protocols.vrf]]
+# name = "blue"
+# table = 100
+# interfaces = ["eth3"]
+# import = "from-peer"
+# [[protocols.static]]
+# prefix = "10.9.0.0/24"
+# via = "10.0.0.2"
+# vrf = "blue"
+#
+# Global BFD defaults, IGMP/MLD multicast, and redistribution export filters.
+# [protocols.bfd]
+# min-tx = 250
+# min-rx = 250
+# detect-mult = 4
+# [protocols.multicast]
+# enabled = true
+# [[protocols.multicast.interface]]
+# name = "lan0"
+# role = "querier"
+# [protocols.export]
+# kernel = "from-peer"
+# import = { static = "from-peer" }
 "#;
 
 /// The whole declarative appliance config.
@@ -392,10 +434,30 @@ pub struct Protocols {
     /// VRRP virtual routers (first-hop redundancy / firewall HA).
     #[serde(default, rename = "vrrp", skip_serializing_if = "Vec::is_empty")]
     pub vrrp: Vec<Vrrp>,
+    /// VRF (Virtual Routing and Forwarding) instances — named isolated tables.
+    #[serde(default, rename = "vrf", skip_serializing_if = "Vec::is_empty")]
+    pub vrfs: Vec<VrfDef>,
+    /// BFD (RFC 5880) global timing / authentication defaults. Compiled to Wren's
+    /// top-level `[bfd]` block; shared by every BFD session a protocol starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bfd: Option<Bfd>,
+    /// Multicast (IGMP/MLD querier + RFC 4605 proxy). Compiled to Wren's
+    /// `[multicast]` block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multicast: Option<Multicast>,
     /// Named route filters (import/export policy), referenced by name from a BGP
     /// neighbour's `import` / `export`. Compiled to Wren's top-level `[[filter]]`.
     #[serde(default, rename = "filter", skip_serializing_if = "Vec::is_empty")]
     pub filters: Vec<Filter>,
+    /// Per-protocol import filters (protocol name → filter name), applied to every
+    /// route that protocol announces before it enters the RIB. Compiled to Wren's
+    /// top-level `[import]` map.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub import: BTreeMap<String, String>,
+    /// Export redistribution filters (per consumer protocol → filter name).
+    /// Compiled to Wren's top-level `[export]` block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export: Option<Export>,
 }
 
 impl Protocols {
@@ -411,24 +473,41 @@ impl Protocols {
             && self.isis.is_none()
             && self.bgp.is_none()
             && self.vrrp.is_empty()
+            && self.vrfs.is_empty()
+            && self.bfd.is_none()
+            && self.multicast.is_none()
             && self.filters.is_empty()
+            && self.import.is_empty()
+            && self.export.is_none()
     }
 }
 
-/// OSPFv2 configuration: a single area whose interfaces run OSPF, with optional
-/// cost / network-type and redistribution. The router-id is the global
-/// `[protocols] router-id`. (Multi-area / stub / NSSA are supported by the Wren
-/// daemon but not yet surfaced here.)
+/// OSPFv2 configuration: the interfaces (with a shared area or per-interface
+/// areas), authentication, timers, area-type (stub/NSSA) and redistribution. The
+/// router-id is the global `[protocols] router-id`. Every field maps 1:1 onto
+/// the Wren daemon's `[ospf]` block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ospf {
     /// Interfaces OSPF runs on (all in [`Ospf::area`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interfaces: Vec<String>,
+    /// Per-interface entries with their own area (an area border router with
+    /// interfaces in several areas). Interfaces in [`Ospf::interfaces`] use
+    /// [`Ospf::area`]; these override the area per interface.
+    #[serde(default, rename = "interface", skip_serializing_if = "Vec::is_empty")]
+    pub interface: Vec<OspfInterface>,
     /// The area these interfaces belong to (dotted quad, e.g. `"0.0.0.0"`).
     /// Defaults to the backbone `0.0.0.0` when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub area: Option<String>,
+    /// This router's priority for DR election on these interfaces (0 = never DR).
+    #[serde(
+        default,
+        rename = "router-priority",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub router_priority: Option<u8>,
     /// The output cost advertised for these interfaces (lower is preferred).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<u16>,
@@ -439,20 +518,145 @@ pub struct Ospf {
         skip_serializing_if = "Option::is_none"
     )]
     pub network_type: Option<String>,
+    /// Interfaces on which OSPF runs passively (subnet advertised, no adjacency).
+    /// Each must also be an OSPF interface.
+    #[serde(
+        default,
+        rename = "passive-interfaces",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub passive_interfaces: Vec<String>,
     /// Route sources redistributed into OSPF as AS-external LSAs (`"static"`,
     /// `"connected"`, `"bgp"`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub redistribute: Vec<String>,
+    /// The external metric advertised for redistributed routes (default 20).
+    #[serde(
+        default,
+        rename = "redistribute-metric",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub redistribute_metric: Option<u32>,
+    /// Stub areas (no AS-external LSAs; an ABR injects a default), by id.
+    #[serde(default, rename = "stub-areas", skip_serializing_if = "Vec::is_empty")]
+    pub stub_areas: Vec<String>,
+    /// The metric an ABR advertises for the default it injects into stub areas.
+    #[serde(
+        default,
+        rename = "stub-default-cost",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stub_default_cost: Option<u32>,
+    /// Not-so-stubby areas (NSSA, RFC 3101), by id.
+    #[serde(default, rename = "nssa-areas", skip_serializing_if = "Vec::is_empty")]
+    pub nssa_areas: Vec<String>,
+    /// Totally-stubby ("no-summary" stub) areas, by id.
+    #[serde(
+        default,
+        rename = "totally-stubby-areas",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub totally_stubby_areas: Vec<String>,
+    /// Totally-NSSA ("no-summary" NSSA) areas, by id.
+    #[serde(
+        default,
+        rename = "totally-nssa-areas",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub totally_nssa_areas: Vec<String>,
+    /// Plain NSSAs into which the ABR additionally injects a type-7 default, by id.
+    #[serde(
+        default,
+        rename = "nssa-default-areas",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub nssa_default_areas: Vec<String>,
+    /// Packet authentication scheme: `"none"`, `"text"` or `"md5"`.
+    #[serde(default, rename = "auth-type", skip_serializing_if = "Option::is_none")]
+    pub auth_type: Option<String>,
+    /// The shared authentication key (cleartext password or MD5 secret).
+    #[serde(default, rename = "auth-key", skip_serializing_if = "Option::is_none")]
+    pub auth_key: Option<String>,
+    /// The MD5 key identifier (`auth-type = "md5"` only). Defaults to 1.
+    #[serde(
+        default,
+        rename = "auth-key-id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub auth_key_id: Option<u8>,
+    /// Enforce RFC 2328 §D.3 anti-replay for `auth-type = "md5"` (default true).
+    #[serde(
+        default,
+        rename = "auth-replay-protection",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub auth_replay_protection: Option<bool>,
+    /// Seconds between Hellos on every OSPF interface (default 10).
+    #[serde(
+        default,
+        rename = "hello-interval",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub hello_interval: Option<u16>,
+    /// Seconds of silence after which a neighbour is declared down (default 40).
+    #[serde(
+        default,
+        rename = "dead-interval",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub dead_interval: Option<u32>,
+    /// Act as a graceful-restart (RFC 3623) restarting router. Defaults to false.
+    #[serde(
+        default,
+        rename = "graceful-restart",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub graceful_restart: bool,
+    /// The grace period (seconds) advertised in the Grace-LSA (default 120).
+    #[serde(
+        default,
+        rename = "graceful-restart-period",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub graceful_restart_period: Option<u32>,
+    /// Run a BFD session to each OSPF neighbour for fast failure detection.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bfd: bool,
+    /// The VRF this OSPF instance runs in (a `[[protocols.vrf]]` name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vrf: Option<String>,
 }
 
-/// OSPFv3 (IPv6) configuration — the IPv6 sibling of [`Ospf`].
+/// One OSPF/OSPFv3 interface placed in a specific area (`[[…ospf.interface]]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OspfInterface {
+    /// The interface name.
+    pub name: String,
+    /// The area it belongs to (dotted quad); defaults to the section `area`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub area: Option<String>,
+}
+
+/// OSPFv3 (IPv6) configuration — the IPv6 sibling of [`Ospf`]. OSPFv3 adds an
+/// Instance ID but has no authentication / stub-area / timer knobs of its own.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ospf3 {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interfaces: Vec<String>,
+    /// Per-interface entries with their own area (reuses [`OspfInterface`]).
+    #[serde(default, rename = "interface", skip_serializing_if = "Vec::is_empty")]
+    pub interface: Vec<OspfInterface>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub area: Option<String>,
+    /// This router's priority for DR election on these interfaces (0 = never DR).
+    #[serde(
+        default,
+        rename = "router-priority",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub router_priority: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<u16>,
     #[serde(
@@ -461,14 +665,34 @@ pub struct Ospf3 {
         skip_serializing_if = "Option::is_none"
     )]
     pub network_type: Option<String>,
+    /// The Instance ID — lets several OSPFv3 instances share one link (default 0).
+    #[serde(
+        default,
+        rename = "instance-id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub instance_id: Option<u8>,
     /// Redistribute sources into OSPFv3 (only `"static"` is honoured by the
     /// daemon's OSPFv3 externals).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub redistribute: Vec<String>,
+    /// The external metric advertised for redistributed routes (default 20).
+    #[serde(
+        default,
+        rename = "redistribute-metric",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub redistribute_metric: Option<u32>,
+    /// Run a BFD session to each Full neighbour for fast failure detection.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bfd: bool,
 }
 
-/// RIP-family configuration shared by RIPv2, RIPng and Babel (they take the same
-/// knobs: which interfaces to run on, and what to redistribute).
+/// RIP-family configuration shared by RIPv2, RIPng and Babel: which interfaces to
+/// run on and what to redistribute. Some knobs only apply to a subset (Wren's
+/// RIPng has no `bfd`/`vrf`; only Babel takes `network`/`router-id`) — the CLI
+/// grammar restricts them accordingly, and emission only writes the fields the
+/// target protocol accepts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rip {
@@ -482,6 +706,20 @@ pub struct Rip {
         skip_serializing_if = "Option::is_none"
     )]
     pub redistribute_metric: Option<u32>,
+    /// Networks originated beyond the connected ones (Babel only), as `addr/len`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub network: Vec<String>,
+    /// The Router-ID (Babel only), a dotted quad; defaults to `[protocols]
+    /// router-id`.
+    #[serde(default, rename = "router-id", skip_serializing_if = "Option::is_none")]
+    pub router_id: Option<String>,
+    /// Run BFD (RFC 5880) to each neighbour (RIP and Babel only).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bfd: bool,
+    /// The VRF this instance runs in, a `[[protocols.vrf]]` name (RIP and Babel
+    /// only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vrf: Option<String>,
 }
 
 /// IS-IS configuration: the interfaces, this router's identity (system-id / area)
@@ -500,6 +738,19 @@ pub struct Isis {
     /// The IS-IS level: `"1"`, `"2"` or `"1-2"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level: Option<String>,
+    /// This router's DIS-election priority (0–127). Defaults to 64.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u8>,
+    /// The metric advertised for each interface's links. Defaults to 10.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metric: Option<u32>,
+    /// HelloInterval in seconds. Defaults to 10.
+    #[serde(
+        default,
+        rename = "hello-interval",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub hello_interval: Option<u64>,
     /// Network type: `"broadcast"` or `"point-to-point"`.
     #[serde(
         default,
@@ -515,6 +766,19 @@ pub struct Isis {
         skip_serializing_if = "Option::is_none"
     )]
     pub redistribute_metric: Option<u32>,
+    /// Leak Level-2 prefixes down into this router's Level-1 area (RFC 5302).
+    #[serde(
+        default,
+        rename = "l2-to-l1-leaking",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub l2_to_l1_leaking: bool,
+    /// Run BFD (RFC 5880) to each neighbour with an up adjacency.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bfd: bool,
+    /// The VRF this IS-IS instance runs in (a `[[protocols.vrf]]` name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vrf: Option<String>,
 }
 
 /// A VRRP virtual router (RFC 5798) — first-hop redundancy / firewall HA: a
@@ -532,6 +796,40 @@ pub struct Vrrp {
     /// This router's priority (higher wins; 255 = address owner). Optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<u8>,
+    /// Advertisement interval in milliseconds (rounded to centiseconds). Optional.
+    #[serde(
+        default,
+        rename = "advert-interval",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub advert_interval: Option<u32>,
+    /// Whether to preempt a lower-priority master. Unset uses the daemon default
+    /// (true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preempt: Option<bool>,
+    /// The prefix length to assign each virtual address with. Unset defaults per
+    /// family at the daemon (24 for IPv4, 64 for IPv6).
+    #[serde(
+        default,
+        rename = "prefix-length",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub prefix_length: Option<u8>,
+    /// Interfaces to track: if any is down, effective priority drops by
+    /// `priority-decrement`, letting a peer with healthy uplinks take over.
+    #[serde(
+        default,
+        rename = "track-interface",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub track_interfaces: Vec<String>,
+    /// How much to subtract from `priority` while a tracked interface is down.
+    #[serde(
+        default,
+        rename = "priority-decrement",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub priority_decrement: Option<u8>,
     /// The virtual IP address(es) the group presents as the gateway.
     #[serde(
         rename = "virtual-address",
@@ -557,6 +855,10 @@ pub struct StaticRoute {
     /// Route metric (lower wins). Optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metric: Option<u32>,
+    /// The VRF this route belongs to (a `[[protocols.vrf]]` name). Unset means the
+    /// default VRF (main table).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vrf: Option<String>,
 }
 
 /// BGP-4 configuration: the local AS, an optional router-id, originated
@@ -647,6 +949,10 @@ pub struct Bgp {
         skip_serializing_if = "std::ops::Not::not"
     )]
     pub ebgp_require_policy: bool,
+    /// The VRF this BGP instance runs in (a `[[protocols.vrf]]` name). Unset runs
+    /// BGP in the default VRF (main table).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vrf: Option<String>,
     /// BGP peers.
     #[serde(default, rename = "neighbor", skip_serializing_if = "Vec::is_empty")]
     pub neighbors: Vec<BgpNeighbor>,
@@ -911,6 +1217,163 @@ pub struct FilterRule {
     pub add_ext_community: Vec<String>,
     /// Whether a matching route is `"accept"`ed or `"reject"`ed.
     pub action: String,
+}
+
+/// BFD (RFC 5880) global timing / authentication defaults (`[protocols.bfd]`).
+/// Shared by every BFD session a protocol starts. Maps onto Wren's `[bfd]`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Bfd {
+    /// Desired Min TX Interval in milliseconds (default 300).
+    #[serde(default, rename = "min-tx", skip_serializing_if = "Option::is_none")]
+    pub min_tx: Option<u32>,
+    /// Required Min RX Interval in milliseconds (default 300).
+    #[serde(default, rename = "min-rx", skip_serializing_if = "Option::is_none")]
+    pub min_rx: Option<u32>,
+    /// Detect Mult — the session fails after this many missed intervals (default 3).
+    #[serde(
+        default,
+        rename = "detect-mult",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub detect_mult: Option<u8>,
+    /// Authentication type: `simple`, `keyed-md5`, `meticulous-md5`, `keyed-sha1`
+    /// or `meticulous-sha1`. Unset runs sessions without authentication.
+    #[serde(default, rename = "auth-type", skip_serializing_if = "Option::is_none")]
+    pub auth_type: Option<String>,
+    /// The authentication key id advertised on the wire (0–255, default 1).
+    #[serde(
+        default,
+        rename = "auth-key-id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub auth_key_id: Option<u8>,
+    /// The shared secret. Required when `auth-type` is set.
+    #[serde(default, rename = "auth-key", skip_serializing_if = "Option::is_none")]
+    pub auth_key: Option<String>,
+    /// Enable the Echo function on every IPv4 session. Defaults to false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub echo: bool,
+    /// The interval between transmitted Echo packets, in milliseconds (default 100).
+    #[serde(
+        default,
+        rename = "echo-interval",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub echo_interval: Option<u32>,
+}
+
+/// Multicast (`[protocols.multicast]`): the IGMP/MLD querier (RFC 3376) and the
+/// RFC 4605 proxy. Maps onto Wren's `[multicast]` block.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Multicast {
+    /// Whether multicast (IGMP/MLD) is enabled.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub enabled: bool,
+    /// Run the IGMP querier/proxy (IPv4). Defaults to true at the daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub igmp: Option<bool>,
+    /// Run the MLDv2 querier/proxy (IPv6). Defaults to false at the daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mld: Option<bool>,
+    /// IGMP version to speak by default (2 or 3). Defaults to 3.
+    #[serde(
+        default,
+        rename = "igmp-version",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub igmp_version: Option<u8>,
+    /// The Robustness Variable (QRV). Defaults to 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub robustness: Option<u8>,
+    /// The Query Interval in seconds. Defaults to 125.
+    #[serde(
+        default,
+        rename = "query-interval",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub query_interval: Option<u32>,
+    /// The Query Response Interval (max response time) in seconds. Defaults to 10.
+    #[serde(
+        default,
+        rename = "query-response-interval",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub query_response_interval: Option<u32>,
+    /// The interfaces multicast runs on, each with a role.
+    #[serde(default, rename = "interface", skip_serializing_if = "Vec::is_empty")]
+    pub interfaces: Vec<MulticastInterface>,
+}
+
+/// One `[[protocols.multicast.interface]]`: an interface and the role it plays.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MulticastInterface {
+    /// The interface name.
+    pub name: String,
+    /// The role: `querier`, `upstream` (proxy upstream) or `downstream` (proxy
+    /// downstream). Defaults to `querier`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// IGMP version for this interface (2 or 3), overriding the section default.
+    #[serde(
+        default,
+        rename = "igmp-version",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub igmp_version: Option<u8>,
+}
+
+/// A VRF instance (`[[protocols.vrf]]`): a named, isolated routing table. Maps
+/// onto Wren's `[[vrf]]` block.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VrfDef {
+    /// The VRF's name, referenced by static routes and per-protocol `vrf` fields.
+    pub name: String,
+    /// The kernel routing table id this VRF programs its routes into.
+    pub table: u32,
+    /// The VRF's Route Distinguisher (RFC 4364, e.g. `"65000:1"`). Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rd: Option<String>,
+    /// Interfaces bound to this VRF.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interfaces: Vec<String>,
+    /// A named route filter applied to routes entering this VRF.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import: Option<String>,
+    /// A named route filter applied to routes leaving this VRF to the kernel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export: Option<String>,
+}
+
+/// Export redistribution filters (`[protocols.export]`): which named filter gates
+/// routes leaving the RIB to each consumer. Maps onto Wren's `[export]`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Export {
+    /// Filter applied to best-path routes before the kernel forwarding table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<String>,
+    /// Filter applied to best-path routes before redistribution into BGP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bgp: Option<String>,
+    /// Filter applied to best-path routes before redistribution into OSPF.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ospf: Option<String>,
+    /// Filter applied to best-path routes before redistribution into RIP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rip: Option<String>,
+    /// Filter applied to best-path routes before redistribution into RIPng.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ripng: Option<String>,
+    /// Filter applied to best-path routes before redistribution into Babel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub babel: Option<String>,
+    /// Filter applied to best-path routes before redistribution into IS-IS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isis: Option<String>,
 }
 
 /// NAT — Network Address Translation. Kept separate from [`Firewall`] because it
@@ -2519,7 +2982,65 @@ impl Appliance {
             .iter()
             .map(|f| f.name.as_str())
             .collect();
+        // The set of declared VRF names — every per-protocol / static `vrf` and a
+        // VRF's own name must resolve here.
+        let vrf_names: HashSet<&str> = self
+            .protocols
+            .vrfs
+            .iter()
+            .map(|v| v.name.as_str())
+            .collect();
+        let check_filter_ref = |name: &str, whose: &str| -> Result<()> {
+            if !filter_names.contains(name) {
+                bail!("protocols {whose} references unknown filter {name:?}");
+            }
+            Ok(())
+        };
+        let check_vrf_ref = |name: &Option<String>, whose: &str| -> Result<()> {
+            if let Some(name) = name {
+                if !vrf_names.contains(name.as_str()) {
+                    bail!("protocols {whose} references unknown vrf {name:?}");
+                }
+            }
+            Ok(())
+        };
+        // Static routes may name a VRF (validated once the VRF set is known).
+        for r in &self.protocols.statics {
+            check_vrf_ref(&r.vrf, &format!("static route {:?}", r.prefix))?;
+        }
+        // VRF definitions: a table id, and import/export naming declared filters.
+        for v in &self.protocols.vrfs {
+            if v.name.is_empty() {
+                bail!("protocols vrf: a vrf needs a name");
+            }
+            if let Some(f) = &v.import {
+                check_filter_ref(f, &format!("vrf {:?} import", v.name))?;
+            }
+            if let Some(f) = &v.export {
+                check_filter_ref(f, &format!("vrf {:?} export", v.name))?;
+            }
+        }
+        // Global export / import redistribution filters must name declared filters.
+        if let Some(export) = &self.protocols.export {
+            for (proto, name) in [
+                ("kernel", &export.kernel),
+                ("bgp", &export.bgp),
+                ("ospf", &export.ospf),
+                ("rip", &export.rip),
+                ("ripng", &export.ripng),
+                ("babel", &export.babel),
+                ("isis", &export.isis),
+            ] {
+                if let Some(name) = name {
+                    check_filter_ref(name, &format!("export {proto}"))?;
+                }
+            }
+        }
+        for (proto, name) in &self.protocols.import {
+            check_filter_ref(name, &format!("import {proto}"))?;
+        }
         if let Some(bgp) = &self.protocols.bgp {
+            check_vrf_ref(&bgp.vrf, "bgp vrf")?;
             if bgp.local_as == 0 {
                 bail!("protocols bgp: local-as must be non-zero");
             }
@@ -2563,13 +3084,72 @@ impl Appliance {
             if let Some(area) = &ospf.area {
                 validate_ipv4(area).with_context(|| "protocols ospf area (dotted quad)")?;
             }
+            for i in &ospf.interface {
+                if let Some(area) = &i.area {
+                    validate_ipv4(area)
+                        .with_context(|| format!("protocols ospf interface {:?} area", i.name))?;
+                }
+            }
+            for (which, areas) in [
+                ("stub-areas", &ospf.stub_areas),
+                ("nssa-areas", &ospf.nssa_areas),
+                ("totally-stubby-areas", &ospf.totally_stubby_areas),
+                ("totally-nssa-areas", &ospf.totally_nssa_areas),
+                ("nssa-default-areas", &ospf.nssa_default_areas),
+            ] {
+                for a in areas {
+                    validate_ipv4(a)
+                        .with_context(|| format!("protocols ospf {which} (dotted quad)"))?;
+                }
+            }
+            if let Some(at) = &ospf.auth_type {
+                if !matches!(at.as_str(), "none" | "text" | "md5") {
+                    bail!(
+                        "protocols ospf auth-type {at:?}: expected \"none\", \"text\" or \"md5\""
+                    );
+                }
+            }
             validate_ospf_network_type(ospf.network_type.as_deref(), "ospf")?;
+            check_vrf_ref(&ospf.vrf, "ospf vrf")?;
         }
         if let Some(o) = &self.protocols.ospf3 {
             if let Some(area) = &o.area {
                 validate_ipv4(area).with_context(|| "protocols ospf3 area (dotted quad)")?;
             }
+            for i in &o.interface {
+                if let Some(area) = &i.area {
+                    validate_ipv4(area)
+                        .with_context(|| format!("protocols ospf3 interface {:?} area", i.name))?;
+                }
+            }
             validate_ospf_network_type(o.network_type.as_deref(), "ospf3")?;
+        }
+        // RIP / RIPng / Babel: VRF references, and the RIPng-only restriction that
+        // it accepts none of the RIP/Babel extras (Wren's Ripng lacks them).
+        if let Some(rip) = &self.protocols.rip {
+            check_vrf_ref(&rip.vrf, "rip vrf")?;
+        }
+        if let Some(ripng) = &self.protocols.ripng {
+            if ripng.bfd
+                || ripng.vrf.is_some()
+                || !ripng.network.is_empty()
+                || ripng.router_id.is_some()
+            {
+                bail!(
+                    "protocols ripng: bfd / vrf / network / router-id are not supported for RIPng"
+                );
+            }
+        }
+        if let Some(babel) = &self.protocols.babel {
+            check_vrf_ref(&babel.vrf, "babel vrf")?;
+            for net in &babel.network {
+                // Babel is dual-stack; accept an IPv4 or IPv6 prefix.
+                route_prefix_family(net)
+                    .with_context(|| format!("protocols babel network {net:?}"))?;
+            }
+            if let Some(rid) = &babel.router_id {
+                validate_ipv4(rid).with_context(|| "protocols babel router-id (dotted quad)")?;
+            }
         }
         if let Some(isis) = &self.protocols.isis {
             if let Some(lvl) = &isis.level {
@@ -2584,6 +3164,7 @@ impl Appliance {
                     );
                 }
             }
+            check_vrf_ref(&isis.vrf, "isis vrf")?;
         }
         for v in &self.protocols.vrrp {
             if v.interface.is_empty() {
@@ -2592,6 +3173,43 @@ impl Appliance {
             for addr in &v.virtual_address {
                 validate_ipv4(addr)
                     .with_context(|| format!("protocols vrrp vrid {} virtual-address", v.vrid))?;
+            }
+        }
+        // BFD global defaults: the authentication type, when set.
+        if let Some(bfd) = &self.protocols.bfd {
+            if let Some(t) = &bfd.auth_type {
+                if !BFD_AUTH_TYPES.contains(&t.as_str()) {
+                    bail!("protocols bfd auth-type {t:?} not one of {BFD_AUTH_TYPES:?}");
+                }
+            }
+        }
+        // Multicast: interface roles and IGMP versions.
+        if let Some(mc) = &self.protocols.multicast {
+            for i in &mc.interfaces {
+                if i.name.is_empty() {
+                    bail!("protocols multicast interface: name must be set");
+                }
+                if let Some(role) = &i.role {
+                    if !MULTICAST_ROLES.contains(&role.as_str()) {
+                        bail!(
+                            "protocols multicast interface {:?}: role {role:?} not one of {MULTICAST_ROLES:?}",
+                            i.name
+                        );
+                    }
+                }
+                if let Some(v) = i.igmp_version {
+                    if v != 2 && v != 3 {
+                        bail!(
+                            "protocols multicast interface {:?}: igmp-version {v} must be 2 or 3",
+                            i.name
+                        );
+                    }
+                }
+            }
+            if let Some(v) = mc.igmp_version {
+                if v != 2 && v != 3 {
+                    bail!("protocols multicast igmp-version {v} must be 2 or 3");
+                }
             }
         }
 
@@ -3065,6 +3683,9 @@ pub(crate) fn validate_iface_name(name: &str) -> Result<()> {
 
 /// The BGP Roles a speaker may take toward a neighbour (RFC 9234).
 const BGP_ROLES: &[&str] = &["provider", "customer", "peer", "rs-server", "rs-client"];
+
+/// The multicast interface roles Wren accepts (its `MulticastRole`, lowercase).
+const MULTICAST_ROLES: &[&str] = &["querier", "upstream", "downstream"];
 
 /// The per-neighbour BFD authentication types Wren accepts.
 const BFD_AUTH_TYPES: &[&str] = &[
@@ -4481,5 +5102,109 @@ name = "to-peer"
         // A filter rule with a non-accept/reject action is rejected.
         let bad_action = "[system]\nhostname = \"r1\"\n[protocols]\n[[protocols.filter]]\nname = \"f\"\n[[protocols.filter.rule]]\naction = \"drop\"\n";
         assert!(Appliance::from_toml(bad_action).is_err());
+    }
+
+    #[test]
+    fn protocols_igp_full_surface_parses_validates_and_round_trips() {
+        let toml = r#"
+[system]
+hostname = "r1"
+[protocols]
+router-id = "10.0.0.1"
+import = { static = "f1" }
+[[protocols.filter]]
+name = "f1"
+default = "accept"
+[[protocols.vrf]]
+name = "blue"
+table = 100
+interfaces = ["eth3"]
+import = "f1"
+[[protocols.static]]
+prefix = "10.9.0.0/24"
+via = "10.0.0.2"
+vrf = "blue"
+[protocols.export]
+kernel = "f1"
+[protocols.ospf]
+interfaces = ["eth0"]
+router-priority = 5
+auth-type = "md5"
+hello-interval = 5
+graceful-restart = true
+bfd = true
+vrf = "blue"
+[[protocols.ospf.interface]]
+name = "eth1"
+area = "0.0.0.1"
+[protocols.ospf3]
+interfaces = ["eth0"]
+instance-id = 2
+[protocols.babel]
+interfaces = ["eth0"]
+network = ["2001:db8::/64"]
+bfd = true
+vrf = "blue"
+[protocols.bfd]
+min-tx = 250
+auth-type = "meticulous-sha1"
+echo = true
+[protocols.multicast]
+enabled = true
+[[protocols.multicast.interface]]
+name = "wan0"
+role = "upstream"
+[[protocols.vrrp]]
+name = "v1"
+interface = "eth0"
+vrid = 10
+advert-interval = 500
+preempt = false
+track-interface = ["eth1"]
+priority-decrement = 30
+virtual-address = ["10.0.0.254"]
+"#;
+        let a = Appliance::from_toml(toml).expect("parses + validates");
+        let p = &a.protocols;
+        assert_eq!(
+            p.ospf.as_ref().unwrap().interface[0].area.as_deref(),
+            Some("0.0.0.1")
+        );
+        assert_eq!(p.ospf3.as_ref().unwrap().instance_id, Some(2));
+        assert_eq!(p.vrfs[0].table, 100);
+        assert_eq!(
+            p.multicast.as_ref().unwrap().interfaces[0].role.as_deref(),
+            Some("upstream")
+        );
+        assert_eq!(p.vrrp[0].preempt, Some(false));
+        // Round-trips through its own serialization.
+        let a2 = Appliance::from_toml(&a.to_toml().unwrap()).expect("re-parses");
+        assert_eq!(a2.protocols.bfd.as_ref().unwrap().min_tx, Some(250));
+    }
+
+    #[test]
+    fn protocols_new_validation_rejects_bad_values() {
+        let base = "[system]\nhostname = \"r1\"\n[protocols]\n";
+        // RIPng rejects the RIP/Babel-only extras.
+        assert!(Appliance::from_toml(&format!("{base}[protocols.ripng]\nbfd = true\n")).is_err());
+        // An unknown VRF reference is rejected.
+        assert!(
+            Appliance::from_toml(&format!("{base}[protocols.ospf]\nvrf = \"nope\"\n")).is_err()
+        );
+        // A bad multicast role is rejected.
+        assert!(Appliance::from_toml(&format!(
+            "{base}[protocols.multicast]\nenabled = true\n[[protocols.multicast.interface]]\nname = \"lan0\"\nrole = \"bogus\"\n"
+        ))
+        .is_err());
+        // A bad OSPF auth-type is rejected.
+        assert!(
+            Appliance::from_toml(&format!("{base}[protocols.ospf]\nauth-type = \"sha256\"\n"))
+                .is_err()
+        );
+        // An export referencing an undeclared filter is rejected.
+        assert!(
+            Appliance::from_toml(&format!("{base}[protocols.export]\nkernel = \"nope\"\n"))
+                .is_err()
+        );
     }
 }
