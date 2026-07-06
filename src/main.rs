@@ -424,14 +424,14 @@ fn apply_boot(
 
     system::set_hostname(&appliance.system.hostname)?;
     // Re-assert interface addressing from the saved config (networkd units) +
-    // the co-services, so a reboot restores the live IPs the same way it restores
-    // the hostname. This runs BEFORE networkd, so it only renders/units-and-
-    // restarts — the link-dependent runtime state (tc qdiscs, Multi-WAN routes,
-    // IPsec SAs) is deferred to `apply-boot-late`, which runs after networkd has
-    // brought the links up (running it here would no-op against links that don't
-    // exist yet, and would poison the change-detect stamps so the late pass skips
-    // them too).
-    net::apply_persistent(&appliance)?;
+    // the co-service drop-ins, so a reboot restores the live config the same way
+    // it restores the hostname. `ApplyMode::Boot` = render ONLY: this runs BEFORE
+    // networkd, so it must not touch a single unit (networkd reads the units on
+    // its own start; a `networkctl`/`systemctl restart` here would deadlock the
+    // boot). The link-dependent runtime state (tc qdiscs, Multi-WAN routes, IPsec
+    // SAs) — which a file can't express — is deferred to `apply-boot-late`, run
+    // after networkd has brought the links up.
+    net::apply_persistent(&appliance, net::ApplyMode::Boot)?;
     Ok(())
 }
 
