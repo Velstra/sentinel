@@ -13,10 +13,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::config::{
-    Action, Appliance, Bgp, BgpNeighbor, DhcpServer, Dns, Firewall, Groups, HealthCheck, IfaceType,
-    Interface, IpsecConnection, Isis, MultiWan, Nat, NatDestination, NatSource, Ntp, Ospf, Ospf3,
-    PortSpec, Pppoe, Proto, Protocols, Qos, QosDiscipline, Rip, RouterAdvert, Rule, Services,
-    StaticRoute, System, Vpn, Vrrp, WanMode, WanUplink, WgPeer, ZoneCfg,
+    Action, Appliance, Bgp, BgpAggregate, BgpNeighbor, BgpRoa, BgpRtr, DhcpServer, Dns, Filter,
+    FilterRule, Firewall, Groups, HealthCheck, IfaceType, Interface, IpsecConnection, Isis,
+    MultiWan, Nat, NatDestination, NatSource, Ntp, Ospf, Ospf3, PortSpec, Pppoe, Proto, Protocols,
+    Qos, QosDiscipline, Rip, RouterAdvert, Rule, Services, StaticRoute, System, Vpn, Vrrp, WanMode,
+    WanUplink, WgPeer, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -213,15 +214,79 @@ struct StaticDraft {
     metric: Option<u32>,
 }
 
-/// The candidate's BGP configuration.
+/// The candidate's BGP configuration — the full surface Wren's `[bgp]` accepts.
 #[derive(Debug, Clone, Default)]
 struct BgpDraft {
     local_as: Option<u32>,
     router_id: Option<String>,
+    hold_time: Option<u16>,
     network: Vec<String>,
     redistribute: Vec<String>,
-    /// Peers, keyed by address → remote AS.
-    neighbors: Vec<(String, u32)>,
+    cluster_id: Option<String>,
+    confederation_id: Option<u32>,
+    confederation_members: Vec<u32>,
+    community: Vec<String>,
+    large_community: Vec<String>,
+    ext_community: Vec<String>,
+    multipath: Option<usize>,
+    rpki_reject_invalid: bool,
+    ebgp_require_policy: bool,
+    /// The RTR validating cache (`server`, `refresh`), if set.
+    rtr: RtrDraft,
+    /// Address aggregates, keyed by prefix.
+    aggregate: Vec<(String, bool)>,
+    /// Static RPKI ROAs, keyed by prefix.
+    roa: Vec<(String, RoaDraft)>,
+    /// Peers, keyed by address.
+    neighbors: Vec<(String, NeighborDraft)>,
+}
+
+/// The RTR validating cache draft (`[protocols.bgp.rtr]`).
+#[derive(Debug, Clone, Default)]
+struct RtrDraft {
+    server: Option<String>,
+    refresh: Option<u32>,
+}
+
+impl RtrDraft {
+    fn is_empty(&self) -> bool {
+        self.server.is_none() && self.refresh.is_none()
+    }
+}
+
+/// One static ROA's non-key fields (keyed by prefix in [`BgpDraft::roa`]).
+#[derive(Debug, Clone, Default)]
+struct RoaDraft {
+    max_length: Option<u8>,
+    origin_as: Option<u32>,
+}
+
+/// A partially-specified BGP neighbor (keyed by its address). Boolean flags
+/// default off; `remote-as` is required to materialize.
+#[derive(Debug, Clone, Default)]
+struct NeighborDraft {
+    remote_as: Option<u32>,
+    passive: bool,
+    route_reflector_client: bool,
+    ttl_security: Option<u8>,
+    password: Option<String>,
+    ao_key: Option<String>,
+    ao_key_id: Option<u8>,
+    max_prefix: Option<u32>,
+    default_originate: bool,
+    add_path: bool,
+    extended_nexthop: bool,
+    evpn: bool,
+    flowspec: bool,
+    srpolicy: bool,
+    link_state: bool,
+    import: Option<String>,
+    export: Option<String>,
+    role: Option<String>,
+    bfd: bool,
+    bfd_auth_type: Option<String>,
+    bfd_auth_key_id: Option<u8>,
+    bfd_auth_key: Option<String>,
 }
 
 impl BgpDraft {
@@ -229,9 +294,63 @@ impl BgpDraft {
     fn is_empty(&self) -> bool {
         self.local_as.is_none()
             && self.router_id.is_none()
+            && self.hold_time.is_none()
             && self.network.is_empty()
             && self.redistribute.is_empty()
+            && self.cluster_id.is_none()
+            && self.confederation_id.is_none()
+            && self.confederation_members.is_empty()
+            && self.community.is_empty()
+            && self.large_community.is_empty()
+            && self.ext_community.is_empty()
+            && self.multipath.is_none()
+            && !self.rpki_reject_invalid
+            && !self.ebgp_require_policy
+            && self.rtr.is_empty()
+            && self.aggregate.is_empty()
+            && self.roa.is_empty()
             && self.neighbors.is_empty()
+    }
+}
+
+/// A partially-specified route filter (keyed by name in [`Draft::filters`]).
+#[derive(Debug, Clone, Default)]
+struct FilterDraft {
+    default: Option<String>,
+    /// Rules keyed by an integer index, kept sorted by that index.
+    rules: Vec<(u32, FilterRuleDraft)>,
+}
+
+/// One filter rule's fields (keyed by an integer index in [`FilterDraft::rules`]).
+#[derive(Debug, Clone, Default)]
+struct FilterRuleDraft {
+    prefix: Vec<String>,
+    protocol: Option<String>,
+    metric_le: Option<u32>,
+    metric_ge: Option<u32>,
+    set_metric: Option<u32>,
+    add_metric: Option<i64>,
+    set_preference: Option<u32>,
+    set_community: Vec<String>,
+    add_community: Vec<String>,
+    set_large_community: Vec<String>,
+    add_large_community: Vec<String>,
+    set_ext_community: Vec<String>,
+    add_ext_community: Vec<String>,
+    action: Option<String>,
+}
+
+impl FilterDraft {
+    /// Mutable access to the rule at index `idx`, inserting it (kept sorted by
+    /// index) if new.
+    fn rule_mut(&mut self, idx: u32) -> &mut FilterRuleDraft {
+        if let Some(i) = self.rules.iter().position(|(n, _)| *n == idx) {
+            return &mut self.rules[i].1;
+        }
+        self.rules.push((idx, FilterRuleDraft::default()));
+        self.rules.sort_by_key(|(n, _)| *n);
+        let i = self.rules.iter().position(|(n, _)| *n == idx).unwrap();
+        &mut self.rules[i].1
     }
 }
 
@@ -279,6 +398,232 @@ fn rip_to_draft(r: &Rip) -> RipDraft {
         redistribute: r.redistribute.clone(),
         redistribute_metric: r.redistribute_metric,
     }
+}
+
+/// Build a [`BgpDraft`] from a saved `[protocols.bgp]` section.
+fn bgp_to_draft(b: &Bgp) -> BgpDraft {
+    BgpDraft {
+        local_as: Some(b.local_as),
+        router_id: b.router_id.clone(),
+        hold_time: b.hold_time,
+        network: b.network.clone(),
+        redistribute: b.redistribute.clone(),
+        cluster_id: b.cluster_id.clone(),
+        confederation_id: b.confederation_id,
+        confederation_members: b.confederation_members.clone(),
+        community: b.community.clone(),
+        large_community: b.large_community.clone(),
+        ext_community: b.ext_community.clone(),
+        multipath: b.multipath,
+        rpki_reject_invalid: b.rpki_reject_invalid,
+        ebgp_require_policy: b.ebgp_require_policy,
+        rtr: b.rtr.as_ref().map_or_else(RtrDraft::default, |r| RtrDraft {
+            server: Some(r.server.clone()),
+            refresh: r.refresh,
+        }),
+        aggregate: b
+            .aggregate
+            .iter()
+            .map(|a| (a.prefix.clone(), a.summary_only))
+            .collect(),
+        roa: b
+            .roa
+            .iter()
+            .map(|r| {
+                (
+                    r.prefix.clone(),
+                    RoaDraft {
+                        max_length: r.max_length,
+                        origin_as: Some(r.origin_as),
+                    },
+                )
+            })
+            .collect(),
+        neighbors: b
+            .neighbors
+            .iter()
+            .map(|n| (n.address.clone(), neighbor_to_draft(n)))
+            .collect(),
+    }
+}
+
+/// Build a [`NeighborDraft`] from a saved BGP neighbour.
+fn neighbor_to_draft(n: &BgpNeighbor) -> NeighborDraft {
+    NeighborDraft {
+        remote_as: Some(n.remote_as),
+        passive: n.passive,
+        route_reflector_client: n.route_reflector_client,
+        ttl_security: n.ttl_security,
+        password: n.password.clone(),
+        ao_key: n.ao_key.clone(),
+        ao_key_id: n.ao_key_id,
+        max_prefix: n.max_prefix,
+        default_originate: n.default_originate,
+        add_path: n.add_path,
+        extended_nexthop: n.extended_nexthop,
+        evpn: n.evpn,
+        flowspec: n.flowspec,
+        srpolicy: n.srpolicy,
+        link_state: n.link_state,
+        import: n.import.clone(),
+        export: n.export.clone(),
+        role: n.role.clone(),
+        bfd: n.bfd,
+        bfd_auth_type: n.bfd_auth_type.clone(),
+        bfd_auth_key_id: n.bfd_auth_key_id,
+        bfd_auth_key: n.bfd_auth_key.clone(),
+    }
+}
+
+/// Build a [`FilterDraft`] from a saved `[[protocols.filter]]`. Rules take their
+/// 1-based position as their (stable, sorted) index.
+fn filter_to_draft(f: &Filter) -> FilterDraft {
+    FilterDraft {
+        default: f.default.clone(),
+        rules: f
+            .rules
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                (
+                    (i + 1) as u32,
+                    FilterRuleDraft {
+                        prefix: r.prefix.clone(),
+                        protocol: r.protocol.clone(),
+                        metric_le: r.metric_le,
+                        metric_ge: r.metric_ge,
+                        set_metric: r.set_metric,
+                        add_metric: r.add_metric,
+                        set_preference: r.set_preference,
+                        set_community: r.set_community.clone().unwrap_or_default(),
+                        add_community: r.add_community.clone(),
+                        set_large_community: r.set_large_community.clone().unwrap_or_default(),
+                        add_large_community: r.add_large_community.clone(),
+                        set_ext_community: r.set_ext_community.clone().unwrap_or_default(),
+                        add_ext_community: r.add_ext_community.clone(),
+                        action: Some(r.action.clone()),
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
+/// Materialize a [`BgpDraft`] into a validated [`Bgp`]. `local-as` is required.
+fn bgp_from_draft(d: &BgpDraft) -> Result<Bgp> {
+    Ok(Bgp {
+        local_as: d
+            .local_as
+            .ok_or_else(|| anyhow::anyhow!("protocols bgp: local-as not set"))?,
+        router_id: d.router_id.clone(),
+        hold_time: d.hold_time,
+        network: d.network.clone(),
+        redistribute: d.redistribute.clone(),
+        cluster_id: d.cluster_id.clone(),
+        confederation_id: d.confederation_id,
+        confederation_members: d.confederation_members.clone(),
+        community: d.community.clone(),
+        large_community: d.large_community.clone(),
+        ext_community: d.ext_community.clone(),
+        multipath: d.multipath,
+        aggregate: d
+            .aggregate
+            .iter()
+            .map(|(prefix, summary_only)| BgpAggregate {
+                prefix: prefix.clone(),
+                summary_only: *summary_only,
+            })
+            .collect(),
+        roa: d
+            .roa
+            .iter()
+            .map(|(prefix, r)| {
+                Ok(BgpRoa {
+                    prefix: prefix.clone(),
+                    max_length: r.max_length,
+                    origin_as: r.origin_as.ok_or_else(|| {
+                        anyhow::anyhow!("protocols bgp roa {prefix:?}: origin-as not set")
+                    })?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+        rtr: d.rtr.server.as_ref().map(|server| BgpRtr {
+            server: server.clone(),
+            refresh: d.rtr.refresh,
+        }),
+        rpki_reject_invalid: d.rpki_reject_invalid,
+        ebgp_require_policy: d.ebgp_require_policy,
+        neighbors: d
+            .neighbors
+            .iter()
+            .map(|(address, n)| neighbor_from_draft(address, n))
+            .collect::<Result<Vec<_>>>()?,
+    })
+}
+
+/// Materialize a [`NeighborDraft`] into a [`BgpNeighbor`]. `remote-as` is
+/// required.
+fn neighbor_from_draft(address: &str, n: &NeighborDraft) -> Result<BgpNeighbor> {
+    Ok(BgpNeighbor {
+        address: address.to_string(),
+        remote_as: n.remote_as.ok_or_else(|| {
+            anyhow::anyhow!("protocols bgp neighbor {address:?}: remote-as not set")
+        })?,
+        passive: n.passive,
+        route_reflector_client: n.route_reflector_client,
+        ttl_security: n.ttl_security,
+        password: n.password.clone(),
+        ao_key: n.ao_key.clone(),
+        ao_key_id: n.ao_key_id,
+        max_prefix: n.max_prefix,
+        default_originate: n.default_originate,
+        add_path: n.add_path,
+        extended_nexthop: n.extended_nexthop,
+        evpn: n.evpn,
+        flowspec: n.flowspec,
+        srpolicy: n.srpolicy,
+        link_state: n.link_state,
+        import: n.import.clone(),
+        export: n.export.clone(),
+        role: n.role.clone(),
+        bfd: n.bfd,
+        bfd_auth_type: n.bfd_auth_type.clone(),
+        bfd_auth_key_id: n.bfd_auth_key_id,
+        bfd_auth_key: n.bfd_auth_key.clone(),
+    })
+}
+
+/// Materialize a [`FilterDraft`] into a [`Filter`]. Every rule needs an `action`.
+fn filter_from_draft(name: &str, d: &FilterDraft) -> Result<Filter> {
+    let some_if = |v: &[String]| (!v.is_empty()).then(|| v.to_vec());
+    Ok(Filter {
+        name: name.to_string(),
+        default: d.default.clone(),
+        rules: d
+            .rules
+            .iter()
+            .map(|(idx, r)| {
+                Ok(FilterRule {
+                    prefix: r.prefix.clone(),
+                    protocol: r.protocol.clone(),
+                    metric_le: r.metric_le,
+                    metric_ge: r.metric_ge,
+                    set_metric: r.set_metric,
+                    add_metric: r.add_metric,
+                    set_preference: r.set_preference,
+                    set_community: some_if(&r.set_community),
+                    add_community: r.add_community.clone(),
+                    set_large_community: some_if(&r.set_large_community),
+                    add_large_community: r.add_large_community.clone(),
+                    set_ext_community: some_if(&r.set_ext_community),
+                    add_ext_community: r.add_ext_community.clone(),
+                    action: r.action.clone().ok_or_else(|| {
+                        anyhow::anyhow!("protocols filter {name:?} rule {idx}: action not set")
+                    })?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+    })
 }
 
 /// An IS-IS draft.
@@ -338,6 +683,8 @@ struct Draft {
     isis: IsisDraft,
     bgp: BgpDraft,
     vrrp: Vec<(String, VrrpDraft)>,
+    /// Named route filters (import/export policy), keyed by name.
+    filters: Vec<(String, FilterDraft)>,
     dns: DnsDraft,
     ntp: NtpDraft,
     /// Multi-WAN (roadmap C6): failover/load-balance mode + the uplinks, keyed by
@@ -413,13 +760,44 @@ impl Draft {
         &mut self.statics.last_mut().unwrap().1
     }
 
-    /// Set the remote AS of the BGP peer `addr`, inserting it if new.
-    fn bgp_neighbor_set(&mut self, addr: &str, remote_as: u32) {
+    /// Mutable access to the BGP peer `addr`, inserting it if new.
+    fn bgp_neighbor_mut(&mut self, addr: &str) -> &mut NeighborDraft {
         if let Some(i) = self.bgp.neighbors.iter().position(|(a, _)| a == addr) {
-            self.bgp.neighbors[i].1 = remote_as;
-        } else {
-            self.bgp.neighbors.push((addr.to_string(), remote_as));
+            return &mut self.bgp.neighbors[i].1;
         }
+        self.bgp
+            .neighbors
+            .push((addr.to_string(), NeighborDraft::default()));
+        &mut self.bgp.neighbors.last_mut().unwrap().1
+    }
+
+    /// Mutable access to the `summary-only` flag of the BGP aggregate `prefix`,
+    /// inserting the aggregate if new.
+    fn bgp_aggregate_mut(&mut self, prefix: &str) -> &mut bool {
+        if let Some(i) = self.bgp.aggregate.iter().position(|(p, _)| p == prefix) {
+            return &mut self.bgp.aggregate[i].1;
+        }
+        self.bgp.aggregate.push((prefix.to_string(), false));
+        &mut self.bgp.aggregate.last_mut().unwrap().1
+    }
+
+    /// Mutable access to the static ROA keyed by `prefix`, inserting it if new.
+    fn bgp_roa_mut(&mut self, prefix: &str) -> &mut RoaDraft {
+        if let Some(i) = self.bgp.roa.iter().position(|(p, _)| p == prefix) {
+            return &mut self.bgp.roa[i].1;
+        }
+        self.bgp.roa.push((prefix.to_string(), RoaDraft::default()));
+        &mut self.bgp.roa.last_mut().unwrap().1
+    }
+
+    /// Mutable access to the route filter `name`, inserting it if new.
+    fn filter_mut(&mut self, name: &str) -> &mut FilterDraft {
+        if let Some(i) = self.filters.iter().position(|(n, _)| n == name) {
+            return &mut self.filters[i].1;
+        }
+        self.filters
+            .push((name.to_string(), FilterDraft::default()));
+        &mut self.filters.last_mut().unwrap().1
     }
 
     /// The RIP-family draft (`rip` / `ripng` / `babel`) named by `proto`.
@@ -745,18 +1123,14 @@ impl Draft {
                 .protocols
                 .bgp
                 .as_ref()
-                .map(|b| BgpDraft {
-                    local_as: Some(b.local_as),
-                    router_id: b.router_id.clone(),
-                    network: b.network.clone(),
-                    redistribute: b.redistribute.clone(),
-                    neighbors: b
-                        .neighbors
-                        .iter()
-                        .map(|n| (n.address.clone(), n.remote_as))
-                        .collect(),
-                })
+                .map(bgp_to_draft)
                 .unwrap_or_default(),
+            filters: a
+                .protocols
+                .filters
+                .iter()
+                .map(|f| (f.name.clone(), filter_to_draft(f)))
+                .collect(),
             dns: DnsDraft {
                 upstream: a.services.dns.upstream.clone(),
                 serve_on: a.services.dns.serve_on.clone(),
@@ -1407,6 +1781,21 @@ impl Session {
             ["protocols", "bgp", "router-id", v] => {
                 self.draft.bgp.router_id = Some((*v).to_string());
             }
+            ["protocols", "bgp", "hold-time", v] => {
+                self.draft.bgp.hold_time = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid hold-time {v:?}"))?,
+                );
+            }
+            ["protocols", "bgp", "cluster-id", v] => {
+                self.draft.bgp.cluster_id = Some((*v).to_string());
+            }
+            ["protocols", "bgp", "multipath", v] => {
+                self.draft.bgp.multipath = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid multipath {v:?}"))?,
+                );
+            }
             ["protocols", "bgp", "network", v] => {
                 let net = (*v).to_string();
                 if !self.draft.bgp.network.contains(&net) {
@@ -1419,9 +1808,76 @@ impl Session {
                     self.draft.bgp.redistribute.push(src);
                 }
             }
-            ["protocols", "bgp", "neighbor", addr, "remote-as", v] => {
-                let remote_as = v.parse().with_context(|| format!("invalid AS {v:?}"))?;
-                self.draft.bgp_neighbor_set(addr, remote_as);
+            ["protocols", "bgp", "community", v] => {
+                let c = (*v).to_string();
+                if !self.draft.bgp.community.contains(&c) {
+                    self.draft.bgp.community.push(c);
+                }
+            }
+            ["protocols", "bgp", "large-community", v] => {
+                let c = (*v).to_string();
+                if !self.draft.bgp.large_community.contains(&c) {
+                    self.draft.bgp.large_community.push(c);
+                }
+            }
+            ["protocols", "bgp", "ext-community", v] => {
+                let c = (*v).to_string();
+                if !self.draft.bgp.ext_community.contains(&c) {
+                    self.draft.bgp.ext_community.push(c);
+                }
+            }
+            ["protocols", "bgp", "ebgp-require-policy", v] => {
+                self.draft.bgp.ebgp_require_policy = parse_bool(v)?;
+            }
+            ["protocols", "bgp", "confederation", "id", v] => {
+                self.draft.bgp.confederation_id =
+                    Some(v.parse().with_context(|| format!("invalid AS {v:?}"))?);
+            }
+            ["protocols", "bgp", "confederation", "member", v] => {
+                let asn = v.parse().with_context(|| format!("invalid AS {v:?}"))?;
+                if !self.draft.bgp.confederation_members.contains(&asn) {
+                    self.draft.bgp.confederation_members.push(asn);
+                }
+            }
+            ["protocols", "bgp", "rpki", "reject-invalid", v] => {
+                self.draft.bgp.rpki_reject_invalid = parse_bool(v)?;
+            }
+            ["protocols", "bgp", "rpki", "rtr", v] => {
+                self.draft.bgp.rtr.server = Some((*v).to_string());
+            }
+            ["protocols", "bgp", "rpki", "rtr-refresh", v] => {
+                self.draft.bgp.rtr.refresh = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid refresh {v:?}"))?,
+                );
+            }
+            ["protocols", "bgp", "aggregate", prefix] => {
+                self.draft.bgp_aggregate_mut(prefix);
+            }
+            ["protocols", "bgp", "aggregate", prefix, "summary-only", v] => {
+                *self.draft.bgp_aggregate_mut(prefix) = parse_bool(v)?;
+            }
+            ["protocols", "bgp", "roa", prefix, "origin-as", v] => {
+                self.draft.bgp_roa_mut(prefix).origin_as =
+                    Some(v.parse().with_context(|| format!("invalid AS {v:?}"))?);
+            }
+            ["protocols", "bgp", "roa", prefix, "max-length", v] => {
+                self.draft.bgp_roa_mut(prefix).max_length = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid max-length {v:?}"))?,
+                );
+            }
+            ["protocols", "bgp", "neighbor", addr, field, v] => {
+                self.set_neighbor_field(addr, field, v)?;
+            }
+            ["protocols", "filter", name, "default", v] => {
+                self.draft.filter_mut(name).default = Some((*v).to_string());
+            }
+            ["protocols", "filter", name, "rule", n, field, v] => {
+                let idx = n
+                    .parse()
+                    .with_context(|| format!("invalid rule index {n:?}"))?;
+                self.set_filter_rule_field(name, idx, field, v)?;
             }
             ["protocols", "ospf", "interface", v] => {
                 let iface = (*v).to_string();
@@ -1681,8 +2137,12 @@ impl Session {
                  set nat destination <name> <zone <z> | proto <p> | port <n> | to <ip[:port]>>\n  \
                  set protocols router-id <ip>\n  \
                  set protocols static <prefix> <via <ip> | dev <if> | metric <n>>\n  \
-                 set protocols bgp <local-as <n> | router-id <ip> | network <prefix> | redistribute <src>>\n  \
-                 set protocols bgp neighbor <ip> remote-as <n>\n  \
+                 set protocols bgp <local-as <n> | router-id <ip> | hold-time <n> | network <prefix> | redistribute <src> | community <c> | multipath <n>>\n  \
+                 set protocols bgp <confederation id <n> | confederation member <n> | rpki reject-invalid <bool> | rpki rtr <host:port> | ebgp-require-policy <bool>>\n  \
+                 set protocols bgp aggregate <prefix> summary-only <bool>\n  \
+                 set protocols bgp neighbor <ip> <remote-as <n> | passive <bool> | route-reflector-client <bool> | password <k> | ttl-security <n> | max-prefix <n> | role <r> | import <f> | export <f> | bfd <bool> | ...>\n  \
+                 set protocols filter <name> default <accept|reject>\n  \
+                 set protocols filter <name> rule <n> <prefix <p> | protocol <p> | metric-le <n> | set-metric <n> | set-community <c> | action <accept|reject> | ...>\n  \
                  set protocols ospf <interface <if> | area <id> | cost <n> | network-type <broadcast|point-to-point> | redistribute <src>>\n  \
                  set protocols ospf3 <interface <if> | area <id> | cost <n> | network-type <..> | redistribute <src>>\n  \
                  set protocols <rip|ripng|babel> <interface <if> | redistribute <src> | redistribute-metric <n>>\n  \
@@ -1709,6 +2169,150 @@ impl Session {
             "network-type" => o.network_type = None,
             "redistribute" => o.redistribute.clear(),
             other => bail!("ospf has no field {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Clear one field of a BGP neighbour draft (boolean flags revert to off).
+    fn del_neighbor_field(n: &mut NeighborDraft, field: &str) -> Result<()> {
+        match field {
+            "remote-as" => n.remote_as = None,
+            "passive" => n.passive = false,
+            "route-reflector-client" => n.route_reflector_client = false,
+            "ttl-security" => n.ttl_security = None,
+            "password" => n.password = None,
+            "ao-key" => n.ao_key = None,
+            "ao-key-id" => n.ao_key_id = None,
+            "max-prefix" => n.max_prefix = None,
+            "default-originate" => n.default_originate = false,
+            "add-path" => n.add_path = false,
+            "extended-nexthop" => n.extended_nexthop = false,
+            "evpn" => n.evpn = false,
+            "flowspec" => n.flowspec = false,
+            "srpolicy" => n.srpolicy = false,
+            "link-state" => n.link_state = false,
+            "import" => n.import = None,
+            "export" => n.export = None,
+            "role" => n.role = None,
+            "bfd" => n.bfd = false,
+            "bfd-auth-type" => n.bfd_auth_type = None,
+            "bfd-auth-key-id" => n.bfd_auth_key_id = None,
+            "bfd-auth-key" => n.bfd_auth_key = None,
+            other => bail!("bgp neighbor has no field {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Clear one field of a filter rule draft.
+    fn del_filter_rule_field(r: &mut FilterRuleDraft, field: &str) -> Result<()> {
+        match field {
+            "prefix" => r.prefix.clear(),
+            "protocol" => r.protocol = None,
+            "metric-le" => r.metric_le = None,
+            "metric-ge" => r.metric_ge = None,
+            "set-metric" => r.set_metric = None,
+            "add-metric" => r.add_metric = None,
+            "set-preference" => r.set_preference = None,
+            "set-community" => r.set_community.clear(),
+            "add-community" => r.add_community.clear(),
+            "set-large-community" => r.set_large_community.clear(),
+            "add-large-community" => r.add_large_community.clear(),
+            "set-ext-community" => r.set_ext_community.clear(),
+            "add-ext-community" => r.add_ext_community.clear(),
+            "action" => r.action = None,
+            other => bail!("filter rule has no field {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Set one field of the BGP neighbour `addr` (inserting the neighbour if new).
+    fn set_neighbor_field(&mut self, addr: &str, field: &str, v: &str) -> Result<()> {
+        let n = self.draft.bgp_neighbor_mut(addr);
+        match field {
+            "remote-as" => {
+                n.remote_as = Some(v.parse().with_context(|| format!("invalid AS {v:?}"))?)
+            }
+            "passive" => n.passive = parse_bool(v)?,
+            "route-reflector-client" => n.route_reflector_client = parse_bool(v)?,
+            "ttl-security" => {
+                n.ttl_security = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid ttl-security {v:?}"))?,
+                )
+            }
+            "password" => n.password = Some(v.to_string()),
+            "ao-key" => n.ao_key = Some(v.to_string()),
+            "ao-key-id" => {
+                n.ao_key_id = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid ao-key-id {v:?}"))?,
+                )
+            }
+            "max-prefix" => {
+                n.max_prefix = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid max-prefix {v:?}"))?,
+                )
+            }
+            "default-originate" => n.default_originate = parse_bool(v)?,
+            "add-path" => n.add_path = parse_bool(v)?,
+            "extended-nexthop" => n.extended_nexthop = parse_bool(v)?,
+            "evpn" => n.evpn = parse_bool(v)?,
+            "flowspec" => n.flowspec = parse_bool(v)?,
+            "srpolicy" => n.srpolicy = parse_bool(v)?,
+            "link-state" => n.link_state = parse_bool(v)?,
+            "import" => n.import = Some(v.to_string()),
+            "export" => n.export = Some(v.to_string()),
+            "role" => n.role = Some(v.to_string()),
+            "bfd" => n.bfd = parse_bool(v)?,
+            "bfd-auth-type" => n.bfd_auth_type = Some(v.to_string()),
+            "bfd-auth-key-id" => {
+                n.bfd_auth_key_id =
+                    Some(v.parse().with_context(|| format!("invalid key-id {v:?}"))?)
+            }
+            "bfd-auth-key" => n.bfd_auth_key = Some(v.to_string()),
+            other => bail!("bgp neighbor has no field {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Set one field of the rule `idx` of filter `name` (inserting either if new).
+    fn set_filter_rule_field(&mut self, name: &str, idx: u32, field: &str, v: &str) -> Result<()> {
+        let r = self.draft.filter_mut(name).rule_mut(idx);
+        let push = |set: &mut Vec<String>| {
+            if !set.iter().any(|x| x == v) {
+                set.push(v.to_string());
+            }
+        };
+        match field {
+            "prefix" => push(&mut r.prefix),
+            "protocol" => r.protocol = Some(v.to_string()),
+            "metric-le" => {
+                r.metric_le = Some(v.parse().with_context(|| format!("invalid metric {v:?}"))?)
+            }
+            "metric-ge" => {
+                r.metric_ge = Some(v.parse().with_context(|| format!("invalid metric {v:?}"))?)
+            }
+            "set-metric" => {
+                r.set_metric = Some(v.parse().with_context(|| format!("invalid metric {v:?}"))?)
+            }
+            "add-metric" => {
+                r.add_metric = Some(v.parse().with_context(|| format!("invalid metric {v:?}"))?)
+            }
+            "set-preference" => {
+                r.set_preference = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid preference {v:?}"))?,
+                )
+            }
+            "set-community" => push(&mut r.set_community),
+            "add-community" => push(&mut r.add_community),
+            "set-large-community" => push(&mut r.set_large_community),
+            "add-large-community" => push(&mut r.add_large_community),
+            "set-ext-community" => push(&mut r.set_ext_community),
+            "add-ext-community" => push(&mut r.add_ext_community),
+            "action" => r.action = Some(v.to_string()),
+            other => bail!("filter rule has no field {other:?}"),
         }
         Ok(())
     }
@@ -2002,6 +2606,7 @@ impl Session {
                 self.draft.isis = IsisDraft::default();
                 self.draft.bgp = BgpDraft::default();
                 self.draft.vrrp.clear();
+                self.draft.filters.clear();
             }
             ["protocols", "router-id"] => self.draft.router_id = None,
             ["protocols", "static", prefix] => {
@@ -2019,14 +2624,119 @@ impl Session {
                     bail!("no bgp neighbor {addr:?}");
                 }
             }
+            ["protocols", "bgp", "neighbor", addr, field] => {
+                match self.draft.bgp.neighbors.iter_mut().find(|(a, _)| a == addr) {
+                    Some((_, n)) => Self::del_neighbor_field(n, field)?,
+                    None => bail!("no bgp neighbor {addr:?}"),
+                }
+            }
+            ["protocols", "bgp", "aggregate", prefix] => {
+                let before = self.draft.bgp.aggregate.len();
+                self.draft.bgp.aggregate.retain(|(p, _)| p != prefix);
+                if self.draft.bgp.aggregate.len() == before {
+                    bail!("no bgp aggregate {prefix:?}");
+                }
+            }
+            ["protocols", "bgp", "aggregate", prefix, "summary-only"] => {
+                *self.draft.bgp_aggregate_mut(prefix) = false;
+            }
+            ["protocols", "bgp", "roa", prefix] => {
+                let before = self.draft.bgp.roa.len();
+                self.draft.bgp.roa.retain(|(p, _)| p != prefix);
+                if self.draft.bgp.roa.len() == before {
+                    bail!("no bgp roa {prefix:?}");
+                }
+            }
+            ["protocols", "bgp", "roa", prefix, field] => {
+                match self.draft.bgp.roa.iter_mut().find(|(p, _)| p == prefix) {
+                    Some((_, r)) => match *field {
+                        "origin-as" => r.origin_as = None,
+                        "max-length" => r.max_length = None,
+                        other => bail!("bgp roa has no field {other:?}"),
+                    },
+                    None => bail!("no bgp roa {prefix:?}"),
+                }
+            }
+            ["protocols", "bgp", "confederation"] => {
+                self.draft.bgp.confederation_id = None;
+                self.draft.bgp.confederation_members.clear();
+            }
+            ["protocols", "bgp", "confederation", field] => {
+                let b = &mut self.draft.bgp;
+                match *field {
+                    "id" => b.confederation_id = None,
+                    "member" => b.confederation_members.clear(),
+                    other => bail!("bgp confederation has no field {other:?}"),
+                }
+            }
+            ["protocols", "bgp", "rpki"] => {
+                self.draft.bgp.rpki_reject_invalid = false;
+                self.draft.bgp.rtr = RtrDraft::default();
+            }
+            ["protocols", "bgp", "rpki", field] => {
+                let b = &mut self.draft.bgp;
+                match *field {
+                    "reject-invalid" => b.rpki_reject_invalid = false,
+                    "rtr" => b.rtr.server = None,
+                    "rtr-refresh" => b.rtr.refresh = None,
+                    other => bail!("bgp rpki has no field {other:?}"),
+                }
+            }
             ["protocols", "bgp", field] => {
                 let b = &mut self.draft.bgp;
                 match *field {
                     "local-as" => b.local_as = None,
                     "router-id" => b.router_id = None,
+                    "hold-time" => b.hold_time = None,
+                    "cluster-id" => b.cluster_id = None,
+                    "multipath" => b.multipath = None,
                     "network" => b.network.clear(),
                     "redistribute" => b.redistribute.clear(),
+                    "community" => b.community.clear(),
+                    "large-community" => b.large_community.clear(),
+                    "ext-community" => b.ext_community.clear(),
+                    "ebgp-require-policy" => b.ebgp_require_policy = false,
                     other => bail!("bgp has no field {other:?}"),
+                }
+            }
+            ["protocols", "filter", name] => {
+                let before = self.draft.filters.len();
+                self.draft.filters.retain(|(n, _)| n != name);
+                if self.draft.filters.len() == before {
+                    bail!("no filter {name:?}");
+                }
+            }
+            ["protocols", "filter", name, "default"] => {
+                match self.draft.filters.iter_mut().find(|(n, _)| n == name) {
+                    Some((_, f)) => f.default = None,
+                    None => bail!("no filter {name:?}"),
+                }
+            }
+            ["protocols", "filter", name, "rule", n] => {
+                let idx: u32 = n
+                    .parse()
+                    .with_context(|| format!("invalid rule index {n:?}"))?;
+                match self.draft.filters.iter_mut().find(|(fn_, _)| fn_ == name) {
+                    Some((_, f)) => {
+                        let before = f.rules.len();
+                        f.rules.retain(|(i, _)| *i != idx);
+                        if f.rules.len() == before {
+                            bail!("no rule {idx} in filter {name:?}");
+                        }
+                    }
+                    None => bail!("no filter {name:?}"),
+                }
+            }
+            ["protocols", "filter", name, "rule", n, field] => {
+                let idx: u32 = n
+                    .parse()
+                    .with_context(|| format!("invalid rule index {n:?}"))?;
+                match self.draft.filters.iter_mut().find(|(fn_, _)| fn_ == name) {
+                    Some((_, f)) => match f.rules.iter_mut().find(|(i, _)| *i == idx) {
+                        Some((_, r)) => Self::del_filter_rule_field(r, field)?,
+                        None => bail!("no rule {idx} in filter {name:?}"),
+                    },
+                    None => bail!("no filter {name:?}"),
                 }
             }
             ["protocols", "ospf"] => self.draft.ospf = OspfDraft::default(),
@@ -2490,26 +3200,7 @@ impl Session {
         let bgp = if self.draft.bgp.is_empty() {
             None
         } else {
-            Some(Bgp {
-                local_as: self
-                    .draft
-                    .bgp
-                    .local_as
-                    .ok_or_else(|| anyhow::anyhow!("protocols bgp: local-as not set"))?,
-                router_id: self.draft.bgp.router_id.clone(),
-                network: self.draft.bgp.network.clone(),
-                redistribute: self.draft.bgp.redistribute.clone(),
-                neighbors: self
-                    .draft
-                    .bgp
-                    .neighbors
-                    .iter()
-                    .map(|(address, remote_as)| BgpNeighbor {
-                        address: address.clone(),
-                        remote_as: *remote_as,
-                    })
-                    .collect(),
-            })
+            Some(bgp_from_draft(&self.draft.bgp)?)
         };
         let ospf = if self.draft.ospf.is_empty() {
             None
@@ -2573,6 +3264,12 @@ impl Session {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let filters = self
+            .draft
+            .filters
+            .iter()
+            .map(|(name, d)| filter_from_draft(name, d))
+            .collect::<Result<Vec<_>>>()?;
         let protocols = Protocols {
             router_id: self.draft.router_id.clone(),
             statics,
@@ -2584,6 +3281,7 @@ impl Session {
             isis,
             bgp,
             vrrp,
+            filters,
         };
 
         // multiwan (roadmap C6): the failover/load-balance uplinks. Health-check
@@ -3220,23 +3918,80 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         proto.push_str("    }\n");
     }
     if !draft.bgp.is_empty() {
+        let b = &draft.bgp;
         proto.push_str("    bgp {\n");
-        if let Some(a) = draft.bgp.local_as {
+        if let Some(a) = b.local_as {
             proto.push_str(&format!("        local-as {a}\n"));
         }
-        if let Some(rid) = &draft.bgp.router_id {
+        if let Some(rid) = &b.router_id {
             proto.push_str(&format!("        router-id {rid}\n"));
         }
-        for net in &draft.bgp.network {
+        if let Some(h) = b.hold_time {
+            proto.push_str(&format!("        hold-time {h}\n"));
+        }
+        if let Some(c) = &b.cluster_id {
+            proto.push_str(&format!("        cluster-id {c}\n"));
+        }
+        if let Some(m) = b.multipath {
+            proto.push_str(&format!("        multipath {m}\n"));
+        }
+        for net in &b.network {
             proto.push_str(&format!("        network {net}\n"));
         }
-        for src in &draft.bgp.redistribute {
+        for src in &b.redistribute {
             proto.push_str(&format!("        redistribute {src}\n"));
         }
-        for (addr, remote_as) in &draft.bgp.neighbors {
-            proto.push_str(&format!("        neighbor {addr} remote-as {remote_as}\n"));
+        for c in &b.community {
+            proto.push_str(&format!("        community {c}\n"));
+        }
+        for c in &b.large_community {
+            proto.push_str(&format!("        large-community {c}\n"));
+        }
+        for c in &b.ext_community {
+            proto.push_str(&format!("        ext-community {c}\n"));
+        }
+        if let Some(id) = b.confederation_id {
+            proto.push_str(&format!("        confederation id {id}\n"));
+        }
+        for m in &b.confederation_members {
+            proto.push_str(&format!("        confederation member {m}\n"));
+        }
+        if b.rpki_reject_invalid {
+            proto.push_str("        rpki reject-invalid true\n");
+        }
+        if let Some(s) = &b.rtr.server {
+            proto.push_str(&format!("        rpki rtr {s}\n"));
+        }
+        if let Some(r) = b.rtr.refresh {
+            proto.push_str(&format!("        rpki rtr-refresh {r}\n"));
+        }
+        if b.ebgp_require_policy {
+            proto.push_str("        ebgp-require-policy true\n");
+        }
+        for (prefix, summary_only) in &b.aggregate {
+            proto.push_str(&format!("        aggregate {prefix} {{\n"));
+            if *summary_only {
+                proto.push_str("            summary-only true\n");
+            }
+            proto.push_str("        }\n");
+        }
+        for (prefix, r) in &b.roa {
+            proto.push_str(&format!("        roa {prefix} {{\n"));
+            if let Some(o) = r.origin_as {
+                proto.push_str(&format!("            origin-as {o}\n"));
+            }
+            if let Some(m) = r.max_length {
+                proto.push_str(&format!("            max-length {m}\n"));
+            }
+            proto.push_str("        }\n");
+        }
+        for (addr, n) in &b.neighbors {
+            render_neighbor(&mut proto, addr, n);
         }
         proto.push_str("    }\n");
+    }
+    for (name, f) in &draft.filters {
+        render_filter(&mut proto, name, f);
     }
     if want("protocols") && !proto.is_empty() {
         out.push_str("protocols {\n");
@@ -3407,6 +4162,92 @@ fn parse_proto(s: &str) -> Result<Proto> {
         "udp" => Proto::Udp,
         _ => bail!("invalid proto {s:?} (expected tcp|udp)"),
     })
+}
+
+/// Push `            <key> <val>\n` (12-space indent) when `val` is present.
+fn push_field(out: &mut String, key: &str, val: Option<String>) {
+    if let Some(v) = val {
+        out.push_str(&format!("            {key} {v}\n"));
+    }
+}
+
+/// Render one BGP neighbour as a nested `neighbor <addr> { … }` block (8-space
+/// header, 12-space fields). Booleans print only when set; options when present.
+fn render_neighbor(out: &mut String, addr: &str, n: &NeighborDraft) {
+    out.push_str(&format!("        neighbor {addr} {{\n"));
+    push_field(out, "remote-as", n.remote_as.map(|a| a.to_string()));
+    push_field(out, "ttl-security", n.ttl_security.map(|t| t.to_string()));
+    push_field(out, "password", n.password.clone());
+    push_field(out, "ao-key", n.ao_key.clone());
+    push_field(out, "ao-key-id", n.ao_key_id.map(|v| v.to_string()));
+    push_field(out, "max-prefix", n.max_prefix.map(|v| v.to_string()));
+    push_field(out, "import", n.import.clone());
+    push_field(out, "export", n.export.clone());
+    push_field(out, "role", n.role.clone());
+    push_field(out, "bfd-auth-type", n.bfd_auth_type.clone());
+    push_field(
+        out,
+        "bfd-auth-key-id",
+        n.bfd_auth_key_id.map(|v| v.to_string()),
+    );
+    push_field(out, "bfd-auth-key", n.bfd_auth_key.clone());
+    for (k, set) in [
+        ("passive", n.passive),
+        ("route-reflector-client", n.route_reflector_client),
+        ("default-originate", n.default_originate),
+        ("add-path", n.add_path),
+        ("extended-nexthop", n.extended_nexthop),
+        ("evpn", n.evpn),
+        ("flowspec", n.flowspec),
+        ("srpolicy", n.srpolicy),
+        ("link-state", n.link_state),
+        ("bfd", n.bfd),
+    ] {
+        if set {
+            out.push_str(&format!("            {k} true\n"));
+        }
+    }
+    out.push_str("        }\n");
+}
+
+/// Render one route filter as a nested `filter <name> { … }` block (4-space
+/// header, `rule <n>` at 8 spaces, rule fields at 12).
+fn render_filter(out: &mut String, name: &str, f: &FilterDraft) {
+    out.push_str(&format!("    filter {name} {{\n"));
+    if let Some(d) = &f.default {
+        out.push_str(&format!("        default {d}\n"));
+    }
+    for (idx, r) in &f.rules {
+        out.push_str(&format!("        rule {idx} {{\n"));
+        for p in &r.prefix {
+            out.push_str(&format!("            prefix {p}\n"));
+        }
+        push_field(out, "protocol", r.protocol.clone());
+        push_field(out, "metric-le", r.metric_le.map(|v| v.to_string()));
+        push_field(out, "metric-ge", r.metric_ge.map(|v| v.to_string()));
+        push_field(out, "set-metric", r.set_metric.map(|v| v.to_string()));
+        push_field(out, "add-metric", r.add_metric.map(|v| v.to_string()));
+        push_field(
+            out,
+            "set-preference",
+            r.set_preference.map(|v| v.to_string()),
+        );
+        for (k, set) in [
+            ("set-community", &r.set_community),
+            ("add-community", &r.add_community),
+            ("set-large-community", &r.set_large_community),
+            ("add-large-community", &r.add_large_community),
+            ("set-ext-community", &r.set_ext_community),
+            ("add-ext-community", &r.add_ext_community),
+        ] {
+            for c in set {
+                out.push_str(&format!("            {k} {c}\n"));
+            }
+        }
+        push_field(out, "action", r.action.clone());
+        out.push_str("        }\n");
+    }
+    out.push_str("    }\n");
 }
 
 fn parse_bool(s: &str) -> Result<bool> {
@@ -3994,5 +4835,100 @@ mod tests {
         assert!(shown.contains("hostname fw1"));
         assert!(shown.contains("interface wan0"));
         assert!(shown.contains("zone wan"));
+    }
+
+    #[test]
+    fn bgp_full_neighbor_and_filter_set_show_commit_round_trip() {
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname r1",
+            "set protocols router-id 10.0.0.1",
+            "set protocols bgp local-as 65001",
+            "set protocols bgp hold-time 90",
+            "set protocols bgp confederation id 65000",
+            "set protocols bgp confederation member 65002",
+            "set protocols bgp community 65001:100",
+            "set protocols bgp multipath 4",
+            "set protocols bgp ebgp-require-policy true",
+            "set protocols bgp rpki reject-invalid true",
+            "set protocols bgp rpki rtr 10.0.0.9:3323",
+            "set protocols bgp aggregate 10.11.0.0/16 summary-only true",
+            "set protocols bgp roa 10.11.0.0/16 origin-as 65001",
+            "set protocols bgp roa 10.11.0.0/16 max-length 24",
+            "set protocols bgp neighbor 10.10.0.2 remote-as 65002",
+            "set protocols bgp neighbor 10.10.0.2 passive true",
+            "set protocols bgp neighbor 10.10.0.2 route-reflector-client true",
+            "set protocols bgp neighbor 10.10.0.2 ttl-security 1",
+            "set protocols bgp neighbor 10.10.0.2 password s3cret",
+            "set protocols bgp neighbor 10.10.0.2 max-prefix 1000",
+            "set protocols bgp neighbor 10.10.0.2 role customer",
+            "set protocols bgp neighbor 10.10.0.2 import from-peer",
+            "set protocols bgp neighbor 10.10.0.2 export to-peer",
+            "set protocols bgp neighbor 10.10.0.2 bfd true",
+            "set protocols bgp neighbor 10.10.0.2 bfd-auth-type meticulous-sha1",
+            "set protocols filter from-peer default reject",
+            "set protocols filter from-peer rule 10 prefix 10.0.0.0/8+",
+            "set protocols filter from-peer rule 10 set-metric 100",
+            "set protocols filter from-peer rule 10 set-community 65001:200",
+            "set protocols filter from-peer rule 10 action accept",
+            "set protocols filter to-peer default accept",
+        ] {
+            run(&mut s, line).unwrap();
+        }
+
+        // `show` renders nested neighbor + filter blocks.
+        let shown = s.show();
+        assert!(shown.contains("neighbor 10.10.0.2 {"), "got:\n{shown}");
+        assert!(
+            shown.contains("route-reflector-client true"),
+            "got:\n{shown}"
+        );
+        assert!(shown.contains("import from-peer"), "got:\n{shown}");
+        assert!(shown.contains("filter from-peer {"), "got:\n{shown}");
+        assert!(shown.contains("rule 10 {"), "got:\n{shown}");
+        assert!(shown.contains("action accept"), "got:\n{shown}");
+
+        // It materializes into a validated Appliance carrying every field.
+        let a = s.commit().expect("full bgp + filter config commits");
+        let bgp = a.protocols.bgp.as_ref().unwrap();
+        assert_eq!(bgp.hold_time, Some(90));
+        assert_eq!(bgp.confederation_id, Some(65000));
+        assert_eq!(bgp.aggregate[0].prefix, "10.11.0.0/16");
+        assert!(bgp.aggregate[0].summary_only);
+        assert_eq!(bgp.roa[0].origin_as, 65001);
+        assert_eq!(bgp.rtr.as_ref().unwrap().server, "10.0.0.9:3323");
+        let n = &bgp.neighbors[0];
+        assert!(n.passive && n.route_reflector_client && n.bfd);
+        assert_eq!(n.password.as_deref(), Some("s3cret"));
+        assert_eq!(n.role.as_deref(), Some("customer"));
+        assert_eq!(n.import.as_deref(), Some("from-peer"));
+        assert_eq!(a.protocols.filters.len(), 2);
+
+        // Re-loading the drafted config reproduces the same routing view (rule
+        // indices renumber to their 1-based position on reload).
+        let reloaded = render_appliance(&a);
+        assert!(
+            reloaded.contains("neighbor 10.10.0.2 {"),
+            "got:\n{reloaded}"
+        );
+        assert!(reloaded.contains("password s3cret"), "got:\n{reloaded}");
+        assert!(
+            reloaded.contains("rpki rtr 10.0.0.9:3323"),
+            "got:\n{reloaded}"
+        );
+        assert!(reloaded.contains("filter from-peer {"), "got:\n{reloaded}");
+        assert!(
+            reloaded.contains("set-community 65001:200"),
+            "got:\n{reloaded}"
+        );
+        // The materialized config re-parses + re-validates from its own TOML.
+        Appliance::from_toml(&a.to_toml().unwrap()).expect("re-parses");
+
+        // Deleting a neighbour field and a filter rule works.
+        run(&mut s, "delete protocols bgp neighbor 10.10.0.2 passive").unwrap();
+        assert!(!s.show().contains("passive true"));
+        run(&mut s, "delete protocols filter from-peer rule 10").unwrap();
+        assert!(!s.show().contains("rule 10 {"));
+        assert!(run(&mut s, "delete protocols filter nope").is_err());
     }
 }
