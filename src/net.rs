@@ -1033,12 +1033,17 @@ fn apply_multiwan(appliance: &Appliance) -> Result<()> {
     Ok(())
 }
 
-/// Reconcile networkd units to match `appliance`: write a `.netdev` for every
-/// VLAN subinterface and a `.network` for every interface that needs one (it has
-/// an address, is a VLAN, or is a parent carrying VLANs), remove any stale
-/// sentinel units, then ask networkd to re-apply. Writing the units is required;
-/// the reload is best-effort (at early boot networkd reads the files on start).
-pub fn apply(appliance: &Appliance) -> Result<()> {
+/// Render the persistent network config: write a `.netdev` for every VLAN
+/// subinterface and a `.network` for every interface that needs one (it has an
+/// address, is a VLAN, or is a parent carrying VLANs), remove any stale sentinel
+/// units, then reconcile the always-on co-services (resolved / dnsmasq / chrony)
+/// by writing their drop-ins. Everything here is a file a daemon reads on its own
+/// start — no link needs to be up yet and (critically) nothing is started or
+/// D-Bus-poked synchronously, so this is safe for the early `sentinel-boot` unit
+/// which runs Before networkd. The co-service restarts are guarded to no-op until
+/// those services are actually running (see `system::restart_if_active`); the
+/// link-dependent runtime state (incl. PPPoE) is deferred to [`apply_link_runtime`].
+pub fn apply_persistent(appliance: &Appliance) -> Result<()> {
     let ifaces = &appliance.interfaces;
 
     // A PPPoE client's raw uplink NIC (`parent`) must be link-up for pppd's
@@ -1209,7 +1214,25 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
     // The NTP server (chrony) likewise — its confdir drop-in tracks
     // `[services.ntp]`, and chrony is restarted only when that changed.
     apply_chrony(appliance)?;
-    // PPPoE clients (pppd peer options + secrets + the MSS-clamp ruleset).
+    Ok(())
+}
+
+/// Live runtime state that only exists once networkd has brought the links up:
+/// the PPPoE sessions (pppd needs the parent NIC up), the tc egress qdiscs (QoS),
+/// the Multi-WAN policy routes/tables, and the IPsec SAs loaded into charon. None
+/// of it survives a reboot — the kernel comes up with a bare qdisc, no policy
+/// routes and an empty charon — and none of it can be applied before its target
+/// links exist (and starting a session/daemon from the early, Before-networkd
+/// `sentinel-boot` would deadlock the boot). So `commit` runs it inline (the links
+/// are already up), while at boot the dedicated `sentinel-boot-late` unit (ordered
+/// after systemd-networkd) re-applies it.
+pub fn apply_link_runtime(appliance: &Appliance) -> Result<()> {
+    // PPPoE clients (pppd peer options + secrets + the MSS-clamp ruleset). This
+    // *starts* the `sentinel-pppoe@` sessions, so it belongs after networkd (the
+    // pppd discovery needs the parent NIC up) and out of the early sentinel-boot:
+    // that unit is ordered Before networkd, and starting a session there — the
+    // pppoe unit is After sentinel-boot — would deadlock the boot. The parent
+    // NIC's own `.network` unit is still written by apply_persistent above.
     apply_pppoe(appliance)?;
     // Egress traffic shaping (tc qdiscs) — applied directly, after the links are
     // (re)configured so the target devices exist.
@@ -1220,6 +1243,17 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
     // IPsec tunnels (roadmap C2) — rendered swanctl config loaded into charon,
     // after the underlay uplinks the tunnels ride on are up.
     crate::ipsec::apply(appliance)?;
+    Ok(())
+}
+
+/// Apply the full network config to the running system: the persistent render
+/// (networkd units + co-services) followed by the link-dependent runtime state.
+/// Used by `commit`, where the links are already up so both phases run back to
+/// back. The boot path splits them across two units (see [`apply_persistent`]
+/// and [`apply_link_runtime`]) so the runtime state lands after networkd.
+pub fn apply(appliance: &Appliance) -> Result<()> {
+    apply_persistent(appliance)?;
+    apply_link_runtime(appliance)?;
     Ok(())
 }
 
