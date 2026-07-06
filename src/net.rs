@@ -378,11 +378,32 @@ fn chrony_conf_body(ntp: &Ntp, ifaces: &[Interface]) -> Option<String> {
     Some(body)
 }
 
+/// Which stage of the system's life a `net::apply` runs in — the difference is
+/// whether it may touch running services. `Live` (a `commit`) reloads/restarts
+/// units so a change lands immediately. `Boot` is the early `sentinel-boot`
+/// service, which is ordered **Before** systemd-networkd: it may ONLY render
+/// files (networkd units + resolved/dnsmasq/chrony drop-ins + pppoe peers) and
+/// must perform ZERO unit operations — no `networkctl`, no `systemctl restart`,
+/// no sudo — because every service it would poke is ordered after the network,
+/// so any such call would deadlock networkd's own start against this unit. The
+/// services read the freshly written files on their own (later) start; that is
+/// exactly why sentinel-boot runs before them. Runtime-only state (tc qdiscs,
+/// policy routes) that a file can't express is (re)applied by the post-networkd
+/// `sentinel-boot-late` stage instead — see [`apply_link_runtime`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ApplyMode {
+    /// `commit` on the running system — reload/restart units to apply live.
+    Live,
+    /// Early boot (before networkd) — render files only, never touch a unit.
+    Boot,
+}
+
 /// Reconcile the chrony confdir drop-in to `appliance.services.ntp`: write it
-/// when an NTP server is configured, remove it otherwise, and restart chrony —
-/// but only when the desired config actually changed, so a non-NTP commit never
-/// disturbs the box's timekeeping.
-fn apply_chrony(appliance: &Appliance) -> Result<()> {
+/// when an NTP server is configured, remove it otherwise, and (only in `Live`
+/// mode, and only when it changed) restart chrony — so a non-NTP commit never
+/// disturbs the box's timekeeping, and boot never restarts a service out of
+/// order (chronyd reads the drop-in on its own start).
+fn apply_chrony(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     let path = Path::new(CHRONY_CONFDIR).join(CHRONY_CONF);
     match chrony_conf_body(&appliance.services.ntp, &appliance.interfaces) {
         Some(body) => {
@@ -391,14 +412,16 @@ fn apply_chrony(appliance: &Appliance) -> Result<()> {
                 .unwrap_or(true);
             system::ensure_dir(Path::new(CHRONY_CONFDIR))?;
             system::install_file(&path, &body)?;
-            if changed {
+            if changed && mode == ApplyMode::Live {
                 restart_chrony();
             }
         }
         None => {
             if path.exists() {
                 system::remove_file(&path)?;
-                restart_chrony();
+                if mode == ApplyMode::Live {
+                    restart_chrony();
+                }
             }
         }
     }
@@ -417,7 +440,7 @@ fn restart_chrony() {
 /// forwarder is configured, remove it otherwise, then restart resolved so the
 /// stub listener (re)binds. Best-effort restart (mirrors networkd): the drop-in
 /// is written regardless, so a boot-time resolved start still picks it up.
-fn apply_resolved(appliance: &Appliance) -> Result<()> {
+fn apply_resolved(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     let path = Path::new(RESOLVED_DROPIN_DIR).join(RESOLVED_DROPIN);
     let changed = match resolved_dropin_body(&appliance.services.dns) {
         Some(body) => {
@@ -436,7 +459,9 @@ fn apply_resolved(appliance: &Appliance) -> Result<()> {
             existed
         }
     };
-    if changed {
+    // Boot never restarts (resolved reads the drop-in on its own start, and a
+    // restart from the pre-networkd sentinel-boot would deadlock).
+    if changed && mode == ApplyMode::Live {
         if let Err(e) = system::reload_resolved() {
             eprintln!("warning: restarting systemd-resolved failed (applies on next start): {e}");
         }
@@ -449,7 +474,7 @@ fn apply_resolved(appliance: &Appliance) -> Result<()> {
 /// when the desired config changed, so a non-DNS commit never disturbs the LAN
 /// resolver. Best-effort restart (the drop-in is written regardless, so a
 /// boot-time dnsmasq start still picks it up).
-fn apply_dnsmasq(appliance: &Appliance) -> Result<()> {
+fn apply_dnsmasq(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     let path = Path::new(DNSMASQ_CONFDIR).join(DNSMASQ_CONF);
     let changed = match dnsmasq_conf_body(&appliance.services.dns) {
         Some(body) => {
@@ -468,7 +493,9 @@ fn apply_dnsmasq(appliance: &Appliance) -> Result<()> {
             existed
         }
     };
-    if changed {
+    // Boot never restarts (dnsmasq reads its conf-dir on its own start, and a
+    // restart from the pre-networkd sentinel-boot would deadlock).
+    if changed && mode == ApplyMode::Live {
         if let Err(e) = system::reload_dnsmasq() {
             eprintln!("warning: restarting dnsmasq failed (applies on next start): {e}");
         }
@@ -1037,13 +1064,15 @@ fn apply_multiwan(appliance: &Appliance) -> Result<()> {
 /// subinterface and a `.network` for every interface that needs one (it has an
 /// address, is a VLAN, or is a parent carrying VLANs), remove any stale sentinel
 /// units, then reconcile the always-on co-services (resolved / dnsmasq / chrony)
-/// by writing their drop-ins. Everything here is a file a daemon reads on its own
-/// start — no link needs to be up yet and (critically) nothing is started or
-/// D-Bus-poked synchronously, so this is safe for the early `sentinel-boot` unit
-/// which runs Before networkd. The co-service restarts are guarded to no-op until
-/// those services are actually running (see `system::restart_if_active`); the
-/// link-dependent runtime state (incl. PPPoE) is deferred to [`apply_link_runtime`].
-pub fn apply_persistent(appliance: &Appliance) -> Result<()> {
+/// by writing their drop-ins. In `ApplyMode::Boot` this is ALL it does — pure
+/// file rendering, zero unit operations — so it is safe for the early
+/// `sentinel-boot` unit ordered Before networkd (every service it would poke is
+/// ordered after the network, so poking one deadlocks the boot; the services read
+/// the freshly written files on their own start). In `ApplyMode::Live` (`commit`,
+/// networkd already up) it additionally reloads networkd and restarts the changed
+/// co-services so the change lands immediately. The link-dependent runtime state
+/// (incl. PPPoE) is deferred to [`apply_link_runtime`].
+pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     let ifaces = &appliance.interfaces;
 
     // A PPPoE client's raw uplink NIC (`parent`) must be link-up for pppd's
@@ -1200,20 +1229,24 @@ pub fn apply_persistent(appliance: &Appliance) -> Result<()> {
         }
     }
 
-    // Re-apply live. Non-fatal: networkd may not be up yet at boot, in which
-    // case it picks up the files when it starts.
-    if let Err(e) = system::networkctl_reload(&reloaded) {
-        eprintln!("warning: networkctl reload failed (networkd applies units on start): {e}");
+    // Live only: ask networkd to re-read the units. At boot we DON'T — networkd
+    // reads them on its own start, and a `networkctl reload` here would D-Bus-
+    // activate networkd out of order (sentinel-boot is Before networkd) and
+    // deadlock the boot.
+    if mode == ApplyMode::Live {
+        if let Err(e) = system::networkctl_reload(&reloaded) {
+            eprintln!("warning: networkctl reload failed (networkd applies units on start): {e}");
+        }
     }
 
     // DNS: resolved is the box's own forwarder (`[services.dns] upstream`),
     // dnsmasq is the LAN resolver (`serve-on` + host-overrides + blocklists).
-    // Both track `[services.dns]` and restart only when their config changed.
-    apply_resolved(appliance)?;
-    apply_dnsmasq(appliance)?;
+    // Both track `[services.dns]` and (in Live mode) restart only when changed.
+    apply_resolved(appliance, mode)?;
+    apply_dnsmasq(appliance, mode)?;
     // The NTP server (chrony) likewise — its confdir drop-in tracks
     // `[services.ntp]`, and chrony is restarted only when that changed.
-    apply_chrony(appliance)?;
+    apply_chrony(appliance, mode)?;
     Ok(())
 }
 
@@ -1252,7 +1285,7 @@ pub fn apply_link_runtime(appliance: &Appliance) -> Result<()> {
 /// back. The boot path splits them across two units (see [`apply_persistent`]
 /// and [`apply_link_runtime`]) so the runtime state lands after networkd.
 pub fn apply(appliance: &Appliance) -> Result<()> {
-    apply_persistent(appliance)?;
+    apply_persistent(appliance, ApplyMode::Live)?;
     apply_link_runtime(appliance)?;
     Ok(())
 }
