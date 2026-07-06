@@ -33,8 +33,18 @@ pub struct WrenConfig {
     bgp: Option<WrenBgp>,
     #[serde(rename = "vrrp", skip_serializing_if = "Vec::is_empty")]
     vrrp: Vec<WrenVrrp>,
+    #[serde(rename = "vrf", skip_serializing_if = "Vec::is_empty")]
+    vrfs: Vec<WrenVrf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bfd: Option<WrenBfd>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    multicast: Option<WrenMulticast>,
     #[serde(rename = "filter", skip_serializing_if = "Vec::is_empty")]
     filters: Vec<WrenFilter>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    import: std::collections::BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    export: Option<WrenExport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -46,6 +56,8 @@ struct WrenStatic {
     dev: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     metric: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vrf: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -88,6 +100,8 @@ struct WrenBgp {
         skip_serializing_if = "std::ops::Not::not"
     )]
     ebgp_require_policy: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vrf: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rtr: Option<WrenRtr>,
     #[serde(rename = "aggregate", skip_serializing_if = "Vec::is_empty")]
@@ -229,12 +243,72 @@ struct WrenOspf {
     interfaces: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     area: Option<String>,
+    #[serde(rename = "router-priority", skip_serializing_if = "Option::is_none")]
+    router_priority: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cost: Option<u16>,
     #[serde(rename = "network-type", skip_serializing_if = "Option::is_none")]
     network_type: Option<String>,
+    #[serde(rename = "passive-interfaces", skip_serializing_if = "Vec::is_empty")]
+    passive_interfaces: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     redistribute: Vec<String>,
+    #[serde(
+        rename = "redistribute-metric",
+        skip_serializing_if = "Option::is_none"
+    )]
+    redistribute_metric: Option<u32>,
+    #[serde(rename = "stub-areas", skip_serializing_if = "Vec::is_empty")]
+    stub_areas: Vec<String>,
+    #[serde(rename = "stub-default-cost", skip_serializing_if = "Option::is_none")]
+    stub_default_cost: Option<u32>,
+    #[serde(rename = "nssa-areas", skip_serializing_if = "Vec::is_empty")]
+    nssa_areas: Vec<String>,
+    #[serde(rename = "totally-stubby-areas", skip_serializing_if = "Vec::is_empty")]
+    totally_stubby_areas: Vec<String>,
+    #[serde(rename = "totally-nssa-areas", skip_serializing_if = "Vec::is_empty")]
+    totally_nssa_areas: Vec<String>,
+    #[serde(rename = "nssa-default-areas", skip_serializing_if = "Vec::is_empty")]
+    nssa_default_areas: Vec<String>,
+    #[serde(rename = "auth-type", skip_serializing_if = "Option::is_none")]
+    auth_type: Option<String>,
+    #[serde(rename = "auth-key", skip_serializing_if = "Option::is_none")]
+    auth_key: Option<String>,
+    #[serde(rename = "auth-key-id", skip_serializing_if = "Option::is_none")]
+    auth_key_id: Option<u8>,
+    #[serde(
+        rename = "auth-replay-protection",
+        skip_serializing_if = "Option::is_none"
+    )]
+    auth_replay_protection: Option<bool>,
+    #[serde(rename = "hello-interval", skip_serializing_if = "Option::is_none")]
+    hello_interval: Option<u16>,
+    #[serde(rename = "dead-interval", skip_serializing_if = "Option::is_none")]
+    dead_interval: Option<u32>,
+    #[serde(
+        rename = "graceful-restart",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    graceful_restart: bool,
+    #[serde(
+        rename = "graceful-restart-period",
+        skip_serializing_if = "Option::is_none"
+    )]
+    graceful_restart_period: Option<u32>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    bfd: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vrf: Option<String>,
+    // Array-of-tables — must serialize after every scalar field of `[ospf]`.
+    #[serde(rename = "interface", skip_serializing_if = "Vec::is_empty")]
+    interface: Vec<WrenOspfInterface>,
+}
+
+#[derive(Debug, Serialize)]
+struct WrenOspfInterface {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    area: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -244,16 +318,30 @@ struct WrenOspf3 {
     interfaces: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     area: Option<String>,
+    #[serde(rename = "router-priority", skip_serializing_if = "Option::is_none")]
+    router_priority: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cost: Option<u16>,
     #[serde(rename = "network-type", skip_serializing_if = "Option::is_none")]
     network_type: Option<String>,
+    #[serde(rename = "instance-id", skip_serializing_if = "Option::is_none")]
+    instance_id: Option<u8>,
     /// OSPFv3 only redistributes static externals (a bool in wren's schema).
     #[serde(
         rename = "redistribute-static",
         skip_serializing_if = "std::ops::Not::not"
     )]
     redistribute_static: bool,
+    #[serde(
+        rename = "redistribute-metric",
+        skip_serializing_if = "Option::is_none"
+    )]
+    redistribute_metric: Option<u32>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    bfd: bool,
+    // Array-of-tables — must serialize after every scalar field of `[ospf3]`.
+    #[serde(rename = "interface", skip_serializing_if = "Vec::is_empty")]
+    interface: Vec<WrenOspfInterface>,
 }
 
 #[derive(Debug, Serialize)]
@@ -261,6 +349,11 @@ struct WrenRip {
     enabled: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     interfaces: Vec<String>,
+    /// Babel only (RIP/RIPng ignore these — populated only for the babel table).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    network: Vec<String>,
+    #[serde(rename = "router-id", skip_serializing_if = "Option::is_none")]
+    router_id: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     redistribute: Vec<String>,
     #[serde(
@@ -268,6 +361,11 @@ struct WrenRip {
         skip_serializing_if = "Option::is_none"
     )]
     redistribute_metric: Option<u32>,
+    /// RIP and Babel only (RIPng's schema has no `bfd`/`vrf`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    bfd: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vrf: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -281,6 +379,12 @@ struct WrenIsis {
     area: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     level: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    priority: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metric: Option<u32>,
+    #[serde(rename = "hello-interval", skip_serializing_if = "Option::is_none")]
+    hello_interval: Option<u64>,
     #[serde(rename = "network-type", skip_serializing_if = "Option::is_none")]
     network_type: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -290,6 +394,15 @@ struct WrenIsis {
         skip_serializing_if = "Option::is_none"
     )]
     redistribute_metric: Option<u32>,
+    #[serde(
+        rename = "l2-to-l1-leaking",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    l2_to_l1_leaking: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    bfd: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vrf: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -298,8 +411,102 @@ struct WrenVrrp {
     vrid: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
     priority: Option<u8>,
+    #[serde(rename = "advert-interval", skip_serializing_if = "Option::is_none")]
+    advert_interval: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preempt: Option<bool>,
+    #[serde(rename = "prefix-length", skip_serializing_if = "Option::is_none")]
+    prefix_length: Option<u8>,
+    #[serde(rename = "track-interface", skip_serializing_if = "Vec::is_empty")]
+    track_interfaces: Vec<String>,
+    #[serde(rename = "priority-decrement", skip_serializing_if = "Option::is_none")]
+    priority_decrement: Option<u8>,
     #[serde(rename = "virtual-address", skip_serializing_if = "Vec::is_empty")]
     virtual_address: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct WrenBfd {
+    #[serde(rename = "min-tx", skip_serializing_if = "Option::is_none")]
+    min_tx: Option<u32>,
+    #[serde(rename = "min-rx", skip_serializing_if = "Option::is_none")]
+    min_rx: Option<u32>,
+    #[serde(rename = "detect-mult", skip_serializing_if = "Option::is_none")]
+    detect_mult: Option<u8>,
+    #[serde(rename = "auth-type", skip_serializing_if = "Option::is_none")]
+    auth_type: Option<String>,
+    #[serde(rename = "auth-key-id", skip_serializing_if = "Option::is_none")]
+    auth_key_id: Option<u8>,
+    #[serde(rename = "auth-key", skip_serializing_if = "Option::is_none")]
+    auth_key: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    echo: bool,
+    #[serde(rename = "echo-interval", skip_serializing_if = "Option::is_none")]
+    echo_interval: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct WrenMulticast {
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    igmp: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mld: Option<bool>,
+    #[serde(rename = "igmp-version", skip_serializing_if = "Option::is_none")]
+    igmp_version: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    robustness: Option<u8>,
+    #[serde(rename = "query-interval", skip_serializing_if = "Option::is_none")]
+    query_interval: Option<u32>,
+    #[serde(
+        rename = "query-response-interval",
+        skip_serializing_if = "Option::is_none"
+    )]
+    query_response_interval: Option<u32>,
+    // Array-of-tables — must serialize after every scalar field of `[multicast]`.
+    #[serde(rename = "interface", skip_serializing_if = "Vec::is_empty")]
+    interfaces: Vec<WrenMulticastInterface>,
+}
+
+#[derive(Debug, Serialize)]
+struct WrenMulticastInterface {
+    name: String,
+    role: String,
+    #[serde(rename = "igmp-version", skip_serializing_if = "Option::is_none")]
+    igmp_version: Option<u8>,
+}
+
+#[derive(Debug, Serialize)]
+struct WrenVrf {
+    name: String,
+    table: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rd: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    interfaces: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    import: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    export: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct WrenExport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kernel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bgp: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ospf: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ripng: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    babel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    isis: Option<String>,
 }
 
 impl WrenConfig {
@@ -323,6 +530,7 @@ pub fn compile_wren(appliance: &Appliance) -> WrenConfig {
             via: s.via.clone(),
             dev: s.dev.clone(),
             metric: s.metric,
+            vrf: s.vrf.clone(),
         })
         .collect();
 
@@ -342,6 +550,7 @@ pub fn compile_wren(appliance: &Appliance) -> WrenConfig {
         multipath: b.multipath,
         rpki_reject_invalid: b.rpki_reject_invalid,
         ebgp_require_policy: b.ebgp_require_policy,
+        vrf: b.vrf.clone(),
         rtr: b.rtr.as_ref().map(|r| WrenRtr {
             server: r.server.clone(),
             refresh: r.refresh,
@@ -368,45 +577,118 @@ pub fn compile_wren(appliance: &Appliance) -> WrenConfig {
 
     let filters = p.filters.iter().map(compile_filter).collect();
 
+    let ospf_interfaces = |ifs: &[crate::config::OspfInterface]| {
+        ifs.iter()
+            .map(|i| WrenOspfInterface {
+                name: i.name.clone(),
+                area: i.area.clone(),
+            })
+            .collect::<Vec<_>>()
+    };
     let ospf = p.ospf.as_ref().map(|o| WrenOspf {
         enabled: true,
         interfaces: o.interfaces.clone(),
         area: o.area.clone(),
+        router_priority: o.router_priority,
         cost: o.cost,
         network_type: o.network_type.clone(),
+        passive_interfaces: o.passive_interfaces.clone(),
         redistribute: o.redistribute.clone(),
+        redistribute_metric: o.redistribute_metric,
+        stub_areas: o.stub_areas.clone(),
+        stub_default_cost: o.stub_default_cost,
+        nssa_areas: o.nssa_areas.clone(),
+        totally_stubby_areas: o.totally_stubby_areas.clone(),
+        totally_nssa_areas: o.totally_nssa_areas.clone(),
+        nssa_default_areas: o.nssa_default_areas.clone(),
+        auth_type: o.auth_type.clone(),
+        auth_key: o.auth_key.clone(),
+        auth_key_id: o.auth_key_id,
+        auth_replay_protection: o.auth_replay_protection,
+        hello_interval: o.hello_interval,
+        dead_interval: o.dead_interval,
+        graceful_restart: o.graceful_restart,
+        graceful_restart_period: o.graceful_restart_period,
+        bfd: o.bfd,
+        vrf: o.vrf.clone(),
+        interface: ospf_interfaces(&o.interface),
     });
 
     let ospf3 = p.ospf3.as_ref().map(|o| WrenOspf3 {
         enabled: true,
         interfaces: o.interfaces.clone(),
         area: o.area.clone(),
+        router_priority: o.router_priority,
         cost: o.cost,
         network_type: o.network_type.clone(),
+        instance_id: o.instance_id,
         // OSPFv3 only redistributes static externals (bool in wren's schema).
         redistribute_static: o.redistribute.iter().any(|s| s == "static"),
+        redistribute_metric: o.redistribute_metric,
+        bfd: o.bfd,
+        interface: ospf_interfaces(&o.interface),
     });
 
-    // RIP, RIPng and Babel share the appliance `Rip` shape.
-    let rip_like = |r: &crate::config::Rip| WrenRip {
+    // RIP, RIPng and Babel share the appliance `Rip` shape, but Wren's RIPng
+    // accepts none of the extras and only Babel takes `network`/`router-id` — so
+    // each protocol emits just the fields its Wren schema has.
+    let rip = p.rip.as_ref().map(|r| WrenRip {
         enabled: true,
         interfaces: r.interfaces.clone(),
+        network: Vec::new(),
+        router_id: None,
         redistribute: r.redistribute.clone(),
         redistribute_metric: r.redistribute_metric,
-    };
-    let rip = p.rip.as_ref().map(rip_like);
-    let ripng = p.ripng.as_ref().map(rip_like);
-    let babel = p.babel.as_ref().map(rip_like);
+        bfd: r.bfd,
+        vrf: r.vrf.clone(),
+    });
+    let ripng = p.ripng.as_ref().map(|r| WrenRip {
+        enabled: true,
+        interfaces: r.interfaces.clone(),
+        network: Vec::new(),
+        router_id: None,
+        redistribute: r.redistribute.clone(),
+        redistribute_metric: r.redistribute_metric,
+        bfd: false,
+        vrf: None,
+    });
+    let babel = p.babel.as_ref().map(|r| WrenRip {
+        enabled: true,
+        interfaces: r.interfaces.clone(),
+        network: r.network.clone(),
+        router_id: r.router_id.clone(),
+        redistribute: r.redistribute.clone(),
+        redistribute_metric: r.redistribute_metric,
+        bfd: r.bfd,
+        vrf: r.vrf.clone(),
+    });
 
     let isis = p.isis.as_ref().map(|i| WrenIsis {
         enabled: true,
         interfaces: i.interfaces.clone(),
         system_id: i.system_id.clone(),
         area: i.area.clone(),
-        level: i.level.clone(),
+        // The appliance grammar speaks IOS-style levels ("1" | "2" | "1-2");
+        // wren's schema wants "l1" | "l2" | "l1l2". Translate here so the
+        // operator spelling never leaks into the daemon config.
+        level: i.level.as_deref().map(|l| {
+            match l {
+                "1" => "l1",
+                "2" => "l2",
+                "1-2" => "l1l2",
+                other => other, // already a wren spelling ("l1", "l2", "l1l2")
+            }
+            .to_string()
+        }),
+        priority: i.priority,
+        metric: i.metric,
+        hello_interval: i.hello_interval,
         network_type: i.network_type.clone(),
         redistribute: i.redistribute.clone(),
         redistribute_metric: i.redistribute_metric,
+        l2_to_l1_leaking: i.l2_to_l1_leaking,
+        bfd: i.bfd,
+        vrf: i.vrf.clone(),
     });
 
     let vrrp = p
@@ -416,9 +698,67 @@ pub fn compile_wren(appliance: &Appliance) -> WrenConfig {
             interface: v.interface.clone(),
             vrid: v.vrid,
             priority: v.priority,
+            advert_interval: v.advert_interval,
+            preempt: v.preempt,
+            prefix_length: v.prefix_length,
+            track_interfaces: v.track_interfaces.clone(),
+            priority_decrement: v.priority_decrement,
             virtual_address: v.virtual_address.clone(),
         })
         .collect();
+
+    let vrfs = p
+        .vrfs
+        .iter()
+        .map(|v| WrenVrf {
+            name: v.name.clone(),
+            table: v.table,
+            rd: v.rd.clone(),
+            interfaces: v.interfaces.clone(),
+            import: v.import.clone(),
+            export: v.export.clone(),
+        })
+        .collect();
+
+    let bfd = p.bfd.as_ref().map(|b| WrenBfd {
+        min_tx: b.min_tx,
+        min_rx: b.min_rx,
+        detect_mult: b.detect_mult,
+        auth_type: b.auth_type.clone(),
+        auth_key_id: b.auth_key_id,
+        auth_key: b.auth_key.clone(),
+        echo: b.echo,
+        echo_interval: b.echo_interval,
+    });
+
+    let multicast = p.multicast.as_ref().map(|m| WrenMulticast {
+        enabled: m.enabled,
+        igmp: m.igmp,
+        mld: m.mld,
+        igmp_version: m.igmp_version,
+        robustness: m.robustness,
+        query_interval: m.query_interval,
+        query_response_interval: m.query_response_interval,
+        interfaces: m
+            .interfaces
+            .iter()
+            .map(|i| WrenMulticastInterface {
+                name: i.name.clone(),
+                role: i.role.clone().unwrap_or_else(|| "querier".to_string()),
+                igmp_version: i.igmp_version,
+            })
+            .collect(),
+    });
+
+    let export = p.export.as_ref().map(|e| WrenExport {
+        kernel: e.kernel.clone(),
+        bgp: e.bgp.clone(),
+        ospf: e.ospf.clone(),
+        rip: e.rip.clone(),
+        ripng: e.ripng.clone(),
+        babel: e.babel.clone(),
+        isis: e.isis.clone(),
+    });
 
     WrenConfig {
         router_id: p.router_id.clone(),
@@ -431,7 +771,12 @@ pub fn compile_wren(appliance: &Appliance) -> WrenConfig {
         isis,
         bgp,
         vrrp,
+        vrfs,
+        bfd,
+        multicast,
         filters,
+        import: p.import.clone(),
+        export,
     }
 }
 
@@ -590,6 +935,183 @@ virtual-address = ["10.0.0.254"]
         assert!(out.contains("vrid = 10"), "{out}");
         // Every enabled protocol carries `enabled = true`.
         assert_eq!(out.matches("enabled = true").count(), 5, "{out}");
+    }
+
+    #[test]
+    fn full_igp_surface_emits_wren_spellings() {
+        let toml = r#"
+[system]
+hostname = "r1"
+[protocols]
+router-id = "10.0.0.1"
+import = { static = "f1", connected = "f1" }
+[[protocols.filter]]
+name = "f1"
+default = "accept"
+[[protocols.vrf]]
+name = "blue"
+table = 100
+rd = "65000:1"
+interfaces = ["eth3"]
+import = "f1"
+export = "f1"
+[[protocols.static]]
+prefix = "10.9.0.0/24"
+via = "10.0.0.2"
+vrf = "blue"
+[protocols.export]
+kernel = "f1"
+bgp = "f1"
+[protocols.ospf]
+interfaces = ["eth0"]
+area = "0.0.0.0"
+router-priority = 5
+passive-interfaces = ["eth2"]
+redistribute = ["static"]
+redistribute-metric = 40
+stub-areas = ["0.0.0.2"]
+stub-default-cost = 5
+nssa-default-areas = ["0.0.0.6"]
+auth-type = "md5"
+auth-key = "s3cret"
+auth-key-id = 7
+auth-replay-protection = true
+hello-interval = 5
+dead-interval = 20
+graceful-restart = true
+graceful-restart-period = 90
+bfd = true
+vrf = "blue"
+[[protocols.ospf.interface]]
+name = "eth1"
+area = "0.0.0.1"
+[protocols.ospf3]
+interfaces = ["eth0"]
+router-priority = 3
+instance-id = 2
+redistribute = ["static"]
+redistribute-metric = 30
+bfd = true
+[[protocols.ospf3.interface]]
+name = "eth1"
+area = "0.0.0.1"
+[protocols.rip]
+interfaces = ["eth0"]
+bfd = true
+vrf = "blue"
+[protocols.ripng]
+interfaces = ["eth0"]
+[protocols.babel]
+interfaces = ["eth0"]
+network = ["2001:db8::/64"]
+router-id = "10.0.0.1"
+bfd = true
+vrf = "blue"
+[protocols.isis]
+interfaces = ["eth0"]
+system-id = "1921.6800.1001"
+level = "2"
+priority = 100
+metric = 20
+hello-interval = 3
+l2-to-l1-leaking = true
+bfd = true
+vrf = "blue"
+[protocols.bfd]
+min-tx = 250
+min-rx = 250
+detect-mult = 4
+auth-type = "meticulous-sha1"
+auth-key-id = 1
+auth-key = "bfdsecret"
+echo = true
+echo-interval = 100
+[protocols.multicast]
+enabled = true
+mld = true
+robustness = 2
+query-interval = 30
+[[protocols.multicast.interface]]
+name = "lan0"
+role = "querier"
+[[protocols.multicast.interface]]
+name = "wan0"
+role = "upstream"
+igmp-version = 3
+[[protocols.vrrp]]
+name = "v1"
+interface = "eth0"
+vrid = 10
+priority = 200
+advert-interval = 500
+preempt = false
+prefix-length = 24
+track-interface = ["eth1"]
+priority-decrement = 30
+virtual-address = ["10.0.0.254"]
+"#;
+        let appliance = Appliance::from_toml(toml).unwrap();
+        appliance.validate().expect("valid appliance");
+        let out = compile_wren(&appliance).to_toml().unwrap();
+        for needle in [
+            // OSPFv2.
+            "[[ospf.interface]]",
+            "router-priority = 5",
+            "passive-interfaces = [\"eth2\"]",
+            "redistribute-metric = 40",
+            "stub-areas = [\"0.0.0.2\"]",
+            "stub-default-cost = 5",
+            "nssa-default-areas = [\"0.0.0.6\"]",
+            "auth-type = \"md5\"",
+            "auth-replay-protection = true",
+            "hello-interval = 5",
+            "dead-interval = 20",
+            "graceful-restart = true",
+            "graceful-restart-period = 90",
+            // OSPFv3.
+            "[[ospf3.interface]]",
+            "instance-id = 2",
+            // Babel-only network/router-id + rip/babel bfd.
+            "network = [\"2001:db8::/64\"]",
+            // IS-IS. The IOS-style level "2" translates to wren's "l2".
+            "level = \"l2\"",
+            "l2-to-l1-leaking = true",
+            // VRRP.
+            "advert-interval = 500",
+            "preempt = false",
+            "prefix-length = 24",
+            "track-interface = [\"eth1\"]",
+            "priority-decrement = 30",
+            // Global BFD.
+            "[bfd]",
+            "min-tx = 250",
+            "detect-mult = 4",
+            "echo = true",
+            // Multicast.
+            "[multicast]",
+            "[[multicast.interface]]",
+            "role = \"upstream\"",
+            // VRF + static vrf + export + import.
+            "[[vrf]]",
+            "table = 100",
+            "rd = \"65000:1\"",
+            "vrf = \"blue\"",
+            "[export]",
+            "kernel = \"f1\"",
+            "[import]",
+        ] {
+            assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
+        }
+        // RIPng must NOT carry the RIP/Babel-only extras (Wren's Ripng rejects them).
+        let ripng = out
+            .split("[ripng]")
+            .nth(1)
+            .unwrap()
+            .split("[babel]")
+            .next()
+            .unwrap();
+        assert!(!ripng.contains("bfd"), "ripng must not emit bfd:\n{ripng}");
+        assert!(!ripng.contains("vrf"), "ripng must not emit vrf:\n{ripng}");
     }
 
     #[test]
