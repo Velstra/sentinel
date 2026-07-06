@@ -306,16 +306,16 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
                 );
                 h.set_context(&ctx);
             }
-            // VyOS-style prompt, re-rendered each line: it reflects the LIVE
+            // Cisco-style prompt, re-rendered each line: it reflects the LIVE
             // hostname (so a committed change shows immediately), marks
-            // uncommitted edits, and shows the `edit` context path.
+            // uncommitted edits with the leading `[edit] `, and renders the
+            // context as `(config…)` (see repl::prompt_context).
             let edit = if session.dirty() { "[edit] " } else { "" };
-            let at = if ctx.is_empty() {
-                String::new()
-            } else {
-                format!(":{}", ctx.join("/"))
-            };
-            let prompt = format!("{edit}{user}@{}{at}# ", system::current_hostname());
+            let prompt = format!(
+                "{edit}{user}@{}{}# ",
+                system::current_hostname(),
+                repl::prompt_context(&ctx)
+            );
             match rl.readline(&prompt) {
                 Ok(line) => {
                     let _ = rl.add_history_entry(line.as_str());

@@ -168,6 +168,45 @@ port = 443
 # local-subnet = "10.0.0.0/24"
 # remote-subnet = "10.1.0.0/24"
 # psk = "change-me-to-a-strong-shared-secret"
+
+# Dynamic routing (the Wren control plane). BGP with a fully-specified peer and
+# a named route filter used as its import policy. Every field maps 1:1 onto the
+# Wren daemon's config.
+# [protocols]
+# router-id = "10.0.0.1"
+#
+# [protocols.bgp]
+# local-as = 65001
+# hold-time = 90
+# network = ["10.11.0.0/24"]
+# redistribute = ["static", "connected"]
+# community = ["65001:100"]
+# multipath = 4
+# ebgp-require-policy = true
+#
+# [[protocols.bgp.aggregate]]
+# prefix = "10.11.0.0/16"
+# summary-only = true
+#
+# [[protocols.bgp.neighbor]]
+# address = "10.10.0.2"
+# remote-as = 65002
+# password = "peer-secret"
+# ttl-security = 1
+# max-prefix = 1000
+# role = "customer"
+# import = "from-peer"
+# export = "to-peer"
+# bfd = true
+#
+# A route filter: reject the default, accept a prefix range with a set MED.
+# [[protocols.filter]]
+# name = "from-peer"
+# default = "reject"
+# [[protocols.filter.rule]]
+# prefix = ["10.0.0.0/8+"]
+# set-metric = 100
+# action = "accept"
 "#;
 
 /// The whole declarative appliance config.
@@ -353,6 +392,10 @@ pub struct Protocols {
     /// VRRP virtual routers (first-hop redundancy / firewall HA).
     #[serde(default, rename = "vrrp", skip_serializing_if = "Vec::is_empty")]
     pub vrrp: Vec<Vrrp>,
+    /// Named route filters (import/export policy), referenced by name from a BGP
+    /// neighbour's `import` / `export`. Compiled to Wren's top-level `[[filter]]`.
+    #[serde(default, rename = "filter", skip_serializing_if = "Vec::is_empty")]
+    pub filters: Vec<Filter>,
 }
 
 impl Protocols {
@@ -368,6 +411,7 @@ impl Protocols {
             && self.isis.is_none()
             && self.bgp.is_none()
             && self.vrrp.is_empty()
+            && self.filters.is_empty()
     }
 }
 
@@ -516,7 +560,8 @@ pub struct StaticRoute {
 }
 
 /// BGP-4 configuration: the local AS, an optional router-id, originated
-/// networks, redistribution and the peer list.
+/// networks, redistribution, policy knobs and the peer list. The full surface
+/// maps 1:1 onto the Wren daemon's `[bgp]` block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Bgp {
@@ -526,19 +571,133 @@ pub struct Bgp {
     /// BGP router-id; falls back to `[protocols] router-id` when unset.
     #[serde(default, rename = "router-id", skip_serializing_if = "Option::is_none")]
     pub router_id: Option<String>,
+    /// The Hold Time proposed in OPEN, in seconds (default 180 at the daemon).
+    #[serde(default, rename = "hold-time", skip_serializing_if = "Option::is_none")]
+    pub hold_time: Option<u16>,
     /// Prefixes originated into BGP (advertised to peers).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub network: Vec<String>,
     /// Route sources redistributed into BGP (`"static"`, `"connected"`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub redistribute: Vec<String>,
+    /// The route reflector CLUSTER_ID (dotted quad); defaults to the router-id.
+    #[serde(
+        default,
+        rename = "cluster-id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cluster_id: Option<String>,
+    /// The Confederation Identifier (RFC 5065) — the AS shown to true external
+    /// peers. When set, `local-as` is this router's Member-AS.
+    #[serde(
+        default,
+        rename = "confederation-id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub confederation_id: Option<u32>,
+    /// The Member-AS numbers of the other sub-ASes in this confederation.
+    #[serde(
+        default,
+        rename = "confederation-members",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub confederation_members: Vec<u32>,
+    /// COMMUNITIES (RFC 1997) attached to every originated route.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub community: Vec<String>,
+    /// LARGE_COMMUNITY (RFC 8092) tags attached to every originated route.
+    #[serde(
+        default,
+        rename = "large-community",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub large_community: Vec<String>,
+    /// EXTENDED_COMMUNITIES (RFC 4360) attached to every originated route.
+    #[serde(
+        default,
+        rename = "ext-community",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub ext_community: Vec<String>,
+    /// The maximum number of equal-cost paths to install as ECMP (BGP multipath).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multipath: Option<usize>,
+    /// Address aggregates (RFC 4271 §9.2.2.2): a covering prefix advertised when
+    /// a more-specific route falls inside it.
+    #[serde(default, rename = "aggregate", skip_serializing_if = "Vec::is_empty")]
+    pub aggregate: Vec<BgpAggregate>,
+    /// Static RPKI ROAs (RFC 6811) to validate received route origins against.
+    #[serde(default, rename = "roa", skip_serializing_if = "Vec::is_empty")]
+    pub roa: Vec<BgpRoa>,
+    /// An RTR (RFC 8210) validating cache to fetch ROAs from live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtr: Option<BgpRtr>,
+    /// Reject any received route RPKI origin validation classifies as Invalid.
+    #[serde(
+        default,
+        rename = "rpki-reject-invalid",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub rpki_reject_invalid: bool,
+    /// RFC 8212 strict default-deny for eBGP: require an explicit policy on every
+    /// eBGP peer before it exchanges transit routes.
+    #[serde(
+        default,
+        rename = "ebgp-require-policy",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub ebgp_require_policy: bool,
     /// BGP peers.
     #[serde(default, rename = "neighbor", skip_serializing_if = "Vec::is_empty")]
     pub neighbors: Vec<BgpNeighbor>,
 }
 
-/// A BGP peer: its address and remote AS.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One BGP address aggregate (`[[protocols.bgp.aggregate]]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BgpAggregate {
+    /// The covering prefix to advertise, as `addr/len`.
+    pub prefix: String,
+    /// Suppress the contributing more-specifics, advertising only the aggregate.
+    #[serde(
+        default,
+        rename = "summary-only",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub summary_only: bool,
+}
+
+/// One static RPKI ROA (`[[protocols.bgp.roa]]`, RFC 6811).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BgpRoa {
+    /// The authorised prefix, as `addr/len`.
+    pub prefix: String,
+    /// The longest prefix length the origin may announce within `prefix`.
+    #[serde(
+        default,
+        rename = "max-length",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_length: Option<u8>,
+    /// The Autonomous System authorised to originate it.
+    #[serde(rename = "origin-as")]
+    pub origin_as: u32,
+}
+
+/// An RTR validating cache to fetch RPKI ROAs from (`[protocols.bgp.rtr]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BgpRtr {
+    /// The cache's `host:port` (the RTR port is conventionally 3323).
+    pub server: String,
+    /// The refresh interval in seconds; unset uses the cache's advertised value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh: Option<u32>,
+}
+
+/// A BGP peer: its address, remote AS and the full per-neighbor policy surface.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BgpNeighbor {
     /// Peer IP address.
@@ -546,6 +705,212 @@ pub struct BgpNeighbor {
     /// The peer's autonomous system number.
     #[serde(rename = "remote-as")]
     pub remote_as: u32,
+    /// Wait for the peer to connect rather than initiating the TCP connection.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub passive: bool,
+    /// This iBGP peer is a route-reflector client (RFC 4456).
+    #[serde(
+        default,
+        rename = "route-reflector-client",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub route_reflector_client: bool,
+    /// GTSM (RFC 5082) maximum number of hops to the peer (1 for a directly
+    /// connected eBGP neighbour). Unset disables GTSM.
+    #[serde(
+        default,
+        rename = "ttl-security",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ttl_security: Option<u8>,
+    /// A TCP-MD5 signature password (RFC 2385). Mutually exclusive with `ao-key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    /// A TCP-AO master key (RFC 5925). Mutually exclusive with `password`.
+    #[serde(default, rename = "ao-key", skip_serializing_if = "Option::is_none")]
+    pub ao_key: Option<String>,
+    /// The TCP-AO key id (SendID/RecvID), default 100. Ignored without `ao-key`.
+    #[serde(default, rename = "ao-key-id", skip_serializing_if = "Option::is_none")]
+    pub ao_key_id: Option<u8>,
+    /// The maximum number of prefixes to accept from this peer (RFC 4486 §4).
+    #[serde(
+        default,
+        rename = "max-prefix",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_prefix: Option<u32>,
+    /// Advertise a default route (`0.0.0.0/0`) to this peer unconditionally.
+    #[serde(
+        default,
+        rename = "default-originate",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub default_originate: bool,
+    /// Negotiate ADD-PATH (RFC 7911) with this neighbour for IPv4 unicast.
+    #[serde(
+        default,
+        rename = "add-path",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub add_path: bool,
+    /// Negotiate Extended Next Hop Encoding (RFC 5549 / RFC 8950).
+    #[serde(
+        default,
+        rename = "extended-nexthop",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub extended_nexthop: bool,
+    /// Negotiate the EVPN address family (RFC 7432) with this neighbour.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub evpn: bool,
+    /// Negotiate the FlowSpec address family (RFC 8955) with this neighbour.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub flowspec: bool,
+    /// Negotiate the SR Policy address family (RFC 9256) with this neighbour.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub srpolicy: bool,
+    /// Negotiate the BGP-LS address family (RFC 7752) with this neighbour.
+    #[serde(
+        default,
+        rename = "link-state",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub link_state: bool,
+    /// Inbound route policy: the name of a `[[protocols.filter]]` (import map).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import: Option<String>,
+    /// Outbound route policy: the name of a `[[protocols.filter]]` (export map).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export: Option<String>,
+    /// This speaker's BGP Role toward this neighbour (RFC 9234): `provider`,
+    /// `customer`, `peer`, `rs-server` or `rs-client`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Run a BFD (RFC 5880) session to this neighbour for fast failure detection.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bfd: bool,
+    /// Per-neighbour BFD authentication type: `simple`, `keyed-md5`,
+    /// `meticulous-md5`, `keyed-sha1` or `meticulous-sha1`.
+    #[serde(
+        default,
+        rename = "bfd-auth-type",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub bfd_auth_type: Option<String>,
+    /// The wire key id for this neighbour's BFD authentication (default 1).
+    #[serde(
+        default,
+        rename = "bfd-auth-key-id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub bfd_auth_key_id: Option<u8>,
+    /// The shared secret for this neighbour's BFD authentication.
+    #[serde(
+        default,
+        rename = "bfd-auth-key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub bfd_auth_key: Option<String>,
+}
+
+/// A named route filter (`[[protocols.filter]]`): an ordered list of rules plus
+/// a default action, referenced by name from a neighbour's `import` / `export`.
+/// Maps onto Wren's top-level `[[filter]]` block.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Filter {
+    /// The filter's name, referenced from a neighbour's import/export.
+    pub name: String,
+    /// The action when no rule matches: `"accept"` (default) or `"reject"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    /// The rules, evaluated in order (first match wins).
+    #[serde(default, rename = "rule", skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<FilterRule>,
+}
+
+/// One rule of a [`Filter`] (`[[protocols.filter.rule]]`). Conditions present are
+/// ANDed; `set-*`/`add-*` modify a matching route before `action` is taken.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilterRule {
+    /// Prefix patterns (any-match), e.g. `["10.0.0.0/8+"]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prefix: Vec<String>,
+    /// Match this protocol name (`connected`/`static`/`bgp`/…).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    /// The route's metric must be ≤ this.
+    #[serde(default, rename = "metric-le", skip_serializing_if = "Option::is_none")]
+    pub metric_le: Option<u32>,
+    /// The route's metric must be ≥ this.
+    #[serde(default, rename = "metric-ge", skip_serializing_if = "Option::is_none")]
+    pub metric_ge: Option<u32>,
+    /// Set the matching route's metric to this.
+    #[serde(
+        default,
+        rename = "set-metric",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub set_metric: Option<u32>,
+    /// Add this signed delta to the matching route's metric.
+    #[serde(
+        default,
+        rename = "add-metric",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub add_metric: Option<i64>,
+    /// Set the matching route's administrative preference to this.
+    #[serde(
+        default,
+        rename = "set-preference",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub set_preference: Option<u32>,
+    /// Replace the matching route's communities with these.
+    #[serde(
+        default,
+        rename = "set-community",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub set_community: Option<Vec<String>>,
+    /// Append these communities to the matching route.
+    #[serde(
+        default,
+        rename = "add-community",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub add_community: Vec<String>,
+    /// Replace the matching route's large communities with these.
+    #[serde(
+        default,
+        rename = "set-large-community",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub set_large_community: Option<Vec<String>>,
+    /// Append these large communities to the matching route.
+    #[serde(
+        default,
+        rename = "add-large-community",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub add_large_community: Vec<String>,
+    /// Replace the matching route's extended communities with these.
+    #[serde(
+        default,
+        rename = "set-ext-community",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub set_ext_community: Option<Vec<String>>,
+    /// Append these extended communities to the matching route.
+    #[serde(
+        default,
+        rename = "add-ext-community",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub add_ext_community: Vec<String>,
+    /// Whether a matching route is `"accept"`ed or `"reject"`ed.
+    pub action: String,
 }
 
 /// NAT — Network Address Translation. Kept separate from [`Firewall`] because it
@@ -2146,6 +2511,14 @@ impl Appliance {
                 }
             }
         }
+        // The set of declared filter names — a BGP neighbour's import/export must
+        // reference one of these (they compile to Wren's `[[filter]]` blocks).
+        let filter_names: HashSet<&str> = self
+            .protocols
+            .filters
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
         if let Some(bgp) = &self.protocols.bgp {
             if bgp.local_as == 0 {
                 bail!("protocols bgp: local-as must be non-zero");
@@ -2153,20 +2526,38 @@ impl Appliance {
             if let Some(rid) = &bgp.router_id {
                 validate_ipv4(rid).with_context(|| "protocols bgp router-id")?;
             }
+            if let Some(cid) = &bgp.cluster_id {
+                validate_ipv4(cid).with_context(|| "protocols bgp cluster-id (dotted quad)")?;
+            }
             for net in &bgp.network {
                 validate_cidr_or_ip(net)
                     .with_context(|| format!("protocols bgp network {net:?}"))?;
             }
-            for n in &bgp.neighbors {
-                validate_ipv4(&n.address)
-                    .with_context(|| format!("protocols bgp neighbor {:?}", n.address))?;
-                if n.remote_as == 0 {
+            for a in &bgp.aggregate {
+                validate_cidr_or_ip(&a.prefix)
+                    .with_context(|| format!("protocols bgp aggregate {:?}", a.prefix))?;
+            }
+            for r in &bgp.roa {
+                validate_cidr_or_ip(&r.prefix)
+                    .with_context(|| format!("protocols bgp roa {:?}", r.prefix))?;
+                if r.origin_as == 0 {
                     bail!(
-                        "protocols bgp neighbor {:?}: remote-as must be non-zero",
-                        n.address
+                        "protocols bgp roa {:?}: origin-as must be non-zero",
+                        r.prefix
                     );
                 }
             }
+            if let Some(rtr) = &bgp.rtr {
+                if rtr.server.is_empty() {
+                    bail!("protocols bgp rtr: server (host:port) must be set");
+                }
+            }
+            for n in &bgp.neighbors {
+                validate_bgp_neighbor(n, &filter_names)?;
+            }
+        }
+        for f in &self.protocols.filters {
+            validate_filter(f)?;
         }
         if let Some(ospf) = &self.protocols.ospf {
             if let Some(area) = &ospf.area {
@@ -2668,6 +3059,133 @@ pub(crate) fn validate_iface_name(name: &str) -> Result<()> {
         .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
     {
         bail!("interface name {name:?}: only ASCII letters, digits, '.', '_' and '-' are allowed");
+    }
+    Ok(())
+}
+
+/// The BGP Roles a speaker may take toward a neighbour (RFC 9234).
+const BGP_ROLES: &[&str] = &["provider", "customer", "peer", "rs-server", "rs-client"];
+
+/// The per-neighbour BFD authentication types Wren accepts.
+const BFD_AUTH_TYPES: &[&str] = &[
+    "simple",
+    "keyed-md5",
+    "meticulous-md5",
+    "keyed-sha1",
+    "meticulous-sha1",
+];
+
+/// Validate one BGP neighbour: its address/AS plus the policy knobs, with
+/// import/export referring to a declared filter (`filter_names`).
+fn validate_bgp_neighbor(n: &BgpNeighbor, filter_names: &HashSet<&str>) -> Result<()> {
+    validate_ipv4(&n.address).with_context(|| format!("protocols bgp neighbor {:?}", n.address))?;
+    if n.remote_as == 0 {
+        bail!(
+            "protocols bgp neighbor {:?}: remote-as must be non-zero",
+            n.address
+        );
+    }
+    if let Some(role) = &n.role {
+        if !BGP_ROLES.contains(&role.as_str()) {
+            bail!(
+                "protocols bgp neighbor {:?}: role {role:?} not one of {BGP_ROLES:?}",
+                n.address
+            );
+        }
+    }
+    if let Some(hops) = n.ttl_security {
+        if !(1..=254).contains(&hops) {
+            bail!(
+                "protocols bgp neighbor {:?}: ttl-security {hops} out of range 1..=254",
+                n.address
+            );
+        }
+    }
+    if let Some(max) = n.max_prefix {
+        if max == 0 {
+            bail!(
+                "protocols bgp neighbor {:?}: max-prefix must be non-zero",
+                n.address
+            );
+        }
+    }
+    if let Some(t) = &n.bfd_auth_type {
+        if !BFD_AUTH_TYPES.contains(&t.as_str()) {
+            bail!(
+                "protocols bgp neighbor {:?}: bfd-auth-type {t:?} not one of {BFD_AUTH_TYPES:?}",
+                n.address
+            );
+        }
+    }
+    for (which, name) in [("import", &n.import), ("export", &n.export)] {
+        if let Some(name) = name {
+            if !filter_names.contains(name.as_str()) {
+                bail!(
+                    "protocols bgp neighbor {:?}: {which} references unknown filter {name:?}",
+                    n.address
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate one named route filter: the default/rule actions ∈ {accept,reject},
+/// non-empty prefix patterns and well-formed community tags.
+fn validate_filter(f: &Filter) -> Result<()> {
+    if f.name.is_empty() {
+        bail!("protocols filter: a filter needs a name");
+    }
+    if let Some(d) = &f.default {
+        validate_filter_action(d)
+            .with_context(|| format!("protocols filter {:?} default", f.name))?;
+    }
+    for (i, r) in f.rules.iter().enumerate() {
+        validate_filter_action(&r.action)
+            .with_context(|| format!("protocols filter {:?} rule {i} action", f.name))?;
+        for p in &r.prefix {
+            if p.is_empty() {
+                bail!(
+                    "protocols filter {:?} rule {i}: empty prefix pattern",
+                    f.name
+                );
+            }
+        }
+        let communities = [
+            r.set_community.as_deref().unwrap_or(&[]),
+            &r.add_community,
+            r.set_large_community.as_deref().unwrap_or(&[]),
+            &r.add_large_community,
+            r.set_ext_community.as_deref().unwrap_or(&[]),
+            &r.add_ext_community,
+        ];
+        for set in communities {
+            for c in set {
+                validate_community(c)
+                    .with_context(|| format!("protocols filter {:?} rule {i}", f.name))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A filter action must be `accept` or `reject`.
+fn validate_filter_action(a: &str) -> Result<()> {
+    if a != "accept" && a != "reject" {
+        bail!("action {a:?}: expected \"accept\" or \"reject\"");
+    }
+    Ok(())
+}
+
+/// A community tag is a well-known name or an `asn:value`-shaped token (this is
+/// a shape check; the Wren daemon does the definitive parse).
+fn validate_community(c: &str) -> Result<()> {
+    const WELL_KNOWN: &[&str] = &["no-export", "no-advertise", "no-export-subconfed"];
+    if WELL_KNOWN.contains(&c) {
+        return Ok(());
+    }
+    if c.split(':').count() < 2 || c.split(':').any(|p| p.is_empty()) {
+        bail!("community {c:?}: expected a well-known name or `asn:value`");
     }
     Ok(())
 }
@@ -3881,5 +4399,87 @@ dns = ["10.0.0.1"]
         let via_toml = Appliance::from_toml(&a.to_toml().unwrap()).unwrap();
         assert_eq!(a.summary(), via_json.summary());
         assert_eq!(a.summary(), via_toml.summary());
+    }
+
+    #[test]
+    fn bgp_full_neighbor_and_filter_parse_validate_and_round_trip() {
+        let toml = r#"
+[system]
+hostname = "r1"
+[protocols]
+router-id = "10.0.0.1"
+[protocols.bgp]
+local-as = 65001
+hold-time = 90
+confederation-id = 65000
+confederation-members = [65002]
+community = ["65001:100", "no-export"]
+multipath = 4
+ebgp-require-policy = true
+[[protocols.bgp.roa]]
+prefix = "10.0.0.0/8"
+max-length = 24
+origin-as = 65001
+[[protocols.bgp.neighbor]]
+address = "10.10.0.2"
+remote-as = 65002
+passive = true
+route-reflector-client = true
+ttl-security = 1
+password = "s3cret"
+max-prefix = 1000
+role = "customer"
+import = "from-peer"
+export = "to-peer"
+bfd = true
+bfd-auth-type = "meticulous-sha1"
+[[protocols.filter]]
+name = "from-peer"
+default = "reject"
+[[protocols.filter.rule]]
+prefix = ["10.0.0.0/8+"]
+set-metric = 100
+set-community = ["65001:200"]
+action = "accept"
+[[protocols.filter]]
+name = "to-peer"
+"#;
+        let a = Appliance::from_toml(toml).expect("full bgp config parses + validates");
+        let bgp = a.protocols.bgp.as_ref().unwrap();
+        assert_eq!(bgp.hold_time, Some(90));
+        assert_eq!(bgp.confederation_members, vec![65002]);
+        let n = &bgp.neighbors[0];
+        assert!(n.passive && n.route_reflector_client && n.bfd);
+        assert_eq!(n.ttl_security, Some(1));
+        assert_eq!(n.role.as_deref(), Some("customer"));
+        assert_eq!(n.import.as_deref(), Some("from-peer"));
+        assert_eq!(a.protocols.filters.len(), 2);
+        assert_eq!(a.protocols.filters[0].rules[0].action, "accept");
+        // Round-trips through TOML losslessly.
+        let b = Appliance::from_toml(&a.to_toml().unwrap()).expect("re-parses");
+        assert_eq!(a.summary(), b.summary());
+    }
+
+    #[test]
+    fn bgp_and_filter_validation_rejects_bad_values() {
+        let base = "[system]\nhostname = \"r1\"\n[protocols]\n[protocols.bgp]\nlocal-as = 65001\n";
+        // An unknown role is rejected.
+        let bad_role = format!(
+            "{base}[[protocols.bgp.neighbor]]\naddress = \"10.0.0.2\"\nremote-as = 65002\nrole = \"bogus\"\n"
+        );
+        assert!(Appliance::from_toml(&bad_role).is_err());
+        // ttl-security out of range is rejected.
+        let bad_ttl = format!(
+            "{base}[[protocols.bgp.neighbor]]\naddress = \"10.0.0.2\"\nremote-as = 65002\nttl-security = 255\n"
+        );
+        assert!(Appliance::from_toml(&bad_ttl).is_err());
+        // An import referencing an undeclared filter is rejected.
+        let dangling = format!(
+            "{base}[[protocols.bgp.neighbor]]\naddress = \"10.0.0.2\"\nremote-as = 65002\nimport = \"nope\"\n"
+        );
+        assert!(Appliance::from_toml(&dangling).is_err());
+        // A filter rule with a non-accept/reject action is rejected.
+        let bad_action = "[system]\nhostname = \"r1\"\n[protocols]\n[[protocols.filter]]\nname = \"f\"\n[[protocols.filter.rule]]\naction = \"drop\"\n";
+        assert!(Appliance::from_toml(bad_action).is_err());
     }
 }

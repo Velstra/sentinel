@@ -92,17 +92,30 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
             if rest.is_empty() {
                 Err(anyhow!("edit needs a path, e.g. `edit firewall rule web`"))
             } else {
+                // Deep validation: accept any path that names an interior node of
+                // the grammar (an instance name is allowed even before it exists —
+                // creation happens on the first `set` inside), reject garbage with
+                // a hint listing what IS valid there.
                 let full = with_ctx(rest);
-                if TOP.iter().any(|(k, _)| *k == full[0]) {
+                if is_interior_node(&full) {
                     *ctx = full;
                     eprintln!("[edit {}]", ctx.join(" "));
                     Ok(())
                 } else {
-                    Err(anyhow!(
-                        "unknown config node {:?} (system | interface | firewall | nat | protocols)",
-                        full[0]
-                    ))
+                    Err(edit_error(&full))
                 }
+            }
+        }
+        // `no <path…>` — Cisco-style deletion relative to the context: `no bfd`.
+        "no" => {
+            if rest.is_empty() {
+                Err(anyhow!(
+                    "no needs a path, e.g. `no bfd` or `no neighbor 10.0.0.1`"
+                ))
+            } else {
+                let full = with_ctx(rest);
+                let view: Vec<&str> = full.iter().map(String::as_str).collect();
+                session.delete(&view)
             }
         }
         "up" => {
@@ -113,13 +126,15 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
             }
             Ok(())
         }
-        "top" => {
+        // `top` (VyOS) and `end` (Cisco) both jump straight to the top context.
+        "top" | "end" => {
             ctx.clear();
             eprintln!("[edit]");
             Ok(())
         }
-        // vtysh/VyOS: run an operational command without leaving config mode.
-        "run" => match std::env::current_exe() {
+        // vtysh/VyOS `run` and Cisco `do`: run an operational command without
+        // leaving config mode.
+        "run" | "do" => match std::env::current_exe() {
             Ok(exe) => {
                 let status = std::process::Command::new(exe).args(rest).status();
                 match status {
@@ -142,11 +157,15 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
         }
         "discard" => session.discard().map(|()| eprintln!("discarded edits")),
         "exit" | "quit" => {
-            // VyOS: `exit` inside an edit context returns to the top of the
-            // config tree; at the top it leaves configuration mode.
+            // Cisco: `exit` pops ONE context level; only at the top does it leave
+            // configuration mode. A level can span a keyword+instance pair
+            // (`interface eth0`), so pop back to the next real interior node.
             if !ctx.is_empty() {
-                ctx.clear();
-                eprintln!("[edit]");
+                pop_level(ctx);
+                match ctx.is_empty() {
+                    true => eprintln!("[edit]"),
+                    false => eprintln!("[edit {}]", ctx.join(" ")),
+                }
                 return false;
             }
             if session.dirty() {
@@ -158,12 +177,100 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
             eprint!("{HELP}");
             Ok(())
         }
-        other => Err(anyhow!("unknown command {other:?} (try `help`)")),
+        // Not a known command. Cisco-style context feel: interpret the whole line
+        // as either (b) a path to descend into, or (c) an implicit `set` relative
+        // to the current context. Descend is tried BEFORE set so that entering
+        // e.g. `neighbor 10.0.0.1` opens that context instead of only creating it.
+        _ => {
+            let full = with_ctx(&args);
+            if is_interior_node(&full) {
+                *ctx = full;
+                eprintln!("[edit {}]", ctx.join(" "));
+                Ok(())
+            } else {
+                let view: Vec<&str> = full.iter().map(String::as_str).collect();
+                match session.set(&view) {
+                    Ok(()) => Ok(()),
+                    Err(set_err) => Err(anyhow!(
+                        "unknown command or config path {:?}: {set_err} \
+                         (Tab/? lists what's valid here)",
+                        line.trim()
+                    )),
+                }
+            }
+        }
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
     }
     false
+}
+
+/// The child keywords the grammar offers directly beneath `path` (an absolute
+/// config path, i.e. relative to the top of the tree). Reuses the completion
+/// tables so `edit`/context-entry validity stays in lockstep with Tab/`?`.
+fn child_keywords(path: &[String]) -> Vec<&'static str> {
+    let mut toks: Vec<&str> = Vec::with_capacity(path.len() + 1);
+    toks.push("set");
+    toks.extend(path.iter().map(String::as_str));
+    candidates(&toks).iter().map(|(k, _)| *k).collect()
+}
+
+/// Whether `path` names an interior node we can descend into — used by `edit`
+/// and by the Cisco-style context-entry shorthand. An instance-name position
+/// (`firewall rule web`, `interface eth0`) counts as interior even before the
+/// instance exists; creation happens on the first `set` inside.
+fn is_interior_node(path: &[String]) -> bool {
+    !path.is_empty() && !child_keywords(path).is_empty()
+}
+
+/// Pop one *level* off the edit context: drop the last token, then keep dropping
+/// trailing tokens until the context is empty or again names a real interior
+/// node. This steps `exit` up one Cisco-style level even when a level spans a
+/// keyword+instance pair (`interface eth0`, `firewall rule web`, `… neighbor X`).
+fn pop_level(ctx: &mut Vec<String>) {
+    ctx.pop();
+    while !ctx.is_empty() && !is_interior_node(ctx) {
+        ctx.pop();
+    }
+}
+
+/// The error for an `edit`/descend to an unknown path: point at the first bad
+/// token and list what WOULD be valid at that level.
+fn edit_error(full: &[String]) -> anyhow::Error {
+    for cut in (0..full.len()).rev() {
+        let kids = child_keywords(&full[..cut]);
+        if !kids.is_empty() {
+            return anyhow!(
+                "unknown config node {:?} — valid here: {}",
+                full[cut],
+                kids.join(" | ")
+            );
+        }
+    }
+    anyhow!(
+        "unknown config node {:?}",
+        full.first().map(String::as_str).unwrap_or("")
+    )
+}
+
+/// Render the edit context as a Cisco-style prompt fragment: `(config)` at the
+/// top, `(config-if-eth0)` for an interface, `(config-router-bgp)` for BGP,
+/// `(config-bgp-neighbor-10.0.0.1)` for a BGP neighbor, and generically
+/// `(config-<last-two-tokens-joined-by-->)` for everything else. main.rs wraps
+/// this in `user@host…# `.
+pub fn prompt_context(ctx: &[String]) -> String {
+    let t: Vec<&str> = ctx.iter().map(String::as_str).collect();
+    match t.as_slice() {
+        [] => "(config)".to_string(),
+        ["interface", name] => format!("(config-if-{name})"),
+        ["protocols", "bgp"] => "(config-router-bgp)".to_string(),
+        ["protocols", "bgp", "neighbor", nbr] => format!("(config-bgp-neighbor-{nbr})"),
+        rest => {
+            let tail = &rest[rest.len().saturating_sub(2)..];
+            format!("(config-{})", tail.join("-"))
+        }
+    }
 }
 
 /// `commit`: validate the candidate, persist it, then — if enabled — apply it to
@@ -432,6 +539,9 @@ commands:
                             firewall zone <z>  stateful|block-icmp|default-action|log|block …
                             firewall rule <r>  from|to|action|proto|port|log|source|source-group|port-group …
                             firewall group  address-group <n> address <csv> | port-group <n> port <csv>
+                            protocols bgp  local-as|router-id|hold-time|network|community|multipath|confederation|rpki|aggregate|roa|ebgp-require-policy …
+                            protocols bgp neighbor <ip>  remote-as|passive|password|ttl-security|max-prefix|role|import|export|bfd …
+                            protocols filter <name>  default accept|reject | rule <n> prefix|protocol|set-metric|set-community|action …
                             nat source <s>  zone …
                             nat destination <d>  zone|proto|port|to …
                             multiwan mode failover|load-balance
@@ -444,11 +554,23 @@ commands:
   show [section]          show the candidate config (all, or one section:
                           system | interfaces | firewall | nat | protocols |
                           services | multiwan | vpn)
-  edit <path...>          descend into a subtree; set/delete/show become
-                          relative to it, e.g.  edit firewall rule web
-  up | top                move one level up / back to the top of the tree
+  edit <path...>          descend into a subtree (a context); set/delete/show
+                          become relative to it, e.g.  edit firewall rule web
+                          Any interior node works: edit interface eth0,
+                          edit protocols bgp neighbor 10.0.0.1
+  <path...>               context shorthand (Cisco-style): a bare path that
+                          names a subtree descends into it — `interface eth0`,
+                          and inside it `zone lan` — while a complete leaf path
+                          is an implicit set — inside a rule, `action accept`
+                          ≡ `set action accept`
+  no <path...>            delete relative to the context (Cisco `no`), e.g.
+                          `no action`  ≡  delete action
+  exit                    pop one context level; at the top, leave config mode
+  end | top               jump straight back to the top of the tree
+  up                      move one token up from the edit context
   run <op command>        run an operational command from config mode,
                           e.g.  run show ip route   run show ip bgp summary
+  do <op command>         Cisco alias for `run`, e.g.  do show ip route
   compare [<N> [<M>]]     diff the candidate vs the saved config (no args),
                           vs archived revision N, or revision N vs revision M
                           (list revisions with `run show system commit`)
@@ -461,8 +583,10 @@ commands:
   rollback <N>            revert to archived revision N (0 = newest); list them
                           with `run show system commit`
   discard                 drop edits, reload from disk
-  exit | quit             leave the edit context / configuration mode
-  (Tab or `?` lists commands, config keys, and value keywords.)
+  quit                    alias for `exit`
+  (Tab or `?` lists commands, config keys, and value keywords.
+   examples:  edit interface eth0 → zone lan → address 10.0.0.1/24 → exit
+              edit protocols bgp → local-as 65001 → neighbor 10.0.0.2 remote-as 65002)
 ";
 
 /// A completion candidate: the keyword to insert plus a short description shown
@@ -501,6 +625,15 @@ const COMMANDS: &[Cand] = &[
     ("discard", "drop uncommitted edits"),
     ("exit", "leave the edit context / configuration mode"),
     ("help", "show command help"),
+];
+
+// Cisco-style extras offered at the first-token position alongside COMMANDS.
+// Kept out of COMMANDS so the flat completion grammar (and its tests) is
+// unchanged; they still work as typed commands everywhere.
+const CONTEXT_COMMANDS: &[Cand] = &[
+    ("end", "jump to the top of the config tree (Cisco `end`)"),
+    ("no", "delete a node relative to the context (Cisco `no`)"),
+    ("do", "run an operational command (Cisco `do show …`)"),
 ];
 
 // `run <Tab>` — the operational commands reachable from config mode.
@@ -708,6 +841,7 @@ const PROTOCOLS_NODES: &[Cand] = &[
     ("isis", "IS-IS: interfaces, system-id, area, level"),
     ("bgp", "BGP-4: local-as, networks, neighbors"),
     ("vrrp", "VRRP virtual router (first-hop redundancy)"),
+    ("filter", "a named route filter (import/export policy)"),
 ];
 const OSPF_FIELDS: &[Cand] = &[
     ("interface", "a NIC OSPF runs on"),
@@ -758,9 +892,100 @@ const BGP_FIELDS: &[Cand] = &[
         "router-id",
         "BGP router-id (defaults to protocols router-id)",
     ),
+    ("hold-time", "the OPEN Hold Time in seconds (default 180)"),
+    ("cluster-id", "route-reflector CLUSTER_ID (dotted quad)"),
     ("network", "a prefix to originate/advertise"),
     ("redistribute", "inject a route source (static / connected)"),
-    ("neighbor", "a BGP peer (<ip> remote-as <n>)"),
+    ("community", "a community attached to originated routes"),
+    ("large-community", "a large community on originated routes"),
+    ("ext-community", "an ext community on originated routes"),
+    ("multipath", "max equal-cost paths (BGP multipath / ECMP)"),
+    ("confederation", "confederation id / member (RFC 5065)"),
+    ("aggregate", "a covering aggregate prefix (<prefix>)"),
+    ("roa", "a static RPKI ROA (<prefix> origin-as <n>)"),
+    ("rpki", "RPKI: reject-invalid, rtr cache"),
+    ("ebgp-require-policy", "require a policy on every eBGP peer"),
+    ("neighbor", "a BGP peer (<ip> remote-as <n> ...)"),
+];
+// A BGP neighbour's per-peer policy surface.
+const NEIGHBOR_FIELDS: &[Cand] = &[
+    ("remote-as", "the peer's AS number"),
+    ("passive", "wait for the peer to connect"),
+    ("route-reflector-client", "this iBGP peer is an RR client"),
+    ("ttl-security", "GTSM max hops to the peer (1-254)"),
+    ("password", "TCP-MD5 signature password"),
+    ("ao-key", "TCP-AO master key"),
+    ("ao-key-id", "TCP-AO key id (default 100)"),
+    ("max-prefix", "tear down over this many prefixes"),
+    ("default-originate", "advertise a default route to the peer"),
+    ("add-path", "negotiate ADD-PATH (RFC 7911)"),
+    ("extended-nexthop", "negotiate IPv4-over-IPv6 next hop"),
+    ("evpn", "negotiate the EVPN address family"),
+    ("flowspec", "negotiate the FlowSpec address family"),
+    ("srpolicy", "negotiate the SR Policy address family"),
+    ("link-state", "negotiate the BGP-LS address family"),
+    ("import", "inbound route policy (a filter name)"),
+    ("export", "outbound route policy (a filter name)"),
+    ("role", "BGP Role toward the peer (RFC 9234)"),
+    ("bfd", "run a BFD session to the peer"),
+    ("bfd-auth-type", "per-neighbour BFD auth type"),
+    ("bfd-auth-key-id", "BFD auth wire key id (default 1)"),
+    ("bfd-auth-key", "BFD auth shared secret"),
+];
+// Values for `neighbor <ip> role`.
+const BGP_ROLES: &[Cand] = &[
+    ("provider", "transit provider (OTC applies)"),
+    ("customer", "transit customer"),
+    ("peer", "settlement-free peer"),
+    ("rs-server", "route-server"),
+    ("rs-client", "route-server client"),
+];
+// Values for `neighbor <ip> bfd-auth-type`.
+const BFD_AUTH_TYPES: &[Cand] = &[
+    ("simple", "simple password"),
+    ("keyed-md5", "keyed MD5"),
+    ("meticulous-md5", "meticulous keyed MD5"),
+    ("keyed-sha1", "keyed SHA1"),
+    ("meticulous-sha1", "meticulous keyed SHA1"),
+];
+const CONFEDERATION_FIELDS: &[Cand] = &[
+    ("id", "the confederation identifier (AS shown externally)"),
+    ("member", "a member-AS of this confederation"),
+];
+const RPKI_FIELDS: &[Cand] = &[
+    ("reject-invalid", "drop RPKI-Invalid routes"),
+    ("rtr", "RTR validating cache (host:port)"),
+    ("rtr-refresh", "RTR refresh interval (seconds)"),
+];
+const AGGREGATE_FIELDS: &[Cand] = &[("summary-only", "advertise only the aggregate")];
+const ROA_FIELDS: &[Cand] = &[
+    ("origin-as", "the AS authorised to originate the prefix"),
+    ("max-length", "the longest prefix length authorised"),
+];
+// A route filter's fields, and one rule's fields.
+const FILTER_FIELDS: &[Cand] = &[
+    ("default", "action when no rule matches (accept / reject)"),
+    ("rule", "a rule, keyed by an integer index (<n>)"),
+];
+const FILTER_RULE_FIELDS: &[Cand] = &[
+    ("prefix", "a prefix pattern to match (e.g. 10.0.0.0/8+)"),
+    ("protocol", "match this route's protocol"),
+    ("metric-le", "match metric ≤ this"),
+    ("metric-ge", "match metric ≥ this"),
+    ("set-metric", "set the matched route's metric"),
+    ("add-metric", "add a signed delta to the metric"),
+    ("set-preference", "set the administrative preference"),
+    ("set-community", "replace communities"),
+    ("add-community", "append a community"),
+    ("set-large-community", "replace large communities"),
+    ("add-large-community", "append a large community"),
+    ("set-ext-community", "replace ext communities"),
+    ("add-ext-community", "append an ext community"),
+    ("action", "accept / reject a matching route"),
+];
+const ACCEPT_REJECT: &[Cand] = &[
+    ("accept", "accept the route"),
+    ("reject", "reject the route"),
 ];
 const REDIST: &[Cand] = &[
     ("static", "redistribute static routes"),
@@ -1124,6 +1349,51 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "protocols", "static", _prefix] => STATIC_FIELDS,
         ["set" | "delete", "protocols", "bgp"] => BGP_FIELDS,
         ["set", "protocols", "bgp", "redistribute"] => REDIST,
+        ["set", "protocols", "bgp", "ebgp-require-policy"] => BOOLS,
+        ["set" | "delete", "protocols", "bgp", "confederation"] => CONFEDERATION_FIELDS,
+        ["set" | "delete", "protocols", "bgp", "rpki"] => RPKI_FIELDS,
+        ["set", "protocols", "bgp", "rpki", "reject-invalid"] => BOOLS,
+        ["set" | "delete", "protocols", "bgp", "aggregate", _prefix] => AGGREGATE_FIELDS,
+        [
+            "set",
+            "protocols",
+            "bgp",
+            "aggregate",
+            _prefix,
+            "summary-only",
+        ] => BOOLS,
+        ["set" | "delete", "protocols", "bgp", "roa", _prefix] => ROA_FIELDS,
+        ["set" | "delete", "protocols", "bgp", "neighbor", _addr] => NEIGHBOR_FIELDS,
+        ["set", "protocols", "bgp", "neighbor", _addr, "role"] => BGP_ROLES,
+        [
+            "set",
+            "protocols",
+            "bgp",
+            "neighbor",
+            _addr,
+            "bfd-auth-type",
+        ] => BFD_AUTH_TYPES,
+        [
+            "set",
+            "protocols",
+            "bgp",
+            "neighbor",
+            _addr,
+            "passive"
+            | "route-reflector-client"
+            | "default-originate"
+            | "add-path"
+            | "extended-nexthop"
+            | "evpn"
+            | "flowspec"
+            | "srpolicy"
+            | "link-state"
+            | "bfd",
+        ] => BOOLS,
+        ["set" | "delete", "protocols", "filter", _name] => FILTER_FIELDS,
+        ["set", "protocols", "filter", _name, "default"] => ACCEPT_REJECT,
+        ["set" | "delete", "protocols", "filter", _name, "rule", _n] => FILTER_RULE_FIELDS,
+        ["set", "protocols", "filter", _name, "rule", _n, "action"] => ACCEPT_REJECT,
         ["set" | "delete", "protocols", "ospf"] => OSPF_FIELDS,
         ["set", "protocols", "ospf", "redistribute"] => REDIST,
         ["set", "protocols", "ospf", "network-type"] => OSPF_NETWORK_TYPES,
@@ -1247,6 +1517,27 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
     }
 }
 
+/// Candidates at the first-token (command) position, Cisco-aware: the flat
+/// commands, plus the extra commands (end/no/do), plus the child keywords of the
+/// current context — so an empty-line Tab/`?` inside a context lists both the
+/// commands and the subtree you can descend into or implicitly `set`.
+fn first_token_candidates(ctx: &[String], names: &DynNames) -> Vec<(String, String)> {
+    let mut all = dyn_candidates(&[], names); // COMMANDS
+    for (k, d) in CONTEXT_COMMANDS {
+        if !all.iter().any(|(kw, _)| kw == k) {
+            all.push((k.to_string(), d.to_string()));
+        }
+    }
+    let mut child_toks: Vec<&str> = vec!["set"];
+    child_toks.extend(ctx.iter().map(String::as_str));
+    for c in dyn_candidates(&child_toks, names) {
+        if !all.iter().any(|(kw, _)| *kw == c.0) {
+            all.push(c);
+        }
+    }
+    all
+}
+
 /// The terminal width (columns), so the completion menu can be laid out one
 /// candidate per line. Falls back to 80 when it can't be queried.
 fn term_width() -> usize {
@@ -1357,7 +1648,13 @@ impl Completer for ConfigCompleter {
         let eff = effective_tokens(&before, &ctx);
         let eff_view: Vec<&str> = eff.iter().map(String::as_str).collect();
         let names = self.names.borrow();
-        let all = dyn_candidates(&eff_view, &names);
+        // First-token completion is Cisco-aware (see first_token_candidates);
+        // deeper positions use the plain grammar.
+        let all = if before.is_empty() {
+            first_token_candidates(&ctx, &names)
+        } else {
+            dyn_candidates(&eff_view, &names)
+        };
         let matched: Vec<&(String, String)> = all
             .iter()
             .filter(|(kw, _)| kw.starts_with(prefix))
@@ -1602,6 +1899,75 @@ mod tests {
     }
 
     #[test]
+    fn bgp_and_filter_completion_is_discoverable() {
+        // The protocols sub-tree now offers filters alongside bgp.
+        assert!(kw(&["set", "protocols"]).contains(&"filter"));
+        // The extended BGP field set.
+        let bgp = kw(&["set", "protocols", "bgp"]);
+        for f in [
+            "hold-time",
+            "confederation",
+            "rpki",
+            "aggregate",
+            "roa",
+            "neighbor",
+        ] {
+            assert!(bgp.contains(&f), "bgp fields missing {f:?}: {bgp:?}");
+        }
+        // A neighbour's full per-peer surface.
+        let n = kw(&["set", "protocols", "bgp", "neighbor", "10.0.0.2"]);
+        for f in [
+            "remote-as",
+            "passive",
+            "role",
+            "import",
+            "export",
+            "bfd-auth-type",
+        ] {
+            assert!(n.contains(&f), "neighbor fields missing {f:?}: {n:?}");
+        }
+        // Value-keyword lists.
+        assert_eq!(
+            kw(&["set", "protocols", "bgp", "neighbor", "10.0.0.2", "role"]),
+            ["provider", "customer", "peer", "rs-server", "rs-client"]
+        );
+        assert_eq!(
+            kw(&["set", "protocols", "bgp", "neighbor", "10.0.0.2", "passive"]),
+            ["true", "false"]
+        );
+        assert_eq!(
+            kw(&["set", "protocols", "bgp", "confederation"]),
+            ["id", "member"]
+        );
+        assert_eq!(
+            kw(&["set", "protocols", "bgp", "rpki"]),
+            ["reject-invalid", "rtr", "rtr-refresh"]
+        );
+        assert_eq!(
+            kw(&["set", "protocols", "bgp", "aggregate", "10.0.0.0/8"]),
+            ["summary-only"]
+        );
+        assert_eq!(
+            kw(&["set", "protocols", "bgp", "roa", "10.0.0.0/8"]),
+            ["origin-as", "max-length"]
+        );
+        // The filter sub-tree: fields, default values, rule fields, rule action.
+        assert_eq!(
+            kw(&["set", "protocols", "filter", "f"]),
+            ["default", "rule"]
+        );
+        assert_eq!(
+            kw(&["set", "protocols", "filter", "f", "default"]),
+            ["accept", "reject"]
+        );
+        assert!(kw(&["set", "protocols", "filter", "f", "rule", "10"]).contains(&"set-community"));
+        assert_eq!(
+            kw(&["set", "protocols", "filter", "f", "rule", "10", "action"]),
+            ["accept", "reject"]
+        );
+    }
+
+    #[test]
     fn dynamic_candidates_offer_live_names() {
         let names = DynNames {
             interfaces: vec!["eth0".into(), "eth1".into()],
@@ -1783,6 +2149,232 @@ mod tests {
         // Non-path commands pass through untouched.
         let eff = effective_tokens(&["run", "show"], &ctx);
         assert_eq!(eff, ["run", "show"]);
+    }
+
+    fn sv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn prompt_context_renders_cisco_style() {
+        assert_eq!(prompt_context(&[]), "(config)");
+        assert_eq!(
+            prompt_context(&sv(&["interface", "eth0"])),
+            "(config-if-eth0)"
+        );
+        assert_eq!(
+            prompt_context(&sv(&["protocols", "bgp"])),
+            "(config-router-bgp)"
+        );
+        assert_eq!(
+            prompt_context(&sv(&["protocols", "bgp", "neighbor", "10.0.0.1"])),
+            "(config-bgp-neighbor-10.0.0.1)"
+        );
+        // Generic: the last (up to) two tokens joined by '-'.
+        assert_eq!(
+            prompt_context(&sv(&["firewall", "rule", "web"])),
+            "(config-rule-web)"
+        );
+        assert_eq!(prompt_context(&sv(&["system"])), "(config-system)");
+    }
+
+    #[test]
+    fn is_interior_node_accepts_nodes_and_instances_rejects_garbage() {
+        assert!(is_interior_node(&sv(&["firewall"])));
+        assert!(is_interior_node(&sv(&["firewall", "rule", "web"]))); // instance ok
+        assert!(is_interior_node(&sv(&["interface", "eth0"])));
+        assert!(is_interior_node(&sv(&["protocols", "bgp"])));
+        assert!(!is_interior_node(&sv(&["bogus"])));
+        assert!(!is_interior_node(&[])); // empty is not a node
+        // A value-leaf path (past a value) is not descendable.
+        assert!(!is_interior_node(&sv(&[
+            "firewall", "rule", "web", "action", "drop"
+        ])));
+    }
+
+    /// Build a throwaway session backed by a temp file.
+    fn scratch_session(tag: &str) -> (Session, std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("sentinel-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.toml");
+        let s = Session::load(&path).unwrap();
+        (s, path, dir)
+    }
+
+    #[test]
+    fn exit_pops_one_level_and_end_jumps_to_top() {
+        let (mut s, _p, dir) = scratch_session("exit");
+        let act = Apply::off();
+        let mut ctx = Vec::new();
+
+        // Descend two token-levels, then a keyword+instance level.
+        exec_line(&mut s, &act, &mut ctx, "edit protocols bgp");
+        assert_eq!(ctx, vec!["protocols", "bgp"]);
+        // `exit` pops one level: bgp → protocols.
+        exec_line(&mut s, &act, &mut ctx, "exit");
+        assert_eq!(ctx, vec!["protocols"]);
+        // `exit` again: protocols → top.
+        exec_line(&mut s, &act, &mut ctx, "exit");
+        assert!(ctx.is_empty());
+
+        // A keyword+instance level (`interface eth0`) is popped as ONE level.
+        exec_line(&mut s, &act, &mut ctx, "edit interface eth0");
+        assert_eq!(ctx, vec!["interface", "eth0"]);
+        exec_line(&mut s, &act, &mut ctx, "exit");
+        assert!(ctx.is_empty(), "interface+name pops as one level");
+
+        // `end` clears from any depth without leaving config mode.
+        exec_line(&mut s, &act, &mut ctx, "edit firewall rule web");
+        assert_eq!(ctx, vec!["firewall", "rule", "web"]);
+        assert!(!exec_line(&mut s, &act, &mut ctx, "end"));
+        assert!(ctx.is_empty());
+
+        // At the top, `exit` leaves the session (returns true).
+        assert!(exec_line(&mut s, &act, &mut ctx, "exit"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn context_shorthand_descends_and_implicit_set_mutates_draft() {
+        let (mut s, _p, dir) = scratch_session("shorthand");
+        let act = Apply::off();
+        let mut ctx = Vec::new();
+
+        // A bare path that names a subtree descends (context-entry shorthand).
+        assert!(!exec_line(&mut s, &act, &mut ctx, "interface eth0"));
+        assert_eq!(ctx, vec!["interface", "eth0"]);
+        // Inside it, a complete leaf path is an implicit set.
+        assert!(!exec_line(&mut s, &act, &mut ctx, "address 10.0.0.1/24"));
+        assert!(!exec_line(&mut s, &act, &mut ctx, "zone lan"));
+
+        // Descend a keyword+instance level, then implicit-set two leaves.
+        exec_line(&mut s, &act, &mut ctx, "end");
+        assert!(!exec_line(&mut s, &act, &mut ctx, "firewall rule web"));
+        assert_eq!(ctx, vec!["firewall", "rule", "web"]);
+        assert!(!exec_line(&mut s, &act, &mut ctx, "from lan"));
+        assert!(!exec_line(&mut s, &act, &mut ctx, "action accept"));
+
+        let shown = s.show();
+        assert!(shown.contains("10.0.0.1/24"), "{shown}");
+        assert!(shown.contains("web"), "{shown}");
+        assert!(shown.contains("accept"), "{shown}");
+
+        // Garbage that is neither a node nor a valid set errors (draft untouched).
+        let before = s.show();
+        assert!(!exec_line(&mut s, &act, &mut ctx, "totally bogus"));
+        assert_eq!(s.show(), before, "a failed shorthand must not mutate");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_deletes_relative_to_context() {
+        let (mut s, _p, dir) = scratch_session("no");
+        let act = Apply::off();
+        let mut ctx = Vec::new();
+
+        exec_line(&mut s, &act, &mut ctx, "edit firewall rule web");
+        exec_line(&mut s, &act, &mut ctx, "action accept");
+        assert!(s.show().contains("accept"), "{}", s.show());
+        // Cisco `no` deletes relative to the context.
+        assert!(!exec_line(&mut s, &act, &mut ctx, "no action"));
+        assert!(!s.show().contains("accept"), "{}", s.show());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_rejects_garbage_with_a_helpful_error() {
+        let (mut s, _p, dir) = scratch_session("editerr");
+        let act = Apply::off();
+        let mut ctx = Vec::new();
+        // Deep validation still accepts a valid interior node.
+        assert!(!exec_line(&mut s, &act, &mut ctx, "edit protocols bgp"));
+        assert_eq!(ctx, vec!["protocols", "bgp"]);
+        // The error helper points at the first bad token and lists valid children.
+        let err = edit_error(&sv(&["firewall", "bogus"]));
+        let msg = err.to_string();
+        assert!(msg.contains("\"bogus\""), "{msg}");
+        assert!(msg.contains("rule"), "{msg}"); // a real firewall child
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn first_token_completion_offers_context_children_and_extras() {
+        let names = DynNames::default();
+        // At the top: commands + Cisco extras + the top-level subtree keywords.
+        let top: Vec<String> = first_token_candidates(&[], &names)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert!(top.contains(&"set".to_string()));
+        assert!(top.contains(&"end".to_string()));
+        assert!(top.contains(&"no".to_string()));
+        assert!(top.contains(&"do".to_string()));
+        assert!(top.contains(&"interface".to_string())); // a top subtree
+        assert!(top.contains(&"protocols".to_string()));
+
+        // Inside a context, the child keywords of that context are offered so a
+        // bare Tab/`?` lists what you can descend into / implicitly set.
+        let kids: Vec<String> = first_token_candidates(&sv(&["firewall", "rule", "web"]), &names)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert!(kids.contains(&"from".to_string()), "{kids:?}");
+        assert!(kids.contains(&"action".to_string()), "{kids:?}");
+        assert!(kids.contains(&"set".to_string()), "{kids:?}"); // commands still there
+    }
+
+    #[test]
+    fn cisco_style_session_end_to_end() {
+        let (mut s, _p, dir) = scratch_session("e2e");
+        let act = Apply::off();
+        let mut ctx = Vec::new();
+        // A realistic Cisco-style session: descend, implicit-set, exit, descend a
+        // keyword+instance level, end, descend routing, implicit-set a deep leaf.
+        for line in [
+            "interface eth0",
+            "zone lan",
+            "address 10.0.0.1/24",
+            "exit",
+            "firewall rule web",
+            "from lan",
+            "action accept",
+            "end",
+            "protocols bgp",
+            "local-as 65001",
+            "neighbor 10.0.0.2 remote-as 65002",
+            "end",
+        ] {
+            assert!(!exec_line(&mut s, &act, &mut ctx, line), "line: {line}");
+        }
+        assert!(ctx.is_empty());
+        let shown = s.show();
+        for needle in ["eth0", "10.0.0.1/24", "web", "accept", "65001", "65002"] {
+            assert!(shown.contains(needle), "missing {needle:?} in:\n{shown}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flat_grammar_still_works_from_the_top() {
+        // Regression: the flat grammar (no context) must behave exactly as before,
+        // since piped scripts / nixosTests depend on it.
+        let (mut s, _p, dir) = scratch_session("flat");
+        let act = Apply::off();
+        let mut ctx = Vec::new();
+        assert!(!exec_line(
+            &mut s,
+            &act,
+            &mut ctx,
+            "set protocols bgp neighbor 1.2.3.4 remote-as 65001"
+        ));
+        assert!(ctx.is_empty(), "a flat `set` must not change the context");
+        let shown = s.show();
+        assert!(shown.contains("1.2.3.4"), "{shown}");
+        assert!(shown.contains("65001"), "{shown}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
