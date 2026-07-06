@@ -120,6 +120,14 @@ enum Command {
         #[arg(long, default_value = repl::DEFAULT_WREN_OUT)]
         wren_out: PathBuf,
     },
+    /// Second boot stage (after networkd): re-apply the runtime-only network
+    /// state a reboot wipes — tc qdiscs (QoS), Multi-WAN routes, IPsec SAs. Used
+    /// by the sentinel-boot-late service.
+    ApplyBootLate {
+        /// The active appliance config to apply.
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    },
     /// Compile + install the Velstra agent config, then reload the data plane.
     Apply {
         /// Path to the appliance config (TOML or JSON).
@@ -229,6 +237,7 @@ async fn main() -> Result<()> {
             out,
             wren_out,
         } => apply_boot(&config, &out, &wren_out),
+        Command::ApplyBootLate { config } => apply_boot_late(&config),
         Command::Apply { file, out, reload } => apply(&file, &out, reload.as_deref()),
         Command::ConfirmRollback { config } => confirm_rollback(&config),
         Command::Ports { controller } => ports(&controller).await,
@@ -414,10 +423,25 @@ fn apply_boot(
         .with_context(|| format!("writing {}", wren_out.display()))?;
 
     system::set_hostname(&appliance.system.hostname)?;
-    // Re-assert interface addressing from the saved config (networkd units),
-    // so a reboot restores the live IPs the same way it restores the hostname.
-    net::apply(&appliance)?;
+    // Re-assert interface addressing from the saved config (networkd units) +
+    // the co-services, so a reboot restores the live IPs the same way it restores
+    // the hostname. This runs BEFORE networkd, so it only renders/units-and-
+    // restarts — the link-dependent runtime state (tc qdiscs, Multi-WAN routes,
+    // IPsec SAs) is deferred to `apply-boot-late`, which runs after networkd has
+    // brought the links up (running it here would no-op against links that don't
+    // exist yet, and would poison the change-detect stamps so the late pass skips
+    // them too).
+    net::apply_persistent(&appliance)?;
     Ok(())
+}
+
+/// Second boot stage: after networkd has brought the links up, apply the
+/// runtime-only network state that a reboot wipes and that could not be applied
+/// before the links existed — tc egress qdiscs (QoS), the Multi-WAN policy
+/// routes, and the IPsec SAs. Run by the `sentinel-boot-late` service.
+fn apply_boot_late(config: &std::path::Path) -> Result<()> {
+    let appliance = Appliance::load(config)?;
+    net::apply_link_runtime(&appliance)
 }
 
 /// `sentinel install`: with no target on a terminal, run the interactive wizard

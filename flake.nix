@@ -420,6 +420,56 @@
               RestartSec = "5s";
             };
           };
+          # Second boot stage — the reboot-persistence fix. `sentinel-boot` runs
+          # BEFORE networkd (it seeds the editable config and writes the networkd
+          # units), so it can only render files and restart co-services — it can't
+          # apply state that lives on a link networkd hasn't brought up (or, for a
+          # VLAN/bridge/bond/tunnel, hasn't even created) yet. This unit runs the
+          # deferred `apply-boot-late` AFTER networkd, re-installing exactly that
+          # runtime-only state a reboot wipes: the tc egress qdiscs (QoS), the
+          # Multi-WAN policy routes, and the IPsec SAs. Without it a saved config's
+          # shaping/SAs silently vanish on every reboot.
+          systemd.services.sentinel-boot-late = {
+            description = "Re-apply runtime network state (QoS/Multi-WAN/IPsec) after networkd";
+            wantedBy = [ "multi-user.target" ];
+            # Order after networkd (which creates the VLAN/bridge/bond/tunnel links
+            # and configures addresses), NOT after network-online.target: that
+            # target waits for every managed link to be *online*, so a saved config
+            # with a carrierless/lease-less DHCP uplink would wedge this unit — and
+            # a config re-apply must never block the boot. RemainAfterExit but
+            # nothing depends on it, so even a failure is a warning, not a hang.
+            after = [
+              "sentinel-boot.service"
+              "systemd-networkd.service"
+            ];
+            requires = [ "sentinel-boot.service" ];
+            # It reads the editable config, so wait for its partition (a no-op when
+            # /var/lib is on the root fs; load-bearing when it is its own mount).
+            unitConfig.RequiresMountsFor = [ "/var/lib/sentinel" ];
+            serviceConfig = {
+              Type = "oneshot";
+              RemainAfterExit = true;
+              # Give the links a bounded chance to come up before shaping them —
+              # `--any` returns as soon as ONE link is online (a static-addressed
+              # link reaches routable in ~1s), and the leading `-` + `--timeout`
+              # mean a stuck uplink is ignored after 30s rather than blocking boot.
+              ExecStartPre = "-${pkgs.systemd}/lib/systemd/systemd-networkd-wait-online --any --timeout=30";
+              ExecStart = "${sentinel}/bin/sentinel apply-boot-late --config /var/lib/sentinel/appliance.toml";
+              # Hard cap: a re-apply that somehow stalls is killed, not left to hang
+              # the boot. The persistent config + data plane are already up by now.
+              TimeoutStartSec = 90;
+            };
+          };
+
+          # Persistence guard for the editable config itself: order the
+          # config-seeding boot service after the /var/lib/sentinel mount, so on a
+          # deployment where that path is its own partition (as on the appliance
+          # image) the seed + read land on the persistent device and are never
+          # shadowed by a not-yet-mounted dir — otherwise a reboot can read the
+          # factory default and forget the saved config entirely. image.nix sets
+          # this too; declaring it here also covers the plain nixosModule.
+          systemd.services.sentinel-boot.unitConfig.RequiresMountsFor = [ "/var/lib/sentinel" ];
+
           # IPsec (roadmap C2): strongSwan's charon (charon-systemd) is always up
           # so a `commit` can `swanctl --load-all` the rendered site-to-site
           # tunnels into it. Its own /etc/swanctl config stays empty — Sentinel
@@ -660,6 +710,117 @@
           # still-writing producer under pipefail)
           machine.succeed("sentinel show version | grep wren")
           machine.succeed("sentinel show firewall")
+        '';
+      };
+
+      # Reboot persistence (the real thing): `configure`+`commit`+`save`, then a
+      # genuine `machine.reboot()`, and assert the WHOLE running config is back —
+      # not just the files on disk but the live runtime state (networkd address,
+      # dnsmasq drop-in, and the tc qdisc, which is kernel-runtime-only and must
+      # be re-installed at boot AFTER networkd brings the links up). The editable
+      # config lives on a dedicated ext4 partition (as it does on the real
+      # appliance image), so the reboot models the immutable-appliance layout:
+      # volatile /run + a persistent /var/lib/sentinel.
+      #   nix build .#checks.x86_64-linux.reboot -L
+      reboot = pkgs.testers.runNixOSTest {
+        name = "sentinel-reboot";
+        nodes.machine =
+          { lib, pkgs, ... }:
+          {
+            imports = [ self.nixosModules.sentinel ];
+            virtualisation.memorySize = 2048;
+            # A dedicated, persistent block device for the editable config —
+            # exactly like the appliance image's LABEL=data partition. This
+            # survives the reboot below; the rest of the VM state is incidental.
+            virtualisation.emptyDiskImages = [ 512 ];
+            virtualisation.fileSystems."/var/lib/sentinel" = {
+              device = "/dev/vdb";
+              fsType = "ext4";
+              autoFormat = true;
+            };
+            # `tc` for the qdisc assertions (iproute2; the CLI resolves it via
+            # SENTINEL_TC_BIN).
+            environment.systemPackages = [ pkgs.iproute2 ];
+          };
+        testScript = ''
+          machine.wait_for_unit("multi-user.target")
+          machine.wait_for_unit("sentinel-boot.service")
+          machine.wait_for_unit("velstra.service")
+          machine.wait_for_unit("wren.service")
+          # The config partition is a real block device, not the volatile root.
+          machine.succeed("findmnt -no SOURCE /var/lib/sentinel | grep -q /dev/")
+
+          # Configure a representative slice of the box AS THE ADMIN, commit it
+          # live, and persist it with `save`: a hostname, a VLAN subinterface with
+          # an address + zone + egress QoS (the qdisc is the runtime-only state
+          # that a reboot must rebuild), a firewall posture, a LAN DNS resolver,
+          # and a static route (routing / wren).
+          machine.succeed(
+              "su admin -c \"printf '%s\\n' "
+              "'set system hostname fw-reboot' "
+              "'set interface eth0 zone wan' 'set interface eth0 address dhcp' "
+              "'set interface eth0.50 parent eth0' 'set interface eth0.50 vlan 50' "
+              "'set interface eth0.50 zone lan' 'set interface eth0.50 address 10.0.50.1/24' "
+              "'set interface eth0.50 qos discipline cake' "
+              "'set interface eth0.50 qos bandwidth 100mbit' "
+              "'set interface eth0.50 qos rtt internet' "
+              "'set firewall global block-icmp true' "
+              "'set services dns upstream 10.0.50.99' 'set services dns serve-on eth0.50' "
+              "'set protocols static 192.168.77.0/24 via 10.0.50.99' "
+              "commit save exit "
+              "| sentinel configure\""
+          )
+
+          # --- Pre-reboot: everything applied live. ---
+          machine.succeed("hostname | grep -x fw-reboot")
+          machine.wait_until_succeeds("ip addr show eth0.50 | grep -q 10.0.50.1", timeout=20)
+          machine.wait_until_succeeds("tc qdisc show dev eth0.50 root | grep -q cake", timeout=30)
+          machine.succeed("test -f /run/sentinel/dnsmasq.d/sentinel.conf")
+          machine.succeed("grep -q 192.168.77.0/24 /run/sentinel/wren.toml")
+
+          # --- Reboot. Volatile /run is wiped; /var/lib/sentinel persists. ---
+          # A full stop + cold boot (not machine.reboot(): the test VM runs qemu
+          # with -no-reboot, so an in-guest reboot makes qemu exit rather than
+          # restart). shutdown()+start() reuses the same disk images, so the root
+          # comes up fresh (wiped /run) while the /var/lib/sentinel partition — and
+          # the saved config on it — persists, exactly as on a real power cycle.
+          machine.shutdown()
+          machine.start()
+
+          machine.wait_for_unit("multi-user.target")
+          machine.wait_for_unit("sentinel-boot.service")
+          machine.wait_for_unit("velstra.service")
+          machine.wait_for_unit("wren.service")
+
+          # The saved config survived on the persistent partition, unchanged.
+          machine.succeed("grep -q 'hostname = \"fw-reboot\"' /var/lib/sentinel/appliance.toml")
+          machine.succeed("grep -q '10.0.50.1/24' /var/lib/sentinel/appliance.toml")
+          machine.succeed("grep -q 'cake' /var/lib/sentinel/appliance.toml")
+
+          # Boot re-asserted the hostname from the saved config.
+          machine.succeed("hostname | grep -x fw-reboot")
+
+          # Boot re-compiled the runtime agent configs into the fresh /run.
+          machine.succeed("grep -q '\"eth0.50\"' /run/sentinel/velstra.toml")
+          machine.succeed("grep -q 'drop_icmp = true' /run/sentinel/velstra.toml")
+          machine.succeed("grep -q 192.168.77.0/24 /run/sentinel/wren.toml")
+
+          # Boot re-applied the live L3 addressing (networkd units + link).
+          machine.wait_until_succeeds("ip addr show eth0.50 | grep -q 10.0.50.1", timeout=30)
+
+          # Boot re-rendered the LAN DNS drop-in.
+          machine.wait_until_succeeds(
+              "test -f /run/sentinel/dnsmasq.d/sentinel.conf", timeout=30
+          )
+
+          # The tc qdisc — kernel runtime state, gone after a reboot — was
+          # rebuilt on the VLAN link (which networkd only creates during boot, so
+          # the shaping must be re-applied AFTER networkd, not before it).
+          machine.wait_until_succeeds("tc qdisc show dev eth0.50 root | grep -q cake", timeout=45)
+
+          # The data plane and routing daemon are both healthy on the seeded config.
+          machine.succeed("systemctl is-active velstra.service")
+          machine.succeed("systemctl is-active wren.service")
         '';
       };
 
