@@ -191,6 +191,18 @@ struct WrenNeighbor {
     bfd_auth_key_id: Option<u8>,
     #[serde(rename = "bfd-auth-key", skip_serializing_if = "Option::is_none")]
     bfd_auth_key: Option<String>,
+    #[serde(rename = "local-as", skip_serializing_if = "Option::is_none")]
+    local_as: Option<u32>,
+    #[serde(rename = "update-source", skip_serializing_if = "Option::is_none")]
+    update_source: Option<String>,
+    #[serde(rename = "ebgp-multihop", skip_serializing_if = "Option::is_none")]
+    ebgp_multihop: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    shutdown: bool,
+    #[serde(rename = "hold-time", skip_serializing_if = "Option::is_none")]
+    hold_time: Option<u16>,
 }
 
 #[derive(Debug, Serialize)]
@@ -807,6 +819,12 @@ fn compile_neighbor(n: &crate::config::BgpNeighbor) -> WrenNeighbor {
         bfd_auth_type: n.bfd_auth_type.clone(),
         bfd_auth_key_id: n.bfd_auth_key_id,
         bfd_auth_key: n.bfd_auth_key.clone(),
+        local_as: n.local_as,
+        update_source: n.update_source.clone(),
+        ebgp_multihop: n.ebgp_multihop,
+        description: n.description.clone(),
+        shutdown: n.shutdown,
+        hold_time: n.hold_time,
     }
 }
 
@@ -1174,6 +1192,15 @@ bfd = true
 bfd-auth-type = "meticulous-sha1"
 bfd-auth-key-id = 7
 bfd-auth-key = "k"
+local-as = 65099
+update-source = "10.10.0.11"
+description = "R2 transit uplink"
+shutdown = true
+hold-time = 30
+[[protocols.bgp.neighbor]]
+address = "10.10.0.3"
+remote-as = 65003
+ebgp-multihop = 4
 [[protocols.filter]]
 name = "in"
 [[protocols.filter]]
@@ -1202,6 +1229,12 @@ name = "out"
             "bfd-auth-type = \"meticulous-sha1\"",
             "bfd-auth-key-id = 7",
             "bfd-auth-key = \"k\"",
+            "local-as = 65099",
+            "update-source = \"10.10.0.11\"",
+            "ebgp-multihop = 4",
+            "description = \"R2 transit uplink\"",
+            "shutdown = true",
+            "hold-time = 30",
         ] {
             assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
         }

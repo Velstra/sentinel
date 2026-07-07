@@ -565,16 +565,17 @@ pub const HELP: &str = "\
 commands:
   set <path...> <value>   set a config node. The tree (Tab/`?` explores it):
                             system hostname <name>
-                            interface <n> zone|address|parent|vlan|type|qos|pppoe …
+                            interface <n> description|disabled|zone|address|parent|vlan|type|qos|pppoe …
+                            interface <n> dhcp-server  pool-offset|pool-size|dns|lease-time|default-router|domain|static-mapping …
                             firewall global  stateful|block-icmp|default-action|log|block …
-                            firewall zone <z>  stateful|block-icmp|default-action|log|block …
-                            firewall rule <r>  from|to|action|proto|port|log|source|source-group|port-group …
+                            firewall zone <z>  description|stateful|block-icmp|default-action|log|block …
+                            firewall rule <r>  description|disabled|from|to|action|proto|port|log|source|source-group|port-group …
                             firewall group  address-group <n> address <csv> | port-group <n> port <csv>
                             protocols bgp  local-as|router-id|hold-time|network|community|multipath|confederation|rpki|aggregate|roa|ebgp-require-policy …
-                            protocols bgp neighbor <ip>  remote-as|passive|password|ttl-security|max-prefix|role|import|export|bfd …
+                            protocols bgp neighbor <ip>  remote-as|local-as|update-source|ebgp-multihop|description|shutdown|hold-time|passive|password|ttl-security|max-prefix|role|import|export|bfd …
                             protocols filter <name>  default accept|reject | rule <n> prefix|protocol|set-metric|set-community|action …
-                            nat source <s>  zone …
-                            nat destination <d>  zone|proto|port|to …
+                            nat source <s>  zone|description|disabled …
+                            nat destination <d>  zone|proto|port|to|description|disabled …
                             multiwan mode failover|load-balance
                             multiwan uplink <if>  priority|weight|table|gateway|check …
                             vpn ipsec <name>  local|remote|local-subnet|remote-subnet|psk|…
@@ -851,6 +852,8 @@ const DNS_FIELDS: &[Cand] = &[
         "sinkhole a domain (ad/tracker/malware blocking)",
     ),
     ("dnssec", "DNSSEC mode: yes / no / allow-downgrade"),
+    ("cache-size", "max cached answers (dnsmasq cache-size)"),
+    ("local-domain", "site local domain (local=/… + domain=)"),
 ];
 const DNSSEC_MODES: &[Cand] = &[
     ("yes", "validate"),
@@ -1111,6 +1114,15 @@ const NEIGHBOR_FIELDS: &[Cand] = &[
     ("bfd-auth-type", "per-neighbour BFD auth type"),
     ("bfd-auth-key-id", "BFD auth wire key id (default 1)"),
     ("bfd-auth-key", "BFD auth shared secret"),
+    ("local-as", "override this speaker's AS for this session"),
+    ("update-source", "source address for the outgoing session"),
+    (
+        "ebgp-multihop",
+        "session TTL for a distant eBGP peer (1-255)",
+    ),
+    ("description", "free-form label for this neighbour"),
+    ("shutdown", "administratively shut the session down"),
+    ("hold-time", "per-session hold-time proposed in the OPEN"),
 ];
 // Values for `neighbor <ip> role`.
 const BGP_ROLES: &[Cand] = &[
@@ -1223,6 +1235,7 @@ const GLOBAL_FIELDS: &[Cand] = &[
     ("block", "drop a source IP/CIDR everywhere"),
 ];
 const ZONE_FIELDS: &[Cand] = &[
+    ("description", "free-text label for this zone"),
     ("stateful", "stateful inspection for this zone (true|false)"),
     ("block-icmp", "drop inbound ICMP on this zone (true|false)"),
     (
@@ -1232,12 +1245,24 @@ const ZONE_FIELDS: &[Cand] = &[
     ("log", "log this zone's traffic (true|false)"),
     ("block", "drop a source IP/CIDR on this zone"),
 ];
-const NAT_SOURCE_FIELDS: &[Cand] = &[("zone", "egress (WAN) zone to masquerade")];
+const NAT_SOURCE_FIELDS: &[Cand] = &[
+    ("zone", "egress (WAN) zone to masquerade"),
+    ("description", "free-text label for this rule"),
+    (
+        "disabled",
+        "administratively disable this rule (true|false)",
+    ),
+];
 const NAT_DEST_FIELDS: &[Cand] = &[
     ("zone", "ingress zone (public side)"),
     ("proto", "tcp / udp"),
     ("port", "public destination port"),
     ("to", "internal target ip or ip:port"),
+    ("description", "free-text label for this rule"),
+    (
+        "disabled",
+        "administratively disable this rule (true|false)",
+    ),
 ];
 const BOOLS: &[Cand] = &[("true", "enabled"), ("false", "disabled")];
 const ACTIONS: &[Cand] = &[
@@ -1247,6 +1272,11 @@ const ACTIONS: &[Cand] = &[
 ];
 const PROTOS: &[Cand] = &[("tcp", "TCP"), ("udp", "UDP")];
 const IFACE_FIELDS: &[Cand] = &[
+    (
+        "description",
+        "free-text label (rendered as a unit comment)",
+    ),
+    ("disabled", "administratively disable this NIC (true|false)"),
     ("zone", "the zone this NIC belongs to"),
     ("address", "static CIDR or `dhcp`"),
     (
@@ -1394,7 +1424,17 @@ const DHCP_SERVER_FIELDS: &[Cand] = &[
     ("pool-offset", "first pool address offset within the subnet"),
     ("pool-size", "number of addresses in the pool"),
     ("dns", "DNS servers to advertise (comma-separated)"),
-    ("lease-time", "default lease time in seconds"),
+    ("lease-time", "default lease time (12h, 1h30m, or seconds)"),
+    (
+        "default-router",
+        "override the advertised gateway (option 3)",
+    ),
+    ("domain", "domain name to advertise (option 15)"),
+    ("static-mapping", "a fixed lease: <name> mac <mac> ip <ip>"),
+];
+const STATIC_MAPPING_FIELDS: &[Cand] = &[
+    ("mac", "the client MAC (52:54:00:12:34:56)"),
+    ("ip", "the fixed address (inside the server subnet)"),
 ];
 const RA_FIELDS: &[Cand] = &[
     ("enable", "turn the RA sender on"),
@@ -1419,6 +1459,11 @@ const PEER_FIELDS: &[Cand] = &[
     ("preshared-key", "optional pre-shared key"),
 ];
 const RULE_FIELDS: &[Cand] = &[
+    ("description", "free-text label for this rule"),
+    (
+        "disabled",
+        "administratively disable this rule (true|false)",
+    ),
     ("from", "source zone"),
     ("to", "destination zone"),
     ("action", "accept / drop / reject"),
@@ -1466,8 +1511,17 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set", "interface", _name, "qos", "rtt"] => QOS_RTT,
         ["set", "interface", _name, "qos", "diffserv"] => QOS_DIFFSERV,
         ["set", "interface", _name, "qos", "nat" | "ack-filter"] => BOOLS,
-        // The DHCP-server sub-tree of an interface.
+        // The DHCP-server sub-tree of an interface, incl. per-reservation fields.
         ["set" | "delete", "interface", _name, "dhcp-server"] => DHCP_SERVER_FIELDS,
+        [
+            "set" | "delete",
+            "interface",
+            _name,
+            "dhcp-server",
+            "static-mapping",
+            _lname,
+        ] => STATIC_MAPPING_FIELDS,
+        ["set", "interface", _name, "disabled"] => BOOLS,
         // The IPv6 Router-Advertisement sub-tree of an interface.
         ["set" | "delete", "interface", _name, "router-advert"] => RA_FIELDS,
         [
@@ -1516,13 +1570,15 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "firewall", "rule", _name] => RULE_FIELDS,
         ["set", "firewall", "rule", _name, "action"] => ACTIONS,
         ["set", "firewall", "rule", _name, "proto"] => PROTOS,
-        ["set", "firewall", "rule", _name, "log"] => BOOLS,
+        ["set", "firewall", "rule", _name, "log" | "disabled"] => BOOLS,
 
         // The nat sub-tree (its own top-level node).
         ["set" | "delete", "nat"] => NAT_NODES,
         ["set" | "delete", "nat", "source", _name] => NAT_SOURCE_FIELDS,
+        ["set", "nat", "source", _name, "disabled"] => BOOLS,
         ["set" | "delete", "nat", "destination", _name] => NAT_DEST_FIELDS,
         ["set", "nat", "destination", _name, "proto"] => PROTOS,
+        ["set", "nat", "destination", _name, "disabled"] => BOOLS,
 
         // The protocols (routing) sub-tree.
         ["set" | "delete", "protocols"] => PROTOCOLS_NODES,
@@ -1568,7 +1624,8 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
             | "flowspec"
             | "srpolicy"
             | "link-state"
-            | "bfd",
+            | "bfd"
+            | "shutdown",
         ] => BOOLS,
         ["set" | "delete", "protocols", "filter", _name] => FILTER_FIELDS,
         ["set", "protocols", "filter", _name, "default"] => ACCEPT_REJECT,
@@ -1953,6 +2010,8 @@ mod tests {
         assert_eq!(
             kw(&["set", "interface", "wan0"]),
             [
+                "description",
+                "disabled",
                 "zone",
                 "address",
                 "address6",
@@ -2006,8 +2065,23 @@ mod tests {
                 "pool-offset",
                 "pool-size",
                 "dns",
-                "lease-time"
+                "lease-time",
+                "default-router",
+                "domain",
+                "static-mapping"
             ]
+        );
+        // A per-reservation sub-context (mac / ip) is discoverable.
+        assert_eq!(
+            kw(&[
+                "set",
+                "interface",
+                "lan0",
+                "dhcp-server",
+                "static-mapping",
+                "printer"
+            ]),
+            ["mac", "ip"]
         );
         // The router-advert sub-tree of an interface is discoverable too.
         assert_eq!(
@@ -2069,7 +2143,14 @@ mod tests {
         );
         assert_eq!(
             kw(&["set", "firewall", "zone", "wan"]),
-            ["stateful", "block-icmp", "default-action", "log", "block"]
+            [
+                "description",
+                "stateful",
+                "block-icmp",
+                "default-action",
+                "log",
+                "block"
+            ]
         );
         assert_eq!(
             kw(&["set", "firewall", "zone", "wan", "block-icmp"]),
@@ -2078,6 +2159,8 @@ mod tests {
         assert_eq!(
             kw(&["set", "firewall", "rule", "web"]),
             [
+                "description",
+                "disabled",
                 "from",
                 "to",
                 "action",
@@ -2103,10 +2186,13 @@ mod tests {
         );
         // The nat sub-tree: source (masquerade) + destination (port-forward).
         assert_eq!(kw(&["set", "nat"]), ["source", "destination"]);
-        assert_eq!(kw(&["set", "nat", "source", "wan-masq"]), ["zone"]);
+        assert_eq!(
+            kw(&["set", "nat", "source", "wan-masq"]),
+            ["zone", "description", "disabled"]
+        );
         assert_eq!(
             kw(&["set", "nat", "destination", "web"]),
-            ["zone", "proto", "port", "to"]
+            ["zone", "proto", "port", "to", "description", "disabled"]
         );
         assert_eq!(
             kw(&["set", "nat", "destination", "web", "proto"]),
@@ -2260,6 +2346,8 @@ mod tests {
         assert_eq!(
             kws(&["set", "interface", "eth0"]),
             [
+                "description",
+                "disabled",
                 "zone",
                 "address",
                 "address6",

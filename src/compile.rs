@@ -129,9 +129,14 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
     // The zones actually in use (a zone with no assigned interface needs no
     // policy; interfaces the system provides but that aren't assigned a zone yet
     // are simply not firewalled). Sorted + deduped → stable ids starting at 1.
+    // An administratively disabled interface is dropped from the data plane
+    // entirely: it contributes no zone and gets no policy binding (so the agent
+    // never attaches XDP to it). A disabled rule / NAT entry is likewise skipped
+    // below.
     let mut zone_names: Vec<&str> = appliance
         .interfaces
         .iter()
+        .filter(|i| !i.disabled)
         .filter_map(|i| i.zone.as_deref())
         .collect();
     zone_names.sort_unstable();
@@ -152,10 +157,9 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
             let default_action = match posture.default_action {
                 Some(a) => action_str(a),
                 None => {
-                    let initiates = appliance
-                        .rules
-                        .iter()
-                        .any(|r| r.from == zone && r.is_broad() && r.action == Action::Accept);
+                    let initiates = appliance.rules.iter().any(|r| {
+                        !r.disabled && r.from == zone && r.is_broad() && r.action == Action::Accept
+                    });
                     if initiates {
                         "pass"
                     } else {
@@ -173,7 +177,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
             let port_rules = appliance
                 .rules
                 .iter()
-                .filter(|r| r.from == zone && r.is_port_rule())
+                .filter(|r| !r.disabled && r.from == zone && r.is_port_rule())
                 .flat_map(|r| {
                     let proto = proto_str(r.proto.unwrap());
                     let action = action_str(r.action);
@@ -214,12 +218,14 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
         .nat
         .source
         .iter()
+        .filter(|s| !s.disabled)
         .map(|s| s.zone.as_str())
         .collect();
 
     let interfaces = appliance
         .interfaces
         .iter()
+        .filter(|i| !i.disabled)
         .filter_map(|i| {
             i.zone.as_deref().map(|zone| Interface {
                 name: i.name.clone(),
@@ -236,6 +242,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
         .nat
         .destination
         .iter()
+        .filter(|dst| !dst.disabled)
         .filter_map(|dst| {
             let policy = *ids.get(dst.zone.as_str())?;
             let (ip, port) = crate::config::parse_host_port(&dst.to).ok()?;
@@ -359,6 +366,83 @@ action = "accept"
         assert!(cfg.blocklist.is_empty());
         // An empty blocklist is skipped, so the agent never sees `blocklist = []`.
         assert!(!cfg.to_toml().unwrap().contains("blocklist"));
+    }
+
+    #[test]
+    fn disabled_interfaces_rules_and_nat_are_dropped_from_the_data_plane() {
+        let toml = r#"
+[system]
+hostname = "fw"
+
+[[interface]]
+name = "wan0"
+zone = "wan"
+
+[[interface]]
+name = "lan0"
+zone = "lan"
+
+# A disabled interface: its zone contributes no policy and it gets no binding
+# (so the agent never attaches XDP to it).
+[[interface]]
+name = "dmz0"
+zone = "dmz"
+disabled = true
+
+# An active inbound rule and a parked (disabled) one on the same zone pair.
+[[rule]]
+name = "allow-https-in"
+from = "wan"
+to = "lan"
+action = "accept"
+proto = "tcp"
+port = 443
+
+[[rule]]
+name = "parked"
+from = "wan"
+to = "lan"
+action = "accept"
+proto = "tcp"
+port = 8080
+disabled = true
+
+# A disabled port-forward is not emitted; an active one is.
+[[nat.destination]]
+name = "web"
+zone = "wan"
+proto = "tcp"
+port = 443
+to = "10.0.0.10:8443"
+
+[[nat.destination]]
+name = "parked-fwd"
+zone = "wan"
+proto = "tcp"
+port = 2222
+to = "10.0.0.11:22"
+disabled = true
+"#;
+        let appliance = Appliance::from_toml(toml).unwrap();
+        let cfg = compile(&appliance);
+
+        // The disabled interface's zone (dmz) produced no policy, and only the
+        // two enabled interfaces are bound.
+        assert!(
+            cfg.policies.iter().all(|p| p.name != "dmz"),
+            "disabled interface's zone must not become a policy"
+        );
+        assert_eq!(cfg.interfaces.len(), 2);
+        assert!(cfg.interfaces.iter().all(|i| i.name != "dmz0"));
+
+        // Only the enabled port rule survives on the WAN policy.
+        let wan = cfg.policies.iter().find(|p| p.name == "wan").unwrap();
+        assert_eq!(wan.port_rules.len(), 1);
+        assert_eq!(wan.port_rules[0].port, 443);
+
+        // Only the enabled port-forward is emitted.
+        assert_eq!(cfg.port_forwards.len(), 1);
+        assert_eq!(cfg.port_forwards[0].port, 443);
     }
 
     #[test]
