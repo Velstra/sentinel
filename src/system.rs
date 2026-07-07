@@ -359,6 +359,41 @@ pub fn install_ppp_secret(path: &Path, contents: &str) -> Result<()> {
     sudo("install", &["-m", "0600", tmp_s, dst_s])
 }
 
+/// Install a service secret (an SNMP community, a dyndns password) at a
+/// root-owned `path`, mode **0640 root:root** — readable by root but never
+/// world-readable. The consuming daemon (snmpd, ddclient) runs as root, so 0640
+/// is ample; the group bit only matters if a monitoring group is later added.
+/// Staged in `/run/sentinel` (wheel-writable) then `install`ed atomically, so
+/// there is never a window where the secret is world-readable, in both the
+/// boot-service (root) and `configure` (admin) paths.
+pub fn install_service_secret(path: &Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    let tmp = Path::new("/run/sentinel").join(".svc-secret.tmp");
+    std::fs::write(&tmp, contents).with_context(|| format!("staging {}", tmp.display()))?;
+    let (Some(tmp_s), Some(dst_s)) = (tmp.to_str(), path.to_str()) else {
+        bail!("non-UTF-8 path");
+    };
+    sudo("install", &["-m", "0640", tmp_s, dst_s])
+}
+
+/// (Re)start a Sentinel-owned box service (`sentinel-snmpd`, `lldpd`, …) to pick
+/// up freshly rendered config — a `restart` re-reads the config and starts it if
+/// it wasn't running. Only invoked (by [`crate::net`]) when the rendered config
+/// changed, or to (re)assert the service at boot-late (after networkd). Mirrors
+/// [`multiwan_restart`], generalised over the unit name.
+pub fn service_restart(unit: &str) -> Result<()> {
+    run_priv("systemctl", &["restart", unit])
+}
+
+/// Stop a Sentinel-owned box service (its config was removed). Best-effort at the
+/// call site — a stop that fails because the unit was never up must not abort the
+/// reconcile. Mirrors [`multiwan_stop`], generalised over the unit name.
+pub fn service_stop(unit: &str) -> Result<()> {
+    run_priv("systemctl", &["stop", unit])
+}
+
 /// Remove a (possibly root-owned) file, tolerating an already-absent path.
 pub fn remove_file(path: &Path) -> Result<()> {
     if !path.exists() {
@@ -383,6 +418,42 @@ pub fn ensure_dir(dir: &Path) -> Result<()> {
         bail!("non-UTF-8 path");
     };
     sudo("mkdir", &["-p", d])
+}
+
+/// Ensure a directory exists with an explicit mode (privileged `mkdir -m <mode>
+/// -p`). Used for the PKI store's per-CA/per-cert subdir, created **0700** so a
+/// key generated inside it is never reachable through a world-readable parent
+/// before its own mode is tightened. `-m` applies to the final component only,
+/// so intermediate dirs keep the default mode; on an existing dir `mkdir -p` is
+/// a no-op, so the mode is re-asserted with a `chmod` afterwards.
+pub fn ensure_dir_mode(dir: &Path, mode: &str) -> Result<()> {
+    let Some(d) = dir.to_str() else {
+        bail!("non-UTF-8 path");
+    };
+    if dir.is_dir() {
+        return set_mode(dir, mode);
+    }
+    run_priv("mkdir", &["-m", mode, "-p", d])
+}
+
+/// Set the mode of a (possibly root-owned) path, privileged (`chmod <mode>`).
+/// Used by the PKI applier to lock a freshly generated key to 0600 and relax its
+/// containing directory back to 0755 once the key material is in place.
+pub fn set_mode(path: &Path, mode: &str) -> Result<()> {
+    let Some(p) = path.to_str() else {
+        bail!("non-UTF-8 path");
+    };
+    run_priv("chmod", &[mode, p])
+}
+
+/// Run `openssl` privileged (roadmap C19 PKI): generate a CA / leaf key +
+/// certificate into the persistent store under `/var/lib/sentinel/pki`. Root is
+/// used so a leaf can be signed with a 0600 CA key and every artifact is
+/// consistently root-owned in both the boot-service (root) and `configure`
+/// (admin, via `sudo`) paths. openssl reads no secret from `args` (only subject
+/// / path arguments), so surfacing them on failure leaks nothing.
+pub fn openssl(args: &[&str]) -> Result<()> {
+    run_priv("openssl", args)
 }
 
 /// Tell systemd-networkd to re-read its unit files and re-apply them to the
@@ -419,9 +490,11 @@ pub fn bin(name: &str) -> String {
         "nft" => "SENTINEL_NFT_BIN",
         "tc" => "SENTINEL_TC_BIN",
         "swanctl" => "SENTINEL_SWANCTL_BIN",
+        "openssl" => "SENTINEL_OPENSSL_BIN",
         "lsblk" => "SENTINEL_LSBLK_BIN",
         "install" => "SENTINEL_INSTALL_BIN",
         "mkdir" => "SENTINEL_MKDIR_BIN",
+        "chmod" => "SENTINEL_CHMOD_BIN",
         "rm" => "SENTINEL_RM_BIN",
         "uname" => "SENTINEL_UNAME_BIN",
         // installer tools
