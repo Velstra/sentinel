@@ -63,6 +63,15 @@ jobs:
           - nat64
     steps:
       - uses: actions/checkout@v4
+      # nixosTests build a full NixOS VM (kernel + qemu + system closure), which
+      # needs far more than a stock runner's free disk. Reclaim the space the
+      # hosted image wastes on toolchains we don't use.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker image prune --all --force || true
+          df -h /
       # Hard requirement: without /dev/kvm the VM tests can't boot. Fail loudly
       # rather than silently skipping — a "green" run without KVM proves nothing.
       - name: Verify KVM is available
@@ -77,7 +86,9 @@ jobs:
           extra-conf: |
             experimental-features = nix-command flakes
             system-features = nixos-test benchmark big-parallel kvm
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      # No magic-nix-cache: nixosTest closures are multi-GB and 8 matrix legs
+      # exhaust the GitHub Actions cache rate limit (HTTP 418). nix pulls from
+      # cache.nixos.org directly instead.
       - name: "nix build .#checks.x86_64-linux.${{ matrix.check }}"
         run: nix build -L ".#checks.x86_64-linux.${{ matrix.check }}"
 
@@ -89,6 +100,12 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker image prune --all --force || true
+          df -h /
       - name: Verify KVM is available
         run: |
           if [ ! -e /dev/kvm ]; then
@@ -101,5 +118,5 @@ jobs:
           extra-conf: |
             experimental-features = nix-command flakes
             system-features = nixos-test benchmark big-parallel kvm
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      # No magic-nix-cache (GitHub Actions cache rate limit at nixosTest scale).
       - run: nix flake check -L
