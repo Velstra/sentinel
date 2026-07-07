@@ -18,19 +18,18 @@
     };
     # The Velstra Fabric source (the data-plane agent lives here). Source only —
     # we build it with our own toolchain, so it needs no flake of its own.
-    # Local checkout while fabric is private; switch to "github:Velstra/fabric"
-    # once it is public (then it works for CI/others too). Uses fabric's
-    # committed HEAD — commit pending fabric changes before building.
+    # Public upstream so the build works on CI and for others; the exact revision
+    # is pinned in flake.lock (bump with `nix flake update fabric`).
     fabric = {
-      url = "git+file:///home/mbrandt/01_repositories/velstra/fabric";
+      url = "github:Velstra/fabric";
       flake = false;
     };
     # The Wren routing daemon (BGP/OSPF/IS-IS/RIP/Babel/VRRP control plane).
     # Source only — stable Rust, built with nixpkgs' rustc (no flake of its own).
-    # Local checkout while wren is developed alongside; switch to
-    # "github:Velstra/wren" once public. Uses wren's committed HEAD.
+    # Public upstream; the exact revision is pinned in flake.lock (bump with
+    # `nix flake update wren`).
     wren = {
-      url = "git+file:///home/mbrandt/01_repositories/wren";
+      url = "github:Velstra/wren";
       flake = false;
     };
   };
