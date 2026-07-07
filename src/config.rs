@@ -51,8 +51,28 @@ address = "dhcp"
 name = "lan0"
 zone = "lan"
 address = "10.0.0.1/24"
+# A free-text label (shown in `show`, rendered as a comment on the networkd
+# unit) and an administrative disable (link kept down + dropped from the data
+# plane) are available on any interface:
+# description = "office LAN"
+# disabled = false
 # Dual-stack: add a static IPv6 (or "auto" for SLAAC / accept-RA).
 # address6 = "2001:db8:1::1/64"
+
+# A LAN DHCP server on lan0: hand out a pool, advertise DNS + a gateway, and
+# pin a couple of hosts to fixed addresses. In TOML lease-time is seconds (the
+# CLI additionally accepts a human duration like 12h / 1h30m).
+# [interface.dhcp-server]
+# pool-offset = 100
+# pool-size = 100
+# dns = ["10.0.0.1"]
+# lease-time = 43200
+# default-router = "10.0.0.1"
+# domain = "lan.example"
+# [[interface.dhcp-server.static-mapping]]
+# name = "printer"
+# mac = "52:54:00:12:34:56"
+# ip = "10.0.0.20"
 
 # A VLAN subinterface on lan0, in its own zone:
 # [[interface]]
@@ -116,6 +136,8 @@ port = 443
 # [services.dns]
 # upstream = ["9.9.9.9", "1.1.1.1"]
 # serve-on = ["lan0"]
+# cache-size = 1000        # max cached answers (dnsmasq default is 150)
+# local-domain = "lan.example"  # answered locally + handed to clients
 #
 # A LAN NTP server (built on chrony): sync to upstreams, serve lan0's subnet.
 # [services.ntp]
@@ -191,8 +213,13 @@ port = 443
 # [[protocols.bgp.neighbor]]
 # address = "10.10.0.2"
 # remote-as = 65002
+# local-as = 65099             # per-session AS override (IOS/FRR local-as)
+# update-source = "10.10.0.11" # source address for the outgoing session
+# description = "R2 transit uplink"
+# hold-time = 30               # per-session hold-time (negotiated = min)
+# shutdown = false             # true = administratively down
 # password = "peer-secret"
-# ttl-security = 1
+# ttl-security = 1             # or ebgp-multihop = 4 for a distant peer
 # max-prefix = 1000
 # role = "customer"
 # import = "from-peer"
@@ -383,6 +410,23 @@ pub struct Dns {
     /// upstreams break strict validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dnssec: Option<String>,
+    /// Maximum number of cached DNS answers the LAN resolver (dnsmasq) keeps —
+    /// rendered as dnsmasq `cache-size=<n>`. Unset ⇒ dnsmasq's default (150).
+    #[serde(
+        default,
+        rename = "cache-size",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cache_size: Option<u32>,
+    /// The site's local domain. Rendered as dnsmasq `local=/<domain>/` (queries
+    /// for it are answered locally, never forwarded) plus `domain=<domain>` (the
+    /// suffix handed to DHCP clients / appended to bare names). `None` ⇒ none.
+    #[serde(
+        default,
+        rename = "local-domain",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub local_domain: Option<String>,
 }
 
 impl Dns {
@@ -393,6 +437,8 @@ impl Dns {
             && self.host_override.is_empty()
             && self.blocklist.is_empty()
             && self.dnssec.is_none()
+            && self.cache_size.is_none()
+            && self.local_domain.is_none()
     }
 }
 
@@ -1117,6 +1163,37 @@ pub struct BgpNeighbor {
         skip_serializing_if = "Option::is_none"
     )]
     pub bfd_auth_key: Option<String>,
+    /// Override this speaker's AS for THIS session only (like IOS/FRR
+    /// `neighbor X local-as`): sent as My-AS in the OPEN, used for eBGP/iBGP
+    /// classification and prepended on eBGP export toward this peer.
+    #[serde(default, rename = "local-as", skip_serializing_if = "Option::is_none")]
+    pub local_as: Option<u32>,
+    /// Bind the outgoing session to this source address (must match the
+    /// neighbour's address family).
+    #[serde(
+        default,
+        rename = "update-source",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub update_source: Option<String>,
+    /// Session TTL for a non-directly-connected eBGP peer (1-255). Mutually
+    /// exclusive with `ttl-security` (GTSM).
+    #[serde(
+        default,
+        rename = "ebgp-multihop",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ebgp_multihop: Option<u8>,
+    /// Free-form label for this neighbour, shown in `show bgp neighbors`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Administratively shut the session down: never dial, refuse inbound.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shutdown: bool,
+    /// Per-session hold-time proposed in the OPEN (seconds); the negotiated
+    /// value is the minimum of both sides.
+    #[serde(default, rename = "hold-time", skip_serializing_if = "Option::is_none")]
+    pub hold_time: Option<u16>,
 }
 
 /// A named route filter (`[[protocols.filter]]`): an ordered list of rules plus
@@ -1407,6 +1484,13 @@ impl Nat {
 #[serde(deny_unknown_fields)]
 pub struct NatSource {
     pub name: String,
+    /// A free-text label, shown in `show`. Purely documentary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Administratively disable this masquerade rule: the compiler drops it (the
+    /// zone's interfaces are not marked `masquerade`). Off by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
     /// The egress (WAN) zone whose outbound traffic is masqueraded — must be
     /// backed by an interface.
     pub zone: String,
@@ -1420,6 +1504,13 @@ pub struct NatSource {
 #[serde(deny_unknown_fields)]
 pub struct NatDestination {
     pub name: String,
+    /// A free-text label, shown in `show`. Purely documentary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Administratively disable this port-forward: the compiler drops it (no
+    /// `[[port_forward]]` emitted). Off by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
     /// The ingress zone (the public side) — must be backed by an interface.
     pub zone: String,
     pub proto: Proto,
@@ -1763,6 +1854,9 @@ pub const MAX_RULE_EXPANSION: usize = 4096;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ZoneCfg {
+    /// A free-text label for this zone, shown in `show`. Purely documentary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// Stateful inspection for this zone (inherits `[firewall] stateful`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stateful: Option<bool>,
@@ -1799,6 +1893,16 @@ pub struct ResolvedZone {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Interface {
     pub name: String,
+    /// A free-text label shown in `show` and rendered as a comment header on the
+    /// generated networkd `.network` unit. Purely documentary — never affects the
+    /// data plane. `None` for an undocumented interface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Administratively disable this interface: networkd keeps the link down
+    /// (`[Link] ActivationPolicy=down`) and the compiler drops it from the Velstra
+    /// data plane (no policy binding, so no XDP attach). Off by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
     /// The zone this interface belongs to (a key in `[zone.*]` / referenced by
     /// rules). `None` for a NIC the system provides but the operator hasn't
     /// assigned yet (it shows up in the config but is not firewalled until a zone
@@ -2075,13 +2179,48 @@ pub struct DhcpServer {
     /// DNS servers advertised to clients (emitted only when non-empty).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dns: Vec<String>,
-    /// Default lease time, in seconds.
+    /// Default lease time, in seconds. The CLI accepts a human duration
+    /// (`12h`, `1h30m`, or a bare number of seconds) and stores the resolved
+    /// seconds here; rendered as networkd `DefaultLeaseTimeSec=`.
     #[serde(
         default,
         rename = "lease-time",
         skip_serializing_if = "Option::is_none"
     )]
     pub lease_time: Option<u32>,
+    /// The default-router (gateway) address handed to clients (DHCP option 3),
+    /// rendered as networkd `[DHCPServer] Router=`. Unset ⇒ networkd advertises
+    /// the server's own address (the usual case).
+    #[serde(
+        default,
+        rename = "default-router",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub default_router: Option<String>,
+    /// The domain name handed to clients (DHCP option 15), rendered as a networkd
+    /// `[DHCPServer] SendOption=15:string:<domain>`. `None` sends no domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// Static host reservations: a fixed address bound to a client MAC. Each
+    /// becomes a networkd `[DHCPServerStaticLease]` section. The `name` is a CLI
+    /// handle only (networkd keys on MAC + address).
+    #[serde(
+        default,
+        rename = "static-mapping",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub static_mappings: Vec<DhcpStaticLease>,
+}
+
+/// A static DHCP reservation on a [`DhcpServer`]: bind `ip` to the client whose
+/// hardware address is `mac`. Rendered to a networkd `[DHCPServerStaticLease]`
+/// (`MACAddress=` + `Address=`); the `name` is a documentary CLI handle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DhcpStaticLease {
+    pub name: String,
+    pub mac: String,
+    pub ip: String,
 }
 
 /// A traffic-shaping / queue-management discipline attached to an interface's
@@ -2361,6 +2500,14 @@ impl<'de> Deserialize<'de> for PortSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rule {
     pub name: String,
+    /// A free-text label for this rule, shown in `show`. Purely documentary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Administratively disable this rule: the compiler drops it from the Velstra
+    /// data plane (no port rule / no effect on the zone's derived posture). Off by
+    /// default. Lets an operator park a rule without deleting it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
     /// Source zone name (must be a zone backed by at least one interface).
     pub from: String,
     /// Destination zone name.
@@ -2483,10 +2630,14 @@ impl Appliance {
             validate_cidr_or_ip(entry).context("firewall.blocklist")?;
         }
 
-        // Per-zone blocklists must also be valid.
+        // Per-zone blocklists must also be valid; an optional zone description
+        // must be a sane one-line label.
         for (name, z) in &self.zones {
             for entry in &z.blocklist {
                 validate_cidr_or_ip(entry).with_context(|| format!("zone {name:?} blocklist"))?;
+            }
+            if let Some(d) = &z.description {
+                validate_description(d).with_context(|| format!("zone {name:?} description"))?;
             }
         }
 
@@ -2494,6 +2645,10 @@ impl Appliance {
         let mut seen = HashSet::new();
         for iface in &self.interfaces {
             validate_iface_name(&iface.name)?;
+            if let Some(d) = &iface.description {
+                validate_description(d)
+                    .with_context(|| format!("interface {:?} description", iface.name))?;
+            }
             if let Some(parent) = &iface.parent {
                 validate_iface_name(parent)
                     .with_context(|| format!("interface {:?} parent", iface.name))?;
@@ -2765,6 +2920,38 @@ impl Appliance {
                     validate_ipv4(dns)
                         .with_context(|| format!("interface {:?} dhcp-server dns", iface.name))?;
                 }
+                if let Some(gw) = &dhcp.default_router {
+                    validate_ipv4(gw).with_context(|| {
+                        format!("interface {:?} dhcp-server default-router", iface.name)
+                    })?;
+                }
+                // Static reservations: a valid MAC and an address inside the
+                // server's own subnet (a lease outside it can never be handed
+                // out). `address` is a static CIDR here (checked just above).
+                let subnet = iface.address.as_deref().unwrap_or("");
+                for m in &dhcp.static_mappings {
+                    validate_mac(&m.mac).with_context(|| {
+                        format!(
+                            "interface {:?} dhcp-server static-mapping {:?}",
+                            iface.name, m.name
+                        )
+                    })?;
+                    validate_ipv4(&m.ip).with_context(|| {
+                        format!(
+                            "interface {:?} dhcp-server static-mapping {:?}",
+                            iface.name, m.name
+                        )
+                    })?;
+                    if !ipv4_in_cidr(&m.ip, subnet).unwrap_or(false) {
+                        bail!(
+                            "interface {:?} dhcp-server static-mapping {:?}: ip {} is not inside the server subnet {}",
+                            iface.name,
+                            m.name,
+                            m.ip,
+                            subnet
+                        );
+                    }
+                }
             }
 
             // Router Advertisements: advertised prefixes must be IPv6 CIDRs (a
@@ -2855,6 +3042,10 @@ impl Appliance {
             .filter_map(|i| i.zone.as_deref())
             .collect();
         for rule in &self.rules {
+            if let Some(d) = &rule.description {
+                validate_description(d)
+                    .with_context(|| format!("rule {:?} description", rule.name))?;
+            }
             for (which, zone) in [("from", &rule.from), ("to", &rule.to)] {
                 if !zones_in_use.contains(zone.as_str()) {
                     bail!(
@@ -2921,6 +3112,10 @@ impl Appliance {
 
         // Source NAT (masquerade) targets a zone that must have an interface.
         for src in &self.nat.source {
+            if let Some(d) = &src.description {
+                validate_description(d)
+                    .with_context(|| format!("nat source {:?} description", src.name))?;
+            }
             if !zones_in_use.contains(src.zone.as_str()) {
                 bail!(
                     "nat source {:?}: zone {:?} has no interface",
@@ -2933,6 +3128,10 @@ impl Appliance {
         // Destination NAT (port-forward) targets a zone (must have an interface)
         // and a valid internal host.
         for dst in &self.nat.destination {
+            if let Some(d) = &dst.description {
+                validate_description(d)
+                    .with_context(|| format!("nat destination {:?} description", dst.name))?;
+            }
             if !zones_in_use.contains(dst.zone.as_str()) {
                 bail!(
                     "nat destination {:?}: zone {:?} has no interface",
@@ -3748,6 +3947,40 @@ fn validate_bgp_neighbor(n: &BgpNeighbor, filter_names: &HashSet<&str>) -> Resul
             }
         }
     }
+    if n.local_as == Some(0) {
+        bail!(
+            "protocols bgp neighbor {:?}: local-as must be non-zero",
+            n.address
+        );
+    }
+    if let Some(src) = &n.update_source {
+        validate_ipv4(src)
+            .with_context(|| format!("protocols bgp neighbor {:?} update-source", n.address))?;
+    }
+    if let Some(ttl) = n.ebgp_multihop {
+        if ttl == 0 {
+            bail!(
+                "protocols bgp neighbor {:?}: ebgp-multihop must be 1..=255",
+                n.address
+            );
+        }
+        // RFC 5082 practice: GTSM and a relaxed multihop TTL contradict each
+        // other on one session — wren rejects the combination too.
+        if n.ttl_security.is_some() {
+            bail!(
+                "protocols bgp neighbor {:?}: ebgp-multihop and ttl-security are mutually exclusive",
+                n.address
+            );
+        }
+    }
+    if let Some(hold) = n.hold_time {
+        if hold != 0 && hold < 3 {
+            bail!(
+                "protocols bgp neighbor {:?}: hold-time must be 0 or >= 3 seconds (RFC 4271)",
+                n.address
+            );
+        }
+    }
     Ok(())
 }
 
@@ -3866,6 +4099,51 @@ pub(crate) fn parse_host_port(s: &str) -> Result<(Ipv4Addr, u16)> {
         .parse::<Ipv4Addr>()
         .with_context(|| format!("invalid IPv4 in {s:?}"))?;
     Ok((ip, port))
+}
+
+/// True when the IPv4 `ip` falls inside the IPv4 CIDR `cidr` (host bits masked).
+/// Returns an error if either side fails to parse — the caller treats that as
+/// "not inside". Used to keep a DHCP static reservation within the server subnet.
+pub(crate) fn ipv4_in_cidr(ip: &str, cidr: &str) -> Result<bool> {
+    let addr: Ipv4Addr = ip
+        .parse()
+        .with_context(|| format!("{ip:?} is not an IPv4 address"))?;
+    let (net, prefix) = cidr
+        .split_once('/')
+        .with_context(|| format!("{cidr:?} is not an IPv4 CIDR"))?;
+    let net: Ipv4Addr = net
+        .parse()
+        .with_context(|| format!("invalid IPv4 in {cidr:?}"))?;
+    let prefix: u8 = prefix
+        .parse()
+        .with_context(|| format!("invalid prefix in {cidr:?}"))?;
+    if prefix > 32 {
+        bail!("prefix /{prefix} in {cidr:?} exceeds /32");
+    }
+    // A /0 masks everything (mask 0); shifting a u32 by 32 is UB, so special-case.
+    let mask: u32 = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    Ok((u32::from(addr) & mask) == (u32::from(net) & mask))
+}
+
+/// Validate a free-text `description` (interface/rule/zone/nat label): non-empty
+/// after trimming and within a sane length, and free of control characters — the
+/// value is echoed into a networkd comment / the CLI, so it must stay one line.
+pub(crate) fn validate_description(s: &str) -> Result<()> {
+    const MAX_DESCRIPTION_LEN: usize = 256;
+    if s.trim().is_empty() {
+        bail!("description must not be empty");
+    }
+    if s.len() > MAX_DESCRIPTION_LEN {
+        bail!("description too long ({} > {MAX_DESCRIPTION_LEN})", s.len());
+    }
+    if s.chars().any(|c| c.is_control()) {
+        bail!("description must not contain control characters (incl. newlines)");
+    }
+    Ok(())
 }
 
 /// Validate a firewall blocklist entry: a bare IPv4 (`192.0.2.5`) or an IPv4
