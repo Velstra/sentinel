@@ -16,3 +16,7 @@ target/
 *.crt
 
 *.qcow2
+
+# Nix build result symlinks (point at machine-local /nix/store paths)
+/result
+/result-*

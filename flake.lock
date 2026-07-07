@@ -3,17 +3,17 @@
     "fabric": {
       "flake": false,
       "locked": {
-        "lastModified": 1782938393,
-        "narHash": "sha256-GUxhHott9vVCqDhkiCODWjS4VZu/eabpaulUJOjpYO8=",
-        "ref": "refs/heads/main",
-        "rev": "60a79e54695d79d7709faf1192f2ba90bffd76b9",
-        "revCount": 21,
-        "type": "git",
-        "url": "file:///home/mbrandt/01_repositories/velstra/fabric"
+        "lastModified": 1783454459,
+        "narHash": "sha256-1GBXmuUoZ2e/aRKTYStMa4Uamvg/5hWZ3LoQTQ4KpoY=",
+        "owner": "Velstra",
+        "repo": "fabric",
+        "rev": "874f690d72859e121e3209931ac0732c28207fe6",
+        "type": "github"
       },
       "original": {
-        "type": "git",
-        "url": "file:///home/mbrandt/01_repositories/velstra/fabric"
+        "owner": "Velstra",
+        "repo": "fabric",
+        "type": "github"
       }
     },
     "fenix": {
@@ -81,17 +81,17 @@
     "wren": {
       "flake": false,
       "locked": {
-        "lastModified": 1782854031,
-        "narHash": "sha256-YGVmmI1v5zbqk8ZVEa1vgocaKYijLCHYoNbKcpDDWuc=",
-        "ref": "refs/heads/main",
-        "rev": "2032600080c57ba486991d20463f41ecae14c6a5",
-        "revCount": 89,
-        "type": "git",
-        "url": "file:///home/mbrandt/01_repositories/wren"
+        "lastModified": 1783454437,
+        "narHash": "sha256-kVkCuMFvxFKoPZnpjvzGGl94kfcBDig4cIbGeRiiF8k=",
+        "owner": "Velstra",
+        "repo": "wren",
+        "rev": "72eb44b3d1f441c0f33d8180f5481df40ab3b73b",
+        "type": "github"
       },
       "original": {
-        "type": "git",
-        "url": "file:///home/mbrandt/01_repositories/wren"
+        "owner": "Velstra",
+        "repo": "wren",
+        "type": "github"
       }
     }
   },
