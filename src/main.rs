@@ -9,6 +9,7 @@
 //! and apply that document — and, via [`velstra_proto`] (from crates.io), talk to
 //! a running Velstra controller.
 
+mod api;
 mod archive;
 mod compile;
 mod config;
@@ -180,6 +181,28 @@ enum Command {
         #[arg(long, default_value = "http://127.0.0.1:50052")]
         controller: String,
     },
+    /// Serve the REST management API (roadmap C12) over the same config model the
+    /// CLI edits: `GET/PUT /api/v1/config`, `GET /api/v1/status`,
+    /// `GET /api/v1/show/*`. Bearer-token auth; binds localhost by default (widen
+    /// with `--listen 0.0.0.0:<port>`). A `PUT` validates + applies live + saves
+    /// through the exact same paths as a CLI `commit`+`save`.
+    Api {
+        /// Address to bind (host:port). Localhost by default — the API is not
+        /// exposed off-box unless you widen this.
+        #[arg(long, default_value = api::DEFAULT_LISTEN)]
+        listen: String,
+        /// The running/boot config a GET reads and a PUT writes.
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+        /// Validate + save on PUT, but don't apply to the running system
+        /// (off-box). Mirrors `configure --no-apply`.
+        #[arg(long)]
+        no_apply: bool,
+        /// The bearer-token file (generated 0600 if absent; overridden by
+        /// `$SENTINEL_API_TOKEN`).
+        #[arg(long, default_value = api::DEFAULT_TOKEN_PATH)]
+        token_file: PathBuf,
+    },
     /// Wake a host on the LAN: send a Wake-on-LAN magic packet to a MAC address
     /// (an operational action, not persistent config). Broadcasts on the given
     /// interface's link, or on all interfaces when none is named.
@@ -252,6 +275,12 @@ async fn main() -> Result<()> {
         Command::Apply { file, out, reload } => apply(&file, &out, reload.as_deref()),
         Command::ConfirmRollback { config } => confirm_rollback(&config),
         Command::Ports { controller } => ports(&controller).await,
+        Command::Api {
+            listen,
+            config,
+            no_apply,
+            token_file,
+        } => api::serve(&listen, &config, live_apply(!no_apply), &token_file).await,
         Command::Wol { mac, interface } => wol(&mac, interface.as_deref()),
     }
 }

@@ -12,15 +12,15 @@
 //! both ways.
 
 use std::collections::{BTreeMap, HashSet};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
 use anyhow::Result;
 
 use crate::config::{
-    Appliance, DhcpRelay, DhcpServer, Dns, Dyndns, IfaceType, Interface, Lldp, Mdns, MultiWan, Ntp,
-    Qos, QosDiscipline, RouterAdvert, Snmp, WAN_CHECK_FAIL, WAN_CHECK_INTERVAL, WAN_CHECK_RISE,
-    WAN_CHECK_TIMEOUT, WanMode,
+    Appliance, DhcpRelay, DhcpServer, Dns, Dyndns, IfaceType, Interface, Lldp, Mdns, MultiWan,
+    Nat64, Ntp, Qos, QosDiscipline, RouterAdvert, Snmp, WAN_CHECK_FAIL, WAN_CHECK_INTERVAL,
+    WAN_CHECK_RISE, WAN_CHECK_TIMEOUT, WanMode,
 };
 use crate::system::{self, NETWORKD_RUNTIME_DIR};
 
@@ -584,6 +584,20 @@ const DDCLIENT_UNIT: &str = "sentinel-ddclient.service";
 const DHCP_RELAY_CONF: &str = "/run/sentinel/dhcp-relay/relay.conf";
 const DHCP_RELAY_UNIT: &str = "sentinel-dhcp-relay.service";
 
+/// NAT64 (roadmap C10). tayga's daemon config + a datapath setup script (the
+/// `nat64` tun device + pool/prefix routes tayga can't add itself), driven by the
+/// Sentinel-owned `sentinel-nat64` unit. DNS64 rides a second `sentinel-dns64`
+/// unit running unbound against a rendered config.
+const NAT64_DIR: &str = "/run/sentinel/nat64";
+const TAYGA_CONF: &str = "/run/sentinel/nat64/tayga.conf";
+const TAYGA_SETUP: &str = "/run/sentinel/nat64/setup.sh";
+const NAT64_UNIT: &str = "sentinel-nat64.service";
+const DNS64_CONF: &str = "/run/sentinel/nat64/unbound.conf";
+const DNS64_UNIT: &str = "sentinel-dns64.service";
+/// The tun device tayga translates on (matches the `tun-device` in tayga.conf and
+/// the routes in the setup script).
+const NAT64_DEV: &str = "nat64";
+
 /// Render lldpd's confdir drop-in, or `None` when LLDP is off. When an interface
 /// whitelist is given it becomes an lldpcli `configure system interface pattern`
 /// (a comma-separated glob list); an empty list ⇒ every interface (lldpd's own
@@ -782,6 +796,184 @@ fn apply_box_services(appliance: &Appliance) -> Result<()> {
         DHCP_RELAY_UNIT,
         Path::new(DHCP_RELAY_CONF),
         dhcp_relay_conf_body(&s.dhcp_relay, &appliance.interfaces),
+        false,
+    )?;
+    Ok(())
+}
+
+// --- NAT64 + DNS64 (roadmap C10) -------------------------------------------
+//
+// tayga translates an IPv6-only segment's traffic to `64:ff9b::<v4>` into real
+// IPv4 sourced from `pool`; unbound (DNS64) synthesises AAAA in the prefix for
+// v4-only names so unmodified clients resolve+reach v4 hosts. Both are Sentinel-
+// owned units started/stopped from apply_link_runtime (after networkd, so tayga's
+// routes land on up links and unbound can bind the serving interface's address).
+
+/// The bare IPv6 host of a static CIDR (`"2001:db8::1/64"` → `"2001:db8::1"`), or
+/// `None` for a non-IPv6/`auto`/`dhcp` address. DNS64's unbound binds this.
+fn ipv6_of(addr: &str) -> Option<String> {
+    let ip = addr.split('/').next()?;
+    ip.parse::<Ipv6Addr>().ok().map(|_| ip.to_string())
+}
+
+/// tayga's own IPv4 address — the first host of the pool (`"192.0.2.0/24"` →
+/// `"192.0.2.1"`). tayga reserves this from the dynamic pool for its self / ICMP.
+fn nat64_router_ipv4(pool: &str) -> Option<String> {
+    let (net, prefix) = pool.split_once('/')?;
+    let net: Ipv4Addr = net.parse().ok()?;
+    let prefix: u8 = prefix.parse().ok()?;
+    if prefix > 32 {
+        return None;
+    }
+    // Mask to the network address, then +1 for the first host (a /0 masks nothing;
+    // shifting a u32 by 32 is UB, so special-case it).
+    let mask: u32 = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    let network = u32::from(net) & mask;
+    Some(Ipv4Addr::from(network + 1).to_string())
+}
+
+/// Render tayga's daemon config, or `None` when NAT64 is off. The tun device +
+/// prefix/pool routes are set up out-of-band by [`tayga_setup_body`]; this file is
+/// only the translator's own knobs (its self-addresses, the prefix, the pool).
+/// `ipv6-addr` is tayga's own node address (the source of its ICMPv6 errors),
+/// taken from the serving interface's static v6 address — mandatory with the
+/// well-known prefix and a non-global (e.g. behind-NAT) IPv4 pool.
+fn tayga_conf_body(n64: &Nat64, ifaces: &[Interface]) -> Option<String> {
+    if !n64.enabled {
+        return None;
+    }
+    let pool = n64.pool.as_deref()?;
+    let router = nat64_router_ipv4(pool)?;
+    let iface = n64.interface.as_deref()?;
+    let node6 = ifaces
+        .iter()
+        .find(|i| i.name == iface)
+        .and_then(|i| i.address6.as_deref())
+        .and_then(ipv6_of)?;
+    let mut body = String::from("# rendered by sentinel — NAT64 (tayga)\n");
+    body.push_str(&format!("tun-device {NAT64_DEV}\n"));
+    body.push_str(&format!("ipv4-addr {router}\n"));
+    body.push_str(&format!("ipv6-addr {node6}\n"));
+    body.push_str(&format!("prefix {}\n", n64.effective_prefix()));
+    body.push_str(&format!("dynamic-pool {pool}\n"));
+    body.push_str(&format!("data-dir {NAT64_DIR}\n"));
+    Some(body)
+}
+
+/// Render the datapath setup script tayga's unit runs before the daemon: create
+/// the `nat64` tun, bring it up, add tayga's self-address and the pool/prefix
+/// routes (so the kernel forwards `64:ff9b::/96` and pool traffic to the tun), and
+/// enable forwarding. Idempotent (`replace`/existence-guarded) so a re-apply or a
+/// restart is safe. `None` when NAT64 is off.
+fn tayga_setup_body(n64: &Nat64) -> Option<String> {
+    if !n64.enabled {
+        return None;
+    }
+    let pool = n64.pool.as_deref()?;
+    let router = nat64_router_ipv4(pool)?;
+    let prefix = n64.effective_prefix();
+    let mut body = String::from(
+        "#!/bin/sh\n# rendered by sentinel — NAT64 datapath (tayga tun + routes)\nset -e\n",
+    );
+    body.push_str(&format!(
+        "ip link show {NAT64_DEV} >/dev/null 2>&1 || tayga --mktun --config {TAYGA_CONF}\n"
+    ));
+    body.push_str(&format!("ip link set {NAT64_DEV} up\n"));
+    body.push_str(&format!("ip addr replace {router}/32 dev {NAT64_DEV}\n"));
+    body.push_str(&format!("ip route replace {pool} dev {NAT64_DEV}\n"));
+    body.push_str(&format!("ip -6 route replace {prefix} dev {NAT64_DEV}\n"));
+    body.push_str("sysctl -qw net.ipv6.conf.all.forwarding=1\n");
+    body.push_str("sysctl -qw net.ipv4.ip_forward=1\n");
+    Some(body)
+}
+
+/// Render the DNS64 unbound config, or `None` when DNS64 is off. unbound binds the
+/// serving interface's IPv6 address on :53, forwards every query to the box's
+/// configured upstream(s), and synthesises `AAAA` inside the NAT64 prefix for
+/// v4-only names (`module-config: "dns64 iterator"`). Privilege-drop/chroot are
+/// disabled — the unit already sandboxes it and /run is the only writable path.
+fn unbound_dns64_body(n64: &Nat64, dns: &Dns, ifaces: &[Interface]) -> Option<String> {
+    if !n64.enabled || !n64.dns64 {
+        return None;
+    }
+    // Bind the serving interface's static IPv6 address (validation guarantees it).
+    let iface = n64.interface.as_deref()?;
+    let listen = ifaces
+        .iter()
+        .find(|i| i.name == iface)
+        .and_then(|i| i.address6.as_deref())
+        .and_then(ipv6_of)?;
+    if dns.upstream.is_empty() {
+        return None;
+    }
+    let mut body = String::from("# rendered by sentinel — DNS64 (unbound)\nserver:\n");
+    body.push_str("    verbosity: 1\n");
+    body.push_str(&format!("    interface: {listen}\n"));
+    body.push_str("    port: 53\n");
+    // Bind the serving v6 address even if networkd has not brought it up yet, so
+    // a fresh commit/boot doesn't fail the first start (it would restart, but
+    // freebind avoids the window entirely).
+    body.push_str("    ip-freebind: yes\n");
+    body.push_str("    do-ip4: yes\n    do-ip6: yes\n    do-udp: yes\n    do-tcp: yes\n");
+    body.push_str("    access-control: 0.0.0.0/0 allow\n    access-control: ::/0 allow\n");
+    body.push_str("    module-config: \"dns64 iterator\"\n");
+    body.push_str(&format!("    dns64-prefix: {}\n", n64.effective_prefix()));
+    body.push_str(&format!("    directory: \"{NAT64_DIR}\"\n"));
+    body.push_str("    chroot: \"\"\n    username: \"\"\n    pidfile: \"\"\n    use-syslog: yes\n");
+    body.push_str("forward-zone:\n    name: \".\"\n");
+    for up in &dns.upstream {
+        body.push_str(&format!("    forward-addr: {up}\n"));
+    }
+    Some(body)
+}
+
+/// Reconcile NAT64 (tayga) + DNS64 (unbound) to the config. tayga owns two
+/// artifacts (its conf + the datapath setup script) behind one unit, so it can't
+/// use the single-file [`apply_box_service`]; DNS64 (one config, one unit) does.
+fn apply_nat64(appliance: &Appliance) -> Result<()> {
+    let n64 = &appliance.nat.nat64;
+    let conf_path = Path::new(TAYGA_CONF);
+    let setup_path = Path::new(TAYGA_SETUP);
+    match (
+        tayga_conf_body(n64, &appliance.interfaces),
+        tayga_setup_body(n64),
+    ) {
+        (Some(conf), Some(setup)) => {
+            let changed = file_changed(conf_path, &conf) || file_changed(setup_path, &setup);
+            system::ensure_dir(Path::new(NAT64_DIR))?;
+            system::install_file(conf_path, &conf)?;
+            system::install_file(setup_path, &setup)?;
+            if changed {
+                if let Err(e) = system::service_restart(NAT64_UNIT) {
+                    eprintln!(
+                        "warning: (re)starting {NAT64_UNIT} failed (applies on next start): {e}"
+                    );
+                }
+            }
+        }
+        _ => {
+            if conf_path.exists() || setup_path.exists() {
+                if let Err(e) = system::service_stop(NAT64_UNIT) {
+                    eprintln!("warning: stopping {NAT64_UNIT}: {e}");
+                }
+                if conf_path.exists() {
+                    system::remove_file(conf_path)?;
+                }
+                if setup_path.exists() {
+                    system::remove_file(setup_path)?;
+                }
+            }
+        }
+    }
+    // DNS64 (unbound) — a single config behind a single unit.
+    apply_box_service(
+        DNS64_UNIT,
+        Path::new(DNS64_CONF),
+        unbound_dns64_body(n64, &appliance.services.dns, &appliance.interfaces),
         false,
     )?;
     Ok(())
@@ -1570,6 +1762,10 @@ pub fn apply_link_runtime(appliance: &Appliance) -> Result<()> {
     // Sentinel-owned daemon (re)started after networkd so the link-scoped ones
     // (LLDP/mDNS/relay) see their interfaces up.
     apply_box_services(appliance)?;
+    // NAT64 + DNS64 (roadmap C10) — tayga's tun/routes need the up links, and the
+    // DNS64 unbound binds the serving interface's address, so reconcile them here
+    // (after networkd) too.
+    apply_nat64(appliance)?;
     Ok(())
 }
 
@@ -2733,5 +2929,89 @@ mod tests {
             body.contains("dhcp-relay=10.0.7.1,10.0.99.2"),
             "got:\n{body}"
         );
+    }
+
+    #[test]
+    fn nat64_router_ipv4_is_pool_first_host() {
+        assert_eq!(
+            nat64_router_ipv4("192.0.2.0/24").as_deref(),
+            Some("192.0.2.1")
+        );
+        assert_eq!(
+            nat64_router_ipv4("10.64.0.0/10").as_deref(),
+            Some("10.64.0.1")
+        );
+        assert!(nat64_router_ipv4("192.0.2.1").is_none()); // no prefix
+    }
+
+    #[test]
+    fn tayga_renders_conf_and_setup_or_nothing() {
+        let mut lan6 = iface_addr("lan6", "dhcp");
+        lan6.address = None;
+        lan6.address6 = Some("2001:db8:64::1/64".into());
+        let ifaces = vec![lan6];
+        // Off ⇒ nothing.
+        assert!(tayga_conf_body(&Nat64::default(), &ifaces).is_none());
+        assert!(tayga_setup_body(&Nat64::default()).is_none());
+        // Enabled with the well-known prefix + a pool ⇒ tayga.conf + setup script.
+        let n64 = Nat64 {
+            enabled: true,
+            prefix: None,
+            pool: Some("192.0.2.0/24".into()),
+            interface: Some("lan6".into()),
+            dns64: true,
+        };
+        let conf = tayga_conf_body(&n64, &ifaces).expect("configured");
+        assert!(conf.contains("tun-device nat64"), "got:\n{conf}");
+        assert!(conf.contains("ipv4-addr 192.0.2.1"), "got:\n{conf}");
+        assert!(conf.contains("ipv6-addr 2001:db8:64::1"), "got:\n{conf}");
+        assert!(conf.contains("prefix 64:ff9b::/96"), "got:\n{conf}");
+        assert!(conf.contains("dynamic-pool 192.0.2.0/24"), "got:\n{conf}");
+        let setup = tayga_setup_body(&n64).expect("configured");
+        assert!(setup.contains("tayga --mktun"), "got:\n{setup}");
+        assert!(
+            setup.contains("ip route replace 192.0.2.0/24 dev nat64"),
+            "got:\n{setup}"
+        );
+        assert!(
+            setup.contains("ip -6 route replace 64:ff9b::/96 dev nat64"),
+            "got:\n{setup}"
+        );
+        assert!(
+            setup.contains("net.ipv6.conf.all.forwarding=1"),
+            "got:\n{setup}"
+        );
+    }
+
+    #[test]
+    fn unbound_dns64_renders_synth_or_nothing() {
+        let mut lan6 = iface_addr("lan6", "dhcp");
+        lan6.address = None;
+        lan6.address6 = Some("2001:db8:64::1/64".into());
+        let ifaces = vec![lan6];
+        let dns = Dns {
+            upstream: vec!["10.64.2.2".into()],
+            ..Dns::default()
+        };
+        // dns64 off ⇒ nothing.
+        let off = Nat64 {
+            enabled: true,
+            pool: Some("192.0.2.0/24".into()),
+            interface: Some("lan6".into()),
+            dns64: false,
+            ..Nat64::default()
+        };
+        assert!(unbound_dns64_body(&off, &dns, &ifaces).is_none());
+        // dns64 on ⇒ unbound binds the serving interface's v6 addr, DNS64 synthesis
+        // in the prefix, forwarding to the upstream.
+        let on = Nat64 { dns64: true, ..off };
+        let body = unbound_dns64_body(&on, &dns, &ifaces).expect("configured");
+        assert!(body.contains("interface: 2001:db8:64::1"), "got:\n{body}");
+        assert!(
+            body.contains("module-config: \"dns64 iterator\""),
+            "got:\n{body}"
+        );
+        assert!(body.contains("dns64-prefix: 64:ff9b::/96"), "got:\n{body}");
+        assert!(body.contains("forward-addr: 10.64.2.2"), "got:\n{body}");
     }
 }
