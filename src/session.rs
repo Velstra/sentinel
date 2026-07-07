@@ -13,12 +13,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::config::{
-    Action, Appliance, Bfd, Bgp, BgpAggregate, BgpNeighbor, BgpRoa, BgpRtr, DhcpServer,
-    DhcpStaticLease, Dns, Export, Filter, FilterRule, Firewall, Groups, HealthCheck, IfaceType,
-    Interface, IpsecConnection, Isis, MultiWan, Multicast, MulticastInterface, Nat, NatDestination,
-    NatSource, Ntp, Ospf, Ospf3, OspfInterface, PortSpec, Pppoe, Proto, Protocols, Qos,
-    QosDiscipline, Rip, RouterAdvert, Rule, Services, StaticRoute, System, Vpn, VrfDef, Vrrp,
-    WanMode, WanUplink, WgPeer, ZoneCfg,
+    Acme, Action, Appliance, Bfd, Bgp, BgpAggregate, BgpNeighbor, BgpRoa, BgpRtr, Ca, Certificate,
+    DhcpRelay, DhcpServer, DhcpStaticLease, Dns, Dyndns, Export, Filter, FilterRule, Firewall,
+    Groups, HealthCheck, IfaceType, Interface, IpsecConnection, Isis, Lldp, Mdns, MultiWan,
+    Multicast, MulticastInterface, Nat, NatDestination, NatSource, Ntp, Ospf, Ospf3, OspfInterface,
+    Pki, PortSpec, Pppoe, Proto, Protocols, Qos, QosDiscipline, Rip, RouterAdvert, Rule, Services,
+    Snmp, StaticRoute, System, Vpn, VrfDef, Vrrp, WanMode, WanUplink, WgPeer, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -1003,6 +1003,11 @@ struct Draft {
     export: ExportDraft,
     dns: DnsDraft,
     ntp: NtpDraft,
+    lldp: LldpDraft,
+    snmp: SnmpDraft,
+    mdns: MdnsDraft,
+    dyndns: DyndnsDraft,
+    dhcp_relay: DhcpRelayDraft,
     /// Multi-WAN (roadmap C6): failover/load-balance mode + the uplinks, keyed by
     /// interface in configuration order.
     multiwan_mode: Option<WanMode>,
@@ -1010,6 +1015,11 @@ struct Draft {
     /// IPsec tunnels (roadmap C2): IKEv2 site-to-site connections, keyed by name
     /// in configuration order.
     ipsec: Vec<(String, IpsecDraft)>,
+    /// PKI (roadmap C19): local CAs + issued certs, each keyed by name in
+    /// configuration order, plus the optional ACME account.
+    pki_cas: Vec<(String, PkiCaDraft)>,
+    pki_certs: Vec<(String, PkiCertDraft)>,
+    acme: Option<AcmeDraft>,
 }
 
 /// A partially-specified DNS forwarder (`[services.dns]`).
@@ -1029,6 +1039,47 @@ struct DnsDraft {
 struct NtpDraft {
     upstream: Vec<String>,
     serve_on: Vec<String>,
+}
+
+/// A partially-specified LLDP config (`[services.lldp]`).
+#[derive(Debug, Clone, Default)]
+struct LldpDraft {
+    enable: bool,
+    interface: Vec<String>,
+}
+
+/// A partially-specified SNMP agent (`[services.snmp]`).
+#[derive(Debug, Clone, Default)]
+struct SnmpDraft {
+    community: Option<String>,
+    listen: Option<String>,
+    location: Option<String>,
+    contact: Option<String>,
+    allow: Vec<String>,
+}
+
+/// A partially-specified mDNS reflector (`[services.mdns]`).
+#[derive(Debug, Clone, Default)]
+struct MdnsDraft {
+    interface: Vec<String>,
+}
+
+/// A partially-specified dynamic-DNS client (`[services.dyndns]`).
+#[derive(Debug, Clone, Default)]
+struct DyndnsDraft {
+    provider: Option<String>,
+    server: Option<String>,
+    hostname: Option<String>,
+    login: Option<String>,
+    password: Option<String>,
+    interface: Option<String>,
+}
+
+/// A partially-specified DHCP relay (`[services.dhcp-relay]`).
+#[derive(Debug, Clone, Default)]
+struct DhcpRelayDraft {
+    interface: Vec<String>,
+    server: Vec<String>,
 }
 
 /// A partially-specified Multi-WAN uplink (`[[multiwan.uplink]]`), keyed by its
@@ -1065,6 +1116,38 @@ struct IpsecDraft {
     local_id: Option<String>,
     remote_id: Option<String>,
     start_action: Option<String>,
+}
+
+/// A partially-specified local CA (`[[pki.ca]]`, roadmap C19), keyed by its name
+/// in the draft. `common-name` is required (checked at materialize time).
+#[derive(Debug, Clone, Default)]
+struct PkiCaDraft {
+    common_name: Option<String>,
+    organization: Option<String>,
+    key_type: Option<String>,
+    validity_days: Option<u32>,
+}
+
+/// A partially-specified issued certificate (`[[pki.certificate]]`, roadmap
+/// C19), keyed by its name. `ca` + `common-name` are required.
+#[derive(Debug, Clone, Default)]
+struct PkiCertDraft {
+    ca: Option<String>,
+    common_name: Option<String>,
+    subject_alt_names: Vec<String>,
+    key_type: Option<String>,
+    usage: Option<String>,
+    validity_days: Option<u32>,
+}
+
+/// A partially-specified ACME account (`[pki.acme]`, roadmap C19). `email` is
+/// required.
+#[derive(Debug, Clone, Default)]
+struct AcmeDraft {
+    email: Option<String>,
+    directory_url: Option<String>,
+    challenge: Option<String>,
+    agree_tos: Option<bool>,
 }
 
 impl Draft {
@@ -1172,6 +1255,31 @@ impl Draft {
         }
         self.ipsec.push((name.to_string(), IpsecDraft::default()));
         &mut self.ipsec.last_mut().unwrap().1
+    }
+
+    /// Mutable access to the local CA `name`, inserting it if new (CAs are keyed
+    /// by name in configuration order).
+    fn pki_ca_mut(&mut self, name: &str) -> &mut PkiCaDraft {
+        if let Some(i) = self.pki_cas.iter().position(|(n, _)| n == name) {
+            return &mut self.pki_cas[i].1;
+        }
+        self.pki_cas.push((name.to_string(), PkiCaDraft::default()));
+        &mut self.pki_cas.last_mut().unwrap().1
+    }
+
+    /// Mutable access to the certificate `name`, inserting it if new.
+    fn pki_cert_mut(&mut self, name: &str) -> &mut PkiCertDraft {
+        if let Some(i) = self.pki_certs.iter().position(|(n, _)| n == name) {
+            return &mut self.pki_certs[i].1;
+        }
+        self.pki_certs
+            .push((name.to_string(), PkiCertDraft::default()));
+        &mut self.pki_certs.last_mut().unwrap().1
+    }
+
+    /// Mutable access to the ACME account, creating it on first reference.
+    fn acme_mut(&mut self) -> &mut AcmeDraft {
+        self.acme.get_or_insert_with(AcmeDraft::default)
     }
 }
 
@@ -1579,6 +1687,32 @@ impl Draft {
                 upstream: a.services.ntp.upstream.clone(),
                 serve_on: a.services.ntp.serve_on.clone(),
             },
+            lldp: LldpDraft {
+                enable: a.services.lldp.enable,
+                interface: a.services.lldp.interface.clone(),
+            },
+            snmp: SnmpDraft {
+                community: a.services.snmp.community.clone(),
+                listen: a.services.snmp.listen.clone(),
+                location: a.services.snmp.location.clone(),
+                contact: a.services.snmp.contact.clone(),
+                allow: a.services.snmp.allow.clone(),
+            },
+            mdns: MdnsDraft {
+                interface: a.services.mdns.interface.clone(),
+            },
+            dyndns: DyndnsDraft {
+                provider: a.services.dyndns.provider.clone(),
+                server: a.services.dyndns.server.clone(),
+                hostname: a.services.dyndns.hostname.clone(),
+                login: a.services.dyndns.login.clone(),
+                password: a.services.dyndns.password.clone(),
+                interface: a.services.dyndns.interface.clone(),
+            },
+            dhcp_relay: DhcpRelayDraft {
+                interface: a.services.dhcp_relay.interface.clone(),
+                server: a.services.dhcp_relay.server.clone(),
+            },
             multiwan_mode: (!a.multiwan.mode.is_default()).then_some(a.multiwan.mode),
             uplinks: a
                 .multiwan
@@ -1624,6 +1758,46 @@ impl Draft {
                     )
                 })
                 .collect(),
+            pki_cas: a
+                .pki
+                .cas
+                .iter()
+                .map(|c| {
+                    (
+                        c.name.clone(),
+                        PkiCaDraft {
+                            common_name: Some(c.common_name.clone()),
+                            organization: c.organization.clone(),
+                            key_type: c.key_type.clone(),
+                            validity_days: c.validity_days,
+                        },
+                    )
+                })
+                .collect(),
+            pki_certs: a
+                .pki
+                .certificates
+                .iter()
+                .map(|c| {
+                    (
+                        c.name.clone(),
+                        PkiCertDraft {
+                            ca: Some(c.ca.clone()),
+                            common_name: Some(c.common_name.clone()),
+                            subject_alt_names: c.subject_alt_names.clone(),
+                            key_type: c.key_type.clone(),
+                            usage: c.usage.clone(),
+                            validity_days: c.validity_days,
+                        },
+                    )
+                })
+                .collect(),
+            acme: a.pki.acme.as_ref().map(|c| AcmeDraft {
+                email: Some(c.email.clone()),
+                directory_url: c.directory_url.clone(),
+                challenge: c.challenge.clone(),
+                agree_tos: c.agree_tos,
+            }),
         }
     }
 }
@@ -2304,6 +2478,79 @@ impl Session {
             }
             ["services", "ntp", "serve-on", v] => {
                 self.draft.ntp.serve_on = v.split(',').map(|s| s.trim().to_string()).collect();
+            }
+
+            // services lldp: box-wide LLDP link-layer discovery (lldpd).
+            ["services", "lldp", "enable", v] => {
+                self.draft.lldp.enable = parse_bool(v)?;
+            }
+            ["services", "lldp", "interface", v] => {
+                self.draft.lldp.interface = v.split(',').map(|s| s.trim().to_string()).collect();
+            }
+
+            // services snmp: box-wide read-only SNMP agent (net-snmp).
+            ["services", "snmp", "community", v] => {
+                self.draft.snmp.community = Some((*v).to_string());
+            }
+            ["services", "snmp", "listen", v] => {
+                self.draft.snmp.listen = Some((*v).to_string());
+            }
+            // location/contact are free-form strings — absorb trailing words
+            // (the `description` convention: `location rack 4`, unquoted).
+            ["services", "snmp", "location", rest @ ..] if !rest.is_empty() => {
+                self.draft.snmp.location = Some(rest.join(" "));
+            }
+            ["services", "snmp", "contact", rest @ ..] if !rest.is_empty() => {
+                self.draft.snmp.contact = Some(rest.join(" "));
+            }
+            ["services", "snmp", "allow", v] => {
+                let srcs: Vec<String> = v.split(',').map(|s| s.trim().to_string()).collect();
+                for s in &srcs {
+                    if crate::config::validate_cidr_or_ip(s).is_err()
+                        && crate::config::validate_ipv6_cidr(s).is_err()
+                    {
+                        bail!("services snmp allow {s:?}: not an IPv4/IPv6 address or CIDR");
+                    }
+                }
+                self.draft.snmp.allow = srcs;
+            }
+
+            // services mdns: box-wide mDNS reflector (avahi).
+            ["services", "mdns", "interface", v] => {
+                self.draft.mdns.interface = v.split(',').map(|s| s.trim().to_string()).collect();
+            }
+
+            // services dyndns: box-wide dynamic-DNS client (ddclient).
+            ["services", "dyndns", "provider", v] => {
+                self.draft.dyndns.provider = Some((*v).to_string());
+            }
+            ["services", "dyndns", "server", v] => {
+                self.draft.dyndns.server = Some((*v).to_string());
+            }
+            ["services", "dyndns", "hostname", v] => {
+                self.draft.dyndns.hostname = Some((*v).to_string());
+            }
+            ["services", "dyndns", "login", v] => {
+                self.draft.dyndns.login = Some((*v).to_string());
+            }
+            ["services", "dyndns", "password", v] => {
+                self.draft.dyndns.password = Some((*v).to_string());
+            }
+            ["services", "dyndns", "interface", v] => {
+                self.draft.dyndns.interface = Some((*v).to_string());
+            }
+
+            // services dhcp-relay: box-wide DHCP relay agent (isc dhcrelay).
+            ["services", "dhcp-relay", "interface", v] => {
+                self.draft.dhcp_relay.interface =
+                    v.split(',').map(|s| s.trim().to_string()).collect();
+            }
+            ["services", "dhcp-relay", "server", v] => {
+                let srvs: Vec<String> = v.split(',').map(|s| s.trim().to_string()).collect();
+                for s in &srvs {
+                    validate_ipv4(s)?;
+                }
+                self.draft.dhcp_relay.server = srvs;
             }
 
             // protocols: dynamic routing (the Wren control plane).
@@ -2997,6 +3244,80 @@ impl Session {
                 self.draft.ipsec_mut(name).start_action = Some((*v).to_string());
             }
 
+            // pki (roadmap C19): local CAs, issued certs, the ACME account.
+            ["pki", "ca", name, "common-name", v] => {
+                crate::config::validate_subject_component(v)?;
+                self.draft.pki_ca_mut(name).common_name = Some((*v).to_string());
+            }
+            ["pki", "ca", name, "organization", v] => {
+                crate::config::validate_subject_component(v)?;
+                self.draft.pki_ca_mut(name).organization = Some((*v).to_string());
+            }
+            ["pki", "ca", name, "key-type", v] => {
+                if !matches!(*v, "ec" | "rsa") {
+                    bail!("invalid key-type {v:?} (expected ec|rsa)");
+                }
+                self.draft.pki_ca_mut(name).key_type = Some((*v).to_string());
+            }
+            ["pki", "ca", name, "validity-days", v] => {
+                let n: u32 = v
+                    .parse()
+                    .with_context(|| format!("invalid validity-days {v:?}"))?;
+                if n == 0 {
+                    bail!("validity-days must be greater than 0");
+                }
+                self.draft.pki_ca_mut(name).validity_days = Some(n);
+            }
+            ["pki", "certificate", name, "ca", v] => {
+                self.draft.pki_cert_mut(name).ca = Some((*v).to_string());
+            }
+            ["pki", "certificate", name, "common-name", v] => {
+                crate::config::validate_subject_component(v)?;
+                self.draft.pki_cert_mut(name).common_name = Some((*v).to_string());
+            }
+            ["pki", "certificate", name, "subject-alt-name", v] => {
+                crate::config::validate_san(v)?;
+                push_unique(&mut self.draft.pki_cert_mut(name).subject_alt_names, v);
+            }
+            ["pki", "certificate", name, "key-type", v] => {
+                if !matches!(*v, "ec" | "rsa") {
+                    bail!("invalid key-type {v:?} (expected ec|rsa)");
+                }
+                self.draft.pki_cert_mut(name).key_type = Some((*v).to_string());
+            }
+            ["pki", "certificate", name, "usage", v] => {
+                if !matches!(*v, "server" | "client") {
+                    bail!("invalid usage {v:?} (expected server|client)");
+                }
+                self.draft.pki_cert_mut(name).usage = Some((*v).to_string());
+            }
+            ["pki", "certificate", name, "validity-days", v] => {
+                let n: u32 = v
+                    .parse()
+                    .with_context(|| format!("invalid validity-days {v:?}"))?;
+                if n == 0 {
+                    bail!("validity-days must be greater than 0");
+                }
+                self.draft.pki_cert_mut(name).validity_days = Some(n);
+            }
+            ["pki", "acme", "email", v] => {
+                crate::config::validate_email(v)?;
+                self.draft.acme_mut().email = Some((*v).to_string());
+            }
+            ["pki", "acme", "directory-url", v] => {
+                crate::config::validate_https_url(v)?;
+                self.draft.acme_mut().directory_url = Some((*v).to_string());
+            }
+            ["pki", "acme", "challenge", v] => {
+                if !matches!(*v, "http-01" | "dns-01") {
+                    bail!("invalid challenge {v:?} (expected http-01|dns-01)");
+                }
+                self.draft.acme_mut().challenge = Some((*v).to_string());
+            }
+            ["pki", "acme", "agree-tos", v] => {
+                self.draft.acme_mut().agree_tos = Some(parse_bool(v)?);
+            }
+
             _ => bail!(
                 "unknown set path. The config tree (Tab/`?` explores each level):\n  \
                  set system hostname <name>\n  \
@@ -3040,7 +3361,10 @@ impl Session {
                  set multiwan uplink <if> <priority <n> | weight <n> | table <n> | gateway <ip|dhcp>>\n  \
                  set multiwan uplink <if> check <target <ip> | interval <n> | timeout <n> | fail <n> | rise <n>>\n  \
                  set vpn ipsec <name> <local <ip> | remote <ip> | local-subnet <cidr> | remote-subnet <cidr> | psk <key>>\n  \
-                 set vpn ipsec <name> <ike-version <1|2> | ike-proposal <p> | esp-proposal <p> | local-id <id> | remote-id <id> | start-action <start|trap|none>>"
+                 set vpn ipsec <name> <ike-version <1|2> | ike-proposal <p> | esp-proposal <p> | local-id <id> | remote-id <id> | start-action <start|trap|none>>\n  \
+                 set pki ca <name> <common-name <cn> | organization <o> | key-type <ec|rsa> | validity-days <n>>\n  \
+                 set pki certificate <name> <ca <ca-name|acme> | common-name <cn> | subject-alt-name <DNS:host|IP:addr> | key-type <ec|rsa> | usage <server|client> | validity-days <n>>\n  \
+                 set pki acme <email <addr> | directory-url <https-url> | challenge <http-01|dns-01> | agree-tos <bool>>"
             ),
         }
         self.dirty = true;
@@ -3518,6 +3842,11 @@ impl Session {
             ["services"] => {
                 self.draft.dns = DnsDraft::default();
                 self.draft.ntp = NtpDraft::default();
+                self.draft.lldp = LldpDraft::default();
+                self.draft.snmp = SnmpDraft::default();
+                self.draft.mdns = MdnsDraft::default();
+                self.draft.dyndns = DyndnsDraft::default();
+                self.draft.dhcp_relay = DhcpRelayDraft::default();
             }
             ["services", "dns"] => self.draft.dns = DnsDraft::default(),
             // Remove one host-override by name, or one blocklist entry by value.
@@ -3553,6 +3882,57 @@ impl Session {
                     "upstream" => n.upstream.clear(),
                     "serve-on" => n.serve_on.clear(),
                     other => bail!("services ntp has no field {other:?}"),
+                }
+            }
+            ["services", "lldp"] => self.draft.lldp = LldpDraft::default(),
+            ["services", "lldp", field] => {
+                let l = &mut self.draft.lldp;
+                match *field {
+                    "enable" => l.enable = false,
+                    "interface" => l.interface.clear(),
+                    other => bail!("services lldp has no field {other:?}"),
+                }
+            }
+            ["services", "snmp"] => self.draft.snmp = SnmpDraft::default(),
+            ["services", "snmp", field] => {
+                let s = &mut self.draft.snmp;
+                match *field {
+                    "community" => s.community = None,
+                    "listen" => s.listen = None,
+                    "location" => s.location = None,
+                    "contact" => s.contact = None,
+                    "allow" => s.allow.clear(),
+                    other => bail!("services snmp has no field {other:?}"),
+                }
+            }
+            ["services", "mdns"] => self.draft.mdns = MdnsDraft::default(),
+            ["services", "mdns", field] => {
+                let m = &mut self.draft.mdns;
+                match *field {
+                    "interface" => m.interface.clear(),
+                    other => bail!("services mdns has no field {other:?}"),
+                }
+            }
+            ["services", "dyndns"] => self.draft.dyndns = DyndnsDraft::default(),
+            ["services", "dyndns", field] => {
+                let d = &mut self.draft.dyndns;
+                match *field {
+                    "provider" => d.provider = None,
+                    "server" => d.server = None,
+                    "hostname" => d.hostname = None,
+                    "login" => d.login = None,
+                    "password" => d.password = None,
+                    "interface" => d.interface = None,
+                    other => bail!("services dyndns has no field {other:?}"),
+                }
+            }
+            ["services", "dhcp-relay"] => self.draft.dhcp_relay = DhcpRelayDraft::default(),
+            ["services", "dhcp-relay", field] => {
+                let r = &mut self.draft.dhcp_relay;
+                match *field {
+                    "interface" => r.interface.clear(),
+                    "server" => r.server.clear(),
+                    other => bail!("services dhcp-relay has no field {other:?}"),
                 }
             }
 
@@ -3963,6 +4343,83 @@ impl Session {
                     other => bail!("vpn ipsec connection has no field {other:?}"),
                 }
             }
+
+            // pki (roadmap C19). Bare `delete pki` clears the whole tree; the rest
+            // clear one CA / cert / the ACME account or one of their optional
+            // fields (the required common-name / ca can only be replaced — delete
+            // the whole object to remove them).
+            ["pki"] => {
+                self.draft.pki_cas.clear();
+                self.draft.pki_certs.clear();
+                self.draft.acme = None;
+            }
+            ["pki", "ca"] => self.draft.pki_cas.clear(),
+            ["pki", "ca", name] => {
+                let before = self.draft.pki_cas.len();
+                self.draft.pki_cas.retain(|(n, _)| n != name);
+                if self.draft.pki_cas.len() == before {
+                    bail!("no pki ca {name:?}");
+                }
+            }
+            ["pki", "ca", name, field] => {
+                let d = self.pki_ca(name)?;
+                match *field {
+                    "organization" => d.organization = None,
+                    "key-type" => d.key_type = None,
+                    "validity-days" => d.validity_days = None,
+                    "common-name" => bail!(
+                        "pki ca {name:?}: common-name is required — delete the whole CA \
+                         (`delete pki ca {name}`) to remove it"
+                    ),
+                    other => bail!("pki ca has no field {other:?}"),
+                }
+            }
+            ["pki", "certificate"] => self.draft.pki_certs.clear(),
+            ["pki", "certificate", name] => {
+                let before = self.draft.pki_certs.len();
+                self.draft.pki_certs.retain(|(n, _)| n != name);
+                if self.draft.pki_certs.len() == before {
+                    bail!("no pki certificate {name:?}");
+                }
+            }
+            ["pki", "certificate", name, "subject-alt-name", v] => {
+                let d = self.pki_cert(name)?;
+                let before = d.subject_alt_names.len();
+                d.subject_alt_names.retain(|s| s != v);
+                if d.subject_alt_names.len() == before {
+                    bail!("pki certificate {name:?}: no subject-alt-name {v:?}");
+                }
+            }
+            ["pki", "certificate", name, field] => {
+                let d = self.pki_cert(name)?;
+                match *field {
+                    "subject-alt-name" => d.subject_alt_names.clear(),
+                    "key-type" => d.key_type = None,
+                    "usage" => d.usage = None,
+                    "validity-days" => d.validity_days = None,
+                    "ca" | "common-name" => bail!(
+                        "pki certificate {name:?}: {field} is required — delete the whole \
+                         certificate (`delete pki certificate {name}`) to remove it"
+                    ),
+                    other => bail!("pki certificate has no field {other:?}"),
+                }
+            }
+            ["pki", "acme"] => self.draft.acme = None,
+            ["pki", "acme", field] => {
+                let Some(d) = self.draft.acme.as_mut() else {
+                    bail!("no pki acme account configured");
+                };
+                match *field {
+                    "directory-url" => d.directory_url = None,
+                    "challenge" => d.challenge = None,
+                    "agree-tos" => d.agree_tos = None,
+                    "email" => bail!(
+                        "pki acme: email is required — delete the whole account \
+                         (`delete pki acme`) to remove it"
+                    ),
+                    other => bail!("pki acme has no field {other:?}"),
+                }
+            }
             _ => bail!("unknown delete path"),
         }
         self.dirty = true;
@@ -4023,6 +4480,24 @@ impl Session {
             .ok_or_else(|| anyhow::anyhow!("no vpn ipsec connection {name:?}"))
     }
 
+    fn pki_ca(&mut self, name: &str) -> Result<&mut PkiCaDraft> {
+        self.draft
+            .pki_cas
+            .iter_mut()
+            .find(|(n, _)| n == name)
+            .map(|(_, d)| d)
+            .ok_or_else(|| anyhow::anyhow!("no pki ca {name:?}"))
+    }
+
+    fn pki_cert(&mut self, name: &str) -> Result<&mut PkiCertDraft> {
+        self.draft
+            .pki_certs
+            .iter_mut()
+            .find(|(n, _)| n == name)
+            .map(|(_, d)| d)
+            .ok_or_else(|| anyhow::anyhow!("no pki certificate {name:?}"))
+    }
+
     /// Render the candidate in a readable, hierarchical (JunOS-curly) form.
     pub fn show(&self) -> String {
         render_draft(&self.draft, false)
@@ -4033,7 +4508,7 @@ impl Session {
     pub fn show_only(&self, section: &str) -> String {
         match section {
             "system" | "interface" | "interfaces" | "firewall" | "nat" | "protocols"
-            | "services" | "multiwan" | "vpn" => {
+            | "services" | "multiwan" | "vpn" | "pki" => {
                 let out = render_draft_only(&self.draft, false, Some(section));
                 if out.is_empty() {
                     format!("(no {section} configuration)\n")
@@ -4042,7 +4517,7 @@ impl Session {
                 }
             }
             other => format!(
-                "error: unknown section {other:?} (system | interfaces | firewall | nat | protocols | services | multiwan | vpn)\n"
+                "error: unknown section {other:?} (system | interfaces | firewall | nat | protocols | services | multiwan | vpn | pki)\n"
             ),
         }
     }
@@ -4567,6 +5042,44 @@ impl Session {
                 .collect(),
         };
 
+        // pki (roadmap C19): local CAs, issued certs, the ACME account. Required
+        // fields fall back to empty strings so validation surfaces a clear "X is
+        // required" message rather than silently dropping a half-specified object.
+        let pki = Pki {
+            cas: self
+                .draft
+                .pki_cas
+                .iter()
+                .map(|(name, d)| Ca {
+                    name: name.clone(),
+                    common_name: d.common_name.clone().unwrap_or_default(),
+                    organization: d.organization.clone(),
+                    key_type: d.key_type.clone(),
+                    validity_days: d.validity_days,
+                })
+                .collect(),
+            certificates: self
+                .draft
+                .pki_certs
+                .iter()
+                .map(|(name, d)| Certificate {
+                    name: name.clone(),
+                    ca: d.ca.clone().unwrap_or_default(),
+                    common_name: d.common_name.clone().unwrap_or_default(),
+                    subject_alt_names: d.subject_alt_names.clone(),
+                    key_type: d.key_type.clone(),
+                    usage: d.usage.clone(),
+                    validity_days: d.validity_days,
+                })
+                .collect(),
+            acme: self.draft.acme.as_ref().map(|d| Acme {
+                email: d.email.clone().unwrap_or_default(),
+                directory_url: d.directory_url.clone(),
+                challenge: d.challenge.clone(),
+                agree_tos: d.agree_tos,
+            }),
+        };
+
         let appliance = Appliance {
             system: System { hostname },
             firewall,
@@ -4592,9 +5105,36 @@ impl Session {
                     upstream: self.draft.ntp.upstream.clone(),
                     serve_on: self.draft.ntp.serve_on.clone(),
                 },
+                lldp: Lldp {
+                    enable: self.draft.lldp.enable,
+                    interface: self.draft.lldp.interface.clone(),
+                },
+                snmp: Snmp {
+                    community: self.draft.snmp.community.clone(),
+                    listen: self.draft.snmp.listen.clone(),
+                    location: self.draft.snmp.location.clone(),
+                    contact: self.draft.snmp.contact.clone(),
+                    allow: self.draft.snmp.allow.clone(),
+                },
+                mdns: Mdns {
+                    interface: self.draft.mdns.interface.clone(),
+                },
+                dyndns: Dyndns {
+                    provider: self.draft.dyndns.provider.clone(),
+                    server: self.draft.dyndns.server.clone(),
+                    hostname: self.draft.dyndns.hostname.clone(),
+                    login: self.draft.dyndns.login.clone(),
+                    password: self.draft.dyndns.password.clone(),
+                    interface: self.draft.dyndns.interface.clone(),
+                },
+                dhcp_relay: DhcpRelay {
+                    interface: self.draft.dhcp_relay.interface.clone(),
+                    server: self.draft.dhcp_relay.server.clone(),
+                },
             },
             multiwan,
             vpn,
+            pki,
         };
         appliance.validate()?;
         Ok(appliance)
@@ -5417,7 +5957,28 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         && d.cache_size.is_none()
         && d.local_domain.is_none());
     let ntp_set = !(n.upstream.is_empty() && n.serve_on.is_empty());
-    if want("services") && (dns_set || ntp_set) {
+    let lldp = &draft.lldp;
+    let snmp = &draft.snmp;
+    let mdns = &draft.mdns;
+    let dyndns = &draft.dyndns;
+    let relay = &draft.dhcp_relay;
+    let lldp_set = lldp.enable || !lldp.interface.is_empty();
+    let snmp_set = snmp.community.is_some()
+        || snmp.listen.is_some()
+        || snmp.location.is_some()
+        || snmp.contact.is_some()
+        || !snmp.allow.is_empty();
+    let mdns_set = !mdns.interface.is_empty();
+    let dyndns_set = dyndns.provider.is_some()
+        || dyndns.server.is_some()
+        || dyndns.hostname.is_some()
+        || dyndns.login.is_some()
+        || dyndns.password.is_some()
+        || dyndns.interface.is_some();
+    let relay_set = !relay.interface.is_empty() || !relay.server.is_empty();
+    let any_service =
+        dns_set || ntp_set || lldp_set || snmp_set || mdns_set || dyndns_set || relay_set;
+    if want("services") && any_service {
         out.push_str("services {\n");
         if dns_set {
             out.push_str("    dns {\n");
@@ -5451,6 +6012,75 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             }
             if !n.serve_on.is_empty() {
                 out.push_str(&format!("        serve-on {}\n", n.serve_on.join(",")));
+            }
+            out.push_str("    }\n");
+        }
+        if lldp_set {
+            out.push_str("    lldp {\n");
+            if lldp.enable {
+                out.push_str("        enable true\n");
+            }
+            if !lldp.interface.is_empty() {
+                out.push_str(&format!("        interface {}\n", lldp.interface.join(",")));
+            }
+            out.push_str("    }\n");
+        }
+        if snmp_set {
+            out.push_str("    snmp {\n");
+            if let Some(c) = &snmp.community {
+                out.push_str(&format!("        community {c}\n"));
+            }
+            if let Some(l) = &snmp.listen {
+                out.push_str(&format!("        listen {l}\n"));
+            }
+            if let Some(l) = &snmp.location {
+                out.push_str(&format!("        location {l}\n"));
+            }
+            if let Some(c) = &snmp.contact {
+                out.push_str(&format!("        contact {c}\n"));
+            }
+            if !snmp.allow.is_empty() {
+                out.push_str(&format!("        allow {}\n", snmp.allow.join(",")));
+            }
+            out.push_str("    }\n");
+        }
+        if mdns_set {
+            out.push_str("    mdns {\n");
+            out.push_str(&format!("        interface {}\n", mdns.interface.join(",")));
+            out.push_str("    }\n");
+        }
+        if dyndns_set {
+            out.push_str("    dyndns {\n");
+            if let Some(p) = &dyndns.provider {
+                out.push_str(&format!("        provider {p}\n"));
+            }
+            if let Some(s) = &dyndns.server {
+                out.push_str(&format!("        server {s}\n"));
+            }
+            if let Some(h) = &dyndns.hostname {
+                out.push_str(&format!("        hostname {h}\n"));
+            }
+            if let Some(l) = &dyndns.login {
+                out.push_str(&format!("        login {l}\n"));
+            }
+            if let Some(p) = &dyndns.password {
+                out.push_str(&format!("        password {p}\n"));
+            }
+            if let Some(i) = &dyndns.interface {
+                out.push_str(&format!("        interface {i}\n"));
+            }
+            out.push_str("    }\n");
+        }
+        if relay_set {
+            out.push_str("    dhcp-relay {\n");
+            if !relay.interface.is_empty() {
+                out.push_str(&format!(
+                    "        interface {}\n",
+                    relay.interface.join(",")
+                ));
+            }
+            if !relay.server.is_empty() {
+                out.push_str(&format!("        server {}\n", relay.server.join(",")));
             }
             out.push_str("    }\n");
         }
@@ -5543,6 +6173,68 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             }
             if let Some(v) = &c.start_action {
                 out.push_str(&format!("        start-action {v}\n"));
+            }
+            out.push_str("    }\n");
+        }
+        out.push_str("}\n");
+    }
+
+    // pki { ca <name> { … } certificate <name> { … } acme { … } } — roadmap C19.
+    if want("pki")
+        && (!draft.pki_cas.is_empty() || !draft.pki_certs.is_empty() || draft.acme.is_some())
+    {
+        out.push_str("pki {\n");
+        for (name, c) in &draft.pki_cas {
+            out.push_str(&format!("    ca {name} {{\n"));
+            if let Some(v) = &c.common_name {
+                out.push_str(&format!("        common-name {v}\n"));
+            }
+            if let Some(v) = &c.organization {
+                out.push_str(&format!("        organization {v}\n"));
+            }
+            if let Some(v) = &c.key_type {
+                out.push_str(&format!("        key-type {v}\n"));
+            }
+            if let Some(v) = c.validity_days {
+                out.push_str(&format!("        validity-days {v}\n"));
+            }
+            out.push_str("    }\n");
+        }
+        for (name, c) in &draft.pki_certs {
+            out.push_str(&format!("    certificate {name} {{\n"));
+            if let Some(v) = &c.ca {
+                out.push_str(&format!("        ca {v}\n"));
+            }
+            if let Some(v) = &c.common_name {
+                out.push_str(&format!("        common-name {v}\n"));
+            }
+            for san in &c.subject_alt_names {
+                out.push_str(&format!("        subject-alt-name {san}\n"));
+            }
+            if let Some(v) = &c.key_type {
+                out.push_str(&format!("        key-type {v}\n"));
+            }
+            if let Some(v) = &c.usage {
+                out.push_str(&format!("        usage {v}\n"));
+            }
+            if let Some(v) = c.validity_days {
+                out.push_str(&format!("        validity-days {v}\n"));
+            }
+            out.push_str("    }\n");
+        }
+        if let Some(a) = &draft.acme {
+            out.push_str("    acme {\n");
+            if let Some(v) = &a.email {
+                out.push_str(&format!("        email {v}\n"));
+            }
+            if let Some(v) = &a.directory_url {
+                out.push_str(&format!("        directory-url {v}\n"));
+            }
+            if let Some(v) = &a.challenge {
+                out.push_str(&format!("        challenge {v}\n"));
+            }
+            if let Some(v) = a.agree_tos {
+                out.push_str(&format!("        agree-tos {v}\n"));
             }
             out.push_str("    }\n");
         }
@@ -5930,6 +6622,82 @@ mod tests {
     }
 
     #[test]
+    fn box_services_cli_builds_shows_and_commits() {
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname fw",
+            "set interface lan0 zone lan",
+            "set interface lan0 address 10.0.0.1/24",
+            "set interface iot0 zone iot",
+            "set interface iot0 address 10.0.7.1/24",
+            // LLDP on the two links.
+            "set services lldp enable true",
+            "set services lldp interface lan0,iot0",
+            // Read-only SNMP scoped to the LAN.
+            "set services snmp community public",
+            "set services snmp location rack-4",
+            "set services snmp allow 10.0.0.0/24",
+            // mDNS reflector between the two zones.
+            "set services mdns interface lan0,iot0",
+            // Dynamic-DNS client watching the LAN address.
+            "set services dyndns provider cloudflare",
+            "set services dyndns hostname fw.example.com",
+            "set services dyndns password secret-token",
+            "set services dyndns interface lan0",
+            // DHCP relay from iot0 to an upstream server.
+            "set services dhcp-relay interface iot0",
+            "set services dhcp-relay server 10.0.0.99",
+        ] {
+            run(&mut s, line).unwrap();
+        }
+
+        // `show` renders every new leaf under services.
+        let shown = s.show();
+        for needle in [
+            "lldp {",
+            "enable true",
+            "interface lan0,iot0",
+            "snmp {",
+            "community public",
+            "location rack-4",
+            "allow 10.0.0.0/24",
+            "mdns {",
+            "dyndns {",
+            "provider cloudflare",
+            "hostname fw.example.com",
+            "dhcp-relay {",
+            "server 10.0.0.99",
+        ] {
+            assert!(shown.contains(needle), "show missing {needle:?}:\n{shown}");
+        }
+
+        // It materializes into a validated Appliance carrying every service.
+        let a = s.commit().expect("box services commit");
+        assert!(a.services.lldp.enable);
+        assert_eq!(a.services.lldp.interface, vec!["lan0", "iot0"]);
+        assert_eq!(a.services.snmp.community.as_deref(), Some("public"));
+        assert_eq!(a.services.snmp.allow, vec!["10.0.0.0/24"]);
+        assert_eq!(a.services.mdns.interface, vec!["lan0", "iot0"]);
+        assert_eq!(
+            a.services.dyndns.hostname.as_deref(),
+            Some("fw.example.com")
+        );
+        assert_eq!(a.services.dhcp_relay.server, vec!["10.0.0.99"]);
+
+        // A full TOML round-trip (save → reload) preserves them.
+        let toml = a.to_toml().unwrap();
+        let b = Appliance::from_toml(&toml).expect("re-parses");
+        assert!(b.services.lldp.enable);
+        assert_eq!(b.services.dhcp_relay.interface, vec!["iot0"]);
+
+        // `delete services snmp` clears just that one; the rest survive.
+        run(&mut s, "delete services snmp").unwrap();
+        let a2 = s.commit().expect("still valid after deleting snmp");
+        assert!(a2.services.snmp.is_empty());
+        assert!(a2.services.lldp.enable);
+    }
+
+    #[test]
     fn multiwan_cli_builds_uplinks_shows_and_commits() {
         let mut s = Session::empty();
         for line in [
@@ -6033,6 +6801,78 @@ mod tests {
         // A bad endpoint is rejected at set time.
         let bad = run(&mut s, "set vpn ipsec site remote not-an-ip").unwrap_err();
         assert!(bad.to_string().contains("IPv4"), "got: {bad}");
+    }
+
+    #[test]
+    fn pki_cli_builds_shows_commits_and_deletes() {
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname gw",
+            "set pki ca corp common-name corp.example.com",
+            "set pki ca corp organization Example",
+            "set pki ca corp key-type ec",
+            "set pki certificate vpn-server ca corp",
+            "set pki certificate vpn-server common-name vpn.example.com",
+            "set pki certificate vpn-server subject-alt-name DNS:vpn.example.com",
+            "set pki certificate vpn-server usage server",
+            "set pki acme email admin@example.com",
+            "set pki acme challenge http-01",
+            "set pki acme agree-tos true",
+        ] {
+            run(&mut s, line).unwrap();
+        }
+        // The show block round-trips the CA, cert and ACME account.
+        let shown = s.show_only("pki");
+        assert!(shown.contains("pki {"), "got:\n{shown}");
+        assert!(shown.contains("ca corp {"), "got:\n{shown}");
+        assert!(shown.contains("certificate vpn-server {"), "got:\n{shown}");
+        assert!(
+            shown.contains("subject-alt-name DNS:vpn.example.com"),
+            "got:\n{shown}"
+        );
+        assert!(shown.contains("acme {"), "got:\n{shown}");
+
+        let a = s.commit().expect("valid pki commits");
+        assert_eq!(a.pki.cas.len(), 1);
+        assert_eq!(a.pki.cas[0].common_name, "corp.example.com");
+        assert_eq!(a.pki.certificates.len(), 1);
+        assert_eq!(a.pki.certificates[0].ca, "corp");
+        assert_eq!(
+            a.pki.acme.as_ref().map(|c| c.email.as_str()),
+            Some("admin@example.com")
+        );
+
+        // Delete an optional field, one SAN, then the whole objects.
+        run(&mut s, "delete pki certificate vpn-server usage").unwrap();
+        let b = s.commit().expect("still valid after field delete");
+        assert!(b.pki.certificates[0].usage.is_none());
+        run(&mut s, "delete pki acme").unwrap();
+        run(&mut s, "delete pki certificate vpn-server").unwrap();
+        run(&mut s, "delete pki ca corp").unwrap();
+        let d = s.commit().expect("still valid after object deletes");
+        assert!(d.pki.is_empty());
+    }
+
+    #[test]
+    fn pki_rejects_cert_with_unknown_ca_and_bad_san() {
+        let mut s = Session::empty();
+        run(&mut s, "set system hostname gw").unwrap();
+        run(&mut s, "set pki certificate leaf ca ghost").unwrap();
+        run(
+            &mut s,
+            "set pki certificate leaf common-name leaf.example.com",
+        )
+        .unwrap();
+        // The CA is undeclared → commit-time validation rejects it.
+        let err = s.commit().unwrap_err().to_string();
+        assert!(err.contains("unknown ca"), "got: {err}");
+        // A malformed SAN is rejected at set time.
+        let bad = run(
+            &mut s,
+            "set pki certificate leaf subject-alt-name vpn.example.com",
+        )
+        .unwrap_err();
+        assert!(bad.to_string().contains("DNS:<host>"), "got: {bad}");
     }
 
     #[test]

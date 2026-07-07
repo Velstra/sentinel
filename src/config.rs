@@ -143,6 +143,35 @@ port = 443
 # [services.ntp]
 # upstream = ["pool.ntp.org"]
 # serve-on = ["lan0"]
+#
+# LLDP link-layer discovery (built on lldpd): advertise + learn neighbours.
+# [services.lldp]
+# enable = true
+# interface = ["lan0", "wan0"]   # omit for every interface
+#
+# A read-only SNMP agent (built on net-snmp): v2c, scoped to the NOC subnet.
+# [services.snmp]
+# community = "public"
+# location = "rack 4"
+# contact = "noc@example"
+# allow = ["10.0.0.0/24"]
+#
+# An mDNS reflector (built on avahi): bridge Bonjour between two segments.
+# [services.mdns]
+# interface = ["lan0", "iot0"]
+#
+# A dynamic-DNS client (built on ddclient): keep an FQDN pointed at the WAN IP.
+# [services.dyndns]
+# provider = "cloudflare"
+# hostname = "fw.example.com"
+# login = "user@example"
+# password = "secret-token"
+# interface = "wan0"
+#
+# A DHCP relay (built on isc dhcrelay): forward DHCP to an upstream server.
+# [services.dhcp-relay]
+# interface = ["lan0"]
+# server = ["10.0.99.1"]
 
 # NAT is its own thing (address translation, not filtering). Source NAT
 # masquerades a zone's outbound traffic to its egress IP; destination NAT is an
@@ -331,6 +360,14 @@ pub struct Appliance {
     /// saved configs when no tunnel is declared.
     #[serde(default, skip_serializing_if = "Vpn::is_empty")]
     pub vpn: Vpn,
+    /// Public-key infrastructure (roadmap C19): an on-box certificate authority
+    /// to issue certs for VPN/management, plus an ACME (Let's Encrypt) client for
+    /// public certs. Its own top-level domain (like [`Vpn`]), not a "service".
+    /// Key material is minted at commit time into the persistent
+    /// `/var/lib/sentinel/pki` store (never in the image); the config carries only
+    /// the declarative definitions. Omitted from saved configs when empty.
+    #[serde(default, skip_serializing_if = "Pki::is_empty")]
+    pub pki: Pki,
 }
 
 /// The box-wide services category (`[services.*]`). A thin grouping so DNS, NTP
@@ -344,12 +381,188 @@ pub struct Services {
     /// The LAN NTP server (`[services.ntp]`).
     #[serde(default, skip_serializing_if = "Ntp::is_empty")]
     pub ntp: Ntp,
+    /// LLDP link-layer discovery (`[services.lldp]`).
+    #[serde(default, skip_serializing_if = "Lldp::is_empty")]
+    pub lldp: Lldp,
+    /// Read-only SNMP agent (`[services.snmp]`).
+    #[serde(default, skip_serializing_if = "Snmp::is_empty")]
+    pub snmp: Snmp,
+    /// mDNS reflector (`[services.mdns]`).
+    #[serde(default, skip_serializing_if = "Mdns::is_empty")]
+    pub mdns: Mdns,
+    /// Dynamic-DNS client (`[services.dyndns]`).
+    #[serde(default, skip_serializing_if = "Dyndns::is_empty")]
+    pub dyndns: Dyndns,
+    /// DHCP relay agent (`[services.dhcp-relay]`).
+    #[serde(
+        default,
+        rename = "dhcp-relay",
+        skip_serializing_if = "DhcpRelay::is_empty"
+    )]
+    pub dhcp_relay: DhcpRelay,
 }
 
 impl Services {
     /// True when no service is configured — lets `[services]` be omitted.
     pub fn is_empty(&self) -> bool {
-        self.dns.is_empty() && self.ntp.is_empty()
+        self.dns.is_empty()
+            && self.ntp.is_empty()
+            && self.lldp.is_empty()
+            && self.snmp.is_empty()
+            && self.mdns.is_empty()
+            && self.dyndns.is_empty()
+            && self.dhcp_relay.is_empty()
+    }
+}
+
+/// LLDP link-layer discovery (`[services.lldp]`) — the box advertises itself and
+/// learns its neighbours over 802.1AB, built on the image's `lldpd` (Sentinel
+/// owns its lifecycle: off unless enabled). `show`-able with `lldpctl`. Empty by
+/// default (no discovery).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Lldp {
+    /// Turn LLDP on. Without it the daemon stays stopped (the appliance ships no
+    /// neighbour discovery by default).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub enable: bool,
+    /// Interfaces to run LLDP on (a whitelist). Each must be a declared
+    /// interface. Empty ⇒ every interface (lldpd's default) — the usual case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interface: Vec<String>,
+}
+
+impl Lldp {
+    /// True when LLDP is off and unconfigured — lets `[services.lldp]` be omitted.
+    pub fn is_empty(&self) -> bool {
+        !self.enable && self.interface.is_empty()
+    }
+}
+
+/// A read-only SNMP agent (`[services.snmp]`) — built on the image's net-snmp
+/// `snmpd`, exposing the box's MIBs (interfaces, counters, sysUpTime) to a v2c
+/// monitoring station. Read-only by construction (an `rocommunity`; no write
+/// community is ever rendered). Empty by default; a `community` turns it on.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Snmp {
+    /// The v2c read-only community string (the shared secret a poller presents).
+    /// Rendered into a 0640 `snmpd.conf`, never world-readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub community: Option<String>,
+    /// The address:port the agent listens on (net-snmp `agentaddress`, e.g.
+    /// `"udp:161"` or `"udp:10.0.0.1:161"`). Unset ⇒ `udp:161` (all addresses).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<String>,
+    /// The advertised `syslocation` (a free-form string, e.g. `"rack 4"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    /// The advertised `syscontact` (a free-form string, e.g. `"noc@example"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact: Option<String>,
+    /// Source subnets allowed to poll (IPv4/IPv6 CIDRs or bare IPs). Each becomes
+    /// the source clause of an `rocommunity`. Empty ⇒ `default` (any source can
+    /// poll with the community) — set at least one to scope it to the NOC.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+}
+
+impl Snmp {
+    /// True when no agent is configured — lets `[services.snmp]` be omitted.
+    pub fn is_empty(&self) -> bool {
+        self.community.is_none()
+            && self.listen.is_none()
+            && self.location.is_none()
+            && self.contact.is_none()
+            && self.allow.is_empty()
+    }
+}
+
+/// mDNS reflector (`[services.mdns]`) — reflects multicast-DNS (Bonjour/Avahi)
+/// service announcements between two or more segments so a printer/Chromecast on
+/// one VLAN is discoverable from another. Built on the image's `avahi-daemon` in
+/// reflector mode (Sentinel owns its lifecycle). Empty by default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Mdns {
+    /// Interfaces to reflect mDNS between. At least two are needed for a reflector
+    /// to have anything to bridge; each must be a declared interface.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interface: Vec<String>,
+}
+
+impl Mdns {
+    /// True when no reflector is configured — lets `[services.mdns]` be omitted.
+    pub fn is_empty(&self) -> bool {
+        self.interface.is_empty()
+    }
+}
+
+/// A dynamic-DNS client (`[services.dyndns]`) — keeps a hostname's A/AAAA record
+/// pointed at the box's (possibly dynamic) WAN address, built on the image's
+/// `ddclient`. Empty by default; a `hostname` turns it on.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Dyndns {
+    /// The ddclient protocol (the provider), e.g. `"dyndns2"`, `"cloudflare"`,
+    /// `"namecheap"`. Unset ⇒ `dyndns2` (the de-facto default protocol).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// The provider's update endpoint host (ddclient `server=`), e.g.
+    /// `"members.dyndns.org"`. Unset ⇒ the provider protocol's built-in default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    /// The hostname (FQDN) whose record is kept up to date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    /// The account login/username at the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<String>,
+    /// The account password / API token. Rendered into a 0640 `ddclient.conf`,
+    /// never world-readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    /// The interface whose address to publish (ddclient `use=if, if=<iface>`).
+    /// Each must be a declared interface. Unset ⇒ `use=web` (discover the WAN IP
+    /// via the provider's checkip service — the right choice behind CGNAT).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<String>,
+}
+
+impl Dyndns {
+    /// True when no client is configured — lets `[services.dyndns]` be omitted.
+    pub fn is_empty(&self) -> bool {
+        self.provider.is_none()
+            && self.server.is_none()
+            && self.hostname.is_none()
+            && self.login.is_none()
+            && self.password.is_none()
+            && self.interface.is_none()
+    }
+}
+
+/// A DHCP relay agent (`[services.dhcp-relay]`) — forwards DHCP between a
+/// client-facing interface and an upstream server on another segment (the box
+/// runs no pool itself), built on the image's isc `dhcrelay`. Empty by default;
+/// an upstream `server` turns it on.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DhcpRelay {
+    /// Interfaces the relay listens/relays on — both the client-facing segment(s)
+    /// and the link toward the server. Each must be a declared interface, and
+    /// (validated) must NOT also run a `[interface.dhcp-server]` — a link is
+    /// either served locally or relayed, never both.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interface: Vec<String>,
+    /// Upstream DHCP server addresses to relay requests to (IPv4).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server: Vec<String>,
+}
+
+impl DhcpRelay {
+    /// True when no relay is configured — lets `[services.dhcp-relay]` be omitted.
+    pub fn is_empty(&self) -> bool {
+        self.interface.is_empty() && self.server.is_empty()
     }
 }
 
@@ -1746,6 +1959,143 @@ pub struct IpsecConnection {
         skip_serializing_if = "Option::is_none"
     )]
     pub start_action: Option<String>,
+}
+
+/// Built-in public-key infrastructure (roadmap C19): an on-box certificate
+/// authority for issuing VPN/management certs, plus an ACME (Let's Encrypt)
+/// client for public certs. A distinct top-level tree (like [`Vpn`]) — its own
+/// domain, not a "service". Key material is generated at commit time into the
+/// persistent `/var/lib/sentinel/pki` store; only the declarative definitions
+/// live in the config. Empty by default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pki {
+    /// Local certificate authorities (`[[pki.ca]]`) — each self-signed, its key
+    /// (0600) + cert generated into `/var/lib/sentinel/pki/ca/<name>/`.
+    #[serde(default, rename = "ca", skip_serializing_if = "Vec::is_empty")]
+    pub cas: Vec<Ca>,
+    /// Issued leaf certificates (`[[pki.certificate]]`) — signed by a local CA or
+    /// obtained via ACME.
+    #[serde(default, rename = "certificate", skip_serializing_if = "Vec::is_empty")]
+    pub certificates: Vec<Certificate>,
+    /// ACME account (`[pki.acme]`) — the directory / email / challenge used to
+    /// obtain every `ca = "acme"` certificate. Absent ⇒ no ACME.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acme: Option<Acme>,
+}
+
+impl Pki {
+    /// True when no PKI is configured — lets `[pki]` be omitted from output.
+    pub fn is_empty(&self) -> bool {
+        self.cas.is_empty() && self.certificates.is_empty() && self.acme.is_none()
+    }
+}
+
+/// The reserved `ca` value that marks a [`Certificate`] as ACME-obtained rather
+/// than signed by a local [`Ca`].
+pub const ACME_CA: &str = "acme";
+/// Default key type for a CA / leaf when none is given: NIST P-256 (EC) — small,
+/// fast and universally accepted for TLS and IKE.
+pub const DEFAULT_PKI_KEY_TYPE: &str = "ec";
+/// Default validity of a local CA certificate: 10 years.
+pub const DEFAULT_CA_VALIDITY_DAYS: u32 = 3650;
+/// Default validity of an issued leaf certificate: 825 days (the CA/Browser
+/// Forum maximum for a publicly-trusted server certificate).
+pub const DEFAULT_CERT_VALIDITY_DAYS: u32 = 825;
+/// Default ACME directory: Let's Encrypt production. Point at the staging
+/// directory (`…/acme-staging-v02…`) while testing to avoid rate limits.
+pub const DEFAULT_ACME_DIRECTORY: &str = "https://acme-v02.api.letsencrypt.org/directory";
+
+/// One local certificate authority (`[[pki.ca]]`). Self-signed at commit time;
+/// its key (0600) + cert live under `/var/lib/sentinel/pki/ca/<name>/` and are
+/// never regenerated once present.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Ca {
+    /// CA name — the store subdirectory and the `ca` reference from a
+    /// certificate. Required; restricted to `[A-Za-z0-9_-]` since it names a
+    /// filesystem path.
+    pub name: String,
+    /// The CA certificate's subject common name (`CN`). Required.
+    #[serde(rename = "common-name")]
+    pub common_name: String,
+    /// The subject organization (`O`). Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization: Option<String>,
+    /// Key type: `ec` (P-256, the default) or `rsa` (3072-bit). Unset ⇒
+    /// [`DEFAULT_PKI_KEY_TYPE`].
+    #[serde(default, rename = "key-type", skip_serializing_if = "Option::is_none")]
+    pub key_type: Option<String>,
+    /// Certificate validity in days. Unset ⇒ [`DEFAULT_CA_VALIDITY_DAYS`].
+    #[serde(
+        default,
+        rename = "validity-days",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub validity_days: Option<u32>,
+}
+
+/// One issued leaf certificate (`[[pki.certificate]]`). For a CA-signed cert the
+/// key (0600) + cert are generated into `/var/lib/sentinel/pki/certs/<name>/`;
+/// for `ca = "acme"` the cert is obtained from the [`Acme`] account instead.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Certificate {
+    /// Certificate name — the store subdirectory. Required; `[A-Za-z0-9_-]`.
+    pub name: String,
+    /// The signing authority: the name of a local [`Ca`], or [`ACME_CA`]
+    /// (`"acme"`) for an ACME-obtained cert. Required.
+    pub ca: String,
+    /// The subject common name (`CN`). Required.
+    #[serde(rename = "common-name")]
+    pub common_name: String,
+    /// Subject alternative names, each `DNS:<host>` or `IP:<addr>` — modern
+    /// clients match on these, not the CN.
+    #[serde(
+        default,
+        rename = "subject-alt-name",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub subject_alt_names: Vec<String>,
+    /// Key type: `ec` (default) or `rsa`. Unset ⇒ [`DEFAULT_PKI_KEY_TYPE`].
+    #[serde(default, rename = "key-type", skip_serializing_if = "Option::is_none")]
+    pub key_type: Option<String>,
+    /// Intended usage: `server` (the default) or `client` — selects the extended
+    /// key usage (serverAuth vs clientAuth). Unset ⇒ server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<String>,
+    /// Certificate validity in days. Unset ⇒ [`DEFAULT_CERT_VALIDITY_DAYS`].
+    #[serde(
+        default,
+        rename = "validity-days",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub validity_days: Option<u32>,
+}
+
+/// The ACME account (`[pki.acme]`) used to obtain every `ca = "acme"`
+/// certificate. Live issuance needs external reachability (an HTTP-01 / DNS-01
+/// challenge) and is performed on hardware; in the appliance the account
+/// descriptor is rendered so the config round-trips and the wiring is in place.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Acme {
+    /// The ACME contact email (account registration + expiry notices). Required.
+    pub email: String,
+    /// The ACME directory URL. Unset ⇒ [`DEFAULT_ACME_DIRECTORY`] (Let's Encrypt
+    /// production).
+    #[serde(
+        default,
+        rename = "directory-url",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub directory_url: Option<String>,
+    /// Challenge type: `http-01` (the default) or `dns-01`. Unset ⇒ http-01.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub challenge: Option<String>,
+    /// Whether the ACME terms of service are agreed to (required for issuance).
+    #[serde(default, rename = "agree-tos", skip_serializing_if = "Option::is_none")]
+    pub agree_tos: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3469,6 +3819,90 @@ impl Appliance {
             }
         }
 
+        // LLDP: every listed interface must be a declared interface (no address
+        // requirement — LLDP rides any link, addressed or not).
+        for iface in &self.services.lldp.interface {
+            if !self.interfaces.iter().any(|i| &i.name == iface) {
+                bail!("services lldp interface {iface:?}: not a declared interface");
+            }
+        }
+
+        // SNMP: the source `allow` clauses are IPv4/IPv6 CIDRs or bare IPs; the
+        // agent listens on a net-snmp transport spec. Location/contact are opaque
+        // strings (rendered quoted). The community itself is unconstrained (a
+        // shared secret), but an empty one would be nonsensical.
+        let snmp = &self.services.snmp;
+        if let Some(c) = &snmp.community {
+            if c.is_empty() {
+                bail!("services snmp community: must not be empty");
+            }
+        }
+        for src in &snmp.allow {
+            if validate_cidr_or_ip(src).is_err() && validate_ipv6_cidr(src).is_err() {
+                bail!("services snmp allow {src:?}: not an IPv4/IPv6 address or CIDR");
+            }
+        }
+        if snmp.community.is_none() && !snmp.is_empty() {
+            bail!("services snmp: a `community` is required to run the agent");
+        }
+
+        // mDNS reflector: every listed interface must be declared, and a reflector
+        // needs at least two links to bridge between.
+        let mdns = &self.services.mdns;
+        for iface in &mdns.interface {
+            if !self.interfaces.iter().any(|i| &i.name == iface) {
+                bail!("services mdns interface {iface:?}: not a declared interface");
+            }
+        }
+        if !mdns.interface.is_empty() && mdns.interface.len() < 2 {
+            bail!("services mdns: a reflector needs at least two interfaces to bridge between");
+        }
+
+        // Dynamic DNS: a configured client needs a hostname; the watched interface
+        // (if given) must be declared.
+        let dd = &self.services.dyndns;
+        if !dd.is_empty() && dd.hostname.is_none() {
+            bail!("services dyndns: a `hostname` is required");
+        }
+        if let Some(iface) = &dd.interface {
+            if !self.interfaces.iter().any(|i| &i.name == iface) {
+                bail!("services dyndns interface {iface:?}: not a declared interface");
+            }
+        }
+
+        // DHCP relay: upstream servers are IPv4; every relay interface must be
+        // declared and must NOT also run a local DHCP server (a link is either
+        // served locally or relayed upstream, never both).
+        let relay = &self.services.dhcp_relay;
+        if !relay.is_empty() {
+            if relay.server.is_empty() {
+                bail!("services dhcp-relay: at least one upstream `server` is required");
+            }
+            if relay.interface.is_empty() {
+                bail!("services dhcp-relay: at least one `interface` to relay on is required");
+            }
+        }
+        for srv in &relay.server {
+            validate_ipv4(srv).with_context(|| "services dhcp-relay server")?;
+        }
+        for iface in &relay.interface {
+            match self.interfaces.iter().find(|i| &i.name == iface) {
+                Some(i) if i.dhcp_server.is_some() => bail!(
+                    "services dhcp-relay interface {iface:?}: already runs a DHCP server (a link is either served or relayed, not both)"
+                ),
+                // The relay (dnsmasq) listens on the interface's own address and
+                // stamps it as the DHCP giaddr, so a client-facing relay link
+                // needs a static address (a `dhcp`/unset link cannot relay).
+                Some(i) => match i.address.as_deref() {
+                    Some(addr) if addr != "dhcp" => {}
+                    _ => bail!(
+                        "services dhcp-relay interface {iface:?}: needs a static address (the relay stamps it as the DHCP giaddr)"
+                    ),
+                },
+                None => bail!("services dhcp-relay interface {iface:?}: not a declared interface"),
+            }
+        }
+
         // Multi-WAN (roadmap C6): every uplink must name a declared interface,
         // no interface or routing-table id may be shared between uplinks, table
         // ids must avoid the kernel's reserved tables, gateways are IPv4 (or
@@ -3591,6 +4025,121 @@ impl Appliance {
             if let Some(id) = &c.remote_id {
                 validate_ipsec_id(id)
                     .with_context(|| format!("vpn ipsec {:?} remote-id", c.name))?;
+            }
+        }
+
+        // PKI (roadmap C19): local CAs, issued leaf certs, an ACME account.
+        // Names are unique + store-subdir-safe; subject components and SANs carry
+        // only a safe charset (they are rendered into openssl subject / extension
+        // arguments, so they are an injection boundary); a leaf's `ca` must name a
+        // declared CA or be "acme" (in which case an [pki.acme] account must
+        // exist); key types / usages / challenges come from the accepted sets.
+        let mut seen_ca: HashSet<&str> = HashSet::new();
+        for ca in &self.pki.cas {
+            if ca.name.is_empty() {
+                bail!("pki ca: a CA name must not be empty");
+            }
+            if !ca
+                .name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            {
+                bail!(
+                    "pki ca {:?}: name may only contain letters, digits, '-' and '_'",
+                    ca.name
+                );
+            }
+            if ca.name == ACME_CA {
+                bail!("pki ca: {ACME_CA:?} is reserved for ACME-obtained certificates");
+            }
+            if !seen_ca.insert(ca.name.as_str()) {
+                bail!("pki ca: duplicate CA {:?}", ca.name);
+            }
+            validate_subject_component(&ca.common_name)
+                .with_context(|| format!("pki ca {:?} common-name", ca.name))?;
+            if let Some(o) = &ca.organization {
+                validate_subject_component(o)
+                    .with_context(|| format!("pki ca {:?} organization", ca.name))?;
+            }
+            if let Some(kt) = &ca.key_type {
+                if !matches!(kt.as_str(), "ec" | "rsa") {
+                    bail!("pki ca {:?}: key-type {kt:?} must be ec or rsa", ca.name);
+                }
+            }
+            if ca.validity_days == Some(0) {
+                bail!("pki ca {:?}: validity-days must be greater than 0", ca.name);
+            }
+        }
+        let mut seen_cert: HashSet<&str> = HashSet::new();
+        for cert in &self.pki.certificates {
+            if cert.name.is_empty() {
+                bail!("pki certificate: a certificate name must not be empty");
+            }
+            if !cert
+                .name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            {
+                bail!(
+                    "pki certificate {:?}: name may only contain letters, digits, '-' and '_'",
+                    cert.name
+                );
+            }
+            if !seen_cert.insert(cert.name.as_str()) {
+                bail!("pki certificate: duplicate certificate {:?}", cert.name);
+            }
+            // The signing authority is a declared local CA, or "acme".
+            if cert.ca == ACME_CA {
+                if self.pki.acme.is_none() {
+                    bail!(
+                        "pki certificate {:?}: ca = \"acme\" but no [pki.acme] account is configured",
+                        cert.name
+                    );
+                }
+            } else if !self.pki.cas.iter().any(|c| c.name == cert.ca) {
+                bail!(
+                    "pki certificate {:?}: unknown ca {:?} (declare [[pki.ca]] or use \"acme\")",
+                    cert.name,
+                    cert.ca
+                );
+            }
+            validate_subject_component(&cert.common_name)
+                .with_context(|| format!("pki certificate {:?} common-name", cert.name))?;
+            for san in &cert.subject_alt_names {
+                validate_san(san).with_context(|| format!("pki certificate {:?}", cert.name))?;
+            }
+            if let Some(kt) = &cert.key_type {
+                if !matches!(kt.as_str(), "ec" | "rsa") {
+                    bail!(
+                        "pki certificate {:?}: key-type {kt:?} must be ec or rsa",
+                        cert.name
+                    );
+                }
+            }
+            if let Some(u) = &cert.usage {
+                if !matches!(u.as_str(), "server" | "client") {
+                    bail!(
+                        "pki certificate {:?}: usage {u:?} must be server or client",
+                        cert.name
+                    );
+                }
+            }
+            if cert.validity_days == Some(0) {
+                bail!(
+                    "pki certificate {:?}: validity-days must be greater than 0",
+                    cert.name
+                );
+            }
+        }
+        if let Some(acme) = &self.pki.acme {
+            validate_email(&acme.email).context("pki acme email")?;
+            if let Some(url) = &acme.directory_url {
+                validate_https_url(url).context("pki acme directory-url")?;
+            }
+            if let Some(ch) = &acme.challenge {
+                if !matches!(ch.as_str(), "http-01" | "dns-01") {
+                    bail!("pki acme: challenge {ch:?} must be http-01 or dns-01");
+                }
             }
         }
         Ok(())
@@ -4218,6 +4767,76 @@ pub(crate) fn validate_ipsec_id(s: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate a certificate subject component (a CN or O, roadmap C19). It is
+/// rendered into an openssl `-subj "/CN=…"` argument, so it must not carry the
+/// `/` or `=` separators, a quote/backslash or a control character that would
+/// break the field apart.
+pub(crate) fn validate_subject_component(s: &str) -> Result<()> {
+    if s.is_empty() {
+        bail!("certificate subject component is empty");
+    }
+    if s.len() > 64 {
+        bail!("certificate subject component {s:?}: max 64 characters");
+    }
+    if s.bytes()
+        .any(|b| matches!(b, b'/' | b'=' | b'"' | b'\\') || b.is_ascii_control())
+    {
+        bail!(
+            "certificate subject component {s:?}: '/', '=', '\"', '\\' and control \
+             characters are not allowed"
+        );
+    }
+    Ok(())
+}
+
+/// Validate a certificate Subject Alternative Name: `DNS:<hostname>` or
+/// `IP:<address>`. Rendered verbatim into an openssl extension file, so both the
+/// tag and the value are constrained.
+pub(crate) fn validate_san(s: &str) -> Result<()> {
+    let (tag, value) = s
+        .split_once(':')
+        .with_context(|| format!("subject-alt-name {s:?} must be DNS:<host> or IP:<addr>"))?;
+    match tag {
+        "DNS" => validate_host(value).with_context(|| format!("subject-alt-name {s:?}"))?,
+        "IP" => {
+            if value.parse::<Ipv4Addr>().is_err() && value.parse::<Ipv6Addr>().is_err() {
+                bail!("subject-alt-name {s:?}: {value:?} is not an IP address");
+            }
+        }
+        other => bail!("subject-alt-name {s:?}: tag {other:?} must be DNS or IP"),
+    }
+    Ok(())
+}
+
+/// Validate an ACME contact email — a minimal, injection-safe check (exactly one
+/// `@`, no whitespace or control characters), not full RFC 5322.
+pub(crate) fn validate_email(s: &str) -> Result<()> {
+    let ok = s.matches('@').count() == 1
+        && !s.starts_with('@')
+        && !s.ends_with('@')
+        && s.bytes()
+            .all(|b| !b.is_ascii_whitespace() && !b.is_ascii_control());
+    if !ok {
+        bail!("{s:?} is not a valid email address");
+    }
+    Ok(())
+}
+
+/// Validate an ACME directory URL: an `https://…` URL free of whitespace and
+/// control characters (a security-relevant endpoint — plain http would expose
+/// the account key exchange).
+pub(crate) fn validate_https_url(s: &str) -> Result<()> {
+    if !s.starts_with("https://") || s.len() <= "https://".len() {
+        bail!("{s:?} must be an https:// URL");
+    }
+    if s.bytes()
+        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+    {
+        bail!("{s:?}: URL must not contain whitespace or control characters");
+    }
+    Ok(())
+}
+
 /// Validate a WireGuard peer endpoint `host:port`: the host is an IPv4 literal
 /// or a DNS hostname, the port is 1..=65535.
 pub(crate) fn validate_endpoint(s: &str) -> Result<()> {
@@ -4437,6 +5056,113 @@ priority = 20
         assert_eq!(
             b.multiwan.uplinks[0].check.targets,
             vec!["1.1.1.1".to_string()]
+        );
+    }
+
+    #[test]
+    fn pki_round_trips_and_validates() {
+        let toml = r#"
+[system]
+hostname = "fw"
+
+[[pki.ca]]
+name = "corp"
+common-name = "corp.example.com"
+organization = "Example Inc"
+key-type = "ec"
+validity-days = 3650
+
+[[pki.certificate]]
+name = "vpn-server"
+ca = "corp"
+common-name = "vpn.example.com"
+subject-alt-name = ["DNS:vpn.example.com", "IP:10.0.0.1"]
+usage = "server"
+
+[pki.acme]
+email = "admin@example.com"
+challenge = "http-01"
+agree-tos = true
+"#;
+        let a = Appliance::from_toml(toml).expect("pki config parses + validates");
+        assert_eq!(a.pki.cas.len(), 1);
+        assert_eq!(a.pki.cas[0].name, "corp");
+        assert_eq!(a.pki.cas[0].organization.as_deref(), Some("Example Inc"));
+        assert_eq!(a.pki.certificates.len(), 1);
+        assert_eq!(a.pki.certificates[0].ca, "corp");
+        assert_eq!(
+            a.pki.certificates[0].subject_alt_names,
+            vec!["DNS:vpn.example.com".to_string(), "IP:10.0.0.1".to_string()]
+        );
+        assert_eq!(
+            a.pki.acme.as_ref().map(|c| c.email.as_str()),
+            Some("admin@example.com")
+        );
+        // Round-trips through TOML unchanged, and `[pki]` is emitted.
+        let out = a.to_toml().unwrap();
+        assert!(out.contains("[[pki.ca]]"), "got:\n{out}");
+        assert!(out.contains("[[pki.certificate]]"), "got:\n{out}");
+        assert!(out.contains("[pki.acme]"), "got:\n{out}");
+        let b = Appliance::from_toml(&out).expect("re-parses");
+        assert_eq!(b.pki.certificates[0].common_name, "vpn.example.com");
+    }
+
+    #[test]
+    fn pki_empty_is_omitted_from_output() {
+        let a = Appliance::from_toml("[system]\nhostname = \"fw\"\n").unwrap();
+        assert!(a.pki.is_empty());
+        assert!(!a.to_toml().unwrap().contains("[pki"));
+    }
+
+    #[test]
+    fn pki_rejects_cert_referencing_undeclared_ca() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[pki.certificate]]
+name = "leaf"
+ca = "ghost"
+common-name = "leaf.example.com"
+"#;
+        let err = Appliance::from_toml(toml).unwrap_err().to_string();
+        assert!(err.contains("unknown ca"), "got: {err}");
+    }
+
+    #[test]
+    fn pki_rejects_acme_cert_without_account() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[pki.certificate]]
+name = "public"
+ca = "acme"
+common-name = "www.example.com"
+"#;
+        let err = Appliance::from_toml(toml).unwrap_err().to_string();
+        assert!(err.contains("no [pki.acme] account"), "got: {err}");
+    }
+
+    #[test]
+    fn pki_rejects_bad_key_type_san_and_challenge() {
+        let bad_key = "[system]\nhostname=\"fw\"\n[[pki.ca]]\nname=\"c\"\ncommon-name=\"c\"\nkey-type=\"dsa\"\n";
+        assert!(
+            Appliance::from_toml(bad_key)
+                .unwrap_err()
+                .to_string()
+                .contains("key-type")
+        );
+        let bad_san = "[system]\nhostname=\"fw\"\n[[pki.ca]]\nname=\"c\"\ncommon-name=\"c\"\n[[pki.certificate]]\nname=\"l\"\nca=\"c\"\ncommon-name=\"l\"\nsubject-alt-name=[\"EMAIL:a@b\"]\n";
+        assert!(
+            format!("{:#}", Appliance::from_toml(bad_san).unwrap_err())
+                .contains("must be DNS or IP")
+        );
+        let bad_ch =
+            "[system]\nhostname=\"fw\"\n[pki.acme]\nemail=\"a@b.com\"\nchallenge=\"tls-alpn-01\"\n";
+        assert!(
+            Appliance::from_toml(bad_ch)
+                .unwrap_err()
+                .to_string()
+                .contains("challenge")
         );
     }
 
@@ -5195,6 +5921,122 @@ address = "dhcp"
 serve-on = ["wan0"]
 "#;
         assert!(Appliance::from_toml(bad).is_err());
+    }
+
+    #[test]
+    fn box_services_parse_validate_and_round_trip() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "lan0"
+zone = "lan"
+address = "10.0.0.1/24"
+[[interface]]
+name = "iot0"
+zone = "iot"
+address = "10.0.7.1/24"
+
+[services.lldp]
+enable = true
+interface = ["lan0", "iot0"]
+
+[services.snmp]
+community = "public"
+location = "rack 4"
+contact = "noc@example"
+allow = ["10.0.0.0/24", "fd00::/64"]
+
+[services.mdns]
+interface = ["lan0", "iot0"]
+
+[services.dyndns]
+provider = "cloudflare"
+hostname = "fw.example.com"
+login = "user@example"
+password = "secret-token"
+interface = "lan0"
+
+[services.dhcp-relay]
+interface = ["iot0"]
+server = ["10.0.0.99"]
+"#;
+        let a = Appliance::from_toml(toml).expect("box services parse + validate");
+        assert!(a.services.lldp.enable);
+        assert_eq!(a.services.lldp.interface, vec!["lan0", "iot0"]);
+        assert_eq!(a.services.snmp.community.as_deref(), Some("public"));
+        assert_eq!(a.services.snmp.allow.len(), 2);
+        assert_eq!(a.services.mdns.interface, vec!["lan0", "iot0"]);
+        assert_eq!(
+            a.services.dyndns.hostname.as_deref(),
+            Some("fw.example.com")
+        );
+        assert_eq!(a.services.dhcp_relay.server, vec!["10.0.0.99"]);
+        let out = a.to_toml().unwrap();
+        for section in [
+            "[services.lldp]",
+            "[services.snmp]",
+            "[services.mdns]",
+            "[services.dyndns]",
+            "[services.dhcp-relay]",
+        ] {
+            assert!(out.contains(section), "missing {section}:\n{out}");
+        }
+        let b = Appliance::from_toml(&out).expect("re-parses");
+        assert_eq!(b.services.dhcp_relay.interface, vec!["iot0"]);
+    }
+
+    #[test]
+    fn box_services_reject_invalid_config() {
+        // SNMP allow that is not an IP/CIDR is rejected.
+        let bad_snmp = r#"
+[system]
+hostname = "fw"
+[services.snmp]
+community = "public"
+allow = ["not-a-cidr"]
+"#;
+        assert!(Appliance::from_toml(bad_snmp).is_err());
+
+        // A DHCP relay on the same interface as a DHCP server is rejected.
+        let both = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "lan0"
+zone = "lan"
+address = "10.0.0.1/24"
+[interface.dhcp-server]
+pool-offset = 100
+pool-size = 100
+[services.dhcp-relay]
+interface = ["lan0"]
+server = ["10.0.99.1"]
+"#;
+        assert!(Appliance::from_toml(both).is_err());
+
+        // An mDNS reflector with a single interface is rejected.
+        let one_iface = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "lan0"
+zone = "lan"
+address = "10.0.0.1/24"
+[services.mdns]
+interface = ["lan0"]
+"#;
+        assert!(Appliance::from_toml(one_iface).is_err());
+
+        // A dyndns client without a hostname is rejected.
+        let no_host = r#"
+[system]
+hostname = "fw"
+[services.dyndns]
+provider = "dyndns2"
+login = "user"
+"#;
+        assert!(Appliance::from_toml(no_host).is_err());
     }
 
     #[test]

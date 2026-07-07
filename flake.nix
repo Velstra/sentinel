@@ -68,12 +68,14 @@
             --set SENTINEL_SYSTEMCTL_BIN  ${pkgs.systemd}/bin/systemctl \
             --set SENTINEL_NFT_BIN        ${pkgs.nftables}/bin/nft \
             --set SENTINEL_SWANCTL_BIN    ${pkgs.strongswan}/bin/swanctl \
+            --set SENTINEL_OPENSSL_BIN    ${pkgs.openssl.bin}/bin/openssl \
             --set SENTINEL_SYSTEMD_RUN_BIN ${pkgs.systemd}/bin/systemd-run \
             --set SENTINEL_JOURNALCTL_BIN ${pkgs.systemd}/bin/journalctl \
             --set SENTINEL_WREN_BIN       ${wrenPkg}/bin/wren \
             --set SENTINEL_LSBLK_BIN      ${pkgs.util-linux}/bin/lsblk \
             --set SENTINEL_INSTALL_BIN    ${pkgs.coreutils}/bin/install \
             --set SENTINEL_MKDIR_BIN      ${pkgs.coreutils}/bin/mkdir \
+            --set SENTINEL_CHMOD_BIN      ${pkgs.coreutils}/bin/chmod \
             --set SENTINEL_RM_BIN         ${pkgs.coreutils}/bin/rm \
             --set SENTINEL_UNAME_BIN      ${pkgs.coreutils}/bin/uname \
             --set SENTINEL_SGDISK_BIN     ${pkgs.gptfdisk}/bin/sgdisk \
@@ -297,7 +299,7 @@
       # service — so the box filters as part of the immutable, rollback-able
       # generation.
       nixosModules.sentinel =
-        { pkgs, ... }:
+        { pkgs, lib, ... }:
         {
           imports = [
             ./nix/appliance.nix
@@ -315,6 +317,12 @@
             # SENTINEL_SWANCTL_BIN, but keep it on PATH for `run show vpn` + manual
             # inspection.
             pkgs.strongswan
+            # Box services (roadmap C18): net-snmp (`snmpd` + `snmpget`/`snmpwalk`
+            # for inspection), avahi (mDNS reflector), ddclient (dynamic DNS). LLDP
+            # rides on `services.lldpd` below; the DHCP relay reuses dnsmasq.
+            pkgs.net-snmp
+            pkgs.avahi
+            pkgs.ddclient
           ];
 
           # Egress traffic shaping (roadmap C8) needs the CAKE + fq_codel queue
@@ -470,6 +478,102 @@
           # this too; declaring it here also covers the plain nixosModule.
           systemd.services.sentinel-boot.unitConfig.RequiresMountsFor = [ "/var/lib/sentinel" ];
 
+          # --- Box services (roadmap C18) ------------------------------------
+          # LLDP/SNMP/mDNS/dyndns/DHCP-relay are box-wide services Sentinel owns
+          # the lifecycle of: off by default (`wantedBy = []`), rendered to a
+          # /run/sentinel config and started/stopped from apply-boot-late (after
+          # networkd, so link-scoped ones see their interfaces) + a live commit.
+
+          # LLDP: use the stock lldpd module for the daemon + its `_lldpd`
+          # privsep user, but hand it `-O <our file>` so it reads Sentinel's
+          # rendered lldpcli config at start, and drop its wantedBy so Sentinel
+          # (not multi-user.target) decides when it runs.
+          services.lldpd = {
+            enable = true;
+            extraArgs = [
+              "-O"
+              "/run/sentinel/lldpd.d/sentinel.conf"
+            ];
+          };
+          systemd.services.lldpd.wantedBy = lib.mkForce [ ];
+
+          # SNMP: a read-only net-snmp agent against Sentinel's rendered snmpd.conf
+          # (`-C` = ignore the default config files, `-f`/`-Lo` = foreground+stdout
+          # log so systemd owns it). Sentinel start/stops it on `[services.snmp]`.
+          systemd.services.sentinel-snmpd = {
+            description = "Read-only SNMP agent (sentinel)";
+            after = [
+              "network.target"
+              "sentinel-boot.service"
+            ];
+            serviceConfig = {
+              Type = "exec";
+              ExecStart = "${pkgs.net-snmp}/bin/snmpd -f -Lo -C -c /run/sentinel/snmpd.conf";
+              Restart = "on-failure";
+              RestartSec = "5s";
+            };
+          };
+
+          # mDNS reflector: avahi in reflector mode against Sentinel's rendered
+          # config (the config sets `enable-dbus=no` so it needs no bus). Runs as
+          # the `avahi` user (created below). Test deferred (VM-heavy), but the
+          # unit is real so a committed `[services.mdns]` actually reflects.
+          users.users.avahi = {
+            isSystemUser = true;
+            group = "avahi";
+            description = "avahi-daemon user";
+          };
+          users.groups.avahi = { };
+          systemd.services.sentinel-mdns = {
+            description = "mDNS reflector (sentinel/avahi)";
+            after = [
+              "network.target"
+              "sentinel-boot.service"
+            ];
+            serviceConfig = {
+              Type = "exec";
+              ExecStart = "${pkgs.avahi}/sbin/avahi-daemon -f /run/sentinel/avahi/avahi-daemon.conf";
+              Restart = "on-failure";
+              RestartSec = "5s";
+            };
+          };
+
+          # Dynamic DNS: ddclient in the foreground against Sentinel's rendered
+          # 0640 config (it carries the provider secret). Test deferred (needs a
+          # live provider endpoint), but the unit is real.
+          systemd.services.sentinel-ddclient = {
+            description = "Dynamic-DNS client (sentinel/ddclient)";
+            after = [
+              "network-online.target"
+              "sentinel-boot.service"
+            ];
+            wants = [ "network-online.target" ];
+            serviceConfig = {
+              Type = "exec";
+              ExecStart = "${pkgs.ddclient}/bin/ddclient -foreground -file /run/sentinel/ddclient/ddclient.conf -cache /run/sentinel/ddclient/ddclient.cache";
+              Restart = "on-failure";
+              RestartSec = "30s";
+            };
+          };
+
+          # DHCP relay: isc-dhcp's `dhcrelay` is gone from nixpkgs, so the relay
+          # rides on a SECOND, DNS-disabled dnsmasq instance (Sentinel renders its
+          # `--dhcp-relay=<local>,<server>` config). Distinct from the LAN-resolver
+          # dnsmasq (that one binds :53 on lo; this one runs `port=0`).
+          systemd.services.sentinel-dhcp-relay = {
+            description = "DHCP relay (sentinel/dnsmasq)";
+            after = [
+              "network.target"
+              "sentinel-boot.service"
+            ];
+            serviceConfig = {
+              Type = "exec";
+              ExecStart = "${pkgs.dnsmasq}/bin/dnsmasq --keep-in-foreground --conf-file=/run/sentinel/dhcp-relay/relay.conf";
+              Restart = "on-failure";
+              RestartSec = "5s";
+            };
+          };
+
           # IPsec (roadmap C2): strongSwan's charon (charon-systemd) is always up
           # so a `commit` can `swanctl --load-all` the rendered site-to-site
           # tunnels into it. Its own /etc/swanctl config stays empty — Sentinel
@@ -488,6 +592,12 @@
             # IPsec runtime dir holds the rendered swanctl.conf + the 0600 PSK
             # secrets file (root only).
             "d /run/sentinel/swanctl 0700 root root -"
+            # Box-service (roadmap C18) runtime dirs: LLDP confdir, avahi + DHCP-
+            # relay configs (world-readable), and the ddclient dir (0640 secret).
+            "d /run/sentinel/lldpd.d 0755 root root -"
+            "d /run/sentinel/avahi 0755 root root -"
+            "d /run/sentinel/dhcp-relay 0755 root root -"
+            "d /run/sentinel/ddclient 0750 root root -"
             # pppd's fixed credential lookup paths → Sentinel's rendered secrets.
             "d /etc/ppp 0755 root root -"
             "L+ /etc/ppp/chap-secrets - - - - /run/sentinel/ppp/chap-secrets"
@@ -1033,6 +1143,234 @@
           # swanctl --list-sas.
           out = left.succeed("su admin -c 'sentinel show vpn ipsec'")
           assert "ESTABLISHED" in out, out
+        '';
+      };
+
+      # LLDP link-layer discovery (roadmap C18): two Sentinel boxes on a shared
+      # segment each enable `[services.lldp]`; Sentinel renders lldpd's config and
+      # starts the daemon (off by default). The test proves each box learns the
+      # other as a neighbour over 802.1AB (its advertised SysName = hostname).
+      #   nix build .#checks.x86_64-linux.lldp -L
+      lldp = pkgs.testers.runNixOSTest {
+        name = "sentinel-lldp";
+        nodes =
+          let
+            box =
+              hostname:
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce hostname;
+                networking.firewall.enable = lib.mkForce false;
+                virtualisation.vlans = [ 1 ];
+                virtualisation.memorySize = 2048;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = if hostname == "alpha" then "10.0.0.1" else "10.0.0.2";
+                    prefixLength = 24;
+                  }
+                ];
+              };
+          in
+          {
+            alpha = box "alpha";
+            bravo = box "bravo";
+          };
+        testScript = ''
+          start_all()
+          for m in (alpha, bravo):
+              m.wait_for_unit("multi-user.target")
+              m.wait_for_unit("sentinel-boot.service")
+          alpha.wait_until_succeeds("ip addr show eth1 | grep -q 10.0.0.1", timeout=30)
+          bravo.wait_until_succeeds("ip addr show eth1 | grep -q 10.0.0.2", timeout=30)
+          alpha.wait_until_succeeds("ping -c1 -W2 10.0.0.2", timeout=30)
+
+          # Each box sets its own hostname (so the neighbour's SysName is unique)
+          # and turns LLDP on. Sentinel renders lldpd's config and (re)starts it.
+          def enable_lldp(node, name):
+              node.succeed(
+                  "su admin -c \"printf '%s\\n' "
+                  f"'set system hostname {name}' "
+                  "'set services lldp enable true' "
+                  "commit save exit "
+                  "| sentinel configure\""
+              )
+              node.succeed("test -f /run/sentinel/lldpd.d/sentinel.conf")
+              node.wait_for_unit("lldpd.service")
+
+          enable_lldp(alpha, "alpha")
+          enable_lldp(bravo, "bravo")
+
+          # Each end learns the other as an LLDP neighbour (SysName = hostname).
+          alpha.wait_until_succeeds("lldpctl | grep -q bravo", timeout=120)
+          bravo.wait_until_succeeds("lldpctl | grep -q alpha", timeout=120)
+
+          # Turning LLDP back off stops the daemon and drops the rendered config.
+          alpha.succeed(
+              "su admin -c \"printf '%s\\n' 'delete services lldp' commit save exit "
+              "| sentinel configure\""
+          )
+          alpha.wait_until_fails("systemctl is-active lldpd.service", timeout=30)
+        '';
+      };
+
+      # Read-only SNMP agent (roadmap C18): a box enables `[services.snmp]`;
+      # Sentinel renders a 0640 snmpd.conf and starts net-snmp's agent. The test
+      # proves (1) a v2c poll returns the advertised sysLocation, (2) the config
+      # is 0640 (the community is a secret), and (3) the agent is read-only — an
+      # SNMP SET is refused (no write community is ever rendered).
+      #   nix build .#checks.x86_64-linux.snmp -L
+      snmp = pkgs.testers.runNixOSTest {
+        name = "sentinel-snmp";
+        nodes.machine = {
+          imports = [ self.nixosModules.sentinel ];
+          virtualisation.memorySize = 2048;
+        };
+        testScript = ''
+          machine.wait_for_unit("multi-user.target")
+          machine.wait_for_unit("sentinel-boot.service")
+
+          # Enable a read-only agent scoped to loopback, with a syslocation.
+          machine.succeed(
+              "su admin -c \"printf '%s\\n' "
+              "'set services snmp community public' "
+              "'set services snmp location rack 4' "
+              "'set services snmp allow 127.0.0.0/8' "
+              "commit save exit "
+              "| sentinel configure\""
+          )
+          machine.succeed("test -f /run/sentinel/snmpd.conf")
+          # The rendered config is 0640 (it carries the community secret) and is
+          # read-only — only rocommunity, never rwcommunity.
+          mode = machine.succeed("stat -c %a /run/sentinel/snmpd.conf").strip()
+          assert mode == "640", mode
+          conf = machine.succeed("cat /run/sentinel/snmpd.conf")
+          assert "rocommunity public 127.0.0.0/8" in conf, conf
+          assert "rwcommunity" not in conf, "write access must never be rendered"
+          machine.wait_for_unit("sentinel-snmpd.service")
+
+          # (1) A v2c poll of sysLocation.0 returns the configured location.
+          out = machine.wait_until_succeeds(
+              "snmpget -v2c -c public -Ov 127.0.0.1 1.3.6.1.2.1.1.6.0", timeout=60
+          )
+          assert "rack 4" in out, out
+          # (2) An SNMP SET is refused — the agent exposes no write access.
+          machine.fail(
+              "snmpset -v2c -c public 127.0.0.1 1.3.6.1.2.1.1.6.0 s pwned 2>&1"
+          )
+        '';
+      };
+
+      # DHCP relay (roadmap C18): three nodes — a DHCP `server`, a Sentinel
+      # `relay`, and a `client` — on two segments. The client's segment has no
+      # server; Sentinel's `[services.dhcp-relay]` forwards its DHCP requests to
+      # the server on the other segment (via a DNS-disabled dnsmasq instance).
+      # The test proves the client gets a lease from the relayed pool end to end.
+      #   nix build .#checks.x86_64-linux.dhcp-relay -L
+      dhcp-relay = pkgs.testers.runNixOSTest {
+        name = "sentinel-dhcp-relay";
+        nodes = {
+          # The Sentinel relay: eth1 faces the client segment (vlan 1), eth2 the
+          # server segment (vlan 2). Sentinel owns both addresses + the relay.
+          relay =
+            { lib, ... }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce "relay";
+              networking.firewall.enable = lib.mkForce false;
+              virtualisation.vlans = [
+                1
+                2
+              ];
+              virtualisation.memorySize = 2048;
+            };
+          # The DHCP server (plain NixOS) on the server segment. It serves the
+          # RELAYED client subnet (10.0.1.0/24), matched by the relay's giaddr, and
+          # routes replies back to the giaddr via the relay.
+          server =
+            { pkgs, ... }:
+            {
+              networking.firewall.enable = false;
+              networking.useDHCP = false;
+              virtualisation.vlans = [ 2 ];
+              networking.interfaces.eth1.ipv4 = {
+                addresses = [
+                  {
+                    address = "10.0.2.2";
+                    prefixLength = 24;
+                  }
+                ];
+                routes = [
+                  {
+                    address = "10.0.1.0";
+                    prefixLength = 24;
+                    via = "10.0.2.1";
+                  }
+                ];
+              };
+              systemd.services.dhcpd = {
+                wantedBy = [ "multi-user.target" ];
+                after = [ "network.target" ];
+                serviceConfig = {
+                  Type = "exec";
+                  # A writable lease file: dnsmasq drops to its unprivileged user
+                  # and the default /var/lib/misc/ does not exist in this VM, so
+                  # point it at a world-writable path.
+                  ExecStart = ''
+                    ${pkgs.dnsmasq}/bin/dnsmasq --keep-in-foreground --port=0 \
+                      --dhcp-authoritative --interface=eth1 --bind-interfaces \
+                      --dhcp-leasefile=/tmp/dnsmasq-relay.leases \
+                      --dhcp-range=10.0.1.100,10.0.1.200,255.255.255.0,12h
+                  '';
+                  Restart = "on-failure";
+                  RestartSec = "2s";
+                };
+              };
+            };
+          # The DHCP client (plain NixOS) on the client segment — no server here.
+          client = {
+            networking.firewall.enable = false;
+            networking.useDHCP = false;
+            virtualisation.vlans = [ 1 ];
+            networking.interfaces.eth1.useDHCP = true;
+          };
+        };
+        testScript = ''
+          start_all()
+          relay.wait_for_unit("multi-user.target")
+          relay.wait_for_unit("sentinel-boot.service")
+          server.wait_for_unit("multi-user.target")
+          server.wait_for_unit("dhcpd.service")
+
+          # Sentinel addresses both links and turns the relay on.
+          relay.succeed(
+              "su admin -c \"printf '%s\\n' "
+              # default-action accept so the velstra XDP firewall passes the
+              # ICMP probe and the relayed DHCP traffic across the two segments.
+              "'set firewall global default-action accept' "
+              "'set interface eth1 zone lan' 'set interface eth1 address 10.0.1.1/24' "
+              "'set interface eth2 zone wan' 'set interface eth2 address 10.0.2.1/24' "
+              "'set services dhcp-relay interface eth1' "
+              "'set services dhcp-relay server 10.0.2.2' "
+              "commit save exit "
+              "| sentinel configure\""
+          )
+          relay.succeed("test -f /run/sentinel/dhcp-relay/relay.conf")
+          relay.succeed(
+              "grep -q 'dhcp-relay=10.0.1.1,10.0.2.2' /run/sentinel/dhcp-relay/relay.conf"
+          )
+          relay.wait_until_succeeds("ip addr show eth1 | grep -q 10.0.1.1", timeout=30)
+          relay.wait_until_succeeds("ip addr show eth2 | grep -q 10.0.2.1", timeout=30)
+          relay.wait_for_unit("sentinel-dhcp-relay.service")
+
+          # The relay reaches the server segment.
+          relay.wait_until_succeeds("ping -c1 -W2 10.0.2.2", timeout=30)
+
+          # End to end: the client (whose segment has no server) gets a lease from
+          # the relayed 10.0.1.0/24 pool, proving the relay forwarded its request.
+          client.wait_until_succeeds(
+              "ip -4 addr show eth1 | grep -q 'inet 10.0.1.'", timeout=120
+          )
         '';
       };
 
@@ -3123,6 +3461,109 @@
                 "! tc qdisc show dev eth1 root | grep -q cake", timeout=30
             )
             fw.succeed("! test -f /run/sentinel/qos/eth1")
+          '';
+        };
+
+        # PKI / certificate manager (roadmap C19): commit a local CA + a leaf
+        # signed by it, and assert the material lands under /var/lib/sentinel/pki
+        # with the right perms (key 0600, cert 0644), the leaf verifies against
+        # the CA, and re-committing never regenerates the CA (stable serial +
+        # fingerprint). ACME needs external reachability, so only the rendered
+        # account descriptor is checked; live issuance is deferred to hardware.
+        # One node — proof via openssl.
+        #   nix build .#checks.x86_64-linux.pki -L
+        pki = pkgs.testers.runNixOSTest {
+          name = "sentinel-pki";
+          nodes.machine =
+            { lib, pkgs, ... }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              virtualisation.memorySize = 2048;
+              # velstra needs an underlay interface to attach to (a required
+              # option); the PKI test does no dataplane, so any NIC will do.
+              services.velstra.interface = lib.mkForce "eth0";
+              # `openssl` for the test's own verify / inspection (the sentinel CLI
+              # resolves its own via SENTINEL_OPENSSL_BIN).
+              environment.systemPackages = [ pkgs.openssl ];
+            };
+          testScript = ''
+            start_all()
+            machine.wait_for_unit("multi-user.target")
+            machine.wait_for_unit("velstra.service")
+
+            # Commit a local CA + a server cert signed by it + an ACME account.
+            # ONE `set` per line.
+            machine.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set pki ca corp common-name corp.example.com' "
+                "'set pki ca corp key-type ec' "
+                "'set pki certificate vpn-server ca corp' "
+                "'set pki certificate vpn-server common-name vpn.example.com' "
+                "'set pki certificate vpn-server subject-alt-name DNS:vpn.example.com' "
+                "'set pki certificate vpn-server usage server' "
+                "'set pki acme email admin@example.com' "
+                "'set pki acme challenge http-01' "
+                "'set pki acme agree-tos true' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+
+            # The CA key + cert exist with the right perms (key 0600, cert 0644).
+            machine.wait_until_succeeds("test -f /var/lib/sentinel/pki/ca/corp/ca.crt", timeout=30)
+            machine.succeed("test -f /var/lib/sentinel/pki/ca/corp/ca.key")
+            assert machine.succeed("stat -c %a /var/lib/sentinel/pki/ca/corp/ca.key").strip() == "600"
+            assert machine.succeed("stat -c %a /var/lib/sentinel/pki/ca/corp/ca.crt").strip() == "644"
+
+            # The leaf key + cert exist; the key is 0600.
+            machine.succeed("test -f /var/lib/sentinel/pki/certs/vpn-server/cert.crt")
+            assert (
+                machine.succeed("stat -c %a /var/lib/sentinel/pki/certs/vpn-server/cert.key").strip()
+                == "600"
+            )
+
+            # The leaf verifies against the CA, and carries the SAN + serverAuth EKU.
+            machine.succeed(
+                "openssl verify -CAfile /var/lib/sentinel/pki/ca/corp/ca.crt "
+                "/var/lib/sentinel/pki/certs/vpn-server/cert.crt"
+            )
+            text = machine.succeed(
+                "openssl x509 -in /var/lib/sentinel/pki/certs/vpn-server/cert.crt -noout -text"
+            )
+            assert "DNS:vpn.example.com" in text, text
+            assert "TLS Web Server Authentication" in text, text
+
+            # The ACME account descriptor rendered (no live issuance in the sandbox).
+            acct = machine.succeed("cat /var/lib/sentinel/pki/acme/account.conf")
+            assert "admin@example.com" in acct, acct
+            assert "http-01" in acct, acct
+
+            # `show pki` lists the CA + cert (read from the saved config + disk).
+            out = machine.succeed("su admin -c 'sentinel show pki'")
+            assert "ca corp" in out, out
+            assert "certificate vpn-server" in out, out
+
+            # Idempotency: a second, unrelated commit does NOT regenerate the CA —
+            # its serial + fingerprint are unchanged.
+            serial1 = machine.succeed(
+                "openssl x509 -in /var/lib/sentinel/pki/ca/corp/ca.crt -noout -serial"
+            ).strip()
+            fp1 = machine.succeed(
+                "openssl x509 -in /var/lib/sentinel/pki/ca/corp/ca.crt -noout -fingerprint"
+            ).strip()
+            machine.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set system hostname pki-machine' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            serial2 = machine.succeed(
+                "openssl x509 -in /var/lib/sentinel/pki/ca/corp/ca.crt -noout -serial"
+            ).strip()
+            fp2 = machine.succeed(
+                "openssl x509 -in /var/lib/sentinel/pki/ca/corp/ca.crt -noout -fingerprint"
+            ).strip()
+            assert serial1 == serial2, (serial1, serial2)
+            assert fp1 == fp2, (fp1, fp2)
           '';
         };
 

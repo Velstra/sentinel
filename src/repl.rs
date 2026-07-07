@@ -576,6 +576,9 @@ commands:
                             protocols filter <name>  default accept|reject | rule <n> prefix|protocol|set-metric|set-community|action …
                             nat source <s>  zone|description|disabled …
                             nat destination <d>  zone|proto|port|to|description|disabled …
+                            services dns|ntp  upstream|serve-on …
+                            services lldp  enable|interface | snmp  community|listen|location|contact|allow
+                            services mdns interface | dyndns  provider|hostname|login|password|interface | dhcp-relay  interface|server
                             multiwan mode failover|load-balance
                             multiwan uplink <if>  priority|weight|table|gateway|check …
                             vpn ipsec <name>  local|remote|local-subnet|remote-subnet|psk|…
@@ -681,6 +684,7 @@ const OP_SHOW_TOP: &[Cand] = &[
     ("firewall", "firewall summary / statistics / log"),
     ("nat", "NAT configuration summary"),
     ("vpn", "IPsec VPN: security associations / connections"),
+    ("pki", "local CAs + issued certificates (expiry)"),
     ("configuration", "the saved configuration (config syntax)"),
     ("arp", "the ARP / neighbour table"),
     ("system", "hostname, services, interfaces"),
@@ -726,13 +730,17 @@ const TOP: &[Cand] = &[
     ),
     (
         "services",
-        "box-wide services: DNS forwarder (NTP, … to come)",
+        "box-wide services: DNS, NTP, LLDP, SNMP, mDNS, dyndns, DHCP-relay",
     ),
     (
         "multiwan",
         "WAN uplinks: failover / load-balance + health checks",
     ),
     ("vpn", "site-to-site VPN: IKEv2 IPsec tunnels (strongSwan)"),
+    (
+        "pki",
+        "certificates: local CA, issued certs, ACME (Let's Encrypt)",
+    ),
 ];
 // `multiwan <Tab>` reveals the mode + the uplinks (each keyed by interface).
 const MULTIWAN_NODES: &[Cand] = &[
@@ -811,6 +819,65 @@ const IPSEC_START_ACTIONS: &[Cand] = &[
     ),
     ("none", "wait for the peer to initiate (a responder)"),
 ];
+// `pki <Tab>` reveals the PKI object kinds (roadmap C19).
+const PKI_NODES: &[Cand] = &[
+    ("ca", "a local certificate authority (by name)"),
+    ("certificate", "an issued leaf certificate (by name)"),
+    ("acme", "the ACME account (Let's Encrypt) for public certs"),
+];
+// `pki ca <name> <Tab>` reveals the CA fields.
+const PKI_CA_FIELDS: &[Cand] = &[
+    ("common-name", "the CA subject common name (CN)"),
+    ("organization", "the CA subject organization (O)"),
+    ("key-type", "ec (P-256, default) or rsa (3072-bit)"),
+    (
+        "validity-days",
+        "certificate lifetime in days (default 3650)",
+    ),
+];
+// `pki certificate <name> <Tab>` reveals the leaf-cert fields.
+const PKI_CERT_FIELDS: &[Cand] = &[
+    ("ca", "the signing CA (a local CA name, or acme)"),
+    ("common-name", "the subject common name (CN)"),
+    ("subject-alt-name", "a SAN: DNS:<host> or IP:<addr>"),
+    ("key-type", "ec (default) or rsa"),
+    ("usage", "server (default) or client"),
+    (
+        "validity-days",
+        "certificate lifetime in days (default 825)",
+    ),
+];
+// `pki acme <Tab>` reveals the ACME-account fields.
+const PKI_ACME_FIELDS: &[Cand] = &[
+    (
+        "email",
+        "ACME contact email (registration + expiry notices)",
+    ),
+    (
+        "directory-url",
+        "ACME directory (default Let's Encrypt prod)",
+    ),
+    ("challenge", "http-01 (default) or dns-01"),
+    (
+        "agree-tos",
+        "agree to the ACME terms of service (true/false)",
+    ),
+];
+// `pki ca <name> key-type <Tab>` / `pki certificate <name> key-type <Tab>`.
+const PKI_KEY_TYPES: &[Cand] = &[
+    ("ec", "NIST P-256 elliptic-curve key (small, fast)"),
+    ("rsa", "3072-bit RSA key"),
+];
+// `pki certificate <name> usage <Tab>`.
+const PKI_USAGES: &[Cand] = &[
+    ("server", "TLS/IKE server certificate (serverAuth)"),
+    ("client", "client certificate (clientAuth)"),
+];
+// `pki acme challenge <Tab>`.
+const PKI_CHALLENGES: &[Cand] = &[
+    ("http-01", "HTTP-01 challenge (port 80 reachable)"),
+    ("dns-01", "DNS-01 challenge (a TXT record, wildcards)"),
+];
 // `services <Tab>` reveals the box-wide services (compiled to their daemons' config).
 const SERVICES_NODES: &[Cand] = &[
     (
@@ -820,6 +887,61 @@ const SERVICES_NODES: &[Cand] = &[
     (
         "ntp",
         "LAN NTP server: upstream sources + interfaces to serve on",
+    ),
+    ("lldp", "LLDP link-layer discovery (lldpd)"),
+    ("snmp", "read-only SNMP agent (net-snmp)"),
+    ("mdns", "mDNS reflector between segments (avahi)"),
+    ("dyndns", "dynamic-DNS client (ddclient)"),
+    (
+        "dhcp-relay",
+        "relay DHCP to an upstream server (isc dhcrelay)",
+    ),
+];
+// `services lldp <Tab>` reveals the LLDP fields.
+const LLDP_FIELDS: &[Cand] = &[
+    ("enable", "turn LLDP on (off by default)"),
+    (
+        "interface",
+        "interfaces to run LLDP on (comma-separated; omit for all)",
+    ),
+];
+// `services snmp <Tab>` reveals the read-only agent fields.
+const SNMP_FIELDS: &[Cand] = &[
+    ("community", "the v2c read-only community string (secret)"),
+    ("listen", "agent listen address (net-snmp agentaddress)"),
+    ("location", "advertised syslocation"),
+    ("contact", "advertised syscontact"),
+    (
+        "allow",
+        "source subnets allowed to poll (comma-separated CIDRs)",
+    ),
+];
+// `services mdns <Tab>` reveals the reflector fields.
+const MDNS_FIELDS: &[Cand] = &[(
+    "interface",
+    "interfaces to reflect mDNS between (comma-separated, ≥2)",
+)];
+// `services dyndns <Tab>` reveals the dynamic-DNS client fields.
+const DYNDNS_FIELDS: &[Cand] = &[
+    ("provider", "ddclient protocol (dyndns2/cloudflare/…)"),
+    ("server", "the provider's update endpoint host"),
+    ("hostname", "the FQDN to keep up to date"),
+    ("login", "account login/username"),
+    ("password", "account password / API token (secret)"),
+    (
+        "interface",
+        "interface whose address to publish (else use=web)",
+    ),
+];
+// `services dhcp-relay <Tab>` reveals the relay fields.
+const DHCP_RELAY_FIELDS: &[Cand] = &[
+    (
+        "interface",
+        "interfaces to relay on (comma-separated: client + upstream links)",
+    ),
+    (
+        "server",
+        "upstream DHCP server addresses (comma-separated IPv4)",
     ),
 ];
 // `services ntp <Tab>` reveals the NTP-server fields (a chrony confdir drop-in).
@@ -1537,6 +1659,12 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "services", "dns"] => DNS_FIELDS,
         ["set", "services", "dns", "dnssec"] => DNSSEC_MODES,
         ["set" | "delete", "services", "ntp"] => NTP_FIELDS,
+        ["set" | "delete", "services", "lldp"] => LLDP_FIELDS,
+        ["set", "services", "lldp", "enable"] => BOOLS,
+        ["set" | "delete", "services", "snmp"] => SNMP_FIELDS,
+        ["set" | "delete", "services", "mdns"] => MDNS_FIELDS,
+        ["set" | "delete", "services", "dyndns"] => DYNDNS_FIELDS,
+        ["set" | "delete", "services", "dhcp-relay"] => DHCP_RELAY_FIELDS,
 
         // The firewall sub-tree.
         ["set" | "delete", "firewall"] => FIREWALL_NODES,
@@ -1701,6 +1829,16 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "vpn"] => VPN_NODES,
         ["set" | "delete", "vpn", "ipsec", _name] => IPSEC_FIELDS,
         ["set", "vpn", "ipsec", _name, "start-action"] => IPSEC_START_ACTIONS,
+
+        // The pki (certificate authority + ACME) sub-tree.
+        ["set" | "delete", "pki"] => PKI_NODES,
+        ["set" | "delete", "pki", "ca", _name] => PKI_CA_FIELDS,
+        ["set", "pki", "ca", _name, "key-type"] => PKI_KEY_TYPES,
+        ["set" | "delete", "pki", "certificate", _name] => PKI_CERT_FIELDS,
+        ["set", "pki", "certificate", _name, "key-type"] => PKI_KEY_TYPES,
+        ["set", "pki", "certificate", _name, "usage"] => PKI_USAGES,
+        ["set" | "delete", "pki", "acme"] => PKI_ACME_FIELDS,
+        ["set", "pki", "acme", "challenge"] => PKI_CHALLENGES,
 
         // `run` — operational commands from config mode (vtysh-style).
         ["run"] => RUN_TOP,
@@ -2003,7 +2141,8 @@ mod tests {
                 "protocols",
                 "services",
                 "multiwan",
-                "vpn"
+                "vpn",
+                "pki"
             ]
         );
         assert_eq!(kw(&["set", "system"]), ["hostname"]);
@@ -2198,6 +2337,37 @@ mod tests {
             kw(&["set", "nat", "destination", "web", "proto"]),
             ["tcp", "udp"]
         );
+        // The box-services sub-tree is discoverable level by level — and because
+        // contexts derive from these tables, each new leaf is an enterable context.
+        assert_eq!(
+            kw(&["set", "services"]),
+            ["dns", "ntp", "lldp", "snmp", "mdns", "dyndns", "dhcp-relay"]
+        );
+        assert_eq!(kw(&["set", "services", "lldp"]), ["enable", "interface"]);
+        assert_eq!(
+            kw(&["set", "services", "lldp", "enable"]),
+            ["true", "false"]
+        );
+        assert_eq!(
+            kw(&["set", "services", "snmp"]),
+            ["community", "listen", "location", "contact", "allow"]
+        );
+        assert_eq!(kw(&["set", "services", "mdns"]), ["interface"]);
+        assert_eq!(
+            kw(&["set", "services", "dyndns"]),
+            [
+                "provider",
+                "server",
+                "hostname",
+                "login",
+                "password",
+                "interface"
+            ]
+        );
+        assert_eq!(
+            kw(&["set", "services", "dhcp-relay"]),
+            ["interface", "server"]
+        );
         // zone-value positions are dynamic now (see dynamic_candidates test).
         assert!(kw(&["set", "firewall", "rule", "web", "from"]).is_empty());
         assert!(kw(&["set", "interface", "wan0", "zone"]).is_empty());
@@ -2340,7 +2510,8 @@ mod tests {
                 "protocols",
                 "services",
                 "multiwan",
-                "vpn"
+                "vpn",
+                "pki"
             ]
         );
         assert_eq!(
