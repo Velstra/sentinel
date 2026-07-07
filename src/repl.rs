@@ -9,7 +9,7 @@ use rustyline::{
     validate::Validator,
 };
 
-use crate::{compile, session::Session, system};
+use crate::{compile, session::Session, system, ui};
 
 /// Where the velstra agent reads its compiled config from (writable runtime
 /// path, not the read-only image).
@@ -99,52 +99,27 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
                 let full = with_ctx(rest);
                 if is_interior_node(&full) {
                     *ctx = full;
-                    eprintln!("[edit {}]", ctx.join(" "));
+                    announce_context(ctx);
                     Ok(())
                 } else {
                     Err(edit_error(&full))
                 }
             }
         }
-        // `no <path…>` — Cisco-style deletion relative to the context: `no bfd`.
-        "no" => {
-            if rest.is_empty() {
-                Err(anyhow!(
-                    "no needs a path, e.g. `no bfd` or `no neighbor 10.0.0.1`"
-                ))
-            } else {
-                let full = with_ctx(rest);
-                let view: Vec<&str> = full.iter().map(String::as_str).collect();
-                match session.delete(&view) {
-                    Ok(()) => Ok(()),
-                    // Same absolute fallback as the implicit-set arm below:
-                    // `no interface eth1 …` from inside another context deletes
-                    // by the absolute path (Cisco mode-switch feel).
-                    Err(del_err) if !ctx.is_empty() => {
-                        let abs: Vec<&str> = rest.to_vec();
-                        session.delete(&abs).map_err(|_| del_err)
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-        }
+        // `up` moves one level towards the top; a keyword+instance pair
+        // (`interface eth0`) counts as ONE level.
         "up" => {
-            ctx.pop();
-            match ctx.is_empty() {
-                true => eprintln!("[edit]"),
-                false => eprintln!("[edit {}]", ctx.join(" ")),
-            }
+            pop_level(ctx);
+            announce_context(ctx);
             Ok(())
         }
-        // `top` (VyOS) and `end` (Cisco) both jump straight to the top context.
-        "top" | "end" => {
+        "top" => {
             ctx.clear();
-            eprintln!("[edit]");
+            announce_context(ctx);
             Ok(())
         }
-        // vtysh/VyOS `run` and Cisco `do`: run an operational command without
-        // leaving config mode.
-        "run" | "do" => match std::env::current_exe() {
+        // VyOS `run`: run an operational command without leaving config mode.
+        "run" => match std::env::current_exe() {
             Ok(exe) => {
                 let status = std::process::Command::new(exe).args(rest).status();
                 match status {
@@ -161,78 +136,49 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
         "rollback" => return rollback_line(session, act, rest),
         "save" => {
             let to = rest.first().map(Path::new);
-            session
-                .save(to)
-                .map(|p| eprintln!("saved {} (persists across reboot)", p.display()))
+            session.save(to).map(|p| {
+                eprintln!(
+                    "{} saved {} (persists across reboot)",
+                    ui::green("✔"),
+                    p.display()
+                )
+            })
         }
         "discard" => session.discard().map(|()| eprintln!("discarded edits")),
         "exit" | "quit" => {
-            // Cisco: `exit` pops ONE context level; only at the top does it leave
-            // configuration mode. A level can span a keyword+instance pair
-            // (`interface eth0`), so pop back to the next real interior node.
+            // VyOS: inside an edit context, `exit` returns to the top of the
+            // tree; only at the top does it leave configuration mode.
             if !ctx.is_empty() {
-                pop_level(ctx);
-                match ctx.is_empty() {
-                    true => eprintln!("[edit]"),
-                    false => eprintln!("[edit {}]", ctx.join(" ")),
-                }
+                ctx.clear();
+                announce_context(ctx);
                 return false;
             }
             if session.dirty() {
-                eprintln!("warning: uncommitted edits (use `commit`/`save`, or `discard`)");
+                eprintln!(
+                    "{}",
+                    ui::yellow("warning: uncommitted edits (use `commit`/`save`, or `discard`)")
+                );
             }
             return true;
         }
         "help" => {
-            eprint!("{HELP}");
+            match rest.first() {
+                None => eprint!("{}", help_overview()),
+                Some(name) => match help_command(name) {
+                    Some(text) => eprint!("{text}"),
+                    None => eprintln!("no help for {name:?} — `help` lists all commands"),
+                },
+            }
             Ok(())
         }
-        // Not a known command. Cisco-style context feel: interpret the whole line
-        // as either (b) a path to descend into, or (c) an implicit `set` relative
-        // to the current context. Descend is tried BEFORE set so that entering
-        // e.g. `neighbor 10.0.0.1` opens that context instead of only creating it.
-        _ => {
-            let full = with_ctx(&args);
-            if is_interior_node(&full) {
-                *ctx = full;
-                eprintln!("[edit {}]", ctx.join(" "));
-                Ok(())
-            } else {
-                let view: Vec<&str> = full.iter().map(String::as_str).collect();
-                match session.set(&view) {
-                    Ok(()) => Ok(()),
-                    // Cisco mode-switch: a line that resolves to nothing inside
-                    // the current context may be an ABSOLUTE path — on IOS,
-                    // typing `interface eth1` from (config-if-eth0) switches
-                    // contexts rather than erroring. Only tried with an active
-                    // context; at the top, relative and absolute are the same.
-                    Err(set_err) if !ctx.is_empty() => {
-                        let abs: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
-                        if is_interior_node(&abs) {
-                            *ctx = abs;
-                            eprintln!("[edit {}]", ctx.join(" "));
-                            Ok(())
-                        } else if session.set(&args).is_ok() {
-                            Ok(())
-                        } else {
-                            Err(anyhow!(
-                                "unknown command or config path {:?}: {set_err} \
-                                 (Tab/? lists what's valid here)",
-                                line.trim()
-                            ))
-                        }
-                    }
-                    Err(set_err) => Err(anyhow!(
-                        "unknown command or config path {:?}: {set_err} \
-                         (Tab/? lists what's valid here)",
-                        line.trim()
-                    )),
-                }
-            }
-        }
+        // Anything else is not a command. The grammar is deliberately explicit
+        // (pure VyOS): a bare config path is NOT a shorthand for set/edit, so
+        // every line means exactly one thing. The error still points migrating
+        // fingers in the right direction (renamed spellings, node hints, typos).
+        _ => Err(unknown_command(cmd, rest, ctx)),
     };
     if let Err(e) = result {
-        eprintln!("error: {e}");
+        eprintln!("{} {e}", ui::red("error:"));
     }
     false
 }
@@ -248,7 +194,7 @@ fn child_keywords(path: &[String]) -> Vec<&'static str> {
 }
 
 /// Whether `path` names an interior node we can descend into — used by `edit`
-/// and by the Cisco-style context-entry shorthand. An instance-name position
+/// and by unknown_command's `edit` hint. An instance-name position
 /// (`firewall rule web`, `interface eth0`) counts as interior even before the
 /// instance exists; creation happens on the first `set` inside.
 fn is_interior_node(path: &[String]) -> bool {
@@ -257,8 +203,8 @@ fn is_interior_node(path: &[String]) -> bool {
 
 /// Pop one *level* off the edit context: drop the last token, then keep dropping
 /// trailing tokens until the context is empty or again names a real interior
-/// node. This steps `exit` up one Cisco-style level even when a level spans a
-/// keyword+instance pair (`interface eth0`, `firewall rule web`, `… neighbor X`).
+/// node. This steps `up` one level even when a level spans a keyword+instance
+/// pair (`interface eth0`, `firewall rule web`, `… neighbor X`).
 fn pop_level(ctx: &mut Vec<String>) {
     ctx.pop();
     while !ctx.is_empty() && !is_interior_node(ctx) {
@@ -285,22 +231,91 @@ fn edit_error(full: &[String]) -> anyhow::Error {
     )
 }
 
-/// Render the edit context as a Cisco-style prompt fragment: `(config)` at the
-/// top, `(config-if-eth0)` for an interface, `(config-router-bgp)` for BGP,
-/// `(config-bgp-neighbor-10.0.0.1)` for a BGP neighbor, and generically
-/// `(config-<last-two-tokens-joined-by-->)` for everything else. main.rs wraps
-/// this in `user@host…# `.
-pub fn prompt_context(ctx: &[String]) -> String {
-    let t: Vec<&str> = ctx.iter().map(String::as_str).collect();
-    match t.as_slice() {
-        [] => "(config)".to_string(),
-        ["interface", name] => format!("(config-if-{name})"),
-        ["protocols", "bgp"] => "(config-router-bgp)".to_string(),
-        ["protocols", "bgp", "neighbor", nbr] => format!("(config-bgp-neighbor-{nbr})"),
-        rest => {
-            let tail = &rest[rest.len().saturating_sub(2)..];
-            format!("(config-{})", tail.join("-"))
+/// Render the edit context as the VyOS/JunOS banner line: `[edit]` at the top,
+/// `[edit firewall rule web]` inside a subtree. The interactive loop prints it
+/// (dimmed) above the prompt while a context is active; command handlers print
+/// it whenever the context changes.
+pub fn edit_banner(ctx: &[String]) -> String {
+    match ctx.is_empty() {
+        true => "[edit]".to_string(),
+        false => format!("[edit {}]", ctx.join(" ")),
+    }
+}
+
+/// Print the context banner after a context change (`edit`/`up`/`top`/`exit`).
+fn announce_context(ctx: &[String]) {
+    eprintln!("{}", ui::cyan(&edit_banner(ctx)));
+}
+
+/// Edit distance for did-you-mean suggestions on mistyped commands.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != *cb);
+            cur.push((prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1));
         }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
+/// The command closest to `word` (edit distance ≤ 2), if any.
+fn closest_command(word: &str) -> Option<&'static str> {
+    COMMANDS
+        .iter()
+        .map(|(k, _)| (levenshtein(word, k), *k))
+        .filter(|(d, _)| *d <= 2)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, k)| k)
+}
+
+/// The error for a first token that is not a command. Strict on grammar,
+/// generous on guidance: retired spellings name their replacement, a config
+/// node typed bare gets the explicit `set`/`edit` spellings, and a typo gets
+/// the nearest command.
+fn unknown_command(cmd: &str, rest: &[&str], ctx: &[String]) -> anyhow::Error {
+    let renamed = match cmd {
+        "no" => Some("delete"),
+        "do" => Some("run"),
+        "end" => Some("top"),
+        _ => None,
+    };
+    if let Some(new) = renamed {
+        return anyhow!("`{cmd}` is not a command here — use `{new}`");
+    }
+    // A config keyword typed bare (e.g. `interface eth0` or, inside a rule
+    // context, `action accept`): show the explicit spellings.
+    let mut toks: Vec<&str> = vec!["set"];
+    toks.extend(ctx.iter().map(String::as_str));
+    if candidates(&toks).iter().any(|(k, _)| *k == cmd) {
+        let path = std::iter::once(cmd)
+            .chain(rest.iter().copied())
+            .collect::<Vec<_>>()
+            .join(" ");
+        // Offer `edit` only when the path really names a subtree (context-
+        // relative); a leaf like `action accept` gets just the `set` spelling.
+        let full: Vec<String> = ctx
+            .iter()
+            .cloned()
+            .chain(std::iter::once(cmd.to_string()))
+            .chain(rest.iter().map(|s| (*s).to_string()))
+            .collect();
+        return match is_interior_node(&full) {
+            true => anyhow!(
+                "{cmd:?} is a config node, not a command — `set {path} …` sets a value, \
+                 `edit {path}` enters the subtree"
+            ),
+            false => anyhow!("{cmd:?} is a config node, not a command — use `set {path}`"),
+        };
+    }
+    match closest_command(cmd) {
+        Some(s) => {
+            anyhow!("unknown command {cmd:?} — did you mean `{s}`? (`help` lists all commands)")
+        }
+        None => anyhow!("unknown command {cmd:?} — `help` lists all commands"),
     }
 }
 
@@ -323,8 +338,11 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
     );
 
     if !act.enabled {
-        eprintln!("commit ok (validated): {summary}");
-        eprintln!("note: live apply disabled (off-box or --no-apply)");
+        eprintln!("{} commit ok (validated): {summary}", ui::green("✔"));
+        eprintln!(
+            "{}",
+            ui::dim("  note: live apply disabled (off-box or --no-apply)")
+        );
         return false;
     }
 
@@ -333,13 +351,17 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
     let old_host = system::current_hostname();
     eprintln!("commit: {summary}; applying to the running system…");
     if let Err(e) = apply_live(&appliance, act) {
-        eprintln!("error: applying config: {e}");
+        eprintln!("{} applying config: {e}", ui::red("error:"));
         return false;
     }
     if appliance.system.hostname != old_host {
         eprintln!("  hostname: {old_host} -> {}", appliance.system.hostname);
     }
-    eprintln!("commit ok: applied live (not persisted — `save` to keep across reboot)");
+    eprintln!(
+        "{} commit ok: applied live {}",
+        ui::green("✔"),
+        ui::dim("(not persisted — `save` to keep across reboot)")
+    );
     false
 }
 
@@ -561,69 +583,265 @@ pub(crate) fn apply_live(appliance: &crate::config::Appliance, act: &Apply) -> R
     Ok(())
 }
 
-pub const HELP: &str = "\
-commands:
-  set <path...> <value>   set a config node. The tree (Tab/`?` explores it):
-                            system hostname <name>
-                            interface <n> description|disabled|zone|address|parent|vlan|type|qos|pppoe …
-                            interface <n> dhcp-server  pool-offset|pool-size|dns|lease-time|default-router|domain|static-mapping …
-                            firewall global  stateful|block-icmp|default-action|log|block …
-                            firewall zone <z>  description|stateful|block-icmp|default-action|log|block …
-                            firewall rule <r>  description|disabled|from|to|action|proto|port|log|source|source-group|port-group …
-                            firewall group  address-group <n> address <csv> | port-group <n> port <csv>
-                            protocols bgp  local-as|router-id|hold-time|network|community|multipath|confederation|rpki|aggregate|roa|ebgp-require-policy …
-                            protocols bgp neighbor <ip>  remote-as|local-as|update-source|ebgp-multihop|description|shutdown|hold-time|passive|password|ttl-security|max-prefix|role|import|export|bfd …
-                            protocols filter <name>  default accept|reject | rule <n> prefix|protocol|set-metric|set-community|action …
-                            nat source <s>  zone|description|disabled …
-                            nat destination <d>  zone|proto|port|to|description|disabled …
-                            nat nat64  enabled|prefix|pool|interface|dns64 (IPv6→IPv4 + DNS64)
-                            services dns|ntp  upstream|serve-on …
-                            services lldp  enable|interface | snmp  community|listen|location|contact|allow
-                            services mdns interface | dyndns  provider|hostname|login|password|interface | dhcp-relay  interface|server
-                            multiwan mode failover|load-balance
-                            multiwan uplink <if>  priority|weight|table|gateway|check …
-                            vpn ipsec <name>  local|remote|local-subnet|remote-subnet|psk|…
-                          e.g.  set firewall rule web from wan
-                                set nat source wan-masq zone wan
-                                set nat destination web to 10.0.0.10:8443
-  delete <path...>        remove a node or clear a field
-  show [section]          show the candidate config (all, or one section:
-                          system | interfaces | firewall | nat | protocols |
-                          services | multiwan | vpn)
-  edit <path...>          descend into a subtree (a context); set/delete/show
-                          become relative to it, e.g.  edit firewall rule web
-                          Any interior node works: edit interface eth0,
-                          edit protocols bgp neighbor 10.0.0.1
-  <path...>               context shorthand (Cisco-style): a bare path that
-                          names a subtree descends into it — `interface eth0`,
-                          and inside it `zone lan` — while a complete leaf path
-                          is an implicit set — inside a rule, `action accept`
-                          ≡ `set action accept`
-  no <path...>            delete relative to the context (Cisco `no`), e.g.
-                          `no action`  ≡  delete action
-  exit                    pop one context level; at the top, leave config mode
-  end | top               jump straight back to the top of the tree
-  up                      move one token up from the edit context
-  run <op command>        run an operational command from config mode,
-                          e.g.  run show ip route   run show ip bgp summary
-  do <op command>         Cisco alias for `run`, e.g.  do show ip route
-  compare [<N> [<M>]]     diff the candidate vs the saved config (no args),
-                          vs archived revision N, or revision N vs revision M
-                          (list revisions with `run show system commit`)
-  commit                  apply the candidate to the RUNNING system (live)
-  commit-confirm [mins]   apply live, then auto-revert to the saved config after
-                          `mins` (default 10) unless you `confirm` — the safety
-                          net for editing a firewall over its own link
-  confirm                 keep a commit-confirm change (cancel the auto-revert)
-  save [path]             persist the config so it survives a reboot
-  rollback <N>            revert to archived revision N (0 = newest); list them
-                          with `run show system commit`
-  discard                 drop edits, reload from disk
-  quit                    alias for `exit`
-  (Tab or `?` lists commands, config keys, and value keywords.
-   examples:  edit interface eth0 → zone lan → address 10.0.0.1/24 → exit
-              edit protocols bgp → local-as 65001 → neighbor 10.0.0.2 remote-as 65002)
-";
+/// One command's help. `usage` + `summary` drive the `help` overview; the
+/// `detail` paragraph and `examples` complete `help <command>`.
+struct CmdHelp {
+    name: &'static str,
+    usage: &'static str,
+    summary: &'static str,
+    detail: &'static str,
+    examples: &'static [&'static str],
+}
+
+/// The `help` overview groups, in display order. Every name must exist in
+/// `CMD_HELP` (enforced by a test).
+const HELP_GROUPS: &[(&str, &[&str])] = &[
+    (
+        "Edit the candidate",
+        &["set", "delete", "edit", "up", "top"],
+    ),
+    ("Inspect", &["show", "compare", "run"]),
+    (
+        "Apply and persist",
+        &[
+            "commit",
+            "commit-confirm",
+            "confirm",
+            "save",
+            "rollback",
+            "discard",
+        ],
+    ),
+    ("Session", &["exit", "help"]),
+];
+
+const CMD_HELP: &[CmdHelp] = &[
+    CmdHelp {
+        name: "set",
+        usage: "set <path> <value>",
+        summary: "set a configuration value",
+        detail: "The configuration is a tree. <path> walks it from the top (or from the \
+                 current edit context) down to a field; the last word(s) are the value. \
+                 Tab or `?` lists what is valid at every step, so the whole tree is \
+                 discoverable without documentation.",
+        examples: &[
+            "set system hostname fw1",
+            "set interface eth0 address 10.0.0.1/24",
+            "set firewall rule web action accept",
+            "set protocols bgp neighbor 10.0.0.2 remote-as 65002",
+        ],
+    },
+    CmdHelp {
+        name: "delete",
+        usage: "delete <path>",
+        summary: "delete a node or reset a value",
+        detail: "Removes the named node (an instance like a rule, or a single field). \
+                 Deleting a field restores its default.",
+        examples: &["delete firewall rule web", "delete interface eth0 address"],
+    },
+    CmdHelp {
+        name: "edit",
+        usage: "edit <path>",
+        summary: "enter a subtree; paths become relative to it",
+        detail: "Descends into any interior node of the tree — `set`, `delete` and \
+                 `show` are then relative to it, and the prompt shows the position as \
+                 `[edit <path>]`. Leave with `up` (one level), `top` or `exit` (back to \
+                 the top).",
+        examples: &[
+            "edit firewall rule web",
+            "set action accept        (= set firewall rule web action accept)",
+            "edit protocols bgp neighbor 10.0.0.1",
+        ],
+    },
+    CmdHelp {
+        name: "up",
+        usage: "up",
+        summary: "go one level up from the edit context",
+        detail: "A keyword+instance pair (`interface eth0`) counts as one level.",
+        examples: &[],
+    },
+    CmdHelp {
+        name: "top",
+        usage: "top",
+        summary: "return to the top of the tree",
+        detail: "",
+        examples: &[],
+    },
+    CmdHelp {
+        name: "show",
+        usage: "show [path]",
+        summary: "show the candidate configuration",
+        detail: "Without arguments the whole candidate config; with a section name \
+                 (system, interfaces, firewall, nat, protocols, services, multiwan, \
+                 vpn) just that part. Inside an edit context, `show` is relative to it.",
+        examples: &["show", "show firewall"],
+    },
+    CmdHelp {
+        name: "compare",
+        usage: "compare [N [M]]",
+        summary: "diff the candidate against saved or archived configs",
+        detail: "No arguments: candidate vs the saved config. One argument: vs archived \
+                 revision N. Two: revision N vs revision M. List the archive with \
+                 `run show system commit`.",
+        examples: &["compare", "compare 1", "compare 2 1"],
+    },
+    CmdHelp {
+        name: "run",
+        usage: "run <operational command>",
+        summary: "run an operational command without leaving configure",
+        detail: "",
+        examples: &[
+            "run show ip route",
+            "run show ip bgp summary",
+            "run show firewall log",
+        ],
+    },
+    CmdHelp {
+        name: "commit",
+        usage: "commit",
+        summary: "apply the candidate to the running system",
+        detail: "Validates the candidate, then applies it live — no rebuild, no reboot. \
+                 A commit does NOT persist across reboot; follow up with `save` once \
+                 the change is proven good.",
+        examples: &[],
+    },
+    CmdHelp {
+        name: "commit-confirm",
+        usage: "commit-confirm [minutes]",
+        summary: "commit with an automatic revert unless confirmed",
+        detail: "Applies the candidate live, then reverts to the saved config after \
+                 <minutes> (default 10) unless you type `confirm` — the safety net for \
+                 editing a firewall over the very link it filters.",
+        examples: &["commit-confirm 5", "confirm"],
+    },
+    CmdHelp {
+        name: "confirm",
+        usage: "confirm",
+        summary: "keep a commit-confirm change (cancel the revert)",
+        detail: "",
+        examples: &[],
+    },
+    CmdHelp {
+        name: "save",
+        usage: "save [path]",
+        summary: "persist the configuration across reboot",
+        detail: "Writes the committed config to the boot location (or to <path> for a \
+                 backup copy).",
+        examples: &[],
+    },
+    CmdHelp {
+        name: "rollback",
+        usage: "rollback <N>",
+        summary: "revert to archived revision N (0 = newest)",
+        detail: "Every save archives the previous config. List the revisions with \
+                 `run show system commit`, inspect a diff first with `compare <N>`.",
+        examples: &["rollback 0"],
+    },
+    CmdHelp {
+        name: "discard",
+        usage: "discard",
+        summary: "drop all uncommitted edits",
+        detail: "",
+        examples: &[],
+    },
+    CmdHelp {
+        name: "exit",
+        usage: "exit",
+        summary: "leave the edit context; at the top, leave configure",
+        detail: "Inside an edit context, `exit` returns to the top of the tree. At the \
+                 top it ends the session (warning if edits are uncommitted). `quit` is \
+                 an alias.",
+        examples: &[],
+    },
+    CmdHelp {
+        name: "help",
+        usage: "help [command]",
+        summary: "this overview, or details on one command",
+        detail: "",
+        examples: &["help commit-confirm"],
+    },
+];
+
+/// The grouped, aligned `help` overview.
+pub fn help_overview() -> String {
+    use std::fmt::Write;
+    let w = CMD_HELP.iter().map(|c| c.usage.len()).max().unwrap_or(0);
+    let mut out = String::new();
+    let _ = writeln!(out, "{}", ui::bold("Sentinel configuration mode"));
+    let _ = writeln!(
+        out,
+        "{}",
+        ui::dim("  The configuration is a tree; every command names a path in it.")
+    );
+    for (title, names) in HELP_GROUPS {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "{}", ui::bold(title));
+        for name in *names {
+            let c = CMD_HELP
+                .iter()
+                .find(|c| c.name == *name)
+                .expect("HELP_GROUPS names a known command");
+            let padded = format!("{:<w$}", c.usage);
+            let _ = writeln!(out, "  {}  {}", ui::cyan(&padded), c.summary);
+        }
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "{}",
+        ui::dim(
+            "  `help <command>` shows details and examples; Tab or `?` completes the next word."
+        )
+    );
+    out
+}
+
+/// Detailed help for one command (`help <command>`), if it exists.
+pub fn help_command(name: &str) -> Option<String> {
+    use std::fmt::Write;
+    let canonical = match name {
+        "quit" => "exit",
+        "del" => "delete",
+        other => other,
+    };
+    let c = CMD_HELP.iter().find(|c| c.name == canonical)?;
+    let mut out = String::new();
+    let _ = writeln!(out, "{} {}", ui::bold("Usage:"), ui::cyan(c.usage));
+    let _ = writeln!(out, "  {}", c.summary);
+    if !c.detail.is_empty() {
+        let _ = writeln!(out);
+        for line in wrap(c.detail, 76) {
+            let _ = writeln!(out, "  {line}");
+        }
+    }
+    if !c.examples.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "{}", ui::bold("Examples:"));
+        for e in c.examples {
+            let _ = writeln!(out, "  {}", ui::cyan(e));
+        }
+    }
+    Some(out)
+}
+
+/// Greedy word-wrap for the `help <command>` detail paragraphs.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        if !cur.is_empty() && cur.len() + 1 + word.len() > width {
+            lines.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
 
 /// A completion candidate: the keyword to insert plus a short description shown
 /// in the Tab/`?` listing (VyOS/vtysh style).
@@ -661,15 +879,6 @@ const COMMANDS: &[Cand] = &[
     ("discard", "drop uncommitted edits"),
     ("exit", "leave the edit context / configuration mode"),
     ("help", "show command help"),
-];
-
-// Cisco-style extras offered at the first-token position alongside COMMANDS.
-// Kept out of COMMANDS so the flat completion grammar (and its tests) is
-// unchanged; they still work as typed commands everywhere.
-const CONTEXT_COMMANDS: &[Cand] = &[
-    ("end", "jump to the top of the config tree (Cisco `end`)"),
-    ("no", "delete a node relative to the context (Cisco `no`)"),
-    ("do", "run an operational command (Cisco `do show …`)"),
 ];
 
 // `run <Tab>` — the operational commands reachable from config mode.
@@ -1629,6 +1838,8 @@ const RULE_FIELDS: &[Cand] = &[
 fn candidates(tokens: &[&str]) -> &'static [Cand] {
     match tokens {
         [] => COMMANDS,
+        // `help <Tab>` completes the command names.
+        ["help"] => COMMANDS,
         ["set" | "delete"] => TOP,
         ["set" | "delete", "system"] => SYSTEM_FIELDS,
         // `set interface <name> <field>` — name is freeform, then fields.
@@ -1957,27 +2168,6 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
     }
 }
 
-/// Candidates at the first-token (command) position, Cisco-aware: the flat
-/// commands, plus the extra commands (end/no/do), plus the child keywords of the
-/// current context — so an empty-line Tab/`?` inside a context lists both the
-/// commands and the subtree you can descend into or implicitly `set`.
-fn first_token_candidates(ctx: &[String], names: &DynNames) -> Vec<(String, String)> {
-    let mut all = dyn_candidates(&[], names); // COMMANDS
-    for (k, d) in CONTEXT_COMMANDS {
-        if !all.iter().any(|(kw, _)| kw == k) {
-            all.push((k.to_string(), d.to_string()));
-        }
-    }
-    let mut child_toks: Vec<&str> = vec!["set"];
-    child_toks.extend(ctx.iter().map(String::as_str));
-    for c in dyn_candidates(&child_toks, names) {
-        if !all.iter().any(|(kw, _)| *kw == c.0) {
-            all.push(c);
-        }
-    }
-    all
-}
-
 /// The terminal width (columns), so the completion menu can be laid out one
 /// candidate per line. Falls back to 80 when it can't be queried.
 fn term_width() -> usize {
@@ -2088,13 +2278,10 @@ impl Completer for ConfigCompleter {
         let eff = effective_tokens(&before, &ctx);
         let eff_view: Vec<&str> = eff.iter().map(String::as_str).collect();
         let names = self.names.borrow();
-        // First-token completion is Cisco-aware (see first_token_candidates);
-        // deeper positions use the plain grammar.
-        let all = if before.is_empty() {
-            first_token_candidates(&ctx, &names)
-        } else {
-            dyn_candidates(&eff_view, &names)
-        };
+        // Pure grammar everywhere: at the first token only the commands are
+        // offered (a bare config path is not a command), deeper positions
+        // complete the config tree.
+        let all = dyn_candidates(&eff_view, &names);
         let matched: Vec<&(String, String)> = all
             .iter()
             .filter(|(kw, _)| kw.starts_with(prefix))
@@ -2646,7 +2833,7 @@ mod tests {
     }
 
     #[test]
-    fn cisco_context_enters_new_protocol_subtrees_and_sets_fields() {
+    fn edit_contexts_cover_protocol_subtrees_and_relative_sets() {
         let dir = std::env::temp_dir().join(format!("sentinel-ctx-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("a.toml");
@@ -2655,26 +2842,25 @@ mod tests {
         let mut ctx = Vec::new();
 
         exec_line(&mut s, &act, &mut ctx, "set system hostname r1");
-        // Cisco shorthand: a bare path descends into the OSPF context, then bare
-        // fields set relative to it.
-        exec_line(&mut s, &act, &mut ctx, "protocols ospf");
+        // `edit` descends into the OSPF context; `set` is relative to it.
+        exec_line(&mut s, &act, &mut ctx, "edit protocols ospf");
         assert_eq!(ctx, vec!["protocols", "ospf"]);
-        exec_line(&mut s, &act, &mut ctx, "area 0.0.0.0");
-        exec_line(&mut s, &act, &mut ctx, "hello-interval 5");
-        exec_line(&mut s, &act, &mut ctx, "bfd true");
+        exec_line(&mut s, &act, &mut ctx, "set area 0.0.0.0");
+        exec_line(&mut s, &act, &mut ctx, "set hello-interval 5");
+        exec_line(&mut s, &act, &mut ctx, "set bfd true");
         exec_line(&mut s, &act, &mut ctx, "top");
         assert!(ctx.is_empty());
         // A named VRF context.
-        exec_line(&mut s, &act, &mut ctx, "protocols vrf blue");
+        exec_line(&mut s, &act, &mut ctx, "edit protocols vrf blue");
         assert_eq!(ctx, vec!["protocols", "vrf", "blue"]);
-        exec_line(&mut s, &act, &mut ctx, "table 100");
+        exec_line(&mut s, &act, &mut ctx, "set table 100");
         exec_line(&mut s, &act, &mut ctx, "top");
-        // A multicast interface context (keyed node).
-        exec_line(&mut s, &act, &mut ctx, "protocols multicast");
-        exec_line(&mut s, &act, &mut ctx, "enabled true");
-        exec_line(&mut s, &act, &mut ctx, "interface lan0");
+        // A multicast interface context (keyed node), entered stepwise.
+        exec_line(&mut s, &act, &mut ctx, "edit protocols multicast");
+        exec_line(&mut s, &act, &mut ctx, "set enabled true");
+        exec_line(&mut s, &act, &mut ctx, "edit interface lan0");
         assert_eq!(ctx, vec!["protocols", "multicast", "interface", "lan0"]);
-        exec_line(&mut s, &act, &mut ctx, "role querier");
+        exec_line(&mut s, &act, &mut ctx, "set role querier");
         exec_line(&mut s, &act, &mut ctx, "top");
 
         let shown = s.show();
@@ -2706,26 +2892,16 @@ mod tests {
     }
 
     #[test]
-    fn prompt_context_renders_cisco_style() {
-        assert_eq!(prompt_context(&[]), "(config)");
+    fn edit_banner_renders_vyos_style() {
+        assert_eq!(edit_banner(&[]), "[edit]");
         assert_eq!(
-            prompt_context(&sv(&["interface", "eth0"])),
-            "(config-if-eth0)"
+            edit_banner(&sv(&["firewall", "rule", "web"])),
+            "[edit firewall rule web]"
         );
         assert_eq!(
-            prompt_context(&sv(&["protocols", "bgp"])),
-            "(config-router-bgp)"
+            edit_banner(&sv(&["protocols", "bgp", "neighbor", "10.0.0.1"])),
+            "[edit protocols bgp neighbor 10.0.0.1]"
         );
-        assert_eq!(
-            prompt_context(&sv(&["protocols", "bgp", "neighbor", "10.0.0.1"])),
-            "(config-bgp-neighbor-10.0.0.1)"
-        );
-        // Generic: the last (up to) two tokens joined by '-'.
-        assert_eq!(
-            prompt_context(&sv(&["firewall", "rule", "web"])),
-            "(config-rule-web)"
-        );
-        assert_eq!(prompt_context(&sv(&["system"])), "(config-system)");
     }
 
     #[test]
@@ -2752,31 +2928,39 @@ mod tests {
     }
 
     #[test]
-    fn exit_pops_one_level_and_end_jumps_to_top() {
+    fn exit_returns_to_top_and_up_pops_one_level() {
         let (mut s, _p, dir) = scratch_session("exit");
         let act = Apply::off();
         let mut ctx = Vec::new();
 
-        // Descend two token-levels, then a keyword+instance level.
+        // `up` pops one level: bgp → protocols → top.
         exec_line(&mut s, &act, &mut ctx, "edit protocols bgp");
         assert_eq!(ctx, vec!["protocols", "bgp"]);
-        // `exit` pops one level: bgp → protocols.
-        exec_line(&mut s, &act, &mut ctx, "exit");
+        exec_line(&mut s, &act, &mut ctx, "up");
         assert_eq!(ctx, vec!["protocols"]);
-        // `exit` again: protocols → top.
-        exec_line(&mut s, &act, &mut ctx, "exit");
+        exec_line(&mut s, &act, &mut ctx, "up");
         assert!(ctx.is_empty());
 
-        // A keyword+instance level (`interface eth0`) is popped as ONE level.
+        // A keyword+instance pair (`interface eth0`) pops as ONE level.
         exec_line(&mut s, &act, &mut ctx, "edit interface eth0");
         assert_eq!(ctx, vec!["interface", "eth0"]);
-        exec_line(&mut s, &act, &mut ctx, "exit");
+        exec_line(&mut s, &act, &mut ctx, "up");
         assert!(ctx.is_empty(), "interface+name pops as one level");
 
-        // `end` clears from any depth without leaving config mode.
+        // `exit` inside a context returns to the TOP (VyOS), not one level.
+        exec_line(
+            &mut s,
+            &act,
+            &mut ctx,
+            "edit protocols bgp neighbor 10.0.0.1",
+        );
+        assert!(!exec_line(&mut s, &act, &mut ctx, "exit"));
+        assert!(ctx.is_empty());
+
+        // `top` clears from any depth.
         exec_line(&mut s, &act, &mut ctx, "edit firewall rule web");
         assert_eq!(ctx, vec!["firewall", "rule", "web"]);
-        assert!(!exec_line(&mut s, &act, &mut ctx, "end"));
+        assert!(!exec_line(&mut s, &act, &mut ctx, "top"));
         assert!(ctx.is_empty());
 
         // At the top, `exit` leaves the session (returns true).
@@ -2786,52 +2970,102 @@ mod tests {
     }
 
     #[test]
-    fn context_shorthand_descends_and_implicit_set_mutates_draft() {
-        let (mut s, _p, dir) = scratch_session("shorthand");
+    fn bare_paths_are_rejected_with_guidance_and_do_not_mutate() {
+        let (mut s, _p, dir) = scratch_session("bare");
         let act = Apply::off();
         let mut ctx = Vec::new();
 
-        // A bare path that names a subtree descends (context-entry shorthand).
-        assert!(!exec_line(&mut s, &act, &mut ctx, "interface eth0"));
-        assert_eq!(ctx, vec!["interface", "eth0"]);
-        // Inside it, a complete leaf path is an implicit set.
-        assert!(!exec_line(&mut s, &act, &mut ctx, "address 10.0.0.1/24"));
-        assert!(!exec_line(&mut s, &act, &mut ctx, "zone lan"));
-
-        // Descend a keyword+instance level, then implicit-set two leaves.
-        exec_line(&mut s, &act, &mut ctx, "end");
-        assert!(!exec_line(&mut s, &act, &mut ctx, "firewall rule web"));
-        assert_eq!(ctx, vec!["firewall", "rule", "web"]);
-        assert!(!exec_line(&mut s, &act, &mut ctx, "from lan"));
-        assert!(!exec_line(&mut s, &act, &mut ctx, "action accept"));
-
-        let shown = s.show();
-        assert!(shown.contains("10.0.0.1/24"), "{shown}");
-        assert!(shown.contains("web"), "{shown}");
-        assert!(shown.contains("accept"), "{shown}");
-
-        // Garbage that is neither a node nor a valid set errors (draft untouched).
+        // Pure grammar: a bare config path is NOT a command — it neither
+        // descends nor sets, and the draft stays untouched.
         let before = s.show();
+        assert!(!exec_line(&mut s, &act, &mut ctx, "interface eth0"));
+        assert!(ctx.is_empty(), "a bare path must not change the context");
         assert!(!exec_line(&mut s, &act, &mut ctx, "totally bogus"));
-        assert_eq!(s.show(), before, "a failed shorthand must not mutate");
+        assert_eq!(s.show(), before, "a rejected line must not mutate");
+
+        // The error text points at the explicit spellings.
+        let err = unknown_command("interface", &["eth0"], &[]).to_string();
+        assert!(err.contains("set interface eth0"), "{err}");
+        assert!(err.contains("edit interface eth0"), "{err}");
+        // Inside a context, a bare leaf gets the relative `set` hint.
+        let rule_ctx = sv(&["firewall", "rule", "web"]);
+        let err = unknown_command("action", &["accept"], &rule_ctx).to_string();
+        assert!(err.contains("set action accept"), "{err}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn no_deletes_relative_to_context() {
-        let (mut s, _p, dir) = scratch_session("no");
+    fn retired_spellings_and_typos_get_suggestions() {
+        // The retired Cisco spellings name their replacement.
+        for (old, new) in [("no", "delete"), ("do", "run"), ("end", "top")] {
+            let err = unknown_command(old, &[], &[]).to_string();
+            assert!(err.contains(&format!("`{new}`")), "{old}: {err}");
+        }
+        // A typo suggests the nearest command.
+        let err = unknown_command("shwo", &[], &[]).to_string();
+        assert!(err.contains("did you mean `show`"), "{err}");
+        assert_eq!(closest_command("comit"), Some("commit"));
+        assert_eq!(closest_command("xyzzy"), None);
+    }
+
+    #[test]
+    fn delete_is_relative_to_the_edit_context() {
+        let (mut s, _p, dir) = scratch_session("delrel");
         let act = Apply::off();
         let mut ctx = Vec::new();
 
         exec_line(&mut s, &act, &mut ctx, "edit firewall rule web");
-        exec_line(&mut s, &act, &mut ctx, "action accept");
+        exec_line(&mut s, &act, &mut ctx, "set action accept");
         assert!(s.show().contains("accept"), "{}", s.show());
-        // Cisco `no` deletes relative to the context.
-        assert!(!exec_line(&mut s, &act, &mut ctx, "no action"));
+        // `delete` deletes relative to the context.
+        assert!(!exec_line(&mut s, &act, &mut ctx, "delete action"));
         assert!(!s.show().contains("accept"), "{}", s.show());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn help_engine_is_complete_and_consistent() {
+        // Every command in the completion table has help, and every help group
+        // entry names a real command (the overview renderer asserts the
+        // reverse direction via expect()).
+        for (name, _) in COMMANDS {
+            assert!(
+                help_command(name).is_some(),
+                "command {name:?} has no CMD_HELP entry"
+            );
+        }
+        for (_, names) in HELP_GROUPS {
+            for n in *names {
+                assert!(
+                    CMD_HELP.iter().any(|c| c.name == *n),
+                    "HELP_GROUPS references unknown command {n:?}"
+                );
+            }
+        }
+        // The overview lists every grouped command's usage.
+        let overview = help_overview();
+        for c in CMD_HELP {
+            assert!(overview.contains(c.usage), "overview misses {:?}", c.usage);
+        }
+        // Aliases resolve; garbage does not.
+        assert!(help_command("quit").is_some());
+        assert!(help_command("del").is_some());
+        assert!(help_command("bogus").is_none());
+        // Per-command help carries usage + examples.
+        let cc = help_command("commit-confirm").unwrap();
+        assert!(cc.contains("commit-confirm [minutes]"), "{cc}");
+        assert!(cc.contains("confirm"), "{cc}");
+    }
+
+    #[test]
+    fn wrap_breaks_lines_at_word_boundaries() {
+        let lines = wrap("aa bb cc dd", 5);
+        assert_eq!(lines, ["aa bb", "cc dd"]);
+        assert!(wrap("", 10).is_empty());
+        // A single overlong word is kept whole (never split mid-word).
+        assert_eq!(wrap("supercalifragilistic", 5), ["supercalifragilistic"]);
     }
 
     #[test]
@@ -2851,88 +3085,61 @@ mod tests {
     }
 
     #[test]
-    fn first_token_completion_offers_context_children_and_extras() {
+    fn first_token_completion_offers_only_commands() {
         let names = DynNames::default();
-        // At the top: commands + Cisco extras + the top-level subtree keywords.
-        let top: Vec<String> = first_token_candidates(&[], &names)
+        // At the first token only the commands are offered — a bare config
+        // path is not a command, so the subtree keywords must NOT appear.
+        let top: Vec<String> = dyn_candidates(&[], &names)
             .into_iter()
             .map(|(k, _)| k)
             .collect();
         assert!(top.contains(&"set".to_string()));
-        assert!(top.contains(&"end".to_string()));
-        assert!(top.contains(&"no".to_string()));
-        assert!(top.contains(&"do".to_string()));
-        assert!(top.contains(&"interface".to_string())); // a top subtree
-        assert!(top.contains(&"protocols".to_string()));
+        assert!(top.contains(&"help".to_string()));
+        assert!(!top.contains(&"end".to_string()));
+        assert!(!top.contains(&"no".to_string()));
+        assert!(!top.contains(&"do".to_string()));
+        assert!(!top.contains(&"interface".to_string()));
+        assert!(!top.contains(&"protocols".to_string()));
 
-        // Inside a context, the child keywords of that context are offered so a
-        // bare Tab/`?` lists what you can descend into / implicitly set.
-        let kids: Vec<String> = first_token_candidates(&sv(&["firewall", "rule", "web"]), &names)
+        // `help <Tab>` completes the command names.
+        let help_args: Vec<String> = dyn_candidates(&["help"], &names)
             .into_iter()
             .map(|(k, _)| k)
             .collect();
-        assert!(kids.contains(&"from".to_string()), "{kids:?}");
-        assert!(kids.contains(&"action".to_string()), "{kids:?}");
-        assert!(kids.contains(&"set".to_string()), "{kids:?}"); // commands still there
+        assert!(help_args.contains(&"commit".to_string()), "{help_args:?}");
     }
 
     #[test]
-    fn cisco_style_session_end_to_end() {
+    fn vyos_style_session_end_to_end() {
         let (mut s, _p, dir) = scratch_session("e2e");
         let act = Apply::off();
         let mut ctx = Vec::new();
-        // A realistic Cisco-style session: descend, implicit-set, exit, descend a
-        // keyword+instance level, end, descend routing, implicit-set a deep leaf.
+        // A realistic session: edit, relative sets, exit to top, flat sets, a
+        // deeper context, and a relative delete.
         for line in [
-            "interface eth0",
-            "zone lan",
-            "address 10.0.0.1/24",
+            "edit interface eth0",
+            "set zone lan",
+            "set address 10.0.0.1/24",
             "exit",
-            "firewall rule web",
-            "from lan",
-            "action accept",
-            "end",
-            "protocols bgp",
-            "local-as 65001",
-            "neighbor 10.0.0.2 remote-as 65002",
-            "end",
+            "edit firewall rule web",
+            "set from lan",
+            "set action accept",
+            "top",
+            "set protocols bgp local-as 65001",
+            "edit protocols bgp neighbor 10.0.0.2",
+            "set remote-as 65002",
+            "delete remote-as",
+            "set remote-as 65003",
+            "exit",
         ] {
             assert!(!exec_line(&mut s, &act, &mut ctx, line), "line: {line}");
         }
         assert!(ctx.is_empty());
         let shown = s.show();
-        for needle in ["eth0", "10.0.0.1/24", "web", "accept", "65001", "65002"] {
+        for needle in ["eth0", "10.0.0.1/24", "web", "accept", "65001", "65003"] {
             assert!(shown.contains(needle), "missing {needle:?} in:\n{shown}");
         }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn absolute_path_mode_switches_from_inside_a_context() {
-        let (mut s, _p, dir) = scratch_session("modeswitch");
-        let act = Apply::off();
-        let mut ctx = Vec::new();
-        // IOS feel: from (config-if-eth0), an absolute `firewall rule web` line
-        // switches contexts instead of erroring; an absolute set applies; and
-        // `no` deletes by absolute path from an unrelated context.
-        for line in [
-            "interface eth0",
-            "zone lan",
-            "firewall rule web", // absolute — switches out of the interface ctx
-            "from lan",
-            "system hostname sw1", // absolute set from (config-firewall-rule-web)
-            "no interface eth0 zone", // absolute delete from the same ctx
-        ] {
-            assert!(!exec_line(&mut s, &act, &mut ctx, line), "line: {line}");
-        }
-        assert_eq!(
-            ctx,
-            vec!["firewall".to_string(), "rule".into(), "web".into()]
-        );
-        let shown = s.show();
-        assert!(shown.contains("from lan"), "{shown}");
-        assert!(shown.contains("hostname sw1"), "{shown}");
-        assert!(!shown.contains("zone lan"), "zone not deleted:\n{shown}");
+        assert!(!shown.contains("65002"), "deleted value survived:\n{shown}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

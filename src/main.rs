@@ -22,6 +22,7 @@ mod pki;
 mod repl;
 mod session;
 mod system;
+mod ui;
 mod wgkey;
 mod wren;
 
@@ -388,9 +389,19 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
     let act = live_apply(!no_apply);
 
     if std::io::stdin().is_terminal() {
-        eprintln!("Entering configuration mode. `help` for commands, `exit` to leave.");
+        eprintln!("{}", ui::bold("Sentinel configuration mode"));
+        eprintln!(
+            "{}",
+            ui::dim(
+                "  help: commands · Tab or ?: complete · commit: apply live · \
+                 save: persist · exit: leave"
+            )
+        );
         if !act.enabled {
-            eprintln!("(commit will validate + save only; not applying)");
+            eprintln!(
+                "{}",
+                ui::yellow("  (off-box: commit validates + saves only; not applying)")
+            );
         }
         // `List` completion shows all candidates at once (like bash) instead of
         // cycling through them one Tab at a time.
@@ -424,16 +435,16 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
                 );
                 h.set_context(&ctx);
             }
-            // Cisco-style prompt, re-rendered each line: it reflects the LIVE
-            // hostname (so a committed change shows immediately), marks
-            // uncommitted edits with the leading `[edit] `, and renders the
-            // context as `(config…)` (see repl::prompt_context).
-            let edit = if session.dirty() { "[edit] " } else { "" };
-            let prompt = format!(
-                "{edit}{user}@{}{}# ",
-                system::current_hostname(),
-                repl::prompt_context(&ctx)
-            );
+            // VyOS/JunOS-style prompt, re-rendered each line: the edit context
+            // appears as its own dimmed `[edit …]` banner line above the prompt
+            // (so the prompt itself stays short at any depth), the hostname is
+            // the LIVE one (a committed change shows immediately), and a `*`
+            // marks uncommitted edits (Nokia SR-OS style).
+            if !ctx.is_empty() {
+                eprintln!("{}", ui::dim(&repl::edit_banner(&ctx)));
+            }
+            let dirty = if session.dirty() { "*" } else { "" };
+            let prompt = format!("{user}@{}{dirty}# ", system::current_hostname());
             match rl.readline(&prompt) {
                 Ok(line) => {
                     let _ = rl.add_history_entry(line.as_str());

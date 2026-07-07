@@ -2,20 +2,28 @@
 
 ## [0.2.0] — 2026-07-07
 
-A large release. Sentinel gains a Cisco/vtysh-style hierarchical CLI, the full
-per-object routing surface, an on-box PKI, a REST management API, NAT64/DNS64,
-and a reboot-persistence fix — all still driving the one declarative config
-model.
+A large release. Sentinel gains a coherent VyOS/JunOS-style configuration
+shell, the full per-object routing surface, an on-box PKI, a REST management
+API, NAT64/DNS64, and a reboot-persistence fix — all still driving the one
+declarative config model.
 
 ### Added
 
-- **Hierarchical context CLI.** A Cisco / Dell OS / vtysh-style nested-context
-  shell layered on top of the flat VyOS-style grammar: enter contexts
-  (`interface eth0`, `protocols bgp`, `neighbor <ip>`, …), implicit `set`,
-  `no` to delete, `do` to run an operational command from config mode,
-  `exit`/`end`, and an IOS-style absolute-path mode switch that jumps between
-  contexts. Per-object configuration throughout (interfaces, rules, NAT, zones,
-  neighbors, areas).
+- **A single-paradigm configuration shell (pure VyOS/JunOS).** The config is a
+  tree and every command names a path in it: `set` / `delete` / `show` /
+  `edit` (+ `up` / `top` / `exit`), with the transactional `commit` /
+  `commit-confirm` / `save` / `rollback` / `compare` lifecycle. Every line
+  means exactly one thing — there is no implicit `set`, no bare-path context
+  shorthand, and no absolute-path mode switching. The edit context renders as
+  its own `[edit …]` banner line above a short prompt, and a `*` in the prompt
+  marks uncommitted edits. Per-object configuration throughout (interfaces,
+  rules, NAT, zones, neighbors, areas).
+- **A readable CLI presentation layer.** Grouped, aligned, coloured `help`
+  (with `help <command>` details and examples), contextual Tab/`?` completion
+  with per-keyword descriptions, colour-coded errors/warnings/success (TTY
+  only, `NO_COLOR` respected), and did-you-mean guidance — mistyped commands,
+  retired spellings (`no`/`do`/`end`), and bare config paths all point at the
+  correct VyOS spelling.
 - **Full per-neighbour BGP.** Every wren neighbor field is now reachable:
   `local-as`, `update-source`, `ebgp-multihop`, `description`, `shutdown`,
   `hold-time`, and more; route-maps via `[[protocols.filter]]`, communities,

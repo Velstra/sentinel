@@ -7,21 +7,53 @@ candidate, `compare` it, then `commit` (apply live) and/or `save` (persist).
 
 ```text
 $ sentinel configure
-sentinel# set system hostname fw-a
-sentinel# set interface eth0 zone wan
-sentinel# set interface eth0 address dhcp
-sentinel# compare
+admin@sentinel# set system hostname fw-a
+admin@sentinel*# set interface eth0 zone wan
+admin@sentinel*# set interface eth0 address dhcp
+admin@sentinel*# compare
      system {
 -        hostname sentinel
 +        hostname fw-a
      }
-sentinel# commit save
-sentinel# exit
+admin@sentinel*# commit
+✔ commit ok: applied live (not persisted — `save` to keep across reboot)
+admin@fw-a# save
+✔ saved /var/lib/sentinel/appliance.toml (persists across reboot)
+admin@fw-a# exit
 ```
 
 - **`commit`** applies the candidate to the running system (live).
 - **`save`** persists it to `/var/lib/sentinel/appliance.toml`.
-- **`commit save`** does both. See [the commit model](../architecture/commit-model.md).
+- A **`*`** in the prompt marks uncommitted edits.
+- See [the commit model](../architecture/commit-model.md).
+
+## One grammar, no modes
+
+The shell has exactly one rule: **every command names a path in the config
+tree**. There is no implicit `set`, no bare-path context shorthand, and no
+mode switching — a line always means exactly one thing. `help` shows a grouped
+command overview, `help <command>` details and examples, and a mistyped line
+answers with the correct spelling (`did you mean …`, or the explicit
+`set`/`edit` form when you typed a config path without a command).
+
+## Contexts (`edit`)
+
+`edit <path>` descends into any subtree; `set`, `delete`, and `show` are then
+relative to it. The position shows as an `[edit …]` banner line above the
+prompt:
+
+```text
+admin@fw-a# edit firewall rule web
+[edit firewall rule web]
+admin@fw-a# set from wan
+[edit firewall rule web]
+admin@fw-a*# set action accept
+```
+
+- **`up`** goes one level up (a keyword+instance pair like `interface eth0`
+  counts as one level).
+- **`top`** returns to the top of the tree.
+- **`exit`** returns to the top; at the top it leaves the session.
 
 ## The config tree
 
