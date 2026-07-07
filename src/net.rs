@@ -148,10 +148,18 @@ fn network_body(
     pd: Option<(&str, u8)>,
     mtu: Option<u16>,
     mac: Option<&str>,
+    description: Option<&str>,
+    disabled: bool,
 ) -> String {
     let v4dhcp = address == Some("dhcp");
     let v6dhcp = address6 == Some("dhcp");
-    let mut body = format!("[Match]\nName={iface}\n\n[Network]\n");
+    // An operator description becomes a comment header on the unit — documentary
+    // only, but it makes a generated `/run` unit self-explaining.
+    let mut body = String::new();
+    if let Some(desc) = description {
+        body.push_str(&format!("# {desc}\n"));
+    }
+    body.push_str(&format!("[Match]\nName={iface}\n\n[Network]\n"));
     // Static addresses (v4 then v6). "dhcp" is handled by the combined DHCP=
     // directive below; "auto" (v6) accepts RAs (SLAAC).
     if let Some(addr) = address {
@@ -227,6 +235,23 @@ fn network_body(
             body.push_str("EmitDNS=yes\n");
             body.push_str(&format!("DNS={}\n", d.dns.join(" ")));
         }
+        // An override default-router (option 3). Unset ⇒ networkd advertises the
+        // server's own address, so we emit nothing.
+        if let Some(gw) = &d.default_router {
+            body.push_str(&format!("EmitRouter=yes\nRouter={gw}\n"));
+        }
+        // A domain name (option 15) — networkd has no dedicated key, so use the
+        // generic SendOption escape hatch (`option:type:value`).
+        if let Some(domain) = &d.domain {
+            body.push_str(&format!("SendOption=15:string:{domain}\n"));
+        }
+        // Static reservations become one [DHCPServerStaticLease] section each
+        // (networkd keys on MAC + address; the CLI `name` is not emitted).
+        for lease in &d.static_mappings {
+            body.push_str("\n[DHCPServerStaticLease]\n");
+            body.push_str(&format!("MACAddress={}\n", lease.mac));
+            body.push_str(&format!("Address={}\n", lease.ip));
+        }
     }
 
     // IPv6 Router Advertisements: the [IPv6SendRA] flags/DNS, then one
@@ -254,15 +279,21 @@ fn network_body(
         }
     }
 
-    // Link tunables (MTU / MAC cloning) — a `[Link]` section networkd applies to
-    // the interface. Emitted only when either is set.
-    if mtu.is_some() || mac.is_some() {
+    // Link tunables (MTU / MAC cloning) plus an admin-down policy — a `[Link]`
+    // section networkd applies to the interface. Emitted only when something is
+    // set. `ActivationPolicy=down` keeps an administratively disabled interface
+    // down (networkd 257 also accepts `always-down`; `down` still allows a manual
+    // `ip link set up` for diagnostics, which is the friendlier default).
+    if mtu.is_some() || mac.is_some() || disabled {
         body.push_str("\n[Link]\n");
         if let Some(m) = mtu {
             body.push_str(&format!("MTUBytes={m}\n"));
         }
         if let Some(mac) = mac {
             body.push_str(&format!("MACAddress={mac}\n"));
+        }
+        if disabled {
+            body.push_str("ActivationPolicy=down\n");
         }
     }
     body
@@ -314,6 +345,16 @@ fn dnsmasq_conf_body(dns: &Dns) -> Option<String> {
     }
     for name in &dns.serve_on {
         body.push_str(&format!("interface={name}\n"));
+    }
+    // Cache sizing (dnsmasq default is 150) and the site's local domain: `local=`
+    // answers the domain authoritatively (never forwarded) and `domain=` hands it
+    // to clients as the DHCP/search suffix.
+    if let Some(n) = dns.cache_size {
+        body.push_str(&format!("cache-size={n}\n"));
+    }
+    if let Some(dom) = &dns.local_domain {
+        body.push_str(&format!("local=/{dom}/\n"));
+        body.push_str(&format!("domain={dom}\n"));
     }
     for (host, ip) in &dns.host_override {
         body.push_str(&format!("address=/{host}/{ip}\n"));
@@ -1161,6 +1202,7 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
                     || i.mtu.is_some()
                     || i.mac.is_some()
                     || i.qos.is_some()
+                    || i.disabled
                     || children.contains_key(i.name.as_str())
                     || pppoe_parents.contains(i.name.as_str()))
         })
@@ -1198,6 +1240,8 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
                     pd,
                     i.mtu,
                     i.mac.as_deref(),
+                    i.description.as_deref(),
+                    i.disabled,
                 ),
             ));
             keep.insert(name);
@@ -1293,7 +1337,7 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Pppoe, Qos, QosDiscipline};
+    use crate::config::{DhcpStaticLease, Pppoe, Qos, QosDiscipline};
 
     #[test]
     fn qos_qdisc_args_renders_cake_and_fq_codel() {
@@ -1369,6 +1413,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            false,
         );
         assert!(u.contains("Name=eth0"));
         assert!(u.contains("Address=10.0.0.1/24"));
@@ -1387,6 +1433,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            false,
         );
         assert!(u.contains("DHCP=yes"));
         assert!(!u.contains("Address="));
@@ -1430,6 +1478,8 @@ mod tests {
             ttl: Some(64),
             qos: None,
             pppoe: None,
+            description: None,
+            disabled: false,
         };
         let d = tunnel_netdev_body(&gre);
         assert!(d.contains("Name=gre0"), "{d}");
@@ -1464,6 +1514,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            false,
         );
         assert!(u.contains("VLAN=eth1.20"));
         assert!(u.contains("VLAN=eth1.30"));
@@ -1481,6 +1533,9 @@ mod tests {
             pool_size: Some(50),
             dns: vec!["10.0.0.1".into()],
             lease_time: Some(3600),
+            default_router: None,
+            domain: None,
+            static_mappings: vec![],
         };
         let u = network_body(
             "eth1",
@@ -1493,6 +1548,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            false,
         );
         // The static subnet is still bound, and the server is switched on.
         assert!(u.contains("Address=10.0.0.1/24"));
@@ -1513,6 +1570,9 @@ mod tests {
             pool_size: None,
             dns: vec![],
             lease_time: None,
+            default_router: None,
+            domain: None,
+            static_mappings: vec![],
         };
         let u = network_body(
             "eth1",
@@ -1525,11 +1585,94 @@ mod tests {
             None,
             None,
             None,
+            None,
+            false,
         );
         assert!(u.contains("DHCPServer=yes"));
         assert!(u.contains("[DHCPServer]"));
         assert!(!u.contains("EmitDNS"));
         assert!(!u.contains("DNS="));
+    }
+
+    #[test]
+    fn dhcp_server_renders_router_domain_and_static_leases() {
+        let dhcp = DhcpServer {
+            pool_offset: Some(100),
+            pool_size: Some(50),
+            dns: vec!["10.0.0.1".into()],
+            lease_time: Some(43_200),
+            default_router: Some("10.0.0.254".into()),
+            domain: Some("lan.example".into()),
+            static_mappings: vec![DhcpStaticLease {
+                name: "printer".into(),
+                mac: "52:54:00:12:34:56".into(),
+                ip: "10.0.0.20".into(),
+            }],
+        };
+        let u = network_body(
+            "eth1",
+            Some("10.0.0.1/24"),
+            None,
+            &[],
+            Some(&dhcp),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        // The override gateway (option 3) and domain (option 15).
+        assert!(u.contains("EmitRouter=yes"), "got:\n{u}");
+        assert!(u.contains("Router=10.0.0.254"), "got:\n{u}");
+        assert!(u.contains("SendOption=15:string:lan.example"), "got:\n{u}");
+        // The default lease time round-trips as networkd's key.
+        assert!(u.contains("DefaultLeaseTimeSec=43200"), "got:\n{u}");
+        // The static reservation becomes its own section keyed on MAC + address.
+        assert!(u.contains("[DHCPServerStaticLease]"), "got:\n{u}");
+        assert!(u.contains("MACAddress=52:54:00:12:34:56"), "got:\n{u}");
+        assert!(u.contains("Address=10.0.0.20"), "got:\n{u}");
+    }
+
+    #[test]
+    fn interface_description_and_disabled_render() {
+        // A description becomes a leading comment; `disabled` adds a [Link] with
+        // ActivationPolicy=down even when no MTU/MAC is set.
+        let u = network_body(
+            "eth7",
+            Some("10.0.0.1/24"),
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("office LAN"),
+            true,
+        );
+        assert!(u.starts_with("# office LAN\n"), "got:\n{u}");
+        assert!(u.contains("[Link]"), "got:\n{u}");
+        assert!(u.contains("ActivationPolicy=down"), "got:\n{u}");
+    }
+
+    #[test]
+    fn dnsmasq_renders_cache_size_and_local_domain() {
+        let dns = Dns {
+            upstream: vec!["9.9.9.9".into()],
+            serve_on: vec!["lan0".into()],
+            host_override: std::collections::BTreeMap::new(),
+            blocklist: vec![],
+            dnssec: None,
+            cache_size: Some(1000),
+            local_domain: Some("lan.example".into()),
+        };
+        let d = dnsmasq_conf_body(&dns).expect("LAN resolver configured");
+        assert!(d.contains("cache-size=1000"), "got:\n{d}");
+        assert!(d.contains("local=/lan.example/"), "got:\n{d}");
+        assert!(d.contains("domain=lan.example"), "got:\n{d}");
     }
 
     #[test]
@@ -1563,6 +1706,8 @@ mod tests {
             ttl: None,
             qos: None,
             pppoe: None,
+            description: None,
+            disabled: false,
         }];
         let body = chrony_conf_body(&ntp, &ifaces).expect("ntp configured");
         assert!(body.contains("server pool.ntp.org iburst"));
@@ -1593,6 +1738,8 @@ mod tests {
             host_override,
             blocklist: vec!["ads.example".into()],
             dnssec: None,
+            cache_size: None,
+            local_domain: None,
         };
         // resolved is the box's own forwarder: upstreams + DNSSEC, NO LAN stub.
         let r = resolved_dropin_body(&dns).expect("box forwarder configured");
@@ -1635,6 +1782,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            false,
         );
         assert!(wan.contains("DHCP=yes")); // v4 dhcp + v6 dhcp
         assert!(wan.contains("[DHCPv6]"));
@@ -1651,6 +1800,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            false,
         );
         assert!(wan6.contains("DHCP=ipv6"));
         // LAN downstream: request subnet 2 of the uplink's delegated prefix and
@@ -1666,6 +1817,8 @@ mod tests {
             Some(("wan0", 2)),
             None,
             None,
+            None,
+            false,
         );
         assert!(lan.contains("DHCPPrefixDelegation=yes"));
         assert!(lan.contains("[DHCPPrefixDelegation]"));
@@ -1687,6 +1840,8 @@ mod tests {
             None,
             Some(1492),
             Some("52:54:00:12:34:56"),
+            None,
+            false,
         );
         assert!(u.contains("[Link]"));
         assert!(u.contains("MTUBytes=1492"));
@@ -1702,6 +1857,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            false,
         );
         assert!(!plain.contains("[Link]"));
     }
@@ -1720,6 +1877,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            false,
         );
         assert!(u.contains("Address=10.0.0.1/24"));
         assert!(u.contains("Address=2001:db8:1::1/64"));
@@ -1735,6 +1894,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            false,
         );
         assert!(a.contains("DHCP=yes"));
         assert!(a.contains("IPv6AcceptRA=yes"));
@@ -1768,6 +1929,8 @@ mod tests {
             ttl: None,
             qos: None,
             pppoe: None,
+            description: None,
+            disabled: false,
         };
         let d = virtual_l2_netdev_body(&br);
         assert!(d.contains("Name=br0"));
@@ -1785,6 +1948,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            false,
         );
         assert!(member.contains("[Network]"));
         assert!(member.contains("Bridge=br0"));
@@ -1817,6 +1982,8 @@ mod tests {
             ttl: None,
             qos: None,
             pppoe: None,
+            description: None,
+            disabled: false,
         };
         let d = virtual_l2_netdev_body(&bond);
         assert!(d.contains("Kind=bond"));
@@ -1836,6 +2003,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            false,
         );
         assert!(member.contains("Bond=bond0"));
     }
@@ -1860,6 +2029,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            false,
         );
         // The enabling directive stays in [Network]; the detail sections follow.
         assert!(u.contains("IPv6SendRA=yes"));
@@ -1884,6 +2055,9 @@ mod tests {
             pool_size: Some(10),
             dns: vec![],
             lease_time: None,
+            default_router: None,
+            domain: None,
+            static_mappings: vec![],
         };
         let ra = RouterAdvert {
             prefixes: vec!["2001:db8:9::/64".into()],
@@ -1903,6 +2077,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            false,
         );
         let network_hdr = u.find("[Network]").unwrap();
         let first_subsection = u.find("[DHCPServer]").unwrap();
@@ -1947,6 +2123,8 @@ mod tests {
             ttl: None,
             qos: None,
             pppoe: None,
+            description: None,
+            disabled: false,
         };
         let d = wireguard_netdev_body(&iface);
         assert!(d.contains("Kind=wireguard"));
@@ -1993,6 +2171,8 @@ mod tests {
                 ac_name: None,
                 mru: None,
             }),
+            description: None,
+            disabled: false,
         }
     }
 

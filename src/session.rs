@@ -13,12 +13,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::config::{
-    Action, Appliance, Bfd, Bgp, BgpAggregate, BgpNeighbor, BgpRoa, BgpRtr, DhcpServer, Dns,
-    Export, Filter, FilterRule, Firewall, Groups, HealthCheck, IfaceType, Interface,
-    IpsecConnection, Isis, MultiWan, Multicast, MulticastInterface, Nat, NatDestination, NatSource,
-    Ntp, Ospf, Ospf3, OspfInterface, PortSpec, Pppoe, Proto, Protocols, Qos, QosDiscipline, Rip,
-    RouterAdvert, Rule, Services, StaticRoute, System, Vpn, VrfDef, Vrrp, WanMode, WanUplink,
-    WgPeer, ZoneCfg,
+    Action, Appliance, Bfd, Bgp, BgpAggregate, BgpNeighbor, BgpRoa, BgpRtr, DhcpServer,
+    DhcpStaticLease, Dns, Export, Filter, FilterRule, Firewall, Groups, HealthCheck, IfaceType,
+    Interface, IpsecConnection, Isis, MultiWan, Multicast, MulticastInterface, Nat, NatDestination,
+    NatSource, Ntp, Ospf, Ospf3, OspfInterface, PortSpec, Pppoe, Proto, Protocols, Qos,
+    QosDiscipline, Rip, RouterAdvert, Rule, Services, StaticRoute, System, Vpn, VrfDef, Vrrp,
+    WanMode, WanUplink, WgPeer, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -28,6 +28,9 @@ pub const DEFAULT_CONFIG: &str = "/var/lib/sentinel/appliance.toml";
 /// A partially-specified interface (fields filled in incrementally).
 #[derive(Debug, Clone, Default)]
 struct IfaceDraft {
+    // Documentary label + administrative disable.
+    description: Option<String>,
+    disabled: Option<bool>,
     zone: Option<String>,
     address: Option<String>,
     address6: Option<String>,
@@ -135,6 +138,31 @@ struct DhcpServerDraft {
     pool_size: Option<u32>,
     dns: Vec<String>,
     lease_time: Option<u32>,
+    default_router: Option<String>,
+    domain: Option<String>,
+    // Static reservations, keyed by their CLI name in configuration order.
+    static_mappings: Vec<(String, StaticLeaseDraft)>,
+}
+
+/// A partially-specified static DHCP reservation (mac + ip filled in
+/// incrementally, keyed by name in the parent [`DhcpServerDraft`]).
+#[derive(Debug, Clone, Default)]
+struct StaticLeaseDraft {
+    mac: Option<String>,
+    ip: Option<String>,
+}
+
+impl DhcpServerDraft {
+    /// Mutable access to the static reservation named `name`, inserting it if new
+    /// (reservations are keyed by their CLI name in configuration order).
+    fn static_lease_mut(&mut self, name: &str) -> &mut StaticLeaseDraft {
+        if let Some(i) = self.static_mappings.iter().position(|(n, _)| n == name) {
+            return &mut self.static_mappings[i].1;
+        }
+        self.static_mappings
+            .push((name.to_string(), StaticLeaseDraft::default()));
+        &mut self.static_mappings.last_mut().unwrap().1
+    }
 }
 
 /// A partially-specified IPv6 Router Advertiser (fields filled in incrementally).
@@ -159,6 +187,8 @@ struct PeerDraft {
 /// A partially-specified rule.
 #[derive(Debug, Clone, Default)]
 struct RuleDraft {
+    description: Option<String>,
+    disabled: Option<bool>,
     from: Option<String>,
     to: Option<String>,
     action: Option<Action>,
@@ -173,12 +203,16 @@ struct RuleDraft {
 /// A partially-specified source-NAT (masquerade) rule.
 #[derive(Debug, Clone, Default)]
 struct NatSrcDraft {
+    description: Option<String>,
+    disabled: Option<bool>,
     zone: Option<String>,
 }
 
 /// A partially-specified destination-NAT (port-forward) rule.
 #[derive(Debug, Clone, Default)]
 struct NatDstDraft {
+    description: Option<String>,
+    disabled: Option<bool>,
     zone: Option<String>,
     proto: Option<Proto>,
     port: Option<u16>,
@@ -188,6 +222,7 @@ struct NatDstDraft {
 /// A partially-specified per-zone posture override.
 #[derive(Debug, Clone, Default)]
 struct ZoneDraft {
+    description: Option<String>,
     stateful: Option<bool>,
     block_icmp: Option<bool>,
     blocklist: Vec<String>,
@@ -290,6 +325,12 @@ struct NeighborDraft {
     bfd_auth_type: Option<String>,
     bfd_auth_key_id: Option<u8>,
     bfd_auth_key: Option<String>,
+    local_as: Option<u32>,
+    update_source: Option<String>,
+    ebgp_multihop: Option<u8>,
+    description: Option<String>,
+    shutdown: bool,
+    hold_time: Option<u16>,
 }
 
 impl BgpDraft {
@@ -603,6 +644,12 @@ fn neighbor_to_draft(n: &BgpNeighbor) -> NeighborDraft {
         bfd_auth_type: n.bfd_auth_type.clone(),
         bfd_auth_key_id: n.bfd_auth_key_id,
         bfd_auth_key: n.bfd_auth_key.clone(),
+        local_as: n.local_as,
+        update_source: n.update_source.clone(),
+        ebgp_multihop: n.ebgp_multihop,
+        description: n.description.clone(),
+        shutdown: n.shutdown,
+        hold_time: n.hold_time,
     }
 }
 
@@ -722,6 +769,12 @@ fn neighbor_from_draft(address: &str, n: &NeighborDraft) -> Result<BgpNeighbor> 
         bfd_auth_type: n.bfd_auth_type.clone(),
         bfd_auth_key_id: n.bfd_auth_key_id,
         bfd_auth_key: n.bfd_auth_key.clone(),
+        local_as: n.local_as,
+        update_source: n.update_source.clone(),
+        ebgp_multihop: n.ebgp_multihop,
+        description: n.description.clone(),
+        shutdown: n.shutdown,
+        hold_time: n.hold_time,
     })
 }
 
@@ -967,6 +1020,8 @@ struct DnsDraft {
     host_override: BTreeMap<String, String>,
     blocklist: Vec<String>,
     dnssec: Option<String>,
+    cache_size: Option<u32>,
+    local_domain: Option<String>,
 }
 
 /// A partially-specified NTP server (`[services.ntp]`).
@@ -1178,6 +1233,7 @@ impl Draft {
                     (
                         name.clone(),
                         ZoneDraft {
+                            description: z.description.clone(),
                             stateful: z.stateful,
                             block_icmp: z.block_icmp,
                             blocklist: z.blocklist.clone(),
@@ -1194,6 +1250,10 @@ impl Draft {
                     (
                         i.name.clone(),
                         IfaceDraft {
+                            description: i.description.clone(),
+                            // Only carry the flag when set, so a round-trip never
+                            // renders `disabled false`.
+                            disabled: i.disabled.then_some(true),
                             zone: i.zone.clone(),
                             address: i.address.clone(),
                             address6: i.address6.clone(),
@@ -1223,6 +1283,21 @@ impl Draft {
                                 pool_size: d.pool_size,
                                 dns: d.dns.clone(),
                                 lease_time: d.lease_time,
+                                default_router: d.default_router.clone(),
+                                domain: d.domain.clone(),
+                                static_mappings: d
+                                    .static_mappings
+                                    .iter()
+                                    .map(|l| {
+                                        (
+                                            l.name.clone(),
+                                            StaticLeaseDraft {
+                                                mac: Some(l.mac.clone()),
+                                                ip: Some(l.ip.clone()),
+                                            },
+                                        )
+                                    })
+                                    .collect(),
                             }),
                             router_advert: i.router_advert.as_ref().map(|r| RouterAdvertDraft {
                                 prefixes: r.prefixes.clone(),
@@ -1269,6 +1344,8 @@ impl Draft {
                     (
                         r.name.clone(),
                         RuleDraft {
+                            description: r.description.clone(),
+                            disabled: r.disabled.then_some(true),
                             from: Some(r.from.clone()),
                             to: Some(r.to.clone()),
                             action: Some(r.action),
@@ -1290,6 +1367,8 @@ impl Draft {
                     (
                         s.name.clone(),
                         NatSrcDraft {
+                            description: s.description.clone(),
+                            disabled: s.disabled.then_some(true),
                             zone: Some(s.zone.clone()),
                         },
                     )
@@ -1303,6 +1382,8 @@ impl Draft {
                     (
                         d.name.clone(),
                         NatDstDraft {
+                            description: d.description.clone(),
+                            disabled: d.disabled.then_some(true),
                             zone: Some(d.zone.clone()),
                             proto: Some(d.proto),
                             port: Some(d.port),
@@ -1491,6 +1572,8 @@ impl Draft {
                 host_override: a.services.dns.host_override.clone(),
                 blocklist: a.services.dns.blocklist.clone(),
                 dnssec: a.services.dns.dnssec.clone(),
+                cache_size: a.services.dns.cache_size,
+                local_domain: a.services.dns.local_domain.clone(),
             },
             ntp: NtpDraft {
                 upstream: a.services.ntp.upstream.clone(),
@@ -1670,6 +1753,16 @@ impl Session {
             ["system", "hostname", v] => self.draft.hostname = Some((*v).to_string()),
 
             // Interfaces (incl. VLAN subinterfaces).
+            // A free-text description may contain spaces, so the tail is captured
+            // and rejoined; `disabled` is a bool.
+            ["interface", name, "description", rest @ ..] if !rest.is_empty() => {
+                let desc = rest.join(" ");
+                crate::config::validate_description(&desc)?;
+                self.draft.iface_mut(name).description = Some(desc);
+            }
+            ["interface", name, "disabled", v] => {
+                self.draft.iface_mut(name).disabled = Some(parse_bool(v)?);
+            }
             ["interface", name, "zone", v] => {
                 self.draft.iface_mut(name).zone = Some((*v).to_string())
             }
@@ -1776,10 +1869,71 @@ impl Session {
                 self.draft.iface_mut(name).dhcp_mut().dns = servers;
             }
             ["interface", name, "dhcp-server", "lease-time", v] => {
-                let lease: u32 = v
-                    .parse()
-                    .with_context(|| format!("invalid lease-time {v:?}"))?;
+                // Accept a human duration (`12h`, `1h30m`) or bare seconds.
+                let lease = parse_duration_secs(v)?;
                 self.draft.iface_mut(name).dhcp_mut().lease_time = Some(lease);
+            }
+            ["interface", name, "dhcp-server", "default-router", v] => {
+                validate_ipv4(v)?;
+                self.draft.iface_mut(name).dhcp_mut().default_router = Some((*v).to_string());
+            }
+            ["interface", name, "dhcp-server", "domain", v] => {
+                self.draft.iface_mut(name).dhcp_mut().domain = Some((*v).to_string());
+            }
+            // A static reservation: `static-mapping <name> mac <mac> ip <ip>` in
+            // one line, or the mac/ip set separately (both filled by commit).
+            [
+                "interface",
+                name,
+                "dhcp-server",
+                "static-mapping",
+                lname,
+                "mac",
+                mac,
+                "ip",
+                ip,
+            ] => {
+                crate::config::validate_mac(mac)?;
+                validate_ipv4(ip)?;
+                let lease = self
+                    .draft
+                    .iface_mut(name)
+                    .dhcp_mut()
+                    .static_lease_mut(lname);
+                lease.mac = Some((*mac).to_string());
+                lease.ip = Some((*ip).to_string());
+            }
+            [
+                "interface",
+                name,
+                "dhcp-server",
+                "static-mapping",
+                lname,
+                "mac",
+                mac,
+            ] => {
+                crate::config::validate_mac(mac)?;
+                self.draft
+                    .iface_mut(name)
+                    .dhcp_mut()
+                    .static_lease_mut(lname)
+                    .mac = Some((*mac).to_string());
+            }
+            [
+                "interface",
+                name,
+                "dhcp-server",
+                "static-mapping",
+                lname,
+                "ip",
+                ip,
+            ] => {
+                validate_ipv4(ip)?;
+                self.draft
+                    .iface_mut(name)
+                    .dhcp_mut()
+                    .static_lease_mut(lname)
+                    .ip = Some((*ip).to_string());
             }
 
             // IPv6 Router Advertisements (SLAAC) on an interface. `enable` just
@@ -1974,6 +2128,11 @@ impl Session {
             }
 
             // firewall zone <name>: per-zone posture overrides.
+            ["firewall", "zone", name, "description", rest @ ..] if !rest.is_empty() => {
+                let desc = rest.join(" ");
+                crate::config::validate_description(&desc)?;
+                self.draft.zone_mut(name).description = Some(desc);
+            }
             ["firewall", "zone", name, "stateful", v] => {
                 self.draft.zone_mut(name).stateful = Some(parse_bool(v)?)
             }
@@ -1992,6 +2151,14 @@ impl Session {
             }
 
             // firewall rule <name>: zone-to-zone rules.
+            ["firewall", "rule", name, "description", rest @ ..] if !rest.is_empty() => {
+                let desc = rest.join(" ");
+                crate::config::validate_description(&desc)?;
+                self.draft.rule_mut(name).description = Some(desc);
+            }
+            ["firewall", "rule", name, "disabled", v] => {
+                self.draft.rule_mut(name).disabled = Some(parse_bool(v)?)
+            }
             ["firewall", "rule", name, "from", v] => {
                 self.draft.rule_mut(name).from = Some((*v).to_string())
             }
@@ -2046,11 +2213,27 @@ impl Session {
             // --- nat { … } — address translation, its own top-level node ---
 
             // nat source <name>: masquerade (SNAT) a zone's outbound traffic.
+            ["nat", "source", name, "description", rest @ ..] if !rest.is_empty() => {
+                let desc = rest.join(" ");
+                crate::config::validate_description(&desc)?;
+                self.draft.nat_source_mut(name).description = Some(desc);
+            }
+            ["nat", "source", name, "disabled", v] => {
+                self.draft.nat_source_mut(name).disabled = Some(parse_bool(v)?)
+            }
             ["nat", "source", name, "zone", v] => {
                 self.draft.nat_source_mut(name).zone = Some((*v).to_string())
             }
 
             // nat destination <name>: inbound DNAT port-forward.
+            ["nat", "destination", name, "description", rest @ ..] if !rest.is_empty() => {
+                let desc = rest.join(" ");
+                crate::config::validate_description(&desc)?;
+                self.draft.nat_destination_mut(name).description = Some(desc);
+            }
+            ["nat", "destination", name, "disabled", v] => {
+                self.draft.nat_destination_mut(name).disabled = Some(parse_bool(v)?)
+            }
             ["nat", "destination", name, "zone", v] => {
                 self.draft.nat_destination_mut(name).zone = Some((*v).to_string())
             }
@@ -2100,6 +2283,15 @@ impl Session {
                     );
                 }
                 self.draft.dns.dnssec = Some((*v).to_string());
+            }
+            ["services", "dns", "cache-size", v] => {
+                self.draft.dns.cache_size = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid cache-size {v:?}"))?,
+                );
+            }
+            ["services", "dns", "local-domain", v] => {
+                self.draft.dns.local_domain = Some((*v).to_string());
             }
 
             // services ntp: the box-wide LAN NTP server (chrony).
@@ -2220,6 +2412,20 @@ impl Session {
                     v.parse()
                         .with_context(|| format!("invalid max-length {v:?}"))?,
                 );
+            }
+            // A neighbour description may contain spaces, so its tail is
+            // captured and rejoined (like interface/rule descriptions).
+            [
+                "protocols",
+                "bgp",
+                "neighbor",
+                addr,
+                "description",
+                rest @ ..,
+            ] if !rest.is_empty() => {
+                let desc = rest.join(" ");
+                crate::config::validate_description(&desc)?;
+                self.draft.bgp_neighbor_mut(addr).description = Some(desc);
             }
             ["protocols", "bgp", "neighbor", addr, field, v] => {
                 self.set_neighbor_field(addr, field, v)?;
@@ -2814,7 +3020,7 @@ impl Session {
                  set protocols bgp <local-as <n> | router-id <ip> | hold-time <n> | network <prefix> | redistribute <src> | community <c> | multipath <n>>\n  \
                  set protocols bgp <confederation id <n> | confederation member <n> | rpki reject-invalid <bool> | rpki rtr <host:port> | ebgp-require-policy <bool>>\n  \
                  set protocols bgp aggregate <prefix> summary-only <bool>\n  \
-                 set protocols bgp neighbor <ip> <remote-as <n> | passive <bool> | route-reflector-client <bool> | password <k> | ttl-security <n> | max-prefix <n> | role <r> | import <f> | export <f> | bfd <bool> | ...>\n  \
+                 set protocols bgp neighbor <ip> <remote-as <n> | local-as <n> | update-source <ip> | ebgp-multihop <n> | description <text> | shutdown <bool> | hold-time <s> | passive <bool> | route-reflector-client <bool> | password <k> | ttl-security <n> | max-prefix <n> | role <r> | import <f> | export <f> | bfd <bool> | ...>\n  \
                  set protocols filter <name> default <accept|reject>\n  \
                  set protocols filter <name> rule <n> <prefix <p> | protocol <p> | metric-le <n> | set-metric <n> | set-community <c> | action <accept|reject> | ...>\n  \
                  set protocols ospf <interface <if> [area <id>] | area <id> | router-priority <n> | cost <n> | network-type <..> | passive-interface <if> | redistribute <src> | redistribute-metric <n> | stub-area <id> | nssa-area <id> | auth-type <none|text|md5> | auth-key <k> | hello-interval <n> | dead-interval <n> | graceful-restart <bool> | bfd <bool> | vrf <name>>\n  \
@@ -2903,6 +3109,12 @@ impl Session {
             "bfd-auth-type" => n.bfd_auth_type = None,
             "bfd-auth-key-id" => n.bfd_auth_key_id = None,
             "bfd-auth-key" => n.bfd_auth_key = None,
+            "local-as" => n.local_as = None,
+            "update-source" => n.update_source = None,
+            "ebgp-multihop" => n.ebgp_multihop = None,
+            "description" => n.description = None,
+            "shutdown" => n.shutdown = false,
+            "hold-time" => n.hold_time = None,
             other => bail!("bgp neighbor has no field {other:?}"),
         }
         Ok(())
@@ -2976,6 +3188,24 @@ impl Session {
                     Some(v.parse().with_context(|| format!("invalid key-id {v:?}"))?)
             }
             "bfd-auth-key" => n.bfd_auth_key = Some(v.to_string()),
+            "local-as" => {
+                n.local_as = Some(v.parse().with_context(|| format!("invalid AS {v:?}"))?)
+            }
+            "update-source" => n.update_source = Some(v.to_string()),
+            "ebgp-multihop" => {
+                n.ebgp_multihop = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid ebgp-multihop {v:?}"))?,
+                )
+            }
+            "description" => n.description = Some(v.to_string()),
+            "shutdown" => n.shutdown = parse_bool(v)?,
+            "hold-time" => {
+                n.hold_time = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid hold-time {v:?}"))?,
+                )
+            }
             other => bail!("bgp neighbor has no field {other:?}"),
         }
         Ok(())
@@ -3033,6 +3263,8 @@ impl Session {
                     bail!("no interface {name:?}");
                 }
             }
+            ["interface", name, "description"] => self.iface(name)?.description = None,
+            ["interface", name, "disabled"] => self.iface(name)?.disabled = None,
             ["interface", name, "address"] => self.iface(name)?.address = None,
             ["interface", name, "address6"] => self.iface(name)?.address6 = None,
             ["interface", name, "pd-from"] => self.iface(name)?.pd_from = None,
@@ -3111,6 +3343,18 @@ impl Session {
                 }
             }
             ["interface", name, "dhcp-server"] => self.iface(name)?.dhcp_server = None,
+            // A single static reservation by name (before the catch-all field arm).
+            ["interface", name, "dhcp-server", "static-mapping", lname] => {
+                let i = self.iface(name)?;
+                let Some(d) = i.dhcp_server.as_mut() else {
+                    bail!("interface {name:?} has no dhcp-server");
+                };
+                let before = d.static_mappings.len();
+                d.static_mappings.retain(|(n, _)| n != lname);
+                if d.static_mappings.len() == before {
+                    bail!("interface {name:?} dhcp-server has no static-mapping {lname:?}");
+                }
+            }
             ["interface", name, "dhcp-server", field] => {
                 let i = self.iface(name)?;
                 let Some(d) = i.dhcp_server.as_mut() else {
@@ -3121,6 +3365,8 @@ impl Session {
                     "pool-size" => d.pool_size = None,
                     "dns" => d.dns.clear(),
                     "lease-time" => d.lease_time = None,
+                    "default-router" => d.default_router = None,
+                    "domain" => d.domain = None,
                     other => bail!("dhcp-server has no field {other:?}"),
                 }
             }
@@ -3181,6 +3427,7 @@ impl Session {
                     .get_mut(*name)
                     .ok_or_else(|| anyhow::anyhow!("no zone {name:?}"))?;
                 match *field {
+                    "description" => z.description = None,
                     "stateful" => z.stateful = None,
                     "block-icmp" => z.block_icmp = None,
                     "default-action" => z.default_action = None,
@@ -3200,6 +3447,8 @@ impl Session {
             ["firewall", "rule", name, field] => {
                 let r = self.rule(name)?;
                 match *field {
+                    "description" => r.description = None,
+                    "disabled" => r.disabled = None,
                     "from" => r.from = None,
                     "to" => r.to = None,
                     "action" => r.action = None,
@@ -3233,8 +3482,14 @@ impl Session {
                     bail!("no nat source {name:?}");
                 }
             }
-            ["nat", "source", name, "zone"] => {
-                self.nat_source(name)?.zone = None;
+            ["nat", "source", name, field] => {
+                let s = self.nat_source(name)?;
+                match *field {
+                    "zone" => s.zone = None,
+                    "description" => s.description = None,
+                    "disabled" => s.disabled = None,
+                    other => bail!("nat source has no field {other:?}"),
+                }
             }
 
             // nat destination <name>
@@ -3248,6 +3503,8 @@ impl Session {
             ["nat", "destination", name, field] => {
                 let d = self.nat_destination(name)?;
                 match *field {
+                    "description" => d.description = None,
+                    "disabled" => d.disabled = None,
                     "zone" => d.zone = None,
                     "proto" => d.proto = None,
                     "port" => d.port = None,
@@ -3284,6 +3541,8 @@ impl Session {
                     "host-override" => d.host_override.clear(),
                     "blocklist" => d.blocklist.clear(),
                     "dnssec" => d.dnssec = None,
+                    "cache-size" => d.cache_size = None,
+                    "local-domain" => d.local_domain = None,
                     other => bail!("services dns has no field {other:?}"),
                 }
             }
@@ -3859,6 +4118,8 @@ impl Session {
             .iter()
             .map(|(name, d)| Interface {
                 name: name.clone(),
+                description: d.description.clone(),
+                disabled: d.disabled.unwrap_or(false),
                 zone: d.zone.clone(),
                 address: d.address.clone(),
                 address6: d.address6.clone(),
@@ -3884,6 +4145,19 @@ impl Session {
                     pool_size: s.pool_size,
                     dns: s.dns.clone(),
                     lease_time: s.lease_time,
+                    default_router: s.default_router.clone(),
+                    domain: s.domain.clone(),
+                    // A reservation missing its mac/ip becomes empty strings that
+                    // `validate` rejects with a clear error (mirrors pppoe above).
+                    static_mappings: s
+                        .static_mappings
+                        .iter()
+                        .map(|(lname, l)| DhcpStaticLease {
+                            name: lname.clone(),
+                            mac: l.mac.clone().unwrap_or_default(),
+                            ip: l.ip.clone().unwrap_or_default(),
+                        })
+                        .collect(),
                 }),
                 router_advert: d.router_advert.as_ref().map(|r| RouterAdvert {
                     prefixes: r.prefixes.clone(),
@@ -3932,6 +4206,8 @@ impl Session {
             .map(|(name, d)| {
                 Ok(Rule {
                     name: name.clone(),
+                    description: d.description.clone(),
+                    disabled: d.disabled.unwrap_or(false),
                     from: d
                         .from
                         .clone()
@@ -3969,6 +4245,7 @@ impl Session {
                 (
                     name.clone(),
                     ZoneCfg {
+                        description: z.description.clone(),
                         stateful: z.stateful,
                         block_icmp: z.block_icmp,
                         blocklist: z.blocklist.clone(),
@@ -3985,6 +4262,8 @@ impl Session {
             .map(|(name, d)| {
                 Ok(NatSource {
                     name: name.clone(),
+                    description: d.description.clone(),
+                    disabled: d.disabled.unwrap_or(false),
                     zone: d
                         .zone
                         .clone()
@@ -3999,6 +4278,8 @@ impl Session {
                 .map(|(name, d)| {
                     Ok(NatDestination {
                         name: name.clone(),
+                        description: d.description.clone(),
+                        disabled: d.disabled.unwrap_or(false),
                         zone: d.zone.clone().ok_or_else(|| {
                             anyhow::anyhow!("nat destination {name:?}: zone not set")
                         })?,
@@ -4304,6 +4585,8 @@ impl Session {
                     host_override: self.draft.dns.host_override.clone(),
                     blocklist: self.draft.dns.blocklist.clone(),
                     dnssec: self.draft.dns.dnssec.clone(),
+                    cache_size: self.draft.dns.cache_size,
+                    local_domain: self.draft.dns.local_domain.clone(),
                 },
                 ntp: Ntp {
                     upstream: self.draft.ntp.upstream.clone(),
@@ -4410,6 +4693,8 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             break;
         }
         if skip_empty_ifaces
+            && i.description.is_none()
+            && i.disabled != Some(true)
             && i.zone.is_none()
             && i.address.is_none()
             && i.address6.is_none()
@@ -4437,6 +4722,12 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             continue;
         }
         out.push_str(&format!("interface {name} {{\n"));
+        if let Some(desc) = &i.description {
+            out.push_str(&format!("    description {desc}\n"));
+        }
+        if i.disabled == Some(true) {
+            out.push_str("    disabled true\n");
+        }
         if let Some(ty) = i.if_type {
             let s = match ty {
                 IfaceType::Bridge => "bridge",
@@ -4590,6 +4881,22 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             if let Some(lease) = d.lease_time {
                 out.push_str(&format!("        lease-time {lease}\n"));
             }
+            if let Some(gw) = &d.default_router {
+                out.push_str(&format!("        default-router {gw}\n"));
+            }
+            if let Some(dom) = &d.domain {
+                out.push_str(&format!("        domain {dom}\n"));
+            }
+            for (lname, l) in &d.static_mappings {
+                out.push_str(&format!("        static-mapping {lname} {{\n"));
+                if let Some(mac) = &l.mac {
+                    out.push_str(&format!("            mac {mac}\n"));
+                }
+                if let Some(ip) = &l.ip {
+                    out.push_str(&format!("            ip {ip}\n"));
+                }
+                out.push_str("        }\n");
+            }
             out.push_str("    }\n");
         }
         if let Some(r) = &i.router_advert {
@@ -4645,6 +4952,9 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
     }
     for (name, z) in &draft.zones {
         fwi.push_str(&format!("    zone {name} {{\n"));
+        if let Some(desc) = &z.description {
+            fwi.push_str(&format!("        description {desc}\n"));
+        }
         if let Some(s) = z.stateful {
             fwi.push_str(&format!("        stateful {s}\n"));
         }
@@ -4683,6 +4993,12 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
     }
     for (name, r) in &draft.rules {
         fwi.push_str(&format!("    rule {name} {{\n"));
+        if let Some(desc) = &r.description {
+            fwi.push_str(&format!("        description {desc}\n"));
+        }
+        if r.disabled == Some(true) {
+            fwi.push_str("        disabled true\n");
+        }
         if let Some(z) = &r.from {
             fwi.push_str(&format!("        from {z}\n"));
         }
@@ -4723,6 +5039,12 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
     let mut nati = String::new();
     for (name, s) in &draft.nat_source {
         nati.push_str(&format!("    source {name} {{\n"));
+        if let Some(desc) = &s.description {
+            nati.push_str(&format!("        description {desc}\n"));
+        }
+        if s.disabled == Some(true) {
+            nati.push_str("        disabled true\n");
+        }
         if let Some(z) = &s.zone {
             nati.push_str(&format!("        zone {z}\n"));
         }
@@ -4730,6 +5052,12 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
     }
     for (name, d) in &draft.nat_destination {
         nati.push_str(&format!("    destination {name} {{\n"));
+        if let Some(desc) = &d.description {
+            nati.push_str(&format!("        description {desc}\n"));
+        }
+        if d.disabled == Some(true) {
+            nati.push_str("        disabled true\n");
+        }
         if let Some(z) = &d.zone {
             nati.push_str(&format!("        zone {z}\n"));
         }
@@ -5085,7 +5413,9 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         && d.serve_on.is_empty()
         && d.host_override.is_empty()
         && d.blocklist.is_empty()
-        && d.dnssec.is_none());
+        && d.dnssec.is_none()
+        && d.cache_size.is_none()
+        && d.local_domain.is_none());
     let ntp_set = !(n.upstream.is_empty() && n.serve_on.is_empty());
     if want("services") && (dns_set || ntp_set) {
         out.push_str("services {\n");
@@ -5105,6 +5435,12 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             }
             if let Some(mode) = &d.dnssec {
                 out.push_str(&format!("        dnssec {mode}\n"));
+            }
+            if let Some(n) = d.cache_size {
+                out.push_str(&format!("        cache-size {n}\n"));
+            }
+            if let Some(dom) = &d.local_domain {
+                out.push_str(&format!("        local-domain {dom}\n"));
             }
             out.push_str("    }\n");
         }
@@ -5359,6 +5695,11 @@ fn render_neighbor(out: &mut String, addr: &str, n: &NeighborDraft) {
         n.bfd_auth_key_id.map(|v| v.to_string()),
     );
     push_field(out, "bfd-auth-key", n.bfd_auth_key.clone());
+    push_field(out, "local-as", n.local_as.map(|v| v.to_string()));
+    push_field(out, "update-source", n.update_source.clone());
+    push_field(out, "ebgp-multihop", n.ebgp_multihop.map(|v| v.to_string()));
+    push_field(out, "description", n.description.clone());
+    push_field(out, "hold-time", n.hold_time.map(|v| v.to_string()));
     for (k, set) in [
         ("passive", n.passive),
         ("route-reflector-client", n.route_reflector_client),
@@ -5370,6 +5711,7 @@ fn render_neighbor(out: &mut String, addr: &str, n: &NeighborDraft) {
         ("srpolicy", n.srpolicy),
         ("link-state", n.link_state),
         ("bfd", n.bfd),
+        ("shutdown", n.shutdown),
     ] {
         if set {
             out.push_str(&format!("            {k} true\n"));
@@ -5424,6 +5766,53 @@ fn parse_bool(s: &str) -> Result<bool> {
         "false" | "off" | "no" => false,
         _ => bail!("invalid boolean {s:?} (expected true|false)"),
     })
+}
+
+/// Parse a lease-time as a human duration into seconds. Accepts a bare number
+/// (seconds — the historical form) or a compound of `<n>d`/`<n>h`/`<n>m`/`<n>s`
+/// units (`12h`, `1h30m`, `7d`). Rejects empty, zero, or unknown units — the
+/// resolved seconds render as networkd `DefaultLeaseTimeSec=`.
+fn parse_duration_secs(s: &str) -> Result<u32> {
+    if s.is_empty() {
+        bail!("empty lease-time");
+    }
+    // A bare number is seconds (back-compatible with the old u32 form).
+    if let Ok(n) = s.parse::<u32>() {
+        if n == 0 {
+            bail!("lease-time must be greater than zero");
+        }
+        return Ok(n);
+    }
+    let mut total: u64 = 0;
+    let mut num = String::new();
+    let mut saw_unit = false;
+    for c in s.chars() {
+        if c.is_ascii_digit() {
+            num.push(c);
+            continue;
+        }
+        if num.is_empty() {
+            bail!("invalid lease-time {s:?}: expected <n>d/<n>h/<n>m/<n>s or bare seconds");
+        }
+        let v: u64 = num.parse().unwrap();
+        let mult = match c {
+            'd' => 86_400,
+            'h' => 3_600,
+            'm' => 60,
+            's' => 1,
+            _ => bail!("invalid lease-time unit {c:?} in {s:?} (use d/h/m/s)"),
+        };
+        total += v * mult;
+        num.clear();
+        saw_unit = true;
+    }
+    if !num.is_empty() {
+        bail!("invalid lease-time {s:?}: trailing number without a unit");
+    }
+    if !saw_unit || total == 0 {
+        bail!("lease-time {s:?} resolves to zero");
+    }
+    u32::try_from(total).map_err(|_| anyhow::anyhow!("lease-time {s:?} is too large"))
 }
 
 fn parse_wan_mode(s: &str) -> Result<WanMode> {
@@ -5864,6 +6253,172 @@ mod tests {
         run(&mut s, "delete nat source wan-masq").unwrap();
         assert!(s.commit().is_ok());
         assert!(run(&mut s, "delete nat destination nope").is_err());
+    }
+
+    #[test]
+    fn per_object_polish_sets_shows_commits_and_round_trips() {
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname fw1",
+            // Interface description + administrative disable.
+            "set interface wan0 zone wan",
+            "set interface wan0 address dhcp",
+            "set interface lan0 zone lan",
+            "set interface lan0 address 10.0.0.1/24",
+            "set interface lan0 description office LAN uplink",
+            "set interface dmz0 zone dmz",
+            "set interface dmz0 disabled true",
+            // DHCP server with the new options + a one-line static reservation.
+            "set interface lan0 dhcp-server pool-offset 100",
+            "set interface lan0 dhcp-server pool-size 100",
+            "set interface lan0 dhcp-server dns 10.0.0.1",
+            "set interface lan0 dhcp-server lease-time 12h",
+            "set interface lan0 dhcp-server default-router 10.0.0.254",
+            "set interface lan0 dhcp-server domain lan.example",
+            "set interface lan0 dhcp-server static-mapping printer mac 52:54:00:12:34:56 ip 10.0.0.20",
+            // Zone description + rule description/disabled.
+            "set firewall zone lan description trusted inside",
+            "set firewall rule web description inbound https",
+            "set firewall rule web from wan",
+            "set firewall rule web to lan",
+            "set firewall rule web action accept",
+            "set firewall rule web proto tcp",
+            "set firewall rule web port 443",
+            "set firewall rule parked from wan",
+            "set firewall rule parked to lan",
+            "set firewall rule parked action accept",
+            "set firewall rule parked disabled true",
+            // NAT description + disable on both source and destination.
+            "set nat source wan-masq zone wan",
+            "set nat source wan-masq description egress masquerade",
+            "set nat destination fwd zone wan",
+            "set nat destination fwd proto tcp",
+            "set nat destination fwd port 443",
+            "set nat destination fwd to 10.0.0.10:8443",
+            "set nat destination fwd description park me",
+            "set nat destination fwd disabled true",
+            // DNS resolver tuning.
+            "set services dns upstream 9.9.9.9",
+            "set services dns serve-on lan0",
+            "set services dns cache-size 1000",
+            "set services dns local-domain lan.example",
+        ] {
+            run(&mut s, line).unwrap();
+        }
+
+        // `show` renders every new leaf.
+        let shown = s.show();
+        for needle in [
+            "description office LAN uplink",
+            "disabled true",
+            "lease-time 43200", // 12h resolved to seconds
+            "default-router 10.0.0.254",
+            "domain lan.example",
+            "static-mapping printer {",
+            "mac 52:54:00:12:34:56",
+            "ip 10.0.0.20",
+            "description trusted inside",
+            "description inbound https",
+            "description egress masquerade",
+            "cache-size 1000",
+            "local-domain lan.example",
+        ] {
+            assert!(shown.contains(needle), "show missing {needle:?}:\n{shown}");
+        }
+
+        // It materializes into a validated Appliance carrying every field.
+        let a = s.commit().expect("per-object polish commits");
+        let lan = a.interfaces.iter().find(|i| i.name == "lan0").unwrap();
+        assert_eq!(lan.description.as_deref(), Some("office LAN uplink"));
+        assert!(!lan.disabled);
+        let dmz = a.interfaces.iter().find(|i| i.name == "dmz0").unwrap();
+        assert!(dmz.disabled);
+        let dhcp = lan.dhcp_server.as_ref().unwrap();
+        assert_eq!(dhcp.lease_time, Some(43_200));
+        assert_eq!(dhcp.default_router.as_deref(), Some("10.0.0.254"));
+        assert_eq!(dhcp.domain.as_deref(), Some("lan.example"));
+        assert_eq!(dhcp.static_mappings.len(), 1);
+        assert_eq!(
+            (
+                dhcp.static_mappings[0].mac.as_str(),
+                dhcp.static_mappings[0].ip.as_str()
+            ),
+            ("52:54:00:12:34:56", "10.0.0.20")
+        );
+        assert_eq!(
+            a.zones.get("lan").and_then(|z| z.description.as_deref()),
+            Some("trusted inside")
+        );
+        let web = a.rules.iter().find(|r| r.name == "web").unwrap();
+        assert_eq!(web.description.as_deref(), Some("inbound https"));
+        let parked = a.rules.iter().find(|r| r.name == "parked").unwrap();
+        assert!(parked.disabled);
+        assert_eq!(
+            a.nat.source[0].description.as_deref(),
+            Some("egress masquerade")
+        );
+        assert!(a.nat.destination[0].disabled);
+        assert_eq!(a.services.dns.cache_size, Some(1000));
+        assert_eq!(a.services.dns.local_domain.as_deref(), Some("lan.example"));
+
+        // Full round-trip: reload the committed Appliance into a fresh draft and
+        // re-render — every field survives from_appliance → render.
+        let round = render_appliance(&a);
+        for needle in [
+            "description office LAN uplink",
+            "disabled true",
+            "lease-time 43200",
+            "default-router 10.0.0.254",
+            "static-mapping printer {",
+            "mac 52:54:00:12:34:56",
+            "description trusted inside",
+            "description inbound https",
+            "cache-size 1000",
+            "local-domain lan.example",
+        ] {
+            assert!(
+                round.contains(needle),
+                "round-trip missing {needle:?}:\n{round}"
+            );
+        }
+
+        // Deleting a single static reservation, then a description field.
+        run(
+            &mut s,
+            "delete interface lan0 dhcp-server static-mapping printer",
+        )
+        .unwrap();
+        assert!(!s.show().contains("static-mapping printer"));
+        run(&mut s, "delete interface lan0 description").unwrap();
+        assert!(!s.show().contains("description office LAN uplink"));
+    }
+
+    #[test]
+    fn lease_time_rejects_zero_and_unknown_units() {
+        let mut s = Session::empty();
+        run(&mut s, "set interface lan0 zone lan").unwrap();
+        // A bare zero, an unknown unit, and a compound that resolves to zero.
+        assert!(run(&mut s, "set interface lan0 dhcp-server lease-time 0").is_err());
+        assert!(run(&mut s, "set interface lan0 dhcp-server lease-time 5y").is_err());
+        // A valid compound resolves to seconds.
+        run(&mut s, "set interface lan0 dhcp-server lease-time 1h30m").unwrap();
+        assert!(s.show().contains("lease-time 5400"), "got:\n{}", s.show());
+    }
+
+    #[test]
+    fn static_mapping_ip_must_be_inside_the_server_subnet() {
+        let mut s = Session::empty();
+        run(&mut s, "set system hostname fw").unwrap();
+        run(&mut s, "set interface lan0 zone lan").unwrap();
+        run(&mut s, "set interface lan0 address 10.0.0.1/24").unwrap();
+        run(&mut s, "set interface lan0 dhcp-server pool-size 50").unwrap();
+        // An address outside 10.0.0.0/24 can never be handed out ⇒ rejected.
+        run(
+            &mut s,
+            "set interface lan0 dhcp-server static-mapping bad mac 52:54:00:aa:bb:cc ip 10.9.9.9",
+        )
+        .unwrap();
+        assert!(s.commit().is_err(), "out-of-subnet reservation must fail");
     }
 
     #[test]
