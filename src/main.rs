@@ -17,6 +17,7 @@ mod diff;
 mod install;
 mod ipsec;
 mod net;
+mod pki;
 mod repl;
 mod session;
 mod system;
@@ -179,6 +180,16 @@ enum Command {
         #[arg(long, default_value = "http://127.0.0.1:50052")]
         controller: String,
     },
+    /// Wake a host on the LAN: send a Wake-on-LAN magic packet to a MAC address
+    /// (an operational action, not persistent config). Broadcasts on the given
+    /// interface's link, or on all interfaces when none is named.
+    Wol {
+        /// The target MAC address (`52:54:00:12:34:56`).
+        mac: String,
+        /// Interface to send the magic packet out (defaults to a global
+        /// broadcast on every link).
+        interface: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -241,7 +252,76 @@ async fn main() -> Result<()> {
         Command::Apply { file, out, reload } => apply(&file, &out, reload.as_deref()),
         Command::ConfirmRollback { config } => confirm_rollback(&config),
         Command::Ports { controller } => ports(&controller).await,
+        Command::Wol { mac, interface } => wol(&mac, interface.as_deref()),
     }
+}
+
+/// `sentinel wol <mac> [interface]`: send a Wake-on-LAN magic packet. The packet
+/// is six `0xFF` bytes followed by the target MAC repeated 16 times (the standard
+/// AMD magic-packet layout), broadcast to UDP port 9. With an interface given we
+/// bind the socket to that link (`SO_BINDTODEVICE`) so the frame egresses there;
+/// otherwise it goes out via the global broadcast route.
+fn wol(mac: &str, interface: Option<&str>) -> Result<()> {
+    use std::net::UdpSocket;
+
+    // Parse the six hex octets (the same shape sentinel validates elsewhere).
+    let octets: Vec<u8> = mac
+        .split(':')
+        .map(|o| u8::from_str_radix(o, 16))
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|_| anyhow::anyhow!("invalid MAC {mac:?}: expected six hex octets"))?;
+    if octets.len() != 6 {
+        anyhow::bail!("invalid MAC {mac:?}: expected six colon-separated hex octets");
+    }
+
+    // Magic packet: 6×0xFF sync stream, then the MAC repeated 16 times.
+    let mut packet = vec![0xFFu8; 6];
+    for _ in 0..16 {
+        packet.extend_from_slice(&octets);
+    }
+
+    let sock = UdpSocket::bind("0.0.0.0:0").context("opening a UDP socket")?;
+    sock.set_broadcast(true).context("enabling broadcast")?;
+    if let Some(dev) = interface {
+        bind_to_device(&sock, dev)?;
+    }
+    sock.send_to(&packet, "255.255.255.255:9")
+        .context("sending the magic packet")?;
+    match interface {
+        Some(dev) => println!("sent Wake-on-LAN magic packet to {mac} on {dev}"),
+        None => println!("sent Wake-on-LAN magic packet to {mac}"),
+    }
+    Ok(())
+}
+
+/// Pin a socket to a link with `SO_BINDTODEVICE` so a broadcast egresses exactly
+/// that interface (needs CAP_NET_RAW/root — the appliance runs `wol` privileged).
+#[cfg(target_os = "linux")]
+fn bind_to_device(sock: &std::net::UdpSocket, dev: &str) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let fd = sock.as_raw_fd();
+    let cstr = std::ffi::CString::new(dev).context("interface name")?;
+    // SAFETY: `setsockopt` reads `cstr.len()` bytes from a valid pointer into a
+    // live socket fd; the buffer outlives the call.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            cstr.as_ptr() as *const libc::c_void,
+            cstr.as_bytes_with_nul().len() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("binding the Wake-on-LAN socket to {dev}"));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bind_to_device(_sock: &std::net::UdpSocket, _dev: &str) -> Result<()> {
+    anyhow::bail!("binding a Wake-on-LAN socket to an interface is only supported on Linux")
 }
 
 /// The live-apply target for `commit`/`commit-confirm`/`confirm-rollback`: the
@@ -668,6 +748,10 @@ fn show_op(args: &[String]) -> Result<()> {
             Ok(())
         }
 
+        // PKI (roadmap C19): the local CAs + issued certs, each annotated with
+        // its on-disk expiry when generated.
+        ["pki", ..] => show_pki(),
+
         // Configuration views.
         ["configuration", ..] => {
             let path = std::path::Path::new(DEFAULT_CONFIG);
@@ -732,6 +816,8 @@ fn show_op(args: &[String]) -> Result<()> {
              show vrrp | show bfd [sessions]\n  \
              show firewall [statistics|log]    firewall summary / counters / log\n  \
              show nat                          NAT configuration\n  \
+             show vpn [ipsec]                  IPsec security associations / connections\n  \
+             show pki                          local CAs + issued certificates (expiry)\n  \
              show configuration                the saved config (config syntax)\n  \
              show log [velstra|wren]           recent service log\n  \
              show version",
@@ -865,6 +951,75 @@ fn show_nat() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The PKI section of the saved config (roadmap C19): local CAs + issued certs,
+/// each annotated with its on-disk status/expiry, plus the ACME account.
+fn show_pki() -> Result<()> {
+    let path = std::path::Path::new(DEFAULT_CONFIG);
+    if !path.exists() {
+        println!("no saved config at {DEFAULT_CONFIG} (run `configure` + `save`)");
+        return Ok(());
+    }
+    let a = Appliance::load(path)?;
+    if a.pki.is_empty() {
+        println!("no PKI configured");
+        return Ok(());
+    }
+    for ca in &a.pki.cas {
+        let crt = format!("/var/lib/sentinel/pki/ca/{}/ca.crt", ca.name);
+        println!(
+            "ca {}: CN={} {}",
+            ca.name,
+            ca.common_name,
+            cert_status(&crt)
+        );
+    }
+    for cert in &a.pki.certificates {
+        let status = if cert.ca == "acme" {
+            "(acme — obtained on hardware)".to_string()
+        } else {
+            cert_status(&format!(
+                "/var/lib/sentinel/pki/certs/{}/cert.crt",
+                cert.name
+            ))
+        };
+        println!(
+            "certificate {}: CN={} ca={} {}",
+            cert.name, cert.common_name, cert.ca, status
+        );
+    }
+    if let Some(acme) = &a.pki.acme {
+        println!(
+            "acme: {} challenge={} email={}",
+            acme.directory_url.as_deref().unwrap_or("letsencrypt-prod"),
+            acme.challenge.as_deref().unwrap_or("http-01"),
+            acme.email
+        );
+    }
+    Ok(())
+}
+
+/// The generated-or-not / expiry annotation for a cert path — reads the on-disk
+/// certificate's `notAfter` via openssl (a plain read; the cert is 0644).
+fn cert_status(crt_path: &str) -> String {
+    if !std::path::Path::new(crt_path).exists() {
+        return "(not yet generated)".to_string();
+    }
+    let out = std::process::Command::new(system::bin("openssl"))
+        .args(["x509", "-enddate", "-noout", "-in", crt_path])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            // openssl prints `notAfter=Jun  1 12:00:00 2035 GMT`.
+            match s.trim().strip_prefix("notAfter=") {
+                Some(d) => format!("expires {}", d.trim()),
+                None => "generated".to_string(),
+            }
+        }
+        _ => "generated".to_string(),
+    }
 }
 
 /// Run a command and print its stdout, ignoring the exit code (for read-only

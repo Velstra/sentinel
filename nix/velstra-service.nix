@@ -99,7 +99,10 @@ in
         ExecStart = "${cfg.package}/bin/velstra run --iface ${cfg.interface} --config /run/sentinel/velstra.toml";
         Restart = "on-failure";
         RestartSec = 2;
-        # Loading + attaching XDP/eBPF needs these capabilities.
+        # Loading + attaching XDP/eBPF needs these capabilities. CAP_SYS_ADMIN is
+        # broad; on kernels that accept CAP_BPF+CAP_PERFMON for XDP load it can be
+        # narrowed — verify against the target kernel via the nixosTest before
+        # dropping it.
         AmbientCapabilities = [
           "CAP_BPF"
           "CAP_NET_ADMIN"
@@ -110,6 +113,17 @@ in
           "CAP_NET_ADMIN"
           "CAP_SYS_ADMIN"
         ];
+        # Sandboxing. Only directives that cannot interfere with eBPF/XDP load,
+        # netlink or raw packet I/O are enabled here; stronger confinement
+        # (ProtectSystem=strict, RestrictAddressFamilies, SystemCallFilter) should
+        # be added once validated against the datapath nixosTests, since a wrong
+        # restriction silently breaks the firewall.
+        NoNewPrivileges = true;
+        ProtectHome = true;
+        ProtectClock = true;
+        RestrictRealtime = true;
+        RestrictSUIDSGID = true;
+        LockPersonality = true;
       };
     };
   };

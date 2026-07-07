@@ -18,8 +18,9 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::config::{
-    Appliance, DhcpServer, Dns, IfaceType, Interface, MultiWan, Ntp, Qos, QosDiscipline,
-    RouterAdvert, WAN_CHECK_FAIL, WAN_CHECK_INTERVAL, WAN_CHECK_RISE, WAN_CHECK_TIMEOUT, WanMode,
+    Appliance, DhcpRelay, DhcpServer, Dns, Dyndns, IfaceType, Interface, Lldp, Mdns, MultiWan, Ntp,
+    Qos, QosDiscipline, RouterAdvert, Snmp, WAN_CHECK_FAIL, WAN_CHECK_INTERVAL, WAN_CHECK_RISE,
+    WAN_CHECK_TIMEOUT, WanMode,
 };
 use crate::system::{self, NETWORKD_RUNTIME_DIR};
 
@@ -541,6 +542,248 @@ fn apply_dnsmasq(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
             eprintln!("warning: restarting dnsmasq failed (applies on next start): {e}");
         }
     }
+    Ok(())
+}
+
+// --- Box services (roadmap C18) --------------------------------------------
+//
+// LLDP / SNMP / mDNS-reflector / dynamic-DNS / DHCP-relay are box-wide services
+// the appliance *offers* (like DNS/NTP), each built on a standard NixOS-packaged
+// daemon Sentinel owns the lifecycle of. Unlike the always-on resolved/dnsmasq/
+// chrony co-services (whose drop-ins render in `apply_persistent`), these are
+// off by default: Sentinel renders each one's config to a `/run/sentinel` file
+// and starts/stops its unit from `apply_link_runtime` — the post-networkd stage,
+// since a link-scoped service (LLDP/mDNS/relay) needs its interfaces up. All
+// follow the change-detect-then-restart model the co-service drop-ins use.
+
+/// lldpd's confdir (symlinked from `/etc/lldpd.d` by the appliance module, which
+/// lldpd reads at start): a `.conf` here is an lldpcli command script scoping the
+/// advertised interfaces.
+const LLDPD_CONFDIR: &str = "/run/sentinel/lldpd.d";
+const LLDPD_CONF: &str = "sentinel.conf";
+const LLDPD_UNIT: &str = "lldpd.service";
+
+/// The net-snmp agent config (rendered 0640 — it carries the community string)
+/// and the Sentinel-owned unit that runs `snmpd` against it.
+const SNMPD_CONF: &str = "/run/sentinel/snmpd.conf";
+const SNMPD_UNIT: &str = "sentinel-snmpd.service";
+
+/// The avahi reflector config + its Sentinel-owned unit.
+const MDNS_CONF: &str = "/run/sentinel/avahi/avahi-daemon.conf";
+const MDNS_UNIT: &str = "sentinel-mdns.service";
+
+/// The ddclient config (rendered 0640 — it carries the provider password) + its
+/// Sentinel-owned unit.
+const DDCLIENT_CONF: &str = "/run/sentinel/ddclient/ddclient.conf";
+const DDCLIENT_UNIT: &str = "sentinel-ddclient.service";
+
+/// The DHCP-relay config (a dnsmasq relay-only instance) + its Sentinel-owned
+/// unit. isc-dhcp's `dhcrelay` is gone from nixpkgs, so the relay rides on
+/// dnsmasq's `--dhcp-relay` mode (the daemon is already in the image); this is a
+/// SECOND, DNS-disabled dnsmasq instance distinct from the LAN resolver.
+const DHCP_RELAY_CONF: &str = "/run/sentinel/dhcp-relay/relay.conf";
+const DHCP_RELAY_UNIT: &str = "sentinel-dhcp-relay.service";
+
+/// Render lldpd's confdir drop-in, or `None` when LLDP is off. When an interface
+/// whitelist is given it becomes an lldpcli `configure system interface pattern`
+/// (a comma-separated glob list); an empty list ⇒ every interface (lldpd's own
+/// default), so we emit just the header.
+fn lldpd_conf_body(lldp: &Lldp) -> Option<String> {
+    if !lldp.enable {
+        return None;
+    }
+    let mut body = String::from("# rendered by sentinel — LLDP (lldpd)\n");
+    if !lldp.interface.is_empty() {
+        body.push_str(&format!(
+            "configure system interface pattern {}\n",
+            lldp.interface.join(",")
+        ));
+    }
+    Some(body)
+}
+
+/// Render the net-snmp `snmpd.conf`, or `None` when no agent is configured. The
+/// agent is read-only by construction — only `rocommunity`/`rocommunity6` lines
+/// are ever emitted, never `rwcommunity`. Each source subnet scopes one
+/// community clause; an empty `allow` list ⇒ `default` (any source).
+fn snmpd_conf_body(snmp: &Snmp) -> Option<String> {
+    let community = snmp.community.as_ref()?;
+    let mut body = String::from("# rendered by sentinel — SNMP (read-only)\n");
+    body.push_str(&format!(
+        "agentaddress {}\n",
+        snmp.listen.as_deref().unwrap_or("udp:161")
+    ));
+    if snmp.allow.is_empty() {
+        body.push_str(&format!("rocommunity {community} default\n"));
+    } else {
+        for src in &snmp.allow {
+            // net-snmp splits the read-only community by address family:
+            // `rocommunity` for IPv4 sources, `rocommunity6` for IPv6.
+            let directive = if src.contains(':') {
+                "rocommunity6"
+            } else {
+                "rocommunity"
+            };
+            body.push_str(&format!("{directive} {community} {src}\n"));
+        }
+    }
+    if let Some(loc) = &snmp.location {
+        body.push_str(&format!("syslocation {loc}\n"));
+    }
+    if let Some(contact) = &snmp.contact {
+        body.push_str(&format!("syscontact {contact}\n"));
+    }
+    Some(body)
+}
+
+/// Render the avahi reflector config, or `None` when no reflector is configured.
+/// `enable-reflector` bridges mDNS between the `allow-interfaces`; publishing is
+/// disabled so the box only relays neighbours' announcements, never its own.
+fn avahi_conf_body(mdns: &Mdns) -> Option<String> {
+    if mdns.interface.is_empty() {
+        return None;
+    }
+    let mut body = String::from("# rendered by sentinel — mDNS reflector (avahi)\n[server]\n");
+    body.push_str(&format!("allow-interfaces={}\n", mdns.interface.join(",")));
+    body.push_str("use-ipv4=yes\nuse-ipv6=yes\n");
+    // No system bus on the appliance — avahi runs standalone as a pure reflector.
+    body.push_str("enable-dbus=no\n");
+    body.push_str("[publish]\ndisable-publishing=yes\n");
+    body.push_str("[reflector]\nenable-reflector=yes\n");
+    Some(body)
+}
+
+/// Render the ddclient config, or `None` when no client is configured. `use=if`
+/// publishes a named interface's address; with no interface we fall back to
+/// `use=web` (discover the WAN IP via the provider's checkip — correct behind
+/// CGNAT). The password is single-quoted so an odd character can't break the
+/// line; the whole file is installed 0640 (it carries the secret).
+fn ddclient_conf_body(dd: &Dyndns) -> Option<String> {
+    let hostname = dd.hostname.as_ref()?;
+    let mut body = String::from("# rendered by sentinel — dynamic DNS (ddclient)\n");
+    body.push_str("daemon=300\nsyslog=yes\nssl=yes\n");
+    body.push_str(&format!(
+        "protocol={}\n",
+        dd.provider.as_deref().unwrap_or("dyndns2")
+    ));
+    match &dd.interface {
+        Some(iface) => body.push_str(&format!("use=if, if={iface}\n")),
+        None => body.push_str("use=web\n"),
+    }
+    if let Some(server) = &dd.server {
+        body.push_str(&format!("server={server}\n"));
+    }
+    if let Some(login) = &dd.login {
+        body.push_str(&format!("login={login}\n"));
+    }
+    if let Some(password) = &dd.password {
+        body.push_str(&format!("password='{password}'\n"));
+    }
+    body.push_str(&format!("{hostname}\n"));
+    Some(body)
+}
+
+/// The bare IPv4 of a static CIDR (`"10.0.7.1/24"` → `"10.0.7.1"`), or `None` for
+/// a non-IPv4/`dhcp` address. The relay stamps this as the DHCP giaddr.
+fn ipv4_of(addr: &str) -> Option<String> {
+    let ip = addr.split('/').next()?;
+    ip.parse::<Ipv4Addr>().ok().map(|_| ip.to_string())
+}
+
+/// Render the dnsmasq relay-only config, or `None` when no relay is configured.
+/// `port=0` disables the DNS half (this instance ONLY relays DHCP), then one
+/// `dhcp-relay=<local-addr>,<server>` line per (client-facing interface, upstream
+/// server): dnsmasq listens for DHCP on the interface owning `<local-addr>` and
+/// forwards to `<server>`. Interfaces without a resolvable static IPv4 are
+/// skipped (validation already forbids them).
+fn dhcp_relay_conf_body(relay: &DhcpRelay, ifaces: &[Interface]) -> Option<String> {
+    if relay.server.is_empty() || relay.interface.is_empty() {
+        return None;
+    }
+    let mut body = String::from("# rendered by sentinel — DHCP relay (dnsmasq)\nport=0\n");
+    let mut any = false;
+    for name in &relay.interface {
+        let Some(local) = ifaces
+            .iter()
+            .find(|i| &i.name == name)
+            .and_then(|i| i.address.as_deref())
+            .and_then(ipv4_of)
+        else {
+            continue;
+        };
+        for server in &relay.server {
+            body.push_str(&format!("dhcp-relay={local},{server}\n"));
+            any = true;
+        }
+    }
+    any.then_some(body)
+}
+
+/// Reconcile one Sentinel-owned box service to its rendered config: write the
+/// file (0640 when it carries a secret) and (re)start the unit when the config
+/// changed, or stop the unit and drop the file when the service is unconfigured.
+/// The generic core behind [`apply_lldp`]/[`apply_snmp`]/… — mirrors
+/// [`apply_multiwan`]'s model, parameterised over unit + path + body.
+fn apply_box_service(unit: &str, path: &Path, body: Option<String>, secret: bool) -> Result<()> {
+    match body {
+        Some(body) => {
+            let changed = file_changed(path, &body);
+            if secret {
+                system::install_service_secret(path, &body)?;
+            } else {
+                system::install_file(path, &body)?;
+            }
+            if changed {
+                if let Err(e) = system::service_restart(unit) {
+                    eprintln!("warning: (re)starting {unit} failed (applies on next start): {e}");
+                }
+            }
+        }
+        None => {
+            if path.exists() {
+                if let Err(e) = system::service_stop(unit) {
+                    eprintln!("warning: stopping {unit}: {e}");
+                }
+                system::remove_file(path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reconcile all box services (LLDP/SNMP/mDNS/dyndns/DHCP-relay) to the config.
+fn apply_box_services(appliance: &Appliance) -> Result<()> {
+    let s = &appliance.services;
+    apply_box_service(
+        LLDPD_UNIT,
+        &Path::new(LLDPD_CONFDIR).join(LLDPD_CONF),
+        lldpd_conf_body(&s.lldp),
+        false,
+    )?;
+    apply_box_service(
+        SNMPD_UNIT,
+        Path::new(SNMPD_CONF),
+        snmpd_conf_body(&s.snmp),
+        true,
+    )?;
+    apply_box_service(
+        MDNS_UNIT,
+        Path::new(MDNS_CONF),
+        avahi_conf_body(&s.mdns),
+        false,
+    )?;
+    apply_box_service(
+        DDCLIENT_UNIT,
+        Path::new(DDCLIENT_CONF),
+        ddclient_conf_body(&s.dyndns),
+        true,
+    )?;
+    apply_box_service(
+        DHCP_RELAY_UNIT,
+        Path::new(DHCP_RELAY_CONF),
+        dhcp_relay_conf_body(&s.dhcp_relay, &appliance.interfaces),
+        false,
+    )?;
     Ok(())
 }
 
@@ -1291,6 +1534,9 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     // The NTP server (chrony) likewise — its confdir drop-in tracks
     // `[services.ntp]`, and chrony is restarted only when that changed.
     apply_chrony(appliance, mode)?;
+    // PKI (roadmap C19): the ACME descriptor renders in both modes; CA/leaf key
+    // material is minted on a live commit only (idempotent, link-independent).
+    crate::pki::apply(appliance, mode)?;
     Ok(())
 }
 
@@ -1320,6 +1566,10 @@ pub fn apply_link_runtime(appliance: &Appliance) -> Result<()> {
     // IPsec tunnels (roadmap C2) — rendered swanctl config loaded into charon,
     // after the underlay uplinks the tunnels ride on are up.
     crate::ipsec::apply(appliance)?;
+    // Box services (roadmap C18) — LLDP/SNMP/mDNS/dyndns/DHCP-relay, each a
+    // Sentinel-owned daemon (re)started after networkd so the link-scoped ones
+    // (LLDP/mDNS/relay) see their interfaces up.
+    apply_box_services(appliance)?;
     Ok(())
 }
 
@@ -2317,6 +2567,171 @@ mod tests {
         assert!(
             s.contains("nexthop via \"$gw\" dev \"${IF[i]}\" weight \"${WT[i]}\""),
             "got:\n{s}"
+        );
+    }
+
+    // --- Box services (roadmap C18) ---------------------------------------
+
+    #[test]
+    fn lldp_conf_renders_pattern_or_nothing() {
+        // Disabled ⇒ no file at all (the daemon stays stopped).
+        assert!(lldpd_conf_body(&Lldp::default()).is_none());
+        // Enabled with a whitelist ⇒ an interface pattern.
+        let l = Lldp {
+            enable: true,
+            interface: vec!["lan0".into(), "wan0".into()],
+        };
+        let body = lldpd_conf_body(&l).expect("enabled");
+        assert!(
+            body.contains("configure system interface pattern lan0,wan0"),
+            "got:\n{body}"
+        );
+        // Enabled with no whitelist ⇒ header only (lldpd's default = all links).
+        let all = Lldp {
+            enable: true,
+            interface: vec![],
+        };
+        let body = lldpd_conf_body(&all).expect("enabled");
+        assert!(!body.contains("interface pattern"), "got:\n{body}");
+    }
+
+    #[test]
+    fn snmp_conf_is_read_only_and_scopes_by_family() {
+        assert!(snmpd_conf_body(&Snmp::default()).is_none());
+        let s = Snmp {
+            community: Some("public".into()),
+            listen: Some("udp:10.0.0.1:161".into()),
+            location: Some("rack 4".into()),
+            contact: Some("noc@example".into()),
+            allow: vec!["10.0.0.0/24".into(), "fd00::/64".into()],
+        };
+        let body = snmpd_conf_body(&s).expect("configured");
+        assert!(
+            body.contains("agentaddress udp:10.0.0.1:161"),
+            "got:\n{body}"
+        );
+        // IPv4 source ⇒ rocommunity; IPv6 source ⇒ rocommunity6. Read-only only.
+        assert!(
+            body.contains("rocommunity public 10.0.0.0/24"),
+            "got:\n{body}"
+        );
+        assert!(
+            body.contains("rocommunity6 public fd00::/64"),
+            "got:\n{body}"
+        );
+        assert!(
+            !body.contains("rwcommunity"),
+            "must never render write access"
+        );
+        assert!(body.contains("syslocation rack 4"), "got:\n{body}");
+        // No allow list ⇒ `default` (any source).
+        let any = Snmp {
+            community: Some("public".into()),
+            ..Snmp::default()
+        };
+        assert!(
+            snmpd_conf_body(&any)
+                .unwrap()
+                .contains("rocommunity public default")
+        );
+    }
+
+    #[test]
+    fn avahi_reflector_conf_renders() {
+        assert!(avahi_conf_body(&Mdns::default()).is_none());
+        let m = Mdns {
+            interface: vec!["lan0".into(), "iot0".into()],
+        };
+        let body = avahi_conf_body(&m).expect("configured");
+        assert!(body.contains("enable-reflector=yes"), "got:\n{body}");
+        assert!(body.contains("allow-interfaces=lan0,iot0"), "got:\n{body}");
+    }
+
+    #[test]
+    fn ddclient_conf_renders_secret_and_use_modes() {
+        assert!(ddclient_conf_body(&Dyndns::default()).is_none());
+        // An interface ⇒ use=if; a password is single-quoted.
+        let d = Dyndns {
+            provider: Some("cloudflare".into()),
+            server: None,
+            hostname: Some("fw.example.com".into()),
+            login: Some("user@example".into()),
+            password: Some("secret-token".into()),
+            interface: Some("wan0".into()),
+        };
+        let body = ddclient_conf_body(&d).expect("configured");
+        assert!(body.contains("protocol=cloudflare"), "got:\n{body}");
+        assert!(body.contains("use=if, if=wan0"), "got:\n{body}");
+        assert!(body.contains("password='secret-token'"), "got:\n{body}");
+        assert!(body.trim_end().ends_with("fw.example.com"), "got:\n{body}");
+        // No interface ⇒ use=web (discover the WAN IP).
+        let web = Dyndns {
+            interface: None,
+            ..d
+        };
+        assert!(ddclient_conf_body(&web).unwrap().contains("use=web"));
+    }
+
+    /// A bare interface carrying just a name + address (Interface has no Default).
+    fn iface_addr(name: &str, address: &str) -> Interface {
+        Interface {
+            name: name.into(),
+            zone: None,
+            address: Some(address.into()),
+            address6: None,
+            parent: None,
+            vlan: None,
+            private_key: None,
+            listen_port: None,
+            peers: vec![],
+            dhcp_server: None,
+            router_advert: None,
+            if_type: None,
+            master: None,
+            bond_mode: None,
+            pd_from: None,
+            pd_subnet: None,
+            mtu: None,
+            mac: None,
+            local: None,
+            remote: None,
+            tunnel_key: None,
+            ttl: None,
+            qos: None,
+            pppoe: None,
+            description: None,
+            disabled: false,
+        }
+    }
+
+    #[test]
+    fn dhcp_relay_conf_renders_dnsmasq_relay_or_nothing() {
+        let ifaces = vec![
+            iface_addr("lan0", "10.0.7.1/24"),
+            iface_addr("wan0", "dhcp"),
+        ];
+        assert!(dhcp_relay_conf_body(&DhcpRelay::default(), &ifaces).is_none());
+        // No server ⇒ nothing (a relay needs an upstream).
+        let no_srv = DhcpRelay {
+            interface: vec!["lan0".into()],
+            server: vec![],
+        };
+        assert!(dhcp_relay_conf_body(&no_srv, &ifaces).is_none());
+        // A static-addressed relay interface ⇒ a `dhcp-relay=<local>,<server>`
+        // line per server; `port=0` disables this instance's DNS half.
+        let r = DhcpRelay {
+            interface: vec!["lan0".into()],
+            server: vec!["10.0.99.1".into(), "10.0.99.2".into()],
+        };
+        let body = dhcp_relay_conf_body(&r, &ifaces).expect("configured");
+        assert!(body.contains("port=0"), "got:\n{body}");
+        assert!(
+            body.contains("dhcp-relay=10.0.7.1,10.0.99.1"),
+            "got:\n{body}"
+        );
+        assert!(
+            body.contains("dhcp-relay=10.0.7.1,10.0.99.2"),
+            "got:\n{body}"
         );
     }
 }

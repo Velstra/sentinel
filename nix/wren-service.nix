@@ -69,6 +69,20 @@ in
           "CAP_NET_RAW"
           "CAP_NET_BIND_SERVICE"
         ];
+        # Sandboxing. wren writes only its control socket under /run/wren
+        # (RuntimeDirectory, which stays writable under ProtectSystem=strict) and
+        # reads /run/sentinel/wren.toml; nothing under /usr, /etc, /home or /boot,
+        # so these confinements are safe. Stronger ones (RestrictAddressFamilies,
+        # SystemCallFilter) should be added once validated against the routing
+        # nixosTests.
+        NoNewPrivileges = true;
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        ProtectClock = true;
+        ProtectKernelModules = true;
+        RestrictRealtime = true;
+        RestrictSUIDSGID = true;
+        LockPersonality = true;
       };
     };
   };
