@@ -16,9 +16,10 @@ use crate::config::{
     Acme, Action, Appliance, Bfd, Bgp, BgpAggregate, BgpNeighbor, BgpRoa, BgpRtr, Ca, Certificate,
     DhcpRelay, DhcpServer, DhcpStaticLease, Dns, Dyndns, Export, Filter, FilterRule, Firewall,
     Groups, HealthCheck, IfaceType, Interface, IpsecConnection, Isis, Lldp, Mdns, MultiWan,
-    Multicast, MulticastInterface, Nat, NatDestination, NatSource, Ntp, Ospf, Ospf3, OspfInterface,
-    Pki, PortSpec, Pppoe, Proto, Protocols, Qos, QosDiscipline, Rip, RouterAdvert, Rule, Services,
-    Snmp, StaticRoute, System, Vpn, VrfDef, Vrrp, WanMode, WanUplink, WgPeer, ZoneCfg,
+    Multicast, MulticastInterface, Nat, Nat64, NatDestination, NatSource, Ntp, Ospf, Ospf3,
+    OspfInterface, Pki, PortSpec, Pppoe, Proto, Protocols, Qos, QosDiscipline, Rip, RouterAdvert,
+    Rule, Services, Snmp, StaticRoute, System, Vpn, VrfDef, Vrrp, WanMode, WanUplink, WgPeer,
+    ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -979,6 +980,8 @@ struct Draft {
     rules: Vec<(String, RuleDraft)>,
     nat_source: Vec<(String, NatSrcDraft)>,
     nat_destination: Vec<(String, NatDstDraft)>,
+    /// NAT64 + DNS64 (roadmap C10) — a single-instance sub-tree under `[nat]`.
+    nat64: Nat64Draft,
     router_id: Option<String>,
     statics: Vec<(String, StaticDraft)>,
     ospf: OspfDraft,
@@ -1080,6 +1083,16 @@ struct DyndnsDraft {
 struct DhcpRelayDraft {
     interface: Vec<String>,
     server: Vec<String>,
+}
+
+/// A partially-specified NAT64 config (`[nat.nat64]`, roadmap C10).
+#[derive(Debug, Clone, Default)]
+struct Nat64Draft {
+    enabled: Option<bool>,
+    prefix: Option<String>,
+    pool: Option<String>,
+    interface: Option<String>,
+    dns64: Option<bool>,
 }
 
 /// A partially-specified Multi-WAN uplink (`[[multiwan.uplink]]`), keyed by its
@@ -1500,6 +1513,13 @@ impl Draft {
                     )
                 })
                 .collect(),
+            nat64: Nat64Draft {
+                enabled: a.nat.nat64.enabled.then_some(true),
+                prefix: a.nat.nat64.prefix.clone(),
+                pool: a.nat.nat64.pool.clone(),
+                interface: a.nat.nat64.interface.clone(),
+                dns64: a.nat.nat64.dns64.then_some(true),
+            },
             router_id: a.protocols.router_id.clone(),
             statics: a
                 .protocols
@@ -2423,6 +2443,15 @@ impl Session {
                 self.draft.nat_destination_mut(name).to = Some((*v).to_string());
             }
 
+            // nat nat64: stateful IPv6→IPv4 translation (tayga) + DNS64 (unbound).
+            // A single-instance sub-tree (no name key). Deep validation (prefix /96,
+            // pool CIDR, interface declared) runs at materialize time.
+            ["nat", "nat64", "enabled", v] => self.draft.nat64.enabled = Some(parse_bool(v)?),
+            ["nat", "nat64", "prefix", v] => self.draft.nat64.prefix = Some((*v).to_string()),
+            ["nat", "nat64", "pool", v] => self.draft.nat64.pool = Some((*v).to_string()),
+            ["nat", "nat64", "interface", v] => self.draft.nat64.interface = Some((*v).to_string()),
+            ["nat", "nat64", "dns64", v] => self.draft.nat64.dns64 = Some(parse_bool(v)?),
+
             // services dns: the box-wide LAN DNS forwarder (systemd-resolved).
             ["services", "dns", "upstream", v] => {
                 let ups: Vec<String> = v.split(',').map(|s| s.trim().to_string()).collect();
@@ -3336,6 +3365,7 @@ impl Session {
                  set firewall rule <name> <proto tcp|udp | port <n|lo-hi> | log <true|false> | source <cidr>>\n  \
                  set nat source <name> zone <zone>\n  \
                  set nat destination <name> <zone <z> | proto <p> | port <n> | to <ip[:port]>>\n  \
+                 set nat nat64 <enabled <true|false> | prefix <64:ff9b::/96> | pool <v4-cidr> | interface <if> | dns64 <true|false>>\n  \
                  set protocols router-id <ip>\n  \
                  set protocols static <prefix> <via <ip> | dev <if> | metric <n>>\n  \
                  set protocols bgp <local-as <n> | router-id <ip> | hold-time <n> | network <prefix> | redistribute <src> | community <c> | multipath <n>>\n  \
@@ -3834,6 +3864,20 @@ impl Session {
                     "port" => d.port = None,
                     "to" => d.to = None,
                     other => bail!("nat destination has no field {other:?}"),
+                }
+            }
+
+            // nat nat64 — the whole sub-tree, or one field.
+            ["nat", "nat64"] => self.draft.nat64 = Nat64Draft::default(),
+            ["nat", "nat64", field] => {
+                let n = &mut self.draft.nat64;
+                match *field {
+                    "enabled" => n.enabled = None,
+                    "prefix" => n.prefix = None,
+                    "pool" => n.pool = None,
+                    "interface" => n.interface = None,
+                    "dns64" => n.dns64 = None,
+                    other => bail!("nat nat64 has no field {other:?}"),
                 }
             }
 
@@ -5089,6 +5133,13 @@ impl Session {
             nat: Nat {
                 source: nat_source,
                 destination: nat_destination,
+                nat64: Nat64 {
+                    enabled: self.draft.nat64.enabled.unwrap_or(false),
+                    prefix: self.draft.nat64.prefix.clone(),
+                    pool: self.draft.nat64.pool.clone(),
+                    interface: self.draft.nat64.interface.clone(),
+                    dns64: self.draft.nat64.dns64.unwrap_or(false),
+                },
             },
             protocols,
             services: Services {
@@ -5152,28 +5203,11 @@ impl Session {
     pub fn save(&mut self, to: Option<&Path>) -> Result<PathBuf> {
         let appliance = self.materialize()?;
         let path = to.unwrap_or(&self.path).to_path_buf();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        // Atomic write: a temp file then rename. rename only needs write on the
-        // directory (the admin has it via the wheel group), so this replaces a
-        // root-owned/read-only seed file cleanly — and the agent never sees a
-        // half-written config.
-        let toml = appliance.to_toml()?;
-        let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, &toml).with_context(|| format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, &path).with_context(|| format!("installing {}", path.display()))?;
+        // Archive only when saving the box's own config, not an ad-hoc
+        // `save <path>` export.
+        let written = persist_appliance(&appliance, &path, to.is_none())?;
         self.dirty = false;
-        // Archive this revision (only when saving the box's own config, not an
-        // ad-hoc `save <path>` export). Best-effort — a failed archive must never
-        // fail the save that already landed.
-        if to.is_none() {
-            if let Err(e) = crate::archive::archive_config(&path, &toml) {
-                eprintln!("warning: could not archive this config revision: {e}");
-            }
-        }
-        Ok(path)
+        Ok(written)
     }
 
     /// Discard all edits, reloading from the backing file (or empty).
@@ -5186,6 +5220,31 @@ impl Session {
         self.dirty = false;
         Ok(())
     }
+}
+
+/// Persist a validated appliance to `path` — the single save path shared by the
+/// CLI `save` and the REST API `PUT /config`, so a config written through either
+/// surface lands byte-identically (the "one config model" guarantee). Writes the
+/// canonical TOML atomically (temp file + rename, which needs write only on the
+/// directory, so it replaces a root-owned/read-only seed file cleanly and the
+/// agent never sees a half-written config) and, when `archive` is set, records a
+/// revision. Archiving is best-effort — a failed archive must never fail the
+/// save that already landed.
+pub fn persist_appliance(appliance: &Appliance, path: &Path, archive: bool) -> Result<PathBuf> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let toml = appliance.to_toml()?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, &toml).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("installing {}", path.display()))?;
+    if archive {
+        if let Err(e) = crate::archive::archive_config(path, &toml) {
+            eprintln!("warning: could not archive this config revision: {e}");
+        }
+    }
+    Ok(path.to_path_buf())
 }
 
 /// Diff two rendered configs, returning empty when identical (so `compare`
@@ -5609,6 +5668,32 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         if let Some(t) = &d.to {
             nati.push_str(&format!("        to {t}\n"));
+        }
+        nati.push_str("    }\n");
+    }
+    // NAT64 + DNS64 (roadmap C10) — a single-instance sub-tree under nat.
+    let n64 = &draft.nat64;
+    if n64.enabled.is_some()
+        || n64.prefix.is_some()
+        || n64.pool.is_some()
+        || n64.interface.is_some()
+        || n64.dns64.is_some()
+    {
+        nati.push_str("    nat64 {\n");
+        if n64.enabled == Some(true) {
+            nati.push_str("        enabled true\n");
+        }
+        if let Some(p) = &n64.prefix {
+            nati.push_str(&format!("        prefix {p}\n"));
+        }
+        if let Some(p) = &n64.pool {
+            nati.push_str(&format!("        pool {p}\n"));
+        }
+        if let Some(i) = &n64.interface {
+            nati.push_str(&format!("        interface {i}\n"));
+        }
+        if n64.dns64 == Some(true) {
+            nati.push_str("        dns64 true\n");
         }
         nati.push_str("    }\n");
     }
