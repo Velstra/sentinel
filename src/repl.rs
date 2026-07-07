@@ -576,6 +576,7 @@ commands:
                             protocols filter <name>  default accept|reject | rule <n> prefix|protocol|set-metric|set-community|action …
                             nat source <s>  zone|description|disabled …
                             nat destination <d>  zone|proto|port|to|description|disabled …
+                            nat nat64  enabled|prefix|pool|interface|dns64 (IPv6→IPv4 + DNS64)
                             services dns|ntp  upstream|serve-on …
                             services lldp  enable|interface | snmp  community|listen|location|contact|allow
                             services mdns interface | dyndns  provider|hostname|login|password|interface | dhcp-relay  interface|server
@@ -1334,13 +1335,28 @@ const PORT_GROUP_FIELDS: &[Cand] = &[(
     "port",
     "members: ports/ranges, comma-separated (replaces the set)",
 )];
-// `nat <Tab>` reveals the two NAT directions (VyOS-style).
+// `nat <Tab>` reveals the NAT directions (VyOS-style) plus NAT64.
 const NAT_NODES: &[Cand] = &[
     ("source", "SNAT/masquerade a zone's outbound traffic"),
     (
         "destination",
         "inbound DNAT port-forward to an internal host",
     ),
+    (
+        "nat64",
+        "stateful IPv6→IPv4 translation (tayga) + DNS64 (unbound)",
+    ),
+];
+// `nat nat64 <Tab>` reveals the NAT64 fields.
+const NAT64_FIELDS: &[Cand] = &[
+    ("enabled", "turn NAT64 on (off by default)"),
+    ("prefix", "translation prefix /96 (default 64:ff9b::/96)"),
+    ("pool", "IPv4 source pool for translated flows (a CIDR)"),
+    (
+        "interface",
+        "the IPv6-only side (DNS64 binds its v6 address)",
+    ),
+    ("dns64", "synthesize AAAA for v4-only names (true|false)"),
 ];
 const SYSTEM_FIELDS: &[Cand] = &[("hostname", "the appliance hostname")];
 const GLOBAL_FIELDS: &[Cand] = &[
@@ -1707,6 +1723,8 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "nat", "destination", _name] => NAT_DEST_FIELDS,
         ["set", "nat", "destination", _name, "proto"] => PROTOS,
         ["set", "nat", "destination", _name, "disabled"] => BOOLS,
+        ["set" | "delete", "nat", "nat64"] => NAT64_FIELDS,
+        ["set", "nat", "nat64", "enabled" | "dns64"] => BOOLS,
 
         // The protocols (routing) sub-tree.
         ["set" | "delete", "protocols"] => PROTOCOLS_NODES,
@@ -1905,6 +1923,12 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
             .collect(),
         // `multiwan uplink <Tab>` → the NICs, so you pick one to make an uplink.
         ["set" | "delete", "multiwan", "uplink"] => names
+            .interfaces
+            .iter()
+            .map(|n| (n.clone(), "interface".to_string()))
+            .collect(),
+        // `nat nat64 interface <Tab>` → the NICs (the IPv6-only side).
+        ["set", "nat", "nat64", "interface"] => names
             .interfaces
             .iter()
             .map(|n| (n.clone(), "interface".to_string()))
@@ -2323,8 +2347,12 @@ mod tests {
             kw(&["set", "firewall", "rule", "web", "proto"]),
             ["tcp", "udp"]
         );
-        // The nat sub-tree: source (masquerade) + destination (port-forward).
-        assert_eq!(kw(&["set", "nat"]), ["source", "destination"]);
+        // The nat sub-tree: source (masquerade) + destination (port-forward) + nat64.
+        assert_eq!(kw(&["set", "nat"]), ["source", "destination", "nat64"]);
+        assert_eq!(
+            kw(&["set", "nat", "nat64"]),
+            ["enabled", "prefix", "pool", "interface", "dns64"]
+        );
         assert_eq!(
             kw(&["set", "nat", "source", "wan-masq"]),
             ["zone", "description", "disabled"]

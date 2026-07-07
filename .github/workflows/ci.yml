@@ -4,11 +4,18 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  schedule:
+    # Nightly: run the FULL `nix flake check` (all ~40 VM tests). This is the
+    # exhaustive integration proof; the per-PR job below runs only a curated
+    # subset so pushes stay fast.
+    - cron: "0 3 * * *"
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Fast gate: formatting, lints, unit/integration tests, release build. Runs on
+  # every push/PR and does NOT need KVM.
   check:
     name: fmt, clippy, test, build
     runs-on: ubuntu-latest
@@ -23,3 +30,76 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       - run: cargo build --release
+
+  # Integration proof: the nixosTests boot real VMs and exercise the appliance
+  # end-to-end, so they genuinely need hardware virtualization. GitHub-hosted
+  # `ubuntu-24.04` runners expose /dev/kvm (nested virt), which the Nix VM tests
+  # use. We run a curated, representative subset in a matrix so the legs run in
+  # parallel and the job stays reasonable on every PR.
+  #
+  # To add more coverage per-PR, append the check's attrname (from
+  # `checks.x86_64-linux.<name>` in flake.nix) to the matrix below. The complete
+  # set (~40 tests) runs nightly via the `flake-check-full` job, or locally with
+  # `nix flake check -L`.
+  nixos-tests:
+    name: "nixosTest: ${{ matrix.check }}"
+    # Skip on the nightly schedule — the full run below covers everything.
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # Curated cross-section: commit pipeline, reboot persistence, the REST
+        # API, on-box PKI, DNS, LLDP, one routing protocol (BGP), and NAT64.
+        # Every name here is a real `checks.x86_64-linux.<name>` attribute.
+        check:
+          - commit
+          - reboot
+          - api
+          - pki
+          - dns
+          - lldp
+          - bgp
+          - nat64
+    steps:
+      - uses: actions/checkout@v4
+      # Hard requirement: without /dev/kvm the VM tests can't boot. Fail loudly
+      # rather than silently skipping — a "green" run without KVM proves nothing.
+      - name: Verify KVM is available
+        run: |
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::/dev/kvm is missing — nixosTests require hardware virtualization."
+            exit 1
+          fi
+          ls -l /dev/kvm
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            system-features = nixos-test benchmark big-parallel kvm
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: "nix build .#checks.x86_64-linux.${{ matrix.check }}"
+        run: nix build -L ".#checks.x86_64-linux.${{ matrix.check }}"
+
+  # Nightly exhaustive run: every check in the flake. Only fires on the cron
+  # schedule so it never blocks a PR.
+  flake-check-full:
+    name: full nix flake check (nightly)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify KVM is available
+        run: |
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::/dev/kvm is missing — nixosTests require hardware virtualization."
+            exit 1
+          fi
+          ls -l /dev/kvm
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            system-features = nixos-test benchmark big-parallel kvm
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - run: nix flake check -L

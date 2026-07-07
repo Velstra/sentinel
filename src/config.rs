@@ -186,6 +186,18 @@ port = 443
 # proto = "tcp"
 # port = 443
 # to = "10.0.0.10:8443"
+#
+# NAT64 (roadmap C10): an IPv6-only LAN reaching the IPv4 internet. tayga
+# translates 64:ff9b::<v4> → real IPv4 out of `pool`; DNS64 (unbound on
+# `interface`) synthesises AAAA for v4-only names so clients need no config.
+# Sentinel ships NO application-layer gateways (FTP/SIP ALG) — the modern secure
+# default; apps needing NAT traversal use STUN/ICE/TURN.
+# [nat.nat64]
+# enabled = true
+# prefix = "64:ff9b::/96"   # default (RFC 6052 well-known); omit to use it
+# pool = "192.0.2.0/24"     # IPv4 source pool for translated flows
+# interface = "lan6"        # the IPv6-only side (DNS64 binds its v6 address)
+# dns64 = true              # synthesize AAAA (needs [services.dns] upstream)
 
 # Multi-WAN (roadmap C6): two uplinks with health-checked failover. The lowest
 # `priority` is the primary; if its health check fails, the default route swings
@@ -1681,15 +1693,24 @@ pub struct Nat {
     /// Destination NAT: inbound port-forwards.
     #[serde(default, rename = "destination", skip_serializing_if = "Vec::is_empty")]
     pub destination: Vec<NatDestination>,
+    /// NAT64 (roadmap C10): stateful IPv6→IPv4 translation for an IPv6-only client
+    /// network reaching the IPv4 internet, plus optional DNS64 AAAA synthesis.
+    /// Omitted from saved configs when unconfigured.
+    #[serde(default, skip_serializing_if = "Nat64::is_empty")]
+    pub nat64: Nat64,
 }
 
 impl Nat {
     /// True when no NAT is configured — lets `[nat]` be omitted from a saved
     /// config that never set any.
     pub fn is_empty(&self) -> bool {
-        self.source.is_empty() && self.destination.is_empty()
+        self.source.is_empty() && self.destination.is_empty() && self.nat64.is_empty()
     }
 }
+
+/// The well-known NAT64 prefix (RFC 6052 §2.1 / RFC 6146) — the default when the
+/// operator names no explicit prefix. Always a `/96`.
+pub const NAT64_WELL_KNOWN_PREFIX: &str = "64:ff9b::/96";
 
 /// A source-NAT (masquerade) rule: SNAT all traffic egressing `zone` to that
 /// zone's egress address. The classic WAN masquerade.
@@ -1731,6 +1752,62 @@ pub struct NatDestination {
     pub port: u16,
     /// Internal target, `"10.0.0.10"` or `"10.0.0.10:8443"`.
     pub to: String,
+}
+
+/// NAT64 (roadmap C10) — stateful IPv6→IPv4 translation. An IPv6-only client
+/// network reaches the IPv4 internet by addressing v4 destinations inside a
+/// NAT64 prefix (`64:ff9b::<v4>`); the box translates those to real IPv4 with a
+/// pooled source address. Realised by **tayga** (a userspace `nat64` tun device)
+/// — chosen over Jool because it needs no out-of-tree kernel module, so it runs
+/// unmodified in the appliance image and the CI VM. `dns64` layers on an
+/// **unbound** resolver that synthesises `AAAA` records inside the prefix for
+/// v4-only names, so unmodified IPv6-only clients resolve+reach v4 hosts.
+///
+/// No ALG: Sentinel ships no FTP/SIP/etc. application-layer gateways — the modern
+/// secure default (ALGs mangle payloads, break TLS/SIP-over-TLS and are a
+/// recurring CVE source). Applications that need NAT traversal use STUN/ICE/TURN.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Nat64 {
+    /// Turn NAT64 on. Off by default; the pool (and, for DNS64, a serving
+    /// interface) must also be set. Skipped from output when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub enabled: bool,
+    /// The NAT64 translation prefix — an IPv6 `/96`. Unset ⇒ the well-known
+    /// [`NAT64_WELL_KNOWN_PREFIX`] (`64:ff9b::/96`, RFC 6052).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// The IPv4 pool (a CIDR like `"192.0.2.0/24"`) tayga draws translated source
+    /// addresses from — the box's public/routable v4 space (or a private range
+    /// masqueraded out the WAN). Required when `enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
+    /// The IPv6-only side — a declared interface. DNS64 binds its resolver to this
+    /// interface's IPv6 address so only that segment's clients get synthesised
+    /// answers. Required when `dns64` is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<String>,
+    /// Synthesize `AAAA` records inside the NAT64 prefix for v4-only names (an
+    /// unbound resolver on `interface`). Off by default. Needs `interface` (with a
+    /// static IPv6 address) and an upstream (`[services.dns] upstream`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dns64: bool,
+}
+
+impl Nat64 {
+    /// True when NAT64 is unconfigured — lets `[nat.nat64]` be omitted.
+    pub fn is_empty(&self) -> bool {
+        !self.enabled
+            && self.prefix.is_none()
+            && self.pool.is_none()
+            && self.interface.is_none()
+            && !self.dns64
+    }
+
+    /// The effective translation prefix — the operator's, else the well-known.
+    pub fn effective_prefix(&self) -> &str {
+        self.prefix.as_deref().unwrap_or(NAT64_WELL_KNOWN_PREFIX)
+    }
 }
 
 /// Multi-WAN (roadmap C6) — several WAN uplinks reconciled into failover or
@@ -3490,6 +3567,54 @@ impl Appliance {
                 );
             }
             parse_host_port(&dst.to).with_context(|| format!("nat destination {:?}", dst.name))?;
+        }
+
+        // NAT64 (roadmap C10): stateful IPv6→IPv4 translation (tayga) + DNS64.
+        let n64 = &self.nat.nat64;
+        if n64.enabled {
+            // The IPv4 pool tayga maps into is required and must be a real CIDR
+            // (not a bare host) — the pool needs a prefix length to size the range.
+            let pool = n64.pool.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("nat nat64: pool <ipv4-cidr> is required when enabled")
+            })?;
+            if !pool.contains('/') {
+                bail!("nat nat64 pool {pool:?}: expected an IPv4 CIDR like \"192.0.2.0/24\"");
+            }
+            validate_cidr_or_ip(pool).with_context(|| "nat nat64 pool")?;
+            // The translation prefix (operator's or the well-known) must be a
+            // valid IPv6 CIDR, and — per RFC 6146 for the well-known form — a /96.
+            let prefix = n64.effective_prefix();
+            validate_ipv6_cidr(prefix).with_context(|| "nat nat64 prefix")?;
+            if !prefix.ends_with("/96") {
+                bail!("nat nat64 prefix {prefix:?}: must be a /96 (RFC 6052)");
+            }
+            // The IPv6-only side interface + its static IPv6 address are required:
+            // it is the segment NAT64 serves, DNS64 binds its resolver to that
+            // address, and tayga sources its own node/ICMPv6 address from it —
+            // mandatory with the well-known prefix and a non-global pool.
+            let iface = n64.interface.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("nat nat64: needs interface <name> (the IPv6-only side)")
+            })?;
+            let decl = self
+                .interfaces
+                .iter()
+                .find(|i| i.name == iface)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("nat nat64 interface {iface:?}: not a declared interface")
+                })?;
+            match decl.address6.as_deref() {
+                Some(a) if a.contains(':') && a.contains('/') => {
+                    validate_ipv6_cidr(a)
+                        .with_context(|| format!("nat nat64 interface {iface:?} address6"))?;
+                }
+                _ => bail!(
+                    "nat nat64: interface {iface:?} needs a static IPv6 address6 (the v6 side + tayga's node address)"
+                ),
+            }
+            // DNS64 additionally forwards synthesis misses upstream.
+            if n64.dns64 && self.services.dns.upstream.is_empty() {
+                bail!("nat nat64 dns64: needs an upstream resolver ([services.dns] upstream)");
+            }
         }
 
         // Routing (Wren): validate router-id, static routes and BGP peers.
@@ -6140,6 +6265,105 @@ dns = ["10.0.0.1"]
         let via_toml = Appliance::from_toml(&a.to_toml().unwrap()).unwrap();
         assert_eq!(a.summary(), via_json.summary());
         assert_eq!(a.summary(), via_toml.summary());
+    }
+
+    #[test]
+    fn nat64_parses_validates_and_round_trips() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "lan6"
+zone = "lan"
+address6 = "2001:db8:64::1/64"
+[zone.lan]
+[services.dns]
+upstream = ["10.64.2.2"]
+[nat.nat64]
+enabled = true
+prefix = "64:ff9b::/96"
+pool = "192.0.2.0/24"
+interface = "lan6"
+dns64 = true
+"#;
+        let a = Appliance::from_toml(toml).expect("nat64 config parses + validates");
+        assert!(a.nat.nat64.enabled && a.nat.nat64.dns64);
+        assert_eq!(a.nat.nat64.effective_prefix(), "64:ff9b::/96");
+        assert_eq!(a.nat.nat64.pool.as_deref(), Some("192.0.2.0/24"));
+        assert!(!a.nat.is_empty());
+        // Round-trips through TOML losslessly.
+        let b = Appliance::from_toml(&a.to_toml().unwrap()).expect("re-parses");
+        assert_eq!(a.summary(), b.summary());
+        // The well-known prefix is the default when omitted.
+        let dflt = Nat64 {
+            enabled: true,
+            pool: Some("192.0.2.0/24".into()),
+            ..Default::default()
+        };
+        assert_eq!(dflt.effective_prefix(), NAT64_WELL_KNOWN_PREFIX);
+    }
+
+    #[test]
+    fn nat64_validation_rejects_bad_config() {
+        let base = |body: &str| {
+            format!(
+                "[system]\nhostname = \"fw\"\n[[interface]]\nname = \"lan6\"\nzone = \"lan\"\naddress6 = \"2001:db8:64::1/64\"\n[zone.lan]\n[services.dns]\nupstream = [\"10.64.2.2\"]\n{body}"
+            )
+        };
+        // enabled without a pool.
+        assert!(
+            Appliance::from_toml(&base("[nat.nat64]\nenabled = true\ninterface = \"lan6\"\n"))
+                .is_err()
+        );
+        // enabled without an interface (the v6 side is required).
+        assert!(
+            Appliance::from_toml(&base(
+                "[nat.nat64]\nenabled = true\npool = \"192.0.2.0/24\"\n"
+            ))
+            .is_err()
+        );
+        // A pool that is a bare host, not a CIDR.
+        assert!(
+            Appliance::from_toml(&base(
+                "[nat.nat64]\nenabled = true\npool = \"192.0.2.1\"\ninterface = \"lan6\"\n"
+            ))
+            .is_err()
+        );
+        // A prefix that is not a /96.
+        assert!(Appliance::from_toml(&base(
+            "[nat.nat64]\nenabled = true\npool = \"192.0.2.0/24\"\ninterface = \"lan6\"\nprefix = \"64:ff9b::/64\"\n"
+        ))
+        .is_err());
+        // dns64 naming an undeclared interface.
+        assert!(Appliance::from_toml(&base(
+            "[nat.nat64]\nenabled = true\npool = \"192.0.2.0/24\"\ninterface = \"nope\"\ndns64 = true\n"
+        ))
+        .is_err());
+        // A valid dns64 config parses.
+        assert!(Appliance::from_toml(&base(
+            "[nat.nat64]\nenabled = true\npool = \"192.0.2.0/24\"\ninterface = \"lan6\"\ndns64 = true\n"
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn nat64_dns64_requires_upstream() {
+        // dns64 on, interface with static v6, but no [services.dns] upstream.
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "lan6"
+zone = "lan"
+address6 = "2001:db8:64::1/64"
+[zone.lan]
+[nat.nat64]
+enabled = true
+pool = "192.0.2.0/24"
+interface = "lan6"
+dns64 = true
+"#;
+        assert!(Appliance::from_toml(toml).is_err());
     }
 
     #[test]
