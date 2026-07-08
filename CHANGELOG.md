@@ -33,6 +33,10 @@ declarative config model.
   IPsec connections, PKI CAs/certificates, WireGuard tunnels. The completion
   list is typographically layered (bold keywords, italic hints, dim
   descriptions) and the command word highlights green/red as you type.
+- **C14 — MACVLAN + QinQ.** `type = macvlan` (a pseudo-NIC with its own MAC on
+  a parent, `macvlan-mode`), and `vlan-protocol 802.1ad` on a VLAN subinterface
+  for 802.1ad QinQ (stack a C-tag VLAN on an S-tag VLAN) — rendered as networkd
+  netdevs.
 - **L2 done right: bridge/bond members and 802.1Q on the device.** Membership
   now lives on the bridge/bond itself — `set interface br0 member eth1`
   (repeatable, per-member delete); the old per-NIC `master` field is gone. A

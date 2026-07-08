@@ -116,6 +116,25 @@ address = "10.0.0.1/24"
 # name = "lan5"
 # vlan-tagged = [10, 20]
 # vlan-untagged = 1
+#
+# MACVLAN (roadmap C14): a pseudo-NIC with its own MAC on a parent link.
+# [[interface]]
+# name = "mv0"
+# type = "macvlan"
+# parent = "eth0"
+# macvlan-mode = "bridge"        # bridge (default) | private | vepa | passthru
+# address = "10.0.0.9/24"
+#
+# QinQ (roadmap C14): stack a C-tag VLAN on an 802.1ad S-tag VLAN.
+# [[interface]]
+# name = "eth0.100"              # the outer S-VLAN (service tag)
+# parent = "eth0"
+# vlan = 100
+# vlan-protocol = "802.1ad"
+# [[interface]]
+# name = "eth0.100.20"           # the inner C-VLAN, riding the S-VLAN
+# parent = "eth0.100"
+# vlan = 20
 
 # A broad rule (no proto/port) opens a zone's posture with `action = "accept"`
 # — here the LAN may initiate outbound. The WAN stays default-drop (the global
@@ -2619,6 +2638,25 @@ pub struct Interface {
     /// VLAN id (1–4094) for a subinterface. Set together with `parent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vlan: Option<u16>,
+    /// The VLAN tag protocol for a subinterface (roadmap C14 QinQ): `802.1q`
+    /// (the default C-VLAN) or `802.1ad` (an S-VLAN / service tag). Stacking a
+    /// `802.1q` VLAN whose `parent` is an `802.1ad` VLAN gives 802.1ad QinQ
+    /// (S-tag outer, C-tag inner). Only valid on a VLAN subinterface.
+    #[serde(
+        default,
+        rename = "vlan-protocol",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub vlan_protocol: Option<String>,
+    /// The MACVLAN mode for a `type = "macvlan"` interface (roadmap C14):
+    /// `bridge` (default — the sub-interfaces can talk to each other),
+    /// `private`, `vepa`, or `passthru`. Only valid on a macvlan interface.
+    #[serde(
+        default,
+        rename = "macvlan-mode",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub macvlan_mode: Option<String>,
     /// When set, networkd runs a built-in DHCP server on this interface, handing
     /// out leases from the interface's own static subnet. Requires a static
     /// `address` (the server needs a subnet to allocate from).
@@ -2752,6 +2790,11 @@ pub enum IfaceType {
     /// A GRETAP L2 tunnel — GRE carrying Ethernet frames (a virtual bridge port
     /// over GRE); like `gre` but the link is a broadcast-capable L2 device.
     Gretap,
+    /// A MACVLAN pseudo-interface (roadmap C14): a virtual NIC with its own MAC
+    /// on top of a `parent` physical NIC (`Kind=macvlan` + `[MACVLAN] Mode=`).
+    /// Lets one link carry several L2 identities (containers/VMs, a management
+    /// address separate from the host, …).
+    Macvlan,
 }
 
 /// PPPoE client parameters (a `type = "pppoe"` interface). The session is
@@ -3062,6 +3105,14 @@ impl Interface {
     /// True for a tunnel type that carries a GRE key (`gre`/`gretap`); IPIP does not.
     pub fn tunnel_supports_key(&self) -> bool {
         matches!(self.if_type, Some(IfaceType::Gre) | Some(IfaceType::Gretap))
+    }
+    /// True for a MACVLAN pseudo-interface (`type = "macvlan"`, roadmap C14).
+    pub fn is_macvlan(&self) -> bool {
+        self.if_type == Some(IfaceType::Macvlan)
+    }
+    /// True for a VLAN subinterface (has both `parent` and `vlan`).
+    pub fn is_vlan(&self) -> bool {
+        self.parent.is_some() && self.vlan.is_some()
     }
 }
 
@@ -3425,10 +3476,11 @@ impl Appliance {
                 validate_qos(qos).with_context(|| format!("interface {:?} qos", iface.name))?;
             }
             // VLAN subinterface: parent + vlan come as a pair; vlan in range; the
-            // parent must be a declared interface. A PPPoE client also carries a
-            // `parent` (its raw uplink NIC) but no `vlan`, so it is validated
-            // separately below — skip the pairing rule for it.
-            if !iface.is_pppoe() {
+            // parent must be a declared interface. A PPPoE client and a MACVLAN
+            // also carry a `parent` (the raw uplink NIC / the parent link) but no
+            // `vlan`, so they are validated separately below — skip the pairing
+            // rule for them.
+            if !iface.is_pppoe() && !iface.is_macvlan() {
                 match (&iface.parent, iface.vlan) {
                     (Some(parent), Some(vlan)) => {
                         if !(1..=4094).contains(&vlan) {
@@ -3712,6 +3764,58 @@ impl Appliance {
                     "interface {:?}: `member` is only valid on a type=bridge/bond device",
                     iface.name
                 );
+            }
+
+            // MACVLAN (roadmap C14): needs a `parent`, a valid mode, and cannot
+            // also be a VLAN. The parent must be a declared/discovered interface.
+            if iface.is_macvlan() {
+                match &iface.parent {
+                    None => bail!(
+                        "interface {:?}: a type=macvlan interface needs a `parent` NIC",
+                        iface.name
+                    ),
+                    Some(p) if !self.interfaces.iter().any(|i| &i.name == p) => bail!(
+                        "interface {:?}: macvlan parent {p:?} is not a declared interface",
+                        iface.name
+                    ),
+                    Some(_) => {}
+                }
+                if iface.vlan.is_some() {
+                    bail!(
+                        "interface {:?}: a macvlan cannot also be a VLAN (drop `vlan`)",
+                        iface.name
+                    );
+                }
+            }
+            if let Some(mode) = &iface.macvlan_mode {
+                if !iface.is_macvlan() {
+                    bail!(
+                        "interface {:?}: macvlan-mode is only valid on a type=macvlan",
+                        iface.name
+                    );
+                }
+                if !matches!(mode.as_str(), "bridge" | "private" | "vepa" | "passthru") {
+                    bail!(
+                        "interface {:?}: macvlan-mode {mode:?} must be bridge, private, vepa or passthru",
+                        iface.name
+                    );
+                }
+            }
+            // QinQ (roadmap C14): `vlan-protocol` only on a VLAN subinterface, and
+            // one of the two 802.1 tag protocols.
+            if let Some(proto) = &iface.vlan_protocol {
+                if !iface.is_vlan() {
+                    bail!(
+                        "interface {:?}: vlan-protocol is only valid on a VLAN subinterface (needs parent + vlan)",
+                        iface.name
+                    );
+                }
+                if !matches!(proto.as_str(), "802.1q" | "802.1ad") {
+                    bail!(
+                        "interface {:?}: vlan-protocol {proto:?} must be 802.1q or 802.1ad",
+                        iface.name
+                    );
+                }
             }
             if let Some(mode) = &iface.bond_mode {
                 if !iface.is_bond() {

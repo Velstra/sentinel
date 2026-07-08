@@ -37,9 +37,29 @@ fn netdev_name(iface: &str) -> String {
     format!("{PREFIX}{iface}.netdev")
 }
 
-/// The `.netdev` that creates an 802.1Q VLAN link `iface` with the given id.
-fn netdev_body(iface: &str, vlan: u16) -> String {
-    format!("[NetDev]\nName={iface}\nKind=vlan\n\n[VLAN]\nId={vlan}\n")
+/// The `.netdev` that creates a VLAN link `iface` with the given id. `protocol`
+/// selects the tag TPID: `802.1q` (or `None` — the default C-VLAN) renders no
+/// `Protocol=` line, while `802.1ad` emits `Protocol=802.1ad` for an S-VLAN
+/// (service tag). Stacking an `802.1q` VLAN on an `802.1ad` VLAN gives 802.1ad
+/// QinQ (roadmap C14).
+fn netdev_body(iface: &str, vlan: u16, protocol: Option<&str>) -> String {
+    let mut body = format!("[NetDev]\nName={iface}\nKind=vlan\n\n[VLAN]\nId={vlan}\n");
+    if protocol == Some("802.1ad") {
+        body.push_str("Protocol=802.1ad\n");
+    }
+    body
+}
+
+/// The `.netdev` for a MACVLAN pseudo-interface (roadmap C14): `Kind=macvlan`
+/// plus a `[MACVLAN] Mode=` (default `bridge`). The device attaches to its
+/// `parent` NIC through the parent's `.network` (`MACVLAN=<name>`), not here —
+/// mirroring how a VLAN child attaches via the parent's `VLAN=`.
+fn macvlan_netdev_body(iface: &Interface) -> String {
+    let mode = iface.macvlan_mode.as_deref().unwrap_or("bridge");
+    format!(
+        "[NetDev]\nName={}\nKind=macvlan\n\n[MACVLAN]\nMode={mode}\n",
+        iface.name
+    )
 }
 
 /// The `[BridgeVLAN]` port section for a member of a VLAN-aware bridge: a `VLAN=`
@@ -91,7 +111,10 @@ fn virtual_l2_netdev_body(iface: &Interface) -> String {
             | IfaceType::Wireguard
             | IfaceType::Gre
             | IfaceType::Ipip
-            | IfaceType::Gretap,
+            | IfaceType::Gretap
+            // MACVLAN gets its own netdev renderer (macvlan_netdev_body), not
+            // this virtual-L2 one.
+            | IfaceType::Macvlan,
         ) => String::new(),
     }
 }
@@ -172,6 +195,7 @@ fn network_body(
     address: Option<&str>,
     address6: Option<&str>,
     vlan_children: &[String],
+    macvlan_children: &[String],
     dhcp: Option<&DhcpServer>,
     ra: Option<&RouterAdvert>,
     master: Option<&str>,
@@ -217,6 +241,11 @@ fn network_body(
     }
     for child in vlan_children {
         body.push_str(&format!("VLAN={child}\n"));
+    }
+    // MACVLAN children attach to this (parent) interface the same way VLAN
+    // children do — a `[Network]` directive naming each pseudo-NIC riding on it.
+    for child in macvlan_children {
+        body.push_str(&format!("MACVLAN={child}\n"));
     }
     // Both the DHCP server and the RA sender are switched on by a directive in
     // [Network]; their detailed [DHCPServer] / [IPv6SendRA] / [IPv6Prefix]
@@ -1664,6 +1693,21 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
         }
     }
 
+    // Map each parent NIC to the MACVLAN pseudo-interfaces riding on it — the
+    // MACVLAN counterpart of the VLAN `children` map (roadmap C14). A macvlan's
+    // `parent` names its host NIC, whose `.network` gains a `MACVLAN=` per child.
+    let mut macvlan_children: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for i in ifaces {
+        if i.is_macvlan() {
+            if let Some(parent) = &i.parent {
+                macvlan_children
+                    .entry(parent.as_str())
+                    .or_default()
+                    .push(i.name.clone());
+            }
+        }
+    }
+
     // Map each member NIC to its owning bridge/bond device (name + whether it is a
     // bond), derived from every device's `member` list — the inverse of the old
     // per-member `master`. A member's `.network` gets `Bridge=`/`Bond=` from this.
@@ -1692,11 +1736,23 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     // Files that carry a secret (a WireGuard private key): 0640 root:systemd-network.
     let mut secrets: HashSet<String> = HashSet::new();
 
-    // VLAN .netdev units.
+    // VLAN .netdev units. `vlan_protocol` selects the tag TPID (802.1q default /
+    // 802.1ad S-VLAN); a VLAN whose parent is itself a VLAN stacks (QinQ).
     for i in ifaces {
         if let (Some(_), Some(vlan)) = (&i.parent, i.vlan) {
             let name = netdev_name(&i.name);
-            writes.push((name.clone(), netdev_body(&i.name, vlan)));
+            let body = netdev_body(&i.name, vlan, i.vlan_protocol.as_deref());
+            writes.push((name.clone(), body));
+            keep.insert(name);
+        }
+    }
+
+    // MACVLAN .netdev units (roadmap C14): a pseudo-NIC with its own MAC on a
+    // parent link. The parent's `.network` references it via `MACVLAN=` below.
+    for i in ifaces {
+        if i.is_macvlan() {
+            let name = netdev_name(&i.name);
+            writes.push((name.clone(), macvlan_netdev_body(i)));
             keep.insert(name);
         }
     }
@@ -1751,6 +1807,8 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
                     || i.router_advert.is_some()
                     || i.is_virtual_l2()
                     || i.is_tunnel()
+                    || i.is_macvlan()
+                    || macvlan_children.contains_key(i.name.as_str())
                     || master_of.contains_key(i.name.as_str())
                     || !i.vlan_tagged.is_empty()
                     || i.vlan_untagged.is_some()
@@ -1764,6 +1822,10 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
         })
         .map(|i| {
             let kids = children
+                .get(i.name.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let mv_kids = macvlan_children
                 .get(i.name.as_str())
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
@@ -1786,6 +1848,7 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
                 i.address.as_deref(),
                 i.address6.as_deref(),
                 kids,
+                mv_kids,
                 i.dhcp_server.as_ref(),
                 i.router_advert.as_ref(),
                 master.as_deref(),
@@ -1982,6 +2045,7 @@ mod tests {
             Some("10.0.0.1/24"),
             None,
             &[],
+            &[],
             None,
             None,
             None,
@@ -2002,6 +2066,7 @@ mod tests {
             Some("dhcp"),
             None,
             &[],
+            &[],
             None,
             None,
             None,
@@ -2017,11 +2082,96 @@ mod tests {
 
     #[test]
     fn vlan_netdev_declares_kind_and_id() {
-        let d = netdev_body("eth1.20", 20);
+        let d = netdev_body("eth1.20", 20, None);
         assert!(d.contains("Name=eth1.20"));
         assert!(d.contains("Kind=vlan"));
         assert!(d.contains("Id=20"));
+        // A plain (802.1q) VLAN renders no Protocol= line.
+        assert!(!d.contains("Protocol="));
         assert_eq!(netdev_name("eth1.20"), "10-sentinel-eth1.20.netdev");
+
+        // An 802.1ad S-VLAN adds Protocol=802.1ad; explicit 802.1q stays bare.
+        let sv = netdev_body("eth1.100", 100, Some("802.1ad"));
+        assert!(sv.contains("Protocol=802.1ad"), "{sv}");
+        let cv = netdev_body("eth1.30", 30, Some("802.1q"));
+        assert!(!cv.contains("Protocol="), "{cv}");
+    }
+
+    #[test]
+    fn macvlan_netdev_declares_kind_and_mode() {
+        // A macvlan renders Kind=macvlan + [MACVLAN] Mode=; the mode defaults to
+        // bridge when unset (roadmap C14).
+        let mv = Interface {
+            name: "mv0".into(),
+            zone: Some("lan".into()),
+            address: Some("10.9.0.2/24".into()),
+            address6: None,
+            parent: Some("eth1".into()),
+            vlan: None,
+            vlan_protocol: None,
+            macvlan_mode: Some("bridge".into()),
+            dhcp_server: None,
+            router_advert: None,
+            if_type: Some(IfaceType::Macvlan),
+            members: vec![],
+            vlan_aware: None,
+            vlan_tagged: vec![],
+            vlan_untagged: None,
+            bond_mode: None,
+            pd_from: None,
+            pd_subnet: None,
+            mtu: None,
+            mac: None,
+            local: None,
+            remote: None,
+            tunnel_key: None,
+            ttl: None,
+            qos: None,
+            pppoe: None,
+            description: None,
+            disabled: false,
+        };
+        let d = macvlan_netdev_body(&mv);
+        assert!(d.contains("Name=mv0"), "{d}");
+        assert!(d.contains("Kind=macvlan"), "{d}");
+        assert!(d.contains("Mode=bridge"), "{d}");
+
+        // An unset mode still defaults to bridge.
+        let mv2 = Interface {
+            macvlan_mode: None,
+            ..mv.clone()
+        };
+        assert!(macvlan_netdev_body(&mv2).contains("Mode=bridge"));
+
+        // A vepa mode is rendered verbatim.
+        let mv3 = Interface {
+            macvlan_mode: Some("vepa".into()),
+            ..mv.clone()
+        };
+        assert!(macvlan_netdev_body(&mv3).contains("Mode=vepa"));
+    }
+
+    #[test]
+    fn parent_network_references_macvlan_children() {
+        // The parent NIC's .network lists each macvlan riding on it via MACVLAN=,
+        // mirroring how VLAN children get VLAN= (roadmap C14).
+        let u = network_body(
+            "eth1",
+            Some("10.0.0.1/24"),
+            None,
+            &[],
+            &["mv0".into(), "mv1".into()],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(u.contains("MACVLAN=mv0"), "{u}");
+        assert!(u.contains("MACVLAN=mv1"), "{u}");
     }
 
     #[test]
@@ -2035,6 +2185,8 @@ mod tests {
             address6: None,
             parent: None,
             vlan: None,
+            vlan_protocol: None,
+            macvlan_mode: None,
             dhcp_server: None,
             router_advert: None,
             if_type: Some(IfaceType::Gre),
@@ -2083,6 +2235,7 @@ mod tests {
             Some("10.0.0.1/24"),
             None,
             &["eth1.20".into(), "eth1.30".into()],
+            &[],
             None,
             None,
             None,
@@ -2116,6 +2269,7 @@ mod tests {
             "eth1",
             Some("10.0.0.1/24"),
             None,
+            &[],
             &[],
             Some(&dhcp),
             None,
@@ -2154,6 +2308,7 @@ mod tests {
             Some("10.0.0.1/24"),
             None,
             &[],
+            &[],
             Some(&dhcp),
             None,
             None,
@@ -2189,6 +2344,7 @@ mod tests {
             Some("10.0.0.1/24"),
             None,
             &[],
+            &[],
             Some(&dhcp),
             None,
             None,
@@ -2218,6 +2374,7 @@ mod tests {
             "eth7",
             Some("10.0.0.1/24"),
             None,
+            &[],
             &[],
             None,
             None,
@@ -2282,6 +2439,8 @@ mod tests {
             address6: None,
             parent: None,
             vlan: None,
+            vlan_protocol: None,
+            macvlan_mode: None,
             dhcp_server: None,
             router_advert: None,
             if_type: None,
@@ -2372,6 +2531,7 @@ mod tests {
             Some("dhcp"),
             Some("dhcp"),
             &[],
+            &[],
             None,
             None,
             None,
@@ -2390,6 +2550,7 @@ mod tests {
             None,
             Some("dhcp"),
             &[],
+            &[],
             None,
             None,
             None,
@@ -2406,6 +2567,7 @@ mod tests {
             "lan0",
             Some("10.0.0.1/24"),
             None,
+            &[],
             &[],
             None,
             None,
@@ -2430,6 +2592,7 @@ mod tests {
             Some("dhcp"),
             None,
             &[],
+            &[],
             None,
             None,
             None,
@@ -2446,6 +2609,7 @@ mod tests {
             "lan0",
             Some("10.0.0.1/24"),
             None,
+            &[],
             &[],
             None,
             None,
@@ -2467,6 +2631,7 @@ mod tests {
             Some("10.0.0.1/24"),
             Some("2001:db8:1::1/64"),
             &[],
+            &[],
             None,
             None,
             None,
@@ -2483,6 +2648,7 @@ mod tests {
             "wan0",
             Some("dhcp"),
             Some("auto"),
+            &[],
             &[],
             None,
             None,
@@ -2507,6 +2673,8 @@ mod tests {
             address6: None,
             parent: None,
             vlan: None,
+            vlan_protocol: None,
+            macvlan_mode: None,
             dhcp_server: None,
             router_advert: None,
             if_type: Some(IfaceType::Bridge),
@@ -2538,6 +2706,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
             None,
             None,
             Some("Bridge=br0"),
@@ -2560,6 +2729,8 @@ mod tests {
             address6: None,
             parent: None,
             vlan: None,
+            vlan_protocol: None,
+            macvlan_mode: None,
             dhcp_server: None,
             router_advert: None,
             if_type: Some(IfaceType::Bond),
@@ -2593,6 +2764,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
             None,
             None,
             Some("Bond=bond0"),
@@ -2618,6 +2790,7 @@ mod tests {
             "lan0",
             Some("10.0.0.1/24"),
             None,
+            &[],
             &[],
             None,
             Some(&ra),
@@ -2666,6 +2839,7 @@ mod tests {
             "lan0",
             Some("10.0.0.1/24"),
             None,
+            &[],
             &[],
             Some(&dhcp),
             Some(&ra),
@@ -2722,6 +2896,8 @@ mod tests {
             address6: None,
             parent: None,
             vlan: None,
+            vlan_protocol: None,
+            macvlan_mode: None,
             dhcp_server: None,
             router_advert: None,
             if_type: Some(IfaceType::Bridge),
@@ -2768,6 +2944,8 @@ mod tests {
             pd_subnet: None,
             parent: Some(parent.into()),
             vlan: None,
+            vlan_protocol: None,
+            macvlan_mode: None,
             dhcp_server: None,
             router_advert: None,
             if_type: Some(IfaceType::Pppoe),
@@ -3158,6 +3336,8 @@ mod tests {
             address6: None,
             parent: None,
             vlan: None,
+            vlan_protocol: None,
+            macvlan_mode: None,
             dhcp_server: None,
             router_advert: None,
             if_type: None,

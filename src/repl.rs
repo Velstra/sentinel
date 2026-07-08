@@ -1729,13 +1729,21 @@ const IFACE_FIELDS: &[Cand] = &[
         "pd-subnet",
         "which /64 of the delegated prefix to use (0-255)",
     ),
-    ("parent", "parent interface (for a VLAN subinterface)"),
+    ("parent", "parent interface (VLAN subinterface or macvlan)"),
     ("vlan", "802.1Q VLAN id 1–4094 (with `parent`)"),
+    (
+        "vlan-protocol",
+        "VLAN tag protocol: 802.1q (default) | 802.1ad (QinQ S-tag)",
+    ),
+    (
+        "macvlan-mode",
+        "MACVLAN mode: bridge | private | vepa | passthru (type=macvlan)",
+    ),
     ("dhcp-server", "serve DHCP from this NIC's static subnet"),
     ("router-advert", "emit IPv6 Router Advertisements (SLAAC)"),
     (
         "type",
-        "make this a bridge | bond | wireguard | pppoe | gre | ipip | gretap interface",
+        "bridge | bond | wireguard | pppoe | gre | ipip | gretap | macvlan",
     ),
     ("local", "tunnel local endpoint IP (type gre/ipip/gretap)"),
     ("remote", "tunnel remote endpoint IP (type gre/ipip/gretap)"),
@@ -1796,6 +1804,20 @@ const IFACE_TYPES: &[Cand] = &[
         "gretap",
         "a GRETAP L2 tunnel (GRE carrying Ethernet frames)",
     ),
+    (
+        "macvlan",
+        "a MACVLAN pseudo-NIC on a `parent` (own MAC; `macvlan-mode`)",
+    ),
+];
+const MACVLAN_MODES: &[Cand] = &[
+    ("bridge", "sub-interfaces can talk to each other (default)"),
+    ("private", "sub-interfaces are isolated from each other"),
+    ("vepa", "traffic goes out to an 802.1Qbg switch and back"),
+    ("passthru", "one sub-interface gets the parent's queue"),
+];
+const VLAN_PROTOCOLS: &[Cand] = &[
+    ("802.1q", "a C-VLAN customer tag (the default)"),
+    ("802.1ad", "an S-VLAN service tag (QinQ outer tag)"),
 ];
 const PPPOE_FIELDS: &[Cand] = &[
     ("username", "ISP login (PPPoE/PAP/CHAP username)"),
@@ -2027,6 +2049,8 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         // Bridge/bond value completions.
         ["set", "interface", _name, "type"] => IFACE_TYPES,
         ["set", "interface", _name, "bond-mode"] => BOND_MODES,
+        ["set", "interface", _name, "macvlan-mode"] => MACVLAN_MODES,
+        ["set", "interface", _name, "vlan-protocol"] => VLAN_PROTOCOLS,
         // The PPPoE-client sub-tree of an interface.
         ["set" | "delete", "interface", _name, "pppoe"] => PPPOE_FIELDS,
         // The QoS / traffic-shaping sub-tree of an interface.
@@ -2965,6 +2989,8 @@ mod tests {
                 "pd-subnet",
                 "parent",
                 "vlan",
+                "vlan-protocol",
+                "macvlan-mode",
                 "dhcp-server",
                 "router-advert",
                 "type",
@@ -3357,6 +3383,8 @@ mod tests {
                 "pd-subnet",
                 "parent",
                 "vlan",
+                "vlan-protocol",
+                "macvlan-mode",
                 "dhcp-server",
                 "router-advert",
                 "type",
