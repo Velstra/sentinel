@@ -3803,6 +3803,93 @@
           '';
         };
 
+        # MACVLAN + QinQ (roadmap C14): the two remaining networkd-rendered L2
+        # interface types, on the same render path as VLANs/bridges. One fw node
+        # with three NICs: eth1 hosts a macvlan `mv0` (its own MAC, mode bridge)
+        # AND an 802.1ad S-VLAN `eth1.100` carrying a stacked 802.1q C-VLAN
+        # `eth1.100.20` (QinQ). eth3 is left free for the velstra XDP attach so the
+        # data plane never touches the tagged/pseudo links. Proves the render →
+        # kernel path: the macvlan device exists with its own MAC in mode bridge,
+        # the S-VLAN link is 802.1ad, and the stacked C-VLAN is up with its address.
+        #   nix build .#checks.x86_64-linux.c14 -L
+        c14 = pkgs.testers.runNixOSTest {
+          name = "sentinel-c14";
+          nodes.fw =
+            { lib, ... }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce "fw";
+              networking.firewall.enable = lib.mkForce false;
+              virtualisation.vlans = [ 1 2 3 ];
+              virtualisation.memorySize = 2048;
+              services.velstra.interface = lib.mkForce "eth3";
+            };
+          testScript = ''
+            start_all()
+            fw.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+
+            # Declare eth1 (the shared parent NIC), a macvlan `mv0` on it in mode
+            # bridge with its own address, an 802.1ad S-VLAN `eth1.100`, and a
+            # stacked 802.1q C-VLAN `eth1.100.20` (parent/vlan inferred from the
+            # dotted name) with an address. ONE `set` per line.
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth1' "
+                "'set interface mv0 type macvlan' "
+                "'set interface mv0 parent eth1' "
+                "'set interface mv0 macvlan-mode bridge' "
+                "'set interface mv0 zone lan' "
+                "'set interface mv0 address 10.9.0.2/24' "
+                "'set interface eth1.100 vlan-protocol 802.1ad' "
+                "'set interface eth1.100.20 zone lan' "
+                "'set interface eth1.100.20 address 10.20.0.1/24' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+
+            # Sentinel rendered the macvlan netdev (Kind=macvlan + Mode=bridge) and
+            # attached it to the parent's .network (MACVLAN=mv0), exactly as a VLAN
+            # child attaches via VLAN=.
+            fw.wait_until_succeeds(
+                "test -f /run/systemd/network/10-sentinel-mv0.netdev", timeout=20
+            )
+            mvdev = fw.succeed("cat /run/systemd/network/10-sentinel-mv0.netdev")
+            assert "Kind=macvlan" in mvdev, mvdev
+            assert "Mode=bridge" in mvdev, mvdev
+            eth1net = fw.succeed("cat /run/systemd/network/10-sentinel-eth1.network")
+            assert "MACVLAN=mv0" in eth1net, eth1net
+            assert "VLAN=eth1.100" in eth1net, eth1net
+
+            # The S-VLAN netdev carries Protocol=802.1ad; the stacked C-VLAN netdev
+            # is a plain 802.1q link (no Protocol=) and rides on the S-VLAN, whose
+            # .network references it via VLAN= (generic parent keying → QinQ).
+            svdev = fw.succeed("cat /run/systemd/network/10-sentinel-eth1.100.netdev")
+            assert "Kind=vlan" in svdev, svdev
+            assert "Id=100" in svdev, svdev
+            assert "Protocol=802.1ad" in svdev, svdev
+            cvdev = fw.succeed("cat /run/systemd/network/10-sentinel-eth1.100.20.netdev")
+            assert "Id=20" in cvdev, cvdev
+            assert "Protocol=" not in cvdev, cvdev
+            svnet = fw.succeed("cat /run/systemd/network/10-sentinel-eth1.100.network")
+            assert "VLAN=eth1.100.20" in svnet, svnet
+
+            # networkd realised them in the kernel. The macvlan is mode bridge with
+            # its own hardware address distinct from the parent eth1.
+            fw.wait_until_succeeds("ip -d link show mv0 | grep -q 'macvlan mode bridge'", timeout=30)
+            fw.wait_until_succeeds("ip -4 addr show mv0 | grep -q '10.9.0.2'", timeout=30)
+            parent_mac = fw.succeed("cat /sys/class/net/eth1/address").strip()
+            mv_mac = fw.succeed("cat /sys/class/net/mv0/address").strip()
+            assert mv_mac and mv_mac != parent_mac, (mv_mac, parent_mac)
+
+            # The S-VLAN is 802.1ad; the stacked C-VLAN exists, is up, and holds its
+            # address (proving the QinQ stack was created end to end).
+            fw.wait_until_succeeds("ip -d link show eth1.100 | grep -q 'vlan protocol 802.1ad'", timeout=30)
+            fw.wait_until_succeeds("ip link show eth1.100.20 | grep -q 'state UP\\|LOWER_UP'", timeout=30)
+            fw.wait_until_succeeds("ip -4 addr show eth1.100.20 | grep -q '10.20.0.1'", timeout=30)
+          '';
+        };
+
         # Kernel tunnels (roadmap C3): two Sentinel appliances (`left`/`right`) on
         # a shared segment (eth1, static underlay addresses), each configuring a GRE
         # tunnel to the other with an inner /30. Sentinel renders a networkd tunnel
