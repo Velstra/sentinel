@@ -68,6 +68,7 @@
             --set SENTINEL_NFT_BIN        ${pkgs.nftables}/bin/nft \
             --set SENTINEL_SWANCTL_BIN    ${pkgs.strongswan}/bin/swanctl \
             --set SENTINEL_OPENSSL_BIN    ${pkgs.openssl.bin}/bin/openssl \
+            --set SENTINEL_CURL_BIN       ${pkgs.curl.bin}/bin/curl \
             --set SENTINEL_SYSTEMD_RUN_BIN ${pkgs.systemd}/bin/systemd-run \
             --set SENTINEL_JOURNALCTL_BIN ${pkgs.systemd}/bin/journalctl \
             --set SENTINEL_WREN_BIN       ${wrenPkg}/bin/wren \
@@ -334,6 +335,11 @@
             # hashed with `openssl passwd -6` (already present for the PKI), so the
             # bundled `ocpasswd` tool isn't in the render path.
             pkgs.ocserv
+            # Signed update channel (roadmap C13): the CLI fetches the release
+            # manifest + image with curl (resolved via SENTINEL_CURL_BIN); keep it
+            # on PATH too for manual channel inspection. Ed25519 verification +
+            # SHA-256 reuse the openssl already present for the PKI.
+            pkgs.curl
           ];
 
           # Egress traffic shaping (roadmap C8) needs the CAKE + fq_codel queue
@@ -2034,6 +2040,101 @@
                   machine.succeed("test -f /mnt/esp/EFI/Linux/sentinel-b+3.efi")
                   assert "sentinel-b" in machine.succeed("cat /mnt/esp/loader/loader.conf")
                   machine.succeed("umount /mnt/esp")
+          '';
+        };
+
+        # The signed update channel's CRYPTO GATE (roadmap C13). Proves the
+        # authenticity check in front of the A/B slot-writer, NOT the slot write
+        # itself (that's checks.update's job) — so it needs no image.nix disk and
+        # no reboot, and stays fast. A single node builds a `file://` channel with
+        # openssl, then drives `sentinel update check`/`install` across the good,
+        # tampered-image, and wrong-key cases.
+        #   nix build .#checks.x86_64-linux.updatechannel -L
+        updatechannel = pkgs.testers.runNixOSTest {
+          name = "sentinel-updatechannel";
+          nodes.machine = {
+            imports = [ self.nixosModules.sentinel ];
+            virtualisation.memorySize = 1024;
+            # `openssl` for the test's own keygen/sign/hash (the sentinel CLI uses
+            # its pinned SENTINEL_OPENSSL_BIN/SENTINEL_CURL_BIN); `curl` is already
+            # pulled in by the sentinel module.
+            environment.systemPackages = [
+              pkgs.openssl
+              pkgs.curl
+            ];
+          };
+          testScript = ''
+            machine.wait_for_unit("multi-user.target")
+            # Boot seeded the editable config, so `set update …` layers onto it.
+            machine.wait_for_unit("sentinel-boot.service")
+            machine.succeed("test -f /var/lib/sentinel/appliance.toml")
+
+            with subtest("build a file:// channel signed by a pinned Ed25519 key"):
+                machine.succeed("mkdir -p /tmp/chan")
+                # The pinned release key, plus a DIFFERENT key for the wrong-key case.
+                machine.succeed("openssl genpkey -algorithm ed25519 -out /tmp/priv.pem")
+                machine.succeed("openssl pkey -in /tmp/priv.pem -pubout -out /tmp/pub.pem")
+                machine.succeed("openssl genpkey -algorithm ed25519 -out /tmp/wrong.pem")
+                # A small fixture "image" and a manifest naming it + its sha256.
+                machine.succeed("head -c 4096 /dev/urandom > /tmp/chan/sentinel-0.3.0.img")
+                sha = machine.succeed(
+                    "openssl dgst -sha256 /tmp/chan/sentinel-0.3.0.img | awk '{print $NF}'"
+                ).strip()
+                machine.succeed(
+                    "printf '%s' "
+                    "'{\"version\":\"0.3.0\",\"image\":\"sentinel-0.3.0.img\",\"sha256\":\"'"
+                    + sha + "'\"}' > /tmp/chan/manifest.json"
+                )
+                # Detached Ed25519 signature over the EXACT manifest bytes.
+                machine.succeed(
+                    "openssl pkeyutl -sign -inkey /tmp/priv.pem -rawin "
+                    "-in /tmp/chan/manifest.json -out /tmp/chan/manifest.json.sig"
+                )
+
+            with subtest("pin the channel in the appliance config"):
+                machine.succeed(
+                    "su admin -c \"printf '%s\\n' "
+                    "'set update url file:///tmp/chan' "
+                    "'set update public-key file:/tmp/pub.pem' "
+                    "commit save exit "
+                    "| sentinel configure --no-apply\""
+                )
+                machine.succeed("grep -q 'file:///tmp/chan' /var/lib/sentinel/appliance.toml")
+
+            with subtest("GOOD: `update check` verifies the manifest and prints the version"):
+                out = machine.succeed("sentinel update check")
+                assert "0.3.0" in out, f"check should report the signed version: {out}"
+
+            with subtest("GOOD: a verified image reaches the slot-writer (crypto passed)"):
+                # No A/B disk here, so the writer fails at find_source_disk — but
+                # ONLY the crypto-verified image gets that far, which is the proof.
+                status, out = machine.execute("sentinel update install 2>&1")
+                assert status != 0, f"expected the writer to fail without a disk: {out}"
+                assert "could not resolve the source disk" in out, (
+                    f"verification should pass and control reach the slot-writer: {out}"
+                )
+
+            with subtest("TAMPERED image: SHA-256 mismatch refuses the update"):
+                machine.succeed(
+                    "printf 'X' | dd of=/tmp/chan/sentinel-0.3.0.img bs=1 seek=0 "
+                    "count=1 conv=notrunc"
+                )
+                status, out = machine.execute("sentinel update install 2>&1")
+                assert status != 0, f"a tampered image must be refused: {out}"
+                assert "mismatch" in out.lower(), f"expected a SHA-256 mismatch: {out}"
+
+            with subtest("WRONG key: signature verification fails closed"):
+                # Re-sign the (unchanged) manifest with a DIFFERENT key; the pinned
+                # public key no longer matches, so `check` must refuse.
+                machine.succeed(
+                    "openssl pkeyutl -sign -inkey /tmp/wrong.pem -rawin "
+                    "-in /tmp/chan/manifest.json -out /tmp/chan/manifest.json.sig"
+                )
+                status, out = machine.execute("sentinel update check 2>&1")
+                assert status != 0, f"a wrong-key signature must be refused: {out}"
+                assert "signature verification failed" in out.lower(), (
+                    f"expected a signature verification failure: {out}"
+                )
           '';
         };
 

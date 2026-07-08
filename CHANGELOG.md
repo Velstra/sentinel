@@ -84,6 +84,11 @@ declarative config model.
 - **C10 — NAT64 / DNS64.** tayga (NAT64) + unbound (DNS64) for IPv6-only
   networks reaching IPv4 destinations, with a documented no-ALG stance.
   (Hairpin NAT is deferred — it needs the eBPF datapath.)
+- **C13 — signed update channel.** `[update]` pins a channel URL + an Ed25519
+  release-signing key; `sentinel update check`/`install` fetch a signed
+  manifest, verify its detached signature against the pinned key and the image's
+  SHA-256 before ever writing an A/B slot — the authenticity gate in front of
+  the existing verified-boot slot switch.
 - **Per-object polish.** Description and `disabled` on interfaces, firewall
   rules, NAT rules, and zones; DHCP static mappings plus lease / domain /
   router / DNS options; DNS cache-size and local-domain tunables.

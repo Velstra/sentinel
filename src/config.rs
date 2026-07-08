@@ -359,6 +359,14 @@ port = 443
 # [protocols.export]
 # kernel = "from-peer"
 # import = { static = "from-peer" }
+
+# Signed update channel (roadmap C13): the A/B image updater
+# (`sentinel update`) only writes a slot if the release manifest is signed by
+# this pinned Ed25519 key. `url` holds manifest.json + its .sig + the images;
+# `public-key` is the PEM (or `file:<path>` so it can live in the image).
+# [update]
+# url = "https://updates.example.com/sentinel/stable"
+# public-key = "file:/etc/sentinel/update-key.pem"
 "#;
 
 /// The whole declarative appliance config.
@@ -422,6 +430,35 @@ pub struct Appliance {
     /// the declarative definitions. Omitted from saved configs when empty.
     #[serde(default, skip_serializing_if = "Pki::is_empty")]
     pub pki: Pki,
+    /// Signed update channel (roadmap C13): where to fetch A/B image updates from
+    /// and the pinned public key that must have signed them. The slot-write +
+    /// boot-switch already exist (`sentinel update`); this adds the authenticity
+    /// gate in front of it, so only a release signed by the pinned key is ever
+    /// written to a slot. Omitted from saved configs when not configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<UpdateChannel>,
+}
+
+/// The signed update channel (`[update]`, roadmap C13). `sentinel update check`
+/// fetches a signed manifest from `url`, verifies its detached signature against
+/// the pinned `public-key` (an Ed25519 key), and only then trusts the version +
+/// image digest it names; `sentinel update install` re-verifies before writing
+/// the image to the inactive A/B slot. The pinned key is the trust anchor for
+/// the whole distribution path — in production it is baked into the immutable
+/// image; carrying it in config here lets an operator pin their own channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateChannel {
+    /// Base URL of the update channel — the directory holding `manifest.json`
+    /// (+ its `.sig`) and the images it names. Must be `https://` (or `file://`
+    /// for a local/offline mirror). Required.
+    pub url: String,
+    /// The pinned Ed25519 public key that release manifests must be signed with,
+    /// PEM (`-----BEGIN PUBLIC KEY-----`). Required — an unsigned or
+    /// wrong-key manifest is refused. A `file:`-prefixed value reads the PEM
+    /// from that path instead (so the key can live in the image, not the config).
+    #[serde(rename = "public-key")]
+    pub public_key: String,
 }
 
 /// The box-wide services category (`[services.*]`). A thin grouping so DNS, NTP
@@ -4847,6 +4884,31 @@ impl Appliance {
                 if !matches!(ch.as_str(), "http-01" | "dns-01") {
                     bail!("pki acme: challenge {ch:?} must be http-01 or dns-01");
                 }
+            }
+        }
+
+        // Signed update channel (roadmap C13): the URL must be a fetchable
+        // channel and the pinned key must be present (its cryptographic validity
+        // is checked by openssl at update time — here we reject the obvious
+        // mistakes so a `commit` fails fast rather than an update later).
+        if let Some(up) = &self.update {
+            if !(up.url.starts_with("https://") || up.url.starts_with("file://")) {
+                bail!(
+                    "update: url {:?} must be an https:// or file:// URL",
+                    up.url
+                );
+            }
+            if up.public_key.trim().is_empty() {
+                bail!("update: public-key is required (the pinned release signing key)");
+            }
+            let key = up.public_key.trim();
+            let looks_like_pem = key.contains("BEGIN PUBLIC KEY");
+            let is_file_ref = key.starts_with("file:");
+            if !looks_like_pem && !is_file_ref {
+                bail!(
+                    "update: public-key must be a PEM public key (-----BEGIN PUBLIC KEY-----) \
+                     or a `file:<path>` reference"
+                );
             }
         }
         Ok(())
