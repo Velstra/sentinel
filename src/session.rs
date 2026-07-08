@@ -39,6 +39,10 @@ struct IfaceDraft {
     pd_subnet: Option<u8>,
     parent: Option<String>,
     vlan: Option<u16>,
+    // 802.1ad QinQ tag protocol on a VLAN subinterface, and the MACVLAN mode on
+    // a `type = macvlan` pseudo-NIC (roadmap C14).
+    vlan_protocol: Option<String>,
+    macvlan_mode: Option<String>,
     // A built-in DHCP server serving this interface's static subnet.
     dhcp_server: Option<DhcpServerDraft>,
     // An IPv6 Router Advertiser (SLAAC) on this interface.
@@ -1487,6 +1491,8 @@ impl Draft {
                             pd_subnet: i.pd_subnet,
                             parent: i.parent.clone(),
                             vlan: i.vlan,
+                            vlan_protocol: i.vlan_protocol.clone(),
+                            macvlan_mode: i.macvlan_mode.clone(),
                             dhcp_server: i.dhcp_server.as_ref().map(|d| DhcpServerDraft {
                                 pool_offset: d.pool_offset,
                                 pool_size: d.pool_size,
@@ -2368,9 +2374,10 @@ impl Session {
                     "gre" => IfaceType::Gre,
                     "ipip" => IfaceType::Ipip,
                     "gretap" => IfaceType::Gretap,
+                    "macvlan" => IfaceType::Macvlan,
                     other => {
                         bail!(
-                            "interface type {other:?}: expected \"bridge\", \"bond\", \"wireguard\", \"pppoe\", \"gre\", \"ipip\" or \"gretap\""
+                            "interface type {other:?}: expected \"bridge\", \"bond\", \"wireguard\", \"pppoe\", \"gre\", \"ipip\", \"gretap\" or \"macvlan\""
                         )
                     }
                 };
@@ -2390,6 +2397,23 @@ impl Session {
                     );
                 }
                 self.draft.iface_mut(name).bond_mode = Some((*v).to_string());
+            }
+            // 802.1ad QinQ tag protocol on a VLAN subinterface, and the MACVLAN
+            // mode on a `type = macvlan` pseudo-NIC (roadmap C14). The cross-field
+            // constraints (VLAN-only / macvlan-only) are enforced by `validate`.
+            ["interface", name, "vlan-protocol", v] => {
+                if !matches!(*v, "802.1q" | "802.1ad") {
+                    bail!("vlan-protocol {v:?}: expected \"802.1q\" or \"802.1ad\"");
+                }
+                self.draft.iface_mut(name).vlan_protocol = Some((*v).to_string());
+            }
+            ["interface", name, "macvlan-mode", v] => {
+                if !matches!(*v, "bridge" | "private" | "vepa" | "passthru") {
+                    bail!(
+                        "macvlan-mode {v:?}: expected \"bridge\", \"private\", \"vepa\" or \"passthru\""
+                    );
+                }
+                self.draft.iface_mut(name).macvlan_mode = Some((*v).to_string());
             }
             ["interface", name, "vlan-aware", v] => {
                 self.draft.iface_mut(name).vlan_aware = Some(parse_bool(v)?);
@@ -3891,6 +3915,8 @@ impl Session {
             ["interface", name, "vlan"] => self.iface(name)?.vlan = None,
             ["interface", name, "type"] => self.iface(name)?.if_type = None,
             ["interface", name, "bond-mode"] => self.iface(name)?.bond_mode = None,
+            ["interface", name, "vlan-protocol"] => self.iface(name)?.vlan_protocol = None,
+            ["interface", name, "macvlan-mode"] => self.iface(name)?.macvlan_mode = None,
             ["interface", name, "vlan-aware"] => self.iface(name)?.vlan_aware = None,
             ["interface", name, "vlan-tagged"] => self.iface(name)?.vlan_tagged.clear(),
             ["interface", name, "vlan-untagged"] => self.iface(name)?.vlan_untagged = None,
@@ -5059,6 +5085,8 @@ impl Session {
                 pd_subnet: d.pd_subnet,
                 parent: d.parent.clone(),
                 vlan: d.vlan,
+                vlan_protocol: d.vlan_protocol.clone(),
+                macvlan_mode: d.macvlan_mode.clone(),
                 dhcp_server: d.dhcp_server.as_ref().map(|s| DhcpServer {
                     pool_offset: s.pool_offset,
                     pool_size: s.pool_size,
@@ -5780,6 +5808,8 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             && i.pd_subnet.is_none()
             && i.parent.is_none()
             && i.vlan.is_none()
+            && i.vlan_protocol.is_none()
+            && i.macvlan_mode.is_none()
             && i.dhcp_server.is_none()
             && i.router_advert.is_none()
             && i.if_type.is_none()
@@ -5815,6 +5845,7 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
                 IfaceType::Gre => "gre",
                 IfaceType::Ipip => "ipip",
                 IfaceType::Gretap => "gretap",
+                IfaceType::Macvlan => "macvlan",
             };
             out.push_str(&format!("    type {s}\n"));
         }
@@ -5877,6 +5908,12 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         if let Some(v) = i.vlan {
             out.push_str(&format!("    vlan {v}\n"));
+        }
+        if let Some(proto) = &i.vlan_protocol {
+            out.push_str(&format!("    vlan-protocol {proto}\n"));
+        }
+        if let Some(mode) = &i.macvlan_mode {
+            out.push_str(&format!("    macvlan-mode {mode}\n"));
         }
         if let Some(q) = &i.qos {
             out.push_str("    qos {\n");
@@ -8081,6 +8118,106 @@ mod tests {
         // vlan-tagged on a port outside a vlan-aware bridge is rejected.
         run(&mut s, "set interface eth3 vlan-tagged 10").unwrap();
         assert!(s.commit().is_err());
+    }
+
+    #[test]
+    fn macvlan_interface_set_show_commit_roundtrip() {
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname fw",
+            // The parent NIC must be a declared interface for validate() to pass.
+            "set interface eth0 zone wan",
+            "set interface mv0 type macvlan",
+            "set interface mv0 parent eth0",
+            "set interface mv0 macvlan-mode bridge",
+            "set interface mv0 zone lan",
+            "set interface mv0 address 10.20.0.1/24",
+        ] {
+            run(&mut s, line).unwrap();
+        }
+        let shown = s.show_only("interface");
+        assert!(shown.contains("type macvlan"), "got:\n{shown}");
+        assert!(shown.contains("parent eth0"), "got:\n{shown}");
+        assert!(shown.contains("macvlan-mode bridge"), "got:\n{shown}");
+
+        let a = s.commit().expect("macvlan interface commits");
+        let mv0 = a.interfaces.iter().find(|i| i.name == "mv0").unwrap();
+        assert_eq!(mv0.if_type, Some(IfaceType::Macvlan));
+        assert_eq!(mv0.macvlan_mode.as_deref(), Some("bridge"));
+        assert_eq!(mv0.parent.as_deref(), Some("eth0"));
+
+        // from_appliance ∘ materialize is the identity on the macvlan fields.
+        let round = Session {
+            draft: Draft::from_appliance(&a),
+            path: PathBuf::from("/dev/null"),
+            dirty: false,
+        };
+        let b = round.materialize().expect("re-materialises");
+        let mv0b = b.interfaces.iter().find(|i| i.name == "mv0").unwrap();
+        assert_eq!(mv0b.if_type, Some(IfaceType::Macvlan));
+        assert_eq!(mv0b.macvlan_mode.as_deref(), Some("bridge"));
+        assert_eq!(mv0b.parent.as_deref(), Some("eth0"));
+
+        // A macvlan-mode value outside the set is rejected at set-time.
+        assert!(run(&mut s, "set interface mv0 macvlan-mode bogus").is_err());
+    }
+
+    #[test]
+    fn qinq_stack_set_show_commit() {
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname fw",
+            "set interface eth0 zone wan",
+            // S-VLAN: an 802.1ad service tag riding the physical NIC.
+            "set interface svlan parent eth0",
+            "set interface svlan vlan 100",
+            "set interface svlan vlan-protocol 802.1ad",
+            // C-VLAN: a plain 802.1q customer tag stacked on the S-VLAN → QinQ.
+            "set interface cvlan parent svlan",
+            "set interface cvlan vlan 200",
+            "set interface cvlan zone lan",
+            "set interface cvlan address 10.30.0.1/24",
+        ] {
+            run(&mut s, line).unwrap();
+        }
+        let shown = s.show_only("interface");
+        assert!(shown.contains("vlan-protocol 802.1ad"), "got:\n{shown}");
+
+        let a = s.commit().expect("QinQ stack commits");
+        let svlan = a.interfaces.iter().find(|i| i.name == "svlan").unwrap();
+        assert_eq!(svlan.vlan_protocol.as_deref(), Some("802.1ad"));
+        assert_eq!(svlan.vlan, Some(100));
+        let cvlan = a.interfaces.iter().find(|i| i.name == "cvlan").unwrap();
+        assert_eq!(cvlan.parent.as_deref(), Some("svlan"));
+        assert_eq!(cvlan.vlan, Some(200));
+
+        // vlan-protocol only accepts 802.1q / 802.1ad.
+        assert!(run(&mut s, "set interface svlan vlan-protocol 802.1x").is_err());
+    }
+
+    #[test]
+    fn macvlan_and_qinq_fields_delete() {
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname fw",
+            "set interface eth0 zone wan",
+            "set interface mv0 type macvlan",
+            "set interface mv0 parent eth0",
+            "set interface mv0 macvlan-mode vepa",
+            "set interface svlan parent eth0",
+            "set interface svlan vlan 100",
+            "set interface svlan vlan-protocol 802.1ad",
+        ] {
+            run(&mut s, line).unwrap();
+        }
+        assert!(s.show_only("interface").contains("macvlan-mode vepa"));
+        assert!(s.show_only("interface").contains("vlan-protocol 802.1ad"));
+
+        run(&mut s, "delete interface mv0 macvlan-mode").unwrap();
+        run(&mut s, "delete interface svlan vlan-protocol").unwrap();
+        let shown = s.show_only("interface");
+        assert!(!shown.contains("macvlan-mode"), "got:\n{shown}");
+        assert!(!shown.contains("vlan-protocol"), "got:\n{shown}");
     }
 
     #[test]

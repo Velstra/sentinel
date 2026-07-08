@@ -132,6 +132,41 @@ sentinel# set interface eth1 vlan-tagged 10,20
 sentinel# set interface eth1 vlan-untagged 1
 ```
 
+## MACVLAN & QinQ
+
+A **MACVLAN** is a pseudo-NIC with its own MAC address riding on top of a parent
+NIC — several independent L3 interfaces (each with a distinct MAC the switch
+sees) sharing one physical port. Declare it with `type macvlan`, a `parent`, and
+a `macvlan-mode` (`bridge` — the default, sub-interfaces can talk to each other
+— or `private` / `vepa` / `passthru`):
+
+```text
+sentinel# set interface mv0 type macvlan
+sentinel# set interface mv0 parent eth0
+sentinel# set interface mv0 macvlan-mode bridge
+sentinel# set interface mv0 zone lan
+sentinel# set interface mv0 address 10.20.0.1/24
+```
+
+**QinQ** (802.1ad) stacks a customer VLAN (C-tag) on top of a service-provider
+VLAN (S-tag). Mark the outer VLAN subinterface as an `802.1ad` service tag with
+`vlan-protocol`, then hang a plain (`802.1q`, the default) VLAN off it as the
+parent — the two tags nest, S-tag outer, C-tag inner:
+
+```text
+sentinel# set interface svlan parent eth0
+sentinel# set interface svlan vlan 100
+sentinel# set interface svlan vlan-protocol 802.1ad
+sentinel# set interface cvlan parent svlan
+sentinel# set interface cvlan vlan 200
+sentinel# set interface cvlan zone lan
+sentinel# set interface cvlan address 10.30.0.1/24
+```
+
+`macvlan-mode` is only valid on a `type macvlan` interface; `vlan-protocol` only
+on a VLAN subinterface (one with a `parent` + `vlan`). Both render as networkd
+netdevs.
+
 ## WireGuard
 
 A **WireGuard** tunnel is a `type = "wireguard"` interface (address/zone like any
