@@ -18,6 +18,7 @@ mod diff;
 mod install;
 mod ipsec;
 mod net;
+mod openconnect;
 mod pki;
 mod repl;
 mod session;

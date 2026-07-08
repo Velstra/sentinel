@@ -71,6 +71,7 @@ nat        source <s>      zone
            destination <d> zone | proto | port | to
 vpn        ipsec <name>      local | remote | local-subnet | remote-subnet | psk | …
            wireguard <if>    private-key | listen-port | peer <pubkey> …
+           openconnect       certificate | port | pool | dns | routes | default-route | zone | user <name> …
 ```
 
 The split is deliberate: **`firewall`** *filters* packets (zones, posture,
@@ -146,6 +147,47 @@ sentinel# set vpn wireguard wg0 listen-port 51820
 sentinel# set vpn wireguard wg0 peer <pubkey> allowed-ips 10.9.0.2/32
 sentinel# set vpn wireguard wg0 peer <pubkey> endpoint 203.0.113.9:51820
 ```
+
+## OpenConnect (road-warrior VPN)
+
+**OpenConnect** is a TLS client VPN (AnyConnect-compatible, served by `ocserv`)
+for roaming devices — the client-VPN modality alongside site-to-site
+[IPsec](#) and peer-to-peer [WireGuard](#wireguard). Because it rides over
+TLS on port 443 by default, it traverses restrictive networks that only allow
+HTTPS. There is at most **one** server per box, so it lives under `vpn
+openconnect` as a singleton (no name key).
+
+The server needs a TLS identity: name a `pki certificate` (roadmap C19) — a leaf
+issued by the on-box PKI (or `acme`) — as its `certificate`. Clients authenticate
+with a **password**; each `user <name> password <secret>` is rendered into a
+`0600` password file (never into `ocserv.conf`).
+
+```text
+sentinel# set pki ca corp common-name corp.example.com
+sentinel# set pki certificate vpn-server ca corp
+sentinel# set pki certificate vpn-server common-name vpn.example.com
+sentinel# set vpn openconnect certificate vpn-server
+sentinel# set vpn openconnect pool 10.99.0.0/24        # client address pool (required)
+sentinel# set vpn openconnect port 443                 # optional; 443 by default
+sentinel# set vpn openconnect dns 10.99.0.1            # pushed resolver(s), repeatable
+sentinel# set vpn openconnect routes 10.0.0.0/8        # split-tunnel route(s), repeatable
+sentinel# set vpn openconnect zone vpn                 # firewall zone for the tun device
+sentinel# set vpn openconnect user alice password s3cret
+sentinel# commit save
+```
+
+Notes:
+
+- **`pool`** and **`certificate`** are required, and at least one **`user`** —
+  a server with no users can accept no one.
+- **`routes`** pushes split-tunnel routes; **`default-route true`** makes it a
+  full tunnel instead (all client traffic over the VPN). The two are mutually
+  exclusive.
+- **`dns`** / **`routes`** append and de-duplicate (`delete vpn openconnect dns
+  <ip>` / `routes <cidr>` removes one entry); `delete vpn openconnect user
+  <name>` removes one credential; `delete vpn openconnect` removes the whole
+  server.
+- **`disabled true`** parks the server without deleting its config.
 
 ## Firewall posture — global defaults + per-zone overrides
 
