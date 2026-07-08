@@ -19,7 +19,7 @@ use crate::config::{
     Multicast, MulticastInterface, Nat, Nat64, NatDestination, NatSource, Ntp, Ospf, Ospf3,
     OspfInterface, Pki, PortSpec, Pppoe, Proto, Protocols, Qos, QosDiscipline, Rip, RouterAdvert,
     Rule, Services, Snmp, StaticRoute, System, Vpn, VrfDef, Vrrp, WanMode, WanUplink, WgPeer,
-    ZoneCfg,
+    WireguardTunnel, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -39,19 +39,19 @@ struct IfaceDraft {
     pd_subnet: Option<u8>,
     parent: Option<String>,
     vlan: Option<u16>,
-    // WireGuard: a `private-key` makes this a WG tunnel; peers ride on it.
-    private_key: Option<String>,
-    listen_port: Option<u16>,
-    peers: Vec<(String, PeerDraft)>,
     // A built-in DHCP server serving this interface's static subnet.
     dhcp_server: Option<DhcpServerDraft>,
     // An IPv6 Router Advertiser (SLAAC) on this interface.
     router_advert: Option<RouterAdvertDraft>,
-    // Virtual L2 device kind (bridge/bond) + bond mode, and (for a member) the
-    // bridge/bond it is enslaved to.
+    // Virtual L2 device kind (bridge/bond/wireguard) + bond mode, the member NICs
+    // enslaved to a bridge/bond, and (for a vlan-aware bridge) the filtering flag /
+    // per-port tagged+untagged VLAN membership.
     if_type: Option<IfaceType>,
-    master: Option<String>,
+    members: Vec<String>,
     bond_mode: Option<String>,
+    vlan_aware: Option<bool>,
+    vlan_tagged: Vec<u16>,
+    vlan_untagged: Option<u16>,
     // Link tunables.
     mtu: Option<u16>,
     mac: Option<String>,
@@ -67,16 +67,6 @@ struct IfaceDraft {
 }
 
 impl IfaceDraft {
-    /// Mutable access to the WireGuard peer keyed by public key `pk`, inserting
-    /// it if new (peers are identified by their public key).
-    fn peer_mut(&mut self, pk: &str) -> &mut PeerDraft {
-        if let Some(i) = self.peers.iter().position(|(k, _)| k == pk) {
-            return &mut self.peers[i].1;
-        }
-        self.peers.push((pk.to_string(), PeerDraft::default()));
-        &mut self.peers.last_mut().unwrap().1
-    }
-
     /// Mutable access to the DHCP-server sub-draft, enabling it (inserting a
     /// default) if not yet present. Setting any `dhcp-server` field first turns
     /// the server on, mirroring how the first peer field creates the peer.
@@ -1018,6 +1008,9 @@ struct Draft {
     /// IPsec tunnels (roadmap C2): IKEv2 site-to-site connections, keyed by name
     /// in configuration order.
     ipsec: Vec<(String, IpsecDraft)>,
+    /// WireGuard tunnels (roadmap C1): keys + peers for each `type = "wireguard"`
+    /// interface, keyed by interface name in configuration order.
+    wireguard: Vec<(String, WgTunnelDraft)>,
     /// PKI (roadmap C19): local CAs + issued certs, each keyed by name in
     /// configuration order, plus the optional ACME account.
     pki_cas: Vec<(String, PkiCaDraft)>,
@@ -1129,6 +1122,28 @@ struct IpsecDraft {
     local_id: Option<String>,
     remote_id: Option<String>,
     start_action: Option<String>,
+}
+
+/// A partially-specified WireGuard tunnel (`[[vpn.wireguard]]`), keyed by the
+/// interface name in the draft. `private-key` is required at commit; peers are
+/// keyed by their public key so fields fill in incrementally.
+#[derive(Debug, Clone, Default)]
+struct WgTunnelDraft {
+    private_key: Option<String>,
+    listen_port: Option<u16>,
+    peers: Vec<(String, PeerDraft)>,
+}
+
+impl WgTunnelDraft {
+    /// Mutable access to the peer keyed by public key `pk`, inserting it if new
+    /// (peers are identified by their public key).
+    fn peer_mut(&mut self, pk: &str) -> &mut PeerDraft {
+        if let Some(i) = self.peers.iter().position(|(k, _)| k == pk) {
+            return &mut self.peers[i].1;
+        }
+        self.peers.push((pk.to_string(), PeerDraft::default()));
+        &mut self.peers.last_mut().unwrap().1
+    }
 }
 
 /// A partially-specified local CA (`[[pki.ca]]`, roadmap C19), keyed by its name
@@ -1270,6 +1285,17 @@ impl Draft {
         &mut self.ipsec.last_mut().unwrap().1
     }
 
+    /// Mutable access to the WireGuard tunnel keyed by interface `name`, inserting
+    /// it if new (tunnels are keyed by interface name in configuration order).
+    fn wireguard_mut(&mut self, name: &str) -> &mut WgTunnelDraft {
+        if let Some(i) = self.wireguard.iter().position(|(n, _)| n == name) {
+            return &mut self.wireguard[i].1;
+        }
+        self.wireguard
+            .push((name.to_string(), WgTunnelDraft::default()));
+        &mut self.wireguard.last_mut().unwrap().1
+    }
+
     /// Mutable access to the local CA `name`, inserting it if new (CAs are keyed
     /// by name in configuration order).
     fn pki_ca_mut(&mut self, name: &str) -> &mut PkiCaDraft {
@@ -1382,23 +1408,6 @@ impl Draft {
                             pd_subnet: i.pd_subnet,
                             parent: i.parent.clone(),
                             vlan: i.vlan,
-                            private_key: i.private_key.clone(),
-                            listen_port: i.listen_port,
-                            peers: i
-                                .peers
-                                .iter()
-                                .map(|p| {
-                                    (
-                                        p.public_key.clone(),
-                                        PeerDraft {
-                                            allowed_ips: p.allowed_ips.clone(),
-                                            endpoint: p.endpoint.clone(),
-                                            persistent_keepalive: p.persistent_keepalive,
-                                            preshared_key: p.preshared_key.clone(),
-                                        },
-                                    )
-                                })
-                                .collect(),
                             dhcp_server: i.dhcp_server.as_ref().map(|d| DhcpServerDraft {
                                 pool_offset: d.pool_offset,
                                 pool_size: d.pool_size,
@@ -1428,8 +1437,11 @@ impl Draft {
                                 router_lifetime: r.router_lifetime,
                             }),
                             if_type: i.if_type,
-                            master: i.master.clone(),
+                            members: i.members.clone(),
                             bond_mode: i.bond_mode.clone(),
+                            vlan_aware: i.vlan_aware,
+                            vlan_tagged: i.vlan_tagged.clone(),
+                            vlan_untagged: i.vlan_untagged,
                             mtu: i.mtu,
                             mac: i.mac.clone(),
                             local: i.local.clone(),
@@ -1468,7 +1480,7 @@ impl Draft {
                             description: r.description.clone(),
                             disabled: r.disabled.then_some(true),
                             from: Some(r.from.clone()),
-                            to: Some(r.to.clone()),
+                            to: r.to.clone(),
                             action: Some(r.action),
                             proto: r.proto,
                             port: r.port,
@@ -1778,6 +1790,35 @@ impl Draft {
                     )
                 })
                 .collect(),
+            wireguard: a
+                .vpn
+                .wireguard
+                .iter()
+                .map(|t| {
+                    (
+                        t.name.clone(),
+                        WgTunnelDraft {
+                            private_key: Some(t.private_key.clone()),
+                            listen_port: t.listen_port,
+                            peers: t
+                                .peers
+                                .iter()
+                                .map(|p| {
+                                    (
+                                        p.public_key.clone(),
+                                        PeerDraft {
+                                            allowed_ips: p.allowed_ips.clone(),
+                                            endpoint: p.endpoint.clone(),
+                                            persistent_keepalive: p.persistent_keepalive,
+                                            preshared_key: p.preshared_key.clone(),
+                                        },
+                                    )
+                                })
+                                .collect(),
+                        },
+                    )
+                })
+                .collect(),
             pki_cas: a
                 .pki
                 .cas
@@ -1940,6 +1981,50 @@ impl Session {
         names
     }
 
+    /// The declared route-filter names — completion offers these for a BGP
+    /// neighbour's / VRF's import/export and `delete protocols filter …`.
+    pub fn filter_names(&self) -> Vec<String> {
+        self.draft.filters.iter().map(|(n, _)| n.clone()).collect()
+    }
+
+    /// The declared VRF names — completion offers these for a per-protocol /
+    /// static `vrf` value and `delete protocols vrf …`.
+    pub fn vrf_names(&self) -> Vec<String> {
+        self.draft.vrfs.iter().map(|(n, _)| n.clone()).collect()
+    }
+
+    /// The declared IPsec connection names — completion offers these for
+    /// `set/delete vpn ipsec …`.
+    pub fn ipsec_names(&self) -> Vec<String> {
+        self.draft.ipsec.iter().map(|(n, _)| n.clone()).collect()
+    }
+
+    /// The declared PKI CA names — completion offers these for a certificate's
+    /// `ca` value and `set/delete pki ca …`.
+    pub fn pki_ca_names(&self) -> Vec<String> {
+        self.draft.pki_cas.iter().map(|(n, _)| n.clone()).collect()
+    }
+
+    /// The declared PKI certificate names — completion offers these for
+    /// `set/delete pki certificate …`.
+    pub fn pki_certificate_names(&self) -> Vec<String> {
+        self.draft
+            .pki_certs
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
+    /// The declared WireGuard tunnel names (keys of `[[vpn.wireguard]]`) —
+    /// completion offers these for `set/delete vpn wireguard …`.
+    pub fn wireguard_names(&self) -> Vec<String> {
+        self.draft
+            .wireguard
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
     /// `set <path...> <value>` — set one config node.
     pub fn set(&mut self, args: &[&str]) -> Result<()> {
         match args {
@@ -1947,6 +2032,11 @@ impl Session {
             ["system", "hostname", v] => self.draft.hostname = Some((*v).to_string()),
 
             // Interfaces (incl. VLAN subinterfaces).
+            // Bare `set interface <name>` just declares the node (a NIC with no
+            // config yet — e.g. a bridge/bond member port that carries no address).
+            ["interface", name] => {
+                self.draft.iface_mut(name);
+            }
             // A free-text description may contain spaces, so the tail is captured
             // and rejoined; `disabled` is a bool.
             ["interface", name, "description", rest @ ..] if !rest.is_empty() => {
@@ -1989,50 +2079,24 @@ impl Session {
                 );
             }
 
-            // WireGuard interface + peers.
-            ["interface", name, "private-key", "generate"] => {
-                let (private, public) = crate::wgkey::generate_keypair()?;
-                self.draft.iface_mut(name).private_key = Some(private);
-                // The operator needs the public key to hand to the far end.
-                println!("generated wireguard key for {name}; public key: {public}");
-            }
-            ["interface", name, "private-key", v] => {
-                validate_wg_key(v)?;
-                self.draft.iface_mut(name).private_key = Some((*v).to_string());
-            }
-            ["interface", name, "listen-port", v] => {
-                let port: u16 = v
-                    .parse()
-                    .with_context(|| format!("invalid listen-port {v:?}"))?;
-                if port == 0 {
-                    bail!("listen-port 0 is not valid");
+            // Per-port 802.1Q VLAN filtering (only on a member of a vlan-aware
+            // bridge): a CSV of tagged ids, and a single untagged (PVID) id.
+            ["interface", name, "vlan-tagged", v] => {
+                let mut ids = Vec::new();
+                for part in v.split(',') {
+                    let id: u16 = part
+                        .trim()
+                        .parse()
+                        .with_context(|| format!("invalid vlan id {part:?}"))?;
+                    ids.push(id);
                 }
-                self.draft.iface_mut(name).listen_port = Some(port);
+                self.draft.iface_mut(name).vlan_tagged = ids;
             }
-            ["interface", name, "peer", pk, "allowed-ips", v] => {
-                validate_wg_key(pk)?;
-                let ips: Vec<String> = v.split(',').map(|s| s.trim().to_string()).collect();
-                for ip in &ips {
-                    validate_block_entry(ip)?;
-                }
-                self.draft.iface_mut(name).peer_mut(pk).allowed_ips = ips;
-            }
-            ["interface", name, "peer", pk, "endpoint", v] => {
-                validate_wg_key(pk)?;
-                validate_endpoint(v)?;
-                self.draft.iface_mut(name).peer_mut(pk).endpoint = Some((*v).to_string());
-            }
-            ["interface", name, "peer", pk, "keepalive", v] => {
-                validate_wg_key(pk)?;
-                let k: u16 = v
-                    .parse()
-                    .with_context(|| format!("invalid keepalive {v:?}"))?;
-                self.draft.iface_mut(name).peer_mut(pk).persistent_keepalive = Some(k);
-            }
-            ["interface", name, "peer", pk, "preshared-key", v] => {
-                validate_wg_key(pk)?;
-                validate_wg_key(v)?;
-                self.draft.iface_mut(name).peer_mut(pk).preshared_key = Some((*v).to_string());
+            ["interface", name, "vlan-untagged", v] => {
+                self.draft.iface_mut(name).vlan_untagged = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid vlan id {v:?}"))?,
+                );
             }
 
             // Built-in DHCP server on an interface (needs a static address).
@@ -2056,11 +2120,10 @@ impl Session {
                 self.draft.iface_mut(name).dhcp_mut().pool_size = Some(size);
             }
             ["interface", name, "dhcp-server", "dns", v] => {
-                let servers: Vec<String> = v.split(',').map(|s| s.trim().to_string()).collect();
-                for s in &servers {
+                for s in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                     validate_ipv4(s)?;
                 }
-                self.draft.iface_mut(name).dhcp_mut().dns = servers;
+                append_csv(&mut self.draft.iface_mut(name).dhcp_mut().dns, v);
             }
             ["interface", name, "dhcp-server", "lease-time", v] => {
                 // Accept a human duration (`12h`, `1h30m`) or bare seconds.
@@ -2139,18 +2202,16 @@ impl Session {
                 self.draft.iface_mut(name).router_advert = None;
             }
             ["interface", name, "router-advert", "prefix", v] => {
-                let prefixes: Vec<String> = v.split(',').map(|s| s.trim().to_string()).collect();
-                for p in &prefixes {
+                for p in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                     crate::config::validate_ipv6_cidr(p)?;
                 }
-                self.draft.iface_mut(name).ra_mut().prefixes = prefixes;
+                append_csv(&mut self.draft.iface_mut(name).ra_mut().prefixes, v);
             }
             ["interface", name, "router-advert", "dns", v] => {
-                let servers: Vec<String> = v.split(',').map(|s| s.trim().to_string()).collect();
-                for s in &servers {
+                for s in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                     validate_ipv6(s)?;
                 }
-                self.draft.iface_mut(name).ra_mut().dns = servers;
+                append_csv(&mut self.draft.iface_mut(name).ra_mut().dns, v);
             }
             ["interface", name, "router-advert", "managed", v] => {
                 self.draft.iface_mut(name).ra_mut().managed = parse_bool(v)?;
@@ -2165,26 +2226,32 @@ impl Session {
                 self.draft.iface_mut(name).ra_mut().router_lifetime = Some(life);
             }
 
-            // Bridge / bond: `type` makes this a virtual L2 device, `master`
-            // enslaves it to one, `bond-mode` sets a bond's aggregation mode.
+            // Bridge / bond / wireguard: `type` makes this a virtual device;
+            // `member` enslaves a NIC to a bridge/bond (repeatable → appends);
+            // `bond-mode` sets a bond's aggregation mode; `vlan-aware` turns on
+            // 802.1Q filtering on a bridge.
             ["interface", name, "type", v] => {
                 let ty = match *v {
                     "bridge" => IfaceType::Bridge,
                     "bond" => IfaceType::Bond,
+                    "wireguard" => IfaceType::Wireguard,
                     "pppoe" => IfaceType::Pppoe,
                     "gre" => IfaceType::Gre,
                     "ipip" => IfaceType::Ipip,
                     "gretap" => IfaceType::Gretap,
                     other => {
                         bail!(
-                            "interface type {other:?}: expected \"bridge\", \"bond\", \"pppoe\", \"gre\", \"ipip\" or \"gretap\""
+                            "interface type {other:?}: expected \"bridge\", \"bond\", \"wireguard\", \"pppoe\", \"gre\", \"ipip\" or \"gretap\""
                         )
                     }
                 };
                 self.draft.iface_mut(name).if_type = Some(ty);
             }
-            ["interface", name, "master", v] => {
-                self.draft.iface_mut(name).master = Some((*v).to_string());
+            ["interface", name, "member", v] => {
+                let members = &mut self.draft.iface_mut(name).members;
+                if !members.iter().any(|m| m == v) {
+                    members.push((*v).to_string());
+                }
             }
             ["interface", name, "bond-mode", v] => {
                 if !crate::config::BOND_MODES.contains(v) {
@@ -2194,6 +2261,9 @@ impl Session {
                     );
                 }
                 self.draft.iface_mut(name).bond_mode = Some((*v).to_string());
+            }
+            ["interface", name, "vlan-aware", v] => {
+                self.draft.iface_mut(name).vlan_aware = Some(parse_bool(v)?);
             }
             ["interface", name, "mtu", v] => {
                 let mtu: u16 = v.parse().with_context(|| format!("invalid mtu {v:?}"))?;
@@ -2385,23 +2455,27 @@ impl Session {
             // referenced by a rule's source-group / port-group. Members are a
             // comma-separated list and replace the group's contents.
             ["firewall", "group", "address-group", name, "address", v] => {
-                let members: Vec<String> = v
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(String::from)
-                    .collect();
-                self.draft
+                let list = self
+                    .draft
                     .groups
                     .address
-                    .insert((*name).to_string(), members);
+                    .entry((*name).to_string())
+                    .or_default();
+                append_csv(list, v);
             }
             ["firewall", "group", "port-group", name, "port", v] => {
-                let mut specs = Vec::new();
+                let list = self
+                    .draft
+                    .groups
+                    .port
+                    .entry((*name).to_string())
+                    .or_default();
                 for tok in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                    specs.push(PortSpec::parse(tok)?);
+                    let spec = PortSpec::parse(tok)?;
+                    if !list.contains(&spec) {
+                        list.push(spec);
+                    }
                 }
-                self.draft.groups.port.insert((*name).to_string(), specs);
             }
 
             // --- nat { … } — address translation, its own top-level node ---
@@ -2454,16 +2528,15 @@ impl Session {
 
             // services dns: the box-wide LAN DNS forwarder (systemd-resolved).
             ["services", "dns", "upstream", v] => {
-                let ups: Vec<String> = v.split(',').map(|s| s.trim().to_string()).collect();
-                for u in &ups {
+                for u in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                     if validate_ipv4(u).is_err() && validate_ipv6(u).is_err() {
                         bail!("services dns upstream {u:?}: not an IPv4 or IPv6 address");
                     }
                 }
-                self.draft.dns.upstream = ups;
+                append_csv(&mut self.draft.dns.upstream, v);
             }
             ["services", "dns", "serve-on", v] => {
-                self.draft.dns.serve_on = v.split(',').map(|s| s.trim().to_string()).collect();
+                append_csv(&mut self.draft.dns.serve_on, v);
             }
             // A local DNS record: `host-override <name> <ip>` (split-horizon).
             ["services", "dns", "host-override", name, ip] => {
@@ -2499,14 +2572,13 @@ impl Session {
 
             // services ntp: the box-wide LAN NTP server (chrony).
             ["services", "ntp", "upstream", v] => {
-                let ups: Vec<String> = v.split(',').map(|s| s.trim().to_string()).collect();
-                for u in &ups {
+                for u in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                     crate::config::validate_host(u)?;
                 }
-                self.draft.ntp.upstream = ups;
+                append_csv(&mut self.draft.ntp.upstream, v);
             }
             ["services", "ntp", "serve-on", v] => {
-                self.draft.ntp.serve_on = v.split(',').map(|s| s.trim().to_string()).collect();
+                append_csv(&mut self.draft.ntp.serve_on, v);
             }
 
             // services lldp: box-wide LLDP link-layer discovery (lldpd).
@@ -2514,7 +2586,7 @@ impl Session {
                 self.draft.lldp.enable = parse_bool(v)?;
             }
             ["services", "lldp", "interface", v] => {
-                self.draft.lldp.interface = v.split(',').map(|s| s.trim().to_string()).collect();
+                append_csv(&mut self.draft.lldp.interface, v);
             }
 
             // services snmp: box-wide read-only SNMP agent (net-snmp).
@@ -2533,20 +2605,19 @@ impl Session {
                 self.draft.snmp.contact = Some(rest.join(" "));
             }
             ["services", "snmp", "allow", v] => {
-                let srcs: Vec<String> = v.split(',').map(|s| s.trim().to_string()).collect();
-                for s in &srcs {
+                for s in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                     if crate::config::validate_cidr_or_ip(s).is_err()
                         && crate::config::validate_ipv6_cidr(s).is_err()
                     {
                         bail!("services snmp allow {s:?}: not an IPv4/IPv6 address or CIDR");
                     }
                 }
-                self.draft.snmp.allow = srcs;
+                append_csv(&mut self.draft.snmp.allow, v);
             }
 
             // services mdns: box-wide mDNS reflector (avahi).
             ["services", "mdns", "interface", v] => {
-                self.draft.mdns.interface = v.split(',').map(|s| s.trim().to_string()).collect();
+                append_csv(&mut self.draft.mdns.interface, v);
             }
 
             // services dyndns: box-wide dynamic-DNS client (ddclient).
@@ -2571,15 +2642,13 @@ impl Session {
 
             // services dhcp-relay: box-wide DHCP relay agent (isc dhcrelay).
             ["services", "dhcp-relay", "interface", v] => {
-                self.draft.dhcp_relay.interface =
-                    v.split(',').map(|s| s.trim().to_string()).collect();
+                append_csv(&mut self.draft.dhcp_relay.interface, v);
             }
             ["services", "dhcp-relay", "server", v] => {
-                let srvs: Vec<String> = v.split(',').map(|s| s.trim().to_string()).collect();
-                for s in &srvs {
+                for s in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                     validate_ipv4(s)?;
                 }
-                self.draft.dhcp_relay.server = srvs;
+                append_csv(&mut self.draft.dhcp_relay.server, v);
             }
 
             // protocols: dynamic routing (the Wren control plane).
@@ -2619,34 +2688,19 @@ impl Session {
                 );
             }
             ["protocols", "bgp", "network", v] => {
-                let net = (*v).to_string();
-                if !self.draft.bgp.network.contains(&net) {
-                    self.draft.bgp.network.push(net);
-                }
+                append_csv(&mut self.draft.bgp.network, v);
             }
             ["protocols", "bgp", "redistribute", v] => {
-                let src = (*v).to_string();
-                if !self.draft.bgp.redistribute.contains(&src) {
-                    self.draft.bgp.redistribute.push(src);
-                }
+                append_csv(&mut self.draft.bgp.redistribute, v);
             }
             ["protocols", "bgp", "community", v] => {
-                let c = (*v).to_string();
-                if !self.draft.bgp.community.contains(&c) {
-                    self.draft.bgp.community.push(c);
-                }
+                append_csv(&mut self.draft.bgp.community, v);
             }
             ["protocols", "bgp", "large-community", v] => {
-                let c = (*v).to_string();
-                if !self.draft.bgp.large_community.contains(&c) {
-                    self.draft.bgp.large_community.push(c);
-                }
+                append_csv(&mut self.draft.bgp.large_community, v);
             }
             ["protocols", "bgp", "ext-community", v] => {
-                let c = (*v).to_string();
-                if !self.draft.bgp.ext_community.contains(&c) {
-                    self.draft.bgp.ext_community.push(c);
-                }
+                append_csv(&mut self.draft.bgp.ext_community, v);
             }
             ["protocols", "bgp", "ebgp-require-policy", v] => {
                 self.draft.bgp.ebgp_require_policy = parse_bool(v)?;
@@ -2656,9 +2710,11 @@ impl Session {
                     Some(v.parse().with_context(|| format!("invalid AS {v:?}"))?);
             }
             ["protocols", "bgp", "confederation", "member", v] => {
-                let asn = v.parse().with_context(|| format!("invalid AS {v:?}"))?;
-                if !self.draft.bgp.confederation_members.contains(&asn) {
-                    self.draft.bgp.confederation_members.push(asn);
+                for tok in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    let asn: u32 = tok.parse().with_context(|| format!("invalid AS {tok:?}"))?;
+                    if !self.draft.bgp.confederation_members.contains(&asn) {
+                        self.draft.bgp.confederation_members.push(asn);
+                    }
                 }
             }
             ["protocols", "bgp", "rpki", "reject-invalid", v] => {
@@ -2716,10 +2772,7 @@ impl Session {
                 self.set_filter_rule_field(name, idx, field, v)?;
             }
             ["protocols", "ospf", "interface", v] => {
-                let iface = (*v).to_string();
-                if !self.draft.ospf.interfaces.contains(&iface) {
-                    self.draft.ospf.interfaces.push(iface);
-                }
+                append_csv(&mut self.draft.ospf.interfaces, v);
             }
             ["protocols", "ospf", "area", v] => {
                 self.draft.ospf.area = Some((*v).to_string());
@@ -2732,18 +2785,12 @@ impl Session {
                 self.draft.ospf.network_type = Some((*v).to_string());
             }
             ["protocols", "ospf", "redistribute", v] => {
-                let src = (*v).to_string();
-                if !self.draft.ospf.redistribute.contains(&src) {
-                    self.draft.ospf.redistribute.push(src);
-                }
+                append_csv(&mut self.draft.ospf.redistribute, v);
             }
 
             // ospf3 (OSPFv3, IPv6) — same fields as ospf.
             ["protocols", "ospf3", "interface", v] => {
-                let i = (*v).to_string();
-                if !self.draft.ospf3.interfaces.contains(&i) {
-                    self.draft.ospf3.interfaces.push(i);
-                }
+                append_csv(&mut self.draft.ospf3.interfaces, v);
             }
             ["protocols", "ospf3", "area", v] => self.draft.ospf3.area = Some((*v).to_string()),
             ["protocols", "ospf3", "cost", v] => {
@@ -2754,10 +2801,7 @@ impl Session {
                 self.draft.ospf3.network_type = Some((*v).to_string());
             }
             ["protocols", "ospf3", "redistribute", v] => {
-                let src = (*v).to_string();
-                if !self.draft.ospf3.redistribute.contains(&src) {
-                    self.draft.ospf3.redistribute.push(src);
-                }
+                append_csv(&mut self.draft.ospf3.redistribute, v);
             }
 
             // rip / ripng / babel — same knobs (RipDraft).
@@ -2767,11 +2811,7 @@ impl Session {
                 "interface",
                 v,
             ] => {
-                let d = self.draft.rip_family_mut(proto);
-                let i = (*v).to_string();
-                if !d.interfaces.contains(&i) {
-                    d.interfaces.push(i);
-                }
+                append_csv(&mut self.draft.rip_family_mut(proto).interfaces, v);
             }
             [
                 "protocols",
@@ -2779,11 +2819,7 @@ impl Session {
                 "redistribute",
                 v,
             ] => {
-                let d = self.draft.rip_family_mut(proto);
-                let s = (*v).to_string();
-                if !d.redistribute.contains(&s) {
-                    d.redistribute.push(s);
-                }
+                append_csv(&mut self.draft.rip_family_mut(proto).redistribute, v);
             }
             [
                 "protocols",
@@ -2797,10 +2833,7 @@ impl Session {
 
             // isis (IS-IS).
             ["protocols", "isis", "interface", v] => {
-                let i = (*v).to_string();
-                if !self.draft.isis.interfaces.contains(&i) {
-                    self.draft.isis.interfaces.push(i);
-                }
+                append_csv(&mut self.draft.isis.interfaces, v);
             }
             ["protocols", "isis", "system-id", v] => {
                 self.draft.isis.system_id = Some((*v).to_string());
@@ -2811,10 +2844,7 @@ impl Session {
                 self.draft.isis.network_type = Some((*v).to_string());
             }
             ["protocols", "isis", "redistribute", v] => {
-                let s = (*v).to_string();
-                if !self.draft.isis.redistribute.contains(&s) {
-                    self.draft.isis.redistribute.push(s);
-                }
+                append_csv(&mut self.draft.isis.redistribute, v);
             }
             ["protocols", "isis", "redistribute-metric", v] => {
                 self.draft.isis.redistribute_metric =
@@ -2836,11 +2866,7 @@ impl Session {
                 );
             }
             ["protocols", "vrrp", name, "virtual-address", v] => {
-                let d = self.draft.vrrp_mut(name);
-                let a = (*v).to_string();
-                if !d.virtual_address.contains(&a) {
-                    d.virtual_address.push(a);
-                }
+                append_csv(&mut self.draft.vrrp_mut(name).virtual_address, v);
             }
 
             // static route VRF placement.
@@ -2896,11 +2922,7 @@ impl Session {
                 );
             }
             ["protocols", "ospf", "passive-interface", v] => {
-                let d = &mut self.draft.ospf;
-                let i = (*v).to_string();
-                if !d.passive_interfaces.contains(&i) {
-                    d.passive_interfaces.push(i);
-                }
+                append_csv(&mut self.draft.ospf.passive_interfaces, v);
             }
             [
                 "protocols",
@@ -2920,10 +2942,7 @@ impl Session {
                     "totally-nssa-area" => &mut d.totally_nssa_areas,
                     _ => &mut d.nssa_default_areas,
                 };
-                let a = (*v).to_string();
-                if !set.contains(&a) {
-                    set.push(a);
-                }
+                append_csv(set, v);
             }
             ["protocols", "ospf", "stub-default-cost", v] => {
                 self.draft.ospf.stub_default_cost =
@@ -2973,11 +2992,7 @@ impl Session {
                 self.draft.rip_family_mut(proto).vrf = Some((*v).to_string());
             }
             ["protocols", "babel", "network", v] => {
-                let d = self.draft.rip_family_mut("babel");
-                let n = (*v).to_string();
-                if !d.network.contains(&n) {
-                    d.network.push(n);
-                }
+                append_csv(&mut self.draft.rip_family_mut("babel").network, v);
             }
             ["protocols", "babel", "router-id", v] => {
                 self.draft.rip_family_mut("babel").router_id = Some((*v).to_string());
@@ -3027,11 +3042,7 @@ impl Session {
                 );
             }
             ["protocols", "vrrp", name, "track-interface", v] => {
-                let d = self.draft.vrrp_mut(name);
-                let i = (*v).to_string();
-                if !d.track_interfaces.contains(&i) {
-                    d.track_interfaces.push(i);
-                }
+                append_csv(&mut self.draft.vrrp_mut(name).track_interfaces, v);
             }
             ["protocols", "vrrp", name, "priority-decrement", v] => {
                 self.draft.vrrp_mut(name).priority_decrement = Some(
@@ -3122,11 +3133,7 @@ impl Session {
 
             // vrf (a named isolated routing table, keyed by name).
             ["protocols", "vrf", name, "interface", v] => {
-                let d = self.draft.vrf_mut(name);
-                let i = (*v).to_string();
-                if !d.interfaces.contains(&i) {
-                    d.interfaces.push(i);
-                }
+                append_csv(&mut self.draft.vrf_mut(name).interfaces, v);
             }
             ["protocols", "vrf", name, field, v] => {
                 let d = self.draft.vrf_mut(name);
@@ -3273,6 +3280,58 @@ impl Session {
                 self.draft.ipsec_mut(name).start_action = Some((*v).to_string());
             }
 
+            // vpn wireguard (roadmap C1): keys + peers for a `type = "wireguard"`
+            // interface, keyed by the interface name.
+            ["vpn", "wireguard", name, "private-key", "generate"] => {
+                let (private, public) = crate::wgkey::generate_keypair()?;
+                self.draft.wireguard_mut(name).private_key = Some(private);
+                // The operator needs the public key to hand to the far end.
+                println!("generated wireguard key for {name}; public key: {public}");
+            }
+            ["vpn", "wireguard", name, "private-key", v] => {
+                validate_wg_key(v)?;
+                self.draft.wireguard_mut(name).private_key = Some((*v).to_string());
+            }
+            ["vpn", "wireguard", name, "listen-port", v] => {
+                let port: u16 = v
+                    .parse()
+                    .with_context(|| format!("invalid listen-port {v:?}"))?;
+                if port == 0 {
+                    bail!("listen-port 0 is not valid");
+                }
+                self.draft.wireguard_mut(name).listen_port = Some(port);
+            }
+            ["vpn", "wireguard", name, "peer", pk, "allowed-ips", v] => {
+                validate_wg_key(pk)?;
+                for ip in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    validate_block_entry(ip)?;
+                }
+                append_csv(
+                    &mut self.draft.wireguard_mut(name).peer_mut(pk).allowed_ips,
+                    v,
+                );
+            }
+            ["vpn", "wireguard", name, "peer", pk, "endpoint", v] => {
+                validate_wg_key(pk)?;
+                validate_endpoint(v)?;
+                self.draft.wireguard_mut(name).peer_mut(pk).endpoint = Some((*v).to_string());
+            }
+            ["vpn", "wireguard", name, "peer", pk, "keepalive", v] => {
+                validate_wg_key(pk)?;
+                let k: u16 = v
+                    .parse()
+                    .with_context(|| format!("invalid keepalive {v:?}"))?;
+                self.draft
+                    .wireguard_mut(name)
+                    .peer_mut(pk)
+                    .persistent_keepalive = Some(k);
+            }
+            ["vpn", "wireguard", name, "peer", pk, "preshared-key", v] => {
+                validate_wg_key(pk)?;
+                validate_wg_key(v)?;
+                self.draft.wireguard_mut(name).peer_mut(pk).preshared_key = Some((*v).to_string());
+            }
+
             // pki (roadmap C19): local CAs, issued certs, the ACME account.
             ["pki", "ca", name, "common-name", v] => {
                 crate::config::validate_subject_component(v)?;
@@ -3352,7 +3411,10 @@ impl Session {
                  set system hostname <name>\n  \
                  set interface <name> zone <zone>\n  \
                  set interface <name> address <dhcp|CIDR>\n  \
-                 set interface <name> <parent <iface> | vlan <id>>\n  \
+                 set interface <name> <parent <iface> | vlan <id>>  (or name it <parent>.<id> to infer)\n  \
+                 set interface <name> type <bridge|bond|wireguard|pppoe|gre|ipip|gretap>\n  \
+                 set interface <name> <member <nic> | bond-mode <m> | vlan-aware <bool>>\n  \
+                 set interface <name> <vlan-tagged <id,...> | vlan-untagged <id>>  (port of a vlan-aware bridge)\n  \
                  set interface <name> type <gre|ipip|gretap> local <ip> remote <ip> [key <n>] [ttl <n>]\n  \
                  set firewall global <stateful|block-icmp|log> <true|false>\n  \
                  set firewall global default-action <accept|drop|reject>\n  \
@@ -3392,6 +3454,8 @@ impl Session {
                  set multiwan uplink <if> check <target <ip> | interval <n> | timeout <n> | fail <n> | rise <n>>\n  \
                  set vpn ipsec <name> <local <ip> | remote <ip> | local-subnet <cidr> | remote-subnet <cidr> | psk <key>>\n  \
                  set vpn ipsec <name> <ike-version <1|2> | ike-proposal <p> | esp-proposal <p> | local-id <id> | remote-id <id> | start-action <start|trap|none>>\n  \
+                 set vpn wireguard <ifname> <private-key <key|generate> | listen-port <port>>\n  \
+                 set vpn wireguard <ifname> peer <pubkey> <allowed-ips <cidr,...> | endpoint <host:port> | keepalive <s> | preshared-key <key>>\n  \
                  set pki ca <name> <common-name <cn> | organization <o> | key-type <ec|rsa> | validity-days <n>>\n  \
                  set pki certificate <name> <ca <ca-name|acme> | common-name <cn> | subject-alt-name <DNS:host|IP:addr> | key-type <ec|rsa> | usage <server|client> | validity-days <n>>\n  \
                  set pki acme <email <addr> | directory-url <https-url> | challenge <http-01|dns-01> | agree-tos <bool>>"
@@ -3568,13 +3632,8 @@ impl Session {
     /// Set one field of the rule `idx` of filter `name` (inserting either if new).
     fn set_filter_rule_field(&mut self, name: &str, idx: u32, field: &str, v: &str) -> Result<()> {
         let r = self.draft.filter_mut(name).rule_mut(idx);
-        let push = |set: &mut Vec<String>| {
-            if !set.iter().any(|x| x == v) {
-                set.push(v.to_string());
-            }
-        };
         match field {
-            "prefix" => push(&mut r.prefix),
+            "prefix" => append_csv(&mut r.prefix, v),
             "protocol" => r.protocol = Some(v.to_string()),
             "metric-le" => {
                 r.metric_le = Some(v.parse().with_context(|| format!("invalid metric {v:?}"))?)
@@ -3594,12 +3653,12 @@ impl Session {
                         .with_context(|| format!("invalid preference {v:?}"))?,
                 )
             }
-            "set-community" => push(&mut r.set_community),
-            "add-community" => push(&mut r.add_community),
-            "set-large-community" => push(&mut r.set_large_community),
-            "add-large-community" => push(&mut r.add_large_community),
-            "set-ext-community" => push(&mut r.set_ext_community),
-            "add-ext-community" => push(&mut r.add_ext_community),
+            "set-community" => append_csv(&mut r.set_community, v),
+            "add-community" => append_csv(&mut r.add_community, v),
+            "set-large-community" => append_csv(&mut r.set_large_community, v),
+            "add-large-community" => append_csv(&mut r.add_large_community, v),
+            "set-ext-community" => append_csv(&mut r.set_ext_community, v),
+            "add-ext-community" => append_csv(&mut r.add_ext_community, v),
             "action" => r.action = Some(v.to_string()),
             other => bail!("filter rule has no field {other:?}"),
         }
@@ -3626,11 +3685,22 @@ impl Session {
             ["interface", name, "zone"] => self.iface(name)?.zone = None,
             ["interface", name, "parent"] => self.iface(name)?.parent = None,
             ["interface", name, "vlan"] => self.iface(name)?.vlan = None,
-            ["interface", name, "private-key"] => self.iface(name)?.private_key = None,
-            ["interface", name, "listen-port"] => self.iface(name)?.listen_port = None,
             ["interface", name, "type"] => self.iface(name)?.if_type = None,
-            ["interface", name, "master"] => self.iface(name)?.master = None,
             ["interface", name, "bond-mode"] => self.iface(name)?.bond_mode = None,
+            ["interface", name, "vlan-aware"] => self.iface(name)?.vlan_aware = None,
+            ["interface", name, "vlan-tagged"] => self.iface(name)?.vlan_tagged.clear(),
+            ["interface", name, "vlan-untagged"] => self.iface(name)?.vlan_untagged = None,
+            // `delete interface X member` clears all members; `... member <nic>`
+            // removes one.
+            ["interface", name, "member"] => self.iface(name)?.members.clear(),
+            ["interface", name, "member", m] => {
+                let i = self.iface(name)?;
+                let before = i.members.len();
+                i.members.retain(|x| x != m);
+                if i.members.len() == before {
+                    bail!("interface {name:?} has no member {m:?}");
+                }
+            }
             ["interface", name, "mtu"] => self.iface(name)?.mtu = None,
             ["interface", name, "mac"] => self.iface(name)?.mac = None,
             ["interface", name, "local"] => self.iface(name)?.local = None,
@@ -3674,28 +3744,6 @@ impl Session {
                     other => bail!("pppoe has no field {other:?}"),
                 }
             }
-            ["interface", name, "peer", pk] => {
-                let i = self.iface(name)?;
-                let before = i.peers.len();
-                i.peers.retain(|(k, _)| k != pk);
-                if i.peers.len() == before {
-                    bail!("interface {name:?} has no peer {pk:?}");
-                }
-            }
-            ["interface", name, "peer", pk, field] => {
-                let i = self.iface(name)?;
-                let Some(idx) = i.peers.iter().position(|(k, _)| k == pk) else {
-                    bail!("interface {name:?} has no peer {pk:?}");
-                };
-                let p = &mut i.peers[idx].1;
-                match *field {
-                    "allowed-ips" => p.allowed_ips.clear(),
-                    "endpoint" => p.endpoint = None,
-                    "keepalive" => p.persistent_keepalive = None,
-                    "preshared-key" => p.preshared_key = None,
-                    other => bail!("peer has no field {other:?}"),
-                }
-            }
             ["interface", name, "dhcp-server"] => self.iface(name)?.dhcp_server = None,
             // A single static reservation by name (before the catch-all field arm).
             ["interface", name, "dhcp-server", "static-mapping", lname] => {
@@ -3707,6 +3755,17 @@ impl Session {
                 d.static_mappings.retain(|(n, _)| n != lname);
                 if d.static_mappings.len() == before {
                     bail!("interface {name:?} dhcp-server has no static-mapping {lname:?}");
+                }
+            }
+            // Remove one advertised DNS server (the whole list clears via the
+            // `dns` field arm below).
+            ["interface", name, "dhcp-server", "dns", v] => {
+                let i = self.iface(name)?;
+                let Some(d) = i.dhcp_server.as_mut() else {
+                    bail!("interface {name:?} has no dhcp-server");
+                };
+                if !remove_item(&mut d.dns, v) {
+                    bail!("interface {name:?} dhcp-server has no dns {v:?}");
                 }
             }
             ["interface", name, "dhcp-server", field] => {
@@ -4358,11 +4417,14 @@ impl Session {
                 }
             }
 
-            // vpn ipsec (roadmap C2). Bare `delete vpn` clears every tunnel; the
-            // rest clear one connection or one of its optional fields (the
-            // required endpoints/subnets/psk can only be replaced, not cleared —
-            // delete the whole connection to remove them).
-            ["vpn"] => self.draft.ipsec.clear(),
+            // vpn ipsec (roadmap C2). Bare `delete vpn` clears every VPN tunnel
+            // (ipsec + wireguard); the rest clear one connection or one of its
+            // optional fields (the required endpoints/subnets/psk can only be
+            // replaced, not cleared — delete the whole connection to remove them).
+            ["vpn"] => {
+                self.draft.ipsec.clear();
+                self.draft.wireguard.clear();
+            }
             ["vpn", "ipsec"] => self.draft.ipsec.clear(),
             ["vpn", "ipsec", name] => {
                 let before = self.draft.ipsec.len();
@@ -4387,6 +4449,48 @@ impl Session {
                     other => bail!("vpn ipsec connection has no field {other:?}"),
                 }
             }
+
+            // vpn wireguard (roadmap C1). `delete vpn wireguard` clears every
+            // tunnel; `... <name>` one tunnel; `... <name> listen-port` an optional
+            // field; `... <name> peer <pk>` one peer, or `... peer <pk> <field>` one
+            // of its optional fields (private-key can only be replaced).
+            ["vpn", "wireguard"] => self.draft.wireguard.clear(),
+            ["vpn", "wireguard", name] => {
+                let before = self.draft.wireguard.len();
+                self.draft.wireguard.retain(|(n, _)| n != name);
+                if self.draft.wireguard.len() == before {
+                    bail!("no vpn wireguard tunnel {name:?}");
+                }
+            }
+            ["vpn", "wireguard", name, "listen-port"] => {
+                self.wireguard(name)?.listen_port = None;
+            }
+            ["vpn", "wireguard", name, "peer", pk] => {
+                let t = self.wireguard(name)?;
+                let before = t.peers.len();
+                t.peers.retain(|(k, _)| k != pk);
+                if t.peers.len() == before {
+                    bail!("vpn wireguard {name:?} has no peer {pk:?}");
+                }
+            }
+            ["vpn", "wireguard", name, "peer", pk, field] => {
+                let t = self.wireguard(name)?;
+                let Some(idx) = t.peers.iter().position(|(k, _)| k == pk) else {
+                    bail!("vpn wireguard {name:?} has no peer {pk:?}");
+                };
+                let p = &mut t.peers[idx].1;
+                match *field {
+                    "allowed-ips" => p.allowed_ips.clear(),
+                    "endpoint" => p.endpoint = None,
+                    "keepalive" => p.persistent_keepalive = None,
+                    "preshared-key" => p.preshared_key = None,
+                    other => bail!("wireguard peer has no field {other:?}"),
+                }
+            }
+            ["vpn", "wireguard", name, "private-key"] => bail!(
+                "vpn wireguard {name:?}: private-key is required — delete the whole tunnel \
+                 (`delete vpn wireguard {name}`) to remove it"
+            ),
 
             // pki (roadmap C19). Bare `delete pki` clears the whole tree; the rest
             // clear one CA / cert / the ACME account or one of their optional
@@ -4524,6 +4628,15 @@ impl Session {
             .ok_or_else(|| anyhow::anyhow!("no vpn ipsec connection {name:?}"))
     }
 
+    fn wireguard(&mut self, name: &str) -> Result<&mut WgTunnelDraft> {
+        self.draft
+            .wireguard
+            .iter_mut()
+            .find(|(n, _)| n == name)
+            .map(|(_, d)| d)
+            .ok_or_else(|| anyhow::anyhow!("no vpn wireguard tunnel {name:?}"))
+    }
+
     fn pki_ca(&mut self, name: &str) -> Result<&mut PkiCaDraft> {
         self.draft
             .pki_cas
@@ -4646,19 +4759,6 @@ impl Session {
                 pd_subnet: d.pd_subnet,
                 parent: d.parent.clone(),
                 vlan: d.vlan,
-                private_key: d.private_key.clone(),
-                listen_port: d.listen_port,
-                peers: d
-                    .peers
-                    .iter()
-                    .map(|(pk, p)| WgPeer {
-                        public_key: pk.clone(),
-                        allowed_ips: p.allowed_ips.clone(),
-                        endpoint: p.endpoint.clone(),
-                        persistent_keepalive: p.persistent_keepalive,
-                        preshared_key: p.preshared_key.clone(),
-                    })
-                    .collect(),
                 dhcp_server: d.dhcp_server.as_ref().map(|s| DhcpServer {
                     pool_offset: s.pool_offset,
                     pool_size: s.pool_size,
@@ -4686,8 +4786,11 @@ impl Session {
                     router_lifetime: r.router_lifetime,
                 }),
                 if_type: d.if_type,
-                master: d.master.clone(),
+                members: d.members.clone(),
                 bond_mode: d.bond_mode.clone(),
+                vlan_aware: d.vlan_aware,
+                vlan_tagged: d.vlan_tagged.clone(),
+                vlan_untagged: d.vlan_untagged,
                 mtu: d.mtu,
                 mac: d.mac.clone(),
                 local: d.local.clone(),
@@ -4731,10 +4834,7 @@ impl Session {
                         .from
                         .clone()
                         .ok_or_else(|| anyhow::anyhow!("rule {name:?}: from not set"))?,
-                    to: d
-                        .to
-                        .clone()
-                        .ok_or_else(|| anyhow::anyhow!("rule {name:?}: to not set"))?,
+                    to: d.to.clone(),
                     action: d
                         .action
                         .ok_or_else(|| anyhow::anyhow!("rule {name:?}: action not set"))?,
@@ -5084,6 +5184,30 @@ impl Session {
                     start_action: d.start_action.clone(),
                 })
                 .collect(),
+            // WireGuard tunnels (roadmap C1). A missing private-key falls back to
+            // an empty string so validation surfaces a clear "private-key is
+            // required" rather than silently dropping a half-specified tunnel.
+            wireguard: self
+                .draft
+                .wireguard
+                .iter()
+                .map(|(name, d)| WireguardTunnel {
+                    name: name.clone(),
+                    private_key: d.private_key.clone().unwrap_or_default(),
+                    listen_port: d.listen_port,
+                    peers: d
+                        .peers
+                        .iter()
+                        .map(|(pk, p)| WgPeer {
+                            public_key: pk.clone(),
+                            allowed_ips: p.allowed_ips.clone(),
+                            endpoint: p.endpoint.clone(),
+                            persistent_keepalive: p.persistent_keepalive,
+                            preshared_key: p.preshared_key.clone(),
+                        })
+                        .collect(),
+                })
+                .collect(),
         };
 
         // pki (roadmap C19): local CAs, issued certs, the ACME account. Required
@@ -5124,7 +5248,7 @@ impl Session {
             }),
         };
 
-        let appliance = Appliance {
+        let mut appliance = Appliance {
             system: System { hostname },
             firewall,
             zones,
@@ -5187,6 +5311,9 @@ impl Session {
             vpn,
             pki,
         };
+        // Fill inferred VLAN parent/vlan from `<parent>.<id>` names before
+        // validating (mirrors `Appliance::from_toml`).
+        appliance.normalize();
         appliance.validate()?;
         Ok(appliance)
     }
@@ -5301,14 +5428,14 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             && i.pd_subnet.is_none()
             && i.parent.is_none()
             && i.vlan.is_none()
-            && i.private_key.is_none()
-            && i.listen_port.is_none()
-            && i.peers.is_empty()
             && i.dhcp_server.is_none()
             && i.router_advert.is_none()
             && i.if_type.is_none()
-            && i.master.is_none()
+            && i.members.is_empty()
             && i.bond_mode.is_none()
+            && i.vlan_aware.is_none()
+            && i.vlan_tagged.is_empty()
+            && i.vlan_untagged.is_none()
             && i.mtu.is_none()
             && i.mac.is_none()
             && i.local.is_none()
@@ -5331,6 +5458,7 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             let s = match ty {
                 IfaceType::Bridge => "bridge",
                 IfaceType::Bond => "bond",
+                IfaceType::Wireguard => "wireguard",
                 IfaceType::Pppoe => "pppoe",
                 IfaceType::Gre => "gre",
                 IfaceType::Ipip => "ipip",
@@ -5353,11 +5481,26 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         if let Some(id) = i.pd_subnet {
             out.push_str(&format!("    pd-subnet {id}\n"));
         }
-        if let Some(m) = &i.master {
-            out.push_str(&format!("    master {m}\n"));
+        for m in &i.members {
+            out.push_str(&format!("    member {m}\n"));
         }
         if let Some(mode) = &i.bond_mode {
             out.push_str(&format!("    bond-mode {mode}\n"));
+        }
+        if let Some(aware) = i.vlan_aware {
+            out.push_str(&format!("    vlan-aware {aware}\n"));
+        }
+        if !i.vlan_tagged.is_empty() {
+            let ids = i
+                .vlan_tagged
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            out.push_str(&format!("    vlan-tagged {ids}\n"));
+        }
+        if let Some(u) = i.vlan_untagged {
+            out.push_str(&format!("    vlan-untagged {u}\n"));
         }
         if let Some(mtu) = i.mtu {
             out.push_str(&format!("    mtu {mtu}\n"));
@@ -5382,35 +5525,6 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         if let Some(v) = i.vlan {
             out.push_str(&format!("    vlan {v}\n"));
-        }
-        if let Some(pk) = &i.private_key {
-            out.push_str(&format!("    private-key {pk}\n"));
-            // Operators need the derived public key to hand to the far end.
-            if let Ok(public) = crate::wgkey::public_from_private(pk) {
-                out.push_str(&format!("    # public-key {public}\n"));
-            }
-        }
-        if let Some(port) = i.listen_port {
-            out.push_str(&format!("    listen-port {port}\n"));
-        }
-        for (peer_pk, p) in &i.peers {
-            out.push_str(&format!("    peer {peer_pk} {{\n"));
-            if !p.allowed_ips.is_empty() {
-                out.push_str(&format!(
-                    "        allowed-ips {}\n",
-                    p.allowed_ips.join(",")
-                ));
-            }
-            if let Some(ep) = &p.endpoint {
-                out.push_str(&format!("        endpoint {ep}\n"));
-            }
-            if let Some(k) = p.persistent_keepalive {
-                out.push_str(&format!("        keepalive {k}\n"));
-            }
-            if let Some(psk) = &p.preshared_key {
-                out.push_str(&format!("        preshared-key {psk}\n"));
-            }
-            out.push_str("    }\n");
         }
         if let Some(q) = &i.qos {
             out.push_str("    qos {\n");
@@ -6221,8 +6335,9 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         out.push_str("}\n");
     }
 
-    // vpn { ipsec <name> { … } } — IKEv2 site-to-site IPsec (roadmap C2).
-    if want("vpn") && !draft.ipsec.is_empty() {
+    // vpn { ipsec <name> { … } wireguard <name> { … } } — IKEv2 site-to-site
+    // IPsec (roadmap C2) + WireGuard tunnels (roadmap C1).
+    if want("vpn") && (!draft.ipsec.is_empty() || !draft.wireguard.is_empty()) {
         out.push_str("vpn {\n");
         for (name, c) in &draft.ipsec {
             out.push_str(&format!("    ipsec {name} {{\n"));
@@ -6258,6 +6373,39 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             }
             if let Some(v) = &c.start_action {
                 out.push_str(&format!("        start-action {v}\n"));
+            }
+            out.push_str("    }\n");
+        }
+        for (name, t) in &draft.wireguard {
+            out.push_str(&format!("    wireguard {name} {{\n"));
+            if let Some(pk) = &t.private_key {
+                out.push_str(&format!("        private-key {pk}\n"));
+                // Operators need the derived public key to hand to the far end.
+                if let Ok(public) = crate::wgkey::public_from_private(pk) {
+                    out.push_str(&format!("        # public-key {public}\n"));
+                }
+            }
+            if let Some(port) = t.listen_port {
+                out.push_str(&format!("        listen-port {port}\n"));
+            }
+            for (peer_pk, p) in &t.peers {
+                out.push_str(&format!("        peer {peer_pk} {{\n"));
+                if !p.allowed_ips.is_empty() {
+                    out.push_str(&format!(
+                        "            allowed-ips {}\n",
+                        p.allowed_ips.join(",")
+                    ));
+                }
+                if let Some(ep) = &p.endpoint {
+                    out.push_str(&format!("            endpoint {ep}\n"));
+                }
+                if let Some(k) = p.persistent_keepalive {
+                    out.push_str(&format!("            keepalive {k}\n"));
+                }
+                if let Some(psk) = &p.preshared_key {
+                    out.push_str(&format!("            preshared-key {psk}\n"));
+                }
+                out.push_str("        }\n");
             }
             out.push_str("    }\n");
         }
@@ -6337,6 +6485,28 @@ fn push_unique(list: &mut Vec<String>, v: &str) {
     if !list.iter().any(|e| e == v) {
         list.push(v.to_string());
     }
+}
+
+/// Append every comma-separated item in `v` to `list`, de-duplicating (an item
+/// already present is not re-added). The shared `set … <field> <v[,v…]>` idiom
+/// for a list that appends rather than replaces — a single value is just a CSV
+/// of length one, so `set … <field> <one>` keeps working.
+fn append_csv(list: &mut Vec<String>, v: &str) {
+    for item in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if !list.iter().any(|e| e == item) {
+            list.push(item.to_string());
+        }
+    }
+}
+
+/// Remove a single (trimmed) item from `list` — the `delete … <field> <v>`
+/// counterpart of [`append_csv`]. Returns whether anything was removed, so the
+/// caller can bail with "not present".
+fn remove_item(list: &mut Vec<String>, v: &str) -> bool {
+    let v = v.trim();
+    let before = list.len();
+    list.retain(|e| e != v);
+    list.len() != before
 }
 
 fn parse_action(s: &str) -> Result<Action> {
@@ -7030,6 +7200,136 @@ mod tests {
         // A VLAN id out of range is rejected at commit.
         run(&mut s, "set interface bad parent eth1").unwrap();
         run(&mut s, "set interface bad vlan 9000").unwrap();
+        assert!(s.commit().is_err());
+    }
+
+    #[test]
+    fn vlan_parent_id_inferred_from_dotted_name() {
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname fw",
+            "set interface eth0 zone lan",
+            "set interface eth0 address 10.0.0.1/24",
+            // Just the name + address — parent/vlan are inferred at commit.
+            "set interface eth0.20 zone iot",
+            "set interface eth0.20 address 10.0.20.1/24",
+        ] {
+            run(&mut s, line).unwrap();
+        }
+        let a = s.commit().expect("inferred vlan commits");
+        let vlan = a.interfaces.iter().find(|i| i.name == "eth0.20").unwrap();
+        assert_eq!(
+            (vlan.parent.as_deref(), vlan.vlan),
+            (Some("eth0"), Some(20))
+        );
+    }
+
+    #[test]
+    fn wireguard_cli_builds_shows_commits_and_deletes() {
+        let key = "OK+2ftLGli1Dle9tRWx5Bj0eLc0X7KcInScVBpg+3lc=";
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname gw".to_string(),
+            "set interface wg0 type wireguard".to_string(),
+            "set interface wg0 zone vpn".to_string(),
+            "set interface wg0 address 10.9.0.1/24".to_string(),
+            "set nat source vpn-masq zone vpn".to_string(),
+            format!("set vpn wireguard wg0 private-key {key}"),
+            "set vpn wireguard wg0 listen-port 51820".to_string(),
+            format!("set vpn wireguard wg0 peer {key} allowed-ips 10.9.0.2/32"),
+            format!("set vpn wireguard wg0 peer {key} endpoint 203.0.113.9:51820"),
+            format!("set vpn wireguard wg0 peer {key} keepalive 25"),
+        ] {
+            run(&mut s, &line).unwrap();
+        }
+        // The interface shows the type; the crypto shows under vpn.
+        let iface = s.show_only("interface");
+        assert!(iface.contains("type wireguard"), "got:\n{iface}");
+        let vpn = s.show_only("vpn");
+        assert!(vpn.contains("wireguard wg0 {"), "got:\n{vpn}");
+        assert!(vpn.contains("listen-port 51820"), "got:\n{vpn}");
+        assert!(vpn.contains(&format!("peer {key} {{")), "got:\n{vpn}");
+
+        let a = s.commit().expect("valid wireguard commits");
+        assert!(
+            a.interfaces
+                .iter()
+                .any(|i| i.name == "wg0" && i.is_wireguard())
+        );
+        assert_eq!(a.vpn.wireguard.len(), 1);
+        assert_eq!(a.vpn.wireguard[0].name, "wg0");
+        assert_eq!(a.vpn.wireguard[0].peers.len(), 1);
+
+        // A type=wireguard interface with no tunnel is rejected.
+        run(&mut s, "set interface wg1 type wireguard").unwrap();
+        assert!(s.commit().is_err());
+
+        // Delete the orphan interface, then a peer, then the whole tunnel.
+        run(&mut s, "delete interface wg1").unwrap();
+        run(&mut s, &format!("delete vpn wireguard wg0 peer {key}")).unwrap();
+        let b = s.commit().expect("still valid after peer delete");
+        assert!(b.vpn.wireguard[0].peers.is_empty());
+    }
+
+    #[test]
+    fn bridge_members_set_on_device_and_delete() {
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname fw",
+            "set interface br0 type bridge",
+            "set interface br0 zone lan",
+            "set interface br0 address 10.0.0.1/24",
+            "set interface br0 member eth1",
+            "set interface br0 member eth2",
+            "set interface eth1",
+            "set interface eth2",
+        ] {
+            run(&mut s, line).unwrap();
+        }
+        let shown = s.show_only("interface");
+        assert!(shown.contains("member eth1"), "got:\n{shown}");
+        assert!(shown.contains("member eth2"), "got:\n{shown}");
+        let a = s.commit().expect("bridge with members commits");
+        let br = a.interfaces.iter().find(|i| i.name == "br0").unwrap();
+        assert_eq!(br.members, vec!["eth1".to_string(), "eth2".to_string()]);
+
+        // Remove one member; the other survives.
+        run(&mut s, "delete interface br0 member eth1").unwrap();
+        let b = s.commit().unwrap();
+        let br = b.interfaces.iter().find(|i| i.name == "br0").unwrap();
+        assert_eq!(br.members, vec!["eth2".to_string()]);
+
+        // `member` on a non-device interface is rejected at commit.
+        run(&mut s, "set interface eth2 member eth1").unwrap();
+        assert!(s.commit().is_err());
+    }
+
+    #[test]
+    fn vlan_aware_bridge_ports_set_and_commit() {
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname fw",
+            "set interface br0 type bridge",
+            "set interface br0 vlan-aware true",
+            "set interface br0 zone lan",
+            "set interface br0 address 10.0.0.1/24",
+            "set interface br0 member eth1",
+            "set interface eth1 vlan-tagged 10,20",
+            "set interface eth1 vlan-untagged 1",
+        ] {
+            run(&mut s, line).unwrap();
+        }
+        let shown = s.show_only("interface");
+        assert!(shown.contains("vlan-aware true"), "got:\n{shown}");
+        assert!(shown.contains("vlan-tagged 10,20"), "got:\n{shown}");
+        assert!(shown.contains("vlan-untagged 1"), "got:\n{shown}");
+        let a = s.commit().expect("vlan-aware bridge commits");
+        let eth1 = a.interfaces.iter().find(|i| i.name == "eth1").unwrap();
+        assert_eq!(eth1.vlan_tagged, vec![10u16, 20u16]);
+        assert_eq!(eth1.vlan_untagged, Some(1));
+
+        // vlan-tagged on a port outside a vlan-aware bridge is rejected.
+        run(&mut s, "set interface eth3 vlan-tagged 10").unwrap();
         assert!(s.commit().is_err());
     }
 
