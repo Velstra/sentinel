@@ -257,6 +257,22 @@ port = 443
 # allowed-ips = ["10.9.0.2/32"]
 # endpoint = "203.0.113.9:51820"
 # persistent-keepalive = 25
+#
+# OpenConnect (roadmap C17): an AnyConnect-compatible TLS road-warrior VPN for
+# client devices — a single server, not a tunnel list. Its TLS identity is a
+# leaf issued by the on-box PKI (C19). Each connecting client is handed an
+# address from `pool`; `routes` are the subnets pushed to the client (omit +
+# `default-route = true` for a full tunnel). Users authenticate by password.
+# [vpn.openconnect]
+# certificate = "vpn-server"    # a [[pki.certificate]] name (or "acme")
+# port = 443
+# pool = "10.99.0.0/24"
+# dns = ["10.0.0.1"]
+# routes = ["10.0.0.0/24"]      # split tunnel; omit for `default-route = true`
+# zone = "vpn"
+# [[vpn.openconnect.user]]
+# name = "alice"
+# password = "change-me"
 
 # Dynamic routing (the Wren control plane). BGP with a fully-specified peer and
 # a named route filter used as its import policy. Every field maps 1:1 onto the
@@ -1986,13 +2002,95 @@ pub struct Vpn {
     /// peers — the interface itself only declares the address/zone/mtu.
     #[serde(default, rename = "wireguard", skip_serializing_if = "Vec::is_empty")]
     pub wireguard: Vec<WireguardTunnel>,
+    /// The OpenConnect (AnyConnect-compatible) road-warrior VPN server
+    /// (`[vpn.openconnect]`), rendered to an `ocserv.conf` + a 0600 password
+    /// file. At most one per box — it is a single listening service, unlike the
+    /// site-to-site tunnel lists above.
+    #[serde(
+        default,
+        rename = "openconnect",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub openconnect: Option<OpenConnectServer>,
 }
 
 impl Vpn {
     /// True when no VPN is configured — lets `[vpn]` be omitted from output.
     pub fn is_empty(&self) -> bool {
-        self.ipsec.is_empty() && self.wireguard.is_empty()
+        self.ipsec.is_empty() && self.wireguard.is_empty() && self.openconnect.is_none()
     }
+}
+
+/// Default TCP/UDP port the OpenConnect server listens on — 443, so it traverses
+/// restrictive networks that only allow HTTPS (the whole point of a TLS VPN).
+pub const DEFAULT_OPENCONNECT_PORT: u16 = 443;
+
+/// The OpenConnect (AnyConnect-compatible) VPN server (`[vpn.openconnect]`) —
+/// a TLS road-warrior VPN for client devices, complementing site-to-site IPsec
+/// and peer-to-peer WireGuard. Rendered by `openconnect.rs` into an `ocserv.conf`
+/// (served by `ocserv`) plus a 0600 `ocpasswd` file for the user credentials.
+/// The server certificate is a leaf issued by the on-box PKI (C19).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenConnectServer {
+    /// Administratively disable the server without deleting its config (parks it
+    /// like `interface … disabled`). Off by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
+    /// TCP (and UDP/DTLS) port to listen on. Defaults to
+    /// [`DEFAULT_OPENCONNECT_PORT`] (443).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// The PKI certificate (`[[pki.certificate]]` name, or `acme`) used as the
+    /// server's TLS identity. Required — the client validates it.
+    pub certificate: String,
+    /// The client address pool as a CIDR (e.g. `10.99.0.0/24`): each connected
+    /// client is handed an address from it. Required.
+    pub pool: String,
+    /// DNS resolvers pushed to connected clients. Empty ⇒ none pushed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns: Vec<String>,
+    /// Split-tunnel routes pushed to clients (CIDRs the client sends over the
+    /// VPN). Empty with `default-route = false` ⇒ the client keeps its own
+    /// default and only the pushed routes go over the tunnel.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<String>,
+    /// Push a default route so ALL client traffic goes over the VPN (full
+    /// tunnel). Mutually exclusive with a non-empty `routes` list.
+    #[serde(
+        default,
+        rename = "default-route",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub default_route: bool,
+    /// The firewall zone the server's `vpn0` tun interface belongs to, so zone
+    /// rules apply to VPN clients. Optional (unset ⇒ no zone binding).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
+    /// The users allowed to connect (`[[vpn.openconnect.user]]`). Each is a
+    /// name + password rendered into the 0600 password file. At least one is
+    /// required — a server with no users can accept no one.
+    #[serde(default, rename = "user", skip_serializing_if = "Vec::is_empty")]
+    pub users: Vec<OpenConnectUser>,
+}
+
+impl OpenConnectServer {
+    /// The effective listen port (explicit or the 443 default).
+    pub fn port(&self) -> u16 {
+        self.port.unwrap_or(DEFAULT_OPENCONNECT_PORT)
+    }
+}
+
+/// One OpenConnect client credential (`[[vpn.openconnect.user]]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenConnectUser {
+    /// Login name. Required; `[A-Za-z0-9_.-]` (rendered into a line-based
+    /// password file).
+    pub name: String,
+    /// The account password. Secret — rendered to the 0600 password file,
+    /// never into ocserv.conf. Required.
+    pub password: String,
 }
 
 /// One WireGuard tunnel (`[[vpn.wireguard]]`) — the keys + peers for the
@@ -4547,6 +4645,93 @@ impl Appliance {
                     iface.name,
                     iface.name
                 );
+            }
+        }
+
+        // OpenConnect road-warrior server (roadmap C17): a single TLS VPN
+        // service. The server cert must be a declared PKI leaf (or ACME); the
+        // pool/routes/dns are IP formats; users carry a safe charset + secret
+        // that lands in a line-based password file.
+        if let Some(oc) = &self.vpn.openconnect {
+            if oc.port == Some(0) {
+                bail!("vpn openconnect: port 0 is not valid");
+            }
+            if !oc.pool.contains('/') {
+                bail!(
+                    "vpn openconnect: pool must be a CIDR with a prefix length (e.g. 10.99.0.0/24)"
+                );
+            }
+            validate_cidr_or_ip(&oc.pool).with_context(
+                || "vpn openconnect: pool must be an IPv4 CIDR (e.g. 10.99.0.0/24)",
+            )?;
+            for d in &oc.dns {
+                if d.parse::<IpAddr>().is_err() {
+                    bail!("vpn openconnect: dns {d:?} is not an IP address");
+                }
+            }
+            for r in &oc.routes {
+                validate_cidr_or_ip(r).with_context(|| format!("vpn openconnect: route {r:?}"))?;
+            }
+            if oc.default_route && !oc.routes.is_empty() {
+                bail!(
+                    "vpn openconnect: `default-route` (full tunnel) and an explicit `routes` \
+                     list are mutually exclusive"
+                );
+            }
+            // The server certificate must name a declared leaf (or ACME).
+            let cert_ok = oc.certificate == ACME_CA
+                || self
+                    .pki
+                    .certificates
+                    .iter()
+                    .any(|c| c.name == oc.certificate);
+            if !cert_ok {
+                bail!(
+                    "vpn openconnect: certificate {:?} is not a declared pki certificate",
+                    oc.certificate
+                );
+            }
+            if let Some(z) = &oc.zone {
+                if !zones_in_use.contains(z.as_str()) {
+                    bail!("vpn openconnect: zone {z:?} has no interface");
+                }
+            }
+            if oc.users.is_empty() {
+                bail!(
+                    "vpn openconnect: at least one user is required (a server with no users \
+                     can accept no one)"
+                );
+            }
+            let mut seen_user = HashSet::new();
+            for u in &oc.users {
+                if u.name.is_empty() {
+                    bail!("vpn openconnect: a user name must not be empty");
+                }
+                if !u
+                    .name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+                {
+                    bail!(
+                        "vpn openconnect: user {:?} name may only contain letters, digits, \
+                         '-', '_' and '.'",
+                        u.name
+                    );
+                }
+                if !seen_user.insert(u.name.as_str()) {
+                    bail!("vpn openconnect: duplicate user {:?}", u.name);
+                }
+                if u.password.is_empty() {
+                    bail!("vpn openconnect: user {:?} password is required", u.name);
+                }
+                // The password lands in a line-based password file — a control
+                // char (newline) would forge extra entries.
+                if u.password.chars().any(|c| c.is_control()) {
+                    bail!(
+                        "vpn openconnect: user {:?} password must not contain control characters",
+                        u.name
+                    );
+                }
             }
         }
 

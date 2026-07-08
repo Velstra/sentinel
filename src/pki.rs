@@ -52,6 +52,15 @@ fn cert_dir(name: &str) -> PathBuf {
     Path::new(PKI_DIR).join("certs").join(name)
 }
 
+/// The on-disk `(certificate, private-key)` paths for the issued leaf `name` —
+/// the TLS identity another daemon (e.g. the OpenConnect server) serves. The
+/// files are written by [`apply`]; the caller must handle their possible
+/// absence (a not-yet-issued cert) rather than assume they exist.
+pub fn leaf_paths(name: &str) -> (PathBuf, PathBuf) {
+    let dir = cert_dir(name);
+    (dir.join(CERT_CRT), dir.join(CERT_KEY))
+}
+
 /// A path as `&str`, or a clear error for a non-UTF-8 path (never expected for
 /// our fixed store layout, but openssl args must be UTF-8).
 fn p(path: &Path) -> Result<&str> {

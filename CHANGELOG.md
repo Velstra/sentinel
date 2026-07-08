@@ -69,6 +69,10 @@ declarative config model.
   filters.
 - **C18 — services parity.** LLDP, read-only SNMP, Wake-on-LAN, mDNS repeater,
   dynamic DNS, and DHCP relay.
+- **C17 — OpenConnect VPN server.** An AnyConnect-compatible TLS road-warrior
+  VPN (`set vpn openconnect …`, served by ocserv): client address pool, pushed
+  DNS/routes or full-tunnel, password auth, TLS identity from the on-box PKI —
+  the client-VPN modality alongside site-to-site IPsec and peer WireGuard.
 - **C19 — PKI + ACME.** An on-box certificate authority with leaf issuance
   (runtime, idempotent, private keys mode `0600`) plus ACME / Let's Encrypt
   account configuration.
