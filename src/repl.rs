@@ -1006,7 +1006,36 @@ const VPN_NODES: &[Cand] = &[
         "wireguard",
         "a WireGuard tunnel's keys + peers (by interface name)",
     ),
+    (
+        "openconnect",
+        "the OpenConnect (AnyConnect) road-warrior VPN server",
+    ),
 ];
+// `vpn openconnect <Tab>` reveals the road-warrior server fields (roadmap C17).
+const OPENCONNECT_FIELDS: &[Cand] = &[
+    (
+        "certificate",
+        "TLS server identity — a `pki certificate` name",
+    ),
+    ("port", "TCP/UDP listen port (default 443)"),
+    ("pool", "client address pool (IPv4 CIDR, e.g. 10.99.0.0/24)"),
+    ("dns", "DNS resolver(s) pushed to clients (repeatable)"),
+    (
+        "routes",
+        "split-tunnel subnets pushed to clients (repeatable)",
+    ),
+    (
+        "default-route",
+        "full tunnel: push a default route (true|false)",
+    ),
+    ("zone", "firewall zone for the server's tun interface"),
+    (
+        "disabled",
+        "administratively disable the server (true|false)",
+    ),
+    ("user", "a client login (by name) + password"),
+];
+const OPENCONNECT_USER_FIELDS: &[Cand] = &[("password", "the client account password (secret)")];
 // `vpn ipsec <name> <Tab>` reveals the per-connection fields.
 const IPSEC_FIELDS: &[Cand] = &[
     ("local", "this box's IKE endpoint (IPv4)"),
@@ -1957,6 +1986,10 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "vpn", "wireguard", _name] => WG_TUNNEL_FIELDS,
         ["set", "vpn", "wireguard", _name, "private-key"] => WG_KEY_GEN,
         ["set" | "delete", "vpn", "wireguard", _name, "peer", _pk] => PEER_FIELDS,
+        // OpenConnect road-warrior server (singleton): its fields, then a user.
+        ["set" | "delete", "vpn", "openconnect"] => OPENCONNECT_FIELDS,
+        ["set" | "delete", "vpn", "openconnect", "user", _u] => OPENCONNECT_USER_FIELDS,
+        ["set", "vpn", "openconnect", "default-route" | "disabled"] => BOOLS,
         // `address6 auto` completes the SLAAC keyword.
         ["set", "interface", _name, "address6"] => ADDRESS6_HINT,
         // Bridge/bond value completions.
@@ -2553,6 +2586,26 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
             "local-subnet" | "remote-subnet",
         ] => own_cands(&[PH_IPV4_CIDR]),
         ["set", "vpn", "ipsec", _name, "psk"] => own_cands(&[PH_KEY]),
+        // OpenConnect value positions.
+        ["set", "vpn", "openconnect", "certificate"] => {
+            let mut v: Vec<(String, String)> = names
+                .pki_certificates
+                .iter()
+                .map(|n| (n.clone(), "a declared pki certificate".to_string()))
+                .collect();
+            v.push((
+                "acme".to_string(),
+                "an ACME-obtained certificate".to_string(),
+            ));
+            v
+        }
+        ["set", "vpn", "openconnect", "port"] => own_cands(&[PH_PORT]),
+        ["set", "vpn", "openconnect", "pool"] => own_cands(&[PH_IPV4_CIDR]),
+        ["set", "vpn", "openconnect", "dns"] => own_cands(&[PH_IPV4, PH_IPV6]),
+        ["set", "vpn", "openconnect", "routes"] => own_cands(&[PH_IPV4_CIDR, PH_IPV6_CIDR]),
+        ["set", "vpn", "openconnect", "zone"] => zones("zone"),
+        ["set" | "delete", "vpn", "openconnect", "user"] => own_cands(&[PH_NAME]),
+        ["set", "vpn", "openconnect", "user", _u, "password"] => own_cands(&[PH_KEY]),
         ["set", "pki", "acme", "directory-url"] => own_cands(&[PH_URL]),
         ["set", "pki", "acme", "email"] => own_cands(&[("<email>", "a contact email address")]),
 
@@ -3318,6 +3371,16 @@ mod tests {
             ["<port|lo-hi>"]
         );
         assert_eq!(kws(&["set", "vpn", "ipsec", "t0", "psk"]), ["<key>"]);
+        // OpenConnect value positions get their vtysh-style hints, and the
+        // certificate position offers the literal `acme` fallback.
+        assert_eq!(kws(&["set", "vpn", "openconnect", "pool"]), ["<A.B.C.D/M>"]);
+        assert_eq!(kws(&["set", "vpn", "openconnect", "port"]), ["<1-65535>"]);
+        assert!(kws(&["set", "vpn", "openconnect", "certificate"]).contains(&"acme".to_string()));
+        assert_eq!(kws(&["set", "vpn", "openconnect", "user"]), ["<name>"]);
+        assert_eq!(
+            kws(&["set", "vpn", "openconnect", "user", "alice", "password"]),
+            ["<key>"]
+        );
         // A description anywhere, and any password, get generic hints.
         assert_eq!(
             kws(&["set", "firewall", "rule", "web", "description"]),

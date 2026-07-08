@@ -1878,6 +1878,10 @@ pub fn apply_link_runtime(appliance: &Appliance) -> Result<()> {
     // IPsec tunnels (roadmap C2) — rendered swanctl config loaded into charon,
     // after the underlay uplinks the tunnels ride on are up.
     crate::ipsec::apply(appliance)?;
+    // OpenConnect road-warrior VPN (roadmap C17) — rendered ocserv.conf + 0600
+    // ocpasswd, then the ocserv unit (re)started, after the WAN the server binds
+    // is up and after the PKI leaf it serves was minted by apply_persistent.
+    crate::openconnect::apply(appliance)?;
     // Box services (roadmap C18) — LLDP/SNMP/mDNS/dyndns/DHCP-relay, each a
     // Sentinel-owned daemon (re)started after networkd so the link-scoped ones
     // (LLDP/mDNS/relay) see their interfaces up.

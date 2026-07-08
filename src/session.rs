@@ -16,10 +16,10 @@ use crate::config::{
     Acme, Action, Appliance, Bfd, Bgp, BgpAggregate, BgpNeighbor, BgpRoa, BgpRtr, Ca, Certificate,
     DhcpRelay, DhcpServer, DhcpStaticLease, Dns, Dyndns, Export, Filter, FilterRule, Firewall,
     Groups, HealthCheck, IfaceType, Interface, IpsecConnection, Isis, Lldp, Mdns, MultiWan,
-    Multicast, MulticastInterface, Nat, Nat64, NatDestination, NatSource, Ntp, Ospf, Ospf3,
-    OspfInterface, Pki, PortSpec, Pppoe, Proto, Protocols, Qos, QosDiscipline, Rip, RouterAdvert,
-    Rule, Services, Snmp, StaticRoute, System, Vpn, VrfDef, Vrrp, WanMode, WanUplink, WgPeer,
-    WireguardTunnel, ZoneCfg,
+    Multicast, MulticastInterface, Nat, Nat64, NatDestination, NatSource, Ntp, OpenConnectServer,
+    OpenConnectUser, Ospf, Ospf3, OspfInterface, Pki, PortSpec, Pppoe, Proto, Protocols, Qos,
+    QosDiscipline, Rip, RouterAdvert, Rule, Services, Snmp, StaticRoute, System, Vpn, VrfDef, Vrrp,
+    WanMode, WanUplink, WgPeer, WireguardTunnel, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -1016,6 +1016,10 @@ struct Draft {
     pki_cas: Vec<(String, PkiCaDraft)>,
     pki_certs: Vec<(String, PkiCertDraft)>,
     acme: Option<AcmeDraft>,
+    /// OpenConnect (roadmap C17): the single TLS road-warrior VPN server, or
+    /// `None` when unconfigured. A singleton (unlike the ipsec/wireguard lists)
+    /// created on the first `set vpn openconnect …`.
+    openconnect: Option<OpenConnectDraft>,
 }
 
 /// A partially-specified DNS forwarder (`[services.dns]`).
@@ -1144,6 +1148,31 @@ impl WgTunnelDraft {
         self.peers.push((pk.to_string(), PeerDraft::default()));
         &mut self.peers.last_mut().unwrap().1
     }
+}
+
+/// A partially-specified OpenConnect server (`[vpn.openconnect]`, roadmap C17).
+/// A singleton, so it lives behind an `Option` on the draft rather than in a
+/// keyed list. `certificate` + `pool` + at least one user are required at
+/// commit; everything else is optional and checked by `validate()`.
+#[derive(Debug, Clone, Default)]
+struct OpenConnectDraft {
+    disabled: bool,
+    port: Option<u16>,
+    certificate: Option<String>,
+    pool: Option<String>,
+    dns: Vec<String>,
+    routes: Vec<String>,
+    default_route: bool,
+    zone: Option<String>,
+    /// Client credentials keyed by login name (`user <name> password …`).
+    users: BTreeMap<String, OcUserDraft>,
+}
+
+/// A partially-specified OpenConnect user (`[[vpn.openconnect.user]]`). Keyed by
+/// name in [`OpenConnectDraft::users`]; `password` is required at commit.
+#[derive(Debug, Clone, Default)]
+struct OcUserDraft {
+    password: Option<String>,
 }
 
 /// A partially-specified local CA (`[[pki.ca]]`, roadmap C19), keyed by its name
@@ -1294,6 +1323,13 @@ impl Draft {
         self.wireguard
             .push((name.to_string(), WgTunnelDraft::default()));
         &mut self.wireguard.last_mut().unwrap().1
+    }
+
+    /// Mutable access to the OpenConnect server, creating an empty one on first
+    /// touch (it is a singleton, so `set vpn openconnect …` materialises it).
+    fn openconnect_mut(&mut self) -> &mut OpenConnectDraft {
+        self.openconnect
+            .get_or_insert_with(OpenConnectDraft::default)
     }
 
     /// Mutable access to the local CA `name`, inserting it if new (CAs are keyed
@@ -1858,6 +1894,28 @@ impl Draft {
                 directory_url: c.directory_url.clone(),
                 challenge: c.challenge.clone(),
                 agree_tos: c.agree_tos,
+            }),
+            openconnect: a.vpn.openconnect.as_ref().map(|oc| OpenConnectDraft {
+                disabled: oc.disabled,
+                port: oc.port,
+                certificate: Some(oc.certificate.clone()),
+                pool: Some(oc.pool.clone()),
+                dns: oc.dns.clone(),
+                routes: oc.routes.clone(),
+                default_route: oc.default_route,
+                zone: oc.zone.clone(),
+                users: oc
+                    .users
+                    .iter()
+                    .map(|u| {
+                        (
+                            u.name.clone(),
+                            OcUserDraft {
+                                password: Some(u.password.clone()),
+                            },
+                        )
+                    })
+                    .collect(),
             }),
         }
     }
@@ -3332,6 +3390,48 @@ impl Session {
                 self.draft.wireguard_mut(name).peer_mut(pk).preshared_key = Some((*v).to_string());
             }
 
+            // vpn openconnect (roadmap C17): the single TLS road-warrior VPN
+            // server. Deep validation (CIDR/IP formats, cert must name a declared
+            // leaf, ≥1 user) lives in config `validate()` and runs at commit — here
+            // we only shape the draft. `dns`/`routes` append+dedup like the other
+            // list fields; users are keyed by login name.
+            ["vpn", "openconnect", "certificate", v] => {
+                self.draft.openconnect_mut().certificate = Some((*v).to_string());
+            }
+            ["vpn", "openconnect", "port", v] => {
+                let port: u16 = v.parse().with_context(|| format!("invalid port {v:?}"))?;
+                if port == 0 {
+                    bail!("port 0 is not valid");
+                }
+                self.draft.openconnect_mut().port = Some(port);
+            }
+            ["vpn", "openconnect", "pool", v] => {
+                self.draft.openconnect_mut().pool = Some((*v).to_string());
+            }
+            ["vpn", "openconnect", "dns", v] => {
+                append_csv(&mut self.draft.openconnect_mut().dns, v);
+            }
+            ["vpn", "openconnect", "routes", v] => {
+                append_csv(&mut self.draft.openconnect_mut().routes, v);
+            }
+            ["vpn", "openconnect", "default-route", v] => {
+                self.draft.openconnect_mut().default_route = parse_bool(v)?;
+            }
+            ["vpn", "openconnect", "zone", v] => {
+                self.draft.openconnect_mut().zone = Some((*v).to_string());
+            }
+            ["vpn", "openconnect", "disabled", v] => {
+                self.draft.openconnect_mut().disabled = parse_bool(v)?;
+            }
+            ["vpn", "openconnect", "user", name, "password", v] => {
+                self.draft
+                    .openconnect_mut()
+                    .users
+                    .entry((*name).to_string())
+                    .or_default()
+                    .password = Some((*v).to_string());
+            }
+
             // pki (roadmap C19): local CAs, issued certs, the ACME account.
             ["pki", "ca", name, "common-name", v] => {
                 crate::config::validate_subject_component(v)?;
@@ -4492,6 +4592,48 @@ impl Session {
                  (`delete vpn wireguard {name}`) to remove it"
             ),
 
+            // vpn openconnect (roadmap C17). Bare `delete vpn openconnect` removes
+            // the whole server; a per-item `... dns <ip>` / `... routes <cidr>`
+            // drops one entry; `... user <name>` one credential; any other
+            // `... <field>` resets an optional field or clears a list. The
+            // required `certificate`/`pool` can only be replaced — delete the
+            // whole server to remove them.
+            ["vpn", "openconnect"] => self.draft.openconnect = None,
+            ["vpn", "openconnect", "dns", v] => {
+                let oc = self.openconnect()?;
+                if !remove_item(&mut oc.dns, v) {
+                    bail!("vpn openconnect has no dns {v:?}");
+                }
+            }
+            ["vpn", "openconnect", "routes", v] => {
+                let oc = self.openconnect()?;
+                if !remove_item(&mut oc.routes, v) {
+                    bail!("vpn openconnect has no route {v:?}");
+                }
+            }
+            ["vpn", "openconnect", "user", name] => {
+                let oc = self.openconnect()?;
+                if oc.users.remove(*name).is_none() {
+                    bail!("vpn openconnect has no user {name:?}");
+                }
+            }
+            ["vpn", "openconnect", field] => {
+                let oc = self.openconnect()?;
+                match *field {
+                    "port" => oc.port = None,
+                    "dns" => oc.dns.clear(),
+                    "routes" => oc.routes.clear(),
+                    "default-route" => oc.default_route = false,
+                    "zone" => oc.zone = None,
+                    "disabled" => oc.disabled = false,
+                    "certificate" | "pool" => bail!(
+                        "vpn openconnect: {field} is required — delete the whole server \
+                         (`delete vpn openconnect`) to remove it"
+                    ),
+                    other => bail!("vpn openconnect has no field {other:?}"),
+                }
+            }
+
             // pki (roadmap C19). Bare `delete pki` clears the whole tree; the rest
             // clear one CA / cert / the ACME account or one of their optional
             // fields (the required common-name / ca can only be replaced — delete
@@ -4635,6 +4777,13 @@ impl Session {
             .find(|(n, _)| n == name)
             .map(|(_, d)| d)
             .ok_or_else(|| anyhow::anyhow!("no vpn wireguard tunnel {name:?}"))
+    }
+
+    fn openconnect(&mut self) -> Result<&mut OpenConnectDraft> {
+        self.draft
+            .openconnect
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("no vpn openconnect server"))
     }
 
     fn pki_ca(&mut self, name: &str) -> Result<&mut PkiCaDraft> {
@@ -5208,6 +5357,29 @@ impl Session {
                         .collect(),
                 })
                 .collect(),
+            // OpenConnect road-warrior server (roadmap C17). Required fields
+            // (certificate/pool) fall back to empty strings so validation
+            // surfaces a clear "X is required" message rather than silently
+            // dropping a half-specified server. Users are emitted in name order
+            // (the BTreeMap keys).
+            openconnect: self.draft.openconnect.as_ref().map(|oc| OpenConnectServer {
+                disabled: oc.disabled,
+                port: oc.port,
+                certificate: oc.certificate.clone().unwrap_or_default(),
+                pool: oc.pool.clone().unwrap_or_default(),
+                dns: oc.dns.clone(),
+                routes: oc.routes.clone(),
+                default_route: oc.default_route,
+                zone: oc.zone.clone(),
+                users: oc
+                    .users
+                    .iter()
+                    .map(|(name, u)| OpenConnectUser {
+                        name: name.clone(),
+                        password: u.password.clone().unwrap_or_default(),
+                    })
+                    .collect(),
+            }),
         };
 
         // pki (roadmap C19): local CAs, issued certs, the ACME account. Required
@@ -6335,9 +6507,12 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         out.push_str("}\n");
     }
 
-    // vpn { ipsec <name> { … } wireguard <name> { … } } — IKEv2 site-to-site
-    // IPsec (roadmap C2) + WireGuard tunnels (roadmap C1).
-    if want("vpn") && (!draft.ipsec.is_empty() || !draft.wireguard.is_empty()) {
+    // vpn { ipsec <name> { … } wireguard <name> { … } openconnect { … } } —
+    // IKEv2 site-to-site IPsec (roadmap C2) + WireGuard tunnels (roadmap C1) +
+    // the OpenConnect road-warrior server (roadmap C17).
+    if want("vpn")
+        && (!draft.ipsec.is_empty() || !draft.wireguard.is_empty() || draft.openconnect.is_some())
+    {
         out.push_str("vpn {\n");
         for (name, c) in &draft.ipsec {
             out.push_str(&format!("    ipsec {name} {{\n"));
@@ -6404,6 +6579,44 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
                 }
                 if let Some(psk) = &p.preshared_key {
                     out.push_str(&format!("            preshared-key {psk}\n"));
+                }
+                out.push_str("        }\n");
+            }
+            out.push_str("    }\n");
+        }
+        // openconnect { … } — the singleton TLS road-warrior server. Secrets
+        // (user passwords) are shown verbatim, matching how wireguard private-key
+        // and ipsec psk render above.
+        if let Some(oc) = &draft.openconnect {
+            out.push_str("    openconnect {\n");
+            if oc.disabled {
+                out.push_str("        disabled true\n");
+            }
+            if let Some(cert) = &oc.certificate {
+                out.push_str(&format!("        certificate {cert}\n"));
+            }
+            if let Some(port) = oc.port {
+                out.push_str(&format!("        port {port}\n"));
+            }
+            if let Some(pool) = &oc.pool {
+                out.push_str(&format!("        pool {pool}\n"));
+            }
+            if !oc.dns.is_empty() {
+                out.push_str(&format!("        dns {}\n", oc.dns.join(",")));
+            }
+            if !oc.routes.is_empty() {
+                out.push_str(&format!("        routes {}\n", oc.routes.join(",")));
+            }
+            if oc.default_route {
+                out.push_str("        default-route true\n");
+            }
+            if let Some(zone) = &oc.zone {
+                out.push_str(&format!("        zone {zone}\n"));
+            }
+            for (name, u) in &oc.users {
+                out.push_str(&format!("        user {name} {{\n"));
+                if let Some(pw) = &u.password {
+                    out.push_str(&format!("            password {pw}\n"));
                 }
                 out.push_str("        }\n");
             }
@@ -7269,6 +7482,189 @@ mod tests {
         run(&mut s, &format!("delete vpn wireguard wg0 peer {key}")).unwrap();
         let b = s.commit().expect("still valid after peer delete");
         assert!(b.vpn.wireguard[0].peers.is_empty());
+    }
+
+    /// Seed a session with the PKI leaf + zoned interface an OpenConnect server
+    /// needs to pass commit-time validation, so the OpenConnect tests only have
+    /// to exercise their own surface.
+    #[cfg(test)]
+    fn openconnect_prereqs(s: &mut Session) {
+        for line in [
+            "set system hostname gw",
+            "set pki ca corp common-name corp.example.com",
+            "set pki certificate vpn-server ca corp",
+            "set pki certificate vpn-server common-name vpn.example.com",
+            "set interface eth1 zone vpn",
+            "set interface eth1 address 10.99.0.1/24",
+        ] {
+            run(s, line).unwrap();
+        }
+    }
+
+    #[test]
+    fn openconnect_cli_builds_shows_commits_and_deletes() {
+        let mut s = Session::empty();
+        openconnect_prereqs(&mut s);
+        for line in [
+            "set vpn openconnect certificate vpn-server",
+            "set vpn openconnect port 4443",
+            "set vpn openconnect pool 10.99.0.0/24",
+            "set vpn openconnect dns 10.99.0.1",
+            "set vpn openconnect routes 10.0.0.0/8",
+            "set vpn openconnect zone vpn",
+            "set vpn openconnect user alice password s3cret",
+        ] {
+            run(&mut s, line).unwrap();
+        }
+        // The show block round-trips the server + its fields + the user.
+        let shown = s.show_only("vpn");
+        assert!(shown.contains("vpn {"), "got:\n{shown}");
+        assert!(shown.contains("openconnect {"), "got:\n{shown}");
+        assert!(shown.contains("certificate vpn-server"), "got:\n{shown}");
+        assert!(shown.contains("port 4443"), "got:\n{shown}");
+        assert!(shown.contains("pool 10.99.0.0/24"), "got:\n{shown}");
+        assert!(shown.contains("dns 10.99.0.1"), "got:\n{shown}");
+        assert!(shown.contains("routes 10.0.0.0/8"), "got:\n{shown}");
+        assert!(shown.contains("zone vpn"), "got:\n{shown}");
+        assert!(shown.contains("user alice {"), "got:\n{shown}");
+        // Secrets render verbatim, matching wireguard private-key / ipsec psk.
+        assert!(shown.contains("password s3cret"), "got:\n{shown}");
+
+        let a = s.commit().expect("valid openconnect commits");
+        let oc = a.vpn.openconnect.as_ref().expect("server present");
+        assert_eq!(oc.certificate, "vpn-server");
+        assert_eq!(oc.port(), 4443);
+        assert_eq!(oc.pool, "10.99.0.0/24");
+        assert_eq!(oc.dns, vec!["10.99.0.1".to_string()]);
+        assert_eq!(oc.routes, vec!["10.0.0.0/8".to_string()]);
+        assert_eq!(oc.zone.as_deref(), Some("vpn"));
+        assert_eq!(oc.users.len(), 1);
+        assert_eq!(oc.users[0].name, "alice");
+        assert_eq!(oc.users[0].password, "s3cret");
+
+        // `default-route` and an explicit `routes` list are mutually exclusive —
+        // drop the routes first, then full-tunnel commits.
+        run(&mut s, "delete vpn openconnect routes").unwrap();
+        run(&mut s, "set vpn openconnect default-route true").unwrap();
+        let b = s.commit().expect("full-tunnel commits");
+        assert!(b.vpn.openconnect.as_ref().unwrap().default_route);
+
+        // Reset an optional field, then delete the whole server.
+        run(&mut s, "delete vpn openconnect port").unwrap();
+        let c = s.commit().expect("still valid after field delete");
+        assert!(c.vpn.openconnect.as_ref().unwrap().port.is_none());
+        run(&mut s, "delete vpn openconnect").unwrap();
+        let d = s.commit().expect("still valid after server delete");
+        assert!(d.vpn.openconnect.is_none());
+    }
+
+    #[test]
+    fn openconnect_dns_and_routes_append_and_remove() {
+        let mut s = Session::empty();
+        openconnect_prereqs(&mut s);
+        run(&mut s, "set vpn openconnect certificate vpn-server").unwrap();
+        run(&mut s, "set vpn openconnect pool 10.99.0.0/24").unwrap();
+        run(&mut s, "set vpn openconnect user bob password pw").unwrap();
+        // Append with dedup: a CSV plus a repeat of an existing entry.
+        run(&mut s, "set vpn openconnect dns 10.99.0.1,10.99.0.2").unwrap();
+        run(&mut s, "set vpn openconnect dns 10.99.0.1").unwrap();
+        run(
+            &mut s,
+            "set vpn openconnect routes 10.0.0.0/8,172.16.0.0/12",
+        )
+        .unwrap();
+        let a = s.commit().expect("commits");
+        let oc = a.vpn.openconnect.as_ref().unwrap();
+        assert_eq!(
+            oc.dns,
+            vec!["10.99.0.1".to_string(), "10.99.0.2".to_string()]
+        );
+        assert_eq!(
+            oc.routes,
+            vec!["10.0.0.0/8".to_string(), "172.16.0.0/12".to_string()]
+        );
+
+        // Per-item removal drops one entry, leaving the rest.
+        run(&mut s, "delete vpn openconnect dns 10.99.0.1").unwrap();
+        run(&mut s, "delete vpn openconnect routes 10.0.0.0/8").unwrap();
+        let b = s.commit().expect("still valid after item removal");
+        let oc = b.vpn.openconnect.as_ref().unwrap();
+        assert_eq!(oc.dns, vec!["10.99.0.2".to_string()]);
+        assert_eq!(oc.routes, vec!["172.16.0.0/12".to_string()]);
+
+        // Removing an absent item is an error.
+        let err = run(&mut s, "delete vpn openconnect dns 8.8.8.8").unwrap_err();
+        assert!(err.to_string().contains("no dns"), "got: {err}");
+    }
+
+    #[test]
+    fn openconnect_users_add_and_delete() {
+        let mut s = Session::empty();
+        openconnect_prereqs(&mut s);
+        run(&mut s, "set vpn openconnect certificate vpn-server").unwrap();
+        run(&mut s, "set vpn openconnect pool 10.99.0.0/24").unwrap();
+        run(&mut s, "set vpn openconnect user alice password a").unwrap();
+        run(&mut s, "set vpn openconnect user bob password b").unwrap();
+        let a = s.commit().expect("two users commit");
+        assert_eq!(a.vpn.openconnect.as_ref().unwrap().users.len(), 2);
+
+        // Deleting one user leaves the other (a server must keep ≥1 user).
+        run(&mut s, "delete vpn openconnect user alice").unwrap();
+        let b = s.commit().expect("still valid with one user");
+        let users = &b.vpn.openconnect.as_ref().unwrap().users;
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].name, "bob");
+
+        // Deleting the last user leaves a server that can accept no one.
+        run(&mut s, "delete vpn openconnect user bob").unwrap();
+        let err = s.commit().unwrap_err().to_string();
+        assert!(err.contains("at least one user"), "got: {err}");
+
+        // Deleting an absent user is an error.
+        let err = run(&mut s, "delete vpn openconnect user ghost").unwrap_err();
+        assert!(err.to_string().contains("no user"), "got: {err}");
+    }
+
+    #[test]
+    fn openconnect_materialize_round_trips() {
+        let mut s = Session::empty();
+        openconnect_prereqs(&mut s);
+        for line in [
+            "set vpn openconnect certificate vpn-server",
+            "set vpn openconnect port 443",
+            "set vpn openconnect pool 10.99.0.0/24",
+            "set vpn openconnect dns 10.99.0.1,10.99.0.2",
+            "set vpn openconnect routes 10.0.0.0/8",
+            "set vpn openconnect zone vpn",
+            "set vpn openconnect disabled true",
+            "set vpn openconnect user alice password a",
+            "set vpn openconnect user bob password b",
+        ] {
+            run(&mut s, line).unwrap();
+        }
+        let a = s.commit().expect("commits");
+        // from_appliance ∘ materialize is the identity on the server.
+        let round = Session {
+            draft: Draft::from_appliance(&a),
+            path: PathBuf::from("/dev/null"),
+            dirty: false,
+        };
+        let b = round.materialize().expect("re-materialises");
+        let (oc0, oc1) = (
+            a.vpn.openconnect.as_ref().unwrap(),
+            b.vpn.openconnect.as_ref().unwrap(),
+        );
+        assert_eq!(oc0.disabled, oc1.disabled);
+        assert_eq!(oc0.port, oc1.port);
+        assert_eq!(oc0.certificate, oc1.certificate);
+        assert_eq!(oc0.pool, oc1.pool);
+        assert_eq!(oc0.dns, oc1.dns);
+        assert_eq!(oc0.routes, oc1.routes);
+        assert_eq!(oc0.default_route, oc1.default_route);
+        assert_eq!(oc0.zone, oc1.zone);
+        let names0: Vec<_> = oc0.users.iter().map(|u| &u.name).collect();
+        let names1: Vec<_> = oc1.users.iter().map(|u| &u.name).collect();
+        assert_eq!(names0, names1);
     }
 
     #[test]

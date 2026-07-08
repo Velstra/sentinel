@@ -328,6 +328,12 @@
             # synthesis. Both are Sentinel-owned units (below), off until configured.
             pkgs.tayga
             pkgs.unbound
+            # OpenConnect (roadmap C17): ocserv is the AnyConnect-compatible TLS
+            # VPN server. It's a Sentinel-owned unit (below), off until configured;
+            # `ocserv`/`occtl` on PATH also allow manual inspection. Passwords are
+            # hashed with `openssl passwd -6` (already present for the PKI), so the
+            # bundled `ocpasswd` tool isn't in the render path.
+            pkgs.ocserv
           ];
 
           # Egress traffic shaping (roadmap C8) needs the CAKE + fq_codel queue
@@ -659,6 +665,33 @@
           # loads the appliance's connections from /run/sentinel/swanctl via the
           # loader's `--file`, so the immutable /etc never needs to change.
           services.strongswan-swanctl.enable = true;
+
+          # OpenConnect (roadmap C17): ocserv terminates TLS road-warrior clients
+          # from the rendered /run/sentinel/ocserv/ocserv.conf. Present but idle —
+          # `wantedBy = []` so it does NOT auto-start at boot; Sentinel renders the
+          # config and (re)starts it from openconnect::apply (on a live commit and
+          # from sentinel-boot-late), matching how the box's other daemons are
+          # driven. `--foreground` so systemd owns the process; ocserv needs
+          # iproute2 (it runs `ip` to set up the vpn0 tun) on PATH.
+          systemd.services.ocserv = {
+            description = "OpenConnect VPN server (sentinel/ocserv)";
+            after = [
+              "network.target"
+              "sentinel-boot.service"
+            ];
+            wantedBy = [ ];
+            path = [ pkgs.iproute2 ];
+            # Retry indefinitely (no start-rate limit): a fresh commit/boot may race
+            # networkd bringing the WAN the server binds up, or the PKI leaf mint.
+            unitConfig.StartLimitIntervalSec = 0;
+            serviceConfig = {
+              Type = "exec";
+              ExecStart = "${pkgs.ocserv}/bin/ocserv --foreground --config /run/sentinel/ocserv/ocserv.conf";
+              Restart = "on-failure";
+              RestartSec = "5s";
+            };
+          };
+
           systemd.tmpfiles.rules = [
             "d /run/sentinel 0755 root root -"
             "d /run/sentinel/chrony.d 0755 root root -"
@@ -671,6 +704,9 @@
             # IPsec runtime dir holds the rendered swanctl.conf + the 0600 PSK
             # secrets file (root only).
             "d /run/sentinel/swanctl 0700 root root -"
+            # OpenConnect (roadmap C17) runtime dir holds ocserv.conf + the 0600
+            # ocpasswd credential file + the control socket (root only).
+            "d /run/sentinel/ocserv 0750 root root -"
             # Box-service (roadmap C18) runtime dirs: LLDP confdir, avahi + DHCP-
             # relay configs (world-readable), and the ddclient dir (0640 secret).
             "d /run/sentinel/lldpd.d 0755 root root -"
@@ -1320,6 +1356,164 @@
           # swanctl --list-sas.
           out = left.succeed("su admin -c 'sentinel show vpn ipsec'")
           assert "ESTABLISHED" in out, out
+        '';
+      };
+
+      # OpenConnect road-warrior VPN (roadmap C17): one Sentinel appliance (`fw`)
+      # on a WAN segment with a `lan0` dummy (10.100.0.1/24) standing in for a host
+      # behind it, and one plain `client` running the `openconnect` CLI. The fw
+      # commits a PKI CA + a `vpn-server` leaf and a `[vpn.openconnect]` server
+      # (pool 10.99.0.0/24, a user, a pushed route to the LAN); Sentinel renders
+      # ocserv.conf + a 0600 ocpasswd and (re)starts ocserv. The test proves (1)
+      # the render + 0600 credential file + ocserv unit come up, (2) the client's
+      # TLS tunnel establishes (it pins the fw's self-issued cert by SPKI hash) and
+      # is handed a pool address, and (3) real traffic flows: a ping from the client
+      # reaches the LAN address through the tunnel.
+      #   nix build .#checks.x86_64-linux.openconnect -L
+      openconnect = pkgs.testers.runNixOSTest {
+        name = "sentinel-openconnect";
+        nodes = {
+          fw =
+            { lib, pkgs, ... }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              # Pin the runtime hostname to the node name so the driver's per-machine
+              # python variable resolves (sentinel forces the factory hostname
+              # otherwise; sentinel-boot re-applies it regardless).
+              networking.hostName = lib.mkForce "fw";
+              # velstra is the firewall; no NixOS iptables dropping the TLS/ESP flows.
+              networking.firewall.enable = lib.mkForce false;
+              virtualisation.vlans = [ 1 ];
+              virtualisation.memorySize = 2048;
+              # The WAN the ocserv server binds — set at the NixOS level (boot-stable),
+              # so the VPN config is the only thing `sentinel commit` drives.
+              networking.interfaces.eth1.ipv4.addresses = [
+                {
+                  address = "10.0.0.1";
+                  prefixLength = 24;
+                }
+              ];
+              # Forwarding on (a real VPN gateway routes between the tun and the LAN),
+              # and the tun module present for ocserv's vpn0 device.
+              boot.kernel.sysctl."net.ipv4.ip_forward" = 1;
+              boot.kernelModules = [
+                "dummy"
+                "tun"
+              ];
+              # `openssl` to derive the server-cert pin the client trusts; iproute2
+              # is already present.
+              environment.systemPackages = [ pkgs.openssl ];
+              # The "host behind the firewall" the tunnel reaches: a dummy carrying
+              # the LAN address the pushed route points at.
+              systemd.services.lanhost = {
+                wantedBy = [ "multi-user.target" ];
+                after = [ "network-pre.target" ];
+                path = [ pkgs.iproute2 ];
+                serviceConfig = {
+                  Type = "oneshot";
+                  RemainAfterExit = true;
+                };
+                script = ''
+                  ip link add lan0 type dummy 2>/dev/null || true
+                  ip addr add 10.100.0.1/24 dev lan0 2>/dev/null || true
+                  ip link set lan0 up
+                '';
+              };
+            };
+          client =
+            { pkgs, ... }:
+            {
+              networking.firewall.enable = false;
+              virtualisation.vlans = [ 1 ];
+              virtualisation.memorySize = 1024;
+              networking.interfaces.eth1.ipv4.addresses = [
+                {
+                  address = "10.0.0.2";
+                  prefixLength = 24;
+                }
+              ];
+              boot.kernelModules = [ "tun" ];
+              # `openconnect` is the client; `vpnc-scripts` provides the vpnc-script
+              # openconnect runs to configure the tun (assign the pool IP + routes).
+              environment.systemPackages = [
+                pkgs.openconnect
+                pkgs.vpnc-scripts
+              ];
+            };
+        };
+        testScript = ''
+          start_all()
+          fw.wait_for_unit("multi-user.target")
+          fw.wait_for_unit("sentinel-boot.service")
+          fw.wait_for_unit("velstra.service")
+          client.wait_for_unit("multi-user.target")
+
+          # The WAN underlay is up on both ends, and the LAN dummy behind the fw.
+          fw.wait_until_succeeds("ip addr show eth1 | grep -q 10.0.0.1", timeout=30)
+          client.wait_until_succeeds("ip addr show eth1 | grep -q 10.0.0.2", timeout=30)
+          client.wait_until_succeeds("ping -c1 -W2 10.0.0.1", timeout=30)
+          fw.wait_until_succeeds("ip addr show lan0 | grep -q 10.100.0.1", timeout=30)
+
+          # Commit the server AS THE ADMIN USER: a PKI CA + a `vpn-server` leaf
+          # (IP SAN for the WAN), then the OpenConnect server (pool + a pushed route
+          # to the LAN + DNS + one user). commit applies live, save persists it.
+          fw.succeed(
+              "su admin -c \"printf '%s\\n' "
+              "'set pki ca vpn-ca common-name vpn-ca' "
+              "'set pki certificate vpn-server ca vpn-ca' "
+              "'set pki certificate vpn-server common-name fw' "
+              "'set pki certificate vpn-server subject-alt-name IP:10.0.0.1' "
+              "'set pki certificate vpn-server usage server' "
+              "'set vpn openconnect certificate vpn-server' "
+              "'set vpn openconnect pool 10.99.0.0/24' "
+              "'set vpn openconnect routes 10.100.0.0/24' "
+              "'set vpn openconnect dns 10.99.0.1' "
+              "'set vpn openconnect user vpnuser password vpnpass' "
+              "commit save exit "
+              "| sentinel configure\""
+          )
+
+          # Sentinel rendered ocserv.conf (no plaintext password in it) + a 0600
+          # ocpasswd, and the ocserv unit is up.
+          conf = fw.succeed("cat /run/sentinel/ocserv/ocserv.conf")
+          assert "tcp-port = 443" in conf, conf
+          assert "ipv4-network = 10.99.0.0" in conf, conf
+          assert "route = 10.100.0.0/24" in conf, conf
+          assert "vpnpass" not in conf, "password leaked into ocserv.conf"
+          mode = fw.succeed("stat -c %a /run/sentinel/ocserv/ocpasswd").strip()
+          assert mode == "600", mode
+          fw.succeed("grep -q 'vpnuser:' /run/sentinel/ocserv/ocpasswd")
+          # save persisted the server (with the user) to the editable config.
+          fw.succeed("grep -q 'openconnect' /var/lib/sentinel/appliance.toml")
+          fw.wait_for_unit("ocserv.service")
+
+          # Pin the fw's self-issued server certificate by its SPKI SHA-256 (the
+          # form openconnect accepts as `pin-sha256:`), so the client trusts the
+          # on-box CA leaf without a shared trust store.
+          crt = "/var/lib/sentinel/pki/certs/vpn-server/cert.crt"
+          fw.wait_until_succeeds(f"test -f {crt}", timeout=30)
+          pin = fw.succeed(
+              f"openssl x509 -in {crt} -pubkey -noout "
+              "| openssl pkey -pubin -outform der "
+              "| openssl dgst -sha256 -binary "
+              "| openssl base64"
+          ).strip()
+
+          # Establish the TLS tunnel. ocserv's plain auth prompts for the username
+          # and password as form fields, so feed both on stdin (one line each).
+          # We shell-background openconnect (not its own `-b`, whose backgrounding
+          # keeps the driver's stdout pipe open so `succeed` would block forever)
+          # and then poll for the tun coming up.
+          client.succeed(
+              "printf 'vpnuser\\nvpnpass\\n' | openconnect --no-dtls "
+              f"--servercert pin-sha256:{pin} "
+              "https://10.0.0.1:443 >/tmp/oc.log 2>&1 & sleep 3; true"
+          )
+          client.wait_until_succeeds("ip -4 addr show | grep -q 'inet 10.99.0'", timeout=60)
+
+          # (3) Traffic flows through the tunnel: the client reaches the LAN address
+          # behind the fw over the pushed route.
+          client.wait_until_succeeds("ping -c1 -W2 10.100.0.1", timeout=60)
         '';
       };
 
