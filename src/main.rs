@@ -24,6 +24,7 @@ mod repl;
 mod session;
 mod system;
 mod ui;
+mod update;
 mod wgkey;
 mod wren;
 
@@ -162,9 +163,18 @@ enum Command {
     },
     /// A/B update: write a new appliance image into the inactive slot and boot
     /// it next (auto-rollback to the current slot if it fails).
+    ///
+    /// `<target>` is either a local image/block-device path (written directly —
+    /// the trusted-image form), or one of the signed-channel keywords (roadmap
+    /// C13, using the saved `[update]` channel):
+    ///
+    /// * `check` — fetch + verify the signed release manifest and print the
+    ///   available version (needs neither root nor the disk);
+    /// * `install` — re-verify, fetch the image, verify its SHA-256, then write
+    ///   the inactive slot (`--commit`).
     Update {
-        /// The new appliance image (raw file) or a block device to re-seal from.
-        image: PathBuf,
+        /// A local image/block-device path, or `check` / `install`.
+        target: Option<String>,
         /// Actually perform the (destructive-to-the-inactive-slot) update.
         #[arg(long)]
         commit: bool,
@@ -267,7 +277,7 @@ async fn main() -> Result<()> {
             source,
             commit,
         } => install_cmd(&targets, raid.into(), source, commit),
-        Command::Update { image, commit } => install::update(&image, commit),
+        Command::Update { target, commit } => update_cmd(target.as_deref(), commit),
         Command::ApplyBoot {
             config,
             out,
@@ -575,6 +585,43 @@ fn apply_boot_late(config: &std::path::Path) -> Result<()> {
 /// (pick mode + disks); with target(s), validate the selection and show the
 /// plan. Destructive execution happens on `--commit` (or after the wizard's
 /// confirmation).
+/// Dispatch `sentinel update <target> [--commit]`. `target` is a local
+/// image/block-device path (written directly by the existing slot-writer), or a
+/// signed-channel keyword driving roadmap C13's authenticity gate against the
+/// saved `[update]` channel.
+fn update_cmd(target: Option<&str>, commit: bool) -> Result<()> {
+    match target {
+        None => anyhow::bail!(
+            "usage: sentinel update <image>|check|install [--commit]\n\
+             (`check`/`install` use the saved [update] channel; a path writes that image directly)"
+        ),
+        Some("check") => {
+            let chan = load_update_channel()?;
+            let manifest = update::check(&chan)?;
+            println!(
+                "update available: {} (image {}, sha256 {})",
+                manifest.version, manifest.image, manifest.sha256
+            );
+            Ok(())
+        }
+        Some("install") => {
+            let chan = load_update_channel()?;
+            install::update_from_channel(&chan, commit)
+        }
+        // Any other value is a local, operator-trusted image/block-device path.
+        Some(path) => install::update(std::path::Path::new(path), commit),
+    }
+}
+
+/// Load the saved appliance's `[update]` channel, or bail if none is configured.
+fn load_update_channel() -> Result<config::UpdateChannel> {
+    let path = std::path::Path::new(DEFAULT_CONFIG);
+    let appliance = Appliance::load(path)?;
+    appliance.update.ok_or_else(|| {
+        anyhow::anyhow!("no [update] channel configured (set update url + public-key, then save)")
+    })
+}
+
 fn install_cmd(
     targets: &[String],
     raid: install::Raid,

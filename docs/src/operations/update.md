@@ -25,6 +25,39 @@ What happens:
 
 Without `--commit`, the plan is printed but nothing is written.
 
+## Signed updates (`update`)
+
+The updater refuses any image whose release manifest isn't signed by a key you
+have pinned. Pin the channel in config (roadmap C13):
+
+```shell
+configure
+set update url https://updates.velstra.example/sentinel
+set update public-key file:/etc/sentinel/release.pem
+commit
+save
+```
+
+- `url` is the channel base — an `https://` (or `file://` for an offline
+  mirror) directory holding the signed `manifest.json` and the images it names.
+- `public-key` is the pinned Ed25519 release-signing key, PEM. `file:<path>`
+  reads it from disk (so the key can live in the immutable image rather than the
+  config); an inline PEM also works.
+
+Both fields are required — `commit` rejects a half-specified channel. With a
+channel pinned:
+
+```shell
+sentinel update check            # fetch + verify the manifest, report the version
+sentinel update install --commit # re-verify, then write the inactive A/B slot
+```
+
+`check` fetches the manifest, verifies its detached signature against the pinned
+`public-key`, and only then trusts the version + image digest it names.
+`install` re-verifies the signature **and** the image's SHA-256 before writing
+anything — the authenticity gate in front of the verified-boot slot switch
+below. An unsigned or wrong-key manifest is refused; no slot is touched.
+
 ## The rollback guarantee
 
 The new slot boots with `+3` tries. A clean boot (no failed units) is **blessed**

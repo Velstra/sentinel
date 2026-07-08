@@ -955,6 +955,18 @@ const TOP: &[Cand] = &[
         "pki",
         "certificates: local CA, issued certs, ACME (Let's Encrypt)",
     ),
+    (
+        "update",
+        "signed update channel: URL + pinned release signing key",
+    ),
+];
+// `update <Tab>` reveals the signed-update-channel fields (roadmap C13).
+const UPDATE_FIELDS: &[Cand] = &[
+    ("url", "channel base URL (holds manifest.json + images)"),
+    (
+        "public-key",
+        "pinned Ed25519 signing key (PEM or file:<path>)",
+    ),
 ];
 // `multiwan <Tab>` reveals the mode + the uplinks (each keyed by interface).
 const MULTIWAN_NODES: &[Cand] = &[
@@ -2206,6 +2218,7 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
 
         // The pki (certificate authority + ACME) sub-tree.
         ["set" | "delete", "pki"] => PKI_NODES,
+        ["set" | "delete", "update"] => UPDATE_FIELDS,
         ["set" | "delete", "pki", "ca", _name] => PKI_CA_FIELDS,
         ["set", "pki", "ca", _name, "key-type"] => PKI_KEY_TYPES,
         ["set" | "delete", "pki", "certificate", _name] => PKI_CERT_FIELDS,
@@ -2606,6 +2619,10 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
         ["set", "vpn", "openconnect", "zone"] => zones("zone"),
         ["set" | "delete", "vpn", "openconnect", "user"] => own_cands(&[PH_NAME]),
         ["set", "vpn", "openconnect", "user", _u, "password"] => own_cands(&[PH_KEY]),
+        ["set", "update", "url"] => own_cands(&[PH_URL]),
+        ["set", "update", "public-key"] => {
+            own_cands(&[("<pem|file:path>", "PEM key or file:<path>")])
+        }
         ["set", "pki", "acme", "directory-url"] => own_cands(&[PH_URL]),
         ["set", "pki", "acme", "email"] => own_cands(&[("<email>", "a contact email address")]),
 
@@ -2888,7 +2905,8 @@ mod tests {
                 "services",
                 "multiwan",
                 "vpn",
-                "pki"
+                "pki",
+                "update"
             ]
         );
         assert_eq!(kw(&["set", "system"]), ["hostname"]);
@@ -3270,7 +3288,8 @@ mod tests {
                 "services",
                 "multiwan",
                 "vpn",
-                "pki"
+                "pki",
+                "update"
             ]
         );
         assert_eq!(
@@ -3371,6 +3390,9 @@ mod tests {
             ["<port|lo-hi>"]
         );
         assert_eq!(kws(&["set", "vpn", "ipsec", "t0", "psk"]), ["<key>"]);
+        // Signed update channel value positions (roadmap C13).
+        assert_eq!(kws(&["set", "update", "url"]), ["<url>"]);
+        assert_eq!(kws(&["set", "update", "public-key"]), ["<pem|file:path>"]);
         // OpenConnect value positions get their vtysh-style hints, and the
         // certificate position offers the literal `acme` fallback.
         assert_eq!(kws(&["set", "vpn", "openconnect", "pool"]), ["<A.B.C.D/M>"]);
