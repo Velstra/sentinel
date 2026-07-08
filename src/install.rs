@@ -16,7 +16,9 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
+use crate::config::UpdateChannel;
 use crate::system;
+use crate::update;
 
 /// A candidate target block device.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -584,6 +586,35 @@ pub fn update(image: &std::path::Path, commit: bool) -> Result<()> {
         inactive.name, active.name
     );
     Ok(())
+}
+
+/// Signed-channel update (roadmap C13): verify the channel's signed release
+/// manifest against the pinned key, fetch the image it names and verify its
+/// SHA-256, then hand that verified image to the existing slot-writer
+/// [`update`]. This is the ONLY path from a remote channel to the slot-write,
+/// and it is fail-closed: the call to `update()` is reached only after both
+/// [`update::check`] and [`update::fetch_verified_image`] have returned `Ok`, so
+/// an unsigned, wrong-key, or digest-mismatched image can never be written.
+///
+/// The local-file form (`sentinel update <image>`) still calls [`update`]
+/// directly for a trusted, operator-supplied image; only the channel path goes
+/// through verification.
+pub fn update_from_channel(chan: &UpdateChannel, commit: bool) -> Result<()> {
+    let manifest = update::check(chan)?;
+    eprintln!(
+        "verified release {} (image {}) — signed by the pinned update key",
+        manifest.version, manifest.image
+    );
+
+    // Stage the verified image in a self-cleaning scratch dir that outlives the
+    // slot-write below (it drops — and deletes the image — when this fn returns).
+    let scratch = update::Scratch::new()?;
+    let image = scratch.join("image.img");
+    update::fetch_verified_image(chan, &manifest, &image)?;
+    eprintln!("image SHA-256 verified against the signed manifest");
+
+    // Only now, past both crypto gates, does the image reach the slot-writer.
+    update(&image, commit)
 }
 
 /// The mountpoint of a block device, if it's currently mounted.

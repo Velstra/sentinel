@@ -18,8 +18,8 @@ use crate::config::{
     Groups, HealthCheck, IfaceType, Interface, IpsecConnection, Isis, Lldp, Mdns, MultiWan,
     Multicast, MulticastInterface, Nat, Nat64, NatDestination, NatSource, Ntp, OpenConnectServer,
     OpenConnectUser, Ospf, Ospf3, OspfInterface, Pki, PortSpec, Pppoe, Proto, Protocols, Qos,
-    QosDiscipline, Rip, RouterAdvert, Rule, Services, Snmp, StaticRoute, System, Vpn, VrfDef, Vrrp,
-    WanMode, WanUplink, WgPeer, WireguardTunnel, ZoneCfg,
+    QosDiscipline, Rip, RouterAdvert, Rule, Services, Snmp, StaticRoute, System, UpdateChannel,
+    Vpn, VrfDef, Vrrp, WanMode, WanUplink, WgPeer, WireguardTunnel, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -1020,6 +1020,10 @@ struct Draft {
     /// `None` when unconfigured. A singleton (unlike the ipsec/wireguard lists)
     /// created on the first `set vpn openconnect …`.
     openconnect: Option<OpenConnectDraft>,
+    /// Signed update channel (roadmap C13): the pinned channel URL + release
+    /// signing key, or `None` when unconfigured. A singleton created on the first
+    /// `set update …`.
+    update: Option<UpdateChannelDraft>,
 }
 
 /// A partially-specified DNS forwarder (`[services.dns]`).
@@ -1173,6 +1177,16 @@ struct OpenConnectDraft {
 #[derive(Debug, Clone, Default)]
 struct OcUserDraft {
     password: Option<String>,
+}
+
+/// A partially-specified signed update channel (`[update]`, roadmap C13). A
+/// singleton behind an `Option` on the draft. Both `url` and `public-key` are
+/// required at commit — a half-specified channel materialises with an empty
+/// string for the missing side so `validate()` surfaces a clear "required".
+#[derive(Debug, Clone, Default)]
+struct UpdateChannelDraft {
+    url: Option<String>,
+    public_key: Option<String>,
 }
 
 /// A partially-specified local CA (`[[pki.ca]]`, roadmap C19), keyed by its name
@@ -1330,6 +1344,12 @@ impl Draft {
     fn openconnect_mut(&mut self) -> &mut OpenConnectDraft {
         self.openconnect
             .get_or_insert_with(OpenConnectDraft::default)
+    }
+
+    /// Mutable access to the signed update channel, creating an empty one on
+    /// first touch (a singleton, so `set update …` materialises it).
+    fn update_mut(&mut self) -> &mut UpdateChannelDraft {
+        self.update.get_or_insert_with(UpdateChannelDraft::default)
     }
 
     /// Mutable access to the local CA `name`, inserting it if new (CAs are keyed
@@ -1916,6 +1936,10 @@ impl Draft {
                         )
                     })
                     .collect(),
+            }),
+            update: a.update.as_ref().map(|u| UpdateChannelDraft {
+                url: Some(u.url.clone()),
+                public_key: Some(u.public_key.clone()),
             }),
         }
     }
@@ -3506,6 +3530,17 @@ impl Session {
                 self.draft.acme_mut().agree_tos = Some(parse_bool(v)?);
             }
 
+            // update (roadmap C13): the single signed update channel. `url` is a
+            // single token; `public-key` may be a `file:<path>` ref or an inline
+            // PEM whose whitespace-split tokens are rejoined. Format/PEM checks
+            // live in config `validate()` and run at commit.
+            ["update", "url", v] => {
+                self.draft.update_mut().url = Some((*v).to_string());
+            }
+            ["update", "public-key", rest @ ..] if !rest.is_empty() => {
+                self.draft.update_mut().public_key = Some(rest.join(" "));
+            }
+
             _ => bail!(
                 "unknown set path. The config tree (Tab/`?` explores each level):\n  \
                  set system hostname <name>\n  \
@@ -3558,7 +3593,8 @@ impl Session {
                  set vpn wireguard <ifname> peer <pubkey> <allowed-ips <cidr,...> | endpoint <host:port> | keepalive <s> | preshared-key <key>>\n  \
                  set pki ca <name> <common-name <cn> | organization <o> | key-type <ec|rsa> | validity-days <n>>\n  \
                  set pki certificate <name> <ca <ca-name|acme> | common-name <cn> | subject-alt-name <DNS:host|IP:addr> | key-type <ec|rsa> | usage <server|client> | validity-days <n>>\n  \
-                 set pki acme <email <addr> | directory-url <https-url> | challenge <http-01|dns-01> | agree-tos <bool>>"
+                 set pki acme <email <addr> | directory-url <https-url> | challenge <http-01|dns-01> | agree-tos <bool>>\n  \
+                 set update <url <https-url|file-url> | public-key <PEM|file:path>>"
             ),
         }
         self.dirty = true;
@@ -4710,6 +4746,22 @@ impl Session {
                     other => bail!("pki acme has no field {other:?}"),
                 }
             }
+
+            // update (roadmap C13). Bare `delete update` removes the whole
+            // channel; `... url` / `... public-key` clears one field (both are
+            // required, so a lone remaining field fails commit — clear the block
+            // to fully remove it).
+            ["update"] => self.draft.update = None,
+            ["update", field] => {
+                let Some(d) = self.draft.update.as_mut() else {
+                    bail!("no update channel configured");
+                };
+                match *field {
+                    "url" => d.url = None,
+                    "public-key" => d.public_key = None,
+                    other => bail!("update has no field {other:?}"),
+                }
+            }
             _ => bail!("unknown delete path"),
         }
         self.dirty = true;
@@ -4814,7 +4866,7 @@ impl Session {
     pub fn show_only(&self, section: &str) -> String {
         match section {
             "system" | "interface" | "interfaces" | "firewall" | "nat" | "protocols"
-            | "services" | "multiwan" | "vpn" | "pki" => {
+            | "services" | "multiwan" | "vpn" | "pki" | "update" => {
                 let out = render_draft_only(&self.draft, false, Some(section));
                 if out.is_empty() {
                     format!("(no {section} configuration)\n")
@@ -4823,7 +4875,7 @@ impl Session {
                 }
             }
             other => format!(
-                "error: unknown section {other:?} (system | interfaces | firewall | nat | protocols | services | multiwan | vpn | pki)\n"
+                "error: unknown section {other:?} (system | interfaces | firewall | nat | protocols | services | multiwan | vpn | pki | update)\n"
             ),
         }
     }
@@ -5482,6 +5534,20 @@ impl Session {
             multiwan,
             vpn,
             pki,
+            // Signed update channel (roadmap C13). A required field left unset
+            // falls back to an empty string so `validate()` surfaces a clear "X
+            // is required" rather than silently dropping a half-specified
+            // channel; a block with neither field set materialises to None.
+            update: self.draft.update.as_ref().and_then(|u| {
+                if u.url.is_none() && u.public_key.is_none() {
+                    None
+                } else {
+                    Some(UpdateChannel {
+                        url: u.url.clone().unwrap_or_default(),
+                        public_key: u.public_key.clone().unwrap_or_default(),
+                    })
+                }
+            }),
         };
         // Fill inferred VLAN parent/vlan from `<parent>.<id>` names before
         // validating (mirrors `Appliance::from_toml`).
@@ -6685,6 +6751,22 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             out.push_str("    }\n");
         }
         out.push_str("}\n");
+    }
+
+    // update { … } — the signed update channel (roadmap C13). The pinned key is
+    // shown verbatim, matching how wireguard private-key / ipsec psk render
+    // (in practice it is a short `file:<path>` ref).
+    if want("update") {
+        if let Some(u) = &draft.update {
+            out.push_str("update {\n");
+            if let Some(url) = &u.url {
+                out.push_str(&format!("    url {url}\n"));
+            }
+            if let Some(key) = &u.public_key {
+                out.push_str(&format!("    public-key {key}\n"));
+            }
+            out.push_str("}\n");
+        }
     }
 
     if out.is_empty() && !skip_empty_ifaces {
@@ -8494,5 +8576,108 @@ mod tests {
         assert!(run(&mut s, "set protocols ripng bfd true").is_err());
         assert!(run(&mut s, "set protocols ripng vrf blue").is_err());
         assert!(run(&mut s, "set protocols ripng network 10.0.0.0/8").is_err());
+    }
+
+    #[test]
+    fn update_channel_builds_shows_commits_and_round_trips() {
+        let mut s = Session::empty();
+        run(&mut s, "set system hostname box").unwrap();
+        run(
+            &mut s,
+            "set update url https://updates.velstra.example/sentinel",
+        )
+        .unwrap();
+        run(
+            &mut s,
+            "set update public-key file:/etc/sentinel/release.pem",
+        )
+        .unwrap();
+
+        // The show block round-trips the channel + its fields.
+        let shown = s.show_only("update");
+        assert!(shown.contains("update {"), "got:\n{shown}");
+        assert!(
+            shown.contains("url https://updates.velstra.example/sentinel"),
+            "got:\n{shown}"
+        );
+        assert!(
+            shown.contains("public-key file:/etc/sentinel/release.pem"),
+            "got:\n{shown}"
+        );
+
+        let a = s.commit().expect("valid update channel commits");
+        let up = a.update.as_ref().expect("channel present");
+        assert_eq!(up.url, "https://updates.velstra.example/sentinel");
+        assert_eq!(up.public_key, "file:/etc/sentinel/release.pem");
+
+        // A fresh session seeded from the committed appliance shows the same.
+        let reloaded = Session {
+            draft: Draft::from_appliance(&a),
+            path: PathBuf::from("/dev/null"),
+            dirty: false,
+        }
+        .show_only("update");
+        assert!(
+            reloaded.contains("url https://updates.velstra.example/sentinel"),
+            "reload:\n{reloaded}"
+        );
+        assert!(
+            reloaded.contains("public-key file:/etc/sentinel/release.pem"),
+            "reload:\n{reloaded}"
+        );
+    }
+
+    #[test]
+    fn update_channel_delete_field_and_whole_block() {
+        let mut s = Session::empty();
+        run(&mut s, "set system hostname box").unwrap();
+        run(&mut s, "set update url https://u.example/ch").unwrap();
+        run(&mut s, "set update public-key file:/etc/k.pem").unwrap();
+
+        // Clearing a required field leaves the block dangling — commit then fails
+        // fast with the config-layer "required" message rather than dropping it.
+        run(&mut s, "delete update public-key").unwrap();
+        let err = s.commit().unwrap_err().to_string();
+        assert!(err.contains("public-key is required"), "got: {err}");
+
+        // Restoring it commits again.
+        run(&mut s, "set update public-key file:/etc/k.pem").unwrap();
+        s.commit().expect("valid again after restore");
+
+        // Deleting the whole block removes it entirely (a config with no channel
+        // is valid).
+        run(&mut s, "delete update").unwrap();
+        let a = s.commit().expect("valid with no channel");
+        assert!(a.update.is_none());
+        assert!(!s.show().contains("update {"));
+
+        // Deleting a field of an absent channel is an error.
+        let err = run(&mut s, "delete update url").unwrap_err().to_string();
+        assert!(err.contains("no update channel"), "got: {err}");
+    }
+
+    #[test]
+    fn update_channel_materialize_round_trips() {
+        let mut s = Session::empty();
+        run(&mut s, "set system hostname box").unwrap();
+        run(&mut s, "set update url file:///srv/mirror/sentinel").unwrap();
+        run(&mut s, "set update public-key file:/etc/sentinel/k.pem").unwrap();
+
+        let a = s.commit().expect("valid update channel commits");
+        // from_appliance ∘ materialize is the identity on the channel.
+        let round = Session {
+            draft: Draft::from_appliance(&a),
+            path: PathBuf::from("/dev/null"),
+            dirty: false,
+        };
+        let b = round.materialize().expect("re-materialises");
+        assert_eq!(
+            a.update.as_ref().unwrap().url,
+            b.update.as_ref().unwrap().url
+        );
+        assert_eq!(
+            a.update.as_ref().unwrap().public_key,
+            b.update.as_ref().unwrap().public_key
+        );
     }
 }
