@@ -424,15 +424,21 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
             // with each command) so `set interface <Tab>` lists the current NICs,
             // and the edit context so completion is relative to it.
             if let Some(h) = rl.helper() {
-                h.set_names(
-                    session.interface_names(),
-                    session.rule_names(),
-                    session.zone_names(),
-                    session.nat_source_names(),
-                    session.nat_destination_names(),
-                    session.address_group_names(),
-                    session.port_group_names(),
-                );
+                h.set_names(repl::DynNames {
+                    interfaces: session.interface_names(),
+                    rules: session.rule_names(),
+                    zones: session.zone_names(),
+                    nat_source: session.nat_source_names(),
+                    nat_destination: session.nat_destination_names(),
+                    address_groups: session.address_group_names(),
+                    port_groups: session.port_group_names(),
+                    filters: session.filter_names(),
+                    vrfs: session.vrf_names(),
+                    ipsec: session.ipsec_names(),
+                    pki_cas: session.pki_ca_names(),
+                    pki_certificates: session.pki_certificate_names(),
+                    wireguard: session.wireguard_names(),
+                });
                 h.set_context(&ctx);
             }
             // VyOS/JunOS-style prompt, re-rendered each line: the edit context

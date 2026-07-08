@@ -74,11 +74,11 @@ address = "10.0.0.1/24"
 # mac = "52:54:00:12:34:56"
 # ip = "10.0.0.20"
 
-# A VLAN subinterface on lan0, in its own zone:
+# A VLAN subinterface on lan0, in its own zone (802.1Q tagged link). `parent`
+# and `vlan` are inferred from a `<parent>.<id>` name, so naming it "lan0.20" is
+# enough; set them explicitly only to override — a name/value mismatch is an error.
 # [[interface]]
 # name = "lan0.20"
-# parent = "lan0"
-# vlan = 20
 # zone = "iot"
 # address = "10.0.20.1/24"
 
@@ -88,44 +88,52 @@ address = "10.0.0.1/24"
 # prefixes = ["2001:db8:1::/64"]
 # dns = ["2001:db8:1::1"]
 
-# A bridge (switch) that holds the LAN address, with NICs enslaved to it:
+# A bridge (switch) that holds the LAN address; the member NICs are listed on
+# the device itself with a `member` array (repeated `member <nic>` in the CLI):
 # [[interface]]
 # name = "br0"
 # type = "bridge"
 # zone = "lan"
 # address = "10.0.0.1/24"
-# [[interface]]
-# name = "lan1"
-# master = "br0"
+# member = ["lan1", "lan2"]
 #
-# A bond (link aggregation) — set the mode on the device, enslave with master:
+# A bond (link aggregation) — set the mode and the members on the device:
 # [[interface]]
 # name = "bond0"
 # type = "bond"
 # bond-mode = "active-backup"
+# member = ["lan3", "lan4"]
+#
+# A VLAN-aware bridge does 802.1Q filtering in the switch: mark the bridge
+# `vlan-aware`, then give each member port its tagged VLAN ids and/or a single
+# untagged (PVID) VLAN:
 # [[interface]]
-# name = "lan2"
-# master = "bond0"
+# name = "br1"
+# type = "bridge"
+# vlan-aware = true
+# member = ["lan5", "lan6"]
+# [[interface]]
+# name = "lan5"
+# vlan-tagged = [10, 20]
+# vlan-untagged = 1
 
-# Broad zone rules set a zone's posture (action: accept | drop | reject).
+# A broad rule (no proto/port) opens a zone's posture with `action = "accept"`
+# — here the LAN may initiate outbound. The WAN stays default-drop (the global
+# `default-action`), so nothing is needed to keep inbound traffic out; a broad
+# `drop`/`reject` rule is a datapath no-op and is rejected at commit — express an
+# explicit deny with `firewall zone <z> default-action drop` instead.
+# `to = "<zone>"` is optional and declares zone-pair intent; the datapath does
+# not enforce the destination zone yet, so setting it draws a commit warning.
 [[rule]]
-name = "lan-to-wan"
+name = "lan-out"
 from = "lan"
-to = "wan"
 action = "accept"
-
-[[rule]]
-name = "wan-to-lan"
-from = "wan"
-to = "lan"
-action = "drop"
 
 # Port rules open a specific proto/port even on a default-drop zone — here,
 # inbound HTTPS from the WAN.
 [[rule]]
 name = "allow-https-in"
 from = "wan"
-to = "lan"
 action = "accept"
 proto = "tcp"
 port = 443
@@ -231,6 +239,24 @@ port = 443
 # local-subnet = "10.0.0.0/24"
 # remote-subnet = "10.1.0.0/24"
 # psk = "change-me-to-a-strong-shared-secret"
+#
+# WireGuard (roadmap C1): create a `type = "wireguard"` interface (address/zone
+# like any interface), then configure its keys + peers under vpn, keyed by the
+# interface name. `private-key` accepts a literal key or `generate` in the CLI.
+# [[interface]]
+# name = "wg0"
+# type = "wireguard"
+# zone = "vpn"
+# address = "10.9.0.1/24"
+# [[vpn.wireguard]]
+# name = "wg0"
+# private-key = "OK+2...base64-32-bytes...=="
+# listen-port = 51820
+# [[vpn.wireguard.peer]]
+# public-key = "HIGw...peer-pubkey...=="
+# allowed-ips = ["10.9.0.2/32"]
+# endpoint = "203.0.113.9:51820"
+# persistent-keepalive = 25
 
 # Dynamic routing (the Wren control plane). BGP with a fully-specified peer and
 # a named route filter used as its import policy. Every field maps 1:1 onto the
@@ -1861,9 +1887,11 @@ pub const WAN_CHECK_FAIL: u32 = 3;
 pub const WAN_CHECK_RISE: u32 = 3;
 
 impl MultiWan {
-    /// True when no uplink is configured — lets `[multiwan]` be omitted.
+    /// True when nothing is configured — no uplink AND the default mode — lets
+    /// `[multiwan]` be omitted. A non-default `mode` alone keeps it (so a
+    /// mode-without-uplinks misconfiguration round-trips and is caught at commit).
     pub fn is_empty(&self) -> bool {
-        self.uplinks.is_empty()
+        self.uplinks.is_empty() && self.mode.is_default()
     }
 
     /// The routing-table id uplink `u` at index `idx` owns: its explicit
@@ -1953,13 +1981,46 @@ pub struct Vpn {
     /// strongSwan swanctl.conf + a 0600 PSK secrets file.
     #[serde(default, rename = "ipsec", skip_serializing_if = "Vec::is_empty")]
     pub ipsec: Vec<IpsecConnection>,
+    /// WireGuard tunnels (`[[vpn.wireguard]]`), each keyed by the name of a
+    /// `type = "wireguard"` interface. Carries the private key, listen port and
+    /// peers — the interface itself only declares the address/zone/mtu.
+    #[serde(default, rename = "wireguard", skip_serializing_if = "Vec::is_empty")]
+    pub wireguard: Vec<WireguardTunnel>,
 }
 
 impl Vpn {
     /// True when no VPN is configured — lets `[vpn]` be omitted from output.
     pub fn is_empty(&self) -> bool {
-        self.ipsec.is_empty()
+        self.ipsec.is_empty() && self.wireguard.is_empty()
     }
+}
+
+/// One WireGuard tunnel (`[[vpn.wireguard]]`) — the keys + peers for the
+/// `type = "wireguard"` interface named in `name`. The interface declares the
+/// link's L3 config (address/zone/mtu); this carries the crypto. Rendered by
+/// `net.rs` into the interface's `.netdev` (`[WireGuard]` + `[WireGuardPeer]`
+/// sections), which is a secret (private key) installed 0640 root:systemd-network.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireguardTunnel {
+    /// The interface this tunnel configures — must name a declared
+    /// `type = "wireguard"` interface.
+    pub name: String,
+    /// WireGuard private key (base64 of 32 raw bytes). Required — a
+    /// `type = "wireguard"` interface without one is rejected at commit.
+    #[serde(rename = "private-key")]
+    pub private_key: String,
+    /// UDP port WireGuard listens on. Optional (an outbound-only tunnel needs
+    /// none); when set the peer can reach us at this port.
+    #[serde(
+        default,
+        rename = "listen-port",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub listen_port: Option<u16>,
+    /// WireGuard peers reachable over this tunnel.
+    #[serde(default, rename = "peer", skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<WgPeer>,
 }
 
 /// Default IKE (phase-1) proposal when none is given: AES-256 / SHA-256 with a
@@ -2365,26 +2426,6 @@ pub struct Interface {
     /// VLAN id (1–4094) for a subinterface. Set together with `parent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vlan: Option<u16>,
-    /// WireGuard private key (base64 of 32 raw bytes). Its presence makes this a
-    /// WireGuard interface (`Kind=wireguard`); the `.netdev` carrying it is a
-    /// secret and is written mode 0600.
-    #[serde(
-        default,
-        rename = "private-key",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub private_key: Option<String>,
-    /// UDP port WireGuard listens on. Optional (an outbound-only tunnel needs
-    /// none); when set the peer can reach us at this port.
-    #[serde(
-        default,
-        rename = "listen-port",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub listen_port: Option<u16>,
-    /// WireGuard peers reachable over this interface.
-    #[serde(default, rename = "peer", skip_serializing_if = "Vec::is_empty")]
-    pub peers: Vec<WgPeer>,
     /// When set, networkd runs a built-in DHCP server on this interface, handing
     /// out leases from the interface's own static subnet. Requires a static
     /// `address` (the server needs a subnet to allocate from).
@@ -2407,21 +2448,47 @@ pub struct Interface {
     pub router_advert: Option<RouterAdvert>,
     /// For a **virtual L2 device** — a `bridge` or a `bond` this box creates
     /// (rather than a physical NIC). The device is a networkd `.netdev`
-    /// (`Kind=bridge`/`bond`); member NICs point at it with `master`. A bridge
-    /// switches its members; a bond aggregates them (mode via `bond-mode`). Set
-    /// on the *device* interface, not its members.
+    /// (`Kind=bridge`/`bond`); the member NICs are listed on the device in
+    /// `members`. A bridge switches its members; a bond aggregates them (mode via
+    /// `bond-mode`). Set on the *device* interface, not its members.
     #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
     pub if_type: Option<IfaceType>,
-    /// Enslave this interface to a `bridge`/`bond` device named here (the inverse
-    /// of `if_type`): the member gets `Bridge=`/`Bond=` in its `.network`. The
-    /// master must be a declared `type = "bridge"`/`"bond"` interface.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub master: Option<String>,
+    /// The member NICs enslaved to this `bridge`/`bond` device — each gets
+    /// `Bridge=`/`Bond=` in its own `.network`, derived from this list. Only valid
+    /// on a `type = "bridge"`/`"bond"` device; every member must be a declared or
+    /// discovered interface, may belong to at most one bond/bridge, and must not
+    /// itself be a bond/bridge/VLAN. Empty on a non-device interface.
+    #[serde(default, rename = "member", skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<String>,
     /// Bonding mode for a `type = "bond"` device (`"active-backup"`,
     /// `"802.3ad"`, `"balance-rr"`, …). Only meaningful on a bond device;
     /// defaults to `active-backup` when unset.
     #[serde(default, rename = "bond-mode", skip_serializing_if = "Option::is_none")]
     pub bond_mode: Option<String>,
+    /// Enable 802.1Q VLAN filtering on a `type = "bridge"` device (networkd
+    /// `[Bridge] VLANFiltering=yes`). Only valid on a bridge. When on, each member
+    /// port carries its own tagged/untagged VLAN membership (`vlan-tagged` /
+    /// `vlan-untagged`). Unset ⇒ a plain, VLAN-unaware bridge.
+    #[serde(
+        default,
+        rename = "vlan-aware",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub vlan_aware: Option<bool>,
+    /// The 802.1Q VLAN ids this port carries **tagged** (one `[BridgeVLAN] VLAN=`
+    /// each). Only valid on a member port of a `vlan-aware` bridge. Empty ⇒ the
+    /// port carries no tagged VLANs.
+    #[serde(default, rename = "vlan-tagged", skip_serializing_if = "Vec::is_empty")]
+    pub vlan_tagged: Vec<u16>,
+    /// The single **untagged** (PVID + egress-untagged) VLAN id for this port
+    /// (`[BridgeVLAN] PVID=`/`EgressUntagged=`). Only valid on a member port of a
+    /// `vlan-aware` bridge. `None` ⇒ the port has no untagged VLAN.
+    #[serde(
+        default,
+        rename = "vlan-untagged",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub vlan_untagged: Option<u16>,
     /// Link MTU in bytes (e.g. `1492` for PPPoE, `9000` for jumbo frames).
     /// `None` leaves the kernel/driver default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2469,16 +2536,20 @@ pub struct Interface {
 }
 
 /// The `type` of a synthesised or client interface. `bridge`/`bond` are
-/// **virtual L2 devices** Sentinel creates to enslave members; `pppoe` is a
-/// PPPoE **client** session brought up over a raw uplink NIC (`parent`);
+/// **virtual L2 devices** Sentinel creates to enslave members; `wireguard` is a
+/// WireGuard tunnel device whose keys + peers are configured under `[[vpn.wireguard]]`;
+/// `pppoe` is a PPPoE **client** session brought up over a raw uplink NIC (`parent`);
 /// `gre`/`ipip`/`gretap` are **kernel point-to-point tunnels** (roadmap C3) built
-/// between two endpoint addresses (`local`/`remote`). Physical NICs and
-/// VLAN/WireGuard links carry no `type`.
+/// between two endpoint addresses (`local`/`remote`). Physical NICs and 802.1Q
+/// VLAN subinterfaces carry no `type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IfaceType {
     Bridge,
     Bond,
+    /// A WireGuard tunnel device (`Kind=wireguard`). The private key, listen port
+    /// and peers live in the matching [`WireguardTunnel`] under `[[vpn.wireguard]]`.
+    Wireguard,
     Pppoe,
     /// A GRE (Generic Routing Encapsulation) L3 tunnel — carries IP, supports an
     /// optional 32-bit `key` to demultiplex several tunnels between the same pair.
@@ -2736,8 +2807,9 @@ impl Qos {
     }
 }
 
-/// A WireGuard peer: the far end of a tunnel on a `[[interface]]` that carries a
-/// `private-key`. Keys are the standard base64 encoding of 32 raw bytes.
+/// A WireGuard peer: the far end of a tunnel, listed under a `[[vpn.wireguard]]`
+/// entry (`[[vpn.wireguard.peer]]`). Keys are the standard base64 encoding of 32
+/// raw bytes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WgPeer {
     #[serde(rename = "public-key")]
@@ -2761,13 +2833,18 @@ pub struct WgPeer {
 }
 
 impl Interface {
-    /// A WireGuard interface is any interface that carries a `private-key`.
+    /// A WireGuard interface is a `type = "wireguard"` device; its keys + peers
+    /// live in the matching [`WireguardTunnel`] under `[[vpn.wireguard]]`.
     pub fn is_wireguard(&self) -> bool {
-        self.private_key.is_some()
+        self.if_type == Some(IfaceType::Wireguard)
     }
     /// True for a bond device (`type = "bond"`).
     pub fn is_bond(&self) -> bool {
         self.if_type == Some(IfaceType::Bond)
+    }
+    /// True for a bridge device (`type = "bridge"`).
+    pub fn is_bridge(&self) -> bool {
+        self.if_type == Some(IfaceType::Bridge)
     }
     /// True for a virtual L2 device (bridge or bond) this box synthesises. A
     /// `pppoe` client is NOT an L2 device (it has no netdev and enslaves no
@@ -2937,8 +3014,12 @@ pub struct Rule {
     pub disabled: bool,
     /// Source zone name (must be a zone backed by at least one interface).
     pub from: String,
-    /// Destination zone name.
-    pub to: String,
+    /// Destination zone name. Optional: without it the rule honestly matches
+    /// traffic from `from` toward anywhere — which is exactly what the
+    /// datapath enforces today. Setting it declares zone-pair intent and
+    /// draws a commit warning until the datapath can match on egress zone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
     pub action: Action,
     /// With `port`, makes this a **port rule** (a specific proto/port);
     /// without, it is a **broad** rule that sets the from-zone's posture.
@@ -3013,17 +3094,43 @@ impl Rule {
 impl Appliance {
     /// Parse and validate a config from TOML text.
     pub fn from_toml(toml_text: &str) -> Result<Self> {
-        let appliance: Appliance = toml::from_str(toml_text).context("parsing TOML config")?;
+        let mut appliance: Appliance = toml::from_str(toml_text).context("parsing TOML config")?;
+        appliance.normalize();
         appliance.validate()?;
         Ok(appliance)
     }
 
     /// Parse and validate a config from JSON text.
     pub fn from_json(json_text: &str) -> Result<Self> {
-        let appliance: Appliance =
+        let mut appliance: Appliance =
             serde_json::from_str(json_text).context("parsing JSON config")?;
+        appliance.normalize();
         appliance.validate()?;
         Ok(appliance)
+    }
+
+    /// Fill in inferred VLAN `parent`/`vlan` from a `<parent>.<id>` interface name
+    /// (both derived from the name only when unset and the interface carries no
+    /// `type`; explicit values always win, and a name/value mismatch is caught by
+    /// [`Self::validate`]). Runs before validation so a bare
+    /// `interface eth0.20 address …` works without repeating parent/vlan.
+    pub fn normalize(&mut self) {
+        for iface in &mut self.interfaces {
+            if iface.if_type.is_some() || iface.parent.is_some() || iface.vlan.is_some() {
+                continue;
+            }
+            if let Some((parent, id)) = iface.name.rsplit_once('.') {
+                if parent.is_empty() {
+                    continue;
+                }
+                if let Ok(vlan) = id.parse::<u16>() {
+                    if (1..=4094).contains(&vlan) {
+                        iface.parent = Some(parent.to_string());
+                        iface.vlan = Some(vlan);
+                    }
+                }
+            }
+        }
     }
 
     /// Load and validate a config file, picking the format by extension
@@ -3143,6 +3250,20 @@ impl Appliance {
                                 iface.name
                             );
                         }
+                        // If the name is `<parent>.<id>`, the explicit parent/vlan
+                        // must agree with it (inference filled them when unset, so
+                        // reaching here with a mismatch means they were set by hand
+                        // to something inconsistent with the name).
+                        if let Some((np, nid)) = iface.name.rsplit_once('.') {
+                            if let Ok(nvlan) = nid.parse::<u16>() {
+                                if (parent != np || vlan != nvlan) && !np.is_empty() {
+                                    bail!(
+                                        "interface {:?}: name implies parent {np:?} vlan {nvlan}, but parent {parent:?} vlan {vlan} were set",
+                                        iface.name
+                                    );
+                                }
+                            }
+                        }
                     }
                     (None, None) => {}
                     _ => bail!(
@@ -3197,12 +3318,6 @@ impl Appliance {
                         iface.name
                     );
                 }
-                if iface.is_wireguard() {
-                    bail!(
-                        "interface {:?}: a pppoe interface cannot also be WireGuard",
-                        iface.name
-                    );
-                }
                 if iface.address.is_some() || iface.address6.is_some() {
                     bail!(
                         "interface {:?}: a pppoe interface gets its address from the peer — do not set `address`",
@@ -3217,6 +3332,15 @@ impl Appliance {
                         );
                     }
                 }
+                // A PPP session has no L2 device to clone a MAC onto, so `mac`
+                // is dead here — reject it rather than silently drop it.
+                if iface.mac.is_some() {
+                    bail!(
+                        "interface {:?}: `mac` is not applicable to a pppoe interface \
+                         (a PPP session has no L2 device to clone a MAC onto)",
+                        iface.name
+                    );
+                }
             } else if iface.pppoe.is_some() {
                 bail!(
                     "interface {:?}: `pppoe` credentials require `type = \"pppoe\"`",
@@ -3224,43 +3348,13 @@ impl Appliance {
                 );
             }
 
-            // WireGuard: a `private-key` turns an interface into a WG tunnel.
-            if iface.is_wireguard() {
-                if iface.parent.is_some() || iface.vlan.is_some() {
-                    bail!(
-                        "interface {:?}: a wireguard interface cannot also be a VLAN",
-                        iface.name
-                    );
-                }
-                let key = iface.private_key.as_deref().unwrap();
-                validate_wg_key(key)
-                    .with_context(|| format!("interface {:?} private-key", iface.name))?;
-                if let Some(port) = iface.listen_port {
-                    if port == 0 {
-                        bail!("interface {:?}: listen-port 0 is not valid", iface.name);
-                    }
-                }
-                for peer in &iface.peers {
-                    validate_wg_key(&peer.public_key)
-                        .with_context(|| format!("interface {:?} peer public-key", iface.name))?;
-                    for cidr in &peer.allowed_ips {
-                        validate_cidr_or_ip(cidr).with_context(|| {
-                            format!("interface {:?} peer allowed-ips", iface.name)
-                        })?;
-                    }
-                    if let Some(ep) = &peer.endpoint {
-                        validate_endpoint(ep)
-                            .with_context(|| format!("interface {:?} peer endpoint", iface.name))?;
-                    }
-                    if let Some(psk) = &peer.preshared_key {
-                        validate_wg_key(psk).with_context(|| {
-                            format!("interface {:?} peer preshared-key", iface.name)
-                        })?;
-                    }
-                }
-            } else if iface.listen_port.is_some() || !iface.peers.is_empty() {
+            // WireGuard: a `type = "wireguard"` device. Its private key, listen
+            // port and peers live in the matching `[[vpn.wireguard]]` entry
+            // (cross-checked + validated in the vpn pass below); here we only
+            // reject combining the tunnel device with a VLAN.
+            if iface.is_wireguard() && (iface.parent.is_some() || iface.vlan.is_some()) {
                 bail!(
-                    "interface {:?}: listen-port/peer require private-key",
+                    "interface {:?}: a wireguard interface cannot also be a VLAN",
                     iface.name
                 );
             }
@@ -3268,7 +3362,7 @@ impl Appliance {
             // Kernel tunnel (`type = gre|ipip|gretap`, roadmap C3): a point-to-point
             // link between two endpoint addresses. Requires `local` + `remote` of the
             // same family; the GRE `key` is only valid on gre/gretap; and a tunnel
-            // cannot double as a VLAN / WireGuard / bridge/bond / member. Endpoint
+            // cannot double as a VLAN. Endpoint
             // addresses are a security boundary too — they are rendered verbatim into
             // a networkd `[Tunnel]` section.
             if iface.is_tunnel() {
@@ -3312,18 +3406,6 @@ impl Appliance {
                 if iface.parent.is_some() || iface.vlan.is_some() {
                     bail!("interface {:?}: a tunnel cannot also be a VLAN", iface.name);
                 }
-                if iface.is_wireguard() {
-                    bail!(
-                        "interface {:?}: a tunnel cannot also be WireGuard",
-                        iface.name
-                    );
-                }
-                if iface.master.is_some() {
-                    bail!(
-                        "interface {:?}: a tunnel cannot be enslaved to a bridge/bond",
-                        iface.name
-                    );
-                }
             } else if iface.local.is_some()
                 || iface.remote.is_some()
                 || iface.tunnel_key.is_some()
@@ -3347,15 +3429,34 @@ impl Appliance {
                     validate_ipv4(dns)
                         .with_context(|| format!("interface {:?} dhcp-server dns", iface.name))?;
                 }
+                // `address` is a static CIDR here (checked just above).
+                let subnet = iface.address.as_deref().unwrap_or("");
+                // The default-router (gateway) handed to clients must be a valid
+                // IPv4 that lies inside the server's own subnet.
                 if let Some(gw) = &dhcp.default_router {
                     validate_ipv4(gw).with_context(|| {
                         format!("interface {:?} dhcp-server default-router", iface.name)
                     })?;
+                    if !ipv4_in_cidr(gw, subnet).unwrap_or(false) {
+                        bail!(
+                            "interface {:?} dhcp-server default-router {gw}: not inside the server subnet {subnet}",
+                            iface.name
+                        );
+                    }
+                }
+                // The lease pool (offset addresses in, `size` long) must fit
+                // inside the interface's subnet — a pool that runs off the end
+                // hands out addresses the subnet doesn't contain.
+                if let (Some(off), Some(size)) = (dhcp.pool_offset, dhcp.pool_size) {
+                    if !dhcp_pool_fits(subnet, off, size) {
+                        bail!(
+                            "interface {:?} dhcp-server: pool (offset {off} + size {size}) does not fit inside the subnet {subnet}",
+                            iface.name
+                        );
+                    }
                 }
                 // Static reservations: a valid MAC and an address inside the
-                // server's own subnet (a lease outside it can never be handed
-                // out). `address` is a static CIDR here (checked just above).
-                let subnet = iface.address.as_deref().unwrap_or("");
+                // server's own subnet (a lease outside it can never be handed out).
                 for m in &dhcp.static_mappings {
                     validate_mac(&m.mac).with_context(|| {
                         format!(
@@ -3388,6 +3489,13 @@ impl Appliance {
                     validate_ipv6_cidr(prefix).with_context(|| {
                         format!("interface {:?} router-advert prefix", iface.name)
                     })?;
+                    // Stateless autoconfiguration (SLAAC) requires a /64.
+                    if !prefix.ends_with("/64") {
+                        bail!(
+                            "interface {:?} router-advert prefix {prefix:?}: must be a /64 (required for SLAAC)",
+                            iface.name
+                        );
+                    }
                 }
                 for dns in &ra.dns {
                     validate_ipv6(dns)
@@ -3395,13 +3503,20 @@ impl Appliance {
                 }
             }
 
-            // Bridge / bond: a `type` device cannot also be a VLAN or WireGuard;
-            // a `bond-mode` is only meaningful on a bond; a `master` must name a
-            // declared bridge/bond device (checked in a second pass below, once
-            // every interface's type is known).
-            if iface.is_virtual_l2() && (iface.parent.is_some() || iface.is_wireguard()) {
+            // Bridge / bond: a `type` device cannot also be a VLAN subinterface;
+            // `member` is only valid on such a device; a `bond-mode` is only
+            // meaningful on a bond; `vlan-aware` only on a bridge. The membership
+            // list is cross-checked in a second pass below, once every interface's
+            // type is known.
+            if iface.is_virtual_l2() && (iface.parent.is_some() || iface.vlan.is_some()) {
                 bail!(
-                    "interface {:?}: a bridge/bond device cannot also be a VLAN or WireGuard",
+                    "interface {:?}: a bridge/bond device cannot also be a VLAN",
+                    iface.name
+                );
+            }
+            if !iface.members.is_empty() && !iface.is_virtual_l2() {
+                bail!(
+                    "interface {:?}: `member` is only valid on a type=bridge/bond device",
                     iface.name
                 );
             }
@@ -3419,26 +3534,76 @@ impl Appliance {
                     );
                 }
             }
+            if iface.vlan_aware.is_some() && !iface.is_bridge() {
+                bail!(
+                    "interface {:?}: vlan-aware is only valid on a type=bridge",
+                    iface.name
+                );
+            }
+            // Per-port VLAN ids must be in range; their scoping to a vlan-aware
+            // bridge is checked in the membership pass (which knows who owns whom).
+            for id in iface.vlan_tagged.iter().copied().chain(iface.vlan_untagged) {
+                if !(1..=4094).contains(&id) {
+                    bail!(
+                        "interface {:?}: vlan id {id} out of range (1–4094)",
+                        iface.name
+                    );
+                }
+            }
         }
 
-        // Enslavement pass: every `master` must reference a declared bridge/bond
-        // device, and a device cannot enslave to itself.
+        // Membership pass: resolve each bridge/bond device's `member` list. A
+        // member must be a declared/known interface, may belong to at most one
+        // bond/bridge, and must not itself be a bond/bridge/VLAN (no nesting or
+        // loops). The member → owning-device map also scopes the per-port VLAN
+        // filtering below.
+        let mut member_of: BTreeMap<&str, &str> = BTreeMap::new();
+        for dev in &self.interfaces {
+            for m in &dev.members {
+                if m == &dev.name {
+                    bail!("interface {:?}: cannot enslave itself", dev.name);
+                }
+                let Some(mi) = self.interfaces.iter().find(|i| &i.name == m) else {
+                    bail!(
+                        "interface {:?}: member {m:?} is not a declared interface",
+                        dev.name
+                    );
+                };
+                if mi.is_virtual_l2()
+                    || mi.vlan.is_some()
+                    || mi.is_pppoe()
+                    || mi.is_wireguard()
+                    || mi.is_tunnel()
+                {
+                    bail!(
+                        "interface {:?}: member {m:?} is itself a bridge/bond/VLAN/pppoe/wireguard/tunnel and cannot be enslaved",
+                        dev.name
+                    );
+                }
+                if let Some(prev) = member_of.insert(m.as_str(), dev.name.as_str()) {
+                    bail!(
+                        "interface {m:?}: already a member of {prev:?}, cannot also join {:?}",
+                        dev.name
+                    );
+                }
+            }
+        }
+
+        // Per-port VLAN filtering (`vlan-tagged`/`vlan-untagged`) is only valid on
+        // a port that is a member of a vlan-aware bridge.
         for iface in &self.interfaces {
-            if let Some(master) = &iface.master {
-                match self.interfaces.iter().find(|i| &i.name == master) {
-                    Some(m) if m.is_virtual_l2() => {}
-                    Some(_) => bail!(
-                        "interface {:?}: master {master:?} is not a bridge/bond device",
-                        iface.name
-                    ),
-                    None => bail!(
-                        "interface {:?}: master {master:?} is not a declared interface",
-                        iface.name
-                    ),
-                }
-                if master == &iface.name {
-                    bail!("interface {:?}: cannot enslave to itself", iface.name);
-                }
+            if iface.vlan_tagged.is_empty() && iface.vlan_untagged.is_none() {
+                continue;
+            }
+            let bridge = member_of
+                .get(iface.name.as_str())
+                .and_then(|owner| self.interfaces.iter().find(|d| d.name.as_str() == *owner));
+            match bridge {
+                Some(b) if b.is_bridge() && b.vlan_aware == Some(true) => {}
+                _ => bail!(
+                    "interface {:?}: vlan-tagged/vlan-untagged require membership of a vlan-aware bridge",
+                    iface.name
+                ),
             }
         }
 
@@ -3473,7 +3638,11 @@ impl Appliance {
                 validate_description(d)
                     .with_context(|| format!("rule {:?} description", rule.name))?;
             }
-            for (which, zone) in [("from", &rule.from), ("to", &rule.to)] {
+            let mut zone_refs = vec![("from", &rule.from)];
+            if let Some(to) = &rule.to {
+                zone_refs.push(("to", to));
+            }
+            for (which, zone) in zone_refs {
                 if !zones_in_use.contains(zone.as_str()) {
                     bail!(
                         "rule {:?}: {which} zone {zone:?} has no interface",
@@ -3504,6 +3673,22 @@ impl Appliance {
             if let Some(port) = rule.port {
                 port.validate()
                     .with_context(|| format!("rule {:?}", rule.name))?;
+            }
+            // An inline source constraint must be an IPv4 host or CIDR.
+            if let Some(src) = &rule.source {
+                validate_cidr_or_ip(src).with_context(|| format!("rule {:?} source", rule.name))?;
+            }
+            // A broad rule (no proto/port) only *opens* a zone with `accept`; the
+            // data plane derives a zone's deny posture from its default-action, so
+            // a broad `drop`/`reject` never reaches the datapath — reject it rather
+            // than let it silently do nothing.
+            if rule.is_broad() && matches!(rule.action, Action::Drop | Action::Reject) {
+                bail!(
+                    "rule {:?}: broad drop/reject rules are not supported yet — set \
+                     `firewall zone {} default-action drop` instead, or give the rule proto/port",
+                    rule.name,
+                    rule.from
+                );
             }
             // A referenced group must be declared.
             if let Some(g) = &rule.source_group {
@@ -3566,7 +3751,20 @@ impl Appliance {
                     dst.zone
                 );
             }
-            parse_host_port(&dst.to).with_context(|| format!("nat destination {:?}", dst.name))?;
+            if dst.port == 0 {
+                bail!("nat destination {:?}: port 0 is not valid", dst.name);
+            }
+            let (_to_ip, to_port) = parse_host_port(&dst.to)
+                .with_context(|| format!("nat destination {:?}", dst.name))?;
+            // An explicit `ip:0` target port is invalid (a bare `ip` with no
+            // colon legitimately parses to 0, meaning "keep the public port").
+            if dst.to.contains(':') && to_port == 0 {
+                bail!(
+                    "nat destination {:?}: target port 0 in {:?} is not valid",
+                    dst.name,
+                    dst.to
+                );
+            }
         }
 
         // NAT64 (roadmap C10): stateful IPv6→IPv4 translation (tayga) + DNS64.
@@ -3682,10 +3880,43 @@ impl Appliance {
         for r in &self.protocols.statics {
             check_vrf_ref(&r.vrf, &format!("static route {:?}", r.prefix))?;
         }
-        // VRF definitions: a table id, and import/export naming declared filters.
+        // Routing-table ids the Multi-WAN uplinks own (explicit `table` or the
+        // derived `WAN_TABLE_BASE + idx`) — a VRF table must not collide.
+        let wan_tables: HashSet<u32> = self
+            .multiwan
+            .uplinks
+            .iter()
+            .enumerate()
+            .map(|(idx, u)| self.multiwan.table_for(idx, u))
+            .collect();
+        // VRF definitions: a table id (unique, in range, not a WAN table) and
+        // import/export naming declared filters.
+        let mut seen_vrf_tables: HashSet<u32> = HashSet::new();
         for v in &self.protocols.vrfs {
             if v.name.is_empty() {
                 bail!("protocols vrf: a vrf needs a name");
+            }
+            // 0 and 253–255 (default/main/local) are kernel-reserved.
+            if !(1..=252).contains(&v.table) {
+                bail!(
+                    "protocols vrf {:?}: table {} out of range (1–252; 0 and 253–255 are reserved)",
+                    v.name,
+                    v.table
+                );
+            }
+            if !seen_vrf_tables.insert(v.table) {
+                bail!(
+                    "protocols vrf {:?}: table {} is used by more than one vrf",
+                    v.name,
+                    v.table
+                );
+            }
+            if wan_tables.contains(&v.table) {
+                bail!(
+                    "protocols vrf {:?}: table {} collides with a multiwan uplink routing table",
+                    v.name,
+                    v.table
+                );
             }
             if let Some(f) = &v.import {
                 check_filter_ref(f, &format!("vrf {:?} import", v.name))?;
@@ -3711,6 +3942,11 @@ impl Appliance {
             }
         }
         for (proto, name) in &self.protocols.import {
+            if !IMPORT_PROTOCOLS.contains(&proto.as_str()) {
+                bail!(
+                    "protocols import: unknown protocol {proto:?} (expected one of {IMPORT_PROTOCOLS:?})"
+                );
+            }
             check_filter_ref(name, &format!("import {proto}"))?;
         }
         if let Some(bgp) = &self.protocols.bgp {
@@ -3728,6 +3964,16 @@ impl Appliance {
                 validate_cidr_or_ip(net)
                     .with_context(|| format!("protocols bgp network {net:?}"))?;
             }
+            // Communities attached to every originated route are shape-checked
+            // through the same helper the filter rules use.
+            for c in bgp
+                .community
+                .iter()
+                .chain(&bgp.large_community)
+                .chain(&bgp.ext_community)
+            {
+                validate_community(c).with_context(|| "protocols bgp community")?;
+            }
             for a in &bgp.aggregate {
                 validate_cidr_or_ip(&a.prefix)
                     .with_context(|| format!("protocols bgp aggregate {:?}", a.prefix))?;
@@ -3741,11 +3987,20 @@ impl Appliance {
                         r.prefix
                     );
                 }
+                if let Some(ml) = r.max_length {
+                    if ml > 128 {
+                        bail!(
+                            "protocols bgp roa {:?}: max-length {ml} out of range (0–128)",
+                            r.prefix
+                        );
+                    }
+                }
             }
             if let Some(rtr) = &bgp.rtr {
                 if rtr.server.is_empty() {
                     bail!("protocols bgp rtr: server (host:port) must be set");
                 }
+                validate_endpoint(&rtr.server).with_context(|| "protocols bgp rtr server")?;
             }
             for n in &bgp.neighbors {
                 validate_bgp_neighbor(n, &filter_names)?;
@@ -3784,6 +4039,18 @@ impl Appliance {
                 }
             }
             validate_ospf_network_type(ospf.network_type.as_deref(), "ospf")?;
+            // Timers: a Hello ≥ 1s, and a Dead strictly greater than the Hello
+            // (a Dead ≤ Hello would expire a neighbour before its first Hello).
+            if ospf.hello_interval == Some(0) {
+                bail!("protocols ospf hello-interval must be >= 1 second");
+            }
+            if let (Some(hello), Some(dead)) = (ospf.hello_interval, ospf.dead_interval) {
+                if dead <= hello as u32 {
+                    bail!(
+                        "protocols ospf dead-interval {dead} must be greater than hello-interval {hello}"
+                    );
+                }
+            }
             check_vrf_ref(&ospf.vrf, "ospf vrf")?;
         }
         if let Some(o) = &self.protocols.ospf3 {
@@ -3838,11 +4105,22 @@ impl Appliance {
                     );
                 }
             }
+            if let Some(p) = isis.priority {
+                if p > 127 {
+                    bail!("protocols isis priority {p} out of range (0–127)");
+                }
+            }
+            if isis.hello_interval == Some(0) {
+                bail!("protocols isis hello-interval must be >= 1 second");
+            }
             check_vrf_ref(&isis.vrf, "isis vrf")?;
         }
         for v in &self.protocols.vrrp {
             if v.interface.is_empty() {
                 bail!("protocols vrrp: interface must be set");
+            }
+            if v.vrid == 0 {
+                bail!("protocols vrrp {:?}: vrid must be 1–255", v.name);
             }
             for addr in &v.virtual_address {
                 validate_ipv4(addr)
@@ -3855,6 +4133,15 @@ impl Appliance {
                 if !BFD_AUTH_TYPES.contains(&t.as_str()) {
                     bail!("protocols bfd auth-type {t:?} not one of {BFD_AUTH_TYPES:?}");
                 }
+            }
+            if bfd.detect_mult == Some(0) {
+                bail!("protocols bfd detect-mult must be >= 1");
+            }
+            if bfd.min_tx == Some(0) {
+                bail!("protocols bfd min-tx must be >= 1 ms");
+            }
+            if bfd.min_rx == Some(0) {
+                bail!("protocols bfd min-rx must be >= 1 ms");
             }
         }
         // Multicast: interface roles and IGMP versions.
@@ -3927,6 +4214,12 @@ impl Appliance {
         if (!dns.host_override.is_empty() || !dns.blocklist.is_empty()) && dns.serve_on.is_empty() {
             bail!("services dns host-override/blocklist need at least one `serve-on` interface");
         }
+        // local-domain is rendered into dnsmasq `local=/<domain>/` + `domain=`
+        // directives, so it must be a plain domain-label sequence (no slash, no
+        // whitespace) — validate_host enforces exactly that label charset.
+        if let Some(dom) = &dns.local_domain {
+            validate_host(dom).with_context(|| "services dns local-domain")?;
+        }
 
         // NTP server: upstreams are IPs or hostnames; every serving interface
         // must be declared and carry a static address (its subnet is `allow`ed).
@@ -3962,6 +4255,15 @@ impl Appliance {
                 bail!("services snmp community: must not be empty");
             }
         }
+        // location/contact are rendered as quoted syslocation/syscontact lines in
+        // snmpd.conf — a newline, quote or backslash could break out of the line.
+        for (field, val) in [("location", &snmp.location), ("contact", &snmp.contact)] {
+            if let Some(v) = val {
+                if v.bytes().any(|b| matches!(b, b'\n' | b'\r' | b'"' | b'\\')) {
+                    bail!("services snmp {field}: must not contain a newline, quote or backslash");
+                }
+            }
+        }
         for src in &snmp.allow {
             if validate_cidr_or_ip(src).is_err() && validate_ipv6_cidr(src).is_err() {
                 bail!("services snmp allow {src:?}: not an IPv4/IPv6 address or CIDR");
@@ -3988,6 +4290,21 @@ impl Appliance {
         let dd = &self.services.dyndns;
         if !dd.is_empty() && dd.hostname.is_none() {
             bail!("services dyndns: a `hostname` is required");
+        }
+        if let Some(h) = &dd.hostname {
+            validate_host(h).with_context(|| "services dyndns hostname")?;
+        }
+        if let Some(s) = &dd.server {
+            validate_host(s).with_context(|| "services dyndns server")?;
+        }
+        // login/password are rendered into ddclient.conf lines — a newline or a
+        // single-quote could smuggle another directive.
+        for (field, val) in [("login", &dd.login), ("password", &dd.password)] {
+            if let Some(v) = val {
+                if v.bytes().any(|b| matches!(b, b'\n' | b'\r' | b'\'')) {
+                    bail!("services dyndns {field}: must not contain a newline or single-quote");
+                }
+            }
         }
         if let Some(iface) = &dd.interface {
             if !self.interfaces.iter().any(|i| &i.name == iface) {
@@ -4034,6 +4351,9 @@ impl Appliance {
         // `dhcp`) and health-check targets are IPv4. A single uplink is allowed
         // (it just has nothing to fail over to) — no artificial floor.
         let mw = &self.multiwan;
+        if mw.uplinks.is_empty() && !mw.mode.is_default() {
+            bail!("multiwan mode set but no uplinks defined");
+        }
         let mut seen_if: HashSet<&str> = HashSet::new();
         let mut seen_tbl: HashSet<u32> = HashSet::new();
         for (idx, u) in mw.uplinks.iter().enumerate() {
@@ -4079,6 +4399,18 @@ impl Appliance {
                     format!("multiwan uplink {:?} health-check target", u.interface)
                 })?;
             }
+            if u.check.interval == Some(0) {
+                bail!(
+                    "multiwan uplink {:?}: health-check interval must be >= 1 second",
+                    u.interface
+                );
+            }
+            if u.check.timeout == Some(0) {
+                bail!(
+                    "multiwan uplink {:?}: health-check timeout must be >= 1 second",
+                    u.interface
+                );
+            }
         }
 
         // VPN / IPsec (roadmap C2): a policy-based IKEv2 site-to-site tunnel.
@@ -4113,6 +4445,9 @@ impl Appliance {
                 .with_context(|| format!("vpn ipsec {:?} remote-subnet", c.name))?;
             if c.psk.is_empty() {
                 bail!("vpn ipsec {:?}: psk is required", c.name);
+            }
+            if c.psk.len() < 8 {
+                bail!("vpn ipsec {:?}: psk must be at least 8 characters", c.name);
             }
             // The PSK is rendered inside double quotes in the secrets file — a
             // quote or a newline would break out of it.
@@ -4150,6 +4485,68 @@ impl Appliance {
             if let Some(id) = &c.remote_id {
                 validate_ipsec_id(id)
                     .with_context(|| format!("vpn ipsec {:?} remote-id", c.name))?;
+            }
+        }
+
+        // vpn wireguard (roadmap C1): each tunnel names a `type = "wireguard"`
+        // interface and carries its private key, listen port and peers (the keys
+        // are a security boundary — rendered verbatim into the interface's
+        // `.netdev`). Names are unique and must reference a declared wireguard
+        // interface; conversely, every wireguard interface must have exactly one
+        // tunnel (its private key lives here, not on the interface).
+        let mut seen_wg: HashSet<&str> = HashSet::new();
+        for t in &self.vpn.wireguard {
+            if !seen_wg.insert(t.name.as_str()) {
+                bail!("vpn wireguard: duplicate tunnel {:?}", t.name);
+            }
+            match self.interfaces.iter().find(|i| i.name == t.name) {
+                Some(i) if i.is_wireguard() => {}
+                Some(_) => bail!(
+                    "vpn wireguard {:?}: interface {:?} is not type=wireguard",
+                    t.name,
+                    t.name
+                ),
+                None => bail!(
+                    "vpn wireguard {:?}: no such interface (declare `interface {} type wireguard` first)",
+                    t.name,
+                    t.name
+                ),
+            }
+            if t.private_key.is_empty() {
+                bail!("vpn wireguard {:?}: private-key is required", t.name);
+            }
+            validate_wg_key(&t.private_key)
+                .with_context(|| format!("vpn wireguard {:?} private-key", t.name))?;
+            if t.listen_port == Some(0) {
+                bail!("vpn wireguard {:?}: listen-port 0 is not valid", t.name);
+            }
+            for peer in &t.peers {
+                validate_wg_key(&peer.public_key)
+                    .with_context(|| format!("vpn wireguard {:?} peer public-key", t.name))?;
+                for cidr in &peer.allowed_ips {
+                    validate_cidr_or_ip(cidr)
+                        .with_context(|| format!("vpn wireguard {:?} peer allowed-ips", t.name))?;
+                }
+                if let Some(ep) = &peer.endpoint {
+                    validate_endpoint(ep)
+                        .with_context(|| format!("vpn wireguard {:?} peer endpoint", t.name))?;
+                }
+                if let Some(psk) = &peer.preshared_key {
+                    validate_wg_key(psk).with_context(|| {
+                        format!("vpn wireguard {:?} peer preshared-key", t.name)
+                    })?;
+                }
+            }
+        }
+        // Every `type = "wireguard"` interface needs its matching tunnel — the
+        // private key lives under vpn, so a bare wireguard interface is incomplete.
+        for iface in &self.interfaces {
+            if iface.is_wireguard() && !seen_wg.contains(iface.name.as_str()) {
+                bail!(
+                    "interface {:?}: missing vpn wireguard {} private-key",
+                    iface.name,
+                    iface.name
+                );
             }
         }
 
@@ -4288,6 +4685,29 @@ impl Appliance {
         }
     }
 
+    /// Non-fatal advisories surfaced at commit time (the orchestrator prints
+    /// them; nothing here blocks a commit). Today the data plane keys firewall
+    /// policies on the *source* zone only, so a rule's `to <zone>` is decorative:
+    /// every rule effectively applies from its `from` zone to ALL zones.
+    // Printed by the repl orchestrator (a different slice); unused inside the
+    // binary until that wiring lands, so silence dead_code here.
+    #[allow(dead_code)]
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for rule in &self.rules {
+            // Only a rule that DECLARES a destination zone warns: `to` is
+            // optional, and omitting it states exactly what the datapath does.
+            if let Some(to) = &rule.to {
+                out.push(format!(
+                    "rule {:?}: `to {to}` is not enforced by the datapath yet — the rule \
+                     currently applies from {} to ALL zones",
+                    rule.name, rule.from
+                ));
+            }
+        }
+        out
+    }
+
     /// A human-readable summary for `config show`.
     pub fn summary(&self) -> String {
         let mut out = format!("hostname: {}\n", self.system.hostname);
@@ -4310,7 +4730,7 @@ impl Appliance {
                 "  {:<16} {} -> {}  {}{}\n",
                 r.name,
                 r.from,
-                r.to,
+                r.to.as_deref().unwrap_or("any"),
                 action_str(r.action),
                 proto_port,
             ));
@@ -4557,6 +4977,22 @@ pub(crate) fn validate_iface_name(name: &str) -> Result<()> {
 /// The BGP Roles a speaker may take toward a neighbour (RFC 9234).
 const BGP_ROLES: &[&str] = &["provider", "customer", "peer", "rs-server", "rs-client"];
 
+/// The protocol names an `[import]` map may key on — wren's authoritative set
+/// (`protocol_from_name` in wren-daemon). A stray key used to be silently
+/// dropped by the daemon, so an unknown one is a commit error. Note this is
+/// NOT the `[export]` set: import filters route *sources* (incl. connected/
+/// static), export has fixed per-protocol fields; there is no `ripng` source.
+const IMPORT_PROTOCOLS: &[&str] = &[
+    "connected",
+    "static",
+    "kernel",
+    "rip",
+    "ospf",
+    "isis",
+    "babel",
+    "bgp",
+];
+
 /// The multicast interface roles Wren accepts (its `MulticastRole`, lowercase).
 const MULTICAST_ROLES: &[&str] = &["querier", "upstream", "downstream"];
 
@@ -4602,6 +5038,14 @@ fn validate_bgp_neighbor(n: &BgpNeighbor, filter_names: &HashSet<&str>) -> Resul
                 n.address
             );
         }
+    }
+    // TCP-MD5 (RFC 2385) and TCP-AO (RFC 5925) are different TCP options that
+    // cannot both protect one session.
+    if n.password.is_some() && n.ao_key.is_some() {
+        bail!(
+            "protocols bgp neighbor {:?}: password (TCP-MD5) and ao-key (TCP-AO) are mutually exclusive",
+            n.address
+        );
     }
     if let Some(t) = &n.bfd_auth_type {
         if !BFD_AUTH_TYPES.contains(&t.as_str()) {
@@ -4678,6 +5122,8 @@ fn validate_filter(f: &Filter) -> Result<()> {
                     f.name
                 );
             }
+            validate_filter_prefix(p)
+                .with_context(|| format!("protocols filter {:?} rule {i} prefix", f.name))?;
         }
         let communities = [
             r.set_community.as_deref().unwrap_or(&[]),
@@ -4695,6 +5141,20 @@ fn validate_filter(f: &Filter) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Validate a route-filter prefix pattern: an IPv4 or IPv6 CIDR, optionally with
+/// a Wren match-modifier suffix — a trailing `+` (this and more-specific), `-`
+/// (this and less-specific), or a `{min,max}` length range. The base CIDR is
+/// checked v4-or-v6; the modifier is stripped first so it does not confuse the
+/// parse.
+fn validate_filter_prefix(p: &str) -> Result<()> {
+    // Drop a `{min,max}` length-range suffix, then a trailing `+`/`-` modifier.
+    let base = p.split('{').next().unwrap_or(p);
+    let base = base.trim_end_matches(['+', '-']);
+    route_prefix_family(base)
+        .map(|_| ())
+        .with_context(|| format!("prefix pattern {p:?} is not a valid IPv4/IPv6 CIDR"))
 }
 
 /// A filter action must be `accept` or `reject`.
@@ -4801,6 +5261,29 @@ pub(crate) fn ipv4_in_cidr(ip: &str, cidr: &str) -> Result<bool> {
         u32::MAX << (32 - prefix)
     };
     Ok((u32::from(addr) & mask) == (u32::from(net) & mask))
+}
+
+/// True when a DHCP lease pool (`size` addresses starting at host-offset
+/// `offset`) fits inside the IPv4 `cidr`. networkd numbers `PoolOffset` from the
+/// network address, so the pool occupies indices `offset ..= offset + size - 1`,
+/// which must stay within the subnet's address count. Returns false on a
+/// malformed CIDR or a zero-length pool.
+pub(crate) fn dhcp_pool_fits(cidr: &str, offset: u32, size: u32) -> bool {
+    if size == 0 {
+        return false;
+    }
+    let Some((_net, prefix)) = cidr.split_once('/') else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u8>() else {
+        return false;
+    };
+    if prefix > 32 {
+        return false;
+    }
+    // Total addresses in the subnet (u64 so a /0 does not overflow).
+    let count: u64 = 1u64 << (32 - prefix as u64);
+    offset >= 1 && (offset as u64) + (size as u64) <= count
 }
 
 /// Validate a free-text `description` (interface/rule/zone/nat label): non-empty
@@ -5019,7 +5502,7 @@ mod tests {
         let a = Appliance::from_toml(EXAMPLE).expect("example must parse + validate");
         assert_eq!(a.system.hostname, "sentinel-fw");
         assert_eq!(a.interfaces.len(), 2);
-        assert_eq!(a.rules.len(), 3); // 2 broad + 1 port rule
+        assert_eq!(a.rules.len(), 2); // 1 broad accept + 1 port rule
         // The port rule has proto+port; the broad ones don't.
         assert_eq!(a.rules.iter().filter(|r| r.is_port_rule()).count(), 1);
     }
@@ -5644,26 +6127,27 @@ name = "br0"
 type = "bridge"
 zone = "lan"
 address = "10.0.0.1/24"
+member = ["lan1"]
 [[interface]]
 name = "lan1"
-master = "br0"
 [[interface]]
 name = "bond0"
 type = "bond"
 bond-mode = "802.3ad"
+member = ["lan2"]
 [[interface]]
 name = "lan2"
-master = "bond0"
 "#;
         let a = Appliance::from_toml(toml).expect("bridge/bond config parses + validates");
         assert_eq!(a.interfaces[0].if_type, Some(IfaceType::Bridge));
-        assert_eq!(a.interfaces[1].master.as_deref(), Some("br0"));
+        assert_eq!(a.interfaces[0].members, vec!["lan1".to_string()]);
         assert!(a.interfaces[2].is_bond());
         assert_eq!(a.interfaces[2].bond_mode.as_deref(), Some("802.3ad"));
-        // Round-trips through TOML (type + master survive).
+        assert_eq!(a.interfaces[2].members, vec!["lan2".to_string()]);
+        // Round-trips through TOML (type + members survive).
         let out = a.to_toml().unwrap();
         assert!(out.contains("type = \"bridge\""), "got:\n{out}");
-        assert!(out.contains("master = \"bond0\""), "got:\n{out}");
+        assert!(out.contains("member = [\"lan2\"]"), "got:\n{out}");
         assert!(Appliance::from_toml(&out).is_ok());
     }
 
@@ -5870,18 +6354,57 @@ limit = 1200
 
     #[test]
     fn bridge_bond_reject_bad_master_mode_and_combos() {
-        // master pointing at a non-device interface is rejected.
-        let bad_master = r#"
+        // `member` on a non-device interface is rejected.
+        let member_on_plain = r#"
 [system]
 hostname = "fw"
 [[interface]]
 name = "eth0"
 zone = "lan"
+member = ["eth1"]
 [[interface]]
 name = "eth1"
-master = "eth0"
 "#;
-        assert!(Appliance::from_toml(bad_master).is_err());
+        assert!(Appliance::from_toml(member_on_plain).is_err());
+        // A member that is not a declared interface is rejected.
+        let unknown_member = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "br0"
+type = "bridge"
+member = ["ghost"]
+"#;
+        assert!(Appliance::from_toml(unknown_member).is_err());
+        // A member enslaved to two devices is rejected.
+        let double_member = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "br0"
+type = "bridge"
+member = ["eth1"]
+[[interface]]
+name = "bond0"
+type = "bond"
+member = ["eth1"]
+[[interface]]
+name = "eth1"
+"#;
+        assert!(Appliance::from_toml(double_member).is_err());
+        // A member that is itself a bridge/bond is rejected (no nesting).
+        let nested_member = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "br0"
+type = "bridge"
+member = ["bond0"]
+[[interface]]
+name = "bond0"
+type = "bond"
+"#;
+        assert!(Appliance::from_toml(nested_member).is_err());
         // bond-mode on a bridge is rejected.
         let mode_on_bridge = r#"
 [system]
@@ -5902,6 +6425,150 @@ type = "bond"
 bond-mode = "round-robin"
 "#;
         assert!(Appliance::from_toml(bad_mode).is_err());
+    }
+
+    #[test]
+    fn wireguard_moves_under_vpn() {
+        let key = "OK+2ftLGli1Dle9tRWx5Bj0eLc0X7KcInScVBpg+3lc=";
+        let toml = format!(
+            r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wg0"
+type = "wireguard"
+zone = "vpn"
+address = "10.9.0.1/24"
+[[vpn.wireguard]]
+name = "wg0"
+private-key = "{key}"
+listen-port = 51820
+[[vpn.wireguard.peer]]
+public-key = "{key}"
+allowed-ips = ["10.9.0.2/32"]
+endpoint = "203.0.113.9:51820"
+persistent-keepalive = 25
+"#
+        );
+        let a = Appliance::from_toml(&toml).expect("wireguard config parses + validates");
+        assert!(a.interfaces[0].is_wireguard());
+        assert_eq!(a.vpn.wireguard.len(), 1);
+        assert_eq!(a.vpn.wireguard[0].name, "wg0");
+        assert_eq!(a.vpn.wireguard[0].peers.len(), 1);
+        // Round-trips.
+        let out = a.to_toml().unwrap();
+        assert!(out.contains("type = \"wireguard\""), "got:\n{out}");
+        assert!(out.contains("[[vpn.wireguard]]"), "got:\n{out}");
+        assert!(Appliance::from_toml(&out).is_ok());
+    }
+
+    #[test]
+    fn wireguard_iface_without_tunnel_is_rejected() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wg0"
+type = "wireguard"
+address = "10.9.0.1/24"
+"#;
+        // A type=wireguard interface with no [[vpn.wireguard]] entry is an error.
+        assert!(Appliance::from_toml(toml).is_err());
+    }
+
+    #[test]
+    fn wireguard_tunnel_without_iface_is_rejected() {
+        let key = "OK+2ftLGli1Dle9tRWx5Bj0eLc0X7KcInScVBpg+3lc=";
+        let toml = format!(
+            r#"
+[system]
+hostname = "fw"
+[[vpn.wireguard]]
+name = "wg0"
+private-key = "{key}"
+"#
+        );
+        // A tunnel that names no declared wireguard interface is an error.
+        assert!(Appliance::from_toml(&toml).is_err());
+    }
+
+    #[test]
+    fn vlan_parent_and_id_inferred_from_name() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "eth0"
+zone = "lan"
+address = "10.0.0.1/24"
+[[interface]]
+name = "eth0.20"
+zone = "iot"
+address = "10.0.20.1/24"
+"#;
+        let a = Appliance::from_toml(toml).expect("vlan inference parses + validates");
+        assert_eq!(a.interfaces[1].parent.as_deref(), Some("eth0"));
+        assert_eq!(a.interfaces[1].vlan, Some(20));
+        // A name/value mismatch is rejected.
+        let mismatch = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "eth0"
+zone = "lan"
+address = "10.0.0.1/24"
+[[interface]]
+name = "eth0.20"
+parent = "eth0"
+vlan = 30
+zone = "iot"
+address = "10.0.20.1/24"
+"#;
+        assert!(Appliance::from_toml(mismatch).is_err());
+    }
+
+    #[test]
+    fn vlan_aware_bridge_ports_parse_and_validate() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "br0"
+type = "bridge"
+vlan-aware = true
+zone = "lan"
+address = "10.0.0.1/24"
+member = ["lan1"]
+[[interface]]
+name = "lan1"
+vlan-tagged = [10, 20]
+vlan-untagged = 1
+"#;
+        let a = Appliance::from_toml(toml).expect("vlan-aware bridge parses + validates");
+        assert_eq!(a.interfaces[0].vlan_aware, Some(true));
+        assert_eq!(a.interfaces[1].vlan_tagged, vec![10u16, 20u16]);
+        assert_eq!(a.interfaces[1].vlan_untagged, Some(1));
+        assert!(Appliance::from_toml(&a.to_toml().unwrap()).is_ok());
+        // vlan-aware on a non-bridge is rejected.
+        let aware_on_bond = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "bond0"
+type = "bond"
+vlan-aware = true
+"#;
+        assert!(Appliance::from_toml(aware_on_bond).is_err());
+        // vlan-tagged on a port that isn't a member of a vlan-aware bridge.
+        let orphan_tagged = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "eth0"
+zone = "lan"
+vlan-tagged = [10]
+"#;
+        assert!(Appliance::from_toml(orphan_tagged).is_err());
     }
 
     #[test]

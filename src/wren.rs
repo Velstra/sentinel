@@ -344,6 +344,14 @@ struct WrenOspf3 {
         skip_serializing_if = "std::ops::Not::not"
     )]
     redistribute_static: bool,
+    /// Appliance `[protocols.ospf3] redistribute` sources that wren's OSPFv3 has
+    /// no field for. Wren's `Ospf3` (deny_unknown_fields) exposes ONLY
+    /// `redistribute-static` — there is no `redistribute` array like OSPFv2 has —
+    /// so `"static"` is the sole representable source. Any other source is
+    /// captured here at compile time and rejected by [`WrenConfig::to_toml`],
+    /// rather than silently dropped. Never serialized (wren would reject the key).
+    #[serde(skip)]
+    redistribute_unsupported: Vec<String>,
     #[serde(
         rename = "redistribute-metric",
         skip_serializing_if = "Option::is_none"
@@ -525,6 +533,20 @@ impl WrenConfig {
     /// Render as the TOML the Wren daemon loads with `--config`.
     pub fn to_toml(&self) -> anyhow::Result<String> {
         use anyhow::Context;
+        // OSPFv3 externals are static-only in wren (its `Ospf3` has just
+        // `redistribute-static`, no `redistribute` array). A source we could not
+        // map to a wren field must fail loudly here — never silently vanish.
+        if let Some(o) = &self.ospf3 {
+            if !o.redistribute_unsupported.is_empty() {
+                anyhow::bail!(
+                    "wren OSPFv3 can only redistribute static routes (supported set: [\"static\"]); \
+                     `[protocols.ospf3] redistribute` names {:?}, which have no OSPFv3 field in the \
+                     wren daemon — drop them (OSPFv3 externals are static-only) or redistribute those \
+                     sources via OSPFv2/another protocol",
+                    o.redistribute_unsupported
+                );
+            }
+        }
         toml::to_string_pretty(self).context("serializing the wren config")
     }
 }
@@ -634,8 +656,16 @@ pub fn compile_wren(appliance: &Appliance) -> WrenConfig {
         cost: o.cost,
         network_type: o.network_type.clone(),
         instance_id: o.instance_id,
-        // OSPFv3 only redistributes static externals (bool in wren's schema).
+        // OSPFv3 only redistributes static externals (bool in wren's schema); any
+        // other configured source has no wren OSPFv3 field, so record it for the
+        // render-time rejection in `to_toml` instead of dropping it silently.
         redistribute_static: o.redistribute.iter().any(|s| s == "static"),
+        redistribute_unsupported: o
+            .redistribute
+            .iter()
+            .filter(|s| s.as_str() != "static")
+            .cloned()
+            .collect(),
         redistribute_metric: o.redistribute_metric,
         bfd: o.bfd,
         interface: ospf_interfaces(&o.interface),
@@ -962,7 +992,7 @@ virtual-address = ["10.0.0.254"]
 hostname = "r1"
 [protocols]
 router-id = "10.0.0.1"
-import = { static = "f1", connected = "f1" }
+import = { bgp = "f1", ospf = "f1" }
 [[protocols.filter]]
 name = "f1"
 default = "accept"
@@ -1130,6 +1160,44 @@ virtual-address = ["10.0.0.254"]
             .unwrap();
         assert!(!ripng.contains("bfd"), "ripng must not emit bfd:\n{ripng}");
         assert!(!ripng.contains("vrf"), "ripng must not emit vrf:\n{ripng}");
+    }
+
+    #[test]
+    fn ospf3_redistribute_static_only_and_rejects_unsupported() {
+        // `static` is the one source wren's OSPFv3 can represent → renders fine.
+        let ok = r#"
+[system]
+hostname = "r1"
+[protocols.ospf3]
+interfaces = ["eth1"]
+redistribute = ["static"]
+"#;
+        let appliance = Appliance::from_toml(ok).unwrap();
+        let out = compile_wren(&appliance).to_toml().unwrap();
+        assert!(out.contains("redistribute-static = true"), "{out}");
+
+        // Any other source has no wren OSPFv3 field: it must error at render time,
+        // naming the supported set — never be silently dropped.
+        let bad = r#"
+[system]
+hostname = "r1"
+[protocols.ospf3]
+interfaces = ["eth1"]
+redistribute = ["static", "connected", "bgp"]
+"#;
+        let appliance = Appliance::from_toml(bad).unwrap();
+        let cfg = compile_wren(&appliance);
+        // `static` still maps to the bool...
+        assert!(cfg.ospf3.as_ref().unwrap().redistribute_static);
+        // ...but the unrepresentable sources are captured and rejected on render.
+        let err = cfg.to_toml().unwrap_err().to_string();
+        assert!(err.contains("connected"), "{err}");
+        assert!(err.contains("bgp"), "{err}");
+        assert!(err.contains("[\"static\"]"), "{err}");
+        assert!(
+            !err.contains("\"static\","),
+            "static is not unsupported: {err}"
+        );
     }
 
     #[test]

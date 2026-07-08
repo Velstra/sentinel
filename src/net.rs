@@ -20,7 +20,7 @@ use anyhow::Result;
 use crate::config::{
     Appliance, DhcpRelay, DhcpServer, Dns, Dyndns, IfaceType, Interface, Lldp, Mdns, MultiWan,
     Nat64, Ntp, Qos, QosDiscipline, RouterAdvert, Snmp, WAN_CHECK_FAIL, WAN_CHECK_INTERVAL,
-    WAN_CHECK_RISE, WAN_CHECK_TIMEOUT, WanMode,
+    WAN_CHECK_RISE, WAN_CHECK_TIMEOUT, WanMode, WireguardTunnel,
 };
 use crate::system::{self, NETWORKD_RUNTIME_DIR};
 
@@ -42,12 +42,38 @@ fn netdev_body(iface: &str, vlan: u16) -> String {
     format!("[NetDev]\nName={iface}\nKind=vlan\n\n[VLAN]\nId={vlan}\n")
 }
 
+/// The `[BridgeVLAN]` port section for a member of a VLAN-aware bridge: a `VLAN=`
+/// per tagged id, plus `PVID=`/`EgressUntagged=` for the single untagged VLAN.
+/// networkd merges the keys, so one section suffices. Empty when the port has no
+/// VLAN membership (so it appends nothing).
+fn bridge_vlan_body(tagged: &[u16], untagged: Option<u16>) -> String {
+    if tagged.is_empty() && untagged.is_none() {
+        return String::new();
+    }
+    let mut body = String::from("\n[BridgeVLAN]\n");
+    for id in tagged {
+        body.push_str(&format!("VLAN={id}\n"));
+    }
+    if let Some(pvid) = untagged {
+        body.push_str(&format!("PVID={pvid}\nEgressUntagged={pvid}\n"));
+    }
+    body
+}
+
 /// The `.netdev` for a virtual L2 device: a bridge (`Kind=bridge`) or a bond
 /// (`Kind=bond` + `[Bond] Mode=`, default `active-backup`). Members attach via
 /// their own `.network` (`Bridge=`/`Bond=`), not here.
 fn virtual_l2_netdev_body(iface: &Interface) -> String {
     match iface.if_type {
-        Some(IfaceType::Bridge) => format!("[NetDev]\nName={}\nKind=bridge\n", iface.name),
+        Some(IfaceType::Bridge) => {
+            let mut body = format!("[NetDev]\nName={}\nKind=bridge\n", iface.name);
+            // A VLAN-aware bridge does 802.1Q filtering in the switch; the member
+            // ports carry their tagged/untagged VLANs in `[BridgeVLAN]` sections.
+            if iface.vlan_aware == Some(true) {
+                body.push_str("\n[Bridge]\nVLANFiltering=yes\n");
+            }
+            body
+        }
         Some(IfaceType::Bond) => {
             let mode = iface.bond_mode.as_deref().unwrap_or("active-backup");
             format!(
@@ -59,9 +85,14 @@ fn virtual_l2_netdev_body(iface: &Interface) -> String {
         // networkd netdev — `apply_pppoe` owns it, so there is nothing to render
         // here (same as an interface with no type). Kernel tunnels are handled by
         // `tunnel_netdev_body`, not this virtual-L2 renderer.
-        None | Some(IfaceType::Pppoe | IfaceType::Gre | IfaceType::Ipip | IfaceType::Gretap) => {
-            String::new()
-        }
+        None
+        | Some(
+            IfaceType::Pppoe
+            | IfaceType::Wireguard
+            | IfaceType::Gre
+            | IfaceType::Ipip
+            | IfaceType::Gretap,
+        ) => String::new(),
     }
 }
 
@@ -100,18 +131,16 @@ fn tunnel_netdev_body(iface: &Interface) -> String {
 
 /// The `.netdev` that creates a WireGuard link: the `[WireGuard]` section
 /// carries the private key (and optional listen port), and one
-/// `[WireGuardPeer]` block per peer. The file is a secret (private key) and is
+/// `[WireGuardPeer]` block per peer. The crypto is sourced from the interface's
+/// matching `[[vpn.wireguard]]` tunnel. The file is a secret (private key) and is
 /// installed 0640 root:systemd-network by [`apply`].
-fn wireguard_netdev_body(iface: &Interface) -> String {
-    let name = &iface.name;
+fn wireguard_netdev_body(name: &str, tunnel: &WireguardTunnel) -> String {
     let mut body = format!("[NetDev]\nName={name}\nKind=wireguard\n\n[WireGuard]\n");
-    if let Some(pk) = &iface.private_key {
-        body.push_str(&format!("PrivateKey={pk}\n"));
-    }
-    if let Some(port) = iface.listen_port {
+    body.push_str(&format!("PrivateKey={}\n", tunnel.private_key));
+    if let Some(port) = tunnel.listen_port {
         body.push_str(&format!("ListenPort={port}\n"));
     }
-    for peer in &iface.peers {
+    for peer in &tunnel.peers {
         body.push_str("\n[WireGuardPeer]\n");
         body.push_str(&format!("PublicKey={}\n", peer.public_key));
         if !peer.allowed_ips.is_empty() {
@@ -331,14 +360,33 @@ fn resolved_dropin_body(dns: &Dns) -> Option<String> {
 const DNSMASQ_CONFDIR: &str = "/run/sentinel/dnsmasq.d";
 const DNSMASQ_CONF: &str = "sentinel.conf";
 
+/// Reject a value that would break the line-oriented daemon config it is
+/// interpolated into. Control characters (newline/CR/NUL/tab) can splice an extra
+/// directive; `extra` names any config-specific delimiter that would also corrupt
+/// syntax (e.g. `'` inside a single-quoted field, `/` inside a `/domain/` pattern).
+///
+/// This is render-time defense in depth: config-side validation should already
+/// reject these, but a hostile value must never reach a generated config intact —
+/// and we prefer erroring loudly over silently mangling it. `field` names the
+/// offending input so the error is actionable.
+fn reject_unsafe(field: &str, value: &str, extra: &[char]) -> Result<()> {
+    if let Some(c) = value.chars().find(|c| c.is_control() || extra.contains(c)) {
+        anyhow::bail!(
+            "{field} contains an unsafe character {c:?} that could corrupt the generated \
+             daemon config; remove it"
+        );
+    }
+    Ok(())
+}
+
 /// Render the dnsmasq drop-in for the LAN resolver, or `None` when no interface
 /// serves DNS. `interface=`/`bind-interfaces` (base config) restrict dnsmasq to
 /// exactly the serving links (so it never fights resolved for 127.0.0.53);
 /// `server=` sets the upstreams, `address=/name/ip` is a host-override, and
 /// `address=/domain/0.0.0.0` (+`::`) sinkholes a blocked domain.
-fn dnsmasq_conf_body(dns: &Dns) -> Option<String> {
+fn dnsmasq_conf_body(dns: &Dns) -> Result<Option<String>> {
     if dns.serve_on.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut body = String::from("# rendered by sentinel — LAN DNS (dnsmasq)\nno-resolv\n");
     for up in &dns.upstream {
@@ -354,13 +402,18 @@ fn dnsmasq_conf_body(dns: &Dns) -> Option<String> {
         body.push_str(&format!("cache-size={n}\n"));
     }
     if let Some(dom) = &dns.local_domain {
+        // The domain is delimited by `/` in `local=/dom/`; a `/` (or control char)
+        // would break the pattern and could splice a directive.
+        reject_unsafe("dns local-domain", dom, &['/'])?;
         body.push_str(&format!("local=/{dom}/\n"));
         body.push_str(&format!("domain={dom}\n"));
     }
     for (host, ip) in &dns.host_override {
+        reject_unsafe("dns host-override name", host, &['/'])?;
         body.push_str(&format!("address=/{host}/{ip}\n"));
     }
     for domain in &dns.blocklist {
+        reject_unsafe("dns blocklist entry", domain, &['/'])?;
         // Sinkhole to a dead address (v4 and v6), the pfBlocker/pi-hole convention.
         body.push_str(&format!("address=/{domain}/0.0.0.0\n"));
         body.push_str(&format!("address=/{domain}/::\n"));
@@ -368,7 +421,7 @@ fn dnsmasq_conf_body(dns: &Dns) -> Option<String> {
     if dns.dnssec.as_deref() == Some("yes") {
         body.push_str("dnssec\n");
     }
-    Some(body)
+    Ok(Some(body))
 }
 
 /// chrony's runtime confdir (the image enables `services.chrony` and includes
@@ -518,7 +571,7 @@ fn apply_resolved(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
 /// boot-time dnsmasq start still picks it up).
 fn apply_dnsmasq(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     let path = Path::new(DNSMASQ_CONFDIR).join(DNSMASQ_CONF);
-    let changed = match dnsmasq_conf_body(&appliance.services.dns) {
+    let changed = match dnsmasq_conf_body(&appliance.services.dns)? {
         Some(body) => {
             let changed = std::fs::read_to_string(&path)
                 .map(|c| c != body)
@@ -620,8 +673,10 @@ fn lldpd_conf_body(lldp: &Lldp) -> Option<String> {
 /// agent is read-only by construction — only `rocommunity`/`rocommunity6` lines
 /// are ever emitted, never `rwcommunity`. Each source subnet scopes one
 /// community clause; an empty `allow` list ⇒ `default` (any source).
-fn snmpd_conf_body(snmp: &Snmp) -> Option<String> {
-    let community = snmp.community.as_ref()?;
+fn snmpd_conf_body(snmp: &Snmp) -> Result<Option<String>> {
+    let Some(community) = snmp.community.as_ref() else {
+        return Ok(None);
+    };
     let mut body = String::from("# rendered by sentinel — SNMP (read-only)\n");
     body.push_str(&format!(
         "agentaddress {}\n",
@@ -642,12 +697,16 @@ fn snmpd_conf_body(snmp: &Snmp) -> Option<String> {
         }
     }
     if let Some(loc) = &snmp.location {
+        // syslocation/syscontact take the rest of the line as free text; a newline
+        // would inject a fresh directive (e.g. `rwcommunity`), so reject controls.
+        reject_unsafe("snmp location", loc, &[])?;
         body.push_str(&format!("syslocation {loc}\n"));
     }
     if let Some(contact) = &snmp.contact {
+        reject_unsafe("snmp contact", contact, &[])?;
         body.push_str(&format!("syscontact {contact}\n"));
     }
-    Some(body)
+    Ok(Some(body))
 }
 
 /// Render the avahi reflector config, or `None` when no reflector is configured.
@@ -672,8 +731,14 @@ fn avahi_conf_body(mdns: &Mdns) -> Option<String> {
 /// `use=web` (discover the WAN IP via the provider's checkip — correct behind
 /// CGNAT). The password is single-quoted so an odd character can't break the
 /// line; the whole file is installed 0640 (it carries the secret).
-fn ddclient_conf_body(dd: &Dyndns) -> Option<String> {
-    let hostname = dd.hostname.as_ref()?;
+fn ddclient_conf_body(dd: &Dyndns) -> Result<Option<String>> {
+    let Some(hostname) = dd.hostname.as_ref() else {
+        return Ok(None);
+    };
+    // Every interpolated field lands on its own `key=value` (or bare) line, so a
+    // newline in any of them would inject a directive; the password is additionally
+    // single-quoted, so a literal `'` would break out of the quoting.
+    reject_unsafe("dyndns hostname", hostname, &[])?;
     let mut body = String::from("# rendered by sentinel — dynamic DNS (ddclient)\n");
     body.push_str("daemon=300\nsyslog=yes\nssl=yes\n");
     body.push_str(&format!(
@@ -685,16 +750,19 @@ fn ddclient_conf_body(dd: &Dyndns) -> Option<String> {
         None => body.push_str("use=web\n"),
     }
     if let Some(server) = &dd.server {
+        reject_unsafe("dyndns server", server, &[])?;
         body.push_str(&format!("server={server}\n"));
     }
     if let Some(login) = &dd.login {
+        reject_unsafe("dyndns login", login, &[])?;
         body.push_str(&format!("login={login}\n"));
     }
     if let Some(password) = &dd.password {
+        reject_unsafe("dyndns password", password, &['\''])?;
         body.push_str(&format!("password='{password}'\n"));
     }
     body.push_str(&format!("{hostname}\n"));
-    Some(body)
+    Ok(Some(body))
 }
 
 /// The bare IPv4 of a static CIDR (`"10.0.7.1/24"` → `"10.0.7.1"`), or `None` for
@@ -777,7 +845,7 @@ fn apply_box_services(appliance: &Appliance) -> Result<()> {
     apply_box_service(
         SNMPD_UNIT,
         Path::new(SNMPD_CONF),
-        snmpd_conf_body(&s.snmp),
+        snmpd_conf_body(&s.snmp)?,
         true,
     )?;
     apply_box_service(
@@ -789,7 +857,7 @@ fn apply_box_services(appliance: &Appliance) -> Result<()> {
     apply_box_service(
         DDCLIENT_UNIT,
         Path::new(DDCLIENT_CONF),
-        ddclient_conf_body(&s.dyndns),
+        ddclient_conf_body(&s.dyndns)?,
         true,
     )?;
     apply_box_service(
@@ -1016,6 +1084,14 @@ const PPPOE_MSS_NFT: &str = "/run/sentinel/ppp/mss.nft";
 /// `nic-<iface>` option rather than the legacy `plugin rp-pppoe.so <iface>`
 /// positional form (removed in ppp 2.5). The `rp_pppoe_service`/`rp_pppoe_ac`
 /// options are still accepted as legacy aliases by that plugin.
+/// A PPPoE client that should be dialing: a `type = "pppoe"` interface that is
+/// not administratively disabled. A disabled one renders no pppd peer/secret and
+/// no MSS clamp, and — being absent from the desired set — is torn down by
+/// [`apply_pppoe`] exactly like a removed interface.
+fn is_active_pppoe(iface: &Interface) -> bool {
+    iface.is_pppoe() && !iface.disabled
+}
+
 fn pppoe_peer_body(iface: &Interface) -> String {
     let p = iface
         .pppoe
@@ -1051,7 +1127,7 @@ fn pppoe_peer_body(iface: &Interface) -> String {
 /// whichever auth the ISP negotiates finds the credential. `None` when no PPPoE
 /// interface is configured.
 fn ppp_secrets_body(ifaces: &[Interface]) -> Option<String> {
-    let ppp: Vec<&Interface> = ifaces.iter().filter(|i| i.is_pppoe()).collect();
+    let ppp: Vec<&Interface> = ifaces.iter().filter(|i| is_active_pppoe(i)).collect();
     if ppp.is_empty() {
         return None;
     }
@@ -1072,7 +1148,7 @@ fn ppp_secrets_body(ifaces: &[Interface]) -> Option<String> {
 /// this file replaces our table wholesale, and with no PPPoE interface it just
 /// removes it.
 fn pppoe_mss_body(ifaces: &[Interface]) -> String {
-    let ppp: Vec<&Interface> = ifaces.iter().filter(|i| i.is_pppoe()).collect();
+    let ppp: Vec<&Interface> = ifaces.iter().filter(|i| is_active_pppoe(i)).collect();
     let mut body =
         String::from("# rendered by sentinel — PPPoE TCP MSS clamp (clamp-mss-to-pmtu)\n");
     body.push_str("table inet sentinel-mss\ndelete table inet sentinel-mss\n");
@@ -1105,7 +1181,10 @@ fn file_changed(path: &Path, body: &str) -> bool {
 /// rendered config changed, so an unrelated commit never drops a live WAN link.
 fn apply_pppoe(appliance: &Appliance) -> Result<()> {
     let ifaces = &appliance.interfaces;
-    let ppp: Vec<&Interface> = ifaces.iter().filter(|i| i.is_pppoe()).collect();
+    // Only *active* (enabled) PPPoE clients dial. A disabled interface is left out
+    // of `desired` below, so the teardown loop stops+removes its session exactly
+    // as it would for an interface deleted from the config.
+    let ppp: Vec<&Interface> = ifaces.iter().filter(|i| is_active_pppoe(i)).collect();
 
     system::ensure_dir(Path::new(PPPOE_PEERS_DIR))?;
 
@@ -1339,7 +1418,7 @@ fn multiwan_script_body(mw: &MultiWan) -> Option<String> {
     let mut tmos = Vec::new();
     let mut failn = Vec::new();
     let mut risen = Vec::new();
-    let mut min_interval = u32::MAX;
+    let mut ivs = Vec::new();
     for (idx, u) in mw.uplinks.iter().enumerate() {
         ifs.push(shq(&u.interface));
         // A `dhcp` (or unset) gateway is resolved at runtime from the link's
@@ -1358,11 +1437,10 @@ fn multiwan_script_body(mw: &MultiWan) -> Option<String> {
         tmos.push(u.check.timeout.unwrap_or(WAN_CHECK_TIMEOUT).to_string());
         failn.push(u.check.fail.unwrap_or(WAN_CHECK_FAIL).to_string());
         risen.push(u.check.rise.unwrap_or(WAN_CHECK_RISE).to_string());
-        let iv = u.check.interval.unwrap_or(WAN_CHECK_INTERVAL);
-        min_interval = min_interval.min(iv);
-    }
-    if min_interval == u32::MAX {
-        min_interval = WAN_CHECK_INTERVAL;
+        // Each uplink keeps its OWN probe interval — the daemon schedules each on
+        // its own cadence (see MULTIWAN_LOGIC), so a slow uplink is not dragged to
+        // a fast neighbour's rate (nor the reverse).
+        ivs.push(u.check.interval.unwrap_or(WAN_CHECK_INTERVAL).to_string());
     }
     let mode = match mw.mode {
         WanMode::Failover => "failover",
@@ -1374,7 +1452,6 @@ fn multiwan_script_body(mw: &MultiWan) -> Option<String> {
     s.push_str("# rendered by sentinel — Multi-WAN health check + failover (roadmap C6)\n");
     s.push_str("set -u\n");
     s.push_str(&format!("MODE={}\n", shq(mode)));
-    s.push_str(&format!("INTERVAL={min_interval}\n"));
     s.push_str(&format!("IF=({})\n", ifs.join(" ")));
     s.push_str(&format!("GW=({})\n", gws.join(" ")));
     s.push_str(&format!("TB=({})\n", tbs.join(" ")));
@@ -1384,6 +1461,7 @@ fn multiwan_script_body(mw: &MultiWan) -> Option<String> {
     s.push_str(&format!("TMO=({})\n", tmos.join(" ")));
     s.push_str(&format!("FAILN=({})\n", failn.join(" ")));
     s.push_str(&format!("RISEN=({})\n", risen.join(" ")));
+    s.push_str(&format!("IV=({})\n", ivs.join(" ")));
     // The fixed control logic. Kept as a raw block so the daemon reads clearly;
     // every dynamic value is already baked into the arrays above.
     s.push_str(MULTIWAN_LOGIC);
@@ -1397,8 +1475,12 @@ fn multiwan_script_body(mw: &MultiWan) -> Option<String> {
 /// reprograms on any state change.
 const MULTIWAN_LOGIC: &str = r#"
 N=${#IF[@]}
-declare -a UP FAILC RISEC
-for ((i=0;i<N;i++)); do UP[i]=1; FAILC[i]=0; RISEC[i]=0; done
+declare -a UP FAILC RISEC NEXT
+now=$(date +%s)
+# NEXT[i] is the epoch second uplink i is next due to be probed; seeding it to
+# `now` makes every uplink due on the first pass, then each reschedules itself
+# IV[i] seconds ahead — so each uplink is probed strictly on its own interval.
+for ((i=0;i<N;i++)); do UP[i]=1; FAILC[i]=0; RISEC[i]=0; NEXT[i]=$now; done
 
 gw_of() { # echo the gateway for uplink $1 (static, or learned from the link)
   local i=$1
@@ -1464,8 +1546,13 @@ while true; do
   # replace` / `rule del`+`add`), so this self-heals an uplink whose address
   # appears after the daemon starts, without ever blipping a live table.
   setup
+  now=$(date +%s)
   changed=0
   for ((i=0;i<N;i++)); do
+    # Skip uplinks not yet due; each one probes only every IV[i] seconds, so its
+    # fail/rise counters advance at its own cadence.
+    [ "$now" -lt "${NEXT[i]}" ] && continue
+    NEXT[i]=$(( now + IV[i] ))
     if check "$i"; then
       RISEC[i]=$(( RISEC[i] + 1 )); FAILC[i]=0
       if [ "${UP[i]}" = 0 ] && [ "${RISEC[i]}" -ge "${RISEN[i]}" ]; then UP[i]=1; changed=1; fi
@@ -1475,7 +1562,13 @@ while true; do
     fi
   done
   [ "$changed" = 1 ] && apply
-  sleep "$INTERVAL"
+  # Sleep only until the soonest uplink is next due — no fixed tick, so distinct
+  # per-uplink intervals are each honoured without busy-looping.
+  nxt=${NEXT[0]}
+  for ((i=1;i<N;i++)); do [ "${NEXT[i]}" -lt "$nxt" ] && nxt=${NEXT[i]}; done
+  s=$(( nxt - $(date +%s) ))
+  [ "$s" -lt 1 ] && s=1
+  sleep "$s"
 done
 "#;
 
@@ -1571,6 +1664,27 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
         }
     }
 
+    // Map each member NIC to its owning bridge/bond device (name + whether it is a
+    // bond), derived from every device's `member` list — the inverse of the old
+    // per-member `master`. A member's `.network` gets `Bridge=`/`Bond=` from this.
+    let mut master_of: BTreeMap<&str, (&str, bool)> = BTreeMap::new();
+    for dev in ifaces {
+        if dev.is_virtual_l2() {
+            for m in &dev.members {
+                master_of.insert(m.as_str(), (dev.name.as_str(), dev.is_bond()));
+            }
+        }
+    }
+
+    // Index the WireGuard tunnels by interface name so a `type = "wireguard"`
+    // interface's `.netdev` can pull its keys + peers from `[[vpn.wireguard]]`.
+    let wg_by_name: BTreeMap<&str, &WireguardTunnel> = appliance
+        .vpn
+        .wireguard
+        .iter()
+        .map(|t| (t.name.as_str(), t))
+        .collect();
+
     system::ensure_dir(Path::new(NETWORKD_RUNTIME_DIR))?;
 
     let mut keep: HashSet<String> = HashSet::new();
@@ -1587,11 +1701,16 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
         }
     }
 
-    // WireGuard .netdev units (secret — the private key lives here → 0640).
+    // WireGuard .netdev units (secret — the private key lives here → 0640). The
+    // crypto comes from the matching `[[vpn.wireguard]]` tunnel; validation
+    // guarantees one exists for every `type = "wireguard"` interface.
     for i in ifaces {
         if i.is_wireguard() {
+            let Some(tunnel) = wg_by_name.get(i.name.as_str()) else {
+                continue;
+            };
             let name = netdev_name(&i.name);
-            writes.push((name.clone(), wireguard_netdev_body(i)));
+            writes.push((name.clone(), wireguard_netdev_body(&i.name, tunnel)));
             secrets.insert(name.clone());
             keep.insert(name);
         }
@@ -1632,7 +1751,9 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
                     || i.router_advert.is_some()
                     || i.is_virtual_l2()
                     || i.is_tunnel()
-                    || i.master.is_some()
+                    || master_of.contains_key(i.name.as_str())
+                    || !i.vlan_tagged.is_empty()
+                    || i.vlan_untagged.is_some()
                     || i.pd_from.is_some()
                     || i.mtu.is_some()
                     || i.mac.is_some()
@@ -1646,39 +1767,38 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
                 .get(i.name.as_str())
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            // Resolve a member's `master` to the right networkd directive
-            // (`Bridge=`/`Bond=`) by looking up the master's device type.
-            let master = i.master.as_deref().and_then(|m| {
-                ifaces.iter().find(|d| d.name == m).map(|d| {
-                    if d.is_bond() {
-                        format!("Bond={m}")
-                    } else {
-                        format!("Bridge={m}")
-                    }
-                })
+            // Resolve this interface's bridge/bond membership (derived from the
+            // owning device's `member` list) to the networkd directive.
+            let master = master_of.get(i.name.as_str()).map(|(dev, is_bond)| {
+                if *is_bond {
+                    format!("Bond={dev}")
+                } else {
+                    format!("Bridge={dev}")
+                }
             });
             let pd = i
                 .pd_from
                 .as_deref()
                 .map(|up| (up, i.pd_subnet.unwrap_or(0)));
             let name = network_name(&i.name);
-            writes.push((
-                name.clone(),
-                network_body(
-                    &i.name,
-                    i.address.as_deref(),
-                    i.address6.as_deref(),
-                    kids,
-                    i.dhcp_server.as_ref(),
-                    i.router_advert.as_ref(),
-                    master.as_deref(),
-                    pd,
-                    i.mtu,
-                    i.mac.as_deref(),
-                    i.description.as_deref(),
-                    i.disabled,
-                ),
-            ));
+            let mut body = network_body(
+                &i.name,
+                i.address.as_deref(),
+                i.address6.as_deref(),
+                kids,
+                i.dhcp_server.as_ref(),
+                i.router_advert.as_ref(),
+                master.as_deref(),
+                pd,
+                i.mtu,
+                i.mac.as_deref(),
+                i.description.as_deref(),
+                i.disabled,
+            );
+            // 802.1Q port membership on a VLAN-aware bridge (appended as its own
+            // [BridgeVLAN] section; empty for a non-filtering port).
+            body.push_str(&bridge_vlan_body(&i.vlan_tagged, i.vlan_untagged));
+            writes.push((name.clone(), body));
             keep.insert(name);
             i.name.clone()
         })
@@ -1906,13 +2026,13 @@ mod tests {
             address6: None,
             parent: None,
             vlan: None,
-            private_key: None,
-            listen_port: None,
-            peers: vec![],
             dhcp_server: None,
             router_advert: None,
             if_type: Some(IfaceType::Gre),
-            master: None,
+            members: vec![],
+            vlan_aware: None,
+            vlan_tagged: vec![],
+            vlan_untagged: None,
             bond_mode: None,
             pd_from: None,
             pd_subnet: None,
@@ -2115,10 +2235,29 @@ mod tests {
             cache_size: Some(1000),
             local_domain: Some("lan.example".into()),
         };
-        let d = dnsmasq_conf_body(&dns).expect("LAN resolver configured");
+        let d = dnsmasq_conf_body(&dns)
+            .unwrap()
+            .expect("LAN resolver configured");
         assert!(d.contains("cache-size=1000"), "got:\n{d}");
         assert!(d.contains("local=/lan.example/"), "got:\n{d}");
         assert!(d.contains("domain=lan.example"), "got:\n{d}");
+    }
+
+    #[test]
+    fn dnsmasq_rejects_injection_in_local_domain() {
+        // A `/` closes the `local=/dom/` pattern early; a newline splices a line.
+        let slash = Dns {
+            serve_on: vec!["lan0".into()],
+            local_domain: Some("lan/address=/evil.com/1.2.3.4".into()),
+            ..Dns::default()
+        };
+        assert!(dnsmasq_conf_body(&slash).is_err());
+        let nl = Dns {
+            serve_on: vec!["lan0".into()],
+            local_domain: Some("lan\nserver=6.6.6.6".into()),
+            ..Dns::default()
+        };
+        assert!(dnsmasq_conf_body(&nl).is_err());
     }
 
     #[test]
@@ -2134,13 +2273,13 @@ mod tests {
             address6: None,
             parent: None,
             vlan: None,
-            private_key: None,
-            listen_port: None,
-            peers: vec![],
             dhcp_server: None,
             router_advert: None,
             if_type: None,
-            master: None,
+            members: vec![],
+            vlan_aware: None,
+            vlan_tagged: vec![],
+            vlan_untagged: None,
             bond_mode: None,
             pd_from: None,
             pd_subnet: None,
@@ -2197,7 +2336,9 @@ mod tests {
         );
         assert!(r.contains("DNSSEC=no"));
         // dnsmasq is the LAN resolver: forward, serve on the link, override + block.
-        let d = dnsmasq_conf_body(&dns).expect("LAN resolver configured");
+        let d = dnsmasq_conf_body(&dns)
+            .unwrap()
+            .expect("LAN resolver configured");
         assert!(d.contains("server=9.9.9.9"), "got:\n{d}");
         assert!(d.contains("interface=lan0"), "got:\n{d}");
         assert!(
@@ -2211,7 +2352,7 @@ mod tests {
         assert!(d.contains("address=/ads.example/::"), "blocklist v6:\n{d}");
         // No upstream ⇒ no box forwarder; no serve-on ⇒ no LAN resolver.
         assert!(resolved_dropin_body(&Dns::default()).is_none());
-        assert!(dnsmasq_conf_body(&Dns::default()).is_none());
+        assert!(dnsmasq_conf_body(&Dns::default()).unwrap().is_none());
     }
 
     #[test]
@@ -2357,13 +2498,13 @@ mod tests {
             address6: None,
             parent: None,
             vlan: None,
-            private_key: None,
-            listen_port: None,
-            peers: vec![],
             dhcp_server: None,
             router_advert: None,
             if_type: Some(IfaceType::Bridge),
-            master: None,
+            members: vec![],
+            vlan_aware: None,
+            vlan_tagged: vec![],
+            vlan_untagged: None,
             bond_mode: None,
             pd_from: None,
             pd_subnet: None,
@@ -2410,13 +2551,13 @@ mod tests {
             address6: None,
             parent: None,
             vlan: None,
-            private_key: None,
-            listen_port: None,
-            peers: vec![],
             dhcp_server: None,
             router_advert: None,
             if_type: Some(IfaceType::Bond),
-            master: None,
+            members: vec![],
+            vlan_aware: None,
+            vlan_tagged: vec![],
+            vlan_untagged: None,
             bond_mode: Some("802.3ad".into()),
             pd_from: None,
             pd_subnet: None,
@@ -2537,15 +2678,11 @@ mod tests {
 
     #[test]
     fn wireguard_netdev_renders_kind_key_and_peer() {
-        use crate::config::WgPeer;
-        let iface = Interface {
+        use crate::config::{WgPeer, WireguardTunnel};
+        // The crypto now lives in a [[vpn.wireguard]] tunnel keyed by interface name.
+        let tunnel = WireguardTunnel {
             name: "wg0".into(),
-            zone: Some("lan".into()),
-            address: Some("10.9.0.1/24".into()),
-            address6: None,
-            parent: None,
-            vlan: None,
-            private_key: Some("ICOioMTTlfQE/2NndOoEntortz+0tZ5Hll0AEM7tdmE=".into()),
+            private_key: "ICOioMTTlfQE/2NndOoEntortz+0tZ5Hll0AEM7tdmE=".into(),
             listen_port: Some(51820),
             peers: vec![WgPeer {
                 public_key: "ukF+iwo+aai/wm9k1nIlxCBFRnZ+bLPb2xIu4+4PvmQ=".into(),
@@ -2554,10 +2691,35 @@ mod tests {
                 persistent_keepalive: Some(25),
                 preshared_key: None,
             }],
+        };
+        let d = wireguard_netdev_body("wg0", &tunnel);
+        assert!(d.contains("Kind=wireguard"));
+        assert!(d.contains("PrivateKey=ICOioMTTlfQE/2NndOoEntortz+0tZ5Hll0AEM7tdmE="));
+        assert!(d.contains("ListenPort=51820"));
+        assert!(d.contains("[WireGuardPeer]"));
+        assert!(d.contains("PublicKey=ukF+iwo+aai/wm9k1nIlxCBFRnZ+bLPb2xIu4+4PvmQ="));
+        assert!(d.contains("AllowedIPs=10.9.0.2/32"));
+        assert!(d.contains("Endpoint=192.0.2.7:51820"));
+        assert!(d.contains("PersistentKeepalive=25"));
+    }
+
+    #[test]
+    fn vlan_aware_bridge_renders_filtering_and_port_vlans() {
+        // A vlan-aware bridge netdev carries VLANFiltering=yes.
+        let br = Interface {
+            name: "br0".into(),
+            zone: Some("lan".into()),
+            address: Some("10.0.0.1/24".into()),
+            address6: None,
+            parent: None,
+            vlan: None,
             dhcp_server: None,
             router_advert: None,
-            if_type: None,
-            master: None,
+            if_type: Some(IfaceType::Bridge),
+            members: vec!["lan1".into()],
+            vlan_aware: Some(true),
+            vlan_tagged: vec![],
+            vlan_untagged: None,
             bond_mode: None,
             pd_from: None,
             pd_subnet: None,
@@ -2572,15 +2734,17 @@ mod tests {
             description: None,
             disabled: false,
         };
-        let d = wireguard_netdev_body(&iface);
-        assert!(d.contains("Kind=wireguard"));
-        assert!(d.contains("PrivateKey=ICOioMTTlfQE/2NndOoEntortz+0tZ5Hll0AEM7tdmE="));
-        assert!(d.contains("ListenPort=51820"));
-        assert!(d.contains("[WireGuardPeer]"));
-        assert!(d.contains("PublicKey=ukF+iwo+aai/wm9k1nIlxCBFRnZ+bLPb2xIu4+4PvmQ="));
-        assert!(d.contains("AllowedIPs=10.9.0.2/32"));
-        assert!(d.contains("Endpoint=192.0.2.7:51820"));
-        assert!(d.contains("PersistentKeepalive=25"));
+        let d = virtual_l2_netdev_body(&br);
+        assert!(d.contains("VLANFiltering=yes"), "{d}");
+        // A port's [BridgeVLAN] section: one VLAN= per tagged id + PVID/EgressUntagged.
+        let port = bridge_vlan_body(&[10, 20], Some(1));
+        assert!(port.contains("[BridgeVLAN]"), "{port}");
+        assert!(port.contains("VLAN=10"), "{port}");
+        assert!(port.contains("VLAN=20"), "{port}");
+        assert!(port.contains("PVID=1"), "{port}");
+        assert!(port.contains("EgressUntagged=1"), "{port}");
+        // A non-filtering port renders nothing.
+        assert!(bridge_vlan_body(&[], None).is_empty());
     }
 
     /// A PPPoE client interface `ppp0` over uplink `parent`, with the given
@@ -2595,13 +2759,13 @@ mod tests {
             pd_subnet: None,
             parent: Some(parent.into()),
             vlan: None,
-            private_key: None,
-            listen_port: None,
-            peers: vec![],
             dhcp_server: None,
             router_advert: None,
             if_type: Some(IfaceType::Pppoe),
-            master: None,
+            members: vec![],
+            vlan_aware: None,
+            vlan_tagged: vec![],
+            vlan_untagged: None,
             bond_mode: None,
             mtu: Some(1492),
             mac: None,
@@ -2674,6 +2838,31 @@ mod tests {
     }
 
     #[test]
+    fn disabled_pppoe_renders_nothing_and_is_torn_down_like_a_removed_one() {
+        let mut iface = pppoe_iface("eth0", "user@isp.de", "s3cret");
+        iface.disabled = true;
+        // A disabled PPPoE client is not "active": no pppd session should dial.
+        assert!(!is_active_pppoe(&iface));
+        // No credentials and no MSS clamp are rendered for it.
+        assert!(
+            ppp_secrets_body(std::slice::from_ref(&iface)).is_none(),
+            "disabled pppoe must not emit credentials"
+        );
+        let mss = pppoe_mss_body(std::slice::from_ref(&iface));
+        assert!(
+            !mss.contains("maxseg"),
+            "disabled pppoe must not get an MSS clamp:\n{mss}"
+        );
+        // It is absent from the desired set that `apply_pppoe` builds, so the
+        // teardown loop stops+removes its session exactly as for a removed one —
+        // the same mechanism the enabled case leaves untouched.
+        let mut enabled = pppoe_iface("eth0", "user@isp.de", "s3cret");
+        enabled.disabled = false;
+        assert!(is_active_pppoe(&enabled));
+        assert!(ppp_secrets_body(std::slice::from_ref(&enabled)).is_some());
+    }
+
+    #[test]
     fn multiwan_script_renders_arrays_tables_and_failover() {
         use crate::config::{HealthCheck, MultiWan, WanMode, WanUplink};
         let mw = MultiWan {
@@ -2714,8 +2903,12 @@ mod tests {
         // Derived table ids (WAN_TABLE_BASE + idx).
         assert!(s.contains("TB=(200 201)"), "got:\n{s}");
         assert!(s.contains("PR=(10 20)"), "got:\n{s}");
-        // The loop tick is the smallest configured interval.
-        assert!(s.contains("INTERVAL=2"), "got:\n{s}");
+        // Each uplink keeps its own probe interval (uplink 1 falls back to the
+        // WAN_CHECK_INTERVAL default of 5) — no collapse to a single global tick.
+        assert!(s.contains("IV=(2 5)"), "got:\n{s}");
+        assert!(!s.contains("INTERVAL="), "no single global tick:\n{s}");
+        // The scheduler probes each uplink only when its own NEXT[i] falls due.
+        assert!(s.contains("NEXT[i]=$(( now + IV[i] ))"), "got:\n{s}");
         // The fixed logic sets up per-uplink tables + programs the main default.
         assert!(
             s.contains("ip route replace default via \"$gw\" dev \"${IF[i]}\" table \"${TB[i]}\""),
@@ -2766,6 +2959,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn multiwan_uplinks_keep_distinct_check_intervals() {
+        use crate::config::{HealthCheck, MultiWan, WanMode, WanUplink};
+        let mk = |iface: &str, interval: u32| WanUplink {
+            interface: iface.into(),
+            priority: None,
+            weight: None,
+            table: None,
+            gateway: Some("10.0.0.254".into()),
+            check: HealthCheck {
+                targets: vec!["1.1.1.1".into()],
+                interval: Some(interval),
+                ..HealthCheck::default()
+            },
+        };
+        let mw = MultiWan {
+            mode: WanMode::Failover,
+            uplinks: vec![mk("wan0", 5), mk("wan1", 30)],
+        };
+        let s = multiwan_script_body(&mw).expect("uplinks configured");
+        // Both cadences survive verbatim — the fast uplink does not force the slow
+        // one to 5s, nor does the slow one relax the fast one to 30s.
+        assert!(s.contains("IV=(5 30)"), "got:\n{s}");
+        // A per-uplink next-due gate drives the scheduling.
+        assert!(
+            s.contains("[ \"$now\" -lt \"${NEXT[i]}\" ] && continue"),
+            "got:\n{s}"
+        );
+        // The daemon sleeps only until the soonest uplink is due, never a fixed tick.
+        assert!(s.contains("s=$(( nxt - $(date +%s) ))"), "got:\n{s}");
+        assert!(!s.contains("sleep \"$INTERVAL\""), "no global tick:\n{s}");
+    }
+
     // --- Box services (roadmap C18) ---------------------------------------
 
     #[test]
@@ -2793,7 +3019,7 @@ mod tests {
 
     #[test]
     fn snmp_conf_is_read_only_and_scopes_by_family() {
-        assert!(snmpd_conf_body(&Snmp::default()).is_none());
+        assert!(snmpd_conf_body(&Snmp::default()).unwrap().is_none());
         let s = Snmp {
             community: Some("public".into()),
             listen: Some("udp:10.0.0.1:161".into()),
@@ -2801,7 +3027,7 @@ mod tests {
             contact: Some("noc@example".into()),
             allow: vec!["10.0.0.0/24".into(), "fd00::/64".into()],
         };
-        let body = snmpd_conf_body(&s).expect("configured");
+        let body = snmpd_conf_body(&s).unwrap().expect("configured");
         assert!(
             body.contains("agentaddress udp:10.0.0.1:161"),
             "got:\n{body}"
@@ -2828,8 +3054,26 @@ mod tests {
         assert!(
             snmpd_conf_body(&any)
                 .unwrap()
+                .expect("configured")
                 .contains("rocommunity public default")
         );
+    }
+
+    #[test]
+    fn snmp_rejects_injection_in_location_and_contact() {
+        // A newline in location/contact would splice a fresh snmpd directive.
+        let loc = Snmp {
+            community: Some("public".into()),
+            location: Some("rack\nrwcommunity evil".into()),
+            ..Snmp::default()
+        };
+        assert!(snmpd_conf_body(&loc).is_err());
+        let contact = Snmp {
+            community: Some("public".into()),
+            contact: Some("noc\nrwcommunity evil".into()),
+            ..Snmp::default()
+        };
+        assert!(snmpd_conf_body(&contact).is_err());
     }
 
     #[test]
@@ -2845,7 +3089,7 @@ mod tests {
 
     #[test]
     fn ddclient_conf_renders_secret_and_use_modes() {
-        assert!(ddclient_conf_body(&Dyndns::default()).is_none());
+        assert!(ddclient_conf_body(&Dyndns::default()).unwrap().is_none());
         // An interface ⇒ use=if; a password is single-quoted.
         let d = Dyndns {
             provider: Some("cloudflare".into()),
@@ -2855,7 +3099,7 @@ mod tests {
             password: Some("secret-token".into()),
             interface: Some("wan0".into()),
         };
-        let body = ddclient_conf_body(&d).expect("configured");
+        let body = ddclient_conf_body(&d).unwrap().expect("configured");
         assert!(body.contains("protocol=cloudflare"), "got:\n{body}");
         assert!(body.contains("use=if, if=wan0"), "got:\n{body}");
         assert!(body.contains("password='secret-token'"), "got:\n{body}");
@@ -2865,7 +3109,35 @@ mod tests {
             interface: None,
             ..d
         };
-        assert!(ddclient_conf_body(&web).unwrap().contains("use=web"));
+        assert!(
+            ddclient_conf_body(&web)
+                .unwrap()
+                .expect("configured")
+                .contains("use=web")
+        );
+    }
+
+    #[test]
+    fn ddclient_rejects_injection_in_fields() {
+        // A `'` in the single-quoted password breaks out of the quoting.
+        let pw = Dyndns {
+            hostname: Some("fw.example.com".into()),
+            password: Some("a'; evil".into()),
+            ..Dyndns::default()
+        };
+        assert!(ddclient_conf_body(&pw).is_err());
+        // A newline in a bare/`key=value` field would inject a directive.
+        let host = Dyndns {
+            hostname: Some("fw.example.com\nlogin=evil".into()),
+            ..Dyndns::default()
+        };
+        assert!(ddclient_conf_body(&host).is_err());
+        let login = Dyndns {
+            hostname: Some("fw.example.com".into()),
+            login: Some("u\nserver=evil".into()),
+            ..Dyndns::default()
+        };
+        assert!(ddclient_conf_body(&login).is_err());
     }
 
     /// A bare interface carrying just a name + address (Interface has no Default).
@@ -2877,13 +3149,13 @@ mod tests {
             address6: None,
             parent: None,
             vlan: None,
-            private_key: None,
-            listen_port: None,
-            peers: vec![],
             dhcp_server: None,
             router_advert: None,
             if_type: None,
-            master: None,
+            members: vec![],
+            vlan_aware: None,
+            vlan_tagged: vec![],
+            vlan_untagged: None,
             bond_mode: None,
             pd_from: None,
             pd_subnet: None,
