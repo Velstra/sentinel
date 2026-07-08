@@ -1,6 +1,7 @@
 //! The interactive `configure` shell: command execution shared by the
 //! interactive (rustyline, with tab-completion) and piped (plain stdin) paths.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
@@ -336,6 +337,9 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
         appliance.interfaces.len(),
         appliance.rules.len()
     );
+    for w in appliance.warnings() {
+        eprintln!("{} {w}", ui::yellow("warning:"));
+    }
 
     if !act.enabled {
         eprintln!("{} commit ok (validated): {summary}", ui::green("✔"));
@@ -996,7 +1000,13 @@ const CHECK_FIELDS: &[Cand] = &[
     ("rise", "consecutive successes to mark up (default 3)"),
 ];
 // `vpn <Tab>` reveals the VPN types (IPsec today; OpenVPN/road-warrior later).
-const VPN_NODES: &[Cand] = &[("ipsec", "an IKEv2 site-to-site IPsec tunnel (by name)")];
+const VPN_NODES: &[Cand] = &[
+    ("ipsec", "an IKEv2 site-to-site IPsec tunnel (by name)"),
+    (
+        "wireguard",
+        "a WireGuard tunnel's keys + peers (by interface name)",
+    ),
+];
 // `vpn ipsec <name> <Tab>` reveals the per-connection fields.
 const IPSEC_FIELDS: &[Cand] = &[
     ("local", "this box's IKE endpoint (IPv4)"),
@@ -1514,6 +1524,26 @@ const ACCEPT_REJECT: &[Cand] = &[
 const REDIST: &[Cand] = &[
     ("static", "redistribute static routes"),
     ("connected", "redistribute connected (interface) routes"),
+    ("bgp", "redistribute BGP routes"),
+];
+// `services dyndns provider <Tab>` — the ddclient protocols we render for.
+const DYNDNS_PROVIDERS: &[Cand] = &[
+    ("dyndns2", "the generic DynDNS v2 protocol (default)"),
+    ("cloudflare", "Cloudflare DNS"),
+    ("duckdns", "Duck DNS"),
+    ("noip", "No-IP"),
+];
+// `protocols filter <name> rule <n> protocol <Tab>` — the route sources a filter
+// rule can match on.
+const FILTER_PROTOCOLS: &[Cand] = &[
+    ("connected", "connected (interface) routes"),
+    ("static", "static routes"),
+    ("kernel", "kernel routes"),
+    ("rip", "RIP routes"),
+    ("ospf", "OSPF routes"),
+    ("bgp", "BGP routes"),
+    ("isis", "IS-IS routes"),
+    ("babel", "Babel routes"),
 ];
 // `firewall <Tab>` reveals the three firewall sub-trees (NAT lives at top level).
 const FIREWALL_NODES: &[Cand] = &[
@@ -1640,21 +1670,33 @@ const IFACE_FIELDS: &[Cand] = &[
     ),
     ("parent", "parent interface (for a VLAN subinterface)"),
     ("vlan", "802.1Q VLAN id 1–4094 (with `parent`)"),
-    ("private-key", "WireGuard private key (or `generate`)"),
-    ("listen-port", "WireGuard UDP listen port"),
-    ("peer", "WireGuard peer (by public key)"),
     ("dhcp-server", "serve DHCP from this NIC's static subnet"),
     ("router-advert", "emit IPv6 Router Advertisements (SLAAC)"),
     (
         "type",
-        "make this a bridge | bond | pppoe | gre | ipip | gretap interface",
+        "make this a bridge | bond | wireguard | pppoe | gre | ipip | gretap interface",
     ),
     ("local", "tunnel local endpoint IP (type gre/ipip/gretap)"),
     ("remote", "tunnel remote endpoint IP (type gre/ipip/gretap)"),
     ("key", "GRE key (type gre/gretap) — demultiplexes tunnels"),
     ("ttl", "tunnel outer TTL 0–255 (0 = inherit inner)"),
-    ("master", "enslave this NIC to a bridge/bond device"),
+    (
+        "member",
+        "enslave a NIC to this bridge/bond device (repeatable)",
+    ),
     ("bond-mode", "bonding mode (on a type=bond device)"),
+    (
+        "vlan-aware",
+        "802.1Q VLAN filtering on this bridge (true|false)",
+    ),
+    (
+        "vlan-tagged",
+        "tagged VLAN ids on a vlan-aware bridge port (csv)",
+    ),
+    (
+        "vlan-untagged",
+        "untagged/PVID VLAN id on a vlan-aware bridge port",
+    ),
     ("mtu", "link MTU in bytes (e.g. 1492 PPPoE, 9000 jumbo)"),
     (
         "mac",
@@ -1674,8 +1716,12 @@ const ADDRESS6_HINT: &[Cand] = &[
     ),
 ];
 const IFACE_TYPES: &[Cand] = &[
-    ("bridge", "an L2 switch; enslave NICs with `master`"),
-    ("bond", "link aggregation; enslave NICs with `master`"),
+    ("bridge", "an L2 switch; enslave NICs with `member`"),
+    ("bond", "link aggregation; enslave NICs with `member`"),
+    (
+        "wireguard",
+        "a WireGuard tunnel; keys/peers under `vpn wireguard`",
+    ),
     (
         "pppoe",
         "a PPPoE client over a raw uplink NIC (VDSL/fibre WAN)",
@@ -1799,6 +1845,11 @@ const RA_FIELDS: &[Cand] = &[
     ),
 ];
 const WG_KEY_GEN: &[Cand] = &[("generate", "generate a fresh WireGuard keypair")];
+const WG_TUNNEL_FIELDS: &[Cand] = &[
+    ("private-key", "WireGuard private key (or `generate`)"),
+    ("listen-port", "WireGuard UDP listen port"),
+    ("peer", "WireGuard peer (by public key)"),
+];
 const PEER_FIELDS: &[Cand] = &[
     ("allowed-ips", "CIDRs routed to this peer (comma-separated)"),
     ("endpoint", "peer's public host:port"),
@@ -1831,10 +1882,66 @@ const RULE_FIELDS: &[Cand] = &[
     ),
 ];
 
+// ---- Display-only value placeholders (vtysh style) --------------------------
+// A completion candidate whose keyword starts with '<' is a *hint* at a value
+// position (`<A.B.C.D>`, `<1-65535>`, …). It is shown in the Tab/`?` list but
+// never inserted — see [`is_placeholder`]/[`matches_for`], which give it a
+// no-op replacement so it can never be typed literally. Defined once here and
+// reused across every value position so the vocabulary stays consistent, and so
+// new grammar entries can drop in the same shared consts.
+const PH_IPV4: Cand = ("<A.B.C.D>", "an IPv4 address");
+const PH_IPV6: Cand = ("<X:X::X:X>", "an IPv6 address");
+const PH_IPV4_CIDR: Cand = ("<A.B.C.D/M>", "an IPv4 prefix (address/length)");
+const PH_IPV6_CIDR: Cand = ("<X:X::X:X/M>", "an IPv6 prefix (address/length)");
+const PH_IPV4_TO: Cand = ("<A.B.C.D:port>", "an internal target — ip or ip:port");
+const PH_PORT: Cand = ("<1-65535>", "a TCP/UDP port");
+const PH_PORT_RANGE: Cand = ("<port|lo-hi>", "a port or range (e.g. 443 or 8000-8100)");
+const PH_ASN: Cand = ("<1-4294967295>", "an AS number");
+const PH_VLAN: Cand = ("<1-4094>", "a VLAN id");
+const PH_VLAN_CSV: Cand = ("<id,…>", "comma-separated VLAN ids");
+const PH_PUBKEY: Cand = ("<pubkey>", "the peer's WireGuard public key");
+const PH_U8: Cand = ("<0-255>", "a number 0-255");
+const PH_SECONDS: Cand = ("<seconds>", "a duration in seconds");
+const PH_NAME: Cand = ("<name>", "a name");
+const PH_TEXT: Cand = ("<text>", "free-form text");
+const PH_MAC: Cand = ("<xx:xx:xx:xx:xx:xx>", "a MAC address");
+const PH_KEY: Cand = ("<key>", "a key / secret");
+const PH_HOST_PORT: Cand = ("<host:port>", "a host and port");
+const PH_URL: Cand = ("<url>", "a URL");
+const PH_MTU: Cand = ("<68-9216>", "link MTU in bytes");
+const PH_NUMBER: Cand = ("<number>", "a number");
+const PH_DURATION: Cand = ("<12h|30m|3600>", "a duration (12h, 1h30m, or seconds)");
+
+/// Whether a completion keyword is a display-only value placeholder (see the
+/// `PH_*` consts) rather than a real, insertable keyword.
+fn is_placeholder(keyword: &str) -> bool {
+    keyword.starts_with('<')
+}
+
+/// Filter `all` candidates for the word the user has typed (`prefix`) and decide
+/// what each inserts. Real keywords are prefix-filtered as usual; display-only
+/// placeholders (`<…>`) always pass — even once the user has started typing a
+/// value like `10.` — and insert the current word unchanged, i.e. a no-op, so a
+/// literal `<A.B.C.D>` can never end up in the line. Returns, per surviving
+/// candidate, `(keyword, description, replacement)`.
+fn matches_for<'a>(all: &'a [(String, String)], prefix: &str) -> Vec<(&'a str, &'a str, String)> {
+    all.iter()
+        .filter(|(kw, _)| is_placeholder(kw) || kw.starts_with(prefix))
+        .map(|(kw, desc)| {
+            let replacement = if is_placeholder(kw) {
+                prefix.to_string() // no-op: leave the typed word untouched
+            } else {
+                format!("{kw} ")
+            };
+            (kw.as_str(), desc.as_str(), replacement)
+        })
+        .collect()
+}
+
 /// Static completion candidates for the token being typed, given the
 /// already-complete `tokens` before it. The interface/rule/zone/nat **name**
-/// positions and the zone-value positions are filled dynamically from the live
-/// config — see [`dyn_candidates`].
+/// positions, the zone-value positions and every free-form **value** position
+/// (which get `<…>` placeholders) are filled dynamically — see [`dyn_candidates`].
 fn candidates(tokens: &[&str]) -> &'static [Cand] {
     match tokens {
         [] => COMMANDS,
@@ -1844,9 +1951,12 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "system"] => SYSTEM_FIELDS,
         // `set interface <name> <field>` — name is freeform, then fields.
         ["set" | "delete", "interface", _name] => IFACE_FIELDS,
-        // WireGuard: `private-key` offers `generate`; a peer's fields follow its key.
-        ["set", "interface", _name, "private-key"] => WG_KEY_GEN,
-        ["set" | "delete", "interface", _name, "peer", _pk] => PEER_FIELDS,
+        ["set", "interface", _name, "vlan-aware"] => BOOLS,
+        // WireGuard keys + peers live under `vpn wireguard <ifname>` (the
+        // interface itself only carries `type wireguard` + address/zone).
+        ["set" | "delete", "vpn", "wireguard", _name] => WG_TUNNEL_FIELDS,
+        ["set", "vpn", "wireguard", _name, "private-key"] => WG_KEY_GEN,
+        ["set" | "delete", "vpn", "wireguard", _name, "peer", _pk] => PEER_FIELDS,
         // `address6 auto` completes the SLAAC keyword.
         ["set", "interface", _name, "address6"] => ADDRESS6_HINT,
         // Bridge/bond value completions.
@@ -1891,6 +2001,7 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "services", "snmp"] => SNMP_FIELDS,
         ["set" | "delete", "services", "mdns"] => MDNS_FIELDS,
         ["set" | "delete", "services", "dyndns"] => DYNDNS_FIELDS,
+        ["set", "services", "dyndns", "provider"] => DYNDNS_PROVIDERS,
         ["set" | "delete", "services", "dhcp-relay"] => DHCP_RELAY_FIELDS,
 
         // The firewall sub-tree.
@@ -1988,6 +2099,7 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set", "protocols", "filter", _name, "default"] => ACCEPT_REJECT,
         ["set" | "delete", "protocols", "filter", _name, "rule", _n] => FILTER_RULE_FIELDS,
         ["set", "protocols", "filter", _name, "rule", _n, "action"] => ACCEPT_REJECT,
+        ["set", "protocols", "filter", _name, "rule", _n, "protocol"] => FILTER_PROTOCOLS,
         ["set" | "delete", "protocols", "ospf"] => OSPF_FIELDS,
         ["set", "protocols", "ospf", "redistribute"] => REDIST,
         ["set", "protocols", "ospf", "network-type"] => OSPF_NETWORK_TYPES,
@@ -2090,18 +2202,31 @@ pub struct DynNames {
     pub nat_destination: Vec<String>,
     pub address_groups: Vec<String>,
     pub port_groups: Vec<String>,
+    pub filters: Vec<String>,
+    pub vrfs: Vec<String>,
+    pub ipsec: Vec<String>,
+    pub pki_cas: Vec<String>,
+    pub pki_certificates: Vec<String>,
+    pub wireguard: Vec<String>,
+}
+
+/// Own a static `Cand` slice into `(keyword, description)` pairs — the bridge
+/// from the static grammar / `PH_*` placeholders to the owned candidate list.
+fn own_cands(slice: &[Cand]) -> Vec<(String, String)> {
+    slice
+        .iter()
+        .map(|(k, d)| (k.to_string(), d.to_string()))
+        .collect()
 }
 
 /// Candidates for `tokens`, splicing in the live interface/rule/zone names at the
-/// name + zone-value positions and falling back to the static grammar elsewhere.
-/// Returns owned `(keyword, description)` pairs.
+/// name + zone-value positions, `<…>` value placeholders at every free-form value
+/// leaf, and falling back to the static grammar elsewhere. Returns owned
+/// `(keyword, description)` pairs. New grammar leaves adopt the same pattern:
+/// add an arm returning `own_cands(&[PH_…])` (a value) or the live names plus a
+/// `<name>` placeholder (a keyed instance).
 fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
-    let own = |slice: &[Cand]| -> Vec<(String, String)> {
-        slice
-            .iter()
-            .map(|(k, d)| (k.to_string(), d.to_string()))
-            .collect()
-    };
+    // Reference an existing zone (a value position).
     let zones = |label: &'static str| -> Vec<(String, String)> {
         names
             .zones
@@ -2109,62 +2234,334 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
             .map(|z| (z.clone(), label.to_string()))
             .collect()
     };
+    // Pick a live NIC (a value position that names an interface).
+    let nics = |label: &'static str| -> Vec<(String, String)> {
+        names
+            .interfaces
+            .iter()
+            .map(|n| (n.clone(), label.to_string()))
+            .collect()
+    };
+    // A keyed-instance NAME position: the existing instances, then a `<name>`
+    // placeholder inviting a fresh one (VyOS-style discovery).
+    let named =
+        |items: &[String], label: &'static str, hint: &'static str| -> Vec<(String, String)> {
+            let mut v: Vec<(String, String)> = items
+                .iter()
+                .map(|n| (n.clone(), label.to_string()))
+                .collect();
+            v.push(("<name>".to_string(), hint.to_string()));
+            v
+        };
     match tokens {
-        // `set interface <Tab>` → the NICs already present (system-discovered or
-        // added), so you can pick one to keep configuring — VyOS-style.
-        ["set" | "delete", "interface"] => names
-            .interfaces
-            .iter()
-            .map(|n| (n.clone(), "interface".to_string()))
-            .collect(),
-        ["set" | "delete", "firewall", "rule"] => names
-            .rules
-            .iter()
-            .map(|n| (n.clone(), "rule".to_string()))
-            .collect(),
-        ["set" | "delete", "nat", "source"] => names
-            .nat_source
-            .iter()
-            .map(|n| (n.clone(), "nat source".to_string()))
-            .collect(),
-        ["set" | "delete", "nat", "destination"] => names
-            .nat_destination
-            .iter()
-            .map(|n| (n.clone(), "nat destination".to_string()))
-            .collect(),
-        // `multiwan uplink <Tab>` → the NICs, so you pick one to make an uplink.
-        ["set" | "delete", "multiwan", "uplink"] => names
-            .interfaces
-            .iter()
-            .map(|n| (n.clone(), "interface".to_string()))
-            .collect(),
-        // `nat nat64 interface <Tab>` → the NICs (the IPv6-only side).
-        ["set", "nat", "nat64", "interface"] => names
-            .interfaces
-            .iter()
-            .map(|n| (n.clone(), "interface".to_string()))
-            .collect(),
-        // Zone-name positions splice in the known zones.
-        ["set" | "delete", "firewall", "zone"] => zones("zone"),
+        // ---- Keyed-instance NAME positions: live names + a `<name>` hint -----
+        ["set" | "delete", "interface"] => named(
+            &names.interfaces,
+            "interface",
+            "a new interface name (wg0, br0, …)",
+        ),
+        ["set" | "delete", "firewall", "rule"] => named(&names.rules, "rule", "a new rule name"),
+        ["set" | "delete", "nat", "source"] => named(
+            &names.nat_source,
+            "nat source",
+            "a new source-NAT rule name",
+        ),
+        ["set" | "delete", "nat", "destination"] => named(
+            &names.nat_destination,
+            "nat destination",
+            "a new destination-NAT rule name",
+        ),
+        ["set" | "delete", "firewall", "zone"] => named(&names.zones, "zone", "a new zone name"),
+        ["set" | "delete", "firewall", "group", "address-group"] => named(
+            &names.address_groups,
+            "address-group",
+            "a new address-group name",
+        ),
+        ["set" | "delete", "firewall", "group", "port-group"] => {
+            named(&names.port_groups, "port-group", "a new port-group name")
+        }
+        ["set" | "delete", "protocols", "vrrp"] => own_cands(&[PH_NAME]),
+        ["set" | "delete", "vpn", "ipsec"] => {
+            named(&names.ipsec, "IPsec connection", "a new connection name")
+        }
+        ["set" | "delete", "pki", "ca"] => named(&names.pki_cas, "CA", "a new CA name"),
+        ["set" | "delete", "pki", "certificate"] => named(
+            &names.pki_certificates,
+            "certificate",
+            "a new certificate name",
+        ),
+        ["set" | "delete", "protocols", "filter"] => {
+            named(&names.filters, "route filter", "a new filter name")
+        }
+        ["set" | "delete", "protocols", "vrf"] => named(&names.vrfs, "VRF", "a new VRF name"),
+        [
+            "set" | "delete",
+            "interface",
+            _name,
+            "dhcp-server",
+            "static-mapping",
+        ] => own_cands(&[PH_NAME]),
+        // Prefix / address instance positions.
+        ["set" | "delete", "protocols", "static"] => own_cands(&[PH_IPV4_CIDR, PH_IPV6_CIDR]),
+        ["set" | "delete", "protocols", "bgp", "aggregate" | "roa"] => {
+            own_cands(&[PH_IPV4_CIDR, PH_IPV6_CIDR])
+        }
+        ["set" | "delete", "protocols", "bgp", "neighbor"] => own_cands(&[PH_IPV4, PH_IPV6]),
+        ["set" | "delete", "protocols", "filter", _name, "rule"] => {
+            own_cands(&[("<1-4294967295>", "a rule index (lower runs first)")])
+        }
+
+        // ---- NIC-picker sub-positions (choose a live interface) --------------
+        ["set" | "delete", "multiwan", "uplink"] => nics("interface"),
+        ["set", "nat", "nat64", "interface"] => nics("interface"),
+        [
+            "set" | "delete",
+            "protocols",
+            "ospf" | "ospf3" | "rip" | "ripng" | "babel" | "isis" | "multicast",
+            "interface",
+        ] => nics("interface"),
+        ["set", "protocols", "vrrp", _name, "interface"] => nics("interface"),
+        ["set", "protocols", "static", _pfx, "dev"] => nics("interface"),
+        ["set", "interface", _name, "parent"] => nics("parent interface"),
+        ["set", "interface", _name, "pd-from"] => nics("uplink interface"),
+        ["set", "services", "dns" | "ntp", "serve-on"] => nics("interface"),
+        [
+            "set",
+            "services",
+            "lldp" | "mdns" | "dyndns" | "dhcp-relay",
+            "interface",
+        ] => nics("interface"),
+
+        // ---- Zone-VALUE positions (reference an existing zone) ---------------
         ["set", "interface", _name, "zone"] => zones("zone"),
         ["set", "firewall", "rule", _name, "from" | "to"] => zones("zone"),
         ["set", "nat", "source", _name, "zone"] => zones("zone"),
         ["set", "nat", "destination", _name, "zone"] => zones("zone"),
-        // Group-name positions splice in the declared alias names — both when
-        // editing/deleting a group and when a rule references one.
-        ["set" | "delete", "firewall", "group", "address-group"]
-        | ["set", "firewall", "rule", _, "source-group"] => names
+        // Group-REFERENCE positions (an existing alias, no `<name>` invite).
+        ["set", "firewall", "rule", _, "source-group"] => names
             .address_groups
             .iter()
             .map(|n| (n.clone(), "address-group".to_string()))
             .collect(),
-        ["set" | "delete", "firewall", "group", "port-group"]
-        | ["set", "firewall", "rule", _, "port-group"] => names
+        ["set", "firewall", "rule", _, "port-group"] => names
             .port_groups
             .iter()
             .map(|n| (n.clone(), "port-group".to_string()))
             .collect(),
-        _ => own(candidates(tokens)),
+
+        // ---- Interface value leaves ------------------------------------------
+        ["set", "interface", _name, "address"] => {
+            own_cands(&[PH_IPV4_CIDR, ("dhcp", "obtain the address via DHCP")])
+        }
+        ["set", "interface", _name, "address6"] => {
+            let mut v = own_cands(&[PH_IPV6_CIDR]);
+            v.extend(own_cands(ADDRESS6_HINT));
+            v
+        }
+        ["set", "interface", _name, "vlan"] => own_cands(&[PH_VLAN]),
+        ["set", "interface", _name, "pd-subnet" | "ttl"] => own_cands(&[PH_U8]),
+        ["set", "interface", _name, "mtu"] => own_cands(&[PH_MTU]),
+        ["set", "interface", _name, "mac"] => own_cands(&[PH_MAC]),
+        // Bridge/bond membership + per-port VLAN filtering.
+        ["set" | "delete", "interface", _name, "member"] => nics("member NIC"),
+        ["set", "interface", _name, "vlan-untagged"] => own_cands(&[PH_VLAN]),
+        ["set", "interface", _name, "vlan-tagged"] => own_cands(&[PH_VLAN_CSV]),
+        // WireGuard tunnel config (under `vpn wireguard <ifname>`): offer the
+        // declared type=wireguard interfaces first, all NICs as fallback.
+        ["set" | "delete", "vpn", "wireguard"] => {
+            let mut v: Vec<(String, String)> = names
+                .wireguard
+                .iter()
+                .map(|n| (n.clone(), "a type=wireguard interface".to_string()))
+                .collect();
+            if v.is_empty() {
+                v = nics("an interface (set `type wireguard` on it)");
+            }
+            v.push((PH_NAME.0.to_string(), PH_NAME.1.to_string()));
+            v
+        }
+        // Filter-name reference positions: the declared route filters.
+        ["set", "protocols", "import" | "export", _]
+        | [
+            "set",
+            "protocols",
+            "bgp",
+            "neighbor",
+            _,
+            "import" | "export",
+        ]
+        | ["set", "protocols", "vrf", _, "import" | "export"] => {
+            let mut v: Vec<(String, String)> = names
+                .filters
+                .iter()
+                .map(|n| (n.clone(), "a declared route filter".to_string()))
+                .collect();
+            v.push((PH_NAME.0.to_string(), "a filter name".to_string()));
+            v
+        }
+        // VRF-name reference positions: the declared VRFs.
+        ["set", "protocols", "static", _, "vrf"]
+        | [
+            "set",
+            "protocols",
+            "bgp" | "ospf" | "ospf3" | "rip" | "ripng" | "babel" | "isis",
+            "vrf",
+        ] => {
+            let mut v: Vec<(String, String)> = names
+                .vrfs
+                .iter()
+                .map(|n| (n.clone(), "a declared VRF".to_string()))
+                .collect();
+            v.push((PH_NAME.0.to_string(), "a VRF name".to_string()));
+            v
+        }
+        ["set" | "delete", "vpn", "wireguard", _name, "peer"] => own_cands(&[PH_PUBKEY]),
+        ["set", "vpn", "wireguard", _name, "listen-port"] => own_cands(&[PH_PORT]),
+        ["set", "vpn", "wireguard", _name, "private-key"] => {
+            let mut v = own_cands(&[PH_KEY]);
+            v.extend(own_cands(WG_KEY_GEN));
+            v
+        }
+        ["set", "vpn", "wireguard", _name, "peer", _pk, "endpoint"] => own_cands(&[PH_HOST_PORT]),
+        ["set", "vpn", "wireguard", _name, "peer", _pk, "allowed-ips"] => {
+            own_cands(&[PH_IPV4_CIDR, PH_IPV6_CIDR])
+        }
+        ["set", "vpn", "wireguard", _name, "peer", _pk, "keepalive"] => own_cands(&[PH_SECONDS]),
+        [
+            "set",
+            "vpn",
+            "wireguard",
+            _name,
+            "peer",
+            _pk,
+            "preshared-key",
+        ] => own_cands(&[PH_KEY]),
+        ["set", "interface", _name, "local" | "remote"] => own_cands(&[PH_IPV4]),
+        [
+            "set",
+            "interface",
+            _name,
+            "dhcp-server",
+            "dns" | "default-router",
+        ] => own_cands(&[PH_IPV4]),
+        [
+            "set",
+            "interface",
+            _name,
+            "dhcp-server",
+            "static-mapping",
+            _l,
+            "mac",
+        ] => own_cands(&[PH_MAC]),
+        [
+            "set",
+            "interface",
+            _name,
+            "dhcp-server",
+            "static-mapping",
+            _l,
+            "ip",
+        ] => own_cands(&[PH_IPV4]),
+        ["set", "interface", _name, "router-advert", "prefix"] => own_cands(&[PH_IPV6_CIDR]),
+        ["set", "interface", _name, "router-advert", "dns"] => own_cands(&[PH_IPV6]),
+        [
+            "set",
+            "interface",
+            _name,
+            "router-advert",
+            "router-lifetime",
+        ] => own_cands(&[PH_SECONDS]),
+        ["set", "interface", _name, "pppoe", "mru"] => own_cands(&[PH_MTU]),
+        ["set", "interface", _name, "key"] => {
+            own_cands(&[("<0-4294967295>", "a GRE key (demultiplexes tunnels)")])
+        }
+        [
+            "set",
+            "interface",
+            _name,
+            "dhcp-server",
+            "pool-offset" | "pool-size",
+        ] => own_cands(&[PH_NUMBER]),
+        ["set", "interface", _name, "dhcp-server", "lease-time"] => own_cands(&[PH_DURATION]),
+        ["set", "interface", _name, "qos", "limit"] => {
+            own_cands(&[("<packets>", "fq_codel backlog packet limit")])
+        }
+
+        // ---- protocols value leaves ------------------------------------------
+        ["set", "protocols", "router-id"] => own_cands(&[PH_IPV4]),
+        ["set", "protocols", "static", _pfx, "via"] => own_cands(&[PH_IPV4, PH_IPV6]),
+        ["set", "protocols", "babel", "router-id"] => own_cands(&[PH_IPV4]),
+        ["set", "protocols", "bgp", "local-as"] => own_cands(&[PH_ASN]),
+        ["set", "protocols", "bgp", "router-id"] => own_cands(&[PH_IPV4]),
+        ["set", "protocols", "bgp", "hold-time"] => own_cands(&[PH_SECONDS]),
+        ["set", "protocols", "bgp", "network"] => own_cands(&[PH_IPV4_CIDR, PH_IPV6_CIDR]),
+        ["set", "protocols", "bgp", "confederation", "id" | "member"] => own_cands(&[PH_ASN]),
+        ["set", "protocols", "bgp", "rpki", "rtr"] => own_cands(&[PH_HOST_PORT]),
+        ["set", "protocols", "bgp", "rpki", "rtr-refresh"] => own_cands(&[PH_SECONDS]),
+        ["set", "protocols", "bgp", "roa", _pfx, "origin-as"] => own_cands(&[PH_ASN]),
+        [
+            "set",
+            "protocols",
+            "bgp",
+            "neighbor",
+            _addr,
+            "remote-as" | "local-as",
+        ] => own_cands(&[PH_ASN]),
+        ["set", "protocols", "bgp", "neighbor", _addr, "hold-time"] => own_cands(&[PH_SECONDS]),
+        [
+            "set",
+            "protocols",
+            "bgp",
+            "neighbor",
+            _addr,
+            "update-source",
+        ] => own_cands(&[PH_IPV4, PH_IPV6]),
+        ["set", "protocols", "vrrp", _name, "virtual-address"] => own_cands(&[PH_IPV4, PH_IPV6]),
+
+        // ---- firewall / nat value leaves -------------------------------------
+        ["set", "firewall", "global", "block"] => own_cands(&[PH_IPV4_CIDR, PH_IPV6_CIDR]),
+        ["set", "firewall", "zone", _name, "block"] => own_cands(&[PH_IPV4_CIDR, PH_IPV6_CIDR]),
+        ["set", "firewall", "rule", _name, "source"] => own_cands(&[PH_IPV4_CIDR, PH_IPV6_CIDR]),
+        ["set", "firewall", "rule", _name, "port"] => own_cands(&[PH_PORT_RANGE]),
+        ["set", "nat", "destination", _name, "port"] => own_cands(&[PH_PORT]),
+        ["set", "nat", "destination", _name, "to"] => own_cands(&[PH_IPV4_TO]),
+        ["set", "nat", "nat64", "prefix"] => own_cands(&[PH_IPV6_CIDR]),
+        ["set", "nat", "nat64", "pool"] => own_cands(&[PH_IPV4_CIDR]),
+
+        // ---- services value leaves -------------------------------------------
+        ["set", "services", "dns" | "ntp", "upstream"] => own_cands(&[PH_IPV4, PH_IPV6]),
+        ["set", "services", "snmp", "listen"] => own_cands(&[PH_IPV4]),
+        ["set", "services", "snmp", "community"] => own_cands(&[PH_KEY]),
+        ["set", "services", "snmp", "location" | "contact"] => own_cands(&[PH_TEXT]),
+        ["set", "services", "dhcp-relay", "server"] => own_cands(&[PH_IPV4]),
+        ["set", "services", "dyndns", "hostname"] => {
+            own_cands(&[("<fqdn>", "a fully-qualified domain name")])
+        }
+        ["set", "services", "dyndns", "server"] => own_cands(&[PH_HOST_PORT]),
+
+        // ---- multiwan / vpn / pki value leaves -------------------------------
+        ["set", "multiwan", "uplink", _if, "gateway"] => {
+            own_cands(&[PH_IPV4, ("dhcp", "resolve from the DHCP lease")])
+        }
+        ["set", "multiwan", "uplink", _if, "check", "target"] => own_cands(&[PH_IPV4]),
+        ["set", "vpn", "ipsec", _name, "local" | "remote"] => own_cands(&[PH_IPV4]),
+        [
+            "set",
+            "vpn",
+            "ipsec",
+            _name,
+            "local-subnet" | "remote-subnet",
+        ] => own_cands(&[PH_IPV4_CIDR]),
+        ["set", "vpn", "ipsec", _name, "psk"] => own_cands(&[PH_KEY]),
+        ["set", "pki", "acme", "directory-url"] => own_cands(&[PH_URL]),
+        ["set", "pki", "acme", "email"] => own_cands(&[("<email>", "a contact email address")]),
+
+        // ---- Generic trailing hints (field names that mean the same anywhere) -
+        ["set", .., "hostname"] => own_cands(&[PH_NAME]),
+        [.., "password"] => own_cands(&[PH_KEY]),
+        [.., "description"] => own_cands(&[PH_TEXT]),
+
+        _ => own_cands(candidates(tokens)),
     }
 }
 
@@ -2223,36 +2620,108 @@ impl ConfigCompleter {
         *self.context.borrow_mut() = ctx.to_vec();
     }
 
-    /// Refresh the interface/rule/zone names offered at the name + zone-value
+    /// Refresh the live instance names offered at the name + reference-value
     /// positions. Called from the configure loop after every command so new
-    /// interfaces/rules/zones become completable immediately.
-    #[allow(clippy::too_many_arguments)]
-    pub fn set_names(
-        &self,
-        interfaces: Vec<String>,
-        rules: Vec<String>,
-        zones: Vec<String>,
-        nat_source: Vec<String>,
-        nat_destination: Vec<String>,
-        address_groups: Vec<String>,
-        port_groups: Vec<String>,
-    ) {
-        *self.names.borrow_mut() = DynNames {
-            interfaces,
-            rules,
-            zones,
-            nat_source,
-            nat_destination,
-            address_groups,
-            port_groups,
-        };
+    /// interfaces/rules/zones/filters/… become completable immediately.
+    pub fn set_names(&self, names: DynNames) {
+        *self.names.borrow_mut() = names;
+    }
+}
+
+/// The commands the shell actually accepts, for first-word highlighting: the
+/// completion table plus the two working aliases (`del`, `quit`). Retired Cisco
+/// spellings (`no`/`do`/`end`) are deliberately absent — they render red.
+fn is_known_command(word: &str) -> bool {
+    COMMANDS.iter().any(|(k, _)| *k == word) || matches!(word, "del" | "quit")
+}
+
+/// A ghost hint that is displayed but never inserted: `completion()` returns
+/// `None`, so right-arrow/End does nothing and a value placeholder like
+/// `<A.B.C.D>` can never leak into the line (unlike the stock `String` hint).
+pub struct ValueHint(String);
+impl rustyline::hint::Hint for ValueHint {
+    fn display(&self) -> &str {
+        &self.0
+    }
+    fn completion(&self) -> Option<&str> {
+        None
     }
 }
 
 impl Hinter for ConfigCompleter {
-    type Hint = String;
+    type Hint = ValueHint;
+
+    /// At a fresh word boundary (the line ends in a space) whose next token is a
+    /// value position, show the `<…>` placeholder(s) as dimmed ghost text — so
+    /// the box says *what to type* even where there is a single value and no
+    /// keyword list to Tab through.
+    fn hint(&self, line: &str, pos: usize, _ctx: &rustyline::Context<'_>) -> Option<ValueHint> {
+        if pos != line.len() || !ui::enabled() || !line.ends_with(char::is_whitespace) {
+            return None;
+        }
+        let before: Vec<&str> = line.split_whitespace().collect();
+        if before.is_empty() {
+            return None;
+        }
+        let ctx = self.context.borrow();
+        let eff = effective_tokens(&before, &ctx);
+        let eff_view: Vec<&str> = eff.iter().map(String::as_str).collect();
+        let names = self.names.borrow();
+        let hints: Vec<String> = dyn_candidates(&eff_view, &names)
+            .into_iter()
+            .map(|(k, _)| k)
+            .filter(|k| is_placeholder(k))
+            .collect();
+        if hints.is_empty() {
+            return None;
+        }
+        Some(ValueHint(ui::dim(&format!(" {}", hints.join(" | ")))))
+    }
 }
-impl Highlighter for ConfigCompleter {}
+
+impl Highlighter for ConfigCompleter {
+    /// Colour the first word once it is complete (a space follows it): bold green
+    /// if it is a real command, bold red if not. The rest of the line is left
+    /// untouched, and a half-typed command (no space yet) is not flagged.
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
+        if !ui::enabled() {
+            return Cow::Borrowed(line);
+        }
+        let lead = line.len() - line.trim_start().len();
+        let rest = &line[lead..];
+        let Some(word_len) = rest.find(char::is_whitespace) else {
+            return Cow::Borrowed(line); // first word not finished yet
+        };
+        let word = &rest[..word_len];
+        let coloured = if is_known_command(word) {
+            ui::green_bold(word)
+        } else {
+            ui::red_bold(word)
+        };
+        Cow::Owned(format!("{}{coloured}{}", &line[..lead], &rest[word_len..]))
+    }
+
+    /// Bold the prompt. rustyline measures the *plain* prompt passed to
+    /// `readline` for its width maths, so wrapping it in ANSI here is safe — the
+    /// `*` dirty-marker stays part of that plain prompt.
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
+        &'s self,
+        prompt: &'p str,
+        _default: bool,
+    ) -> Cow<'b, str> {
+        if ui::enabled() {
+            Cow::Owned(ui::bold(prompt))
+        } else {
+            Cow::Borrowed(prompt)
+        }
+    }
+
+    /// Re-highlight once the first word is complete (a space is present): cheap,
+    /// and enough to catch the word flipping known↔unknown as it is edited.
+    fn highlight_char(&self, line: &str, _pos: usize, forced: bool) -> bool {
+        forced || (ui::enabled() && line.contains(char::is_whitespace))
+    }
+}
 impl Validator for ConfigCompleter {}
 impl Helper for ConfigCompleter {}
 
@@ -2282,27 +2751,40 @@ impl Completer for ConfigCompleter {
         // offered (a bare config path is not a command), deeper positions
         // complete the config tree.
         let all = dyn_candidates(&eff_view, &names);
-        let matched: Vec<&(String, String)> = all
-            .iter()
-            .filter(|(kw, _)| kw.starts_with(prefix))
-            .collect();
+        // Real keywords are prefix-filtered; `<…>` placeholders always show (and
+        // insert nothing) — so a value position keeps hinting even mid-value.
+        let matched = matches_for(&all, prefix);
 
-        // Align the keyword column, then pad each row out to the terminal width
-        // so rustyline lists one candidate per line (keyword + description
-        // stacked vertically), vtysh-style, instead of a packed grid.
-        let kw_w = matched.iter().map(|(kw, _)| kw.len()).max().unwrap_or(0);
+        // Align the keyword column on VISIBLE width (the keywords carry no colour
+        // yet), colour each piece, then pad each row out to the terminal width so
+        // rustyline lists one candidate per line, vtysh-style, not a packed grid.
+        let kw_w = matched.iter().map(|(kw, _, _)| kw.len()).max().unwrap_or(0);
         let row_w = term_width().saturating_sub(1);
         let matches = matched
             .iter()
-            .map(|(kw, desc)| {
-                let body = if desc.is_empty() {
-                    kw.clone()
+            .map(|(kw, desc, repl)| {
+                // Keyword column bold; a `<…>` placeholder italic+yellow; the
+                // description column dimmed.
+                let kw_col = if is_placeholder(kw) {
+                    ui::italic(&ui::yellow(kw))
                 } else {
-                    format!("{kw:<kw_w$}  {desc}")
+                    ui::bold(kw)
                 };
+                // Compute the row's VISIBLE width from the plain pieces so the
+                // padding is right despite the (zero-visible-width) colour codes.
+                let (body, visible) = if desc.is_empty() {
+                    (kw_col, kw.len())
+                } else {
+                    let gap = " ".repeat(kw_w.saturating_sub(kw.len()));
+                    (
+                        format!("{kw_col}{gap}  {}", ui::dim(desc)),
+                        kw_w + 2 + desc.len(),
+                    )
+                };
+                let pad = " ".repeat(row_w.saturating_sub(visible));
                 Pair {
-                    display: format!("{body:<row_w$}"),
-                    replacement: format!("{kw} "),
+                    display: format!("{body}{pad}"),
+                    replacement: repl.clone(),
                 }
             })
             .collect();
@@ -2369,9 +2851,6 @@ mod tests {
                 "pd-subnet",
                 "parent",
                 "vlan",
-                "private-key",
-                "listen-port",
-                "peer",
                 "dhcp-server",
                 "router-advert",
                 "type",
@@ -2379,13 +2858,25 @@ mod tests {
                 "remote",
                 "key",
                 "ttl",
-                "master",
+                "member",
                 "bond-mode",
+                "vlan-aware",
+                "vlan-tagged",
+                "vlan-untagged",
                 "mtu",
                 "mac",
                 "qos",
                 "pppoe"
             ]
+        );
+        // WireGuard tunnel config is discoverable under `vpn wireguard`.
+        assert_eq!(
+            kw(&["set", "vpn", "wireguard", "wg0"]),
+            ["private-key", "listen-port", "peer"]
+        );
+        assert_eq!(
+            kw(&["set", "vpn", "wireguard", "wg0", "peer", "PUBKEY"]),
+            ["allowed-ips", "endpoint", "keepalive", "preshared-key"]
         );
         // The QoS sub-tree of an interface is discoverable.
         assert_eq!(
@@ -2451,16 +2942,8 @@ mod tests {
             kw(&["set", "interface", "ppp0", "pppoe"]),
             ["username", "password", "service-name", "ac-name", "mru"]
         );
-        // WireGuard completion: `private-key` offers `generate`; a peer's fields
-        // follow after its public key.
-        assert_eq!(
-            kw(&["set", "interface", "wg0", "private-key"]),
-            ["generate"]
-        );
-        assert_eq!(
-            kw(&["set", "interface", "wg0", "peer", "PUBKEY"]),
-            ["allowed-ips", "endpoint", "keepalive", "preshared-key"]
-        );
+        // WireGuard keys/peers moved to `vpn wireguard` — the interface no
+        // longer offers them (asserted via the exact IFACE_FIELDS list above).
         // The firewall sub-tree is discoverable level by level (NAT is separate).
         assert_eq!(
             kw(&["set", "firewall"]),
@@ -2669,6 +3152,12 @@ mod tests {
             nat_destination: vec!["web-fwd".into()],
             address_groups: vec!["mgmt".into()],
             port_groups: vec!["webports".into()],
+            filters: vec!["from-peer".into()],
+            vrfs: vec!["blue".into()],
+            ipsec: vec!["hq".into()],
+            pki_cas: vec!["root".into()],
+            pki_certificates: vec!["api".into()],
+            wireguard: vec!["wg0".into()],
         };
         let kws = |toks: &[&str]| -> Vec<String> {
             dyn_candidates(toks, &names)
@@ -2676,12 +3165,13 @@ mod tests {
                 .map(|(k, _)| k)
                 .collect()
         };
-        // Name positions splice in the live interface/rule/zone/nat names.
-        assert_eq!(kws(&["set", "interface"]), ["eth0", "eth1"]);
-        assert_eq!(kws(&["delete", "firewall", "rule"]), ["web"]);
-        assert_eq!(kws(&["set", "nat", "source"]), ["wan-masq"]);
-        assert_eq!(kws(&["set", "nat", "destination"]), ["web-fwd"]);
-        assert_eq!(kws(&["set", "firewall", "zone"]), ["lan", "wan"]);
+        // Name positions splice in the live interface/rule/zone/nat names, then
+        // a `<name>` placeholder inviting a fresh instance.
+        assert_eq!(kws(&["set", "interface"]), ["eth0", "eth1", "<name>"]);
+        assert_eq!(kws(&["delete", "firewall", "rule"]), ["web", "<name>"]);
+        assert_eq!(kws(&["set", "nat", "source"]), ["wan-masq", "<name>"]);
+        assert_eq!(kws(&["set", "nat", "destination"]), ["web-fwd", "<name>"]);
+        assert_eq!(kws(&["set", "firewall", "zone"]), ["lan", "wan", "<name>"]);
         // Zone-value positions splice in the known zone names.
         assert_eq!(kws(&["set", "interface", "eth0", "zone"]), ["lan", "wan"]);
         assert_eq!(
@@ -2696,15 +3186,16 @@ mod tests {
             kws(&["set", "nat", "destination", "web-fwd", "zone"]),
             ["lan", "wan"]
         );
-        // Group-name positions splice in the declared alias names (both when
-        // editing a group and when a rule references one).
+        // Group-DEFINITION positions splice in the declared alias names, then a
+        // `<name>` invite; group-REFERENCE positions (a rule) list only the
+        // existing aliases.
         assert_eq!(
             kws(&["set", "firewall", "group", "address-group"]),
-            ["mgmt"]
+            ["mgmt", "<name>"]
         );
         assert_eq!(
             kws(&["set", "firewall", "group", "port-group"]),
-            ["webports"]
+            ["webports", "<name>"]
         );
         assert_eq!(
             kws(&["set", "firewall", "rule", "web", "source-group"]),
@@ -2741,9 +3232,6 @@ mod tests {
                 "pd-subnet",
                 "parent",
                 "vlan",
-                "private-key",
-                "listen-port",
-                "peer",
                 "dhcp-server",
                 "router-advert",
                 "type",
@@ -2751,14 +3239,222 @@ mod tests {
                 "remote",
                 "key",
                 "ttl",
-                "master",
+                "member",
                 "bond-mode",
+                "vlan-aware",
+                "vlan-tagged",
+                "vlan-untagged",
                 "mtu",
                 "mac",
                 "qos",
                 "pppoe"
             ]
         );
+        // WireGuard keys/peers live under `vpn wireguard <ifname>`, not on the
+        // interface.
+        assert_eq!(
+            kws(&["set", "vpn", "wireguard", "wg0"]),
+            ["private-key", "listen-port", "peer"]
+        );
+        assert_eq!(
+            kws(&["set", "vpn", "wireguard", "wg0", "private-key"]),
+            ["<key>", "generate"]
+        );
+    }
+
+    #[test]
+    fn value_positions_offer_display_only_placeholders() {
+        let names = DynNames::default();
+        let kws = |toks: &[&str]| -> Vec<String> {
+            dyn_candidates(toks, &names)
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect()
+        };
+        // A BGP neighbour address position hints both address families.
+        let n = kws(&["set", "protocols", "bgp", "neighbor"]);
+        assert!(n.contains(&"<A.B.C.D>".to_string()), "{n:?}");
+        assert!(n.contains(&"<X:X::X:X>".to_string()), "{n:?}");
+        // remote-as / hold-time / interface address / nat to / firewall source /
+        // rule port / mac / psk each get their vtysh-style value hint.
+        assert_eq!(
+            kws(&[
+                "set",
+                "protocols",
+                "bgp",
+                "neighbor",
+                "10.0.0.2",
+                "remote-as"
+            ]),
+            ["<1-4294967295>"]
+        );
+        assert_eq!(
+            kws(&["set", "protocols", "bgp", "hold-time"]),
+            ["<seconds>"]
+        );
+        assert_eq!(
+            kws(&["set", "interface", "eth0", "address"]),
+            ["<A.B.C.D/M>", "dhcp"]
+        );
+        assert_eq!(
+            kws(&["set", "interface", "eth0", "address6"]),
+            ["<X:X::X:X/M>", "auto", "dhcp"]
+        );
+        assert_eq!(kws(&["set", "interface", "eth0", "vlan"]), ["<1-4094>"]);
+        assert_eq!(
+            kws(&["set", "interface", "eth0", "mac"]),
+            ["<xx:xx:xx:xx:xx:xx>"]
+        );
+        assert_eq!(
+            kws(&["set", "nat", "destination", "web", "to"]),
+            ["<A.B.C.D:port>"]
+        );
+        assert_eq!(
+            kws(&["set", "firewall", "rule", "web", "source"]),
+            ["<A.B.C.D/M>", "<X:X::X:X/M>"]
+        );
+        assert_eq!(
+            kws(&["set", "firewall", "rule", "web", "port"]),
+            ["<port|lo-hi>"]
+        );
+        assert_eq!(kws(&["set", "vpn", "ipsec", "t0", "psk"]), ["<key>"]);
+        // A description anywhere, and any password, get generic hints.
+        assert_eq!(
+            kws(&["set", "firewall", "rule", "web", "description"]),
+            ["<text>"]
+        );
+        assert_eq!(kws(&["set", "system", "hostname"]), ["<name>"]);
+        assert_eq!(
+            kws(&["set", "interface", "ppp0", "pppoe", "password"]),
+            ["<key>"]
+        );
+        // A fresh keyed-instance name position invites a `<name>`.
+        assert_eq!(kws(&["set", "vpn", "ipsec"]), ["<name>"]);
+        assert_eq!(kws(&["set", "pki", "ca"]), ["<name>"]);
+    }
+
+    #[test]
+    fn matches_for_keeps_placeholders_and_makes_them_no_ops() {
+        let all = vec![
+            ("<A.B.C.D/M>".to_string(), "an IPv4 prefix".to_string()),
+            ("dhcp".to_string(), "obtain via DHCP".to_string()),
+        ];
+        let names = |v: &[(&str, &str, String)]| -> Vec<String> {
+            v.iter().map(|(k, _, _)| k.to_string()).collect()
+        };
+        // Empty prefix: both the placeholder and the real keyword show.
+        let m = matches_for(&all, "");
+        assert_eq!(names(&m), ["<A.B.C.D/M>", "dhcp"]);
+        // A typed value prefix (`10.`) still lists the placeholder, but drops the
+        // now-non-matching real keyword.
+        let m = matches_for(&all, "10.");
+        assert_eq!(names(&m), ["<A.B.C.D/M>"]);
+        // The placeholder's replacement is a no-op: it re-inserts the typed word
+        // unchanged, so a literal `<A.B.C.D/M>` is never entered.
+        assert_eq!(m[0].2, "10.");
+        // With prefix `d` both the (always-shown) placeholder and `dhcp` match;
+        // the real keyword inserts itself plus a trailing space.
+        let m = matches_for(&all, "d");
+        assert_eq!(names(&m), ["<A.B.C.D/M>", "dhcp"]);
+        let dhcp = m.iter().find(|(k, _, _)| *k == "dhcp").unwrap();
+        assert_eq!(dhcp.2, "dhcp ");
+    }
+
+    #[test]
+    fn followup_audit_positions_are_covered() {
+        // Closed-enum tables (static grammar).
+        assert!(kw(&["set", "protocols", "ospf", "redistribute"]).contains(&"bgp"));
+        assert_eq!(
+            kw(&["set", "services", "dyndns", "provider"]),
+            ["dyndns2", "cloudflare", "duckdns", "noip"]
+        );
+        assert_eq!(
+            kw(&["set", "protocols", "filter", "f", "rule", "10", "protocol"]),
+            [
+                "connected",
+                "static",
+                "kernel",
+                "rip",
+                "ospf",
+                "bgp",
+                "isis",
+                "babel"
+            ]
+        );
+
+        // Interface-name splices reuse the live NIC list.
+        let names = DynNames {
+            interfaces: vec!["eth0".into(), "eth1".into()],
+            ..DynNames::default()
+        };
+        let kws = |toks: &[&str]| -> Vec<String> {
+            dyn_candidates(toks, &names)
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect()
+        };
+        for toks in [
+            vec!["set", "interface", "vlan10", "parent"],
+            vec!["set", "interface", "lan0", "pd-from"],
+            vec!["set", "services", "dns", "serve-on"],
+            vec!["set", "services", "ntp", "serve-on"],
+            vec!["set", "services", "lldp", "interface"],
+            vec!["set", "services", "mdns", "interface"],
+            vec!["set", "services", "dhcp-relay", "interface"],
+            vec!["set", "protocols", "vrrp", "v1", "interface"],
+            vec!["set", "protocols", "static", "10.0.0.0/8", "dev"],
+            vec!["set", "protocols", "ospf", "interface"],
+        ] {
+            assert_eq!(
+                kws(&toks),
+                ["eth0", "eth1"],
+                "NIC splice missing at {toks:?}"
+            );
+        }
+
+        // Format-hint placeholders at the remaining value leaves.
+        let ph = |toks: &[&str]| -> Vec<String> { kws(toks) };
+        assert_eq!(ph(&["set", "interface", "eth0", "mtu"]), ["<68-9216>"]);
+        assert_eq!(ph(&["set", "interface", "gre0", "key"]), ["<0-4294967295>"]);
+        assert_eq!(
+            ph(&["set", "interface", "lan0", "dhcp-server", "pool-offset"]),
+            ["<number>"]
+        );
+        assert_eq!(
+            ph(&["set", "interface", "lan0", "dhcp-server", "lease-time"]),
+            ["<12h|30m|3600>"]
+        );
+        assert_eq!(
+            ph(&[
+                "set",
+                "interface",
+                "lan0",
+                "router-advert",
+                "router-lifetime"
+            ]),
+            ["<seconds>"]
+        );
+        assert_eq!(
+            ph(&["set", "interface", "wan0", "qos", "limit"]),
+            ["<packets>"]
+        );
+        // dhcp-relay server is an IP value, not a NIC.
+        assert_eq!(
+            ph(&["set", "services", "dhcp-relay", "server"]),
+            ["<A.B.C.D>"]
+        );
+    }
+
+    #[test]
+    fn command_word_recognition_drives_highlighting() {
+        // Real commands (and the working aliases) are known; retired spellings
+        // and typos are not (they highlight red).
+        for ok in ["set", "delete", "show", "commit", "del", "quit"] {
+            assert!(is_known_command(ok), "{ok} should be known");
+        }
+        for bad in ["no", "do", "end", "interface", "shwo"] {
+            assert!(!is_known_command(bad), "{bad} should be unknown");
+        }
     }
 
     #[test]

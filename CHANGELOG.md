@@ -24,6 +24,41 @@ declarative config model.
   only, `NO_COLOR` respected), and did-you-mean guidance — mistyped commands,
   retired spellings (`no`/`do`/`end`), and bare config paths all point at the
   correct VyOS spelling.
+- **Value hints everywhere (vtysh style).** Every value position shows what to
+  type: `<A.B.C.D>`, `<X:X::X:X>`, `<A.B.C.D/M>`, `<1-65535>`, `<1-4094>`,
+  `<xx:xx:xx:xx:xx:xx>`, `<host:port>`, … as display-only completion entries
+  (Tab never inserts them) plus a dimmed inline ghost hint at single-value
+  positions. Live names are offered wherever a value references something that
+  exists: interfaces, zones, rules, NAT rules, groups, route filters, VRFs,
+  IPsec connections, PKI CAs/certificates, WireGuard tunnels. The completion
+  list is typographically layered (bold keywords, italic hints, dim
+  descriptions) and the command word highlights green/red as you type.
+- **L2 done right: bridge/bond members and 802.1Q on the device.** Membership
+  now lives on the bridge/bond itself — `set interface br0 member eth1`
+  (repeatable, per-member delete); the old per-NIC `master` field is gone. A
+  bridge can be `vlan-aware` with per-port `vlan-tagged <ids>` and
+  `vlan-untagged <pvid>` (rendered as networkd `VLANFiltering=` +
+  `[BridgeVLAN]`). A VLAN subinterface named `<parent>.<id>` infers `parent`
+  and `vlan` from its name at commit.
+- **WireGuard moved under `vpn`.** `set interface wg0 type wireguard` creates
+  the interface (address/zone as usual); keys and peers live at
+  `set vpn wireguard wg0 private-key|listen-port|peer <pubkey> …` next to
+  IPsec — cross-checked both ways at commit.
+- **Config-model audit fixes.** `firewall rule … to <zone>` is now optional
+  and draws an explicit commit warning (the datapath does not enforce the
+  destination zone yet — rules apply from their source zone); broad
+  drop/reject rules are rejected with the working alternative named. List
+  fields (BGP communities/networks, IGP interface/redistribute lists, group
+  members, service upstreams, VRRP addresses, …) gained per-item add/remove
+  instead of replace-on-set. Dozens of new validations: injection-shaped
+  characters in SNMP/dyndns/DNS free-text (also rejected again at render
+  time), VRF table ranges + collision with multi-WAN policy tables,
+  OSPF/IS-IS `dead > hello`, BFD/VRRP/ROA ranges, DHCP pools inside the
+  interface subnet, IPsec PSK length, NAT port 0, `protocols import` keyed to
+  the routing daemon's actual protocol set. Multi-WAN health checks honour
+  per-uplink intervals; a disabled PPPoE interface tears its session down;
+  OSPFv3 `redistribute` values the daemon can't express error instead of
+  silently vanishing.
 - **Full per-neighbour BGP.** Every wren neighbor field is now reachable:
   `local-as`, `update-source`, `ebgp-multihop`, `description`, `shutdown`,
   `hold-time`, and more; route-maps via `[[protocols.filter]]`, communities,

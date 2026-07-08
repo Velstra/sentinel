@@ -1109,9 +1109,10 @@
         '';
       };
 
-      # WireGuard (roadmap C1): a `[[interface]]` that carries a `private-key`
-      # renders to a `Kind=wireguard` netdev (0640 root:systemd-network, since it
-      # embeds the key), participates in the firewall via its `zone`, and networkd
+      # WireGuard (roadmap C1): a `type = "wireguard"` interface plus a matching
+      # `[[vpn.wireguard]]` tunnel (the private key + peers) render to a
+      # `Kind=wireguard` netdev (0640 root:systemd-network, since it embeds the
+      # key), participate in the firewall via the interface `zone`, and networkd
       # + the kernel bring up a real `wg0` link with the declared peer.
       #   nix build .#checks.x86_64-linux.wireguard -L
       # The two fixed keys below were produced with the real `wg` tool:
@@ -1133,16 +1134,17 @@
           machine.wait_for_unit("sentinel-boot.service")
           machine.wait_for_unit("velstra.service")
 
-          # Declare a WireGuard tunnel AS THE ADMIN USER: a private key, a listen
-          # port, an address (so the link is zoned + brought up), a firewall zone,
-          # and one peer with allowed-ips + endpoint. commit applies live.
+          # Declare a WireGuard tunnel AS THE ADMIN USER: create the interface
+          # (type wireguard) with an address + firewall zone, then configure the
+          # private key, listen port and one peer under vpn. commit applies live.
           machine.succeed(
               "su admin -c \"printf '%s\\n' "
-              "'set interface wg0 private-key ICOioMTTlfQE/2NndOoEntortz+0tZ5Hll0AEM7tdmE=' "
-              "'set interface wg0 listen-port 51820' "
+              "'set interface wg0 type wireguard' "
               "'set interface wg0 address 10.9.0.1/24' 'set interface wg0 zone lan' "
-              "'set interface wg0 peer ukF+iwo+aai/wm9k1nIlxCBFRnZ+bLPb2xIu4+4PvmQ= allowed-ips 10.9.0.2/32' "
-              "'set interface wg0 peer ukF+iwo+aai/wm9k1nIlxCBFRnZ+bLPb2xIu4+4PvmQ= endpoint 192.0.2.7:51820' "
+              "'set vpn wireguard wg0 private-key ICOioMTTlfQE/2NndOoEntortz+0tZ5Hll0AEM7tdmE=' "
+              "'set vpn wireguard wg0 listen-port 51820' "
+              "'set vpn wireguard wg0 peer ukF+iwo+aai/wm9k1nIlxCBFRnZ+bLPb2xIu4+4PvmQ= allowed-ips 10.9.0.2/32' "
+              "'set vpn wireguard wg0 peer ukF+iwo+aai/wm9k1nIlxCBFRnZ+bLPb2xIu4+4PvmQ= endpoint 192.0.2.7:51820' "
               "commit save exit "
               "| sentinel configure\""
           )
@@ -3267,31 +3269,42 @@
             fw.wait_for_unit("multi-user.target")
             fw.wait_for_unit("velstra.service")
 
-            # Build a bridge (br0 <- eth1, holding the LAN IP) and a bond (bond0
-            # <- eth2, active-backup). ONE `set` per line.
+            # Build a VLAN-aware bridge (br0 <- eth1, holding the LAN IP) and a
+            # bond (bond0 <- eth2, active-backup). Members are listed on the
+            # device; eth1 is a tagged+untagged bridge port. ONE `set` per line.
             fw.succeed(
                 "su admin -c \"printf '%s\\n' "
                 "'set interface br0 type bridge' "
+                "'set interface br0 vlan-aware true' "
                 "'set interface br0 zone lan' "
                 "'set interface br0 address 10.0.0.1/24' "
-                "'set interface eth1 master br0' "
+                "'set interface br0 member eth1' "
+                "'set interface eth1 vlan-untagged 1' "
+                "'set interface eth1 vlan-tagged 10' "
                 "'set interface bond0 type bond' "
                 "'set interface bond0 bond-mode active-backup' "
-                "'set interface eth2 master bond0' "
+                "'set interface bond0 member eth2' "
+                "'set interface eth2' "
                 "commit save exit "
                 "| sentinel configure\""
             )
 
-            # Sentinel rendered the netdevs + member enslavement.
+            # Sentinel rendered the netdevs + member enslavement (derived from the
+            # device member lists) + the vlan-aware filtering.
             fw.wait_until_succeeds(
                 "test -f /run/systemd/network/10-sentinel-br0.netdev", timeout=20
             )
             brdev = fw.succeed("cat /run/systemd/network/10-sentinel-br0.netdev")
             assert "Kind=bridge" in brdev, brdev
+            assert "VLANFiltering=yes" in brdev, brdev
             bonddev = fw.succeed("cat /run/systemd/network/10-sentinel-bond0.netdev")
             assert "Kind=bond" in bonddev, bonddev
             assert "Mode=active-backup" in bonddev, bonddev
-            assert "Bridge=br0" in fw.succeed("cat /run/systemd/network/10-sentinel-eth1.network")
+            eth1net = fw.succeed("cat /run/systemd/network/10-sentinel-eth1.network")
+            assert "Bridge=br0" in eth1net, eth1net
+            assert "[BridgeVLAN]" in eth1net, eth1net
+            assert "VLAN=10" in eth1net, eth1net
+            assert "PVID=1" in eth1net, eth1net
             assert "Bond=bond0" in fw.succeed("cat /run/systemd/network/10-sentinel-eth2.network")
 
             # networkd realised them in the kernel: the bridge holds the LAN
