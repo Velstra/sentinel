@@ -20,6 +20,7 @@ mod ipsec;
 mod net;
 mod openconnect;
 mod pki;
+mod proxy;
 mod repl;
 mod session;
 mod system;
@@ -449,6 +450,7 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
                     pki_cas: session.pki_ca_names(),
                     pki_certificates: session.pki_certificate_names(),
                     wireguard: session.wireguard_names(),
+                    reverse_proxy: session.reverse_proxy_names(),
                 });
                 h.set_context(&ctx);
             }

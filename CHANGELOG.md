@@ -123,6 +123,10 @@ First tagged release of the Sentinel immutable firewall/router appliance.
   (BGP/OSPF/OSPFv3/IS-IS/RIP/RIPng/Babel/VRRP/static).
 - **PPPoE client + TCP-MSS clamping (C5)** — real WAN uplinks.
 - **QoS / traffic shaping (C8)** — per-interface CAKE / fq_codel.
+- **C22 — L7 reverse proxy / load balancer.** `services reverse-proxy <name>`
+  terminates TLS on a listen port using an on-box PKI certificate and forwards
+  to one or more backends round-robin (HAProxy) — HTTP-aware routing + TLS
+  termination on top of the datapath's L4 path.
 - Verified boot / A-B / secure boot / atomic commit with commit-confirm,
   config archive, rollback-N, diff (C21).
 

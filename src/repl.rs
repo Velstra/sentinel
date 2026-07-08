@@ -1157,6 +1157,26 @@ const SERVICES_NODES: &[Cand] = &[
         "dhcp-relay",
         "relay DHCP to an upstream server (isc dhcrelay)",
     ),
+    (
+        "reverse-proxy",
+        "L7 reverse proxy / load balancer (haproxy, by name)",
+    ),
+];
+// `services reverse-proxy <name> <Tab>` reveals the frontend fields (roadmap C22).
+const REVERSE_PROXY_FIELDS: &[Cand] = &[
+    ("port", "listen port (default 443)"),
+    (
+        "certificate",
+        "TLS termination cert — a `pki certificate` name (omit ⇒ plain HTTP)",
+    ),
+    (
+        "backends",
+        "upstream host:port targets (round-robin; repeatable)",
+    ),
+    (
+        "disabled",
+        "administratively disable this frontend (true|false)",
+    ),
 ];
 // `services lldp <Tab>` reveals the LLDP fields.
 const LLDP_FIELDS: &[Cand] = &[
@@ -2048,6 +2068,8 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "services", "dyndns"] => DYNDNS_FIELDS,
         ["set", "services", "dyndns", "provider"] => DYNDNS_PROVIDERS,
         ["set" | "delete", "services", "dhcp-relay"] => DHCP_RELAY_FIELDS,
+        ["set" | "delete", "services", "reverse-proxy", _name] => REVERSE_PROXY_FIELDS,
+        ["set", "services", "reverse-proxy", _name, "disabled"] => BOOLS,
 
         // The firewall sub-tree.
         ["set" | "delete", "firewall"] => FIREWALL_NODES,
@@ -2254,6 +2276,7 @@ pub struct DynNames {
     pub pki_cas: Vec<String>,
     pub pki_certificates: Vec<String>,
     pub wireguard: Vec<String>,
+    pub reverse_proxy: Vec<String>,
 }
 
 /// Own a static `Cand` slice into `(keyword, description)` pairs — the bridge
@@ -2340,6 +2363,11 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
             named(&names.filters, "route filter", "a new filter name")
         }
         ["set" | "delete", "protocols", "vrf"] => named(&names.vrfs, "VRF", "a new VRF name"),
+        ["set" | "delete", "services", "reverse-proxy"] => named(
+            &names.reverse_proxy,
+            "reverse-proxy frontend",
+            "a new reverse-proxy frontend name",
+        ),
         [
             "set" | "delete",
             "interface",
@@ -2614,6 +2642,21 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
         }
         ["set", "vpn", "openconnect", "port"] => own_cands(&[PH_PORT]),
         ["set", "vpn", "openconnect", "pool"] => own_cands(&[PH_IPV4_CIDR]),
+        // Reverse-proxy value positions (roadmap C22).
+        ["set", "services", "reverse-proxy", _name, "certificate"] => {
+            let mut v: Vec<(String, String)> = names
+                .pki_certificates
+                .iter()
+                .map(|n| (n.clone(), "a declared pki certificate".to_string()))
+                .collect();
+            v.push((
+                "acme".to_string(),
+                "an ACME-obtained certificate".to_string(),
+            ));
+            v
+        }
+        ["set", "services", "reverse-proxy", _name, "port"] => own_cands(&[PH_PORT]),
+        ["set", "services", "reverse-proxy", _name, "backends"] => own_cands(&[PH_HOST_PORT]),
         ["set", "vpn", "openconnect", "dns"] => own_cands(&[PH_IPV4, PH_IPV6]),
         ["set", "vpn", "openconnect", "routes"] => own_cands(&[PH_IPV4_CIDR, PH_IPV6_CIDR]),
         ["set", "vpn", "openconnect", "zone"] => zones("zone"),
@@ -3110,7 +3153,16 @@ mod tests {
         // contexts derive from these tables, each new leaf is an enterable context.
         assert_eq!(
             kw(&["set", "services"]),
-            ["dns", "ntp", "lldp", "snmp", "mdns", "dyndns", "dhcp-relay"]
+            [
+                "dns",
+                "ntp",
+                "lldp",
+                "snmp",
+                "mdns",
+                "dyndns",
+                "dhcp-relay",
+                "reverse-proxy"
+            ]
         );
         assert_eq!(kw(&["set", "services", "lldp"]), ["enable", "interface"]);
         assert_eq!(
@@ -3229,6 +3281,7 @@ mod tests {
             pki_cas: vec!["root".into()],
             pki_certificates: vec!["api".into()],
             wireguard: vec!["wg0".into()],
+            reverse_proxy: vec!["web".into()],
         };
         let kws = |toks: &[&str]| -> Vec<String> {
             dyn_candidates(toks, &names)
