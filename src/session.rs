@@ -18,8 +18,8 @@ use crate::config::{
     Groups, HealthCheck, IfaceType, Interface, IpsecConnection, Isis, Lldp, Mdns, MultiWan,
     Multicast, MulticastInterface, Nat, Nat64, NatDestination, NatSource, Ntp, OpenConnectServer,
     OpenConnectUser, Ospf, Ospf3, OspfInterface, Pki, PortSpec, Pppoe, Proto, Protocols, Qos,
-    QosDiscipline, Rip, RouterAdvert, Rule, Services, Snmp, StaticRoute, System, UpdateChannel,
-    Vpn, VrfDef, Vrrp, WanMode, WanUplink, WgPeer, WireguardTunnel, ZoneCfg,
+    QosDiscipline, ReverseProxy, Rip, RouterAdvert, Rule, Services, Snmp, StaticRoute, System,
+    UpdateChannel, Vpn, VrfDef, Vrrp, WanMode, WanUplink, WgPeer, WireguardTunnel, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -1024,6 +1024,11 @@ struct Draft {
     /// signing key, or `None` when unconfigured. A singleton created on the first
     /// `set update …`.
     update: Option<UpdateChannelDraft>,
+    /// L7 reverse-proxy / load-balancer frontends (roadmap C22), keyed by name in
+    /// sorted order (a `BTreeMap`, so materialise/show are name-ordered). Each
+    /// terminates a listen port (optionally TLS via a PKI cert) and forwards to
+    /// one or more backends round-robin.
+    reverse_proxy: BTreeMap<String, ReverseProxyDraft>,
 }
 
 /// A partially-specified DNS forwarder (`[services.dns]`).
@@ -1221,6 +1226,18 @@ struct AcmeDraft {
     agree_tos: Option<bool>,
 }
 
+/// A partially-specified L7 reverse-proxy frontend (`[[services.reverse-proxy]]`,
+/// roadmap C22). Keyed by name in [`Draft::reverse_proxy`]; at least one backend
+/// (`host:port`) is required at commit, and `port`/`certificate` are validated by
+/// `config::validate()`. `port` unset ⇒ 443; `certificate` unset ⇒ plain HTTP.
+#[derive(Debug, Clone, Default)]
+struct ReverseProxyDraft {
+    disabled: Option<bool>,
+    port: Option<u16>,
+    certificate: Option<String>,
+    backends: Vec<String>,
+}
+
 impl Draft {
     /// Mutable access to the static route with `prefix`, inserting it if new.
     fn static_mut(&mut self, prefix: &str) -> &mut StaticDraft {
@@ -1344,6 +1361,12 @@ impl Draft {
     fn openconnect_mut(&mut self) -> &mut OpenConnectDraft {
         self.openconnect
             .get_or_insert_with(OpenConnectDraft::default)
+    }
+
+    /// Mutable access to the reverse-proxy frontend `name`, inserting an empty one
+    /// on first touch (frontends are keyed by name).
+    fn reverse_proxy_mut(&mut self, name: &str) -> &mut ReverseProxyDraft {
+        self.reverse_proxy.entry(name.to_string()).or_default()
     }
 
     /// Mutable access to the signed update channel, creating an empty one on
@@ -1941,6 +1964,22 @@ impl Draft {
                 url: Some(u.url.clone()),
                 public_key: Some(u.public_key.clone()),
             }),
+            reverse_proxy: a
+                .services
+                .reverse_proxy
+                .iter()
+                .map(|rp| {
+                    (
+                        rp.name.clone(),
+                        ReverseProxyDraft {
+                            disabled: rp.disabled.then_some(true),
+                            port: rp.port,
+                            certificate: rp.certificate.clone(),
+                            backends: rp.backends.clone(),
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 }
@@ -2033,6 +2072,14 @@ impl Session {
             .iter()
             .map(|(n, _)| n.clone())
             .collect()
+    }
+
+    /// The reverse-proxy frontend names — completion offers these for
+    /// `set/delete services reverse-proxy …`. Consumed by `repl.rs` once its
+    /// completion table is wired for the C22 grammar (added separately).
+    #[allow(dead_code)]
+    pub fn reverse_proxy_names(&self) -> Vec<String> {
+        self.draft.reverse_proxy.keys().cloned().collect()
     }
 
     /// The declared address-group names — completion offers these for a rule's
@@ -2731,6 +2778,27 @@ impl Session {
                     validate_ipv4(s)?;
                 }
                 append_csv(&mut self.draft.dhcp_relay.server, v);
+            }
+
+            // services reverse-proxy <name> (roadmap C22): the L7 TLS-terminating
+            // load balancer (HAProxy). `backends` append+dedup (CSV) like the
+            // other list fields; validation (port≠0/unique across frontends, cert
+            // declared in pki, ≥1 `host:port` backend) runs at commit.
+            ["services", "reverse-proxy", name, "port", v] => {
+                let port: u16 = v.parse().with_context(|| format!("invalid port {v:?}"))?;
+                if port == 0 {
+                    bail!("port 0 is not valid");
+                }
+                self.draft.reverse_proxy_mut(name).port = Some(port);
+            }
+            ["services", "reverse-proxy", name, "certificate", v] => {
+                self.draft.reverse_proxy_mut(name).certificate = Some((*v).to_string());
+            }
+            ["services", "reverse-proxy", name, "backends", v] => {
+                append_csv(&mut self.draft.reverse_proxy_mut(name).backends, v);
+            }
+            ["services", "reverse-proxy", name, "disabled", v] => {
+                self.draft.reverse_proxy_mut(name).disabled = Some(parse_bool(v)?);
             }
 
             // protocols: dynamic routing (the Wren control plane).
@@ -4175,6 +4243,30 @@ impl Session {
                 }
             }
 
+            // services reverse-proxy <name> (roadmap C22): the whole frontend, one
+            // backend, or a reset field.
+            ["services", "reverse-proxy", name] => {
+                if self.draft.reverse_proxy.remove(*name).is_none() {
+                    bail!("no reverse-proxy frontend {name:?}");
+                }
+            }
+            ["services", "reverse-proxy", name, "backends", v] => {
+                let rp = self.reverse_proxy(name)?;
+                if !remove_item(&mut rp.backends, v) {
+                    bail!("reverse-proxy {name:?} has no backend {v:?}");
+                }
+            }
+            ["services", "reverse-proxy", name, field] => {
+                let rp = self.reverse_proxy(name)?;
+                match *field {
+                    "port" => rp.port = None,
+                    "certificate" => rp.certificate = None,
+                    "backends" => rp.backends.clear(),
+                    "disabled" => rp.disabled = None,
+                    other => bail!("services reverse-proxy has no field {other:?}"),
+                }
+            }
+
             // protocols: dynamic routing (Wren).
             // Bare `delete protocols` clears the ENTIRE routing subtree, not just
             // the router-id — otherwise a configured ospf/bgp/… silently survives.
@@ -4793,6 +4885,13 @@ impl Session {
             .find(|(n, _)| n == name)
             .map(|(_, d)| d)
             .ok_or_else(|| anyhow::anyhow!("no nat source {name:?}"))
+    }
+
+    fn reverse_proxy(&mut self, name: &str) -> Result<&mut ReverseProxyDraft> {
+        self.draft
+            .reverse_proxy
+            .get_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("no reverse-proxy frontend {name:?}"))
     }
 
     fn nat_destination(&mut self, name: &str) -> Result<&mut NatDstDraft> {
@@ -5530,6 +5629,21 @@ impl Session {
                     interface: self.draft.dhcp_relay.interface.clone(),
                     server: self.draft.dhcp_relay.server.clone(),
                 },
+                // L7 reverse-proxy frontends (roadmap C22), name-ordered by the
+                // BTreeMap key. `config::validate()` enforces port/cert/backend
+                // rules — we just carry the draft across.
+                reverse_proxy: self
+                    .draft
+                    .reverse_proxy
+                    .iter()
+                    .map(|(name, d)| ReverseProxy {
+                        name: name.clone(),
+                        disabled: d.disabled.unwrap_or(false),
+                        port: d.port,
+                        certificate: d.certificate.clone(),
+                        backends: d.backends.clone(),
+                    })
+                    .collect(),
             },
             multiwan,
             vpn,
@@ -6413,8 +6527,16 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         || dyndns.password.is_some()
         || dyndns.interface.is_some();
     let relay_set = !relay.interface.is_empty() || !relay.server.is_empty();
-    let any_service =
-        dns_set || ntp_set || lldp_set || snmp_set || mdns_set || dyndns_set || relay_set;
+    let rproxy = &draft.reverse_proxy;
+    let rproxy_set = !rproxy.is_empty();
+    let any_service = dns_set
+        || ntp_set
+        || lldp_set
+        || snmp_set
+        || mdns_set
+        || dyndns_set
+        || relay_set
+        || rproxy_set;
     if want("services") && any_service {
         out.push_str("services {\n");
         if dns_set {
@@ -6518,6 +6640,23 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             }
             if !relay.server.is_empty() {
                 out.push_str(&format!("        server {}\n", relay.server.join(",")));
+            }
+            out.push_str("    }\n");
+        }
+        // reverse-proxy <name> { … } — L7 frontends, name-ordered (BTreeMap).
+        for (name, rp) in rproxy {
+            out.push_str(&format!("    reverse-proxy {name} {{\n"));
+            if let Some(port) = rp.port {
+                out.push_str(&format!("        port {port}\n"));
+            }
+            if let Some(cert) = &rp.certificate {
+                out.push_str(&format!("        certificate {cert}\n"));
+            }
+            for backend in &rp.backends {
+                out.push_str(&format!("        backends {backend}\n"));
+            }
+            if rp.disabled == Some(true) {
+                out.push_str("        disabled true\n");
             }
             out.push_str("    }\n");
         }
@@ -7401,6 +7540,139 @@ mod tests {
         run(&mut s, "delete pki ca corp").unwrap();
         let d = s.commit().expect("still valid after object deletes");
         assert!(d.pki.is_empty());
+    }
+
+    #[test]
+    fn reverse_proxy_cli_builds_shows_commits_and_roundtrips() {
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname gw",
+            "set pki ca corp common-name corp.example.com",
+            "set pki certificate web-cert ca corp",
+            "set pki certificate web-cert common-name web.example.com",
+            "set services reverse-proxy web port 443",
+            "set services reverse-proxy web certificate web-cert",
+            "set services reverse-proxy web backends 10.0.0.10:8080,10.0.0.11:8080",
+            // A second frontend on a different port exercises the keyed list.
+            "set services reverse-proxy api port 8443",
+            "set services reverse-proxy api backends 10.0.0.20:9000",
+        ] {
+            run(&mut s, line).unwrap();
+        }
+        // show nests both frontends under services, name-ordered (api before web).
+        let shown = s.show_only("services");
+        assert!(shown.contains("reverse-proxy api {"), "got:\n{shown}");
+        assert!(shown.contains("reverse-proxy web {"), "got:\n{shown}");
+        assert!(
+            shown.find("reverse-proxy api {") < shown.find("reverse-proxy web {"),
+            "frontends should be name-ordered:\n{shown}"
+        );
+        assert!(shown.contains("certificate web-cert"), "got:\n{shown}");
+        assert!(shown.contains("backends 10.0.0.10:8080"), "got:\n{shown}");
+        assert!(shown.contains("backends 10.0.0.11:8080"), "got:\n{shown}");
+
+        let a = s.commit().expect("valid reverse-proxy commits");
+        assert_eq!(a.services.reverse_proxy.len(), 2);
+        assert_eq!(a.services.reverse_proxy[0].name, "api");
+        assert_eq!(a.services.reverse_proxy[0].port(), 8443);
+        assert_eq!(a.services.reverse_proxy[1].name, "web");
+        assert_eq!(a.services.reverse_proxy[1].port(), 443);
+        assert_eq!(
+            a.services.reverse_proxy[1].certificate.as_deref(),
+            Some("web-cert")
+        );
+        assert_eq!(a.services.reverse_proxy[1].backends.len(), 2);
+
+        // from_appliance ∘ materialize is the identity on the frontends.
+        let round = Session {
+            draft: Draft::from_appliance(&a),
+            path: PathBuf::from("/dev/null"),
+            dirty: false,
+        };
+        let b = round.materialize().expect("re-materialises");
+        assert_eq!(
+            a.services.reverse_proxy.len(),
+            b.services.reverse_proxy.len()
+        );
+        assert_eq!(
+            a.services.reverse_proxy[1].name,
+            b.services.reverse_proxy[1].name
+        );
+        assert_eq!(
+            a.services.reverse_proxy[1].backends,
+            b.services.reverse_proxy[1].backends
+        );
+        assert_eq!(
+            a.services.reverse_proxy[1].certificate,
+            b.services.reverse_proxy[1].certificate
+        );
+    }
+
+    #[test]
+    fn reverse_proxy_backends_append_and_remove() {
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname gw",
+            "set services reverse-proxy web backends 10.0.0.10:80",
+            "set services reverse-proxy web backends 10.0.0.11:80,10.0.0.12:80",
+            // A duplicate is deduped by append_csv, not appended twice.
+            "set services reverse-proxy web backends 10.0.0.10:80",
+        ] {
+            run(&mut s, line).unwrap();
+        }
+        // No certificate ⇒ plain-HTTP frontend, which is still valid.
+        let a = s.commit().expect("plain-HTTP proxy is valid");
+        assert_eq!(
+            a.services.reverse_proxy[0].backends,
+            ["10.0.0.10:80", "10.0.0.11:80", "10.0.0.12:80"]
+        );
+
+        run(
+            &mut s,
+            "delete services reverse-proxy web backends 10.0.0.11:80",
+        )
+        .unwrap();
+        let b = s.commit().expect("still valid after backend remove");
+        assert_eq!(
+            b.services.reverse_proxy[0].backends,
+            ["10.0.0.10:80", "10.0.0.12:80"]
+        );
+
+        let err = run(
+            &mut s,
+            "delete services reverse-proxy web backends 9.9.9.9:80",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no backend"), "got: {err}");
+    }
+
+    #[test]
+    fn reverse_proxy_delete_frontend_and_field() {
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname gw",
+            "set services reverse-proxy web port 8080",
+            "set services reverse-proxy web backends 10.0.0.10:80",
+        ] {
+            run(&mut s, line).unwrap();
+        }
+        // Reset the port field back to the 443 default.
+        run(&mut s, "delete services reverse-proxy web port").unwrap();
+        let a = s.commit().expect("valid after field delete");
+        assert!(a.services.reverse_proxy[0].port.is_none());
+        assert_eq!(a.services.reverse_proxy[0].port(), 443);
+
+        // Delete the whole frontend — services empties out.
+        run(&mut s, "delete services reverse-proxy web").unwrap();
+        let b = s.commit().expect("valid after frontend delete");
+        assert!(b.services.reverse_proxy.is_empty());
+
+        // Deleting an absent frontend errors.
+        let err = run(&mut s, "delete services reverse-proxy web").unwrap_err();
+        assert!(
+            err.to_string().contains("no reverse-proxy frontend"),
+            "got: {err}"
+        );
     }
 
     #[test]

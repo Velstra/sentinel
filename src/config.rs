@@ -180,6 +180,15 @@ port = 443
 # [services.dhcp-relay]
 # interface = ["lan0"]
 # server = ["10.0.99.1"]
+#
+# L7 reverse proxy / load balancer (roadmap C22): terminate TLS on a listen
+# port (cert from the on-box PKI) and forward to one or more backends
+# round-robin. Omit `certificate` for a plain-HTTP proxy.
+# [[services.reverse-proxy]]
+# name = "web"
+# port = 443
+# certificate = "web-cert"          # a [[pki.certificate]] name (or "acme")
+# backends = ["10.0.0.10:8080", "10.0.0.11:8080"]
 
 # NAT is its own thing (address translation, not filtering). Source NAT
 # masquerades a zone's outbound traffic to its egress IP; destination NAT is an
@@ -491,6 +500,15 @@ pub struct Services {
         skip_serializing_if = "DhcpRelay::is_empty"
     )]
     pub dhcp_relay: DhcpRelay,
+    /// L7 reverse-proxy / load-balancer frontends (`[[services.reverse-proxy]]`,
+    /// roadmap C22): each terminates a listen port (optionally with TLS from the
+    /// on-box PKI) and forwards to one or more backends (round-robin).
+    #[serde(
+        default,
+        rename = "reverse-proxy",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub reverse_proxy: Vec<ReverseProxy>,
 }
 
 impl Services {
@@ -503,6 +521,46 @@ impl Services {
             && self.mdns.is_empty()
             && self.dyndns.is_empty()
             && self.dhcp_relay.is_empty()
+            && self.reverse_proxy.is_empty()
+    }
+}
+
+/// Default reverse-proxy listen port when none is given — 443 (HTTPS), the
+/// common case for a TLS-terminating proxy.
+pub const DEFAULT_REVERSE_PROXY_PORT: u16 = 443;
+
+/// One L7 reverse-proxy / load-balancer frontend (`[[services.reverse-proxy]]`,
+/// roadmap C22). Rendered by `proxy.rs` into an HAProxy `frontend`/`backend`
+/// pair: it binds `port` (TLS-terminated when `certificate` names a PKI leaf,
+/// else plain HTTP) and forwards requests to `backends` round-robin. The XDP L4
+/// load-balancer (fabric) is the separate high-throughput path; this is the L7
+/// tier that does TLS termination + HTTP-aware routing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReverseProxy {
+    /// Frontend name — the HAProxy `frontend`/`backend` id + the log tag.
+    /// Required; `[A-Za-z0-9_-]` (rendered as a config section name).
+    pub name: String,
+    /// Administratively disable this frontend without deleting it. Off by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
+    /// The port to listen on. Defaults to [`DEFAULT_REVERSE_PROXY_PORT`] (443).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// The PKI certificate (`[[pki.certificate]]` name, or `acme`) used to
+    /// terminate TLS on the listen port. Unset ⇒ plain HTTP (no termination).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<String>,
+    /// The upstream backends as `host:port`, load-balanced round-robin. At least
+    /// one is required.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backends: Vec<String>,
+}
+
+impl ReverseProxy {
+    /// The effective listen port (explicit or the 443 default).
+    pub fn port(&self) -> u16 {
+        self.port.unwrap_or(DEFAULT_REVERSE_PROXY_PORT)
     }
 }
 
@@ -4477,6 +4535,61 @@ impl Appliance {
                     ),
                 },
                 None => bail!("services dhcp-relay interface {iface:?}: not a declared interface"),
+            }
+        }
+
+        // L7 reverse proxy (roadmap C22): each frontend needs a safe name, a
+        // valid port, at least one host:port backend, and — when TLS-terminating
+        // — a certificate that names a declared PKI leaf (or ACME). Names and
+        // ports must not collide across frontends.
+        let mut seen_proxy = HashSet::new();
+        let mut seen_proxy_port = HashSet::new();
+        for rp in &self.services.reverse_proxy {
+            if rp.name.is_empty() {
+                bail!("services reverse-proxy: a frontend name must not be empty");
+            }
+            if !rp
+                .name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+            {
+                bail!(
+                    "services reverse-proxy {:?}: name may only contain letters, digits, '-' and '_'",
+                    rp.name
+                );
+            }
+            if !seen_proxy.insert(rp.name.as_str()) {
+                bail!("services reverse-proxy: duplicate frontend {:?}", rp.name);
+            }
+            if rp.port == Some(0) {
+                bail!("services reverse-proxy {:?}: port 0 is not valid", rp.name);
+            }
+            if !seen_proxy_port.insert(rp.port()) {
+                bail!(
+                    "services reverse-proxy {:?}: port {} is already bound by another frontend",
+                    rp.name,
+                    rp.port()
+                );
+            }
+            if rp.backends.is_empty() {
+                bail!(
+                    "services reverse-proxy {:?}: at least one `backend` (host:port) is required",
+                    rp.name
+                );
+            }
+            for b in &rp.backends {
+                validate_endpoint(b)
+                    .with_context(|| format!("services reverse-proxy {:?} backend", rp.name))?;
+            }
+            if let Some(cert) = &rp.certificate {
+                let cert_ok =
+                    cert == ACME_CA || self.pki.certificates.iter().any(|c| &c.name == cert);
+                if !cert_ok {
+                    bail!(
+                        "services reverse-proxy {:?}: certificate {cert:?} is not a declared pki certificate",
+                        rp.name
+                    );
+                }
             }
         }
 

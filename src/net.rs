@@ -1882,6 +1882,11 @@ pub fn apply_link_runtime(appliance: &Appliance) -> Result<()> {
     // ocpasswd, then the ocserv unit (re)started, after the WAN the server binds
     // is up and after the PKI leaf it serves was minted by apply_persistent.
     crate::openconnect::apply(appliance)?;
+    // L7 reverse proxy / load balancer (roadmap C22) — rendered haproxy.cfg +
+    // per-frontend TLS bundles, then the haproxy unit (re)started, after the WAN
+    // it binds is up and after the PKI leaf it terminates with was minted by
+    // apply_persistent.
+    crate::proxy::apply(appliance)?;
     // Box services (roadmap C18) — LLDP/SNMP/mDNS/dyndns/DHCP-relay, each a
     // Sentinel-owned daemon (re)started after networkd so the link-scoped ones
     // (LLDP/mDNS/relay) see their interfaces up.

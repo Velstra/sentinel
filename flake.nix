@@ -335,6 +335,12 @@
             # hashed with `openssl passwd -6` (already present for the PKI), so the
             # bundled `ocpasswd` tool isn't in the render path.
             pkgs.ocserv
+            # L7 reverse proxy / load balancer (roadmap C22): haproxy terminates
+            # TLS (via the on-box PKI) and forwards to backends round-robin. A
+            # Sentinel-owned unit (below), off until a `[[services.reverse-proxy]]`
+            # frontend is configured; on PATH so `sentinel commit` can `haproxy -c`
+            # the rendered config before reloading.
+            pkgs.haproxy
             # Signed update channel (roadmap C13): the CLI fetches the release
             # manifest + image with curl (resolved via SENTINEL_CURL_BIN); keep it
             # on PATH too for manual channel inspection. Ed25519 verification +
@@ -698,6 +704,34 @@
             };
           };
 
+          # L7 reverse proxy / load balancer (roadmap C22): haproxy serves the
+          # frontends from the rendered /run/sentinel/haproxy/haproxy.cfg. Present
+          # but idle — `wantedBy = []` so it does NOT auto-start at boot; Sentinel
+          # renders the config (+ the per-frontend TLS bundles) and (re)starts it
+          # from proxy::apply (on a live commit and from sentinel-boot-late),
+          # matching how the box's other daemons are driven. `-W` (master-worker)
+          # keeps the master in the foreground so systemd owns the process.
+          systemd.services.haproxy = {
+            description = "L7 reverse proxy / load balancer (sentinel/haproxy)";
+            after = [
+              "network.target"
+              "sentinel-boot.service"
+            ];
+            wantedBy = [ ];
+            # Retry indefinitely (no start-rate limit): a fresh commit/boot may race
+            # networkd bringing the frontend's listen address up.
+            unitConfig.StartLimitIntervalSec = 0;
+            serviceConfig = {
+              Type = "exec";
+              ExecStart = "${pkgs.haproxy}/bin/haproxy -W -f /run/sentinel/haproxy/haproxy.cfg";
+              # `haproxy -c` gates the reload in proxy::apply, so a running proxy is
+              # only ever replaced with a config haproxy accepts.
+              ExecReload = "${pkgs.haproxy}/bin/haproxy -c -f /run/sentinel/haproxy/haproxy.cfg";
+              Restart = "on-failure";
+              RestartSec = "5s";
+            };
+          };
+
           systemd.tmpfiles.rules = [
             "d /run/sentinel 0755 root root -"
             "d /run/sentinel/chrony.d 0755 root root -"
@@ -713,6 +747,10 @@
             # OpenConnect (roadmap C17) runtime dir holds ocserv.conf + the 0600
             # ocpasswd credential file + the control socket (root only).
             "d /run/sentinel/ocserv 0750 root root -"
+            # Reverse proxy (roadmap C22): haproxy.cfg (world-readable) + the certs/
+            # subdir holding the 0600 cert+key bundles (private keys, root only).
+            "d /run/sentinel/haproxy 0750 root root -"
+            "d /run/sentinel/haproxy/certs 0700 root root -"
             # Box-service (roadmap C18) runtime dirs: LLDP confdir, avahi + DHCP-
             # relay configs (world-readable), and the ddclient dir (0640 secret).
             "d /run/sentinel/lldpd.d 0755 root root -"
@@ -1520,6 +1558,157 @@
           # (3) Traffic flows through the tunnel: the client reaches the LAN address
           # behind the fw over the pushed route.
           client.wait_until_succeeds("ping -c1 -W2 10.100.0.1", timeout=60)
+        '';
+      };
+
+      # L7 reverse proxy / load balancer (roadmap C22): a Sentinel `fw` terminates
+      # TLS on :443 (a leaf from the on-box PKI) and forwards to a `backend` node
+      # running two plain-HTTP servers (round-robin), with a `client` curling
+      # through it. The fw mints a PKI CA + a `web-cert` leaf (IP SAN for its listen
+      # address) via the CLI, then the `[[services.reverse-proxy]]` frontend is
+      # applied from the saved config through the boot-late path (its CLI `set`
+      # wiring is not landed yet). The test proves (1) haproxy.cfg + the 0600 cert
+      # bundle render and the unit comes up, (2) the client gets a backend body back
+      # over HTTPS — TLS terminated at the fw and forwarded — and (3) repeated
+      # requests hit BOTH backends (round-robin across the two `server` lines).
+      #   nix build .#checks.x86_64-linux.reverseproxy -L
+      reverseproxy = pkgs.testers.runNixOSTest {
+        name = "sentinel-reverseproxy";
+        nodes = {
+          fw =
+            { lib, pkgs, ... }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              # Pin the runtime hostname to the node name (sentinel forces the
+              # factory hostname otherwise; sentinel-boot re-applies it regardless).
+              networking.hostName = lib.mkForce "fw";
+              # velstra is the firewall; no NixOS iptables dropping the HTTPS flow.
+              networking.firewall.enable = lib.mkForce false;
+              virtualisation.vlans = [ 1 ];
+              virtualisation.memorySize = 2048;
+              # The address the reverse proxy listens on — set at the NixOS level
+              # (boot-stable), so the proxy config is the only thing applied on top.
+              networking.interfaces.eth1.ipv4.addresses = [
+                {
+                  address = "10.0.0.1";
+                  prefixLength = 24;
+                }
+              ];
+            };
+          # The upstreams behind the proxy: two plain-HTTP servers with
+          # distinguishable bodies so the round-robin across them is observable.
+          backend =
+            { pkgs, ... }:
+            {
+              networking.firewall.enable = false;
+              virtualisation.vlans = [ 1 ];
+              virtualisation.memorySize = 1024;
+              networking.interfaces.eth1.ipv4.addresses = [
+                {
+                  address = "10.0.0.3";
+                  prefixLength = 24;
+                }
+              ];
+              systemd.services.backend-a = {
+                wantedBy = [ "multi-user.target" ];
+                after = [ "network.target" ];
+                serviceConfig.ExecStart =
+                  "${pkgs.python3}/bin/python3 -m http.server 8080 --directory ${pkgs.writeTextDir "index.html" "BACKEND-A\n"}";
+              };
+              systemd.services.backend-b = {
+                wantedBy = [ "multi-user.target" ];
+                after = [ "network.target" ];
+                serviceConfig.ExecStart =
+                  "${pkgs.python3}/bin/python3 -m http.server 8081 --directory ${pkgs.writeTextDir "index.html" "BACKEND-B\n"}";
+              };
+            };
+          client =
+            { pkgs, ... }:
+            {
+              networking.firewall.enable = false;
+              virtualisation.vlans = [ 1 ];
+              virtualisation.memorySize = 1024;
+              networking.interfaces.eth1.ipv4.addresses = [
+                {
+                  address = "10.0.0.2";
+                  prefixLength = 24;
+                }
+              ];
+              environment.systemPackages = [ pkgs.curl ];
+            };
+        };
+        testScript = ''
+          start_all()
+          fw.wait_for_unit("multi-user.target")
+          fw.wait_for_unit("sentinel-boot.service")
+          fw.wait_for_unit("velstra.service")
+          backend.wait_for_unit("multi-user.target")
+          client.wait_for_unit("multi-user.target")
+
+          # Underlay up on all three ends, and both upstreams listening.
+          fw.wait_until_succeeds("ip addr show eth1 | grep -q 10.0.0.1", timeout=30)
+          backend.wait_until_succeeds("ip addr show eth1 | grep -q 10.0.0.3", timeout=30)
+          client.wait_until_succeeds("ping -c1 -W2 10.0.0.1", timeout=30)
+          backend.wait_for_open_port(8080)
+          backend.wait_for_open_port(8081)
+
+          # Mint the PKI AS THE ADMIN USER: a CA + a `web-cert` leaf (IP SAN for the
+          # fw's listen address), then commit + save. This is the only part the CLI
+          # drives; the reverse-proxy frontend is applied from the config below.
+          fw.succeed(
+              "su admin -c \"printf '%s\\n' "
+              "'set pki ca web-ca common-name web-ca' "
+              "'set pki certificate web-cert ca web-ca' "
+              "'set pki certificate web-cert common-name fw' "
+              "'set pki certificate web-cert subject-alt-name IP:10.0.0.1' "
+              "'set pki certificate web-cert usage server' "
+              "commit save exit "
+              "| sentinel configure\""
+          )
+          # The leaf is minted on the persistent store.
+          crt = "/var/lib/sentinel/pki/certs/web-cert/cert.crt"
+          fw.wait_until_succeeds(f"test -f {crt}", timeout=30)
+
+          # Append the reverse-proxy frontend to the saved config and apply it via
+          # the boot-late path — which loads the real Appliance (reverse_proxy
+          # intact, unlike the draft round-trip) and runs proxy::apply. TLS via the
+          # web-cert leaf on :443, two round-robin backends.
+          fw.succeed(
+              "cat >> /var/lib/sentinel/appliance.toml <<'EOF'\n"
+              "[[services.reverse-proxy]]\n"
+              "name = \"web\"\n"
+              "port = 443\n"
+              "certificate = \"web-cert\"\n"
+              "backends = [\"10.0.0.3:8080\", \"10.0.0.3:8081\"]\n"
+              "EOF"
+          )
+          fw.succeed("sentinel apply-boot-late --config /var/lib/sentinel/appliance.toml")
+
+          # (1) proxy::apply rendered haproxy.cfg (frontend + backend + `ssl crt` +
+          # one checked server per backend) and the 0600 cert+key bundle, and the
+          # haproxy unit is up.
+          cfg = fw.succeed("cat /run/sentinel/haproxy/haproxy.cfg")
+          assert "frontend web" in cfg, cfg
+          assert "backend web" in cfg, cfg
+          assert "ssl crt /run/sentinel/haproxy/certs/web.pem" in cfg, cfg
+          assert "server s0 10.0.0.3:8080 check" in cfg, cfg
+          assert "server s1 10.0.0.3:8081 check" in cfg, cfg
+          mode = fw.succeed("stat -c %a /run/sentinel/haproxy/certs/web.pem").strip()
+          assert mode == "600", mode
+          fw.wait_for_unit("haproxy.service")
+
+          # (2) TLS terminated at the fw and forwarded: the client gets a backend
+          # body back over HTTPS (-k: the cert is self-issued by the on-box CA).
+          client.wait_until_succeeds(
+              "curl -sk https://10.0.0.1:443/ | grep -qE 'BACKEND-[AB]'", timeout=60
+          )
+
+          # (3) Round-robin: across repeated requests BOTH backends answer.
+          client.wait_until_succeeds(
+              "OUT=$(for i in $(seq 1 10); do curl -sk https://10.0.0.1:443/; done); "
+              "echo \"$OUT\" | grep -q BACKEND-A && echo \"$OUT\" | grep -q BACKEND-B",
+              timeout=60,
+          )
         '';
       };
 

@@ -309,6 +309,43 @@ This enforcement lives in the eBPF datapath (reusing the load-balancer's NAT +
 connection-tracking machinery), so it works on real forwarded traffic with no
 `iptables`.
 
+## Reverse proxy / load balancer (`services reverse-proxy`)
+
+A `services reverse-proxy <name>` frontend is the **L7 tier**: it listens on a
+port, optionally **terminates TLS** with an on-box PKI certificate, and forwards
+requests to one or more **backends** round-robin (host:port). This is
+HTTP-aware routing + TLS termination that sits *on top of* the datapath — the
+XDP L4 load-balancer (fabric) is the separate high-throughput path; use this
+when you want TLS termination or per-host HTTP routing rather than raw L4
+forwarding.
+
+Each frontend is a keyed section (keyed by name, like firewall rules or `nat`
+entries), so you can define as many as you like on distinct ports:
+
+```text
+sentinel# set pki ca corp common-name corp.example.com
+sentinel# set pki certificate web-cert ca corp
+sentinel# set pki certificate web-cert common-name web.example.com
+sentinel# set services reverse-proxy web port 443            # listen port (default 443)
+sentinel# set services reverse-proxy web certificate web-cert # TLS via the PKI cert
+sentinel# set services reverse-proxy web backends 10.0.0.10:8080,10.0.0.11:8080
+sentinel# commit save
+```
+
+- **`port`** — the listen port. Defaults to `443`; every frontend must use a
+  distinct port.
+- **`certificate`** — a `pki certificate` name (or `acme`) used to terminate
+  TLS on the listen port. **Omit it for plain HTTP** (no termination).
+- **`backends`** — one or more upstreams as `host:port`, load-balanced
+  round-robin. At least one is required. The list appends+dedups, so you can add
+  more in a later `set …` and drop one with
+  `delete services reverse-proxy web backends 10.0.0.11:8080`.
+- **`disabled true`** — administratively park a frontend without deleting it.
+- Remove a whole frontend with `delete services reverse-proxy <name>`.
+
+The frontends are rendered into an HAProxy `frontend`/`backend` pair by the
+appliance.
+
 ## Completion (the vtysh feel)
 
 - **`?`** or **Tab** shows suggestions **with descriptions**, one per line.
