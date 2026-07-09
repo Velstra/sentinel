@@ -3288,6 +3288,126 @@
           '';
         };
 
+        # mDNS reflector (roadmap C18): three nodes — a `responder` publishing
+        # `responder.local` on segment A (vlan 2), the sentinel `relay` reflecting
+        # mDNS between segment A and segment B, and a `browser` on segment B
+        # (vlan 3). mDNS is link-local multicast: without the reflector the browser
+        # cannot see the responder at all. The relay's eth2/eth3 are sentinel-owned
+        # (the reflected segments); velstra attaches to an isolated eth1. Sentinel
+        # renders avahi's reflector config (`enable-reflector=yes`,
+        # `allow-interfaces=eth2,eth3`) + its unit. The test proves the browser on
+        # segment B resolves the responder on segment A — i.e. the reflector
+        # actually bridges the announcement across the two links.
+        #   nix build .#checks.x86_64-linux.mdns -L
+        mdns = pkgs.testers.runNixOSTest {
+          name = "sentinel-mdns";
+          nodes = {
+            # Segment A (vlan 2): publishes responder.local via a full avahi. The
+            # test framework assigns the vlan address (192.168.2.x); mDNS is
+            # link-local multicast so the subnet is irrelevant to reflection.
+            # systemd-resolved's own mDNS stack is disabled so avahi is the only
+            # responder on 5353 (else the two race and reflection is unreliable).
+            responder =
+              { pkgs, lib, ... }:
+              {
+                virtualisation.vlans = [ 2 ];
+                networking = {
+                  hostName = "responder";
+                  firewall.enable = false;
+                };
+                services.resolved.enable = lib.mkForce false;
+                services.avahi = {
+                  enable = true;
+                  publish = {
+                    enable = true;
+                    addresses = true;
+                    domain = true;
+                  };
+                };
+              };
+            # Segment B (vlan 3): resolves mDNS via its own avahi — only reachable
+            # to segment A's announcements through the reflector.
+            browser =
+              { pkgs, lib, ... }:
+              {
+                virtualisation.vlans = [ 3 ];
+                networking = {
+                  hostName = "browser";
+                  firewall.enable = false;
+                };
+                services.resolved.enable = lib.mkForce false;
+                services.avahi.enable = true;
+                environment.systemPackages = [ pkgs.avahi ];
+              };
+            # The sentinel reflector: eth1 (vlan 1) isolated for velstra; eth2
+            # (vlan 2, segment A) and eth3 (vlan 3, segment B) sentinel-owned and
+            # bridged by the mDNS reflector.
+            relay =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "relay";
+                networking.firewall.enable = lib.mkForce false;
+                virtualisation.vlans = [
+                  1
+                  2
+                  3
+                ];
+                virtualisation.memorySize = 2048;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = "192.168.99.1";
+                    prefixLength = 24;
+                  }
+                ];
+                # The sentinel-mdns avahi is the only mDNS stack on the reflector;
+                # disable systemd-resolved's so they don't race on 5353.
+                services.resolved.enable = lib.mkForce false;
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+          };
+          testScript = ''
+            start_all()
+            relay.wait_for_unit("multi-user.target")
+            relay.wait_for_unit("velstra.service")
+            responder.wait_for_unit("avahi-daemon.service")
+            browser.wait_for_unit("avahi-daemon.service")
+
+            # eth2/eth3 are sentinel-owned: address both reflected segments and turn
+            # on the mDNS reflector between them. ONE `set` per line.
+            relay.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth2 address 10.1.0.1/24' "
+                "'set interface eth3 address 10.2.0.1/24' "
+                "'set services mdns interface eth2' "
+                "'set services mdns interface eth3' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            relay.wait_for_unit("velstra.service")
+
+            # Sentinel rendered the avahi reflector config + unit.
+            relay.wait_until_succeeds(
+                "test -f /run/sentinel/avahi/avahi-daemon.conf", timeout=20
+            )
+            conf = relay.succeed("cat /run/sentinel/avahi/avahi-daemon.conf")
+            assert "enable-reflector=yes" in conf, conf
+            assert "allow-interfaces=eth2,eth3" in conf, conf
+            relay.wait_for_unit("sentinel-mdns.service")
+            relay.wait_until_succeeds("ip -4 addr show eth2 | grep -q 10.1.0.1", timeout=30)
+            relay.wait_until_succeeds("ip -4 addr show eth3 | grep -q 10.2.0.1", timeout=30)
+            relay.succeed("grep -q 'mdns' /var/lib/sentinel/appliance.toml")
+
+            # The headline: the browser on segment B resolves the responder on
+            # segment A. mDNS is link-local — resolution only succeeds because the
+            # sentinel relay reflects the announcement across the two segments
+            # (address-agnostic: any answer means the record crossed the reflector).
+            browser.wait_until_succeeds(
+                "avahi-resolve -4 -n responder.local", timeout=120
+            )
+          '';
+        };
+
         # PPPoE client + MSS clamping (roadmap C5). Two nodes on the WAN segment
         # (vlan 2): a `concentrator` runs rp-pppoe's `pppoe-server` (its own
         # self-contained pppd + rp-pppoe.so plugin, require-CHAP), and the sentinel
