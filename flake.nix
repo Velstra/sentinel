@@ -175,7 +175,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-4AUh/iJf9VjGUBkD1NM/0rYc4bvu8/ncjvF92uprL8Y=";
+      ebpfHash = "sha256-KDQ58pjxG27wukfuMT6g8ZjDTxRNM/ShQnknmWr3MAE=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -2572,6 +2572,138 @@
             client.wait_until_succeeds(
                 "curl -s --max-time 5 http://10.1.0.1:8080/ | grep -q hello-from-server",
                 timeout=40,
+            )
+          '';
+        };
+
+        # Hairpin NAT / NAT reflection (roadmap C10): an internal client reaches a
+        # port-forwarded service via the box's OWN public IP. client + server sit
+        # on the SAME LAN segment (vlan 1); the fw's WAN is vlan 2. A `hairpin`
+        # port-forward makes the compiler emit a reflection entry on the LAN policy
+        # (match the public IP, DNAT to the server, SNAT the source to the box's LAN
+        # ip) so the server's reply routes back through the box instead of straight
+        # to the client with the server's real address. Proven end to end: the
+        # client curls the WAN ip and gets the server's payload, all in XDP.
+        #   nix build .#checks.x86_64-linux.hairpin -L
+        hairpin = pkgs.testers.runNixOSTest {
+          name = "sentinel-hairpin";
+          nodes = {
+            # Internal server on the LAN segment, serving :8443.
+            server =
+              { pkgs, ... }:
+              {
+                virtualisation.vlans = [ 1 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                  interfaces.eth1.ipv4.addresses = [
+                    {
+                      address = "10.1.0.2";
+                      prefixLength = 24;
+                    }
+                  ];
+                  defaultGateway = {
+                    address = "10.1.0.1";
+                    interface = "eth1";
+                  };
+                };
+                systemd.services.web = {
+                  wantedBy = [ "multi-user.target" ];
+                  after = [ "network-online.target" ];
+                  script = ''
+                    mkdir -p /srv/web && echo hello-from-server > /srv/web/index.html
+                    exec ${pkgs.python3}/bin/python3 -m http.server 8443 --directory /srv/web
+                  '';
+                };
+              };
+            # Internal client on the SAME LAN segment — it dials the box's public IP.
+            client =
+              { pkgs, ... }:
+              {
+                virtualisation.vlans = [ 1 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                  interfaces.eth1.ipv4.addresses = [
+                    {
+                      address = "10.1.0.3";
+                      prefixLength = 24;
+                    }
+                  ];
+                  defaultGateway = {
+                    address = "10.1.0.1";
+                    interface = "eth1";
+                  };
+                };
+                environment.systemPackages = [ pkgs.curl ];
+              };
+            # The appliance: LAN = eth1 (vlan 1), WAN = eth2 (vlan 2). Sentinel owns
+            # both addresses so the compiler knows the public IP for the reflection.
+            fw =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "fw";
+                networking.firewall.enable = lib.mkForce false;
+                virtualisation.vlans = [
+                  1
+                  2
+                ];
+                virtualisation.memorySize = 2048;
+                # Route/forward on the LAN segment; the hairpin reply's source is
+                # rewritten to the WAN ip (a local address) at XDP ingress on the
+                # LAN nic, so relax reverse-path filtering + accept_local (as the
+                # nat check does).
+                boot.kernel.sysctl = {
+                  "net.ipv4.ip_forward" = 1;
+                  "net.ipv4.conf.all.rp_filter" = 0;
+                  "net.ipv4.conf.default.rp_filter" = 0;
+                  "net.ipv4.conf.all.accept_local" = 1;
+                  "net.ipv4.conf.all.log_martians" = 1;
+                };
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+          };
+          testScript = ''
+            start_all()
+            fw.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+            server.wait_for_unit("web.service")
+
+            # Sentinel owns both addresses + zones + the hairpin port-forward. The
+            # WAN address must be in the config for the compiler to resolve the
+            # reflection's match (public IP) and SNAT (the box's LAN ip).
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth1 zone lan' 'set interface eth1 address 10.1.0.1/24' "
+                "'set interface eth2 zone wan' 'set interface eth2 address 198.51.100.1/24' "
+                "'set firewall zone lan default-action accept' "
+                "'set firewall zone wan default-action accept' "
+                "'set nat destination web zone wan' 'set nat destination web proto tcp' "
+                "'set nat destination web port 8080' 'set nat destination web to 10.1.0.2:8443' "
+                "'set nat destination web hairpin true' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            fw.wait_for_unit("velstra.service")
+            # The compiler emitted the reflection entry (match the public IP, SNAT
+            # the source to the box's LAN ip).
+            fw.succeed("grep -q 'match_dst = \"198.51.100.1\"' /run/sentinel/velstra.toml")
+            fw.succeed("grep -q 'snat_ip = \"10.1.0.1\"' /run/sentinel/velstra.toml")
+            fw.wait_until_succeeds("ip addr show eth1 | grep -q 10.1.0.1", timeout=30)
+            fw.wait_until_succeeds("ip addr show eth2 | grep -q 198.51.100.1", timeout=30)
+
+            # Sanity: the fw reaches the server directly on the LAN.
+            fw.succeed("curl -s --max-time 5 http://10.1.0.2:8443/ | grep -q hello-from-server")
+
+            # The headline: an internal client dials the box's PUBLIC ip:8080 and
+            # reaches the internal server on the same LAN — DNAT in + hairpin SNAT
+            # so the reply routes back through the box, all in the eBPF datapath.
+            client.wait_until_succeeds(
+                "curl -s --max-time 5 http://198.51.100.1:8080/ | grep -q hello-from-server",
+                timeout=60,
             )
           '';
         };

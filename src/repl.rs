@@ -1733,6 +1733,10 @@ const NAT_DEST_FIELDS: &[Cand] = &[
     ("proto", "tcp / udp"),
     ("port", "public destination port"),
     ("to", "internal target ip or ip:port"),
+    (
+        "hairpin",
+        "NAT reflection: reach this service via the public IP from inside (true|false)",
+    ),
     ("description", "free-text label for this rule"),
     (
         "disabled",
@@ -2184,7 +2188,7 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set", "nat", "source", _name, "disabled"] => BOOLS,
         ["set" | "delete", "nat", "destination", _name] => NAT_DEST_FIELDS,
         ["set", "nat", "destination", _name, "proto"] => PROTOS,
-        ["set", "nat", "destination", _name, "disabled"] => BOOLS,
+        ["set", "nat", "destination", _name, "disabled" | "hairpin"] => BOOLS,
         ["set" | "delete", "nat", "nat64"] => NAT64_FIELDS,
         ["set", "nat", "nat64", "enabled" | "dns64"] => BOOLS,
 
@@ -3350,7 +3354,7 @@ mod tests {
         );
         assert_eq!(
             kw(&["set", "nat", "destination", "web"]),
-            ["zone", "proto", "port", "to", "description", "disabled"]
+            ["zone", "proto", "port", "to", "hairpin", "description", "disabled"]
         );
         assert_eq!(
             kw(&["set", "nat", "destination", "web", "proto"]),
