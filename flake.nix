@@ -584,8 +584,7 @@
           };
 
           # Dynamic DNS: ddclient in the foreground against Sentinel's rendered
-          # 0640 config (it carries the provider secret). Test deferred (needs a
-          # live provider endpoint), but the unit is real.
+          # 0640 config (it carries the provider secret). Verified by checks.dyndns.
           systemd.services.sentinel-ddclient = {
             description = "Dynamic-DNS client (sentinel/ddclient)";
             after = [
@@ -593,6 +592,14 @@
               "sentinel-boot.service"
             ];
             wants = [ "network-online.target" ];
+            # ddclient shells out: `ip` (iproute2) for `use=if` interface address
+            # discovery, and `logger` (util-linux) for `syslog=yes`. Without these
+            # on PATH `use=if` fails ("missing ip or ifconfig command") and never
+            # sends an update.
+            path = [
+              pkgs.iproute2
+              pkgs.util-linux
+            ];
             serviceConfig = {
               Type = "exec";
               ExecStart = "${pkgs.ddclient}/bin/ddclient -foreground -file /run/sentinel/ddclient/ddclient.conf -cache /run/sentinel/ddclient/ddclient.cache";
@@ -3407,6 +3414,147 @@
             )
           '';
         };
+
+        # Dynamic DNS (roadmap C18): two nodes — a `provider` running an HTTPS mock
+        # that speaks the dyndns2 update protocol (responds `good`, logs every
+        # update it receives), and the sentinel `fw` with a `[services.dyndns]`
+        # pointed at it. Sentinel renders ddclient.conf (0640) + its unit; ddclient
+        # publishes eth1's address (`use=if`) to the provider over TLS. The fw
+        # trusts a build-time self-signed cert whose SAN is `dyndns.test`, mapped to
+        # the provider. The test proves the whole chain: ddclient reads Sentinel's
+        # config and sends a correct dyndns2 update for the hostname to the server.
+        #   nix build .#checks.x86_64-linux.dyndns -L
+        dyndns =
+          let
+            # A self-signed cert for the mock provider (SAN dyndns.test); the fw
+            # trusts it so ddclient's TLS to the mock verifies.
+            dyndnsCert =
+              pkgs.runCommand "dyndns-cert" { nativeBuildInputs = [ pkgs.openssl ]; }
+                ''
+                  mkdir -p $out
+                  openssl req -x509 -newkey rsa:2048 -nodes \
+                    -keyout $out/key.pem -out $out/cert.pem -days 3650 \
+                    -subj "/CN=dyndns.test" -addext "subjectAltName=DNS:dyndns.test"
+                '';
+            # A minimal dyndns2 HTTPS endpoint: log the update path, answer `good`.
+            mockPy = pkgs.writeText "dyndns-mock.py" ''
+              import http.server, ssl
+              class H(http.server.BaseHTTPRequestHandler):
+                  def do_GET(self):
+                      with open("/tmp/updates.log", "a") as f:
+                          f.write(self.path + "\n")
+                      self.send_response(200)
+                      self.end_headers()
+                      self.wfile.write(b"good 10.0.0.1\n")
+                  def log_message(self, *a):
+                      pass
+              srv = http.server.HTTPServer(("0.0.0.0", 443), H)
+              ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+              ctx.load_cert_chain("${dyndnsCert}/cert.pem", "${dyndnsCert}/key.pem")
+              srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+              srv.serve_forever()
+            '';
+          in
+          pkgs.testers.runNixOSTest {
+            name = "sentinel-dyndns";
+            nodes = {
+              # The DDNS provider: an HTTPS dyndns2 mock on 443.
+              provider =
+                { pkgs, ... }:
+                {
+                  virtualisation.vlans = [ 1 ];
+                  networking = {
+                    useNetworkd = true;
+                    useDHCP = false;
+                    firewall.enable = false;
+                    interfaces.eth1.ipv4.addresses = [
+                      {
+                        address = "10.0.0.2";
+                        prefixLength = 24;
+                      }
+                    ];
+                  };
+                  systemd.services.dyndns-mock = {
+                    wantedBy = [ "multi-user.target" ];
+                    after = [ "network.target" ];
+                    serviceConfig.ExecStart = "${pkgs.python3}/bin/python3 ${mockPy}";
+                  };
+                };
+              # The sentinel appliance: eth1 (vlan 1) carries the DDNS traffic and is
+              # the address ddclient publishes; velstra sits on an isolated eth2.
+              fw =
+                { lib, ... }:
+                {
+                  imports = [ self.nixosModules.sentinel ];
+                  networking.hostName = lib.mkForce "fw";
+                  networking.firewall.enable = lib.mkForce false;
+                  virtualisation.vlans = [
+                    1
+                    2
+                  ];
+                  virtualisation.memorySize = 2048;
+                  networking.interfaces.eth2.ipv4.addresses = [
+                    {
+                      address = "192.168.50.1";
+                      prefixLength = 24;
+                    }
+                  ];
+                  # Reach the mock by its cert name, and trust that cert so ddclient's
+                  # TLS verifies.
+                  networking.extraHosts = "10.0.0.2 dyndns.test";
+                  security.pki.certificateFiles = [ "${dyndnsCert}/cert.pem" ];
+                  services.velstra.interface = lib.mkForce "eth2";
+                };
+            };
+            testScript = ''
+              start_all()
+              fw.wait_for_unit("multi-user.target")
+              fw.wait_for_unit("velstra.service")
+              provider.wait_for_unit("dyndns-mock.service")
+              provider.wait_until_succeeds("ss -tlnp | grep -q ':443'", timeout=30)
+
+              # eth1 is sentinel-owned (its address is what ddclient publishes); turn
+              # on the dynamic-DNS client pointed at the mock provider.
+              fw.succeed(
+                  "su admin -c \"printf '%s\\n' "
+                  "'set interface eth1 address 10.0.0.1/24' "
+                  "'set services dyndns hostname host.dyndns.test' "
+                  "'set services dyndns server dyndns.test' "
+                  "'set services dyndns login user' "
+                  "'set services dyndns password secretpw' "
+                  "'set services dyndns interface eth1' "
+                  "commit save exit "
+                  "| sentinel configure\""
+              )
+
+              # Sentinel rendered ddclient.conf (0640, secret) with the right fields.
+              fw.wait_until_succeeds(
+                  "test -f /run/sentinel/ddclient/ddclient.conf", timeout=20
+              )
+              conf = fw.succeed("cat /run/sentinel/ddclient/ddclient.conf")
+              assert "protocol=dyndns2" in conf, conf
+              assert "server=dyndns.test" in conf, conf
+              assert "use=if, if=eth1" in conf, conf
+              assert "login=user" in conf, conf
+              assert "password='secretpw'" in conf, conf
+              assert "host.dyndns.test" in conf, conf
+              # Sentinel renders it 0640; ddclient tightens it to 0600 on start
+              # ("must be accessible only by its owner"). Either way it is never
+              # world- or group-writable and never world-readable.
+              mode = fw.succeed("stat -c %a /run/sentinel/ddclient/ddclient.conf").strip()
+              assert mode in ("640", "600"), mode
+              fw.wait_until_succeeds("ip -4 addr show eth1 | grep -q 10.0.0.1", timeout=30)
+              fw.wait_for_unit("sentinel-ddclient.service")
+              fw.succeed("grep -q 'dyndns' /var/lib/sentinel/appliance.toml")
+
+              # The headline: ddclient sent a dyndns2 update for the hostname to the
+              # provider — the mock logged it, proving Sentinel's config drove a real
+              # update over TLS end to end.
+              provider.wait_until_succeeds(
+                  "grep -q 'host.dyndns.test' /tmp/updates.log", timeout=120
+              )
+            '';
+          };
 
         # PPPoE client + MSS clamping (roadmap C5). Two nodes on the WAN segment
         # (vlan 2): a `concentrator` runs rp-pppoe's `pppoe-server` (its own
