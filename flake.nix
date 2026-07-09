@@ -3144,6 +3144,150 @@
           '';
         };
 
+        # DHCP relay (roadmap C18): three nodes — a `dhcpserver` on a back segment
+        # (vlan 3) serving a pool for the CLIENT subnet it never touches, the
+        # sentinel `relay` bridging the two segments, and a `client` on the front
+        # segment (vlan 2) with no local DHCP server. The relay's client-facing
+        # eth2 is sentinel-owned (static 10.1.0.1/24 → the DHCP giaddr); velstra
+        # attaches to an isolated eth1 so it never sees the relayed DHCP. Sentinel
+        # renders a dnsmasq `--dhcp-relay` instance (`dhcp-relay=10.1.0.1,10.2.0.2`)
+        # + its unit. The test proves the whole path works: the client — with only
+        # the relay on its segment — obtains a lease from the far server's pool,
+        # i.e. the relay forwarded the DISCOVER upstream and the OFFER back.
+        #   nix build .#checks.x86_64-linux.dhcprelay -L
+        dhcprelay = pkgs.testers.runNixOSTest {
+          name = "sentinel-dhcprelay";
+          nodes = {
+            # Front segment (vlan 2): a DHCP client with no local server.
+            client =
+              { ... }:
+              {
+                virtualisation.vlans = [ 2 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                };
+                systemd.network.networks."10-eth1" = {
+                  matchConfig.Name = "eth1";
+                  networkConfig.DHCP = "ipv4";
+                };
+              };
+            # Back segment (vlan 3): the real DHCP server. It serves the CLIENT
+            # subnet (10.1.0.0/24) it isn't attached to — dnsmasq matches the
+            # relay's giaddr to this dhcp-range — and routes replies to that subnet
+            # back through the relay.
+            dhcpserver =
+              { pkgs, ... }:
+              {
+                virtualisation.vlans = [ 3 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                  interfaces.eth1.ipv4.addresses = [
+                    {
+                      address = "10.2.0.2";
+                      prefixLength = 24;
+                    }
+                  ];
+                  interfaces.eth1.ipv4.routes = [
+                    {
+                      address = "10.1.0.0";
+                      prefixLength = 24;
+                      via = "10.2.0.1";
+                    }
+                  ];
+                };
+                services.dnsmasq = {
+                  enable = true;
+                  settings = {
+                    port = 0;
+                    interface = "eth1";
+                    bind-interfaces = true;
+                    dhcp-authoritative = true;
+                    dhcp-range = [ "10.1.0.100,10.1.0.150,255.255.255.0,12h" ];
+                  };
+                };
+              };
+            # The sentinel relay: eth1 (vlan 1, isolated) hosts velstra; eth2
+            # (vlan 2) faces the client and is sentinel-owned; eth3 (vlan 3) faces
+            # the server (NixOS-static).
+            relay =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "relay";
+                networking.firewall.enable = lib.mkForce false;
+                virtualisation.vlans = [
+                  1
+                  2
+                  3
+                ];
+                virtualisation.memorySize = 2048;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = "192.168.99.1";
+                    prefixLength = 24;
+                  }
+                ];
+                networking.interfaces.eth3.ipv4.addresses = [
+                  {
+                    address = "10.2.0.1";
+                    prefixLength = 24;
+                  }
+                ];
+                # A reply to the giaddr (10.1.0.1, on eth2) arrives on eth3 from the
+                # server; loose rp_filter keeps strict reverse-path from dropping it.
+                boot.kernel.sysctl = {
+                  "net.ipv4.conf.all.rp_filter" = 2;
+                  "net.ipv4.conf.default.rp_filter" = 2;
+                };
+                # velstra lives on the isolated eth1 — never on the relayed segments.
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+          };
+          testScript = ''
+            start_all()
+            relay.wait_for_unit("multi-user.target")
+            relay.wait_for_unit("velstra.service")
+            dhcpserver.wait_for_unit("dnsmasq.service")
+
+            # eth2 is sentinel-owned: give it the client-facing address and turn on
+            # the DHCP relay to the back-segment server. ONE `set` per line.
+            relay.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth2 address 10.1.0.1/24' "
+                "'set services dhcp-relay interface eth2' "
+                "'set services dhcp-relay server 10.2.0.2' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            relay.wait_for_unit("velstra.service")
+
+            # Sentinel rendered the dnsmasq relay config + unit.
+            relay.wait_until_succeeds(
+                "test -f /run/sentinel/dhcp-relay/relay.conf", timeout=20
+            )
+            conf = relay.succeed("cat /run/sentinel/dhcp-relay/relay.conf")
+            assert "dhcp-relay=10.1.0.1,10.2.0.2" in conf, conf
+            assert "port=0" in conf, conf
+            relay.wait_for_unit("sentinel-dhcp-relay.service")
+            # eth2 came up with the giaddr address; save persisted the relay.
+            relay.wait_until_succeeds("ip -4 addr show eth2 | grep -q '10.1.0.1'", timeout=30)
+            relay.succeed("grep -q 'dhcp-relay' /var/lib/sentinel/appliance.toml")
+
+            # The headline: the client — whose segment has only the relay — obtains
+            # a lease from the far server's pool (10.1.0.100-150), proving the
+            # DISCOVER was relayed upstream and the OFFER relayed back.
+            client.wait_for_unit("multi-user.target")
+            client.wait_until_succeeds(
+                "ip -4 addr show eth1 | grep -qE '10[.]1[.]0[.]1[0-5][0-9]'",
+                timeout=120,
+            )
+          '';
+        };
+
         # PPPoE client + MSS clamping (roadmap C5). Two nodes on the WAN segment
         # (vlan 2): a `concentrator` runs rp-pppoe's `pppoe-server` (its own
         # self-contained pppd + rp-pppoe.so plugin, require-CHAP), and the sentinel
