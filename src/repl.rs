@@ -956,9 +956,65 @@ const TOP: &[Cand] = &[
         "certificates: local CA, issued certs, ACME (Let's Encrypt)",
     ),
     (
+        "policy",
+        "routing policy: prefix-lists + route-maps (match/set)",
+    ),
+    (
         "update",
         "signed update channel: URL + pinned release signing key",
     ),
+];
+// `policy <Tab>` reveals the two object kinds (VyOS-style, roadmap policy).
+const POLICY_NODES: &[Cand] = &[
+    (
+        "prefix-list",
+        "a named, reusable set of prefix ranges (by name)",
+    ),
+    ("route-map", "an ordered match/set route policy (by name)"),
+];
+// `policy prefix-list <name> rule <seq> <Tab>`.
+const PREFIX_LIST_RULE_FIELDS: &[Cand] = &[
+    ("prefix", "the base prefix (addr/len)"),
+    ("ge", "match prefixes at least this long"),
+    ("le", "match prefixes at most this long"),
+];
+// `policy route-map <name> <Tab>`.
+const ROUTE_MAP_FIELDS: &[Cand] = &[
+    ("default", "action when no rule matches (permit / deny)"),
+    ("rule", "a rule, keyed by a sequence number (<seq>)"),
+];
+// `policy route-map <name> rule <seq> <Tab>`.
+const ROUTE_MAP_RULE_FIELDS: &[Cand] = &[
+    ("action", "permit / deny a matching route"),
+    ("match", "conditions a route must meet (ANDed)"),
+    ("set", "attributes to change on a matching route"),
+];
+// `policy route-map <name> rule <seq> match <Tab>`.
+const ROUTE_MAP_MATCH_FIELDS: &[Cand] = &[
+    ("prefix-list", "match a named policy prefix-list"),
+    (
+        "prefix",
+        "match an inline prefix pattern (e.g. 10.0.0.0/8+)",
+    ),
+    ("protocol", "match this route's protocol"),
+    ("metric-le", "match metric ≤ this"),
+    ("metric-ge", "match metric ≥ this"),
+];
+// `policy route-map <name> rule <seq> set <Tab>`.
+const ROUTE_MAP_SET_FIELDS: &[Cand] = &[
+    ("metric", "set the route's metric"),
+    ("add-metric", "add a signed delta to the metric"),
+    ("preference", "set the administrative preference"),
+    ("community", "replace communities"),
+    ("add-community", "append a community"),
+    ("large-community", "replace large communities"),
+    ("add-large-community", "append a large community"),
+    ("ext-community", "replace extended communities"),
+    ("add-ext-community", "append an extended community"),
+];
+const PERMIT_DENY: &[Cand] = &[
+    ("permit", "permit the route"),
+    ("deny", "deny (drop) the route"),
 ];
 // `update <Tab>` reveals the signed-update-channel fields (roadmap C13).
 const UPDATE_FIELDS: &[Cand] = &[
@@ -1281,9 +1337,14 @@ const PROTOCOLS_NODES: &[Cand] = &[
     ("vrf", "a VRF (named isolated routing table)"),
     ("bfd", "global BFD timing / authentication defaults"),
     ("multicast", "IGMP/MLD querier + RFC 4605 proxy"),
-    ("filter", "a named route filter (import/export policy)"),
-    ("import", "per-protocol import filter (<proto> <filter>)"),
-    ("export", "redistribution export filter (<proto> <filter>)"),
+    (
+        "import",
+        "per-protocol import route-map (<proto> <route-map>)",
+    ),
+    (
+        "export",
+        "redistribution export route-map (<proto> <route-map>)",
+    ),
 ];
 const OSPF_FIELDS: &[Cand] = &[
     (
@@ -1558,30 +1619,6 @@ const ROA_FIELDS: &[Cand] = &[
     ("max-length", "the longest prefix length authorised"),
 ];
 // A route filter's fields, and one rule's fields.
-const FILTER_FIELDS: &[Cand] = &[
-    ("default", "action when no rule matches (accept / reject)"),
-    ("rule", "a rule, keyed by an integer index (<n>)"),
-];
-const FILTER_RULE_FIELDS: &[Cand] = &[
-    ("prefix", "a prefix pattern to match (e.g. 10.0.0.0/8+)"),
-    ("protocol", "match this route's protocol"),
-    ("metric-le", "match metric ≤ this"),
-    ("metric-ge", "match metric ≥ this"),
-    ("set-metric", "set the matched route's metric"),
-    ("add-metric", "add a signed delta to the metric"),
-    ("set-preference", "set the administrative preference"),
-    ("set-community", "replace communities"),
-    ("add-community", "append a community"),
-    ("set-large-community", "replace large communities"),
-    ("add-large-community", "append a large community"),
-    ("set-ext-community", "replace ext communities"),
-    ("add-ext-community", "append an ext community"),
-    ("action", "accept / reject a matching route"),
-];
-const ACCEPT_REJECT: &[Cand] = &[
-    ("accept", "accept the route"),
-    ("reject", "reject the route"),
-];
 const REDIST: &[Cand] = &[
     ("static", "redistribute static routes"),
     ("connected", "redistribute connected (interface) routes"),
@@ -2186,11 +2223,41 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
             | "bfd"
             | "shutdown",
         ] => BOOLS,
-        ["set" | "delete", "protocols", "filter", _name] => FILTER_FIELDS,
-        ["set", "protocols", "filter", _name, "default"] => ACCEPT_REJECT,
-        ["set" | "delete", "protocols", "filter", _name, "rule", _n] => FILTER_RULE_FIELDS,
-        ["set", "protocols", "filter", _name, "rule", _n, "action"] => ACCEPT_REJECT,
-        ["set", "protocols", "filter", _name, "rule", _n, "protocol"] => FILTER_PROTOCOLS,
+        // Routing policy (VyOS-style `[policy]`): prefix-lists + route-maps.
+        ["set" | "delete", "policy"] => POLICY_NODES,
+        ["set" | "delete", "policy", "prefix-list", _name, "rule", _n] => PREFIX_LIST_RULE_FIELDS,
+        ["set" | "delete", "policy", "route-map", _name] => ROUTE_MAP_FIELDS,
+        ["set", "policy", "route-map", _name, "default"] => PERMIT_DENY,
+        ["set" | "delete", "policy", "route-map", _name, "rule", _n] => ROUTE_MAP_RULE_FIELDS,
+        ["set", "policy", "route-map", _name, "rule", _n, "action"] => PERMIT_DENY,
+        [
+            "set" | "delete",
+            "policy",
+            "route-map",
+            _name,
+            "rule",
+            _n,
+            "match",
+        ] => ROUTE_MAP_MATCH_FIELDS,
+        [
+            "set",
+            "policy",
+            "route-map",
+            _name,
+            "rule",
+            _n,
+            "match",
+            "protocol",
+        ] => FILTER_PROTOCOLS,
+        [
+            "set" | "delete",
+            "policy",
+            "route-map",
+            _name,
+            "rule",
+            _n,
+            "set",
+        ] => ROUTE_MAP_SET_FIELDS,
         ["set" | "delete", "protocols", "ospf"] => OSPF_FIELDS,
         ["set", "protocols", "ospf", "redistribute"] => REDIST,
         ["set", "protocols", "ospf", "network-type"] => OSPF_NETWORK_TYPES,
@@ -2301,6 +2368,7 @@ pub struct DynNames {
     pub pki_certificates: Vec<String>,
     pub wireguard: Vec<String>,
     pub reverse_proxy: Vec<String>,
+    pub prefix_lists: Vec<String>,
 }
 
 /// Own a static `Cand` slice into `(keyword, description)` pairs — the bridge
@@ -2383,8 +2451,29 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
             "certificate",
             "a new certificate name",
         ),
-        ["set" | "delete", "protocols", "filter"] => {
-            named(&names.filters, "route filter", "a new filter name")
+        ["set" | "delete", "policy", "route-map"] => {
+            named(&names.filters, "route-map", "a new route-map name")
+        }
+        ["set" | "delete", "policy", "prefix-list"] => {
+            named(&names.prefix_lists, "prefix-list", "a new prefix-list name")
+        }
+        [
+            "set",
+            "policy",
+            "route-map",
+            _name,
+            "rule",
+            _n,
+            "match",
+            "prefix-list",
+        ] => {
+            let mut v: Vec<(String, String)> = names
+                .prefix_lists
+                .iter()
+                .map(|n| (n.clone(), "a declared policy prefix-list".to_string()))
+                .collect();
+            v.push((PH_NAME.0.to_string(), "a prefix-list name".to_string()));
+            v
         }
         ["set" | "delete", "protocols", "vrf"] => named(&names.vrfs, "VRF", "a new VRF name"),
         ["set" | "delete", "services", "reverse-proxy"] => named(
@@ -2686,6 +2775,63 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
         ["set", "vpn", "openconnect", "zone"] => zones("zone"),
         ["set" | "delete", "vpn", "openconnect", "user"] => own_cands(&[PH_NAME]),
         ["set", "vpn", "openconnect", "user", _u, "password"] => own_cands(&[PH_KEY]),
+        // Routing-policy value positions (VyOS `[policy]`).
+        ["set" | "delete", "policy", "prefix-list", _name, "rule"] => {
+            own_cands(&[("<seq>", "a rule sequence number")])
+        }
+        ["set" | "delete", "policy", "route-map", _name, "rule"] => {
+            own_cands(&[("<seq>", "a rule sequence number")])
+        }
+        ["set", "policy", "prefix-list", _name, "rule", _n, "prefix"]
+        | [
+            "set",
+            "policy",
+            "route-map",
+            _name,
+            "rule",
+            _n,
+            "match",
+            "prefix",
+        ] => own_cands(&[PH_IPV4_CIDR, PH_IPV6_CIDR]),
+        [
+            "set",
+            "policy",
+            "prefix-list",
+            _name,
+            "rule",
+            _n,
+            "ge" | "le",
+        ]
+        | [
+            "set",
+            "policy",
+            "route-map",
+            _name,
+            "rule",
+            _n,
+            "match",
+            "metric-le" | "metric-ge",
+        ] => own_cands(&[("<0-128>", "a prefix length / metric bound")]),
+        [
+            "set",
+            "policy",
+            "route-map",
+            _name,
+            "rule",
+            _n,
+            "set",
+            "metric" | "add-metric" | "preference",
+        ] => own_cands(&[PH_NUMBER]),
+        [
+            "set",
+            "policy",
+            "route-map",
+            _name,
+            "rule",
+            _n,
+            "set",
+            _attr,
+        ] => own_cands(&[("<asn:value>", "a community value")]),
         ["set", "update", "url"] => own_cands(&[PH_URL]),
         ["set", "update", "public-key"] => {
             own_cands(&[("<pem|file:path>", "PEM key or file:<path>")])
@@ -2973,6 +3119,7 @@ mod tests {
                 "multiwan",
                 "vpn",
                 "pki",
+                "policy",
                 "update"
             ]
         );
@@ -3224,8 +3371,10 @@ mod tests {
 
     #[test]
     fn bgp_and_filter_completion_is_discoverable() {
-        // The protocols sub-tree now offers filters alongside bgp.
-        assert!(kw(&["set", "protocols"]).contains(&"filter"));
+        // Route policy lives under the top-level `policy` node (prefix-list +
+        // route-map), not under `protocols`.
+        assert!(kw(&["set"]).contains(&"policy"));
+        assert_eq!(kw(&["set", "policy"]), ["prefix-list", "route-map"]);
         // The extended BGP field set.
         let bgp = kw(&["set", "protocols", "bgp"]);
         for f in [
@@ -3275,19 +3424,34 @@ mod tests {
             kw(&["set", "protocols", "bgp", "roa", "10.0.0.0/8"]),
             ["origin-as", "max-length"]
         );
-        // The filter sub-tree: fields, default values, rule fields, rule action.
+        // Routing policy (VyOS `[policy]`): prefix-list + route-map with match/set.
+        assert_eq!(kw(&["set", "policy"]), ["prefix-list", "route-map"]);
         assert_eq!(
-            kw(&["set", "protocols", "filter", "f"]),
+            kw(&["set", "policy", "route-map", "RM"]),
             ["default", "rule"]
         );
         assert_eq!(
-            kw(&["set", "protocols", "filter", "f", "default"]),
-            ["accept", "reject"]
+            kw(&["set", "policy", "route-map", "RM", "default"]),
+            ["permit", "deny"]
         );
-        assert!(kw(&["set", "protocols", "filter", "f", "rule", "10"]).contains(&"set-community"));
         assert_eq!(
-            kw(&["set", "protocols", "filter", "f", "rule", "10", "action"]),
-            ["accept", "reject"]
+            kw(&["set", "policy", "route-map", "RM", "rule", "10"]),
+            ["action", "match", "set"]
+        );
+        assert_eq!(
+            kw(&["set", "policy", "route-map", "RM", "rule", "10", "action"]),
+            ["permit", "deny"]
+        );
+        assert!(
+            kw(&["set", "policy", "route-map", "RM", "rule", "10", "match"])
+                .contains(&"prefix-list")
+        );
+        assert!(
+            kw(&["set", "policy", "route-map", "RM", "rule", "10", "set"]).contains(&"community")
+        );
+        assert_eq!(
+            kw(&["set", "policy", "prefix-list", "LAN", "rule", "10"]),
+            ["prefix", "ge", "le"]
         );
     }
 
@@ -3308,6 +3472,7 @@ mod tests {
             pki_certificates: vec!["api".into()],
             wireguard: vec!["wg0".into()],
             reverse_proxy: vec!["web".into()],
+            prefix_lists: vec!["LAN".into()],
         };
         let kws = |toks: &[&str]| -> Vec<String> {
             dyn_candidates(toks, &names)
@@ -3368,6 +3533,7 @@ mod tests {
                 "multiwan",
                 "vpn",
                 "pki",
+                "policy",
                 "update"
             ]
         );
@@ -3535,7 +3701,16 @@ mod tests {
             ["dyndns2", "cloudflare", "duckdns", "noip"]
         );
         assert_eq!(
-            kw(&["set", "protocols", "filter", "f", "rule", "10", "protocol"]),
+            kw(&[
+                "set",
+                "policy",
+                "route-map",
+                "f",
+                "rule",
+                "10",
+                "match",
+                "protocol"
+            ]),
             [
                 "connected",
                 "static",

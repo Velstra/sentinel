@@ -4618,6 +4618,118 @@
             '';
           };
 
+        # Routing policy: two Sentinel appliances peer over BGP; node A originates
+        # three networks but exports them through a VyOS-style `[policy]` route-map
+        # that permits only the 10/8 space (via a prefix-list `10.0.0.0/8 le 24`)
+        # and denies the rest. End-to-end proof that `set policy prefix-list` +
+        # `set policy route-map` compile to a wren `[[filter]]` (the prefix-list
+        # entry expanded to wren's `10.0.0.0/8{8,24}` PrefixPattern range syntax)
+        # and actually filter what the peer learns: policy2 installs ONLY the two
+        # permitted 10/8 prefixes proto bgp; the 192.168/24 route is dropped.
+        policy =
+          let
+            node = hostname: addr: {
+              lib,
+              ...
+            }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce hostname;
+              networking.firewall.enable = lib.mkForce false;
+              networking.interfaces.eth1.ipv4.addresses = [
+                {
+                  address = addr;
+                  prefixLength = 24;
+                }
+              ];
+              virtualisation.vlans = [ 1 ];
+              virtualisation.memorySize = 2048;
+              services.velstra.interface = lib.mkForce "eth1";
+            };
+          in
+          pkgs.testers.runNixOSTest {
+            name = "sentinel-policy";
+            nodes = {
+              policy1 = node "policy1" "10.10.0.1";
+              policy2 = node "policy2" "10.10.0.2";
+            };
+            testScript = ''
+              start_all()
+              for m in (policy1, policy2):
+                  m.wait_for_unit("multi-user.target")
+                  m.wait_for_unit("velstra.service")
+                  m.wait_for_unit("wren.service")
+              policy1.wait_until_succeeds("ip addr show eth1 | grep -q 10.10.0.1", timeout=20)
+              policy2.wait_until_succeeds("ip addr show eth1 | grep -q 10.10.0.2", timeout=20)
+
+              # Node A (policy1) originates 10.20.0.0/24, 10.30.0.0/24 and
+              # 192.168.0.0/24, but its neighbour `export` route-map permits only
+              # the 10/8 prefixes (prefix-list `10.0.0.0/8 le 24`, rule 10 permit)
+              # and denies everything else (rule 20 deny). default-action accept so
+              # the Velstra firewall on eth1 passes the BGP session.
+              policy1.succeed(
+                  "su admin -c \"printf '%s\\n' "
+                  "'set firewall global default-action accept' "
+                  "'set interface eth1 zone wan' "
+                  "'set protocols router-id 10.10.0.1' "
+                  "'set protocols bgp local-as 65001' "
+                  "'set protocols bgp network 10.20.0.0/24' "
+                  "'set protocols bgp network 10.30.0.0/24' "
+                  "'set protocols bgp network 192.168.0.0/24' "
+                  "'set protocols bgp neighbor 10.10.0.2 remote-as 65002' "
+                  "'set protocols bgp neighbor 10.10.0.2 export to-peer' "
+                  "'set policy prefix-list LAN rule 10 prefix 10.0.0.0/8' "
+                  "'set policy prefix-list LAN rule 10 le 24' "
+                  "'set policy route-map to-peer default deny' "
+                  "'set policy route-map to-peer rule 10 action permit' "
+                  "'set policy route-map to-peer rule 10 match prefix-list LAN' "
+                  "'set policy route-map to-peer rule 10 set metric 100' "
+                  "'set policy route-map to-peer rule 20 action deny' "
+                  "commit save exit "
+                  "| sentinel configure\""
+              )
+              policy1.wait_for_unit("wren.service")
+
+              # Node B (policy2): a plain peer, no policy.
+              policy2.succeed(
+                  "su admin -c \"printf '%s\\n' "
+                  "'set firewall global default-action accept' "
+                  "'set interface eth1 zone wan' "
+                  "'set protocols router-id 10.10.0.2' "
+                  "'set protocols bgp local-as 65002' "
+                  "'set protocols bgp neighbor 10.10.0.1 remote-as 65001' "
+                  "commit save exit "
+                  "| sentinel configure\""
+              )
+              policy2.wait_for_unit("wren.service")
+
+              # The sentinel→wren compile under test: A's route-map became a
+              # top-level wren filter, the prefix-list entry `10.0.0.0/8 le 24`
+              # expanded to wren's PrefixPattern range `10.0.0.0/8{8,24}`, and the
+              # `set metric` clause carried through.
+              policy1.succeed("grep -q 'name = \"to-peer\"' /run/sentinel/wren.toml")
+              policy1.succeed("grep -q '10.0.0.0/8{8,24}' /run/sentinel/wren.toml")
+              policy1.succeed("grep -q 'set-metric = 100' /run/sentinel/wren.toml")
+
+              # Headline: policy2 learns ONLY the permitted 10/8 prefixes over BGP
+              # and installs them proto bgp in the kernel FIB. Session establish +
+              # convergence take a little while, so retry generously.
+              policy2.wait_until_succeeds(
+                  "ip -4 route show proto bgp | grep -q '10.20.0.0/24'", timeout=90
+              )
+              policy2.wait_until_succeeds(
+                  "ip -4 route show proto bgp | grep -q '10.30.0.0/24'", timeout=90
+              )
+              # The denied 192.168.0.0/24 must NOT be present. Both permitted routes
+              # arrived in the same update batch, so its absence is the route-map
+              # deny at work — not slow propagation.
+              policy2.succeed("! ip -4 route show proto bgp | grep -q '192.168.0.0/24'")
+
+              # The session is established and `wren show` works on the box.
+              policy2.succeed("wren show bgp neighbors | grep -qi established")
+            '';
+          };
+
         # Routing: two Sentinel appliances form an OSPFv2 point-to-point adjacency
         # and each learns the other's redistributed network — proof the Wren OSPF
         # path is wired through the same `set protocols …` CLI. ospf1 originates
