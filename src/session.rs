@@ -227,6 +227,7 @@ struct NatDstDraft {
     proto: Option<Proto>,
     port: Option<u16>,
     to: Option<String>,
+    hairpin: bool,
 }
 
 /// A partially-specified per-zone posture override.
@@ -1713,6 +1714,7 @@ impl Draft {
                             proto: Some(d.proto),
                             port: Some(d.port),
                             to: Some(d.to.clone()),
+                            hairpin: d.hairpin,
                         },
                     )
                 })
@@ -2807,6 +2809,9 @@ impl Session {
             ["nat", "destination", name, "to", v] => {
                 crate::config::parse_host_port(v)?;
                 self.draft.nat_destination_mut(name).to = Some((*v).to_string());
+            }
+            ["nat", "destination", name, "hairpin", v] => {
+                self.draft.nat_destination_mut(name).hairpin = parse_bool(v)?;
             }
 
             // nat nat64: stateful IPv6→IPv4 translation (tayga) + DNS64 (unbound).
@@ -4387,6 +4392,7 @@ impl Session {
                     "proto" => d.proto = None,
                     "port" => d.port = None,
                     "to" => d.to = None,
+                    "hairpin" => d.hairpin = false,
                     other => bail!("nat destination has no field {other:?}"),
                 }
             }
@@ -5510,6 +5516,7 @@ impl Session {
                         to: d.to.clone().ok_or_else(|| {
                             anyhow::anyhow!("nat destination {name:?}: to not set")
                         })?,
+                        hairpin: d.hairpin,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -6462,6 +6469,9 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         if let Some(t) = &d.to {
             nati.push_str(&format!("        to {t}\n"));
+        }
+        if d.hairpin {
+            nati.push_str("        hairpin true\n");
         }
         nati.push_str("    }\n");
     }
@@ -8825,6 +8835,15 @@ mod tests {
         // Completion name helpers see the new rules.
         assert_eq!(s.nat_source_names(), ["wan-masq"]);
         assert_eq!(s.nat_destination_names(), ["web"]);
+
+        // Hairpin (NAT reflection) is an optional flag on a destination rule: it
+        // sets, renders in `show`, commits, and clears.
+        run(&mut s, "set nat destination web hairpin true").unwrap();
+        assert!(s.show().contains("hairpin true"), "got:\n{}", s.show());
+        assert!(s.commit().unwrap().nat.destination[0].hairpin);
+        run(&mut s, "delete nat destination web hairpin").unwrap();
+        assert!(!s.show().contains("hairpin"), "got:\n{}", s.show());
+        assert!(!s.commit().unwrap().nat.destination[0].hairpin);
 
         // Delete a field, then a whole rule; deleting an absent one errors.
         run(&mut s, "delete nat destination web port").unwrap();

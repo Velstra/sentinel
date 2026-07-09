@@ -91,6 +91,14 @@ struct PortForwardOut {
     port: u16,
     dst_ip: String,
     dst_port: u16,
+    /// Hairpin (NAT reflection) match guard — only DNAT when the packet's
+    /// destination equals this (the box's public IP). Absent ⇒ match any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    match_dst: Option<String>,
+    /// Hairpin source-NAT address (the box's IP on the client's segment). Absent
+    /// ⇒ no source rewrite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snat_ip: Option<String>,
 }
 
 impl VelstraConfig {
@@ -235,26 +243,72 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
         })
         .collect();
 
+    // A zone's static IPv4 (the box's own address on that segment), taken from the
+    // first enabled interface in the zone with a parseable static v4 CIDR. `dhcp`
+    // (or an address-less) interface yields `None`. Used to resolve hairpin match /
+    // SNAT addresses at compile time.
+    let zone_ipv4 = |zone: &str| -> Option<std::net::Ipv4Addr> {
+        appliance
+            .interfaces
+            .iter()
+            .filter(|i| !i.disabled && i.zone.as_deref() == Some(zone))
+            .find_map(|i| {
+                let addr = i.address.as_deref()?;
+                addr.split('/').next()?.parse::<std::net::Ipv4Addr>().ok()
+            })
+    };
+
     // Destination NAT (port-forwards) binds to its ingress zone's policy; `to`
     // splits into the internal ip:port (validated already, so a parse miss just
     // drops the entry). Source NAT (masquerade) is enforced in Phase 4b.
-    let port_forwards = appliance
-        .nat
-        .destination
-        .iter()
-        .filter(|dst| !dst.disabled)
-        .filter_map(|dst| {
-            let policy = *ids.get(dst.zone.as_str())?;
-            let (ip, port) = crate::config::parse_host_port(&dst.to).ok()?;
-            Some(PortForwardOut {
-                policy,
-                proto: proto_str(dst.proto),
+    //
+    // A `hairpin` destination additionally emits one **reflection** entry per other
+    // zone: an internal client dialling the box's public IP is DNAT'd to the server
+    // and source-NAT'd to the box's address on that segment, so the reply routes
+    // back through the box. Reflection needs the ingress zone's public IP known at
+    // compile time — skipped (with the plain forward still emitted) when the
+    // ingress zone is DHCP/address-less.
+    let mut port_forwards: Vec<PortForwardOut> = Vec::new();
+    for dst in appliance.nat.destination.iter().filter(|d| !d.disabled) {
+        let Some(&policy) = ids.get(dst.zone.as_str()) else {
+            continue;
+        };
+        let Ok((ip, port)) = crate::config::parse_host_port(&dst.to) else {
+            continue;
+        };
+        let proto = proto_str(dst.proto);
+        let dst_ip = ip.to_string();
+        // The plain forward on the ingress (public) zone.
+        port_forwards.push(PortForwardOut {
+            policy,
+            proto,
+            port: dst.port,
+            dst_ip: dst_ip.clone(),
+            dst_port: port,
+            match_dst: None,
+            snat_ip: None,
+        });
+        if !dst.hairpin {
+            continue;
+        }
+        let Some(public_ip) = zone_ipv4(&dst.zone) else {
+            continue; // no static public IP → reflection can't be resolved.
+        };
+        for (&zname, &zpolicy) in ids.iter().filter(|(z, _)| **z != dst.zone.as_str()) {
+            let Some(box_ip) = zone_ipv4(zname) else {
+                continue; // this internal zone has no static box address → skip.
+            };
+            port_forwards.push(PortForwardOut {
+                policy: zpolicy,
+                proto,
                 port: dst.port,
-                dst_ip: ip.to_string(),
+                dst_ip: dst_ip.clone(),
                 dst_port: port,
-            })
-        })
-        .collect();
+                match_dst: Some(public_ip.to_string()),
+                snat_ip: Some(box_ip.to_string()),
+            });
+        }
+    }
 
     VelstraConfig {
         // Deny by default; interfaces opt into their zone policy.
@@ -622,6 +676,73 @@ to = "10.0.0.10:8443"
         let out = cfg.to_toml().unwrap();
         assert!(out.contains("[[port_forward]]"), "{out}");
         assert!(out.contains("dst_ip = \"10.0.0.10\""), "{out}");
+    }
+
+    #[test]
+    fn hairpin_destination_emits_a_reflection_entry_per_internal_zone() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+address = "198.51.100.1/24"
+[[interface]]
+name = "lan0"
+zone = "lan"
+address = "10.0.0.1/24"
+[[nat.destination]]
+name = "web"
+zone = "wan"
+proto = "tcp"
+port = 443
+to = "10.0.0.10:8443"
+hairpin = true
+"#;
+        let cfg = compile(&Appliance::from_toml(toml).unwrap());
+        // ids: lan=1, wan=2. A plain WAN forward plus one reflection entry for lan.
+        assert_eq!(cfg.port_forwards.len(), 2);
+        // The plain forward binds the wan (ingress) policy with no match/snat.
+        let plain = cfg.port_forwards.iter().find(|p| p.policy == 2).unwrap();
+        assert_eq!((plain.dst_ip.as_str(), plain.dst_port), ("10.0.0.10", 8443));
+        assert!(plain.match_dst.is_none() && plain.snat_ip.is_none());
+        // The reflection entry binds the lan policy: match the public IP, SNAT the
+        // source to the box's lan address so the reply routes back through the box.
+        let refl = cfg.port_forwards.iter().find(|p| p.policy == 1).unwrap();
+        assert_eq!(refl.match_dst.as_deref(), Some("198.51.100.1"));
+        assert_eq!(refl.snat_ip.as_deref(), Some("10.0.0.1"));
+        assert_eq!((refl.dst_ip.as_str(), refl.dst_port), ("10.0.0.10", 8443));
+        let out = cfg.to_toml().unwrap();
+        assert!(out.contains("match_dst = \"198.51.100.1\""), "{out}");
+        assert!(out.contains("snat_ip = \"10.0.0.1\""), "{out}");
+    }
+
+    #[test]
+    fn hairpin_without_static_public_ip_skips_reflection() {
+        // A DHCP wan → the public IP is unknown at compile time, so only the plain
+        // forward is emitted (no reflection entry that couldn't match anything).
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+address = "dhcp"
+[[interface]]
+name = "lan0"
+zone = "lan"
+address = "10.0.0.1/24"
+[[nat.destination]]
+name = "web"
+zone = "wan"
+proto = "tcp"
+port = 443
+to = "10.0.0.10:8443"
+hairpin = true
+"#;
+        let cfg = compile(&Appliance::from_toml(toml).unwrap());
+        assert_eq!(cfg.port_forwards.len(), 1);
+        assert!(cfg.port_forwards[0].match_dst.is_none());
     }
 
     #[test]

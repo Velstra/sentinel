@@ -366,11 +366,31 @@ sentinel# commit save
 
 - **`zone`** — the ingress (public) zone; must be backed by an interface.
 - **`to`** — `"ip"` (keep the public port) or `"ip:port"` (remap).
+- **`hairpin`** — enable **NAT reflection** (see below).
 - Remove one with `delete nat destination <name>`.
 
 This enforcement lives in the eBPF datapath (reusing the load-balancer's NAT +
 connection-tracking machinery), so it works on real forwarded traffic with no
 `iptables`.
+
+#### Hairpin NAT (NAT reflection)
+
+By default a port-forward only fires for traffic arriving on the public zone. An
+**internal** client that dials the box's *public* IP would otherwise fail — the
+server would reply straight to the client with its own internal address, which
+the client never asked for. `hairpin` fixes that: the compiler emits a reflection
+entry on every other zone that DNATs the public IP to the internal server **and**
+source-NATs the client to the box's address on that segment, so the reply routes
+back through the box.
+
+```text
+sentinel# set nat destination web hairpin true
+sentinel# commit save
+```
+
+Reflection needs the ingress zone's **public IP known at commit time**, so the
+WAN interface must carry a static `address` (a DHCP/address-less WAN still gets
+the plain forward, just no reflection).
 
 ## Reverse proxy / load balancer (`services reverse-proxy`)
 

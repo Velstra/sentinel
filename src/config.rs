@@ -2007,6 +2007,13 @@ pub struct NatDestination {
     pub port: u16,
     /// Internal target, `"10.0.0.10"` or `"10.0.0.10:8443"`.
     pub to: String,
+    /// Hairpin NAT (NAT reflection): also let internal clients reach this service
+    /// via the box's public address. The compiler emits an extra reflection entry
+    /// per other zone (matched on the public IP, source-NAT'd to the box's address
+    /// on the client's segment) so the internal server's reply routes back through
+    /// the box. Requires the ingress zone to have a static address. Off by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hairpin: bool,
 }
 
 /// NAT64 (roadmap C10) — stateful IPv6→IPv4 translation. An IPv6-only client
