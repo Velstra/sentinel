@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::{
     Acme, Action, Appliance, Bfd, Bgp, BgpAggregate, BgpNeighbor, BgpRoa, BgpRtr, Ca, Certificate,
-    DhcpRelay, DhcpServer, DhcpStaticLease, Dns, Dyndns, Export, Filter, FilterRule, Firewall,
+    Dhcp6Pool, DhcpRelay, DhcpServer, DhcpStaticLease, Dns, Dyndns, Export, Filter, FilterRule, Firewall,
     Groups, HealthCheck, IfaceType, Interface, IpsecConnection, Isis, Lldp, Mdns, MultiWan,
     Multicast, MulticastInterface, Nat, Nat64, NatDestination, NatSource, Ntp, OpenConnectServer,
     OpenConnectUser, Ospf, Ospf3, OspfInterface, Pki, Policy, PortSpec, Pppoe, PrefixEntry,
@@ -169,6 +169,20 @@ struct RouterAdvertDraft {
     managed: bool,
     other_config: bool,
     router_lifetime: Option<u32>,
+    dhcp6_pool: Option<Dhcp6Pool>,
+}
+
+impl RouterAdvertDraft {
+    /// Mutable access to the stateful-DHCPv6 pool sub-draft, inserting an empty one
+    /// (blank endpoints) if not yet present — the first `dhcp6-pool` field creates
+    /// it; commit-time validation rejects a still-incomplete pool.
+    fn dhcp6_pool_mut(&mut self) -> &mut Dhcp6Pool {
+        self.dhcp6_pool.get_or_insert_with(|| Dhcp6Pool {
+            start: String::new(),
+            end: String::new(),
+            lease_time: None,
+        })
+    }
 }
 
 /// A partially-specified WireGuard peer (keyed by its public key in the draft).
@@ -1612,6 +1626,7 @@ impl Draft {
                                 managed: r.managed,
                                 other_config: r.other_config,
                                 router_lifetime: r.router_lifetime,
+                                dhcp6_pool: r.dhcp6_pool.clone(),
                             }),
                             if_type: i.if_type,
                             members: i.members.clone(),
@@ -2468,6 +2483,21 @@ impl Session {
                     .parse()
                     .with_context(|| format!("invalid router-lifetime {v:?}"))?;
                 self.draft.iface_mut(name).ra_mut().router_lifetime = Some(life);
+            }
+            // Stateful DHCPv6: `dhcp6-pool start|end <ipv6>` bounds the address pool,
+            // `lease-time` sets its lease. Setting any turns the RA's Managed flag on
+            // at render; validation ties the pool to an advertised prefix at commit.
+            ["interface", name, "router-advert", "dhcp6-pool", "start", v] => {
+                validate_ipv6(v)?;
+                self.draft.iface_mut(name).ra_mut().dhcp6_pool_mut().start = v.to_string();
+            }
+            ["interface", name, "router-advert", "dhcp6-pool", "end", v] => {
+                validate_ipv6(v)?;
+                self.draft.iface_mut(name).ra_mut().dhcp6_pool_mut().end = v.to_string();
+            }
+            ["interface", name, "router-advert", "dhcp6-pool", "lease-time", v] => {
+                let lease = parse_duration_secs(v)?;
+                self.draft.iface_mut(name).ra_mut().dhcp6_pool_mut().lease_time = Some(lease);
             }
 
             // Bridge / bond / wireguard: `type` makes this a virtual device;
@@ -4229,6 +4259,7 @@ impl Session {
                     "managed" => r.managed = false,
                     "other-config" => r.other_config = false,
                     "router-lifetime" => r.router_lifetime = None,
+                    "dhcp6-pool" => r.dhcp6_pool = None,
                     other => bail!("router-advert has no field {other:?}"),
                 }
             }
@@ -5351,6 +5382,7 @@ impl Session {
                     managed: r.managed,
                     other_config: r.other_config,
                     router_lifetime: r.router_lifetime,
+                    dhcp6_pool: r.dhcp6_pool.clone(),
                 }),
                 if_type: d.if_type,
                 members: d.members.clone(),
@@ -6267,6 +6299,15 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             }
             if let Some(life) = r.router_lifetime {
                 out.push_str(&format!("        router-lifetime {life}\n"));
+            }
+            if let Some(pool) = &r.dhcp6_pool {
+                out.push_str("        dhcp6-pool {\n");
+                out.push_str(&format!("            start {}\n", pool.start));
+                out.push_str(&format!("            end {}\n", pool.end));
+                if let Some(lease) = pool.lease_time {
+                    out.push_str(&format!("            lease-time {lease}\n"));
+                }
+                out.push_str("        }\n");
             }
             out.push_str("    }\n");
         }
@@ -7689,6 +7730,66 @@ mod tests {
             "delete" => session.delete(&parts[1..]),
             _ => panic!("test helper only does set/delete"),
         }
+    }
+
+    #[test]
+    fn dhcp6_pool_grammar_sets_shows_commits_and_deletes() {
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname fw1",
+            "set interface lan0 zone lan",
+            "set interface lan0 address 10.0.0.1/24",
+            "set interface lan0 router-advert enable",
+            "set interface lan0 router-advert prefix 2001:db8:1::/64",
+            "set interface lan0 router-advert dhcp6-pool start 2001:db8:1::100",
+            "set interface lan0 router-advert dhcp6-pool end 2001:db8:1::1ff",
+            "set interface lan0 router-advert dhcp6-pool lease-time 12h",
+        ] {
+            run(&mut s, line).unwrap();
+        }
+        // `show` renders the pool as a nested block; the human duration is stored
+        // as seconds.
+        let shown = s.show();
+        assert!(shown.contains("dhcp6-pool {"), "got:\n{shown}");
+        assert!(shown.contains("start 2001:db8:1::100"), "got:\n{shown}");
+        assert!(shown.contains("end 2001:db8:1::1ff"), "got:\n{shown}");
+        assert!(shown.contains("lease-time 43200"), "got:\n{shown}");
+
+        let a = s.commit().expect("dhcp6 pool commits");
+        let ra = a
+            .interfaces
+            .iter()
+            .find(|i| i.name == "lan0")
+            .and_then(|i| i.router_advert.as_ref())
+            .expect("ra present");
+        let pool = ra.dhcp6_pool.as_ref().expect("pool present");
+        assert_eq!(pool.start, "2001:db8:1::100");
+        assert_eq!(pool.end, "2001:db8:1::1ff");
+        assert_eq!(pool.lease_time, Some(43_200));
+
+        // A pool outside every advertised prefix is rejected at commit.
+        run(
+            &mut s,
+            "set interface lan0 router-advert dhcp6-pool start 2001:db8:9::1",
+        )
+        .unwrap();
+        assert!(s.commit().is_err(), "pool must sit inside an advertised prefix");
+
+        // `delete` clears the whole pool.
+        run(
+            &mut s,
+            "set interface lan0 router-advert dhcp6-pool start 2001:db8:1::100",
+        )
+        .unwrap();
+        run(&mut s, "delete interface lan0 router-advert dhcp6-pool").unwrap();
+        let a = s.commit().expect("commits without a pool");
+        let ra = a
+            .interfaces
+            .iter()
+            .find(|i| i.name == "lan0")
+            .and_then(|i| i.router_advert.as_ref())
+            .expect("ra still present");
+        assert!(ra.dhcp6_pool.is_none());
     }
 
     #[test]

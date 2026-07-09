@@ -318,7 +318,9 @@ fn network_body(
     // an address from each prefix to this interface — no separate v6 address).
     if let Some(r) = ra {
         body.push_str("\n[IPv6SendRA]\n");
-        if r.managed {
+        // A stateful `dhcp6-pool` forces the Managed (M) flag: clients must ask the
+        // DHCPv6 server (our second dnsmasq instance) for an address, not autoconf.
+        if r.managed || r.dhcp6_pool.is_some() {
             body.push_str("Managed=yes\n");
         }
         if r.other_config {
@@ -666,6 +668,13 @@ const DDCLIENT_UNIT: &str = "sentinel-ddclient.service";
 const DHCP_RELAY_CONF: &str = "/run/sentinel/dhcp-relay/relay.conf";
 const DHCP_RELAY_UNIT: &str = "sentinel-dhcp-relay.service";
 
+/// Stateful DHCPv6 server: a THIRD dnsmasq instance (DNS + RA both disabled) that
+/// only hands out addresses from each interface's `dhcp6-pool`. networkd owns the
+/// RA (with the Managed flag forced on above); dnsmasq answers the DHCPv6 request
+/// the M flag triggers. Same second-instance pattern as the DHCP relay.
+const DHCP6_CONF: &str = "/run/sentinel/dhcp6/dhcp6.conf";
+const DHCP6_UNIT: &str = "sentinel-dhcp6.service";
+
 /// NAT64 (roadmap C10). tayga's daemon config + a datapath setup script (the
 /// `nat64` tun device + pool/prefix routes tayga can't add itself), driven by the
 /// Sentinel-owned `sentinel-nat64` unit. DNS64 rides a second `sentinel-dns64`
@@ -830,6 +839,47 @@ fn dhcp_relay_conf_body(relay: &DhcpRelay, ifaces: &[Interface]) -> Option<Strin
     any.then_some(body)
 }
 
+/// The stateful-DHCPv6 default lease, in seconds (12h) — matches the config-layer
+/// EXAMPLE and the DHCPv4 server's conventions.
+const DHCP6_DEFAULT_LEASE: u32 = 43_200;
+
+/// Render the DHCPv6 dnsmasq config, or `None` when no interface declares a
+/// `dhcp6-pool`. `port=0` disables the DNS half; the absence of `enable-ra` keeps
+/// dnsmasq from sending RAs (networkd owns those), so it hands out addresses only.
+/// One `interface=` + `dhcp-range=<start>,<end>,<prefix-len>,<lease>` per pool; the
+/// prefix length is taken from the advertised prefix containing the pool (validation
+/// guarantees one exists — fall back to /64, dnsmasq's own default).
+fn dhcp6_conf_body(ifaces: &[Interface]) -> Option<String> {
+    let mut body = String::from("# rendered by sentinel — stateful DHCPv6 (dnsmasq)\nport=0\n");
+    let mut any = false;
+    for iface in ifaces {
+        let Some(ra) = iface.router_advert.as_ref() else {
+            continue;
+        };
+        let Some(pool) = ra.dhcp6_pool.as_ref() else {
+            continue;
+        };
+        let start: Ipv6Addr = match pool.start.parse() {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        let plen = ra
+            .prefixes
+            .iter()
+            .filter(|p| crate::config::ipv6_in_prefix(&start, p))
+            .find_map(|p| p.split('/').nth(1).and_then(|l| l.parse::<u8>().ok()))
+            .unwrap_or(64);
+        let lease = pool.lease_time.unwrap_or(DHCP6_DEFAULT_LEASE);
+        body.push_str(&format!("interface={}\n", iface.name));
+        body.push_str(&format!(
+            "dhcp-range={},{},{},{}\n",
+            pool.start, pool.end, plen, lease
+        ));
+        any = true;
+    }
+    any.then_some(body)
+}
+
 /// Reconcile one Sentinel-owned box service to its rendered config: write the
 /// file (0640 when it carries a secret) and (re)start the unit when the config
 /// changed, or stop the unit and drop the file when the service is unconfigured.
@@ -893,6 +943,12 @@ fn apply_box_services(appliance: &Appliance) -> Result<()> {
         DHCP_RELAY_UNIT,
         Path::new(DHCP_RELAY_CONF),
         dhcp_relay_conf_body(&s.dhcp_relay, &appliance.interfaces),
+        false,
+    )?;
+    apply_box_service(
+        DHCP6_UNIT,
+        Path::new(DHCP6_CONF),
+        dhcp6_conf_body(&appliance.interfaces),
         false,
     )?;
     Ok(())
@@ -2785,6 +2841,7 @@ mod tests {
             managed: false,
             other_config: true,
             router_lifetime: Some(1800),
+            dhcp6_pool: None,
         };
         let u = network_body(
             "lan0",
@@ -2834,6 +2891,7 @@ mod tests {
             managed: false,
             other_config: false,
             router_lifetime: None,
+            dhcp6_pool: None,
         };
         let u = network_body(
             "lan0",
@@ -3388,6 +3446,56 @@ mod tests {
         );
         assert!(
             body.contains("dhcp-relay=10.0.7.1,10.0.99.2"),
+            "got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn dhcp6_conf_renders_stateful_pool_or_nothing() {
+        use crate::config::Dhcp6Pool;
+        // No interface with a pool ⇒ nothing.
+        let plain = vec![iface_addr("lan0", "10.0.0.1/24")];
+        assert!(dhcp6_conf_body(&plain).is_none());
+        // An interface whose RA carries a `dhcp6-pool` ⇒ one `interface=` +
+        // `dhcp-range=<start>,<end>,<prefix-len>,<lease>`; prefix-len taken from the
+        // advertised prefix, lease defaulting to 12h when unset.
+        let mut lan = iface_addr("lan0", "10.0.0.1/24");
+        lan.router_advert = Some(RouterAdvert {
+            prefixes: vec!["2001:db8:1::/64".into()],
+            dns: vec![],
+            managed: false,
+            other_config: false,
+            router_lifetime: None,
+            dhcp6_pool: Some(Dhcp6Pool {
+                start: "2001:db8:1::100".into(),
+                end: "2001:db8:1::1ff".into(),
+                lease_time: None,
+            }),
+        });
+        let body = dhcp6_conf_body(&[lan]).expect("configured");
+        assert!(body.contains("port=0"), "got:\n{body}");
+        assert!(body.contains("interface=lan0"), "got:\n{body}");
+        assert!(
+            body.contains("dhcp-range=2001:db8:1::100,2001:db8:1::1ff,64,43200"),
+            "got:\n{body}"
+        );
+        // An explicit lease overrides the default.
+        let mut lan = iface_addr("lan0", "10.0.0.1/24");
+        lan.router_advert = Some(RouterAdvert {
+            prefixes: vec!["2001:db8:2::/60".into()],
+            dns: vec![],
+            managed: true,
+            other_config: false,
+            router_lifetime: None,
+            dhcp6_pool: Some(Dhcp6Pool {
+                start: "2001:db8:2::10".into(),
+                end: "2001:db8:2::20".into(),
+                lease_time: Some(7200),
+            }),
+        });
+        let body = dhcp6_conf_body(&[lan]).expect("configured");
+        assert!(
+            body.contains("dhcp-range=2001:db8:2::10,2001:db8:2::20,60,7200"),
             "got:\n{body}"
         );
     }

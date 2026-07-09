@@ -626,6 +626,28 @@
             };
           };
 
+          # Stateful DHCPv6 (roadmap C7): networkd's IPv6SendRA carries the Managed
+          # flag but has no DHCPv6 server, so a THIRD DNS-disabled dnsmasq instance
+          # hands out addresses from each interface's `dhcp6-pool`. Sentinel renders
+          # `--conf-file=/run/sentinel/dhcp6/dhcp6.conf` (`port=0`, no `enable-ra` —
+          # networkd owns the RA, so dnsmasq never fights it).
+          systemd.services.sentinel-dhcp6 = {
+            description = "stateful DHCPv6 server (sentinel/dnsmasq)";
+            after = [
+              "network.target"
+              "sentinel-boot.service"
+            ];
+            serviceConfig = {
+              Type = "exec";
+              # A DHCPv6 *server* (unlike the relay) writes leases: point the lease
+              # file at our runtime dir and stay root, else dnsmasq drops to `nobody`
+              # and cannot open it (the default /var/lib/misc does not exist here).
+              ExecStart = "${pkgs.dnsmasq}/bin/dnsmasq --keep-in-foreground --user=root --conf-file=/run/sentinel/dhcp6/dhcp6.conf --dhcp-leasefile=/run/sentinel/dhcp6/dhcp6.leases";
+              Restart = "on-failure";
+              RestartSec = "5s";
+            };
+          };
+
           # NAT64 (roadmap C10): tayga translates the IPv6-only segment's
           # 64:ff9b::<v4> traffic to real IPv4 out of the pool. Sentinel renders
           # tayga.conf + a datapath setup script (the `nat64` tun + pool/prefix
@@ -763,6 +785,8 @@
             "d /run/sentinel/lldpd.d 0755 root root -"
             "d /run/sentinel/avahi 0755 root root -"
             "d /run/sentinel/dhcp-relay 0755 root root -"
+            # Stateful DHCPv6 (roadmap C7): the second dnsmasq instance's config.
+            "d /run/sentinel/dhcp6 0755 root root -"
             "d /run/sentinel/ddclient 0750 root root -"
             # NAT64 (roadmap C10): tayga's conf + setup script + data-dir, and the
             # DNS64 unbound config all live here (world-readable, root-owned).
@@ -3791,6 +3815,99 @@
             client.wait_for_unit("multi-user.target")
             client.wait_until_succeeds(
                 "ip -6 addr show eth1 | grep -qi '2001:db8:1:'", timeout=90
+            )
+          '';
+        };
+
+        # Stateful DHCPv6 (roadmap C7): the v6 counterpart of the DHCP-server
+        # check, and the stateful sibling of the SLAAC `ra` check above. The fw
+        # advertises 2001:db8:1::/64 with the Managed (M) flag forced on by a
+        # `dhcp6-pool`, and Sentinel's THIRD dnsmasq instance hands out addresses
+        # from 2001:db8:1::100–1ff. networkd owns the RA (dnsmasq sends none, so
+        # they don't fight); dnsmasq owns the address assignment. The client runs
+        # networkd DHCPv6 (`DHCP=ipv6`) and must obtain a stateful lease from the
+        # pool — an address in `::1xx`, distinct from its SLAAC EUI64 address —
+        # proving the server end to end. The lan zone accepts so the XDP firewall
+        # passes the DHCPv6 solicit/reply on eth1.
+        #   nix build .#checks.x86_64-linux.dhcp6 -L
+        dhcp6 = pkgs.testers.runNixOSTest {
+          name = "sentinel-dhcp6";
+          nodes = {
+            client =
+              { ... }:
+              {
+                virtualisation.vlans = [ 1 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                };
+                # Accept RAs (for the on-link prefix/route) AND run the stateful
+                # DHCPv6 client — the M flag in the fw's RA triggers the solicit.
+                systemd.network.networks."10-eth1" = {
+                  matchConfig.Name = "eth1";
+                  networkConfig = {
+                    IPv6AcceptRA = true;
+                    DHCP = "ipv6";
+                  };
+                };
+              };
+            fw =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "fw";
+                networking.firewall.enable = lib.mkForce false;
+                virtualisation.vlans = [ 1 ];
+                virtualisation.memorySize = 2048;
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+          };
+          testScript = ''
+            start_all()
+            fw.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+
+            # Static v6 address on eth1 (so dnsmasq has a GUA in the pool's /64 to
+            # bind), RA on with a stateful dhcp6-pool. ONE `set` per line.
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth1 zone lan' "
+                "'set firewall zone lan default-action accept' "
+                "'set interface eth1 address6 2001:db8:1::1/64' "
+                "'set interface eth1 router-advert enable' "
+                "'set interface eth1 router-advert prefix 2001:db8:1::/64' "
+                "'set interface eth1 router-advert dhcp6-pool start 2001:db8:1::100' "
+                "'set interface eth1 router-advert dhcp6-pool end 2001:db8:1::1ff' "
+                "'set interface eth1 router-advert dhcp6-pool lease-time 12h' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            fw.wait_for_unit("velstra.service")
+
+            # Sentinel forced the Managed flag on and rendered the DHCPv6 server.
+            netw = fw.succeed("cat /run/systemd/network/10-sentinel-eth1.network")
+            assert "Managed=yes" in netw, netw
+            fw.wait_until_succeeds(
+                "test -f /run/sentinel/dhcp6/dhcp6.conf", timeout=20
+            )
+            conf = fw.succeed("cat /run/sentinel/dhcp6/dhcp6.conf")
+            assert "port=0" in conf, conf
+            assert "interface=eth1" in conf, conf
+            assert "dhcp-range=2001:db8:1::100,2001:db8:1::1ff,64,43200" in conf, conf
+            fw.wait_for_unit("sentinel-dhcp6.service")
+            fw.wait_until_succeeds(
+                "ip -6 addr show eth1 | grep -qi '2001:db8:1::1'", timeout=30
+            )
+
+            # End to end: the client obtains a stateful lease from the pool. Its
+            # DHCPv6 address is the `::` compressed form in ::100–1ff; its SLAAC
+            # EUI64 address is not (it carries ff:fe), so this uniquely asserts the
+            # DHCPv6 assignment.
+            client.wait_for_unit("multi-user.target")
+            client.wait_until_succeeds(
+                "ip -6 addr show eth1 | grep -qiE '2001:db8:1::1[0-9a-f][0-9a-f]/'",
+                timeout=120,
             )
           '';
         };

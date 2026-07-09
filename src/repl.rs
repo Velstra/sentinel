@@ -1963,6 +1963,15 @@ const RA_FIELDS: &[Cand] = &[
         "router-lifetime",
         "router lifetime seconds (0 = not a default router)",
     ),
+    (
+        "dhcp6-pool",
+        "stateful DHCPv6 address pool (start / end / lease-time)",
+    ),
+];
+const RA_DHCP6_POOL_FIELDS: &[Cand] = &[
+    ("start", "first IPv6 address of the pool"),
+    ("end", "last IPv6 address of the pool"),
+    ("lease-time", "lease time (12h, 1h30m, or seconds)"),
 ];
 const WG_KEY_GEN: &[Cand] = &[("generate", "generate a fresh WireGuard keypair")];
 const WG_TUNNEL_FIELDS: &[Cand] = &[
@@ -2116,6 +2125,9 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
             "router-advert",
             "managed" | "other-config",
         ] => BOOLS,
+        ["set" | "delete", "interface", _name, "router-advert", "dhcp6-pool"] => {
+            RA_DHCP6_POOL_FIELDS
+        }
 
         // The box-wide services sub-tree, and the DNS forwarder within it.
         ["set" | "delete", "services"] => SERVICES_NODES,
@@ -2658,6 +2670,22 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
             "router-advert",
             "router-lifetime",
         ] => own_cands(&[PH_SECONDS]),
+        [
+            "set",
+            "interface",
+            _name,
+            "router-advert",
+            "dhcp6-pool",
+            "start" | "end",
+        ] => own_cands(&[PH_IPV6]),
+        [
+            "set",
+            "interface",
+            _name,
+            "router-advert",
+            "dhcp6-pool",
+            "lease-time",
+        ] => own_cands(&[PH_DURATION]),
         ["set", "interface", _name, "pppoe", "mru"] => own_cands(&[PH_MTU]),
         ["set", "interface", _name, "key"] => {
             own_cands(&[("<0-4294967295>", "a GRE key (demultiplexes tunnels)")])
@@ -3221,8 +3249,14 @@ mod tests {
                 "dns",
                 "managed",
                 "other-config",
-                "router-lifetime"
+                "router-lifetime",
+                "dhcp6-pool"
             ]
+        );
+        // The stateful-DHCPv6 pool sub-tree offers its start/end/lease fields.
+        assert_eq!(
+            kw(&["set", "interface", "lan0", "router-advert", "dhcp6-pool"]),
+            ["start", "end", "lease-time"]
         );
         // The PPPoE-client sub-tree of an interface is discoverable.
         assert_eq!(
