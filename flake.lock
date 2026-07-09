@@ -3,11 +3,11 @@
     "fabric": {
       "flake": false,
       "locked": {
-        "lastModified": 1783544766,
-        "narHash": "sha256-2Rl31BOtPDoP1KdmGmSS/T6nrXhEenPA+iytUU/jKVY=",
+        "lastModified": 1783621416,
+        "narHash": "sha256-6jK/h+9k/w/iW2dr5BGpKIiPzC72ocFo11isHbPMl8Y=",
         "owner": "Velstra",
         "repo": "fabric",
-        "rev": "0a0fd0e0151dd33daee9e7e5a3e077cfefbbef44",
+        "rev": "e9e7f5508e7e1903877712ee83f24afa7a0b1a5c",
         "type": "github"
       },
       "original": {
