@@ -107,6 +107,32 @@ sentinel# set interface eth1.20 zone iot
 sentinel# set interface eth1.20 address 10.0.20.1/24
 ```
 
+## IPv6 addressing & Router Advertisements
+
+An interface carries an independent IPv4 `address` and IPv6 `address6` (either can
+be `dhcp`). To hand IPv6 to a LAN, turn on **Router Advertisements** and advertise
+one or more prefixes — networkd emits the RAs (no radvd), and `Assign=yes` binds
+the router its own address from each prefix:
+
+```text
+sentinel# set interface eth1 address6 2001:db8:1::1/64
+sentinel# set interface eth1 router-advert enable
+sentinel# set interface eth1 router-advert prefix 2001:db8:1::/64
+sentinel# set interface eth1 router-advert dns 2001:db8:1::1
+```
+
+With only a prefix, clients self-configure by **SLAAC**. For a **stateful DHCPv6**
+server (leases from a fixed pool, e.g. for logging or fixed addressing) add a
+`dhcp6-pool` — the pool must sit inside an advertised prefix. Setting it forces the
+RA's Managed (M) flag on, so clients ask the server for an address; a second
+`dnsmasq` instance hands them out (networkd still owns the RA):
+
+```text
+sentinel# set interface eth1 router-advert dhcp6-pool start 2001:db8:1::100
+sentinel# set interface eth1 router-advert dhcp6-pool end 2001:db8:1::1ff
+sentinel# set interface eth1 router-advert dhcp6-pool lease-time 12h
+```
+
 ## Bridges, bonds & VLAN-aware switching
 
 A **bridge** (software switch) or a **bond** (link aggregation) is a

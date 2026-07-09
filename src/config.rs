@@ -88,6 +88,13 @@ address = "10.0.0.1/24"
 # prefixes = ["2001:db8:1::/64"]
 # dns = ["2001:db8:1::1"]
 
+# Stateful DHCPv6 instead of SLAAC (roadmap C7): hand out addresses from a pool
+# inside the advertised prefix. The Managed (M) flag is forced on so clients ask
+# via DHCPv6; a dnsmasq server on the interface leases the addresses.
+# [interface.router-advert]
+# prefixes = ["2001:db8:1::/64"]
+# dhcp6-pool = { start = "2001:db8:1::100", end = "2001:db8:1::1ff", lease-time = 43200 }
+
 # A bridge (switch) that holds the LAN address; the member NICs are listed on
 # the device itself with a `member` array (repeated `member <nic>` in the CLI):
 # [[interface]]
@@ -2985,6 +2992,35 @@ pub struct RouterAdvert {
         skip_serializing_if = "Option::is_none"
     )]
     pub router_lifetime: Option<u32>,
+    /// Stateful DHCPv6 address pool (roadmap C7). When set, this box hands out
+    /// addresses from `[start, end]` over DHCPv6 — a dnsmasq server bound to the
+    /// interface, since networkd's DHCP server is IPv4-only. The RA's Managed (M)
+    /// flag is forced on so clients obtain their address via DHCPv6 rather than
+    /// SLAAC. `None` ⇒ pure SLAAC (prefixes are advertised, no address server).
+    #[serde(default, rename = "dhcp6-pool", skip_serializing_if = "Option::is_none")]
+    pub dhcp6_pool: Option<Dhcp6Pool>,
+}
+
+/// A stateful DHCPv6 address pool on a [`RouterAdvert`] (roadmap C7): the box
+/// leases IPv6 addresses in `[start, end]` to clients over DHCPv6 via a dnsmasq
+/// server bound to the interface. Both endpoints must be in the same /64 as an
+/// advertised prefix; the RA's M flag (forced on) is what makes clients ask.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Dhcp6Pool {
+    /// First address of the pool, e.g. `"2001:db8:1::100"`.
+    pub start: String,
+    /// Last address of the pool, e.g. `"2001:db8:1::1ff"`.
+    pub end: String,
+    /// Lease time in seconds. The CLI accepts a human duration (`12h`, `1h30m`,
+    /// or a bare number of seconds) and stores the resolved seconds here; rendered
+    /// as the dnsmasq `dhcp-range` lease field. Unset ⇒ dnsmasq's default.
+    #[serde(
+        default,
+        rename = "lease-time",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub lease_time: Option<u32>,
 }
 
 /// A built-in (systemd-networkd) DHCP server on an interface that carries a
@@ -3837,6 +3873,48 @@ impl Appliance {
                 for dns in &ra.dns {
                     validate_ipv6(dns)
                         .with_context(|| format!("interface {:?} router-advert dns", iface.name))?;
+                }
+                // Stateful DHCPv6 pool (roadmap C7): both endpoints must be IPv6,
+                // ordered, and — since DHCPv6 hands out addresses from an
+                // advertised prefix — fall inside one of the RA's /64 prefixes.
+                if let Some(pool) = &ra.dhcp6_pool {
+                    let start = pool.start.parse::<Ipv6Addr>().map_err(|_| {
+                        anyhow::anyhow!(
+                            "interface {:?} router-advert dhcp6-pool start {:?}: not an IPv6 address",
+                            iface.name,
+                            pool.start
+                        )
+                    })?;
+                    let end = pool.end.parse::<Ipv6Addr>().map_err(|_| {
+                        anyhow::anyhow!(
+                            "interface {:?} router-advert dhcp6-pool end {:?}: not an IPv6 address",
+                            iface.name,
+                            pool.end
+                        )
+                    })?;
+                    if start > end {
+                        bail!(
+                            "interface {:?} router-advert dhcp6-pool: start {:?} is above end {:?}",
+                            iface.name,
+                            pool.start,
+                            pool.end
+                        );
+                    }
+                    if ra.prefixes.is_empty() {
+                        bail!(
+                            "interface {:?} router-advert dhcp6-pool: needs an advertised prefix the pool sits in",
+                            iface.name
+                        );
+                    }
+                    let in_a_prefix = ra.prefixes.iter().any(|p| ipv6_in_prefix(&start, p) && ipv6_in_prefix(&end, p));
+                    if !in_a_prefix {
+                        bail!(
+                            "interface {:?} router-advert dhcp6-pool: {:?}-{:?} is not inside any advertised prefix",
+                            iface.name,
+                            pool.start,
+                            pool.end
+                        );
+                    }
                 }
             }
 
@@ -5534,6 +5612,24 @@ pub(crate) fn validate_host(s: &str) -> Result<()> {
         bail!("{s:?} is not a valid host (IP or hostname)");
     }
     Ok(())
+}
+
+/// Whether `addr` falls inside the IPv6 CIDR `prefix` (`"2001:db8::/64"`). A
+/// malformed prefix, a missing length, or `len > 128` returns `false` (the prefix
+/// is validated as a CIDR elsewhere); used to keep a stateful DHCPv6 pool inside
+/// one of the interface's advertised prefixes.
+pub(crate) fn ipv6_in_prefix(addr: &Ipv6Addr, prefix: &str) -> bool {
+    let Some((net, len)) = prefix.split_once('/') else {
+        return false;
+    };
+    let (Ok(net), Ok(len)) = (net.parse::<Ipv6Addr>(), len.parse::<u32>()) else {
+        return false;
+    };
+    if len > 128 {
+        return false;
+    }
+    let mask: u128 = if len == 0 { 0 } else { u128::MAX << (128 - len) };
+    (u128::from(*addr) & mask) == (u128::from(net) & mask)
 }
 
 /// Validate an IPv6 CIDR such as an advertised RA prefix (`2001:db8:1::/64`).
@@ -7510,6 +7606,82 @@ router-lifetime = 1800
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn dhcp6_pool_parses_validates_and_round_trips() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "lan0"
+zone = "lan"
+address = "10.0.0.1/24"
+
+[interface.router-advert]
+prefixes = ["2001:db8:1::/64"]
+dhcp6-pool = { start = "2001:db8:1::100", end = "2001:db8:1::1ff", lease-time = 43200 }
+"#;
+        let a = Appliance::from_toml(toml).expect("dhcp6-pool parses + validates");
+        let pool = a.interfaces[0]
+            .router_advert
+            .as_ref()
+            .unwrap()
+            .dhcp6_pool
+            .as_ref()
+            .expect("has a pool");
+        assert_eq!(pool.start, "2001:db8:1::100");
+        assert_eq!(pool.end, "2001:db8:1::1ff");
+        assert_eq!(pool.lease_time, Some(43200));
+        // Survives save → load.
+        let out = a.to_toml().unwrap();
+        assert!(out.contains("dhcp6-pool"), "got:\n{out}");
+        assert!(Appliance::from_toml(&out).is_ok());
+    }
+
+    #[test]
+    fn dhcp6_pool_rejects_bad_combos() {
+        let base = |pool: &str| {
+            format!(
+                r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "lan0"
+zone = "lan"
+address = "10.0.0.1/24"
+[interface.router-advert]
+prefixes = ["2001:db8:1::/64"]
+dhcp6-pool = {pool}
+"#
+            )
+        };
+        // start above end.
+        assert!(Appliance::from_toml(&base(
+            r#"{ start = "2001:db8:1::200", end = "2001:db8:1::100" }"#
+        ))
+        .is_err());
+        // pool outside every advertised prefix.
+        assert!(Appliance::from_toml(&base(
+            r#"{ start = "2001:db8:2::10", end = "2001:db8:2::20" }"#
+        ))
+        .is_err());
+        // a non-IPv6 endpoint.
+        assert!(
+            Appliance::from_toml(&base(r#"{ start = "10.0.0.1", end = "2001:db8:1::20" }"#)).is_err()
+        );
+        // a pool with no advertised prefix to sit in.
+        let no_prefix = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "lan0"
+zone = "lan"
+address = "10.0.0.1/24"
+[interface.router-advert]
+dhcp6-pool = { start = "2001:db8:1::10", end = "2001:db8:1::20" }
+"#;
+        assert!(Appliance::from_toml(no_prefix).is_err());
     }
 
     #[test]
