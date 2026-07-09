@@ -17,9 +17,10 @@ use crate::config::{
     DhcpRelay, DhcpServer, DhcpStaticLease, Dns, Dyndns, Export, Filter, FilterRule, Firewall,
     Groups, HealthCheck, IfaceType, Interface, IpsecConnection, Isis, Lldp, Mdns, MultiWan,
     Multicast, MulticastInterface, Nat, Nat64, NatDestination, NatSource, Ntp, OpenConnectServer,
-    OpenConnectUser, Ospf, Ospf3, OspfInterface, Pki, PortSpec, Pppoe, Proto, Protocols, Qos,
-    QosDiscipline, ReverseProxy, Rip, RouterAdvert, Rule, Services, Snmp, StaticRoute, System,
-    UpdateChannel, Vpn, VrfDef, Vrrp, WanMode, WanUplink, WgPeer, WireguardTunnel, ZoneCfg,
+    OpenConnectUser, Ospf, Ospf3, OspfInterface, Pki, Policy, PortSpec, Pppoe, PrefixEntry,
+    PrefixList, Proto, Protocols, Qos, QosDiscipline, ReverseProxy, Rip, RouterAdvert, Rule,
+    Services, Snmp, StaticRoute, System, UpdateChannel, Vpn, VrfDef, Vrrp, WanMode, WanUplink,
+    WgPeer, WireguardTunnel, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -364,6 +365,8 @@ struct FilterDraft {
 /// One filter rule's fields (keyed by an integer index in [`FilterDraft::rules`]).
 #[derive(Debug, Clone, Default)]
 struct FilterRuleDraft {
+    /// The named `[[policy.prefix-list]]` this rule matches (`match prefix-list`).
+    match_prefix_list: Option<String>,
     prefix: Vec<String>,
     protocol: Option<String>,
     metric_le: Option<u32>,
@@ -391,6 +394,35 @@ impl FilterDraft {
         self.rules.sort_by_key(|(n, _)| *n);
         let i = self.rules.iter().position(|(n, _)| *n == idx).unwrap();
         &mut self.rules[i].1
+    }
+}
+
+/// A partially-specified prefix-list (keyed by name in [`Draft::prefix_lists`]).
+#[derive(Debug, Clone, Default)]
+struct PrefixListDraft {
+    /// Entries keyed by their sequence number, kept sorted by it.
+    entries: Vec<(u32, PrefixEntryDraft)>,
+}
+
+/// One prefix-list entry's fields (keyed by `seq` in [`PrefixListDraft::entries`]).
+#[derive(Debug, Clone, Default)]
+struct PrefixEntryDraft {
+    prefix: Option<String>,
+    ge: Option<u8>,
+    le: Option<u8>,
+}
+
+impl PrefixListDraft {
+    /// Mutable access to the entry at sequence `seq`, inserting it (kept sorted
+    /// by `seq`) if new.
+    fn entry_mut(&mut self, seq: u32) -> &mut PrefixEntryDraft {
+        if let Some(i) = self.entries.iter().position(|(n, _)| *n == seq) {
+            return &mut self.entries[i].1;
+        }
+        self.entries.push((seq, PrefixEntryDraft::default()));
+        self.entries.sort_by_key(|(n, _)| *n);
+        let i = self.entries.iter().position(|(n, _)| *n == seq).unwrap();
+        &mut self.entries[i].1
     }
 }
 
@@ -648,8 +680,9 @@ fn neighbor_to_draft(n: &BgpNeighbor) -> NeighborDraft {
     }
 }
 
-/// Build a [`FilterDraft`] from a saved `[[protocols.filter]]`. Rules take their
-/// 1-based position as their (stable, sorted) index.
+/// Build a [`FilterDraft`] from a saved `[[policy.route-map]]`. Each rule keeps
+/// its explicit `seq` (VyOS rule number); a legacy rule with no number falls
+/// back to its 1-based position.
 fn filter_to_draft(f: &Filter) -> FilterDraft {
     FilterDraft {
         default: f.default.clone(),
@@ -658,9 +691,11 @@ fn filter_to_draft(f: &Filter) -> FilterDraft {
             .iter()
             .enumerate()
             .map(|(i, r)| {
+                let idx = if r.seq != 0 { r.seq } else { (i + 1) as u32 };
                 (
-                    (i + 1) as u32,
+                    idx,
                     FilterRuleDraft {
+                        match_prefix_list: r.match_prefix_list.clone(),
                         prefix: r.prefix.clone(),
                         protocol: r.protocol.clone(),
                         metric_le: r.metric_le,
@@ -784,6 +819,8 @@ fn filter_from_draft(name: &str, d: &FilterDraft) -> Result<Filter> {
             .iter()
             .map(|(idx, r)| {
                 Ok(FilterRule {
+                    seq: *idx,
+                    match_prefix_list: r.match_prefix_list.clone(),
                     prefix: r.prefix.clone(),
                     protocol: r.protocol.clone(),
                     metric_le: r.metric_le,
@@ -798,8 +835,50 @@ fn filter_from_draft(name: &str, d: &FilterDraft) -> Result<Filter> {
                     set_ext_community: some_if(&r.set_ext_community),
                     add_ext_community: r.add_ext_community.clone(),
                     action: r.action.clone().ok_or_else(|| {
-                        anyhow::anyhow!("protocols filter {name:?} rule {idx}: action not set")
+                        anyhow::anyhow!("policy route-map {name:?} rule {idx}: action not set")
                     })?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+    })
+}
+
+/// Build a [`PrefixListDraft`] from a saved `[[policy.prefix-list]]`.
+fn prefix_list_to_draft(pl: &PrefixList) -> PrefixListDraft {
+    PrefixListDraft {
+        entries: pl
+            .entries
+            .iter()
+            .map(|e| {
+                (
+                    e.seq,
+                    PrefixEntryDraft {
+                        prefix: Some(e.prefix.clone()),
+                        ge: e.ge,
+                        le: e.le,
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
+/// Materialize a [`PrefixListDraft`] into a [`PrefixList`]. Every entry needs a
+/// base prefix; `ge`/`le` bounds are optional.
+fn prefix_list_from_draft(name: &str, d: &PrefixListDraft) -> Result<PrefixList> {
+    Ok(PrefixList {
+        name: name.to_string(),
+        entries: d
+            .entries
+            .iter()
+            .map(|(seq, e)| {
+                Ok(PrefixEntry {
+                    seq: *seq,
+                    prefix: e.prefix.clone().ok_or_else(|| {
+                        anyhow::anyhow!("policy prefix-list {name:?} rule {seq}: prefix not set")
+                    })?,
+                    ge: e.ge,
+                    le: e.le,
                 })
             })
             .collect::<Result<Vec<_>>>()?,
@@ -992,7 +1071,10 @@ struct Draft {
     bfd: BfdDraft,
     /// Multicast (IGMP/MLD querier + RFC 4605 proxy).
     multicast: MulticastDraft,
-    /// Named route filters (import/export policy), keyed by name.
+    /// Named prefix-lists (`[[policy.prefix-list]]`), keyed by name.
+    prefix_lists: Vec<(String, PrefixListDraft)>,
+    /// Named route-maps (`[[policy.route-map]]`, import/export policy), keyed by
+    /// name.
     filters: Vec<(String, FilterDraft)>,
     /// Per-protocol import filters (protocol → filter name).
     import: BTreeMap<String, String>,
@@ -1283,7 +1365,7 @@ impl Draft {
         &mut self.bgp.roa.last_mut().unwrap().1
     }
 
-    /// Mutable access to the route filter `name`, inserting it if new.
+    /// Mutable access to the route-map `name`, inserting it if new.
     fn filter_mut(&mut self, name: &str) -> &mut FilterDraft {
         if let Some(i) = self.filters.iter().position(|(n, _)| n == name) {
             return &mut self.filters[i].1;
@@ -1291,6 +1373,16 @@ impl Draft {
         self.filters
             .push((name.to_string(), FilterDraft::default()));
         &mut self.filters.last_mut().unwrap().1
+    }
+
+    /// Mutable access to the prefix-list `name`, inserting it if new.
+    fn prefix_list_mut(&mut self, name: &str) -> &mut PrefixListDraft {
+        if let Some(i) = self.prefix_lists.iter().position(|(n, _)| n == name) {
+            return &mut self.prefix_lists[i].1;
+        }
+        self.prefix_lists
+            .push((name.to_string(), PrefixListDraft::default()));
+        &mut self.prefix_lists.last_mut().unwrap().1
     }
 
     /// The RIP-family draft (`rip` / `ripng` / `babel`) named by `proto`.
@@ -1770,9 +1862,15 @@ impl Draft {
                 .as_ref()
                 .map(bgp_to_draft)
                 .unwrap_or_default(),
+            prefix_lists: a
+                .policy
+                .prefix_lists
+                .iter()
+                .map(|pl| (pl.name.clone(), prefix_list_to_draft(pl)))
+                .collect(),
             filters: a
-                .protocols
-                .filters
+                .policy
+                .route_maps
                 .iter()
                 .map(|f| (f.name.clone(), filter_to_draft(f)))
                 .collect(),
@@ -2116,10 +2214,21 @@ impl Session {
         names
     }
 
-    /// The declared route-filter names — completion offers these for a BGP
-    /// neighbour's / VRF's import/export and `delete protocols filter …`.
+    /// The declared route-map names — completion offers these for a BGP
+    /// neighbour's / VRF's import/export, the redistribution maps and
+    /// `delete policy route-map …`.
     pub fn filter_names(&self) -> Vec<String> {
         self.draft.filters.iter().map(|(n, _)| n.clone()).collect()
+    }
+
+    /// The declared prefix-list names — completion offers these for a route-map
+    /// rule's `match prefix-list` and `delete policy prefix-list …`.
+    pub fn prefix_list_names(&self) -> Vec<String> {
+        self.draft
+            .prefix_lists
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect()
     }
 
     /// The declared VRF names — completion offers these for a per-protocol /
@@ -2936,14 +3045,36 @@ impl Session {
             ["protocols", "bgp", "neighbor", addr, field, v] => {
                 self.set_neighbor_field(addr, field, v)?;
             }
-            ["protocols", "filter", name, "default", v] => {
-                self.draft.filter_mut(name).default = Some((*v).to_string());
-            }
-            ["protocols", "filter", name, "rule", n, field, v] => {
-                let idx = n
+            // Routing policy (VyOS `[policy]`): prefix-lists + route-maps. A
+            // prefix-list entry is `prefix`/`ge`/`le`; a route-map rule has an
+            // `action` plus `match`/`set` clauses. `permit`/`deny` map to the
+            // stored `accept`/`reject`.
+            ["policy", "prefix-list", name, "rule", n, field, v] => {
+                let seq = n
                     .parse()
-                    .with_context(|| format!("invalid rule index {n:?}"))?;
-                self.set_filter_rule_field(name, idx, field, v)?;
+                    .with_context(|| format!("invalid rule seq {n:?}"))?;
+                self.set_prefix_list_entry(name, seq, field, v)?;
+            }
+            ["policy", "route-map", name, "default", v] => {
+                self.draft.filter_mut(name).default = Some(permit_deny_to_action(v)?);
+            }
+            ["policy", "route-map", name, "rule", n, "action", v] => {
+                let seq = n
+                    .parse()
+                    .with_context(|| format!("invalid rule seq {n:?}"))?;
+                self.draft.filter_mut(name).rule_mut(seq).action = Some(permit_deny_to_action(v)?);
+            }
+            ["policy", "route-map", name, "rule", n, "match", field, v] => {
+                let seq = n
+                    .parse()
+                    .with_context(|| format!("invalid rule seq {n:?}"))?;
+                self.set_route_map_match(name, seq, field, v)?;
+            }
+            ["policy", "route-map", name, "rule", n, "set", field, v] => {
+                let seq = n
+                    .parse()
+                    .with_context(|| format!("invalid rule seq {n:?}"))?;
+                self.set_route_map_set(name, seq, field, v)?;
             }
             ["protocols", "ospf", "interface", v] => {
                 append_csv(&mut self.draft.ospf.interfaces, v);
@@ -3661,8 +3792,9 @@ impl Session {
                  set protocols bgp <confederation id <n> | confederation member <n> | rpki reject-invalid <bool> | rpki rtr <host:port> | ebgp-require-policy <bool>>\n  \
                  set protocols bgp aggregate <prefix> summary-only <bool>\n  \
                  set protocols bgp neighbor <ip> <remote-as <n> | local-as <n> | update-source <ip> | ebgp-multihop <n> | description <text> | shutdown <bool> | hold-time <s> | passive <bool> | route-reflector-client <bool> | password <k> | ttl-security <n> | max-prefix <n> | role <r> | import <f> | export <f> | bfd <bool> | ...>\n  \
-                 set protocols filter <name> default <accept|reject>\n  \
-                 set protocols filter <name> rule <n> <prefix <p> | protocol <p> | metric-le <n> | set-metric <n> | set-community <c> | action <accept|reject> | ...>\n  \
+                 set policy prefix-list <name> rule <seq> <prefix <addr/len> | ge <n> | le <n>>\n  \
+                 set policy route-map <name> default <permit|deny>\n  \
+                 set policy route-map <name> rule <seq> <action <permit|deny> | match <prefix-list <name> | prefix <p> | protocol <p> | metric-le <n> | metric-ge <n>> | set <metric <n> | preference <n> | community <c> | add-community <c> | ...>>\n  \
                  set protocols ospf <interface <if> [area <id>] | area <id> | router-priority <n> | cost <n> | network-type <..> | passive-interface <if> | redistribute <src> | redistribute-metric <n> | stub-area <id> | nssa-area <id> | auth-type <none|text|md5> | auth-key <k> | hello-interval <n> | dead-interval <n> | graceful-restart <bool> | bfd <bool> | vrf <name>>\n  \
                  set protocols ospf3 <interface <if> [area <id>] | area <id> | router-priority <n> | cost <n> | network-type <..> | instance-id <n> | redistribute <src> | redistribute-metric <n> | bfd <bool>>\n  \
                  set protocols <rip|babel> <interface <if> | redistribute <src> | redistribute-metric <n> | bfd <bool> | vrf <name>>; babel also network <p> | router-id <ip>\n  \
@@ -3766,24 +3898,40 @@ impl Session {
         Ok(())
     }
 
-    /// Clear one field of a filter rule draft.
-    fn del_filter_rule_field(r: &mut FilterRuleDraft, field: &str) -> Result<()> {
+    /// Clear one `match` field of a route-map rule draft. `item`, if given,
+    /// removes just that entry from a repeatable list (`match prefix`).
+    fn del_route_map_match(r: &mut FilterRuleDraft, field: &str, item: Option<&str>) -> Result<()> {
         match field {
-            "prefix" => r.prefix.clear(),
+            "prefix-list" => r.match_prefix_list = None,
+            "prefix" => del_from_list(&mut r.prefix, item, "match prefix")?,
             "protocol" => r.protocol = None,
             "metric-le" => r.metric_le = None,
             "metric-ge" => r.metric_ge = None,
-            "set-metric" => r.set_metric = None,
+            other => bail!("route-map match has no field {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Clear one `set` field of a route-map rule draft. `item`, if given, removes
+    /// just that entry from a repeatable community list (`set add-community` …).
+    fn del_route_map_set(r: &mut FilterRuleDraft, field: &str, item: Option<&str>) -> Result<()> {
+        match field {
+            "metric" => r.set_metric = None,
             "add-metric" => r.add_metric = None,
-            "set-preference" => r.set_preference = None,
-            "set-community" => r.set_community.clear(),
-            "add-community" => r.add_community.clear(),
-            "set-large-community" => r.set_large_community.clear(),
-            "add-large-community" => r.add_large_community.clear(),
-            "set-ext-community" => r.set_ext_community.clear(),
-            "add-ext-community" => r.add_ext_community.clear(),
-            "action" => r.action = None,
-            other => bail!("filter rule has no field {other:?}"),
+            "preference" => r.set_preference = None,
+            "community" => del_from_list(&mut r.set_community, item, "set community")?,
+            "add-community" => del_from_list(&mut r.add_community, item, "set add-community")?,
+            "large-community" => {
+                del_from_list(&mut r.set_large_community, item, "set large-community")?
+            }
+            "add-large-community" => {
+                del_from_list(&mut r.add_large_community, item, "set add-large-community")?
+            }
+            "ext-community" => del_from_list(&mut r.set_ext_community, item, "set ext-community")?,
+            "add-ext-community" => {
+                del_from_list(&mut r.add_ext_community, item, "set add-ext-community")?
+            }
+            other => bail!("route-map set has no field {other:?}"),
         }
         Ok(())
     }
@@ -3857,10 +4005,12 @@ impl Session {
         Ok(())
     }
 
-    /// Set one field of the rule `idx` of filter `name` (inserting either if new).
-    fn set_filter_rule_field(&mut self, name: &str, idx: u32, field: &str, v: &str) -> Result<()> {
-        let r = self.draft.filter_mut(name).rule_mut(idx);
+    /// Set one `match` field of route-map `name` rule `seq` (inserting either if
+    /// new). Conditions are ANDed; `match prefix` appends (repeatable).
+    fn set_route_map_match(&mut self, name: &str, seq: u32, field: &str, v: &str) -> Result<()> {
+        let r = self.draft.filter_mut(name).rule_mut(seq);
         match field {
+            "prefix-list" => r.match_prefix_list = Some(v.to_string()),
             "prefix" => append_csv(&mut r.prefix, v),
             "protocol" => r.protocol = Some(v.to_string()),
             "metric-le" => {
@@ -3869,28 +4019,82 @@ impl Session {
             "metric-ge" => {
                 r.metric_ge = Some(v.parse().with_context(|| format!("invalid metric {v:?}"))?)
             }
-            "set-metric" => {
+            other => bail!("route-map match has no field {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Set one `set` field of route-map `name` rule `seq` (inserting either if
+    /// new). A bare `community` replaces the set; `add-community` appends — same
+    /// distinction for large- and ext-communities.
+    fn set_route_map_set(&mut self, name: &str, seq: u32, field: &str, v: &str) -> Result<()> {
+        let r = self.draft.filter_mut(name).rule_mut(seq);
+        match field {
+            "metric" => {
                 r.set_metric = Some(v.parse().with_context(|| format!("invalid metric {v:?}"))?)
             }
             "add-metric" => {
                 r.add_metric = Some(v.parse().with_context(|| format!("invalid metric {v:?}"))?)
             }
-            "set-preference" => {
+            "preference" => {
                 r.set_preference = Some(
                     v.parse()
                         .with_context(|| format!("invalid preference {v:?}"))?,
                 )
             }
-            "set-community" => append_csv(&mut r.set_community, v),
+            "community" => append_csv(&mut r.set_community, v),
             "add-community" => append_csv(&mut r.add_community, v),
-            "set-large-community" => append_csv(&mut r.set_large_community, v),
+            "large-community" => append_csv(&mut r.set_large_community, v),
             "add-large-community" => append_csv(&mut r.add_large_community, v),
-            "set-ext-community" => append_csv(&mut r.set_ext_community, v),
+            "ext-community" => append_csv(&mut r.set_ext_community, v),
             "add-ext-community" => append_csv(&mut r.add_ext_community, v),
-            "action" => r.action = Some(v.to_string()),
-            other => bail!("filter rule has no field {other:?}"),
+            other => bail!("route-map set has no field {other:?}"),
         }
         Ok(())
+    }
+
+    /// Set one field (`prefix`/`ge`/`le`) of prefix-list `name` entry `seq`
+    /// (inserting either if new).
+    fn set_prefix_list_entry(&mut self, name: &str, seq: u32, field: &str, v: &str) -> Result<()> {
+        let e = self.draft.prefix_list_mut(name).entry_mut(seq);
+        match field {
+            "prefix" => e.prefix = Some(v.to_string()),
+            "ge" => e.ge = Some(v.parse().with_context(|| format!("invalid ge {v:?}"))?),
+            "le" => e.le = Some(v.parse().with_context(|| format!("invalid le {v:?}"))?),
+            other => bail!("prefix-list rule has no field {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Existing rule `seq` of route-map `name`, for `delete` (never inserts).
+    fn route_map_rule_mut(&mut self, name: &str, seq: u32) -> Result<&mut FilterRuleDraft> {
+        let Some((_, f)) = self.draft.filters.iter_mut().find(|(n, _)| n == name) else {
+            bail!("no route-map {name:?}");
+        };
+        let Some((_, r)) = f.rules.iter_mut().find(|(i, _)| *i == seq) else {
+            bail!("no rule {seq} in route-map {name:?}");
+        };
+        Ok(r)
+    }
+
+    /// Existing prefix-list `name`, for `delete` (never inserts).
+    fn prefix_list_draft_mut(&mut self, name: &str) -> Result<&mut PrefixListDraft> {
+        self.draft
+            .prefix_lists
+            .iter_mut()
+            .find(|(n, _)| n == name)
+            .map(|(_, pl)| pl)
+            .ok_or_else(|| anyhow::anyhow!("no prefix-list {name:?}"))
+    }
+
+    /// Existing entry `seq` of prefix-list `name`, for `delete` (never inserts).
+    fn prefix_list_entry_mut(&mut self, name: &str, seq: u32) -> Result<&mut PrefixEntryDraft> {
+        let pl = self.prefix_list_draft_mut(name)?;
+        pl.entries
+            .iter_mut()
+            .find(|(i, _)| *i == seq)
+            .map(|(_, e)| e)
+            .ok_or_else(|| anyhow::anyhow!("no rule {seq} in prefix-list {name:?}"))
     }
 
     pub fn delete(&mut self, args: &[&str]) -> Result<()> {
@@ -4310,7 +4514,6 @@ impl Session {
                 self.draft.vrfs.clear();
                 self.draft.bfd = BfdDraft::default();
                 self.draft.multicast = MulticastDraft::default();
-                self.draft.filters.clear();
                 self.draft.import.clear();
                 self.draft.export = ExportDraft::default();
             }
@@ -4406,45 +4609,81 @@ impl Session {
                     other => bail!("bgp has no field {other:?}"),
                 }
             }
-            ["protocols", "filter", name] => {
+            // Routing policy (VyOS `[policy]`): prefix-lists + route-maps.
+            ["policy"] => {
+                self.draft.prefix_lists.clear();
+                self.draft.filters.clear();
+            }
+            ["policy", "prefix-list", name] => {
+                let before = self.draft.prefix_lists.len();
+                self.draft.prefix_lists.retain(|(n, _)| n != name);
+                if self.draft.prefix_lists.len() == before {
+                    bail!("no prefix-list {name:?}");
+                }
+            }
+            ["policy", "prefix-list", name, "rule", n] => {
+                let seq = parse_seq(n)?;
+                let pl = self.prefix_list_draft_mut(name)?;
+                let before = pl.entries.len();
+                pl.entries.retain(|(i, _)| *i != seq);
+                if pl.entries.len() == before {
+                    bail!("no rule {seq} in prefix-list {name:?}");
+                }
+            }
+            ["policy", "prefix-list", name, "rule", n, field] => {
+                let seq = parse_seq(n)?;
+                let e = self.prefix_list_entry_mut(name, seq)?;
+                match *field {
+                    "prefix" => e.prefix = None,
+                    "ge" => e.ge = None,
+                    "le" => e.le = None,
+                    other => bail!("prefix-list rule has no field {other:?}"),
+                }
+            }
+            ["policy", "route-map", name] => {
                 let before = self.draft.filters.len();
                 self.draft.filters.retain(|(n, _)| n != name);
                 if self.draft.filters.len() == before {
-                    bail!("no filter {name:?}");
+                    bail!("no route-map {name:?}");
                 }
             }
-            ["protocols", "filter", name, "default"] => {
+            ["policy", "route-map", name, "default"] => {
                 match self.draft.filters.iter_mut().find(|(n, _)| n == name) {
                     Some((_, f)) => f.default = None,
-                    None => bail!("no filter {name:?}"),
+                    None => bail!("no route-map {name:?}"),
                 }
             }
-            ["protocols", "filter", name, "rule", n] => {
-                let idx: u32 = n
-                    .parse()
-                    .with_context(|| format!("invalid rule index {n:?}"))?;
+            ["policy", "route-map", name, "rule", n] => {
+                let seq = parse_seq(n)?;
                 match self.draft.filters.iter_mut().find(|(fn_, _)| fn_ == name) {
                     Some((_, f)) => {
                         let before = f.rules.len();
-                        f.rules.retain(|(i, _)| *i != idx);
+                        f.rules.retain(|(i, _)| *i != seq);
                         if f.rules.len() == before {
-                            bail!("no rule {idx} in filter {name:?}");
+                            bail!("no rule {seq} in route-map {name:?}");
                         }
                     }
-                    None => bail!("no filter {name:?}"),
+                    None => bail!("no route-map {name:?}"),
                 }
             }
-            ["protocols", "filter", name, "rule", n, field] => {
-                let idx: u32 = n
-                    .parse()
-                    .with_context(|| format!("invalid rule index {n:?}"))?;
-                match self.draft.filters.iter_mut().find(|(fn_, _)| fn_ == name) {
-                    Some((_, f)) => match f.rules.iter_mut().find(|(i, _)| *i == idx) {
-                        Some((_, r)) => Self::del_filter_rule_field(r, field)?,
-                        None => bail!("no rule {idx} in filter {name:?}"),
-                    },
-                    None => bail!("no filter {name:?}"),
-                }
+            ["policy", "route-map", name, "rule", n, "action"] => {
+                self.route_map_rule_mut(name, parse_seq(n)?)?.action = None;
+            }
+            ["policy", "route-map", name, "rule", n, "match", field] => {
+                let r = self.route_map_rule_mut(name, parse_seq(n)?)?;
+                Self::del_route_map_match(r, field, None)?;
+            }
+            ["policy", "route-map", name, "rule", n, "match", field, item] => {
+                let r = self.route_map_rule_mut(name, parse_seq(n)?)?;
+                Self::del_route_map_match(r, field, Some(item))?;
+            }
+            ["policy", "route-map", name, "rule", n, "set", field] => {
+                let r = self.route_map_rule_mut(name, parse_seq(n)?)?;
+                Self::del_route_map_set(r, field, None)?;
+            }
+            ["policy", "route-map", name, "rule", n, "set", field, item] => {
+                let r = self.route_map_rule_mut(name, parse_seq(n)?)?;
+                Self::del_route_map_set(r, field, Some(item))?;
             }
             ["protocols", "ospf"] => self.draft.ospf = OspfDraft::default(),
             ["protocols", "ospf", field] => Self::del_ospf_field(&mut self.draft.ospf, field)?,
@@ -4990,7 +5229,7 @@ impl Session {
     /// `show <path>` view. Unknown sections yield an error line.
     pub fn show_only(&self, section: &str) -> String {
         match section {
-            "system" | "interface" | "interfaces" | "firewall" | "nat" | "protocols"
+            "system" | "interface" | "interfaces" | "firewall" | "nat" | "protocols" | "policy"
             | "services" | "multiwan" | "vpn" | "pki" | "update" => {
                 let out = render_draft_only(&self.draft, false, Some(section));
                 if out.is_empty() {
@@ -5000,7 +5239,7 @@ impl Session {
                 }
             }
             other => format!(
-                "error: unknown section {other:?} (system | interfaces | firewall | nat | protocols | services | multiwan | vpn | pki | update)\n"
+                "error: unknown section {other:?} (system | interfaces | firewall | nat | protocols | policy | services | multiwan | vpn | pki | update)\n"
             ),
         }
     }
@@ -5425,7 +5664,15 @@ impl Session {
                     .collect(),
             }
         });
-        let filters = self
+        // Routing policy (VyOS `[policy]`): prefix-lists + route-maps live under
+        // their own top-level node, not inside `protocols`.
+        let prefix_lists = self
+            .draft
+            .prefix_lists
+            .iter()
+            .map(|(name, d)| prefix_list_from_draft(name, d))
+            .collect::<Result<Vec<_>>>()?;
+        let route_maps = self
             .draft
             .filters
             .iter()
@@ -5457,7 +5704,6 @@ impl Session {
             vrfs,
             bfd,
             multicast,
-            filters,
             import: self.draft.import.clone(),
             export,
         };
@@ -5617,6 +5863,10 @@ impl Session {
                 },
             },
             protocols,
+            policy: Policy {
+                prefix_lists,
+                route_maps,
+            },
             services: Services {
                 dns: Dns {
                     upstream: self.draft.dns.upstream.clone(),
@@ -6525,13 +6775,27 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         proto.push_str("    }\n");
     }
-    for (name, f) in &draft.filters {
-        render_filter(&mut proto, name, f);
-    }
     if want("protocols") && !proto.is_empty() {
         out.push_str("protocols {\n");
         out.push_str(&proto);
         out.push_str("}\n");
+    }
+
+    // policy: the routing-policy toolbox (VyOS `[policy]`), a top-level node —
+    // prefix-lists then route-maps, each with VyOS `match`/`set` grouping.
+    if want("policy") {
+        let mut pol = String::new();
+        for (name, d) in &draft.prefix_lists {
+            render_prefix_list(&mut pol, name, d);
+        }
+        for (name, f) in &draft.filters {
+            render_route_map(&mut pol, name, f);
+        }
+        if !pol.is_empty() {
+            out.push_str("policy {\n");
+            out.push_str(&pol);
+            out.push_str("}\n");
+        }
     }
 
     // services: box-wide offered services (dns, ntp), each nested one level.
@@ -6980,6 +7244,47 @@ fn remove_item(list: &mut Vec<String>, v: &str) -> bool {
     list.len() != before
 }
 
+/// Clear a repeatable draft list, or (when `item` is given) remove just that one
+/// entry — the `delete … <field> [<item>]` shape shared by the route-map
+/// `match`/`set` clear helpers. Bails if a named `item` is not present.
+fn del_from_list(list: &mut Vec<String>, item: Option<&str>, what: &str) -> Result<()> {
+    match item {
+        Some(v) => {
+            if !remove_item(list, v) {
+                bail!("no {what} {v:?}");
+            }
+        }
+        None => list.clear(),
+    }
+    Ok(())
+}
+
+/// Parse a VyOS rule/entry sequence number token.
+fn parse_seq(n: &str) -> Result<u32> {
+    n.parse().with_context(|| format!("invalid rule seq {n:?}"))
+}
+
+/// Map the CLI's `permit`/`deny` route-map action to the stored `accept`/`reject`
+/// (what config/Wren expect). Accepts the stored spellings too, so a config
+/// loaded from disk round-trips.
+fn permit_deny_to_action(v: &str) -> Result<String> {
+    Ok(match v {
+        "permit" | "accept" => "accept".to_string(),
+        "deny" | "reject" => "reject".to_string(),
+        other => bail!("expected permit or deny, got {other:?}"),
+    })
+}
+
+/// The inverse of [`permit_deny_to_action`] for `show`: render the stored
+/// `accept`/`reject` as the CLI's `permit`/`deny`.
+fn action_to_permit_deny(a: &str) -> &str {
+    match a {
+        "accept" => "permit",
+        "reject" => "deny",
+        other => other,
+    }
+}
+
 fn parse_action(s: &str) -> Result<Action> {
     Ok(match s {
         "accept" => Action::Accept,
@@ -7138,41 +7443,103 @@ fn render_neighbor(out: &mut String, addr: &str, n: &NeighborDraft) {
     out.push_str("        }\n");
 }
 
-/// Render one route filter as a nested `filter <name> { … }` block (4-space
-/// header, `rule <n>` at 8 spaces, rule fields at 12).
-fn render_filter(out: &mut String, name: &str, f: &FilterDraft) {
-    out.push_str(&format!("    filter {name} {{\n"));
-    if let Some(d) = &f.default {
-        out.push_str(&format!("        default {d}\n"));
-    }
-    for (idx, r) in &f.rules {
-        out.push_str(&format!("        rule {idx} {{\n"));
-        for p in &r.prefix {
+/// Render one prefix-list as a nested `prefix-list <name> { … }` block (4-space
+/// header, `rule <seq>` at 8 spaces, entry fields at 12).
+fn render_prefix_list(out: &mut String, name: &str, d: &PrefixListDraft) {
+    out.push_str(&format!("    prefix-list {name} {{\n"));
+    for (seq, e) in &d.entries {
+        out.push_str(&format!("        rule {seq} {{\n"));
+        if let Some(p) = &e.prefix {
             out.push_str(&format!("            prefix {p}\n"));
         }
-        push_field(out, "protocol", r.protocol.clone());
-        push_field(out, "metric-le", r.metric_le.map(|v| v.to_string()));
-        push_field(out, "metric-ge", r.metric_ge.map(|v| v.to_string()));
-        push_field(out, "set-metric", r.set_metric.map(|v| v.to_string()));
-        push_field(out, "add-metric", r.add_metric.map(|v| v.to_string()));
-        push_field(
-            out,
-            "set-preference",
-            r.set_preference.map(|v| v.to_string()),
-        );
-        for (k, set) in [
-            ("set-community", &r.set_community),
-            ("add-community", &r.add_community),
-            ("set-large-community", &r.set_large_community),
-            ("add-large-community", &r.add_large_community),
-            ("set-ext-community", &r.set_ext_community),
-            ("add-ext-community", &r.add_ext_community),
-        ] {
-            for c in set {
-                out.push_str(&format!("            {k} {c}\n"));
-            }
+        if let Some(g) = e.ge {
+            out.push_str(&format!("            ge {g}\n"));
         }
-        push_field(out, "action", r.action.clone());
+        if let Some(l) = e.le {
+            out.push_str(&format!("            le {l}\n"));
+        }
+        out.push_str("        }\n");
+    }
+    out.push_str("    }\n");
+}
+
+/// Render one route-map as a nested `route-map <name> { … }` block with VyOS
+/// `match`/`set` grouping (4-space header, `rule <seq>` at 8, `action` +
+/// `match`/`set` at 12, their fields at 16). The stored `accept`/`reject` render
+/// back as `permit`/`deny`.
+fn render_route_map(out: &mut String, name: &str, f: &FilterDraft) {
+    out.push_str(&format!("    route-map {name} {{\n"));
+    if let Some(d) = &f.default {
+        out.push_str(&format!("        default {}\n", action_to_permit_deny(d)));
+    }
+    for (seq, r) in &f.rules {
+        out.push_str(&format!("        rule {seq} {{\n"));
+        if let Some(a) = &r.action {
+            out.push_str(&format!(
+                "            action {}\n",
+                action_to_permit_deny(a)
+            ));
+        }
+        // match { … } — only when a condition is present.
+        let has_match = r.match_prefix_list.is_some()
+            || !r.prefix.is_empty()
+            || r.protocol.is_some()
+            || r.metric_le.is_some()
+            || r.metric_ge.is_some();
+        if has_match {
+            out.push_str("            match {\n");
+            if let Some(pl) = &r.match_prefix_list {
+                out.push_str(&format!("                prefix-list {pl}\n"));
+            }
+            for p in &r.prefix {
+                out.push_str(&format!("                prefix {p}\n"));
+            }
+            if let Some(p) = &r.protocol {
+                out.push_str(&format!("                protocol {p}\n"));
+            }
+            if let Some(m) = r.metric_le {
+                out.push_str(&format!("                metric-le {m}\n"));
+            }
+            if let Some(m) = r.metric_ge {
+                out.push_str(&format!("                metric-ge {m}\n"));
+            }
+            out.push_str("            }\n");
+        }
+        // set { … } — only when an attribute change is present.
+        let has_set = r.set_metric.is_some()
+            || r.add_metric.is_some()
+            || r.set_preference.is_some()
+            || !r.set_community.is_empty()
+            || !r.add_community.is_empty()
+            || !r.set_large_community.is_empty()
+            || !r.add_large_community.is_empty()
+            || !r.set_ext_community.is_empty()
+            || !r.add_ext_community.is_empty();
+        if has_set {
+            out.push_str("            set {\n");
+            if let Some(m) = r.set_metric {
+                out.push_str(&format!("                metric {m}\n"));
+            }
+            if let Some(m) = r.add_metric {
+                out.push_str(&format!("                add-metric {m}\n"));
+            }
+            if let Some(p) = r.set_preference {
+                out.push_str(&format!("                preference {p}\n"));
+            }
+            for (k, set) in [
+                ("community", &r.set_community),
+                ("add-community", &r.add_community),
+                ("large-community", &r.set_large_community),
+                ("add-large-community", &r.add_large_community),
+                ("ext-community", &r.set_ext_community),
+                ("add-ext-community", &r.add_ext_community),
+            ] {
+                for c in set {
+                    out.push_str(&format!("                {k} {c}\n"));
+                }
+            }
+            out.push_str("            }\n");
+        }
         out.push_str("        }\n");
     }
     out.push_str("    }\n");
@@ -8701,17 +9068,17 @@ mod tests {
             "set protocols bgp neighbor 10.10.0.2 export to-peer",
             "set protocols bgp neighbor 10.10.0.2 bfd true",
             "set protocols bgp neighbor 10.10.0.2 bfd-auth-type meticulous-sha1",
-            "set protocols filter from-peer default reject",
-            "set protocols filter from-peer rule 10 prefix 10.0.0.0/8+",
-            "set protocols filter from-peer rule 10 set-metric 100",
-            "set protocols filter from-peer rule 10 set-community 65001:200",
-            "set protocols filter from-peer rule 10 action accept",
-            "set protocols filter to-peer default accept",
+            "set policy route-map from-peer default deny",
+            "set policy route-map from-peer rule 10 match prefix 10.0.0.0/8+",
+            "set policy route-map from-peer rule 10 set metric 100",
+            "set policy route-map from-peer rule 10 set community 65001:200",
+            "set policy route-map from-peer rule 10 action permit",
+            "set policy route-map to-peer default permit",
         ] {
             run(&mut s, line).unwrap();
         }
 
-        // `show` renders nested neighbor + filter blocks.
+        // `show` renders nested neighbor + route-map blocks.
         let shown = s.show();
         assert!(shown.contains("neighbor 10.10.0.2 {"), "got:\n{shown}");
         assert!(
@@ -8719,12 +9086,14 @@ mod tests {
             "got:\n{shown}"
         );
         assert!(shown.contains("import from-peer"), "got:\n{shown}");
-        assert!(shown.contains("filter from-peer {"), "got:\n{shown}");
+        assert!(shown.contains("route-map from-peer {"), "got:\n{shown}");
         assert!(shown.contains("rule 10 {"), "got:\n{shown}");
-        assert!(shown.contains("action accept"), "got:\n{shown}");
+        // permit/deny render, not the stored accept/reject.
+        assert!(shown.contains("action permit"), "got:\n{shown}");
+        assert!(shown.contains("default deny"), "got:\n{shown}");
 
         // It materializes into a validated Appliance carrying every field.
-        let a = s.commit().expect("full bgp + filter config commits");
+        let a = s.commit().expect("full bgp + route-map config commits");
         let bgp = a.protocols.bgp.as_ref().unwrap();
         assert_eq!(bgp.hold_time, Some(90));
         assert_eq!(bgp.confederation_id, Some(65000));
@@ -8737,10 +9106,13 @@ mod tests {
         assert_eq!(n.password.as_deref(), Some("s3cret"));
         assert_eq!(n.role.as_deref(), Some("customer"));
         assert_eq!(n.import.as_deref(), Some("from-peer"));
-        assert_eq!(a.protocols.filters.len(), 2);
+        assert_eq!(a.policy.route_maps.len(), 2);
+        // permit/deny stored as accept/reject.
+        assert_eq!(a.policy.route_maps[0].default.as_deref(), Some("reject"));
+        assert_eq!(a.policy.route_maps[0].rules[0].action, "accept");
 
         // Re-loading the drafted config reproduces the same routing view (rule
-        // indices renumber to their 1-based position on reload).
+        // numbers are preserved by their explicit `seq`).
         let reloaded = render_appliance(&a);
         assert!(
             reloaded.contains("neighbor 10.10.0.2 {"),
@@ -8751,20 +9123,170 @@ mod tests {
             reloaded.contains("rpki rtr 10.0.0.9:3323"),
             "got:\n{reloaded}"
         );
-        assert!(reloaded.contains("filter from-peer {"), "got:\n{reloaded}");
         assert!(
-            reloaded.contains("set-community 65001:200"),
+            reloaded.contains("route-map from-peer {"),
             "got:\n{reloaded}"
         );
+        assert!(reloaded.contains("community 65001:200"), "got:\n{reloaded}");
         // The materialized config re-parses + re-validates from its own TOML.
         Appliance::from_toml(&a.to_toml().unwrap()).expect("re-parses");
 
-        // Deleting a neighbour field and a filter rule works.
+        // Deleting a neighbour field and a route-map rule works.
         run(&mut s, "delete protocols bgp neighbor 10.10.0.2 passive").unwrap();
         assert!(!s.show().contains("passive true"));
-        run(&mut s, "delete protocols filter from-peer rule 10").unwrap();
+        run(&mut s, "delete policy route-map from-peer rule 10").unwrap();
         assert!(!s.show().contains("rule 10 {"));
-        assert!(run(&mut s, "delete protocols filter nope").is_err());
+        assert!(run(&mut s, "delete policy route-map nope").is_err());
+    }
+
+    #[test]
+    fn policy_prefix_list_and_route_map_round_trip() {
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname r1",
+            // A prefix-list with two ge/le-bounded entries.
+            "set policy prefix-list LAN rule 10 prefix 10.0.0.0/8",
+            "set policy prefix-list LAN rule 10 le 24",
+            "set policy prefix-list LAN rule 20 prefix 192.168.0.0/16",
+            "set policy prefix-list LAN rule 20 ge 24",
+            "set policy prefix-list LAN rule 20 le 30",
+            // A route-map: rule 10 permits LAN prefixes and rewrites attributes;
+            // rule 20 denies everything else.
+            "set policy route-map IMPORT default deny",
+            "set policy route-map IMPORT rule 10 action permit",
+            "set policy route-map IMPORT rule 10 match prefix-list LAN",
+            "set policy route-map IMPORT rule 10 set metric 100",
+            "set policy route-map IMPORT rule 10 set community 65001:100",
+            "set policy route-map IMPORT rule 20 action deny",
+        ] {
+            run(&mut s, line).unwrap();
+        }
+
+        // `show` renders the top-level policy block with match/set grouping.
+        let shown = s.show();
+        assert!(shown.contains("policy {"), "got:\n{shown}");
+        assert!(shown.contains("prefix-list LAN {"), "got:\n{shown}");
+        assert!(shown.contains("le 24"), "got:\n{shown}");
+        assert!(shown.contains("route-map IMPORT {"), "got:\n{shown}");
+        assert!(shown.contains("match {"), "got:\n{shown}");
+        assert!(shown.contains("prefix-list LAN"), "got:\n{shown}");
+        assert!(shown.contains("set {"), "got:\n{shown}");
+        assert!(shown.contains("community 65001:100"), "got:\n{shown}");
+        assert!(shown.contains("action permit"), "got:\n{shown}");
+
+        // Materialize: policy is a top-level node; permit/deny stored as
+        // accept/reject; the prefix-list keeps its seq/bounds.
+        let a = s.commit().expect("policy config commits");
+        assert_eq!(a.policy.prefix_lists.len(), 1);
+        assert_eq!(a.policy.prefix_lists[0].entries.len(), 2);
+        assert_eq!(a.policy.prefix_lists[0].entries[1].seq, 20);
+        assert_eq!(a.policy.prefix_lists[0].entries[1].ge, Some(24));
+        assert_eq!(a.policy.route_maps.len(), 1);
+        let rm = &a.policy.route_maps[0];
+        assert_eq!(rm.default.as_deref(), Some("reject"));
+        assert_eq!(rm.rules[0].seq, 10);
+        assert_eq!(rm.rules[0].action, "accept");
+        assert_eq!(rm.rules[0].match_prefix_list.as_deref(), Some("LAN"));
+        assert_eq!(rm.rules[0].set_metric, Some(100));
+        assert_eq!(rm.rules[1].action, "reject");
+
+        // from_appliance ∘ materialize is the identity on the policy node.
+        let round = Session {
+            draft: Draft::from_appliance(&a),
+            path: PathBuf::from("/dev/null"),
+            dirty: false,
+        };
+        let b = round.materialize().expect("re-materialises");
+        assert_eq!(b.policy.prefix_lists.len(), 1);
+        assert_eq!(b.policy.prefix_lists[0].entries[1].le, Some(30));
+        assert_eq!(b.policy.route_maps[0].rules[0].set_metric, Some(100));
+        assert_eq!(b.policy.route_maps[0].rules[1].action, "reject");
+        // And it re-parses + re-validates from its own TOML.
+        Appliance::from_toml(&a.to_toml().unwrap()).expect("re-parses");
+    }
+
+    #[test]
+    fn policy_append_and_per_item_remove() {
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname r1",
+            "set policy route-map M default permit",
+            "set policy route-map M rule 10 action permit",
+            "set policy route-map M rule 10 match prefix 10.0.0.0/8",
+            "set policy route-map M rule 10 match prefix 172.16.0.0/12",
+            "set policy route-map M rule 10 set add-community 65001:1",
+            "set policy route-map M rule 10 set add-community 65001:2",
+        ] {
+            run(&mut s, line).unwrap();
+        }
+        let a = s.commit().expect("commits");
+        let r = &a.policy.route_maps[0].rules[0];
+        assert_eq!(r.prefix.len(), 2);
+        assert_eq!(r.add_community.len(), 2);
+
+        // A per-item remove drops just the named entry, leaving the rest.
+        run(
+            &mut s,
+            "delete policy route-map M rule 10 match prefix 10.0.0.0/8",
+        )
+        .unwrap();
+        run(
+            &mut s,
+            "delete policy route-map M rule 10 set add-community 65001:1",
+        )
+        .unwrap();
+        let a = s.commit().expect("commits");
+        let r = &a.policy.route_maps[0].rules[0];
+        assert_eq!(r.prefix, ["172.16.0.0/12"]);
+        assert_eq!(r.add_community, ["65001:2"]);
+        // Removing an absent item is an error.
+        assert!(
+            run(
+                &mut s,
+                "delete policy route-map M rule 10 match prefix 8.8.8.8/32"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn policy_delete_rule_and_whole_object() {
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname r1",
+            "set policy prefix-list PL rule 10 prefix 10.0.0.0/8",
+            "set policy route-map M rule 10 action permit",
+            "set policy route-map M rule 20 action deny",
+        ] {
+            run(&mut s, line).unwrap();
+        }
+        // Delete a single route-map rule.
+        run(&mut s, "delete policy route-map M rule 20").unwrap();
+        assert_eq!(s.commit().unwrap().policy.route_maps[0].rules.len(), 1);
+        // Delete a whole prefix-list and a whole route-map.
+        run(&mut s, "delete policy prefix-list PL").unwrap();
+        run(&mut s, "delete policy route-map M").unwrap();
+        let a = s.commit().unwrap();
+        assert!(a.policy.is_empty());
+        assert!(run(&mut s, "delete policy prefix-list PL").is_err());
+    }
+
+    #[test]
+    fn policy_permit_deny_maps_to_accept_reject() {
+        let mut s = Session::empty();
+        run(&mut s, "set system hostname r1").unwrap();
+        run(&mut s, "set policy route-map M default permit").unwrap();
+        run(&mut s, "set policy route-map M rule 10 action deny").unwrap();
+        // Commit stores accept/reject.
+        let a = s.commit().unwrap();
+        assert_eq!(a.policy.route_maps[0].default.as_deref(), Some("accept"));
+        assert_eq!(a.policy.route_maps[0].rules[0].action, "reject");
+        // Show renders permit/deny, never accept/reject.
+        let shown = s.show();
+        assert!(shown.contains("default permit"), "got:\n{shown}");
+        assert!(shown.contains("action deny"), "got:\n{shown}");
+        assert!(!shown.contains("accept"), "got:\n{shown}");
+        assert!(!shown.contains("reject"), "got:\n{shown}");
     }
 
     #[test]
@@ -8779,7 +9301,7 @@ mod tests {
             "set protocols vrf blue interface eth3",
             "set protocols vrf blue import from-peer",
             "set protocols vrf blue export from-peer",
-            "set protocols filter from-peer default reject",
+            "set policy route-map from-peer default deny",
             "set protocols static 10.9.0.0/24 via 10.0.0.2",
             "set protocols static 10.9.0.0/24 vrf blue",
             // OSPFv2 full surface.

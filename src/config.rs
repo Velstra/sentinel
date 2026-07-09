@@ -337,14 +337,23 @@ port = 443
 # export = "to-peer"
 # bfd = true
 #
-# A route filter: reject the default, accept a prefix range with a set MED.
-# [[protocols.filter]]
+# Routing policy (VyOS-style): a prefix-list and a route-map that references it.
+# The route-map is named from a neighbour's import/export (above), a VRF's
+# import/export, or the redistribution maps (below).
+# [[policy.prefix-list]]
+# name = "LAN"
+# [[policy.prefix-list.rule]]
+# seq = 10
+# prefix = "10.0.0.0/8"
+# le = 24
+# [[policy.route-map]]
 # name = "from-peer"
 # default = "reject"
-# [[protocols.filter.rule]]
-# prefix = ["10.0.0.0/8+"]
+# [[policy.route-map.rule]]
+# seq = 10
+# action = "permit"
+# match-prefix-list = "LAN"
 # set-metric = 100
-# action = "accept"
 #
 # OSPFv2 with an area border interface, authentication, timers and a stub area.
 # [protocols.ospf]
@@ -458,6 +467,12 @@ pub struct Appliance {
     /// the declarative definitions. Omitted from saved configs when empty.
     #[serde(default, skip_serializing_if = "Pki::is_empty")]
     pub pki: Pki,
+    /// Routing policy (VyOS-style `[policy]`): named prefix-lists + route-maps,
+    /// referenced by BGP neighbours, VRFs and redistribution. Its own top-level
+    /// node so route-maps + prefix-lists live under one place instead of inside
+    /// `[protocols]`. Omitted from saved configs when empty.
+    #[serde(default, skip_serializing_if = "Policy::is_empty")]
+    pub policy: Policy,
     /// Signed update channel (roadmap C13): where to fetch A/B image updates from
     /// and the pinned public key that must have signed them. The slot-write +
     /// boot-switch already exist (`sentinel update`); this adds the authenticity
@@ -872,10 +887,6 @@ pub struct Protocols {
     /// `[multicast]` block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multicast: Option<Multicast>,
-    /// Named route filters (import/export policy), referenced by name from a BGP
-    /// neighbour's `import` / `export`. Compiled to Wren's top-level `[[filter]]`.
-    #[serde(default, rename = "filter", skip_serializing_if = "Vec::is_empty")]
-    pub filters: Vec<Filter>,
     /// Per-protocol import filters (protocol name → filter name), applied to every
     /// route that protocol announces before it enters the RIB. Compiled to Wren's
     /// top-level `[import]` map.
@@ -903,7 +914,6 @@ impl Protocols {
             && self.vrfs.is_empty()
             && self.bfd.is_none()
             && self.multicast.is_none()
-            && self.filters.is_empty()
             && self.import.is_empty()
             && self.export.is_none()
     }
@@ -1509,10 +1519,10 @@ pub struct BgpNeighbor {
         skip_serializing_if = "std::ops::Not::not"
     )]
     pub link_state: bool,
-    /// Inbound route policy: the name of a `[[protocols.filter]]` (import map).
+    /// Inbound route policy: the name of a `[[policy.route-map]]` (import).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub import: Option<String>,
-    /// Outbound route policy: the name of a `[[protocols.filter]]` (export map).
+    /// Outbound route policy: the name of a `[[policy.route-map]]` (export).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub export: Option<String>,
     /// This speaker's BGP Role toward this neighbour (RFC 9234): `provider`,
@@ -1598,7 +1608,21 @@ pub struct Filter {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FilterRule {
-    /// Prefix patterns (any-match), e.g. `["10.0.0.0/8+"]`.
+    /// The rule sequence number (VyOS `rule <N>`): rules are evaluated in
+    /// ascending `seq` order, first match wins. Defaults to 0 for a legacy rule
+    /// with no explicit number (they keep their file order among equal seqs).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub seq: u32,
+    /// Match a named `[[policy.prefix-list]]` (its patterns are ORed into this
+    /// rule's prefix match at compile). The VyOS `match prefix-list` clause.
+    #[serde(
+        default,
+        rename = "match-prefix-list",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub match_prefix_list: Option<String>,
+    /// Inline prefix patterns (any-match), e.g. `["10.0.0.0/8+"]`. ORed with the
+    /// `match-prefix-list` patterns.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prefix: Vec<String>,
     /// Match this protocol name (`connected`/`static`/`bgp`/…).
@@ -1673,8 +1697,76 @@ pub struct FilterRule {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub add_ext_community: Vec<String>,
-    /// Whether a matching route is `"accept"`ed or `"reject"`ed.
+    /// Whether a matching route is `"accept"`ed (VyOS `permit`) or `"reject"`ed
+    /// (VyOS `deny`). The CLI spells these `permit`/`deny`; both spellings parse.
     pub action: String,
+}
+
+/// serde `skip_serializing_if` helper: true when a `u32` is its default (0), so
+/// an unnumbered rule's `seq` is omitted from the saved config.
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
+}
+
+/// The routing-policy toolbox (`[policy]`, VyOS-style): named prefix-lists and
+/// route-maps, grouped under one node. Route-maps are referenced by name from a
+/// BGP neighbour's `import`/`export`, a VRF's `import`/`export`, and the
+/// per-protocol `[protocols.import]`/`[protocols.export]` redistribution maps —
+/// the route-map decides which routes pass and how their attributes are set;
+/// prefix-lists are reusable match helpers a route-map rule names via
+/// `match prefix-list`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Policy {
+    /// Named prefix-lists (`[[policy.prefix-list]]`) — reusable sets of prefix
+    /// ranges a route-map rule matches with `match prefix-list <name>`.
+    #[serde(default, rename = "prefix-list", skip_serializing_if = "Vec::is_empty")]
+    pub prefix_lists: Vec<PrefixList>,
+    /// Named route-maps (`[[policy.route-map]]`) — ordered match/set rules with a
+    /// default action, compiled to Wren's top-level `[[filter]]`.
+    #[serde(default, rename = "route-map", skip_serializing_if = "Vec::is_empty")]
+    pub route_maps: Vec<Filter>,
+}
+
+impl Policy {
+    /// True when no policy object is configured — lets `[policy]` be omitted.
+    pub fn is_empty(&self) -> bool {
+        self.prefix_lists.is_empty() && self.route_maps.is_empty()
+    }
+}
+
+/// A named prefix-list (`[[policy.prefix-list]]`): an ordered set of prefix
+/// ranges. Each entry is a prefix plus optional `ge`/`le` bounds on the match
+/// length (VyOS semantics). At compile each entry becomes one Wren prefix
+/// pattern (`p/len`, `p/len{ge,le}`), ORed into any route-map rule that names
+/// this list. Entries are permit-only (a deny is expressed by a route-map rule
+/// `action deny`, not inside the list).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrefixList {
+    /// The list name, referenced by a route-map rule's `match prefix-list`.
+    pub name: String,
+    /// The entries, keyed and ordered by `seq` (VyOS-style rule numbers).
+    #[serde(default, rename = "rule", skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<PrefixEntry>,
+}
+
+/// One entry of a [`PrefixList`] (`[[policy.prefix-list.rule]]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrefixEntry {
+    /// The rule sequence number (ordering; VyOS-style).
+    pub seq: u32,
+    /// The base prefix, `addr/len`.
+    pub prefix: String,
+    /// Match prefixes at least this long (VyOS `ge`). Unset ⇒ the prefix's own
+    /// length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ge: Option<u8>,
+    /// Match prefixes at most this long (VyOS `le`). Unset ⇒ the address
+    /// family's max (32 / 128).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub le: Option<u8>,
 }
 
 /// BFD (RFC 5880) global timing / authentication defaults (`[protocols.bfd]`).
@@ -4143,11 +4235,12 @@ impl Appliance {
                 }
             }
         }
-        // The set of declared filter names — a BGP neighbour's import/export must
-        // reference one of these (they compile to Wren's `[[filter]]` blocks).
+        // The set of declared route-map names — a BGP neighbour's import/export,
+        // a VRF's import/export and the redistribution maps must reference one of
+        // these (they compile to Wren's `[[filter]]` blocks).
         let filter_names: HashSet<&str> = self
-            .protocols
-            .filters
+            .policy
+            .route_maps
             .iter()
             .map(|f| f.name.as_str())
             .collect();
@@ -4303,8 +4396,66 @@ impl Appliance {
                 validate_bgp_neighbor(n, &filter_names)?;
             }
         }
-        for f in &self.protocols.filters {
-            validate_filter(f)?;
+        // Routing policy (VyOS `[policy]`): prefix-lists + route-maps. Validate
+        // the prefix-lists, then the route-maps (whose `match prefix-list` must
+        // name a declared list).
+        let prefix_list_names: HashSet<&str> = self
+            .policy
+            .prefix_lists
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        let mut seen_pl = HashSet::new();
+        for pl in &self.policy.prefix_lists {
+            if pl.name.is_empty() {
+                bail!("policy prefix-list: a name must not be empty");
+            }
+            if !seen_pl.insert(pl.name.as_str()) {
+                bail!("policy prefix-list: duplicate list {:?}", pl.name);
+            }
+            for e in &pl.entries {
+                validate_cidr_or_ip(&e.prefix)
+                    .with_context(|| format!("policy prefix-list {:?} prefix", pl.name))?;
+                let maxlen = if e.prefix.contains(':') { 128 } else { 32 };
+                for (which, b) in [("ge", e.ge), ("le", e.le)] {
+                    if let Some(b) = b {
+                        if b > maxlen {
+                            bail!(
+                                "policy prefix-list {:?}: {which} {b} exceeds the max prefix length {maxlen}",
+                                pl.name
+                            );
+                        }
+                    }
+                }
+                if let (Some(ge), Some(le)) = (e.ge, e.le) {
+                    if ge > le {
+                        bail!(
+                            "policy prefix-list {:?}: ge {ge} must be <= le {le}",
+                            pl.name
+                        );
+                    }
+                }
+            }
+        }
+        let mut seen_rm = HashSet::new();
+        for rm in &self.policy.route_maps {
+            if rm.name.is_empty() {
+                bail!("policy route-map: a name must not be empty");
+            }
+            if !seen_rm.insert(rm.name.as_str()) {
+                bail!("policy route-map: duplicate route-map {:?}", rm.name);
+            }
+            for rule in &rm.rules {
+                if let Some(pl) = &rule.match_prefix_list {
+                    if !prefix_list_names.contains(pl.as_str()) {
+                        bail!(
+                            "policy route-map {:?}: match prefix-list {pl:?} is not a declared policy prefix-list",
+                            rm.name
+                        );
+                    }
+                }
+            }
+            validate_filter(rm)?;
         }
         if let Some(ospf) = &self.protocols.ospf {
             if let Some(area) = &ospf.area {
@@ -7529,15 +7680,16 @@ import = "from-peer"
 export = "to-peer"
 bfd = true
 bfd-auth-type = "meticulous-sha1"
-[[protocols.filter]]
+[[policy.route-map]]
 name = "from-peer"
 default = "reject"
-[[protocols.filter.rule]]
+[[policy.route-map.rule]]
+seq = 10
 prefix = ["10.0.0.0/8+"]
 set-metric = 100
 set-community = ["65001:200"]
 action = "accept"
-[[protocols.filter]]
+[[policy.route-map]]
 name = "to-peer"
 "#;
         let a = Appliance::from_toml(toml).expect("full bgp config parses + validates");
@@ -7549,8 +7701,8 @@ name = "to-peer"
         assert_eq!(n.ttl_security, Some(1));
         assert_eq!(n.role.as_deref(), Some("customer"));
         assert_eq!(n.import.as_deref(), Some("from-peer"));
-        assert_eq!(a.protocols.filters.len(), 2);
-        assert_eq!(a.protocols.filters[0].rules[0].action, "accept");
+        assert_eq!(a.policy.route_maps.len(), 2);
+        assert_eq!(a.policy.route_maps[0].rules[0].action, "accept");
         // Round-trips through TOML losslessly.
         let b = Appliance::from_toml(&a.to_toml().unwrap()).expect("re-parses");
         assert_eq!(a.summary(), b.summary());
@@ -7574,8 +7726,8 @@ name = "to-peer"
             "{base}[[protocols.bgp.neighbor]]\naddress = \"10.0.0.2\"\nremote-as = 65002\nimport = \"nope\"\n"
         );
         assert!(Appliance::from_toml(&dangling).is_err());
-        // A filter rule with a non-accept/reject action is rejected.
-        let bad_action = "[system]\nhostname = \"r1\"\n[protocols]\n[[protocols.filter]]\nname = \"f\"\n[[protocols.filter.rule]]\naction = \"drop\"\n";
+        // A route-map rule with a non-accept/reject action is rejected.
+        let bad_action = "[system]\nhostname = \"r1\"\n[[policy.route-map]]\nname = \"f\"\n[[policy.route-map.rule]]\naction = \"drop\"\n";
         assert!(Appliance::from_toml(bad_action).is_err());
     }
 
@@ -7587,7 +7739,7 @@ hostname = "r1"
 [protocols]
 router-id = "10.0.0.1"
 import = { static = "f1" }
-[[protocols.filter]]
+[[policy.route-map]]
 name = "f1"
 default = "accept"
 [[protocols.vrf]]

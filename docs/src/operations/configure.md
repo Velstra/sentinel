@@ -69,6 +69,8 @@ firewall   global        stateful | block-icmp | default-action | log | block
            rule <r>      from | to | action | proto | port
 nat        source <s>      zone
            destination <d> zone | proto | port | to
+policy     prefix-list <n>  rule <seq> <prefix | ge | le>
+           route-map <n>    default | rule <seq> <action | match … | set …>
 vpn        ipsec <name>      local | remote | local-subnet | remote-subnet | psk | …
            wireguard <if>    private-key | listen-port | peer <pubkey> …
            openconnect       certificate | port | pool | dns | routes | default-route | zone | user <name> …
@@ -380,6 +382,63 @@ sentinel# commit save
 
 The frontends are rendered into an HAProxy `frontend`/`backend` pair by the
 appliance.
+
+## Routing policy (`policy`)
+
+`policy` is the routing-policy toolbox — a top-level node (VyOS-style) holding
+two kinds of named object: **prefix-lists** and **route-maps**. Route-maps are
+what BGP neighbours, VRFs and redistribution actually reference; prefix-lists
+are reusable match helpers a route-map rule names with `match prefix-list`.
+
+A **prefix-list** is an ordered set of prefix ranges, each keyed by a
+sequence number:
+
+```text
+sentinel# set policy prefix-list LAN rule 10 prefix 10.0.0.0/8
+sentinel# set policy prefix-list LAN rule 10 le 24        # match up to /24
+sentinel# set policy prefix-list LAN rule 20 prefix 192.168.0.0/16
+sentinel# set policy prefix-list LAN rule 20 ge 24        # match /24 and longer
+```
+
+`ge` / `le` bound the match length (VyOS semantics); omit them to match the
+prefix exactly.
+
+A **route-map** is an ordered list of rules (first match wins) plus a default
+action. Each rule has an `action` and, VyOS-style, separate `match` (conditions,
+ANDed) and `set` (attribute rewrites) clauses:
+
+```text
+sentinel# set policy route-map IMPORT default deny
+sentinel# set policy route-map IMPORT rule 10 action permit
+sentinel# set policy route-map IMPORT rule 10 match prefix-list LAN
+sentinel# set policy route-map IMPORT rule 10 match protocol static
+sentinel# set policy route-map IMPORT rule 10 set metric 100
+sentinel# set policy route-map IMPORT rule 10 set community 65001:100
+sentinel# set policy route-map IMPORT rule 20 action deny
+```
+
+- **`action`** and **`default`** are spelled **`permit`** / **`deny`** (they are
+  stored as `accept` / `reject`, which is what the routing daemon expects).
+- **`match`** conditions: `prefix-list <name>`, `prefix <pattern>` (an inline
+  Wren pattern such as `10.0.0.0/8+`, repeatable), `protocol <x>`,
+  `metric-le <n>`, `metric-ge <n>`.
+- **`set`** rewrites: `metric` / `add-metric`, `preference`, and the community
+  families — a bare `community <c>` **replaces** the set, `add-community <c>`
+  **appends** one; likewise `large-community` / `add-large-community` and
+  `ext-community` / `add-ext-community`.
+
+A route-map is named from wherever an import/export policy is expected — a BGP
+neighbour (`set protocols bgp neighbor <ip> import <route-map>` / `export …`), a
+VRF (`set protocols vrf <name> import <route-map>` / `export …`), and the
+redistribution maps (`set protocols import <proto> <route-map>` /
+`set protocols export <proto> <route-map>`). The name must resolve to a declared
+`policy route-map`.
+
+Remove pieces at any depth: `delete policy route-map IMPORT rule 20` drops one
+rule, `delete policy route-map IMPORT rule 10 match prefix-list` clears one
+field, `delete policy route-map IMPORT rule 10 set add-community 65001:1` drops
+one appended community, and `delete policy prefix-list LAN` /
+`delete policy route-map IMPORT` remove the whole object.
 
 ## Completion (the vtysh feel)
 
