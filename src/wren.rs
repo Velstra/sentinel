@@ -609,7 +609,22 @@ pub fn compile_wren(appliance: &Appliance) -> WrenConfig {
         neighbors: b.neighbors.iter().map(compile_neighbor).collect(),
     });
 
-    let filters = p.filters.iter().map(compile_filter).collect();
+    // VyOS `[policy]`: route-maps (`[[policy.route-map]]`) compile to wren's
+    // top-level `[[filter]]`. A route-map rule's `match prefix-list <name>` expands
+    // that list's entries into the rule's wren `prefix` patterns (ORed with any
+    // inline patterns), so build the name→list map once for `compile_filter`.
+    let prefix_lists: std::collections::BTreeMap<&str, &crate::config::PrefixList> = appliance
+        .policy
+        .prefix_lists
+        .iter()
+        .map(|pl| (pl.name.as_str(), pl))
+        .collect();
+    let filters = appliance
+        .policy
+        .route_maps
+        .iter()
+        .map(|rm| compile_filter(rm, &prefix_lists))
+        .collect();
 
     let ospf_interfaces = |ifs: &[crate::config::OspfInterface]| {
         ifs.iter()
@@ -858,32 +873,73 @@ fn compile_neighbor(n: &crate::config::BgpNeighbor) -> WrenNeighbor {
     }
 }
 
-/// Translate one appliance route filter into its Wren `[[filter]]` form.
-fn compile_filter(f: &crate::config::Filter) -> WrenFilter {
+/// Translate one appliance route-map (`[[policy.route-map]]`) into its Wren
+/// `[[filter]]` form. Rules emit in ascending `seq` order (stable for equal seqs,
+/// so they keep file order); each rule's wren `prefix` patterns are its inline
+/// patterns plus, when it names `match prefix-list <name>`, that list's entries
+/// expanded to wren prefix-pattern strings. `seq` and `match-prefix-list` are
+/// sentinel-only — they are consumed here, never sent to wren. The action string
+/// ("accept"/"reject", or the CLI's "permit"/"deny") passes through unchanged;
+/// wren's filter parser accepts both spellings.
+fn compile_filter(
+    f: &crate::config::Filter,
+    prefix_lists: &std::collections::BTreeMap<&str, &crate::config::PrefixList>,
+) -> WrenFilter {
+    let mut rules: Vec<&crate::config::FilterRule> = f.rules.iter().collect();
+    rules.sort_by_key(|r| r.seq);
     WrenFilter {
         name: f.name.clone(),
         default: f.default.clone(),
-        rules: f
-            .rules
-            .iter()
-            .map(|r| WrenFilterRule {
-                prefix: r.prefix.clone(),
-                protocol: r.protocol.clone(),
-                metric_le: r.metric_le,
-                metric_ge: r.metric_ge,
-                set_metric: r.set_metric,
-                add_metric: r.add_metric,
-                set_preference: r.set_preference,
-                set_community: r.set_community.clone(),
-                add_community: r.add_community.clone(),
-                set_large_community: r.set_large_community.clone(),
-                add_large_community: r.add_large_community.clone(),
-                set_ext_community: r.set_ext_community.clone(),
-                add_ext_community: r.add_ext_community.clone(),
-                action: r.action.clone(),
+        rules: rules
+            .into_iter()
+            .map(|r| {
+                let mut prefix = r.prefix.clone();
+                if let Some(list_name) = &r.match_prefix_list {
+                    if let Some(pl) = prefix_lists.get(list_name.as_str()) {
+                        prefix.extend(pl.entries.iter().map(expand_prefix_entry));
+                    }
+                }
+                WrenFilterRule {
+                    prefix,
+                    protocol: r.protocol.clone(),
+                    metric_le: r.metric_le,
+                    metric_ge: r.metric_ge,
+                    set_metric: r.set_metric,
+                    add_metric: r.add_metric,
+                    set_preference: r.set_preference,
+                    set_community: r.set_community.clone(),
+                    add_community: r.add_community.clone(),
+                    set_large_community: r.set_large_community.clone(),
+                    add_large_community: r.add_large_community.clone(),
+                    set_ext_community: r.set_ext_community.clone(),
+                    add_ext_community: r.add_ext_community.clone(),
+                    action: r.action.clone(),
+                }
             })
             .collect(),
     }
+}
+
+/// Expand one prefix-list entry (`[[policy.prefix-list.rule]]`) into a single Wren
+/// `PrefixPattern` string. With neither `ge` nor `le` it is an exact match
+/// (`addr/len`); with either bound present it emits wren's range form
+/// `addr/len{min,max}`, where an unset `ge` defaults to the prefix's own length
+/// and an unset `le` to the address-family max (32 for IPv4, 128 for IPv6). Wren
+/// clamps the window to `[network.len(), network.max_len()]` on parse, so these
+/// defaults are exact-length and family-max respectively.
+fn expand_prefix_entry(e: &crate::config::PrefixEntry) -> String {
+    if e.ge.is_none() && e.le.is_none() {
+        return e.prefix.clone();
+    }
+    let maxlen: u8 = if e.prefix.contains(':') { 128 } else { 32 };
+    let plen = e
+        .prefix
+        .split_once('/')
+        .and_then(|(_, l)| l.parse::<u8>().ok())
+        .unwrap_or(maxlen);
+    let min = e.ge.unwrap_or(plen);
+    let max = e.le.unwrap_or(maxlen);
+    format!("{}{{{min},{max}}}", e.prefix)
 }
 
 #[cfg(test)]
@@ -993,7 +1049,7 @@ hostname = "r1"
 [protocols]
 router-id = "10.0.0.1"
 import = { bgp = "f1", ospf = "f1" }
-[[protocols.filter]]
+[[policy.route-map]]
 name = "f1"
 default = "accept"
 [[protocols.vrf]]
@@ -1269,9 +1325,9 @@ hold-time = 30
 address = "10.10.0.3"
 remote-as = 65003
 ebgp-multihop = 4
-[[protocols.filter]]
+[[policy.route-map]]
 name = "in"
-[[protocols.filter]]
+[[policy.route-map]]
 name = "out"
 "#;
         let appliance = Appliance::from_toml(toml).unwrap();
@@ -1314,10 +1370,10 @@ name = "out"
 [system]
 hostname = "r1"
 [protocols]
-[[protocols.filter]]
+[[policy.route-map]]
 name = "peer-in"
 default = "reject"
-[[protocols.filter.rule]]
+[[policy.route-map.rule]]
 prefix = ["10.0.0.0/8+", "192.168.0.0/16"]
 protocol = "bgp"
 metric-le = 100
@@ -1340,6 +1396,106 @@ action = "accept"
             "{out}"
         );
         assert!(out.contains("action = \"accept\""), "{out}");
+    }
+
+    #[test]
+    fn prefix_entry_expands_to_wren_pattern_syntax() {
+        use crate::config::PrefixEntry;
+        let entry = |prefix: &str, ge: Option<u8>, le: Option<u8>| PrefixEntry {
+            seq: 0,
+            prefix: prefix.to_string(),
+            ge,
+            le,
+        };
+        // No bounds → exact match: the bare prefix (BIRD `prefix`).
+        assert_eq!(
+            expand_prefix_entry(&entry("10.0.0.0/8", None, None)),
+            "10.0.0.0/8"
+        );
+        // `le` only → `ge` defaults to the prefix's own length.
+        assert_eq!(
+            expand_prefix_entry(&entry("10.0.0.0/8", None, Some(24))),
+            "10.0.0.0/8{8,24}"
+        );
+        // `ge` only → `le` defaults to the IPv4 family max (32).
+        assert_eq!(
+            expand_prefix_entry(&entry("10.0.0.0/8", Some(16), None)),
+            "10.0.0.0/8{16,32}"
+        );
+        // Both bounds present.
+        assert_eq!(
+            expand_prefix_entry(&entry("192.168.0.0/16", Some(24), Some(28))),
+            "192.168.0.0/16{24,28}"
+        );
+        // IPv6 `le` default is 128.
+        assert_eq!(
+            expand_prefix_entry(&entry("2001:db8::/32", Some(48), None)),
+            "2001:db8::/32{48,128}"
+        );
+    }
+
+    #[test]
+    fn route_map_expands_prefix_list_and_orders_by_seq() {
+        // A route-map rule with `match prefix-list` gets that list's entries ORed
+        // into its wren `prefix`, alongside any inline patterns; rules emit in
+        // ascending `seq`; the neighbour `export` still names the route-map.
+        let toml = r#"
+[system]
+hostname = "r1"
+[protocols]
+[protocols.bgp]
+local-as = 65001
+[[protocols.bgp.neighbor]]
+address = "10.10.0.2"
+remote-as = 65002
+export = "to-peer"
+[[policy.prefix-list]]
+name = "LAN"
+[[policy.prefix-list.rule]]
+seq = 10
+prefix = "10.0.0.0/8"
+le = 24
+[[policy.prefix-list.rule]]
+seq = 20
+prefix = "192.168.0.0/16"
+[[policy.route-map]]
+name = "to-peer"
+default = "reject"
+[[policy.route-map.rule]]
+seq = 20
+action = "reject"
+[[policy.route-map.rule]]
+seq = 10
+action = "accept"
+match-prefix-list = "LAN"
+prefix = ["172.16.0.0/12+"]
+set-metric = 100
+"#;
+        let appliance = Appliance::from_toml(toml).unwrap();
+        appliance.validate().expect("valid appliance");
+        let out = compile_wren(&appliance).to_toml().unwrap();
+        // The route-map compiled to a top-level wren filter keeping its name.
+        assert!(out.contains("[[filter]]"), "{out}");
+        assert!(out.contains("name = \"to-peer\""), "{out}");
+        assert!(out.contains("default = \"reject\""), "{out}");
+        // The neighbour export still references the route-map by name (unchanged).
+        assert!(out.contains("export = \"to-peer\""), "{out}");
+        // The accepting rule's prefix is the union of its inline pattern and LAN's
+        // entries expanded to wren PrefixPattern strings: the inline
+        // `172.16.0.0/12+`, LAN seq 10 `10.0.0.0/8{8,24}` (le 24), and LAN seq 20
+        // `192.168.0.0/16` (exact, no ge/le).
+        let filter = out.split("[[filter]]").nth(1).unwrap();
+        assert!(filter.contains("172.16.0.0/12+"), "{out}");
+        assert!(filter.contains("10.0.0.0/8{8,24}"), "{out}");
+        assert!(filter.contains("192.168.0.0/16"), "{out}");
+        assert!(filter.contains("set-metric = 100"), "{out}");
+        // Rules emit in ascending seq order: seq 10 accept before seq 20 reject.
+        let accept_at = out.find("action = \"accept\"").expect("accept rule");
+        let reject_at = out.find("action = \"reject\"").expect("reject rule");
+        assert!(
+            accept_at < reject_at,
+            "seq 10 (accept) must precede seq 20 (reject):\n{out}"
+        );
     }
 
     #[test]

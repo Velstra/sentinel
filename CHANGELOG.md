@@ -65,8 +65,12 @@ declarative config model.
   silently vanishing.
 - **Full per-neighbour BGP.** Every wren neighbor field is now reachable:
   `local-as`, `update-source`, `ebgp-multihop`, `description`, `shutdown`,
-  `hold-time`, and more; route-maps via `[[protocols.filter]]`, communities,
+  `hold-time`, and more; route-maps, communities,
   RPKI, confederation, and aggregate-address.
+- **Routing policy (`policy`).** VyOS-style `set policy prefix-list` +
+  `set policy route-map` with explicit `match` / `set` clauses and
+  `match prefix-list`, replacing `[[protocols.filter]]`; route-maps are
+  referenced by BGP neighbours, VRFs and redistribution.
 - **Per-object IGP + routing surface.** OSPFv2 / OSPFv3 (areas, auth, timers,
   stub/NSSA), IS-IS, RIP / RIPng, Babel, VRRP with interface/route tracking,
   global BFD, multicast (IGMP/MLD), VRFs, and per-protocol redistribution
