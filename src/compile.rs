@@ -196,7 +196,15 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
             let port_rules = appliance
                 .rules
                 .iter()
-                .filter(|r| !r.disabled && r.from == zone && r.is_port_rule())
+                // A scheduled rule (roadmap C15) is emitted only while its weekly
+                // window is open (local time); a systemd timer re-applies at the
+                // boundaries. An unscheduled rule is always emitted.
+                .filter(|r| {
+                    !r.disabled
+                        && r.from == zone
+                        && r.is_port_rule()
+                        && r.schedule.as_ref().is_none_or(|s| s.is_active_now())
+                })
                 .flat_map(|r| {
                     let proto = proto_str(r.proto.unwrap());
                     let action = action_str(r.action);

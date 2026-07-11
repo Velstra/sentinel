@@ -3486,6 +3486,113 @@ pub struct Rule {
     /// `port`/range — mutually exclusive with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port_group: Option<String>,
+    /// Time-based activation (roadmap C15): the rule is only in force during this
+    /// weekly schedule (local time). Enforced at compile time — the compiler emits
+    /// the rule only while the window is open, and a systemd timer re-applies at the
+    /// window boundaries. Absent means "always active".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<Schedule>,
+}
+
+/// A weekly time window a firewall rule is active in (roadmap C15). Times are the
+/// box's **local** time, `"HH:MM"`, and the window does not span midnight
+/// (`start < end`). `days` lists the weekdays it applies on.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Schedule {
+    /// Weekdays the window is open on (at least one).
+    pub days: Vec<Day>,
+    /// Window start, local `"HH:MM"` (inclusive).
+    pub start: String,
+    /// Window end, local `"HH:MM"` (exclusive).
+    pub end: String,
+}
+
+/// A day of the week, `tm_wday`-compatible (`Sun` = 0).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Day {
+    Sun,
+    Mon,
+    Tue,
+    Wed,
+    Thu,
+    Fri,
+    Sat,
+}
+
+impl Day {
+    /// The libc `tm_wday` value (Sunday = 0) — matches `localtime_r`.
+    pub fn wday(self) -> i32 {
+        match self {
+            Day::Sun => 0,
+            Day::Mon => 1,
+            Day::Tue => 2,
+            Day::Wed => 3,
+            Day::Thu => 4,
+            Day::Fri => 5,
+            Day::Sat => 6,
+        }
+    }
+    /// The systemd `OnCalendar` day abbreviation.
+    pub fn calendar(self) -> &'static str {
+        match self {
+            Day::Sun => "Sun",
+            Day::Mon => "Mon",
+            Day::Tue => "Tue",
+            Day::Wed => "Wed",
+            Day::Thu => "Thu",
+            Day::Fri => "Fri",
+            Day::Sat => "Sat",
+        }
+    }
+    /// Parse a lowercase day name (`"mon"`), or `None`.
+    pub fn parse(s: &str) -> Option<Day> {
+        Some(match s {
+            "sun" => Day::Sun,
+            "mon" => Day::Mon,
+            "tue" => Day::Tue,
+            "wed" => Day::Wed,
+            "thu" => Day::Thu,
+            "fri" => Day::Fri,
+            "sat" => Day::Sat,
+            _ => return None,
+        })
+    }
+}
+
+/// Parse an `"HH:MM"` local time into minutes since midnight (`0..=1439`), or
+/// `None` if malformed / out of range.
+pub(crate) fn parse_hhmm(s: &str) -> Option<u16> {
+    let (h, m) = s.split_once(':')?;
+    let h: u16 = h.parse().ok()?;
+    let m: u16 = m.parse().ok()?;
+    if h > 23 || m > 59 {
+        return None;
+    }
+    Some(h * 60 + m)
+}
+
+impl Schedule {
+    /// Whether the window is open on `wday` (`tm_wday`, Sun = 0) at `minute`
+    /// (minutes since local midnight). Pure — the caller supplies the clock.
+    pub fn is_active_at(&self, wday: i32, minute: u16) -> bool {
+        let (Some(start), Some(end)) = (parse_hhmm(&self.start), parse_hhmm(&self.end)) else {
+            return false;
+        };
+        self.days.iter().any(|d| d.wday() == wday) && minute >= start && minute < end
+    }
+
+    /// Whether the window is open right now, in the box's local time.
+    pub fn is_active_now(&self) -> bool {
+        // SAFETY: `localtime_r` fills a caller-owned `tm` from a `time_t`; both
+        // pointers are valid for the call.
+        let now = unsafe { libc::time(std::ptr::null_mut()) };
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        unsafe { libc::localtime_r(&now, &mut tm) };
+        let minute = (tm.tm_hour * 60 + tm.tm_min) as u16;
+        self.is_active_at(tm.tm_wday, minute)
+    }
 }
 
 impl Rule {
@@ -4320,6 +4427,34 @@ impl Appliance {
                 if !self.firewall.group.port.contains_key(g) {
                     bail!(
                         "rule {:?}: port-group {g:?} is not a declared port group",
+                        rule.name
+                    );
+                }
+            }
+            // Time-based schedule (roadmap C15): valid days + HH:MM window that does
+            // not span midnight. Only meaningful on a port rule (a broad rule sets a
+            // zone's standing posture, which can't flip on a timer).
+            if let Some(sched) = &rule.schedule {
+                if sched.days.is_empty() {
+                    bail!("rule {:?}: schedule needs at least one day", rule.name);
+                }
+                let start = parse_hhmm(&sched.start).ok_or_else(|| {
+                    anyhow::anyhow!("rule {:?}: schedule start {:?} is not HH:MM", rule.name, sched.start)
+                })?;
+                let end = parse_hhmm(&sched.end).ok_or_else(|| {
+                    anyhow::anyhow!("rule {:?}: schedule end {:?} is not HH:MM", rule.name, sched.end)
+                })?;
+                if start >= end {
+                    bail!(
+                        "rule {:?}: schedule start {:?} must be before end {:?} (a window cannot span midnight)",
+                        rule.name,
+                        sched.start,
+                        sched.end
+                    );
+                }
+                if !rule.is_port_rule() {
+                    bail!(
+                        "rule {:?}: a schedule is only valid on a port rule (proto + port)",
                         rule.name
                     );
                 }
@@ -8193,5 +8328,42 @@ virtual-address = ["10.0.0.254"]
             Appliance::from_toml(&format!("{base}[protocols.export]\nkernel = \"nope\"\n"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn schedule_activity_and_validation() {
+        use super::{Day, Schedule, parse_hhmm};
+        assert_eq!(parse_hhmm("09:30"), Some(570));
+        assert_eq!(parse_hhmm("24:00"), None);
+        assert_eq!(parse_hhmm("noon"), None);
+
+        // mon-fri 09:00-17:00.
+        let s = Schedule {
+            days: vec![Day::Mon, Day::Tue, Day::Wed, Day::Thu, Day::Fri],
+            start: "09:00".into(),
+            end: "17:00".into(),
+        };
+        // Wednesday (wday 3) at 12:00 → open.
+        assert!(s.is_active_at(3, 12 * 60));
+        // Wednesday at 08:59 → closed (before start); 17:00 → closed (end exclusive).
+        assert!(!s.is_active_at(3, 8 * 60 + 59));
+        assert!(!s.is_active_at(3, 17 * 60));
+        // Sunday (wday 0) at noon → closed (not in the day set).
+        assert!(!s.is_active_at(0, 12 * 60));
+
+        // Validation: a schedule needs a port rule, a valid HH:MM window, start<end.
+        let base = "[system]\nhostname = \"fw\"\n[[interface]]\nname=\"eth0\"\nzone=\"lan\"\n";
+        // Good: a scheduled port rule.
+        assert!(Appliance::from_toml(&format!(
+            "{base}[[rule]]\nname=\"r\"\nfrom=\"lan\"\naction=\"accept\"\nproto=\"tcp\"\nport=443\n[rule.schedule]\ndays=[\"mon\"]\nstart=\"09:00\"\nend=\"17:00\"\n"
+        )).is_ok());
+        // Bad: start after end.
+        assert!(Appliance::from_toml(&format!(
+            "{base}[[rule]]\nname=\"r\"\nfrom=\"lan\"\naction=\"accept\"\nproto=\"tcp\"\nport=443\n[rule.schedule]\ndays=[\"mon\"]\nstart=\"17:00\"\nend=\"09:00\"\n"
+        )).is_err());
+        // Bad: schedule on a broad rule (no port).
+        assert!(Appliance::from_toml(&format!(
+            "{base}[[rule]]\nname=\"r\"\nfrom=\"lan\"\naction=\"accept\"\n[rule.schedule]\ndays=[\"mon\"]\nstart=\"09:00\"\nend=\"17:00\"\n"
+        )).is_err());
     }
 }

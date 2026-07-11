@@ -2040,6 +2040,16 @@ const RULE_FIELDS: &[Cand] = &[
         "port-group",
         "match a port-group (alias) instead of a single port",
     ),
+    (
+        "schedule",
+        "time-based activation window (days / start / end, local time)",
+    ),
+];
+// `firewall rule <name> schedule <Tab>` — the weekly-window fields.
+const SCHEDULE_FIELDS: &[Cand] = &[
+    ("days", "weekdays the window is open (mon,tue,… csv)"),
+    ("start", "window start, local HH:MM (inclusive)"),
+    ("end", "window end, local HH:MM (exclusive)"),
 ];
 
 // ---- Display-only value placeholders (vtysh style) --------------------------
@@ -2208,6 +2218,7 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set", "firewall", "rule", _name, "action"] => ACTIONS,
         ["set", "firewall", "rule", _name, "proto"] => PROTOS,
         ["set", "firewall", "rule", _name, "log" | "disabled"] => BOOLS,
+        ["set" | "delete", "firewall", "rule", _name, "schedule"] => SCHEDULE_FIELDS,
 
         // The nat sub-tree (its own top-level node).
         ["set" | "delete", "nat"] => NAT_NODES,
@@ -3362,8 +3373,13 @@ mod tests {
                 "log",
                 "source",
                 "source-group",
-                "port-group"
+                "port-group",
+                "schedule"
             ]
+        );
+        assert_eq!(
+            kw(&["set", "firewall", "rule", "web", "schedule"]),
+            ["days", "start", "end"]
         );
         assert_eq!(
             kw(&["set", "firewall", "rule", "web", "log"]),

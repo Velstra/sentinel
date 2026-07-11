@@ -17,7 +17,7 @@ use crate::config::{
     Dhcp6Pool, DhcpRelay, DhcpServer, DhcpStaticLease, Dns, Dyndns, Export, Filter, FilterRule, Firewall,
     Groups, HealthCheck, IfaceType, Interface, IpsecConnection, Isis, Lldp, Mdns, MultiWan,
     Multicast, MulticastInterface, Nat, Nat64, NatDestination, NatNpt66, NatSource, Ntp,
-    OpenConnectServer,
+    OpenConnectServer, Schedule,
     OpenConnectUser, Ospf, Ospf3, OspfInterface, Pki, Policy, PortSpec, Pppoe, PrefixEntry,
     PrefixList, Proto, Protocols, Qos, QosDiscipline, ReverseProxy, Rip, RouterAdvert, Rule,
     Services, Snmp, StaticRoute, System, UpdateChannel, Vpn, VrfDef, Vrrp, WanMode, WanUplink,
@@ -212,6 +212,20 @@ struct RuleDraft {
     source: Option<String>,
     source_group: Option<String>,
     port_group: Option<String>,
+    schedule: Option<Schedule>,
+}
+
+impl RuleDraft {
+    /// Mutable access to the schedule sub-draft, inserting an empty one (no days,
+    /// blank window) if not yet present — commit-time validation rejects a still-
+    /// incomplete schedule.
+    fn schedule_mut(&mut self) -> &mut Schedule {
+        self.schedule.get_or_insert_with(|| Schedule {
+            days: Vec::new(),
+            start: String::new(),
+            end: String::new(),
+        })
+    }
 }
 
 /// A partially-specified source-NAT (masquerade) rule.
@@ -1706,6 +1720,7 @@ impl Draft {
                             source: r.source.clone(),
                             source_group: r.source_group.clone(),
                             port_group: r.port_group.clone(),
+                            schedule: r.schedule.clone(),
                         },
                     )
                 })
@@ -2807,6 +2822,28 @@ impl Session {
             }
             ["firewall", "rule", name, "port-group", v] => {
                 self.draft.rule_mut(name).port_group = Some((*v).to_string())
+            }
+            // Time-based rule schedule (roadmap C15): a weekly local-time window.
+            ["firewall", "rule", name, "schedule", "days", v] => {
+                let mut days = Vec::new();
+                for d in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    days.push(crate::config::Day::parse(d).ok_or_else(|| {
+                        anyhow::anyhow!("schedule day {d:?}: expected mon/tue/…/sun")
+                    })?);
+                }
+                self.draft.rule_mut(name).schedule_mut().days = days;
+            }
+            ["firewall", "rule", name, "schedule", "start", v] => {
+                if crate::config::parse_hhmm(v).is_none() {
+                    bail!("schedule start {v:?}: expected HH:MM");
+                }
+                self.draft.rule_mut(name).schedule_mut().start = (*v).to_string();
+            }
+            ["firewall", "rule", name, "schedule", "end", v] => {
+                if crate::config::parse_hhmm(v).is_none() {
+                    bail!("schedule end {v:?}: expected HH:MM");
+                }
+                self.draft.rule_mut(name).schedule_mut().end = (*v).to_string();
             }
 
             // firewall group <kind> <name>: named aliases (address/port sets)
@@ -4425,6 +4462,7 @@ impl Session {
                     "source" => r.source = None,
                     "source-group" => r.source_group = None,
                     "port-group" => r.port_group = None,
+                    "schedule" => r.schedule = None,
                     other => bail!("rule has no field {other:?}"),
                 }
             }
@@ -5560,6 +5598,7 @@ impl Session {
                     source: d.source.clone(),
                     source_group: d.source_group.clone(),
                     port_group: d.port_group.clone(),
+                    schedule: d.schedule.clone(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -6565,6 +6604,25 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         if let Some(g) = &r.port_group {
             fwi.push_str(&format!("        port-group {g}\n"));
+        }
+        if let Some(s) = &r.schedule {
+            fwi.push_str("        schedule {\n");
+            if !s.days.is_empty() {
+                let days = s
+                    .days
+                    .iter()
+                    .map(|d| d.calendar().to_lowercase())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                fwi.push_str(&format!("            days {days}\n"));
+            }
+            if !s.start.is_empty() {
+                fwi.push_str(&format!("            start {}\n", s.start));
+            }
+            if !s.end.is_empty() {
+                fwi.push_str(&format!("            end {}\n", s.end));
+            }
+            fwi.push_str("        }\n");
         }
         fwi.push_str("    }\n");
     }

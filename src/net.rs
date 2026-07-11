@@ -788,6 +788,49 @@ const MACSEC_UNIT: &str = "sentinel-macsec.service";
 const L2TP_SETUP: &str = "/run/sentinel/l2tp/setup.sh";
 const L2TP_UNIT: &str = "sentinel-l2tp.service";
 
+/// Time-based firewall rules (roadmap C15): a dynamically rendered systemd timer
+/// that fires at every scheduled rule's window boundary and re-applies the config
+/// (`sentinel-fwsched.service`, static in the image), so the compiler re-emits the
+/// rule set for the new time. Written under `/run/systemd/system` (a valid unit
+/// dir) so it can be created/removed as schedules come and go.
+const FWSCHED_TIMER: &str = "/run/systemd/system/sentinel-fwsched.timer";
+const FWSCHED_UNIT: &str = "sentinel-fwsched.timer";
+
+/// Render the time-based-rules timer, or `None` when no rule has a schedule. One
+/// `OnCalendar=` per distinct window boundary (start + end) across all scheduled
+/// rules, in the box's local time (matching the compiler's schedule evaluation).
+fn fwsched_timer_body(appliance: &Appliance) -> Option<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for r in &appliance.rules {
+        if let Some(s) = &r.schedule {
+            let days = s
+                .days
+                .iter()
+                .map(|d| d.calendar())
+                .collect::<Vec<_>>()
+                .join(",");
+            for time in [&s.start, &s.end] {
+                let line = format!("OnCalendar={days} {time}");
+                if !lines.contains(&line) {
+                    lines.push(line);
+                }
+            }
+        }
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let mut body = String::from(
+        "[Unit]\nDescription=re-apply time-based firewall rules at window boundaries\n\n[Timer]\n",
+    );
+    for line in &lines {
+        body.push_str(line);
+        body.push('\n');
+    }
+    body.push_str("\n[Install]\nWantedBy=timers.target\n");
+    Some(body)
+}
+
 const NAT64_DIR: &str = "/run/sentinel/nat64";
 const TAYGA_CONF: &str = "/run/sentinel/nat64/tayga.conf";
 const TAYGA_SETUP: &str = "/run/sentinel/nat64/setup.sh";
@@ -1015,6 +1058,39 @@ fn apply_box_service(unit: &str, path: &Path, body: Option<String>, secret: bool
                     eprintln!("warning: stopping {unit}: {e}");
                 }
                 system::remove_file(path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reconcile the time-based-rules timer (roadmap C15) to the config: write (and
+/// start) the dynamic `sentinel-fwsched.timer` when any rule has a schedule, or
+/// stop + remove it when none do. Writing under `/run/systemd/system` needs a
+/// `daemon-reload` before the unit can be (re)started. Live only touches units; at
+/// boot systemd reads the freshly written unit on its own start.
+fn apply_fwsched(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
+    let path = Path::new(FWSCHED_TIMER);
+    match fwsched_timer_body(appliance) {
+        Some(body) => {
+            let changed = file_changed(path, &body);
+            system::install_file(path, &body)?;
+            if mode == ApplyMode::Live && changed {
+                let _ = system::daemon_reload();
+                if let Err(e) = system::service_restart(FWSCHED_UNIT) {
+                    eprintln!("warning: starting {FWSCHED_UNIT} failed: {e}");
+                }
+            }
+        }
+        None => {
+            if path.exists() {
+                if mode == ApplyMode::Live {
+                    let _ = system::service_stop(FWSCHED_UNIT);
+                }
+                system::remove_file(path)?;
+                if mode == ApplyMode::Live {
+                    let _ = system::daemon_reload();
+                }
             }
         }
     }
@@ -2134,6 +2210,9 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     // PKI (roadmap C19): the ACME descriptor renders in both modes; CA/leaf key
     // material is minted on a live commit only (idempotent, link-independent).
     crate::pki::apply(appliance, mode)?;
+    // Time-based firewall rules (roadmap C15): (re)create or remove the dynamic
+    // timer that re-applies the config at each scheduled rule's window boundaries.
+    apply_fwsched(appliance, mode)?;
     Ok(())
 }
 
