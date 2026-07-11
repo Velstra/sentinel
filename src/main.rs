@@ -442,6 +442,7 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
                     zones: session.zone_names(),
                     nat_source: session.nat_source_names(),
                     nat_destination: session.nat_destination_names(),
+                    nat_npt66: session.nat_npt66_names(),
                     address_groups: session.address_group_names(),
                     port_groups: session.port_group_names(),
                     filters: session.filter_names(),

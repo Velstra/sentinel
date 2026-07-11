@@ -40,6 +40,17 @@ pub struct VelstraConfig {
     interfaces: Vec<Interface>,
     #[serde(rename = "port_forward", skip_serializing_if = "Vec::is_empty")]
     port_forwards: Vec<PortForwardOut>,
+    #[serde(rename = "npt66", skip_serializing_if = "Vec::is_empty")]
+    npt66: Vec<Npt66Out>,
+}
+
+/// One `[[npt66]]` entry in the emitted velstra config — a NPTv6 (RFC 6296)
+/// prefix translation bound to a boundary interface.
+#[derive(Debug, Serialize)]
+struct Npt66Out {
+    interface: String,
+    internal: String,
+    external: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -310,6 +321,18 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
         }
     }
 
+    // NPTv6 (RFC 6296) — one `[[npt66]]` per rule, bound to its boundary interface.
+    let npt66 = appliance
+        .nat
+        .npt66
+        .iter()
+        .map(|n| Npt66Out {
+            interface: n.interface.clone(),
+            internal: n.internal.clone(),
+            external: n.external.clone(),
+        })
+        .collect();
+
     VelstraConfig {
         // Deny by default; interfaces opt into their zone policy.
         default_action: action_str(fw.default_action),
@@ -320,6 +343,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
         policies,
         interfaces,
         port_forwards,
+        npt66,
     }
 }
 
@@ -743,6 +767,32 @@ hairpin = true
         let cfg = compile(&Appliance::from_toml(toml).unwrap());
         assert_eq!(cfg.port_forwards.len(), 1);
         assert!(cfg.port_forwards[0].match_dst.is_none());
+    }
+
+    #[test]
+    fn npt66_emits_a_prefix_translation_entry() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+address6 = "2001:db8:1::1/64"
+[[nat.npt66]]
+name = "v6"
+interface = "wan0"
+internal = "fd00:1::/48"
+external = "2001:db8:1::/48"
+"#;
+        let cfg = compile(&Appliance::from_toml(toml).unwrap());
+        assert_eq!(cfg.npt66.len(), 1);
+        let n = &cfg.npt66[0];
+        assert_eq!(n.interface, "wan0");
+        assert_eq!((n.internal.as_str(), n.external.as_str()), ("fd00:1::/48", "2001:db8:1::/48"));
+        let out = cfg.to_toml().unwrap();
+        assert!(out.contains("[[npt66]]"), "{out}");
+        assert!(out.contains("internal = \"fd00:1::/48\""), "{out}");
+        assert!(out.contains("external = \"2001:db8:1::/48\""), "{out}");
     }
 
     #[test]
