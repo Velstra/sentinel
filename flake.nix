@@ -6439,6 +6439,108 @@
               )
             '';
           };
+
+        # BFD (RFC 5880, wren) fast failure detection under BGP: two Sentinels peer
+        # over BGP with `bfd true` on the neighbour. The BFD control session (UDP
+        # 3784, passed by the WAN policy under default-action accept) comes up
+        # alongside the BGP session. A BGP hold-time of 180s means BGP's OWN failure
+        # detection is minutes away, so when the peer's link drops, BFD — with its
+        # sub-second detection — is what tears the session down and withdraws the
+        # peer's route within seconds. That gap is the point of BFD.
+        #   nix build .#checks.x86_64-linux.bfd -L
+        bfd =
+          let
+            node = hostname: addr: {
+              lib,
+              ...
+            }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce hostname;
+              networking.firewall.enable = lib.mkForce false;
+              networking.interfaces.eth1.ipv4.addresses = [
+                {
+                  address = addr;
+                  prefixLength = 24;
+                }
+              ];
+              virtualisation.vlans = [ 1 ];
+              virtualisation.memorySize = 2048;
+              services.velstra.interface = lib.mkForce "eth1";
+            };
+          in
+          pkgs.testers.runNixOSTest {
+            name = "sentinel-bfd";
+            nodes = {
+              bfd1 = node "bfd1" "10.10.0.1";
+              bfd2 = node "bfd2" "10.10.0.2";
+            };
+            testScript = ''
+              start_all()
+              for m in (bfd1, bfd2):
+                  m.wait_for_unit("multi-user.target")
+                  m.wait_for_unit("velstra.service")
+                  m.wait_for_unit("wren.service")
+              bfd1.wait_until_succeeds("ip addr show eth1 | grep -q 10.10.0.1", timeout=20)
+              bfd2.wait_until_succeeds("ip addr show eth1 | grep -q 10.10.0.2", timeout=20)
+
+              # BGP with a BFD-tracked neighbour and a long hold-time (so BGP's own
+              # keepalive detection stays out of the way — BFD is the fast path).
+              def configure(m, myaddr, myas, mynet, peer, peeras):
+                  m.succeed(
+                      "su admin -c \"printf '%s\\n' "
+                      "'set firewall global default-action accept' "
+                      "'set interface eth1 zone wan' "
+                      f"'set protocols router-id {myaddr}' "
+                      f"'set protocols bgp local-as {myas}' "
+                      f"'set protocols bgp network {mynet}' "
+                      f"'set protocols bgp neighbor {peer} remote-as {peeras}' "
+                      f"'set protocols bgp neighbor {peer} hold-time 180' "
+                      f"'set protocols bgp neighbor {peer} bfd true' "
+                      "commit save exit "
+                      "| sentinel configure\""
+                  )
+                  m.wait_for_unit("wren.service")
+
+              configure(bfd1, "10.10.0.1", 65001, "10.11.0.0/24", "10.10.0.2", 65002)
+              configure(bfd2, "10.10.0.2", 65002, "10.12.0.0/24", "10.10.0.1", 65001)
+
+              # The neighbour's config carries the BFD flag.
+              bfd1.succeed("grep -q 'bfd = true' /run/sentinel/wren.toml")
+
+              # BGP establishes and each router learns the other's network.
+              bfd1.wait_until_succeeds(
+                  "ip -4 route show proto bgp | grep -q '10.12.0.0/24'", timeout=90
+              )
+              bfd2.wait_until_succeeds(
+                  "ip -4 route show proto bgp | grep -q '10.11.0.0/24'", timeout=90
+              )
+
+              # Headline 1 — the BFD control session comes Up on both ends (proves
+              # BFD runs end-to-end over the datapath, not just BGP).
+              bfd1.wait_until_succeeds(
+                  "wren show bfd | grep 10.10.0.2 | grep -qw Up", timeout=40
+              )
+              bfd2.wait_until_succeeds(
+                  "wren show bfd | grep 10.10.0.1 | grep -qw Up", timeout=40
+              )
+
+              # Headline 2 — fail bfd2's link. bfd1's own eth1 stays up, so BGP's own
+              # keepalives would otherwise hold the peer for the full 180s hold-time.
+              # BFD, with its sub-second detection, notices the loss and tears the BGP
+              # session down within a few seconds — far under the hold-time, which is
+              # the proof BFD (not BGP) drove it. (The BGP route is then retained
+              # briefly by graceful restart, so the observable is the BFD/BGP session
+              # state — what BFD actually drives — not the route.)
+              bfd2.succeed("ip link set eth1 down")
+              bfd1.wait_until_succeeds(
+                  "! wren show bfd | grep 10.10.0.2 | grep -qw Up", timeout=20
+              )
+              bfd1.wait_until_succeeds(
+                  "! wren show bgp neighbors | grep -qi established", timeout=20
+              )
+            '';
+          };
       };
     };
 }
