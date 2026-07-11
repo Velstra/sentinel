@@ -394,6 +394,13 @@ pub fn service_stop(unit: &str) -> Result<()> {
     run_priv("systemctl", &["stop", unit])
 }
 
+/// Make systemd re-read unit files after Sentinel wrote/removed one under
+/// `/run/systemd/system` (e.g. the dynamic time-based-rules timer). Required
+/// before starting a freshly written unit.
+pub fn daemon_reload() -> Result<()> {
+    run_priv("systemctl", &["daemon-reload"])
+}
+
 /// Remove a (possibly root-owned) file, tolerating an already-absent path.
 pub fn remove_file(path: &Path) -> Result<()> {
     if !path.exists() {
