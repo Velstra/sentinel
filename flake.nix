@@ -3237,6 +3237,94 @@
           '';
         };
 
+        # Time-based firewall rules (roadmap C15): a port rule may carry a weekly
+        # local-time schedule and is compiled into the data plane ONLY while its
+        # window is open. The datapath has no wall clock (bpf_ktime_get_real_ns is
+        # unavailable), so the schedule is evaluated at COMPILE time in Sentinel,
+        # and a dynamically rendered `sentinel-fwsched.timer` re-runs the compile
+        # at each window boundary. The VM clock is pinned with `date -s` (NTP off)
+        # so the test is deterministic regardless of when it runs.
+        #   nix build .#checks.x86_64-linux.fwschedule -L
+        fwschedule = pkgs.testers.runNixOSTest {
+          name = "sentinel-fwschedule";
+          nodes.machine = {
+            imports = [ self.nixosModules.sentinel ];
+            virtualisation.memorySize = 2048;
+            # A deterministic wall clock: fix the zone to UTC and disable NTP so a
+            # `date -s` sticks for the length of the test (the sandbox has no
+            # network anyway, but this removes any doubt).
+            time.timeZone = "UTC";
+            services.timesyncd.enable = false;
+          };
+          testScript = ''
+            machine.wait_for_unit("multi-user.target")
+            machine.wait_for_unit("sentinel-boot.service")
+            machine.wait_for_unit("velstra.service")
+
+            # Pin the clock to Monday 2026-07-13 12:00:00 UTC — inside the
+            # 09:00-17:00 window the scheduled rule below declares. `%u` == 1
+            # confirms the guest agrees it is a Monday.
+            machine.succeed("date -s '2026-07-13 12:00:00'")
+            machine.succeed('test "$(date +%u)" = 1')
+
+            # Zone the discovered NIC and add a tcp/8443 accept rule that is only
+            # active Mon-Fri 09:00-17:00. `commit` applies live, `save` persists.
+            machine.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth0 zone wan' 'set interface eth0 address dhcp' "
+                "'set firewall rule worktime from wan' "
+                "'set firewall rule worktime action accept' "
+                "'set firewall rule worktime proto tcp' "
+                "'set firewall rule worktime port 8443' "
+                "'set firewall rule worktime schedule days mon,tue,wed,thu,fri' "
+                "'set firewall rule worktime schedule start 09:00' "
+                "'set firewall rule worktime schedule end 17:00' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+
+            # The schedule persisted to the boot config.
+            machine.succeed("grep -q 'schedule' /var/lib/sentinel/appliance.toml")
+            machine.succeed("grep -q '09:00' /var/lib/sentinel/appliance.toml")
+
+            # Window OPEN (Mon 12:00): the rule is compiled into the data plane.
+            machine.succeed("grep -q 'port = 8443' /run/sentinel/velstra.toml")
+
+            # The dynamic timer was rendered with one OnCalendar per window edge.
+            machine.succeed("test -f /run/systemd/system/sentinel-fwsched.timer")
+            machine.succeed(
+                "grep -q 'OnCalendar=Mon,Tue,Wed,Thu,Fri 09:00' "
+                "/run/systemd/system/sentinel-fwsched.timer"
+            )
+            machine.succeed(
+                "grep -q 'OnCalendar=Mon,Tue,Wed,Thu,Fri 17:00' "
+                "/run/systemd/system/sentinel-fwsched.timer"
+            )
+            # The static oneshot the timer fires is present in the image.
+            machine.succeed("systemctl cat sentinel-fwsched.service >/dev/null")
+
+            # Move the clock PAST the window (Mon 20:00) and run the exact service
+            # the boundary timer triggers — `sentinel apply` re-compiles for the
+            # new time. With no config edit, the rule now falls outside its window
+            # and drops straight out of the data plane.
+            machine.succeed("date -s '2026-07-13 20:00:00'")
+            machine.succeed("systemctl start sentinel-fwsched.service")
+            machine.wait_for_unit("velstra.service")
+            machine.fail("grep -q 'port = 8443' /run/sentinel/velstra.toml")
+
+            # Deleting the schedule makes the rule unconditional again: even at
+            # 20:00 it is compiled in, and the now-unused timer is torn down.
+            machine.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'delete firewall rule worktime schedule' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            machine.succeed("grep -q 'port = 8443' /run/sentinel/velstra.toml")
+            machine.fail("test -f /run/systemd/system/sentinel-fwsched.timer")
+          '';
+        };
+
         # Per-rule logging in the eBPF datapath: a 2-node client — fw. The fw's
         # WAN zone has TWO logged rules (a drop on tcp/9999, a pass on tcp/9997)
         # while the policy-wide log is OFF. Traffic to those ports must appear in
