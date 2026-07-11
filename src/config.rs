@@ -2652,6 +2652,42 @@ pub struct System {
     /// login password (console + sudo). Empty ⇒ only the image's built-in `admin`.
     #[serde(default, rename = "login", skip_serializing_if = "Vec::is_empty")]
     pub logins: Vec<Login>,
+    /// HA config sync (`[system.config-sync]`, roadmap C21): push the running config
+    /// to peer firewalls on every commit. Empty ⇒ off.
+    #[serde(
+        rename = "config-sync",
+        default,
+        skip_serializing_if = "ConfigSync::is_empty"
+    )]
+    pub config_sync: ConfigSync,
+}
+
+/// HA config sync (`[system.config-sync]`). On every `commit`, the running config
+/// is pushed to each `peer`'s Sentinel API (`PUT /api/v1/config`, bearer = the
+/// shared `secret`), which applies + persists it — pfSense-XMLRPC-analog, but
+/// declarative. A received sync does NOT re-push (only the interactive commit does),
+/// so a pair does not loop. Configuring a `secret` also arms the receiving side:
+/// this box runs its own API (on `:8080`, token = the secret) so a peer can push to
+/// it. Firewall rules gate who may reach that port.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigSync {
+    /// Peer firewalls to push the config to — `host` or `host:port` (default port
+    /// 8080). Repeatable.
+    #[serde(rename = "peer", default, skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<String>,
+    /// The shared bearer token both peers present. Required once any peer is set;
+    /// it is written to this box's API token file so a peer may push here too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+}
+
+impl ConfigSync {
+    /// True when no config sync is configured — lets `[system.config-sync]` be
+    /// omitted from a saved config.
+    pub fn is_empty(&self) -> bool {
+        self.peers.is_empty() && self.secret.is_none()
+    }
 }
 
 /// A local login account (`[[system.login]]`). Users are reconciled onto the box
@@ -5277,6 +5313,38 @@ impl Appliance {
                          like `$6$salt$hash` (from `mkpasswd -m sha-512`), not a plaintext password"
                     );
                 }
+            }
+        }
+
+        // HA config sync ([system.config-sync]): each peer is a host or host:port
+        // the config is pushed to; a shared secret is required to authenticate the
+        // push (and to arm this box's receiving API), so peers without a secret are
+        // a misconfiguration that would silently never sync.
+        let cs = &self.system.config_sync;
+        for peer in &cs.peers {
+            // A bare host (IPv4 / IPv6 / hostname) is fine; so is `host:port` with a
+            // numeric port (`[v6]:port` for IPv6). Try the bare forms first so a
+            // colon-bearing IPv6 literal is not mis-split as `host:port`.
+            let bare = validate_ipv4(peer).is_ok()
+                || validate_ipv6(peer).is_ok()
+                || validate_hostname(peer).is_ok();
+            let host_port = peer.rsplit_once(':').is_some_and(|(h, p)| {
+                !p.is_empty()
+                    && p.chars().all(|c| c.is_ascii_digit())
+                    && (validate_ipv4(h).is_ok()
+                        || validate_hostname(h).is_ok()
+                        || h.strip_prefix('[')
+                            .and_then(|x| x.strip_suffix(']'))
+                            .is_some_and(|v6| validate_ipv6(v6).is_ok()))
+            });
+            if !bare && !host_port {
+                bail!("system config-sync peer {peer:?}: not a host or host:port");
+            }
+        }
+        if !cs.peers.is_empty() {
+            match &cs.secret {
+                Some(s) if !s.is_empty() => {}
+                _ => bail!("system config-sync: a `secret` is required to push to peers"),
             }
         }
 
@@ -8579,6 +8647,41 @@ virtual-address = ["10.0.0.254"]
         assert!(
             Appliance::from_toml(&format!(
                 "{base}[services.ssh]\nlisten-address = \"not-an-ip\"\n"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn config_sync_parses_validates_and_round_trips() {
+        let base = "[system]\nhostname = \"fw\"\n";
+
+        // A full [system.config-sync] parses, validates, round-trips.
+        let toml = format!(
+            "{base}[system.config-sync]\npeer = [\"10.0.0.2\", \"10.0.0.3:9000\"]\nsecret = \"s3cr3t\"\n"
+        );
+        let a = Appliance::from_toml(&toml).expect("config-sync parses + validates");
+        assert_eq!(a.system.config_sync.peers, vec!["10.0.0.2", "10.0.0.3:9000"]);
+        assert_eq!(a.system.config_sync.secret.as_deref(), Some("s3cr3t"));
+        let round = Appliance::from_toml(&a.to_toml().unwrap()).unwrap();
+        assert_eq!(round.system.config_sync.peers, a.system.config_sync.peers);
+
+        // Default (no section) is empty → omitted from a save.
+        let plain = Appliance::from_toml(base).unwrap();
+        assert!(plain.system.config_sync.is_empty());
+        assert!(!plain.to_toml().unwrap().contains("config-sync"));
+
+        // Bad: a peer without a secret can never sync.
+        assert!(
+            Appliance::from_toml(&format!(
+                "{base}[system.config-sync]\npeer = [\"10.0.0.2\"]\n"
+            ))
+            .is_err()
+        );
+        // Bad: a peer that is not a host / host:port.
+        assert!(
+            Appliance::from_toml(&format!(
+                "{base}[system.config-sync]\npeer = [\"10.0.0.2:bad\"]\nsecret = \"x\"\n"
             ))
             .is_err()
         );
