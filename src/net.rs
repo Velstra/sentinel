@@ -62,6 +62,62 @@ fn macvlan_netdev_body(iface: &Interface) -> String {
     )
 }
 
+/// The `.netdev` for a MACsec (802.1AE) device (roadmap C14): a `Kind=macsec` link
+/// that encrypts + authenticates every frame on its `parent` with a pre-shared
+/// key. Point to point — our transmit association uses the shared key, and one
+/// receive channel/association keyed to the peer's MAC accepts its frames with the
+/// same key (symmetric PSK). The key is a secret, so the whole file is installed
+/// 0640; `KeyId` is fixed at `01` on both ends. The device attaches to its parent
+/// via the parent's `.network` (`MACsec=<name>`), like a VLAN/MACVLAN child.
+fn macsec_netdev_body(iface: &Interface, parent_mac: &str) -> String {
+    // networkd creates the base macsec device (with a deterministic MAC → SCI), but
+    // NOT the secure associations: its static-SA support hits a kernel EBUSY on
+    // install here, so the keys are added out of band by the `sentinel-macsec` unit
+    // via `ip macsec add` (see `macsec_sa_setup_body`). Pinning the device MAC to
+    // the parent's keeps the transmit SCI stable and matching the peer's
+    // `macsec-peer`.
+    format!(
+        "[NetDev]\nName={}\nKind=macsec\nMACAddress={parent_mac}\n\n[MACsec]\nPort=1\nEncrypt=yes\n",
+        iface.name
+    )
+}
+
+/// The `ip macsec` setup script installing the secure associations (the keys) for
+/// every macsec device — run by the `sentinel-macsec` unit after networkd has
+/// created the devices. networkd's own static-SA config fails with EBUSY here, but
+/// the imperative `ip macsec add` path is reliable. Idempotent: each SA is deleted
+/// (best effort) before it is re-added, so a live reconfigure re-keys cleanly. Both
+/// ends use a symmetric key with KeyId `01`; the transmit SA sends, and one receive
+/// SA per peer MAC accepts the peer's frames. Returns `None` when no macsec device
+/// is configured.
+fn macsec_sa_setup_body(ifaces: &[Interface]) -> Option<String> {
+    let mut body = String::from("#!/bin/sh\n# rendered by sentinel — MACsec SA install\nset -e\n");
+    let mut any = false;
+    for i in ifaces.iter().filter(|i| i.is_macsec()) {
+        let (Some(key), Some(peer)) = (i.macsec_key.as_deref(), i.macsec_peer.as_deref()) else {
+            continue;
+        };
+        let dev = &i.name;
+        // Wait for networkd to create the device, then (re)install the SAs.
+        body.push_str(&format!(
+            "for _ in $(seq 1 50); do ip link show {dev} >/dev/null 2>&1 && break; sleep 0.1; done\n"
+        ));
+        body.push_str(&format!("ip macsec del {dev} tx sa 0 2>/dev/null || true\n"));
+        body.push_str(&format!(
+            "ip macsec del {dev} rx address {peer} port 1 2>/dev/null || true\n"
+        ));
+        body.push_str(&format!(
+            "ip macsec add {dev} tx sa 0 pn 1 on key 01 {key}\n"
+        ));
+        body.push_str(&format!("ip macsec add {dev} rx address {peer} port 1\n"));
+        body.push_str(&format!(
+            "ip macsec add {dev} rx address {peer} port 1 sa 0 pn 1 on key 01 {key}\n"
+        ));
+        any = true;
+    }
+    any.then_some(body)
+}
+
 /// The `[BridgeVLAN]` port section for a member of a VLAN-aware bridge: a `VLAN=`
 /// per tagged id, plus `PVID=`/`EgressUntagged=` for the single untagged VLAN.
 /// networkd merges the keys, so one section suffices. Empty when the port has no
@@ -112,9 +168,10 @@ fn virtual_l2_netdev_body(iface: &Interface) -> String {
             | IfaceType::Gre
             | IfaceType::Ipip
             | IfaceType::Gretap
-            // MACVLAN gets its own netdev renderer (macvlan_netdev_body), not
-            // this virtual-L2 one.
-            | IfaceType::Macvlan,
+            // MACVLAN and MACsec get their own netdev renderers (macvlan_netdev_body
+            // / macsec_netdev_body), not this virtual-L2 one.
+            | IfaceType::Macvlan
+            | IfaceType::Macsec,
         ) => String::new(),
     }
 }
@@ -196,6 +253,7 @@ fn network_body(
     address6: Option<&str>,
     vlan_children: &[String],
     macvlan_children: &[String],
+    macsec_children: &[String],
     dhcp: Option<&DhcpServer>,
     ra: Option<&RouterAdvert>,
     master: Option<&str>,
@@ -246,6 +304,11 @@ fn network_body(
     // children do — a `[Network]` directive naming each pseudo-NIC riding on it.
     for child in macvlan_children {
         body.push_str(&format!("MACVLAN={child}\n"));
+    }
+    // MACsec devices (802.1AE) stack on this parent NIC the same way — a
+    // `[Network] MACsec=` directive per encrypted link riding on it (roadmap C14).
+    for child in macsec_children {
+        body.push_str(&format!("MACsec={child}\n"));
     }
     // Both the DHCP server and the RA sender are switched on by a directive in
     // [Network]; their detailed [DHCPServer] / [IPv6SendRA] / [IPv6Prefix]
@@ -679,6 +742,12 @@ const DHCP6_UNIT: &str = "sentinel-dhcp6.service";
 /// `nat64` tun device + pool/prefix routes tayga can't add itself), driven by the
 /// Sentinel-owned `sentinel-nat64` unit. DNS64 rides a second `sentinel-dns64`
 /// unit running unbound against a rendered config.
+/// MACsec (802.1AE, roadmap C14): networkd creates the encrypted device, but its
+/// secure associations (the keys) are installed out of band by this Sentinel-owned
+/// unit via `ip macsec add` — networkd's static-SA install fails with EBUSY.
+const MACSEC_SETUP: &str = "/run/sentinel/macsec/setup.sh";
+const MACSEC_UNIT: &str = "sentinel-macsec.service";
+
 const NAT64_DIR: &str = "/run/sentinel/nat64";
 const TAYGA_CONF: &str = "/run/sentinel/nat64/tayga.conf";
 const TAYGA_SETUP: &str = "/run/sentinel/nat64/setup.sh";
@@ -950,6 +1019,15 @@ fn apply_box_services(appliance: &Appliance) -> Result<()> {
         Path::new(DHCP6_CONF),
         dhcp6_conf_body(&appliance.interfaces),
         false,
+    )?;
+    // MACsec SA install (roadmap C14). The script carries the pre-shared keys, so
+    // it is a secret (0640). Runs after networkd has created the devices (apply
+    // ordering + the script's own wait-loop).
+    apply_box_service(
+        MACSEC_UNIT,
+        Path::new(MACSEC_SETUP),
+        macsec_sa_setup_body(&appliance.interfaces),
+        true,
     )?;
     Ok(())
 }
@@ -1764,6 +1842,20 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
         }
     }
 
+    // Map each parent NIC to the MACsec (802.1AE) devices riding on it — the
+    // parent's `.network` gains a `MACsec=` per encrypted link (roadmap C14).
+    let mut macsec_children: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for i in ifaces {
+        if i.is_macsec() {
+            if let Some(parent) = &i.parent {
+                macsec_children
+                    .entry(parent.as_str())
+                    .or_default()
+                    .push(i.name.clone());
+            }
+        }
+    }
+
     // Map each member NIC to its owning bridge/bond device (name + whether it is a
     // bond), derived from every device's `member` list — the inverse of the old
     // per-member `master`. A member's `.network` gets `Bridge=`/`Bond=` from this.
@@ -1809,6 +1901,25 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
         if i.is_macvlan() {
             let name = netdev_name(&i.name);
             writes.push((name.clone(), macvlan_netdev_body(i)));
+            keep.insert(name);
+        }
+    }
+
+    // MACsec .netdev units (secret — the pre-shared key lives here → 0640). Each
+    // is a Kind=macsec device on its parent NIC (roadmap C14).
+    for i in ifaces {
+        if i.is_macsec() {
+            // The device inherits its parent NIC's MAC so its SCI is deterministic
+            // (validation guarantees the parent is declared with an explicit `mac`).
+            let parent_mac = i
+                .parent
+                .as_deref()
+                .and_then(|p| ifaces.iter().find(|x| x.name == p))
+                .and_then(|p| p.mac.as_deref())
+                .unwrap_or("");
+            let name = netdev_name(&i.name);
+            writes.push((name.clone(), macsec_netdev_body(i, parent_mac)));
+            secrets.insert(name.clone());
             keep.insert(name);
         }
     }
@@ -1864,6 +1975,8 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
                     || i.is_virtual_l2()
                     || i.is_tunnel()
                     || i.is_macvlan()
+                    || i.is_macsec()
+                    || macsec_children.contains_key(i.name.as_str())
                     || macvlan_children.contains_key(i.name.as_str())
                     || master_of.contains_key(i.name.as_str())
                     || !i.vlan_tagged.is_empty()
@@ -1882,6 +1995,10 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
             let mv_kids = macvlan_children
+                .get(i.name.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let ms_kids = macsec_children
                 .get(i.name.as_str())
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
@@ -1905,6 +2022,7 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
                 i.address6.as_deref(),
                 kids,
                 mv_kids,
+                ms_kids,
                 i.dhcp_server.as_ref(),
                 i.router_advert.as_ref(),
                 master.as_deref(),
@@ -2102,6 +2220,7 @@ mod tests {
             None,
             &[],
             &[],
+            &[],
             None,
             None,
             None,
@@ -2121,6 +2240,7 @@ mod tests {
             "eth0",
             Some("dhcp"),
             None,
+            &[],
             &[],
             &[],
             None,
@@ -2166,6 +2286,8 @@ mod tests {
             vlan: None,
             vlan_protocol: None,
             macvlan_mode: Some("bridge".into()),
+            macsec_key: None,
+            macsec_peer: None,
             dhcp_server: None,
             router_advert: None,
             if_type: Some(IfaceType::Macvlan),
@@ -2195,6 +2317,8 @@ mod tests {
         // An unset mode still defaults to bridge.
         let mv2 = Interface {
             macvlan_mode: None,
+            macsec_key: None,
+            macsec_peer: None,
             ..mv.clone()
         };
         assert!(macvlan_netdev_body(&mv2).contains("Mode=bridge"));
@@ -2208,6 +2332,35 @@ mod tests {
     }
 
     #[test]
+    fn macsec_netdev_renders_kind_key_channel_and_association() {
+        let mut ms = iface_addr("macsec0", "10.9.0.1/24");
+        ms.if_type = Some(IfaceType::Macsec);
+        ms.parent = Some("eth1".into());
+        ms.macsec_key = Some("00112233445566778899aabbccddeeff".into());
+        ms.macsec_peer = Some("52:54:00:12:02:02".into());
+        let d = macsec_netdev_body(&ms, "02:00:00:00:00:01");
+        assert!(d.contains("Kind=macsec"), "{d}");
+        // The device pins the parent's MAC (deterministic SCI) + enables encryption.
+        // The keys (SAs) are NOT in the netdev — networkd's static-SA install EBUSYs,
+        // so they are added by the sentinel-macsec unit instead.
+        assert!(d.contains("MACAddress=02:00:00:00:00:01"), "{d}");
+        assert!(d.contains("[MACsec]\nPort=1\nEncrypt=yes"), "{d}");
+        assert!(!d.contains("MACsecTransmitAssociation"), "{d}");
+
+        // The SA setup script installs the transmit + receive associations.
+        let s = macsec_sa_setup_body(std::slice::from_ref(&ms)).expect("configured");
+        assert!(
+            s.contains("ip macsec add macsec0 tx sa 0 pn 1 on key 01 00112233445566778899aabbccddeeff"),
+            "{s}"
+        );
+        assert!(
+            s.contains("ip macsec add macsec0 rx address 52:54:00:12:02:02 port 1"),
+            "{s}"
+        );
+        assert!(macsec_sa_setup_body(&[iface_addr("eth0", "10.0.0.1/24")]).is_none());
+    }
+
+    #[test]
     fn parent_network_references_macvlan_children() {
         // The parent NIC's .network lists each macvlan riding on it via MACVLAN=,
         // mirroring how VLAN children get VLAN= (roadmap C14).
@@ -2217,6 +2370,7 @@ mod tests {
             None,
             &[],
             &["mv0".into(), "mv1".into()],
+            &[],
             None,
             None,
             None,
@@ -2243,6 +2397,8 @@ mod tests {
             vlan: None,
             vlan_protocol: None,
             macvlan_mode: None,
+            macsec_key: None,
+            macsec_peer: None,
             dhcp_server: None,
             router_advert: None,
             if_type: Some(IfaceType::Gre),
@@ -2292,6 +2448,7 @@ mod tests {
             None,
             &["eth1.20".into(), "eth1.30".into()],
             &[],
+            &[],
             None,
             None,
             None,
@@ -2325,6 +2482,7 @@ mod tests {
             "eth1",
             Some("10.0.0.1/24"),
             None,
+            &[],
             &[],
             &[],
             Some(&dhcp),
@@ -2365,6 +2523,7 @@ mod tests {
             None,
             &[],
             &[],
+            &[],
             Some(&dhcp),
             None,
             None,
@@ -2401,6 +2560,7 @@ mod tests {
             None,
             &[],
             &[],
+            &[],
             Some(&dhcp),
             None,
             None,
@@ -2430,6 +2590,7 @@ mod tests {
             "eth7",
             Some("10.0.0.1/24"),
             None,
+            &[],
             &[],
             &[],
             None,
@@ -2497,6 +2658,8 @@ mod tests {
             vlan: None,
             vlan_protocol: None,
             macvlan_mode: None,
+            macsec_key: None,
+            macsec_peer: None,
             dhcp_server: None,
             router_advert: None,
             if_type: None,
@@ -2588,6 +2751,7 @@ mod tests {
             Some("dhcp"),
             &[],
             &[],
+            &[],
             None,
             None,
             None,
@@ -2607,6 +2771,7 @@ mod tests {
             Some("dhcp"),
             &[],
             &[],
+            &[],
             None,
             None,
             None,
@@ -2623,6 +2788,7 @@ mod tests {
             "lan0",
             Some("10.0.0.1/24"),
             None,
+            &[],
             &[],
             &[],
             None,
@@ -2649,6 +2815,7 @@ mod tests {
             None,
             &[],
             &[],
+            &[],
             None,
             None,
             None,
@@ -2665,6 +2832,7 @@ mod tests {
             "lan0",
             Some("10.0.0.1/24"),
             None,
+            &[],
             &[],
             &[],
             None,
@@ -2688,6 +2856,7 @@ mod tests {
             Some("2001:db8:1::1/64"),
             &[],
             &[],
+            &[],
             None,
             None,
             None,
@@ -2704,6 +2873,7 @@ mod tests {
             "wan0",
             Some("dhcp"),
             Some("auto"),
+            &[],
             &[],
             &[],
             None,
@@ -2731,6 +2901,8 @@ mod tests {
             vlan: None,
             vlan_protocol: None,
             macvlan_mode: None,
+            macsec_key: None,
+            macsec_peer: None,
             dhcp_server: None,
             router_advert: None,
             if_type: Some(IfaceType::Bridge),
@@ -2763,6 +2935,7 @@ mod tests {
             None,
             &[],
             &[],
+            &[],
             None,
             None,
             Some("Bridge=br0"),
@@ -2787,6 +2960,8 @@ mod tests {
             vlan: None,
             vlan_protocol: None,
             macvlan_mode: None,
+            macsec_key: None,
+            macsec_peer: None,
             dhcp_server: None,
             router_advert: None,
             if_type: Some(IfaceType::Bond),
@@ -2821,6 +2996,7 @@ mod tests {
             None,
             &[],
             &[],
+            &[],
             None,
             None,
             Some("Bond=bond0"),
@@ -2847,6 +3023,7 @@ mod tests {
             "lan0",
             Some("10.0.0.1/24"),
             None,
+            &[],
             &[],
             &[],
             None,
@@ -2897,6 +3074,7 @@ mod tests {
             "lan0",
             Some("10.0.0.1/24"),
             None,
+            &[],
             &[],
             &[],
             Some(&dhcp),
@@ -2956,6 +3134,8 @@ mod tests {
             vlan: None,
             vlan_protocol: None,
             macvlan_mode: None,
+            macsec_key: None,
+            macsec_peer: None,
             dhcp_server: None,
             router_advert: None,
             if_type: Some(IfaceType::Bridge),
@@ -3004,6 +3184,8 @@ mod tests {
             vlan: None,
             vlan_protocol: None,
             macvlan_mode: None,
+            macsec_key: None,
+            macsec_peer: None,
             dhcp_server: None,
             router_advert: None,
             if_type: Some(IfaceType::Pppoe),
@@ -3396,6 +3578,8 @@ mod tests {
             vlan: None,
             vlan_protocol: None,
             macvlan_mode: None,
+            macsec_key: None,
+            macsec_peer: None,
             dhcp_server: None,
             router_advert: None,
             if_type: None,
