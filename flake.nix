@@ -75,6 +75,9 @@
             --set SENTINEL_LSBLK_BIN      ${pkgs.util-linux}/bin/lsblk \
             --set SENTINEL_INSTALL_BIN    ${pkgs.coreutils}/bin/install \
             --set SENTINEL_MKDIR_BIN      ${pkgs.coreutils}/bin/mkdir \
+            --set SENTINEL_USERADD_BIN    ${pkgs.shadow}/bin/useradd \
+            --set SENTINEL_USERMOD_BIN    ${pkgs.shadow}/bin/usermod \
+            --set SENTINEL_ID_BIN         ${pkgs.coreutils}/bin/id \
             --set SENTINEL_CHMOD_BIN      ${pkgs.coreutils}/bin/chmod \
             --set SENTINEL_RM_BIN         ${pkgs.coreutils}/bin/rm \
             --set SENTINEL_UNAME_BIN      ${pkgs.coreutils}/bin/uname \
@@ -6618,11 +6621,12 @@
             '';
           };
 
-        # SSH management access (roadmap C21): `set services ssh …` makes the image's
-        # key-only sshd runtime-configurable. A client authorises its own generated
-        # key on the firewall and logs in over a non-default port — proving the
-        # persistent authorized_keys + the Port drop-in (which fully owns the port,
-        # since the image emits no `Port` line) are applied and honoured by sshd.
+        # SSH management access + local logins (roadmap C21): `set services ssh …`
+        # tunes the daemon; `set system login <user> …` (VyOS-style) creates the
+        # account with its SSH keys and a pre-hashed console/sudo password. A client
+        # authorises its own generated key for a new `ops` user and logs in over a
+        # non-default port — proving useradd + the per-user authorized_keys.%u file +
+        # the Port drop-in (which fully owns the port) are applied and honoured.
         #   nix build .#checks.x86_64-linux.ssh -L
         ssh = pkgs.testers.runNixOSTest {
           name = "sentinel-ssh";
@@ -6677,36 +6681,40 @@
             ).strip()
 
             # Zone the LAN nic (default-action accept so the firewall passes SSH),
-            # authorise the client's key, and move sshd to a non-default port.
+            # create an `ops` login with the client's key + a hashed password, and
+            # move sshd to a non-default port. The password hash's `$` are escaped
+            # (\$) so the outer shell of `su -c "…"` does not expand them.
             fw.succeed(
                 "su admin -c \"printf '%s\\n' "
                 "'set firewall global default-action accept' "
                 "'set interface eth1 zone lan' "
-                f"'set services ssh authorized-key {pub}' "
+                f"'set system login ops ssh-key {pub}' "
+                "'set system login ops hashed-password \\$6\\$abcdef0123456789\\$WRD0n4BFndQR6MzqT/IJrAHXPQwx4DWSNJI0O48IgLChGg2YXtCj6WtSiczZbbjQzsWT/p9yFIuFMMKBOkL.B0' "
                 "'set services ssh port 2222' "
                 "commit save exit "
                 "| sentinel configure\""
             )
 
-            # Sentinel wrote the root-owned SSH files (StrictModes-clean location).
-            fw.succeed("test -f /run/sentinel-ssh/authorized_keys")
-            fw.succeed("grep -q 'Port 2222' /run/sentinel-ssh/10-sentinel.conf")
+            # Sentinel created the account, set its password hash, and wrote the
+            # root-owned per-user authorized_keys (StrictModes-clean /run location).
+            fw.succeed("id -u ops")
+            fw.succeed("getent shadow ops | grep -q WRD0n4BFndQR")
+            fw.succeed("test -f /run/sentinel-ssh/authorized_keys.ops")
             fw.succeed(
-                "stat -c '%U:%G %a' /run/sentinel-ssh/authorized_keys "
+                "stat -c '%U:%G %a' /run/sentinel-ssh/authorized_keys.ops "
                 "| grep -q 'root:root 644'"
             )
+            fw.succeed("grep -q 'Port 2222' /run/sentinel-ssh/10-sentinel.conf")
 
             # sshd rebound to 2222 and NOT the default 22 (the drop-in owns the port).
             fw.wait_until_succeeds("ss -tlnH 'sport = :2222' | grep -q LISTEN", timeout=30)
             fw.fail("ss -tlnH 'sport = :22' | grep -q LISTEN")
 
-            # The headline: the client logs in as admin over SSH with its key, on the
-            # custom port, and runs a command on the firewall. `whoami` is
-            # deterministic (the login identity) — the box's hostname comes from the
-            # committed config, so it is not a stable assertion target.
+            # The headline: the client logs in as the `ops` user over SSH with its
+            # key, on the custom port, and runs a command on the firewall.
             client.wait_until_succeeds(
                 "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
-                "-o BatchMode=yes -p 2222 admin@10.1.0.1 whoami | grep -qx admin",
+                "-o BatchMode=yes -p 2222 ops@10.1.0.1 whoami | grep -qx ops",
                 timeout=30,
             )
           '';

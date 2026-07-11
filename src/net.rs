@@ -1157,37 +1157,25 @@ fn apply_box_services(appliance: &Appliance) -> Result<()> {
 }
 
 // SSH management access (roadmap C21). The image ships a key-only sshd; Sentinel
-// makes it runtime-configurable through two files under `/run/sentinel-ssh`, which
-// the image points sshd at. `/run/sentinel-ssh` is root:root 0755 — crucially NOT
-// under the wheel-writable `/var/lib/sentinel`, because sshd's StrictModes rejects
-// an AuthorizedKeysFile that has ANY group-writable ancestor. `/run` is a tmpfs, so
-// both files are re-rendered from the saved config at boot (apply_persistent Boot),
-// and sshd is ordered after sentinel-boot so they are present on its first start.
-//   /run/sentinel-ssh/authorized_keys  — the admin's allowed public keys
-//   /run/sentinel-ssh/10-sentinel.conf — a `Port`/`ListenAddress` drop-in the image
-//     `Include`s. Only a drop-in change needs an sshd restart (to rebind); keys are
-//     read per-connection, and `enable` just starts/stops the unit.
-const SSH_AUTHKEYS: &str = "/run/sentinel-ssh/authorized_keys";
+// makes it runtime-configurable through files under `/run/sentinel-ssh`, which the
+// image points sshd at. That dir is root:root 0755 — crucially NOT under the
+// wheel-writable `/var/lib/sentinel`, because sshd's StrictModes rejects an
+// AuthorizedKeysFile with ANY group-writable ancestor. `/run` is a tmpfs, so the
+// files are re-rendered from the saved config at boot (apply_persistent Boot), and
+// sshd is ordered after sentinel-boot so they are present on its first start.
+//   /run/sentinel-ssh/authorized_keys.<user> — a login's allowed public keys (the
+//     image's authorizedKeysFiles is `…/authorized_keys.%u`)
+//   /run/sentinel-ssh/10-sentinel.conf       — a Port/ListenAddress (+ optional
+//     PasswordAuthentication) drop-in the image `Include`s.
+const SSH_DIR: &str = "/run/sentinel-ssh";
 const SSH_DROPIN: &str = "/run/sentinel-ssh/10-sentinel.conf";
 const SSH_UNIT: &str = "sshd.service";
 
-/// The admin's `authorized_keys`, or `None` when no key is set (⇒ remove the file,
-/// leaving console-only access).
-fn ssh_authkeys_body(ssh: &Ssh) -> Option<String> {
-    if ssh.authorized_keys.is_empty() {
-        return None;
-    }
-    let mut body = String::from("# rendered by sentinel — [services.ssh] authorized-key\n");
-    for key in &ssh.authorized_keys {
-        body.push_str(key.trim());
-        body.push('\n');
-    }
-    Some(body)
-}
-
-/// The sshd `Port`/`ListenAddress` drop-in, or `None` when both are default.
+/// The sshd drop-in (`Port`/`ListenAddress`, and a `Match all` that flips on
+/// password auth when `[services.ssh] password-authentication` is set), or `None`
+/// when everything is at its default (port 22, all addresses, key-only).
 fn ssh_dropin_body(ssh: &Ssh) -> Option<String> {
-    if ssh.port.is_none() && ssh.listen_address.is_none() {
+    if ssh.port.is_none() && ssh.listen_address.is_none() && !ssh.password_authentication {
         return None;
     }
     let mut body = String::from("# rendered by sentinel — [services.ssh]\n");
@@ -1197,22 +1185,24 @@ fn ssh_dropin_body(ssh: &Ssh) -> Option<String> {
     if let Some(a) = &ssh.listen_address {
         body.push_str(&format!("ListenAddress {a}\n"));
     }
+    if ssh.password_authentication {
+        // A trailing `Match all` overrides the image's global `PasswordAuthentication
+        // no` (Port/ListenAddress must stay in the global context above the Match).
+        body.push_str("Match all\n    PasswordAuthentication yes\n");
+    }
     Some(body)
 }
 
-/// Reconcile sshd to `[services.ssh]`. The two files are written in BOTH modes
-/// (persistent, so a reboot's sshd picks them up); unit ops (start/stop/restart)
+/// Reconcile sshd + the login accounts to the config. Files are written in BOTH
+/// modes (re-rendered at boot from the saved config); unit ops (start/stop/restart)
 /// run in Live only — at boot sshd starts on its own with the files in place.
 fn apply_ssh(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     let ssh = &appliance.services.ssh;
 
-    // authorized_keys — no sshd restart needed (read per connection).
-    match ssh_authkeys_body(ssh) {
-        Some(body) => system::install_file(Path::new(SSH_AUTHKEYS), &body)?,
-        None => system::remove_file(Path::new(SSH_AUTHKEYS))?,
-    }
+    // Per-user authorized_keys, then daemon settings. Keys are read per connection
+    // (no restart); a drop-in change needs a restart to rebind / flip password auth.
+    apply_logins(appliance, mode)?;
 
-    // Port/ListenAddress drop-in — a change requires an sshd restart to rebind.
     let dropin = Path::new(SSH_DROPIN);
     let dropin_changed = match ssh_dropin_body(ssh) {
         Some(body) => {
@@ -1232,7 +1222,7 @@ fn apply_ssh(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     if mode == ApplyMode::Live {
         if ssh.enable {
             // Ensure running without cutting live sessions; restart only to rebind
-            // a changed Port/ListenAddress.
+            // a changed Port/ListenAddress (or a password-auth toggle).
             if let Err(e) = system::service_start(SSH_UNIT) {
                 eprintln!("warning: starting {SSH_UNIT} failed: {e}");
             }
@@ -1243,6 +1233,62 @@ fn apply_ssh(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
             }
         } else if let Err(e) = system::service_stop(SSH_UNIT) {
             eprintln!("warning: stopping {SSH_UNIT}: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// Reconcile the local login accounts (`[[system.login]]`, VyOS-style). Each named
+/// account is created if missing (mutableUsers: `useradd -m -G wheel`), its pre-
+/// hashed password is set (`chpasswd -e`) when given, and its SSH keys are rendered
+/// to `/run/sentinel-ssh/authorized_keys.<user>`. Key files for users no longer in
+/// the config are removed so revoking a login revokes its key access (the account
+/// itself is left in place — we never `userdel`, so the built-in admin is safe).
+/// Live only creates users / sets passwords; at boot the accounts already exist and
+/// only the (tmpfs) key files are re-rendered.
+fn apply_logins(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
+    use std::collections::BTreeSet;
+    let logins = &appliance.system.logins;
+
+    // Render each configured user's authorized_keys file (root-owned, 0644).
+    let mut wanted: BTreeSet<String> = BTreeSet::new();
+    for login in logins {
+        wanted.insert(login.username.clone());
+        let path = format!("{SSH_DIR}/authorized_keys.{}", login.username);
+        if login.ssh_keys.is_empty() {
+            system::remove_file(Path::new(&path))?;
+        } else {
+            let mut body = format!(
+                "# rendered by sentinel — [[system.login]] {} ssh-key\n",
+                login.username
+            );
+            for key in &login.ssh_keys {
+                body.push_str(key.trim());
+                body.push('\n');
+            }
+            system::install_file(Path::new(&path), &body)?;
+        }
+
+        // Account + password are live-only side effects on the OS user database.
+        if mode == ApplyMode::Live {
+            system::ensure_login_account(&login.username)?;
+            if let Some(hash) = &login.hashed_password {
+                system::set_login_password(&login.username, hash)?;
+            }
+        }
+    }
+
+    // Revoke key files for users dropped from the config (the account lingers, but
+    // key access is gone; at boot only wanted files are re-created on the tmpfs).
+    if let Ok(entries) = std::fs::read_dir(SSH_DIR) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if let Some(user) = name.strip_prefix("authorized_keys.") {
+                if !wanted.contains(user) {
+                    let _ = system::remove_file(&entry.path());
+                }
+            }
         }
     }
     Ok(())

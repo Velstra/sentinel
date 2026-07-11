@@ -686,14 +686,16 @@ pub struct Ssh {
         skip_serializing_if = "Option::is_none"
     )]
     pub listen_address: Option<String>,
-    /// The authorized public keys (OpenSSH `authorized_keys` lines) that may log in
-    /// as `admin`. Empty ⇒ no key login (console only). Repeatable.
+    /// Allow password logins over SSH. Off by default — the appliance is key-only
+    /// (a user's `[[system.login]]` hashed-password is for console + sudo). Turn on
+    /// to also accept that password over SSH. The authorized keys themselves live
+    /// per-user under `[[system.login]] ssh-key`, not here.
     #[serde(
-        rename = "authorized-key",
+        rename = "password-authentication",
         default,
-        skip_serializing_if = "Vec::is_empty"
+        skip_serializing_if = "std::ops::Not::not"
     )]
-    pub authorized_keys: Vec<String>,
+    pub password_authentication: bool,
 }
 
 impl Default for Ssh {
@@ -702,20 +704,20 @@ impl Default for Ssh {
             enable: true,
             port: None,
             listen_address: None,
-            authorized_keys: Vec::new(),
+            password_authentication: false,
         }
     }
 }
 
 impl Ssh {
-    /// True when SSH is at its defaults (enabled, port 22, all addresses, no keys)
+    /// True when SSH is at its defaults (enabled, port 22, all addresses, key-only)
     /// — lets `[services.ssh]` be omitted from a saved config. A box with default
     /// SSH keeps the image's key-only sshd untouched.
     pub fn is_empty(&self) -> bool {
         self.enable
             && self.port.is_none()
             && self.listen_address.is_none()
-            && self.authorized_keys.is_empty()
+            && !self.password_authentication
     }
 }
 
@@ -2645,6 +2647,34 @@ pub struct Acme {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct System {
     pub hostname: String,
+    /// Local login accounts (`[[system.login]]`, VyOS-style). Each carries the
+    /// SSH public keys allowed to log in as that user and an optional pre-hashed
+    /// login password (console + sudo). Empty ⇒ only the image's built-in `admin`.
+    #[serde(default, rename = "login", skip_serializing_if = "Vec::is_empty")]
+    pub logins: Vec<Login>,
+}
+
+/// A local login account (`[[system.login]]`). Users are reconciled onto the box
+/// at commit time (mutableUsers): a named account is created if missing, its SSH
+/// keys and (pre-hashed) password are set. The password is for console + sudo;
+/// SSH stays key-only unless `[services.ssh] password-authentication` is on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Login {
+    /// The account name (POSIX: starts with a letter, then letters/digits/`-`/`_`).
+    pub username: String,
+    /// OpenSSH public keys that may log in as this user. Repeatable.
+    #[serde(rename = "ssh-key", default, skip_serializing_if = "Vec::is_empty")]
+    pub ssh_keys: Vec<String>,
+    /// A pre-hashed login password in crypt(3) form (`$6$salt$hash`, as produced by
+    /// `mkpasswd -m sha-512`). Never a plaintext password. Unset ⇒ no password
+    /// (login only by key). Sets the OS password used for console + sudo.
+    #[serde(
+        rename = "hashed-password",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub hashed_password: Option<String>,
 }
 
 /// Global firewall settings, applied to every firewalled (zoned) interface.
@@ -5184,11 +5214,9 @@ impl Appliance {
             bail!("services snmp: a `community` is required to run the agent");
         }
 
-        // SSH: an optional non-default port (u16, so >0 by construction — reject 0),
-        // an optional listen-address that must be a real IP the box could hold, and
-        // authorized keys that must be single-line OpenSSH key entries (they are
-        // written verbatim into authorized_keys, so a newline would inject a second
-        // key line, and a leading `#`/blank would be a silently-ignored no-op).
+        // SSH daemon: an optional non-default port (u16, so >0 by construction —
+        // reject 0) and an optional listen-address that must be a real IP the box
+        // could hold. The keys themselves live per-user under [[system.login]].
         let ssh = &self.services.ssh;
         if let Some(p) = ssh.port {
             if p == 0 {
@@ -5200,21 +5228,55 @@ impl Appliance {
                 bail!("services ssh listen-address {addr:?}: not an IPv4/IPv6 address");
             }
         }
-        for key in &ssh.authorized_keys {
-            let k = key.trim();
-            if k.is_empty() || k.starts_with('#') {
-                bail!("services ssh authorized-key: must be a non-empty OpenSSH key line");
+
+        // Local login accounts ([[system.login]]): a POSIX-ish username, single-line
+        // OpenSSH keys (written verbatim into a per-user authorized_keys, so a
+        // newline would inject a second key line), and a crypt(3) hashed password
+        // (never plaintext — a value that is not `$id$salt$hash` is almost certainly
+        // a plaintext password pasted by mistake, which we must refuse to store).
+        let mut seen_users = std::collections::BTreeSet::new();
+        for login in &self.system.logins {
+            let u = &login.username;
+            if !seen_users.insert(u.as_str()) {
+                bail!("system login {u:?}: duplicate username");
             }
-            if key.bytes().any(|b| matches!(b, b'\n' | b'\r')) {
-                bail!("services ssh authorized-key: must not contain a newline");
-            }
-            // A public key line is `<type> <base64> [comment]`; require at least the
-            // type + material so an obvious typo (a bare word) is caught early.
-            if k.split_whitespace().count() < 2 {
+            let mut chars = u.chars();
+            let ok_first = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+            let ok_rest = chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            if u.is_empty() || u.len() > 32 || !ok_first || !ok_rest {
                 bail!(
-                    "services ssh authorized-key {key:?}: not an OpenSSH key \
-                     (expected `<type> <base64> [comment]`)"
+                    "system login {u:?}: not a valid username \
+                     (letter/underscore then letters/digits/-/_, max 32)"
                 );
+            }
+            for key in &login.ssh_keys {
+                let k = key.trim();
+                if k.is_empty() || k.starts_with('#') {
+                    bail!("system login {u} ssh-key: must be a non-empty OpenSSH key line");
+                }
+                if key.bytes().any(|b| matches!(b, b'\n' | b'\r')) {
+                    bail!("system login {u} ssh-key: must not contain a newline");
+                }
+                if k.split_whitespace().count() < 2 {
+                    bail!(
+                        "system login {u} ssh-key {key:?}: not an OpenSSH key \
+                         (expected `<type> <base64> [comment]`)"
+                    );
+                }
+            }
+            if let Some(h) = &login.hashed_password {
+                // A crypt(3) hash is `$<id>$[params$]<salt>$<hash>` — at least three
+                // `$`-separated non-empty fields after the leading `$`. Reject a bare
+                // string (a plaintext password) or a `$`-less value.
+                let looks_hashed = h.starts_with('$')
+                    && h.split('$').filter(|s| !s.is_empty()).count() >= 3
+                    && !h.bytes().any(|b| matches!(b, b'\n' | b'\r' | b':'));
+                if !looks_hashed {
+                    bail!(
+                        "system login {u} hashed-password: must be a crypt(3) hash \
+                         like `$6$salt$hash` (from `mkpasswd -m sha-512`), not a plaintext password"
+                    );
+                }
             }
         }
 
@@ -8464,42 +8526,54 @@ virtual-address = ["10.0.0.254"]
     }
 
     #[test]
-    fn ssh_service_parses_validates_and_round_trips() {
+    fn ssh_and_login_parse_validate_and_round_trip() {
         let base = "[system]\nhostname = \"fw\"\n";
         let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIabc admin@host";
+        // A real sha-512 crypt hash shape ($6$salt$hash).
+        let hash = "$6$abcdefghijklmnop$0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab.";
 
-        // A full [services.ssh] parses, validates, and survives a TOML round-trip.
+        // [services.ssh] daemon settings + a [[system.login]] user with a key and a
+        // hashed password: parse, validate, survive a TOML round-trip.
         let toml = format!(
-            "{base}[services.ssh]\nenable = true\nport = 2222\nlisten-address = \"10.0.0.1\"\nauthorized-key = [\"{key}\"]\n"
+            "[system]\nhostname = \"fw\"\n[[system.login]]\nusername = \"ops\"\nssh-key = [\"{key}\"]\nhashed-password = \"{hash}\"\n[services.ssh]\nport = 2222\nlisten-address = \"10.0.0.1\"\npassword-authentication = true\n"
         );
-        let a = Appliance::from_toml(&toml).expect("ssh service parses + validates");
+        let a = Appliance::from_toml(&toml).expect("ssh + login parse + validate");
         assert_eq!(a.services.ssh.port, Some(2222));
-        assert_eq!(a.services.ssh.listen_address.as_deref(), Some("10.0.0.1"));
-        assert_eq!(a.services.ssh.authorized_keys, vec![key.to_string()]);
+        assert!(a.services.ssh.password_authentication);
+        assert_eq!(a.system.logins.len(), 1);
+        assert_eq!(a.system.logins[0].username, "ops");
+        assert_eq!(a.system.logins[0].ssh_keys, vec![key.to_string()]);
+        assert_eq!(a.system.logins[0].hashed_password.as_deref(), Some(hash));
         let round = Appliance::from_toml(&a.to_toml().unwrap()).unwrap();
-        assert_eq!(round.services.ssh.authorized_keys, a.services.ssh.authorized_keys);
+        assert_eq!(round.system.logins[0].ssh_keys, a.system.logins[0].ssh_keys);
+        assert_eq!(round.services.ssh.password_authentication, true);
 
-        // Default SSH (no section) is `is_empty` → omitted from a saved config.
+        // Default SSH (no section, no logins) is `is_empty` → omitted from a save.
         let plain = Appliance::from_toml(base).unwrap();
         assert!(plain.services.ssh.is_empty());
-        assert!(plain.services.ssh.enable, "default sshd is on");
+        assert!(plain.system.logins.is_empty());
         assert!(!plain.to_toml().unwrap().contains("[services.ssh]"));
 
-        // Disabling SSH makes the section non-empty (so it persists).
-        let off = Appliance::from_toml(&format!("{base}[services.ssh]\nenable = false\n")).unwrap();
-        assert!(!off.services.ssh.is_empty());
-
-        // Bad: a key with a newline (would inject a second authorized_keys line).
+        // Bad: a login key with a newline (would inject a second authorized_keys line).
         assert!(
             Appliance::from_toml(&format!(
-                "{base}[services.ssh]\nauthorized-key = [\"{key}\\nssh-rsa BBBB x\"]\n"
+                "{base}[[system.login]]\nusername = \"ops\"\nssh-key = [\"{key}\\nssh-rsa B x\"]\n"
             ))
             .is_err()
         );
-        // Bad: a bare word is not an OpenSSH key.
+        // Bad: a plaintext password where a crypt hash is required.
         assert!(
-            Appliance::from_toml(&format!("{base}[services.ssh]\nauthorized-key = [\"garbage\"]\n"))
-                .is_err()
+            Appliance::from_toml(&format!(
+                "{base}[[system.login]]\nusername = \"ops\"\nhashed-password = \"hunter2\"\n"
+            ))
+            .is_err()
+        );
+        // Bad: an invalid username.
+        assert!(
+            Appliance::from_toml(&format!(
+                "{base}[[system.login]]\nusername = \"1bad name\"\n"
+            ))
+            .is_err()
         );
         // Bad: a listen-address that is not an IP.
         assert!(
