@@ -41,13 +41,22 @@
   services.openssh = {
     enable = true;
     ports = lib.mkForce [ ];
-    authorizedKeysFiles = [ "/run/sentinel-ssh/authorized_keys" ];
+    # Per-user keys: sshd substitutes %u with the login name, so Sentinel renders
+    # /run/sentinel-ssh/authorized_keys.<user> from each [[system.login]].
+    authorizedKeysFiles = [ "/run/sentinel-ssh/authorized_keys.%u" ];
     extraConfig = "Include /run/sentinel-ssh/*.conf";
     settings = {
+      # Key-only by default; a [services.ssh] password-authentication=true renders a
+      # `Match all` drop-in that overrides this to `yes`.
       PasswordAuthentication = false;
       PermitRootLogin = "no";
     };
   };
+
+  # Local login accounts ([[system.login]], roadmap C21) are created at commit time
+  # via useradd/usermod, so the user database must be mutable (the declarative
+  # `admin` below is still created; runtime accounts are added alongside it).
+  users.mutableUsers = true;
   # sshd must see the rendered keys + Port drop-in on its first start at boot, so
   # order it after the boot service that renders them (sentinel-boot runs early,
   # Before networkd, so this does not delay a routable network).

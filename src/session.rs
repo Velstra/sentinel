@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail};
 use crate::config::{
     Acme, Action, Appliance, Bfd, Bgp, BgpAggregate, BgpNeighbor, BgpRoa, BgpRtr, Ca, Certificate,
     Dhcp6Pool, DhcpRelay, DhcpServer, DhcpStaticLease, Dns, Dyndns, Export, Filter, FilterRule, Firewall,
-    Groups, HealthCheck, IfaceType, Interface, IpsecConnection, Isis, Lldp, Mdns, MultiWan,
+    Groups, HealthCheck, IfaceType, Interface, IpsecConnection, Isis, Lldp, Login, Mdns, MultiWan,
     Multicast, MulticastInterface, Nat, Nat64, NatDestination, NatNpt66, NatSource, Ntp,
     OpenConnectServer, Schedule,
     OpenConnectUser, Ospf, Ospf3, OspfInterface, Pki, Policy, PortSpec, Pppoe, PrefixEntry,
@@ -1127,9 +1127,11 @@ struct Draft {
     ntp: NtpDraft,
     lldp: LldpDraft,
     snmp: SnmpDraft,
-    /// SSH management access (`[services.ssh]`). A plain owned struct (no partial
+    /// SSH daemon settings (`[services.ssh]`). A plain owned struct (no partial
     /// state to track), carried through the draft as-is.
     ssh: Ssh,
+    /// Local login accounts (`[[system.login]]`), in configuration order.
+    logins: Vec<Login>,
     mdns: MdnsDraft,
     dyndns: DyndnsDraft,
     dhcp_relay: DhcpRelayDraft,
@@ -1455,6 +1457,20 @@ impl Draft {
         }
         self.vrrp.push((name.to_string(), VrrpDraft::default()));
         &mut self.vrrp.last_mut().unwrap().1
+    }
+
+    /// Mutable access to the login account `name`, inserting it (keys/password
+    /// empty) if new. Accounts keep configuration order.
+    fn login_mut(&mut self, name: &str) -> &mut Login {
+        if let Some(i) = self.logins.iter().position(|l| l.username == name) {
+            return &mut self.logins[i];
+        }
+        self.logins.push(Login {
+            username: name.to_string(),
+            ssh_keys: Vec::new(),
+            hashed_password: None,
+        });
+        self.logins.last_mut().unwrap()
     }
 
     /// Mutable access to the VRF `name`, inserting it if new.
@@ -1990,6 +2006,7 @@ impl Draft {
                 allow: a.services.snmp.allow.clone(),
             },
             ssh: a.services.ssh.clone(),
+            logins: a.system.logins.clone(),
             mdns: MdnsDraft {
                 interface: a.services.mdns.interface.clone(),
             },
@@ -3035,27 +3052,36 @@ impl Session {
                 append_csv(&mut self.draft.snmp.allow, v);
             }
 
-            // services ssh: management access to the box (the image's key-only
-            // sshd, made runtime-configurable). Key-only — no password knob.
+            // services ssh: the SSH DAEMON's settings (the image's key-only sshd,
+            // made runtime-configurable). Per-user keys live under `system login`.
             ["services", "ssh", "enable", v] => {
                 self.draft.ssh.enable = parse_bool(v)?;
             }
             ["services", "ssh", "port", v] => {
                 self.draft.ssh.port = Some(
-                    v.parse::<u16>()
-                        .map_err(|_| anyhow::anyhow!("services ssh port {v:?}: not a 1-65535 port"))?,
+                    v.parse::<u16>().map_err(|_| {
+                        anyhow::anyhow!("services ssh port {v:?}: not a 1-65535 port")
+                    })?,
                 );
             }
             ["services", "ssh", "listen-address", v] => {
                 self.draft.ssh.listen_address = Some((*v).to_string());
             }
-            // A public key is `<type> <base64> [comment]` — absorb the trailing
-            // words so the whitespace-split CLI rebuilds the full key line.
-            ["services", "ssh", "authorized-key", rest @ ..] if !rest.is_empty() => {
+            ["services", "ssh", "password-authentication", v] => {
+                self.draft.ssh.password_authentication = parse_bool(v)?;
+            }
+
+            // system login: local accounts (VyOS-style). Per-user SSH keys + an
+            // optional pre-hashed login password (console + sudo).
+            ["system", "login", name, "ssh-key", rest @ ..] if !rest.is_empty() => {
                 let key = rest.join(" ");
-                if !self.draft.ssh.authorized_keys.contains(&key) {
-                    self.draft.ssh.authorized_keys.push(key);
+                let login = self.draft.login_mut(name);
+                if !login.ssh_keys.contains(&key) {
+                    login.ssh_keys.push(key);
                 }
+            }
+            ["system", "login", name, "hashed-password", v] => {
+                self.draft.login_mut(name).hashed_password = Some((*v).to_string());
             }
 
             // services mdns: box-wide mDNS reflector (avahi).
@@ -4653,8 +4679,8 @@ impl Session {
                     other => bail!("services snmp has no field {other:?}"),
                 }
             }
-            // `delete services ssh` resets to the default (enabled, key-only, no
-            // extra keys). `delete services ssh <field>` clears one field.
+            // `delete services ssh` resets the daemon to defaults (enabled, key-only,
+            // port 22). `delete services ssh <field>` clears one field.
             ["services", "ssh"] => self.draft.ssh = Ssh::default(),
             ["services", "ssh", field] => {
                 let s = &mut self.draft.ssh;
@@ -4662,13 +4688,29 @@ impl Session {
                     "enable" => s.enable = true,
                     "port" => s.port = None,
                     "listen-address" => s.listen_address = None,
-                    "authorized-key" => s.authorized_keys.clear(),
+                    "password-authentication" => s.password_authentication = false,
                     other => bail!("services ssh has no field {other:?}"),
                 }
             }
-            ["services", "ssh", "authorized-key", rest @ ..] if !rest.is_empty() => {
+            // `delete system login <name>` removes the account; `delete system login
+            // <name> <field>` clears its keys or password; `… ssh-key <key>` drops one.
+            ["system", "login", name] => {
+                self.draft.logins.retain(|l| l.username != *name);
+            }
+            ["system", "login", name, "ssh-key", rest @ ..] if !rest.is_empty() => {
                 let key = rest.join(" ");
-                self.draft.ssh.authorized_keys.retain(|k| k != &key);
+                if let Some(l) = self.draft.logins.iter_mut().find(|l| l.username == *name) {
+                    l.ssh_keys.retain(|k| k != &key);
+                }
+            }
+            ["system", "login", name, field] => {
+                if let Some(l) = self.draft.logins.iter_mut().find(|l| l.username == *name) {
+                    match *field {
+                        "ssh-key" => l.ssh_keys.clear(),
+                        "hashed-password" => l.hashed_password = None,
+                        other => bail!("system login has no field {other:?}"),
+                    }
+                }
             }
             ["services", "mdns"] => self.draft.mdns = MdnsDraft::default(),
             ["services", "mdns", field] => {
@@ -6099,7 +6141,10 @@ impl Session {
         };
 
         let mut appliance = Appliance {
-            system: System { hostname },
+            system: System {
+                hostname,
+                logins: self.draft.logins.clone(),
+            },
             firewall,
             zones,
             interfaces,
@@ -6293,10 +6338,22 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         Some(o) => o == section,
     };
     let mut out = String::new();
-    if want("system") {
+    if want("system") && (draft.hostname.is_some() || !draft.logins.is_empty()) {
+        out.push_str("system {\n");
         if let Some(h) = &draft.hostname {
-            out.push_str(&format!("system {{\n    hostname {h}\n}}\n"));
+            out.push_str(&format!("    hostname {h}\n"));
         }
+        for l in &draft.logins {
+            out.push_str(&format!("    login {} {{\n", l.username));
+            for k in &l.ssh_keys {
+                out.push_str(&format!("        ssh-key {k}\n"));
+            }
+            if let Some(h) = &l.hashed_password {
+                out.push_str(&format!("        hashed-password {h}\n"));
+            }
+            out.push_str("    }\n");
+        }
+        out.push_str("}\n");
     }
     // Interfaces are top-level (like VyOS), between `system` and `firewall`.
     for (name, i) in &draft.interfaces {
@@ -7229,8 +7286,8 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             if let Some(a) = &ssh.listen_address {
                 out.push_str(&format!("        listen-address {a}\n"));
             }
-            for key in &ssh.authorized_keys {
-                out.push_str(&format!("        authorized-key {key}\n"));
+            if ssh.password_authentication {
+                out.push_str("        password-authentication true\n");
             }
             out.push_str("    }\n");
         }
