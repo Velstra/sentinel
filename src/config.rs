@@ -2950,6 +2950,11 @@ pub enum IfaceType {
     /// NIC that encrypts + authenticates every frame with a pre-shared key. Point
     /// to point; the peer is named by its MAC (`macsec-peer`).
     Macsec,
+    /// An L2TPv3 (RFC 3931) static Ethernet pseudowire (roadmap C14): a point-to-
+    /// point L2 tunnel between two endpoint IPs (`local`/`remote`) carrying
+    /// Ethernet frames over IP. Created imperatively via `ip l2tp` (not networkd);
+    /// `key` is the tunnel/session id shared by both ends.
+    L2tpv3,
 }
 
 /// PPPoE client parameters (a `type = "pppoe"` interface). The session is
@@ -3297,6 +3302,10 @@ impl Interface {
     /// True for a MACsec (802.1AE) device (`type = "macsec"`, roadmap C14).
     pub fn is_macsec(&self) -> bool {
         self.if_type == Some(IfaceType::Macsec)
+    }
+    /// True for an L2TPv3 pseudowire (`type = "l2tpv3"`, roadmap C14).
+    pub fn is_l2tpv3(&self) -> bool {
+        self.if_type == Some(IfaceType::L2tpv3)
     }
     /// True for a VLAN subinterface (has both `parent` and `vlan`).
     pub fn is_vlan(&self) -> bool {
@@ -3839,13 +3848,45 @@ impl Appliance {
                 if iface.parent.is_some() || iface.vlan.is_some() {
                     bail!("interface {:?}: a tunnel cannot also be a VLAN", iface.name);
                 }
+            } else if iface.is_l2tpv3() {
+                // L2TPv3 (`type = l2tpv3`, roadmap C14): a static Ethernet
+                // pseudowire between two endpoint IPs. Needs `local` + `remote` of
+                // the same family and a `key` (the shared tunnel/session id); it is
+                // not a VLAN. `ttl` is not carried by the `ip l2tp` static setup.
+                let (Some(local), Some(remote)) = (&iface.local, &iface.remote) else {
+                    bail!(
+                        "interface {:?}: an l2tpv3 pseudowire requires both `local` and `remote` endpoint IPs",
+                        iface.name
+                    );
+                };
+                let lip = local.parse::<IpAddr>().map_err(|_| {
+                    anyhow::anyhow!("interface {:?}: local {local:?} is not an IP address", iface.name)
+                })?;
+                let rip = remote.parse::<IpAddr>().map_err(|_| {
+                    anyhow::anyhow!("interface {:?}: remote {remote:?} is not an IP address", iface.name)
+                })?;
+                if lip.is_ipv4() != rip.is_ipv4() {
+                    bail!(
+                        "interface {:?}: local {local:?} and remote {remote:?} must be the same IP family",
+                        iface.name
+                    );
+                }
+                if iface.tunnel_key.is_none() {
+                    bail!(
+                        "interface {:?}: an l2tpv3 pseudowire needs a `key` (the tunnel/session id shared by both ends)",
+                        iface.name
+                    );
+                }
+                if iface.parent.is_some() || iface.vlan.is_some() {
+                    bail!("interface {:?}: an l2tpv3 pseudowire cannot also be a VLAN", iface.name);
+                }
             } else if iface.local.is_some()
                 || iface.remote.is_some()
                 || iface.tunnel_key.is_some()
                 || iface.ttl.is_some()
             {
                 bail!(
-                    "interface {:?}: local/remote/key/ttl require `type = \"gre\"|\"ipip\"|\"gretap\"`",
+                    "interface {:?}: local/remote/key/ttl require `type = \"gre\"|\"ipip\"|\"gretap\"|\"l2tpv3\"`",
                     iface.name
                 );
             }
