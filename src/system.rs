@@ -394,6 +394,14 @@ pub fn service_stop(unit: &str) -> Result<()> {
     run_priv("systemctl", &["stop", unit])
 }
 
+/// Ensure a service is running WITHOUT dropping existing connections — unlike
+/// `restart`, `start` is a no-op when the unit is already up. Used to (re)assert
+/// `sshd` after an `enable` toggle so a `commit` that only added a key doesn't cut
+/// live admin sessions.
+pub fn service_start(unit: &str) -> Result<()> {
+    run_priv("systemctl", &["start", unit])
+}
+
 /// Make systemd re-read unit files after Sentinel wrote/removed one under
 /// `/run/systemd/system` (e.g. the dynamic time-based-rules timer). Required
 /// before starting a freshly written unit.

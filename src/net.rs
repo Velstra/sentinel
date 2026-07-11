@@ -19,7 +19,7 @@ use anyhow::Result;
 
 use crate::config::{
     Appliance, DhcpRelay, DhcpServer, Dns, Dyndns, IfaceType, Interface, Lldp, Mdns, MultiWan,
-    Nat64, Ntp, Qos, QosDiscipline, RouterAdvert, Snmp, WAN_CHECK_FAIL, WAN_CHECK_INTERVAL,
+    Nat64, Ntp, Qos, QosDiscipline, RouterAdvert, Snmp, Ssh, WAN_CHECK_FAIL, WAN_CHECK_INTERVAL,
     WAN_CHECK_RISE, WAN_CHECK_TIMEOUT, WanMode, WireguardTunnel,
 };
 use crate::system::{self, NETWORKD_RUNTIME_DIR};
@@ -1156,6 +1156,98 @@ fn apply_box_services(appliance: &Appliance) -> Result<()> {
     Ok(())
 }
 
+// SSH management access (roadmap C21). The image ships a key-only sshd; Sentinel
+// makes it runtime-configurable through two files under `/run/sentinel-ssh`, which
+// the image points sshd at. `/run/sentinel-ssh` is root:root 0755 — crucially NOT
+// under the wheel-writable `/var/lib/sentinel`, because sshd's StrictModes rejects
+// an AuthorizedKeysFile that has ANY group-writable ancestor. `/run` is a tmpfs, so
+// both files are re-rendered from the saved config at boot (apply_persistent Boot),
+// and sshd is ordered after sentinel-boot so they are present on its first start.
+//   /run/sentinel-ssh/authorized_keys  — the admin's allowed public keys
+//   /run/sentinel-ssh/10-sentinel.conf — a `Port`/`ListenAddress` drop-in the image
+//     `Include`s. Only a drop-in change needs an sshd restart (to rebind); keys are
+//     read per-connection, and `enable` just starts/stops the unit.
+const SSH_AUTHKEYS: &str = "/run/sentinel-ssh/authorized_keys";
+const SSH_DROPIN: &str = "/run/sentinel-ssh/10-sentinel.conf";
+const SSH_UNIT: &str = "sshd.service";
+
+/// The admin's `authorized_keys`, or `None` when no key is set (⇒ remove the file,
+/// leaving console-only access).
+fn ssh_authkeys_body(ssh: &Ssh) -> Option<String> {
+    if ssh.authorized_keys.is_empty() {
+        return None;
+    }
+    let mut body = String::from("# rendered by sentinel — [services.ssh] authorized-key\n");
+    for key in &ssh.authorized_keys {
+        body.push_str(key.trim());
+        body.push('\n');
+    }
+    Some(body)
+}
+
+/// The sshd `Port`/`ListenAddress` drop-in, or `None` when both are default.
+fn ssh_dropin_body(ssh: &Ssh) -> Option<String> {
+    if ssh.port.is_none() && ssh.listen_address.is_none() {
+        return None;
+    }
+    let mut body = String::from("# rendered by sentinel — [services.ssh]\n");
+    if let Some(p) = ssh.port {
+        body.push_str(&format!("Port {p}\n"));
+    }
+    if let Some(a) = &ssh.listen_address {
+        body.push_str(&format!("ListenAddress {a}\n"));
+    }
+    Some(body)
+}
+
+/// Reconcile sshd to `[services.ssh]`. The two files are written in BOTH modes
+/// (persistent, so a reboot's sshd picks them up); unit ops (start/stop/restart)
+/// run in Live only — at boot sshd starts on its own with the files in place.
+fn apply_ssh(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
+    let ssh = &appliance.services.ssh;
+
+    // authorized_keys — no sshd restart needed (read per connection).
+    match ssh_authkeys_body(ssh) {
+        Some(body) => system::install_file(Path::new(SSH_AUTHKEYS), &body)?,
+        None => system::remove_file(Path::new(SSH_AUTHKEYS))?,
+    }
+
+    // Port/ListenAddress drop-in — a change requires an sshd restart to rebind.
+    let dropin = Path::new(SSH_DROPIN);
+    let dropin_changed = match ssh_dropin_body(ssh) {
+        Some(body) => {
+            let changed = file_changed(dropin, &body);
+            system::install_file(dropin, &body)?;
+            changed
+        }
+        None => {
+            let existed = dropin.exists();
+            if existed {
+                system::remove_file(dropin)?;
+            }
+            existed
+        }
+    };
+
+    if mode == ApplyMode::Live {
+        if ssh.enable {
+            // Ensure running without cutting live sessions; restart only to rebind
+            // a changed Port/ListenAddress.
+            if let Err(e) = system::service_start(SSH_UNIT) {
+                eprintln!("warning: starting {SSH_UNIT} failed: {e}");
+            }
+            if dropin_changed {
+                if let Err(e) = system::service_restart(SSH_UNIT) {
+                    eprintln!("warning: restarting {SSH_UNIT} failed: {e}");
+                }
+            }
+        } else if let Err(e) = system::service_stop(SSH_UNIT) {
+            eprintln!("warning: stopping {SSH_UNIT}: {e}");
+        }
+    }
+    Ok(())
+}
+
 // --- NAT64 + DNS64 (roadmap C10) -------------------------------------------
 //
 // tayga translates an IPv6-only segment's traffic to `64:ff9b::<v4>` into real
@@ -2213,6 +2305,9 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     // Time-based firewall rules (roadmap C15): (re)create or remove the dynamic
     // timer that re-applies the config at each scheduled rule's window boundaries.
     apply_fwsched(appliance, mode)?;
+    // SSH management access (roadmap C21): the persistent authorized_keys + the
+    // Port/ListenAddress drop-in; sshd (re)started only in Live mode.
+    apply_ssh(appliance, mode)?;
     Ok(())
 }
 

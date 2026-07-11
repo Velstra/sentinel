@@ -27,14 +27,32 @@
   # all NICs down until the operator assigns addresses.
   systemd.network.wait-online.enable = false;
 
-  # SSH like VyOS — but declarative and key-only.
+  # SSH like VyOS — but declarative and key-only, and runtime-configurable via
+  # `set services ssh …` (roadmap C21). Sentinel renders two files under
+  # /run/sentinel-ssh that sshd reads on its start:
+  #   /run/sentinel-ssh/authorized_keys  — the admin's allowed keys
+  #   /run/sentinel-ssh/*.conf           — a Port/ListenAddress drop-in
+  # They live in a root:root 0755 dir (NOT the wheel-writable /var/lib/sentinel):
+  # sshd's StrictModes refuses an AuthorizedKeysFile with a group-writable ancestor.
+  # /run is a tmpfs, so sentinel-boot re-renders both from the saved config at boot
+  # (and sshd is ordered after it, below). `ports = []` emits no `Port` line, so the
+  # drop-in fully owns the listen port (sshd's built-in default 22 when absent) — a
+  # true port change, not an added listener.
   services.openssh = {
     enable = true;
+    ports = lib.mkForce [ ];
+    authorizedKeysFiles = [ "/run/sentinel-ssh/authorized_keys" ];
+    extraConfig = "Include /run/sentinel-ssh/*.conf";
     settings = {
       PasswordAuthentication = false;
       PermitRootLogin = "no";
     };
   };
+  # sshd must see the rendered keys + Port drop-in on its first start at boot, so
+  # order it after the boot service that renders them (sentinel-boot runs early,
+  # Before networkd, so this does not delay a routable network).
+  systemd.services.sshd.after = [ "sentinel-boot.service" ];
+  systemd.services.sshd.wants = [ "sentinel-boot.service" ];
 
   users.users.admin = {
     isNormalUser = true;
@@ -154,6 +172,13 @@
   # root) can write it; the live apply escalates via sudo.
   systemd.tmpfiles.rules = [
     "d /var/lib/sentinel 0775 root wheel -"
+    # SSH runtime config (roadmap C21): the authorized_keys + Port/ListenAddress
+    # drop-in Sentinel renders here must be root-owned with NO group-writable
+    # ancestor, or sshd's StrictModes refuses the AuthorizedKeysFile. So it is a
+    # dedicated root:root 0755 dir on the tmpfs (NOT under the wheel-writable
+    # /var/lib/sentinel) — Sentinel writes the files via sudo; sentinel-boot
+    # re-renders them from the saved config each boot.
+    "d /run/sentinel-ssh 0755 root root -"
     # The compiled agent config the admin's `commit` writes + the agent reads.
     # /run is tmpfs (recreated each boot); wheel-writable so `configure` (run as
     # admin, not root) can install it.
