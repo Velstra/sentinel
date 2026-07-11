@@ -646,6 +646,24 @@
             };
           };
 
+          # L2TPv3 pseudowires (roadmap C14): networkd has no L2TPv3 device, so the
+          # static Ethernet pseudowires are built imperatively via `ip l2tp`.
+          # networkd then addresses the created links (their `.network`).
+          systemd.services.sentinel-l2tp = {
+            description = "L2TPv3 pseudowires (sentinel/ip l2tp)";
+            after = [
+              "network.target"
+              "systemd-networkd.service"
+              "sentinel-boot.service"
+            ];
+            path = [ pkgs.iproute2 ];
+            serviceConfig = {
+              Type = "oneshot";
+              RemainAfterExit = true;
+              ExecStart = "${pkgs.runtimeShell} /run/sentinel/l2tp/setup.sh";
+            };
+          };
+
           # Stateful DHCPv6 (roadmap C7): networkd's IPv6SendRA carries the Managed
           # flag but has no DHCPv6 server, so a THIRD DNS-disabled dnsmasq instance
           # hands out addresses from each interface's `dhcp6-pool`. Sentinel renders
@@ -809,6 +827,8 @@
             "d /run/sentinel/dhcp6 0755 root root -"
             # MACsec (roadmap C14): the SA-install script carries the keys (0640).
             "d /run/sentinel/macsec 0750 root root -"
+            # L2TPv3 (roadmap C14): the `ip l2tp` pseudowire setup script.
+            "d /run/sentinel/l2tp 0755 root root -"
             "d /run/sentinel/ddclient 0750 root root -"
             # NAT64 (roadmap C10): tayga's conf + setup script + data-dir, and the
             # DNS64 unbound config all live here (world-readable, root-owned).
@@ -3060,6 +3080,65 @@
               a.wait_until_succeeds(
                   "${pkgs.tcpdump}/bin/tcpdump -r /tmp/cap 2>/dev/null | grep -qi macsec", timeout=20
               )
+            '';
+          };
+
+        # L2TPv3 (roadmap C14): two nodes build a static Ethernet pseudowire over
+        # their underlay IPs (`local`/`remote`, shared `key` = tunnel id). The
+        # resulting l2tp0 link carries a separate overlay subnet. Proven: a ping
+        # over the overlay addresses traverses the pseudowire end to end.
+        #   nix build .#checks.x86_64-linux.l2tp -L
+        l2tp =
+          let
+            node =
+              hostName:
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce hostName;
+                networking.firewall.enable = lib.mkForce false;
+                virtualisation.vlans = [ 1 ];
+                virtualisation.memorySize = 2048;
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+          in
+          pkgs.testers.runNixOSTest {
+            name = "sentinel-l2tp";
+            nodes = {
+              a = node "a";
+              b = node "b";
+            };
+            testScript = ''
+              start_all()
+              a.wait_for_unit("velstra.service")
+              b.wait_for_unit("velstra.service")
+
+              def configure(m, underlay, peer, overlay):
+                  m.succeed(
+                      "su admin -c \"printf '%s\\n' "
+                      f"'set interface eth1 zone wan' 'set interface eth1 address {underlay}/24' "
+                      "'set interface l2tp0 type l2tpv3' "
+                      f"'set interface l2tp0 local {underlay}' 'set interface l2tp0 remote {peer}' "
+                      "'set interface l2tp0 key 100' "
+                      f"'set interface l2tp0 address {overlay}/24' "
+                      "'set firewall zone wan default-action accept' "
+                      "commit save exit "
+                      "| sentinel configure\""
+                  )
+
+              configure(a, "10.0.0.1", "10.0.0.2", "192.168.5.1")
+              configure(b, "10.0.0.2", "10.0.0.1", "192.168.5.2")
+
+              # The pseudowire came up on both ends and networkd addressed it.
+              a.wait_for_unit("sentinel-l2tp.service")
+              b.wait_for_unit("sentinel-l2tp.service")
+              a.wait_until_succeeds("ip link show l2tp0 | grep -q l2tp0", timeout=30)
+              a.wait_until_succeeds("ip -4 addr show l2tp0 | grep -q 192.168.5.1", timeout=30)
+
+              # The underlay reaches the peer, and the overlay ping traverses the
+              # pseudowire end to end.
+              a.wait_until_succeeds("ping -c1 -W2 10.0.0.2", timeout=30)
+              a.wait_until_succeeds("ping -c2 -W2 192.168.5.2", timeout=60)
             '';
           };
 

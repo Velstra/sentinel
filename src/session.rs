@@ -2567,9 +2567,10 @@ impl Session {
                     "gretap" => IfaceType::Gretap,
                     "macvlan" => IfaceType::Macvlan,
                     "macsec" => IfaceType::Macsec,
+                    "l2tpv3" => IfaceType::L2tpv3,
                     other => {
                         bail!(
-                            "interface type {other:?}: expected \"bridge\", \"bond\", \"wireguard\", \"pppoe\", \"gre\", \"ipip\", \"gretap\", \"macvlan\" or \"macsec\""
+                            "interface type {other:?}: expected \"bridge\", \"bond\", \"wireguard\", \"pppoe\", \"gre\", \"ipip\", \"gretap\", \"macvlan\", \"macsec\" or \"l2tpv3\""
                         )
                     }
                 };
@@ -6267,6 +6268,7 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
                 IfaceType::Gretap => "gretap",
                 IfaceType::Macvlan => "macvlan",
                 IfaceType::Macsec => "macsec",
+                IfaceType::L2tpv3 => "l2tpv3",
             };
             out.push_str(&format!("    type {s}\n"));
         }
