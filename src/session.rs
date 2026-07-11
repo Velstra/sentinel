@@ -16,7 +16,8 @@ use crate::config::{
     Acme, Action, Appliance, Bfd, Bgp, BgpAggregate, BgpNeighbor, BgpRoa, BgpRtr, Ca, Certificate,
     Dhcp6Pool, DhcpRelay, DhcpServer, DhcpStaticLease, Dns, Dyndns, Export, Filter, FilterRule, Firewall,
     Groups, HealthCheck, IfaceType, Interface, IpsecConnection, Isis, Lldp, Mdns, MultiWan,
-    Multicast, MulticastInterface, Nat, Nat64, NatDestination, NatSource, Ntp, OpenConnectServer,
+    Multicast, MulticastInterface, Nat, Nat64, NatDestination, NatNpt66, NatSource, Ntp,
+    OpenConnectServer,
     OpenConnectUser, Ospf, Ospf3, OspfInterface, Pki, Policy, PortSpec, Pppoe, PrefixEntry,
     PrefixList, Proto, Protocols, Qos, QosDiscipline, ReverseProxy, Rip, RouterAdvert, Rule,
     Services, Snmp, StaticRoute, System, UpdateChannel, Vpn, VrfDef, Vrrp, WanMode, WanUplink,
@@ -228,6 +229,15 @@ struct NatDstDraft {
     port: Option<u16>,
     to: Option<String>,
     hairpin: bool,
+}
+
+/// A partially-specified NPTv6 (RFC 6296) prefix-translation rule.
+#[derive(Debug, Clone, Default)]
+struct NatNpt66Draft {
+    description: Option<String>,
+    interface: Option<String>,
+    internal: Option<String>,
+    external: Option<String>,
 }
 
 /// A partially-specified per-zone posture override.
@@ -1068,6 +1078,7 @@ struct Draft {
     rules: Vec<(String, RuleDraft)>,
     nat_source: Vec<(String, NatSrcDraft)>,
     nat_destination: Vec<(String, NatDstDraft)>,
+    nat_npt66: Vec<(String, NatNpt66Draft)>,
     /// NAT64 + DNS64 (roadmap C10) — a single-instance sub-tree under `[nat]`.
     nat64: Nat64Draft,
     router_id: Option<String>,
@@ -1552,6 +1563,15 @@ impl Draft {
         &mut self.nat_destination.last_mut().unwrap().1
     }
 
+    fn nat_npt66_mut(&mut self, name: &str) -> &mut NatNpt66Draft {
+        if let Some(i) = self.nat_npt66.iter().position(|(n, _)| n == name) {
+            return &mut self.nat_npt66[i].1;
+        }
+        self.nat_npt66
+            .push((name.to_string(), NatNpt66Draft::default()));
+        &mut self.nat_npt66.last_mut().unwrap().1
+    }
+
     fn from_appliance(a: &Appliance) -> Self {
         Draft {
             hostname: Some(a.system.hostname.clone()),
@@ -1715,6 +1735,22 @@ impl Draft {
                             port: Some(d.port),
                             to: Some(d.to.clone()),
                             hairpin: d.hairpin,
+                        },
+                    )
+                })
+                .collect(),
+            nat_npt66: a
+                .nat
+                .npt66
+                .iter()
+                .map(|n| {
+                    (
+                        n.name.clone(),
+                        NatNpt66Draft {
+                            description: n.description.clone(),
+                            interface: Some(n.interface.clone()),
+                            internal: Some(n.internal.clone()),
+                            external: Some(n.external.clone()),
                         },
                     )
                 })
@@ -2190,6 +2226,15 @@ impl Session {
     pub fn nat_destination_names(&self) -> Vec<String> {
         self.draft
             .nat_destination
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
+    /// The NPTv6 rule names — completion offers these for `set/delete nat npt66 …`.
+    pub fn nat_npt66_names(&self) -> Vec<String> {
+        self.draft
+            .nat_npt66
             .iter()
             .map(|(n, _)| n.clone())
             .collect()
@@ -2812,6 +2857,24 @@ impl Session {
             }
             ["nat", "destination", name, "hairpin", v] => {
                 self.draft.nat_destination_mut(name).hairpin = parse_bool(v)?;
+            }
+
+            // nat npt66 <name>: stateless IPv6 prefix translation (RFC 6296).
+            ["nat", "npt66", name, "description", rest @ ..] if !rest.is_empty() => {
+                let desc = rest.join(" ");
+                crate::config::validate_description(&desc)?;
+                self.draft.nat_npt66_mut(name).description = Some(desc);
+            }
+            ["nat", "npt66", name, "interface", v] => {
+                self.draft.nat_npt66_mut(name).interface = Some((*v).to_string());
+            }
+            ["nat", "npt66", name, "internal", v] => {
+                crate::config::validate_ipv6_cidr(v)?;
+                self.draft.nat_npt66_mut(name).internal = Some((*v).to_string());
+            }
+            ["nat", "npt66", name, "external", v] => {
+                crate::config::validate_ipv6_cidr(v)?;
+                self.draft.nat_npt66_mut(name).external = Some((*v).to_string());
             }
 
             // nat nat64: stateful IPv6→IPv4 translation (tayga) + DNS64 (unbound).
@@ -4397,6 +4460,31 @@ impl Session {
                 }
             }
 
+            // nat npt66 — the whole rule, or one field.
+            ["nat", "npt66", name] => {
+                let before = self.draft.nat_npt66.len();
+                self.draft.nat_npt66.retain(|(n, _)| n != name);
+                if self.draft.nat_npt66.len() == before {
+                    bail!("no nat npt66 {name:?}");
+                }
+            }
+            ["nat", "npt66", name, field] => {
+                let i = self
+                    .draft
+                    .nat_npt66
+                    .iter()
+                    .position(|(n, _)| n == name)
+                    .ok_or_else(|| anyhow::anyhow!("no nat npt66 {name:?}"))?;
+                let d = &mut self.draft.nat_npt66[i].1;
+                match *field {
+                    "description" => d.description = None,
+                    "interface" => d.interface = None,
+                    "internal" => d.internal = None,
+                    "external" => d.external = None,
+                    other => bail!("nat npt66 has no field {other:?}"),
+                }
+            }
+
             // nat nat64 — the whole sub-tree, or one field.
             ["nat", "nat64"] => self.draft.nat64 = Nat64Draft::default(),
             ["nat", "nat64", field] => {
@@ -5520,6 +5608,26 @@ impl Session {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
+        let nat_npt66 = self
+            .draft
+            .nat_npt66
+            .iter()
+            .map(|(name, d)| {
+                Ok(NatNpt66 {
+                    name: name.clone(),
+                    description: d.description.clone(),
+                    interface: d.interface.clone().ok_or_else(|| {
+                        anyhow::anyhow!("nat npt66 {name:?}: interface not set")
+                    })?,
+                    internal: d.internal.clone().ok_or_else(|| {
+                        anyhow::anyhow!("nat npt66 {name:?}: internal prefix not set")
+                    })?,
+                    external: d.external.clone().ok_or_else(|| {
+                        anyhow::anyhow!("nat npt66 {name:?}: external prefix not set")
+                    })?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         // protocols: dynamic routing (Wren).
         let statics = self
             .draft
@@ -5900,6 +6008,7 @@ impl Session {
                     interface: self.draft.nat64.interface.clone(),
                     dns64: self.draft.nat64.dns64.unwrap_or(false),
                 },
+                npt66: nat_npt66,
             },
             protocols,
             policy: Policy {
@@ -6472,6 +6581,23 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         if d.hairpin {
             nati.push_str("        hairpin true\n");
+        }
+        nati.push_str("    }\n");
+    }
+    // NPTv6 (roadmap C16) — one named sub-tree per prefix-translation rule.
+    for (name, d) in &draft.nat_npt66 {
+        nati.push_str(&format!("    npt66 {name} {{\n"));
+        if let Some(desc) = &d.description {
+            nati.push_str(&format!("        description {desc}\n"));
+        }
+        if let Some(i) = &d.interface {
+            nati.push_str(&format!("        interface {i}\n"));
+        }
+        if let Some(i) = &d.internal {
+            nati.push_str(&format!("        internal {i}\n"));
+        }
+        if let Some(e) = &d.external {
+            nati.push_str(&format!("        external {e}\n"));
         }
         nati.push_str("    }\n");
     }

@@ -1683,6 +1683,20 @@ const NAT_NODES: &[Cand] = &[
         "nat64",
         "stateful IPv6→IPv4 translation (tayga) + DNS64 (unbound)",
     ),
+    (
+        "npt66",
+        "stateless IPv6 prefix translation (RFC 6296, checksum-neutral)",
+    ),
+];
+// `nat npt66 <name> <Tab>` reveals the NPTv6 rule fields.
+const NAT_NPT66_FIELDS: &[Cand] = &[
+    ("interface", "the boundary (WAN) interface to translate on"),
+    ("internal", "internal IPv6 prefix, e.g. fd00:1::/48"),
+    (
+        "external",
+        "external (delegated) IPv6 prefix, e.g. 2001:db8:1::/48",
+    ),
+    ("description", "free-text label for this rule"),
 ];
 // `nat nat64 <Tab>` reveals the NAT64 fields.
 const NAT64_FIELDS: &[Cand] = &[
@@ -2189,6 +2203,7 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "nat", "destination", _name] => NAT_DEST_FIELDS,
         ["set", "nat", "destination", _name, "proto"] => PROTOS,
         ["set", "nat", "destination", _name, "disabled" | "hairpin"] => BOOLS,
+        ["set" | "delete", "nat", "npt66", _name] => NAT_NPT66_FIELDS,
         ["set" | "delete", "nat", "nat64"] => NAT64_FIELDS,
         ["set", "nat", "nat64", "enabled" | "dns64"] => BOOLS,
 
@@ -2375,6 +2390,7 @@ pub struct DynNames {
     pub zones: Vec<String>,
     pub nat_source: Vec<String>,
     pub nat_destination: Vec<String>,
+    pub nat_npt66: Vec<String>,
     pub address_groups: Vec<String>,
     pub port_groups: Vec<String>,
     pub filters: Vec<String>,
@@ -2448,6 +2464,9 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
             "nat destination",
             "a new destination-NAT rule name",
         ),
+        ["set" | "delete", "nat", "npt66"] => {
+            named(&names.nat_npt66, "nat npt66", "a new NPTv6 rule name")
+        }
         ["set" | "delete", "firewall", "zone"] => named(&names.zones, "zone", "a new zone name"),
         ["set" | "delete", "firewall", "group", "address-group"] => named(
             &names.address_groups,
@@ -2744,6 +2763,7 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
         ["set", "firewall", "rule", _name, "port"] => own_cands(&[PH_PORT_RANGE]),
         ["set", "nat", "destination", _name, "port"] => own_cands(&[PH_PORT]),
         ["set", "nat", "destination", _name, "to"] => own_cands(&[PH_IPV4_TO]),
+        ["set", "nat", "npt66", _name, "internal" | "external"] => own_cands(&[PH_IPV6_CIDR]),
         ["set", "nat", "nat64", "prefix"] => own_cands(&[PH_IPV6_CIDR]),
         ["set", "nat", "nat64", "pool"] => own_cands(&[PH_IPV4_CIDR]),
 
@@ -3342,8 +3362,16 @@ mod tests {
             kw(&["set", "firewall", "rule", "web", "proto"]),
             ["tcp", "udp"]
         );
-        // The nat sub-tree: source (masquerade) + destination (port-forward) + nat64.
-        assert_eq!(kw(&["set", "nat"]), ["source", "destination", "nat64"]);
+        // The nat sub-tree: source (masquerade) + destination (port-forward) +
+        // nat64 + npt66 (NPTv6).
+        assert_eq!(
+            kw(&["set", "nat"]),
+            ["source", "destination", "nat64", "npt66"]
+        );
+        assert_eq!(
+            kw(&["set", "nat", "npt66", "v6-npt"]),
+            ["interface", "internal", "external", "description"]
+        );
         assert_eq!(
             kw(&["set", "nat", "nat64"]),
             ["enabled", "prefix", "pool", "interface", "dns64"]
@@ -3501,6 +3529,7 @@ mod tests {
             zones: vec!["lan".into(), "wan".into()],
             nat_source: vec!["wan-masq".into()],
             nat_destination: vec!["web-fwd".into()],
+            nat_npt66: vec!["v6-npt".into()],
             address_groups: vec!["mgmt".into()],
             port_groups: vec!["webports".into()],
             filters: vec!["from-peer".into()],
