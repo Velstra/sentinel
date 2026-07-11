@@ -24,6 +24,18 @@
 - [Configuring the appliance](operations/configure.md)
 - [Updating (A/B + rollback)](operations/update.md)
 
+# Handbook — the configuration CLI
+
+- [The configuration CLI](handbook/cli.md)
+- [System & management](handbook/system.md)
+- [Interfaces](handbook/interfaces.md)
+- [Firewall & NAT](handbook/firewall.md)
+- [Routing (protocols)](handbook/routing.md)
+- [Services](handbook/services.md)
+- [VPN & PKI](handbook/vpn.md)
+- [Multi-WAN & updates](handbook/multiwan.md)
+- [Example configurations](handbook/examples.md)
+
 # Reference
 
 - [Flake outputs](reference/flake-outputs.md)
