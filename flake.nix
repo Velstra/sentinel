@@ -175,7 +175,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-KDQ58pjxG27wukfuMT6g8ZjDTxRNM/ShQnknmWr3MAE=";
+      ebpfHash = "sha256-FlJGqFt/3xspyyZQ9vbRtpIjmFFC89hKhD0DbryCJXc=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -2837,6 +2837,133 @@
             # the client, and NEVER the client's real private ip (10.2.0.2).
             server.succeed("journalctl -u web.service | grep -q '10.1.0.1 '")
             server.fail("journalctl -u web.service | grep -q '10.2.0.2 '")
+          '';
+        };
+
+        # NPTv6 / NAT66 (roadmap C16, RFC 6296): stateless, checksum-neutral IPv6
+        # prefix translation. A `client` on an internal ULA prefix (fd00:1::/48)
+        # reaches an external `server`; the fw translates the client's source to
+        # the external prefix (2001:db8:1::/48) on WAN egress and un-translates the
+        # reply's destination on WAN ingress. Proven end to end: the client fetches
+        # the server AND the server sees the request coming from the EXTERNAL prefix
+        # (2001:db8:1::…), never the internal ULA — all in the eBPF datapath.
+        #   nix build .#checks.x86_64-linux.npt66 -L
+        npt66 = pkgs.testers.runNixOSTest {
+          name = "sentinel-npt66";
+          nodes = {
+            # External server on the WAN segment; routes the translated external
+            # prefix back via the fw.
+            server =
+              { pkgs, ... }:
+              {
+                virtualisation.vlans = [ 1 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                };
+                systemd.network.networks."10-eth1" = {
+                  matchConfig.Name = "eth1";
+                  address = [ "2001:db8:ffff::2/64" ];
+                  routes = [
+                    {
+                      # The NPTv6 external prefix is reached via the fw's WAN address.
+                      Destination = "2001:db8:1::/48";
+                      Gateway = "2001:db8:ffff::1";
+                    }
+                  ];
+                };
+                systemd.services.web = {
+                  wantedBy = [ "multi-user.target" ];
+                  after = [ "network-online.target" ];
+                  script = ''
+                    mkdir -p /srv/web && echo hello-from-server > /srv/web/index.html
+                    exec ${pkgs.python3}/bin/python3 -m http.server 8080 --bind :: --directory /srv/web
+                  '';
+                };
+              };
+            # Internal client on an internal ULA prefix, default route via the fw.
+            client =
+              { pkgs, ... }:
+              {
+                virtualisation.vlans = [ 2 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                };
+                systemd.network.networks."10-eth1" = {
+                  matchConfig.Name = "eth1";
+                  address = [ "fd00:1:0:5::7/64" ];
+                  routes = [
+                    {
+                      Destination = "::/0";
+                      Gateway = "fd00:1:0:5::1";
+                    }
+                  ];
+                };
+                environment.systemPackages = [ pkgs.curl ];
+              };
+            # The appliance: WAN (external) = eth1 (vlan 1), LAN (internal) = eth2
+            # (vlan 2). Sentinel owns both v6 addresses + zones + the NPTv6 rule.
+            fw =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "fw";
+                networking.firewall.enable = lib.mkForce false;
+                virtualisation.vlans = [
+                  1
+                  2
+                ];
+                virtualisation.memorySize = 2048;
+                boot.kernel.sysctl = {
+                  "net.ipv6.conf.all.forwarding" = 1;
+                };
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+          };
+          testScript = ''
+            start_all()
+            fw.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+            server.wait_for_unit("web.service")
+
+            # Sentinel owns both v6 addresses, the zones, and the NPTv6 rule bound to
+            # the WAN interface.
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth1 zone wan' 'set interface eth1 address6 2001:db8:ffff::1/64' "
+                "'set interface eth2 zone lan' 'set interface eth2 address6 fd00:1:0:5::1/64' "
+                "'set firewall zone lan default-action accept' "
+                "'set firewall zone wan default-action accept' "
+                "'set nat npt66 v6 interface eth1' "
+                "'set nat npt66 v6 internal fd00:1::/48' "
+                "'set nat npt66 v6 external 2001:db8:1::/48' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            fw.wait_for_unit("velstra.service")
+            # The compiler emitted the NPTv6 rule into the velstra config.
+            fw.succeed("grep -q '\\[\\[npt66\\]\\]' /run/sentinel/velstra.toml")
+            fw.succeed("grep -q 'internal = \"fd00:1::/48\"' /run/sentinel/velstra.toml")
+            fw.wait_until_succeeds("ip -6 addr show eth1 | grep -qi 2001:db8:ffff::1", timeout=30)
+            fw.wait_until_succeeds("ip -6 addr show eth2 | grep -qi fd00:1:0:5::1", timeout=30)
+
+            # A ping confirms basic NPTv6 reachability (ICMPv6 is checksum-covered
+            # too, so this also proves the translation is checksum-neutral).
+            client.wait_until_succeeds("ping -c2 -6 2001:db8:ffff::2", timeout=30)
+
+            # End to end: the internal client reaches the external server through the
+            # NPTv6 boundary...
+            client.wait_until_succeeds(
+                "curl -g -s --max-time 5 'http://[2001:db8:ffff::2]:8080/' | grep -q hello-from-server",
+                timeout=60,
+            )
+            # ...and the server saw the request from the EXTERNAL prefix, never the
+            # internal ULA — proving the source was prefix-translated in the datapath.
+            server.succeed("journalctl -u web.service | grep -q '2001:db8:1:'")
+            server.fail("journalctl -u web.service | grep -q 'fd00:1:'")
           '';
         };
 

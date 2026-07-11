@@ -1953,14 +1953,40 @@ pub struct Nat {
     /// Omitted from saved configs when unconfigured.
     #[serde(default, skip_serializing_if = "Nat64::is_empty")]
     pub nat64: Nat64,
+    /// NPTv6 (roadmap C16, RFC 6296): stateless IPv6 prefix translation between an
+    /// internal and an external (provider-delegated) prefix. Checksum-neutral, no
+    /// per-flow state.
+    #[serde(default, rename = "npt66", skip_serializing_if = "Vec::is_empty")]
+    pub npt66: Vec<NatNpt66>,
 }
 
 impl Nat {
     /// True when no NAT is configured — lets `[nat]` be omitted from a saved
     /// config that never set any.
     pub fn is_empty(&self) -> bool {
-        self.source.is_empty() && self.destination.is_empty() && self.nat64.is_empty()
+        self.source.is_empty()
+            && self.destination.is_empty()
+            && self.nat64.is_empty()
+            && self.npt66.is_empty()
     }
+}
+
+/// A NPTv6 (RFC 6296) prefix-translation rule: on the boundary `interface`, an
+/// internal IPv6 source leaving is rewritten to the external prefix, and an
+/// external destination arriving is rewritten back — stateless, checksum-neutral.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NatNpt66 {
+    pub name: String,
+    /// A free-text label, shown in `show`. Purely documentary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The boundary (WAN) interface this translation is applied on.
+    pub interface: String,
+    /// Internal IPv6 prefix, e.g. `"fd00:1::/48"`.
+    pub internal: String,
+    /// External (provider-delegated) IPv6 prefix, e.g. `"2001:db8:1::/48"`.
+    pub external: String,
 }
 
 /// The well-known NAT64 prefix (RFC 6052 §2.1 / RFC 6146) — the default when the
@@ -4286,6 +4312,44 @@ impl Appliance {
             // DNS64 additionally forwards synthesis misses upstream.
             if n64.dns64 && self.services.dns.upstream.is_empty() {
                 bail!("nat nat64 dns64: needs an upstream resolver ([services.dns] upstream)");
+            }
+        }
+
+        // NPTv6 (roadmap C16, RFC 6296): stateless prefix translation. The boundary
+        // interface must be declared; both prefixes must be v6 CIDRs of equal length
+        // that is a non-zero multiple of 16 bits ≤ /64 (the v1 datapath scope).
+        for n in &self.nat.npt66 {
+            if let Some(desc) = &n.description {
+                validate_description(desc)
+                    .with_context(|| format!("nat npt66 {:?} description", n.name))?;
+            }
+            if !self.interfaces.iter().any(|i| i.name == n.interface) {
+                bail!(
+                    "nat npt66 {:?}: interface {:?} is not a declared interface",
+                    n.name,
+                    n.interface
+                );
+            }
+            validate_ipv6_cidr(&n.internal)
+                .with_context(|| format!("nat npt66 {:?} internal", n.name))?;
+            validate_ipv6_cidr(&n.external)
+                .with_context(|| format!("nat npt66 {:?} external", n.name))?;
+            let cidr_len = |s: &str| -> u8 {
+                s.split('/').nth(1).and_then(|l| l.parse().ok()).unwrap_or(0)
+            };
+            let ilen = cidr_len(&n.internal);
+            let elen = cidr_len(&n.external);
+            if ilen != elen {
+                bail!(
+                    "nat npt66 {:?}: internal /{ilen} and external /{elen} prefix lengths must match",
+                    n.name
+                );
+            }
+            if ilen == 0 || ilen > 64 || ilen % 16 != 0 {
+                bail!(
+                    "nat npt66 {:?}: prefix /{ilen} must be a non-zero multiple of 16 bits, ≤ /64",
+                    n.name
+                );
             }
         }
 
