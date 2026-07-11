@@ -1,5 +1,55 @@
 # Changelog
 
+## [Unreleased]
+
+Completes NAT and the interface-type matrix, adds time-based firewall rules and a
+stateful DHCPv6 server, and brings high availability to the appliance: CLI-
+configurable SSH with per-user logins, and config sync across an HA pair. Ships
+with a complete CLI handbook. Each slice ships with a `nixosTest` that loads the
+real config (and, where it touches the datapath, the real eBPF) in a sandboxed VM.
+
+### Firewall & NAT
+
+- **Hairpin NAT (NAT reflection)** — the eBPF-datapath piece deferred in 0.2.0:
+  reach a port-forwarded service via its public IP from inside
+  (`nat destination … hairpin`).
+- **NPTv6 / NAT66** (RFC 6296) — stateless, checksum-neutral IPv6 prefix
+  translation (`nat npt66`).
+- **Time-based firewall rules** — a rule may carry a weekly local-time schedule
+  (`rule … schedule days/start/end`) and is only in force while its window is
+  open; a systemd timer re-applies at the boundaries.
+
+### Interfaces
+
+- **MACsec (802.1AE)** encrypted point-to-point links and **L2TPv3** Ethernet
+  pseudowires, completing the VyOS interface-type parity list.
+
+### Services
+
+- **Stateful DHCPv6 server** (`interface … router-advert dhcp6-pool`).
+- Dynamic-DNS PATH fix (`ddclient` gets iproute2 + util-linux); end-to-end mDNS
+  reflector and DHCP-relay VM tests.
+
+### High availability & management
+
+- **SSH management, CLI-configurable** — `services ssh` (daemon port / listen /
+  password-auth, key-only by default) and `system login <user>` (per-user SSH
+  keys + crypt(3) hashed passwords, VyOS-style; accounts created at commit via
+  `mutableUsers`).
+- **HA config sync** — `system config-sync` pushes the running config to peer
+  firewalls on every commit, over the existing REST API (shared bearer secret,
+  loop-safe).
+- **VRRP, BFD and OSPFv3** are now covered by end-to-end 2-node `nixosTest`s
+  (VRRP virtual-IP failover, BFD sub-second fast-detection, OSPFv3 IPv6 adjacency)
+  — including a fix to the wren daemon so graceful shutdown (and thus a clean VRRP
+  hand-off) runs under `systemctl stop`, not just Ctrl-C.
+
+### Documentation
+
+- A complete **CLI handbook** in the mdBook — every command by section, with
+  worked examples and four full example configurations, auto-published to GitHub
+  Pages.
+
 ## [0.2.0] — 2026-07-07
 
 A large release. Sentinel gains a coherent VyOS/JunOS-style configuration
