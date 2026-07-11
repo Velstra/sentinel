@@ -1794,11 +1794,16 @@ const IFACE_FIELDS: &[Cand] = &[
         "macvlan-mode",
         "MACVLAN mode: bridge | private | vepa | passthru (type=macvlan)",
     ),
+    (
+        "macsec-key",
+        "MACsec pre-shared key, 32/64 hex chars (type=macsec)",
+    ),
+    ("macsec-peer", "MACsec peer MAC address (type=macsec)"),
     ("dhcp-server", "serve DHCP from this NIC's static subnet"),
     ("router-advert", "emit IPv6 Router Advertisements (SLAAC)"),
     (
         "type",
-        "bridge | bond | wireguard | pppoe | gre | ipip | gretap | macvlan",
+        "bridge | bond | wireguard | pppoe | gre | ipip | gretap | macvlan | macsec",
     ),
     ("local", "tunnel local endpoint IP (type gre/ipip/gretap)"),
     ("remote", "tunnel remote endpoint IP (type gre/ipip/gretap)"),
@@ -1862,6 +1867,10 @@ const IFACE_TYPES: &[Cand] = &[
     (
         "macvlan",
         "a MACVLAN pseudo-NIC on a `parent` (own MAC; `macvlan-mode`)",
+    ),
+    (
+        "macsec",
+        "an encrypted MACsec (802.1AE) link on a `parent` (PSK; `macsec-key`/`macsec-peer`)",
     ),
 ];
 const MACVLAN_MODES: &[Cand] = &[
@@ -3190,6 +3199,8 @@ mod tests {
                 "vlan",
                 "vlan-protocol",
                 "macvlan-mode",
+                "macsec-key",
+                "macsec-peer",
                 "dhcp-server",
                 "router-advert",
                 "type",
@@ -3618,6 +3629,8 @@ mod tests {
                 "vlan",
                 "vlan-protocol",
                 "macvlan-mode",
+                "macsec-key",
+                "macsec-peer",
                 "dhcp-server",
                 "router-advert",
                 "type",

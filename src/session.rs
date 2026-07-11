@@ -45,6 +45,9 @@ struct IfaceDraft {
     // a `type = macvlan` pseudo-NIC (roadmap C14).
     vlan_protocol: Option<String>,
     macvlan_mode: Option<String>,
+    // MACsec (802.1AE) pre-shared key + peer MAC on a `type = macsec` link (C14).
+    macsec_key: Option<String>,
+    macsec_peer: Option<String>,
     // A built-in DHCP server serving this interface's static subnet.
     dhcp_server: Option<DhcpServerDraft>,
     // An IPv6 Router Advertiser (SLAAC) on this interface.
@@ -1620,6 +1623,8 @@ impl Draft {
                             vlan: i.vlan,
                             vlan_protocol: i.vlan_protocol.clone(),
                             macvlan_mode: i.macvlan_mode.clone(),
+                            macsec_key: i.macsec_key.clone(),
+                            macsec_peer: i.macsec_peer.clone(),
                             dhcp_server: i.dhcp_server.as_ref().map(|d| DhcpServerDraft {
                                 pool_offset: d.pool_offset,
                                 pool_size: d.pool_size,
@@ -2561,9 +2566,10 @@ impl Session {
                     "ipip" => IfaceType::Ipip,
                     "gretap" => IfaceType::Gretap,
                     "macvlan" => IfaceType::Macvlan,
+                    "macsec" => IfaceType::Macsec,
                     other => {
                         bail!(
-                            "interface type {other:?}: expected \"bridge\", \"bond\", \"wireguard\", \"pppoe\", \"gre\", \"ipip\", \"gretap\" or \"macvlan\""
+                            "interface type {other:?}: expected \"bridge\", \"bond\", \"wireguard\", \"pppoe\", \"gre\", \"ipip\", \"gretap\", \"macvlan\" or \"macsec\""
                         )
                     }
                 };
@@ -2600,6 +2606,18 @@ impl Session {
                     );
                 }
                 self.draft.iface_mut(name).macvlan_mode = Some((*v).to_string());
+            }
+            ["interface", name, "macsec-key", v] => {
+                // Deep validation (hex length, macsec type) runs at materialize time;
+                // reject an obviously non-hex value early for a friendlier error.
+                if !v.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    bail!("macsec-key must be a hex string (32 or 64 chars)");
+                }
+                self.draft.iface_mut(name).macsec_key = Some((*v).to_string());
+            }
+            ["interface", name, "macsec-peer", v] => {
+                crate::config::validate_mac(v)?;
+                self.draft.iface_mut(name).macsec_peer = Some((*v).to_string());
             }
             ["interface", name, "vlan-aware", v] => {
                 self.draft.iface_mut(name).vlan_aware = Some(parse_bool(v)?);
@@ -4219,6 +4237,8 @@ impl Session {
             ["interface", name, "bond-mode"] => self.iface(name)?.bond_mode = None,
             ["interface", name, "vlan-protocol"] => self.iface(name)?.vlan_protocol = None,
             ["interface", name, "macvlan-mode"] => self.iface(name)?.macvlan_mode = None,
+            ["interface", name, "macsec-key"] => self.iface(name)?.macsec_key = None,
+            ["interface", name, "macsec-peer"] => self.iface(name)?.macsec_peer = None,
             ["interface", name, "vlan-aware"] => self.iface(name)?.vlan_aware = None,
             ["interface", name, "vlan-tagged"] => self.iface(name)?.vlan_tagged.clear(),
             ["interface", name, "vlan-untagged"] => self.iface(name)?.vlan_untagged = None,
@@ -5451,6 +5471,8 @@ impl Session {
                 vlan: d.vlan,
                 vlan_protocol: d.vlan_protocol.clone(),
                 macvlan_mode: d.macvlan_mode.clone(),
+                macsec_key: d.macsec_key.clone(),
+                macsec_peer: d.macsec_peer.clone(),
                 dhcp_server: d.dhcp_server.as_ref().map(|s| DhcpServer {
                     pool_offset: s.pool_offset,
                     pool_size: s.pool_size,
@@ -6244,6 +6266,7 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
                 IfaceType::Ipip => "ipip",
                 IfaceType::Gretap => "gretap",
                 IfaceType::Macvlan => "macvlan",
+                IfaceType::Macsec => "macsec",
             };
             out.push_str(&format!("    type {s}\n"));
         }
@@ -6312,6 +6335,12 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         if let Some(mode) = &i.macvlan_mode {
             out.push_str(&format!("    macvlan-mode {mode}\n"));
+        }
+        if let Some(key) = &i.macsec_key {
+            out.push_str(&format!("    macsec-key {key}\n"));
+        }
+        if let Some(peer) = &i.macsec_peer {
+            out.push_str(&format!("    macsec-peer {peer}\n"));
         }
         if let Some(q) = &i.qos {
             out.push_str("    qos {\n");
@@ -8764,6 +8793,44 @@ mod tests {
 
         // A macvlan-mode value outside the set is rejected at set-time.
         assert!(run(&mut s, "set interface mv0 macvlan-mode bogus").is_err());
+    }
+
+    #[test]
+    fn macsec_link_set_show_commits_and_validates() {
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname fw",
+            "set interface eth0 zone wan",
+            "set interface eth0 mac 02:00:00:00:00:01",
+            "set interface sec0 type macsec",
+            "set interface sec0 parent eth0",
+            "set interface sec0 macsec-key 00112233445566778899aabbccddeeff",
+            "set interface sec0 macsec-peer 52:54:00:12:02:02",
+            "set interface sec0 zone lan",
+            "set interface sec0 address 10.9.0.1/24",
+        ] {
+            run(&mut s, line).unwrap();
+        }
+        let shown = s.show_only("interface");
+        assert!(shown.contains("type macsec"), "got:\n{shown}");
+        assert!(shown.contains("macsec-key 00112233"), "got:\n{shown}");
+        assert!(shown.contains("macsec-peer 52:54:00:12:02:02"), "got:\n{shown}");
+
+        let a = s.commit().expect("macsec interface commits");
+        let sec = a.interfaces.iter().find(|i| i.name == "sec0").unwrap();
+        assert_eq!(sec.if_type, Some(IfaceType::Macsec));
+        assert_eq!(sec.macsec_peer.as_deref(), Some("52:54:00:12:02:02"));
+
+        // Bad key length is rejected at commit; key/peer without the macsec type too.
+        run(&mut s, "set interface sec0 macsec-key deadbeef").unwrap();
+        assert!(s.commit().is_err(), "a short key must be rejected");
+        run(
+            &mut s,
+            "set interface sec0 macsec-key 00112233445566778899aabbccddeeff",
+        )
+        .unwrap();
+        // A non-hex key is rejected already at set-time.
+        assert!(run(&mut s, "set interface sec0 macsec-key nothex!!").is_err());
     }
 
     #[test]

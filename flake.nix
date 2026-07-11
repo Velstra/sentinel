@@ -626,6 +626,26 @@
             };
           };
 
+          # MACsec (802.1AE, roadmap C14): networkd creates the encrypted device but
+          # its static secure-association install hits a kernel EBUSY here, so the
+          # keys are installed by this oneshot via `ip macsec add`. Runs after
+          # networkd (which creates the device); the rendered script waits for the
+          # link and is idempotent (deletes then re-adds each SA).
+          systemd.services.sentinel-macsec = {
+            description = "MACsec secure-association install (sentinel/ip macsec)";
+            after = [
+              "network.target"
+              "systemd-networkd.service"
+              "sentinel-boot.service"
+            ];
+            path = [ pkgs.iproute2 ];
+            serviceConfig = {
+              Type = "oneshot";
+              RemainAfterExit = true;
+              ExecStart = "${pkgs.runtimeShell} /run/sentinel/macsec/setup.sh";
+            };
+          };
+
           # Stateful DHCPv6 (roadmap C7): networkd's IPv6SendRA carries the Managed
           # flag but has no DHCPv6 server, so a THIRD DNS-disabled dnsmasq instance
           # hands out addresses from each interface's `dhcp6-pool`. Sentinel renders
@@ -787,6 +807,8 @@
             "d /run/sentinel/dhcp-relay 0755 root root -"
             # Stateful DHCPv6 (roadmap C7): the second dnsmasq instance's config.
             "d /run/sentinel/dhcp6 0755 root root -"
+            # MACsec (roadmap C14): the SA-install script carries the keys (0640).
+            "d /run/sentinel/macsec 0750 root root -"
             "d /run/sentinel/ddclient 0750 root root -"
             # NAT64 (roadmap C10): tayga's conf + setup script + data-dir, and the
             # DNS64 unbound config all live here (world-readable, root-owned).
@@ -2966,6 +2988,80 @@
             server.fail("journalctl -u web.service | grep -q 'fd00:1:'")
           '';
         };
+
+        # MACsec / 802.1AE (roadmap C14): two nodes on one L2 segment bring up a
+        # `type = "macsec"` link with the same pre-shared key, each naming the
+        # other's MAC as the peer. networkd creates the encrypted device; the
+        # `sentinel-macsec` unit installs the secure associations via `ip macsec`.
+        # Proven: the SAs install, a ping over the macsec addresses works (a matching
+        # key is required), and the underlying NIC carries MACsec frames (EtherType
+        # 0x88e5), never the cleartext ICMP.
+        #   nix build .#checks.x86_64-linux.macsec -L
+        macsec =
+          let
+            key = "00112233445566778899aabbccddeeff";
+            macA = "02:00:00:00:00:01";
+            macB = "02:00:00:00:00:02";
+            node =
+              hostName:
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce hostName;
+                networking.firewall.enable = lib.mkForce false;
+                virtualisation.vlans = [ 1 ];
+                virtualisation.memorySize = 2048;
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+          in
+          pkgs.testers.runNixOSTest {
+            name = "sentinel-macsec";
+            nodes = {
+              a = node "a";
+              b = node "b";
+            };
+            testScript = ''
+              start_all()
+              a.wait_for_unit("velstra.service")
+              b.wait_for_unit("velstra.service")
+
+              def configure(m, selfmac, peermac, addr):
+                  m.succeed(
+                      "su admin -c \"printf '%s\\n' "
+                      # eth1 is only the MACsec carrier (a `mac` but no zone → no XDP
+                      # on it). The decrypted sec0 gets the zone + address.
+                      f"'set interface eth1 mac {selfmac}' "
+                      "'set interface sec0 type macsec' 'set interface sec0 parent eth1' "
+                      f"'set interface sec0 macsec-key ${key}' 'set interface sec0 macsec-peer {peermac}' "
+                      f"'set interface sec0 zone lan' 'set interface sec0 address {addr}' "
+                      "'set firewall zone lan default-action accept' "
+                      "commit save exit "
+                      "| sentinel configure\""
+                  )
+
+              configure(a, "${macA}", "${macB}", "10.9.0.1/24")
+              configure(b, "${macB}", "${macA}", "10.9.0.2/24")
+
+              # networkd created the encrypted device and the sentinel-macsec unit
+              # installed its secure associations (the keys).
+              a.wait_until_succeeds("ip -d link show sec0 | grep -q macsec", timeout=30)
+              a.wait_for_unit("sentinel-macsec.service")
+              b.wait_for_unit("sentinel-macsec.service")
+              a.wait_until_succeeds("ip macsec show sec0 | grep -qi 'TXSC'", timeout=30)
+
+              # End to end: the encrypted link carries traffic (a matching key is
+              # required — a mismatch would drop every frame).
+              a.wait_until_succeeds("ping -c2 -W2 10.9.0.2", timeout=60)
+
+              # And the underlying NIC carries MACsec frames (EtherType 0x88e5), not
+              # cleartext ICMP.
+              a.succeed("${pkgs.tcpdump}/bin/tcpdump -i eth1 -c 3 -w /tmp/cap 'ether proto 0x88e5' &")
+              a.succeed("ping -c3 -W2 10.9.0.2")
+              a.wait_until_succeeds(
+                  "${pkgs.tcpdump}/bin/tcpdump -r /tmp/cap 2>/dev/null | grep -qi macsec", timeout=20
+              )
+            '';
+          };
 
         # Reject in the eBPF datapath: a 2-node client — fw. The fw's WAN zone has
         # a rule that REJECTS tcp/9999. A connection from the client must come

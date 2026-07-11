@@ -2789,6 +2789,25 @@ pub struct Interface {
         skip_serializing_if = "Option::is_none"
     )]
     pub macvlan_mode: Option<String>,
+    /// The pre-shared key (hex, 32 chars = 128-bit or 64 chars = 256-bit) for a
+    /// `type = "macsec"` interface (roadmap C14, MACsec / 802.1AE L2 encryption).
+    /// Both ends of the link share this key. A secret — rendered into the 0600
+    /// `.netdev`. Only valid on a macsec interface.
+    #[serde(
+        default,
+        rename = "macsec-key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub macsec_key: Option<String>,
+    /// The peer's MAC address on the parent link for a `type = "macsec"` interface
+    /// — names the receive secure channel (the peer's SCI). Only valid on a macsec
+    /// interface.
+    #[serde(
+        default,
+        rename = "macsec-peer",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub macsec_peer: Option<String>,
     /// When set, networkd runs a built-in DHCP server on this interface, handing
     /// out leases from the interface's own static subnet. Requires a static
     /// `address` (the server needs a subnet to allocate from).
@@ -2927,6 +2946,10 @@ pub enum IfaceType {
     /// Lets one link carry several L2 identities (containers/VMs, a management
     /// address separate from the host, …).
     Macvlan,
+    /// A MACsec (802.1AE) device (roadmap C14): a `Kind=macsec` link on a `parent`
+    /// NIC that encrypts + authenticates every frame with a pre-shared key. Point
+    /// to point; the peer is named by its MAC (`macsec-peer`).
+    Macsec,
 }
 
 /// PPPoE client parameters (a `type = "pppoe"` interface). The session is
@@ -3270,6 +3293,10 @@ impl Interface {
     /// True for a MACVLAN pseudo-interface (`type = "macvlan"`, roadmap C14).
     pub fn is_macvlan(&self) -> bool {
         self.if_type == Some(IfaceType::Macvlan)
+    }
+    /// True for a MACsec (802.1AE) device (`type = "macsec"`, roadmap C14).
+    pub fn is_macsec(&self) -> bool {
+        self.if_type == Some(IfaceType::Macsec)
     }
     /// True for a VLAN subinterface (has both `parent` and `vlan`).
     pub fn is_vlan(&self) -> bool {
@@ -3641,7 +3668,7 @@ impl Appliance {
             // also carry a `parent` (the raw uplink NIC / the parent link) but no
             // `vlan`, so they are validated separately below — skip the pairing
             // rule for them.
-            if !iface.is_pppoe() && !iface.is_macvlan() {
+            if !iface.is_pppoe() && !iface.is_macvlan() && !iface.is_macsec() {
                 match (&iface.parent, iface.vlan) {
                     (Some(parent), Some(vlan)) => {
                         if !(1..=4094).contains(&vlan) {
@@ -3819,6 +3846,55 @@ impl Appliance {
             {
                 bail!(
                     "interface {:?}: local/remote/key/ttl require `type = \"gre\"|\"ipip\"|\"gretap\"`",
+                    iface.name
+                );
+            }
+
+            // MACsec (`type = macsec`, roadmap C14): a Kind=macsec link on a parent
+            // NIC, encrypted with a pre-shared key. Requires `parent`, a valid hex
+            // key (128- or 256-bit), and the peer's MAC; the key/peer fields are only
+            // valid on a macsec interface.
+            if iface.is_macsec() {
+                let Some(parent) = iface.parent.as_deref() else {
+                    bail!(
+                        "interface {:?}: a macsec interface needs a `parent` NIC to protect",
+                        iface.name
+                    );
+                };
+                // The macsec device pins its parent's MAC so its secure-channel id
+                // is deterministic and the peer can name it — so the parent must be
+                // declared with an explicit `mac`.
+                match self.interfaces.iter().find(|x| x.name == parent) {
+                    None => bail!(
+                        "interface {:?}: macsec parent {parent:?} is not a declared interface",
+                        iface.name
+                    ),
+                    Some(p) if p.mac.is_none() => bail!(
+                        "interface {:?}: macsec parent {parent:?} needs an explicit `mac` (the device inherits it for a stable SCI)",
+                        iface.name
+                    ),
+                    Some(_) => {}
+                }
+                let key = iface.macsec_key.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("interface {:?}: macsec needs a `macsec-key`", iface.name)
+                })?;
+                if !matches!(key.len(), 32 | 64) || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    bail!(
+                        "interface {:?}: macsec-key must be 32 hex chars (128-bit) or 64 (256-bit)",
+                        iface.name
+                    );
+                }
+                let peer = iface.macsec_peer.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "interface {:?}: macsec needs a `macsec-peer` MAC address",
+                        iface.name
+                    )
+                })?;
+                validate_mac(peer)
+                    .with_context(|| format!("interface {:?} macsec-peer", iface.name))?;
+            } else if iface.macsec_key.is_some() || iface.macsec_peer.is_some() {
+                bail!(
+                    "interface {:?}: macsec-key/macsec-peer require `type = \"macsec\"`",
                     iface.name
                 );
             }
