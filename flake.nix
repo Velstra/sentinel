@@ -509,9 +509,16 @@
               "sentinel-boot.service"
             ];
             requires = [ "sentinel-boot.service" ];
+            # The listen address defaults to localhost, but HA config sync
+            # (roadmap C21) widens it to receive pushes: `apply_configsync` writes
+            # /run/sentinel/api.env with SENTINEL_API_LISTEN=0.0.0.0:8080 and
+            # (re)starts this service. EnvironmentFile is read at start and, coming
+            # after Environment, overrides the default when present.
+            environment.SENTINEL_API_LISTEN = "127.0.0.1:8080";
             serviceConfig = {
               Type = "exec";
-              ExecStart = "${sentinel}/bin/sentinel api --listen 127.0.0.1:8080 --config /var/lib/sentinel/appliance.toml --token-file /var/lib/sentinel/api-token";
+              EnvironmentFile = "-/run/sentinel/api.env";
+              ExecStart = "${sentinel}/bin/sentinel api --listen $SENTINEL_API_LISTEN --config /var/lib/sentinel/appliance.toml --token-file /var/lib/sentinel/api-token";
               Restart = "on-failure";
               RestartSec = "5s";
             };
@@ -6719,6 +6726,95 @@
             )
           '';
         };
+
+        # HA config sync (roadmap C21): a commit on the primary pushes the running
+        # config to the backup's Sentinel API, which applies + persists it. The
+        # backup arms its receiving API with the shared secret; the primary points
+        # at it and commits a distinctive rule, which then appears in the backup's
+        # saved config. default-action accept so the firewall passes the API (tcp/
+        # 8080). Proves the pfSense-XMLRPC-analog sync over the existing REST API.
+        #   nix build .#checks.x86_64-linux.configsync -L
+        configsync =
+          let
+            node = hostname: addr: {
+              lib,
+              ...
+            }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce hostname;
+              networking.firewall.enable = lib.mkForce false;
+              networking.interfaces.eth1.ipv4.addresses = [
+                {
+                  address = addr;
+                  prefixLength = 24;
+                }
+              ];
+              virtualisation.vlans = [ 1 ];
+              virtualisation.memorySize = 2048;
+              services.velstra.interface = lib.mkForce "eth1";
+            };
+          in
+          pkgs.testers.runNixOSTest {
+            name = "sentinel-configsync";
+            nodes = {
+              primary = node "primary" "10.9.0.1";
+              backup = node "backup" "10.9.0.2";
+            };
+            testScript = ''
+              start_all()
+              for m in (primary, backup):
+                  m.wait_for_unit("multi-user.target")
+                  m.wait_for_unit("velstra.service")
+              primary.wait_until_succeeds("ip addr show eth1 | grep -q 10.9.0.1", timeout=20)
+              backup.wait_until_succeeds("ip addr show eth1 | grep -q 10.9.0.2", timeout=20)
+
+              # The backup arms the receiving side: the shared secret becomes its API
+              # token and widens the API to listen off-box.
+              backup.succeed(
+                  "su admin -c \"printf '%s\\n' "
+                  "'set firewall global default-action accept' "
+                  "'set interface eth1 zone lan' "
+                  "'set system config-sync secret shared-token-123' "
+                  "commit save exit "
+                  "| sentinel configure\""
+              )
+              backup.wait_for_unit("sentinel-api.service")
+              backup.wait_until_succeeds(
+                  "ss -tlnH 'sport = :8080' | grep -q LISTEN", timeout=30
+              )
+
+              # Sanity: the rule is not on the backup yet.
+              backup.fail("grep -q 'synced-rule' /var/lib/sentinel/appliance.toml")
+
+              # The primary points at the backup and commits a distinctive rule. The
+              # commit applies live AND pushes the running config to the backup.
+              primary.succeed(
+                  "su admin -c \"printf '%s\\n' "
+                  "'set firewall global default-action accept' "
+                  "'set interface eth1 zone lan' "
+                  "'set system config-sync secret shared-token-123' "
+                  "'set system config-sync peer 10.9.0.2' "
+                  "'set firewall rule synced-rule from lan' "
+                  "'set firewall rule synced-rule action accept' "
+                  "'set firewall rule synced-rule proto tcp' "
+                  "'set firewall rule synced-rule port 12345' "
+                  "commit save exit "
+                  "| sentinel configure\""
+              )
+
+              # The headline: the backup's SAVED config now carries the primary's
+              # rule — the push landed, was applied and persisted by the backup's API.
+              backup.wait_until_succeeds(
+                  "grep -q 'synced-rule' /var/lib/sentinel/appliance.toml", timeout=30
+              )
+              backup.succeed("grep -q '12345' /var/lib/sentinel/appliance.toml")
+              # And the backup applied it live: the compiled data-plane config has it.
+              backup.wait_until_succeeds(
+                  "grep -q '12345' /run/sentinel/velstra.toml", timeout=20
+              )
+            '';
+          };
       };
     };
 }
