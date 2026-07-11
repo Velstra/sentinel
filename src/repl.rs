@@ -1254,7 +1254,8 @@ const SNMP_FIELDS: &[Cand] = &[
         "source subnets allowed to poll (comma-separated CIDRs)",
     ),
 ];
-// `services ssh <Tab>` reveals the SSH management fields (key-only sshd).
+// `services ssh <Tab>` reveals the SSH DAEMON fields (per-user keys live under
+// `system login`).
 const SSH_FIELDS: &[Cand] = &[
     ("enable", "run the SSH daemon (true|false; default true)"),
     ("port", "TCP port sshd listens on (default 22)"),
@@ -1263,8 +1264,19 @@ const SSH_FIELDS: &[Cand] = &[
         "restrict sshd to one local address (default: all)",
     ),
     (
-        "authorized-key",
-        "an OpenSSH public key allowed to log in as admin (repeatable)",
+        "password-authentication",
+        "allow password logins over SSH (true|false; default false, key-only)",
+    ),
+];
+// `system login <name> <Tab>` reveals a local account's fields (VyOS-style).
+const LOGIN_FIELDS: &[Cand] = &[
+    (
+        "ssh-key",
+        "an OpenSSH public key allowed to log in as this user (repeatable)",
+    ),
+    (
+        "hashed-password",
+        "a crypt(3) password hash for console+sudo ($6$… from mkpasswd)",
     ),
 ];
 // `services mdns <Tab>` reveals the reflector fields.
@@ -1723,7 +1735,10 @@ const NAT64_FIELDS: &[Cand] = &[
     ),
     ("dns64", "synthesize AAAA for v4-only names (true|false)"),
 ];
-const SYSTEM_FIELDS: &[Cand] = &[("hostname", "the appliance hostname")];
+const SYSTEM_FIELDS: &[Cand] = &[
+    ("hostname", "the appliance hostname"),
+    ("login", "a local login account (by username): ssh-key / hashed-password"),
+];
 const GLOBAL_FIELDS: &[Cand] = &[
     (
         "stateful",
@@ -2193,7 +2208,8 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set", "services", "lldp", "enable"] => BOOLS,
         ["set" | "delete", "services", "snmp"] => SNMP_FIELDS,
         ["set" | "delete", "services", "ssh"] => SSH_FIELDS,
-        ["set", "services", "ssh", "enable"] => BOOLS,
+        ["set", "services", "ssh", "enable" | "password-authentication"] => BOOLS,
+        ["set" | "delete", "system", "login", _name] => LOGIN_FIELDS,
         ["set" | "delete", "services", "mdns"] => MDNS_FIELDS,
         ["set" | "delete", "services", "dyndns"] => DYNDNS_FIELDS,
         ["set", "services", "dyndns", "provider"] => DYNDNS_PROVIDERS,
@@ -2811,7 +2827,7 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
         ["set", "services", "dns" | "ntp", "upstream"] => own_cands(&[PH_IPV4, PH_IPV6]),
         ["set", "services", "snmp", "listen"] => own_cands(&[PH_IPV4]),
         ["set", "services", "ssh", "listen-address"] => own_cands(&[PH_IPV4]),
-        ["set", "services", "ssh", "authorized-key"] => own_cands(&[PH_KEY]),
+        ["set", "system", "login", _name, "ssh-key"] => own_cands(&[PH_KEY]),
         ["set", "services", "snmp", "community"] => own_cands(&[PH_KEY]),
         ["set", "services", "snmp", "location" | "contact"] => own_cands(&[PH_TEXT]),
         ["set", "services", "dhcp-relay", "server"] => own_cands(&[PH_IPV4]),
@@ -3217,7 +3233,7 @@ mod tests {
                 "update"
             ]
         );
-        assert_eq!(kw(&["set", "system"]), ["hostname"]);
+        assert_eq!(kw(&["set", "system"]), ["hostname", "login"]);
         assert_eq!(
             kw(&["set", "interface", "wan0"]),
             [
@@ -3455,9 +3471,13 @@ mod tests {
         );
         assert_eq!(
             kw(&["set", "services", "ssh"]),
-            ["enable", "port", "listen-address", "authorized-key"]
+            ["enable", "port", "listen-address", "password-authentication"]
         );
         assert_eq!(kw(&["set", "services", "ssh", "enable"]), ["true", "false"]);
+        assert_eq!(
+            kw(&["set", "system", "login", "ops"]),
+            ["ssh-key", "hashed-password"]
+        );
         assert_eq!(kw(&["set", "services", "lldp"]), ["enable", "interface"]);
         assert_eq!(
             kw(&["set", "services", "lldp", "enable"]),

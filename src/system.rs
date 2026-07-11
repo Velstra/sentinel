@@ -402,6 +402,43 @@ pub fn service_start(unit: &str) -> Result<()> {
     run_priv("systemctl", &["start", unit])
 }
 
+/// Ensure a local login account exists (roadmap C21, `[[system.login]]`). A no-op
+/// when the user is already present (the built-in `admin`, or a prior commit's
+/// account); otherwise `useradd -m -G wheel` creates it with a home, sudo/console
+/// access via `wheel`, and the appliance login shell. Needs `mutableUsers` on.
+pub fn ensure_login_account(user: &str) -> Result<()> {
+    let present = Command::new(bin("id"))
+        .arg("-u")
+        .arg(user)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if present {
+        return Ok(());
+    }
+    run_priv(
+        "useradd",
+        &[
+            "-m",
+            "-G",
+            "wheel",
+            "-s",
+            "/run/current-system/sw/bin/bash",
+            user,
+        ],
+    )
+}
+
+/// Set a login account's password to a pre-hashed crypt(3) value (`chpasswd`-style)
+/// via `usermod -p`. The hash is passed as an argv element — never through a shell —
+/// so its `$`-laden crypt form needs no escaping and cannot be expanded or logged by
+/// a shell. Validation already guarantees it is a hash, not a plaintext password.
+pub fn set_login_password(user: &str, hash: &str) -> Result<()> {
+    run_priv("usermod", &["-p", hash, user])
+}
+
 /// Make systemd re-read unit files after Sentinel wrote/removed one under
 /// `/run/systemd/system` (e.g. the dynamic time-based-rules timer). Required
 /// before starting a freshly written unit.
@@ -511,6 +548,10 @@ pub fn bin(name: &str) -> String {
         "mkdir" => "SENTINEL_MKDIR_BIN",
         "chmod" => "SENTINEL_CHMOD_BIN",
         "rm" => "SENTINEL_RM_BIN",
+        // local login accounts ([[system.login]], roadmap C21)
+        "useradd" => "SENTINEL_USERADD_BIN",
+        "usermod" => "SENTINEL_USERMOD_BIN",
+        "id" => "SENTINEL_ID_BIN",
         "uname" => "SENTINEL_UNAME_BIN",
         // installer tools
         "sgdisk" => "SENTINEL_SGDISK_BIN",
