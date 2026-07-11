@@ -6541,6 +6541,82 @@
               )
             '';
           };
+
+        # OSPFv3 (OSPF for IPv6, RFC 5340, wren) between two Sentinels — the IPv6
+        # counterpart to checks.ospf. Each node gives eth1 a v6 subnet (so the
+        # routers are on-link and form an adjacency over their link-local
+        # addresses), originates a unique IPv6 network as a static on lo, and
+        # redistributes it into OSPFv3. default-action accept so the WAN policy
+        # passes OSPFv3's multicast (IPv6 next-header 89, ff02::5/6) — velstra's v6
+        # path passes it under the default policy, the same way OSPFv2 works.
+        #   nix build .#checks.x86_64-linux.ospf3 -L
+        ospf3 =
+          let
+            node = hostname: {
+              lib,
+              ...
+            }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce hostname;
+              networking.firewall.enable = lib.mkForce false;
+              virtualisation.vlans = [ 1 ];
+              virtualisation.memorySize = 2048;
+              services.velstra.interface = lib.mkForce "eth1";
+            };
+          in
+          pkgs.testers.runNixOSTest {
+            name = "sentinel-ospf3";
+            nodes = {
+              ospf31 = node "ospf31";
+              ospf32 = node "ospf32";
+            };
+            testScript = ''
+              start_all()
+              for m in (ospf31, ospf32):
+                  m.wait_for_unit("multi-user.target")
+                  m.wait_for_unit("velstra.service")
+                  m.wait_for_unit("wren.service")
+
+              # Sentinel assigns the v6 address on eth1 itself (address6), so the two
+              # routers share an on-link subnet; each originates a unique v6 net.
+              def configure(m, routerid, myaddr6, mynet6):
+                  m.succeed(
+                      "su admin -c \"printf '%s\\n' "
+                      "'set firewall global default-action accept' "
+                      "'set interface eth1 zone wan' "
+                      f"'set interface eth1 address6 {myaddr6}' "
+                      f"'set protocols router-id {routerid}' "
+                      f"'set protocols static {mynet6} dev lo' "
+                      "'set protocols ospf3 interface eth1' "
+                      "'set protocols ospf3 area 0.0.0.0' "
+                      "'set protocols ospf3 network-type point-to-point' "
+                      "'set protocols ospf3 redistribute static' "
+                      "commit save exit "
+                      "| sentinel configure\""
+                  )
+                  m.wait_for_unit("wren.service")
+
+              configure(ospf31, "10.10.0.1", "2001:db8:0::1/64", "2001:db8:11::/64")
+              configure(ospf32, "10.10.0.2", "2001:db8:0::2/64", "2001:db8:12::/64")
+
+              # The compiled Wren config carries the OSPFv3 block.
+              ospf31.succeed("grep -q '\\[ospf3\\]' /run/sentinel/wren.toml")
+
+              # Each router learns the OTHER's IPv6 network over OSPFv3 and installs
+              # it into the kernel IPv6 FIB (proto ospf). Adjacency + SPF take a
+              # little while, so retry generously.
+              ospf31.wait_until_succeeds(
+                  "ip -6 route show proto ospf | grep -q '2001:db8:12::/64'", timeout=120
+              )
+              ospf32.wait_until_succeeds(
+                  "ip -6 route show proto ospf | grep -q '2001:db8:11::/64'", timeout=120
+              )
+
+              # And the OSPFv3 adjacency is Full.
+              ospf31.succeed("wren show ospf3 neighbors | grep -qi full")
+            '';
+          };
       };
     };
 }
