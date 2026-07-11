@@ -118,6 +118,38 @@ fn macsec_sa_setup_body(ifaces: &[Interface]) -> Option<String> {
     any.then_some(body)
 }
 
+/// The `ip l2tp` setup script that creates every L2TPv3 (roadmap C14) Ethernet
+/// pseudowire — run by the `sentinel-l2tp` unit (networkd has no L2TPv3 netdev, so
+/// the tunnels are built imperatively). Each tunnel is torn down (best effort) then
+/// recreated so a live reconfigure is idempotent; the `key` is the shared tunnel/
+/// session id (both ends use it symmetrically). networkd then addresses the
+/// resulting `<name>` link via its `.network`. Returns `None` when none configured.
+fn l2tp_setup_body(ifaces: &[Interface]) -> Option<String> {
+    let mut body = String::from("#!/bin/sh\n# rendered by sentinel — L2TPv3 pseudowires\n");
+    let mut any = false;
+    for i in ifaces.iter().filter(|i| i.is_l2tpv3()) {
+        let (Some(local), Some(remote), Some(id)) =
+            (i.local.as_deref(), i.remote.as_deref(), i.tunnel_key)
+        else {
+            continue;
+        };
+        let dev = &i.name;
+        body.push_str(&format!(
+            "ip l2tp del session tunnel_id {id} session_id {id} 2>/dev/null || true\n"
+        ));
+        body.push_str(&format!("ip l2tp del tunnel tunnel_id {id} 2>/dev/null || true\n"));
+        body.push_str(&format!(
+            "ip l2tp add tunnel tunnel_id {id} peer_tunnel_id {id} encap ip local {local} remote {remote}\n"
+        ));
+        body.push_str(&format!(
+            "ip l2tp add session name {dev} tunnel_id {id} session_id {id} peer_session_id {id}\n"
+        ));
+        body.push_str(&format!("ip link set {dev} up\n"));
+        any = true;
+    }
+    any.then_some(body)
+}
+
 /// The `[BridgeVLAN]` port section for a member of a VLAN-aware bridge: a `VLAN=`
 /// per tagged id, plus `PVID=`/`EgressUntagged=` for the single untagged VLAN.
 /// networkd merges the keys, so one section suffices. Empty when the port has no
@@ -169,9 +201,11 @@ fn virtual_l2_netdev_body(iface: &Interface) -> String {
             | IfaceType::Ipip
             | IfaceType::Gretap
             // MACVLAN and MACsec get their own netdev renderers (macvlan_netdev_body
-            // / macsec_netdev_body), not this virtual-L2 one.
+            // / macsec_netdev_body); L2TPv3 is built imperatively via `ip l2tp`.
+            // None of them use this virtual-L2 renderer.
             | IfaceType::Macvlan
-            | IfaceType::Macsec,
+            | IfaceType::Macsec
+            | IfaceType::L2tpv3,
         ) => String::new(),
     }
 }
@@ -748,6 +782,12 @@ const DHCP6_UNIT: &str = "sentinel-dhcp6.service";
 const MACSEC_SETUP: &str = "/run/sentinel/macsec/setup.sh";
 const MACSEC_UNIT: &str = "sentinel-macsec.service";
 
+/// L2TPv3 (roadmap C14): networkd has no L2TPv3 device, so the static Ethernet
+/// pseudowires are built by this Sentinel-owned unit via `ip l2tp`; networkd then
+/// addresses the resulting links.
+const L2TP_SETUP: &str = "/run/sentinel/l2tp/setup.sh";
+const L2TP_UNIT: &str = "sentinel-l2tp.service";
+
 const NAT64_DIR: &str = "/run/sentinel/nat64";
 const TAYGA_CONF: &str = "/run/sentinel/nat64/tayga.conf";
 const TAYGA_SETUP: &str = "/run/sentinel/nat64/setup.sh";
@@ -1028,6 +1068,14 @@ fn apply_box_services(appliance: &Appliance) -> Result<()> {
         Path::new(MACSEC_SETUP),
         macsec_sa_setup_body(&appliance.interfaces),
         true,
+    )?;
+    // L2TPv3 pseudowires (roadmap C14): imperative `ip l2tp` setup, run after
+    // networkd (which then addresses the created links). No secret.
+    apply_box_service(
+        L2TP_UNIT,
+        Path::new(L2TP_SETUP),
+        l2tp_setup_body(&appliance.interfaces),
+        false,
     )?;
     Ok(())
 }
@@ -2358,6 +2406,27 @@ mod tests {
             "{s}"
         );
         assert!(macsec_sa_setup_body(&[iface_addr("eth0", "10.0.0.1/24")]).is_none());
+    }
+
+    #[test]
+    fn l2tp_setup_renders_ip_l2tp_tunnel_and_session() {
+        let mut l = iface_addr("l2tp0", "192.168.5.1/24");
+        l.if_type = Some(IfaceType::L2tpv3);
+        l.local = Some("10.0.0.1".into());
+        l.remote = Some("10.0.0.2".into());
+        l.tunnel_key = Some(100);
+        let s = l2tp_setup_body(std::slice::from_ref(&l)).expect("configured");
+        assert!(
+            s.contains("ip l2tp add tunnel tunnel_id 100 peer_tunnel_id 100 encap ip local 10.0.0.1 remote 10.0.0.2"),
+            "{s}"
+        );
+        assert!(
+            s.contains("ip l2tp add session name l2tp0 tunnel_id 100 session_id 100 peer_session_id 100"),
+            "{s}"
+        );
+        assert!(s.contains("ip link set l2tp0 up"), "{s}");
+        // No l2tpv3 interfaces ⇒ no script.
+        assert!(l2tp_setup_body(&[iface_addr("eth0", "10.0.0.1/24")]).is_none());
     }
 
     #[test]

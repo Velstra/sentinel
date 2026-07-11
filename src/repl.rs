@@ -1803,7 +1803,7 @@ const IFACE_FIELDS: &[Cand] = &[
     ("router-advert", "emit IPv6 Router Advertisements (SLAAC)"),
     (
         "type",
-        "bridge | bond | wireguard | pppoe | gre | ipip | gretap | macvlan | macsec",
+        "bridge | bond | wireguard | pppoe | gre | ipip | gretap | macvlan | macsec | l2tpv3",
     ),
     ("local", "tunnel local endpoint IP (type gre/ipip/gretap)"),
     ("remote", "tunnel remote endpoint IP (type gre/ipip/gretap)"),
@@ -1871,6 +1871,10 @@ const IFACE_TYPES: &[Cand] = &[
     (
         "macsec",
         "an encrypted MACsec (802.1AE) link on a `parent` (PSK; `macsec-key`/`macsec-peer`)",
+    ),
+    (
+        "l2tpv3",
+        "an L2TPv3 Ethernet pseudowire between `local`/`remote` IPs (`key` = tunnel id)",
     ),
 ];
 const MACVLAN_MODES: &[Cand] = &[
