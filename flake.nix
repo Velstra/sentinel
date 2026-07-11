@@ -6340,6 +6340,105 @@
             )
           '';
         };
+
+        # VRRP first-hop redundancy (roadmap C9 / wren RFC 5798): two Sentinels on a
+        # shared L2 segment share one virtual IP under the same VRID. The higher-
+        # priority box is master and owns the VIP; when it fails the backup claims
+        # it, and it is preempted back on recovery. wren runs the real VRRP state
+        # machine (IPPROTO_VRRP socket + netlink VIP assignment). The adverts are
+        # multicast IP proto 112 — `default-action accept` lets the WAN policy pass
+        # them, the same posture the bgp/ospf checks use for control-plane traffic.
+        #   nix build .#checks.x86_64-linux.vrrp -L
+        vrrp =
+          let
+            node = hostname: addr: {
+              lib,
+              ...
+            }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce hostname;
+              networking.firewall.enable = lib.mkForce false;
+              networking.interfaces.eth1.ipv4.addresses = [
+                {
+                  address = addr;
+                  prefixLength = 24;
+                }
+              ];
+              virtualisation.vlans = [ 1 ];
+              virtualisation.memorySize = 2048;
+              services.velstra.interface = lib.mkForce "eth1";
+            };
+          in
+          pkgs.testers.runNixOSTest {
+            name = "sentinel-vrrp";
+            nodes = {
+              vr1 = node "vr1" "10.20.0.1";
+              vr2 = node "vr2" "10.20.0.2";
+            };
+            testScript = ''
+              start_all()
+              for m in (vr1, vr2):
+                  m.wait_for_unit("multi-user.target")
+                  m.wait_for_unit("velstra.service")
+                  m.wait_for_unit("wren.service")
+              vr1.wait_until_succeeds("ip addr show eth1 | grep -q 10.20.0.1", timeout=20)
+              vr2.wait_until_succeeds("ip addr show eth1 | grep -q 10.20.0.2", timeout=20)
+
+              def configure(m, prio):
+                  m.succeed(
+                      "su admin -c \"printf '%s\\n' "
+                      "'set firewall global default-action accept' "
+                      "'set interface eth1 zone wan' "
+                      "'set protocols vrrp VR interface eth1' "
+                      "'set protocols vrrp VR vrid 20' "
+                      f"'set protocols vrrp VR priority {prio}' "
+                      "'set protocols vrrp VR virtual-address 10.20.0.100' "
+                      "'set protocols vrrp VR prefix-length 24' "
+                      "'set protocols vrrp VR advert-interval 500' "
+                      "'set protocols vrrp VR preempt true' "
+                      "commit save exit "
+                      "| sentinel configure\""
+                  )
+                  m.wait_for_unit("wren.service")
+
+              configure(vr1, 200)
+              configure(vr2, 100)
+
+              # The compiled wren config carries the VRRP block.
+              vr1.succeed("grep -q 'vrid = 20' /run/sentinel/wren.toml")
+              vr1.succeed('grep -q "10.20.0.100" /run/sentinel/wren.toml')
+
+              # Headline 1 — the higher-priority box (vr1) becomes master and owns
+              # the VIP; the backup (vr2) hears its adverts and must NOT hold it.
+              vr1.wait_until_succeeds("ip addr show eth1 | grep -q 10.20.0.100", timeout=40)
+              vr2.wait_until_succeeds(
+                  "! ip addr show eth1 | grep -q 10.20.0.100", timeout=40
+              )
+              # The VIP answers on the wire: the backup can ping it (gratuitous ARP
+              # announced it, and the firewall passes the VRRP adverts + ICMP).
+              vr2.wait_until_succeeds("ping -c1 -W2 10.20.0.100", timeout=20)
+
+              # Headline 2 — the master fails: stopping wren on vr1 relinquishes
+              # mastership (graceful shutdown → the VIP is released), so vr2 takes over.
+              vr1.succeed("systemctl stop wren.service")
+              vr2.wait_until_succeeds("ip addr show eth1 | grep -q 10.20.0.100", timeout=30)
+              vr1.wait_until_succeeds(
+                  "! ip addr show eth1 | grep -q 10.20.0.100", timeout=30
+              )
+              # The VIP is still reachable — now served by the backup (vr1 is up,
+              # only its wren is down, so it can still probe the wire).
+              vr1.wait_until_succeeds("ping -c1 -W2 10.20.0.100", timeout=20)
+
+              # Headline 3 — the master recovers: restarting wren on vr1 preempts
+              # (higher priority) and reclaims the VIP; vr2 steps back to backup.
+              vr1.succeed("systemctl start wren.service")
+              vr1.wait_until_succeeds("ip addr show eth1 | grep -q 10.20.0.100", timeout=40)
+              vr2.wait_until_succeeds(
+                  "! ip addr show eth1 | grep -q 10.20.0.100", timeout=40
+              )
+            '';
+          };
       };
     };
 }
