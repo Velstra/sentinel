@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-07-11
+
 Completes NAT and the interface-type matrix, adds time-based firewall rules and a
 stateful DHCPv6 server, and brings high availability to the appliance: CLI-
 configurable SSH with per-user logins, and config sync across an HA pair. Ships
