@@ -439,6 +439,52 @@ pub fn set_login_password(user: &str, hash: &str) -> Result<()> {
     run_priv("usermod", &["-p", hash, user])
 }
 
+/// Install the shared HA-sync bearer token at `path`, mode 0600 (root). Staged in
+/// the wheel-writable `/run/sentinel` then `install`-ed, so it works both as the
+/// admin (`configure`) and as root (boot) — mirrors [`install_secret_file`] but
+/// 0600 root:root (the API reads it as root; no other reader needs it).
+pub fn install_token(path: &Path, secret: &str) -> Result<()> {
+    let tmp = Path::new("/run/sentinel").join(".api-token.tmp");
+    std::fs::write(&tmp, secret).with_context(|| format!("staging {}", tmp.display()))?;
+    let (Some(tmp_s), Some(dst_s)) = (tmp.to_str(), path.to_str()) else {
+        bail!("non-UTF-8 path");
+    };
+    sudo("install", &["-m", "0600", tmp_s, dst_s])
+}
+
+/// PUT a config body (a file of JSON) to a peer's Sentinel API for HA config sync
+/// (roadmap C21). Best-effort at the call site — a down peer must not fail the local
+/// commit. The bearer token is an argv element (no shell), so it is never expanded
+/// or logged; a short timeout keeps a commit from hanging on an unreachable peer.
+pub fn curl_put_config(url: &str, token: &str, body_file: &Path) -> Result<()> {
+    let auth = format!("Authorization: Bearer {token}");
+    let data = format!("@{}", body_file.display());
+    let status = Command::new(bin("curl"))
+        .args([
+            "-sS",
+            "-f",
+            "--max-time",
+            "10",
+            "-X",
+            "PUT",
+            "-H",
+            "Content-Type: application/json",
+            "-H",
+            &auth,
+            "--data-binary",
+            &data,
+            url,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| format!("running curl to {url}"))?;
+    if !status.success() {
+        bail!("curl PUT {url} failed");
+    }
+    Ok(())
+}
+
 /// Make systemd re-read unit files after Sentinel wrote/removed one under
 /// `/run/systemd/system` (e.g. the dynamic time-based-rules timer). Required
 /// before starting a freshly written unit.

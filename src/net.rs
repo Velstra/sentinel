@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::config::{
     Appliance, DhcpRelay, DhcpServer, Dns, Dyndns, IfaceType, Interface, Lldp, Mdns, MultiWan,
@@ -1294,6 +1294,83 @@ fn apply_logins(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     Ok(())
 }
 
+// HA config sync (roadmap C21). The RECEIVING side: when a `secret` is set, share it
+// as the API's bearer token and widen the API to listen off-box so a peer can push
+// here. The env file overrides the unit's default `SENTINEL_API_LISTEN`.
+const API_TOKEN: &str = "/var/lib/sentinel/api-token";
+const API_ENV: &str = "/run/sentinel/api.env";
+const API_UNIT: &str = "sentinel-api.service";
+
+/// Reconcile the receiving side of HA config sync to `[system.config-sync]`: a
+/// configured `secret` becomes the API's bearer token and the API is widened +
+/// started so a peer may push here; removing config sync stops it again. Live only
+/// touches the unit; at boot the API starts on its own with the files in place.
+fn apply_configsync(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
+    let cs = &appliance.system.config_sync;
+    match &cs.secret {
+        Some(secret) => {
+            system::install_token(Path::new(API_TOKEN), secret)?;
+            let env = "SENTINEL_API_LISTEN=0.0.0.0:8080\n";
+            let changed = file_changed(Path::new(API_ENV), env);
+            system::install_file(Path::new(API_ENV), env)?;
+            if mode == ApplyMode::Live {
+                // EnvironmentFile is read at start; restart to pick up a widened
+                // listen / rotated token, else just ensure it is running.
+                let r = if changed {
+                    system::service_restart(API_UNIT)
+                } else {
+                    system::service_start(API_UNIT)
+                };
+                if let Err(e) = r {
+                    eprintln!("warning: (re)starting {API_UNIT} failed: {e}");
+                }
+            }
+        }
+        None => {
+            if Path::new(API_ENV).exists() {
+                if mode == ApplyMode::Live {
+                    let _ = system::service_stop(API_UNIT);
+                }
+                system::remove_file(Path::new(API_ENV))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The SENDING side of HA config sync (roadmap C21): push the just-committed config
+/// to every `[system.config-sync] peer` via its Sentinel API (`PUT /api/v1/config`,
+/// bearer = the shared secret), which applies + persists it. Called from the
+/// interactive `commit` ONLY — never from the API's own PUT handler — so a received
+/// sync does not re-push and a pair never loops. Best-effort per peer: a down backup
+/// warns but does not fail the local commit.
+pub fn push_config_to_peers(appliance: &Appliance) -> Result<()> {
+    let cs = &appliance.system.config_sync;
+    if cs.peers.is_empty() {
+        return Ok(());
+    }
+    let Some(secret) = &cs.secret else {
+        return Ok(());
+    };
+    let json = serde_json::to_string(appliance).context("serializing config for sync")?;
+    let tmp = Path::new("/run/sentinel/.configsync.json");
+    std::fs::write(tmp, &json).with_context(|| format!("staging {}", tmp.display()))?;
+    for peer in &cs.peers {
+        // `host` → default API port; `host:port` (or `[v6]:port`) → used as given.
+        let url = if peer.contains(':') {
+            format!("http://{peer}/api/v1/config")
+        } else {
+            format!("http://{peer}:8080/api/v1/config")
+        };
+        match system::curl_put_config(&url, secret, tmp) {
+            Ok(()) => eprintln!("  config-sync → {peer}"),
+            Err(e) => eprintln!("warning: config-sync to {peer} failed: {e}"),
+        }
+    }
+    let _ = std::fs::remove_file(tmp);
+    Ok(())
+}
+
 // --- NAT64 + DNS64 (roadmap C10) -------------------------------------------
 //
 // tayga translates an IPv6-only segment's traffic to `64:ff9b::<v4>` into real
@@ -2354,6 +2431,9 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     // SSH management access (roadmap C21): the persistent authorized_keys + the
     // Port/ListenAddress drop-in; sshd (re)started only in Live mode.
     apply_ssh(appliance, mode)?;
+    // HA config sync (roadmap C21): the receiving side — share the token + widen
+    // the API when a secret is set. The sending side (push) is driven from commit.
+    apply_configsync(appliance, mode)?;
     Ok(())
 }
 

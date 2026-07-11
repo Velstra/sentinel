@@ -14,6 +14,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::{
     Acme, Action, Appliance, Bfd, Bgp, BgpAggregate, BgpNeighbor, BgpRoa, BgpRtr, Ca, Certificate,
+    ConfigSync,
     Dhcp6Pool, DhcpRelay, DhcpServer, DhcpStaticLease, Dns, Dyndns, Export, Filter, FilterRule, Firewall,
     Groups, HealthCheck, IfaceType, Interface, IpsecConnection, Isis, Lldp, Login, Mdns, MultiWan,
     Multicast, MulticastInterface, Nat, Nat64, NatDestination, NatNpt66, NatSource, Ntp,
@@ -1132,6 +1133,8 @@ struct Draft {
     ssh: Ssh,
     /// Local login accounts (`[[system.login]]`), in configuration order.
     logins: Vec<Login>,
+    /// HA config sync (`[system.config-sync]`). A plain owned struct.
+    config_sync: ConfigSync,
     mdns: MdnsDraft,
     dyndns: DyndnsDraft,
     dhcp_relay: DhcpRelayDraft,
@@ -2007,6 +2010,7 @@ impl Draft {
             },
             ssh: a.services.ssh.clone(),
             logins: a.system.logins.clone(),
+            config_sync: a.system.config_sync.clone(),
             mdns: MdnsDraft {
                 interface: a.services.mdns.interface.clone(),
             },
@@ -3082,6 +3086,16 @@ impl Session {
             }
             ["system", "login", name, "hashed-password", v] => {
                 self.draft.login_mut(name).hashed_password = Some((*v).to_string());
+            }
+
+            // system config-sync: push the running config to peer firewalls on
+            // every commit (HA). `peer` is a host or host:port; `secret` the shared
+            // bearer token (also arms this box's receiving API).
+            ["system", "config-sync", "peer", v] => {
+                append_csv(&mut self.draft.config_sync.peers, v);
+            }
+            ["system", "config-sync", "secret", v] => {
+                self.draft.config_sync.secret = Some((*v).to_string());
             }
 
             // services mdns: box-wide mDNS reflector (avahi).
@@ -4712,6 +4726,15 @@ impl Session {
                     }
                 }
             }
+            ["system", "config-sync"] => self.draft.config_sync = ConfigSync::default(),
+            ["system", "config-sync", field] => {
+                let c = &mut self.draft.config_sync;
+                match *field {
+                    "peer" => c.peers.clear(),
+                    "secret" => c.secret = None,
+                    other => bail!("system config-sync has no field {other:?}"),
+                }
+            }
             ["services", "mdns"] => self.draft.mdns = MdnsDraft::default(),
             ["services", "mdns", field] => {
                 let m = &mut self.draft.mdns;
@@ -6144,6 +6167,7 @@ impl Session {
             system: System {
                 hostname,
                 logins: self.draft.logins.clone(),
+                config_sync: self.draft.config_sync.clone(),
             },
             firewall,
             zones,
@@ -6338,7 +6362,9 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         Some(o) => o == section,
     };
     let mut out = String::new();
-    if want("system") && (draft.hostname.is_some() || !draft.logins.is_empty()) {
+    let cs = &draft.config_sync;
+    let cs_set = !cs.peers.is_empty() || cs.secret.is_some();
+    if want("system") && (draft.hostname.is_some() || !draft.logins.is_empty() || cs_set) {
         out.push_str("system {\n");
         if let Some(h) = &draft.hostname {
             out.push_str(&format!("    hostname {h}\n"));
@@ -6350,6 +6376,16 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             }
             if let Some(h) = &l.hashed_password {
                 out.push_str(&format!("        hashed-password {h}\n"));
+            }
+            out.push_str("    }\n");
+        }
+        if cs_set {
+            out.push_str("    config-sync {\n");
+            if !cs.peers.is_empty() {
+                out.push_str(&format!("        peer {}\n", cs.peers.join(",")));
+            }
+            if let Some(s) = &cs.secret {
+                out.push_str(&format!("        secret {s}\n"));
             }
             out.push_str("    }\n");
         }

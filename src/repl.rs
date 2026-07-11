@@ -361,6 +361,13 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
     if appliance.system.hostname != old_host {
         eprintln!("  hostname: {old_host} -> {}", appliance.system.hostname);
     }
+    // HA config sync (roadmap C21): push the just-applied running config to any
+    // configured peers. Best-effort — a down peer warns but never fails the commit.
+    // Only the interactive commit pushes (never the API's own PUT handler), so a
+    // received sync does not re-push and a pair never loops.
+    if let Err(e) = crate::net::push_config_to_peers(&appliance) {
+        eprintln!("{} config-sync: {e}", ui::yellow("warning:"));
+    }
     eprintln!(
         "{} commit ok: applied live {}",
         ui::green("✔"),
@@ -1738,6 +1745,12 @@ const NAT64_FIELDS: &[Cand] = &[
 const SYSTEM_FIELDS: &[Cand] = &[
     ("hostname", "the appliance hostname"),
     ("login", "a local login account (by username): ssh-key / hashed-password"),
+    ("config-sync", "push the running config to peer firewalls on commit (HA)"),
+];
+// `system config-sync <Tab>` reveals the HA config-sync fields.
+const CONFIGSYNC_FIELDS: &[Cand] = &[
+    ("peer", "a peer firewall to push to — host or host:port (repeatable)"),
+    ("secret", "the shared bearer token both peers present"),
 ];
 const GLOBAL_FIELDS: &[Cand] = &[
     (
@@ -2210,6 +2223,7 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "services", "ssh"] => SSH_FIELDS,
         ["set", "services", "ssh", "enable" | "password-authentication"] => BOOLS,
         ["set" | "delete", "system", "login", _name] => LOGIN_FIELDS,
+        ["set" | "delete", "system", "config-sync"] => CONFIGSYNC_FIELDS,
         ["set" | "delete", "services", "mdns"] => MDNS_FIELDS,
         ["set" | "delete", "services", "dyndns"] => DYNDNS_FIELDS,
         ["set", "services", "dyndns", "provider"] => DYNDNS_PROVIDERS,
@@ -2828,6 +2842,7 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
         ["set", "services", "snmp", "listen"] => own_cands(&[PH_IPV4]),
         ["set", "services", "ssh", "listen-address"] => own_cands(&[PH_IPV4]),
         ["set", "system", "login", _name, "ssh-key"] => own_cands(&[PH_KEY]),
+        ["set", "system", "config-sync", "peer"] => own_cands(&[PH_IPV4]),
         ["set", "services", "snmp", "community"] => own_cands(&[PH_KEY]),
         ["set", "services", "snmp", "location" | "contact"] => own_cands(&[PH_TEXT]),
         ["set", "services", "dhcp-relay", "server"] => own_cands(&[PH_IPV4]),
@@ -3233,7 +3248,11 @@ mod tests {
                 "update"
             ]
         );
-        assert_eq!(kw(&["set", "system"]), ["hostname", "login"]);
+        assert_eq!(kw(&["set", "system"]), ["hostname", "login", "config-sync"]);
+        assert_eq!(
+            kw(&["set", "system", "config-sync"]),
+            ["peer", "secret"]
+        );
         assert_eq!(
             kw(&["set", "interface", "wan0"]),
             [
