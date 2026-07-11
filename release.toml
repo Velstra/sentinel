@@ -1,0 +1,26 @@
+# cargo-release configuration (https://github.com/crate-ci/cargo-release).
+#
+# Sentinel is an appliance, not a crates.io crate (`publish = false` in
+# Cargo.toml). Releases are tag-based. Cut one with, e.g.:
+#
+#   cargo release minor        # 0.2.x -> 0.3.0   (new features)
+#   cargo release patch        # 0.3.0 -> 0.3.1   (a bug-fix release)
+#
+# That bumps Cargo.toml, stamps this version + today's date into CHANGELOG.md
+# (the `## [Unreleased]` section), makes a GPG-signed commit and a signed
+# `vX.Y.Z` tag, and pushes. Pushing the tag triggers .github/workflows/release.yml,
+# which publishes a GitHub release whose body is that version's CHANGELOG section.
+
+sign-commit = true
+sign-tag = true
+publish = false
+push = true
+tag-name = "v{{version}}"
+pre-release-commit-message = "release: sentinel {{version}}"
+tag-message = "sentinel {{version}}"
+
+[[pre-release-replacements]]
+file = "CHANGELOG.md"
+search = "## \\[Unreleased\\]"
+replace = "## [Unreleased]\n\n## [{{version}}] — {{date}}"
+exactly = 1
