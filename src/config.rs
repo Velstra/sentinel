@@ -528,6 +528,9 @@ pub struct Services {
     /// Read-only SNMP agent (`[services.snmp]`).
     #[serde(default, skip_serializing_if = "Snmp::is_empty")]
     pub snmp: Snmp,
+    /// SSH management access (`[services.ssh]`).
+    #[serde(default, skip_serializing_if = "Ssh::is_empty")]
+    pub ssh: Ssh,
     /// mDNS reflector (`[services.mdns]`).
     #[serde(default, skip_serializing_if = "Mdns::is_empty")]
     pub mdns: Mdns,
@@ -559,6 +562,7 @@ impl Services {
             && self.ntp.is_empty()
             && self.lldp.is_empty()
             && self.snmp.is_empty()
+            && self.ssh.is_empty()
             && self.mdns.is_empty()
             && self.dyndns.is_empty()
             && self.dhcp_relay.is_empty()
@@ -655,6 +659,64 @@ pub struct Snmp {
     /// poll with the community) — set at least one to scope it to the NOC.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
+}
+
+/// SSH management access (`[services.ssh]`). The image ships a key-only sshd; this
+/// section makes it runtime-configurable: which public keys may log in (as the
+/// `admin` user), whether the daemon runs at all, and an optional non-default port
+/// / listen-address. **Key-only by design** — no password authentication is ever
+/// rendered. The keys + a `Port`/`ListenAddress` drop-in are written to the
+/// persistent `/var/lib/sentinel/ssh/` so they survive a reboot and sshd reads
+/// them on its normal start (no unit-ordering dance).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Ssh {
+    /// Run the SSH daemon. Defaults to `true` (an appliance is managed over SSH);
+    /// set `false` to stop it (e.g. a box reachable only on the console).
+    #[serde(default = "default_true")]
+    pub enable: bool,
+    /// The TCP port sshd listens on. Unset ⇒ 22.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Restrict sshd to this local address (an IPv4/IPv6 the box holds). Unset ⇒
+    /// all addresses. Scopes management to, e.g., the LAN or a dedicated mgmt IP.
+    #[serde(
+        rename = "listen-address",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub listen_address: Option<String>,
+    /// The authorized public keys (OpenSSH `authorized_keys` lines) that may log in
+    /// as `admin`. Empty ⇒ no key login (console only). Repeatable.
+    #[serde(
+        rename = "authorized-key",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub authorized_keys: Vec<String>,
+}
+
+impl Default for Ssh {
+    fn default() -> Self {
+        Ssh {
+            enable: true,
+            port: None,
+            listen_address: None,
+            authorized_keys: Vec::new(),
+        }
+    }
+}
+
+impl Ssh {
+    /// True when SSH is at its defaults (enabled, port 22, all addresses, no keys)
+    /// — lets `[services.ssh]` be omitted from a saved config. A box with default
+    /// SSH keeps the image's key-only sshd untouched.
+    pub fn is_empty(&self) -> bool {
+        self.enable
+            && self.port.is_none()
+            && self.listen_address.is_none()
+            && self.authorized_keys.is_empty()
+    }
 }
 
 impl Snmp {
@@ -5122,6 +5184,40 @@ impl Appliance {
             bail!("services snmp: a `community` is required to run the agent");
         }
 
+        // SSH: an optional non-default port (u16, so >0 by construction — reject 0),
+        // an optional listen-address that must be a real IP the box could hold, and
+        // authorized keys that must be single-line OpenSSH key entries (they are
+        // written verbatim into authorized_keys, so a newline would inject a second
+        // key line, and a leading `#`/blank would be a silently-ignored no-op).
+        let ssh = &self.services.ssh;
+        if let Some(p) = ssh.port {
+            if p == 0 {
+                bail!("services ssh port: must be 1-65535");
+            }
+        }
+        if let Some(addr) = &ssh.listen_address {
+            if validate_ipv4(addr).is_err() && validate_ipv6(addr).is_err() {
+                bail!("services ssh listen-address {addr:?}: not an IPv4/IPv6 address");
+            }
+        }
+        for key in &ssh.authorized_keys {
+            let k = key.trim();
+            if k.is_empty() || k.starts_with('#') {
+                bail!("services ssh authorized-key: must be a non-empty OpenSSH key line");
+            }
+            if key.bytes().any(|b| matches!(b, b'\n' | b'\r')) {
+                bail!("services ssh authorized-key: must not contain a newline");
+            }
+            // A public key line is `<type> <base64> [comment]`; require at least the
+            // type + material so an obvious typo (a bare word) is caught early.
+            if k.split_whitespace().count() < 2 {
+                bail!(
+                    "services ssh authorized-key {key:?}: not an OpenSSH key \
+                     (expected `<type> <base64> [comment]`)"
+                );
+            }
+        }
+
         // mDNS reflector: every listed interface must be declared, and a reflector
         // needs at least two links to bridge between.
         let mdns = &self.services.mdns;
@@ -8365,5 +8461,52 @@ virtual-address = ["10.0.0.254"]
         assert!(Appliance::from_toml(&format!(
             "{base}[[rule]]\nname=\"r\"\nfrom=\"lan\"\naction=\"accept\"\n[rule.schedule]\ndays=[\"mon\"]\nstart=\"09:00\"\nend=\"17:00\"\n"
         )).is_err());
+    }
+
+    #[test]
+    fn ssh_service_parses_validates_and_round_trips() {
+        let base = "[system]\nhostname = \"fw\"\n";
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIabc admin@host";
+
+        // A full [services.ssh] parses, validates, and survives a TOML round-trip.
+        let toml = format!(
+            "{base}[services.ssh]\nenable = true\nport = 2222\nlisten-address = \"10.0.0.1\"\nauthorized-key = [\"{key}\"]\n"
+        );
+        let a = Appliance::from_toml(&toml).expect("ssh service parses + validates");
+        assert_eq!(a.services.ssh.port, Some(2222));
+        assert_eq!(a.services.ssh.listen_address.as_deref(), Some("10.0.0.1"));
+        assert_eq!(a.services.ssh.authorized_keys, vec![key.to_string()]);
+        let round = Appliance::from_toml(&a.to_toml().unwrap()).unwrap();
+        assert_eq!(round.services.ssh.authorized_keys, a.services.ssh.authorized_keys);
+
+        // Default SSH (no section) is `is_empty` → omitted from a saved config.
+        let plain = Appliance::from_toml(base).unwrap();
+        assert!(plain.services.ssh.is_empty());
+        assert!(plain.services.ssh.enable, "default sshd is on");
+        assert!(!plain.to_toml().unwrap().contains("[services.ssh]"));
+
+        // Disabling SSH makes the section non-empty (so it persists).
+        let off = Appliance::from_toml(&format!("{base}[services.ssh]\nenable = false\n")).unwrap();
+        assert!(!off.services.ssh.is_empty());
+
+        // Bad: a key with a newline (would inject a second authorized_keys line).
+        assert!(
+            Appliance::from_toml(&format!(
+                "{base}[services.ssh]\nauthorized-key = [\"{key}\\nssh-rsa BBBB x\"]\n"
+            ))
+            .is_err()
+        );
+        // Bad: a bare word is not an OpenSSH key.
+        assert!(
+            Appliance::from_toml(&format!("{base}[services.ssh]\nauthorized-key = [\"garbage\"]\n"))
+                .is_err()
+        );
+        // Bad: a listen-address that is not an IP.
+        assert!(
+            Appliance::from_toml(&format!(
+                "{base}[services.ssh]\nlisten-address = \"not-an-ip\"\n"
+            ))
+            .is_err()
+        );
     }
 }

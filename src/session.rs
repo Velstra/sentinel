@@ -20,7 +20,7 @@ use crate::config::{
     OpenConnectServer, Schedule,
     OpenConnectUser, Ospf, Ospf3, OspfInterface, Pki, Policy, PortSpec, Pppoe, PrefixEntry,
     PrefixList, Proto, Protocols, Qos, QosDiscipline, ReverseProxy, Rip, RouterAdvert, Rule,
-    Services, Snmp, StaticRoute, System, UpdateChannel, Vpn, VrfDef, Vrrp, WanMode, WanUplink,
+    Services, Snmp, Ssh, StaticRoute, System, UpdateChannel, Vpn, VrfDef, Vrrp, WanMode, WanUplink,
     WgPeer, WireguardTunnel, ZoneCfg,
 };
 
@@ -1127,6 +1127,9 @@ struct Draft {
     ntp: NtpDraft,
     lldp: LldpDraft,
     snmp: SnmpDraft,
+    /// SSH management access (`[services.ssh]`). A plain owned struct (no partial
+    /// state to track), carried through the draft as-is.
+    ssh: Ssh,
     mdns: MdnsDraft,
     dyndns: DyndnsDraft,
     dhcp_relay: DhcpRelayDraft,
@@ -1986,6 +1989,7 @@ impl Draft {
                 contact: a.services.snmp.contact.clone(),
                 allow: a.services.snmp.allow.clone(),
             },
+            ssh: a.services.ssh.clone(),
             mdns: MdnsDraft {
                 interface: a.services.mdns.interface.clone(),
             },
@@ -3029,6 +3033,29 @@ impl Session {
                     }
                 }
                 append_csv(&mut self.draft.snmp.allow, v);
+            }
+
+            // services ssh: management access to the box (the image's key-only
+            // sshd, made runtime-configurable). Key-only — no password knob.
+            ["services", "ssh", "enable", v] => {
+                self.draft.ssh.enable = parse_bool(v)?;
+            }
+            ["services", "ssh", "port", v] => {
+                self.draft.ssh.port = Some(
+                    v.parse::<u16>()
+                        .map_err(|_| anyhow::anyhow!("services ssh port {v:?}: not a 1-65535 port"))?,
+                );
+            }
+            ["services", "ssh", "listen-address", v] => {
+                self.draft.ssh.listen_address = Some((*v).to_string());
+            }
+            // A public key is `<type> <base64> [comment]` — absorb the trailing
+            // words so the whitespace-split CLI rebuilds the full key line.
+            ["services", "ssh", "authorized-key", rest @ ..] if !rest.is_empty() => {
+                let key = rest.join(" ");
+                if !self.draft.ssh.authorized_keys.contains(&key) {
+                    self.draft.ssh.authorized_keys.push(key);
+                }
             }
 
             // services mdns: box-wide mDNS reflector (avahi).
@@ -4626,6 +4653,23 @@ impl Session {
                     other => bail!("services snmp has no field {other:?}"),
                 }
             }
+            // `delete services ssh` resets to the default (enabled, key-only, no
+            // extra keys). `delete services ssh <field>` clears one field.
+            ["services", "ssh"] => self.draft.ssh = Ssh::default(),
+            ["services", "ssh", field] => {
+                let s = &mut self.draft.ssh;
+                match *field {
+                    "enable" => s.enable = true,
+                    "port" => s.port = None,
+                    "listen-address" => s.listen_address = None,
+                    "authorized-key" => s.authorized_keys.clear(),
+                    other => bail!("services ssh has no field {other:?}"),
+                }
+            }
+            ["services", "ssh", "authorized-key", rest @ ..] if !rest.is_empty() => {
+                let key = rest.join(" ");
+                self.draft.ssh.authorized_keys.retain(|k| k != &key);
+            }
             ["services", "mdns"] => self.draft.mdns = MdnsDraft::default(),
             ["services", "mdns", field] => {
                 let m = &mut self.draft.mdns;
@@ -6102,6 +6146,7 @@ impl Session {
                     contact: self.draft.snmp.contact.clone(),
                     allow: self.draft.snmp.allow.clone(),
                 },
+                ssh: self.draft.ssh.clone(),
                 mdns: Mdns {
                     interface: self.draft.mdns.interface.clone(),
                 },
@@ -7080,12 +7125,14 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
     let mdns = &draft.mdns;
     let dyndns = &draft.dyndns;
     let relay = &draft.dhcp_relay;
+    let ssh = &draft.ssh;
     let lldp_set = lldp.enable || !lldp.interface.is_empty();
     let snmp_set = snmp.community.is_some()
         || snmp.listen.is_some()
         || snmp.location.is_some()
         || snmp.contact.is_some()
         || !snmp.allow.is_empty();
+    let ssh_set = !ssh.is_empty();
     let mdns_set = !mdns.interface.is_empty();
     let dyndns_set = dyndns.provider.is_some()
         || dyndns.server.is_some()
@@ -7100,6 +7147,7 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         || ntp_set
         || lldp_set
         || snmp_set
+        || ssh_set
         || mdns_set
         || dyndns_set
         || relay_set
@@ -7167,6 +7215,22 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             }
             if !snmp.allow.is_empty() {
                 out.push_str(&format!("        allow {}\n", snmp.allow.join(",")));
+            }
+            out.push_str("    }\n");
+        }
+        if ssh_set {
+            out.push_str("    ssh {\n");
+            if !ssh.enable {
+                out.push_str("        enable false\n");
+            }
+            if let Some(p) = ssh.port {
+                out.push_str(&format!("        port {p}\n"));
+            }
+            if let Some(a) = &ssh.listen_address {
+                out.push_str(&format!("        listen-address {a}\n"));
+            }
+            for key in &ssh.authorized_keys {
+                out.push_str(&format!("        authorized-key {key}\n"));
             }
             out.push_str("    }\n");
         }

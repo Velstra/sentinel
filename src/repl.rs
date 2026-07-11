@@ -1207,6 +1207,7 @@ const SERVICES_NODES: &[Cand] = &[
     ),
     ("lldp", "LLDP link-layer discovery (lldpd)"),
     ("snmp", "read-only SNMP agent (net-snmp)"),
+    ("ssh", "SSH management access (openssh, key-only)"),
     ("mdns", "mDNS reflector between segments (avahi)"),
     ("dyndns", "dynamic-DNS client (ddclient)"),
     (
@@ -1251,6 +1252,19 @@ const SNMP_FIELDS: &[Cand] = &[
     (
         "allow",
         "source subnets allowed to poll (comma-separated CIDRs)",
+    ),
+];
+// `services ssh <Tab>` reveals the SSH management fields (key-only sshd).
+const SSH_FIELDS: &[Cand] = &[
+    ("enable", "run the SSH daemon (true|false; default true)"),
+    ("port", "TCP port sshd listens on (default 22)"),
+    (
+        "listen-address",
+        "restrict sshd to one local address (default: all)",
+    ),
+    (
+        "authorized-key",
+        "an OpenSSH public key allowed to log in as admin (repeatable)",
     ),
 ];
 // `services mdns <Tab>` reveals the reflector fields.
@@ -2178,6 +2192,8 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "services", "lldp"] => LLDP_FIELDS,
         ["set", "services", "lldp", "enable"] => BOOLS,
         ["set" | "delete", "services", "snmp"] => SNMP_FIELDS,
+        ["set" | "delete", "services", "ssh"] => SSH_FIELDS,
+        ["set", "services", "ssh", "enable"] => BOOLS,
         ["set" | "delete", "services", "mdns"] => MDNS_FIELDS,
         ["set" | "delete", "services", "dyndns"] => DYNDNS_FIELDS,
         ["set", "services", "dyndns", "provider"] => DYNDNS_PROVIDERS,
@@ -2794,6 +2810,8 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
         // ---- services value leaves -------------------------------------------
         ["set", "services", "dns" | "ntp", "upstream"] => own_cands(&[PH_IPV4, PH_IPV6]),
         ["set", "services", "snmp", "listen"] => own_cands(&[PH_IPV4]),
+        ["set", "services", "ssh", "listen-address"] => own_cands(&[PH_IPV4]),
+        ["set", "services", "ssh", "authorized-key"] => own_cands(&[PH_KEY]),
         ["set", "services", "snmp", "community"] => own_cands(&[PH_KEY]),
         ["set", "services", "snmp", "location" | "contact"] => own_cands(&[PH_TEXT]),
         ["set", "services", "dhcp-relay", "server"] => own_cands(&[PH_IPV4]),
@@ -3428,12 +3446,18 @@ mod tests {
                 "ntp",
                 "lldp",
                 "snmp",
+                "ssh",
                 "mdns",
                 "dyndns",
                 "dhcp-relay",
                 "reverse-proxy"
             ]
         );
+        assert_eq!(
+            kw(&["set", "services", "ssh"]),
+            ["enable", "port", "listen-address", "authorized-key"]
+        );
+        assert_eq!(kw(&["set", "services", "ssh", "enable"]), ["true", "false"]);
         assert_eq!(kw(&["set", "services", "lldp"]), ["enable", "interface"]);
         assert_eq!(
             kw(&["set", "services", "lldp", "enable"]),

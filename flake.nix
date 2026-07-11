@@ -6617,6 +6617,100 @@
               ospf31.succeed("wren show ospf3 neighbors | grep -qi full")
             '';
           };
+
+        # SSH management access (roadmap C21): `set services ssh …` makes the image's
+        # key-only sshd runtime-configurable. A client authorises its own generated
+        # key on the firewall and logs in over a non-default port — proving the
+        # persistent authorized_keys + the Port drop-in (which fully owns the port,
+        # since the image emits no `Port` line) are applied and honoured by sshd.
+        #   nix build .#checks.x86_64-linux.ssh -L
+        ssh = pkgs.testers.runNixOSTest {
+          name = "sentinel-ssh";
+          nodes = {
+            fw =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "fw";
+                networking.firewall.enable = lib.mkForce false;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = "10.1.0.1";
+                    prefixLength = 24;
+                  }
+                ];
+                virtualisation.vlans = [ 1 ];
+                virtualisation.memorySize = 2048;
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+            client =
+              { pkgs, ... }:
+              {
+                virtualisation.vlans = [ 1 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                  interfaces.eth1.ipv4.addresses = [
+                    {
+                      address = "10.1.0.2";
+                      prefixLength = 24;
+                    }
+                  ];
+                };
+                environment.systemPackages = [ pkgs.openssh ];
+              };
+          };
+          testScript = ''
+            start_all()
+            fw.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+            fw.wait_for_unit("sshd.service")
+            client.wait_for_unit("multi-user.target")
+            fw.wait_until_succeeds("ip addr show eth1 | grep -q 10.1.0.1", timeout=20)
+            client.wait_until_succeeds("ip addr show eth1 | grep -q 10.1.0.2", timeout=20)
+
+            # The client generates its own keypair; we authorise the public key.
+            pub = client.succeed(
+                "mkdir -p /root/.ssh && ssh-keygen -t ed25519 -N ''' "
+                "-f /root/.ssh/id_ed25519 -q && cat /root/.ssh/id_ed25519.pub"
+            ).strip()
+
+            # Zone the LAN nic (default-action accept so the firewall passes SSH),
+            # authorise the client's key, and move sshd to a non-default port.
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set firewall global default-action accept' "
+                "'set interface eth1 zone lan' "
+                f"'set services ssh authorized-key {pub}' "
+                "'set services ssh port 2222' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+
+            # Sentinel wrote the root-owned SSH files (StrictModes-clean location).
+            fw.succeed("test -f /run/sentinel-ssh/authorized_keys")
+            fw.succeed("grep -q 'Port 2222' /run/sentinel-ssh/10-sentinel.conf")
+            fw.succeed(
+                "stat -c '%U:%G %a' /run/sentinel-ssh/authorized_keys "
+                "| grep -q 'root:root 644'"
+            )
+
+            # sshd rebound to 2222 and NOT the default 22 (the drop-in owns the port).
+            fw.wait_until_succeeds("ss -tlnH 'sport = :2222' | grep -q LISTEN", timeout=30)
+            fw.fail("ss -tlnH 'sport = :22' | grep -q LISTEN")
+
+            # The headline: the client logs in as admin over SSH with its key, on the
+            # custom port, and runs a command on the firewall. `whoami` is
+            # deterministic (the login identity) — the box's hostname comes from the
+            # committed config, so it is not a stable assertion target.
+            client.wait_until_succeeds(
+                "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+                "-o BatchMode=yes -p 2222 admin@10.1.0.1 whoami | grep -qx admin",
+                timeout=30,
+            )
+          '';
+        };
       };
     };
 }
