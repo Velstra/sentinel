@@ -102,7 +102,9 @@ fn macsec_sa_setup_body(ifaces: &[Interface]) -> Option<String> {
         body.push_str(&format!(
             "for _ in $(seq 1 50); do ip link show {dev} >/dev/null 2>&1 && break; sleep 0.1; done\n"
         ));
-        body.push_str(&format!("ip macsec del {dev} tx sa 0 2>/dev/null || true\n"));
+        body.push_str(&format!(
+            "ip macsec del {dev} tx sa 0 2>/dev/null || true\n"
+        ));
         body.push_str(&format!(
             "ip macsec del {dev} rx address {peer} port 1 2>/dev/null || true\n"
         ));
@@ -137,7 +139,9 @@ fn l2tp_setup_body(ifaces: &[Interface]) -> Option<String> {
         body.push_str(&format!(
             "ip l2tp del session tunnel_id {id} session_id {id} 2>/dev/null || true\n"
         ));
-        body.push_str(&format!("ip l2tp del tunnel tunnel_id {id} 2>/dev/null || true\n"));
+        body.push_str(&format!(
+            "ip l2tp del tunnel tunnel_id {id} 2>/dev/null || true\n"
+        ));
         body.push_str(&format!(
             "ip l2tp add tunnel tunnel_id {id} peer_tunnel_id {id} encap ip local {local} remote {remote}\n"
         ));
@@ -2698,7 +2702,9 @@ mod tests {
         // The SA setup script installs the transmit + receive associations.
         let s = macsec_sa_setup_body(std::slice::from_ref(&ms)).expect("configured");
         assert!(
-            s.contains("ip macsec add macsec0 tx sa 0 pn 1 on key 01 00112233445566778899aabbccddeeff"),
+            s.contains(
+                "ip macsec add macsec0 tx sa 0 pn 1 on key 01 00112233445566778899aabbccddeeff"
+            ),
             "{s}"
         );
         assert!(
@@ -2721,7 +2727,9 @@ mod tests {
             "{s}"
         );
         assert!(
-            s.contains("ip l2tp add session name l2tp0 tunnel_id 100 session_id 100 peer_session_id 100"),
+            s.contains(
+                "ip l2tp add session name l2tp0 tunnel_id 100 session_id 100 peer_session_id 100"
+            ),
             "{s}"
         );
         assert!(s.contains("ip link set l2tp0 up"), "{s}");

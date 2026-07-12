@@ -14,15 +14,13 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::{
     Acme, Action, Appliance, Bfd, Bgp, BgpAggregate, BgpNeighbor, BgpRoa, BgpRtr, Ca, Certificate,
-    ConfigSync,
-    Dhcp6Pool, DhcpRelay, DhcpServer, DhcpStaticLease, Dns, Dyndns, Export, Filter, FilterRule, Firewall,
-    Groups, HealthCheck, IfaceType, Interface, IpsecConnection, Isis, Lldp, Login, Mdns, MultiWan,
-    Multicast, MulticastInterface, Nat, Nat64, NatDestination, NatNpt66, NatSource, Ntp,
-    OpenConnectServer, Schedule,
-    OpenConnectUser, Ospf, Ospf3, OspfInterface, Pki, Policy, PortSpec, Pppoe, PrefixEntry,
-    PrefixList, Proto, Protocols, Qos, QosDiscipline, ReverseProxy, Rip, RouterAdvert, Rule,
-    Services, Snmp, Ssh, StaticRoute, System, UpdateChannel, Vpn, VrfDef, Vrrp, WanMode, WanUplink,
-    WgPeer, WireguardTunnel, ZoneCfg,
+    ConfigSync, Dhcp6Pool, DhcpRelay, DhcpServer, DhcpStaticLease, Dns, Dyndns, Export, Filter,
+    FilterRule, Firewall, Groups, HealthCheck, IfaceType, Interface, IpsecConnection, Isis, Lldp,
+    Login, Mdns, MultiWan, Multicast, MulticastInterface, Nat, Nat64, NatDestination, NatNpt66,
+    NatSource, Ntp, OpenConnectServer, OpenConnectUser, Ospf, Ospf3, OspfInterface, Pki, Policy,
+    PortSpec, Pppoe, PrefixEntry, PrefixList, Proto, Protocols, Qos, QosDiscipline, ReverseProxy,
+    Rip, RouterAdvert, Rule, Schedule, Services, Snmp, Ssh, StaticRoute, System, UpdateChannel,
+    Vpn, VrfDef, Vrrp, WanMode, WanUplink, WgPeer, WireguardTunnel, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -2587,9 +2585,20 @@ impl Session {
                 validate_ipv6(v)?;
                 self.draft.iface_mut(name).ra_mut().dhcp6_pool_mut().end = v.to_string();
             }
-            ["interface", name, "router-advert", "dhcp6-pool", "lease-time", v] => {
+            [
+                "interface",
+                name,
+                "router-advert",
+                "dhcp6-pool",
+                "lease-time",
+                v,
+            ] => {
                 let lease = parse_duration_secs(v)?;
-                self.draft.iface_mut(name).ra_mut().dhcp6_pool_mut().lease_time = Some(lease);
+                self.draft
+                    .iface_mut(name)
+                    .ra_mut()
+                    .dhcp6_pool_mut()
+                    .lease_time = Some(lease);
             }
 
             // Bridge / bond / wireguard: `type` makes this a virtual device;
@@ -3062,11 +3071,10 @@ impl Session {
                 self.draft.ssh.enable = parse_bool(v)?;
             }
             ["services", "ssh", "port", v] => {
-                self.draft.ssh.port = Some(
-                    v.parse::<u16>().map_err(|_| {
+                self.draft.ssh.port =
+                    Some(v.parse::<u16>().map_err(|_| {
                         anyhow::anyhow!("services ssh port {v:?}: not a 1-65535 port")
-                    })?,
-                );
+                    })?);
             }
             ["services", "ssh", "listen-address", v] => {
                 self.draft.ssh.listen_address = Some((*v).to_string());
@@ -5779,26 +5787,26 @@ impl Session {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-        let nat_npt66 = self
-            .draft
-            .nat_npt66
-            .iter()
-            .map(|(name, d)| {
-                Ok(NatNpt66 {
-                    name: name.clone(),
-                    description: d.description.clone(),
-                    interface: d.interface.clone().ok_or_else(|| {
-                        anyhow::anyhow!("nat npt66 {name:?}: interface not set")
-                    })?,
-                    internal: d.internal.clone().ok_or_else(|| {
-                        anyhow::anyhow!("nat npt66 {name:?}: internal prefix not set")
-                    })?,
-                    external: d.external.clone().ok_or_else(|| {
-                        anyhow::anyhow!("nat npt66 {name:?}: external prefix not set")
-                    })?,
+        let nat_npt66 =
+            self.draft
+                .nat_npt66
+                .iter()
+                .map(|(name, d)| {
+                    Ok(NatNpt66 {
+                        name: name.clone(),
+                        description: d.description.clone(),
+                        interface: d.interface.clone().ok_or_else(|| {
+                            anyhow::anyhow!("nat npt66 {name:?}: interface not set")
+                        })?,
+                        internal: d.internal.clone().ok_or_else(|| {
+                            anyhow::anyhow!("nat npt66 {name:?}: internal prefix not set")
+                        })?,
+                        external: d.external.clone().ok_or_else(|| {
+                            anyhow::anyhow!("nat npt66 {name:?}: external prefix not set")
+                        })?,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
+                .collect::<Result<Vec<_>>>()?;
         // protocols: dynamic routing (Wren).
         let statics = self
             .draft
@@ -8155,7 +8163,10 @@ mod tests {
             "set interface lan0 router-advert dhcp6-pool start 2001:db8:9::1",
         )
         .unwrap();
-        assert!(s.commit().is_err(), "pool must sit inside an advertised prefix");
+        assert!(
+            s.commit().is_err(),
+            "pool must sit inside an advertised prefix"
+        );
 
         // `delete` clears the whole pool.
         run(
@@ -9031,7 +9042,10 @@ mod tests {
         let shown = s.show_only("interface");
         assert!(shown.contains("type macsec"), "got:\n{shown}");
         assert!(shown.contains("macsec-key 00112233"), "got:\n{shown}");
-        assert!(shown.contains("macsec-peer 52:54:00:12:02:02"), "got:\n{shown}");
+        assert!(
+            shown.contains("macsec-peer 52:54:00:12:02:02"),
+            "got:\n{shown}"
+        );
 
         let a = s.commit().expect("macsec interface commits");
         let sec = a.interfaces.iter().find(|i| i.name == "sec0").unwrap();
