@@ -6145,6 +6145,244 @@
             '';
           };
 
+        # Routing: RIPng (RFC 2080) — the IPv6 sibling of RIP — between two Sentinel
+        # appliances, exercising the same `set protocols ripng …` wiring on an IPv6
+        # link. Each node redistributes a unique IPv6 static into RIPng; each learns
+        # the other's prefix, installed with RTPROT_RIP (`proto rip`, since Wren tags
+        # RIP and RIPng the same). Closes the per-protocol VM-check gap for RIPng.
+        #   nix build .#checks.x86_64-linux.ripng -L
+        ripng =
+          let
+            node = hostname: addr: {
+              lib,
+              ...
+            }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce hostname;
+              networking.firewall.enable = lib.mkForce false;
+              networking.interfaces.eth1.ipv6.addresses = [
+                {
+                  address = addr;
+                  prefixLength = 64;
+                }
+              ];
+              virtualisation.vlans = [ 1 ];
+              virtualisation.memorySize = 2048;
+              services.velstra.interface = lib.mkForce "eth1";
+            };
+          in
+          pkgs.testers.runNixOSTest {
+            name = "sentinel-ripng";
+            nodes = {
+              ripng1 = node "ripng1" "fd00:10::1";
+              ripng2 = node "ripng2" "fd00:10::2";
+            };
+            testScript = ''
+              start_all()
+              for m in (ripng1, ripng2):
+                  m.wait_for_unit("multi-user.target")
+                  m.wait_for_unit("velstra.service")
+                  m.wait_for_unit("wren.service")
+              ripng1.wait_until_succeeds("ip -6 addr show eth1 | grep -q fd00:10::1", timeout=20)
+              ripng2.wait_until_succeeds("ip -6 addr show eth1 | grep -q fd00:10::2", timeout=20)
+
+              # accept default so the Velstra firewall passes RIPng (UDP 521, ff02::9).
+              # Each node originates a unique IPv6 prefix as a static, into RIPng.
+              def configure(m, mynet):
+                  m.succeed(
+                      "su admin -c \"printf '%s\\n' "
+                      "'set firewall global default-action accept' "
+                      "'set interface eth1 zone wan' "
+                      f"'set protocols static {mynet} dev lo' "
+                      "'set protocols ripng interface eth1' "
+                      "'set protocols ripng redistribute static' "
+                      "commit save exit "
+                      "| sentinel configure\""
+                  )
+                  m.wait_for_unit("wren.service")
+
+              configure(ripng1, "fd00:11::/64")
+              configure(ripng2, "fd00:12::/64")
+
+              # The compiled Wren config carries the RIPng block.
+              ripng1.succeed("grep -q '\\[ripng\\]' /run/sentinel/wren.toml")
+
+              # Each router learns the OTHER's prefix over RIPng and installs it into
+              # the IPv6 FIB. RIPng's 30s update timer means convergence is slow.
+              ripng1.wait_until_succeeds(
+                  "ip -6 route show proto rip | grep -q 'fd00:12::/64'", timeout=120
+              )
+              ripng2.wait_until_succeeds(
+                  "ip -6 route show proto rip | grep -q 'fd00:11::/64'", timeout=120
+              )
+            '';
+          };
+
+        # Routing: Babel (RFC 8966) — a loop-avoiding distance-vector protocol over
+        # IPv6 — between two Sentinel appliances via `set protocols babel …`. Each
+        # redistributes a unique IPv6 static into Babel; each learns the other's
+        # prefix (RTPROT_BABEL, `proto babel`) and the adjacency shows a neighbour.
+        #   nix build .#checks.x86_64-linux.babel -L
+        babel =
+          let
+            node = hostname: addr: {
+              lib,
+              ...
+            }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce hostname;
+              networking.firewall.enable = lib.mkForce false;
+              networking.interfaces.eth1.ipv6.addresses = [
+                {
+                  address = addr;
+                  prefixLength = 64;
+                }
+              ];
+              virtualisation.vlans = [ 1 ];
+              virtualisation.memorySize = 2048;
+              services.velstra.interface = lib.mkForce "eth1";
+            };
+          in
+          pkgs.testers.runNixOSTest {
+            name = "sentinel-babel";
+            nodes = {
+              babel1 = node "babel1" "fd00:10::1";
+              babel2 = node "babel2" "fd00:10::2";
+            };
+            testScript = ''
+              start_all()
+              for m in (babel1, babel2):
+                  m.wait_for_unit("multi-user.target")
+                  m.wait_for_unit("velstra.service")
+                  m.wait_for_unit("wren.service")
+              babel1.wait_until_succeeds("ip -6 addr show eth1 | grep -q fd00:10::1", timeout=20)
+              babel2.wait_until_succeeds("ip -6 addr show eth1 | grep -q fd00:10::2", timeout=20)
+
+              # accept default so the firewall passes Babel (UDP 6696, ff02::1:6).
+              # Babel needs a UNIQUE router-id per node: it tags each advertised route
+              # with its origin router-id (RFC 8966 §3.5), and route selection between
+              # two identical (unset = zero) ids collapses. RIPng needs none (pure
+              # distance-vector) and IS-IS uses its system-id — Babel is the exception.
+              def configure(m, rid, mynet):
+                  m.succeed(
+                      "su admin -c \"printf '%s\\n' "
+                      "'set firewall global default-action accept' "
+                      "'set interface eth1 zone wan' "
+                      f"'set protocols router-id {rid}' "
+                      f"'set protocols static {mynet} dev lo' "
+                      "'set protocols babel interface eth1' "
+                      "'set protocols babel redistribute static' "
+                      "commit save exit "
+                      "| sentinel configure\""
+                  )
+                  m.wait_for_unit("wren.service")
+
+              configure(babel1, "10.0.0.1", "fd00:11::/64")
+              configure(babel2, "10.0.0.2", "fd00:12::/64")
+
+              # The compiled Wren config carries the Babel block.
+              babel1.succeed("grep -q '\\[babel\\]' /run/sentinel/wren.toml")
+
+              # Each router learns the OTHER's prefix over Babel and installs it into
+              # the IPv6 FIB. Match the prefix in the full table rather than filtering
+              # `proto babel`: Wren tags Babel routes RTPROT_BABEL (42), which this
+              # image's iproute2 does not name — Wren's own smokes grep the prefix too.
+              babel1.wait_until_succeeds(
+                  "ip -6 route | grep -q 'fd00:12::/64'", timeout=120
+              )
+              babel2.wait_until_succeeds(
+                  "ip -6 route | grep -q 'fd00:11::/64'", timeout=120
+              )
+              # And the daemon's own view shows the learned Babel route.
+              babel1.succeed("wren show babel routes | grep -q 'fd00:12::/64'")
+            '';
+          };
+
+        # Routing: IS-IS (ISO/IEC 10589 + RFC 1195) — a link-state IGP that runs
+        # directly over L2 (ISO frames, not IP) — between two Sentinel appliances via
+        # `set protocols isis …`. Velstra's XDP passes non-IP ethertypes, so the IS-IS
+        # Hellos/LSPs traverse the datapath. Each node has a unique system-id, forms a
+        # point-to-point adjacency, and redistributes a unique IPv6 static into IS-IS;
+        # each learns the other's prefix (`proto isis`). Mirrors Wren's own IS-IS
+        # redistribute smoke, run end to end through the appliance CLI.
+        #   nix build .#checks.x86_64-linux.isis -L
+        isis =
+          let
+            node = hostname: addr: {
+              lib,
+              ...
+            }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce hostname;
+              networking.firewall.enable = lib.mkForce false;
+              networking.interfaces.eth1.ipv6.addresses = [
+                {
+                  address = addr;
+                  prefixLength = 64;
+                }
+              ];
+              virtualisation.vlans = [ 1 ];
+              virtualisation.memorySize = 2048;
+              services.velstra.interface = lib.mkForce "eth1";
+            };
+          in
+          pkgs.testers.runNixOSTest {
+            name = "sentinel-isis";
+            nodes = {
+              isis1 = node "isis1" "fd00:10::1";
+              isis2 = node "isis2" "fd00:10::2";
+            };
+            testScript = ''
+              start_all()
+              for m in (isis1, isis2):
+                  m.wait_for_unit("multi-user.target")
+                  m.wait_for_unit("velstra.service")
+                  m.wait_for_unit("wren.service")
+              isis1.wait_until_succeeds("ip -6 addr show eth1 | grep -q fd00:10::1", timeout=20)
+              isis2.wait_until_succeeds("ip -6 addr show eth1 | grep -q fd00:10::2", timeout=20)
+
+              # Each node: a unique system-id, a point-to-point circuit on eth1, and a
+              # unique IPv6 static redistributed into IS-IS.
+              def configure(m, sysid, mynet):
+                  m.succeed(
+                      "su admin -c \"printf '%s\\n' "
+                      "'set firewall global default-action accept' "
+                      "'set interface eth1 zone wan' "
+                      f"'set protocols static {mynet} dev lo' "
+                      "'set protocols isis interface eth1' "
+                      f"'set protocols isis system-id {sysid}' "
+                      "'set protocols isis network-type point-to-point' "
+                      "'set protocols isis redistribute static' "
+                      "commit save exit "
+                      "| sentinel configure\""
+                  )
+                  m.wait_for_unit("wren.service")
+
+              configure(isis1, "0000.0000.0001", "fd00:11::/64")
+              configure(isis2, "0000.0000.0002", "fd00:12::/64")
+
+              # The compiled Wren config carries the IS-IS block.
+              isis1.succeed("grep -q '\\[isis\\]' /run/sentinel/wren.toml")
+
+              # The adjacency comes up, then each router learns the other's prefix over
+              # IS-IS and installs it into the IPv6 FIB. Adjacency + LSP flood take a
+              # while. Match the prefix in the full table (proto-agnostic, as Wren's own
+              # IS-IS smoke does) rather than filtering the proto name.
+              isis1.wait_until_succeeds(
+                  "wren show isis neighbors | grep 0000.0000.0002 | grep -qi up", timeout=90
+              )
+              isis1.wait_until_succeeds(
+                  "ip -6 route | grep -q 'fd00:12::/64'", timeout=120
+              )
+              isis2.wait_until_succeeds(
+                  "ip -6 route | grep -q 'fd00:11::/64'", timeout=120
+              )
+            '';
+          };
+
         # commit-confirm (roadmap C21): apply a change live under a timer that
         # auto-reverts to the saved config unless `confirm`ed — the safety net for
         # editing a firewall over its own link. One node; the hostname is the
