@@ -796,7 +796,10 @@ external = "2001:db8:1::/48"
         assert_eq!(cfg.npt66.len(), 1);
         let n = &cfg.npt66[0];
         assert_eq!(n.interface, "wan0");
-        assert_eq!((n.internal.as_str(), n.external.as_str()), ("fd00:1::/48", "2001:db8:1::/48"));
+        assert_eq!(
+            (n.internal.as_str(), n.external.as_str()),
+            ("fd00:1::/48", "2001:db8:1::/48")
+        );
         let out = cfg.to_toml().unwrap();
         assert!(out.contains("[[npt66]]"), "{out}");
         assert!(out.contains("internal = \"fd00:1::/48\""), "{out}");

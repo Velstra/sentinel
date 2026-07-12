@@ -1744,12 +1744,21 @@ const NAT64_FIELDS: &[Cand] = &[
 ];
 const SYSTEM_FIELDS: &[Cand] = &[
     ("hostname", "the appliance hostname"),
-    ("login", "a local login account (by username): ssh-key / hashed-password"),
-    ("config-sync", "push the running config to peer firewalls on commit (HA)"),
+    (
+        "login",
+        "a local login account (by username): ssh-key / hashed-password",
+    ),
+    (
+        "config-sync",
+        "push the running config to peer firewalls on commit (HA)",
+    ),
 ];
 // `system config-sync <Tab>` reveals the HA config-sync fields.
 const CONFIGSYNC_FIELDS: &[Cand] = &[
-    ("peer", "a peer firewall to push to — host or host:port (repeatable)"),
+    (
+        "peer",
+        "a peer firewall to push to — host or host:port (repeatable)",
+    ),
     ("secret", "the shared bearer token both peers present"),
 ];
 const GLOBAL_FIELDS: &[Cand] = &[
@@ -2208,9 +2217,13 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
             "router-advert",
             "managed" | "other-config",
         ] => BOOLS,
-        ["set" | "delete", "interface", _name, "router-advert", "dhcp6-pool"] => {
-            RA_DHCP6_POOL_FIELDS
-        }
+        [
+            "set" | "delete",
+            "interface",
+            _name,
+            "router-advert",
+            "dhcp6-pool",
+        ] => RA_DHCP6_POOL_FIELDS,
 
         // The box-wide services sub-tree, and the DNS forwarder within it.
         ["set" | "delete", "services"] => SERVICES_NODES,
@@ -2221,7 +2234,12 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set", "services", "lldp", "enable"] => BOOLS,
         ["set" | "delete", "services", "snmp"] => SNMP_FIELDS,
         ["set" | "delete", "services", "ssh"] => SSH_FIELDS,
-        ["set", "services", "ssh", "enable" | "password-authentication"] => BOOLS,
+        [
+            "set",
+            "services",
+            "ssh",
+            "enable" | "password-authentication",
+        ] => BOOLS,
         ["set" | "delete", "system", "login", _name] => LOGIN_FIELDS,
         ["set" | "delete", "system", "config-sync"] => CONFIGSYNC_FIELDS,
         ["set" | "delete", "services", "mdns"] => MDNS_FIELDS,
@@ -3249,10 +3267,7 @@ mod tests {
             ]
         );
         assert_eq!(kw(&["set", "system"]), ["hostname", "login", "config-sync"]);
-        assert_eq!(
-            kw(&["set", "system", "config-sync"]),
-            ["peer", "secret"]
-        );
+        assert_eq!(kw(&["set", "system", "config-sync"]), ["peer", "secret"]);
         assert_eq!(
             kw(&["set", "interface", "wan0"]),
             [
@@ -3466,7 +3481,15 @@ mod tests {
         );
         assert_eq!(
             kw(&["set", "nat", "destination", "web"]),
-            ["zone", "proto", "port", "to", "hairpin", "description", "disabled"]
+            [
+                "zone",
+                "proto",
+                "port",
+                "to",
+                "hairpin",
+                "description",
+                "disabled"
+            ]
         );
         assert_eq!(
             kw(&["set", "nat", "destination", "web", "proto"]),
@@ -3490,7 +3513,12 @@ mod tests {
         );
         assert_eq!(
             kw(&["set", "services", "ssh"]),
-            ["enable", "port", "listen-address", "password-authentication"]
+            [
+                "enable",
+                "port",
+                "listen-address",
+                "password-authentication"
+            ]
         );
         assert_eq!(kw(&["set", "services", "ssh", "enable"]), ["true", "false"]);
         assert_eq!(

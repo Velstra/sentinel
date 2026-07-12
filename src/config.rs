@@ -3186,7 +3186,11 @@ pub struct RouterAdvert {
     /// interface, since networkd's DHCP server is IPv4-only. The RA's Managed (M)
     /// flag is forced on so clients obtain their address via DHCPv6 rather than
     /// SLAAC. `None` ⇒ pure SLAAC (prefixes are advertised, no address server).
-    #[serde(default, rename = "dhcp6-pool", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "dhcp6-pool",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub dhcp6_pool: Option<Dhcp6Pool>,
 }
 
@@ -4095,10 +4099,16 @@ impl Appliance {
                     );
                 };
                 let lip = local.parse::<IpAddr>().map_err(|_| {
-                    anyhow::anyhow!("interface {:?}: local {local:?} is not an IP address", iface.name)
+                    anyhow::anyhow!(
+                        "interface {:?}: local {local:?} is not an IP address",
+                        iface.name
+                    )
                 })?;
                 let rip = remote.parse::<IpAddr>().map_err(|_| {
-                    anyhow::anyhow!("interface {:?}: remote {remote:?} is not an IP address", iface.name)
+                    anyhow::anyhow!(
+                        "interface {:?}: remote {remote:?} is not an IP address",
+                        iface.name
+                    )
                 })?;
                 if lip.is_ipv4() != rip.is_ipv4() {
                     bail!(
@@ -4113,7 +4123,10 @@ impl Appliance {
                     );
                 }
                 if iface.parent.is_some() || iface.vlan.is_some() {
-                    bail!("interface {:?}: an l2tpv3 pseudowire cannot also be a VLAN", iface.name);
+                    bail!(
+                        "interface {:?}: an l2tpv3 pseudowire cannot also be a VLAN",
+                        iface.name
+                    );
                 }
             } else if iface.local.is_some()
                 || iface.remote.is_some()
@@ -4291,7 +4304,10 @@ impl Appliance {
                             iface.name
                         );
                     }
-                    let in_a_prefix = ra.prefixes.iter().any(|p| ipv6_in_prefix(&start, p) && ipv6_in_prefix(&end, p));
+                    let in_a_prefix = ra
+                        .prefixes
+                        .iter()
+                        .any(|p| ipv6_in_prefix(&start, p) && ipv6_in_prefix(&end, p));
                     if !in_a_prefix {
                         bail!(
                             "interface {:?} router-advert dhcp6-pool: {:?}-{:?} is not inside any advertised prefix",
@@ -4567,10 +4583,18 @@ impl Appliance {
                     bail!("rule {:?}: schedule needs at least one day", rule.name);
                 }
                 let start = parse_hhmm(&sched.start).ok_or_else(|| {
-                    anyhow::anyhow!("rule {:?}: schedule start {:?} is not HH:MM", rule.name, sched.start)
+                    anyhow::anyhow!(
+                        "rule {:?}: schedule start {:?} is not HH:MM",
+                        rule.name,
+                        sched.start
+                    )
                 })?;
                 let end = parse_hhmm(&sched.end).ok_or_else(|| {
-                    anyhow::anyhow!("rule {:?}: schedule end {:?} is not HH:MM", rule.name, sched.end)
+                    anyhow::anyhow!(
+                        "rule {:?}: schedule end {:?} is not HH:MM",
+                        rule.name,
+                        sched.end
+                    )
                 })?;
                 if start >= end {
                     bail!(
@@ -4715,7 +4739,10 @@ impl Appliance {
             validate_ipv6_cidr(&n.external)
                 .with_context(|| format!("nat npt66 {:?} external", n.name))?;
             let cidr_len = |s: &str| -> u8 {
-                s.split('/').nth(1).and_then(|l| l.parse().ok()).unwrap_or(0)
+                s.split('/')
+                    .nth(1)
+                    .and_then(|l| l.parse().ok())
+                    .unwrap_or(0)
             };
             let ilen = cidr_len(&n.internal);
             let elen = cidr_len(&n.external);
@@ -5277,7 +5304,9 @@ impl Appliance {
                 bail!("system login {u:?}: duplicate username");
             }
             let mut chars = u.chars();
-            let ok_first = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+            let ok_first = chars
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
             let ok_rest = chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
             if u.is_empty() || u.len() > 32 || !ok_first || !ok_rest {
                 bail!(
@@ -6177,7 +6206,11 @@ pub(crate) fn ipv6_in_prefix(addr: &Ipv6Addr, prefix: &str) -> bool {
     if len > 128 {
         return false;
     }
-    let mask: u128 = if len == 0 { 0 } else { u128::MAX << (128 - len) };
+    let mask: u128 = if len == 0 {
+        0
+    } else {
+        u128::MAX << (128 - len)
+    };
     (u128::from(*addr) & mask) == (u128::from(net) & mask)
 }
 
@@ -8206,18 +8239,23 @@ dhcp6-pool = {pool}
             )
         };
         // start above end.
-        assert!(Appliance::from_toml(&base(
-            r#"{ start = "2001:db8:1::200", end = "2001:db8:1::100" }"#
-        ))
-        .is_err());
+        assert!(
+            Appliance::from_toml(&base(
+                r#"{ start = "2001:db8:1::200", end = "2001:db8:1::100" }"#
+            ))
+            .is_err()
+        );
         // pool outside every advertised prefix.
-        assert!(Appliance::from_toml(&base(
-            r#"{ start = "2001:db8:2::10", end = "2001:db8:2::20" }"#
-        ))
-        .is_err());
+        assert!(
+            Appliance::from_toml(&base(
+                r#"{ start = "2001:db8:2::10", end = "2001:db8:2::20" }"#
+            ))
+            .is_err()
+        );
         // a non-IPv6 endpoint.
         assert!(
-            Appliance::from_toml(&base(r#"{ start = "10.0.0.1", end = "2001:db8:1::20" }"#)).is_err()
+            Appliance::from_toml(&base(r#"{ start = "10.0.0.1", end = "2001:db8:1::20" }"#))
+                .is_err()
         );
         // a pool with no advertised prefix to sit in.
         let no_prefix = r#"
@@ -8661,7 +8699,10 @@ virtual-address = ["10.0.0.254"]
             "{base}[system.config-sync]\npeer = [\"10.0.0.2\", \"10.0.0.3:9000\"]\nsecret = \"s3cr3t\"\n"
         );
         let a = Appliance::from_toml(&toml).expect("config-sync parses + validates");
-        assert_eq!(a.system.config_sync.peers, vec!["10.0.0.2", "10.0.0.3:9000"]);
+        assert_eq!(
+            a.system.config_sync.peers,
+            vec!["10.0.0.2", "10.0.0.3:9000"]
+        );
         assert_eq!(a.system.config_sync.secret.as_deref(), Some("s3cr3t"));
         let round = Appliance::from_toml(&a.to_toml().unwrap()).unwrap();
         assert_eq!(round.system.config_sync.peers, a.system.config_sync.peers);
