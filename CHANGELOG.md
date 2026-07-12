@@ -21,14 +21,14 @@
   far-segment DHCPv6 pool through the relay.
 
 ### Changed
-- **Repin fabric for the SRv6 L2 encap data plane (B9).** The appliance's eBPF
-  object now carries the SRv6 headend path (`End.DT2U` encap: outer Ethernet +
-  IPv6 reduced encapsulation, `SRV6_CONFIG` + `SRV6_FDB` maps, `srv6_encap`
-  counter) alongside the existing VXLAN/Geneve overlay. `ebpfHash` bumped to match
-  the rebuilt object. Verifier acceptance of the new datapath is confirmed by the
-  full nixosTest suite loading it (e.g. `checks.nat` boots and NATs green with the
-  SRv6-enabled object); the SRv6 encap itself is a fabric-level primitive with no
-  Sentinel CLI surface yet.
+- **Repin fabric for the SRv6 L2 data plane (B9).** The appliance's eBPF object
+  now carries the full SRv6 `End.DT2U` L2 path — headend encap (`SRV6_CONFIG` +
+  `SRV6_FDB`, `srv6_encap`) *and* endpoint decap (`SRV6_LOCAL_SIDS`, `srv6_decap`)
+  — alongside the existing VXLAN/Geneve overlay, so two fabric hosts bridge an L2
+  tenant over SRv6 end to end. `ebpfHash` bumped to match the rebuilt object;
+  verifier acceptance is confirmed by the nixosTest suite loading it (`checks.nat`
+  boots and NATs green with the SRv6-enabled object). SRv6 is a fabric-level
+  primitive with no Sentinel CLI surface yet.
 
 ### Tested
 - **Per-protocol routing VM checks for RIPng, Babel and IS-IS** — two-appliance
