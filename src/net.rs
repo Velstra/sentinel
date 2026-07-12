@@ -871,11 +871,15 @@ fn snmpd_conf_body(snmp: &Snmp) -> Result<Option<String>> {
     let Some(community) = snmp.community.as_ref() else {
         return Ok(None);
     };
+    // Defense in depth (config validation already rejects these): the community is
+    // rendered unquoted into `rocommunity`, so a newline would inject a directive
+    // such as `rwcommunity` and whitespace would split the line; the listen spec
+    // becomes `agentaddress`. Refuse to emit either with an unsafe character.
+    reject_unsafe("snmp community", community, &[' ', '\t', '"', '\\'])?;
+    let listen = snmp.listen.as_deref().unwrap_or("udp:161");
+    reject_unsafe("snmp listen", listen, &[' ', '\t', '"', '\\'])?;
     let mut body = String::from("# rendered by sentinel — SNMP (read-only)\n");
-    body.push_str(&format!(
-        "agentaddress {}\n",
-        snmp.listen.as_deref().unwrap_or("udp:161")
-    ));
+    body.push_str(&format!("agentaddress {listen}\n"));
     if snmp.allow.is_empty() {
         body.push_str(&format!("rocommunity {community} default\n"));
     } else {

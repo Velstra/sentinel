@@ -209,6 +209,26 @@ pub fn swanctl_show(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Stage `contents` into `tmp` as a private **0600** file. `std::fs::write`
+/// honours the process umask (typically 0644), which would leave the staged
+/// secret world-readable in the wheel-writable, world-traversable `/run/sentinel`
+/// until the next apply — `install` *copies* to the final owner/mode, so the temp
+/// source is never removed by it. Creating the temp 0600 closes that window; the
+/// final installed file still gets whatever mode the `install -m` call sets.
+fn stage_private(tmp: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(tmp)
+        .with_context(|| format!("staging {}", tmp.display()))?;
+    f.write_all(contents.as_bytes())
+        .with_context(|| format!("staging {}", tmp.display()))
+}
+
 /// Install a strongSwan PSK secrets file at a root-owned `path`, mode **0600
 /// root:root**. `charon` runs as root, so the pre-shared key never needs to leave
 /// root — 0600 is the tightest mode that still works. Staged in `/run/sentinel`
@@ -220,7 +240,7 @@ pub fn install_ipsec_secret(path: &Path, contents: &str) -> Result<()> {
         ensure_dir(parent)?;
     }
     let tmp = Path::new("/run/sentinel").join(".ipsec-secret.tmp");
-    std::fs::write(&tmp, contents).with_context(|| format!("staging {}", tmp.display()))?;
+    stage_private(&tmp, contents)?;
     let (Some(tmp_s), Some(dst_s)) = (tmp.to_str(), path.to_str()) else {
         bail!("non-UTF-8 path");
     };
@@ -303,7 +323,7 @@ pub fn install_file(path: &Path, contents: &str) -> Result<()> {
     }
     // Fall back to sudo: stage in /run/sentinel (wheel-writable) then install.
     let tmp = Path::new("/run/sentinel").join(".net-unit.tmp");
-    std::fs::write(&tmp, contents).with_context(|| format!("staging {}", tmp.display()))?;
+    stage_private(&tmp, contents)?;
     let (Some(tmp_s), Some(dst_s)) = (tmp.to_str(), path.to_str()) else {
         bail!("non-UTF-8 path");
     };
@@ -329,7 +349,7 @@ pub fn install_secret_file(path: &Path, contents: &str) -> Result<()> {
     // atomically, so there is never a window where the private key is world- or
     // wrong-group-readable.
     let tmp = Path::new("/run/sentinel").join(".net-secret.tmp");
-    std::fs::write(&tmp, contents).with_context(|| format!("staging {}", tmp.display()))?;
+    stage_private(&tmp, contents)?;
     let (Some(tmp_s), Some(dst_s)) = (tmp.to_str(), path.to_str()) else {
         bail!("non-UTF-8 path");
     };
@@ -352,7 +372,7 @@ pub fn install_ppp_secret(path: &Path, contents: &str) -> Result<()> {
         ensure_dir(parent)?;
     }
     let tmp = Path::new("/run/sentinel").join(".ppp-secret.tmp");
-    std::fs::write(&tmp, contents).with_context(|| format!("staging {}", tmp.display()))?;
+    stage_private(&tmp, contents)?;
     let (Some(tmp_s), Some(dst_s)) = (tmp.to_str(), path.to_str()) else {
         bail!("non-UTF-8 path");
     };
@@ -371,7 +391,7 @@ pub fn install_service_secret(path: &Path, contents: &str) -> Result<()> {
         ensure_dir(parent)?;
     }
     let tmp = Path::new("/run/sentinel").join(".svc-secret.tmp");
-    std::fs::write(&tmp, contents).with_context(|| format!("staging {}", tmp.display()))?;
+    stage_private(&tmp, contents)?;
     let (Some(tmp_s), Some(dst_s)) = (tmp.to_str(), path.to_str()) else {
         bail!("non-UTF-8 path");
     };
