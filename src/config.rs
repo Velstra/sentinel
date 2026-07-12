@@ -2660,6 +2660,15 @@ pub struct System {
         skip_serializing_if = "ConfigSync::is_empty"
     )]
     pub config_sync: ConfigSync,
+    /// HA conntrack-state sync (`[system.conntrack-sync]`, roadmap C9): mirror the
+    /// eBPF conntrack table to peer firewalls so established (NAT'd) flows survive a
+    /// VRRP failover. Empty ⇒ off.
+    #[serde(
+        rename = "conntrack-sync",
+        default,
+        skip_serializing_if = "ConntrackSync::is_empty"
+    )]
+    pub conntrack_sync: ConntrackSync,
 }
 
 /// HA config sync (`[system.config-sync]`). On every `commit`, the running config
@@ -2688,6 +2697,85 @@ impl ConfigSync {
     pub fn is_empty(&self) -> bool {
         self.peers.is_empty() && self.secret.is_none()
     }
+}
+
+/// HA conntrack-state sync (`[system.conntrack-sync]`, roadmap C9). The velstra
+/// data plane binds a UDP socket on `listen`, pushes its live conntrack entries to
+/// each `peer` every `interval` seconds, and applies the entries a peer pushes — a
+/// pfsync-analog for the eBPF conntrack table. Together with VRRP (virtual IP) and
+/// `[system.config-sync]` (running config) it completes the HA triad: a failover
+/// keeps established, NAT'd connections alive instead of dropping every flow.
+///
+/// The sync stream is **unauthenticated** (like pfsync), so it must run over a
+/// trusted/dedicated sync link; firewall rules gate who may reach the port.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConntrackSync {
+    /// Address the data plane binds to receive peer state — `host` or `host:port`
+    /// (default port `5429`). When peers are set but `listen` is omitted, the box
+    /// binds `0.0.0.0:5429`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<String>,
+    /// Peer firewalls to push conntrack state to — `host` or `host:port` (default
+    /// port `5429`). Repeatable.
+    #[serde(rename = "peer", default, skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<String>,
+    /// Seconds between pushes. Defaults to 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval: Option<u64>,
+}
+
+impl ConntrackSync {
+    /// Default UDP port for the conntrack-sync socket.
+    pub const DEFAULT_PORT: u16 = 5429;
+
+    /// True when no conntrack sync is configured — lets `[system.conntrack-sync]`
+    /// be omitted from a saved config.
+    pub fn is_empty(&self) -> bool {
+        self.listen.is_none() && self.peers.is_empty() && self.interval.is_none()
+    }
+
+    /// The `listen` value normalized to `ip:port` for the velstra agent config —
+    /// appending the default port when only a host was given, and defaulting the
+    /// whole endpoint to `0.0.0.0:PORT` when unset. Returns `None` when not enabled.
+    pub fn listen_endpoint(&self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        Some(match &self.listen {
+            Some(l) => with_default_port(l, Self::DEFAULT_PORT),
+            None => format!("0.0.0.0:{}", Self::DEFAULT_PORT),
+        })
+    }
+
+    /// The peers normalized to `ip:port` for the velstra agent config.
+    pub fn peer_endpoints(&self) -> Vec<String> {
+        self.peers
+            .iter()
+            .map(|p| with_default_port(p, Self::DEFAULT_PORT))
+            .collect()
+    }
+}
+
+/// Append `:port` to a `host` that has no explicit port; leave a `host:port`
+/// (including a bracketed `[v6]:port`) untouched. A bare IPv6 literal (which
+/// contains colons but no port) is bracketed and given the default port.
+fn with_default_port(host: &str, port: u16) -> String {
+    // Already `host:port`? A single trailing `:digits` on an IPv4/hostname, or a
+    // bracketed `[v6]:digits`, means a port is present.
+    if let Some((h, p)) = host.rsplit_once(':') {
+        let has_port = !p.is_empty()
+            && p.chars().all(|c| c.is_ascii_digit())
+            && (h.starts_with('[') || !h.contains(':'));
+        if has_port {
+            return host.to_string();
+        }
+    }
+    // A bare IPv6 literal has colons but no port — bracket it.
+    if host.parse::<Ipv6Addr>().is_ok() {
+        return format!("[{host}]:{port}");
+    }
+    format!("{host}:{port}")
 }
 
 /// A local login account (`[[system.login]]`). Users are reconciled onto the box
@@ -5351,29 +5439,31 @@ impl Appliance {
         // a misconfiguration that would silently never sync.
         let cs = &self.system.config_sync;
         for peer in &cs.peers {
-            // A bare host (IPv4 / IPv6 / hostname) is fine; so is `host:port` with a
-            // numeric port (`[v6]:port` for IPv6). Try the bare forms first so a
-            // colon-bearing IPv6 literal is not mis-split as `host:port`.
-            let bare = validate_ipv4(peer).is_ok()
-                || validate_ipv6(peer).is_ok()
-                || validate_hostname(peer).is_ok();
-            let host_port = peer.rsplit_once(':').is_some_and(|(h, p)| {
-                !p.is_empty()
-                    && p.chars().all(|c| c.is_ascii_digit())
-                    && (validate_ipv4(h).is_ok()
-                        || validate_hostname(h).is_ok()
-                        || h.strip_prefix('[')
-                            .and_then(|x| x.strip_suffix(']'))
-                            .is_some_and(|v6| validate_ipv6(v6).is_ok()))
-            });
-            if !bare && !host_port {
-                bail!("system config-sync peer {peer:?}: not a host or host:port");
-            }
+            validate_sync_peer(peer).map_err(|e| anyhow::anyhow!("system config-sync peer {e}"))?;
         }
         if !cs.peers.is_empty() {
             match &cs.secret {
                 Some(s) if !s.is_empty() => {}
                 _ => bail!("system config-sync: a `secret` is required to push to peers"),
+            }
+        }
+
+        // HA conntrack sync ([system.conntrack-sync], C9): the eBPF conntrack table
+        // is mirrored to each peer so established NAT flows survive a VRRP failover.
+        // `listen` and every `peer` must be a host or host:port; the interval must
+        // be a sane, non-zero cadence.
+        let cts = &self.system.conntrack_sync;
+        if let Some(listen) = &cts.listen {
+            validate_sync_peer(listen)
+                .map_err(|e| anyhow::anyhow!("system conntrack-sync listen {e}"))?;
+        }
+        for peer in &cts.peers {
+            validate_sync_peer(peer)
+                .map_err(|e| anyhow::anyhow!("system conntrack-sync peer {e}"))?;
+        }
+        if let Some(iv) = cts.interval {
+            if iv == 0 || iv > 3600 {
+                bail!("system conntrack-sync: interval {iv} must be 1..=3600 seconds");
             }
         }
 
@@ -6188,6 +6278,29 @@ pub(crate) fn validate_host(s: &str) -> Result<()> {
         });
     if !ok {
         bail!("{s:?} is not a valid host (IP or hostname)");
+    }
+    Ok(())
+}
+
+/// Validate an HA peer/listen endpoint: a bare host (IPv4 / IPv6 / hostname) or
+/// `host:port` (`[v6]:port` for an IPv6 literal). Shared by config-sync and
+/// conntrack-sync so both accept the same forms. The bare forms are tried first so
+/// a colon-bearing IPv6 literal is not mis-split as `host:port`.
+pub(crate) fn validate_sync_peer(peer: &str) -> Result<()> {
+    let bare = validate_ipv4(peer).is_ok()
+        || validate_ipv6(peer).is_ok()
+        || validate_hostname(peer).is_ok();
+    let host_port = peer.rsplit_once(':').is_some_and(|(h, p)| {
+        !p.is_empty()
+            && p.chars().all(|c| c.is_ascii_digit())
+            && (validate_ipv4(h).is_ok()
+                || validate_hostname(h).is_ok()
+                || h.strip_prefix('[')
+                    .and_then(|x| x.strip_suffix(']'))
+                    .is_some_and(|v6| validate_ipv6(v6).is_ok()))
+    });
+    if !bare && !host_port {
+        bail!("{peer:?}: not a host or host:port");
     }
     Ok(())
 }
@@ -8723,6 +8836,68 @@ virtual-address = ["10.0.0.254"]
         assert!(
             Appliance::from_toml(&format!(
                 "{base}[system.config-sync]\npeer = [\"10.0.0.2:bad\"]\nsecret = \"x\"\n"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn with_default_port_normalizes_endpoints() {
+        // Bare host → default port; explicit port preserved; IPv6 literal bracketed.
+        assert_eq!(with_default_port("10.0.0.2", 5429), "10.0.0.2:5429");
+        assert_eq!(with_default_port("10.0.0.2:9999", 5429), "10.0.0.2:9999");
+        assert_eq!(with_default_port("fw.local", 5429), "fw.local:5429");
+        assert_eq!(with_default_port("fd00::2", 5429), "[fd00::2]:5429");
+        assert_eq!(with_default_port("[fd00::2]:7000", 5429), "[fd00::2]:7000");
+    }
+
+    #[test]
+    fn conntrack_sync_parses_validates_and_round_trips() {
+        let base = "[system]\nhostname = \"fw\"\n";
+
+        // A full [system.conntrack-sync] parses, validates, round-trips, and
+        // normalizes to ip:port endpoints for the agent config.
+        let toml = format!(
+            "{base}[system.conntrack-sync]\nlisten = \"0.0.0.0\"\npeer = [\"10.9.0.2\", \"10.9.0.3:6000\"]\ninterval = 2\n"
+        );
+        let a = Appliance::from_toml(&toml).expect("conntrack-sync parses + validates");
+        let cts = &a.system.conntrack_sync;
+        assert_eq!(cts.listen_endpoint().as_deref(), Some("0.0.0.0:5429"));
+        assert_eq!(
+            cts.peer_endpoints(),
+            vec!["10.9.0.2:5429".to_string(), "10.9.0.3:6000".to_string()]
+        );
+        assert_eq!(cts.interval, Some(2));
+        let round = Appliance::from_toml(&a.to_toml().unwrap()).unwrap();
+        assert_eq!(round.system.conntrack_sync.peers, cts.peers);
+
+        // Peers-only (no listen) still enables sync and defaults the bind endpoint.
+        let a = Appliance::from_toml(&format!(
+            "{base}[system.conntrack-sync]\npeer = [\"10.9.0.2\"]\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            a.system.conntrack_sync.listen_endpoint().as_deref(),
+            Some("0.0.0.0:5429")
+        );
+
+        // Default (no section) is empty → omitted from a save, no endpoints.
+        let plain = Appliance::from_toml(base).unwrap();
+        assert!(plain.system.conntrack_sync.is_empty());
+        assert!(plain.system.conntrack_sync.listen_endpoint().is_none());
+        assert!(!plain.to_toml().unwrap().contains("conntrack-sync"));
+
+        // Bad: a peer that is not a host / host:port.
+        assert!(
+            Appliance::from_toml(&format!(
+                "{base}[system.conntrack-sync]\npeer = [\"10.9.0.2:bad\"]\n"
+            ))
+            .is_err()
+        );
+        // Bad: an out-of-range interval.
+        assert!(
+            Appliance::from_toml(&format!(
+                "{base}[system.conntrack-sync]\nlisten = \"0.0.0.0\"\ninterval = 0\n"
             ))
             .is_err()
         );
