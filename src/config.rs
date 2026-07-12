@@ -811,12 +811,17 @@ pub struct DhcpRelay {
     /// Upstream DHCP server addresses to relay requests to (IPv4).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub server: Vec<String>,
+    /// Upstream DHCPv6 server addresses to relay requests to (IPv6). A unicast
+    /// server address, or the well-known relay multicast `ff05::1:3`. Enables the
+    /// v6 relay independently of the v4 one — a link can relay either family or both.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server6: Vec<String>,
 }
 
 impl DhcpRelay {
     /// True when no relay is configured — lets `[services.dhcp-relay]` be omitted.
     pub fn is_empty(&self) -> bool {
-        self.interface.is_empty() && self.server.is_empty()
+        self.interface.is_empty() && self.server.is_empty() && self.server6.is_empty()
     }
 }
 
@@ -5511,8 +5516,10 @@ impl Appliance {
         // served locally or relayed upstream, never both).
         let relay = &self.services.dhcp_relay;
         if !relay.is_empty() {
-            if relay.server.is_empty() {
-                bail!("services dhcp-relay: at least one upstream `server` is required");
+            if relay.server.is_empty() && relay.server6.is_empty() {
+                bail!(
+                    "services dhcp-relay: at least one upstream `server` (IPv4) or `server6` (IPv6) is required"
+                );
             }
             if relay.interface.is_empty() {
                 bail!("services dhcp-relay: at least one `interface` to relay on is required");
@@ -5521,20 +5528,33 @@ impl Appliance {
         for srv in &relay.server {
             validate_ipv4(srv).with_context(|| "services dhcp-relay server")?;
         }
+        for srv in &relay.server6 {
+            validate_ipv6(srv).with_context(|| "services dhcp-relay server6")?;
+        }
+        let has_static =
+            |a: &Option<String>| matches!(a.as_deref(), Some(x) if x != "dhcp" && x != "auto");
         for iface in &relay.interface {
             match self.interfaces.iter().find(|i| &i.name == iface) {
                 Some(i) if i.dhcp_server.is_some() => bail!(
                     "services dhcp-relay interface {iface:?}: already runs a DHCP server (a link is either served or relayed, not both)"
                 ),
                 // The relay (dnsmasq) listens on the interface's own address and
-                // stamps it as the DHCP giaddr, so a client-facing relay link
-                // needs a static address (a `dhcp`/unset link cannot relay).
-                Some(i) => match i.address.as_deref() {
-                    Some(addr) if addr != "dhcp" => {}
-                    _ => bail!(
-                        "services dhcp-relay interface {iface:?}: needs a static address (the relay stamps it as the DHCP giaddr)"
-                    ),
-                },
+                // stamps it as the relay source, so a client-facing relay link needs
+                // a static address in each relayed family (a `dhcp`/`auto`/unset link
+                // cannot relay that family). v4 relay ⇒ needs `address`; v6 relay ⇒
+                // needs `address6`.
+                Some(i) => {
+                    if !relay.server.is_empty() && !has_static(&i.address) {
+                        bail!(
+                            "services dhcp-relay interface {iface:?}: needs a static `address` to relay IPv4 (stamped as the DHCP giaddr)"
+                        );
+                    }
+                    if !relay.server6.is_empty() && !has_static(&i.address6) {
+                        bail!(
+                            "services dhcp-relay interface {iface:?}: needs a static `address6` to relay IPv6"
+                        );
+                    }
+                }
                 None => bail!("services dhcp-relay interface {iface:?}: not a declared interface"),
             }
         }
@@ -8182,6 +8202,64 @@ server = ["10.0.0.99"]
         }
         let b = Appliance::from_toml(&out).expect("re-parses");
         assert_eq!(b.services.dhcp_relay.interface, vec!["iot0"]);
+    }
+
+    #[test]
+    fn dhcp_relay_v6_parses_validates_and_round_trips() {
+        let base = |relay: &str| {
+            format!(
+                r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "lan0"
+zone = "lan"
+address = "10.0.0.1/24"
+address6 = "2001:db8:1::1/64"
+[services.dhcp-relay]
+interface = ["lan0"]
+{relay}
+"#
+            )
+        };
+        // A v6-only relay (server6, no v4 server) validates and round-trips.
+        let a = Appliance::from_toml(&base("server6 = [\"2001:db8:99::1\", \"ff05::1:3\"]"))
+            .expect("v6 relay parses + validates");
+        assert_eq!(
+            a.services.dhcp_relay.server6,
+            vec!["2001:db8:99::1", "ff05::1:3"]
+        );
+        assert!(a.services.dhcp_relay.server.is_empty());
+        let round = Appliance::from_toml(&a.to_toml().unwrap()).unwrap();
+        assert_eq!(
+            round.services.dhcp_relay.server6,
+            a.services.dhcp_relay.server6
+        );
+
+        // Dual-stack (server + server6) also validates.
+        assert!(
+            Appliance::from_toml(&base(
+                "server = [\"10.0.0.99\"]\nserver6 = [\"2001:db8:99::1\"]"
+            ))
+            .is_ok()
+        );
+
+        // Bad: server6 that is not an IPv6.
+        assert!(Appliance::from_toml(&base("server6 = [\"not-a-v6\"]")).is_err());
+
+        // Bad: relaying v6 on an interface without a static `address6`.
+        let no_v6 = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "lan0"
+zone = "lan"
+address = "10.0.0.1/24"
+[services.dhcp-relay]
+interface = ["lan0"]
+server6 = ["2001:db8:99::1"]
+"#;
+        assert!(Appliance::from_toml(no_v6).is_err());
     }
 
     #[test]

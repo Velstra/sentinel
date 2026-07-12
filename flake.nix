@@ -4053,6 +4053,146 @@
           '';
         };
 
+        # DHCPv6 relay (roadmap C18): the IPv6 sibling of the DHCP relay. Same
+        # three-node shape — a `client` on an isolated front segment (vlan 2), the
+        # sentinel `relay` in the middle, a DHCPv6 `dhcpserver` on the back segment
+        # (vlan 3) serving the client's /64 it isn't attached to. The relay stamps its
+        # client-facing v6 address as the DHCPv6 relay link-address, dnsmasq matches it
+        # to the pool, and the client obtains a lease from the far pool — proving the
+        # SOLICIT was relayed upstream and the REPLY relayed back. The client solicits
+        # without an RA (networkd `WithoutRA=solicit`) so the test needs no router-ad.
+        #   nix build .#checks.x86_64-linux.dhcprelay6 -L
+        dhcprelay6 = pkgs.testers.runNixOSTest {
+          name = "sentinel-dhcprelay6";
+          nodes = {
+            # Front segment (vlan 2): a DHCPv6 client with no local server. It
+            # solicits DHCPv6 immediately (no RA needed) and takes the offered address.
+            client =
+              { ... }:
+              {
+                virtualisation.vlans = [ 2 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                };
+                systemd.network.networks."10-eth1" = {
+                  matchConfig.Name = "eth1";
+                  networkConfig = {
+                    DHCP = "ipv6";
+                    IPv6AcceptRA = false;
+                  };
+                  dhcpV6Config.WithoutRA = "solicit";
+                };
+              };
+            # Back segment (vlan 3): the real DHCPv6 server. It serves the CLIENT's
+            # /64 (2001:db8:1::/64) it isn't attached to — dnsmasq matches the relay's
+            # link-address to this dhcp-range — and routes replies to that prefix back
+            # through the relay.
+            dhcpserver =
+              { pkgs, ... }:
+              {
+                virtualisation.vlans = [ 3 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                  interfaces.eth1.ipv6.addresses = [
+                    {
+                      address = "2001:db8:2::2";
+                      prefixLength = 64;
+                    }
+                  ];
+                  interfaces.eth1.ipv6.routes = [
+                    {
+                      address = "2001:db8:1::";
+                      prefixLength = 64;
+                      via = "2001:db8:2::1";
+                    }
+                  ];
+                };
+                services.dnsmasq = {
+                  enable = true;
+                  settings = {
+                    port = 0;
+                    interface = "eth1";
+                    bind-interfaces = true;
+                    dhcp-authoritative = true;
+                    dhcp-range = [ "2001:db8:1::100,2001:db8:1::200,64,12h" ];
+                  };
+                };
+              };
+            # The sentinel relay: eth1 (vlan 1, isolated) hosts velstra; eth2 (vlan 2)
+            # faces the client and is sentinel-owned; eth3 (vlan 3) faces the server.
+            relay =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "relay";
+                networking.firewall.enable = lib.mkForce false;
+                virtualisation.vlans = [
+                  1
+                  2
+                  3
+                ];
+                virtualisation.memorySize = 2048;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = "192.168.99.1";
+                    prefixLength = 24;
+                  }
+                ];
+                networking.interfaces.eth3.ipv6.addresses = [
+                  {
+                    address = "2001:db8:2::1";
+                    prefixLength = 64;
+                  }
+                ];
+                boot.kernel.sysctl = {
+                  "net.ipv6.conf.all.forwarding" = 1;
+                };
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+          };
+          testScript = ''
+            start_all()
+            relay.wait_for_unit("multi-user.target")
+            relay.wait_for_unit("velstra.service")
+            dhcpserver.wait_for_unit("dnsmasq.service")
+
+            # eth2 is sentinel-owned: give it the client-facing v6 address and turn on
+            # the DHCPv6 relay to the back-segment server. ONE `set` per line.
+            relay.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth2 address6 2001:db8:1::1/64' "
+                "'set services dhcp-relay interface eth2' "
+                "'set services dhcp-relay server6 2001:db8:2::2' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            relay.wait_for_unit("velstra.service")
+
+            # Sentinel rendered the dnsmasq v6 relay line + unit.
+            relay.wait_until_succeeds(
+                "test -f /run/sentinel/dhcp-relay/relay.conf", timeout=20
+            )
+            conf = relay.succeed("cat /run/sentinel/dhcp-relay/relay.conf")
+            assert "dhcp-relay=2001:db8:1::1,2001:db8:2::2" in conf, conf
+            relay.wait_for_unit("sentinel-dhcp-relay.service")
+            relay.wait_until_succeeds("ip -6 addr show eth2 | grep -q '2001:db8:1::1'", timeout=30)
+            relay.succeed("grep -q 'server6' /var/lib/sentinel/appliance.toml")
+
+            # The headline: the client — whose segment has only the relay — obtains a
+            # DHCPv6 lease from the far server's pool (2001:db8:1::100-200), proving the
+            # SOLICIT was relayed upstream and the REPLY relayed back.
+            client.wait_for_unit("multi-user.target")
+            client.wait_until_succeeds(
+                "ip -6 addr show eth1 | grep -qE '2001:db8:1::(1[0-9a-f][0-9a-f]|200)'",
+                timeout=120,
+            )
+          '';
+        };
+
         # mDNS reflector (roadmap C18): three nodes — a `responder` publishing
         # `responder.local` on segment A (vlan 2), the sentinel `relay` reflecting
         # mDNS between segment A and segment B, and a `browser` on segment B

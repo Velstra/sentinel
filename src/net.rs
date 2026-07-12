@@ -973,23 +973,29 @@ fn ipv4_of(addr: &str) -> Option<String> {
 /// forwards to `<server>`. Interfaces without a resolvable static IPv4 are
 /// skipped (validation already forbids them).
 fn dhcp_relay_conf_body(relay: &DhcpRelay, ifaces: &[Interface]) -> Option<String> {
-    if relay.server.is_empty() || relay.interface.is_empty() {
+    if (relay.server.is_empty() && relay.server6.is_empty()) || relay.interface.is_empty() {
         return None;
     }
     let mut body = String::from("# rendered by sentinel — DHCP relay (dnsmasq)\nport=0\n");
     let mut any = false;
     for name in &relay.interface {
-        let Some(local) = ifaces
-            .iter()
-            .find(|i| &i.name == name)
-            .and_then(|i| i.address.as_deref())
-            .and_then(ipv4_of)
-        else {
-            continue;
-        };
-        for server in &relay.server {
-            body.push_str(&format!("dhcp-relay={local},{server}\n"));
-            any = true;
+        let iface = ifaces.iter().find(|i| &i.name == name);
+        // IPv4 relay: `dhcp-relay=<iface v4>,<server>` — the interface's own address
+        // is stamped as the giaddr.
+        if let Some(local) = iface.and_then(|i| i.address.as_deref()).and_then(ipv4_of) {
+            for server in &relay.server {
+                body.push_str(&format!("dhcp-relay={local},{server}\n"));
+                any = true;
+            }
+        }
+        // IPv6 relay: `dhcp-relay=<iface v6>,<server6>` — dnsmasq relays DHCPv6 out of
+        // the interface owning the local v6 address to each upstream (unicast, or the
+        // relay multicast ff05::1:3).
+        if let Some(local6) = iface.and_then(|i| i.address6.as_deref()).and_then(ipv6_of) {
+            for server in &relay.server6 {
+                body.push_str(&format!("dhcp-relay={local6},{server}\n"));
+                any = true;
+            }
         }
     }
     any.then_some(body)
@@ -3991,6 +3997,7 @@ mod tests {
         let no_srv = DhcpRelay {
             interface: vec!["lan0".into()],
             server: vec![],
+            server6: vec![],
         };
         assert!(dhcp_relay_conf_body(&no_srv, &ifaces).is_none());
         // A static-addressed relay interface ⇒ a `dhcp-relay=<local>,<server>`
@@ -3998,6 +4005,7 @@ mod tests {
         let r = DhcpRelay {
             interface: vec!["lan0".into()],
             server: vec!["10.0.99.1".into(), "10.0.99.2".into()],
+            server6: vec![],
         };
         let body = dhcp_relay_conf_body(&r, &ifaces).expect("configured");
         assert!(body.contains("port=0"), "got:\n{body}");
@@ -4009,6 +4017,47 @@ mod tests {
             body.contains("dhcp-relay=10.0.7.1,10.0.99.2"),
             "got:\n{body}"
         );
+    }
+
+    #[test]
+    fn dhcp_relay_conf_renders_ipv6_and_dual_stack() {
+        // A dual-stack interface (v4 `address` + v6 `address6`) relaying both
+        // families emits a v4 line (giaddr) AND a v6 line (local v6) per upstream.
+        let mut lan = iface_addr("lan0", "10.0.7.1/24");
+        lan.address6 = Some("2001:db8:7::1/64".into());
+        let ifaces = vec![lan];
+        let r = DhcpRelay {
+            interface: vec!["lan0".into()],
+            server: vec!["10.0.99.1".into()],
+            server6: vec!["2001:db8:99::1".into(), "ff05::1:3".into()],
+        };
+        let body = dhcp_relay_conf_body(&r, &ifaces).expect("configured");
+        assert!(
+            body.contains("dhcp-relay=10.0.7.1,10.0.99.1"),
+            "got:\n{body}"
+        );
+        assert!(
+            body.contains("dhcp-relay=2001:db8:7::1,2001:db8:99::1"),
+            "got:\n{body}"
+        );
+        assert!(
+            body.contains("dhcp-relay=2001:db8:7::1,ff05::1:3"),
+            "got:\n{body}"
+        );
+
+        // v6-only: an interface with only `address6` and only `server6` set still
+        // relays v6 (no v4 line, no v4 address needed).
+        let v6only = DhcpRelay {
+            interface: vec!["lan0".into()],
+            server: vec![],
+            server6: vec!["2001:db8:99::1".into()],
+        };
+        let body = dhcp_relay_conf_body(&v6only, &ifaces).expect("configured");
+        assert!(
+            body.contains("dhcp-relay=2001:db8:7::1,2001:db8:99::1"),
+            "got:\n{body}"
+        );
+        assert!(!body.contains("10.0.99"), "no v4 lines expected:\n{body}");
     }
 
     #[test]
