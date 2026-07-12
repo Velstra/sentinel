@@ -14,6 +14,16 @@
   end in the eBPF datapath. Docs: a new HA-conntrack-sync handbook section and a
   three-node HA-cluster example.
 
+### Tested
+- **Per-protocol routing VM checks for RIPng, Babel and IS-IS** — two-appliance
+  `nixosTest`s (`checks.ripng` / `checks.babel` / `checks.isis`) that form an
+  adjacency over the real Velstra datapath and verify each node learns and installs
+  the other's redistributed prefix, closing the standing per-protocol coverage gap
+  (RIP/OSPFv2/OSPFv3/BGP/BFD/VRRP already had one). IS-IS also confirms Velstra's
+  XDP passes its L2 (non-IP) frames. The Babel check surfaced a real requirement —
+  Babel needs a unique per-node `router-id` (it keys route origins on it, RFC 8966
+  §3.5); the docs/examples set one.
+
 ## [0.3.2] — 2026-07-12
 
 ## [0.3.1] — 2026-07-12
