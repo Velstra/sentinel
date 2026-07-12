@@ -79,3 +79,45 @@ set system config-sync peer 10.0.0.2
 > peer list — appropriate when the pair is symmetric. Pair it with
 > [VRRP](routing.md#vrrp) for the virtual IP and you have a full
 > active/standby firewall. See the [HA pair example](examples.md#ha-pair).
+
+`config-sync` scales past a pair: `peer` is repeatable, so an active node can push
+to two or more standbys (a full mesh, each node listing the others). Only the
+interactive `commit` pushes — a received sync never re-pushes — so a cluster of
+any size never loops. There is no designated primary and no merge, so drive edits
+from **one** node (last write wins), exactly like pfSense.
+
+## HA conntrack sync
+
+VRRP alone hands the virtual IP to a standby on failover, but the standby has
+never seen the active node's flows — so every established, NAT'd connection breaks
+the moment the IP moves. `system conntrack-sync` fixes that: it mirrors the eBPF
+conntrack table to the HA peers (a *pfsync*-analog). The data plane binds a UDP
+socket, pushes its live conntrack entries to each peer every interval, and applies
+the entries a peer pushes — so whichever node VRRP promotes already holds the flow
+table and the connections survive.
+
+| Field | Meaning |
+|---|---|
+| `listen` | Local bind endpoint for peer state — `host` or `host:port` (default port `5429`). Defaults to `0.0.0.0:5429`. |
+| `peer` | A peer firewall to push conntrack state to — `host` or `host:port` (default port `5429`, repeatable). |
+| `interval` | Seconds between pushes (default `1`). |
+
+```text
+# Symmetric HA pair — each node pushes to the other:
+# On fw1 (10.0.0.2):
+set system conntrack-sync peer 10.0.0.3
+# On fw2 (10.0.0.3):
+set system conntrack-sync peer 10.0.0.2
+```
+
+Like config-sync, `peer` is repeatable, so a three-or-more node cluster is a full
+mesh: each node pushes its table to every other, and whichever one becomes master
+already has the state. `listen` defaults to `0.0.0.0:5429`, so setting a `peer` is
+enough to enable both directions.
+
+> **Trust the link.** The sync stream is unauthenticated (like pfsync), so it must
+> run over a trusted or dedicated sync segment — a peer that can reach the socket
+> can inject conntrack (hence NAT) state. Gate the port with a firewall rule, or
+> put the sync on its own zone. Together **VRRP + config-sync + conntrack-sync**
+> make a complete stateful active/standby (or active/active-capable) HA cluster;
+> see the [HA pair example](examples.md#ha-pair).

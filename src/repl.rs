@@ -1752,6 +1752,10 @@ const SYSTEM_FIELDS: &[Cand] = &[
         "config-sync",
         "push the running config to peer firewalls on commit (HA)",
     ),
+    (
+        "conntrack-sync",
+        "mirror the conntrack table to peers so NAT flows survive failover (HA, C9)",
+    ),
 ];
 // `system config-sync <Tab>` reveals the HA config-sync fields.
 const CONFIGSYNC_FIELDS: &[Cand] = &[
@@ -1760,6 +1764,18 @@ const CONFIGSYNC_FIELDS: &[Cand] = &[
         "a peer firewall to push to — host or host:port (repeatable)",
     ),
     ("secret", "the shared bearer token both peers present"),
+];
+// `system conntrack-sync <Tab>` reveals the HA conntrack-sync fields (C9).
+const CONNTRACKSYNC_FIELDS: &[Cand] = &[
+    (
+        "listen",
+        "local bind endpoint for peer state — host or host:port (default :5429)",
+    ),
+    (
+        "peer",
+        "a peer firewall to push conntrack state to — host or host:port (repeatable)",
+    ),
+    ("interval", "seconds between pushes (default 1)"),
 ];
 const GLOBAL_FIELDS: &[Cand] = &[
     (
@@ -2242,6 +2258,7 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ] => BOOLS,
         ["set" | "delete", "system", "login", _name] => LOGIN_FIELDS,
         ["set" | "delete", "system", "config-sync"] => CONFIGSYNC_FIELDS,
+        ["set" | "delete", "system", "conntrack-sync"] => CONNTRACKSYNC_FIELDS,
         ["set" | "delete", "services", "mdns"] => MDNS_FIELDS,
         ["set" | "delete", "services", "dyndns"] => DYNDNS_FIELDS,
         ["set", "services", "dyndns", "provider"] => DYNDNS_PROVIDERS,
@@ -2861,6 +2878,7 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
         ["set", "services", "ssh", "listen-address"] => own_cands(&[PH_IPV4]),
         ["set", "system", "login", _name, "ssh-key"] => own_cands(&[PH_KEY]),
         ["set", "system", "config-sync", "peer"] => own_cands(&[PH_IPV4]),
+        ["set", "system", "conntrack-sync", "listen" | "peer"] => own_cands(&[PH_IPV4]),
         ["set", "services", "snmp", "community"] => own_cands(&[PH_KEY]),
         ["set", "services", "snmp", "location" | "contact"] => own_cands(&[PH_TEXT]),
         ["set", "services", "dhcp-relay", "server"] => own_cands(&[PH_IPV4]),
@@ -3266,8 +3284,15 @@ mod tests {
                 "update"
             ]
         );
-        assert_eq!(kw(&["set", "system"]), ["hostname", "login", "config-sync"]);
+        assert_eq!(
+            kw(&["set", "system"]),
+            ["hostname", "login", "config-sync", "conntrack-sync"]
+        );
         assert_eq!(kw(&["set", "system", "config-sync"]), ["peer", "secret"]);
+        assert_eq!(
+            kw(&["set", "system", "conntrack-sync"]),
+            ["listen", "peer", "interval"]
+        );
         assert_eq!(
             kw(&["set", "interface", "wan0"]),
             [

@@ -2907,6 +2907,193 @@
           '';
         };
 
+        # Stateful-HA conntrack sync (roadmap C9): the pfsync-analog for the eBPF
+        # CONNTRACK map. A `client`(LAN) reaches a web server through the masquerading
+        # master `fw`, which creates a conntrack entry for the NAT'd flow — and then
+        # pushes its whole conntrack table over UDP to its HA peers. Two backups
+        # (`bk1`, `bk2`) prove the sync is a full **N-way mesh**, not just a pair:
+        # both receive and apply the master's flow table into their own CONNTRACK map,
+        # so whichever node a VRRP failover promotes already holds the live flows.
+        # `bk1` doubles as the WAN web server (the masq destination); `bk2` is
+        # listen-only. Verified by each node's velstra journal (push on `fw`, apply on
+        # both backups) — the sync datapath runs inside the sandboxed VMs.
+        #   nix build .#checks.x86_64-linux.conntracksync -L
+        conntracksync = pkgs.testers.runNixOSTest {
+          name = "sentinel-conntracksync";
+          nodes = {
+            # Private client on the LAN segment (vlan 2), default route via the fw.
+            client =
+              { pkgs, ... }:
+              {
+                virtualisation.vlans = [ 2 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                  interfaces.eth1.ipv4.addresses = [
+                    {
+                      address = "10.2.0.2";
+                      prefixLength = 24;
+                    }
+                  ];
+                  defaultGateway = {
+                    address = "10.2.0.1";
+                    interface = "eth1";
+                  };
+                };
+                environment.systemPackages = [ pkgs.curl ];
+              };
+            # HA master: WAN = eth1 (vlan 1, masqueraded), LAN = eth2 (vlan 2). It
+            # pushes its conntrack table to BOTH backups (a full mesh, N > 2).
+            fw =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "fw";
+                networking.firewall.enable = lib.mkForce false;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = "10.1.0.1";
+                    prefixLength = 24;
+                  }
+                ];
+                networking.interfaces.eth2.ipv4.addresses = [
+                  {
+                    address = "10.2.0.1";
+                    prefixLength = 24;
+                  }
+                ];
+                virtualisation.vlans = [
+                  1
+                  2
+                ];
+                virtualisation.memorySize = 2048;
+                boot.kernel.sysctl = {
+                  "net.ipv4.ip_forward" = 1;
+                  "net.ipv4.conf.all.rp_filter" = 0;
+                  "net.ipv4.conf.default.rp_filter" = 0;
+                  "net.ipv4.conf.all.accept_local" = 1;
+                };
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+            # Backup 1 on the WAN segment (vlan 1): listens for the master's conntrack
+            # push AND serves the web page the client dials (the masq destination).
+            bk1 =
+              { pkgs, lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "bk1";
+                networking.firewall.enable = lib.mkForce false;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = "10.1.0.2";
+                    prefixLength = 24;
+                  }
+                ];
+                virtualisation.vlans = [ 1 ];
+                virtualisation.memorySize = 2048;
+                services.velstra.interface = lib.mkForce "eth1";
+                systemd.services.web = {
+                  wantedBy = [ "multi-user.target" ];
+                  after = [ "network-online.target" ];
+                  script = ''
+                    mkdir -p /srv/web && echo hello-from-server > /srv/web/index.html
+                    exec ${pkgs.python3}/bin/python3 -m http.server 80 --directory /srv/web
+                  '';
+                };
+              };
+            # Backup 2 on the WAN segment (vlan 1): listen-only. Its only job is to
+            # prove the master pushes to more than one peer (the mesh).
+            bk2 =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "bk2";
+                networking.firewall.enable = lib.mkForce false;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = "10.1.0.3";
+                    prefixLength = 24;
+                  }
+                ];
+                virtualisation.vlans = [ 1 ];
+                virtualisation.memorySize = 2048;
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+          };
+          testScript = ''
+            start_all()
+            for n in (fw, bk1, bk2):
+                n.wait_for_unit("multi-user.target")
+                n.wait_for_unit("velstra.service")
+            bk1.wait_for_unit("web.service")
+
+            # Addresses live before configuring — the agent reads the WAN ip to fill
+            # the masquerade map, and binds the conntrack-sync socket at (re)start.
+            fw.wait_until_succeeds("ip addr show eth1 | grep -q 10.1.0.1", timeout=20)
+            fw.wait_until_succeeds("ip addr show eth2 | grep -q 10.2.0.1", timeout=20)
+
+            # Master: zone both NICs, masquerade the WAN, and push conntrack to BOTH
+            # backups (the N-way mesh).
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth1 zone wan' "
+                "'set interface eth2 zone lan' "
+                "'set firewall zone lan default-action accept' "
+                "'set nat source wan-masq zone wan' "
+                "'set system conntrack-sync listen 0.0.0.0:5429' "
+                "'set system conntrack-sync peer 10.1.0.2' "
+                "'set system conntrack-sync peer 10.1.0.3' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            fw.wait_for_unit("velstra.service")
+            fw.succeed("grep -q '\\[conntrack_sync\\]' /run/sentinel/velstra.toml")
+            fw.succeed("grep -q '10.1.0.2:5429' /run/sentinel/velstra.toml")
+
+            # Each backup: accept ingress on the WAN segment (so the sync UDP + the
+            # masqueraded web request pass the XDP hook) and listen for peer state.
+            for n in (bk1, bk2):
+                n.succeed(
+                    "su admin -c \"printf '%s\\n' "
+                    "'set interface eth1 zone lan' "
+                    "'set firewall zone lan default-action accept' "
+                    "'set system conntrack-sync listen 0.0.0.0:5429' "
+                    "commit save exit "
+                    "| sentinel configure\""
+                )
+                n.wait_for_unit("velstra.service")
+                n.succeed("journalctl -u velstra.service | grep -q 'conntrack-sync: listening'")
+
+            # The headline flow: the LAN client reaches the web server THROUGH the fw,
+            # which masquerades it and records a conntrack entry for the NAT'd flow.
+            client.wait_until_succeeds(
+                "curl -s --max-time 5 http://10.1.0.2:80/ | grep -q hello-from-server",
+                timeout=60,
+            )
+
+            # The master pushes its conntrack table to its peers each interval.
+            fw.wait_until_succeeds(
+                "journalctl -u velstra.service | grep -q 'conntrack-sync: pushed'",
+                timeout=30,
+            )
+
+            # The proof of C9: BOTH backups apply the master's flow entries into their
+            # own CONNTRACK map — the state that lets an established connection survive
+            # a failover. Two applying backups proves the >2-node mesh.
+            bk1.wait_until_succeeds(
+                "journalctl -u velstra.service | grep -q 'conntrack-sync: applied'",
+                timeout=30,
+            )
+            bk2.wait_until_succeeds(
+                "journalctl -u velstra.service | grep -q 'conntrack-sync: applied'",
+                timeout=30,
+            )
+            # The apply came from the master's WAN address (not some stray peer).
+            bk1.succeed("journalctl -u velstra.service | grep 'conntrack-sync: applied' | grep -q '10.1.0.1'")
+          '';
+        };
+
         # NPTv6 / NAT66 (roadmap C16, RFC 6296): stateless, checksum-neutral IPv6
         # prefix translation. A `client` on an internal ULA prefix (fd00:1::/48)
         # reaches an external `server`; the fw translates the client's source to

@@ -42,6 +42,21 @@ pub struct VelstraConfig {
     port_forwards: Vec<PortForwardOut>,
     #[serde(rename = "npt66", skip_serializing_if = "Vec::is_empty")]
     npt66: Vec<Npt66Out>,
+    /// C9 stateful-HA conntrack sync (`[conntrack_sync]`). Present only when the
+    /// appliance has `[system.conntrack-sync]`. A single table emitted after the
+    /// `[[…]]` arrays — velstra reads it order-independently.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conntrack_sync: Option<ConntrackSyncOut>,
+}
+
+/// The `[conntrack_sync]` block in the emitted velstra config — endpoints already
+/// normalized to `ip:port` by the appliance layer.
+#[derive(Debug, Serialize)]
+struct ConntrackSyncOut {
+    listen: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    peer: Vec<String>,
+    interval_secs: u64,
 }
 
 /// One `[[npt66]]` entry in the emitted velstra config — a NPTv6 (RFC 6296)
@@ -341,6 +356,15 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
         })
         .collect();
 
+    // C9 conntrack sync — emit `[conntrack_sync]` only when configured, with the
+    // endpoints already normalized to `ip:port` by the appliance layer.
+    let cts = &appliance.system.conntrack_sync;
+    let conntrack_sync = cts.listen_endpoint().map(|listen| ConntrackSyncOut {
+        listen,
+        peer: cts.peer_endpoints(),
+        interval_secs: cts.interval.unwrap_or(1),
+    });
+
     VelstraConfig {
         // Deny by default; interfaces opt into their zone policy.
         default_action: action_str(fw.default_action),
@@ -352,6 +376,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
         interfaces,
         port_forwards,
         npt66,
+        conntrack_sync,
     }
 }
 
@@ -839,5 +864,45 @@ zone = "wan"
         let value: toml::Value = toml::from_str(&toml).unwrap();
         assert_eq!(value["default_action"].as_str(), Some("drop"));
         assert!(value["policy"].as_array().unwrap().len() == 2);
+    }
+
+    #[test]
+    fn conntrack_sync_emits_normalized_endpoints() {
+        // A `[system.conntrack-sync]` with a bare-host peer + custom interval emits
+        // a `[conntrack_sync]` block whose endpoints carry the default UDP port and
+        // whose interval is passed through.
+        let toml = r#"
+[system]
+hostname = "fw"
+[system.conntrack-sync]
+listen = "0.0.0.0:5429"
+peer = ["10.9.0.2"]
+interval = 3
+[[interface]]
+name = "lan0"
+zone = "lan"
+"#;
+        let cfg = compile(&Appliance::from_toml(toml).unwrap());
+        let cts = cfg.conntrack_sync.as_ref().expect("emitted");
+        assert_eq!(cts.listen, "0.0.0.0:5429");
+        assert_eq!(cts.peer, vec!["10.9.0.2:5429".to_string()]);
+        assert_eq!(cts.interval_secs, 3);
+
+        // And it renders as a `[conntrack_sync]` table velstra can parse.
+        let out = cfg.to_toml().unwrap();
+        assert!(out.contains("[conntrack_sync]"), "{out}");
+        let value: toml::Value = toml::from_str(&out).unwrap();
+        assert_eq!(
+            value["conntrack_sync"]["listen"].as_str(),
+            Some("0.0.0.0:5429")
+        );
+    }
+
+    #[test]
+    fn no_conntrack_sync_omits_the_block() {
+        let appliance = Appliance::from_toml(crate::config::EXAMPLE).unwrap();
+        let cfg = compile(&appliance);
+        assert!(cfg.conntrack_sync.is_none());
+        assert!(!cfg.to_toml().unwrap().contains("conntrack_sync"));
     }
 }
