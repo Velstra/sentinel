@@ -1313,6 +1313,10 @@ const DHCP_RELAY_FIELDS: &[Cand] = &[
         "server",
         "upstream DHCP server addresses (comma-separated IPv4)",
     ),
+    (
+        "server6",
+        "upstream DHCPv6 server addresses (comma-separated IPv6; or ff05::1:3)",
+    ),
 ];
 // `services ntp <Tab>` reveals the NTP-server fields (a chrony confdir drop-in).
 const NTP_FIELDS: &[Cand] = &[
@@ -2882,6 +2886,7 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
         ["set", "services", "snmp", "community"] => own_cands(&[PH_KEY]),
         ["set", "services", "snmp", "location" | "contact"] => own_cands(&[PH_TEXT]),
         ["set", "services", "dhcp-relay", "server"] => own_cands(&[PH_IPV4]),
+        ["set", "services", "dhcp-relay", "server6"] => own_cands(&[PH_IPV6]),
         ["set", "services", "dyndns", "hostname"] => {
             own_cands(&[("<fqdn>", "a fully-qualified domain name")])
         }
@@ -3573,7 +3578,7 @@ mod tests {
         );
         assert_eq!(
             kw(&["set", "services", "dhcp-relay"]),
-            ["interface", "server"]
+            ["interface", "server", "server6"]
         );
         // zone-value positions are dynamic now (see dynamic_candidates test).
         assert!(kw(&["set", "firewall", "rule", "web", "from"]).is_empty());
