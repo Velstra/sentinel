@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-07-12
+
 ## [0.3.0] — 2026-07-11
 
 Completes NAT and the interface-type matrix, adds time-based firewall rules and a
