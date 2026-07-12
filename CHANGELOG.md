@@ -20,6 +20,16 @@
   nixosTest proves a client on a server-less segment obtaining a lease from a
   far-segment DHCPv6 pool through the relay.
 
+### Changed
+- **Repin fabric for the SRv6 L2 encap data plane (B9).** The appliance's eBPF
+  object now carries the SRv6 headend path (`End.DT2U` encap: outer Ethernet +
+  IPv6 reduced encapsulation, `SRV6_CONFIG` + `SRV6_FDB` maps, `srv6_encap`
+  counter) alongside the existing VXLAN/Geneve overlay. `ebpfHash` bumped to match
+  the rebuilt object. Verifier acceptance of the new datapath is confirmed by the
+  full nixosTest suite loading it (e.g. `checks.nat` boots and NATs green with the
+  SRv6-enabled object); the SRv6 encap itself is a fabric-level primitive with no
+  Sentinel CLI surface yet.
+
 ### Tested
 - **Per-protocol routing VM checks for RIPng, Babel and IS-IS** — two-appliance
   `nixosTest`s (`checks.ripng` / `checks.babel` / `checks.isis`) that form an
