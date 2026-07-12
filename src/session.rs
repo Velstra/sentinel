@@ -14,13 +14,14 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::{
     Acme, Action, Appliance, Bfd, Bgp, BgpAggregate, BgpNeighbor, BgpRoa, BgpRtr, Ca, Certificate,
-    ConfigSync, Dhcp6Pool, DhcpRelay, DhcpServer, DhcpStaticLease, Dns, Dyndns, Export, Filter,
-    FilterRule, Firewall, Groups, HealthCheck, IfaceType, Interface, IpsecConnection, Isis, Lldp,
-    Login, Mdns, MultiWan, Multicast, MulticastInterface, Nat, Nat64, NatDestination, NatNpt66,
-    NatSource, Ntp, OpenConnectServer, OpenConnectUser, Ospf, Ospf3, OspfInterface, Pki, Policy,
-    PortSpec, Pppoe, PrefixEntry, PrefixList, Proto, Protocols, Qos, QosDiscipline, ReverseProxy,
-    Rip, RouterAdvert, Rule, Schedule, Services, Snmp, Ssh, StaticRoute, System, UpdateChannel,
-    Vpn, VrfDef, Vrrp, WanMode, WanUplink, WgPeer, WireguardTunnel, ZoneCfg,
+    ConfigSync, ConntrackSync, Dhcp6Pool, DhcpRelay, DhcpServer, DhcpStaticLease, Dns, Dyndns,
+    Export, Filter, FilterRule, Firewall, Groups, HealthCheck, IfaceType, Interface,
+    IpsecConnection, Isis, Lldp, Login, Mdns, MultiWan, Multicast, MulticastInterface, Nat, Nat64,
+    NatDestination, NatNpt66, NatSource, Ntp, OpenConnectServer, OpenConnectUser, Ospf, Ospf3,
+    OspfInterface, Pki, Policy, PortSpec, Pppoe, PrefixEntry, PrefixList, Proto, Protocols, Qos,
+    QosDiscipline, ReverseProxy, Rip, RouterAdvert, Rule, Schedule, Services, Snmp, Ssh,
+    StaticRoute, System, UpdateChannel, Vpn, VrfDef, Vrrp, WanMode, WanUplink, WgPeer,
+    WireguardTunnel, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -1133,6 +1134,8 @@ struct Draft {
     logins: Vec<Login>,
     /// HA config sync (`[system.config-sync]`). A plain owned struct.
     config_sync: ConfigSync,
+    /// HA conntrack sync (`[system.conntrack-sync]`, C9). A plain owned struct.
+    conntrack_sync: ConntrackSync,
     mdns: MdnsDraft,
     dyndns: DyndnsDraft,
     dhcp_relay: DhcpRelayDraft,
@@ -2009,6 +2012,7 @@ impl Draft {
             ssh: a.services.ssh.clone(),
             logins: a.system.logins.clone(),
             config_sync: a.system.config_sync.clone(),
+            conntrack_sync: a.system.conntrack_sync.clone(),
             mdns: MdnsDraft {
                 interface: a.services.mdns.interface.clone(),
             },
@@ -3104,6 +3108,22 @@ impl Session {
             }
             ["system", "config-sync", "secret", v] => {
                 self.draft.config_sync.secret = Some((*v).to_string());
+            }
+
+            // system conntrack-sync (C9): mirror the eBPF conntrack table to peer
+            // firewalls so established NAT flows survive a VRRP failover. `listen`
+            // is the local bind endpoint, `peer` a host or host:port to push to,
+            // `interval` the push cadence in seconds.
+            ["system", "conntrack-sync", "listen", v] => {
+                self.draft.conntrack_sync.listen = Some((*v).to_string());
+            }
+            ["system", "conntrack-sync", "peer", v] => {
+                append_csv(&mut self.draft.conntrack_sync.peers, v);
+            }
+            ["system", "conntrack-sync", "interval", v] => {
+                self.draft.conntrack_sync.interval = Some(v.parse().map_err(|_| {
+                    anyhow::anyhow!("conntrack-sync interval must be a number: {v:?}")
+                })?);
             }
 
             // services mdns: box-wide mDNS reflector (avahi).
@@ -4743,6 +4763,16 @@ impl Session {
                     other => bail!("system config-sync has no field {other:?}"),
                 }
             }
+            ["system", "conntrack-sync"] => self.draft.conntrack_sync = ConntrackSync::default(),
+            ["system", "conntrack-sync", field] => {
+                let c = &mut self.draft.conntrack_sync;
+                match *field {
+                    "listen" => c.listen = None,
+                    "peer" => c.peers.clear(),
+                    "interval" => c.interval = None,
+                    other => bail!("system conntrack-sync has no field {other:?}"),
+                }
+            }
             ["services", "mdns"] => self.draft.mdns = MdnsDraft::default(),
             ["services", "mdns", field] => {
                 let m = &mut self.draft.mdns;
@@ -6176,6 +6206,7 @@ impl Session {
                 hostname,
                 logins: self.draft.logins.clone(),
                 config_sync: self.draft.config_sync.clone(),
+                conntrack_sync: self.draft.conntrack_sync.clone(),
             },
             firewall,
             zones,
@@ -6372,7 +6403,10 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
     let mut out = String::new();
     let cs = &draft.config_sync;
     let cs_set = !cs.peers.is_empty() || cs.secret.is_some();
-    if want("system") && (draft.hostname.is_some() || !draft.logins.is_empty() || cs_set) {
+    let cts = &draft.conntrack_sync;
+    let cts_set = !cts.is_empty();
+    if want("system") && (draft.hostname.is_some() || !draft.logins.is_empty() || cs_set || cts_set)
+    {
         out.push_str("system {\n");
         if let Some(h) = &draft.hostname {
             out.push_str(&format!("    hostname {h}\n"));
@@ -6394,6 +6428,19 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             }
             if let Some(s) = &cs.secret {
                 out.push_str(&format!("        secret {s}\n"));
+            }
+            out.push_str("    }\n");
+        }
+        if cts_set {
+            out.push_str("    conntrack-sync {\n");
+            if let Some(l) = &cts.listen {
+                out.push_str(&format!("        listen {l}\n"));
+            }
+            if !cts.peers.is_empty() {
+                out.push_str(&format!("        peer {}\n", cts.peers.join(",")));
+            }
+            if let Some(iv) = cts.interval {
+                out.push_str(&format!("        interval {iv}\n"));
             }
             out.push_str("    }\n");
         }
@@ -8183,6 +8230,43 @@ mod tests {
             .and_then(|i| i.router_advert.as_ref())
             .expect("ra still present");
         assert!(ra.dhcp6_pool.is_none());
+    }
+
+    #[test]
+    fn conntrack_sync_grammar_sets_shows_commits_and_deletes() {
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname fw1",
+            "set system conntrack-sync listen 0.0.0.0:5429",
+            "set system conntrack-sync peer 10.9.0.2",
+            "set system conntrack-sync peer 10.9.0.3",
+            "set system conntrack-sync interval 2",
+        ] {
+            run(&mut s, line).unwrap();
+        }
+        // `show` renders the HA conntrack-sync block.
+        let shown = s.show();
+        assert!(shown.contains("conntrack-sync {"), "got:\n{shown}");
+        assert!(shown.contains("listen 0.0.0.0:5429"), "got:\n{shown}");
+        assert!(shown.contains("peer 10.9.0.2,10.9.0.3"), "got:\n{shown}");
+        assert!(shown.contains("interval 2"), "got:\n{shown}");
+
+        let a = s.commit().expect("conntrack-sync commits");
+        let cts = &a.system.conntrack_sync;
+        assert_eq!(cts.peers, vec!["10.9.0.2", "10.9.0.3"]);
+        assert_eq!(cts.interval, Some(2));
+        assert_eq!(cts.listen.as_deref(), Some("0.0.0.0:5429"));
+
+        // `delete` of a single field clears just it; deleting the section resets all.
+        run(&mut s, "delete system conntrack-sync peer").unwrap();
+        let a = s.commit().unwrap();
+        assert!(a.system.conntrack_sync.peers.is_empty());
+        assert_eq!(a.system.conntrack_sync.interval, Some(2)); // untouched
+
+        run(&mut s, "delete system conntrack-sync").unwrap();
+        let a = s.commit().unwrap();
+        assert!(a.system.conntrack_sync.is_empty());
+        assert!(!s.show().contains("conntrack-sync {"));
     }
 
     #[test]

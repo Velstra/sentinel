@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Added
+- **HA conntrack sync (C9)** — `set system conntrack-sync`: mirror the eBPF
+  conntrack table to peer firewalls (`listen` / `peer` / `interval`) so established
+  NAT'd connections survive a VRRP failover instead of being dropped. `peer` is
+  repeatable, so it scales past a pair to an **N-node full mesh** (matching VRRP's
+  and config-sync's own N-node support). Completes the HA triad: VRRP (virtual IP)
+  + config-sync (running config) + conntrack-sync (connection state). The
+  `checks.conntracksync` nixosTest proves a masquerading master pushing its flow
+  table to **two** backups, both applying it into their own conntrack map, end to
+  end in the eBPF datapath. Docs: a new HA-conntrack-sync handbook section and a
+  three-node HA-cluster example.
+
 ## [0.3.2] — 2026-07-12
 
 ## [0.3.1] — 2026-07-12
