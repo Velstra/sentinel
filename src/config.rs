@@ -4071,6 +4071,43 @@ impl Appliance {
                 if p.password.is_empty() {
                     bail!("interface {:?}: pppoe password is required", iface.name);
                 }
+                // These credentials flow verbatim into the root-run pppd options
+                // file (`user "…"`, `rp_pppoe_service …`, `rp_pppoe_ac …`) and the
+                // CHAP/PAP secrets file. A newline injects a fresh pppd directive
+                // (connect, pty, plugin, …) that pppd executes AS ROOT, and a quote
+                // or backslash breaks out of the quoted fields — so reject any
+                // control character, quote or backslash in every one of them.
+                for (field, val) in [("username", &p.username), ("password", &p.password)] {
+                    if val
+                        .bytes()
+                        .any(|b| b.is_ascii_control() || matches!(b, b'"' | b'\\'))
+                    {
+                        bail!(
+                            "interface {:?}: pppoe {field} must not contain a control \
+                             character, quote or backslash",
+                            iface.name
+                        );
+                    }
+                }
+                // service-name / ac-name are rendered *unquoted*, so besides the
+                // above they must not contain whitespace or a comment marker that
+                // would split the directive or start a new one.
+                for (field, val) in [
+                    ("service-name", &p.service_name),
+                    ("ac-name", &p.ac_name),
+                ] {
+                    if let Some(v) = val {
+                        if v.bytes().any(|b| {
+                            b.is_ascii_control() || matches!(b, b' ' | b'\t' | b'"' | b'\\' | b'#')
+                        }) {
+                            bail!(
+                                "interface {:?}: pppoe {field} must not contain whitespace, a \
+                                 control character, quote, backslash or '#'",
+                                iface.name
+                            );
+                        }
+                    }
+                }
                 match &iface.parent {
                     Some(parent) if names.contains(parent.as_str()) => {
                         if parent == &iface.name {
@@ -5350,6 +5387,24 @@ impl Appliance {
         if let Some(c) = &snmp.community {
             if c.is_empty() {
                 bail!("services snmp community: must not be empty");
+            }
+        }
+        // `community` is rendered UNQUOTED into snmpd.conf (`rocommunity <community>
+        // …`), so a newline injects a fresh directive — e.g. `rwcommunity`, turning
+        // the read-only agent read-write — and whitespace splits it into extra
+        // tokens. `listen` becomes the `agentaddress` transport spec. Reject any
+        // control character, whitespace, quote or backslash in both (location and
+        // contact are guarded separately below as they are rendered quoted).
+        for (field, val) in [("community", &snmp.community), ("listen", &snmp.listen)] {
+            if let Some(v) = val {
+                if v.bytes().any(|b| {
+                    b.is_ascii_control() || matches!(b, b' ' | b'\t' | b'"' | b'\\')
+                }) {
+                    bail!(
+                        "services snmp {field}: must not contain whitespace, a control \
+                         character, quote or backslash"
+                    );
+                }
             }
         }
         // location/contact are rendered as quoted syslocation/syscontact lines in
@@ -7610,6 +7665,43 @@ mru = 1492
         assert!(out.contains("type = \"pppoe\""), "got:\n{out}");
         assert!(out.contains("username = \"user@isp.de\""), "got:\n{out}");
         assert!(Appliance::from_toml(&out).is_ok());
+    }
+
+    #[test]
+    fn rejects_pppoe_credential_injection() {
+        // A newline in a PPPoE credential injects a fresh pppd options directive
+        // (connect, pty, plugin, …) that pppd runs AS ROOT — the credentials must
+        // be charset-validated, not merely checked for emptiness.
+        let base = |user: &str| {
+            format!(
+                "[system]\nhostname = \"fw\"\n\
+                 [[interface]]\nname = \"eth0\"\n\
+                 [[interface]]\nname = \"ppp0\"\ntype = \"pppoe\"\nparent = \"eth0\"\nzone = \"wan\"\n\
+                 [interface.pppoe]\nusername = {user}\npassword = \"s3cret\"\n"
+            )
+        };
+        // A clean username validates; a newline- or quote-bearing one is rejected.
+        assert!(Appliance::from_toml(&base("\"user@isp.de\"")).is_ok());
+        assert!(Appliance::from_toml(&base("\"user\\nconnect /bin/sh\"")).is_err());
+        assert!(Appliance::from_toml(&base("\"user\\\"evil\"")).is_err());
+    }
+
+    #[test]
+    fn rejects_snmp_community_and_listen_injection() {
+        // A newline in the community injects an `rwcommunity` directive into
+        // snmpd.conf (read-only agent → read-write); the listen spec is likewise
+        // rendered verbatim. Both must be charset-validated.
+        let cfg = |line: &str| {
+            format!("[system]\nhostname = \"fw\"\n[services.snmp]\n{line}\n")
+        };
+        assert!(Appliance::from_toml(&cfg("community = \"public\"")).is_ok());
+        assert!(
+            Appliance::from_toml(&cfg("community = \"public\\nrwcommunity secret\"")).is_err()
+        );
+        assert!(
+            Appliance::from_toml(&cfg("community = \"public\"\nlisten = \"udp:161\\nrwcommunity x\""))
+                .is_err()
+        );
     }
 
     #[test]
