@@ -8652,7 +8652,7 @@ virtual-address = ["10.0.0.254"]
         assert_eq!(a.system.logins[0].hashed_password.as_deref(), Some(hash));
         let round = Appliance::from_toml(&a.to_toml().unwrap()).unwrap();
         assert_eq!(round.system.logins[0].ssh_keys, a.system.logins[0].ssh_keys);
-        assert_eq!(round.services.ssh.password_authentication, true);
+        assert!(round.services.ssh.password_authentication);
 
         // Default SSH (no section, no logins) is `is_empty` → omitted from a save.
         let plain = Appliance::from_toml(base).unwrap();
