@@ -72,12 +72,20 @@ set services dyndns password <api-token>
 ## DHCP relay
 
 Relay DHCP from a client subnet to an upstream server (when the server isn't on
-the box).
+the box). Works for **IPv4** (`server`) and **IPv6** (`server6`) independently —
+a link can relay either family or both.
 
 ```text
 set services dhcp-relay interface eth1,eth0     # client + upstream links
-set services dhcp-relay server 10.0.100.10
+set services dhcp-relay server  10.0.100.10     # IPv4 upstream (uses the link's giaddr)
+set services dhcp-relay server6 2001:db8:100::10 # IPv6 upstream (or ff05::1:3, the relay multicast)
 ```
+
+| Field | Meaning |
+|---|---|
+| `interface` | Interfaces to relay on — both the client-facing link(s) and the link toward the server. |
+| `server` | Upstream DHCPv4 server(s). Each relay interface needs a static `address` (stamped as the giaddr). |
+| `server6` | Upstream DHCPv6 server(s), or the well-known relay multicast `ff05::1:3`. Each relay interface needs a static `address6`. |
 
 ## Reverse proxy / L7 load balancer
 

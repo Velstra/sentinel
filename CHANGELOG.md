@@ -13,6 +13,12 @@
   table to **two** backups, both applying it into their own conntrack map, end to
   end in the eBPF datapath. Docs: a new HA-conntrack-sync handbook section and a
   three-node HA-cluster example.
+- **DHCPv6 relay (C18)** — `set services dhcp-relay server6 <ip|ff05::1:3>`: the
+  IPv6 sibling of the DHCP relay, on the same in-image dnsmasq `--dhcp-relay`
+  engine. A link can relay IPv4, IPv6 or both (each family needs a static address
+  of its own — the v6 relay stamps the interface's `address6`). `checks.dhcprelay6`
+  nixosTest proves a client on a server-less segment obtaining a lease from a
+  far-segment DHCPv6 pool through the relay.
 
 ### Tested
 - **Per-protocol routing VM checks for RIPng, Babel and IS-IS** — two-appliance

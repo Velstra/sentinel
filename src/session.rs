@@ -1227,6 +1227,7 @@ struct DyndnsDraft {
 struct DhcpRelayDraft {
     interface: Vec<String>,
     server: Vec<String>,
+    server6: Vec<String>,
 }
 
 /// A partially-specified NAT64 config (`[nat.nat64]`, roadmap C10).
@@ -2027,6 +2028,7 @@ impl Draft {
             dhcp_relay: DhcpRelayDraft {
                 interface: a.services.dhcp_relay.interface.clone(),
                 server: a.services.dhcp_relay.server.clone(),
+                server6: a.services.dhcp_relay.server6.clone(),
             },
             multiwan_mode: (!a.multiwan.mode.is_default()).then_some(a.multiwan.mode),
             uplinks: a
@@ -3160,6 +3162,12 @@ impl Session {
                     validate_ipv4(s)?;
                 }
                 append_csv(&mut self.draft.dhcp_relay.server, v);
+            }
+            ["services", "dhcp-relay", "server6", v] => {
+                for s in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    crate::config::validate_ipv6(s)?;
+                }
+                append_csv(&mut self.draft.dhcp_relay.server6, v);
             }
 
             // services reverse-proxy <name> (roadmap C22): the L7 TLS-terminating
@@ -4800,6 +4808,7 @@ impl Session {
                 match *field {
                     "interface" => r.interface.clear(),
                     "server" => r.server.clear(),
+                    "server6" => r.server6.clear(),
                     other => bail!("services dhcp-relay has no field {other:?}"),
                 }
             }
@@ -6269,6 +6278,7 @@ impl Session {
                 dhcp_relay: DhcpRelay {
                     interface: self.draft.dhcp_relay.interface.clone(),
                     server: self.draft.dhcp_relay.server.clone(),
+                    server6: self.draft.dhcp_relay.server6.clone(),
                 },
                 // L7 reverse-proxy frontends (roadmap C22), name-ordered by the
                 // BTreeMap key. `config::validate()` enforces port/cert/backend
@@ -7288,7 +7298,8 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         || dyndns.login.is_some()
         || dyndns.password.is_some()
         || dyndns.interface.is_some();
-    let relay_set = !relay.interface.is_empty() || !relay.server.is_empty();
+    let relay_set =
+        !relay.interface.is_empty() || !relay.server.is_empty() || !relay.server6.is_empty();
     let rproxy = &draft.reverse_proxy;
     let rproxy_set = !rproxy.is_empty();
     let any_service = dns_set
@@ -7419,6 +7430,9 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             }
             if !relay.server.is_empty() {
                 out.push_str(&format!("        server {}\n", relay.server.join(",")));
+            }
+            if !relay.server6.is_empty() {
+                out.push_str(&format!("        server6 {}\n", relay.server6.join(",")));
             }
             out.push_str("    }\n");
         }
