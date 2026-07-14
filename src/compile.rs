@@ -221,7 +221,12 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                         && r.schedule.as_ref().is_none_or(|s| s.is_active_now())
                 })
                 .flat_map(|r| {
-                    let proto = proto_str(r.proto.unwrap());
+                    // `is_port_rule()` already implies a proto, but guard the unwrap
+                    // so a future change to that predicate can never panic the
+                    // compile: a proto-less rule simply contributes no port rules.
+                    let Some(proto) = r.proto.map(proto_str) else {
+                        return Vec::new();
+                    };
                     let action = action_str(r.action);
                     let log = r.log;
                     let sources = r.resolved_sources(groups);

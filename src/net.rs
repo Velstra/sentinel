@@ -1352,6 +1352,27 @@ fn apply_configsync(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     Ok(())
 }
 
+/// Build the URL authority (`host[:port]`) for a config-sync peer, defaulting the
+/// port to 8080. A bare IPv6 literal must be bracketed or the URL is malformed —
+/// `peer.contains(':')` alone mistook `2001:db8::1` for a `host:port` and emitted
+/// `http://2001:db8::1/…`, which every HTTP client rejects.
+fn configsync_authority(peer: &str) -> String {
+    if peer.starts_with('[') {
+        // Already bracketed IPv6, with or without a trailing `:port`.
+        peer.to_string()
+    } else if peer.matches(':').count() > 1 {
+        // A bare IPv6 literal (more than one colon, no brackets): bracket it and
+        // add the default port.
+        format!("[{peer}]:8080")
+    } else if peer.contains(':') {
+        // `host:port` or `v4:port` — take it as given.
+        peer.to_string()
+    } else {
+        // A bare host / IPv4 with no port — add the default.
+        format!("{peer}:8080")
+    }
+}
+
 /// The SENDING side of HA config sync (roadmap C21): push the just-committed config
 /// to every `[system.config-sync] peer` via its Sentinel API (`PUT /api/v1/config`,
 /// bearer = the shared secret), which applies + persists it. Called from the
@@ -1368,14 +1389,13 @@ pub fn push_config_to_peers(appliance: &Appliance) -> Result<()> {
     };
     let json = serde_json::to_string(appliance).context("serializing config for sync")?;
     let tmp = Path::new("/run/sentinel/.configsync.json");
-    std::fs::write(tmp, &json).with_context(|| format!("staging {}", tmp.display()))?;
+    // The staged copy is the WHOLE running config — WireGuard keys, IPsec PSKs,
+    // the PPPoE password, the SNMP community and the shared bearer secret. Stage it
+    // 0600 (not the umask-default 0644) so it is never world-readable in the
+    // wheel-writable, world-traversable /run/sentinel during the push.
+    system::stage_private(tmp, &json)?;
     for peer in &cs.peers {
-        // `host` → default API port; `host:port` (or `[v6]:port`) → used as given.
-        let url = if peer.contains(':') {
-            format!("http://{peer}/api/v1/config")
-        } else {
-            format!("http://{peer}:8080/api/v1/config")
-        };
+        let url = format!("http://{}/api/v1/config", configsync_authority(peer));
         match system::curl_put_config(&url, secret, tmp) {
             Ok(()) => eprintln!("  config-sync → {peer}"),
             Err(e) => eprintln!("warning: config-sync to {peer} failed: {e}"),
@@ -2512,6 +2532,23 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
 mod tests {
     use super::*;
     use crate::config::{DhcpStaticLease, Pppoe, Qos, QosDiscipline};
+
+    #[test]
+    fn configsync_authority_brackets_bare_ipv6() {
+        // Bare host / IPv4 → default port.
+        assert_eq!(configsync_authority("10.0.0.2"), "10.0.0.2:8080");
+        assert_eq!(configsync_authority("backup.local"), "backup.local:8080");
+        // host:port / v4:port → as given.
+        assert_eq!(configsync_authority("10.0.0.2:9000"), "10.0.0.2:9000");
+        // Bare IPv6 → bracketed + default port (was malformed before).
+        assert_eq!(configsync_authority("2001:db8::1"), "[2001:db8::1]:8080");
+        // Already bracketed, with or without a port → untouched.
+        assert_eq!(
+            configsync_authority("[2001:db8::1]:9000"),
+            "[2001:db8::1]:9000"
+        );
+        assert_eq!(configsync_authority("[2001:db8::1]"), "[2001:db8::1]");
+    }
 
     #[test]
     fn qos_qdisc_args_renders_cake_and_fq_codel() {
