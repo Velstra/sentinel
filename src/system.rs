@@ -215,7 +215,7 @@ pub fn swanctl_show(args: &[&str]) -> Result<String> {
 /// until the next apply — `install` *copies* to the final owner/mode, so the temp
 /// source is never removed by it. Creating the temp 0600 closes that window; the
 /// final installed file still gets whatever mode the `install -m` call sets.
-fn stage_private(tmp: &Path, contents: &str) -> Result<()> {
+pub(crate) fn stage_private(tmp: &Path, contents: &str) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
