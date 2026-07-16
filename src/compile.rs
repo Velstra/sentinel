@@ -30,6 +30,12 @@ pub struct VelstraConfig {
     stateful: bool,
     drop_icmp: bool,
     log: bool,
+    /// Host-wide: drop a packet the data plane cannot parse rather than pass it.
+    /// Not a per-policy field — the parse fails before any policy is known — so it
+    /// is emitted once, at the top level. Omitted when off, which is velstra's own
+    /// default, so the emitted config stays free of noise.
+    #[serde(skip_serializing_if = "is_false")]
+    fail_closed: bool,
     // Inline array of strings — still a scalar for TOML ordering, so it must
     // precede the `[[policy]]`/`[[interface]]` tables below.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -376,6 +382,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
         stateful: fw.stateful,
         drop_icmp: fw.block_icmp,
         log: fw.log,
+        fail_closed: fw.fail_closed,
         blocklist: fw.blocklist.clone(),
         policies,
         interfaces,
@@ -869,6 +876,38 @@ zone = "wan"
         let value: toml::Value = toml::from_str(&toml).unwrap();
         assert_eq!(value["default_action"].as_str(), Some("drop"));
         assert!(value["policy"].as_array().unwrap().len() == 2);
+    }
+
+    #[test]
+    fn fail_closed_is_emitted_only_when_turned_on() {
+        let appliance = |extra: &str| {
+            let toml = format!(
+                r#"
+[system]
+hostname = "fw"
+[firewall]
+{extra}
+[[interface]]
+name = "lan0"
+zone = "lan"
+"#
+            );
+            Appliance::from_toml(&toml).unwrap()
+        };
+
+        // Off (the default): the field is absent from the emitted config, so
+        // velstra applies its own fail-open default.
+        let cfg = compile(&appliance(""));
+        assert!(!cfg.fail_closed);
+        let out = cfg.to_toml().unwrap();
+        assert!(!out.contains("fail_closed"), "{out}");
+
+        // On: emitted as a top-level scalar velstra reads into its FAIL_CLOSED map.
+        let cfg = compile(&appliance("fail_closed = true"));
+        assert!(cfg.fail_closed);
+        let out = cfg.to_toml().unwrap();
+        let value: toml::Value = toml::from_str(&out).unwrap();
+        assert_eq!(value["fail_closed"].as_bool(), Some(true), "{out}");
     }
 
     #[test]

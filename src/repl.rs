@@ -1792,6 +1792,10 @@ const GLOBAL_FIELDS: &[Cand] = &[
         "default ingress action (accept|drop|reject)",
     ),
     ("log", "log matched traffic by default (true|false)"),
+    (
+        "fail-closed",
+        "drop packets the data plane cannot parse (true|false)",
+    ),
     ("block", "drop a source IP/CIDR everywhere"),
 ];
 const ZONE_FIELDS: &[Cand] = &[
@@ -2287,7 +2291,7 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
             "set",
             "firewall",
             "global",
-            "stateful" | "block-icmp" | "log",
+            "stateful" | "block-icmp" | "log" | "fail-closed",
         ] => BOOLS,
         ["set", "firewall", "global", "default-action"] => ACTIONS,
         ["set" | "delete", "firewall", "zone", _name] => ZONE_FIELDS,
@@ -3433,10 +3437,21 @@ mod tests {
         );
         assert_eq!(
             kw(&["set", "firewall", "global"]),
-            ["stateful", "block-icmp", "default-action", "log", "block"]
+            [
+                "stateful",
+                "block-icmp",
+                "default-action",
+                "log",
+                "fail-closed",
+                "block"
+            ]
         );
         assert_eq!(
             kw(&["set", "firewall", "global", "stateful"]),
+            ["true", "false"]
+        );
+        assert_eq!(
+            kw(&["set", "firewall", "global", "fail-closed"]),
             ["true", "false"]
         );
         assert_eq!(

@@ -278,6 +278,9 @@ struct FirewallDraft {
     blocklist: Vec<String>,
     default_action: Option<Action>,
     log: Option<bool>,
+    /// Global only — the data plane cannot know the zone of a packet it failed to
+    /// parse, so there is no per-zone counterpart in [`ZoneDraft`].
+    fail_closed: Option<bool>,
 }
 
 /// A partially-specified static route (keyed by its prefix).
@@ -1622,6 +1625,7 @@ impl Draft {
                 blocklist: a.firewall.blocklist.clone(),
                 default_action: Some(a.firewall.default_action),
                 log: Some(a.firewall.log),
+                fail_closed: Some(a.firewall.fail_closed),
             },
             groups: a.firewall.group.clone(),
             zones: a
@@ -2799,6 +2803,9 @@ impl Session {
                 self.draft.firewall.default_action = Some(parse_action(v)?)
             }
             ["firewall", "global", "log", v] => self.draft.firewall.log = Some(parse_bool(v)?),
+            ["firewall", "global", "fail-closed", v] => {
+                self.draft.firewall.fail_closed = Some(parse_bool(v)?)
+            }
             ["firewall", "global", "block", v] => {
                 validate_block_entry(v)?;
                 push_unique(&mut self.draft.firewall.blocklist, v);
@@ -4031,7 +4038,7 @@ impl Session {
                  set interface <name> <member <nic> | bond-mode <m> | vlan-aware <bool>>\n  \
                  set interface <name> <vlan-tagged <id,...> | vlan-untagged <id>>  (port of a vlan-aware bridge)\n  \
                  set interface <name> type <gre|ipip|gretap> local <ip> remote <ip> [key <n>] [ttl <n>]\n  \
-                 set firewall global <stateful|block-icmp|log> <true|false>\n  \
+                 set firewall global <stateful|block-icmp|log|fail-closed> <true|false>\n  \
                  set firewall global default-action <accept|drop|reject>\n  \
                  set firewall global block <IP|CIDR>\n  \
                  set firewall zone <name> <stateful|block-icmp|log> <true|false>\n  \
@@ -4506,6 +4513,7 @@ impl Session {
                 "block-icmp" => self.draft.firewall.block_icmp = None,
                 "default-action" => self.draft.firewall.default_action = None,
                 "log" => self.draft.firewall.log = None,
+                "fail-closed" => self.draft.firewall.fail_closed = None,
                 other => bail!("firewall global has no field {other:?}"),
             },
 
@@ -5765,6 +5773,7 @@ impl Session {
             blocklist: self.draft.firewall.blocklist.clone(),
             default_action: self.draft.firewall.default_action.unwrap_or(Action::Drop),
             log: self.draft.firewall.log.unwrap_or(false),
+            fail_closed: self.draft.firewall.fail_closed.unwrap_or(false),
             group: self.draft.groups.clone(),
         };
         let zones: BTreeMap<String, ZoneCfg> = self
@@ -6712,6 +6721,7 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         || fw.block_icmp.is_some()
         || fw.default_action.is_some()
         || fw.log.is_some()
+        || fw.fail_closed.is_some()
         || !fw.blocklist.is_empty()
     {
         fwi.push_str("    global {\n");
@@ -6726,6 +6736,9 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         if let Some(l) = fw.log {
             fwi.push_str(&format!("        log {l}\n"));
+        }
+        if let Some(f) = fw.fail_closed {
+            fwi.push_str(&format!("        fail-closed {f}\n"));
         }
         for e in &fw.blocklist {
             fwi.push_str(&format!("        block {e}\n"));
@@ -9282,6 +9295,34 @@ mod tests {
     }
 
     #[test]
+    fn fail_closed_grammar_sets_shows_commits_and_deletes() {
+        let mut s = Session::empty();
+        run(&mut s, "set system hostname fw1").unwrap();
+
+        // Turning it on reaches the committed appliance and is visible in `show`.
+        run(&mut s, "set firewall global fail-closed true").unwrap();
+        assert!(s.show().contains("fail-closed true"), "got:\n{}", s.show());
+        assert!(s.commit().unwrap().firewall.fail_closed);
+
+        // It survives a config round-trip through TOML, so a reboot keeps it.
+        let toml = s.commit().unwrap().to_toml().unwrap();
+        assert!(Appliance::from_toml(&toml).unwrap().firewall.fail_closed);
+
+        // Explicitly off is honoured, not silently defaulted.
+        run(&mut s, "set firewall global fail-closed false").unwrap();
+        assert!(!s.commit().unwrap().firewall.fail_closed);
+
+        // Deleting the field unsets it: back to the fail-open default, and gone
+        // from `show`.
+        run(&mut s, "delete firewall global fail-closed").unwrap();
+        assert!(!s.show().contains("fail-closed"), "got:\n{}", s.show());
+        assert!(!s.commit().unwrap().firewall.fail_closed);
+
+        // Only a boolean is accepted.
+        assert!(run(&mut s, "set firewall global fail-closed maybe").is_err());
+    }
+
+    #[test]
     fn firewall_settings_set_delete_and_materialize() {
         let mut s = Session::empty();
         run(&mut s, "set system hostname fw1").unwrap();
@@ -9296,6 +9337,9 @@ mod tests {
         assert!(!a.firewall.stateful);
         assert!(a.firewall.block_icmp);
         assert_eq!(a.firewall.blocklist, ["10.6.6.0/24", "192.0.2.5"]);
+        // Unset, fail-closed stays off: the data plane keeps passing what it
+        // cannot parse, which is the safe default for a router.
+        assert!(!a.firewall.fail_closed);
 
         // `show` nests everything under one firewall { global { … } } block.
         let shown = s.show();
