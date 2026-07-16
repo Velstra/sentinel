@@ -2831,6 +2831,14 @@ pub struct Firewall {
     /// Log matched traffic by default (zones inherit this). Off by default.
     #[serde(default)]
     pub log: bool,
+    /// Drop a packet the data plane cannot parse, instead of passing it. Off by
+    /// default — a firewall should not black-hole traffic because of its own
+    /// parsing limits. Turn it on for a strict deny-by-default posture, where a
+    /// packet the filter cannot understand is exactly the one it must not admit.
+    /// Applies to the whole box, not per zone: the parse fails before any zone is
+    /// known.
+    #[serde(default)]
+    pub fail_closed: bool,
     /// Named address/port groups (aliases) that rules reference by name.
     #[serde(default, skip_serializing_if = "Groups::is_empty")]
     pub group: Groups,
@@ -2852,6 +2860,7 @@ impl Default for Firewall {
             blocklist: Vec::new(),
             default_action: Action::Drop,
             log: false,
+            fail_closed: false,
             group: Groups::default(),
         }
     }
@@ -2866,6 +2875,7 @@ impl Firewall {
             && self.blocklist.is_empty()
             && self.default_action == Action::Drop
             && !self.log
+            && !self.fail_closed
             && self.group.is_empty()
     }
 }
@@ -4092,10 +4102,7 @@ impl Appliance {
                 // service-name / ac-name are rendered *unquoted*, so besides the
                 // above they must not contain whitespace or a comment marker that
                 // would split the directive or start a new one.
-                for (field, val) in [
-                    ("service-name", &p.service_name),
-                    ("ac-name", &p.ac_name),
-                ] {
+                for (field, val) in [("service-name", &p.service_name), ("ac-name", &p.ac_name)] {
                     if let Some(v) = val {
                         if v.bytes().any(|b| {
                             b.is_ascii_control() || matches!(b, b' ' | b'\t' | b'"' | b'\\' | b'#')
@@ -5397,9 +5404,9 @@ impl Appliance {
         // contact are guarded separately below as they are rendered quoted).
         for (field, val) in [("community", &snmp.community), ("listen", &snmp.listen)] {
             if let Some(v) = val {
-                if v.bytes().any(|b| {
-                    b.is_ascii_control() || matches!(b, b' ' | b'\t' | b'"' | b'\\')
-                }) {
+                if v.bytes()
+                    .any(|b| b.is_ascii_control() || matches!(b, b' ' | b'\t' | b'"' | b'\\'))
+                {
                     bail!(
                         "services snmp {field}: must not contain whitespace, a control \
                          character, quote or backslash"
@@ -7691,16 +7698,14 @@ mru = 1492
         // A newline in the community injects an `rwcommunity` directive into
         // snmpd.conf (read-only agent → read-write); the listen spec is likewise
         // rendered verbatim. Both must be charset-validated.
-        let cfg = |line: &str| {
-            format!("[system]\nhostname = \"fw\"\n[services.snmp]\n{line}\n")
-        };
+        let cfg = |line: &str| format!("[system]\nhostname = \"fw\"\n[services.snmp]\n{line}\n");
         assert!(Appliance::from_toml(&cfg("community = \"public\"")).is_ok());
+        assert!(Appliance::from_toml(&cfg("community = \"public\\nrwcommunity secret\"")).is_err());
         assert!(
-            Appliance::from_toml(&cfg("community = \"public\\nrwcommunity secret\"")).is_err()
-        );
-        assert!(
-            Appliance::from_toml(&cfg("community = \"public\"\nlisten = \"udp:161\\nrwcommunity x\""))
-                .is_err()
+            Appliance::from_toml(&cfg(
+                "community = \"public\"\nlisten = \"udp:161\\nrwcommunity x\""
+            ))
+            .is_err()
         );
     }
 
