@@ -178,7 +178,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-Mf3rZdyq6L3iGElrYGtKd9tBWE0FbaC+/p36bNitinw=";
+      ebpfHash = "sha256-UZ0NmHH5LMkdsBw1U9876/WXxkpfHue0obZA89+6NTs=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
