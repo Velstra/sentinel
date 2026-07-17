@@ -6148,6 +6148,21 @@ impl Appliance {
                 ));
             }
         }
+        for i in &self.interfaces {
+            // An enabled interface that carries an address but has no zone is bound
+            // to no policy, so the agent never attaches XDP to it and its traffic
+            // passes UNFILTERED. That is a valid state (a NIC awaiting assignment, a
+            // management port), but a silent one on a firewall — surface it. An
+            // address-less interface (e.g. a pure VLAN/PPPoE trunk parent whose
+            // children carry the zoned, addressed traffic) is not flagged.
+            if !i.disabled && i.zone.is_none() && (i.address.is_some() || i.address6.is_some()) {
+                out.push(format!(
+                    "interface {:?}: no zone assigned — it is not firewalled and its traffic \
+                     passes unfiltered; assign one with `set interface {} zone <name>`",
+                    i.name, i.name
+                ));
+            }
+        }
         out
     }
 
@@ -7459,6 +7474,48 @@ name = "wan0"
 zone = "wan"
 "#;
         assert!(Appliance::from_toml(bad).is_err());
+    }
+
+    #[test]
+    fn zoneless_addressed_interface_draws_a_warning() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+address = "203.0.113.2/24"
+[[interface]]
+name = "lan0"
+zone = "lan"
+address = "10.0.0.1/24"
+[[interface]]
+name = "mgmt0"
+address = "192.168.9.1/24"
+[[interface]]
+name = "spare0"
+[[rule]]
+name = "allow-out"
+from = "lan"
+action = "accept"
+"#;
+        let a = Appliance::from_toml(toml).expect("valid config");
+        let warns = a.warnings();
+        // The zoneless but ADDRESSED NIC is flagged as unfirewalled...
+        assert!(
+            warns
+                .iter()
+                .any(|w| w.contains("mgmt0") && w.contains("no zone")),
+            "expected a zoneless-interface warning for mgmt0, got: {warns:?}"
+        );
+        // ...while a zoned interface never is, and an address-less NIC (a pure
+        // trunk/spare) is not noise-warned.
+        assert!(
+            !warns
+                .iter()
+                .any(|w| w.contains("wan0") || w.contains("lan0") || w.contains("spare0")),
+            "only the zoneless addressed NIC should warn, got: {warns:?}"
+        );
     }
 
     #[test]
