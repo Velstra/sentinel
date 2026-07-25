@@ -946,6 +946,9 @@ struct IsisDraft {
     l2_to_l1_leaking: bool,
     bfd: bool,
     vrf: Option<String>,
+    auth_type: Option<String>,
+    auth_key: Option<String>,
+    auth_key_id: Option<u16>,
 }
 
 impl IsisDraft {
@@ -963,6 +966,9 @@ impl IsisDraft {
             && !self.l2_to_l1_leaking
             && !self.bfd
             && self.vrf.is_none()
+            && self.auth_type.is_none()
+            && self.auth_key.is_none()
+            && self.auth_key_id.is_none()
     }
 }
 
@@ -1875,6 +1881,9 @@ impl Draft {
                     l2_to_l1_leaking: i.l2_to_l1_leaking,
                     bfd: i.bfd,
                     vrf: i.vrf.clone(),
+                    auth_type: i.auth_type.clone(),
+                    auth_key: i.auth_key.clone(),
+                    auth_key_id: i.auth_key_id,
                 })
                 .unwrap_or_default(),
             vrrp: a
@@ -3587,6 +3596,18 @@ impl Session {
             ["protocols", "isis", "l2-to-l1-leaking", v] => {
                 self.draft.isis.l2_to_l1_leaking = parse_bool(v)?;
             }
+            // IS-IS PDU authentication (ISO 10589 §9.8 cleartext, RFC 5304 HMAC-MD5,
+            // RFC 5310 HMAC-SHA-256).
+            ["protocols", "isis", "auth-type", v] => {
+                self.draft.isis.auth_type = Some((*v).to_string());
+            }
+            ["protocols", "isis", "auth-key", v] => {
+                self.draft.isis.auth_key = Some((*v).to_string());
+            }
+            ["protocols", "isis", "auth-key-id", v] => {
+                self.draft.isis.auth_key_id =
+                    Some(v.parse().with_context(|| format!("invalid key-id {v:?}"))?);
+            }
             ["protocols", "isis", "bfd", v] => {
                 self.draft.isis.bfd = parse_bool(v)?;
             }
@@ -4063,7 +4084,7 @@ impl Session {
                  set protocols ospf3 <interface <if> [area <id>] | area <id> | router-priority <n> | cost <n> | network-type <..> | instance-id <n> | redistribute <src> | redistribute-metric <n> | bfd <bool>>\n  \
                  set protocols <rip|babel> <interface <if> | redistribute <src> | redistribute-metric <n> | bfd <bool> | vrf <name>>; babel also network <p> | router-id <ip>\n  \
                  set protocols ripng <interface <if> | redistribute <src> | redistribute-metric <n>>\n  \
-                 set protocols isis <interface <if> | system-id <id> | area <id> | level <1|2|1-2> | priority <n> | metric <n> | hello-interval <n> | network-type <..> | redistribute <src> | l2-to-l1-leaking <bool> | bfd <bool> | vrf <name>>\n  \
+                 set protocols isis <interface <if> | system-id <id> | area <id> | level <1|2|1-2> | priority <n> | metric <n> | hello-interval <n> | network-type <..> | redistribute <src> | l2-to-l1-leaking <bool> | auth-type <none|text|hmac-md5|hmac-sha256> | auth-key <secret> | auth-key-id <n> | bfd <bool> | vrf <name>>\n  \
                  set protocols vrrp <name> <interface <if> | vrid <n> | priority <n> | advert-interval <ms> | preempt <bool> | prefix-length <n> | track-interface <if> | priority-decrement <n> | virtual-address <ip>>\n  \
                  set protocols vrf <name> <table <n> | rd <v> | interface <if> | import <filter> | export <filter>>\n  \
                  set protocols bfd <min-tx <ms> | min-rx <ms> | detect-mult <n> | auth-type <t> | auth-key-id <n> | auth-key <k> | echo <bool> | echo-interval <ms>>\n  \
@@ -5070,6 +5091,9 @@ impl Session {
                     "l2-to-l1-leaking" => i.l2_to_l1_leaking = false,
                     "bfd" => i.bfd = false,
                     "vrf" => i.vrf = None,
+                    "auth-type" => i.auth_type = None,
+                    "auth-key" => i.auth_key = None,
+                    "auth-key-id" => i.auth_key_id = None,
                     other => bail!("isis has no field {other:?}"),
                 }
             }
@@ -5961,6 +5985,9 @@ impl Session {
                 l2_to_l1_leaking: i.l2_to_l1_leaking,
                 bfd: i.bfd,
                 vrf: i.vrf.clone(),
+                auth_type: i.auth_type.clone(),
+                auth_key: i.auth_key.clone(),
+                auth_key_id: i.auth_key_id,
             })
         };
         let vrrp = self
@@ -10043,6 +10070,9 @@ mod tests {
             "set protocols isis metric 20",
             "set protocols isis hello-interval 3",
             "set protocols isis l2-to-l1-leaking true",
+            "set protocols isis auth-type hmac-sha256",
+            "set protocols isis auth-key isissecret",
+            "set protocols isis auth-key-id 7",
             "set protocols isis bfd true",
             "set protocols isis vrf blue",
             // BGP vrf.
