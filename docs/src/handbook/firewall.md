@@ -70,6 +70,29 @@ set firewall rule guest-wifi schedule start 09:00
 set firewall rule guest-wifi schedule end 17:00
 ```
 
+## IPv6 and extension headers
+
+Rules apply to both families: the same `proto` + `port` match is evaluated for IPv4
+and IPv6 packets against the same zone policy. (A rule's `source` CIDR is IPv4-only
+today, so a v6 packet is matched only by the source-less rules for its zone.)
+
+For IPv6 the data plane **walks the extension-header chain** (RFC 8200) to find the
+real upper-layer protocol before matching. That matters because the alternative is a
+bypass: classifying by the fixed header's next-header alone means a Hop-by-Hop or
+Destination-Options header placed in front of TCP reads as an unknown protocol with
+no ports, so no port rule matches — and under `default-action accept` such a packet
+would simply pass. Up to eight headers are followed; a longer or truncated chain
+matches no rule and therefore falls to the zone's default action.
+
+Behind a **non-first fragment** the protocol is still resolved, but ports are not
+read — those bytes are payload, and treating them as a TCP header would hand an
+attacker a fragmentation bypass instead. Port-specific rules therefore do not match
+a non-first fragment; protocol-level rules and the default action still do.
+
+`nix build .#checks.x86_64-linux.v6exthdr -L` verifies this on two VMs, with a
+separate destination port per variant so plain, single-header and chained packets can
+be told apart in the log.
+
 ## Groups (aliases)
 
 Named address / port sets you reference from rules, so one edit updates every
