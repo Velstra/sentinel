@@ -6523,6 +6523,114 @@
             '';
           };
 
+        # IS-IS authentication (ISO 10589 §9.8 / RFC 5304 / RFC 5310): IS-IS rides
+        # directly on the data link, so authentication is the only thing keeping an
+        # on-link host from forming an adjacency and injecting LSPs. Two nodes, the
+        # same point-to-point topology as `checks.isis`, driven through three phases
+        # because each rules out a different way of being wrong: matching keys must
+        # come UP (a broken digest would leave the placeholder on the wire and no
+        # adjacency would ever form), a changed key must bring it DOWN (an appliance
+        # that dropped the key on the way to the daemon would sail through phase 1),
+        # and HMAC-MD5 must work too (its digest input differs from RFC 5310's — the
+        # Authentication Value is zeroed, not Apad-filled).
+        #   nix build .#checks.x86_64-linux.isisauth -L
+        isisauth =
+          let
+            node = hostname: addr: {
+              lib,
+              ...
+            }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce hostname;
+              networking.firewall.enable = lib.mkForce false;
+              networking.interfaces.eth1.ipv6.addresses = [
+                {
+                  address = addr;
+                  prefixLength = 64;
+                }
+              ];
+              virtualisation.vlans = [ 1 ];
+              virtualisation.memorySize = 2048;
+              services.velstra.interface = lib.mkForce "eth1";
+            };
+          in
+          pkgs.testers.runNixOSTest {
+            name = "sentinel-isis-auth";
+            nodes = {
+              auth1 = node "auth1" "fd00:10::1";
+              auth2 = node "auth2" "fd00:10::2";
+            };
+            testScript = ''
+              start_all()
+              for m in (auth1, auth2):
+                  m.wait_for_unit("multi-user.target")
+                  m.wait_for_unit("velstra.service")
+                  m.wait_for_unit("wren.service")
+              auth1.wait_until_succeeds("ip -6 addr show eth1 | grep -q fd00:10::1", timeout=20)
+              auth2.wait_until_succeeds("ip -6 addr show eth1 | grep -q fd00:10::2", timeout=20)
+
+              # A short hello-interval so a key change expires the adjacency inside the
+              # test's patience (holding time = hello-interval x 3).
+              def configure(m, sysid, mynet, auth_type, key):
+                  m.succeed(
+                      "su admin -c \"printf '%s\\n' "
+                      "'set firewall global default-action accept' "
+                      "'set interface eth1 zone wan' "
+                      f"'set protocols static {mynet} dev lo' "
+                      "'set protocols isis interface eth1' "
+                      f"'set protocols isis system-id {sysid}' "
+                      "'set protocols isis network-type point-to-point' "
+                      "'set protocols isis hello-interval 3' "
+                      "'set protocols isis redistribute static' "
+                      f"'set protocols isis auth-type {auth_type}' "
+                      f"'set protocols isis auth-key {key}' "
+                      "'set protocols isis auth-key-id 7' "
+                      "commit save exit "
+                      "| sentinel configure\""
+                  )
+                  m.wait_for_unit("wren.service")
+
+              # --- phase 1: matching HMAC-SHA-256 keys ---------------------------
+              configure(auth1, "0000.0000.0001", "fd00:11::/64", "hmac-sha256", "s3cr3t")
+              configure(auth2, "0000.0000.0002", "fd00:12::/64", "hmac-sha256", "s3cr3t")
+
+              # The keys reached the daemon's own config, not just the appliance's.
+              auth1.succeed("grep -q 'auth-type = \"hmac-sha256\"' /run/sentinel/wren.toml")
+              auth1.succeed("grep -q 'auth-key-id = 7' /run/sentinel/wren.toml")
+
+              # Authentication is transparent to a correctly-keyed link: the adjacency
+              # comes up and the prefixes still flood.
+              auth1.wait_until_succeeds(
+                  "wren show isis neighbors | grep 0000.0000.0002 | grep -qi up", timeout=90
+              )
+              auth1.wait_until_succeeds("ip -6 route | grep -q 'fd00:12::/64'", timeout=120)
+              auth2.wait_until_succeeds("ip -6 route | grep -q 'fd00:11::/64'", timeout=120)
+
+              # --- phase 2: a mismatched key must tear it down ------------------
+              # auth1 is the side that proves this: it keeps its config and its Up
+              # adjacency, and must lose it once the peer's PDUs stop authenticating
+              # (holding time = 3 x 3s). auth2's own table is empty either way, since
+              # reconfiguring restarts its wren — assert it, but don't read much into it.
+              configure(auth2, "0000.0000.0002", "fd00:12::/64", "hmac-sha256", "wrongkey")
+              auth1.wait_until_fails(
+                  "wren show isis neighbors | grep 0000.0000.0002 | grep -qi up", timeout=120
+              )
+              auth2.wait_until_fails(
+                  "wren show isis neighbors | grep 0000.0000.0001 | grep -qi up", timeout=120
+              )
+
+              # --- phase 3: HMAC-MD5 (RFC 5304) also works ----------------------
+              configure(auth1, "0000.0000.0001", "fd00:11::/64", "hmac-md5", "s3cr3t")
+              configure(auth2, "0000.0000.0002", "fd00:12::/64", "hmac-md5", "s3cr3t")
+              auth1.succeed("grep -q 'auth-type = \"hmac-md5\"' /run/sentinel/wren.toml")
+              auth1.wait_until_succeeds(
+                  "wren show isis neighbors | grep 0000.0000.0002 | grep -qi up", timeout=120
+              )
+              auth1.wait_until_succeeds("ip -6 route | grep -q 'fd00:12::/64'", timeout=120)
+            '';
+          };
+
         # commit-confirm (roadmap C21): apply a change live under a timer that
         # auto-reverts to the saved config unless `confirm`ed — the safety net for
         # editing a firewall over its own link. One node; the hostname is the
