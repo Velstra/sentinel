@@ -92,11 +92,22 @@ set protocols isis interface eth1
 set protocols isis system-id 0000.0000.0001
 set protocols isis area 49.0001
 set protocols isis level 2
+set protocols isis auth-type hmac-sha256
+set protocols isis auth-key s3cr3t
 ```
 
 All the IGPs share `interface`, `redistribute`, `redistribute-metric`, `bfd`
 and `vrf`; each adds its own knobs (Babel: `network`/`router-id`; IS-IS:
 `system-id`/`area`/`level`/`priority`/`metric`/`network-type`/`l2-to-l1-leaking`).
+
+**Authenticate IS-IS.** It rides directly on the data link, with no IP layer to
+filter at, so on an untrusted segment any host can otherwise form an adjacency and
+inject LSPs. `auth-type` takes `text` (a cleartext password — readable by anyone
+watching the link), `hmac-md5` (RFC 5304, no key id) or `hmac-sha256` (RFC 5310,
+with `auth-key-id`). Prefer `hmac-sha256`; reach for `hmac-md5` when the neighbour
+is another vendor, since that is what most default to. Both ends of a link must
+agree on the **scheme** as well as the key — the two digests are not
+interchangeable.
 
 ## VRRP (first-hop redundancy) {#vrrp}
 
