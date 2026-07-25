@@ -423,6 +423,12 @@ struct WrenIsis {
     bfd: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     vrf: Option<String>,
+    #[serde(rename = "auth-type", skip_serializing_if = "Option::is_none")]
+    auth_type: Option<String>,
+    #[serde(rename = "auth-key", skip_serializing_if = "Option::is_none")]
+    auth_key: Option<String>,
+    #[serde(rename = "auth-key-id", skip_serializing_if = "Option::is_none")]
+    auth_key_id: Option<u16>,
 }
 
 #[derive(Debug, Serialize)]
@@ -746,6 +752,11 @@ pub fn compile_wren(appliance: &Appliance) -> WrenConfig {
         l2_to_l1_leaking: i.l2_to_l1_leaking,
         bfd: i.bfd,
         vrf: i.vrf.clone(),
+        // The authentication keys pass through verbatim — unlike `level`, the
+        // appliance and the daemon spell these the same.
+        auth_type: i.auth_type.clone(),
+        auth_key: i.auth_key.clone(),
+        auth_key_id: i.auth_key_id,
     });
 
     let vrrp = p
@@ -1039,6 +1050,59 @@ virtual-address = ["10.0.0.254"]
         assert!(out.contains("vrid = 10"), "{out}");
         // Every enabled protocol carries `enabled = true`.
         assert_eq!(out.matches("enabled = true").count(), 5, "{out}");
+    }
+
+    #[test]
+    fn isis_authentication_reaches_the_daemon_config() {
+        // The appliance and the daemon spell these keys identically, so the risk here
+        // is not translation but a field silently dropped on the way through — which
+        // would leave IS-IS running unauthenticated while `show` claims otherwise.
+        let toml = r#"
+[system]
+hostname = "r1"
+[protocols]
+[protocols.isis]
+interfaces = ["eth1"]
+system-id = "0000.0000.0001"
+auth-type = "hmac-sha256"
+auth-key = "s3cr3t"
+auth-key-id = 7
+"#;
+        let appliance = Appliance::from_toml(toml).unwrap();
+        let out = compile_wren(&appliance).to_toml().unwrap();
+        assert!(out.contains("auth-type = \"hmac-sha256\""), "{out}");
+        assert!(out.contains("auth-key = \"s3cr3t\""), "{out}");
+        assert!(out.contains("auth-key-id = 7"), "{out}");
+
+        // RFC 5304 has no Key ID, and an instance without authentication must not
+        // grow the keys at all (wren rejects an auth-type it cannot satisfy).
+        let md5 = r#"
+[system]
+hostname = "r1"
+[protocols]
+[protocols.isis]
+interfaces = ["eth1"]
+auth-type = "hmac-md5"
+auth-key = "s3cr3t"
+"#;
+        let out = compile_wren(&Appliance::from_toml(md5).unwrap())
+            .to_toml()
+            .unwrap();
+        assert!(out.contains("auth-type = \"hmac-md5\""), "{out}");
+        assert!(!out.contains("auth-key-id"), "{out}");
+
+        let plain = r#"
+[system]
+hostname = "r1"
+[protocols]
+[protocols.isis]
+interfaces = ["eth1"]
+"#;
+        let out = compile_wren(&Appliance::from_toml(plain).unwrap())
+            .to_toml()
+            .unwrap();
+        assert!(out.contains("[isis]"), "{out}");
+        assert!(!out.contains("auth-"), "{out}");
     }
 
     #[test]

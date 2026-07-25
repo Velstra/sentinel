@@ -1484,10 +1484,25 @@ const ISIS_FIELDS: &[Cand] = &[
     ("redistribute", "inject a route source"),
     ("redistribute-metric", "metric for redistributed routes"),
     ("l2-to-l1-leaking", "leak L2 prefixes into L1 (true/false)"),
+    (
+        "auth-type",
+        "PDU auth: none / text / hmac-md5 / hmac-sha256",
+    ),
+    ("auth-key", "the shared password or HMAC key"),
+    ("auth-key-id", "the wire key id (hmac-sha256 only)"),
     ("bfd", "run BFD to each neighbour (true/false)"),
     ("vrf", "the VRF this instance runs in"),
 ];
 const ISIS_LEVELS: &[Cand] = &[("1", "level 1"), ("2", "level 2"), ("1-2", "both levels")];
+const ISIS_AUTH_TYPES: &[Cand] = &[
+    ("none", "no authentication"),
+    ("text", "cleartext password (readable on the wire)"),
+    (
+        "hmac-md5",
+        "HMAC-MD5 digest (RFC 5304) — the vendor default",
+    ),
+    ("hmac-sha256", "HMAC-SHA-256 digest (RFC 5310) — preferred"),
+];
 const VRRP_FIELDS: &[Cand] = &[
     ("interface", "the NIC the virtual router runs on"),
     ("vrid", "virtual router id (1-255)"),
@@ -2438,6 +2453,7 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set", "protocols", "isis", "redistribute"] => REDIST,
         ["set", "protocols", "isis", "network-type"] => OSPF_NETWORK_TYPES,
         ["set", "protocols", "isis", "level"] => ISIS_LEVELS,
+        ["set", "protocols", "isis", "auth-type"] => ISIS_AUTH_TYPES,
         ["set", "protocols", "isis", "l2-to-l1-leaking" | "bfd"] => BOOLS,
         ["set" | "delete", "protocols", "vrrp", _name] => VRRP_FIELDS,
         ["set", "protocols", "vrrp", _name, "preempt"] => BOOLS,

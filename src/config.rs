@@ -1292,6 +1292,24 @@ pub struct Isis {
     /// The VRF this IS-IS instance runs in (a `[[protocols.vrf]]` name).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vrf: Option<String>,
+    /// PDU authentication: `"text"` (cleartext password, ISO 10589 §9.8),
+    /// `"hmac-md5"` (RFC 5304) or `"hmac-sha256"` (RFC 5310). IS-IS rides directly on
+    /// the data link, so without this any on-link host can form an adjacency and
+    /// inject LSPs. Unset ⇒ no authentication.
+    #[serde(default, rename = "auth-type", skip_serializing_if = "Option::is_none")]
+    pub auth_type: Option<String>,
+    /// The shared secret: the password (`"text"`) or the HMAC key. Required when
+    /// `auth-type` is set.
+    #[serde(default, rename = "auth-key", skip_serializing_if = "Option::is_none")]
+    pub auth_key: Option<String>,
+    /// The Key ID advertised beside the digest (`"hmac-sha256"` only; RFC 5304 has
+    /// none). Defaults to 1.
+    #[serde(
+        default,
+        rename = "auth-key-id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub auth_key_id: Option<u16>,
 }
 
 /// A VRRP virtual router (RFC 5798) — first-hop redundancy / firewall HA: a
@@ -5254,6 +5272,20 @@ impl Appliance {
             if isis.hello_interval == Some(0) {
                 bail!("protocols isis hello-interval must be >= 1 second");
             }
+            // Catch a mistyped scheme or a keyless one here: the daemon would refuse
+            // its whole config, so an IS-IS instance that looked committed would come
+            // up with no routing at all.
+            if let Some(at) = &isis.auth_type {
+                if !matches!(at.as_str(), "none" | "text" | "hmac-md5" | "hmac-sha256") {
+                    bail!(
+                        "protocols isis auth-type {at:?}: expected \"none\", \"text\", \
+                         \"hmac-md5\" or \"hmac-sha256\""
+                    );
+                }
+                if at != "none" && isis.auth_key.as_deref().unwrap_or("").is_empty() {
+                    bail!("protocols isis auth-type {at:?} requires a non-empty auth-key");
+                }
+            }
             check_vrf_ref(&isis.vrf, "isis vrf")?;
         }
         for v in &self.protocols.vrrp {
@@ -8932,6 +8964,27 @@ virtual-address = ["10.0.0.254"]
             Appliance::from_toml(&format!("{base}[protocols.ospf]\nauth-type = \"sha256\"\n"))
                 .is_err()
         );
+        // Same for IS-IS: a mistyped scheme, and a scheme with no key. Both would let
+        // the daemon reject its whole config, so IS-IS would come up with no routing.
+        assert!(
+            Appliance::from_toml(&format!(
+                "{base}[protocols.isis]\nauth-type = \"hmac-sha-256\"\nauth-key = \"k\"\n"
+            ))
+            .is_err()
+        );
+        assert!(
+            Appliance::from_toml(&format!(
+                "{base}[protocols.isis]\nauth-type = \"hmac-md5\"\n"
+            ))
+            .is_err()
+        );
+        // The three valid schemes with a key are accepted.
+        for t in ["text", "hmac-md5", "hmac-sha256"] {
+            Appliance::from_toml(&format!(
+                "{base}[protocols.isis]\nauth-type = \"{t}\"\nauth-key = \"s3cr3t\"\n"
+            ))
+            .unwrap_or_else(|e| panic!("isis auth-type {t:?} should be valid: {e}"));
+        }
         // An export referencing an undeclared filter is rejected.
         assert!(
             Appliance::from_toml(&format!("{base}[protocols.export]\nkernel = \"nope\"\n"))
