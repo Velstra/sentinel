@@ -178,7 +178,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-UZ0NmHH5LMkdsBw1U9876/WXxkpfHue0obZA89+6NTs=";
+      ebpfHash = "sha256-84X8m063hI0Ht6UqgUiGPlvyHRKU3Xrh8D9EihSQ3B8=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -3723,6 +3723,138 @@
             fw.fail("journalctl -u velstra.service | grep -q 'dport=9997'")
           '';
         };
+
+        # IPv6 extension headers must not bypass the firewall (RFC 8200 §4.1). The
+        # datapath used to classify a v6 packet by the FIXED header's next-header, so
+        # a Hop-by-Hop or Destination-Options header in front of TCP read as an
+        # unknown protocol with no ports — no port rule matched, and under
+        # `default-action accept` the packet sailed through. The chain is walked now.
+        #
+        # Each variant gets its OWN destination port, because every drop logs the same
+        # line and identical ports could not be told apart: 9999 is hit by a plain
+        # packet (the baseline v6 rule path), 9998 only ever by a packet behind one
+        # extension header, and 9996 only by a two-header chain. A `DROP6 ... proto=6
+        # dport=9998` line therefore cannot exist unless the walk resolved TCP behind
+        # the header. Port 9997 carries no rule and is the control: an
+        # extension-header packet there must stay unlogged, proving the fix filters by
+        # the resolved protocol rather than blanket-dropping anything with a chain.
+        #   nix build .#checks.x86_64-linux.v6exthdr -L
+        v6exthdr =
+          let
+            send6 = pkgs.writeScriptBin "send6" ''
+              #!${pkgs.python3.withPackages (ps: [ ps.scapy ])}/bin/python3
+              # send6 <dst> <port> plain|hbh|chain
+              import sys
+              from scapy.all import IPv6, IPv6ExtHdrDestOpt, IPv6ExtHdrHopByHop, TCP, send
+
+              dst, port, mode = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+              pkt = IPv6(dst=dst)
+              if mode in ("hbh", "chain"):
+                  pkt = pkt / IPv6ExtHdrHopByHop()
+              if mode == "chain":
+                  pkt = pkt / IPv6ExtHdrDestOpt()
+              # A few copies: a lone SYN can be lost in velstra's re-attach window.
+              send(pkt / TCP(dport=port, flags="S"), count=3, verbose=0)
+            '';
+          in
+          pkgs.testers.runNixOSTest {
+            name = "sentinel-v6-exthdr";
+            nodes = {
+              client =
+                { ... }:
+                {
+                  virtualisation.vlans = [ 1 ];
+                  networking = {
+                    useNetworkd = true;
+                    useDHCP = false;
+                    firewall.enable = false;
+                    interfaces.eth1.ipv6.addresses = [
+                      {
+                        address = "fd00:1::2";
+                        prefixLength = 64;
+                      }
+                    ];
+                  };
+                  environment.systemPackages = [ send6 ];
+                };
+              fw =
+                { lib, ... }:
+                {
+                  imports = [ self.nixosModules.sentinel ];
+                  networking.hostName = lib.mkForce "fw";
+                  networking.firewall.enable = lib.mkForce false;
+                  networking.interfaces.eth1.ipv6.addresses = [
+                    {
+                      address = "fd00:1::1";
+                      prefixLength = 64;
+                    }
+                  ];
+                  virtualisation.vlans = [ 1 ];
+                  virtualisation.memorySize = 2048;
+                  services.velstra.interface = lib.mkForce "eth1";
+                };
+            };
+            testScript = ''
+              start_all()
+              for m in (client, fw):
+                  m.wait_for_unit("multi-user.target")
+              fw.wait_for_unit("velstra.service")
+              client.wait_until_succeeds("ip -6 addr show eth1 | grep -q 'fd00:1::2'", timeout=20)
+              fw.wait_until_succeeds("ip -6 addr show eth1 | grep -q 'fd00:1::1'", timeout=20)
+
+              # default-action accept is the posture where the bypass existed: with a
+              # default drop, an unclassified packet was already refused.
+              fw.succeed(
+                  "su admin -c \"printf '%s\\n' "
+                  "'set firewall global default-action accept' "
+                  "'set interface eth1 zone wan' "
+                  "'set firewall zone wan default-action accept' "
+                  "'set firewall rule plain from wan' "
+                  "'set firewall rule plain action drop' "
+                  "'set firewall rule plain proto tcp' "
+                  "'set firewall rule plain port 9999' "
+                  "'set firewall rule plain log true' "
+                  "'set firewall rule behind-hbh from wan' "
+                  "'set firewall rule behind-hbh action drop' "
+                  "'set firewall rule behind-hbh proto tcp' "
+                  "'set firewall rule behind-hbh port 9998' "
+                  "'set firewall rule behind-hbh log true' "
+                  "'set firewall rule behind-chain from wan' "
+                  "'set firewall rule behind-chain action drop' "
+                  "'set firewall rule behind-chain proto tcp' "
+                  "'set firewall rule behind-chain port 9996' "
+                  "'set firewall rule behind-chain log true' "
+                  "commit save exit "
+                  "| sentinel configure\""
+              )
+              fw.wait_for_unit("velstra.service")
+
+              def journal(pattern):
+                  return fw.execute(f"journalctl -u velstra.service | grep -qE '{pattern}'")[0] == 0
+
+              def hit(_):
+                  client.execute("send6 fd00:1::1 9999 plain")
+                  client.execute("send6 fd00:1::1 9998 hbh")
+                  client.execute("send6 fd00:1::1 9996 chain")
+                  # The control: an extension-header packet to an un-ruled port.
+                  client.execute("send6 fd00:1::1 9997 hbh")
+                  return (
+                      journal("DROP6 proto=6 dport=9999")
+                      and journal("DROP6 proto=6 dport=9998")
+                      and journal("DROP6 proto=6 dport=9996")
+                  )
+
+              # The headline. `dport=9999` is the baseline; `9998` and `9996` can only
+              # be logged if the walk found TCP behind one and two extension headers,
+              # and `proto=6` in those lines is the resolved protocol — before the fix
+              # it would have been 0 (Hop-by-Hop) with no ports at all.
+              retry(hit)
+
+              # The un-ruled port stayed silent: extension headers are classified, not
+              # categorically dropped.
+              fw.fail("journalctl -u velstra.service | grep -q 'dport=9997'")
+            '';
+          };
 
         # Non-TCP reject in the eBPF datapath: the fw's WAN zone REJECTs udp/9999.
         # A UDP probe from the client must come back as an ICMP port-unreachable
