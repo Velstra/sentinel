@@ -109,6 +109,10 @@ is another vendor, since that is what most default to. Both ends of a link must
 agree on the **scheme** as well as the key — the two digests are not
 interchangeable.
 
+`nix build .#checks.x86_64-linux.isisauth -L` verifies this on two real VMs:
+matching HMAC-SHA-256 keys bring the adjacency up and flood prefixes, changing one
+side's key tears it down again, and HMAC-MD5 works the same way.
+
 ## VRRP (first-hop redundancy) {#vrrp}
 
 Two boxes share a virtual IP; the higher-priority one is master and owns it,
