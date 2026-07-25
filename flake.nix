@@ -3420,17 +3420,31 @@
             # The compiled config carries the reject verdict.
             fw.succeed("grep -q 'reject' /run/sentinel/velstra.toml")
 
-            # The headline: a connection to the rejected port comes back refused
-            # (a RST) fast, not a timeout. curl reports "Connection refused" or
-            # "Connection reset" on a RST; a silent drop would instead time out.
-            # Retry so a SYN lost in the velstra reload window can't fail us.
-            def refused(_):
-                out = client.execute(
-                    "curl -sS --max-time 4 -o /dev/null http://10.1.0.1:9999/ 2>&1"
-                )[1].lower()
-                return "refused" in out or "reset" in out
+            # A connection to the rejected port must come back refused (a RST) fast
+            # rather than time out. Retry so a SYN lost in the velstra reload window
+            # can't fail us.
+            #
+            # Assert on curl's EXIT CODE, not its message. 7 is CURLE_COULDNT_CONNECT
+            # — the connect failed outright, which is what receiving a RST looks like —
+            # and 28 is CURLE_OPERATION_TIMEDOUT, which is what a silent drop looks
+            # like. The two codes are curl's stable interface; the English wording is
+            # not, and this test used to match on "refused"/"reset" until a curl that
+            # says "Could not connect to server" turned a working firewall red.
+            # `execute` hands back curl's own exit status, so no shell echo is needed —
+            # and none may be used: the driver runs each command under `set -e`, so a
+            # failing curl would abort the line before any `echo $?` could report it.
+            def probe(port):
+                return client.execute(
+                    f"curl -sS --max-time 4 -o /dev/null http://10.1.0.1:{port}/"
+                )[0]
 
-            retry(refused)
+            # The headline: the rejected port fails FAST with a connect error (the RST).
+            retry(lambda _: probe(9999) == 7)
+
+            # The contrast that gives that its meaning: a port with no rule falls to the
+            # default (drop) and times out instead. Without this, a box that refused
+            # every port equally would pass the assertion above.
+            assert probe(9998) == 28, "a dropped port must time out, not refuse"
           '';
         };
 
