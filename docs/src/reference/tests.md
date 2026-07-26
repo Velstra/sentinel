@@ -1,6 +1,6 @@
 # Test suite (nixosTests)
 
-Sentinel is verified by **66 nixosTests** plus the Rust unit tests. The nixosTests
+Sentinel is verified by **68 nixosTests** plus the Rust unit tests. The nixosTests
 boot real QEMU/OVMF VMs — several of them two or three at a time on shared virtual
 segments — so they need `/dev/kvm`.
 
@@ -42,6 +42,7 @@ authoritative list.
 | `rejectudp` | a rejected UDP port answers with **ICMP port-unreachable** |
 | `log` | per-rule logging fires for a logged drop and a logged pass, and stays quiet otherwise |
 | `srcfilter` | a rule's `source` CIDR matches the intended client and only that one |
+| `nat` | (also) a rule's `destination` CIDR admits one target and denies another, and a rule's rate `limit` holds its bucket's bound |
 | `fwgroups` | address and port groups expand at compile time to the full sources × ports product |
 | `fwschedule` | a rule with a weekly schedule is in the data plane **only** inside its window |
 | `v6exthdr` | IPv6 extension headers do not bypass a rule — the chain is walked to the real protocol |
@@ -50,7 +51,7 @@ authoritative list.
 
 | Check | Proves |
 |---|---|
-| `nat` | a `[[port-forward]]` DNATs an inbound connection to an internal host |
+| `nat` | a `[[port-forward]]` DNATs an inbound connection to an internal host; a load-balanced VIP reaches a pool in **another zone** and its reply is un-NAT'd; both still work when the internal zone denies by default |
 | `masq` | masquerade SNATs a private LAN client out of the WAN address |
 | `hairpin` | an internal client reaches a port-forwarded service via the box's **own** public IP |
 | `npt66` | stateless, checksum-neutral IPv6 prefix translation (RFC 6296) |
