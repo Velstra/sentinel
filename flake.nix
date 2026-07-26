@@ -179,7 +179,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-AjDlV6oPYpXONoLQWSfzFtJMP0sb7uQoJIef6voQOhE=";
+      ebpfHash = "sha256-yBS0YCB2sY3MIjI6zRHVVUMCcNzAM8XvIN1uGmp/1nc=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -3021,15 +3021,35 @@
                 timeout=40,
             )
 
-            # NOT covered, for both NAT paths: an internal zone that denies BY
-            # DEFAULT drops the reply at the firewall stage, before the conntrack
-            # rewrite is reached. The reply's FW_FLOWS entry is recorded in the
-            # policy-independent namespace, and the firewall cannot consult two
-            # namespaces — with a 1-byte map value LLVM folds two lookups of the
-            # same map into one pointer and the verifier rejects it. Closing it
-            # means the NAT path recording the reply under the policy that reply
-            # arrives on, which the config knows and the data plane does not; the
-            # deny-by-default assertion belongs with that change.
+            # …and both NAT paths keep working when the internal zone denies BY
+            # DEFAULT, which is the posture a real appliance runs. To the firewall a
+            # NAT'd reply is an ordinary outbound packet from that zone, so it needs
+            # a state entry recorded under the policy it *arrives* on — resolved by
+            # the agent from the live interface subnet holding the target. Without it
+            # the reply is dropped at the firewall stage, before the un-NAT rewrite.
+            # Nothing about the config is asserted here on purpose: the reply policy
+            # is derived from the running system, so the outcome is the only honest
+            # evidence that it was derived correctly.
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set firewall zone lan default-action drop' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            fw.wait_for_unit("velstra.service")
+            client.wait_until_succeeds(
+                "curl -s --max-time 5 http://10.1.0.1:8080/ | grep -q hello-from-server",
+                timeout=40,
+            )
+            client.succeed("curl -s --max-time 5 http://10.1.0.1:9090/ | grep -q hello-from-server")
+            # Restore the permissive posture for the assertions below.
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set firewall zone lan default-action accept' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            fw.wait_for_unit("velstra.service")
 
 
             # C23 flow insight: the agent's query socket is the ONE path unit tests
