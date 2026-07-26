@@ -48,11 +48,38 @@ pub struct VelstraConfig {
     port_forwards: Vec<PortForwardOut>,
     #[serde(rename = "npt66", skip_serializing_if = "Vec::is_empty")]
     npt66: Vec<Npt66Out>,
+    /// C22 load-balanced services (`[[service]]`) — fabric's XDP L4 load
+    /// balancer, which had no way in from the appliance config.
+    #[serde(rename = "service", skip_serializing_if = "Vec::is_empty")]
+    services: Vec<ServiceOut>,
     /// C9 stateful-HA conntrack sync (`[conntrack_sync]`). Present only when the
     /// appliance has `[system.conntrack-sync]`. A single table emitted after the
     /// `[[…]]` arrays — velstra reads it order-independently.
     #[serde(skip_serializing_if = "Option::is_none")]
     conntrack_sync: Option<ConntrackSyncOut>,
+}
+
+/// One `[[service]]` in the emitted velstra config: a VIP fronting a pool.
+#[derive(Debug, Serialize)]
+struct ServiceOut {
+    /// The ingress zone's policy id — the datapath looks a service up under the
+    /// arriving packet's policy, so a VIP is reachable from the zone it is
+    /// declared on.
+    policy: u32,
+    vip: String,
+    port: u16,
+    proto: &'static str,
+    #[serde(rename = "backends")]
+    backends: Vec<BackendOut>,
+}
+
+/// One backend behind a [`ServiceOut`].
+#[derive(Debug, Serialize)]
+struct BackendOut {
+    ip: String,
+    /// Absent ⇒ keep the client's original destination port.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
 }
 
 /// The `[conntrack_sync]` block in the emitted velstra config — endpoints already
@@ -252,6 +279,38 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                     out
                 })
                 .collect();
+            // C22: open the firewall for each load-balanced service on this zone.
+            //
+            // The data plane special-cases a *port-forward* (a matching
+            // PORT_FORWARDS entry passes the packet regardless of the zone's
+            // default action) but has no such rule for a service, so under a
+            // default-drop zone — the normal configuration — a VIP would be
+            // silently unreachable. Emitting a real `pass` rule instead of adding
+            // another datapath special case has the advantage that the opening is
+            // *visible*: it shows up in the compiled config an operator inspects.
+            let mut port_rules: Vec<PortRule> = port_rules;
+            for lb in appliance
+                .load_balancers
+                .iter()
+                .filter(|l| !l.disabled && l.zone == zone)
+            {
+                let rule = PortRule {
+                    proto: proto_str(lb.proto),
+                    port: lb.port,
+                    action: "pass",
+                    log: false,
+                    src: None,
+                };
+                // An explicit rule the operator wrote for the same (proto, port)
+                // wins — including a `drop`, which is how you take a VIP out of
+                // service without deleting it.
+                if !port_rules
+                    .iter()
+                    .any(|r| r.proto == rule.proto && r.port == rule.port && r.src.is_none())
+                {
+                    port_rules.push(rule);
+                }
+            }
             Policy {
                 id: ids[zone],
                 name: zone.to_string(),
@@ -355,6 +414,35 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
         }
     }
 
+    // C22 load-balanced services — one `[[service]]` per enabled load balancer,
+    // scoped to its ingress zone's policy.
+    let mut services: Vec<ServiceOut> = Vec::new();
+    for lb in appliance.load_balancers.iter().filter(|l| !l.disabled) {
+        let Some(&policy) = ids.get(lb.zone.as_str()) else {
+            continue;
+        };
+        let mut backends = Vec::with_capacity(lb.backends.len());
+        for spec in &lb.backends {
+            let Ok((ip, port)) = crate::config::parse_host_port(spec) else {
+                continue;
+            };
+            backends.push(BackendOut {
+                ip: ip.to_string(),
+                // A bare address parses to port 0, which the datapath reads as
+                // "keep the client's port" — express that as an absent field
+                // rather than emitting a literal 0.
+                port: (port != 0).then_some(port),
+            });
+        }
+        services.push(ServiceOut {
+            policy,
+            vip: lb.vip.clone(),
+            port: lb.port,
+            proto: proto_str(lb.proto),
+            backends,
+        });
+    }
+
     // NPTv6 (RFC 6296) — one `[[npt66]]` per rule, bound to its boundary interface.
     let npt66 = appliance
         .nat
@@ -388,6 +476,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
         interfaces,
         port_forwards,
         npt66,
+        services,
         conntrack_sync,
     }
 }
@@ -597,6 +686,120 @@ port = "8000-8002"
                 .iter()
                 .all(|r| r.proto == "tcp" && r.action == "pass")
         );
+    }
+
+    /// C22: fabric's XDP load balancer had no way in from the appliance config —
+    /// the data plane has had `[[service]]` since phase 3 and nothing emitted it.
+    #[test]
+    fn a_load_balancer_becomes_a_service_scoped_to_its_zone() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+[[interface]]
+name = "lan0"
+zone = "lan"
+[[load-balancer]]
+name = "web"
+zone = "wan"
+vip = "203.0.113.10"
+proto = "tcp"
+port = 443
+backends = ["10.0.0.11:8443", "10.0.0.12"]
+"#;
+        let appliance = Appliance::from_toml(toml).unwrap();
+        appliance.clone().validate().expect("valid");
+        let cfg = compile(&appliance);
+
+        assert_eq!(cfg.services.len(), 1);
+        let svc = &cfg.services[0];
+        // The datapath keys a service by the *arriving* packet's policy, so the
+        // service must carry the ingress zone's id, not a global one.
+        let wan_policy = cfg.policies.iter().find(|p| p.name == "wan").unwrap().id;
+        assert_eq!(svc.policy, wan_policy);
+        assert_eq!(svc.vip, "203.0.113.10");
+        assert_eq!(svc.port, 443);
+        assert_eq!(svc.proto, "tcp");
+
+        assert_eq!(svc.backends.len(), 2);
+        assert_eq!(svc.backends[0].ip, "10.0.0.11");
+        assert_eq!(svc.backends[0].port, Some(8443));
+        // A bare address means "keep the client's port", which the datapath reads
+        // from an absent field — emitting a literal 0 would mean port zero.
+        assert_eq!(svc.backends[1].ip, "10.0.0.12");
+        assert_eq!(svc.backends[1].port, None);
+
+        // The firewall must be opened for the VIP, or a default-drop zone (the
+        // normal configuration) makes it silently unreachable: the data plane
+        // special-cases a port-forward but knows nothing about a service.
+        let wan = cfg.policies.iter().find(|p| p.name == "wan").unwrap();
+        let opened = wan
+            .port_rules
+            .iter()
+            .find(|r| r.port == 443 && r.proto == "tcp")
+            .expect("the service port is opened");
+        assert_eq!(opened.action, "pass");
+
+        let out = cfg.to_toml().unwrap();
+        assert!(out.contains("[[service]]"), "service emitted:\n{out}");
+        assert!(out.contains("vip = \"203.0.113.10\""), "{out}");
+    }
+
+    /// An explicit rule the operator wrote wins over the automatic opening — that
+    /// is how a VIP is taken out of service without deleting it.
+    #[test]
+    fn an_explicit_rule_overrides_the_load_balancer_opening() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+[[load-balancer]]
+name = "web"
+zone = "wan"
+vip = "203.0.113.10"
+proto = "tcp"
+port = 443
+backends = ["10.0.0.11:8443"]
+[[rule]]
+name = "vip-off"
+from = "wan"
+to = "wan"
+action = "drop"
+proto = "tcp"
+port = 443
+"#;
+        let cfg = compile(&Appliance::from_toml(toml).unwrap());
+        let wan = cfg.policies.iter().find(|p| p.name == "wan").unwrap();
+        let matching: Vec<&PortRule> = wan.port_rules.iter().filter(|r| r.port == 443).collect();
+        assert_eq!(matching.len(), 1, "no duplicate rule was added: {matching:?}");
+        assert_eq!(matching[0].action, "drop");
+    }
+
+    /// A disabled service must vanish from the data plane, not merely be marked.
+    #[test]
+    fn a_disabled_load_balancer_emits_nothing() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+[[load-balancer]]
+name = "web"
+zone = "wan"
+vip = "203.0.113.10"
+proto = "tcp"
+port = 443
+disabled = true
+backends = ["10.0.0.11:8443"]
+"#;
+        let cfg = compile(&Appliance::from_toml(toml).unwrap());
+        assert!(cfg.services.is_empty());
+        assert!(!cfg.to_toml().unwrap().contains("[[service]]"));
     }
 
     #[test]
