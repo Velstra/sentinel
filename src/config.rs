@@ -3972,6 +3972,16 @@ pub struct Rule {
         skip_serializing_if = "Option::is_none"
     )]
     pub destination_group: Option<String>,
+    /// Rate-limit the **new** flows this rule admits, in packets per second.
+    /// Absent means unlimited. Only meaningful on an `accept` rule — a limit on a
+    /// drop rule would throttle traffic that is refused anyway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// How much idle time the limit may bank, in packets. Defaults to one second's
+    /// worth of `limit`, which is what an operator means by "100 a second"; a burst
+    /// of one would meter every single packet instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst: Option<u32>,
     /// Reference a port group (`[firewall.group.port]`) instead of an inline
     /// `port`/range — mutually exclusive with it.
     #[serde(default, alias = "port-group", skip_serializing_if = "Option::is_none")]
@@ -4949,6 +4959,36 @@ impl Appliance {
                 bail!(
                     "rule {:?}: `to` is enforced as a destination match, so it cannot be \
                      combined with an explicit `destination` — remove one of them",
+                    rule.name
+                );
+            }
+            // A limit throttles what a rule lets through, so it needs a rule that
+            // lets something through — and a port to bound. Refused rather than
+            // ignored: a configured limit that silently does nothing is the kind of
+            // thing an operator only discovers during the flood it was meant to
+            // stop.
+            if let Some(limit) = rule.limit {
+                if limit == 0 {
+                    bail!("rule {:?}: `limit` must be at least 1 packet/s", rule.name);
+                }
+                if rule.action != Action::Accept {
+                    bail!(
+                        "rule {:?}: `limit` throttles traffic a rule admits, so it only \
+                         applies to an `accept` rule",
+                        rule.name
+                    );
+                }
+                if !rule.is_port_rule() {
+                    bail!(
+                        "rule {:?}: `limit` needs a proto/port — a broad rule sets a zone's \
+                         posture and has no per-rule budget to spend",
+                        rule.name
+                    );
+                }
+            }
+            if rule.burst.is_some() && rule.limit.is_none() {
+                bail!(
+                    "rule {:?}: `burst` sizes a `limit`; set one or remove the burst",
                     rule.name
                 );
             }

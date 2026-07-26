@@ -214,6 +214,8 @@ struct RuleDraft {
     source_group: Option<String>,
     destination: Option<String>,
     destination_group: Option<String>,
+    limit: Option<u32>,
+    burst: Option<u32>,
     port_group: Option<String>,
     schedule: Option<Schedule>,
 }
@@ -1836,6 +1838,8 @@ impl Draft {
                             source_group: r.source_group.clone(),
                             destination: r.destination.clone(),
                             destination_group: r.destination_group.clone(),
+                            limit: r.limit,
+                            burst: r.burst,
                             port_group: r.port_group.clone(),
                             schedule: r.schedule.clone(),
                         },
@@ -3000,6 +3004,12 @@ impl Session {
             }
             ["firewall", "rule", name, "destination-group", v] => {
                 self.draft.rule_mut(name).destination_group = Some((*v).to_string())
+            }
+            ["firewall", "rule", name, "limit", v] => {
+                self.draft.rule_mut(name).limit = Some(parse_u32(v, "limit")?)
+            }
+            ["firewall", "rule", name, "burst", v] => {
+                self.draft.rule_mut(name).burst = Some(parse_u32(v, "burst")?)
             }
             ["firewall", "rule", name, "port-group", v] => {
                 self.draft.rule_mut(name).port_group = Some((*v).to_string())
@@ -4805,6 +4815,8 @@ impl Session {
                     "source-group" => r.source_group = None,
                     "destination" => r.destination = None,
                     "destination-group" => r.destination_group = None,
+                    "limit" => r.limit = None,
+                    "burst" => r.burst = None,
                     "port-group" => r.port_group = None,
                     "schedule" => r.schedule = None,
                     other => bail!("rule has no field {other:?}"),
@@ -6093,6 +6105,8 @@ impl Session {
                     source_group: d.source_group.clone(),
                     destination: d.destination.clone(),
                     destination_group: d.destination_group.clone(),
+                    limit: d.limit,
+                    burst: d.burst,
                     port_group: d.port_group.clone(),
                     schedule: d.schedule.clone(),
                 })
@@ -7203,6 +7217,12 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         if let Some(g) = &r.destination_group {
             fwi.push_str(&format!("        destination-group {g}\n"));
+        }
+        if let Some(l) = r.limit {
+            fwi.push_str(&format!("        limit {l}\n"));
+        }
+        if let Some(b) = r.burst {
+            fwi.push_str(&format!("        burst {b}\n"));
         }
         if let Some(g) = &r.port_group {
             fwi.push_str(&format!("        port-group {g}\n"));
@@ -8536,6 +8556,12 @@ fn render_route_map(out: &mut String, name: &str, f: &FilterDraft) {
         out.push_str("        }\n");
     }
     out.push_str("    }\n");
+}
+
+/// Parse a plain unsigned count, naming the field so the error says which one.
+fn parse_u32(s: &str, field: &str) -> Result<u32> {
+    s.parse()
+        .map_err(|_| anyhow::anyhow!("invalid {field} {s:?} (expected a whole number)"))
 }
 
 fn parse_bool(s: &str) -> Result<bool> {
