@@ -225,6 +225,35 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
         .map(|(i, name)| (*name, i as u32 + 1))
         .collect();
 
+    // The IPv4 subnets a zone owns, as network CIDRs derived from its interfaces'
+    // static addresses ("10.2.0.1/24" -> "10.2.0.0/24"). This is what makes a
+    // rule's `to <zone>` enforceable: the data plane matches addresses, not zone
+    // names, so the destination zone has to be spelled as the prefixes it holds.
+    // A `dhcp` or address-less interface contributes nothing — `warnings()` tells
+    // the operator when that leaves a `to` unenforceable.
+    let zone_subnets = |zone: &str| -> Vec<String> {
+        appliance
+            .interfaces
+            .iter()
+            .filter(|i| !i.disabled && i.zone.as_deref() == Some(zone))
+            .filter_map(|i| {
+                let (addr, prefix) = i.address.as_deref()?.split_once('/')?;
+                let ip: std::net::Ipv4Addr = addr.parse().ok()?;
+                let bits: u32 = prefix.parse().ok()?;
+                if bits > 32 {
+                    return None;
+                }
+                let mask = if bits == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - bits)
+                };
+                let net = std::net::Ipv4Addr::from(u32::from(ip) & mask);
+                Some(format!("{net}/{bits}"))
+            })
+            .collect()
+    };
+
     let policies = zone_names
         .iter()
         .map(|&zone| {
@@ -278,7 +307,25 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                     // than a single `None`, and the product stays one entry per
                     // (constraint, port).
                     let sources = r.resolved_sources(groups);
-                    let destinations = r.resolved_destinations(groups);
+                    // `to <zone>` is enforced as a destination match on that zone's
+                    // subnets — validation has already refused it alongside an
+                    // explicit source or destination, so exactly one of these three
+                    // ever contributes. A zone with no static subnet yields nothing
+                    // to match and falls back to "any" (with a commit warning).
+                    // …but only when the rule has not already bound its source: one
+                    // rule matches one address end, and an explicit source is the
+                    // narrower, operator-written constraint. `warnings()` says so at
+                    // every commit rather than letting it pass unremarked.
+                    let binds_source = r.source.is_some() || r.source_group.is_some();
+                    let zoned: Vec<Option<String>> = match &r.to {
+                        Some(z) if !binds_source => zone_subnets(z).into_iter().map(Some).collect(),
+                        _ => Vec::new(),
+                    };
+                    let destinations = if zoned.is_empty() {
+                        r.resolved_destinations(groups)
+                    } else {
+                        zoned
+                    };
                     let ports = r.resolved_ports(groups);
                     let mut out =
                         Vec::with_capacity(sources.len() * destinations.len() * ports.len());
@@ -856,6 +903,145 @@ destination-group = "blocked"
             .filter_map(|r| r.dst.as_deref())
             .collect();
         assert_eq!(dsts, vec!["192.168.4.0/24", "203.0.113.9"]);
+    }
+
+    /// `to <zone>` used to be accepted and then ignored, so an `accept` rule aimed
+    /// at one zone actually opened the port toward every zone — a rule that lets in
+    /// more than it reads as. It is now matched as the destination zone's subnets.
+    #[test]
+    fn a_destination_zone_is_enforced_as_that_zones_subnets() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+address = "203.0.113.2/24"
+[[interface]]
+name = "lan0"
+zone = "lan"
+address = "10.0.0.1/24"
+[[interface]]
+name = "dmz0"
+zone = "dmz"
+address = "10.9.0.1/24"
+[[rule]]
+name = "https-in"
+from = "wan"
+to = "dmz"
+proto = "tcp"
+port = 443
+action = "accept"
+"#;
+        let appliance = Appliance::from_toml(toml).unwrap();
+        appliance.clone().validate().expect("valid");
+        assert!(
+            appliance.warnings().is_empty(),
+            "an enforceable `to` must not warn: {:?}",
+            appliance.warnings()
+        );
+        let cfg = compile(&appliance);
+        let wan = cfg.policies.iter().find(|p| p.name == "wan").unwrap();
+        let opened: Vec<&str> = wan
+            .port_rules
+            .iter()
+            .filter(|r| r.port == 443)
+            .filter_map(|r| r.dst.as_deref())
+            .collect();
+        // The dmz subnet, as a NETWORK address — the interface carries the box's own
+        // host address, which would match only the box itself.
+        assert_eq!(opened, vec!["10.9.0.0/24"]);
+    }
+
+    /// A rule that already binds its source keeps doing so: one rule matches one
+    /// address end, and the source is the narrower constraint. `to` then stays
+    /// documentation — and the commit says so, because the rule reaches further
+    /// than it reads.
+    #[test]
+    fn a_source_constraint_keeps_the_address_end_and_the_zone_warns() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+address = "203.0.113.2/24"
+[[interface]]
+name = "dmz0"
+zone = "dmz"
+address = "10.9.0.1/24"
+[[rule]]
+name = "https-in"
+from = "wan"
+to = "dmz"
+proto = "tcp"
+port = 443
+action = "accept"
+source = "198.51.100.0/24"
+"#;
+        let appliance = Appliance::from_toml(toml).unwrap();
+        appliance.clone().validate().expect("valid");
+        let warns = appliance.warnings();
+        assert!(
+            warns.iter().any(|w| w.contains("constrains its source")),
+            "{warns:?}"
+        );
+        let cfg = compile(&appliance);
+        let rule = cfg
+            .policies
+            .iter()
+            .find(|p| p.name == "wan")
+            .unwrap()
+            .port_rules
+            .iter()
+            .find(|r| r.port == 443)
+            .unwrap();
+        assert_eq!(rule.src.as_deref(), Some("198.51.100.0/24"));
+        assert!(rule.dst.is_none(), "one address end per rule");
+    }
+
+    /// A destination zone with nothing but a DHCP interface has no subnet to match,
+    /// so the rule silently applies everywhere — which is exactly the case the
+    /// commit warning has to keep covering.
+    #[test]
+    fn an_unaddressed_destination_zone_still_warns() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+address = "dhcp"
+[[interface]]
+name = "lan0"
+zone = "lan"
+address = "10.0.0.1/24"
+[[rule]]
+name = "out"
+from = "lan"
+to = "wan"
+proto = "tcp"
+port = 443
+action = "accept"
+"#;
+        let appliance = Appliance::from_toml(toml).unwrap();
+        appliance.clone().validate().expect("valid");
+        let warns = appliance.warnings();
+        assert!(
+            warns.iter().any(|w| w.contains("cannot be enforced")),
+            "{warns:?}"
+        );
+        let cfg = compile(&appliance);
+        let rule = cfg
+            .policies
+            .iter()
+            .find(|p| p.name == "lan")
+            .unwrap()
+            .port_rules
+            .iter()
+            .find(|r| r.port == 443)
+            .unwrap();
+        assert!(rule.dst.is_none());
     }
 
     /// An explicit rule the operator wrote wins over the automatic opening — that
