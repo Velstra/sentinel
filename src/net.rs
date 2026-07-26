@@ -1137,6 +1137,88 @@ fn apply_box_service(unit: &str, path: &Path, body: Option<String>, secret: bool
     Ok(())
 }
 
+/// The units an `OnFailure=` alert drop-in is installed on (roadmap C23).
+///
+/// Deliberately the units whose failure means the **appliance stops doing its
+/// job** — the data plane, the routing daemon, and the services that carry a
+/// segment's traffic. Not every Sentinel-owned unit: alerting on, say, the mDNS
+/// reflector would train an operator to ignore the alert, which is worse than not
+/// sending it. Units that are not present or not running are simply skipped by
+/// systemd, so listing an inactive one costs nothing.
+const ALERT_WATCHED_UNITS: &[&str] = &[
+    "velstra.service",
+    "wren.service",
+    "sentinel-dnsmasq.service",
+    "sentinel-dhcp6.service",
+    "sentinel-dhcp-relay.service",
+    "sentinel-syslog.service",
+    "sentinel-nat64.service",
+    "sentinel-proxy.service",
+    "sentinel-ocserv.service",
+    "strongswan.service",
+];
+
+/// Where the alert drop-ins live: one `<unit>.d/` directory per watched unit under
+/// `/run/systemd/system`, so they appear and disappear with the config and never
+/// outlive a boot.
+fn alert_dropin_path(unit: &str) -> std::path::PathBuf {
+    Path::new("/run/systemd/system")
+        .join(format!("{unit}.d"))
+        .join("50-sentinel-alert.conf")
+}
+
+/// The drop-in systemd parses. `%n` expands to the failing unit's name, so one
+/// templated handler covers every unit instead of a drop-in per unit that names
+/// itself. Its own function because it is a unit file: a stray leading space
+/// before `[Unit]` makes systemd ignore the section, and that is worth a test
+/// rather than a VM run.
+fn alert_dropin_body() -> String {
+    "# rendered by sentinel — alert on failure (roadmap C23)\n\
+     [Unit]\n\
+     OnFailure=sentinel-alert@%n.service\n"
+        .to_string()
+}
+
+/// Reconcile the alert drop-ins (roadmap C23): install `OnFailure=` on each
+/// watched unit while alerts are configured, remove them when not.
+///
+/// `%n` expands to the failing unit's name, so one templated handler covers every
+/// unit instead of a drop-in per unit that names itself.
+fn apply_alerts(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
+    let configured = !appliance.services.alerts.is_empty();
+    let mut changed = false;
+    for unit in ALERT_WATCHED_UNITS {
+        let path = alert_dropin_path(unit);
+        if configured {
+            let body = alert_dropin_body();
+            if file_changed(&path, &body) {
+                changed = true;
+            }
+            system::install_file(&path, &body)?;
+        } else if path.exists() {
+            system::remove_file(&path)?;
+            changed = true;
+        }
+    }
+    // A drop-in only takes effect after a reload; at boot systemd reads it on its
+    // own start, so only a live apply needs to ask.
+    if changed && mode == ApplyMode::Live {
+        let _ = system::daemon_reload();
+    }
+    // The msmtp config carries the relay password, so it is installed 0600 — msmtp
+    // refuses to run against anything looser.
+    let conf = Path::new(crate::alert::MSMTP_CONF);
+    match crate::alert::msmtp_conf_body(&appliance.services.alerts) {
+        Some(body) => system::install_alert_secret(conf, &body)?,
+        None => {
+            if conf.exists() {
+                system::remove_file(conf)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reconcile the time-based-rules timer (roadmap C15) to the config: write (and
 /// start) the dynamic `sentinel-fwsched.timer` when any rule has a schedule, or
 /// stop + remove it when none do. Writing under `/run/systemd/system` needs a
@@ -2529,6 +2611,9 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     // Time-based firewall rules (roadmap C15): (re)create or remove the dynamic
     // timer that re-applies the config at each scheduled rule's window boundaries.
     apply_fwsched(appliance, mode)?;
+    // Alert notifications (roadmap C23): the OnFailure drop-ins on the units whose
+    // failure means the appliance stopped working, plus the alert-mail config.
+    apply_alerts(appliance, mode)?;
     // SSH management access (roadmap C21): the persistent authorized_keys + the
     // Port/ListenAddress drop-in; sshd (re)started only in Live mode.
     apply_ssh(appliance, mode)?;
@@ -3933,6 +4018,21 @@ mod tests {
         };
         let body = lldpd_conf_body(&all).expect("enabled");
         assert!(!body.contains("interface pattern"), "got:\n{body}");
+    }
+
+    /// A drop-in is a unit file: a leading space before `[Unit]` makes systemd
+    /// ignore the section, and the alert then silently never fires.
+    #[test]
+    fn the_alert_dropin_is_a_parseable_unit_file() {
+        let body = alert_dropin_body();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines[1], "[Unit]", "got {:?}", lines[1]);
+        assert_eq!(lines[2], "OnFailure=sentinel-alert@%n.service");
+        assert!(body.ends_with('\n'), "got:\n{body}");
+        assert_eq!(
+            alert_dropin_path("velstra.service").to_str(),
+            Some("/run/systemd/system/velstra.service.d/50-sentinel-alert.conf")
+        );
     }
 
     /// The two defaults that keep a collector from being flooded or a wedged one

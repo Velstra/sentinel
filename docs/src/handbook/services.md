@@ -143,3 +143,54 @@ Worth knowing:
   collector that stops answering never blocks the appliance's logging.
 - The journal cursor is kept in `/var/lib/sentinel/rsyslog`, so a restart resumes
   where it left off instead of re-shipping the whole journal.
+
+## Alert notifications
+
+`services alerts` is the opposite of remote syslog: syslog ships everything
+somewhere for later, an alert tells a human *now*. The event it exists for is a
+**failed unit** — an appliance whose data plane died still answers ping and still
+answers SSH, so nothing reveals it until traffic is already broken.
+
+The event source is **systemd**, via an `OnFailure=` drop-in Sentinel installs on
+the units whose failure means the box stopped doing its job (the data plane, the
+routing daemon, the DNS/DHCP/relay/VPN/proxy services). Not every unit: alerting
+on the mDNS reflector would train you to ignore the alert.
+
+```text
+set services alerts webhook https://hooks.example.com/sentinel
+set services alerts mail to noc@example.com
+set services alerts mail relay smtp.example.com
+set services alerts mail user fw@example.com
+set services alerts mail password <secret>
+```
+
+A webhook receives a JSON body — `source`, `host`, `subject`, `detail` — where
+`detail` is the failed unit's last journal lines, so the alert is actionable
+without going to the box. `webhook` is repeatable; remove one with `delete
+services alerts webhook <url>`.
+
+| Mail field | Meaning |
+|---|---|
+| `to` | Recipient. Required to send. |
+| `relay` | Smarthost to submit through. Required to send. |
+| `from` | Envelope sender (default `sentinel@<hostname>`). |
+| `port` | Submission port (default 587). |
+| `user` / `password` | SMTP AUTH. The rendered msmtp config is 0600. |
+| `starttls` | Encrypt the submission. Default **true**. |
+
+Mail goes out through **msmtp**, a send-only client — the appliance never runs a
+listening mail server.
+
+Worth knowing:
+
+- **Half a mail target is refused at commit.** A recipient with no relay, or a
+  password with no user, would look configured and never deliver — and nobody goes
+  looking for the alert that never arrived.
+- **Credentials without STARTTLS are refused**, not warned about: submitting a
+  relay password over a cleartext link hands it to anyone on the path.
+- **Delivery is best-effort and never fails the box.** Every target is tried, one
+  bad target does not stop the others, and the handler still exits successfully —
+  a notification failure must not turn one broken service into a restart storm.
+  What went wrong goes to the journal, which syslog forwarding then ships.
+- `delete services alerts` removes the drop-ins again, so no handler is left
+  pointing at an endpoint you no longer configured.

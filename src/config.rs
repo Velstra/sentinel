@@ -566,6 +566,9 @@ pub struct Services {
     /// Remote syslog forwarding (`[services.syslog]`, roadmap C12).
     #[serde(default, skip_serializing_if = "Syslog::is_empty")]
     pub syslog: Syslog,
+    /// Alert notifications (`[services.alerts]`, roadmap C23).
+    #[serde(default, skip_serializing_if = "Alerts::is_empty")]
+    pub alerts: Alerts,
 }
 
 impl Services {
@@ -581,6 +584,88 @@ impl Services {
             && self.dhcp_relay.is_empty()
             && self.reverse_proxy.is_empty()
             && self.syslog.is_empty()
+            && self.alerts.is_empty()
+    }
+}
+
+/// Alert notifications (`[services.alerts]`, roadmap C23).
+///
+/// Remote syslog ships *everything* somewhere for later; an alert is the opposite
+/// — it tells a human, now, about the few events that mean the appliance is not
+/// doing its job. The one that matters most is a **failed unit**: an appliance
+/// whose data plane died is still pingable and still answers SSH, so nothing
+/// reveals it until traffic is already broken.
+///
+/// The event source is **systemd**, via an `OnFailure=` drop-in on each unit
+/// Sentinel owns — not a log scrape. A pattern match on the journal would fire on
+/// a message that merely mentions a failure, and would miss one that never logged.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Alerts {
+    /// Endpoints to POST a JSON alert to. Repeatable; `https` or `http`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub webhook: Vec<String>,
+    /// Where to mail an alert (`[services.alerts.mail]`).
+    #[serde(default, skip_serializing_if = "AlertMail::is_empty")]
+    pub mail: AlertMail,
+}
+
+impl Alerts {
+    pub fn is_empty(&self) -> bool {
+        self.webhook.is_empty() && self.mail.is_empty()
+    }
+}
+
+/// Default submission port for alert mail — 587 (RFC 6409 message submission),
+/// not 25: a relay that accepts authenticated submission is what an appliance
+/// actually has credentials for.
+pub const DEFAULT_ALERT_MAIL_PORT: u16 = 587;
+
+/// Mail delivery for alerts (`[services.alerts.mail]`), realised by **msmtp** —
+/// a send-only SMTP client, so the appliance never runs a listening mail server.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlertMail {
+    /// The recipient. Unset ⇒ no mail is sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// The envelope sender. Unset ⇒ `sentinel@<hostname>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// The smarthost to submit through. Required for mail to work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
+    /// Its port. Unset ⇒ 587.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// SMTP AUTH user. Unset ⇒ submit unauthenticated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// SMTP AUTH password. Rendered into a 0600 msmtp config, never
+    /// world-readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    /// Use STARTTLS. Defaults to **true** — an appliance mailing a password over
+    /// a cleartext link would leak it, so turning encryption off has to be a
+    /// written decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starttls: Option<bool>,
+}
+
+impl AlertMail {
+    pub fn is_empty(&self) -> bool {
+        self.to.is_none()
+            && self.from.is_none()
+            && self.relay.is_none()
+            && self.port.is_none()
+            && self.user.is_none()
+            && self.password.is_none()
+            && self.starttls.is_none()
+    }
+
+    /// Whether enough is set to actually send: a recipient and a smarthost.
+    pub fn is_deliverable(&self) -> bool {
+        self.to.is_some() && self.relay.is_some()
     }
 }
 
@@ -5918,6 +6003,76 @@ impl Appliance {
             }
         }
 
+        // Alert notifications (roadmap C23). The point of this block is to refuse
+        // a configuration that LOOKS like it alerts and does not: half a mail
+        // target is worse than none, because nobody goes looking for the alert
+        // that never arrives.
+        let alerts = &self.services.alerts;
+        let mut seen_hook = HashSet::new();
+        for url in &alerts.webhook {
+            if !(url.starts_with("https://") || url.starts_with("http://")) {
+                bail!("services alerts webhook {url:?}: must be an http(s) URL");
+            }
+            reject_config_token("services alerts webhook", url)?;
+            if !seen_hook.insert(url.as_str()) {
+                bail!("services alerts: duplicate webhook {url:?}");
+            }
+        }
+        let mail = &alerts.mail;
+        if !mail.is_empty() && !mail.is_deliverable() {
+            bail!(
+                "services alerts mail: both `to` and `relay` are required to send \
+                 (got to={:?}, relay={:?})",
+                mail.to,
+                mail.relay
+            );
+        }
+        if let Some(relay) = &mail.relay {
+            validate_host(relay).with_context(|| "services alerts mail relay")?;
+        }
+        if mail.port == Some(0) {
+            bail!("services alerts mail: port 0 is not valid");
+        }
+        for (field, addr) in [("to", &mail.to), ("from", &mail.from)] {
+            if let Some(a) = addr {
+                // Not a full RFC 5322 parse — just enough that msmtp gets an
+                // address rather than a word, and that nothing can break out of
+                // the rendered config line.
+                if !a.contains('@') || a.starts_with('@') || a.ends_with('@') {
+                    bail!("services alerts mail {field} {a:?}: not an email address");
+                }
+                reject_config_token(&format!("services alerts mail {field}"), a)?;
+            }
+        }
+        if mail.password.is_some() && mail.user.is_none() {
+            bail!("services alerts mail: a `password` without a `user` cannot authenticate");
+        }
+        if let Some(user) = &mail.user {
+            reject_config_token("services alerts mail user", user)?;
+        }
+        if let Some(pw) = &mail.password {
+            // A password may contain spaces; a newline or quote would still break
+            // out of the rendered msmtp line.
+            if pw
+                .bytes()
+                .any(|b| b.is_ascii_control() || matches!(b, b'"' | b'\\'))
+            {
+                bail!(
+                    "services alerts mail password: must not contain a control \
+                     character, quote or backslash"
+                );
+            }
+        }
+        // An authenticated submission over a cleartext link hands the relay
+        // password to anyone on the path. Refusing is better than a warning
+        // nobody reads.
+        if mail.user.is_some() && mail.starttls == Some(false) {
+            bail!(
+                "services alerts mail: refusing to send SMTP credentials without \
+                 STARTTLS — remove `user`/`password`, or leave `starttls` on"
+            );
+        }
+
         // Multi-WAN (roadmap C6): every uplink must name a declared interface,
         // no interface or routing-table id may be shared between uplinks, table
         // ids must avoid the kernel's reserved tables, gateways are IPv4 (or
@@ -6603,6 +6758,19 @@ pub(crate) fn route_prefix_family(s: &str) -> Result<bool> {
 
 /// Validate a host that is either an IP literal (v4/v6) or a DNS hostname — used
 /// for an NTP upstream, which may be given by name (`pool.ntp.org`) or address.
+/// Reject a value that cannot be rendered as a single bare token: whitespace, a
+/// control character, a quote or a backslash. Every consumer here (an msmtp
+/// directive, a curl argument) takes the rest of a line or an argv slot, so one of
+/// these turns a value into extra configuration.
+fn reject_config_token(field: &str, v: &str) -> Result<()> {
+    if v.bytes()
+        .any(|b| b.is_ascii_control() || matches!(b, b' ' | b'\t' | b'"' | b'\\'))
+    {
+        bail!("{field}: must not contain whitespace, a control character, quote or backslash");
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_host(s: &str) -> Result<()> {
     if s.parse::<Ipv4Addr>().is_ok() || s.parse::<Ipv6Addr>().is_ok() {
         return Ok(());

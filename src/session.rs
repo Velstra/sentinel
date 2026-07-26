@@ -13,15 +13,16 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::config::{
-    Acme, Action, Appliance, Bfd, Bgp, BgpAggregate, BgpNeighbor, BgpRoa, BgpRtr, Ca, Certificate,
-    ConfigSync, ConntrackSync, Dhcp6Pool, DhcpRelay, DhcpServer, DhcpStaticLease, Dns, Dyndns,
-    Export, Filter, FilterRule, Firewall, Groups, HealthCheck, IfaceType, Interface,
-    IpsecConnection, Isis, Lldp, LoadBalancer, Login, Mdns, MultiWan, Multicast,
-    MulticastInterface, Nat, Nat64, NatDestination, NatNpt66, NatSource, Ntp, OpenConnectServer,
-    OpenConnectUser, Ospf, Ospf3, OspfInterface, Pki, Policy, PortSpec, Pppoe, PrefixEntry,
-    PrefixList, Proto, Protocols, Qos, QosDiscipline, ReverseProxy, Rip, RouterAdvert, Rule,
-    Schedule, Services, Snmp, Ssh, StaticRoute, Syslog, SyslogLevel, SyslogProto, SyslogTarget,
-    System, UpdateChannel, Vpn, VrfDef, Vrrp, WanMode, WanUplink, WgPeer, WireguardTunnel, ZoneCfg,
+    Acme, Action, AlertMail, Alerts, Appliance, Bfd, Bgp, BgpAggregate, BgpNeighbor, BgpRoa,
+    BgpRtr, Ca, Certificate, ConfigSync, ConntrackSync, Dhcp6Pool, DhcpRelay, DhcpServer,
+    DhcpStaticLease, Dns, Dyndns, Export, Filter, FilterRule, Firewall, Groups, HealthCheck,
+    IfaceType, Interface, IpsecConnection, Isis, Lldp, LoadBalancer, Login, Mdns, MultiWan,
+    Multicast, MulticastInterface, Nat, Nat64, NatDestination, NatNpt66, NatSource, Ntp,
+    OpenConnectServer, OpenConnectUser, Ospf, Ospf3, OspfInterface, Pki, Policy, PortSpec, Pppoe,
+    PrefixEntry, PrefixList, Proto, Protocols, Qos, QosDiscipline, ReverseProxy, Rip, RouterAdvert,
+    Rule, Schedule, Services, Snmp, Ssh, StaticRoute, Syslog, SyslogLevel, SyslogProto,
+    SyslogTarget, System, UpdateChannel, Vpn, VrfDef, Vrrp, WanMode, WanUplink, WgPeer,
+    WireguardTunnel, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -1167,6 +1168,8 @@ struct Draft {
     dyndns: DyndnsDraft,
     /// Remote-syslog collectors (roadmap C12), keyed by host in file order.
     syslog: Vec<(String, SyslogTargetDraft)>,
+    /// Alert notification targets (roadmap C23).
+    alerts: AlertsDraft,
     dhcp_relay: DhcpRelayDraft,
     /// Multi-WAN (roadmap C6): failover/load-balance mode + the uplinks, keyed by
     /// interface in configuration order.
@@ -1262,6 +1265,13 @@ struct SyslogTargetDraft {
     port: Option<u16>,
     proto: Option<SyslogProto>,
     level: Option<SyslogLevel>,
+}
+
+/// A partially-specified alert configuration (`[services.alerts]`, roadmap C23).
+#[derive(Debug, Clone, Default)]
+struct AlertsDraft {
+    webhook: Vec<String>,
+    mail: AlertMail,
 }
 
 /// A partially-specified DHCP relay (`[services.dhcp-relay]`).
@@ -2123,6 +2133,10 @@ impl Draft {
                     )
                 })
                 .collect(),
+            alerts: AlertsDraft {
+                webhook: a.services.alerts.webhook.clone(),
+                mail: a.services.alerts.mail.clone(),
+            },
             dhcp_relay: DhcpRelayDraft {
                 interface: a.services.dhcp_relay.interface.clone(),
                 server: a.services.dhcp_relay.server.clone(),
@@ -3324,6 +3338,35 @@ impl Session {
             ["services", "syslog", "target", host, "level", v] => {
                 crate::config::validate_host(host)?;
                 self.draft.syslog_target_mut(host).level = Some(parse_syslog_level(v)?);
+            }
+
+            // services alerts: notify on a failed unit (C23). Webhooks append
+            // (deduped); the mail target is a single relay.
+            ["services", "alerts", "webhook", v] => {
+                push_unique(&mut self.draft.alerts.webhook, v);
+            }
+            ["services", "alerts", "mail", "to", v] => {
+                self.draft.alerts.mail.to = Some((*v).to_string())
+            }
+            ["services", "alerts", "mail", "from", v] => {
+                self.draft.alerts.mail.from = Some((*v).to_string())
+            }
+            ["services", "alerts", "mail", "relay", v] => {
+                crate::config::validate_host(v)?;
+                self.draft.alerts.mail.relay = Some((*v).to_string());
+            }
+            ["services", "alerts", "mail", "port", v] => {
+                self.draft.alerts.mail.port =
+                    Some(v.parse().with_context(|| format!("invalid port {v:?}"))?);
+            }
+            ["services", "alerts", "mail", "user", v] => {
+                self.draft.alerts.mail.user = Some((*v).to_string())
+            }
+            ["services", "alerts", "mail", "password", v] => {
+                self.draft.alerts.mail.password = Some((*v).to_string())
+            }
+            ["services", "alerts", "mail", "starttls", v] => {
+                self.draft.alerts.mail.starttls = Some(parse_bool(v)?)
             }
 
             // services dhcp-relay: box-wide DHCP relay agent (isc dhcrelay).
@@ -5040,6 +5083,30 @@ impl Session {
                     other => bail!("services syslog target has no field {other:?}"),
                 }
             }
+            // services alerts: all of it, one webhook by value, or a mail field.
+            ["services", "alerts"] => self.draft.alerts = AlertsDraft::default(),
+            ["services", "alerts", "webhook"] => self.draft.alerts.webhook.clear(),
+            ["services", "alerts", "webhook", v] => {
+                let before = self.draft.alerts.webhook.len();
+                self.draft.alerts.webhook.retain(|u| u != v);
+                if self.draft.alerts.webhook.len() == before {
+                    bail!("{v:?} is not a configured webhook");
+                }
+            }
+            ["services", "alerts", "mail"] => self.draft.alerts.mail = AlertMail::default(),
+            ["services", "alerts", "mail", field] => {
+                let m = &mut self.draft.alerts.mail;
+                match *field {
+                    "to" => m.to = None,
+                    "from" => m.from = None,
+                    "relay" => m.relay = None,
+                    "port" => m.port = None,
+                    "user" => m.user = None,
+                    "password" => m.password = None,
+                    "starttls" => m.starttls = None,
+                    other => bail!("services alerts mail has no field {other:?}"),
+                }
+            }
             ["services", "dhcp-relay"] => self.draft.dhcp_relay = DhcpRelayDraft::default(),
             ["services", "dhcp-relay", field] => {
                 let r = &mut self.draft.dhcp_relay;
@@ -6555,6 +6622,10 @@ impl Session {
                     allow: self.draft.snmp.allow.clone(),
                 },
                 ssh: self.draft.ssh.clone(),
+                alerts: Alerts {
+                    webhook: self.draft.alerts.webhook.clone(),
+                    mail: self.draft.alerts.mail.clone(),
+                },
                 syslog: Syslog {
                     targets: self
                         .draft
@@ -7640,6 +7711,7 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
     let rproxy = &draft.reverse_proxy;
     let rproxy_set = !rproxy.is_empty();
     let syslog_set = !draft.syslog.is_empty();
+    let alerts_set = !draft.alerts.webhook.is_empty() || !draft.alerts.mail.is_empty();
     let any_service = dns_set
         || ntp_set
         || lldp_set
@@ -7649,7 +7721,8 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         || dyndns_set
         || relay_set
         || rproxy_set
-        || syslog_set;
+        || syslog_set
+        || alerts_set;
     if want("services") && any_service {
         out.push_str("services {\n");
         if dns_set {
@@ -7756,6 +7829,26 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             }
             if let Some(i) = &dyndns.interface {
                 out.push_str(&format!("        interface {i}\n"));
+            }
+            out.push_str("    }\n");
+        }
+        if alerts_set {
+            out.push_str("    alerts {\n");
+            for url in &draft.alerts.webhook {
+                out.push_str(&format!("        webhook {url}\n"));
+            }
+            let m = &draft.alerts.mail;
+            if !m.is_empty() {
+                out.push_str("        mail {\n");
+                // push_field renders at the 12-space depth these fields sit at.
+                push_field(&mut out, "to", m.to.clone());
+                push_field(&mut out, "from", m.from.clone());
+                push_field(&mut out, "relay", m.relay.clone());
+                push_field(&mut out, "port", m.port.map(|p| p.to_string()));
+                push_field(&mut out, "user", m.user.clone());
+                push_field(&mut out, "password", m.password.clone());
+                push_field(&mut out, "starttls", m.starttls.map(|b| b.to_string()));
+                out.push_str("        }\n");
             }
             out.push_str("    }\n");
         }
@@ -8598,6 +8691,102 @@ backends = ["10.0.0.11:8443"]
             rebuilt.load_balancers, appliance.load_balancers,
             "the load balancer must survive a commit that never mentioned it"
         );
+    }
+
+    /// `set services alerts …` end to end, including the refusals that keep a
+    /// half-configured target from looking like a working one.
+    #[test]
+    fn alerts_grammar_sets_shows_commits_and_refuses_half_targets() {
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname fw1",
+            "set interface lan0 zone lan",
+            "set services alerts webhook https://hooks.example.com/sentinel",
+            "set services alerts mail to noc@example.com",
+            "set services alerts mail relay smtp.example.com",
+        ] {
+            run(&mut s, line).unwrap_or_else(|e| panic!("{line}: {e:#}"));
+        }
+        let a = s.commit().expect("alerts commit");
+        assert_eq!(
+            a.services.alerts.webhook,
+            ["https://hooks.example.com/sentinel"]
+        );
+        assert_eq!(
+            a.services.alerts.mail.to.as_deref(),
+            Some("noc@example.com")
+        );
+        assert!(a.services.alerts.mail.is_deliverable());
+
+        let shown = render_draft_only(&s.draft, true, Some("services"));
+        assert!(shown.contains("    alerts {"), "got:\n{shown}");
+        assert!(
+            shown.contains("        webhook https://hooks.example.com/sentinel"),
+            "got:\n{shown}"
+        );
+        assert!(
+            shown.contains("            relay smtp.example.com"),
+            "got:\n{shown}"
+        );
+
+        // A webhook appends, deduped, and is removed by value.
+        run(
+            &mut s,
+            "set services alerts webhook https://hooks.example.com/sentinel",
+        )
+        .unwrap();
+        assert_eq!(s.commit().unwrap().services.alerts.webhook.len(), 1);
+        assert!(run(&mut s, "delete services alerts webhook https://nope/").is_err());
+        run(
+            &mut s,
+            "set services alerts webhook http://10.0.0.9:9000/hook",
+        )
+        .unwrap();
+        run(
+            &mut s,
+            "delete services alerts webhook http://10.0.0.9:9000/hook",
+        )
+        .unwrap();
+        assert_eq!(s.commit().unwrap().services.alerts.webhook.len(), 1);
+
+        // A URL that is not http(s) cannot be posted to — refused at commit.
+        run(
+            &mut s,
+            "set services alerts webhook ftp://files.example.com/x",
+        )
+        .unwrap();
+        let err = format!("{:#}", s.commit().unwrap_err());
+        assert!(err.contains("http(s) URL"), "got: {err}");
+        run(
+            &mut s,
+            "delete services alerts webhook ftp://files.example.com/x",
+        )
+        .unwrap();
+
+        // Half a mail target: a recipient with no relay never sends, and nobody
+        // goes looking for the alert that never arrived.
+        run(&mut s, "delete services alerts mail relay").unwrap();
+        let err = format!("{:#}", s.commit().unwrap_err());
+        assert!(err.contains("both `to` and `relay`"), "got: {err}");
+        run(&mut s, "set services alerts mail relay smtp.example.com").unwrap();
+
+        // Credentials without encryption would hand the relay password to the
+        // path; refused rather than warned about.
+        run(&mut s, "set services alerts mail user fw@example.com").unwrap();
+        run(&mut s, "set services alerts mail password s3cret").unwrap();
+        run(&mut s, "set services alerts mail starttls false").unwrap();
+        let err = format!("{:#}", s.commit().unwrap_err());
+        assert!(err.contains("without STARTTLS"), "got: {err}");
+        run(&mut s, "delete services alerts mail starttls").unwrap();
+        assert!(s.commit().is_ok());
+
+        // A password with no user cannot authenticate.
+        run(&mut s, "delete services alerts mail user").unwrap();
+        let err = format!("{:#}", s.commit().unwrap_err());
+        assert!(err.contains("without a `user`"), "got: {err}");
+
+        run(&mut s, "delete services alerts").unwrap();
+        assert!(s.commit().unwrap().services.alerts.is_empty());
     }
 
     /// `set services syslog target …` end to end.

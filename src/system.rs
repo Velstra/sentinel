@@ -379,6 +379,23 @@ pub fn install_ppp_secret(path: &Path, contents: &str) -> Result<()> {
     sudo("install", &["-m", "0600", tmp_s, dst_s])
 }
 
+/// Install the alert-mail (msmtp) config at a root-owned `path`, mode **0600
+/// root:root**. 0600 is not a preference here: msmtp **refuses to run** against a
+/// config carrying a password that is group- or world-readable, so a looser mode
+/// would turn into "alerts silently stopped working". Same stage-then-`install`
+/// dance as the other secrets, so the password is never briefly readable.
+pub fn install_alert_secret(path: &Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    let tmp = Path::new("/run/sentinel").join(".alert-secret.tmp");
+    stage_private(&tmp, contents)?;
+    let (Some(tmp_s), Some(dst_s)) = (tmp.to_str(), path.to_str()) else {
+        bail!("non-UTF-8 path");
+    };
+    sudo("install", &["-m", "0600", tmp_s, dst_s])
+}
+
 /// Install a service secret (an SNMP community, a dyndns password) at a
 /// root-owned `path`, mode **0640 root:root** — readable by root but never
 /// world-readable. The consuming daemon (snmpd, ddclient) runs as root, so 0640

@@ -1234,6 +1234,30 @@ const SERVICES_NODES: &[Cand] = &[
         "syslog",
         "ship the journal to remote collectors (rsyslog, RFC 5424)",
     ),
+    (
+        "alerts",
+        "notify on a failed unit: webhook and/or mail (roadmap C23)",
+    ),
+];
+// `services alerts <Tab>`: where an alert goes.
+const ALERTS_NODES: &[Cand] = &[
+    (
+        "webhook",
+        "POST a JSON alert to an http(s) endpoint (repeatable)",
+    ),
+    ("mail", "mail an alert through a smarthost (msmtp)"),
+];
+const ALERT_MAIL_FIELDS: &[Cand] = &[
+    ("to", "recipient address (required to send)"),
+    ("from", "envelope sender (default sentinel@<hostname>)"),
+    ("relay", "smarthost to submit through (required to send)"),
+    ("port", "submission port (default 587)"),
+    ("user", "SMTP AUTH user (omit ⇒ unauthenticated)"),
+    ("password", "SMTP AUTH password (stored 0600)"),
+    (
+        "starttls",
+        "encrypt the submission (default true; credentials require it)",
+    ),
 ];
 // `services syslog <Tab>`: one node, since a collector is all there is to set.
 const SYSLOG_NODES: &[Cand] = &[("target", "a collector to ship to, by host")];
@@ -2341,6 +2365,9 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "services", "dhcp-relay"] => DHCP_RELAY_FIELDS,
         ["set" | "delete", "services", "reverse-proxy", _name] => REVERSE_PROXY_FIELDS,
         ["set", "services", "reverse-proxy", _name, "disabled"] => BOOLS,
+        ["set" | "delete", "services", "alerts"] => ALERTS_NODES,
+        ["set" | "delete", "services", "alerts", "mail"] => ALERT_MAIL_FIELDS,
+        ["set", "services", "alerts", "mail", "starttls"] => BOOLS,
         ["set" | "delete", "services", "syslog"] => SYSLOG_NODES,
         ["set" | "delete", "services", "syslog", "target", _host] => SYSLOG_FIELDS,
         ["set", "services", "syslog", "target", _host, "proto"] => SYSLOG_PROTOS,
@@ -2964,6 +2991,8 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
         ["set", "firewall", "zone", _name, "block"] => own_cands(&[PH_IPV4_CIDR, PH_IPV6_CIDR]),
         ["set", "firewall", "rule", _name, "source"] => own_cands(&[PH_IPV4_CIDR, PH_IPV6_CIDR]),
         ["set", "firewall", "rule", _name, "port"] => own_cands(&[PH_PORT_RANGE]),
+        ["set", "services", "alerts", "webhook"] => own_cands(&[PH_URL]),
+        ["set", "services", "alerts", "mail", "port"] => own_cands(&[PH_PORT]),
         ["set", "services", "syslog", "target", _host, "port"] => own_cands(&[PH_PORT]),
         ["set", "load-balancer", _name, "port"] => own_cands(&[PH_PORT]),
         ["set", "load-balancer", _name, "vip"] => own_cands(&[PH_IPV4]),
@@ -3651,7 +3680,8 @@ mod tests {
                 "dyndns",
                 "dhcp-relay",
                 "reverse-proxy",
-                "syslog"
+                "syslog",
+                "alerts"
             ]
         );
         assert_eq!(kw(&["set", "services", "syslog"]), ["target"]);

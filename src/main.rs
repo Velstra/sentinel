@@ -9,6 +9,7 @@
 //! and apply that document — and, via [`velstra_proto`] (from crates.io), talk to
 //! a running Velstra controller.
 
+mod alert;
 mod api;
 mod archive;
 mod compile;
@@ -189,6 +190,16 @@ enum Command {
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
+    /// Deliver an alert for a failed unit (roadmap C23). Invoked by systemd's
+    /// `OnFailure=` on the units Sentinel owns, not by hand — it reads the saved
+    /// config's `[services.alerts]` and notifies every configured target.
+    Alert {
+        /// The systemd unit that failed (systemd passes `%n`).
+        unit: String,
+        /// The saved config holding the alert targets.
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    },
     /// List the ports a Velstra controller currently knows about.
     Ports {
         /// The controller's orchestrator/admin endpoint.
@@ -288,6 +299,7 @@ async fn main() -> Result<()> {
         Command::ApplyBootLate { config } => apply_boot_late(&config),
         Command::Apply { file, out, reload } => apply(&file, &out, reload.as_deref()),
         Command::ConfirmRollback { config } => confirm_rollback(&config),
+        Command::Alert { unit, config } => alert_unit(&unit, &config),
         Command::Ports { controller } => ports(&controller).await,
         Command::Api {
             listen,
@@ -1087,6 +1099,37 @@ fn show_nat() -> Result<()> {
             "destination {}: {} {:?}/{} -> {}",
             d.name, d.zone, d.proto, d.port, d.to
         );
+    }
+    Ok(())
+}
+
+/// Deliver an alert for a failed unit (roadmap C23).
+///
+/// Exits 0 even when nothing could be delivered: this runs as systemd's
+/// `OnFailure=` handler, and a failing handler would add a second failed unit to
+/// the incident — with its own OnFailure, if we ever wired one. What went wrong
+/// goes to the journal instead.
+fn alert_unit(unit: &str, config: &std::path::Path) -> Result<()> {
+    if !config.exists() {
+        eprintln!(
+            "alert: no saved config at {} — nothing to notify",
+            config.display()
+        );
+        return Ok(());
+    }
+    let a = match Appliance::load(config) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("alert: could not read {}: {e:#}", config.display());
+            return Ok(());
+        }
+    };
+    let alert = alert::Alert::unit_failure(unit);
+    let n = alert::deliver(&a.services.alerts, &alert);
+    if n == 0 && !a.services.alerts.is_empty() {
+        eprintln!("alert: {unit} failed but no target accepted the notification");
+    } else if n > 0 {
+        println!("alert: notified {n} target(s) about {unit}");
     }
     Ok(())
 }
