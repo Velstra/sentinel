@@ -543,6 +543,10 @@ fn unwind_err(rb: Rollback, cause: anyhow::Error, stage: &str) -> anyhow::Error 
 /// are rolled back in reverse and a report of what changed is returned.
 pub(crate) fn apply_live(appliance: &crate::config::Appliance, act: &Apply) -> Result<()> {
     // ---- Phase 1: prepare (fallible, NO live side effects) ----
+    // Domain groups become address groups here: the compiler matches addresses and
+    // knows nothing about names. Resolution never fails the commit — a name that
+    // will not resolve falls back to its cached answer.
+    let appliance = &crate::domain::with_resolved(appliance);
     let rendered = compile::compile(appliance)
         .to_toml()
         .context("compiling firewall config")?;
@@ -1774,6 +1778,10 @@ const GROUP_NODES: &[Cand] = &[
         "port-group",
         "a reusable set of ports/ranges (rule port-group)",
     ),
+    (
+        "domain-group",
+        "DNS names resolved to addresses (rule source/destination-group)",
+    ),
 ];
 const ADDRESS_GROUP_FIELDS: &[Cand] = &[(
     "address",
@@ -1782,6 +1790,10 @@ const ADDRESS_GROUP_FIELDS: &[Cand] = &[(
 const PORT_GROUP_FIELDS: &[Cand] = &[(
     "port",
     "members: ports/ranges, comma-separated (replaces the set)",
+)];
+const DOMAIN_GROUP_FIELDS: &[Cand] = &[(
+    "domain",
+    "members: DNS names, comma-separated (replaces the set)",
 )];
 // `nat <Tab>` reveals the NAT directions (VyOS-style) plus NAT64.
 const NAT_NODES: &[Cand] = &[
@@ -2398,6 +2410,7 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
             _name,
         ] => ADDRESS_GROUP_FIELDS,
         ["set" | "delete", "firewall", "group", "port-group", _name] => PORT_GROUP_FIELDS,
+        ["set" | "delete", "firewall", "group", "domain-group", _name] => DOMAIN_GROUP_FIELDS,
         ["set" | "delete", "firewall", "global"] => GLOBAL_FIELDS,
         [
             "set",
@@ -2625,6 +2638,8 @@ pub struct DynNames {
     pub nat_npt66: Vec<String>,
     pub address_groups: Vec<String>,
     pub port_groups: Vec<String>,
+    /// Declared domain-group names.
+    pub domain_groups: Vec<String>,
     pub filters: Vec<String>,
     pub vrfs: Vec<String>,
     pub ipsec: Vec<String>,
@@ -2718,6 +2733,11 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
         ["set" | "delete", "firewall", "group", "port-group"] => {
             named(&names.port_groups, "port-group", "a new port-group name")
         }
+        ["set" | "delete", "firewall", "group", "domain-group"] => named(
+            &names.domain_groups,
+            "domain-group",
+            "a new domain-group name",
+        ),
         ["set" | "delete", "protocols", "vrrp"] => own_cands(&[PH_NAME]),
         ["set" | "delete", "vpn", "ipsec"] => {
             named(&names.ipsec, "IPsec connection", "a new connection name")
@@ -3572,7 +3592,7 @@ mod tests {
         // The group sub-tree: alias kinds and their member fields.
         assert_eq!(
             kw(&["set", "firewall", "group"]),
-            ["address-group", "port-group"]
+            ["address-group", "port-group", "domain-group"]
         );
         assert_eq!(
             kw(&["set", "firewall", "group", "address-group", "mgmt"]),
@@ -3863,6 +3883,7 @@ mod tests {
             nat_npt66: vec!["v6-npt".into()],
             address_groups: vec!["mgmt".into()],
             port_groups: vec!["webports".into()],
+            domain_groups: vec!["ads".into()],
             filters: vec!["from-peer".into()],
             vrfs: vec!["blue".into()],
             ipsec: vec!["hq".into()],

@@ -171,6 +171,37 @@ set firewall rule mgmt port-group web
 set firewall rule mgmt action accept
 ```
 
+### Domain groups
+
+A domain group holds **DNS names**, resolved to addresses at commit time and
+re-resolved every 15 minutes. Rules reference it through the same
+`source-group` / `destination-group` field as an address group — the names share
+one namespace, so a group cannot exist as both.
+
+```text
+set firewall group domain-group trackers domain ads.example.com,metrics.example.net
+
+set firewall rule no-trackers from lan
+set firewall rule no-trackers proto tcp
+set firewall rule no-trackers port 443
+set firewall rule no-trackers action drop
+set firewall rule no-trackers destination-group trackers
+```
+
+Only IPv4 answers are used — the rule tables match IPv4 addresses — and each
+becomes a `/32`.
+
+**A failed lookup keeps the last good answer.** The resolved addresses are cached
+on disk, and a name that will not resolve falls back to its cache rather than
+contributing nothing. That matters because a domain group usually *blocks*
+something: an empty group matches nothing, and a rule that blocks nothing allows
+everything. A DNS outage must not quietly undo the rule. A name that has never
+resolved does contribute nothing, and says so at commit.
+
+This tracks a name, not a service. A large site behind many rotating addresses, or
+one sharing an address with sites you do not mean to match, is a poor fit — for
+DNS-level blocking use `service dns` blocklists instead.
+
 ## NAT
 
 `nat` has four kinds of translation:

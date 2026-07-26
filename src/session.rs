@@ -2445,6 +2445,12 @@ impl Session {
         self.draft.groups.port.keys().cloned().collect()
     }
 
+    /// The declared domain-group names, for completion and
+    /// `delete firewall group domain-group …`.
+    pub fn domain_group_names(&self) -> Vec<String> {
+        self.draft.groups.domain.keys().cloned().collect()
+    }
+
     /// The zone names known to the candidate — those referenced by an interface
     /// plus those with an explicit `[zone.*]` override. Completion offers these
     /// for `set interface <n> zone …` and `set rule <n> from/to …`.
@@ -3045,6 +3051,15 @@ impl Session {
                     .draft
                     .groups
                     .address
+                    .entry((*name).to_string())
+                    .or_default();
+                append_csv(list, v);
+            }
+            ["firewall", "group", "domain-group", name, "domain", v] => {
+                let list = self
+                    .draft
+                    .groups
+                    .domain
                     .entry((*name).to_string())
                     .or_default();
                 append_csv(list, v);
@@ -4827,6 +4842,11 @@ impl Session {
             ["firewall", "group", "address-group", name] => {
                 if self.draft.groups.address.remove(*name).is_none() {
                     bail!("no address-group {name:?}");
+                }
+            }
+            ["firewall", "group", "domain-group", name] => {
+                if self.draft.groups.domain.remove(*name).is_none() {
+                    bail!("no domain-group {name:?}");
                 }
             }
             ["firewall", "group", "port-group", name] => {
@@ -7161,12 +7181,22 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         fwi.push_str("    }\n");
     }
-    if !draft.groups.address.is_empty() || !draft.groups.port.is_empty() {
+    if !draft.groups.address.is_empty()
+        || !draft.groups.port.is_empty()
+        || !draft.groups.domain.is_empty()
+    {
         fwi.push_str("    group {\n");
         for (name, members) in &draft.groups.address {
             fwi.push_str(&format!("        address-group {name} {{\n"));
             if !members.is_empty() {
                 fwi.push_str(&format!("            address {}\n", members.join(",")));
+            }
+            fwi.push_str("        }\n");
+        }
+        for (name, domains) in &draft.groups.domain {
+            fwi.push_str(&format!("        domain-group {name} {{\n"));
+            if !domains.is_empty() {
+                fwi.push_str(&format!("            domain {}\n", domains.join(",")));
             }
             fwi.push_str("        }\n");
         }
