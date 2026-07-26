@@ -16,7 +16,8 @@ use crate::config::{
     Acme, Action, Appliance, Bfd, Bgp, BgpAggregate, BgpNeighbor, BgpRoa, BgpRtr, Ca, Certificate,
     ConfigSync, ConntrackSync, Dhcp6Pool, DhcpRelay, DhcpServer, DhcpStaticLease, Dns, Dyndns,
     Export, Filter, FilterRule, Firewall, Groups, HealthCheck, IfaceType, Interface,
-    IpsecConnection, Isis, Lldp, Login, Mdns, MultiWan, Multicast, MulticastInterface, Nat, Nat64,
+    IpsecConnection, Isis, Lldp, LoadBalancer, Login, Mdns, MultiWan, Multicast,
+    MulticastInterface, Nat, Nat64,
     NatDestination, NatNpt66, NatSource, Ntp, OpenConnectServer, OpenConnectUser, Ospf, Ospf3,
     OspfInterface, Pki, Policy, PortSpec, Pppoe, PrefixEntry, PrefixList, Proto, Protocols, Qos,
     QosDiscipline, ReverseProxy, Rip, RouterAdvert, Rule, Schedule, Services, Snmp, Ssh,
@@ -1102,6 +1103,11 @@ struct Draft {
     zones: BTreeMap<String, ZoneDraft>,
     interfaces: Vec<(String, IfaceDraft)>,
     rules: Vec<(String, RuleDraft)>,
+    /// Load-balanced services (C22). Carried through verbatim rather than as a
+    /// per-field draft: there is no `set load-balancer …` grammar yet, and a
+    /// commit that rebuilt the appliance without them would silently delete what
+    /// the config file declared.
+    load_balancers: Vec<LoadBalancer>,
     nat_source: Vec<(String, NatSrcDraft)>,
     nat_destination: Vec<(String, NatDstDraft)>,
     nat_npt66: Vec<(String, NatNpt66Draft)>,
@@ -1634,6 +1640,7 @@ impl Draft {
                 fail_closed: Some(a.firewall.fail_closed),
             },
             groups: a.firewall.group.clone(),
+            load_balancers: a.load_balancers.clone(),
             zones: a
                 .zones
                 .iter()
@@ -6257,6 +6264,7 @@ impl Session {
             zones,
             interfaces,
             rules,
+            load_balancers: self.draft.load_balancers.clone(),
             nat: Nat {
                 source: nat_source,
                 destination: nat_destination,
@@ -8213,6 +8221,45 @@ fn proto_str(p: Proto) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A load balancer lives only in the config file — there is no `set
+    /// load-balancer …` grammar yet. So a CLI commit, which rebuilds the whole
+    /// appliance from the draft, must carry it through rather than silently
+    /// deleting what the file declared.
+    #[test]
+    fn a_file_configured_load_balancer_survives_a_cli_commit() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+[[load-balancer]]
+name = "web"
+zone = "wan"
+vip = "203.0.113.10"
+proto = "tcp"
+port = 443
+backends = ["10.0.0.11:8443"]
+"#;
+        let appliance = crate::config::Appliance::from_toml(toml).unwrap();
+        assert_eq!(appliance.load_balancers.len(), 1);
+
+        // Seed a draft from it, change something unrelated, and materialize again.
+        let mut draft = Draft::from_appliance(&appliance);
+        draft.hostname = Some("renamed".into());
+        let session = Session {
+            draft,
+            path: std::path::PathBuf::from("/nonexistent"),
+            dirty: true,
+        };
+        let rebuilt = session.materialize().expect("materialize");
+        assert_eq!(rebuilt.system.hostname, "renamed");
+        assert_eq!(
+            rebuilt.load_balancers, appliance.load_balancers,
+            "the load balancer must survive a commit that never mentioned it"
+        );
+    }
 
     fn run(session: &mut Session, line: &str) -> Result<()> {
         let parts: Vec<&str> = line.split_whitespace().collect();

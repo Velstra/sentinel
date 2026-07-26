@@ -2641,6 +2641,43 @@
                 timeout=40,
             )
 
+            # C22: the appliance can now front fabric's XDP load balancer. There is
+            # no `set load-balancer` grammar yet, so this drives the file surface —
+            # which also proves a commit carries the block through rather than
+            # dropping what the file declared.
+            fw.succeed(
+                "cat >> /var/lib/sentinel/appliance.toml <<'EOF'\n"
+                "\n"
+                "[[load-balancer]]\n"
+                'name = "lb-web"\n'
+                'zone = "wan"\n'
+                'vip = "10.1.0.1"\n'
+                'proto = "tcp"\n'
+                "port = 9090\n"
+                'backends = ["10.2.0.2:80"]\n'
+                "EOF"
+            )
+            # Re-enter the config session: it loads the file (now carrying the
+            # load balancer) into a fresh draft and commits it.
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' commit save exit | sentinel configure\""
+            )
+            fw.succeed("grep -q '\\[\\[service\\]\\]' /run/sentinel/velstra.toml")
+            fw.succeed("grep -q 'vip = \"10.1.0.1\"' /run/sentinel/velstra.toml")
+            # The firewall is opened for the VIP, since the data plane special-cases
+            # a port-forward but knows nothing about a service.
+            fw.succeed("grep -A2 '\\[\\[policy.port_rule\\]\\]' /run/sentinel/velstra.toml | grep -q 'port = 9090'")
+            # NOT asserted yet: that a client actually reaches the VIP. Writing this
+            # test found a data-plane bug — try_load_balance records its conntrack
+            # under the *ingress* policy, while try_port_forward deliberately uses
+            # the policy-independent ROUTER_NAT_POLICY so a reply arriving on
+            # another zone still finds its entry. So a load-balanced flow whose
+            # reply comes back through a different zone is never un-NAT'd. The
+            # fabric/K8s case never hit it because there the reply returns on the
+            # same tenant interface. Add the traffic assertion together with that
+            # fix; the config path above is what this check covers today.
+
+
             # C23 flow insight: the agent's query socket is the ONE path unit tests
             # cannot reach (it needs a loaded eBPF object), so assert it here.
             fw.wait_until_succeeds("test -S /run/velstra/query.sock", timeout=20)
