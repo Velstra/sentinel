@@ -36,7 +36,8 @@ sets a zone-pair posture.
 
 | Field | Meaning |
 |---|---|
-| `from` / `to` | Source / destination zone. |
+| `from` | Ingress zone the rule applies on. |
+| `to` | Destination zone — matched as that zone's subnets (see below). |
 | `action` | `accept` / `drop` / `reject`. |
 | `proto` | `tcp` / `udp`. |
 | `port` | Destination port or range (`443`, `8000-8100`). |
@@ -62,6 +63,22 @@ set firewall rule no-lab port 443
 set firewall rule no-lab action drop
 set firewall rule no-lab destination 192.168.4.0/24
 ```
+
+### The destination zone
+
+On a port rule, `to <zone>` is enforced by matching **that zone's subnets** as the
+destination — the data plane matches addresses, not zone names. Two cases it
+cannot cover, and a commit warns about each:
+
+- **The rule already constrains its source.** A rule matches one address end, and
+  an explicit `source` is the narrower, operator-written one, so it keeps that end
+  and `to` stays documentation. Split the rule if the destination zone must bind.
+- **The destination zone has no statically addressed interface** (all DHCP, or
+  unaddressed). There is no subnet to match, so the rule applies toward every zone.
+
+On a *broad* rule (no proto/port) `to` never narrows anything: a broad rule sets
+its from-zone's ingress posture, which applies toward every destination. Give the
+rule a proto/port to make the destination zone enforceable.
 
 A rule constrains **one end**: a `source` (or `source-group`) or a
 `destination` (or `destination-group`), never both. The data plane ranks each

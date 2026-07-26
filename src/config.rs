@@ -4938,6 +4938,20 @@ impl Appliance {
                     rule.name
                 );
             }
+            // A port rule's `to` zone is enforced by matching that zone's subnets
+            // as the destination, so it occupies the destination end and cannot be
+            // combined with an explicit one — nor with a source constraint, since
+            // the data plane ranks one end per rule.
+            if rule.to.is_some()
+                && rule.is_port_rule()
+                && (rule.destination.is_some() || rule.destination_group.is_some())
+            {
+                bail!(
+                    "rule {:?}: `to` is enforced as a destination match, so it cannot be \
+                     combined with an explicit `destination` — remove one of them",
+                    rule.name
+                );
+            }
             if rule.destination.is_some() && rule.destination_group.is_some() {
                 bail!(
                     "rule {:?}: set `destination` or `destination-group`, not both",
@@ -6604,13 +6618,49 @@ impl Appliance {
         for rule in &self.rules {
             // Only a rule that DECLARES a destination zone warns: `to` is
             // optional, and omitting it states exactly what the datapath does.
-            if let Some(to) = &rule.to {
-                out.push(format!(
-                    "rule {:?}: `to {to}` is not enforced by the datapath yet — the rule \
-                     currently applies from {} to ALL zones",
-                    rule.name, rule.from
-                ));
+            let Some(to) = &rule.to else { continue };
+            // A port rule's `to` IS enforced now: the compiler turns it into a
+            // destination match on that zone's subnets. What it cannot cover is a
+            // zone with no statically addressed interface — there is no subnet to
+            // match, so the rule falls back to applying toward every zone.
+            if rule.is_port_rule() {
+                // A rule constrains one address end. When it already binds the
+                // source, that end is taken and `to` cannot also be matched — the
+                // source is the narrower, operator-written constraint, so it wins
+                // and `to` stays documentation. Warned every commit, because the
+                // rule then reaches further than it reads.
+                if rule.source.is_some() || rule.source_group.is_some() {
+                    out.push(format!(
+                        "rule {:?}: `to {to}` is not enforced because the rule constrains its \
+                         source — a rule matches one address end, so this applies from {} \
+                         toward ALL zones. Split it if the destination zone must bind.",
+                        rule.name, rule.from
+                    ));
+                    continue;
+                }
+                let addressed = self.interfaces.iter().any(|i| {
+                    !i.disabled
+                        && i.zone.as_deref() == Some(to.as_str())
+                        && i.address.as_deref().is_some_and(|a| a.contains('/'))
+                });
+                if !addressed {
+                    out.push(format!(
+                        "rule {:?}: `to {to}` cannot be enforced — zone {to:?} has no \
+                         statically addressed interface, so there is no subnet to match \
+                         and the rule applies from {} toward ALL zones",
+                        rule.name, rule.from
+                    ));
+                }
+                continue;
             }
+            // A broad rule sets its from-zone's ingress posture, which is a
+            // property of one zone; there is nothing per-destination to enforce.
+            out.push(format!(
+                "rule {:?}: `to {to}` does not narrow a broad rule — it sets zone {:?}'s \
+                 posture, which applies toward every zone. Give the rule a proto/port to \
+                 make the destination zone enforceable.",
+                rule.name, rule.from
+            ));
         }
         for i in &self.interfaces {
             // An enabled interface that carries an address but has no zone is bound
