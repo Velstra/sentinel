@@ -805,12 +805,87 @@ pub struct Ids {
     /// megabytes and does not belong in a configuration file.
     #[serde(default, rename = "ruleset", skip_serializing_if = "Vec::is_empty")]
     pub rulesets: Vec<String>,
+    /// Have an alert block its source in the data plane (roadmap C11).
+    ///
+    /// Off unless asked for. Acting on a detection means dropping traffic on the
+    /// strength of a pattern match, and a false positive then takes a real user
+    /// off the network — that is a decision an operator makes, not a default.
+    #[serde(
+        default,
+        rename = "block-on-alert",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub block_on_alert: Option<bool>,
+    /// The least severe alert that blocks. Suricata numbers severity with **1 as
+    /// the most severe**, so this is an upper bound. Unset ⇒ 1: only what the
+    /// ruleset itself calls critical.
+    #[serde(
+        default,
+        rename = "block-severity",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub block_severity: Option<u8>,
+    /// How long a block lasts, in seconds. Unset ⇒ [`DEFAULT_IDS_BLOCK_SECONDS`].
+    #[serde(
+        default,
+        rename = "block-duration",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub block_duration: Option<u64>,
+    /// Sources that must never be blocked, however they alert.
+    ///
+    /// This is the lockout guard. An alert can fire on the management network —
+    /// a scanner, a monitoring probe, an operator's own traffic — and blocking it
+    /// removes the way in to fix the problem, at the moment there is a problem.
+    #[serde(default, rename = "never-block", skip_serializing_if = "Vec::is_empty")]
+    pub never_block: Vec<String>,
 }
+
+/// How long an automatic block lasts when none is configured — an hour. Long
+/// enough to see off what triggered it, short enough that a wrong one is an
+/// inconvenience rather than an outage.
+pub const DEFAULT_IDS_BLOCK_SECONDS: u64 = 3600;
+
+/// The default severity ceiling for an automatic block: only alerts the ruleset
+/// itself calls critical (Suricata counts 1 as most severe).
+pub const DEFAULT_IDS_BLOCK_SEVERITY: u8 = 1;
 
 impl Ids {
     /// True when nothing is watched — lets `[services.ids]` be omitted.
     pub fn is_empty(&self) -> bool {
         self.interfaces.is_empty()
+    }
+
+    /// Whether an alert should block its source.
+    pub fn blocks_on_alert(&self) -> bool {
+        self.block_on_alert.unwrap_or(false)
+    }
+
+    /// The severity ceiling for an automatic block.
+    pub fn block_severity(&self) -> u8 {
+        self.block_severity.unwrap_or(DEFAULT_IDS_BLOCK_SEVERITY)
+    }
+
+    /// How long an automatic block lasts.
+    pub fn block_duration(&self) -> u64 {
+        self.block_duration.unwrap_or(DEFAULT_IDS_BLOCK_SECONDS)
+    }
+
+    /// Whether `addr` is protected from automatic blocking.
+    ///
+    /// Matched as a prefix, not as a string: `never-block 10.0.0.0/8` has to
+    /// protect every host inside it, which is the only way the guard is usable.
+    pub fn is_never_blocked(&self, addr: &str) -> bool {
+        let Ok(ip) = addr.parse::<std::net::IpAddr>() else {
+            // Something that is not an address cannot be matched against a
+            // prefix, and blocking it would fail anyway — treat it as protected
+            // rather than pass it on to the data plane.
+            return true;
+        };
+        self.never_block.iter().any(|entry| match (&ip, entry) {
+            (std::net::IpAddr::V4(v4), e) => ipv4_in_prefix(v4, e),
+            (std::net::IpAddr::V6(v6), e) => ipv6_in_prefix(v6, e),
+        })
     }
 
     /// The `HOME_NET` members, configured or default.
@@ -6395,6 +6470,45 @@ impl Appliance {
                     bail!("services ids: duplicate ruleset {path:?}");
                 }
             }
+            for entry in &ids.never_block {
+                validate_cidr_or_ip(entry).with_context(|| "services ids never-block")?;
+            }
+            if let Some(sev) = ids.block_severity {
+                // Suricata's own range. A ceiling of 0 blocks nothing while
+                // looking switched on, which is the failure this whole block of
+                // validation exists to prevent.
+                if !(1..=4).contains(&sev) {
+                    bail!(
+                        "services ids block-severity {sev}: must be 1..=4 \
+                         (1 is the most severe)"
+                    );
+                }
+            }
+            if ids.block_duration == Some(0) {
+                bail!("services ids block-duration: 0 seconds is not a block");
+            }
+            if !ids.blocks_on_alert()
+                && (ids.block_severity.is_some()
+                    || ids.block_duration.is_some()
+                    || !ids.never_block.is_empty())
+            {
+                bail!(
+                    "services ids: block-severity/block-duration/never-block have \
+                     no effect without `block-on-alert true`"
+                );
+            }
+            if ids.blocks_on_alert() && ids.never_block.is_empty() {
+                // A warning, not a refusal: which addresses must stay reachable
+                // is genuinely the operator's call, and some boxes have no
+                // management network to protect. But nobody discovers they needed
+                // this before they needed it.
+                eprintln!(
+                    "warning: services ids: block-on-alert is on with no \
+                     `never-block` — an alert on your management network will \
+                     block your own way in. Blocks do expire (after {}s).",
+                    ids.block_duration()
+                );
+            }
         }
 
         // Multi-WAN (roadmap C6): every uplink must name a declared interface,
@@ -7275,6 +7389,23 @@ pub(crate) fn validate_sync_peer(peer: &str) -> Result<()> {
 /// malformed prefix, a missing length, or `len > 128` returns `false` (the prefix
 /// is validated as a CIDR elsewhere); used to keep a stateful DHCPv6 pool inside
 /// one of the interface's advertised prefixes.
+/// Whether `addr` falls inside the IPv4 CIDR `prefix`. A bare address counts as
+/// a `/32`, because that is how an operator writes "this one host".
+pub(crate) fn ipv4_in_prefix(addr: &Ipv4Addr, prefix: &str) -> bool {
+    let (net, len) = match prefix.split_once('/') {
+        Some((n, l)) => (n, l.parse::<u32>().ok()),
+        None => (prefix, Some(32)),
+    };
+    let (Ok(net), Some(len)) = (net.parse::<Ipv4Addr>(), len) else {
+        return false;
+    };
+    if len > 32 {
+        return false;
+    }
+    let mask: u32 = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+    (u32::from(*addr) & mask) == (u32::from(net) & mask)
+}
+
 pub(crate) fn ipv6_in_prefix(addr: &Ipv6Addr, prefix: &str) -> bool {
     let Some((net, len)) = prefix.split_once('/') else {
         return false;

@@ -263,3 +263,42 @@ Worth knowing:
 - **`sentinel-ids.service` is alerted on** (see above), because a dead detector is
   the textbook silent failure: nothing looks wrong, and the absence of alerts reads
   as good news.
+
+### Acting on an alert
+
+Detection can be wired to the data plane, so an alert blocks its source:
+
+```
+set services ids block-on-alert true
+set services ids never-block 10.9.0.0/16
+```
+
+The block is written into the **eBPF firewall's blocklist** — not into Suricata.
+There is still exactly one thing dropping packets, and `show firewall` still
+explains every drop.
+
+| Field | Meaning |
+|---|---|
+| `block-on-alert` | Have an alert block its source. Default **false**. |
+| `block-severity` | The least severe alert that blocks, `1..=4`. Default **1** — Suricata counts 1 as most severe, so this is only what the ruleset itself calls critical. |
+| `block-duration` | How long a block lasts, in seconds. Default 3600. |
+| `never-block` | Sources that must never be blocked. Matched as a prefix. |
+
+```
+show ids blocks           # what is blocked right now, and for how much longer
+```
+
+Worth knowing:
+
+- **`never-block` is your way in.** An alert can fire on the management network —
+  a scanner, a monitoring probe, your own traffic — and blocking it takes away the
+  access needed to fix the problem, exactly when there is a problem. Sentinel warns
+  at commit if blocking is on with nothing declared.
+- **Every block expires, and none survive a restart.** That is what makes this safe
+  to switch on: acting on a pattern match will sometimes be wrong, so the question
+  is what a wrong one costs — here it costs one address an hour, not an outage
+  somebody has to find and undo.
+- **Blocking is opt-in.** Dropping traffic on the strength of a pattern match is a
+  decision an operator makes, not a default.
+- A block never overrides the configuration: an address the config already blocks is
+  left alone, so an expiry cannot quietly switch off a block you wrote.

@@ -202,6 +202,10 @@ enum Command {
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
+    /// Follow the detector's alerts and block what they name (roadmap C11).
+    /// Run by `sentinel-ids-watch.service` while `block-on-alert` is set, not by
+    /// hand. Every block it asks for expires, and none survive an agent restart.
+    IdsWatch,
     /// List the ports a Velstra controller currently knows about.
     Ports {
         /// The controller's orchestrator/admin endpoint.
@@ -302,6 +306,7 @@ async fn main() -> Result<()> {
         Command::Apply { file, out, reload } => apply(&file, &out, reload.as_deref()),
         Command::ConfirmRollback { config } => confirm_rollback(&config),
         Command::Alert { unit, config } => alert_unit(&unit, &config),
+        Command::IdsWatch => ids::watch(),
         Command::Ports { controller } => ports(&controller).await,
         Command::Api {
             listen,
@@ -864,6 +869,10 @@ fn show_op(args: &[String]) -> Result<()> {
 
         // Intrusion detection (roadmap C11): what is watched, and what fired.
         ["ids"] | ["ids", "status"] => show_ids(),
+        // Asked of the agent, which owns the map and the deadlines — the CLI
+        // keeping its own idea of what is blocked would be a second answer that
+        // can disagree with what the data plane is doing.
+        ["ids", "blocks"] => show_agent_query("blocks", "run-time blocks"),
         ["ids", "alerts"] => show_ids_alerts(DEFAULT_IDS_ALERTS),
         ["ids", "alerts", n] => show_ids_alerts(
             n.parse()

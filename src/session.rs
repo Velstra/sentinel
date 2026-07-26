@@ -3403,6 +3403,24 @@ impl Session {
             ["services", "ids", "ruleset", v] => {
                 push_unique(&mut self.draft.ids.rulesets, v);
             }
+            ["services", "ids", "never-block", v] => {
+                push_unique(&mut self.draft.ids.never_block, v);
+            }
+            ["services", "ids", "block-on-alert", v] => {
+                self.draft.ids.block_on_alert = Some(parse_bool(v)?)
+            }
+            ["services", "ids", "block-severity", v] => {
+                self.draft.ids.block_severity = Some(
+                    v.parse()
+                        .with_context(|| format!("{v:?} is not a severity (1..=4)"))?,
+                )
+            }
+            ["services", "ids", "block-duration", v] => {
+                self.draft.ids.block_duration = Some(
+                    v.parse()
+                        .with_context(|| format!("{v:?} is not a number of seconds"))?,
+                )
+            }
             // A rule is one quoted Suricata rule. It is checked here rather than
             // only at commit so the operator sees the mistake next to what they
             // typed, and replaced by sid rather than appended: re-issuing a rule is
@@ -5188,6 +5206,13 @@ impl Session {
             ["services", "ids", "home-net"] => self.draft.ids.home_net.clear(),
             ["services", "ids", "rule"] => self.draft.ids.rules.clear(),
             ["services", "ids", "ruleset"] => self.draft.ids.rulesets.clear(),
+            ["services", "ids", "never-block"] => self.draft.ids.never_block.clear(),
+            ["services", "ids", "block-on-alert"] => self.draft.ids.block_on_alert = None,
+            ["services", "ids", "block-severity"] => self.draft.ids.block_severity = None,
+            ["services", "ids", "block-duration"] => self.draft.ids.block_duration = None,
+            ["services", "ids", "never-block", v] => {
+                remove_value(&mut self.draft.ids.never_block, v, "a never-block entry")?
+            }
             ["services", "ids", "interface", v] => {
                 remove_value(&mut self.draft.ids.interfaces, v, "a watched interface")?
             }
@@ -8014,6 +8039,25 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             for r in &ids.rulesets {
                 out.push_str(&format!("        ruleset {r}\n"));
             }
+            if let Some(b) = ids.block_on_alert {
+                out.push_str(&format!("        block-on-alert {b}\n"));
+            }
+            if ids.blocks_on_alert() {
+                // The two numbers that decide what an automatic block costs are
+                // shown whether or not they were set: an operator reviewing this
+                // should not have to know the defaults to know the blast radius.
+                out.push_str(&format!(
+                    "        block-severity {}\n",
+                    ids.block_severity()
+                ));
+                out.push_str(&format!(
+                    "        block-duration {}\n",
+                    ids.block_duration()
+                ));
+            }
+            for n in &ids.never_block {
+                out.push_str(&format!("        never-block {n}\n"));
+            }
             out.push_str("    }\n");
         }
         if alerts_set {
@@ -8962,6 +9006,43 @@ backends = ["10.0.0.11:8443"]
             r#"drop icmp any any -> any any (msg:"nope"; itype:8; sid:1000002; rev:1;)"#;
         let err = run(&mut s, &format!("set services ids rule {drop_rule}")).unwrap_err();
         assert!(format!("{err:#}").contains("IPS mode"), "got: {err:#}");
+
+        // Acting on alerts is opt-in, and the knobs that shape it are refused
+        // without it — they would read as configured and do nothing.
+        run(&mut s, &format!("set services ids rule {PING}")).unwrap();
+        run(&mut s, "set services ids block-severity 2").unwrap();
+        let err = s.commit().unwrap_err();
+        assert!(format!("{err:#}").contains("no effect"), "got: {err:#}");
+        run(&mut s, "set services ids block-on-alert true").unwrap();
+        run(&mut s, "set services ids never-block 10.9.0.0/16").unwrap();
+        let a = s.commit().expect("blocking commit");
+        assert!(a.services.ids.blocks_on_alert());
+        assert_eq!(a.services.ids.block_severity(), 2);
+        assert!(a.services.ids.is_never_blocked("10.9.4.11"));
+
+        // Both numbers are shown once blocking is on, set or not: reviewing this
+        // should not require knowing the defaults to know the blast radius.
+        let shown = render_draft_only(&s.draft, true, Some("services"));
+        assert!(
+            shown.contains("        block-on-alert true"),
+            "got:\n{shown}"
+        );
+        assert!(
+            shown.contains("        block-duration 3600"),
+            "got:\n{shown}"
+        );
+        assert!(
+            shown.contains("        never-block 10.9.0.0/16"),
+            "got:\n{shown}"
+        );
+
+        // Severity is Suricata's 1..=4; 0 would block nothing while looking on.
+        run(&mut s, "set services ids block-severity 0").unwrap();
+        assert!(s.commit().is_err());
+        run(&mut s, "delete services ids block-severity").unwrap();
+        run(&mut s, "delete services ids block-on-alert").unwrap();
+        run(&mut s, "delete services ids never-block 10.9.0.0/16").unwrap();
+        s.commit().expect("back to detection only");
 
         // The mistakes that stop the whole ruleset loading, not just one rule.
         for bad in [
