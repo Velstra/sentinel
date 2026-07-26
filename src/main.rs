@@ -859,6 +859,7 @@ fn show_op(args: &[String]) -> Result<()> {
             &["-u", "velstra.service", "-n", "50", "--no-pager"],
         ),
         ["nat"] => show_nat(),
+        ["nat", "cgnat", addr] => show_cgnat(addr),
         ["load-balancer"] => show_load_balancer(),
 
         // IPsec VPN (roadmap C2): the security-association / connection state,
@@ -1097,6 +1098,14 @@ fn show_nat() -> Result<()> {
     }
     for s in &a.nat.source {
         println!("source {}: masquerade zone {}", s.name, s.zone);
+        if let Some(size) = s.cgnat_block_size {
+            let base = s
+                .cgnat_base_port
+                .unwrap_or(crate::config::DEFAULT_CGNAT_BASE_PORT);
+            // The configured shape. Which block a given address holds is the
+            // agent's to answer — see `show nat cgnat <ip>`.
+            println!("  cgnat: {size} ports per address from port {base}");
+        }
     }
     for d in &a.nat.destination {
         println!(
@@ -1144,6 +1153,20 @@ fn alert_unit(unit: &str, config: &std::path::Path) -> Result<()> {
 /// administratively disabled (the compiler drops it entirely), and one whose pool
 /// is empty — legal, but it forwards nothing, which is worth saying out loud
 /// rather than letting an operator read an empty column as "fine".
+/// Report the WAN port block a given internal address is assigned.
+///
+/// Asked of the **agent**, not computed here: it holds the live layout and the
+/// arithmetic the data plane hands ports out with. Sentinel cannot link
+/// `velstra-common` yet (its aya dependency is a git one), and re-deriving the
+/// blocks locally would eventually name a different subscriber than the ports
+/// actually belonged to — which for the one question CGNAT exists to answer is
+/// worse than no answer at all.
+fn show_cgnat(addr: &str) -> Result<()> {
+    addr.parse::<std::net::Ipv4Addr>()
+        .with_context(|| format!("{addr:?} is not an IPv4 address"))?;
+    show_agent_query(&format!("cgnat {addr}"), "cgnat port blocks")
+}
+
 fn show_load_balancer() -> Result<()> {
     let path = std::path::Path::new(DEFAULT_CONFIG);
     if !path.exists() {

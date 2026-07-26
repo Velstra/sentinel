@@ -155,6 +155,17 @@ struct Interface {
     /// interface's zone has a `[[nat.source]]` rule. Omitted when false.
     #[serde(skip_serializing_if = "is_false")]
     masquerade: bool,
+    /// Deterministic CGNAT (roadmap C16): the first WAN port and the ports each
+    /// internal address gets. Both omitted unless the zone's masquerade rule asks
+    /// for blocks — the data plane's own default is the plain hash-spread NAPT.
+    #[serde(skip_serializing_if = "is_zero_u16")]
+    cgnat_base_port: u16,
+    #[serde(skip_serializing_if = "is_zero_u16")]
+    cgnat_block_size: u16,
+}
+
+fn is_zero_u16(v: &u16) -> bool {
+    *v == 0
 }
 
 fn is_false(b: &bool) -> bool {
@@ -405,12 +416,25 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
 
     // Zones that have a source-NAT (masquerade) rule — their interfaces get
     // `masquerade = true` so the data plane SNATs traffic leaving them.
-    let masq_zones: std::collections::HashSet<&str> = appliance
+    // Zone → its masquerade rule's CGNAT layout (`(0, 0)` for plain masquerade).
+    // A map rather than a set, because the layout has to reach the interfaces of
+    // exactly the zone that asked for it.
+    let masq_zones: BTreeMap<&str, (u16, u16)> = appliance
         .nat
         .source
         .iter()
         .filter(|s| !s.disabled)
-        .map(|s| s.zone.as_str())
+        .map(|s| {
+            let layout = match s.cgnat_block_size {
+                Some(size) => (
+                    s.cgnat_base_port
+                        .unwrap_or(crate::config::DEFAULT_CGNAT_BASE_PORT),
+                    size,
+                ),
+                None => (0, 0),
+            };
+            (s.zone.as_str(), layout)
+        })
         .collect();
 
     let interfaces = appliance
@@ -421,7 +445,9 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
             i.zone.as_deref().map(|zone| Interface {
                 name: i.name.clone(),
                 policy: ids[zone],
-                masquerade: masq_zones.contains(zone),
+                masquerade: masq_zones.contains_key(zone),
+                cgnat_base_port: masq_zones.get(zone).map_or(0, |l| l.0),
+                cgnat_block_size: masq_zones.get(zone).map_or(0, |l| l.1),
             })
         })
         .collect();
@@ -1137,6 +1163,85 @@ action = "accept"
         // A burst with nothing to size is a typo, not a configuration.
         let err = refuse(base("proto = \"tcp\"\nport = 22\nburst = 10"));
         assert!(err.contains("sizes a `limit`"), "{err}");
+    }
+
+    /// Deterministic CGNAT reaches the data plane on the interfaces of the zone
+    /// whose masquerade rule asked for it — and only those, so a second uplink
+    /// keeps ordinary NAPT.
+    #[test]
+    fn cgnat_blocks_land_on_the_masqueraded_zones_interfaces() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+address = "203.0.113.2/24"
+[[interface]]
+name = "lan0"
+zone = "lan"
+address = "10.0.0.1/24"
+[[nat.source]]
+name = "carrier"
+zone = "wan"
+cgnat-block-size = 512
+"#;
+        let appliance = Appliance::from_toml(toml).unwrap();
+        appliance.clone().validate().expect("valid");
+        let cfg = compile(&appliance);
+        let wan = cfg.interfaces.iter().find(|i| i.name == "wan0").unwrap();
+        assert!(wan.masquerade);
+        assert_eq!(wan.cgnat_block_size, 512);
+        // The base port defaults to the ephemeral range, leaving the well-known
+        // ports free for port-forwards on the same address.
+        assert_eq!(wan.cgnat_base_port, 32768);
+        // The internal side is not a CGNAT egress and must carry nothing.
+        let lan = cfg.interfaces.iter().find(|i| i.name == "lan0").unwrap();
+        assert!(!lan.masquerade);
+        assert_eq!(lan.cgnat_block_size, 0);
+        // Omitted from the emitted config when unset, so the data plane's own
+        // default (plain hash-spread NAPT) applies rather than a zero layout.
+        let out = cfg.to_toml().unwrap();
+        assert!(out.contains("cgnat_block_size = 512"), "{out}");
+        assert_eq!(out.matches("cgnat_block_size").count(), 1, "{out}");
+    }
+
+    /// A layout that cannot work is refused at commit, not silently downgraded to
+    /// ordinary masquerade — an operator who asked for blocks would otherwise
+    /// believe they had them.
+    #[test]
+    fn an_unworkable_cgnat_layout_is_refused() {
+        let base = |extra: &str| {
+            format!(
+                r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+address = "203.0.113.2/24"
+[[nat.source]]
+name = "carrier"
+zone = "wan"
+{extra}
+"#
+            )
+        };
+        let refuse = |toml: String| -> String {
+            match Appliance::from_toml(&toml) {
+                Err(e) => e.to_string(),
+                Ok(a) => a
+                    .validate()
+                    .expect_err("this layout must be refused")
+                    .to_string(),
+            }
+        };
+        // A block that does not fit above its base port.
+        let err = refuse(base("cgnat-block-size = 1024\ncgnat-base-port = 65000"));
+        assert!(err.contains("does not fit"), "{err}");
+        // A base port with nothing to size.
+        let err = refuse(base("cgnat-base-port = 40000"));
+        assert!(err.contains("sizes nothing"), "{err}");
     }
 
     /// An explicit rule the operator wrote wins over the automatic opening — that

@@ -179,7 +179,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-c1rTx4oDDHtBX89iGPU+PyPwK1lH3xDXZORFogjpY+8=";
+      ebpfHash = "sha256-5rNmy76ztTnhSEUJp2X+xRvpZGglBuhPi8sWjLawQjI=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -3450,6 +3450,44 @@
             # the client, and NEVER the client's real private ip (10.2.0.2).
             server.succeed("journalctl -u web.service | grep -q '10.1.0.1 '")
             server.fail("journalctl -u web.service | grep -q '10.2.0.2 '")
+
+            # C16 deterministic CGNAT: every internal address gets a fixed block of
+            # WAN ports, so a port attributes to a subscriber by arithmetic instead
+            # of by logging every translation.
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set nat source wan-masq cgnat-block-size 512' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            fw.wait_for_unit("velstra.service")
+            fw.succeed("grep -q 'cgnat_block_size = 512' /run/sentinel/velstra.toml")
+
+            # The report comes from the AGENT, which computes it with the same code
+            # that hands the ports out — a second implementation in the CLI would
+            # eventually name a different subscriber than the ports belonged to.
+            fw.wait_until_succeeds("test -S /run/velstra/query.sock", timeout=20)
+            block = fw.succeed("sentinel show nat cgnat 10.2.0.2")
+            import re as _re
+            m = _re.search(r"ports (\d+)-(\d+)", block)
+            assert m, f"no port block reported: {block}"
+            first, last = int(m.group(1)), int(m.group(2))
+            assert last - first == 511, f"block is not 512 ports: {block}"
+            assert first >= 32768, f"block starts below the default base port: {block}"
+
+            # Determinism is the property the feature exists for: the same address
+            # must report the same block every time, or an attribution made later
+            # points somewhere else.
+            again = fw.succeed("sentinel show nat cgnat 10.2.0.2")
+            assert again == block, f"the block moved:\n{block}\n{again}"
+            # …and a different address gets a different block.
+            other = fw.succeed("sentinel show nat cgnat 10.2.0.99")
+            assert other != block, f"two addresses share a block:\n{block}\n{other}"
+
+            # Traffic still flows, and the source port now falls inside the block.
+            client.succeed("curl -s --max-time 5 http://10.1.0.2:80/ >/dev/null")
+            flows = fw.succeed("sentinel show flows")
+            assert "10.1.0.2" in flows, f"the flow is missing: {flows}"
           '';
         };
 

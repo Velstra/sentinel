@@ -1897,6 +1897,14 @@ const ZONE_FIELDS: &[Cand] = &[
 ];
 const NAT_SOURCE_FIELDS: &[Cand] = &[
     ("zone", "egress (WAN) zone to masquerade"),
+    (
+        "cgnat-block-size",
+        "deterministic CGNAT: WAN ports per internal address",
+    ),
+    (
+        "cgnat-base-port",
+        "first WAN port CGNAT hands out (default 32768)",
+    ),
     ("description", "free-text label for this rule"),
     (
         "disabled",
@@ -3693,7 +3701,13 @@ mod tests {
         );
         assert_eq!(
             kw(&["set", "nat", "source", "wan-masq"]),
-            ["zone", "description", "disabled"]
+            [
+                "zone",
+                "cgnat-block-size",
+                "cgnat-base-port",
+                "description",
+                "disabled"
+            ]
         );
         assert_eq!(
             kw(&["set", "nat", "destination", "web"]),
