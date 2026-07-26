@@ -563,6 +563,9 @@ pub struct Services {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub reverse_proxy: Vec<ReverseProxy>,
+    /// Remote syslog forwarding (`[services.syslog]`, roadmap C12).
+    #[serde(default, skip_serializing_if = "Syslog::is_empty")]
+    pub syslog: Syslog,
 }
 
 impl Services {
@@ -577,6 +580,94 @@ impl Services {
             && self.dyndns.is_empty()
             && self.dhcp_relay.is_empty()
             && self.reverse_proxy.is_empty()
+            && self.syslog.is_empty()
+    }
+}
+
+/// Default remote-syslog port — 514, the IANA-assigned syslog port every
+/// collector listens on out of the box.
+pub const DEFAULT_SYSLOG_PORT: u16 = 514;
+
+/// Remote syslog forwarding (`[services.syslog]`, roadmap C12).
+///
+/// An appliance whose logs only exist on the appliance is one you cannot
+/// investigate after it reboots, and cannot correlate with anything else on the
+/// network. This ships the journal to one or more collectors as RFC 5424 syslog,
+/// which is what Graylog / rsyslog / syslog-ng / a SIEM all speak.
+///
+/// Realised by **rsyslog** reading the journal (`imjournal`) and forwarding
+/// (`omfwd`) — the journal is already the single sink every Sentinel service logs
+/// to, so there is nothing to re-plumb.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Syslog {
+    /// Where to ship. Empty ⇒ forwarding is off (the local journal is unaffected
+    /// either way — this adds a copy, it never redirects).
+    #[serde(default, rename = "target", skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<SyslogTarget>,
+}
+
+impl Syslog {
+    pub fn is_empty(&self) -> bool {
+        self.targets.is_empty()
+    }
+}
+
+/// One syslog collector (`[[services.syslog.target]]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyslogTarget {
+    /// The collector's address or hostname.
+    pub host: String,
+    /// Its port. Unset ⇒ 514.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// `udp` (default) or `tcp`. UDP cannot tell you it failed; TCP can, at the
+    /// cost of needing somewhere to buffer when the collector is away — see
+    /// `net.rs`, which always renders that buffer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proto: Option<SyslogProto>,
+    /// The minimum severity to ship. Unset ⇒ `info` — `debug` ships everything
+    /// the journal holds, which is rarely what an operator wants on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<SyslogLevel>,
+}
+
+/// The transport for a syslog target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SyslogProto {
+    Udp,
+    Tcp,
+}
+
+/// A syslog severity (RFC 5424 §6.2.1), named as operators name them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SyslogLevel {
+    Emerg,
+    Alert,
+    Crit,
+    Err,
+    Warning,
+    Notice,
+    Info,
+    Debug,
+}
+
+impl SyslogLevel {
+    /// The rsyslog selector spelling (`*.<level>` ships that level *and above*).
+    pub fn rsyslog(self) -> &'static str {
+        match self {
+            SyslogLevel::Emerg => "emerg",
+            SyslogLevel::Alert => "alert",
+            SyslogLevel::Crit => "crit",
+            SyslogLevel::Err => "err",
+            SyslogLevel::Warning => "warning",
+            SyslogLevel::Notice => "notice",
+            SyslogLevel::Info => "info",
+            SyslogLevel::Debug => "debug",
+        }
     }
 }
 
@@ -5805,6 +5896,25 @@ impl Appliance {
                         rp.name
                     );
                 }
+            }
+        }
+
+        // Remote syslog (roadmap C12): a collector needs a reachable address and a
+        // real port. A duplicate target is refused rather than deduped — two
+        // identical `omfwd` actions would double every message at the collector,
+        // and someone who wrote it twice meant two different collectors.
+        let mut seen_syslog = HashSet::new();
+        for t in &self.services.syslog.targets {
+            if t.host.trim().is_empty() {
+                bail!("services syslog: a target needs a `host`");
+            }
+            validate_host(&t.host).with_context(|| "services syslog target host")?;
+            if t.port == Some(0) {
+                bail!("services syslog target {:?}: port 0 is not valid", t.host);
+            }
+            let key = (t.host.as_str(), t.port.unwrap_or(DEFAULT_SYSLOG_PORT));
+            if !seen_syslog.insert(key) {
+                bail!("services syslog: duplicate target {}:{}", key.0, key.1);
             }
         }
 

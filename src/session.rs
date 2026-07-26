@@ -20,8 +20,8 @@ use crate::config::{
     MulticastInterface, Nat, Nat64, NatDestination, NatNpt66, NatSource, Ntp, OpenConnectServer,
     OpenConnectUser, Ospf, Ospf3, OspfInterface, Pki, Policy, PortSpec, Pppoe, PrefixEntry,
     PrefixList, Proto, Protocols, Qos, QosDiscipline, ReverseProxy, Rip, RouterAdvert, Rule,
-    Schedule, Services, Snmp, Ssh, StaticRoute, System, UpdateChannel, Vpn, VrfDef, Vrrp, WanMode,
-    WanUplink, WgPeer, WireguardTunnel, ZoneCfg,
+    Schedule, Services, Snmp, Ssh, StaticRoute, Syslog, SyslogLevel, SyslogProto, SyslogTarget,
+    System, UpdateChannel, Vpn, VrfDef, Vrrp, WanMode, WanUplink, WgPeer, WireguardTunnel, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -1165,6 +1165,8 @@ struct Draft {
     conntrack_sync: ConntrackSync,
     mdns: MdnsDraft,
     dyndns: DyndnsDraft,
+    /// Remote-syslog collectors (roadmap C12), keyed by host in file order.
+    syslog: Vec<(String, SyslogTargetDraft)>,
     dhcp_relay: DhcpRelayDraft,
     /// Multi-WAN (roadmap C6): failover/load-balance mode + the uplinks, keyed by
     /// interface in configuration order.
@@ -1247,6 +1249,19 @@ struct DyndnsDraft {
     login: Option<String>,
     password: Option<String>,
     interface: Option<String>,
+}
+
+/// A partially-specified remote-syslog collector (`[[services.syslog.target]]`).
+///
+/// Keyed by host in the draft. Two collectors on one host with different ports
+/// are legal in the file and survive a commit (both entries are carried), but the
+/// CLI addresses the first of them — a same-host pair is rare enough that giving
+/// the key a port would cost every ordinary target its readable name.
+#[derive(Debug, Clone, Default)]
+struct SyslogTargetDraft {
+    port: Option<u16>,
+    proto: Option<SyslogProto>,
+    level: Option<SyslogLevel>,
 }
 
 /// A partially-specified DHCP relay (`[services.dhcp-relay]`).
@@ -1638,6 +1653,15 @@ impl Draft {
         self.load_balancers
             .push((name.to_string(), LbDraft::default()));
         &mut self.load_balancers.last_mut().unwrap().1
+    }
+
+    fn syslog_target_mut(&mut self, host: &str) -> &mut SyslogTargetDraft {
+        if let Some(i) = self.syslog.iter().position(|(h, _)| h == host) {
+            return &mut self.syslog[i].1;
+        }
+        self.syslog
+            .push((host.to_string(), SyslogTargetDraft::default()));
+        &mut self.syslog.last_mut().unwrap().1
     }
 
     fn nat_npt66_mut(&mut self, name: &str) -> &mut NatNpt66Draft {
@@ -2083,6 +2107,22 @@ impl Draft {
                 password: a.services.dyndns.password.clone(),
                 interface: a.services.dyndns.interface.clone(),
             },
+            syslog: a
+                .services
+                .syslog
+                .targets
+                .iter()
+                .map(|t| {
+                    (
+                        t.host.clone(),
+                        SyslogTargetDraft {
+                            port: t.port,
+                            proto: t.proto,
+                            level: t.level,
+                        },
+                    )
+                })
+                .collect(),
             dhcp_relay: DhcpRelayDraft {
                 interface: a.services.dhcp_relay.interface.clone(),
                 server: a.services.dhcp_relay.server.clone(),
@@ -2346,6 +2386,12 @@ impl Session {
             .iter()
             .map(|(n, _)| n.clone())
             .collect()
+    }
+
+    /// The remote-syslog collector hosts — completion offers these for
+    /// `set/delete services syslog target …`.
+    pub fn syslog_target_names(&self) -> Vec<String> {
+        self.draft.syslog.iter().map(|(h, _)| h.clone()).collect()
     }
 
     /// The NPTv6 rule names — completion offers these for `set/delete nat npt66 …`.
@@ -3257,6 +3303,27 @@ impl Session {
             }
             ["services", "dyndns", "interface", v] => {
                 self.draft.dyndns.interface = Some((*v).to_string());
+            }
+
+            // services syslog: ship the journal to remote collectors (C12).
+            // A bare `target <host>` is enough to start forwarding — udp/514/info
+            // are the defaults every collector accepts.
+            ["services", "syslog", "target", host] => {
+                crate::config::validate_host(host)?;
+                let _ = self.draft.syslog_target_mut(host);
+            }
+            ["services", "syslog", "target", host, "port", v] => {
+                crate::config::validate_host(host)?;
+                self.draft.syslog_target_mut(host).port =
+                    Some(v.parse().with_context(|| format!("invalid port {v:?}"))?);
+            }
+            ["services", "syslog", "target", host, "proto", v] => {
+                crate::config::validate_host(host)?;
+                self.draft.syslog_target_mut(host).proto = Some(parse_syslog_proto(v)?);
+            }
+            ["services", "syslog", "target", host, "level", v] => {
+                crate::config::validate_host(host)?;
+                self.draft.syslog_target_mut(host).level = Some(parse_syslog_level(v)?);
             }
 
             // services dhcp-relay: box-wide DHCP relay agent (isc dhcrelay).
@@ -4955,6 +5022,24 @@ impl Session {
                     other => bail!("services dyndns has no field {other:?}"),
                 }
             }
+            // services syslog: all forwarding, one collector, or one of its fields.
+            ["services", "syslog"] => self.draft.syslog.clear(),
+            ["services", "syslog", "target", host] => {
+                let before = self.draft.syslog.len();
+                self.draft.syslog.retain(|(h, _)| h != host);
+                if self.draft.syslog.len() == before {
+                    bail!("no syslog target {host:?}");
+                }
+            }
+            ["services", "syslog", "target", host, field] => {
+                let t = self.syslog_target(host)?;
+                match *field {
+                    "port" => t.port = None,
+                    "proto" => t.proto = None,
+                    "level" => t.level = None,
+                    other => bail!("services syslog target has no field {other:?}"),
+                }
+            }
             ["services", "dhcp-relay"] => self.draft.dhcp_relay = DhcpRelayDraft::default(),
             ["services", "dhcp-relay", field] => {
                 let r = &mut self.draft.dhcp_relay;
@@ -5671,6 +5756,15 @@ impl Session {
             .find(|(n, _)| n == name)
             .map(|(_, l)| l)
             .ok_or_else(|| anyhow::anyhow!("no load-balancer {name:?}"))
+    }
+
+    fn syslog_target(&mut self, host: &str) -> Result<&mut SyslogTargetDraft> {
+        self.draft
+            .syslog
+            .iter_mut()
+            .find(|(h, _)| h == host)
+            .map(|(_, t)| t)
+            .ok_or_else(|| anyhow::anyhow!("no syslog target {host:?}"))
     }
 
     fn uplink(&mut self, iface: &str) -> Result<&mut UplinkDraft> {
@@ -6461,6 +6555,19 @@ impl Session {
                     allow: self.draft.snmp.allow.clone(),
                 },
                 ssh: self.draft.ssh.clone(),
+                syslog: Syslog {
+                    targets: self
+                        .draft
+                        .syslog
+                        .iter()
+                        .map(|(host, t)| SyslogTarget {
+                            host: host.clone(),
+                            port: t.port,
+                            proto: t.proto,
+                            level: t.level,
+                        })
+                        .collect(),
+                },
                 mdns: Mdns {
                     interface: self.draft.mdns.interface.clone(),
                 },
@@ -7532,6 +7639,7 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         !relay.interface.is_empty() || !relay.server.is_empty() || !relay.server6.is_empty();
     let rproxy = &draft.reverse_proxy;
     let rproxy_set = !rproxy.is_empty();
+    let syslog_set = !draft.syslog.is_empty();
     let any_service = dns_set
         || ntp_set
         || lldp_set
@@ -7540,7 +7648,8 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         || mdns_set
         || dyndns_set
         || relay_set
-        || rproxy_set;
+        || rproxy_set
+        || syslog_set;
     if want("services") && any_service {
         out.push_str("services {\n");
         if dns_set {
@@ -7647,6 +7756,27 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             }
             if let Some(i) = &dyndns.interface {
                 out.push_str(&format!("        interface {i}\n"));
+            }
+            out.push_str("    }\n");
+        }
+        if syslog_set {
+            out.push_str("    syslog {\n");
+            for (host, t) in &draft.syslog {
+                out.push_str(&format!("        target {host} {{\n"));
+                if let Some(p) = t.port {
+                    out.push_str(&format!("            port {p}\n"));
+                }
+                if let Some(p) = t.proto {
+                    let proto = match p {
+                        SyslogProto::Udp => "udp",
+                        SyslogProto::Tcp => "tcp",
+                    };
+                    out.push_str(&format!("            proto {proto}\n"));
+                }
+                if let Some(l) = t.level {
+                    out.push_str(&format!("            level {}\n", l.rsyslog()));
+                }
+                out.push_str("        }\n");
             }
             out.push_str("    }\n");
         }
@@ -8021,6 +8151,34 @@ fn parse_proto(s: &str) -> Result<Proto> {
         "tcp" => Proto::Tcp,
         "udp" => Proto::Udp,
         _ => bail!("invalid proto {s:?} (expected tcp|udp)"),
+    })
+}
+
+/// The transport for a remote syslog collector.
+fn parse_syslog_proto(s: &str) -> Result<SyslogProto> {
+    Ok(match s {
+        "udp" => SyslogProto::Udp,
+        "tcp" => SyslogProto::Tcp,
+        _ => bail!("invalid syslog proto {s:?} (expected udp|tcp)"),
+    })
+}
+
+/// A syslog severity. `*.<level>` ships that level **and everything above it**,
+/// so `warning` means warning/err/crit/alert/emerg — worth knowing before setting
+/// it, since the name reads like an exact match.
+fn parse_syslog_level(s: &str) -> Result<SyslogLevel> {
+    Ok(match s {
+        "emerg" => SyslogLevel::Emerg,
+        "alert" => SyslogLevel::Alert,
+        "crit" => SyslogLevel::Crit,
+        "err" => SyslogLevel::Err,
+        "warning" => SyslogLevel::Warning,
+        "notice" => SyslogLevel::Notice,
+        "info" => SyslogLevel::Info,
+        "debug" => SyslogLevel::Debug,
+        _ => bail!(
+            "invalid syslog level {s:?} (expected emerg|alert|crit|err|warning|notice|info|debug)"
+        ),
     })
 }
 
@@ -8440,6 +8598,64 @@ backends = ["10.0.0.11:8443"]
             rebuilt.load_balancers, appliance.load_balancers,
             "the load balancer must survive a commit that never mentioned it"
         );
+    }
+
+    /// `set services syslog target …` end to end.
+    #[test]
+    fn syslog_grammar_sets_shows_commits_and_deletes() {
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname fw1",
+            "set interface lan0 zone lan",
+            // A bare target is enough — udp/514/info are the defaults.
+            "set services syslog target 10.0.0.9",
+            "set services syslog target logs.example.com port 6514",
+            "set services syslog target logs.example.com proto tcp",
+            "set services syslog target logs.example.com level warning",
+        ] {
+            run(&mut s, line).unwrap_or_else(|e| panic!("{line}: {e:#}"));
+        }
+        let a = s.commit().expect("syslog commit");
+        assert_eq!(a.services.syslog.targets.len(), 2);
+        let bare = &a.services.syslog.targets[0];
+        assert_eq!(bare.host, "10.0.0.9");
+        // Nothing is materialized for a default: the renderer owns them, so a
+        // later change of default is not silently frozen into saved configs.
+        assert_eq!(bare.port, None);
+        assert_eq!(bare.proto, None);
+        assert_eq!(bare.level, None);
+        let named = &a.services.syslog.targets[1];
+        assert_eq!(named.port, Some(6514));
+        assert_eq!(named.proto, Some(SyslogProto::Tcp));
+        assert_eq!(named.level, Some(SyslogLevel::Warning));
+
+        let shown = render_draft_only(&s.draft, true, Some("services"));
+        assert!(shown.contains("    syslog {"), "got:\n{shown}");
+        assert!(shown.contains("target 10.0.0.9 {"), "got:\n{shown}");
+        assert!(shown.contains("            proto tcp"), "got:\n{shown}");
+        assert!(shown.contains("            level warning"), "got:\n{shown}");
+
+        // Bad values are refused at entry.
+        assert!(run(&mut s, "set services syslog target not_a_host!").is_err());
+        assert!(run(&mut s, "set services syslog target 10.0.0.9 proto sctp").is_err());
+        assert!(run(&mut s, "set services syslog target 10.0.0.9 level chatty").is_err());
+        assert!(run(&mut s, "set services syslog target 10.0.0.9 port 0").is_ok());
+        // …port 0 parses as a u16, so it is the validator that must catch it.
+        assert!(s.commit().is_err(), "port 0 must not commit");
+        run(&mut s, "delete services syslog target 10.0.0.9 port").unwrap();
+
+        // One field, one collector, then all forwarding.
+        run(
+            &mut s,
+            "delete services syslog target logs.example.com level",
+        )
+        .unwrap();
+        assert_eq!(s.commit().unwrap().services.syslog.targets[1].level, None);
+        run(&mut s, "delete services syslog target 10.0.0.9").unwrap();
+        assert!(run(&mut s, "delete services syslog target 10.0.0.9").is_err());
+        assert_eq!(s.commit().unwrap().services.syslog.targets.len(), 1);
+        run(&mut s, "delete services syslog").unwrap();
+        assert!(s.commit().unwrap().services.syslog.is_empty());
     }
 
     /// The `set load-balancer …` surface end to end: build a service from

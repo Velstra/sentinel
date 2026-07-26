@@ -442,6 +442,7 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
                     rules: session.rule_names(),
                     zones: session.zone_names(),
                     load_balancers: session.load_balancer_names(),
+                    syslog_targets: session.syslog_target_names(),
                     nat_source: session.nat_source_names(),
                     nat_destination: session.nat_destination_names(),
                     nat_npt66: session.nat_npt66_names(),

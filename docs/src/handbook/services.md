@@ -105,3 +105,41 @@ set services reverse-proxy web port 443
 set services reverse-proxy web certificate site-cert
 set services reverse-proxy web backends 10.0.0.10:8080,10.0.0.11:8080
 ```
+
+## Remote syslog
+
+`services syslog target <host>` ships the appliance's journal to one or more
+collectors as RFC 5424 syslog — what Graylog, rsyslog, syslog-ng and a SIEM all
+speak. It **adds** a copy on the wire; the local journal is untouched, so losing
+the collector never costs you the local log.
+
+| Field | Meaning |
+|---|---|
+| `port` | Collector port (default 514). |
+| `proto` | `udp` (default) or `tcp`. |
+| `level` | Minimum severity — that level **and above** (default `info`). |
+
+```text
+set services syslog target 10.0.0.9
+set services syslog target logs.example.com port 6514
+set services syslog target logs.example.com proto tcp
+set services syslog target logs.example.com level warning
+```
+
+A bare `target <host>` already forwards: every field has a working default.
+Remove one collector with `delete services syslog target <host>`, or stop
+forwarding entirely with `delete services syslog`.
+
+Worth knowing:
+
+- **`level` is a floor, not a match.** `warning` ships warning, err, crit, alert
+  and emerg. `debug` ships everything the journal holds, which is rarely what you
+  want on the wire.
+- **A named collector is resolved by the appliance**, and a dual-stack name may
+  resolve to either family — make sure the collector listens on the one it
+  advertises.
+- **UDP cannot report a failure.** A collector that is down loses those messages
+  silently; `tcp` notices. Either way each target gets its own buffer, so a
+  collector that stops answering never blocks the appliance's logging.
+- The journal cursor is kept in `/var/lib/sentinel/rsyslog`, so a restart resumes
+  where it left off instead of re-shipping the whole journal.
