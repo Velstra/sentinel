@@ -438,6 +438,12 @@ pub struct Appliance {
     /// Omitted from saved configs when empty.
     #[serde(default, skip_serializing_if = "Nat::is_empty")]
     pub nat: Nat,
+    /// Load-balanced virtual services (roadmap C22): a VIP fronting a pool of
+    /// real servers, DNAT-rewritten in XDP. Distinct from `[[nat.destination]]`,
+    /// which forwards to exactly one host — a load balancer spreads connections
+    /// across several and keeps each one pinned to its backend.
+    #[serde(default, rename = "load-balancer", skip_serializing_if = "Vec::is_empty")]
+    pub load_balancers: Vec<LoadBalancer>,
     /// Dynamic routing (the Wren control plane): a router-id, static routes and
     /// BGP. Compiled to `/run/sentinel/wren.toml` and served by `wren.service`;
     /// operational state is inspected with `wren show …`. Omitted from saved
@@ -2127,6 +2133,36 @@ pub struct NatDestination {
     /// the box. Requires the ingress zone to have a static address. Off by default.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hairpin: bool,
+}
+
+/// A load-balanced virtual service (roadmap C22): traffic reaching `vip` on
+/// `proto`/`port` from `zone` is spread across `backends`, each connection pinned
+/// to one backend by a source hash so it stays there for its lifetime.
+///
+/// This is fabric's XDP load balancer, which the appliance had no way to reach —
+/// the data plane has had `[[service]]` since phase 3, but nothing emitted it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoadBalancer {
+    pub name: String,
+    /// A free-text label, shown in `show`. Purely documentary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Administratively disable this service: the compiler drops it. Off by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
+    /// The zone clients arrive from — the service is matched under that zone's
+    /// policy, mirroring `[[nat.destination]]`.
+    pub zone: String,
+    /// The virtual address clients connect to.
+    pub vip: String,
+    pub proto: Proto,
+    /// The virtual port clients connect to.
+    pub port: u16,
+    /// The backend pool, each `"ip"` or `"ip:port"`. A bare address keeps the
+    /// client's original destination port.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backends: Vec<String>,
 }
 
 /// NAT64 (roadmap C10) — stateful IPv6→IPv4 translation. An IPv6-only client
@@ -4824,6 +4860,66 @@ impl Appliance {
                     dst.to
                 );
             }
+        }
+
+        // Load-balanced services (C22). Every rejection here is a configuration
+        // the data plane would accept and then behave surprisingly on.
+        let mut lb_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        let mut lb_keys: std::collections::BTreeSet<(&str, &str, u16)> =
+            std::collections::BTreeSet::new();
+        for lb in &self.load_balancers {
+            if lb.name.is_empty() {
+                bail!("a load-balancer needs a name");
+            }
+            if !lb_names.insert(lb.name.as_str()) {
+                bail!("duplicate load-balancer {:?}", lb.name);
+            }
+            if let Some(d) = &lb.description {
+                validate_description(d)
+                    .with_context(|| format!("load-balancer {:?} description", lb.name))?;
+            }
+            if !zones_in_use.contains(lb.zone.as_str()) {
+                bail!(
+                    "load-balancer {:?}: zone {:?} has no interface",
+                    lb.name,
+                    lb.zone
+                );
+            }
+            // The datapath keys a service by (policy, vip, port, proto). A second
+            // service on the same tuple would not conflict — it would overwrite
+            // the first in the map, silently.
+            let proto = match lb.proto {
+                Proto::Tcp => "tcp",
+                Proto::Udp => "udp",
+            };
+            if !lb_keys.insert((lb.zone.as_str(), proto, lb.port)) {
+                bail!(
+                    "load-balancer {:?}: zone {:?} already fronts {proto}/{} — one service \
+                     per (zone, protocol, port)",
+                    lb.name,
+                    lb.zone,
+                    lb.port
+                );
+            }
+            validate_ipv4(&lb.vip).with_context(|| format!("load-balancer {:?} vip", lb.name))?;
+            if lb.port == 0 {
+                bail!("load-balancer {:?}: port 0 is not valid", lb.name);
+            }
+            // No protocol check is needed: `Proto` is tcp|udp, so a protocol the
+            // load balancer cannot key a port on is unrepresentable here.
+            for backend in &lb.backends {
+                let (_ip, port) = parse_host_port(backend)
+                    .with_context(|| format!("load-balancer {:?} backend {backend:?}", lb.name))?;
+                if backend.contains(':') && port == 0 {
+                    bail!(
+                        "load-balancer {:?}: backend port 0 in {backend:?} is not valid",
+                        lb.name
+                    );
+                }
+            }
+            // An empty pool is allowed on purpose: draining a service to zero
+            // backends is a normal operation, and the datapath passes the traffic
+            // through (counting lb_no_backend) rather than blackholing it.
         }
 
         // NAT64 (roadmap C10): stateful IPv6→IPv4 translation (tayga) + DNS64.
