@@ -673,6 +673,11 @@ impl AlertMail {
 /// collector listens on out of the box.
 pub const DEFAULT_SYSLOG_PORT: u16 = 514;
 
+/// The first WAN port deterministic CGNAT hands out when none is given: the start
+/// of the ephemeral range, so the well-known and registered ports stay free for
+/// port-forwards on the same address.
+pub const DEFAULT_CGNAT_BASE_PORT: u16 = 32768;
+
 /// Remote syslog forwarding (`[services.syslog]`, roadmap C12).
 ///
 /// An appliance whose logs only exist on the appliance is one you cannot
@@ -2282,6 +2287,25 @@ pub struct NatSource {
     /// The egress (WAN) zone whose outbound traffic is masqueraded — must be
     /// backed by an interface.
     pub zone: String,
+    /// Deterministic CGNAT (roadmap C16): ports per internal address. Set together
+    /// with `cgnat-base-port` to give every internal address a **fixed block** of
+    /// WAN ports, so a WAN port attributes to a subscriber by arithmetic rather
+    /// than by logging every translation. Unset ⇒ ordinary masquerade.
+    #[serde(
+        default,
+        rename = "cgnat-block-size",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cgnat_block_size: Option<u16>,
+    /// The first WAN port CGNAT may hand out. Defaults to 32768 (the ephemeral
+    /// range) when a block size is set, leaving the well-known and registered
+    /// ports alone.
+    #[serde(
+        default,
+        rename = "cgnat-base-port",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cgnat_base_port: Option<u16>,
 }
 
 /// A destination-NAT (port-forward) rule: traffic hitting `zone`'s public
@@ -5164,6 +5188,40 @@ impl Appliance {
                     src.name,
                     src.zone
                 );
+            }
+            // A base port without a block size configures nothing; a block size
+            // that leaves no room for even one block would silently fall back to
+            // ordinary masquerade, which is the opposite of what an operator who
+            // asked for deterministic blocks needs.
+            if src.cgnat_base_port.is_some() && src.cgnat_block_size.is_none() {
+                bail!(
+                    "nat source {:?}: `cgnat-base-port` sizes nothing without \
+                     `cgnat-block-size`",
+                    src.name
+                );
+            }
+            if let Some(size) = src.cgnat_block_size {
+                let base = src.cgnat_base_port.unwrap_or(DEFAULT_CGNAT_BASE_PORT);
+                if size == 0 {
+                    bail!(
+                        "nat source {:?}: `cgnat-block-size` must be at least 1",
+                        src.name
+                    );
+                }
+                if base == 0 {
+                    bail!(
+                        "nat source {:?}: `cgnat-base-port` must be at least 1",
+                        src.name
+                    );
+                }
+                let space = u32::from(u16::MAX) - u32::from(base) + 1;
+                if space < u32::from(size) {
+                    bail!(
+                        "nat source {:?}: a block of {size} does not fit above port {base} \
+                         ({space} ports left)",
+                        src.name
+                    );
+                }
             }
         }
 

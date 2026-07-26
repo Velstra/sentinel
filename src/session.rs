@@ -239,6 +239,8 @@ struct NatSrcDraft {
     description: Option<String>,
     disabled: Option<bool>,
     zone: Option<String>,
+    cgnat_block_size: Option<u16>,
+    cgnat_base_port: Option<u16>,
 }
 
 /// A partially-specified destination-NAT (port-forward) rule.
@@ -1857,6 +1859,8 @@ impl Draft {
                             description: s.description.clone(),
                             disabled: s.disabled.then_some(true),
                             zone: Some(s.zone.clone()),
+                            cgnat_block_size: s.cgnat_block_size,
+                            cgnat_base_port: s.cgnat_base_port,
                         },
                     )
                 })
@@ -3124,6 +3128,14 @@ impl Session {
             }
             ["nat", "source", name, "disabled", v] => {
                 self.draft.nat_source_mut(name).disabled = Some(parse_bool(v)?)
+            }
+            ["nat", "source", name, "cgnat-block-size", v] => {
+                self.draft.nat_source_mut(name).cgnat_block_size =
+                    Some(parse_u16(v, "cgnat-block-size")?)
+            }
+            ["nat", "source", name, "cgnat-base-port", v] => {
+                self.draft.nat_source_mut(name).cgnat_base_port =
+                    Some(parse_u16(v, "cgnat-base-port")?)
             }
             ["nat", "source", name, "zone", v] => {
                 self.draft.nat_source_mut(name).zone = Some((*v).to_string())
@@ -4903,6 +4915,8 @@ impl Session {
                     "zone" => s.zone = None,
                     "description" => s.description = None,
                     "disabled" => s.disabled = None,
+                    "cgnat-block-size" => s.cgnat_block_size = None,
+                    "cgnat-base-port" => s.cgnat_base_port = None,
                     other => bail!("nat source has no field {other:?}"),
                 }
             }
@@ -6173,6 +6187,8 @@ impl Session {
                         .zone
                         .clone()
                         .ok_or_else(|| anyhow::anyhow!("nat source {name:?}: zone not set"))?,
+                    cgnat_block_size: d.cgnat_block_size,
+                    cgnat_base_port: d.cgnat_base_port,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -8589,6 +8605,12 @@ fn render_route_map(out: &mut String, name: &str, f: &FilterDraft) {
 }
 
 /// Parse a plain unsigned count, naming the field so the error says which one.
+/// Parse a port-sized count, naming the field so the error says which one.
+fn parse_u16(s: &str, field: &str) -> Result<u16> {
+    s.parse()
+        .map_err(|_| anyhow::anyhow!("invalid {field} {s:?} (expected 0-65535)"))
+}
+
 fn parse_u32(s: &str, field: &str) -> Result<u32> {
     s.parse()
         .map_err(|_| anyhow::anyhow!("invalid {field} {s:?} (expected a whole number)"))
