@@ -19,8 +19,9 @@ use anyhow::{Context, Result};
 
 use crate::config::{
     Appliance, DhcpRelay, DhcpServer, Dns, Dyndns, IfaceType, Interface, Lldp, Mdns, MultiWan,
-    Nat64, Ntp, Qos, QosDiscipline, RouterAdvert, Snmp, Ssh, WAN_CHECK_FAIL, WAN_CHECK_INTERVAL,
-    WAN_CHECK_RISE, WAN_CHECK_TIMEOUT, WanMode, WireguardTunnel,
+    Nat64, Ntp, Qos, QosDiscipline, RouterAdvert, Snmp, Ssh, Syslog, SyslogLevel, SyslogProto,
+    WAN_CHECK_FAIL, WAN_CHECK_INTERVAL, WAN_CHECK_RISE, WAN_CHECK_TIMEOUT, WanMode,
+    WireguardTunnel,
 };
 use crate::system::{self, NETWORKD_RUNTIME_DIR};
 
@@ -753,6 +754,14 @@ const LLDPD_UNIT: &str = "lldpd.service";
 const SNMPD_CONF: &str = "/run/sentinel/snmpd.conf";
 const SNMPD_UNIT: &str = "sentinel-snmpd.service";
 
+/// Remote syslog forwarding (roadmap C12): the rendered rsyslog config, its
+/// Sentinel-owned unit, and the persistent directory holding the journal cursor
+/// (under `/var/lib`, not `/run`, so a restart resumes instead of re-shipping the
+/// whole journal).
+const RSYSLOG_CONF: &str = "/run/sentinel/rsyslog.conf";
+const RSYSLOG_UNIT: &str = "sentinel-syslog.service";
+const RSYSLOG_STATE_DIR: &str = "/var/lib/sentinel/rsyslog";
+
 /// The avahi reflector config + its Sentinel-owned unit.
 const MDNS_CONF: &str = "/run/sentinel/avahi/avahi-daemon.conf";
 const MDNS_UNIT: &str = "sentinel-mdns.service";
@@ -903,6 +912,56 @@ fn snmpd_conf_body(snmp: &Snmp) -> Result<Option<String>> {
     if let Some(contact) = &snmp.contact {
         reject_unsafe("snmp contact", contact, &[])?;
         body.push_str(&format!("syscontact {contact}\n"));
+    }
+    Ok(Some(body))
+}
+
+/// Render the rsyslog config that ships the journal to remote collectors
+/// (roadmap C12), or `None` when none is configured.
+///
+/// `imjournal` reads the journal every Sentinel service already logs to, and one
+/// `omfwd` action per target forwards in RFC 5424 format
+/// (`RSYSLOG_SyslogProtocol23Format`) — the modern framing a collector needs to
+/// get structured fields and a real timestamp rather than the legacy BSD line.
+///
+/// Two details that are not optional:
+///
+/// * **Every action gets its own disk-assisted queue.** Without one, a TCP
+///   collector that stops answering blocks rsyslog's main queue, and from the
+///   outside the box looks wedged. `action.resumeRetryCount="-1"` keeps retrying
+///   instead of discarding the action after a few failures.
+/// * **`StateFile` lives under `/var/lib`.** The journal cursor has to survive a
+///   restart, or every restart re-ships the whole journal to the collector.
+///   `IgnorePreviousMessages` covers the *first* start, where there is no cursor
+///   yet and the alternative is a flood of history.
+fn rsyslog_conf_body(syslog: &Syslog) -> Result<Option<String>> {
+    if syslog.targets.is_empty() {
+        return Ok(None);
+    }
+    let mut body = String::from("# rendered by sentinel — remote syslog forwarding\n");
+    body.push_str(&format!("global(workDirectory=\"{RSYSLOG_STATE_DIR}\")\n"));
+    body.push_str(
+        "module(load=\"imjournal\" StateFile=\"journal.state\" \
+         IgnorePreviousMessages=\"on\" Ratelimit.Interval=\"0\")\n",
+    );
+    for t in &syslog.targets {
+        // Defense in depth (validation already rejects these): host and the
+        // numeric fields are rendered into a quoted rsyslog parameter, so a quote
+        // or backslash would end the string and let the rest be read as config.
+        reject_unsafe("syslog target host", &t.host, &[' ', '\t', '"', '\\'])?;
+        let port = t.port.unwrap_or(crate::config::DEFAULT_SYSLOG_PORT);
+        let proto = match t.proto.unwrap_or(SyslogProto::Udp) {
+            SyslogProto::Udp => "udp",
+            SyslogProto::Tcp => "tcp",
+        };
+        let level = t.level.unwrap_or(SyslogLevel::Info).rsyslog();
+        body.push_str(&format!(
+            "*.{level} action(type=\"omfwd\" target=\"{}\" port=\"{port}\" \
+             protocol=\"{proto}\" template=\"RSYSLOG_SyslogProtocol23Format\" \
+             queue.type=\"linkedList\" queue.size=\"10000\" \
+             queue.saveOnShutdown=\"on\" action.resumeRetryCount=\"-1\")\n",
+            t.host
+        ));
     }
     Ok(Some(body))
 }
@@ -1132,6 +1191,14 @@ fn apply_box_services(appliance: &Appliance) -> Result<()> {
         avahi_conf_body(&s.mdns),
         false,
     )?;
+    // The state dir must exist before rsyslog starts, or imjournal has nowhere to
+    // keep the cursor and silently re-reads the journal on every restart.
+    let syslog_body = rsyslog_conf_body(&s.syslog)?;
+    if syslog_body.is_some() {
+        std::fs::create_dir_all(RSYSLOG_STATE_DIR)
+            .with_context(|| format!("creating {RSYSLOG_STATE_DIR}"))?;
+    }
+    apply_box_service(RSYSLOG_UNIT, Path::new(RSYSLOG_CONF), syslog_body, false)?;
     apply_box_service(
         DDCLIENT_UNIT,
         Path::new(DDCLIENT_CONF),
@@ -2531,7 +2598,7 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DhcpStaticLease, Pppoe, Qos, QosDiscipline};
+    use crate::config::{DhcpStaticLease, Pppoe, Qos, QosDiscipline, SyslogTarget};
 
     #[test]
     fn configsync_authority_brackets_bare_ipv6() {
@@ -3866,6 +3933,77 @@ mod tests {
         };
         let body = lldpd_conf_body(&all).expect("enabled");
         assert!(!body.contains("interface pattern"), "got:\n{body}");
+    }
+
+    /// The two defaults that keep a collector from being flooded or a wedged one
+    /// from taking rsyslog with it are the whole reason this render is not a
+    /// one-liner, so they are asserted rather than assumed.
+    #[test]
+    fn rsyslog_conf_buffers_every_target_and_keeps_its_journal_cursor() {
+        assert!(rsyslog_conf_body(&Syslog::default()).unwrap().is_none());
+        let s = Syslog {
+            targets: vec![
+                SyslogTarget {
+                    host: "10.0.0.9".into(),
+                    port: None,
+                    proto: None,
+                    level: None,
+                },
+                SyslogTarget {
+                    host: "logs.example.com".into(),
+                    port: Some(6514),
+                    proto: Some(SyslogProto::Tcp),
+                    level: Some(SyslogLevel::Warning),
+                },
+            ],
+        };
+        let body = rsyslog_conf_body(&s).unwrap().expect("configured");
+
+        // Defaults: udp, 514, info — a bare `target <host>` forwards.
+        assert!(
+            body.contains(
+                "*.info action(type=\"omfwd\" target=\"10.0.0.9\" port=\"514\" protocol=\"udp\""
+            ),
+            "got:\n{body}"
+        );
+        assert!(
+            body.contains("target=\"logs.example.com\" port=\"6514\" protocol=\"tcp\""),
+            "got:\n{body}"
+        );
+        assert!(body.contains("*.warning action("), "got:\n{body}");
+
+        // RFC 5424 framing, not the legacy BSD line: a collector needs the
+        // structured fields and a real timestamp.
+        assert_eq!(body.matches("RSYSLOG_SyslogProtocol23Format").count(), 2);
+
+        // Every action queues and retries forever. Without this a TCP collector
+        // that stops answering blocks the main queue and the box looks wedged.
+        assert_eq!(body.matches("queue.type=\"linkedList\"").count(), 2);
+        assert_eq!(body.matches("action.resumeRetryCount=\"-1\"").count(), 2);
+
+        // The journal cursor is persistent, or every restart re-ships the whole
+        // journal; ignore-previous covers the first start, where there is none.
+        assert!(body.contains("/var/lib/sentinel/rsyslog"), "got:\n{body}");
+        assert!(body.contains("StateFile=\"journal.state\""), "got:\n{body}");
+        assert!(
+            body.contains("IgnorePreviousMessages=\"on\""),
+            "got:\n{body}"
+        );
+    }
+
+    /// A host is rendered into a quoted rsyslog parameter, so a quote would end
+    /// the string and let the rest be read as configuration.
+    #[test]
+    fn a_syslog_host_with_an_unsafe_character_is_refused() {
+        let s = Syslog {
+            targets: vec![SyslogTarget {
+                host: "10.0.0.9\" x=\"y".into(),
+                port: None,
+                proto: None,
+                level: None,
+            }],
+        };
+        assert!(rsyslog_conf_body(&s).is_err());
     }
 
     #[test]

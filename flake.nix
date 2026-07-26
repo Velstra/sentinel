@@ -344,6 +344,12 @@
             # frontend is configured; on PATH so `sentinel commit` can `haproxy -c`
             # the rendered config before reloading.
             pkgs.haproxy
+            # Remote syslog (roadmap C12): rsyslog reads the journal (imjournal) and
+            # forwards RFC 5424 to the configured collectors. A Sentinel-owned unit
+            # (below), off until `[services.syslog]` names a target. It never
+            # replaces the local journal — this is an additional copy on the wire,
+            # so losing the collector never costs you the local log.
+            pkgs.rsyslog
             # Signed update channel (roadmap C13): the CLI fetches the release
             # manifest + image with curl (resolved via SENTINEL_CURL_BIN); keep it
             # on PATH too for manual channel inspection. Ed25519 verification +
@@ -564,6 +570,24 @@
             serviceConfig = {
               Type = "exec";
               ExecStart = "${pkgs.net-snmp}/bin/snmpd -f -Lo -C -c /run/sentinel/snmpd.conf";
+              Restart = "on-failure";
+              RestartSec = "5s";
+            };
+          };
+
+          # Remote syslog (roadmap C12): rsyslog in the foreground against
+          # Sentinel's rendered config. `-n` keeps it attached so systemd owns the
+          # process; `-i NONE` skips the pid file (systemd tracks it). Sentinel
+          # starts/stops this on `[services.syslog]`.
+          systemd.services.sentinel-syslog = {
+            description = "Remote syslog forwarding (sentinel/rsyslog)";
+            after = [
+              "network.target"
+              "sentinel-boot.service"
+            ];
+            serviceConfig = {
+              Type = "exec";
+              ExecStart = "${pkgs.rsyslog}/bin/rsyslogd -n -i NONE -f /run/sentinel/rsyslog.conf";
               Restart = "on-failure";
               RestartSec = "5s";
             };
@@ -1922,6 +1946,104 @@
           machine.fail(
               "snmpset -v2c -c public 127.0.0.1 1.3.6.1.2.1.1.6.0 s pwned 2>&1"
           )
+        '';
+      };
+
+      # Remote syslog (roadmap C12): a Sentinel `fw` ships its journal to a
+      # `collector` on the same segment. The collector runs a plain UDP listener
+      # rather than a syslog daemon, so what is asserted is what actually went out
+      # on the wire — including that it is RFC 5424 framing (`<PRI>1 ` and a real
+      # hostname), which is the part a collector needs to parse structured fields.
+      #   nix build .#checks.x86_64-linux.syslog -L
+      syslog = pkgs.testers.runNixOSTest {
+        name = "sentinel-syslog";
+        nodes = {
+          fw =
+            { lib, ... }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce "fw";
+              networking.firewall.enable = lib.mkForce false;
+              virtualisation.memorySize = 2048;
+            };
+          collector =
+            { lib, pkgs, ... }:
+            {
+              networking.hostName = lib.mkForce "collector";
+              networking.firewall.enable = lib.mkForce false;
+              # Append every datagram to a file, one line each, so the test can
+              # grep the raw wire format.
+              systemd.services.udp-sink = {
+                wantedBy = [ "multi-user.target" ];
+                after = [ "network.target" ];
+                serviceConfig = {
+                  Type = "exec";
+                  ExecStart = "${pkgs.python3}/bin/python3 -u ${
+                    pkgs.writeText "udp-sink.py" ''
+                      import socket
+                      # Dual-stack, like a real collector: the appliance resolves
+                      # the target by name and the resolver may hand back either
+                      # family, so an IPv4-only sink silently receives nothing.
+                      s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+                      s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                      s.bind(("::", 514))
+                      f = open("/var/log/received.log", "ab", buffering=0)
+                      while True:
+                          d, _ = s.recvfrom(65535)
+                          f.write(d.rstrip(b"\n") + b"\n")
+                    ''
+                  }";
+                };
+              };
+            };
+        };
+        testScript = ''
+          start_all()
+          fw.wait_for_unit("multi-user.target")
+          fw.wait_for_unit("sentinel-boot.service")
+          collector.wait_for_unit("udp-sink.service")
+
+          # Nothing is forwarded until a target is named — the service must not be
+          # running just because rsyslog is in the image.
+          fw.fail("systemctl is-active sentinel-syslog.service")
+
+          # Named, not addressed: writing 192.168.1.x here would depend on Nix
+          # ordering the node attrset alphabetically (collector gets .1, fw .2),
+          # and the name also exercises the resolution rsyslog really does — which
+          # is how this test first failed, resolving to IPv6 against an IPv4 sink.
+          fw.succeed(
+              "su admin -c \"printf '%s\\n' "
+              "'set services syslog target collector' "
+              "commit save exit "
+              "| sentinel configure\""
+          )
+          fw.wait_for_unit("sentinel-syslog.service")
+          conf = fw.succeed("cat /run/sentinel/rsyslog.conf")
+          assert 'target="collector" port="514" protocol="udp"' in conf, conf
+          # The journal cursor is persistent, so a restart resumes rather than
+          # re-shipping everything the box has ever logged.
+          fw.succeed("test -d /var/lib/sentinel/rsyslog")
+
+          # The headline: a message logged on the appliance arrives at the
+          # collector. `logger` writes to the journal, which is imjournal's source.
+          fw.succeed("logger -t sentinel-test hello-from-the-appliance")
+          collector.wait_until_succeeds(
+              "grep -q hello-from-the-appliance /var/log/received.log", timeout=60
+          )
+          # RFC 5424, not the legacy BSD line: `<PRI>1 <timestamp> <host> …`.
+          line = collector.succeed("grep hello-from-the-appliance /var/log/received.log")
+          assert ">1 " in line, f"not RFC 5424 framing: {line}"
+          assert "fw" in line, f"the sending host is missing: {line}"
+
+          # Deleting the target stops the forwarder rather than leaving it running
+          # against a config with nowhere to send.
+          fw.succeed(
+              "su admin -c \"printf '%s\\n' "
+              "'delete services syslog' "
+              "commit save exit "
+              "| sentinel configure\""
+          )
+          fw.wait_until_fails("systemctl is-active sentinel-syslog.service", timeout=30)
         '';
       };
 
