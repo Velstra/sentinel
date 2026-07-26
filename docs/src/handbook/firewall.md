@@ -219,6 +219,33 @@ DNS-level blocking use `service dns` blocklists instead.
 set nat source wan-masq zone wan            # masquerade everything leaving wan
 ```
 
+#### Deterministic CGNAT
+
+Carrier NAT has to answer *who was behind this address and port*. Logging every
+translation is one way; giving each internal address a **fixed block** of WAN ports
+is the better one — the question is then answered by arithmetic, and one record of
+the block layout covers every flow inside it.
+
+```text
+set nat source wan-masq zone wan
+set nat source wan-masq cgnat-block-size 512      # ports per internal address
+set nat source wan-masq cgnat-base-port 32768     # optional; this is the default
+```
+
+```text
+show nat                       # the configured layout
+show nat cgnat 10.0.0.7        # which ports that address holds
+```
+
+`show nat cgnat` asks the **agent**, which computes the answer with the same code
+that hands the ports out — so what you report and what was actually used cannot
+drift apart. A layout that cannot work (a block that does not fit above its base
+port, a base port sizing nothing) is refused at commit rather than quietly falling
+back to ordinary masquerade.
+
+The default base port leaves the well-known and registered ports free, so
+port-forwards on the same address are unaffected.
+
 ### Destination NAT (port-forward)
 
 | Field | Meaning |
