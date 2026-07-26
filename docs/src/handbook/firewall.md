@@ -44,6 +44,7 @@ sets a zone-pair posture.
 | `source` | Source address/CIDR (default: any). |
 | `destination` | Destination address/CIDR (default: any). |
 | `source-group` / `destination-group` / `port-group` | Match an [alias](#groups-aliases) instead. |
+| `limit` / `burst` | Rate-limit the new flows this rule admits (see below). |
 | `log` | Log packets matching this rule (`true`/`false`). |
 | `schedule` | A time-based activation window (see below). |
 | `description` / `disabled` | Label / administratively disable. |
@@ -90,6 +91,31 @@ Across both ends, **the more specific rule wins** — a `/24` destination beats 
 `/8` source on the same port. Where two matching rules are equally specific the
 denying one wins, so the outcome never depends on which table was consulted
 first.
+
+### Rate limits
+
+`limit <n>` caps how many **new flows** an accept rule admits per second; `burst`
+sizes how much idle time it may bank, defaulting to one second's worth of the
+limit.
+
+```text
+set firewall rule ssh-in from wan
+set firewall rule ssh-in proto tcp
+set firewall rule ssh-in port 22
+set firewall rule ssh-in action accept
+set firewall rule ssh-in limit 5
+set firewall rule ssh-in burst 10
+```
+
+Established connections are never metered — the limit bounds how fast new
+connections are accepted, not how fast an accepted one may transfer. Excess is
+dropped rather than rejected: answering every excess packet would turn a flood
+aimed at the box into a flood aimed at whatever source the packets claim.
+`show firewall statistics` counts them under `dropped_rate_limit`, separately from
+`dropped_rule`, so a limit biting is distinguishable from a rule denying.
+
+A limit is refused on anything it could not throttle — a `drop`/`reject` rule, or a
+broad rule with no proto/port — rather than accepted and quietly ignored.
 
 ### Time-based rules
 
