@@ -71,6 +71,13 @@ struct ServiceOut {
     proto: &'static str,
     #[serde(rename = "backends")]
     backends: Vec<BackendOut>,
+    /// Always true on an appliance. A VIP is declared on the zone clients reach it
+    /// from, while its pool lives on an internal zone, so the backend's reply
+    /// arrives under a *different* policy than the request did. Without this the
+    /// datapath's conntrack entry — scoped to the ingress policy, which is right for
+    /// a multi-tenant fabric — never matches that reply, and the client receives a
+    /// packet from the backend's own address instead of from the VIP.
+    router_nat: bool,
 }
 
 /// One backend behind a [`ServiceOut`].
@@ -440,6 +447,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
             port: lb.port,
             proto: proto_str(lb.proto),
             backends,
+            router_nat: true,
         });
     }
 
@@ -722,6 +730,12 @@ backends = ["10.0.0.11:8443", "10.0.0.12"]
         assert_eq!(svc.vip, "203.0.113.10");
         assert_eq!(svc.port, 443);
         assert_eq!(svc.proto, "tcp");
+        // …and it must claim the router-NAT conntrack namespace. On an appliance
+        // the pool answers through an internal zone, so the reply arrives under a
+        // different policy than the request; scoped to the ingress policy (right
+        // for a multi-tenant fabric) that reply is never rewritten back to the VIP
+        // and the client drops it as coming from a stranger.
+        assert!(svc.router_nat, "an appliance service is router-NAT'd");
 
         assert_eq!(svc.backends.len(), 2);
         assert_eq!(svc.backends[0].ip, "10.0.0.11");

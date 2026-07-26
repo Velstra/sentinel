@@ -179,7 +179,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-6V2sm1ywGm/3qUARmVEm5BqP6muEhc4wqavb2y5o9J0=";
+      ebpfHash = "sha256-AjDlV6oPYpXONoLQWSfzFtJMP0sb7uQoJIef6voQOhE=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -3011,15 +3011,25 @@
             # The firewall is opened for the VIP, since the data plane special-cases
             # a port-forward but knows nothing about a service.
             fw.succeed("grep -A2 '\\[\\[policy.port_rule\\]\\]' /run/sentinel/velstra.toml | grep -q 'port = 9090'")
-            # NOT asserted yet: that a client actually reaches the VIP. Writing this
-            # test found a data-plane bug — try_load_balance records its conntrack
-            # under the *ingress* policy, while try_port_forward deliberately uses
-            # the policy-independent ROUTER_NAT_POLICY so a reply arriving on
-            # another zone still finds its entry. So a load-balanced flow whose
-            # reply comes back through a different zone is never un-NAT'd. The
-            # fabric/K8s case never hit it because there the reply returns on the
-            # same tenant interface. Add the traffic assertion together with that
-            # fix; the config path above is what this check covers today.
+            # The headline for C22: a client actually reaches the VIP. This is the
+            # cross-zone case — the request enters on the wan policy and the
+            # backend's reply comes back on the lan policy — which is exactly what
+            # the datapath got wrong until `router_nat` gave a service the
+            # policy-independent conntrack namespace port-forwards already used.
+            client.wait_until_succeeds(
+                "curl -s --max-time 5 http://10.1.0.1:9090/ | grep -q hello-from-server",
+                timeout=40,
+            )
+
+            # NOT covered, for both NAT paths: an internal zone that denies BY
+            # DEFAULT drops the reply at the firewall stage, before the conntrack
+            # rewrite is reached. The reply's FW_FLOWS entry is recorded in the
+            # policy-independent namespace, and the firewall cannot consult two
+            # namespaces — with a 1-byte map value LLVM folds two lookups of the
+            # same map into one pointer and the verifier rejects it. Closing it
+            # means the NAT path recording the reply under the policy that reply
+            # arrives on, which the config knows and the data plane does not; the
+            # deny-by-default assertion belongs with that change.
 
 
             # C23 flow insight: the agent's query socket is the ONE path unit tests
