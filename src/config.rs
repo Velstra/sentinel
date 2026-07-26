@@ -442,7 +442,11 @@ pub struct Appliance {
     /// real servers, DNAT-rewritten in XDP. Distinct from `[[nat.destination]]`,
     /// which forwards to exactly one host — a load balancer spreads connections
     /// across several and keeps each one pinned to its backend.
-    #[serde(default, rename = "load-balancer", skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        rename = "load-balancer",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub load_balancers: Vec<LoadBalancer>,
     /// Dynamic routing (the Wren control plane): a router-id, static routes and
     /// BGP. Compiled to `/run/sentinel/wren.toml` and served by `wren.service`;

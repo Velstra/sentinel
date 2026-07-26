@@ -89,7 +89,8 @@ mod tests {
             let mut line = String::new();
             reader.read_line(&mut line).expect("read the command");
             let mut out = reader.into_inner();
-            out.write_all(format!("got {line}").as_bytes()).expect("reply");
+            out.write_all(format!("got {line}").as_bytes())
+                .expect("reply");
         });
 
         let reply = query_at(&path, "flows 5").expect("query");

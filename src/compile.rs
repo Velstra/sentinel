@@ -775,7 +775,11 @@ port = 443
         let cfg = compile(&Appliance::from_toml(toml).unwrap());
         let wan = cfg.policies.iter().find(|p| p.name == "wan").unwrap();
         let matching: Vec<&PortRule> = wan.port_rules.iter().filter(|r| r.port == 443).collect();
-        assert_eq!(matching.len(), 1, "no duplicate rule was added: {matching:?}");
+        assert_eq!(
+            matching.len(),
+            1,
+            "no duplicate rule was added: {matching:?}"
+        );
         assert_eq!(matching[0].action, "drop");
     }
 
