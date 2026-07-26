@@ -69,6 +69,7 @@
             --set SENTINEL_SWANCTL_BIN    ${pkgs.strongswan}/bin/swanctl \
             --set SENTINEL_OPENSSL_BIN    ${pkgs.openssl.bin}/bin/openssl \
             --set SENTINEL_CURL_BIN       ${pkgs.curl.bin}/bin/curl \
+            --set SENTINEL_MSMTP_BIN      ${pkgs.msmtp}/bin/msmtp \
             --set SENTINEL_SYSTEMD_RUN_BIN ${pkgs.systemd}/bin/systemd-run \
             --set SENTINEL_JOURNALCTL_BIN ${pkgs.systemd}/bin/journalctl \
             --set SENTINEL_WREN_BIN       ${wrenPkg}/bin/wren \
@@ -350,6 +351,10 @@
             # replaces the local journal — this is an additional copy on the wire,
             # so losing the collector never costs you the local log.
             pkgs.rsyslog
+            # Alert notifications (roadmap C23): msmtp is a send-only SMTP client,
+            # so the appliance mails an alert without ever running a listening mail
+            # server. Webhooks reuse the curl already pinned above.
+            pkgs.msmtp
             # Signed update channel (roadmap C13): the CLI fetches the release
             # manifest + image with curl (resolved via SENTINEL_CURL_BIN); keep it
             # on PATH too for manual channel inspection. Ed25519 verification +
@@ -572,6 +577,18 @@
               ExecStart = "${pkgs.net-snmp}/bin/snmpd -f -Lo -C -c /run/sentinel/snmpd.conf";
               Restart = "on-failure";
               RestartSec = "5s";
+            };
+          };
+
+          # Alert notifications (roadmap C23): a templated one-shot systemd invokes
+          # via `OnFailure=sentinel-alert@%n.service` on the units Sentinel owns, so
+          # the instance name IS the unit that failed. Static in the image; the
+          # drop-ins that reference it appear only while alerts are configured.
+          systemd.services."sentinel-alert@" = {
+            description = "Notify about a failed unit (sentinel): %i";
+            serviceConfig = {
+              Type = "oneshot";
+              ExecStart = "${sentinel}/bin/sentinel alert %i";
             };
           };
 
@@ -1946,6 +1963,119 @@
           machine.fail(
               "snmpset -v2c -c public 127.0.0.1 1.3.6.1.2.1.1.6.0 s pwned 2>&1"
           )
+        '';
+      };
+
+      # Alert notifications (roadmap C23): a Sentinel `fw` and a `receiver` running
+      # a one-shot HTTP endpoint. The test makes a watched unit actually fail and
+      # asserts the alert arrives with the failing unit named and its journal as
+      # evidence — the systemd OnFailure path end to end, not a rendered file.
+      #   nix build .#checks.x86_64-linux.alerts -L
+      alerts = pkgs.testers.runNixOSTest {
+        name = "sentinel-alerts";
+        nodes = {
+          fw =
+            { lib, ... }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce "fw";
+              networking.firewall.enable = lib.mkForce false;
+              virtualisation.memorySize = 2048;
+            };
+          receiver =
+            { lib, pkgs, ... }:
+            {
+              networking.hostName = lib.mkForce "receiver";
+              networking.firewall.enable = lib.mkForce false;
+              # Append each POST body to a file, so the test reads exactly what
+              # went on the wire rather than trusting a framework's parse.
+              systemd.services.hook-sink = {
+                wantedBy = [ "multi-user.target" ];
+                after = [ "network.target" ];
+                serviceConfig = {
+                  Type = "exec";
+                  ExecStart = "${pkgs.python3}/bin/python3 -u ${
+                    pkgs.writeText "hook-sink.py" ''
+                      from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+                      import socket
+
+                      class H(BaseHTTPRequestHandler):
+                          def do_POST(self):
+                              n = int(self.headers.get("Content-Length", 0))
+                              body = self.rfile.read(n)
+                              with open("/var/log/hooks.log", "ab", buffering=0) as f:
+                                  f.write(body.rstrip(b"\n") + b"\n")
+                              self.send_response(204)
+                              self.end_headers()
+                          def log_message(self, *a):
+                              pass
+
+                      # Dual-stack: the appliance resolves the receiver by name and
+                      # the resolver may hand back either family.
+                      class S(ThreadingHTTPServer):
+                          address_family = socket.AF_INET6
+                      srv = S(("::", 9000), H)
+                      srv.serve_forever()
+                    ''
+                  }";
+                };
+              };
+            };
+        };
+        testScript = ''
+          start_all()
+          fw.wait_for_unit("multi-user.target")
+          fw.wait_for_unit("sentinel-boot.service")
+          receiver.wait_for_unit("hook-sink.service")
+
+          # No drop-in until alerts are configured: an appliance must not carry an
+          # OnFailure handler that has nowhere to send.
+          fw.fail("test -e /run/systemd/system/velstra.service.d/50-sentinel-alert.conf")
+
+          fw.succeed(
+              "su admin -c \"printf '%s\\n' "
+              "'set services alerts webhook http://receiver:9000/hook' "
+              "commit save exit "
+              "| sentinel configure\""
+          )
+          fw.succeed("test -e /run/systemd/system/velstra.service.d/50-sentinel-alert.conf")
+          dropin = fw.succeed("cat /run/systemd/system/velstra.service.d/50-sentinel-alert.conf")
+          assert "OnFailure=sentinel-alert@%n.service" in dropin, dropin
+
+          # The headline: a unit fails and SYSTEMD drives the handler. A transient
+          # unit carrying the same OnFailure line the drop-in installs is used
+          # rather than killing a watched service, because every watched unit has a
+          # Restart= policy: it would recover instead of entering `failed`, and
+          # forcing it past its start limit would make this test a timing race.
+          # What the assertion above already covers is that the real units carry
+          # this exact line; what this covers is that the line works.
+          fw.succeed(
+              "systemd-run --unit=alert-probe -p Type=oneshot "
+              "-p OnFailure='sentinel-alert@alert-probe.service' "
+              "/bin/sh -c 'echo the-probe-died; exit 7' || true"
+          )
+          receiver.wait_until_succeeds("grep -q 'unit failed' /var/log/hooks.log", timeout=60)
+          body = receiver.succeed("grep 'unit failed' /var/log/hooks.log | tail -1")
+          assert '"source":"sentinel"' in body, body
+          # Ask the box its name rather than assuming the test's: sentinel-boot
+          # sets the hostname from the saved config, so it is not the node name.
+          host = fw.succeed("hostname").strip()
+          assert f'"host":"{host}"' in body, body
+          assert "alert-probe" in body, body
+          # The detail carries the unit's own journal, so the alert is actionable
+          # on its own rather than sending the operator to the box to find out.
+          assert "the-probe-died" in body, f"the journal evidence is missing: {body}"
+          assert body.count("{") == 1, f"not one JSON object: {body}"
+
+          # Turning alerts off removes the drop-ins rather than leaving handlers
+          # pointed at an endpoint that is no longer configured.
+          fw.succeed(
+              "su admin -c \"printf '%s\\n' "
+              "'delete services alerts' "
+              "commit save exit "
+              "| sentinel configure\""
+          )
+          fw.fail("test -e /run/systemd/system/velstra.service.d/50-sentinel-alert.conf")
         '';
       };
 
