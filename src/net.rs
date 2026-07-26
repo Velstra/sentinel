@@ -1215,6 +1215,9 @@ const ALERT_WATCHED_UNITS: &[&str] = &[
     "sentinel-dhcp6.service",
     "sentinel-dhcp-relay.service",
     "sentinel-syslog.service",
+    // A detector that died is the textbook silent failure: nothing about the
+    // appliance looks wrong, and the absence of alerts reads as good news.
+    "sentinel-ids.service",
     "sentinel-nat64.service",
     "sentinel-proxy.service",
     "sentinel-ocserv.service",
@@ -1917,7 +1920,7 @@ fn pppoe_mss_body(ifaces: &[Interface]) -> String {
 
 /// Whether writing `body` to `path` would change what is already there (or the
 /// file is absent) — the same change-detect the DNS/NTP drop-ins use.
-fn file_changed(path: &Path, body: &str) -> bool {
+pub(crate) fn file_changed(path: &Path, body: &str) -> bool {
     std::fs::read_to_string(path)
         .map(|c| c != body)
         .unwrap_or(true)
@@ -2722,6 +2725,9 @@ pub fn apply_link_runtime(appliance: &Appliance) -> Result<()> {
     // it binds is up and after the PKI leaf it terminates with was minted by
     // apply_persistent.
     crate::proxy::apply(appliance)?;
+    // Intrusion detection (roadmap C11) — Suricata on the watched links. After
+    // networkd, since AF_PACKET needs the interface to exist before it can bind.
+    crate::ids::apply(appliance)?;
     // Box services (roadmap C18) — LLDP/SNMP/mDNS/dyndns/DHCP-relay, each a
     // Sentinel-owned daemon (re)started after networkd so the link-scoped ones
     // (LLDP/mDNS/relay) see their interfaces up.

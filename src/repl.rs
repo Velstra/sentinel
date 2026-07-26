@@ -908,6 +908,7 @@ const OP_SHOW_TOP: &[Cand] = &[
     ("bfd", "BFD sessions"),
     ("firewall", "firewall summary / statistics / log"),
     ("nat", "NAT configuration summary"),
+    ("ids", "intrusion detection: what is watched, what fired"),
     ("load-balancer", "load-balanced services + their pools"),
     ("vpn", "IPsec VPN: security associations / connections"),
     ("pki", "local CAs + issued certificates (expiry)"),
@@ -1242,6 +1243,31 @@ const SERVICES_NODES: &[Cand] = &[
         "alerts",
         "notify on a failed unit: webhook and/or mail (roadmap C23)",
     ),
+    (
+        "ids",
+        "intrusion detection: watch links with suricata (roadmap C11)",
+    ),
+];
+// `services ids <Tab>`: what to watch, what counts as inside, and the rules.
+const IDS_NODES: &[Cand] = &[
+    ("interface", "a link to watch (repeatable)"),
+    (
+        "home-net",
+        "an address range that counts as inside (default: the private ranges)",
+    ),
+    (
+        "rule",
+        "a suricata rule, quoted (repeatable; replaced by sid)",
+    ),
+    (
+        "ruleset",
+        "absolute path to a rule file on the box (repeatable)",
+    ),
+];
+// `show ids <Tab>`.
+const OP_IDS: &[Cand] = &[
+    ("status", "what is watched and whether the detector runs"),
+    ("alerts", "the most recent alerts (default 20)"),
 ];
 // `services alerts <Tab>`: where an alert goes.
 const ALERTS_NODES: &[Cand] = &[
@@ -2401,6 +2427,7 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "services", "alerts"] => ALERTS_NODES,
         ["set" | "delete", "services", "alerts", "mail"] => ALERT_MAIL_FIELDS,
         ["set", "services", "alerts", "mail", "starttls"] => BOOLS,
+        ["set" | "delete", "services", "ids"] => IDS_NODES,
         ["set" | "delete", "services", "syslog"] => SYSLOG_NODES,
         ["set" | "delete", "services", "syslog", "target", _host] => SYSLOG_FIELDS,
         ["set", "services", "syslog", "target", _host, "proto"] => SYSLOG_PROTOS,
@@ -2628,6 +2655,7 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["run", "show", "ip"] => OP_IP,
         ["run", "show", "ipv6"] => OP_IPV6,
         ["run", "show", "vpn"] => OP_VPN,
+        ["run", "show", "ids"] => OP_IDS,
         _ => &[],
     }
 }
@@ -3740,8 +3768,13 @@ mod tests {
                 "dhcp-relay",
                 "reverse-proxy",
                 "syslog",
-                "alerts"
+                "alerts",
+                "ids"
             ]
+        );
+        assert_eq!(
+            kw(&["set", "services", "ids"]),
+            ["interface", "home-net", "rule", "ruleset"]
         );
         assert_eq!(kw(&["set", "services", "syslog"]), ["target"]);
         assert_eq!(
