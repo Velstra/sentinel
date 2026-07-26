@@ -2211,6 +2211,11 @@ const RULE_FIELDS: &[Cand] = &[
         "destination-group",
         "match an address-group (alias) as the destination",
     ),
+    ("limit", "rate-limit new flows this rule admits (packets/s)"),
+    (
+        "burst",
+        "burst capacity for `limit` (packets); default 1s of it",
+    ),
     (
         "port-group",
         "match a port-group (alias) instead of a single port",
@@ -3630,6 +3635,8 @@ mod tests {
                 "source-group",
                 "destination",
                 "destination-group",
+                "limit",
+                "burst",
                 "port-group",
                 "schedule"
             ]

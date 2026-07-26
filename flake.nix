@@ -179,7 +179,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-xTm7DpmRiQWI3anvXI2wJYr1q74y964p+y8uggaBXdU=";
+      ebpfHash = "sha256-c1rTx4oDDHtBX89iGPU+PyPwK1lH3xDXZORFogjpY+8=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -3123,6 +3123,69 @@
                 "| sentinel configure\" 2>&1 || true"
             )
             assert "not both" in both, f"a two-ended rule was accepted: {both}"
+
+            # C15 per-rule rate limits. Asserted as a ratio rather than a count:
+            # the bucket is shared across CPUs and updated without locking, so a
+            # race may let a token be spent twice. The point is that a limit of 2/s
+            # admits a small fraction of 40 attempts, not an exact number.
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set firewall rule limited from wan' "
+                "'set firewall rule limited proto tcp' "
+                "'set firewall rule limited port 80' "
+                "'set firewall rule limited action accept' "
+                "'set firewall rule limited destination 10.2.0.2/32' "
+                "'set firewall rule limited limit 2' "
+                "'set firewall rule limited burst 2' "
+                "commit exit "
+                "| sentinel configure\""
+            )
+            fw.wait_for_unit("velstra.service")
+            fw.succeed("grep -q 'limit = 2' /run/sentinel/velstra.toml")
+            # Connections back to back, timed. A blocked attempt costs its connect
+            # timeout, so the run takes seconds and the bucket legitimately refills
+            # while it does — asserting a fixed count would be asserting how long
+            # curl takes. What must hold is the bucket's own bound: never more than
+            # the burst plus the refill for the time actually elapsed.
+            attempts = 30
+            res = client.succeed(
+                "s=$(date +%%s); n=0; for i in $(seq 1 %d); do "
+                "curl -s --connect-timeout 0.3 --max-time 1 http://10.2.0.2/ "
+                ">/dev/null 2>&1 && n=$((n+1)); "
+                "done; echo $n $(( $(date +%%s) - s ))" % attempts
+            ).split()
+            ok, secs = int(res[0]), int(res[1])
+            # +1 for the whole-second clock, +1 for the cross-CPU race on the bucket.
+            bound = 2 + 2 * (secs + 1) + 1
+            assert ok <= bound, f"{ok} passed in {secs}s, above the 2/s bound of {bound}"
+            assert ok < attempts, f"the limit did not bite at all: {ok}/{attempts}"
+            assert ok > 0, "the limit blocked everything, including its burst"
+            # The drop is attributed to the limit, not to a rule denying.
+            stats = fw.succeed("sentinel show firewall statistics")
+            assert "dropped_rate_limit" in stats, f"the counter is missing: {stats}"
+
+            # Lifting the limit restores full throughput, which is what proves the
+            # earlier shortfall came from the bucket and not from the network.
+            # Redeclared in full without the limit: `commit` above did not `save`,
+            # so a fresh session starts from the saved config and a bare `delete`
+            # would drop the whole rule rather than just its budget.
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set firewall rule limited from wan' "
+                "'set firewall rule limited proto tcp' "
+                "'set firewall rule limited port 80' "
+                "'set firewall rule limited action accept' "
+                "'set firewall rule limited destination 10.2.0.2/32' "
+                "commit exit "
+                "| sentinel configure\""
+            )
+            fw.wait_for_unit("velstra.service")
+            again = int(client.succeed(
+                "n=0; for i in $(seq 1 10); do "
+                "curl -s --max-time 2 http://10.2.0.2/ >/dev/null 2>&1 && n=$((n+1)); "
+                "done; echo $n"
+            ).strip())
+            assert again == 10, f"unlimited should pass all 10, got {again}"
           '';
         };
 

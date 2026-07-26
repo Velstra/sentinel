@@ -138,6 +138,13 @@ struct PortRule {
     /// together with `src` — the data plane ranks one end per rule.
     #[serde(skip_serializing_if = "Option::is_none")]
     dst: Option<String>,
+    /// New-flow rate limit in packets/s. Omitted when the rule is unlimited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit: Option<u32>,
+    /// Burst capacity in packets. Omitted to let the data plane default it to one
+    /// second's worth of `limit`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    burst: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -339,6 +346,8 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                                     log,
                                     src: src.clone(),
                                     dst: dst.clone(),
+                                    limit: r.limit,
+                                    burst: r.burst,
                                 });
                             }
                         }
@@ -368,6 +377,8 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                     log: false,
                     src: None,
                     dst: None,
+                    limit: None,
+                    burst: None,
                 };
                 // An explicit rule the operator wrote for the same (proto, port)
                 // wins — including a `drop`, which is how you take a VIP out of
@@ -1042,6 +1053,90 @@ action = "accept"
             .find(|r| r.port == 443)
             .unwrap();
         assert!(rule.dst.is_none());
+    }
+
+    /// A rate limit reaches the data plane on the rule it belongs to, and the burst
+    /// stays absent when unset so the agent applies its own default rather than the
+    /// compiler inventing one.
+    #[test]
+    fn a_rate_limit_flows_onto_the_port_rule() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+[[rule]]
+name = "ssh-in"
+from = "wan"
+proto = "tcp"
+port = 22
+action = "accept"
+limit = 5
+"#;
+        let appliance = Appliance::from_toml(toml).unwrap();
+        appliance.clone().validate().expect("valid");
+        let cfg = compile(&appliance);
+        let rule = cfg
+            .policies
+            .iter()
+            .find(|p| p.name == "wan")
+            .unwrap()
+            .port_rules
+            .iter()
+            .find(|r| r.port == 22)
+            .unwrap();
+        assert_eq!(rule.limit, Some(5));
+        assert_eq!(rule.burst, None, "an unset burst is the agent's to default");
+        let out = cfg.to_toml().unwrap();
+        assert!(out.contains("limit = 5"), "{out}");
+        assert!(!out.contains("burst"), "{out}");
+    }
+
+    /// A limit that cannot bite is refused, not ignored — a configured limit that
+    /// silently does nothing is discovered during the flood it was meant to stop.
+    #[test]
+    fn a_limit_needs_an_accept_rule_with_a_port() {
+        let base = |extra: &str| {
+            format!(
+                r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+[[rule]]
+name = "r"
+from = "wan"
+action = "accept"
+{extra}
+"#
+            )
+        };
+        // `from_toml` already validates, so either step may carry the refusal.
+        let refuse = |toml: String| -> String {
+            match Appliance::from_toml(&toml) {
+                Err(e) => e.to_string(),
+                Ok(a) => a
+                    .validate()
+                    .expect_err("this configuration must be refused")
+                    .to_string(),
+            }
+        };
+        // A broad rule has no per-rule budget: it sets the zone's posture.
+        let err = refuse(base("limit = 5"));
+        assert!(err.contains("proto/port"), "{err}");
+
+        // Throttling a rule that already denies throttles nothing.
+        let err = refuse(
+            base("proto = \"tcp\"\nport = 22\nlimit = 5")
+                .replace("action = \"accept\"", "action = \"drop\""),
+        );
+        assert!(err.contains("admits"), "{err}");
+
+        // A burst with nothing to size is a typo, not a configuration.
+        let err = refuse(base("proto = \"tcp\"\nport = 22\nburst = 10"));
+        assert!(err.contains("sizes a `limit`"), "{err}");
     }
 
     /// An explicit rule the operator wrote wins over the automatic opening — that
