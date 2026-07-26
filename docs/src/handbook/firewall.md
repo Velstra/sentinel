@@ -182,7 +182,17 @@ set load-balancer web backend 10.0.0.12
 
 Committing a service **opens the firewall for its port** in that zone (a visible
 `pass` rule an explicit rule of your own overrides), and only one service may
-hold a given `(zone, proto, port)`. See
+hold a given `(zone, proto, port)`. The pool normally lives on an internal zone,
+so a backend's reply arrives on a different zone than the request did; the data
+plane rewrites it back to the VIP either way.
+
+> **The internal zone must permit its own outbound traffic.** A backend's reply
+> is, to the firewall, an ordinary outbound packet from the internal zone. If
+> that zone denies by default and no rule admits the direction, the reply is
+> dropped and the client sees a connection that opens and then stalls. The same
+> applies to a port-forward's internal host.
+
+See
 [Load balancer](../operations/configure.md) for the full surface, and
 `services reverse-proxy` when you need TLS termination or HTTP-aware routing
 instead.
