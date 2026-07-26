@@ -70,6 +70,7 @@
             --set SENTINEL_OPENSSL_BIN    ${pkgs.openssl.bin}/bin/openssl \
             --set SENTINEL_CURL_BIN       ${pkgs.curl.bin}/bin/curl \
             --set SENTINEL_MSMTP_BIN      ${pkgs.msmtp}/bin/msmtp \
+            --set SENTINEL_SURICATA_SHARE ${pkgs.suricata}/etc/suricata \
             --set SENTINEL_SYSTEMD_RUN_BIN ${pkgs.systemd}/bin/systemd-run \
             --set SENTINEL_JOURNALCTL_BIN ${pkgs.systemd}/bin/journalctl \
             --set SENTINEL_WREN_BIN       ${wrenPkg}/bin/wren \
@@ -589,6 +590,40 @@
             serviceConfig = {
               Type = "oneshot";
               ExecStart = "${sentinel}/bin/sentinel alert %i";
+            };
+          };
+
+          # Intrusion detection (roadmap C11): Suricata reading the watched links
+          # through AF_PACKET, against Sentinel's rendered config. It only sees
+          # traffic at all because the data plane ends an allowed packet on
+          # XDP_PASS and lets the kernel route it.
+          #
+          # EVE JSON goes out through syslog, so journald captures alerts:
+          # rotation is handled, `show ids alerts` is a journal query, and remote
+          # syslog forwards them to a SIEM without a second log path. journald's
+          # rate limit is disabled for this unit — an alert storm is exactly when
+          # the records matter, and exactly what the default limit would discard.
+          systemd.services.sentinel-ids = {
+            description = "Intrusion detection (sentinel/suricata)";
+            after = [
+              "network.target"
+              "sentinel-boot.service"
+            ];
+            serviceConfig = {
+              Type = "exec";
+              ExecStart = "${pkgs.suricata}/bin/suricata -c /run/sentinel/suricata.yaml --af-packet --no-random";
+              # Suricata wants a writable log directory even when every output it
+              # is given goes to stdout. systemd owns it, so the config apply
+              # never has to create a root-owned directory.
+              LogsDirectory = "suricata";
+              Restart = "on-failure";
+              RestartSec = "10s";
+              LogRateLimitIntervalSec = 0;
+              # Packet capture needs the capability, not the whole box.
+              AmbientCapabilities = [
+                "CAP_NET_RAW"
+                "CAP_NET_ADMIN"
+              ];
             };
           };
 
@@ -2155,6 +2190,120 @@
               "| sentinel configure\""
           )
           fw.fail("test -e /run/systemd/system/velstra.service.d/50-sentinel-alert.conf")
+        '';
+      };
+
+      # Intrusion detection (roadmap C11): a Sentinel `fw` watches its LAN link
+      # with Suricata while a `neighbour` generates the traffic a rule matches.
+      #
+      # What this has to prove is that the detector sees traffic *at all*: the
+      # data plane runs the firewall in XDP, and had it forwarded packets itself
+      # they would never reach AF_PACKET. So the assertion is an end-to-end one —
+      # real traffic on the wire turns into an alert an operator can read — not
+      # that a config file was rendered.
+      #   nix build .#checks.x86_64-linux.ids -L
+      ids = pkgs.testers.runNixOSTest {
+        name = "sentinel-ids";
+        nodes = {
+          fw =
+            { lib, ... }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce "fw";
+              networking.firewall.enable = lib.mkForce false;
+              # Suricata loads its rule set into memory before it processes a
+              # packet; the default test VM cannot hold it and the detector dies
+              # in a restart loop that looks like a config fault.
+              virtualisation.memorySize = 3072;
+            };
+          neighbour =
+            { lib, ... }:
+            {
+              networking.hostName = lib.mkForce "neighbour";
+              networking.firewall.enable = lib.mkForce false;
+            };
+        };
+        testScript = ''
+          start_all()
+          fw.wait_for_unit("multi-user.target")
+          fw.wait_for_unit("sentinel-boot.service")
+          neighbour.wait_for_unit("multi-user.target")
+
+          # Nothing is watched until an interface is named: the detector must not
+          # run merely because Suricata is in the image.
+          fw.fail("systemctl is-active sentinel-ids.service")
+          assert "is off" in fw.succeed("sentinel show ids"), "an unconfigured detector must say so"
+
+          # An interface with no rules is refused: it looks like a working
+          # detector and detects nothing.
+          # Output to a file rather than into `grep -q`: grep exits on the first
+          # match and the writer takes SIGPIPE, which makes the assertion fail at
+          # random depending on who ran first.
+          fw.succeed(
+              "su admin -c \"printf '%s\\n' "
+              "'set services ids interface eth1' commit exit "
+              "| sentinel configure\" > /tmp/norules.out 2>&1"
+          )
+          fw.succeed("grep -q 'no rules' /tmp/norules.out")
+
+          # The rule goes in through a file rather than a nested quoting cascade:
+          # a Suricata rule contains quotes, spaces and `->`, and what is being
+          # tested is the detector, not the test's own escaping.
+          fw.succeed(
+              """cat > /tmp/ids.cfg <<'CFG'
+          set services ids interface eth1
+          set services ids rule alert icmp any any -> any any (msg:"velstra ids echo request"; itype:8; sid:1000001; rev:1;)
+          set services ids ruleset /var/lib/sentinel/absent.rules
+          commit
+          save
+          exit
+          CFG"""
+          )
+          fw.succeed("sed -i 's/^          //' /tmp/ids.cfg")
+          fw.succeed("su admin -c 'sentinel configure < /tmp/ids.cfg'")
+          fw.succeed("test -e /run/sentinel/suricata.yaml")
+          fw.wait_for_unit("sentinel-ids.service")
+
+          conf = fw.succeed("cat /run/sentinel/suricata.yaml")
+          assert "- interface: eth1" in conf, conf
+          assert "filetype: syslog" in conf, conf
+          # The named-but-absent ruleset is skipped so the detector still starts
+          # with the rules that do exist — and `show ids` is where that stops
+          # being silent.
+          assert "/var/lib/sentinel/absent.rules" not in conf, conf
+          status = fw.succeed("sentinel show ids")
+          assert "MISSING" in status, status
+          assert "eth1" in status, status
+          assert "10.0.0.0/8" in status, "the default HOME_NET must be visible: " + status
+
+          # The headline: traffic on the wire becomes a readable alert. Suricata
+          # attaches to the link some seconds after the unit goes active, so the
+          # traffic is repeated until it lands rather than sent once and hoped for.
+          def alerted(_last: bool) -> bool:
+              neighbour.succeed("ping -4 -c 2 -W 1 fw >/dev/null || true")
+              return "velstra ids echo request" in fw.succeed("sentinel show ids alerts")
+
+          retry(alerted, timeout=180)
+
+          # The alert carries who talked to whom — an alert without endpoints
+          # sends the operator looking, which is most of the delay it removes.
+          # Asserted as "two addresses on the segment" rather than as literals:
+          # which node gets .1 depends on Nix ordering the node attrset.
+          alerts = fw.succeed("sentinel show ids alerts 5")
+          assert "ICMP" in alerts, alerts
+          assert "sev " in alerts, alerts
+          assert alerts.count("192.168.1.") >= 2, "both endpoints must appear: " + alerts
+
+          # Removing the configuration stops the detector rather than leaving it
+          # running against a config file that is no longer the intent.
+          fw.succeed(
+              "su admin -c \"printf '%s\\n' "
+              "'delete services ids' "
+              "commit save exit "
+              "| sentinel configure\""
+          )
+          fw.wait_until_fails("systemctl is-active sentinel-ids.service", timeout=60)
+          fw.fail("test -e /run/sentinel/suricata.yaml")
         '';
       };
 

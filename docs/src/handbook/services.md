@@ -194,3 +194,72 @@ Worth knowing:
   What went wrong goes to the journal, which syslog forwarding then ships.
 - `delete services alerts` removes the drop-ins again, so no handler is left
   pointing at an endpoint you no longer configured.
+
+## Intrusion detection
+
+Watch a link and raise an alert when traffic matches a rule (roadmap C11).
+
+```
+set services ids interface eth1
+set services ids rule alert icmp any any -> $HOME_NET any (msg:"echo request from outside"; itype:8; sid:1000001; rev:1;)
+```
+
+The detector is **Suricata**, reading the named interfaces through AF_PACKET. It
+sees traffic because the eBPF data plane ends an allowed packet on `XDP_PASS` and
+lets the kernel route it — so the detector observes exactly what the firewall
+admitted, which is the interesting half.
+
+| Field | Meaning |
+|---|---|
+| `interface` | A link to watch. Repeatable. Nothing runs until one is set. |
+| `home-net` | An address range that counts as inside. Default: the RFC 1918 blocks plus CGNAT space. |
+| `rule` | One Suricata rule, written as the rest of the line. Repeatable. |
+| `ruleset` | Absolute path to a rule file on the box. Repeatable. |
+
+Rules written here are the rest of the command line, so no quoting is needed:
+
+```
+set services ids rule alert http any any -> any any (msg:"admin panel"; http.uri; content:"/admin"; sid:1000002; rev:1;)
+```
+
+A rule is **replaced by its sid**, so re-issuing one with the same `sid:` edits it
+rather than adding a second — two rules sharing a sid stop Suricata loading
+either. Delete by sid: `delete services ids rule 1000002`.
+
+For a published ruleset (Emerging Threats, say), put the file on the box and name
+it with `ruleset`; the configuration keeps the path, not megabytes of rules that
+would immediately go stale.
+
+### It detects, it does not block
+
+Suricata can drop, but only in an IPS mode that needs NFQUEUE or an inline
+AF_PACKET pair — either would put a second verdict stage behind the eBPF
+firewall, and a packet could then vanish for a reason `show firewall` cannot
+explain. Blocking stays with the data plane that owns the policy. A rule written
+with `drop` or `reject` is **refused at commit** rather than accepted and quietly
+ignored: use `alert`, and write a firewall rule for the block.
+
+### Reading alerts
+
+```
+show ids                  # what is watched, and whether the detector runs
+show ids alerts           # the 20 most recent
+show ids alerts 100
+```
+
+Alerts go into the **journal**, so they rotate like everything else and reach a
+SIEM through `services syslog` with no extra configuration.
+
+Worth knowing:
+
+- **An interface with no rules is refused at commit.** It would look exactly like
+  a working detector from the outside and detect nothing.
+- **A rule that Suricata would reject is refused too** — a missing `sid:`, a short
+  header, an unknown action. Suricata refuses to start on a bad rule, so one typo
+  would take down the whole ruleset rather than one line.
+- **A `ruleset` path that does not exist is skipped with a warning**, and
+  `show ids` marks it `MISSING`. Partial coverage from the rules that do load beats
+  a detector that will not start.
+- **`sentinel-ids.service` is alerted on** (see above), because a dead detector is
+  the textbook silent failure: nothing looks wrong, and the absence of alerts reads
+  as good news.

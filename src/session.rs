@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail};
 use crate::config::{
     Acme, Action, AlertMail, Alerts, Appliance, Bfd, Bgp, BgpAggregate, BgpNeighbor, BgpRoa,
     BgpRtr, Ca, Certificate, ConfigSync, ConntrackSync, Dhcp6Pool, DhcpRelay, DhcpServer,
-    DhcpStaticLease, Dns, Dyndns, Export, Filter, FilterRule, Firewall, Groups, HealthCheck,
+    DhcpStaticLease, Dns, Dyndns, Export, Filter, FilterRule, Firewall, Groups, HealthCheck, Ids,
     IfaceType, Interface, IpsecConnection, Isis, Lldp, LoadBalancer, Login, Mdns, MultiWan,
     Multicast, MulticastInterface, Nat, Nat64, NatDestination, NatNpt66, NatSource, Ntp,
     OpenConnectServer, OpenConnectUser, Ospf, Ospf3, OspfInterface, Pki, Policy, PortSpec, Pppoe,
@@ -1176,6 +1176,9 @@ struct Draft {
     syslog: Vec<(String, SyslogTargetDraft)>,
     /// Alert notification targets (roadmap C23).
     alerts: AlertsDraft,
+    /// Intrusion detection (roadmap C11). Every field is a list with a working
+    /// default, so the config type doubles as its own draft.
+    ids: Ids,
     dhcp_relay: DhcpRelayDraft,
     /// Multi-WAN (roadmap C6): failover/load-balance mode + the uplinks, keyed by
     /// interface in configuration order.
@@ -2149,6 +2152,7 @@ impl Draft {
                 webhook: a.services.alerts.webhook.clone(),
                 mail: a.services.alerts.mail.clone(),
             },
+            ids: a.services.ids.clone(),
             dhcp_relay: DhcpRelayDraft {
                 interface: a.services.dhcp_relay.interface.clone(),
                 server: a.services.dhcp_relay.server.clone(),
@@ -3385,6 +3389,41 @@ impl Session {
             ["services", "syslog", "target", host, "level", v] => {
                 crate::config::validate_host(host)?;
                 self.draft.syslog_target_mut(host).level = Some(parse_syslog_level(v)?);
+            }
+
+            // services ids: intrusion detection (C11). Every field is a list that
+            // appends, deduped — an operator adds a second watched interface or a
+            // second ruleset without restating the first.
+            ["services", "ids", "interface", v] => {
+                push_unique(&mut self.draft.ids.interfaces, v);
+            }
+            ["services", "ids", "home-net", v] => {
+                push_unique(&mut self.draft.ids.home_net, v);
+            }
+            ["services", "ids", "ruleset", v] => {
+                push_unique(&mut self.draft.ids.rulesets, v);
+            }
+            // A rule is one quoted Suricata rule. It is checked here rather than
+            // only at commit so the operator sees the mistake next to what they
+            // typed, and replaced by sid rather than appended: re-issuing a rule is
+            // how you edit one, and two rules sharing a sid stop the whole load.
+            ["services", "ids", "rule", rest @ ..] if !rest.is_empty() => {
+                // A Suricata rule always contains spaces, and the CLI splits on
+                // whitespace, so the rule is the rest of the line — the same shape
+                // `description` uses. Runs of spaces collapse to one; the only
+                // place that is observable is inside a `content:"…"` match, where
+                // the hex form (`|20 20|`) or a ruleset file is the answer.
+                let rule = rest.join(" ");
+                let sid = crate::config::validate_ids_rule(&rule)?;
+                let v = &rule;
+                let rules = &mut self.draft.ids.rules;
+                match rules
+                    .iter()
+                    .position(|r| crate::config::validate_ids_rule(r).ok() == Some(sid))
+                {
+                    Some(i) => rules[i] = (*v).to_string(),
+                    None => rules.push((*v).to_string()),
+                }
             }
 
             // services alerts: notify on a failed unit (C23). Webhooks append
@@ -5141,6 +5180,42 @@ impl Session {
                     other => bail!("services syslog target has no field {other:?}"),
                 }
             }
+            // services ids: all of it, one list, or one entry by value. A rule is
+            // deleted by its sid as well as by its full text — nobody retypes a
+            // Suricata rule verbatim to remove it.
+            ["services", "ids"] => self.draft.ids = Ids::default(),
+            ["services", "ids", "interface"] => self.draft.ids.interfaces.clear(),
+            ["services", "ids", "home-net"] => self.draft.ids.home_net.clear(),
+            ["services", "ids", "rule"] => self.draft.ids.rules.clear(),
+            ["services", "ids", "ruleset"] => self.draft.ids.rulesets.clear(),
+            ["services", "ids", "interface", v] => {
+                remove_value(&mut self.draft.ids.interfaces, v, "a watched interface")?
+            }
+            ["services", "ids", "home-net", v] => {
+                remove_value(&mut self.draft.ids.home_net, v, "a home-net member")?
+            }
+            ["services", "ids", "ruleset", v] => {
+                remove_value(&mut self.draft.ids.rulesets, v, "a configured ruleset")?
+            }
+            ["services", "ids", "rule", rest @ ..] if !rest.is_empty() => {
+                let joined = rest.join(" ");
+                let v = &joined;
+                let by_sid = v
+                    .parse::<u32>()
+                    .ok()
+                    .or_else(|| crate::config::validate_ids_rule(v).ok());
+                let rules = &mut self.draft.ids.rules;
+                let before = rules.len();
+                match by_sid {
+                    Some(sid) => {
+                        rules.retain(|r| crate::config::validate_ids_rule(r).ok() != Some(sid))
+                    }
+                    None => rules.retain(|r| r != v),
+                }
+                if rules.len() == before {
+                    bail!("{v:?} is not a configured rule or rule sid");
+                }
+            }
             // services alerts: all of it, one webhook by value, or a mail field.
             ["services", "alerts"] => self.draft.alerts = AlertsDraft::default(),
             ["services", "alerts", "webhook"] => self.draft.alerts.webhook.clear(),
@@ -6686,6 +6761,7 @@ impl Session {
                     allow: self.draft.snmp.allow.clone(),
                 },
                 ssh: self.draft.ssh.clone(),
+                ids: self.draft.ids.clone(),
                 alerts: Alerts {
                     webhook: self.draft.alerts.webhook.clone(),
                     mail: self.draft.alerts.mail.clone(),
@@ -7798,6 +7874,7 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
     let rproxy_set = !rproxy.is_empty();
     let syslog_set = !draft.syslog.is_empty();
     let alerts_set = !draft.alerts.webhook.is_empty() || !draft.alerts.mail.is_empty();
+    let ids_set = !draft.ids.is_empty();
     let any_service = dns_set
         || ntp_set
         || lldp_set
@@ -7808,7 +7885,8 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         || relay_set
         || rproxy_set
         || syslog_set
-        || alerts_set;
+        || alerts_set
+        || ids_set;
     if want("services") && any_service {
         out.push_str("services {\n");
         if dns_set {
@@ -7915,6 +7993,26 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             }
             if let Some(i) = &dyndns.interface {
                 out.push_str(&format!("        interface {i}\n"));
+            }
+            out.push_str("    }\n");
+        }
+        if ids_set {
+            let ids = &draft.ids;
+            out.push_str("    ids {\n");
+            for i in &ids.interfaces {
+                out.push_str(&format!("        interface {i}\n"));
+            }
+            // The default HOME_NET is shown as the members it stands for, not as
+            // silence: which addresses count as "inside" decides what nearly every
+            // rule matches, and an operator should not have to know the default.
+            for n in ids.home_net() {
+                out.push_str(&format!("        home-net {n}\n"));
+            }
+            for r in &ids.rules {
+                out.push_str(&format!("        rule {r}\n"));
+            }
+            for r in &ids.rulesets {
+                out.push_str(&format!("        ruleset {r}\n"));
             }
             out.push_str("    }\n");
         }
@@ -8244,6 +8342,18 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         out.push_str("(empty configuration)\n");
     }
     out
+}
+
+/// Remove `v` from `list`, reporting what it was supposed to be when it is not
+/// there. Deleting something that was never set is a typo far more often than it
+/// is a no-op, and a silent success hides it until the next commit does nothing.
+fn remove_value(list: &mut Vec<String>, v: &str, what: &str) -> Result<()> {
+    let before = list.len();
+    list.retain(|e| e != v);
+    if list.len() == before {
+        bail!("{v:?} is not {what}");
+    }
+    Ok(())
 }
 
 /// Append `v` to `list` unless it's already present (idempotent `set … block`).
@@ -8789,6 +8899,82 @@ backends = ["10.0.0.11:8443"]
             rebuilt.load_balancers, appliance.load_balancers,
             "the load balancer must survive a commit that never mentioned it"
         );
+    }
+
+    /// `set services ids …` end to end (roadmap C11), including the refusals that
+    /// keep a detector from looking like it is watching when it is not.
+    #[test]
+    fn ids_grammar_sets_shows_commits_and_refuses_silent_configurations() {
+        const PING: &str =
+            r#"alert icmp any any -> any any (msg:"ping seen"; itype:8; sid:1000001; rev:1;)"#;
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname fw1",
+            "set interface lan0 zone lan",
+            "set services ids interface lan0",
+            &format!("set services ids rule {PING}"),
+        ] {
+            run(&mut s, line).unwrap_or_else(|e| panic!("{line}: {e:#}"));
+        }
+        let a = s.commit().expect("ids commit");
+        assert_eq!(a.services.ids.interfaces, ["lan0"]);
+        assert_eq!(a.services.ids.rules.len(), 1);
+        // Unset home-net is not "no home-net": nearly every rule is written
+        // external → home, so it has to stand for the private ranges.
+        assert!(
+            a.services
+                .ids
+                .home_net()
+                .contains(&"10.0.0.0/8".to_string())
+        );
+
+        let shown = render_draft_only(&s.draft, true, Some("services"));
+        assert!(shown.contains("    ids {"), "got:\n{shown}");
+        assert!(shown.contains("        interface lan0"), "got:\n{shown}");
+        // The default HOME_NET is shown, not left to be guessed.
+        assert!(
+            shown.contains("        home-net 10.0.0.0/8"),
+            "got:\n{shown}"
+        );
+
+        // Re-issuing a rule with the same sid replaces it — that is how a rule is
+        // edited. Two rules sharing a sid would stop Suricata loading either.
+        let tightened = r#"alert icmp any any -> $HOME_NET any (msg:"ping seen"; itype:8; sid:1000001; rev:2;)"#;
+        run(&mut s, &format!("set services ids rule {tightened}")).unwrap();
+        let a = s.commit().unwrap();
+        assert_eq!(a.services.ids.rules.len(), 1, "the sid must be replaced");
+        assert!(a.services.ids.rules[0].contains("rev:2"));
+
+        // A rule is deleted by sid; nobody retypes a Suricata rule to remove one.
+        run(&mut s, "delete services ids rule 1000001").unwrap();
+        assert!(run(&mut s, "delete services ids rule 1000001").is_err());
+
+        // And with the last rule gone, the commit is refused: watching an
+        // interface with no rules detects nothing, while looking exactly like a
+        // working detector from the outside.
+        let err = s.commit().unwrap_err();
+        assert!(format!("{err:#}").contains("no rules"), "got: {err:#}");
+
+        // A verdict action is inert here: Suricata only enforces it in an IPS mode
+        // Sentinel does not run, so accepting it would promise a block that never
+        // happens.
+        let drop_rule =
+            r#"drop icmp any any -> any any (msg:"nope"; itype:8; sid:1000002; rev:1;)"#;
+        let err = run(&mut s, &format!("set services ids rule {drop_rule}")).unwrap_err();
+        assert!(format!("{err:#}").contains("IPS mode"), "got: {err:#}");
+
+        // The mistakes that stop the whole ruleset loading, not just one rule.
+        for bad in [
+            r#"alert icmp any any -> any any (msg:"no sid"; itype:8;)"#,
+            r#"alert icmp any any -> any any (itype:8; sid:5;)"#,
+            r#"alert icmp any any (msg:"short header"; sid:6;)"#,
+            r#"notanaction icmp any any -> any any (msg:"x"; sid:7;)"#,
+        ] {
+            assert!(
+                run(&mut s, &format!("set services ids rule {bad}")).is_err(),
+                "must refuse: {bad}"
+            );
+        }
     }
 
     /// `set services alerts …` end to end, including the refusals that keep a
