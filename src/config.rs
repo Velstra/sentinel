@@ -3949,11 +3949,32 @@ pub struct Rule {
     pub source: Option<String>,
     /// Reference an address group (`[firewall.group.address]`) as the source
     /// constraint instead of an inline `source` — mutually exclusive with it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "source-group",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub source_group: Option<String>,
+    /// Optional destination-address constraint — an IPv4 CIDR or a bare host, same
+    /// forms as `source`. Absent means "to any destination", and a more specific
+    /// constraint wins over a less specific one whichever end it names.
+    ///
+    /// Mutually exclusive with `source`/`source-group`: the data plane ranks each
+    /// end in its own longest-prefix table and one rule cannot sit in both, so a
+    /// rule naming both ends is refused rather than half-enforced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+    /// Reference an address group as the destination constraint instead of an
+    /// inline `destination` — mutually exclusive with it.
+    #[serde(
+        default,
+        alias = "destination-group",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub destination_group: Option<String>,
     /// Reference a port group (`[firewall.group.port]`) instead of an inline
     /// `port`/range — mutually exclusive with it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "port-group", skip_serializing_if = "Option::is_none")]
     pub port_group: Option<String>,
     /// Time-based activation (roadmap C15): the rule is only in force during this
     /// weekly schedule (local time). Enforced at compile time — the compiler emits
@@ -4086,6 +4107,22 @@ impl Rule {
                 .unwrap_or_default()
         } else if let Some(s) = &self.source {
             vec![Some(s.clone())]
+        } else {
+            vec![None]
+        }
+    }
+
+    /// The destination constraints this rule matches, expanding a
+    /// `destination_group`. `None` means "to any"; mirrors [`Self::resolved_sources`].
+    pub fn resolved_destinations(&self, groups: &Groups) -> Vec<Option<String>> {
+        if let Some(g) = &self.destination_group {
+            groups
+                .address
+                .get(g)
+                .map(|m| m.iter().cloned().map(Some).collect())
+                .unwrap_or_default()
+        } else if let Some(d) = &self.destination {
+            vec![Some(d.clone())]
         } else {
             vec![None]
         }
@@ -4901,6 +4938,24 @@ impl Appliance {
                     rule.name
                 );
             }
+            if rule.destination.is_some() && rule.destination_group.is_some() {
+                bail!(
+                    "rule {:?}: set `destination` or `destination-group`, not both",
+                    rule.name
+                );
+            }
+            // One rule, one end. The data plane ranks each end in its own
+            // longest-prefix table, so a rule constraining both would have to sit in
+            // two of them — and whichever one matched would enforce only half of
+            // what the rule says. Two rules express it exactly.
+            if (rule.source.is_some() || rule.source_group.is_some())
+                && (rule.destination.is_some() || rule.destination_group.is_some())
+            {
+                bail!(
+                    "rule {:?}: a rule constrains a source or a destination, not both —                      split it into two rules",
+                    rule.name
+                );
+            }
             let has_port = rule.port.is_some() || rule.port_group.is_some();
             if rule.proto.is_some() != has_port {
                 bail!(
@@ -4916,6 +4971,10 @@ impl Appliance {
             // An inline source constraint must be an IPv4 host or CIDR.
             if let Some(src) = &rule.source {
                 validate_cidr_or_ip(src).with_context(|| format!("rule {:?} source", rule.name))?;
+            }
+            if let Some(dst) = &rule.destination {
+                validate_cidr_or_ip(dst)
+                    .with_context(|| format!("rule {:?} destination", rule.name))?;
             }
             // A broad rule (no proto/port) only *opens* a zone with `accept`; the
             // data plane derives a zone's deny posture from its default-action, so
@@ -4934,6 +4993,14 @@ impl Appliance {
                 if !self.firewall.group.address.contains_key(g) {
                     bail!(
                         "rule {:?}: source-group {g:?} is not a declared address group",
+                        rule.name
+                    );
+                }
+            }
+            if let Some(g) = &rule.destination_group {
+                if !self.firewall.group.address.contains_key(g) {
+                    bail!(
+                        "rule {:?}: destination-group {g:?} is not a declared address group",
                         rule.name
                     );
                 }

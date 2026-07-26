@@ -41,7 +41,8 @@ sets a zone-pair posture.
 | `proto` | `tcp` / `udp`. |
 | `port` | Destination port or range (`443`, `8000-8100`). |
 | `source` | Source address/CIDR (default: any). |
-| `source-group` / `port-group` | Match an [alias](#groups-aliases) instead. |
+| `destination` | Destination address/CIDR (default: any). |
+| `source-group` / `destination-group` / `port-group` | Match an [alias](#groups-aliases) instead. |
 | `log` | Log packets matching this rule (`true`/`false`). |
 | `schedule` | A time-based activation window (see below). |
 | `description` / `disabled` | Label / administratively disable. |
@@ -53,7 +54,25 @@ set firewall rule https-in to lan
 set firewall rule https-in proto tcp
 set firewall rule https-in port 443
 set firewall rule https-in action accept
+
+# Let the LAN out, except to one network:
+set firewall rule no-lab from lan
+set firewall rule no-lab proto tcp
+set firewall rule no-lab port 443
+set firewall rule no-lab action drop
+set firewall rule no-lab destination 192.168.4.0/24
 ```
+
+A rule constrains **one end**: a `source` (or `source-group`) or a
+`destination` (or `destination-group`), never both. The data plane ranks each
+end in its own longest-prefix table, and a rule can only sit in one of them, so
+one naming both ends would enforce half of what it says. A commit refuses it and
+tells you to split it in two.
+
+Across both ends, **the more specific rule wins** — a `/24` destination beats a
+`/8` source on the same port. Where two matching rules are equally specific the
+denying one wins, so the outcome never depends on which table was consulted
+first.
 
 ### Time-based rules
 

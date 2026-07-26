@@ -212,6 +212,8 @@ struct RuleDraft {
     log: Option<bool>,
     source: Option<String>,
     source_group: Option<String>,
+    destination: Option<String>,
+    destination_group: Option<String>,
     port_group: Option<String>,
     schedule: Option<Schedule>,
 }
@@ -1832,6 +1834,8 @@ impl Draft {
                             log: Some(r.log),
                             source: r.source.clone(),
                             source_group: r.source_group.clone(),
+                            destination: r.destination.clone(),
+                            destination_group: r.destination_group.clone(),
                             port_group: r.port_group.clone(),
                             schedule: r.schedule.clone(),
                         },
@@ -2990,6 +2994,12 @@ impl Session {
             }
             ["firewall", "rule", name, "source-group", v] => {
                 self.draft.rule_mut(name).source_group = Some((*v).to_string())
+            }
+            ["firewall", "rule", name, "destination", v] => {
+                self.draft.rule_mut(name).destination = Some((*v).to_string())
+            }
+            ["firewall", "rule", name, "destination-group", v] => {
+                self.draft.rule_mut(name).destination_group = Some((*v).to_string())
             }
             ["firewall", "rule", name, "port-group", v] => {
                 self.draft.rule_mut(name).port_group = Some((*v).to_string())
@@ -4793,6 +4803,8 @@ impl Session {
                     "log" => r.log = None,
                     "source" => r.source = None,
                     "source-group" => r.source_group = None,
+                    "destination" => r.destination = None,
+                    "destination-group" => r.destination_group = None,
                     "port-group" => r.port_group = None,
                     "schedule" => r.schedule = None,
                     other => bail!("rule has no field {other:?}"),
@@ -6079,6 +6091,8 @@ impl Session {
                     log: d.log.unwrap_or(false),
                     source: d.source.clone(),
                     source_group: d.source_group.clone(),
+                    destination: d.destination.clone(),
+                    destination_group: d.destination_group.clone(),
                     port_group: d.port_group.clone(),
                     schedule: d.schedule.clone(),
                 })
@@ -7183,6 +7197,12 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         if let Some(g) = &r.source_group {
             fwi.push_str(&format!("        source-group {g}\n"));
+        }
+        if let Some(d) = &r.destination {
+            fwi.push_str(&format!("        destination {d}\n"));
+        }
+        if let Some(g) = &r.destination_group {
+            fwi.push_str(&format!("        destination-group {g}\n"));
         }
         if let Some(g) = &r.port_group {
             fwi.push_str(&format!("        port-group {g}\n"));

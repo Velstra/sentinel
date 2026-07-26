@@ -2204,6 +2204,14 @@ const RULE_FIELDS: &[Cand] = &[
         "match an address-group (alias) as the source",
     ),
     (
+        "destination",
+        "destination address/CIDR (e.g. 192.168.4.0/24); default any",
+    ),
+    (
+        "destination-group",
+        "match an address-group (alias) as the destination",
+    ),
+    (
         "port-group",
         "match a port-group (alias) instead of a single port",
     ),
@@ -2795,6 +2803,11 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
             .iter()
             .map(|n| (n.clone(), "address-group".to_string()))
             .collect(),
+        ["set", "firewall", "rule", _, "destination-group"] => names
+            .address_groups
+            .iter()
+            .map(|n| (n.clone(), "address-group".to_string()))
+            .collect(),
         ["set", "firewall", "rule", _, "port-group"] => names
             .port_groups
             .iter()
@@ -2990,6 +3003,9 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
         ["set", "firewall", "global", "block"] => own_cands(&[PH_IPV4_CIDR, PH_IPV6_CIDR]),
         ["set", "firewall", "zone", _name, "block"] => own_cands(&[PH_IPV4_CIDR, PH_IPV6_CIDR]),
         ["set", "firewall", "rule", _name, "source"] => own_cands(&[PH_IPV4_CIDR, PH_IPV6_CIDR]),
+        ["set", "firewall", "rule", _name, "destination"] => {
+            own_cands(&[PH_IPV4_CIDR, PH_IPV6_CIDR])
+        }
         ["set", "firewall", "rule", _name, "port"] => own_cands(&[PH_PORT_RANGE]),
         ["set", "services", "alerts", "webhook"] => own_cands(&[PH_URL]),
         ["set", "services", "alerts", "mail", "port"] => own_cands(&[PH_PORT]),
@@ -3612,6 +3628,8 @@ mod tests {
                 "log",
                 "source",
                 "source-group",
+                "destination",
+                "destination-group",
                 "port-group",
                 "schedule"
             ]

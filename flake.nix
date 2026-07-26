@@ -179,7 +179,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-yBS0YCB2sY3MIjI6zRHVVUMCcNzAM8XvIN1uGmp/1nc=";
+      ebpfHash = "sha256-xTm7DpmRiQWI3anvXI2wJYr1q74y964p+y8uggaBXdU=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -3075,6 +3075,54 @@
             top = fw.succeed("sentinel show top-talkers")
             assert "connections" in top, f"top-talkers must name its unit: {top}"
             assert "10.1.0.2" in top, f"the client is not ranked: {top}"
+
+            # Destination-constrained rules: until now only the source end could be
+            # matched, so "let this in, but only toward that network" was
+            # inexpressible. Proven by flipping the destination and nothing else —
+            # the same client, port and action — so a pass caused by some other rule
+            # would show up as the second curl succeeding too.
+            def dst_rule(cidr):
+                fw.succeed(
+                    "su admin -c \"printf '%s\\n' "
+                    "'set firewall rule dst-test from wan' "
+                    "'set firewall rule dst-test proto tcp' "
+                    "'set firewall rule dst-test port 80' "
+                    "'set firewall rule dst-test action accept' "
+                    f"'set firewall rule dst-test destination {cidr}' "
+                    "commit exit "
+                    "| sentinel configure\""
+                )
+                fw.wait_for_unit("velstra.service")
+
+            # Matching the server's own /32 admits the flow through a wan zone that
+            # denies by default (no port-forward involved: this is the server's real
+            # address and port, routed through the box).
+            dst_rule("10.2.0.2/32")
+            fw.succeed("grep -q 'dst = \"10.2.0.2/32\"' /run/sentinel/velstra.toml")
+            client.wait_until_succeeds(
+                "curl -s --max-time 5 http://10.2.0.2/ | grep -q hello-from-server",
+                timeout=40,
+            )
+            # Point the same rule at a different /32 and the flow is denied again.
+            dst_rule("10.2.0.99/32")
+            client.fail("curl -s --max-time 5 http://10.2.0.2/ | grep -q hello-from-server")
+            # A rule naming both ends is refused at commit rather than enforcing one
+            # of them — the data plane ranks a single end per rule. Declared in full
+            # in one session: `commit` above did not `save`, so a fresh session
+            # starts from the saved config and would otherwise build an incomplete
+            # rule and fail on that instead.
+            both = fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set firewall rule two-ends from wan' "
+                "'set firewall rule two-ends proto tcp' "
+                "'set firewall rule two-ends port 80' "
+                "'set firewall rule two-ends action accept' "
+                "'set firewall rule two-ends source 10.1.0.2/32' "
+                "'set firewall rule two-ends destination 10.2.0.2/32' "
+                "commit exit "
+                "| sentinel configure\" 2>&1 || true"
+            )
+            assert "not both" in both, f"a two-ended rule was accepted: {both}"
           '';
         };
 
