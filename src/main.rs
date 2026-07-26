@@ -17,6 +17,7 @@ mod config;
 mod confirm;
 mod diff;
 mod domain;
+mod ids;
 mod install;
 mod ipsec;
 mod net;
@@ -860,6 +861,14 @@ fn show_op(args: &[String]) -> Result<()> {
         ),
         ["nat"] => show_nat(),
         ["nat", "cgnat", addr] => show_cgnat(addr),
+
+        // Intrusion detection (roadmap C11): what is watched, and what fired.
+        ["ids"] | ["ids", "status"] => show_ids(),
+        ["ids", "alerts"] => show_ids_alerts(DEFAULT_IDS_ALERTS),
+        ["ids", "alerts", n] => show_ids_alerts(
+            n.parse()
+                .with_context(|| format!("{n:?} is not a number of alerts"))?,
+        ),
         ["load-balancer"] => show_load_balancer(),
 
         // IPsec VPN (roadmap C2): the security-association / connection state,
@@ -1165,6 +1174,69 @@ fn show_cgnat(addr: &str) -> Result<()> {
     addr.parse::<std::net::Ipv4Addr>()
         .with_context(|| format!("{addr:?} is not an IPv4 address"))?;
     show_agent_query(&format!("cgnat {addr}"), "cgnat port blocks")
+}
+
+/// How many alerts `show ids alerts` lists when the operator names no count.
+const DEFAULT_IDS_ALERTS: usize = 20;
+
+/// What the detector is watching, and whether it is actually doing so (roadmap
+/// C11).
+///
+/// A ruleset file the operator named but that is not on the box is called out
+/// here: the render skips it so the detector still starts with the rules that do
+/// exist, and this is where that gap stops being silent.
+fn show_ids() -> Result<()> {
+    let path = std::path::Path::new(DEFAULT_CONFIG);
+    if !path.exists() {
+        println!("no saved config at {DEFAULT_CONFIG} (run `configure` + `save`)");
+        return Ok(());
+    }
+    let ids = Appliance::load(path)?.services.ids;
+    if ids.is_empty() {
+        println!("intrusion detection is off (no `services ids interface` is set)");
+        return Ok(());
+    }
+    let running = system::unit_active(ids::SURICATA_UNIT);
+    println!(
+        "detector: {}",
+        if running { "running" } else { "NOT running" }
+    );
+    println!("watching: {}", ids.interfaces.join(", "));
+    println!("home-net: {}", ids.home_net().join(", "));
+    println!("rules from the configuration: {}", ids.rules.len());
+    for path in &ids.rulesets {
+        if std::path::Path::new(path).exists() {
+            println!("ruleset: {path}");
+        } else {
+            println!("ruleset: {path}  — MISSING, its rules are not loaded");
+        }
+    }
+    if !running {
+        println!("(`systemctl status {}` says why)", ids::SURICATA_UNIT);
+    }
+    Ok(())
+}
+
+/// The most recent alerts, oldest first so the newest is next to the prompt.
+fn show_ids_alerts(limit: usize) -> Result<()> {
+    let alerts = ids::recent_alerts(limit)?;
+    if alerts.is_empty() {
+        println!("no alerts recorded");
+        // An empty list means "nothing fired" only if something could have. The
+        // difference matters: a quiet detector and an absent one look identical
+        // here, and only one of them is good news.
+        if !system::unit_active(ids::SURICATA_UNIT) {
+            println!("(the detector is not running — see `show ids`)");
+        }
+        return Ok(());
+    }
+    for a in &alerts {
+        println!(
+            "{} [sev {}] {} — {} {} -> {}",
+            a.timestamp, a.severity, a.signature, a.proto, a.src, a.dst
+        );
+    }
+    Ok(())
 }
 
 fn show_load_balancer() -> Result<()> {

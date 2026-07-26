@@ -569,6 +569,9 @@ pub struct Services {
     /// Alert notifications (`[services.alerts]`, roadmap C23).
     #[serde(default, skip_serializing_if = "Alerts::is_empty")]
     pub alerts: Alerts,
+    /// Intrusion detection (`[services.ids]`, roadmap C11).
+    #[serde(default, skip_serializing_if = "Ids::is_empty")]
+    pub ids: Ids,
 }
 
 impl Services {
@@ -585,6 +588,7 @@ impl Services {
             && self.reverse_proxy.is_empty()
             && self.syslog.is_empty()
             && self.alerts.is_empty()
+            && self.ids.is_empty()
     }
 }
 
@@ -757,6 +761,64 @@ impl SyslogLevel {
             SyslogLevel::Notice => "notice",
             SyslogLevel::Info => "info",
             SyslogLevel::Debug => "debug",
+        }
+    }
+}
+
+/// The address ranges `HOME_NET` covers when the operator names none: the three
+/// RFC 1918 blocks plus RFC 6598 CGNAT space. Nearly every published rule is
+/// written as "external → home", so an empty `HOME_NET` silently matches nothing
+/// and the whole ruleset goes quiet — the one failure mode an IDS must not have.
+pub const DEFAULT_IDS_HOME_NET: &[&str] = &[
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "100.64.0.0/10",
+];
+
+/// Intrusion detection (`[services.ids]`, roadmap C11).
+///
+/// Suricata watching named interfaces through AF_PACKET. It works here because
+/// the data plane ends an allowed packet on `XDP_PASS` and lets the kernel route
+/// it, so the packet still traverses the stack where AF_PACKET can see it.
+///
+/// **Detection only — it does not drop.** Suricata's IPS modes need either
+/// NFQUEUE or an inline AF_PACKET pair, and both would put a second, competing
+/// verdict stage behind the eBPF firewall: a packet could then vanish for a reason
+/// `show firewall` cannot explain. Blocking belongs to the data plane that already
+/// owns the policy, so an alert here is evidence, not an action.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Ids {
+    /// Interfaces to watch. Empty ⇒ intrusion detection is off.
+    #[serde(default, rename = "interface", skip_serializing_if = "Vec::is_empty")]
+    pub interfaces: Vec<String>,
+    /// What counts as "inside" for rules written against `$HOME_NET`. Unset ⇒
+    /// [`DEFAULT_IDS_HOME_NET`].
+    #[serde(default, rename = "home-net", skip_serializing_if = "Vec::is_empty")]
+    pub home_net: Vec<String>,
+    /// Rules written inline in the configuration, one Suricata rule per entry.
+    #[serde(default, rename = "rule", skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<String>,
+    /// Absolute paths to rule files the operator put on the box (an Emerging
+    /// Threats set, say). Kept as paths rather than content because a ruleset is
+    /// megabytes and does not belong in a configuration file.
+    #[serde(default, rename = "ruleset", skip_serializing_if = "Vec::is_empty")]
+    pub rulesets: Vec<String>,
+}
+
+impl Ids {
+    /// True when nothing is watched — lets `[services.ids]` be omitted.
+    pub fn is_empty(&self) -> bool {
+        self.interfaces.is_empty()
+    }
+
+    /// The `HOME_NET` members, configured or default.
+    pub fn home_net(&self) -> Vec<String> {
+        if self.home_net.is_empty() {
+            DEFAULT_IDS_HOME_NET.iter().map(|s| s.to_string()).collect()
+        } else {
+            self.home_net.clone()
         }
     }
 }
@@ -6286,6 +6348,55 @@ impl Appliance {
             );
         }
 
+        // Intrusion detection (roadmap C11). Everything here is refused at commit
+        // rather than discovered at run time, because the failure is silent in the
+        // worst way: Suricata that will not start, or starts with no rules, leaves
+        // an operator believing the box is watched when nothing is.
+        let ids = &self.services.ids;
+        if !ids.is_empty() {
+            let mut seen_iface = HashSet::new();
+            for name in &ids.interfaces {
+                // Deliberately NOT required to be a declared interface: an
+                // appliance can perfectly well watch a link whose addressing it
+                // does not own, and a check against the config would refuse that.
+                validate_iface_name(name).with_context(|| "services ids interface")?;
+                if !seen_iface.insert(name.as_str()) {
+                    bail!("services ids: interface {name:?} is watched twice");
+                }
+            }
+            for net in &ids.home_net {
+                validate_cidr_or_ip(net).with_context(|| "services ids home-net")?;
+            }
+            if ids.rules.is_empty() && ids.rulesets.is_empty() {
+                bail!(
+                    "services ids: no rules — add `rule` or `ruleset`, or remove \
+                     the interfaces; a detector with no rules detects nothing"
+                );
+            }
+            let mut seen_sid = HashSet::new();
+            for rule in &ids.rules {
+                let sid = validate_ids_rule(rule)?;
+                if !seen_sid.insert(sid) {
+                    // Suricata refuses to load a duplicate sid at all, so this
+                    // would take down the whole ruleset, not just one rule.
+                    bail!("services ids: duplicate rule sid {sid}");
+                }
+            }
+            let mut seen_set = HashSet::new();
+            for path in &ids.rulesets {
+                if !path.starts_with('/') {
+                    bail!(
+                        "services ids ruleset {path:?}: must be an absolute path \
+                         (the detector's working directory is not the operator's)"
+                    );
+                }
+                reject_config_token("services ids ruleset", path)?;
+                if !seen_set.insert(path.as_str()) {
+                    bail!("services ids: duplicate ruleset {path:?}");
+                }
+            }
+        }
+
         // Multi-WAN (roadmap C6): every uplink must name a declared interface,
         // no interface or routing-table id may be shared between uplinks, table
         // ids must avoid the kernel's reserved tables, gateways are IPv4 (or
@@ -7045,6 +7156,78 @@ fn reject_config_token(field: &str, v: &str) -> Result<()> {
         bail!("{field}: must not contain whitespace, a control character, quote or backslash");
     }
     Ok(())
+}
+
+/// The rule actions Suricata accepts. `drop`/`reject` are refused below: they are
+/// only honoured in an IPS mode Sentinel deliberately does not run.
+const IDS_RULE_ACTIONS: &[&str] = &["alert", "pass", "drop", "reject", "rejectsrc", "rejectdst"];
+
+/// Check one inline Suricata rule far enough to keep a typo from taking the whole
+/// ruleset down, and return its `sid`.
+///
+/// Not a Suricata parser — the detector is the authority on its own grammar. This
+/// catches the mistakes that are both common and catastrophic: a rule Suricata
+/// refuses to load makes it exit, and an exiting detector means nothing is watched
+/// at all. A rule that merely fails to *match* is the operator's business.
+pub(crate) fn validate_ids_rule(rule: &str) -> Result<u32> {
+    let r = rule.trim();
+    if r.is_empty() {
+        bail!("services ids: an empty rule");
+    }
+    if r.contains('\n') {
+        bail!("services ids rule: one rule per entry — {r:?} spans lines");
+    }
+    let action = r.split_whitespace().next().unwrap_or_default();
+    if !IDS_RULE_ACTIONS.contains(&action) {
+        bail!(
+            "services ids rule: {action:?} is not a rule action \
+             (expected one of {})",
+            IDS_RULE_ACTIONS.join(", ")
+        );
+    }
+    // A verdict action would be silently inert: Suricata only enforces it in an
+    // IPS mode, and Sentinel runs detection alongside the eBPF data plane rather
+    // than in the forwarding path. Saying so at commit beats a rule that appears
+    // to block for as long as nobody tests it.
+    if action != "alert" && action != "pass" {
+        bail!(
+            "services ids rule: {action:?} only takes effect in IPS mode, which \
+             Sentinel does not run — the eBPF firewall owns blocking. Use `alert` \
+             and write a firewall rule for the drop."
+        );
+    }
+    let body_start = r.find('(');
+    let (Some(open), true) = (body_start, r.ends_with(')')) else {
+        bail!("services ids rule: no `(...)` option block in {r:?}");
+    };
+    let body = &r[open + 1..r.len() - 1];
+    // action proto src sport direction dst dport — Suricata rejects the rule
+    // outright if the header is short, which stops the whole load.
+    if r[..open].split_whitespace().count() != 7 {
+        bail!(
+            "services ids rule: the header before `(` must be \
+             `<action> <proto> <src> <sport> <dir> <dst> <dport>` — got {:?}",
+            r[..open].trim()
+        );
+    }
+    let sid = body
+        .split(';')
+        .map(str::trim)
+        .find_map(|opt| opt.strip_prefix("sid:"))
+        .ok_or_else(|| {
+            anyhow::anyhow!("services ids rule: no `sid:` in {r:?} — Suricata requires one")
+        })?;
+    let sid: u32 = sid
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("services ids rule: sid {sid:?} is not a number"))?;
+    if !body.contains("msg:") {
+        bail!(
+            "services ids rule sid {sid}: no `msg:` — an alert with no message is \
+             unreadable in the log it lands in"
+        );
+    }
+    Ok(sid)
 }
 
 pub(crate) fn validate_host(s: &str) -> Result<()> {
