@@ -2021,12 +2021,74 @@
                 };
               };
             };
+          # A minimal SMTP sink, so the mail path is exercised against a real
+          # server rather than only asserting the rendered msmtp config. It speaks
+          # just enough of RFC 5321 to accept one message; no TLS, so the test
+          # config turns STARTTLS off (legal here precisely because it sends no
+          # credentials — with a user configured, validation refuses that).
+          mailsink =
+            { lib, pkgs, ... }:
+            {
+              networking.hostName = lib.mkForce "mailsink";
+              networking.firewall.enable = lib.mkForce false;
+              systemd.services.smtp-sink = {
+                wantedBy = [ "multi-user.target" ];
+                after = [ "network.target" ];
+                serviceConfig = {
+                  Type = "exec";
+                  ExecStart = "${pkgs.python3}/bin/python3 -u ${
+                    pkgs.writeText "smtp-sink.py" ''
+                      import socket
+
+                      srv = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+                      srv.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                      srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                      srv.bind(("::", 2525))
+                      srv.listen(5)
+
+                      while True:
+                          conn, _ = srv.accept()
+                          f = conn.makefile("rwb", buffering=0)
+                          f.write(b"220 sink ESMTP\r\n")
+                          in_data, body = False, []
+                          while True:
+                              line = f.readline()
+                              if not line:
+                                  break
+                              if in_data:
+                                  if line.strip() == b".":
+                                      in_data = False
+                                      f.write(b"250 OK queued\r\n")
+                                      with open("/var/log/mail.log", "ab", buffering=0) as out:
+                                          out.write(b"".join(body))
+                                      body = []
+                                  else:
+                                      body.append(line)
+                                  continue
+                              verb = line.upper()
+                              if verb.startswith(b"DATA"):
+                                  f.write(b"354 go ahead\r\n")
+                                  in_data = True
+                              elif verb.startswith(b"QUIT"):
+                                  f.write(b"221 bye\r\n")
+                                  break
+                              else:
+                                  # EHLO/HELO/MAIL/RCPT/RSET: a bare 250 is enough
+                                  # for a client that was told not to use TLS or auth.
+                                  f.write(b"250 OK\r\n")
+                          conn.close()
+                    ''
+                  }";
+                };
+              };
+            };
         };
         testScript = ''
           start_all()
           fw.wait_for_unit("multi-user.target")
           fw.wait_for_unit("sentinel-boot.service")
           receiver.wait_for_unit("hook-sink.service")
+          mailsink.wait_for_unit("smtp-sink.service")
 
           # No drop-in until alerts are configured: an appliance must not carry an
           # OnFailure handler that has nowhere to send.
@@ -2035,6 +2097,10 @@
           fw.succeed(
               "su admin -c \"printf '%s\\n' "
               "'set services alerts webhook http://receiver:9000/hook' "
+              "'set services alerts mail to noc@example.com' "
+              "'set services alerts mail relay mailsink' "
+              "'set services alerts mail port 2525' "
+              "'set services alerts mail starttls false' "
               "commit save exit "
               "| sentinel configure\""
           )
@@ -2066,6 +2132,19 @@
           # on its own rather than sending the operator to the box to find out.
           assert "the-probe-died" in body, f"the journal evidence is missing: {body}"
           assert body.count("{") == 1, f"not one JSON object: {body}"
+
+          # The msmtp config carries the relay and is 0600 — msmtp refuses to run
+          # against a password-bearing config that is group-readable, so the mode is
+          # part of the feature working, not a preference.
+          mode = fw.succeed("stat -c %a /run/sentinel/msmtp.conf").strip()
+          assert mode == "600", mode
+
+          # And the mail actually reaches a real SMTP server, subject and body.
+          mailsink.wait_until_succeeds("grep -q 'unit failed' /var/log/mail.log", timeout=60)
+          mail = mailsink.succeed("cat /var/log/mail.log")
+          assert "To: noc@example.com" in mail, mail
+          assert f"Subject: [sentinel/{host}] unit failed: alert-probe" in mail, mail
+          assert "the-probe-died" in mail, f"the journal evidence is missing: {mail}"
 
           # Turning alerts off removes the drop-ins rather than leaving handlers
           # pointed at an endpoint that is no longer configured.
