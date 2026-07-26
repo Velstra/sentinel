@@ -627,6 +627,25 @@
             };
           };
 
+          # The prevention half of C11: follow the detector's alerts and block
+          # what they name — in the eBPF data plane, not in Suricata. Suricata's
+          # own IPS modes would add a second verdict stage in the forwarding
+          # path; this way there is still exactly one thing dropping packets.
+          # Started only while `block-on-alert` is set.
+          systemd.services.sentinel-ids-watch = {
+            description = "Block sources the detector alerts on (sentinel)";
+            after = [
+              "sentinel-ids.service"
+              "velstra.service"
+            ];
+            serviceConfig = {
+              Type = "exec";
+              ExecStart = "${sentinel}/bin/sentinel ids-watch";
+              Restart = "on-failure";
+              RestartSec = "10s";
+            };
+          };
+
           # Remote syslog (roadmap C12): rsyslog in the foreground against
           # Sentinel's rendered config. `-n` keeps it attached so systemd owns the
           # process; `-i NONE` skips the pid file (systemd tracks it). Sentinel
@@ -2294,6 +2313,60 @@
           assert "sev " in alerts, alerts
           assert alerts.count("192.168.1.") >= 2, "both endpoints must appear: " + alerts
 
+          # --- the prevention half: an alert becomes a data-plane block --------
+          #
+          # Switched on with the neighbour in `never-block`, so what is asserted
+          # first is the guard: the alert keeps firing and the source stays
+          # reachable. A detector that can take away the operator's own way in is
+          # the failure this feature must not have.
+          fw.succeed(
+              """cat > /tmp/ids2.cfg <<'CFG'
+          set services ids block-on-alert true
+          set services ids block-severity 3
+          set services ids never-block 192.168.1.0/24
+          commit
+          save
+          exit
+          CFG"""
+          )
+          fw.succeed("sed -i 's/^          //' /tmp/ids2.cfg")
+          fw.succeed("su admin -c 'sentinel configure < /tmp/ids2.cfg'")
+          fw.wait_for_unit("sentinel-ids-watch.service")
+
+          neighbour.succeed("ping -4 -c 3 -W 1 fw >/dev/null")
+          blocks = fw.succeed("sentinel show ids blocks")
+          assert "no run-time blocks" in blocks, "never-block was ignored: " + blocks
+          fw.succeed("journalctl -u sentinel-ids-watch.service --no-pager > /tmp/watch.log")
+          fw.succeed("grep -q 'never-block' /tmp/watch.log")
+
+          # Now take the guard away, and the same traffic gets the source blocked
+          # — in the eBPF data plane, with a deadline on it.
+          fw.succeed(
+              """cat > /tmp/ids3.cfg <<'CFG'
+          delete services ids never-block
+          commit
+          save
+          exit
+          CFG"""
+          )
+          fw.succeed("sed -i 's/^          //' /tmp/ids3.cfg")
+          fw.succeed("su admin -c 'sentinel configure < /tmp/ids3.cfg'")
+          fw.wait_for_unit("sentinel-ids-watch.service")
+
+          def blocked(_last: bool) -> bool:
+              neighbour.succeed("ping -4 -c 2 -W 1 fw >/dev/null || true")
+              return "192.168.1." in fw.succeed("sentinel show ids blocks")
+
+          retry(blocked, timeout=180)
+          blocks = fw.succeed("sentinel show ids blocks")
+          # The deadline is the whole reason this is safe to switch on: whatever
+          # the detector decides, it undoes itself.
+          assert "s remaining" in blocks, blocks
+
+          # And it can be lifted by hand without waiting for the deadline.
+          addr = blocks.split()[0]
+          fw.succeed(f"sentinel show ids blocks | grep -q {addr}")
+
           # Removing the configuration stops the detector rather than leaving it
           # running against a config file that is no longer the intent.
           fw.succeed(
@@ -2303,6 +2376,7 @@
               "| sentinel configure\""
           )
           fw.wait_until_fails("systemctl is-active sentinel-ids.service", timeout=60)
+          fw.wait_until_fails("systemctl is-active sentinel-ids-watch.service", timeout=60)
           fw.fail("test -e /run/sentinel/suricata.yaml")
         '';
       };

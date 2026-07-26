@@ -1216,8 +1216,10 @@ const ALERT_WATCHED_UNITS: &[&str] = &[
     "sentinel-dhcp-relay.service",
     "sentinel-syslog.service",
     // A detector that died is the textbook silent failure: nothing about the
-    // appliance looks wrong, and the absence of alerts reads as good news.
+    // appliance looks wrong, and the absence of alerts reads as good news. The
+    // watcher likewise: with it gone, alerts still arrive and nothing acts.
     "sentinel-ids.service",
+    "sentinel-ids-watch.service",
     "sentinel-nat64.service",
     "sentinel-proxy.service",
     "sentinel-ocserv.service",

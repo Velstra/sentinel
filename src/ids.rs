@@ -35,6 +35,7 @@
 //! `/dev/stdout` fails with ENXIO and the whole eve-log output silently does not
 //! start.)
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
 
@@ -52,6 +53,17 @@ pub const SURICATA_CONF: &str = "/run/sentinel/suricata.yaml";
 pub const SURICATA_RULES: &str = "/run/sentinel/suricata.rules";
 /// The unit the image defines; Sentinel starts and stops it with the config.
 pub const SURICATA_UNIT: &str = "sentinel-ids.service";
+/// The unit that turns alerts into data-plane blocks. Started only while
+/// `block-on-alert` is set — see [`watch`].
+pub const WATCH_UNIT: &str = "sentinel-ids-watch.service";
+/// What the watcher reads.
+///
+/// Rendered here rather than read from the saved appliance config, because the
+/// two are not the same thing at the same time: a `commit` applies before a
+/// `save` writes, and `commit` without `save` never writes at all. A watcher
+/// reading the saved file would enforce the *previous* `never-block` — the guard
+/// being wrong is exactly the case that must not happen.
+pub const WATCH_CONF: &str = "/run/sentinel/ids-watch.toml";
 /// Suricata insists on a writable log directory even when every output it is
 /// given goes elsewhere. systemd creates and owns this one (`LogsDirectory=` on
 /// the unit), so nothing here has to mkdir as root. EVE output does not land
@@ -229,6 +241,7 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
     match suricata_yaml_body(ids) {
         Some(yaml) => {
             let rules_body = rules_body(ids).unwrap_or_default();
+            let watch_conf = watch_conf_body(ids);
             let changed = crate::net::file_changed(conf, &yaml)
                 || crate::net::file_changed(rules, &rules_body);
             // Rules first: the config names the rule file, so writing them the
@@ -244,18 +257,168 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
                     );
                 }
             }
+            // Restarted on every apply, not only when the rendered files changed:
+            // the watcher reads the saved appliance config on start, and the
+            // settings that matter to it — `never-block` above all — do not appear
+            // in the rendered ones at all. Gating it on `changed` would leave a
+            // tightened guard not taking effect until something unrelated
+            // happened to restart it, which is the worst possible moment to find
+            // out.
+            match watch_conf {
+                Some(body) => system::install_file(Path::new(WATCH_CONF), &body)?,
+                None => {
+                    if Path::new(WATCH_CONF).exists() {
+                        system::remove_file(Path::new(WATCH_CONF))?;
+                    }
+                }
+            }
+            if ids.blocks_on_alert() {
+                if let Err(e) = system::service_restart(WATCH_UNIT) {
+                    eprintln!("warning: (re)starting {WATCH_UNIT} failed: {e}");
+                }
+            } else if system::unit_active(WATCH_UNIT) {
+                if let Err(e) = system::service_stop(WATCH_UNIT) {
+                    eprintln!("warning: stopping {WATCH_UNIT}: {e}");
+                }
+            }
         }
         None => {
             if conf.exists() {
                 if let Err(e) = system::service_stop(SURICATA_UNIT) {
                     eprintln!("warning: stopping {SURICATA_UNIT}: {e}");
                 }
+                if system::unit_active(WATCH_UNIT) {
+                    if let Err(e) = system::service_stop(WATCH_UNIT) {
+                        eprintln!("warning: stopping {WATCH_UNIT}: {e}");
+                    }
+                }
                 system::remove_file(conf)?;
                 system::remove_file(rules)?;
+                if Path::new(WATCH_CONF).exists() {
+                    system::remove_file(Path::new(WATCH_CONF))?;
+                }
             }
         }
     }
     Ok(())
+}
+
+/// What the watcher needs, split out of the appliance config so it can be
+/// rendered at apply time. See [`WATCH_CONF`] for why that matters.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct WatchConfig {
+    pub severity: u8,
+    pub seconds: u64,
+    #[serde(default)]
+    pub never_block: Vec<String>,
+}
+
+impl WatchConfig {
+    /// Whether `addr` is protected. Same prefix matching as the config type —
+    /// see `Ids::is_never_blocked`, which this mirrors deliberately so the guard
+    /// behaves identically wherever it is asked.
+    fn is_never_blocked(&self, addr: &str) -> bool {
+        let ids = Ids {
+            never_block: self.never_block.clone(),
+            ..Default::default()
+        };
+        ids.is_never_blocked(addr)
+    }
+}
+
+/// The watcher's settings, or `None` when alerts should not block.
+pub fn watch_conf_body(ids: &Ids) -> Option<String> {
+    if ids.is_empty() || !ids.blocks_on_alert() {
+        return None;
+    }
+    let conf = WatchConfig {
+        severity: ids.block_severity(),
+        seconds: ids.block_duration(),
+        never_block: ids.never_block.clone(),
+    };
+    toml::to_string_pretty(&conf).ok()
+}
+
+/// Follow the detector's alerts and block what they name, until killed.
+///
+/// This is the whole of the "prevention" half, and it deliberately does not live
+/// in Suricata. Suricata's own IPS modes would make it a second verdict stage in
+/// the forwarding path; instead an alert becomes a **source block in the eBPF
+/// data plane** — the one place that already decides what passes. There is
+/// still exactly one thing dropping packets, and `show firewall` still explains
+/// every drop.
+///
+/// Every block it asks for carries a deadline, and the agent forgets all of them
+/// when it restarts. A detector acting on a pattern match will sometimes be
+/// wrong, so the question is not whether it produces a false positive but what a
+/// false positive costs: here it costs one address an hour, not an outage
+/// somebody has to find and undo.
+pub fn watch() -> Result<()> {
+    let raw = std::fs::read_to_string(WATCH_CONF)
+        .with_context(|| format!("reading {WATCH_CONF} — is block-on-alert set?"))?;
+    let ids: WatchConfig = toml::from_str(&raw).with_context(|| format!("parsing {WATCH_CONF}"))?;
+    let ceiling = u64::from(ids.severity);
+    let seconds = ids.seconds;
+    eprintln!(
+        "watching {SURICATA_UNIT} for alerts at severity <= {ceiling}; \
+         blocking sources for {seconds}s"
+    );
+    // `--since now`: on start, act on what happens from here rather than
+    // replaying every alert the journal still holds. Restarting the watcher must
+    // not re-block yesterday's traffic.
+    let mut child = Command::new(system::bin("journalctl"))
+        .args(["-u", SURICATA_UNIT, "-f", "-o", "cat", "--since", "now"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .context("following the journal")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("journalctl produced no output stream"))?;
+    let reader = std::io::BufReader::new(stdout);
+    let mut blocked: BTreeSet<String> = BTreeSet::new();
+    for line in std::io::BufRead::lines(reader) {
+        let line = line.context("reading the alert stream")?;
+        let Some(alert) = parse_alert(&line) else {
+            continue;
+        };
+        if alert.severity > ceiling || alert.severity == 0 {
+            continue;
+        }
+        if alert.src_ip.is_empty() {
+            continue;
+        }
+        if ids.is_never_blocked(&alert.src_ip) {
+            eprintln!(
+                "not blocking {} ({}): it is in never-block",
+                alert.src_ip, alert.signature
+            );
+            continue;
+        }
+        // A noisy signature fires many times a second; asking the agent for the
+        // same block over and over would turn one attack into a second load
+        // problem on the box that is meant to be handling it.
+        if !blocked.insert(alert.src_ip.clone()) {
+            continue;
+        }
+        match crate::velstra::query(&format!("block {} {seconds}", alert.src_ip)) {
+            Ok(reply) => eprintln!(
+                "blocked {} after {:?}: {}",
+                alert.src_ip,
+                alert.signature,
+                reply.trim()
+            ),
+            Err(e) => {
+                eprintln!("could not block {}: {e:#}", alert.src_ip);
+                // Not remembered as blocked, so the next alert from the same
+                // source tries again — an agent that was briefly away must not
+                // mean that source is never blocked.
+                blocked.remove(&alert.src_ip);
+            }
+        }
+    }
+    let _ = child.wait();
+    anyhow::bail!("the alert stream ended")
 }
 
 /// One decoded EVE alert, reduced to what an operator reads in a list.
@@ -266,6 +429,10 @@ pub struct IdsAlert {
     pub src: String,
     pub dst: String,
     pub proto: String,
+    /// The source address alone. Kept apart from the rendered `src` because a
+    /// block takes an address, and re-splitting a display string to get one back
+    /// is how a port ends up in a blocklist entry.
+    pub src_ip: String,
 }
 
 /// The most recent alerts, newest last, read back out of the journal.
@@ -329,6 +496,11 @@ fn parse_alert(line: &str) -> Option<IdsAlert> {
         severity: alert.get("severity").and_then(|s| s.as_u64()).unwrap_or(0),
         src: endpoint(&v, "src_ip", "src_port"),
         dst: endpoint(&v, "dest_ip", "dest_port"),
+        src_ip: v
+            .get("src_ip")
+            .and_then(|a| a.as_str())
+            .unwrap_or_default()
+            .to_string(),
         proto: v
             .get("proto")
             .and_then(|p| p.as_str())
@@ -353,9 +525,8 @@ mod tests {
     fn ids(rules: &[&str]) -> Ids {
         Ids {
             interfaces: vec!["eth1".into()],
-            home_net: Vec::new(),
             rules: rules.iter().map(|r| r.to_string()).collect(),
-            rulesets: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -444,6 +615,74 @@ mod tests {
 
         let rules = rules_body(&ids(&[RULE])).expect("configured");
         assert!(rules.contains("sid:1000001"), "got:\n{rules}");
+    }
+
+    /// `never-block` is the lockout guard, so it has to match as a prefix — an
+    /// operator writes their management network, not every host in it. Getting
+    /// this wrong is how a detector takes away the way in to fix it.
+    #[test]
+    fn never_block_protects_a_whole_prefix() {
+        let mut guarded = ids(&[RULE]);
+        guarded.block_on_alert = Some(true);
+        guarded.never_block = vec!["10.9.0.0/16".into(), "203.0.113.7".into()];
+        assert!(guarded.is_never_blocked("10.9.4.11"), "inside the prefix");
+        assert!(guarded.is_never_blocked("10.9.0.0"), "the network address");
+        assert!(
+            guarded.is_never_blocked("203.0.113.7"),
+            "a bare address is a /32"
+        );
+        assert!(
+            !guarded.is_never_blocked("10.10.4.11"),
+            "outside the prefix"
+        );
+        assert!(
+            !guarded.is_never_blocked("203.0.113.8"),
+            "a neighbour is not it"
+        );
+
+        // Something that is not an address at all must not reach the data plane
+        // as a block: it cannot be matched against the guard either way.
+        assert!(guarded.is_never_blocked("not-an-address"));
+
+        // With nothing declared, nothing is protected — that is the state the
+        // commit warns about rather than silently inventing a safe default.
+        assert!(!ids(&[RULE]).is_never_blocked("10.9.4.11"));
+    }
+
+    /// The watcher's settings are rendered, not read from the saved config: a
+    /// `commit` applies before a `save` writes, and `commit` without `save` never
+    /// writes at all — so a watcher reading the saved file would enforce the
+    /// *previous* never-block. That is the one setting that must never lag.
+    #[test]
+    fn the_watcher_config_is_rendered_from_what_was_applied() {
+        // Nothing rendered while alerts only detect.
+        assert!(watch_conf_body(&ids(&[RULE])).is_none());
+
+        let mut blocking = ids(&[RULE]);
+        blocking.block_on_alert = Some(true);
+        blocking.never_block = vec!["10.9.0.0/16".into()];
+        let body = watch_conf_body(&blocking).expect("blocking");
+        let parsed: WatchConfig = toml::from_str(&body).expect("round-trips");
+        assert_eq!(parsed.severity, 1);
+        assert_eq!(parsed.seconds, 3600);
+        // The guard must survive the round trip intact and keep matching as a
+        // prefix on the other side.
+        assert!(parsed.is_never_blocked("10.9.4.11"));
+        assert!(!parsed.is_never_blocked("10.10.4.11"));
+    }
+
+    /// The numbers that decide what an automatic block costs. Severity counts
+    /// **down** in Suricata, so the default has to be the most severe only.
+    #[test]
+    fn automatic_blocking_defaults_to_the_narrowest_useful_setting() {
+        let plain = ids(&[RULE]);
+        assert!(!plain.blocks_on_alert(), "acting on alerts is opt-in");
+        assert_eq!(
+            plain.block_severity(),
+            1,
+            "only what the ruleset calls critical"
+        );
+        assert_eq!(plain.block_duration(), 3600);
     }
 
     /// An EVE alert is decoded; Suricata's own status lines and its stats records
