@@ -16,6 +16,7 @@ mod compile;
 mod config;
 mod confirm;
 mod diff;
+mod domain;
 mod install;
 mod ipsec;
 mod net;
@@ -460,6 +461,7 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
                     nat_npt66: session.nat_npt66_names(),
                     address_groups: session.address_group_names(),
                     port_groups: session.port_group_names(),
+                    domain_groups: session.domain_group_names(),
                     filters: session.filter_names(),
                     vrfs: session.vrf_names(),
                     ipsec: session.ipsec_names(),
@@ -516,7 +518,9 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
 /// Compile the appliance config, atomically install the Velstra agent config at
 /// `out`, and (if given) reload the systemd `unit` running the data plane.
 fn apply(file: &std::path::Path, out: &std::path::Path, reload: Option<&str>) -> Result<()> {
-    let appliance = Appliance::load(file)?;
+    // Resolve domain groups before compiling: the compiler only knows addresses,
+    // and this is also the periodic refresh — the timer re-runs exactly this.
+    let appliance = domain::with_resolved(&Appliance::load(file)?);
     let rendered = compile::compile(&appliance).to_toml()?;
 
     if let Some(parent) = out.parent() {
@@ -552,7 +556,7 @@ fn apply_boot(
     out: &std::path::Path,
     wren_out: &std::path::Path,
 ) -> Result<()> {
-    let appliance = Appliance::load(config)?;
+    let appliance = domain::with_resolved(&Appliance::load(config)?);
 
     // Compile BOTH configs before writing either, so a compile error can't leave
     // a half-seeded system (velstra written, wren missing). Rendering is pure and

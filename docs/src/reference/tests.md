@@ -1,6 +1,6 @@
 # Test suite (nixosTests)
 
-Sentinel is verified by **68 nixosTests** plus the Rust unit tests. The nixosTests
+Sentinel is verified by **69 nixosTests** plus the Rust unit tests. The nixosTests
 boot real QEMU/OVMF VMs — several of them two or three at a time on shared virtual
 segments — so they need `/dev/kvm`.
 
@@ -44,6 +44,7 @@ authoritative list.
 | `srcfilter` | a rule's `source` CIDR matches the intended client and only that one |
 | `nat` | (also) a rule's `destination` CIDR admits one target and denies another, and a rule's rate `limit` holds its bucket's bound |
 | `fwgroups` | address and port groups expand at compile time to the full sources × ports product |
+| `fwdomain` | a domain group resolves to addresses the rules match on, the answer is cached, and a **failed lookup keeps it** rather than emptying a blocking rule |
 | `fwschedule` | a rule with a weekly schedule is in the data plane **only** inside its window |
 | `v6exthdr` | IPv6 extension headers do not bypass a rule — the chain is walked to the real protocol |
 

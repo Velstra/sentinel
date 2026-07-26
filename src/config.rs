@@ -3128,12 +3128,25 @@ pub struct Groups {
     /// Port groups: name → ports/ranges. Referenced by a rule's `port_group`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub port: BTreeMap<String, Vec<PortSpec>>,
+    /// Domain groups: name → DNS names, resolved to addresses at apply time and
+    /// refreshed on a timer. Referenced by a rule's `source_group` /
+    /// `destination_group` exactly like an address group — the apply path folds
+    /// the resolved addresses into [`Groups::address`] before the compiler runs,
+    /// so a rule never has to know which kind of group it names.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub domain: BTreeMap<String, Vec<String>>,
 }
 
 impl Groups {
     /// No groups defined (lets `[firewall]` be omitted when untouched).
     pub fn is_empty(&self) -> bool {
-        self.address.is_empty() && self.port.is_empty()
+        self.address.is_empty() && self.port.is_empty() && self.domain.is_empty()
+    }
+
+    /// Whether `name` is a declared address **or** domain group — the two share a
+    /// namespace, since a rule references either through the same field.
+    pub fn has_address_like(&self, name: &str) -> bool {
+        self.address.contains_key(name) || self.domain.contains_key(name)
     }
 }
 
@@ -4905,6 +4918,26 @@ impl Appliance {
                 }
             }
         }
+        // A domain group shares the address groups' namespace — a rule references
+        // either through the same field, so a name in both would resolve by
+        // whichever the merge happened to write last.
+        for name in self.firewall.group.domain.keys() {
+            if self.firewall.group.address.contains_key(name) {
+                bail!(
+                    "firewall group domain-group {name:?}: a group of that name already \
+                     exists as an address-group; rules reference both the same way"
+                );
+            }
+        }
+        for (name, domains) in &self.firewall.group.domain {
+            if domains.is_empty() {
+                bail!("firewall group domain-group {name:?}: no domains — remove it instead");
+            }
+            for d in domains {
+                validate_domain_name(d)
+                    .with_context(|| format!("firewall group domain-group {name:?}: {d:?}"))?;
+            }
+        }
         for (name, specs) in &self.firewall.group.port {
             for s in specs {
                 s.validate()
@@ -5044,17 +5077,18 @@ impl Appliance {
             }
             // A referenced group must be declared.
             if let Some(g) = &rule.source_group {
-                if !self.firewall.group.address.contains_key(g) {
+                if !self.firewall.group.has_address_like(g) {
                     bail!(
-                        "rule {:?}: source-group {g:?} is not a declared address group",
+                        "rule {:?}: source-group {g:?} is not a declared address or domain group",
                         rule.name
                     );
                 }
             }
             if let Some(g) = &rule.destination_group {
-                if !self.firewall.group.address.contains_key(g) {
+                if !self.firewall.group.has_address_like(g) {
                     bail!(
-                        "rule {:?}: destination-group {g:?} is not a declared address group",
+                        "rule {:?}: destination-group {g:?} is not a declared address or \
+                         domain group",
                         rule.name
                     );
                 }
@@ -6752,6 +6786,33 @@ impl Appliance {
 }
 
 /// Validate a bare IPv4 address (router-id, gateway, BGP peer — no prefix).
+/// Validate a DNS name a domain group may resolve: labels of letters, digits and
+/// hyphens, separated by dots, at least two labels. Deliberately strict — a
+/// wildcard or a URL here would resolve to nothing and leave the group silently
+/// empty, which on a blocking rule means "allowed".
+pub(crate) fn validate_domain_name(s: &str) -> Result<()> {
+    let name = s.strip_suffix('.').unwrap_or(s);
+    if name.is_empty() || name.len() > 253 {
+        bail!("{s:?} is not a DNS name");
+    }
+    let labels: Vec<&str> = name.split('.').collect();
+    if labels.len() < 2 {
+        bail!("{s:?} needs at least two labels (e.g. \"example.com\")");
+    }
+    for label in labels {
+        if label.is_empty() || label.len() > 63 {
+            bail!("{s:?} has an empty or over-long label");
+        }
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            bail!("{s:?} may only contain letters, digits, hyphens and dots");
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            bail!("{s:?} has a label starting or ending with a hyphen");
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_ipv4(s: &str) -> Result<()> {
     s.parse::<Ipv4Addr>()
         .with_context(|| format!("{s:?} is not an IPv4 address"))?;

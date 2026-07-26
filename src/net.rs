@@ -844,6 +844,69 @@ fn fwsched_timer_body(appliance: &Appliance) -> Option<String> {
     Some(body)
 }
 
+/// Domain groups (roadmap C15): a periodic re-apply so a group tracks the DNS
+/// answers as they change. A commit resolves once; without this the firewall would
+/// keep matching whatever the addresses were at commit time, which for a
+/// load-balanced or CDN-hosted name is stale within minutes.
+const FWDOMAIN_TIMER: &str = "/run/systemd/system/sentinel-fwdomain.timer";
+const FWDOMAIN_UNIT: &str = "sentinel-fwdomain.timer";
+
+/// How often a domain group is re-resolved. Fixed rather than TTL-driven: the
+/// resolver API in use reports no TTL, and inventing a shorter interval to
+/// compensate would hammer the name server for a firewall rule that changes rarely.
+const FWDOMAIN_INTERVAL: &str = "15min";
+
+/// The static re-apply unit both dynamic timers trigger.
+const FWSCHED_SERVICE: &str = "sentinel-fwsched.service";
+
+/// Render the domain-refresh timer, or `None` when no domain group is declared.
+fn fwdomain_timer_body(appliance: &Appliance) -> Option<String> {
+    if appliance.firewall.group.domain.is_empty() {
+        return None;
+    }
+    // `Unit=` is not optional here: a timer activates the service of its own name
+    // by default, and there is no `sentinel-fwdomain.service` — it drives the same
+    // re-apply unit the schedule timer does, so there is one such unit, not two
+    // that can drift.
+    Some(format!(
+        "[Unit]\nDescription=re-resolve firewall domain groups\n\n\
+         [Timer]\nUnit={FWSCHED_SERVICE}\nOnBootSec=2min\n\
+         OnUnitActiveSec={FWDOMAIN_INTERVAL}\n\n\
+         [Install]\nWantedBy=timers.target\n"
+    ))
+}
+
+/// Install/remove the domain-refresh timer, mirroring [`apply_fwsched`]. It drives
+/// the same static `sentinel-fwsched.service` (a plain re-apply), so there is one
+/// re-apply unit rather than two that could drift apart.
+fn apply_fwdomain(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
+    let path = Path::new(FWDOMAIN_TIMER);
+    match fwdomain_timer_body(appliance) {
+        Some(body) => {
+            let changed = file_changed(path, &body);
+            system::install_file(path, &body)?;
+            if mode == ApplyMode::Live && changed {
+                let _ = system::daemon_reload();
+                if let Err(e) = system::service_restart(FWDOMAIN_UNIT) {
+                    eprintln!("warning: starting {FWDOMAIN_UNIT} failed: {e}");
+                }
+            }
+        }
+        None => {
+            if path.exists() {
+                if mode == ApplyMode::Live {
+                    let _ = system::service_stop(FWDOMAIN_UNIT);
+                }
+                system::remove_file(path)?;
+                if mode == ApplyMode::Live {
+                    let _ = system::daemon_reload();
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 const NAT64_DIR: &str = "/run/sentinel/nat64";
 const TAYGA_CONF: &str = "/run/sentinel/nat64/tayga.conf";
 const TAYGA_SETUP: &str = "/run/sentinel/nat64/setup.sh";
@@ -2611,6 +2674,7 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     // Time-based firewall rules (roadmap C15): (re)create or remove the dynamic
     // timer that re-applies the config at each scheduled rule's window boundaries.
     apply_fwsched(appliance, mode)?;
+    apply_fwdomain(appliance, mode)?;
     // Alert notifications (roadmap C23): the OnFailure drop-ins on the units whose
     // failure means the appliance stopped working, plus the alert-mail config.
     apply_alerts(appliance, mode)?;
@@ -2682,6 +2746,35 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A box with no domain group must not carry the refresh timer at all — an
+    /// idle timer that re-applies the whole config every 15 minutes is a moving
+    /// part nobody asked for.
+    #[test]
+    fn the_domain_timer_exists_only_when_a_domain_group_does() {
+        let plain = Appliance::from_toml("[system]\nhostname = \"fw\"\n").unwrap();
+        assert!(fwdomain_timer_body(&plain).is_none());
+
+        let with_group = Appliance::from_toml(
+            "[system]\nhostname = \"fw\"\n[firewall.group.domain]\nads = [\"example.com\"]\n",
+        )
+        .unwrap();
+        let body = fwdomain_timer_body(&with_group).expect("a domain group needs the timer");
+        // Periodic, not calendar-based: the answer can change at any moment, so
+        // there is no boundary to fire on.
+        assert!(body.contains("OnUnitActiveSec="), "{body}");
+        // …and it must fire after a boot too, or a box that rebooted keeps the
+        // addresses it resolved before the reboot until the first interval passes.
+        assert!(body.contains("OnBootSec="), "{body}");
+        assert!(body.contains("[Install]"), "{body}");
+        // A timer activates the service of its own name unless told otherwise, and
+        // no `sentinel-fwdomain.service` exists — without this the timer would fire
+        // forever and re-apply nothing.
+        assert!(
+            body.contains("Unit=sentinel-fwsched.service"),
+            "the timer must name the unit it triggers: {body}"
+        );
+    }
     use super::*;
     use crate::config::{DhcpStaticLease, Pppoe, Qos, QosDiscipline, SyslogTarget};
 

@@ -4002,6 +4002,79 @@
         # at each window boundary. The VM clock is pinned with `date -s` (NTP off)
         # so the test is deterministic regardless of when it runs.
         #   nix build .#checks.x86_64-linux.fwschedule -L
+        # Domain groups (roadmap C15): DNS names resolved to addresses the rule
+        # tables can match. Single node with a hosts entry as the name server, so
+        # the check tests the resolve-merge-compile path rather than the internet.
+        #   nix build .#checks.x86_64-linux.fwdomain -L
+        fwdomain = pkgs.testers.runNixOSTest {
+          name = "sentinel-fwdomain";
+          nodes.machine = {
+            imports = [ self.nixosModules.sentinel ];
+            virtualisation.memorySize = 2048;
+            # A name the resolver answers without a network. /etc/hosts is what
+            # `getaddrinfo` consults first, which is the path `sentinel` takes.
+            networking.extraHosts = "198.51.100.7 tracker.example.com";
+          };
+          testScript = ''
+            machine.wait_for_unit("multi-user.target")
+            machine.wait_for_unit("sentinel-boot.service")
+            machine.wait_for_unit("velstra.service")
+
+            # A domain group, referenced as a rule's destination. The rule itself
+            # never mentions an address — that is the point.
+            machine.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth0 zone wan' 'set interface eth0 address dhcp' "
+                "'set firewall group domain-group trackers domain tracker.example.com' "
+                "'set firewall rule no-trackers from wan' "
+                "'set firewall rule no-trackers action drop' "
+                "'set firewall rule no-trackers proto tcp' "
+                "'set firewall rule no-trackers port 443' "
+                "'set firewall rule no-trackers destination-group trackers' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+
+            # The compiled data-plane config carries the resolved ADDRESS, which is
+            # the whole job: the rule tables match prefixes and know no names.
+            cfg = machine.succeed("cat /run/sentinel/velstra.toml")
+            assert 'dst = "198.51.100.7/32"' in cfg, f"the name was not resolved:\n{cfg}"
+
+            # The resolution is cached, so a later DNS outage cannot empty the group
+            # and turn a blocking rule into no rule at all.
+            cache = machine.succeed("cat /var/lib/sentinel/domain-groups.toml")
+            assert "198.51.100.7/32" in cache, f"nothing was cached:\n{cache}"
+
+            # Prove the fallback rather than trust it: break resolution entirely and
+            # re-apply. The rule must still carry the address.
+            machine.succeed("mv /etc/hosts /etc/hosts.bak")
+            machine.succeed(
+                "sentinel apply /var/lib/sentinel/appliance.toml "
+                "--out /run/sentinel/velstra.toml"
+            )
+            cfg = machine.succeed("cat /run/sentinel/velstra.toml")
+            assert 'dst = "198.51.100.7/32"' in cfg, (
+                f"a failed lookup emptied the group, unblocking it:\n{cfg}"
+            )
+            machine.succeed("mv /etc/hosts.bak /etc/hosts")
+
+            # A refresh timer exists, because DNS answers change and a commit is a
+            # single moment.
+            machine.succeed("systemctl is-active sentinel-fwdomain.timer")
+
+            # Removing the group takes the timer with it — no idle unit re-applying
+            # the whole config every quarter hour for nothing.
+            machine.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'delete firewall rule no-trackers' "
+                "'delete firewall group domain-group trackers' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            machine.fail("systemctl is-active sentinel-fwdomain.timer")
+          '';
+        };
+
         fwschedule = pkgs.testers.runNixOSTest {
           name = "sentinel-fwschedule";
           nodes.machine = {
@@ -7541,7 +7614,7 @@
                 "'delete firewall group address-group mgmt' commit exit "
                 "| sentinel configure\" 2>&1"
             )
-            assert "not a declared address group" in out, out
+            assert "not a declared address or domain group" in out, out
 
             # Dropping the rule first, then the groups, commits cleanly.
             machine.succeed(
