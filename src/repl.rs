@@ -1263,11 +1263,31 @@ const IDS_NODES: &[Cand] = &[
         "ruleset",
         "absolute path to a rule file on the box (repeatable)",
     ),
+    (
+        "block-on-alert",
+        "have an alert block its source in the data plane (default false)",
+    ),
+    (
+        "block-severity",
+        "the least severe alert that blocks, 1..=4 (default 1, most severe)",
+    ),
+    (
+        "block-duration",
+        "how long a block lasts, in seconds (default 3600)",
+    ),
+    (
+        "never-block",
+        "a source that must never be blocked — your way in (repeatable)",
+    ),
 ];
 // `show ids <Tab>`.
 const OP_IDS: &[Cand] = &[
     ("status", "what is watched and whether the detector runs"),
     ("alerts", "the most recent alerts (default 20)"),
+    (
+        "blocks",
+        "sources blocked right now, and for how much longer",
+    ),
 ];
 // `services alerts <Tab>`: where an alert goes.
 const ALERTS_NODES: &[Cand] = &[
@@ -2428,6 +2448,7 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "services", "alerts", "mail"] => ALERT_MAIL_FIELDS,
         ["set", "services", "alerts", "mail", "starttls"] => BOOLS,
         ["set" | "delete", "services", "ids"] => IDS_NODES,
+        ["set", "services", "ids", "block-on-alert"] => BOOLS,
         ["set" | "delete", "services", "syslog"] => SYSLOG_NODES,
         ["set" | "delete", "services", "syslog", "target", _host] => SYSLOG_FIELDS,
         ["set", "services", "syslog", "target", _host, "proto"] => SYSLOG_PROTOS,
@@ -3774,7 +3795,20 @@ mod tests {
         );
         assert_eq!(
             kw(&["set", "services", "ids"]),
-            ["interface", "home-net", "rule", "ruleset"]
+            [
+                "interface",
+                "home-net",
+                "rule",
+                "ruleset",
+                "block-on-alert",
+                "block-severity",
+                "block-duration",
+                "never-block"
+            ]
+        );
+        assert_eq!(
+            kw(&["set", "services", "ids", "block-on-alert"]),
+            ["true", "false"]
         );
         assert_eq!(kw(&["set", "services", "syslog"]), ["target"]);
         assert_eq!(

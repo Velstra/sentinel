@@ -128,7 +128,7 @@ authoritative list.
 | `lldp` | LLDP neighbours are discovered between two boxes (the daemon is off by default) |
 | `pki` | a local CA and a leaf signed by it land under `/var/lib/sentinel/pki` with the right modes |
 | `reverseproxy` | TLS terminates on :443 with an on-box leaf and load-balances to a backend |
-| `ids` | real traffic on the wire becomes an alert an operator can read — which is also what proves the detector sees anything at all behind an XDP data plane |
+| `ids` | real traffic on the wire becomes an alert an operator can read — which is also what proves the detector sees anything at all behind an XDP data plane; then that an alert blocks its source in the data plane, and that `never-block` stops it |
 
 ## Rust unit tests
 
