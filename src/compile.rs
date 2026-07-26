@@ -134,6 +134,10 @@ struct PortRule {
     /// Optional source CIDR ("10.0.0.0/24"). Omitted when the rule is `from any`.
     #[serde(skip_serializing_if = "Option::is_none")]
     src: Option<String>,
+    /// Optional destination CIDR. Omitted when the rule is `to any`. Never set
+    /// together with `src` — the data plane ranks one end per rule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dst: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -269,18 +273,27 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                     };
                     let action = action_str(r.action);
                     let log = r.log;
+                    // A rule constrains one end or the other — validation refuses
+                    // both — so exactly one of these expands to something other
+                    // than a single `None`, and the product stays one entry per
+                    // (constraint, port).
                     let sources = r.resolved_sources(groups);
+                    let destinations = r.resolved_destinations(groups);
                     let ports = r.resolved_ports(groups);
-                    let mut out = Vec::with_capacity(sources.len() * ports.len());
+                    let mut out =
+                        Vec::with_capacity(sources.len() * destinations.len() * ports.len());
                     for src in &sources {
-                        for &port in &ports {
-                            out.push(PortRule {
-                                proto,
-                                port,
-                                action,
-                                log,
-                                src: src.clone(),
-                            });
+                        for dst in &destinations {
+                            for &port in &ports {
+                                out.push(PortRule {
+                                    proto,
+                                    port,
+                                    action,
+                                    log,
+                                    src: src.clone(),
+                                    dst: dst.clone(),
+                                });
+                            }
                         }
                     }
                     out
@@ -307,6 +320,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                     action: "pass",
                     log: false,
                     src: None,
+                    dst: None,
                 };
                 // An explicit rule the operator wrote for the same (proto, port)
                 // wins — including a `drop`, which is how you take a VIP out of
@@ -759,6 +773,89 @@ backends = ["10.0.0.11:8443", "10.0.0.12"]
         let out = cfg.to_toml().unwrap();
         assert!(out.contains("[[service]]"), "service emitted:\n{out}");
         assert!(out.contains("vip = \"203.0.113.10\""), "{out}");
+    }
+
+    /// Until now only the *source* end could be constrained, so "allow the lan out,
+    /// but not to this network" was inexpressible. The destination is a second
+    /// longest-prefix dimension in the data plane, and the compiler has to keep the
+    /// two apart: a rule sits in one table or the other.
+    #[test]
+    fn a_rule_can_constrain_the_destination_instead_of_the_source() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "lan0"
+zone = "lan"
+[[interface]]
+name = "wan0"
+zone = "wan"
+[[rule]]
+name = "no-doc-server"
+from = "lan"
+proto = "tcp"
+port = 443
+action = "drop"
+destination = "192.168.4.0/24"
+[[rule]]
+name = "trusted-in"
+from = "wan"
+proto = "tcp"
+port = 22
+action = "accept"
+source = "198.51.100.0/24"
+"#;
+        let appliance = Appliance::from_toml(toml).unwrap();
+        appliance.clone().validate().expect("valid");
+        let cfg = compile(&appliance);
+
+        let lan = cfg.policies.iter().find(|p| p.name == "lan").unwrap();
+        let blocked = lan.port_rules.iter().find(|r| r.port == 443).unwrap();
+        assert_eq!(blocked.dst.as_deref(), Some("192.168.4.0/24"));
+        assert!(blocked.src.is_none(), "one end per rule");
+
+        let wan = cfg.policies.iter().find(|p| p.name == "wan").unwrap();
+        let allowed = wan.port_rules.iter().find(|r| r.port == 22).unwrap();
+        assert_eq!(allowed.src.as_deref(), Some("198.51.100.0/24"));
+        assert!(allowed.dst.is_none());
+
+        // Both ends reach the emitted config under the names the agent parses.
+        let out = cfg.to_toml().unwrap();
+        assert!(out.contains(r#"dst = "192.168.4.0/24""#), "{out}");
+        assert!(out.contains(r#"src = "198.51.100.0/24""#), "{out}");
+    }
+
+    /// An address group works on either end, expanding to one data-plane rule per
+    /// member — the same treatment `source-group` already gets.
+    #[test]
+    fn a_destination_group_expands_to_one_rule_per_member() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "lan0"
+zone = "lan"
+[firewall.group.address]
+blocked = ["192.168.4.0/24", "203.0.113.9"]
+[[rule]]
+name = "no-go"
+from = "lan"
+proto = "tcp"
+port = 443
+action = "drop"
+destination-group = "blocked"
+"#;
+        let appliance = Appliance::from_toml(toml).unwrap();
+        appliance.clone().validate().expect("valid");
+        let cfg = compile(&appliance);
+        let lan = cfg.policies.iter().find(|p| p.name == "lan").unwrap();
+        let dsts: Vec<&str> = lan
+            .port_rules
+            .iter()
+            .filter(|r| r.port == 443)
+            .filter_map(|r| r.dst.as_deref())
+            .collect();
+        assert_eq!(dsts, vec!["192.168.4.0/24", "203.0.113.9"]);
     }
 
     /// An explicit rule the operator wrote wins over the automatic opening — that
