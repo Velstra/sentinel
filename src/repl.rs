@@ -1230,6 +1230,36 @@ const SERVICES_NODES: &[Cand] = &[
         "reverse-proxy",
         "L7 reverse proxy / load balancer (haproxy, by name)",
     ),
+    (
+        "syslog",
+        "ship the journal to remote collectors (rsyslog, RFC 5424)",
+    ),
+];
+// `services syslog <Tab>`: one node, since a collector is all there is to set.
+const SYSLOG_NODES: &[Cand] = &[("target", "a collector to ship to, by host")];
+// `services syslog target <host> <Tab>` — every field has a working default, so a
+// bare `target <host>` already forwards.
+const SYSLOG_FIELDS: &[Cand] = &[
+    ("port", "collector port (default 514)"),
+    ("proto", "udp (default) / tcp"),
+    (
+        "level",
+        "minimum severity to ship, that level and above (default info)",
+    ),
+];
+const SYSLOG_PROTOS: &[Cand] = &[
+    ("udp", "fire-and-forget; cannot report a failure"),
+    ("tcp", "acknowledged; buffered when the collector is away"),
+];
+const SYSLOG_LEVELS: &[Cand] = &[
+    ("emerg", "system is unusable"),
+    ("alert", "action must be taken immediately"),
+    ("crit", "critical conditions"),
+    ("err", "errors"),
+    ("warning", "warnings and above"),
+    ("notice", "normal but significant"),
+    ("info", "informational and above (the default)"),
+    ("debug", "everything the journal holds"),
 ];
 // `services reverse-proxy <name> <Tab>` reveals the frontend fields (roadmap C22).
 const REVERSE_PROXY_FIELDS: &[Cand] = &[
@@ -2311,6 +2341,10 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "services", "dhcp-relay"] => DHCP_RELAY_FIELDS,
         ["set" | "delete", "services", "reverse-proxy", _name] => REVERSE_PROXY_FIELDS,
         ["set", "services", "reverse-proxy", _name, "disabled"] => BOOLS,
+        ["set" | "delete", "services", "syslog"] => SYSLOG_NODES,
+        ["set" | "delete", "services", "syslog", "target", _host] => SYSLOG_FIELDS,
+        ["set", "services", "syslog", "target", _host, "proto"] => SYSLOG_PROTOS,
+        ["set", "services", "syslog", "target", _host, "level"] => SYSLOG_LEVELS,
 
         // The firewall sub-tree.
         ["set" | "delete", "firewall"] => FIREWALL_NODES,
@@ -2545,6 +2579,7 @@ pub struct DynNames {
     pub rules: Vec<String>,
     pub zones: Vec<String>,
     pub load_balancers: Vec<String>,
+    pub syslog_targets: Vec<String>,
     pub nat_source: Vec<String>,
     pub nat_destination: Vec<String>,
     pub nat_npt66: Vec<String>,
@@ -2611,6 +2646,11 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
             "a new interface name (wg0, br0, …)",
         ),
         ["set" | "delete", "firewall", "rule"] => named(&names.rules, "rule", "a new rule name"),
+        ["set" | "delete", "services", "syslog", "target"] => named(
+            &names.syslog_targets,
+            "syslog target",
+            "a collector's address or hostname",
+        ),
         ["set" | "delete", "load-balancer"] => named(
             &names.load_balancers,
             "load-balancer",
@@ -2924,6 +2964,7 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
         ["set", "firewall", "zone", _name, "block"] => own_cands(&[PH_IPV4_CIDR, PH_IPV6_CIDR]),
         ["set", "firewall", "rule", _name, "source"] => own_cands(&[PH_IPV4_CIDR, PH_IPV6_CIDR]),
         ["set", "firewall", "rule", _name, "port"] => own_cands(&[PH_PORT_RANGE]),
+        ["set", "services", "syslog", "target", _host, "port"] => own_cands(&[PH_PORT]),
         ["set", "load-balancer", _name, "port"] => own_cands(&[PH_PORT]),
         ["set", "load-balancer", _name, "vip"] => own_cands(&[PH_IPV4]),
         // A bare address keeps the client's port, so the pool member placeholder
@@ -3609,8 +3650,18 @@ mod tests {
                 "mdns",
                 "dyndns",
                 "dhcp-relay",
-                "reverse-proxy"
+                "reverse-proxy",
+                "syslog"
             ]
+        );
+        assert_eq!(kw(&["set", "services", "syslog"]), ["target"]);
+        assert_eq!(
+            kw(&["set", "services", "syslog", "target", "10.0.0.9"]),
+            ["port", "proto", "level"]
+        );
+        assert_eq!(
+            kw(&["set", "services", "syslog", "target", "10.0.0.9", "proto"]),
+            ["udp", "tcp"]
         );
         assert_eq!(
             kw(&["set", "services", "ssh"]),
@@ -3751,6 +3802,7 @@ mod tests {
             rules: vec!["web".into()],
             zones: vec!["lan".into(), "wan".into()],
             load_balancers: vec!["api-vip".into()],
+            syslog_targets: vec!["10.0.0.9".into()],
             nat_source: vec!["wan-masq".into()],
             nat_destination: vec!["web-fwd".into()],
             nat_npt66: vec!["v6-npt".into()],
