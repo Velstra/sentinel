@@ -2641,29 +2641,42 @@
                 timeout=40,
             )
 
-            # C22: the appliance can now front fabric's XDP load balancer. There is
-            # no `set load-balancer` grammar yet, so this drives the file surface —
-            # which also proves a commit carries the block through rather than
-            # dropping what the file declared.
+            # C22: the appliance fronts fabric's XDP load balancer, built through
+            # the CLI — `set load-balancer …` on the real box, not a hand-written
+            # config file, so the grammar itself is under test here.
             fw.succeed(
-                "cat >> /var/lib/sentinel/appliance.toml <<'EOF'\n"
-                "\n"
-                "[[load-balancer]]\n"
-                'name = "lb-web"\n'
-                'zone = "wan"\n'
-                'vip = "10.1.0.1"\n'
-                'proto = "tcp"\n'
-                "port = 9090\n"
-                'backends = ["10.2.0.2:80"]\n'
-                "EOF"
-            )
-            # Re-enter the config session: it loads the file (now carrying the
-            # load balancer) into a fresh draft and commits it.
-            fw.succeed(
-                "su admin -c \"printf '%s\\n' commit save exit | sentinel configure\""
+                "su admin -c \"printf '%s\\n' "
+                "'set load-balancer lb-web zone wan' "
+                "'set load-balancer lb-web vip 10.1.0.1' "
+                "'set load-balancer lb-web proto tcp' "
+                "'set load-balancer lb-web port 9090' "
+                "'set load-balancer lb-web backend 10.2.0.2:80' "
+                "commit save exit "
+                "| sentinel configure\""
             )
             fw.succeed("grep -q '\\[\\[service\\]\\]' /run/sentinel/velstra.toml")
             fw.succeed("grep -q 'vip = \"10.1.0.1\"' /run/sentinel/velstra.toml")
+            # It round-trips: the service is in the saved config, and `show
+            # load-balancer` reads it back with its pool.
+            fw.succeed("grep -q 'name = \"lb-web\"' /var/lib/sentinel/appliance.toml")
+            shown = fw.succeed("sentinel show load-balancer")
+            assert "lb-web" in shown, f"the service is missing from show: {shown}"
+            assert "backend 10.2.0.2:80" in shown, f"the pool is missing: {shown}"
+            # A second service on the same (zone, proto, port) is refused rather
+            # than silently overwriting the first in the datapath's map.
+            # (`|| true`: the REPL reports the rejection and carries on, so the
+            # message — not the exit status — is what this asserts on.)
+            clash = fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set load-balancer clash zone wan' "
+                "'set load-balancer clash vip 10.1.0.1' "
+                "'set load-balancer clash proto tcp' "
+                "'set load-balancer clash port 9090' "
+                "commit exit "
+                "| sentinel configure\" 2>&1 || true"
+            )
+            assert "already fronts" in clash, f"the duplicate was accepted: {clash}"
+            fw.fail("grep -q 'name = \"clash\"' /var/lib/sentinel/appliance.toml")
             # The firewall is opened for the VIP, since the data plane special-cases
             # a port-forward but knows nothing about a service.
             fw.succeed("grep -A2 '\\[\\[policy.port_rule\\]\\]' /run/sentinel/velstra.toml | grep -q 'port = 9090'")

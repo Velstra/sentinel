@@ -904,6 +904,7 @@ const OP_SHOW_TOP: &[Cand] = &[
     ("bfd", "BFD sessions"),
     ("firewall", "firewall summary / statistics / log"),
     ("nat", "NAT configuration summary"),
+    ("load-balancer", "load-balanced services + their pools"),
     ("vpn", "IPsec VPN: security associations / connections"),
     ("pki", "local CAs + issued certificates (expiry)"),
     ("configuration", "the saved configuration (config syntax)"),
@@ -944,6 +945,10 @@ const TOP: &[Cand] = &[
     (
         "nat",
         "address translation: source (masquerade), destination (port-forward)",
+    ),
+    (
+        "load-balancer",
+        "load-balanced services: a virtual address in front of a backend pool",
     ),
     (
         "protocols",
@@ -1832,6 +1837,24 @@ const NAT_SOURCE_FIELDS: &[Cand] = &[
         "administratively disable this rule (true|false)",
     ),
 ];
+// A load-balanced service (roadmap C22): the VIP clients reach and the pool
+// behind it.
+const LB_FIELDS: &[Cand] = &[
+    ("zone", "ingress zone clients arrive from"),
+    ("vip", "the virtual address clients connect to"),
+    ("proto", "tcp / udp"),
+    ("port", "the virtual port clients connect to"),
+    (
+        "backend",
+        "add a pool member: ip, or ip:port to change the port",
+    ),
+    ("description", "free-text label for this service"),
+    (
+        "disabled",
+        "administratively disable this service (true|false)",
+    ),
+];
+
 const NAT_DEST_FIELDS: &[Cand] = &[
     ("zone", "ingress zone (public side)"),
     ("proto", "tcp / udp"),
@@ -2325,6 +2348,10 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "firewall", "rule", _name, "schedule"] => SCHEDULE_FIELDS,
 
         // The nat sub-tree (its own top-level node).
+        ["set" | "delete", "load-balancer", _name] => LB_FIELDS,
+        ["set", "load-balancer", _name, "proto"] => PROTOS,
+        ["set", "load-balancer", _name, "disabled"] => BOOLS,
+
         ["set" | "delete", "nat"] => NAT_NODES,
         ["set" | "delete", "nat", "source", _name] => NAT_SOURCE_FIELDS,
         ["set", "nat", "source", _name, "disabled"] => BOOLS,
@@ -2517,6 +2544,7 @@ pub struct DynNames {
     pub interfaces: Vec<String>,
     pub rules: Vec<String>,
     pub zones: Vec<String>,
+    pub load_balancers: Vec<String>,
     pub nat_source: Vec<String>,
     pub nat_destination: Vec<String>,
     pub nat_npt66: Vec<String>,
@@ -2583,6 +2611,11 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
             "a new interface name (wg0, br0, …)",
         ),
         ["set" | "delete", "firewall", "rule"] => named(&names.rules, "rule", "a new rule name"),
+        ["set" | "delete", "load-balancer"] => named(
+            &names.load_balancers,
+            "load-balancer",
+            "a new load-balanced service name",
+        ),
         ["set" | "delete", "nat", "source"] => named(
             &names.nat_source,
             "nat source",
@@ -2686,6 +2719,7 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
         // ---- Zone-VALUE positions (reference an existing zone) ---------------
         ["set", "interface", _name, "zone"] => zones("zone"),
         ["set", "firewall", "rule", _name, "from" | "to"] => zones("zone"),
+        ["set", "load-balancer", _name, "zone"] => zones("zone"),
         ["set", "nat", "source", _name, "zone"] => zones("zone"),
         ["set", "nat", "destination", _name, "zone"] => zones("zone"),
         // Group-REFERENCE positions (an existing alias, no `<name>` invite).
@@ -2890,6 +2924,11 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
         ["set", "firewall", "zone", _name, "block"] => own_cands(&[PH_IPV4_CIDR, PH_IPV6_CIDR]),
         ["set", "firewall", "rule", _name, "source"] => own_cands(&[PH_IPV4_CIDR, PH_IPV6_CIDR]),
         ["set", "firewall", "rule", _name, "port"] => own_cands(&[PH_PORT_RANGE]),
+        ["set", "load-balancer", _name, "port"] => own_cands(&[PH_PORT]),
+        ["set", "load-balancer", _name, "vip"] => own_cands(&[PH_IPV4]),
+        // A bare address keeps the client's port, so the pool member placeholder
+        // is the same "ip or ip:port" shape a port-forward target takes.
+        ["set" | "delete", "load-balancer", _name, "backend"] => own_cands(&[PH_IPV4_TO]),
         ["set", "nat", "destination", _name, "port"] => own_cands(&[PH_PORT]),
         ["set", "nat", "destination", _name, "to"] => own_cands(&[PH_IPV4_TO]),
         ["set", "nat", "npt66", _name, "internal" | "external"] => own_cands(&[PH_IPV6_CIDR]),
@@ -3300,6 +3339,7 @@ mod tests {
                 "interface",
                 "firewall",
                 "nat",
+                "load-balancer",
                 "protocols",
                 "services",
                 "multiwan",
@@ -3710,6 +3750,7 @@ mod tests {
             interfaces: vec!["eth0".into(), "eth1".into()],
             rules: vec!["web".into()],
             zones: vec!["lan".into(), "wan".into()],
+            load_balancers: vec!["api-vip".into()],
             nat_source: vec!["wan-masq".into()],
             nat_destination: vec!["web-fwd".into()],
             nat_npt66: vec!["v6-npt".into()],
@@ -3778,6 +3819,7 @@ mod tests {
                 "interface",
                 "firewall",
                 "nat",
+                "load-balancer",
                 "protocols",
                 "services",
                 "multiwan",

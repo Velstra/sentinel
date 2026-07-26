@@ -157,3 +157,32 @@ set nat nat64 dns64 true
 `npt66` maps an internal ULA prefix to a delegated external prefix statelessly —
 configured per interface via `[nat.npt66]` (internal ↔ external `/48`s); see
 `show nat`.
+
+## Load-balanced services
+
+`load-balancer` is its own top-level node — a virtual address in front of a
+backend pool, translated in the XDP data plane rather than by a userspace proxy.
+
+| Field | Meaning |
+|---|---|
+| `zone` | Ingress zone clients arrive from; the service is keyed under its policy. |
+| `vip` | The virtual address clients connect to. |
+| `proto` | `tcp` / `udp`. |
+| `port` | The virtual port clients connect to. |
+| `backend` | A pool member, `ip` (keep the client's port) or `ip:port`. Repeat to add. |
+
+```text
+set load-balancer web zone wan
+set load-balancer web vip 203.0.113.10
+set load-balancer web proto tcp
+set load-balancer web port 443
+set load-balancer web backend 10.0.0.11:8443
+set load-balancer web backend 10.0.0.12
+```
+
+Committing a service **opens the firewall for its port** in that zone (a visible
+`pass` rule an explicit rule of your own overrides), and only one service may
+hold a given `(zone, proto, port)`. See
+[Load balancer](../operations/configure.md) for the full surface, and
+`services reverse-proxy` when you need TLS termination or HTTP-aware routing
+instead.
