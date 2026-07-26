@@ -17,12 +17,11 @@ use crate::config::{
     ConfigSync, ConntrackSync, Dhcp6Pool, DhcpRelay, DhcpServer, DhcpStaticLease, Dns, Dyndns,
     Export, Filter, FilterRule, Firewall, Groups, HealthCheck, IfaceType, Interface,
     IpsecConnection, Isis, Lldp, LoadBalancer, Login, Mdns, MultiWan, Multicast,
-    MulticastInterface, Nat, Nat64,
-    NatDestination, NatNpt66, NatSource, Ntp, OpenConnectServer, OpenConnectUser, Ospf, Ospf3,
-    OspfInterface, Pki, Policy, PortSpec, Pppoe, PrefixEntry, PrefixList, Proto, Protocols, Qos,
-    QosDiscipline, ReverseProxy, Rip, RouterAdvert, Rule, Schedule, Services, Snmp, Ssh,
-    StaticRoute, System, UpdateChannel, Vpn, VrfDef, Vrrp, WanMode, WanUplink, WgPeer,
-    WireguardTunnel, ZoneCfg,
+    MulticastInterface, Nat, Nat64, NatDestination, NatNpt66, NatSource, Ntp, OpenConnectServer,
+    OpenConnectUser, Ospf, Ospf3, OspfInterface, Pki, Policy, PortSpec, Pppoe, PrefixEntry,
+    PrefixList, Proto, Protocols, Qos, QosDiscipline, ReverseProxy, Rip, RouterAdvert, Rule,
+    Schedule, Services, Snmp, Ssh, StaticRoute, System, UpdateChannel, Vpn, VrfDef, Vrrp, WanMode,
+    WanUplink, WgPeer, WireguardTunnel, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -247,6 +246,22 @@ struct NatDstDraft {
     port: Option<u16>,
     to: Option<String>,
     hairpin: bool,
+}
+
+/// A partially-specified load-balanced service (roadmap C22).
+///
+/// The backend pool is a plain list rather than a named sub-tree: a backend has
+/// no properties of its own beyond `ip[:port]`, so naming each one would add a
+/// level of nesting that carries no information.
+#[derive(Debug, Clone, Default)]
+struct LbDraft {
+    description: Option<String>,
+    disabled: Option<bool>,
+    zone: Option<String>,
+    vip: Option<String>,
+    proto: Option<Proto>,
+    port: Option<u16>,
+    backends: Vec<String>,
 }
 
 /// A partially-specified NPTv6 (RFC 6296) prefix-translation rule.
@@ -1103,11 +1118,8 @@ struct Draft {
     zones: BTreeMap<String, ZoneDraft>,
     interfaces: Vec<(String, IfaceDraft)>,
     rules: Vec<(String, RuleDraft)>,
-    /// Load-balanced services (C22). Carried through verbatim rather than as a
-    /// per-field draft: there is no `set load-balancer …` grammar yet, and a
-    /// commit that rebuilt the appliance without them would silently delete what
-    /// the config file declared.
-    load_balancers: Vec<LoadBalancer>,
+    /// Load-balanced services (C22), keyed by name in declaration order.
+    load_balancers: Vec<(String, LbDraft)>,
     nat_source: Vec<(String, NatSrcDraft)>,
     nat_destination: Vec<(String, NatDstDraft)>,
     nat_npt66: Vec<(String, NatNpt66Draft)>,
@@ -1619,6 +1631,15 @@ impl Draft {
         &mut self.nat_destination.last_mut().unwrap().1
     }
 
+    fn load_balancer_mut(&mut self, name: &str) -> &mut LbDraft {
+        if let Some(i) = self.load_balancers.iter().position(|(n, _)| n == name) {
+            return &mut self.load_balancers[i].1;
+        }
+        self.load_balancers
+            .push((name.to_string(), LbDraft::default()));
+        &mut self.load_balancers.last_mut().unwrap().1
+    }
+
     fn nat_npt66_mut(&mut self, name: &str) -> &mut NatNpt66Draft {
         if let Some(i) = self.nat_npt66.iter().position(|(n, _)| n == name) {
             return &mut self.nat_npt66[i].1;
@@ -1640,7 +1661,24 @@ impl Draft {
                 fail_closed: Some(a.firewall.fail_closed),
             },
             groups: a.firewall.group.clone(),
-            load_balancers: a.load_balancers.clone(),
+            load_balancers: a
+                .load_balancers
+                .iter()
+                .map(|l| {
+                    (
+                        l.name.clone(),
+                        LbDraft {
+                            description: l.description.clone(),
+                            disabled: l.disabled.then_some(true),
+                            zone: Some(l.zone.clone()),
+                            vip: Some(l.vip.clone()),
+                            proto: Some(l.proto),
+                            port: Some(l.port),
+                            backends: l.backends.clone(),
+                        },
+                    )
+                })
+                .collect(),
             zones: a
                 .zones
                 .iter()
@@ -2300,6 +2338,16 @@ impl Session {
             .collect()
     }
 
+    /// The load-balanced service names — completion offers these for
+    /// `set/delete load-balancer …`.
+    pub fn load_balancer_names(&self) -> Vec<String> {
+        self.draft
+            .load_balancers
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
     /// The NPTv6 rule names — completion offers these for `set/delete nat npt66 …`.
     pub fn nat_npt66_names(&self) -> Vec<String> {
         self.draft
@@ -2934,6 +2982,41 @@ impl Session {
                         list.push(spec);
                     }
                 }
+            }
+
+            // --- load-balancer <name> { … } — a load-balanced service (C22) ---
+            //
+            // Its own top-level node, mirroring the `[[load-balancer]]` file key.
+            // Not under `nat`: a service is a thing clients connect to, and
+            // filing it under address translation would describe how it happens
+            // to be implemented rather than what it is.
+            ["load-balancer", name, "description", rest @ ..] if !rest.is_empty() => {
+                let desc = rest.join(" ");
+                crate::config::validate_description(&desc)?;
+                self.draft.load_balancer_mut(name).description = Some(desc);
+            }
+            ["load-balancer", name, "disabled", v] => {
+                self.draft.load_balancer_mut(name).disabled = Some(parse_bool(v)?)
+            }
+            ["load-balancer", name, "zone", v] => {
+                self.draft.load_balancer_mut(name).zone = Some((*v).to_string())
+            }
+            ["load-balancer", name, "vip", v] => {
+                validate_ipv4(v)?;
+                self.draft.load_balancer_mut(name).vip = Some((*v).to_string());
+            }
+            ["load-balancer", name, "proto", v] => {
+                self.draft.load_balancer_mut(name).proto = Some(parse_proto(v)?)
+            }
+            ["load-balancer", name, "port", v] => {
+                self.draft.load_balancer_mut(name).port =
+                    Some(v.parse().with_context(|| format!("invalid port {v:?}"))?);
+            }
+            // Appends, deduped — a pool is built one member at a time, and
+            // `delete … backend <spec>` takes one back out.
+            ["load-balancer", name, "backend", v] => {
+                crate::config::parse_host_port(v)?;
+                push_unique(&mut self.draft.load_balancer_mut(name).backends, v);
             }
 
             // --- nat { … } — address translation, its own top-level node ---
@@ -4618,6 +4701,40 @@ impl Session {
                 }
             }
 
+            // load-balancer <name>: the whole service, one field, or one backend.
+            ["load-balancer", name] => {
+                let before = self.draft.load_balancers.len();
+                self.draft.load_balancers.retain(|(n, _)| n != name);
+                if self.draft.load_balancers.len() == before {
+                    bail!("no load-balancer {name:?}");
+                }
+            }
+            // A backend is addressed by its value, so removing one member reads
+            // the same as removing a blocklist entry.
+            ["load-balancer", name, "backend", v] => {
+                let l = self.load_balancer(name)?;
+                let before = l.backends.len();
+                l.backends.retain(|b| b != v);
+                if l.backends.len() == before {
+                    bail!("{v:?} is not a backend of load-balancer {name:?}");
+                }
+            }
+            ["load-balancer", name, field] => {
+                let l = self.load_balancer(name)?;
+                match *field {
+                    "description" => l.description = None,
+                    "disabled" => l.disabled = None,
+                    "zone" => l.zone = None,
+                    "vip" => l.vip = None,
+                    "proto" => l.proto = None,
+                    "port" => l.port = None,
+                    // Bare `backend` drains the pool; the datapath keeps the
+                    // service and counts `lb_no_backend`.
+                    "backend" => l.backends.clear(),
+                    other => bail!("load-balancer has no field {other:?}"),
+                }
+            }
+
             // nat source <name>
             ["nat", "source", name] => {
                 let before = self.draft.nat_source.len();
@@ -5547,6 +5664,15 @@ impl Session {
             .ok_or_else(|| anyhow::anyhow!("no nat destination {name:?}"))
     }
 
+    fn load_balancer(&mut self, name: &str) -> Result<&mut LbDraft> {
+        self.draft
+            .load_balancers
+            .iter_mut()
+            .find(|(n, _)| n == name)
+            .map(|(_, l)| l)
+            .ok_or_else(|| anyhow::anyhow!("no load-balancer {name:?}"))
+    }
+
     fn uplink(&mut self, iface: &str) -> Result<&mut UplinkDraft> {
         self.draft
             .uplinks
@@ -5863,6 +5989,33 @@ impl Session {
                             anyhow::anyhow!("nat destination {name:?}: to not set")
                         })?,
                         hairpin: d.hairpin,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+        // A load-balanced service needs all four of zone/vip/proto/port to mean
+        // anything; an empty backend pool is legal (a drained service).
+        let load_balancers =
+            self.draft
+                .load_balancers
+                .iter()
+                .map(|(name, l)| {
+                    Ok(LoadBalancer {
+                        name: name.clone(),
+                        description: l.description.clone(),
+                        disabled: l.disabled.unwrap_or(false),
+                        zone: l.zone.clone().ok_or_else(|| {
+                            anyhow::anyhow!("load-balancer {name:?}: zone not set")
+                        })?,
+                        vip: l.vip.clone().ok_or_else(|| {
+                            anyhow::anyhow!("load-balancer {name:?}: vip not set")
+                        })?,
+                        proto: l.proto.ok_or_else(|| {
+                            anyhow::anyhow!("load-balancer {name:?}: proto not set")
+                        })?,
+                        port: l.port.ok_or_else(|| {
+                            anyhow::anyhow!("load-balancer {name:?}: port not set")
+                        })?,
+                        backends: l.backends.clone(),
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -6264,7 +6417,7 @@ impl Session {
             zones,
             interfaces,
             rules,
-            load_balancers: self.draft.load_balancers.clone(),
+            load_balancers,
             nat: Nat {
                 source: nat_source,
                 destination: nat_destination,
@@ -6881,6 +7034,35 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         out.push_str("firewall {\n");
         out.push_str(&fwi);
         out.push_str("}\n");
+    }
+
+    // Load-balanced services (C22) — one top-level node per service.
+    if want("load-balancer") {
+        for (name, l) in &draft.load_balancers {
+            out.push_str(&format!("load-balancer {name} {{\n"));
+            if let Some(desc) = &l.description {
+                out.push_str(&format!("    description {desc}\n"));
+            }
+            if l.disabled == Some(true) {
+                out.push_str("    disabled true\n");
+            }
+            if let Some(z) = &l.zone {
+                out.push_str(&format!("    zone {z}\n"));
+            }
+            if let Some(v) = &l.vip {
+                out.push_str(&format!("    vip {v}\n"));
+            }
+            if let Some(p) = l.proto {
+                out.push_str(&format!("    proto {}\n", proto_str(p)));
+            }
+            if let Some(p) = l.port {
+                out.push_str(&format!("    port {p}\n"));
+            }
+            for b in &l.backends {
+                out.push_str(&format!("    backend {b}\n"));
+            }
+            out.push_str("}\n");
+        }
     }
 
     // NAT is its own top-level node (address translation, not filtering), split
@@ -8222,10 +8404,9 @@ fn proto_str(p: Proto) -> &'static str {
 mod tests {
     use super::*;
 
-    /// A load balancer lives only in the config file — there is no `set
-    /// load-balancer …` grammar yet. So a CLI commit, which rebuilds the whole
-    /// appliance from the draft, must carry it through rather than silently
-    /// deleting what the file declared.
+    /// A CLI commit rebuilds the whole appliance from the draft, so a service
+    /// the config *file* declared has to survive one that never mentioned it —
+    /// every field of it, not just its name.
     #[test]
     fn a_file_configured_load_balancer_survives_a_cli_commit() {
         let toml = r#"
@@ -8259,6 +8440,77 @@ backends = ["10.0.0.11:8443"]
             rebuilt.load_balancers, appliance.load_balancers,
             "the load balancer must survive a commit that never mentioned it"
         );
+    }
+
+    /// The `set load-balancer …` surface end to end: build a service from
+    /// nothing, see it in `show`, commit it, and take it apart again.
+    #[test]
+    fn load_balancer_grammar_sets_shows_commits_and_deletes() {
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname fw1",
+            "set interface wan0 zone wan",
+            "set interface wan0 address 203.0.113.2/24",
+            "set load-balancer web zone wan",
+            "set load-balancer web vip 203.0.113.10",
+            "set load-balancer web proto tcp",
+            "set load-balancer web port 443",
+            "set load-balancer web backend 10.0.0.11:8443",
+            "set load-balancer web backend 10.0.0.12",
+            "set load-balancer web description public web tier",
+        ] {
+            run(&mut s, line).unwrap_or_else(|e| panic!("{line}: {e:#}"));
+        }
+
+        // A pool member is appended, deduped, and keeps declaration order — the
+        // datapath hashes over the pool, so a reordering would move live flows.
+        run(&mut s, "set load-balancer web backend 10.0.0.11:8443").unwrap();
+        let a = s.materialize().expect("materialize");
+        assert_eq!(a.load_balancers.len(), 1);
+        let lb = &a.load_balancers[0];
+        assert_eq!(lb.name, "web");
+        assert_eq!(lb.zone, "wan");
+        assert_eq!(lb.vip, "203.0.113.10");
+        assert_eq!(lb.port, 443);
+        assert_eq!(lb.backends, ["10.0.0.11:8443", "10.0.0.12"]);
+        assert_eq!(lb.description.as_deref(), Some("public web tier"));
+
+        // `show` renders it in config syntax, and the section filter finds it.
+        let shown = render_draft_only(&s.draft, true, Some("load-balancer"));
+        assert!(shown.contains("load-balancer web {"), "got:\n{shown}");
+        assert!(shown.contains("    vip 203.0.113.10"), "got:\n{shown}");
+        assert!(shown.contains("    backend 10.0.0.12"), "got:\n{shown}");
+
+        // A bad value is refused at entry rather than at commit.
+        assert!(run(&mut s, "set load-balancer web vip 203.0.113.999").is_err());
+        assert!(run(&mut s, "set load-balancer web port 70000").is_err());
+        assert!(run(&mut s, "set load-balancer web backend not-an-ip").is_err());
+        assert!(run(&mut s, "set load-balancer web nonsense 1").is_err());
+
+        // Removing one member leaves the rest; removing an absent one errors.
+        run(&mut s, "delete load-balancer web backend 10.0.0.12").unwrap();
+        assert!(run(&mut s, "delete load-balancer web backend 10.0.0.12").is_err());
+        assert_eq!(
+            s.materialize().unwrap().load_balancers[0].backends,
+            ["10.0.0.11:8443"]
+        );
+
+        // Draining the pool keeps the service: the datapath passes that traffic
+        // through and counts it, which is what an operator draining wants.
+        run(&mut s, "delete load-balancer web backend").unwrap();
+        let drained = s.materialize().expect("an empty pool is legal");
+        assert!(drained.load_balancers[0].backends.is_empty());
+
+        // A required field cleared is caught at commit, naming the field.
+        run(&mut s, "delete load-balancer web vip").unwrap();
+        let err = format!("{:#}", s.materialize().unwrap_err());
+        assert!(err.contains("vip not set"), "got: {err}");
+        run(&mut s, "set load-balancer web vip 203.0.113.10").unwrap();
+
+        // And the whole service goes away by name.
+        run(&mut s, "delete load-balancer web").unwrap();
+        assert!(run(&mut s, "delete load-balancer web").is_err());
+        assert!(s.materialize().unwrap().load_balancers.is_empty());
     }
 
     fn run(session: &mut Session, line: &str) -> Result<()> {

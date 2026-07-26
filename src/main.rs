@@ -441,6 +441,7 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
                     interfaces: session.interface_names(),
                     rules: session.rule_names(),
                     zones: session.zone_names(),
+                    load_balancers: session.load_balancer_names(),
                     nat_source: session.nat_source_names(),
                     nat_destination: session.nat_destination_names(),
                     nat_npt66: session.nat_npt66_names(),
@@ -841,6 +842,7 @@ fn show_op(args: &[String]) -> Result<()> {
             &["-u", "velstra.service", "-n", "50", "--no-pager"],
         ),
         ["nat"] => show_nat(),
+        ["load-balancer"] => show_load_balancer(),
 
         // IPsec VPN (roadmap C2): the security-association / connection state,
         // proxied to strongSwan's swanctl (run privileged — charon's vici socket
@@ -990,7 +992,10 @@ fn show_agent_query(command: &str, what: &str) -> Result<()> {
         }
         Err(e) => {
             println!("{what} unavailable: {e:#}");
-            println!("(the agent serves this on {}; check `systemctl status velstra.service`)", velstra::SOCKET);
+            println!(
+                "(the agent serves this on {}; check `systemctl status velstra.service`)",
+                velstra::SOCKET
+            );
             Ok(())
         }
     }
@@ -1081,6 +1086,39 @@ fn show_nat() -> Result<()> {
             "destination {}: {} {:?}/{} -> {}",
             d.name, d.zone, d.proto, d.port, d.to
         );
+    }
+    Ok(())
+}
+
+/// The load-balanced services of the saved config (roadmap C22).
+///
+/// Names the two states the config alone reads past: a service that is
+/// administratively disabled (the compiler drops it entirely), and one whose pool
+/// is empty — legal, but it forwards nothing, which is worth saying out loud
+/// rather than letting an operator read an empty column as "fine".
+fn show_load_balancer() -> Result<()> {
+    let path = std::path::Path::new(DEFAULT_CONFIG);
+    if !path.exists() {
+        println!("no saved config at {DEFAULT_CONFIG} (run `configure` + `save`)");
+        return Ok(());
+    }
+    let a = Appliance::load(path)?;
+    if a.load_balancers.is_empty() {
+        println!("no load-balanced services configured");
+        return Ok(());
+    }
+    for lb in &a.load_balancers {
+        let state = if lb.disabled { " (disabled)" } else { "" };
+        println!(
+            "{}: {} {:?}/{} vip {}{state}",
+            lb.name, lb.zone, lb.proto, lb.port, lb.vip
+        );
+        if lb.backends.is_empty() {
+            println!("    no backends — the pool is drained, traffic is passed through");
+        }
+        for b in &lb.backends {
+            println!("    backend {b}");
+        }
     }
     Ok(())
 }

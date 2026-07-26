@@ -57,9 +57,9 @@ admin@fw-a*# set action accept
 
 ## The config tree
 
-There are **four** top-level nodes, each a clear domain, so it's always obvious
-where a setting lives. Press **Tab** or **`?`** at any level to see what's
-available next (with a description for each), VyOS-style:
+Each top-level node is a clear domain, so it's always obvious where a setting
+lives. Press **Tab** or **`?`** at any level to see what's available next (with a
+description for each), VyOS-style:
 
 ```text
 system     hostname <name>
@@ -69,6 +69,7 @@ firewall   global        stateful | block-icmp | default-action | log | block
            rule <r>      from | to | action | proto | port
 nat        source <s>      zone
            destination <d> zone | proto | port | to
+load-balancer <n>          zone | vip | proto | port | backend
 policy     prefix-list <n>  rule <seq> <prefix | ge | le>
            route-map <n>    default | rule <seq> <action | match … | set …>
 vpn        ipsec <name>      local | remote | local-subnet | remote-subnet | psk | …
@@ -392,15 +393,51 @@ Reflection needs the ingress zone's **public IP known at commit time**, so the
 WAN interface must carry a static `address` (a DHCP/address-less WAN still gets
 the plain forward, just no reflection).
 
-## Reverse proxy / load balancer (`services reverse-proxy`)
+## Load balancer (`load-balancer`) — the L4 path
+
+A `load-balancer <name>` puts a **virtual address** in front of a pool of
+backends. Unlike the reverse proxy below, this is not a userspace process: the
+XDP data plane rewrites the destination in the kernel and connection-tracks the
+flow, so a connection reaches a backend without ever being copied to userspace.
+Use it for raw throughput; use the reverse proxy when you need TLS termination or
+HTTP-aware routing.
+
+```text
+sentinel# set load-balancer web zone wan             # the zone clients arrive from
+sentinel# set load-balancer web vip 203.0.113.10     # the address clients connect to
+sentinel# set load-balancer web proto tcp
+sentinel# set load-balancer web port 443
+sentinel# set load-balancer web backend 10.0.0.11:8443
+sentinel# set load-balancer web backend 10.0.0.12    # bare ip keeps the client's port
+sentinel# commit save
+```
+
+- **`zone`** — the ingress zone; the service is matched under that zone's policy,
+  so a VIP is reachable from the zone it is declared on. It must be backed by an
+  interface.
+- **`backend`** — repeat it to build the pool. `"ip"` keeps the client's original
+  destination port; `"ip:port"` remaps it. `delete load-balancer <name> backend
+  <ip[:port]>` takes one member out.
+- **One service per `(zone, proto, port)`.** A second on the same tuple is
+  refused at commit: the data plane keys a service by that tuple, so it would
+  quietly overwrite the first rather than conflict.
+- **Committing a service opens the firewall for its port** — a `pass` rule on
+  `(proto, port)` in that zone, visible in the compiled config. An explicit rule
+  you write on the same protocol and port wins, which is how a VIP is taken out
+  of service without deleting it.
+- **An empty pool is allowed.** Draining a service to zero backends is a normal
+  operation; the data plane passes that traffic through (counting
+  `lb_no_backend`) rather than blackholing it. `delete load-balancer <name>
+  backend` drains the pool and keeps the service.
+
+## Reverse proxy (`services reverse-proxy`) — the L7 path
 
 A `services reverse-proxy <name>` frontend is the **L7 tier**: it listens on a
 port, optionally **terminates TLS** with an on-box PKI certificate, and forwards
 requests to one or more **backends** round-robin (host:port). This is
-HTTP-aware routing + TLS termination that sits *on top of* the datapath — the
-XDP L4 load-balancer (fabric) is the separate high-throughput path; use this
-when you want TLS termination or per-host HTTP routing rather than raw L4
-forwarding.
+HTTP-aware routing + TLS termination that sits *on top of* the datapath — use it
+when you want TLS termination or per-host HTTP routing rather than the raw L4
+forwarding `load-balancer` above does.
 
 Each frontend is a keyed section (keyed by name, like firewall rules or `nat`
 entries), so you can define as many as you like on distinct ports:
