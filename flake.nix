@@ -2640,6 +2640,30 @@
                 "curl -s --max-time 5 http://10.1.0.1:8080/ | grep -q hello-from-server",
                 timeout=40,
             )
+
+            # C23 flow insight: the agent's query socket is the ONE path unit tests
+            # cannot reach (it needs a loaded eBPF object), so assert it here.
+            fw.wait_until_succeeds("test -S /run/velstra/query.sock", timeout=20)
+
+            # Counters now come from the live maps rather than from scraping the
+            # agent's journal, so they are present even though this VM sets no
+            # --stats-interval, which the old log-scraping path depended on.
+            stats = fw.succeed("sentinel show firewall statistics")
+            assert "rx_packets" in stats, f"live counters missing: {stats}"
+            assert "drop rate" in stats, f"counter table truncated: {stats}"
+
+            # The forwarded connection above is NAT'd, so it must show up in the
+            # state table together with the DNAT target the port-forward names.
+            client.succeed("curl -s --max-time 5 http://10.1.0.1:8080/ >/dev/null")
+            flows = fw.succeed("sentinel show flows")
+            assert "10.1.0.2" in flows, f"the client's flow is missing: {flows}"
+            assert "10.2.0.2:80" in flows, f"the DNAT target is missing: {flows}"
+
+            # Top talkers ranks by connection count and must name that unit: the
+            # flow state carries no byte counters to rank by.
+            top = fw.succeed("sentinel show top-talkers")
+            assert "connections" in top, f"top-talkers must name its unit: {top}"
+            assert "10.1.0.2" in top, f"the client is not ranked: {top}"
           '';
         };
 

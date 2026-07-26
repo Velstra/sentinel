@@ -26,6 +26,7 @@ mod session;
 mod system;
 mod ui;
 mod update;
+mod velstra;
 mod wgkey;
 mod wren;
 
@@ -828,6 +829,13 @@ fn show_op(args: &[String]) -> Result<()> {
             Ok(())
         }
         ["firewall", "statistics" | "stats"] => show_firewall_stats(),
+        // C23 flow insight: the live state table, straight from the data plane.
+        ["firewall", "flows"] | ["flows"] | ["connections"] | ["conntrack"] => {
+            show_agent_query("flows", "flows")
+        }
+        ["firewall", "top-talkers" | "top"] | ["top-talkers"] => {
+            show_agent_query("top", "top talkers")
+        }
         ["firewall", "log"] => run_show(
             &system::bin("journalctl"),
             &["-u", "velstra.service", "-n", "50", "--no-pager"],
@@ -913,6 +921,7 @@ fn show_op(args: &[String]) -> Result<()> {
              show babel [neighbors|routes]\n  \
              show vrrp | show bfd [sessions]\n  \
              show firewall [statistics|log]    firewall summary / counters / log\n  \
+             show flows [| top-talkers]        live state table / busiest sources\n  \
              show nat                          NAT configuration\n  \
              show vpn [ipsec]                  IPsec security associations / connections\n  \
              show pki                          local CAs + issued certificates (expiry)\n  \
@@ -969,7 +978,32 @@ fn wren_show_or(words: &[&str], fallback_cmd: &str, fallback_args: &[&str]) -> R
 
 /// The latest counter table the velstra agent dumped to its journal — the
 /// firewall's live statistics (rx/pass/drop/reject/NAT counters + drop rate).
+/// Ask the agent's query socket and print its reply. A missing socket is reported
+/// as such rather than as a failure: an agent started without `--query-socket`
+/// (or an older one) is a normal state, and the operator needs to know *why* the
+/// view is empty rather than see a stack of errors.
+fn show_agent_query(command: &str, what: &str) -> Result<()> {
+    match velstra::query(command) {
+        Ok(reply) => {
+            print!("{reply}");
+            Ok(())
+        }
+        Err(e) => {
+            println!("{what} unavailable: {e:#}");
+            println!("(the agent serves this on {}; check `systemctl status velstra.service`)", velstra::SOCKET);
+            Ok(())
+        }
+    }
+}
+
 fn show_firewall_stats() -> Result<()> {
+    // Prefer the agent's live counters. The journal scrape below is the fallback
+    // for an agent without a query socket: it only ever shows whatever the last
+    // periodic dump happened to contain, so it is a poor substitute, not a peer.
+    if let Ok(reply) = velstra::query("stats") {
+        print!("{reply}");
+        return Ok(());
+    }
     let out = std::process::Command::new(system::bin("journalctl"))
         .args([
             "-u",

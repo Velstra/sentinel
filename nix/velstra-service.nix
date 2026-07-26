@@ -96,7 +96,13 @@ in
       # (start-limit-hit). Restart=on-failure below still self-heals real crashes.
       startLimitIntervalSec = 0;
       serviceConfig = {
-        ExecStart = "${cfg.package}/bin/velstra run --iface ${cfg.interface} --config /run/sentinel/velstra.toml";
+        # The query socket (C23) is what `show flows` / `show firewall statistics`
+        # read: the agent owns the eBPF maps, so it is the only process that can
+        # answer what the data plane is doing. RuntimeDirectory creates (and
+        # cleans up) /run/velstra for it.
+        ExecStart = "${cfg.package}/bin/velstra run --iface ${cfg.interface} --config /run/sentinel/velstra.toml --query-socket /run/velstra/query.sock";
+        RuntimeDirectory = "velstra";
+        RuntimeDirectoryMode = "0700";
         Restart = "on-failure";
         RestartSec = 2;
         # Loading + attaching XDP/eBPF needs these capabilities. CAP_SYS_ADMIN is
