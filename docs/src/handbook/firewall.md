@@ -18,6 +18,7 @@ overrides them for one zone.
 | `stateful` | Track flows so return traffic is allowed (`true`/`false`). |
 | `block-icmp` | Drop inbound ICMP by default (`true`/`false`). |
 | `log` | Log matched traffic by default (`true`/`false`). |
+| `source-validation` | Reject spoofed source addresses: `disable` / `loose` / `strict`. |
 | `block <IP\|CIDR>` | Drop a source everywhere (`global`) or on one zone. |
 | `description` | (zone only) free-text label. |
 
@@ -131,6 +132,63 @@ set firewall rule guest-wifi schedule days mon,tue,wed,thu,fri
 set firewall rule guest-wifi schedule start 09:00
 set firewall rule guest-wifi schedule end 17:00
 ```
+
+## Source validation (anti-spoofing)
+
+A packet claiming a source address it could not possibly have come from is the
+oldest trick there is: it is how a WAN neighbour pretends to be on your LAN, and
+how your own network becomes somebody else's reflection amplifier. Source
+validation answers that with the routing table — it looks up a route back to the
+sender and asks whether the answer makes sense for the interface the packet
+arrived on.
+
+```text
+set firewall zone wan source-validation strict
+```
+
+| Mode | The rule |
+|---|---|
+| `disable` | Accept any source address. **The default.** |
+| `loose` | The source must be routable *somewhere*. |
+| `strict` | ...and by the interface it arrived on. |
+
+**`strict` is the real anti-spoofing rule** (BCP 38 / RFC 3704): a source whose
+return path leaves by another interface cannot be the sender, so it is dropped.
+It is also the mode that breaks things — wherever routing is asymmetric, a reply
+legitimately returns by a different path than the request took, and `strict`
+drops that traffic with no other symptom. A second WAN uplink is the usual cause,
+and the commit warns when it sees one.
+
+`loose` is what to reach for there. It cannot tell a LAN address arriving on the
+WAN from a real one, but it still refuses everything that could never answer at
+all — unrouted space, bogons, the addresses an amplification attack is built on.
+
+Neither mode is switched on for you, and that is deliberate: this feature drops
+traffic, and *which* traffic depends on your routing table rather than on
+anything written in the config.
+
+**Always accepted, in every mode:** a `0.0.0.0` source (that is how a DHCP client
+asks for its first address — validating it would make a DHCP server unreachable
+the moment you turned this on) and IPv6 link-local sources (`fe80::/10`), which
+are not routable by definition and carry Neighbor Discovery, Router
+Advertisement and DHCPv6. **Never accepted, in every mode:** loopback,
+multicast and broadcast *sources*, which have routes but can never send.
+
+Drops are counted, not silent:
+
+```text
+sentinel show firewall             # names each zone that validates
+sentinel show firewall statistics  # dropped_spoofed
+```
+
+A rising `dropped_spoofed` on an edge interface is someone spoofing. A rising one
+on an internal interface is usually asymmetric routing meeting `strict`, and the
+answer there is `loose`.
+
+`nix build .#checks.x86_64-linux.spoofing -L` verifies this on two VMs: it forges
+a LAN source onto the WAN link and asserts `strict` catches it, `loose` does not
+(it is routable, just not here), a loopback source is refused by both, and honest
+traffic keeps flowing throughout.
 
 ## IPv6 and extension headers
 

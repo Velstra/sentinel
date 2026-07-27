@@ -30,6 +30,10 @@ pub struct VelstraConfig {
     stateful: bool,
     drop_icmp: bool,
     log: bool,
+    /// Source-address validation (uRPF) for the default policy. Omitted when
+    /// disabled, which is velstra's own default.
+    #[serde(skip_serializing_if = "is_disabled")]
+    source_validation: &'static str,
     /// Host-wide: drop a packet the data plane cannot parse rather than pass it.
     /// Not a per-policy field — the parse fails before any policy is known — so it
     /// is emitted once, at the top level. Omitted when off, which is velstra's own
@@ -116,6 +120,8 @@ struct Policy {
     stateful: bool,
     drop_icmp: bool,
     log: bool,
+    #[serde(skip_serializing_if = "is_disabled")]
+    source_validation: &'static str,
     // Scalars above, the array-of-tables below (TOML requires this order).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     blocklist: Vec<String>,
@@ -170,6 +176,10 @@ fn is_zero_u16(v: &u16) -> bool {
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+fn is_disabled(mode: &&'static str) -> bool {
+    **mode == *"disable"
 }
 
 #[derive(Debug, Serialize)]
@@ -408,6 +418,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                 stateful: posture.stateful,
                 drop_icmp: posture.block_icmp,
                 log: posture.log,
+                source_validation: posture.source_validation.as_str(),
                 blocklist: posture.blocklist,
                 port_rules,
             }
@@ -576,6 +587,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
         stateful: fw.stateful,
         drop_icmp: fw.block_icmp,
         log: fw.log,
+        source_validation: fw.source_validation.as_str(),
         fail_closed: fw.fail_closed,
         blocklist: fw.blocklist.clone(),
         policies,
@@ -591,6 +603,51 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
 mod tests {
     use super::*;
     use crate::config::Appliance;
+
+    #[test]
+    fn source_validation_reaches_the_zone_that_asked_for_it() {
+        let toml = r#"
+[system]
+hostname = "fw"
+
+[firewall]
+source-validation = "loose"
+
+[zone.wan]
+source-validation = "strict"
+
+[[interface]]
+name = "wan0"
+zone = "wan"
+
+[[interface]]
+name = "lan0"
+zone = "lan"
+"#;
+        let appliance = Appliance::from_toml(toml).unwrap();
+        let cfg = compile(&appliance);
+        let wan = cfg.policies.iter().find(|p| p.name == "wan").unwrap();
+        let lan = cfg.policies.iter().find(|p| p.name == "lan").unwrap();
+        // The edge validates strictly; the inside inherits the global `loose`.
+        assert_eq!(wan.source_validation, "strict");
+        assert_eq!(lan.source_validation, "loose");
+
+        let rendered = cfg.to_toml().unwrap();
+        assert!(
+            rendered.contains(r#"source_validation = "strict""#),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn disabled_source_validation_writes_nothing() {
+        // The default must not appear in the emitted config: an agent reading it
+        // would behave identically, and a line that says "disable" invites the
+        // reader to think something is switched on.
+        let appliance = Appliance::from_toml(crate::config::EXAMPLE).unwrap();
+        let rendered = compile(&appliance).to_toml().unwrap();
+        assert!(!rendered.contains("source_validation"), "{rendered}");
+    }
 
     #[test]
     fn compiles_example_to_zone_ingress_posture() {

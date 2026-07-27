@@ -180,7 +180,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-5rNmy76ztTnhSEUJp2X+xRvpZGglBuhPi8sWjLawQjI=";
+      ebpfHash = "sha256-Ub+7+GstFNCtJxA1A/N1Kbm788dKGBPy5MeiPl9Tmc4=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -2221,6 +2221,198 @@
       # real traffic on the wire turns into an alert an operator can read — not
       # that a config file was rendered.
       #   nix build .#checks.x86_64-linux.ids -L
+      # Source validation (uRPF, roadmap B12): a packet whose source address
+      # could not have come from the interface it arrived on is dropped, and the
+      # verdict comes from the box's own routing table. Two segments are the
+      # minimum that can tell `strict` from `loose` apart: with one interface
+      # every foreign source is simply unroutable, which loose catches too.
+      spoofing = pkgs.testers.runNixOSTest {
+        name = "sentinel-spoofing";
+        nodes = {
+          # On the WAN segment, and able to forge a source address.
+          attacker =
+            { pkgs, lib, ... }:
+            {
+              networking.hostName = lib.mkForce "attacker";
+              networking.firewall.enable = lib.mkForce false;
+              virtualisation.vlans = [ 1 ];
+              networking.useNetworkd = true;
+              networking.useDHCP = false;
+              networking.interfaces.eth1.ipv4.addresses = [
+                {
+                  address = "10.1.0.2";
+                  prefixLength = 24;
+                }
+              ];
+              environment.systemPackages = [ (pkgs.python3.withPackages (ps: [ ps.scapy ])) ];
+            };
+          # The appliance: WAN = eth1 (vlan 1), LAN = eth2 (vlan 2). The LAN
+          # segment exists only so that a LAN address has a route pointing at a
+          # *different* interface — which is exactly what strict validation
+          # compares against.
+          fw =
+            { lib, ... }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce "fw";
+              networking.firewall.enable = lib.mkForce false;
+              networking.interfaces.eth1.ipv4.addresses = [
+                {
+                  address = "10.1.0.1";
+                  prefixLength = 24;
+                }
+              ];
+              networking.interfaces.eth2.ipv4.addresses = [
+                {
+                  address = "10.2.0.1";
+                  prefixLength = 24;
+                }
+              ];
+              virtualisation.vlans = [
+                1
+                2
+              ];
+              virtualisation.memorySize = 2048;
+              boot.kernel.sysctl = {
+                "net.ipv4.ip_forward" = 1;
+                # The kernel's own reverse-path filter must be OFF, or it would
+                # drop the forged packets before XDP's verdict is observable and
+                # the test would pass without the feature working at all.
+                "net.ipv4.conf.all.rp_filter" = 0;
+                "net.ipv4.conf.default.rp_filter" = 0;
+              };
+              services.velstra.interface = lib.mkForce "eth1";
+            };
+        };
+        testScript = ''
+          start_all()
+          fw.wait_for_unit("multi-user.target")
+          fw.wait_for_unit("velstra.service")
+          attacker.wait_for_unit("multi-user.target")
+          fw.wait_until_succeeds("ip addr show eth1 | grep -q 10.1.0.1", timeout=20)
+          fw.wait_until_succeeds("ip addr show eth2 | grep -q 10.2.0.1", timeout=20)
+
+          def spoofed(_=0):
+              """How many packets the data plane has refused as spoofed.
+
+              Asks the agent's live counters; the query socket comes up a moment
+              after the unit does, so the first read waits for it rather than
+              falling back to the journal dump, which lags by a whole interval.
+              """
+              fw.wait_until_succeeds(
+                  "sentinel show firewall statistics > /tmp/stats; "
+                  "grep -c dropped_spoofed /tmp/stats",
+                  timeout=90,
+              )
+              out = fw.succeed("cat /tmp/stats")
+              for line in out.splitlines():
+                  if "dropped_spoofed" in line:
+                      return int(line.split()[-1])
+              raise Exception("no dropped_spoofed counter:\n" + out)
+
+          def wait_for_spoofed(at_least):
+              """Block until the spoofed-drop counter reaches `at_least`."""
+              fw.wait_until_succeeds(
+                  "sentinel show firewall statistics > /tmp/stats; "
+                  f"test $(awk '/dropped_spoofed/ {{print $NF}}' /tmp/stats) -ge {at_least}",
+                  timeout=30,
+              )
+
+          def forge(src, n=5):
+              """Send `n` echo requests to the fw's WAN address from `src`."""
+              attacker.succeed(
+                  "python3 -c \"from scapy.all import *; "
+                  f"send(IP(src='{src}',dst='10.1.0.1')/ICMP(), count={n}, "
+                  "iface='eth1', verbose=0)\""
+              )
+
+          def apply(*lines):
+              cmds = " ".join(f"'{l}'" for l in lines)
+              fw.succeed(
+                  "su admin -c \"printf '%s\\n' " + cmds
+                  + " commit save exit | sentinel configure\""
+              )
+
+          with subtest("nothing is validated until a zone asks"):
+              apply(
+                  "set interface eth1 zone wan",
+                  "set interface eth2 zone lan",
+                  "set firewall zone wan default-action accept",
+              )
+              fw.wait_for_unit("velstra.service")
+              # The emitted data-plane config says nothing about validation, and
+              # a forged source is forwarded like any other.
+              fw.fail("grep -q source_validation /run/sentinel/velstra.toml")
+              before = spoofed(0)
+              forge("10.2.0.99")
+              assert spoofed(0) == before, "a disabled check dropped something"
+
+          with subtest("strict refuses a source that belongs on another link"):
+              apply("set firewall zone wan source-validation strict")
+              fw.wait_for_unit("velstra.service")
+              fw.succeed("grep -q 'source_validation = \"strict\"' /run/sentinel/velstra.toml")
+              # `show firewall` names the zone that validates — the setting is
+              # silent when it works, so it has to be visible when it is on.
+              posture = fw.succeed("sentinel show firewall")
+              assert "wan      strict" in posture, posture
+
+              # A LAN address arriving on the WAN link: the route back to it
+              # leaves by eth2, so it cannot be the sender. This is BCP 38.
+              before = spoofed(0)
+              forge("10.2.0.99")
+              wait_for_spoofed(before + 5)
+
+              # ...and the attacker's own, honest address still works. A source
+              # validator that breaks legitimate traffic is worse than none.
+              attacker.succeed("ping -4 -c 2 -W 5 10.1.0.1")
+
+          with subtest("loose accepts what is merely routable"):
+              apply("set firewall zone wan source-validation loose")
+              fw.wait_for_unit("velstra.service")
+              # 10.2.0.99 IS routable — just not via this link. That difference
+              # is the whole reason both modes exist, and it is why a
+              # multi-homed edge can validate at all.
+              before = spoofed(0)
+              forge("10.2.0.99")
+              attacker.succeed("ping -4 -c 2 -W 5 10.1.0.1")
+              assert spoofed(0) == before, "loose validation rejected a routable source"
+
+          with subtest("a source that can never send is refused either way"):
+              # 127.0.0.1 has a route (via lo), so the routing table alone would
+              # admit it under loose. Loopback, multicast and broadcast sources
+              # are refused on their own account.
+              before = spoofed(0)
+              forge("127.0.0.1")
+              wait_for_spoofed(before + 5)
+
+          with subtest("a second uplink warns that strict will drop return traffic"):
+              # Warnings go to stderr (they are advisory, not output), so the
+              # subshell has to merge it in before the assertion can see one.
+              out = fw.succeed(
+                  "su admin -c \"printf '%s\\n' "
+                  "'set firewall zone wan source-validation strict' "
+                  "'set multiwan uplink eth1 priority 1' "
+                  "'set multiwan uplink eth2 priority 2' "
+                  "commit exit | sentinel configure\" 2>&1"
+              )
+              assert "source-validation strict" in out, out
+
+          with subtest("removing it stops the checking"):
+              apply(
+                  "delete firewall zone wan source-validation",
+                  "delete multiwan uplink eth1",
+                  "delete multiwan uplink eth2",
+              )
+              fw.wait_for_unit("velstra.service")
+              fw.fail("grep -q source_validation /run/sentinel/velstra.toml")
+              before = spoofed(0)
+              forge("10.2.0.99")
+              forge("127.0.0.1")
+              assert spoofed(0) == before, "validation kept running after removal"
+              assert "source validation" not in fw.succeed("sentinel show firewall")
+        '';
+      };
+
       ids = pkgs.testers.runNixOSTest {
         name = "sentinel-ids";
         nodes = {

@@ -1938,6 +1938,10 @@ const GLOBAL_FIELDS: &[Cand] = &[
         "fail-closed",
         "drop packets the data plane cannot parse (true|false)",
     ),
+    (
+        "source-validation",
+        "reject spoofed source addresses (disable|loose|strict)",
+    ),
     ("block", "drop a source IP/CIDR everywhere"),
 ];
 const ZONE_FIELDS: &[Cand] = &[
@@ -1949,6 +1953,10 @@ const ZONE_FIELDS: &[Cand] = &[
         "ingress action for this zone (accept|drop|reject)",
     ),
     ("log", "log this zone's traffic (true|false)"),
+    (
+        "source-validation",
+        "reject spoofed sources on this zone (disable|loose|strict)",
+    ),
     ("block", "drop a source IP/CIDR on this zone"),
 ];
 const NAT_SOURCE_FIELDS: &[Cand] = &[
@@ -2005,6 +2013,14 @@ const ACTIONS: &[Cand] = &[
     ("accept", "allow matching traffic"),
     ("drop", "silently discard"),
     ("reject", "discard with an ICMP error"),
+];
+const SOURCE_VALIDATION: &[Cand] = &[
+    ("disable", "accept any source address (default)"),
+    ("loose", "the source must be routable somewhere"),
+    (
+        "strict",
+        "...and by the interface it arrived on (BCP 38; breaks asymmetric routing)",
+    ),
 ];
 const PROTOS: &[Cand] = &[("tcp", "TCP"), ("udp", "UDP")];
 const IFACE_FIELDS: &[Cand] = &[
@@ -2485,6 +2501,7 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
             "stateful" | "block-icmp" | "log" | "fail-closed",
         ] => BOOLS,
         ["set", "firewall", "global", "default-action"] => ACTIONS,
+        ["set", "firewall", "global", "source-validation"] => SOURCE_VALIDATION,
         ["set" | "delete", "firewall", "zone", _name] => ZONE_FIELDS,
         [
             "set",
@@ -2494,6 +2511,7 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
             "stateful" | "block-icmp" | "log",
         ] => BOOLS,
         ["set", "firewall", "zone", _name, "default-action"] => ACTIONS,
+        ["set", "firewall", "zone", _name, "source-validation"] => SOURCE_VALIDATION,
         ["set" | "delete", "firewall", "rule", _name] => RULE_FIELDS,
         ["set", "firewall", "rule", _name, "action"] => ACTIONS,
         ["set", "firewall", "rule", _name, "proto"] => PROTOS,
@@ -3679,6 +3697,7 @@ mod tests {
                 "default-action",
                 "log",
                 "fail-closed",
+                "source-validation",
                 "block"
             ]
         );
@@ -3702,6 +3721,7 @@ mod tests {
                 "block-icmp",
                 "default-action",
                 "log",
+                "source-validation",
                 "block"
             ]
         );
