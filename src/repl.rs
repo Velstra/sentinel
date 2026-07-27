@@ -1246,6 +1246,10 @@ const SERVICES_NODES: &[Cand] = &[
         "L7 reverse proxy / load balancer (haproxy, by name)",
     ),
     (
+        "broadcast-relay",
+        "carry a UDP broadcast between segments (by name)",
+    ),
+    (
         "syslog",
         "ship the journal to remote collectors (rsyslog, RFC 5424)",
     ),
@@ -1346,6 +1350,18 @@ const SYSLOG_LEVELS: &[Cand] = &[
     ("debug", "everything the journal holds"),
 ];
 // `services reverse-proxy <name> <Tab>` reveals the frontend fields (roadmap C22).
+const BROADCAST_RELAY_FIELDS: &[Cand] = &[
+    ("port", "the UDP port to relay"),
+    (
+        "interface",
+        "an interface this relay bridges (repeatable; at least two)",
+    ),
+    ("description", "free-text label for this relay"),
+    (
+        "disabled",
+        "administratively disable this relay (true|false)",
+    ),
+];
 const REVERSE_PROXY_FIELDS: &[Cand] = &[
     ("port", "listen port (default 443)"),
     (
@@ -2470,6 +2486,8 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "services", "dhcp-relay"] => DHCP_RELAY_FIELDS,
         ["set" | "delete", "services", "reverse-proxy", _name] => REVERSE_PROXY_FIELDS,
         ["set", "services", "reverse-proxy", _name, "disabled"] => BOOLS,
+        ["set" | "delete", "services", "broadcast-relay", _name] => BROADCAST_RELAY_FIELDS,
+        ["set", "services", "broadcast-relay", _name, "disabled"] => BOOLS,
         ["set" | "delete", "services", "alerts"] => ALERTS_NODES,
         ["set" | "delete", "services", "alerts", "mail"] => ALERT_MAIL_FIELDS,
         ["set", "services", "alerts", "mail", "starttls"] => BOOLS,
@@ -2734,6 +2752,7 @@ pub struct DynNames {
     pub pki_certificates: Vec<String>,
     pub wireguard: Vec<String>,
     pub reverse_proxy: Vec<String>,
+    pub broadcast_relay: Vec<String>,
     pub prefix_lists: Vec<String>,
 }
 
@@ -2865,6 +2884,12 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
             "reverse-proxy frontend",
             "a new reverse-proxy frontend name",
         ),
+        ["set" | "delete", "services", "broadcast-relay"] => named(
+            &names.broadcast_relay,
+            "broadcast relay",
+            "a new broadcast-relay name",
+        ),
+
         [
             "set" | "delete",
             "interface",
@@ -2902,6 +2927,9 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
             "lldp" | "mdns" | "dyndns" | "dhcp-relay",
             "interface",
         ] => nics("interface"),
+        ["set", "services", "broadcast-relay", _name, "interface"] => {
+            nics("an interface this relay bridges")
+        }
 
         // ---- Zone-VALUE positions (reference an existing zone) ---------------
         ["set", "interface", _name, "zone"] => zones("zone"),
@@ -3192,6 +3220,7 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
             v
         }
         ["set", "services", "reverse-proxy", _name, "port"] => own_cands(&[PH_PORT]),
+        ["set", "services", "broadcast-relay", _name, "port"] => own_cands(&[PH_PORT]),
         ["set", "services", "reverse-proxy", _name, "backends"] => own_cands(&[PH_HOST_PORT]),
         ["set", "vpn", "openconnect", "dns"] => own_cands(&[PH_IPV4, PH_IPV6]),
         ["set", "vpn", "openconnect", "routes"] => own_cands(&[PH_IPV4_CIDR, PH_IPV6_CIDR]),
@@ -3820,6 +3849,7 @@ mod tests {
                 "dyndns",
                 "dhcp-relay",
                 "reverse-proxy",
+                "broadcast-relay",
                 "syslog",
                 "alerts",
                 "ids"
@@ -4004,6 +4034,7 @@ mod tests {
             pki_certificates: vec!["api".into()],
             wireguard: vec!["wg0".into()],
             reverse_proxy: vec!["web".into()],
+            broadcast_relay: vec!["wol".into()],
             prefix_lists: vec!["LAN".into()],
         };
         let kws = |toks: &[&str]| -> Vec<String> {

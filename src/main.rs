@@ -24,6 +24,7 @@ mod net;
 mod openconnect;
 mod pki;
 mod proxy;
+mod relay;
 mod repl;
 mod session;
 mod system;
@@ -213,6 +214,10 @@ enum Command {
     /// Run by `sentinel-ids-watch.service` while `block-on-alert` is set, not by
     /// hand. Every block it asks for expires, and none survive an agent restart.
     IdsWatch,
+    /// Carry UDP broadcasts between segments (roadmap C18). Run by
+    /// `sentinel-broadcast-relay.service` from the config an apply rendered, not
+    /// by hand.
+    BroadcastRelay,
     /// List the ports a Velstra controller currently knows about.
     Ports {
         /// The controller's orchestrator/admin endpoint.
@@ -315,6 +320,7 @@ async fn main() -> Result<()> {
         Command::ConfirmRollback { config } => confirm_rollback(&config),
         Command::Alert { unit, config } => alert_unit(&unit, &config),
         Command::IdsWatch => ids::watch(),
+        Command::BroadcastRelay => relay::run(),
         Command::Ports { controller } => ports(&controller).await,
         Command::Api {
             listen,
@@ -483,6 +489,7 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
                     pki_certificates: session.pki_certificate_names(),
                     wireguard: session.wireguard_names(),
                     reverse_proxy: session.reverse_proxy_names(),
+                    broadcast_relay: session.broadcast_relay_names(),
                     prefix_lists: session.prefix_list_names(),
                 });
                 h.set_context(&ctx);
@@ -875,6 +882,10 @@ fn show_op(args: &[String]) -> Result<()> {
         ["nat"] => show_nat(),
         ["nat", "cgnat", addr] => show_cgnat(addr),
 
+        // UDP broadcast relay (roadmap C18): what is carried, and whether the
+        // daemon that carries it is up.
+        ["broadcast-relay"] | ["broadcast-relay", "status"] => show_broadcast_relay(),
+
         // Intrusion detection (roadmap C11): what is watched, and what fired.
         ["ids"] | ["ids", "status"] => show_ids(),
         // Asked of the agent, which owns the map and the deadlines — the CLI
@@ -1229,6 +1240,43 @@ const DEFAULT_IDS_ALERTS: usize = 20;
 /// A ruleset file the operator named but that is not on the box is called out
 /// here: the render skips it so the detector still starts with the rules that do
 /// exist, and this is where that gap stops being silent.
+fn show_broadcast_relay() -> Result<()> {
+    let path = std::path::Path::new(DEFAULT_CONFIG);
+    if !path.exists() {
+        println!("no saved config at {DEFAULT_CONFIG} (run `configure` + `save`)");
+        return Ok(());
+    }
+    let relays = Appliance::load(path)?.services.broadcast_relay;
+    if relays.is_empty() {
+        println!("no broadcast relay is configured");
+        return Ok(());
+    }
+    let running = system::unit_active(relay::RELAY_UNIT);
+    println!("relay: {}", if running { "running" } else { "NOT running" });
+    for r in &relays {
+        let state = if r.disabled { "  (disabled)" } else { "" };
+        println!(
+            "  {:<12} udp/{:<6} {}{state}",
+            r.name,
+            r.port,
+            r.interface.join(" <-> "),
+        );
+    }
+    // A relay whose port the firewall drops carries nothing while looking
+    // perfectly configured, so the same advisory the commit prints is repeated
+    // here — this is where someone looks when it is not working.
+    let appliance = Appliance::load(path)?;
+    for w in appliance.warnings() {
+        if w.contains("broadcast-relay") {
+            println!("warning: {w}");
+        }
+    }
+    if !running && relays.iter().any(|r| !r.disabled) {
+        println!("(`systemctl status {}` says why)", relay::RELAY_UNIT);
+    }
+    Ok(())
+}
+
 fn show_ids() -> Result<()> {
     let path = std::path::Path::new(DEFAULT_CONFIG);
     if !path.exists() {
