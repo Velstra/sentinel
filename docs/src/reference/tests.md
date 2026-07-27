@@ -1,6 +1,6 @@
 # Test suite (nixosTests)
 
-Sentinel is verified by **72 nixosTests** plus the Rust unit tests. The nixosTests
+Sentinel is verified by **73 nixosTests** plus the Rust unit tests. The nixosTests
 boot real QEMU/OVMF VMs — several of them two or three at a time on shared virtual
 segments — so they need `/dev/kvm`.
 
@@ -128,6 +128,7 @@ authoritative list.
 | `lldp` | LLDP neighbours are discovered between two boxes (the daemon is off by default) |
 | `pki` | a local CA and a leaf signed by it land under `/var/lib/sentinel/pki` with the right modes |
 | `reverseproxy` | TLS terminates on :443 with an on-box leaf and load-balances to a backend |
+| `acme` | a certificate is really issued — the appliance registers with a Pebble directory, serves the http-01 challenge on :80, and Pebble fetches it back before signing |
 | `bcastrelay` | a broadcast on one segment reaches another carrying the ORIGINAL sender's address — the property request/response discovery depends on — and arrives exactly once |
 | `spoofing` | a forged LAN source on the WAN link is refused by `strict` but not by `loose` (it is routable, just not there), a loopback source by both, and honest traffic keeps flowing throughout |
 | `ids` | real traffic on the wire becomes an alert an operator can read — which is also what proves the detector sees anything at all behind an XDP data plane; then that an alert blocks its source in the data plane, and that `never-block` stops it |
