@@ -20,9 +20,9 @@ use crate::config::{
     Multicast, MulticastInterface, Nat, Nat64, NatDestination, NatNpt66, NatSource, Ntp,
     OpenConnectServer, OpenConnectUser, Ospf, Ospf3, OspfInterface, Pki, Policy, PortSpec, Pppoe,
     PrefixEntry, PrefixList, Proto, Protocols, Qos, QosDiscipline, ReverseProxy, Rip, RouterAdvert,
-    Rule, Schedule, Services, Snmp, Ssh, StaticRoute, Syslog, SyslogLevel, SyslogProto,
-    SyslogTarget, System, UpdateChannel, Vpn, VrfDef, Vrrp, WanMode, WanUplink, WgPeer,
-    WireguardTunnel, ZoneCfg,
+    Rule, Schedule, Services, Snmp, SourceValidation, Ssh, StaticRoute, Syslog, SyslogLevel,
+    SyslogProto, SyslogTarget, System, UpdateChannel, Vpn, VrfDef, Vrrp, WanMode, WanUplink,
+    WgPeer, WireguardTunnel, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -289,6 +289,7 @@ struct ZoneDraft {
     blocklist: Vec<String>,
     default_action: Option<Action>,
     log: Option<bool>,
+    source_validation: Option<SourceValidation>,
 }
 
 /// The candidate's global firewall posture. `None` fields fall back to the
@@ -304,6 +305,8 @@ struct FirewallDraft {
     /// Global only — the data plane cannot know the zone of a packet it failed to
     /// parse, so there is no per-zone counterpart in [`ZoneDraft`].
     fail_closed: Option<bool>,
+    /// Source-address validation (uRPF) every zone inherits.
+    source_validation: Option<SourceValidation>,
 }
 
 /// A partially-specified static route (keyed by its prefix).
@@ -1702,6 +1705,7 @@ impl Draft {
                 default_action: Some(a.firewall.default_action),
                 log: Some(a.firewall.log),
                 fail_closed: Some(a.firewall.fail_closed),
+                source_validation: Some(a.firewall.source_validation),
             },
             groups: a.firewall.group.clone(),
             load_balancers: a
@@ -1735,6 +1739,7 @@ impl Draft {
                             blocklist: z.blocklist.clone(),
                             default_action: z.default_action,
                             log: z.log,
+                            source_validation: z.source_validation,
                         },
                     )
                 })
@@ -2952,6 +2957,9 @@ impl Session {
             ["firewall", "global", "fail-closed", v] => {
                 self.draft.firewall.fail_closed = Some(parse_bool(v)?)
             }
+            ["firewall", "global", "source-validation", v] => {
+                self.draft.firewall.source_validation = Some(parse_source_validation(v)?)
+            }
             ["firewall", "global", "block", v] => {
                 validate_block_entry(v)?;
                 push_unique(&mut self.draft.firewall.blocklist, v);
@@ -2974,6 +2982,9 @@ impl Session {
             }
             ["firewall", "zone", name, "log", v] => {
                 self.draft.zone_mut(name).log = Some(parse_bool(v)?)
+            }
+            ["firewall", "zone", name, "source-validation", v] => {
+                self.draft.zone_mut(name).source_validation = Some(parse_source_validation(v)?)
             }
             ["firewall", "zone", name, "block", v] => {
                 validate_block_entry(v)?;
@@ -4839,6 +4850,7 @@ impl Session {
                 "default-action" => self.draft.firewall.default_action = None,
                 "log" => self.draft.firewall.log = None,
                 "fail-closed" => self.draft.firewall.fail_closed = None,
+                "source-validation" => self.draft.firewall.source_validation = None,
                 other => bail!("firewall global has no field {other:?}"),
             },
 
@@ -4872,6 +4884,7 @@ impl Session {
                     "block-icmp" => z.block_icmp = None,
                     "default-action" => z.default_action = None,
                     "log" => z.log = None,
+                    "source-validation" => z.source_validation = None,
                     other => bail!("zone has no field {other:?}"),
                 }
             }
@@ -6254,6 +6267,7 @@ impl Session {
             default_action: self.draft.firewall.default_action.unwrap_or(Action::Drop),
             log: self.draft.firewall.log.unwrap_or(false),
             fail_closed: self.draft.firewall.fail_closed.unwrap_or(false),
+            source_validation: self.draft.firewall.source_validation.unwrap_or_default(),
             group: self.draft.groups.clone(),
         };
         let zones: BTreeMap<String, ZoneCfg> = self
@@ -6270,6 +6284,7 @@ impl Session {
                         blocklist: z.blocklist.clone(),
                         default_action: z.default_action,
                         log: z.log,
+                        source_validation: z.source_validation,
                     },
                 )
             })
@@ -7253,6 +7268,7 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         || fw.default_action.is_some()
         || fw.log.is_some()
         || fw.fail_closed.is_some()
+        || fw.source_validation.is_some()
         || !fw.blocklist.is_empty()
     {
         fwi.push_str("    global {\n");
@@ -7270,6 +7286,9 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         if let Some(f) = fw.fail_closed {
             fwi.push_str(&format!("        fail-closed {f}\n"));
+        }
+        if let Some(v) = fw.source_validation {
+            fwi.push_str(&format!("        source-validation {}\n", v.as_str()));
         }
         for e in &fw.blocklist {
             fwi.push_str(&format!("        block {e}\n"));
@@ -7292,6 +7311,9 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         if let Some(l) = z.log {
             fwi.push_str(&format!("        log {l}\n"));
+        }
+        if let Some(v) = z.source_validation {
+            fwi.push_str(&format!("        source-validation {}\n", v.as_str()));
         }
         for e in &z.blocklist {
             fwi.push_str(&format!("        block {e}\n"));
@@ -8468,6 +8490,15 @@ fn action_to_permit_deny(a: &str) -> &str {
         "reject" => "deny",
         other => other,
     }
+}
+
+fn parse_source_validation(s: &str) -> Result<SourceValidation> {
+    Ok(match s {
+        "disable" => SourceValidation::Disable,
+        "loose" => SourceValidation::Loose,
+        "strict" => SourceValidation::Strict,
+        _ => bail!("invalid source-validation {s:?} (expected disable|loose|strict)"),
+    })
 }
 
 fn parse_action(s: &str) -> Result<Action> {
@@ -10388,6 +10419,84 @@ backends = ["10.0.0.11:8443"]
         assert!(s.compare_revision(9).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn source_validation_is_set_per_zone_and_inherits_the_global() {
+        let mut s = Session::empty();
+        run(&mut s, "set system hostname fw1").unwrap();
+        run(&mut s, "set interface eth0 zone wan").unwrap();
+        run(&mut s, "set interface eth1 zone lan").unwrap();
+
+        // The realistic posture: validate at the edge, leave the inside alone.
+        run(&mut s, "set firewall zone wan source-validation strict").unwrap();
+        assert!(
+            s.show().contains("source-validation strict"),
+            "got:\n{}",
+            s.show()
+        );
+        let a = s.commit().unwrap();
+        assert_eq!(
+            a.zone_posture("wan").source_validation,
+            SourceValidation::Strict
+        );
+        assert_eq!(
+            a.zone_posture("lan").source_validation,
+            SourceValidation::Disable,
+            "a zone that was never asked to validate must not start"
+        );
+
+        // A global default is inherited by a zone with no override of its own,
+        // and the zone's own value still wins.
+        run(&mut s, "set firewall global source-validation loose").unwrap();
+        let a = s.commit().unwrap();
+        assert_eq!(
+            a.zone_posture("lan").source_validation,
+            SourceValidation::Loose
+        );
+        assert_eq!(
+            a.zone_posture("wan").source_validation,
+            SourceValidation::Strict
+        );
+
+        // It survives the TOML round-trip, so a reboot keeps validating.
+        let toml = a.to_toml().unwrap();
+        let back = Appliance::from_toml(&toml).unwrap();
+        assert_eq!(
+            back.zone_posture("wan").source_validation,
+            SourceValidation::Strict
+        );
+
+        // Deleting the zone override falls back to the global one.
+        run(&mut s, "delete firewall zone wan source-validation").unwrap();
+        assert_eq!(
+            s.commit().unwrap().zone_posture("wan").source_validation,
+            SourceValidation::Loose
+        );
+
+        // A typo is refused rather than quietly leaving the zone unvalidated.
+        assert!(run(&mut s, "set firewall zone wan source-validation rpf").is_err());
+    }
+
+    #[test]
+    fn strict_source_validation_warns_about_a_second_uplink() {
+        let mut s = Session::empty();
+        run(&mut s, "set system hostname fw1").unwrap();
+        run(&mut s, "set interface eth0 zone wan").unwrap();
+        run(&mut s, "set firewall zone wan source-validation strict").unwrap();
+        assert!(
+            s.commit().unwrap().warnings().is_empty(),
+            "one uplink is the case strict is for"
+        );
+
+        run(&mut s, "set interface eth2 zone wan").unwrap();
+        run(&mut s, "set multiwan uplink eth0 priority 1").unwrap();
+        run(&mut s, "set multiwan uplink eth2 priority 2").unwrap();
+        let warns = s.commit().unwrap().warnings();
+        assert!(
+            warns.iter().any(|w| w.contains("source-validation strict")),
+            "a second uplink makes strict drop return traffic; got: {warns:?}"
+        );
     }
 
     #[test]

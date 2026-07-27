@@ -3201,6 +3201,40 @@ pub struct Login {
     pub hashed_password: Option<String>,
 }
 
+/// Source-address validation (uRPF, RFC 3704) for a zone's interfaces.
+///
+/// The question it answers is "could this sender's address really be over
+/// there?", asked of the routing table: the box looks up a route back to the
+/// packet's source and compares it against the interface the packet came in on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SourceValidation {
+    /// Accept any source address. The default — this drops traffic, and *which*
+    /// traffic depends on the routing table, so it is never switched on for you.
+    #[default]
+    Disable,
+    /// The source must be routable somewhere. Catches addresses that could never
+    /// answer, and survives asymmetric routing.
+    Loose,
+    /// The route back to the source must leave by the interface it arrived on.
+    /// This is BCP 38 — the rule that stops a WAN neighbour from claiming a LAN
+    /// address, and stops your own network from being a spoofing source. It also
+    /// drops legitimate traffic wherever routing is asymmetric (two uplinks, a
+    /// VPN that returns by another path), which is what `loose` is for.
+    Strict,
+}
+
+impl SourceValidation {
+    /// The word this mode is written as, in TOML and in `show`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disable => "disable",
+            Self::Loose => "loose",
+            Self::Strict => "strict",
+        }
+    }
+}
+
 /// Global firewall settings, applied to every firewalled (zoned) interface.
 /// These map onto Velstra's per-policy `stateful` / `drop_icmp` / `blocklist`
 /// — capabilities the data plane already enforces.
@@ -3234,9 +3268,24 @@ pub struct Firewall {
     /// known.
     #[serde(default)]
     pub fail_closed: bool,
+    /// Source-address validation (uRPF) every zone inherits. `disable` by
+    /// default; set it per zone to validate only where it belongs.
+    #[serde(
+        rename = "source-validation",
+        default,
+        skip_serializing_if = "SourceValidation::is_disabled"
+    )]
+    pub source_validation: SourceValidation,
     /// Named address/port groups (aliases) that rules reference by name.
     #[serde(default, skip_serializing_if = "Groups::is_empty")]
     pub group: Groups,
+}
+
+impl SourceValidation {
+    /// Serde skip predicate — the default needs no line in a saved config.
+    fn is_disabled(&self) -> bool {
+        *self == SourceValidation::Disable
+    }
 }
 
 fn default_true() -> bool {
@@ -3256,6 +3305,7 @@ impl Default for Firewall {
             default_action: Action::Drop,
             log: false,
             fail_closed: false,
+            source_validation: SourceValidation::Disable,
             group: Groups::default(),
         }
     }
@@ -3271,6 +3321,7 @@ impl Firewall {
             && self.default_action == Action::Drop
             && !self.log
             && !self.fail_closed
+            && self.source_validation == SourceValidation::Disable
             && self.group.is_empty()
     }
 }
@@ -3346,6 +3397,14 @@ pub struct ZoneCfg {
     /// Log matched traffic for this zone (inherits `[firewall] log`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<bool>,
+    /// Source-address validation for this zone (inherits `[firewall]
+    /// source-validation`).
+    #[serde(
+        rename = "source-validation",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub source_validation: Option<SourceValidation>,
 }
 
 /// A zone's posture after inheriting the global `[firewall]` defaults — the
@@ -3359,6 +3418,7 @@ pub struct ResolvedZone {
     /// the rule-derived posture (broad accept ⇒ pass) or the firewall default.
     pub default_action: Option<Action>,
     pub log: bool,
+    pub source_validation: SourceValidation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -6960,6 +7020,9 @@ impl Appliance {
             blocklist,
             default_action: z.and_then(|z| z.default_action),
             log: z.and_then(|z| z.log).unwrap_or(fw.log),
+            source_validation: z
+                .and_then(|z| z.source_validation)
+                .unwrap_or(fw.source_validation),
         }
     }
 
@@ -7034,6 +7097,30 @@ impl Appliance {
                 ));
             }
         }
+        // Strict source validation asks that the route back to a sender leave by
+        // the interface it arrived on. With a second uplink that is exactly what
+        // fails: a reply may legitimately return by the other one, and the traffic
+        // simply disappears — the failure mode nobody debugs to uRPF. Loose still
+        // catches unroutable sources without making that assumption.
+        if self.multiwan.uplinks.len() > 1 {
+            let mut strict: Vec<&str> = self
+                .interfaces
+                .iter()
+                .filter(|i| !i.disabled)
+                .filter_map(|i| i.zone.as_deref())
+                .filter(|z| self.zone_posture(z).source_validation == SourceValidation::Strict)
+                .collect();
+            strict.sort_unstable();
+            strict.dedup();
+            for zone in strict {
+                out.push(format!(
+                    "zone {zone:?}: `source-validation strict` with {} WAN uplinks will drop \
+                     traffic that returns by the other path; use `loose` unless routing is \
+                     symmetric",
+                    self.multiwan.uplinks.len()
+                ));
+            }
+        }
         out
     }
 
@@ -7048,6 +7135,29 @@ impl Appliance {
                 i.zone.as_deref().unwrap_or("(unassigned)"),
                 i.address.as_deref().unwrap_or("(auto)"),
             ));
+        }
+        // Source validation is silent when it works and invisible when it does
+        // not, so a zone that validates says so here. Zones that don't are
+        // omitted: listing "disable" against every zone would bury the one line
+        // that matters.
+        let mut validating: Vec<(&str, &'static str)> = Vec::new();
+        for iface in &self.interfaces {
+            let Some(zone) = iface.zone.as_deref() else {
+                continue;
+            };
+            if validating.iter().any(|(z, _)| *z == zone) {
+                continue;
+            }
+            let mode = self.zone_posture(zone).source_validation;
+            if mode != SourceValidation::Disable {
+                validating.push((zone, mode.as_str()));
+            }
+        }
+        if !validating.is_empty() {
+            out.push_str("source validation:\n");
+            for (zone, mode) in validating {
+                out.push_str(&format!("  {zone:<8} {mode}\n"));
+            }
         }
         out.push_str(&format!("rules ({}):\n", self.rules.len()));
         for r in &self.rules {
