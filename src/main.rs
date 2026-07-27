@@ -32,6 +32,7 @@ mod system;
 mod ui;
 mod update;
 mod velstra;
+mod webui;
 mod wgkey;
 mod wren;
 
