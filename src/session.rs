@@ -14,10 +14,10 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::{
     Acme, Action, AlertMail, Alerts, Appliance, Bfd, Bgp, BgpAggregate, BgpNeighbor, BgpRoa,
-    BgpRtr, Ca, Certificate, ConfigSync, ConntrackSync, Dhcp6Pool, DhcpRelay, DhcpServer,
-    DhcpStaticLease, Dns, Dyndns, Export, Filter, FilterRule, Firewall, Groups, HealthCheck, Ids,
-    IfaceType, Interface, IpsecConnection, Isis, Lldp, LoadBalancer, Login, Mdns, MultiWan,
-    Multicast, MulticastInterface, Nat, Nat64, NatDestination, NatNpt66, NatSource, Ntp,
+    BgpRtr, BroadcastRelay, Ca, Certificate, ConfigSync, ConntrackSync, Dhcp6Pool, DhcpRelay,
+    DhcpServer, DhcpStaticLease, Dns, Dyndns, Export, Filter, FilterRule, Firewall, Groups,
+    HealthCheck, Ids, IfaceType, Interface, IpsecConnection, Isis, Lldp, LoadBalancer, Login, Mdns,
+    MultiWan, Multicast, MulticastInterface, Nat, Nat64, NatDestination, NatNpt66, NatSource, Ntp,
     OpenConnectServer, OpenConnectUser, Ospf, Ospf3, OspfInterface, Pki, Policy, PortSpec, Pppoe,
     PrefixEntry, PrefixList, Proto, Protocols, Qos, QosDiscipline, ReverseProxy, Rip, RouterAdvert,
     Rule, Schedule, Services, Snmp, SourceValidation, Ssh, StaticRoute, Syslog, SyslogLevel,
@@ -1211,6 +1211,7 @@ struct Draft {
     /// terminates a listen port (optionally TLS via a PKI cert) and forwards to
     /// one or more backends round-robin.
     reverse_proxy: BTreeMap<String, ReverseProxyDraft>,
+    broadcast_relay: BTreeMap<String, BroadcastRelayDraft>,
 }
 
 /// A partially-specified DNS forwarder (`[services.dns]`).
@@ -1433,6 +1434,17 @@ struct AcmeDraft {
 /// roadmap C22). Keyed by name in [`Draft::reverse_proxy`]; at least one backend
 /// (`host:port`) is required at commit, and `port`/`certificate` are validated by
 /// `config::validate()`. `port` unset ⇒ 443; `certificate` unset ⇒ plain HTTP.
+/// A partially-specified UDP broadcast relay (`[[services.broadcast-relay]]`,
+/// roadmap C18). Keyed by name in [`Draft::broadcast_relay`]; `relay::validate`
+/// enforces the port and the two-interface minimum at commit.
+#[derive(Debug, Clone, Default)]
+struct BroadcastRelayDraft {
+    description: Option<String>,
+    disabled: Option<bool>,
+    port: Option<u16>,
+    interfaces: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ReverseProxyDraft {
     disabled: Option<bool>,
@@ -1594,6 +1606,10 @@ impl Draft {
     /// on first touch (frontends are keyed by name).
     fn reverse_proxy_mut(&mut self, name: &str) -> &mut ReverseProxyDraft {
         self.reverse_proxy.entry(name.to_string()).or_default()
+    }
+
+    fn broadcast_relay_mut(&mut self, name: &str) -> &mut BroadcastRelayDraft {
+        self.broadcast_relay.entry(name.to_string()).or_default()
     }
 
     /// Mutable access to the signed update channel, creating an empty one on
@@ -2319,6 +2335,22 @@ impl Draft {
                     )
                 })
                 .collect(),
+            broadcast_relay: a
+                .services
+                .broadcast_relay
+                .iter()
+                .map(|r| {
+                    (
+                        r.name.clone(),
+                        BroadcastRelayDraft {
+                            description: r.description.clone(),
+                            disabled: r.disabled.then_some(true),
+                            port: Some(r.port),
+                            interfaces: r.interface.clone(),
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 }
@@ -2444,6 +2476,10 @@ impl Session {
     #[allow(dead_code)]
     pub fn reverse_proxy_names(&self) -> Vec<String> {
         self.draft.reverse_proxy.keys().cloned().collect()
+    }
+
+    pub fn broadcast_relay_names(&self) -> Vec<String> {
+        self.draft.broadcast_relay.keys().cloned().collect()
     }
 
     /// The declared address-group names — completion offers these for a rule's
@@ -3520,6 +3556,35 @@ impl Session {
             }
             ["services", "reverse-proxy", name, "disabled", v] => {
                 self.draft.reverse_proxy_mut(name).disabled = Some(parse_bool(v)?);
+            }
+
+            // services broadcast-relay <name> (roadmap C18): carry a UDP
+            // broadcast onto the other segments. `interface` appends+dedups like
+            // the other list fields; the two-interface minimum is checked at
+            // commit, where the whole relay is visible.
+            ["services", "broadcast-relay", name, "port", v] => {
+                let port: u16 = v.parse().with_context(|| format!("invalid port {v:?}"))?;
+                if port == 0 {
+                    bail!("port 0 is not valid");
+                }
+                self.draft.broadcast_relay_mut(name).port = Some(port);
+            }
+            ["services", "broadcast-relay", name, "interface", v] => {
+                append_csv(&mut self.draft.broadcast_relay_mut(name).interfaces, v);
+            }
+            ["services", "broadcast-relay", name, "disabled", v] => {
+                self.draft.broadcast_relay_mut(name).disabled = Some(parse_bool(v)?);
+            }
+            [
+                "services",
+                "broadcast-relay",
+                name,
+                "description",
+                rest @ ..,
+            ] if !rest.is_empty() => {
+                let desc = rest.join(" ");
+                crate::config::validate_description(&desc)?;
+                self.draft.broadcast_relay_mut(name).description = Some(desc);
             }
 
             // protocols: dynamic routing (the Wren control plane).
@@ -5313,6 +5378,29 @@ impl Session {
                 }
             }
 
+            // services broadcast-relay <name> (roadmap C18).
+            ["services", "broadcast-relay", name] => {
+                if self.draft.broadcast_relay.remove(*name).is_none() {
+                    bail!("no broadcast-relay {name:?}");
+                }
+            }
+            ["services", "broadcast-relay", name, "interface", v] => {
+                let r = self.broadcast_relay(name)?;
+                if !remove_item(&mut r.interfaces, v) {
+                    bail!("broadcast-relay {name:?} does not relay on {v:?}");
+                }
+            }
+            ["services", "broadcast-relay", name, field] => {
+                let r = self.broadcast_relay(name)?;
+                match *field {
+                    "port" => r.port = None,
+                    "interface" => r.interfaces.clear(),
+                    "disabled" => r.disabled = None,
+                    "description" => r.description = None,
+                    other => bail!("services broadcast-relay has no field {other:?}"),
+                }
+            }
+
             // protocols: dynamic routing (Wren).
             // Bare `delete protocols` clears the ENTIRE routing subtree, not just
             // the router-id — otherwise a configured ospf/bgp/… silently survives.
@@ -5969,6 +6057,13 @@ impl Session {
             .find(|(n, _)| n == name)
             .map(|(_, d)| d)
             .ok_or_else(|| anyhow::anyhow!("no nat source {name:?}"))
+    }
+
+    fn broadcast_relay(&mut self, name: &str) -> Result<&mut BroadcastRelayDraft> {
+        self.draft
+            .broadcast_relay
+            .get_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("no broadcast-relay {name:?}"))
     }
 
     fn reverse_proxy(&mut self, name: &str) -> Result<&mut ReverseProxyDraft> {
@@ -6848,6 +6943,21 @@ impl Session {
                         port: d.port,
                         certificate: d.certificate.clone(),
                         backends: d.backends.clone(),
+                    })
+                    .collect(),
+                // UDP broadcast relays (roadmap C18), name-ordered. A relay with
+                // no port set materialises to 0 so `validate()` says "port 0 is
+                // not a UDP port" rather than silently relaying nothing.
+                broadcast_relay: self
+                    .draft
+                    .broadcast_relay
+                    .iter()
+                    .map(|(name, d)| BroadcastRelay {
+                        name: name.clone(),
+                        description: d.description.clone(),
+                        disabled: d.disabled.unwrap_or(false),
+                        port: d.port.unwrap_or(0),
+                        interface: d.interfaces.clone(),
                     })
                     .collect(),
             },
@@ -7919,6 +8029,8 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         !relay.interface.is_empty() || !relay.server.is_empty() || !relay.server6.is_empty();
     let rproxy = &draft.reverse_proxy;
     let rproxy_set = !rproxy.is_empty();
+    let bcast = &draft.broadcast_relay;
+    let bcast_set = !bcast.is_empty();
     let syslog_set = !draft.syslog.is_empty();
     let alerts_set = !draft.alerts.webhook.is_empty() || !draft.alerts.mail.is_empty();
     let ids_set = !draft.ids.is_empty();
@@ -7931,6 +8043,7 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         || dyndns_set
         || relay_set
         || rproxy_set
+        || bcast_set
         || syslog_set
         || alerts_set
         || ids_set;
@@ -8152,6 +8265,23 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
                 out.push_str(&format!("        backends {backend}\n"));
             }
             if rp.disabled == Some(true) {
+                out.push_str("        disabled true\n");
+            }
+            out.push_str("    }\n");
+        }
+        // broadcast-relay <name> { … } — UDP broadcast relays, name-ordered.
+        for (name, r) in bcast {
+            out.push_str(&format!("    broadcast-relay {name} {{\n"));
+            if let Some(desc) = &r.description {
+                out.push_str(&format!("        description {desc}\n"));
+            }
+            if let Some(port) = r.port {
+                out.push_str(&format!("        port {port}\n"));
+            }
+            for iface in &r.interfaces {
+                out.push_str(&format!("        interface {iface}\n"));
+            }
+            if r.disabled == Some(true) {
                 out.push_str("        disabled true\n");
             }
             out.push_str("    }\n");

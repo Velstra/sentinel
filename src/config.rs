@@ -572,6 +572,13 @@ pub struct Services {
     /// Intrusion detection (`[services.ids]`, roadmap C11).
     #[serde(default, skip_serializing_if = "Ids::is_empty")]
     pub ids: Ids,
+    /// UDP broadcast relays (`[[services.broadcast-relay]]`, roadmap C18).
+    #[serde(
+        default,
+        rename = "broadcast-relay",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub broadcast_relay: Vec<BroadcastRelay>,
 }
 
 impl Services {
@@ -589,6 +596,7 @@ impl Services {
             && self.syslog.is_empty()
             && self.alerts.is_empty()
             && self.ids.is_empty()
+            && self.broadcast_relay.is_empty()
     }
 }
 
@@ -1078,6 +1086,37 @@ impl Mdns {
     pub fn is_empty(&self) -> bool {
         self.interface.is_empty()
     }
+}
+
+/// A UDP broadcast relay (`[[services.broadcast-relay]]`, roadmap C18) — carries
+/// a broadcast that would otherwise stop at the router onto the other segments,
+/// so discovery that assumes one flat LAN keeps working across VLANs (Wake-on-LAN
+/// magic packets, SSDP, game-server browsers, industrial gear that announces
+/// itself).
+///
+/// Each relay names one UDP port and the interfaces it bridges; a packet arriving
+/// on one is re-emitted on every other. **The original source address is
+/// preserved**, which is what makes request/response discovery work: a device
+/// answering an SSDP `M-SEARCH` replies unicast to the address it saw, and if
+/// that were the router the answer would never reach the asker.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BroadcastRelay {
+    /// A name for this relay, used in `show` and to address it from the CLI.
+    pub name: String,
+    /// A free-text label. Purely documentary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Administratively disable this relay without deleting it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
+    /// The UDP port to relay. One port per relay — a relay carrying two unrelated
+    /// protocols would have to be reasoned about as two anyway.
+    pub port: u16,
+    /// The interfaces this relay bridges. At least two: a relay onto the segment
+    /// a packet came from has nothing to do.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interface: Vec<String>,
 }
 
 /// A dynamic-DNS client (`[services.dyndns]`) — keeps a hostname's A/AAAA record
@@ -6394,6 +6433,29 @@ impl Appliance {
             }
         }
 
+        // UDP broadcast relay (roadmap C18): a relay needs a name nothing else
+        // uses, a real port, and interfaces that exist. A relay naming an
+        // interface the box does not have would bind nothing and carry nothing,
+        // while `show` listed it as configured.
+        let mut seen_relay = HashSet::new();
+        for r in &self.services.broadcast_relay {
+            if r.name.is_empty() {
+                bail!("services broadcast-relay: a relay name must not be empty");
+            }
+            if !seen_relay.insert(r.name.as_str()) {
+                bail!("services broadcast-relay: duplicate relay {:?}", r.name);
+            }
+            crate::relay::validate(r)?;
+            for iface in &r.interface {
+                if !self.interfaces.iter().any(|i| &i.name == iface) {
+                    bail!(
+                        "services broadcast-relay {:?}: {iface:?} is not a declared interface",
+                        r.name
+                    );
+                }
+            }
+        }
+
         // Remote syslog (roadmap C12): a collector needs a reachable address and a
         // real port. A duplicate target is refused rather than deduped — two
         // identical `omfwd` actions would double every message at the collector,
@@ -7094,6 +7156,55 @@ impl Appliance {
                     "interface {:?}: no zone assigned — it is not firewalled and its traffic \
                      passes unfiltered; assign one with `set interface {} zone <name>`",
                     i.name, i.name
+                ));
+            }
+        }
+        // A broadcast relay reads from an ordinary socket, so the packets have
+        // already passed the XDP firewall by the time it sees them. Under a
+        // deny-by-default zone they never arrive, and the relay looks broken
+        // while being blameless — the hardest kind of failure to attribute.
+        for r in &self.services.broadcast_relay {
+            if r.disabled {
+                continue;
+            }
+            let mut unopened: Vec<&str> = Vec::new();
+            for iface in &r.interface {
+                let Some(zone) = self
+                    .interfaces
+                    .iter()
+                    .find(|i| &i.name == iface)
+                    .and_then(|i| i.zone.as_deref())
+                else {
+                    continue; // an unzoned interface is unfiltered; nothing to open
+                };
+                if self.zone_posture(zone).default_action == Some(Action::Accept) {
+                    continue;
+                }
+                let admitted = self.rules.iter().any(|rule| {
+                    !rule.disabled
+                        && rule.from == zone
+                        && rule.action == Action::Accept
+                        && match (rule.proto, rule.port) {
+                            (Some(Proto::Udp), Some(spec)) => {
+                                let (lo, hi) = spec.bounds();
+                                (lo..=hi).contains(&r.port)
+                            }
+                            // A broad accept from the zone opens everything,
+                            // including this port.
+                            (None, None) => true,
+                            _ => false,
+                        }
+                });
+                if !admitted && !unopened.contains(&zone) {
+                    unopened.push(zone);
+                }
+            }
+            for zone in unopened {
+                out.push(format!(
+                    "services broadcast-relay {:?}: zone {zone:?} does not admit udp/{}, so the \
+                     broadcasts are dropped before the relay sees them; add a rule accepting \
+                     udp/{} from {zone}",
+                    r.name, r.port, r.port
                 ));
             }
         }
