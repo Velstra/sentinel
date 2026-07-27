@@ -359,6 +359,25 @@ pub fn install_secret_file(path: &Path, contents: &str) -> Result<()> {
     )
 }
 
+/// Install a root-owned private file at `path`, mode **0600 root:root** —
+/// staged in `/run/sentinel` (wheel-writable) and then `install`ed atomically, so
+/// there is never a window where the contents are group- or world-readable.
+///
+/// Used for key material Sentinel receives rather than generates: an ACME
+/// certificate's private key arrives as bytes from lego, so it cannot be created
+/// in place inside an already-locked directory the way `pki` generates a leaf.
+pub fn install_private_file(path: &Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    let tmp = Path::new("/run/sentinel").join(".private.tmp");
+    stage_private(&tmp, contents)?;
+    let (Some(tmp_s), Some(dst_s)) = (tmp.to_str(), path.to_str()) else {
+        bail!("non-UTF-8 path");
+    };
+    sudo("install", &["-m", "0600", tmp_s, dst_s])
+}
+
 /// Install a PPPoE credentials file (`chap-secrets`/`pap-secrets`) at a
 /// root-owned `path`, mode **0600 root:root**. Unlike a WireGuard `.netdev`
 /// (which an unprivileged `systemd-network` must read, hence 0640), `pppd` runs
@@ -626,6 +645,7 @@ pub fn bin(name: &str) -> String {
         "tc" => "SENTINEL_TC_BIN",
         "swanctl" => "SENTINEL_SWANCTL_BIN",
         "openssl" => "SENTINEL_OPENSSL_BIN",
+        "lego" => "SENTINEL_LEGO_BIN",
         "lsblk" => "SENTINEL_LSBLK_BIN",
         "install" => "SENTINEL_INSTALL_BIN",
         "mkdir" => "SENTINEL_MKDIR_BIN",

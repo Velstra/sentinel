@@ -68,6 +68,7 @@
             --set SENTINEL_NFT_BIN        ${pkgs.nftables}/bin/nft \
             --set SENTINEL_SWANCTL_BIN    ${pkgs.strongswan}/bin/swanctl \
             --set SENTINEL_OPENSSL_BIN    ${pkgs.openssl.bin}/bin/openssl \
+            --set SENTINEL_LEGO_BIN       ${pkgs.lego}/bin/lego \
             --set SENTINEL_CURL_BIN       ${pkgs.curl.bin}/bin/curl \
             --set SENTINEL_MSMTP_BIN      ${pkgs.msmtp}/bin/msmtp \
             --set SENTINEL_SURICATA_SHARE ${pkgs.suricata}/etc/suricata \
@@ -643,6 +644,40 @@
               ExecStart = "${sentinel}/bin/sentinel ids-watch";
               Restart = "on-failure";
               RestartSec = "10s";
+            };
+          };
+
+          # ACME issuance (roadmap C19): obtain and renew the certificates the
+          # config declares with `ca = "acme"`. A oneshot behind a timer rather
+          # than part of the commit, because it talks to a server, waits to be
+          # called back, and fails for reasons the config cannot fix — a commit
+          # is the wrong place for any of that. Renewal is the same code path,
+          # so there is only one of them to be wrong.
+          #
+          # lego serves the http-01 challenge itself on :80, which needs the
+          # privileged port and nothing else.
+          systemd.services.sentinel-acme = {
+            description = "ACME certificate issuance and renewal (sentinel/lego)";
+            after = [
+              "network-online.target"
+              "sentinel-boot.service"
+            ];
+            wants = [ "network-online.target" ];
+            serviceConfig = {
+              Type = "oneshot";
+              ExecStart = "${sentinel}/bin/sentinel acme-renew";
+              AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ];
+            };
+          };
+          systemd.timers.sentinel-acme = {
+            description = "Renew ACME certificates (sentinel)";
+            timerConfig = {
+              # Daily with a spread, which is what every ACME directory asks for:
+              # a fleet renewing on the same second is a self-inflicted outage.
+              OnCalendar = "daily";
+              RandomizedDelaySec = "6h";
+              Persistent = true;
+              Unit = "sentinel-acme.service";
             };
           };
 
@@ -2244,6 +2279,159 @@
       # real traffic on the wire turns into an alert an operator can read — not
       # that a config file was rendered.
       #   nix build .#checks.x86_64-linux.ids -L
+      # ACME issuance (roadmap C19). The roadmap called this "deferred to
+      # hardware" because a challenge needs external reachability — but Pebble is
+      # a real RFC 8555 server small enough to run beside the appliance, so the
+      # whole path (register, order, serve the http-01 challenge, install the
+      # result) is verifiable here after all.
+      #
+      # The one thing this cannot exercise is the public trust store: Pebble
+      # presents a self-signed identity, so lego is pointed at it explicitly.
+      acme = pkgs.testers.runNixOSTest {
+        name = "sentinel-acme";
+        nodes = {
+          # The certificate authority. Pebble validates for real — it fetches the
+          # challenge back over port 80 — so a certificate coming out the far end
+          # proves the exchange happened, not merely that lego was invoked.
+          ca =
+            { pkgs, lib, ... }:
+            {
+              networking.hostName = lib.mkForce "ca";
+              networking.firewall.enable = lib.mkForce false;
+              environment.systemPackages = [
+                pkgs.pebble
+                pkgs.openssl
+              ];
+              environment.etc."pebble.json".text = builtins.toJSON {
+                pebble = {
+                  listenAddress = "0.0.0.0:14000";
+                  managementListenAddress = "0.0.0.0:15000";
+                  certificate = "/var/lib/pebble/pebble.crt";
+                  privateKey = "/var/lib/pebble/pebble.key";
+                  # Validate over the port the appliance really serves on.
+                  httpPort = 80;
+                  tlsPort = 443;
+                  ocspResponderURL = "";
+                  externalAccountBindingRequired = false;
+                };
+              };
+            };
+          fw =
+            { pkgs, lib, ... }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce "fw";
+              networking.firewall.enable = lib.mkForce false;
+              virtualisation.memorySize = 2048;
+              # For the assertions only: the appliance drives its own pinned
+              # openssl, it does not put one on an operator's PATH.
+              environment.systemPackages = [ pkgs.openssl ];
+              # Pebble is its own root. A public directory needs none of this.
+              systemd.services.sentinel-acme.environment.LEGO_CA_CERTIFICATES =
+                "/run/pebble-ca.crt";
+            };
+        };
+        testScript = ''
+          start_all()
+          ca.wait_for_unit("multi-user.target")
+          fw.wait_for_unit("multi-user.target")
+          fw.wait_for_unit("sentinel-boot.service")
+
+          def apply(*lines):
+              cmds = " ".join(f"'{l}'" for l in lines)
+              return fw.succeed(
+                  "su admin -c \"printf '%s\\n' " + cmds
+                  + " commit save exit | sentinel configure\" 2>&1"
+              )
+
+          with subtest("a directory to talk to"):
+              ca.succeed("mkdir -p /var/lib/pebble")
+              ca.succeed(
+                  "openssl req -x509 -newkey rsa:2048 -nodes -days 2 "
+                  "-keyout /var/lib/pebble/pebble.key -out /var/lib/pebble/pebble.crt "
+                  "-subj /CN=ca -addext subjectAltName=DNS:ca"
+              )
+              ca.succeed(
+                  "systemd-run --unit=pebble --collect "
+                  "-E PEBBLE_VA_NOSLEEP=1 pebble -config /etc/pebble.json"
+              )
+              ca.wait_for_open_port(14000)
+              # Hand the appliance the root it will have to accept.
+              root = ca.succeed("cat /var/lib/pebble/pebble.crt")
+              fw.succeed(
+                  "cat > /run/pebble-ca.crt <<'PEMEOF'\n" + root + "PEMEOF"
+              )
+
+          with subtest("issuance is refused before it can fail in a timer"):
+              # Without accepting the terms there is no way to obtain anything;
+              # lego would say so hours later, inside the renewal timer, where
+              # nobody is watching.
+              out = apply(
+                  "set pki acme email admin@example.com",
+                  "set pki acme directory-url https://ca:14000/dir",
+                  "set pki certificate web ca acme",
+                  "set pki certificate web common-name fw",
+              )
+              assert "terms of service" in out, out
+              fw.fail("test -f /run/sentinel/acme.toml")
+
+              # An address cannot be certified over http-01 either. Stated in
+              # full: the refusal above saved nothing, so there is no half-built
+              # certificate left behind to build on.
+              out = apply(
+                  "set pki acme email admin@example.com",
+                  "set pki acme agree-tos true",
+                  "set pki certificate web ca acme",
+                  "set pki certificate web common-name 10.0.0.1",
+              )
+              assert "is an address" in out, out
+
+          with subtest("the certificate is obtained and lands where every cert does"):
+              apply(
+                  "set pki acme email admin@example.com",
+                  "set pki acme directory-url https://ca:14000/dir",
+                  "set pki acme agree-tos true",
+                  "set pki certificate web ca acme",
+                  "set pki certificate web common-name fw",
+              )
+              fw.succeed("test -f /run/sentinel/acme.toml")
+              # The apply asks for a run immediately rather than leaving a fresh
+              # box without a certificate until the timer's first tick.
+              fw.wait_until_succeeds(
+                  "test -f /var/lib/sentinel/pki/certs/web/cert.crt", timeout=120
+              )
+
+              # Signed by Pebble, for the name we asked for — this is what proves
+              # the challenge was really served and really fetched.
+              issuer = fw.succeed(
+                  "openssl x509 -in /var/lib/sentinel/pki/certs/web/cert.crt -noout -issuer"
+              )
+              assert "Pebble" in issuer, issuer
+              subject = fw.succeed(
+                  "openssl x509 -in /var/lib/sentinel/pki/certs/web/cert.crt -noout -text"
+              )
+              assert "DNS:fw" in subject, subject
+
+              # The private key is not readable by anyone but root.
+              mode = fw.succeed(
+                  "stat -c %a /var/lib/sentinel/pki/certs/web/cert.key"
+              ).strip()
+              assert mode == "600", "key mode is " + mode
+
+          with subtest("show reports it like any other certificate"):
+              out = fw.succeed("sentinel show pki")
+              # Same store, same status line: nothing downstream should be able to
+              # tell where a certificate came from.
+              assert "certificate web" in out and "expires" in out, out
+              assert "acme renewal: scheduled" in out, out
+
+          with subtest("removing it stops the renewal"):
+              apply("delete pki certificate web")
+              fw.fail("test -f /run/sentinel/acme.toml")
+              fw.wait_until_fails("systemctl is-active sentinel-acme.timer", timeout=30)
+        '';
+      };
+
       # UDP broadcast relay (roadmap C18): a broadcast stops at the router, which
       # is correct and is also why discovery breaks the moment a flat LAN gets
       # segmented. Three nodes are the minimum that can show the relay carrying a

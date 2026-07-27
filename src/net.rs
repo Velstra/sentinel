@@ -2731,6 +2731,7 @@ pub fn apply_link_runtime(appliance: &Appliance) -> Result<()> {
     // networkd, since AF_PACKET needs the interface to exist before it can bind.
     crate::ids::apply(appliance)?;
     crate::relay::apply(appliance)?;
+    crate::acme::apply(appliance)?;
     // Box services (roadmap C18) — LLDP/SNMP/mDNS/dyndns/DHCP-relay, each a
     // Sentinel-owned daemon (re)started after networkd so the link-scoped ones
     // (LLDP/mDNS/relay) see their interfaces up.
