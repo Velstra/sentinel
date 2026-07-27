@@ -101,3 +101,50 @@ set pki certificate site-cert common-name www.example.com
 ```
 
 `show pki` lists CAs and issued certs with their expiry.
+
+### ACME issuance
+
+A locally-signed certificate is right for a VPN, where both ends are yours. It is
+useless for anything a person points a browser at — the management API, the
+reverse proxy — because nothing trusts it. `ca = "acme"` obtains a real one.
+
+**Issuance is a job, not part of the commit.** Obtaining a certificate talks to a
+server and waits for it to call back, and it fails for reasons the config cannot
+fix: a name that does not point here yet, port 80 unreachable, the directory down.
+So the commit records what is wanted and `sentinel-acme.service` does the work,
+run by a daily timer with a randomised delay. Renewal is the same code path, and
+starts 30 days before expiry — so a fortnight of failures still leaves room.
+
+An apply also asks for one run immediately, because a fresh box otherwise has no
+certificate until the timer's first tick while everything reports success.
+
+**Port 80 has to be reachable.** The http-01 challenge is fetched back over it
+from outside; if no zone admits `tcp/80`, the commit says so and `show pki`
+repeats it, rather than letting the failure surface in a timer weeks later:
+
+```text
+set firewall rule acme-challenge from wan action accept proto tcp port 80
+```
+
+**Refused at commit**, because each would otherwise fail hours later inside a
+timer with nobody watching: issuing without `agree-tos` (the protocol has no way
+to), `challenge dns-01` (it needs provider credentials Sentinel does not model),
+and a `common-name` that is an address (a public CA issues for names, which is
+what the challenge is fetched over). An `IP:` subject-alt-name is dropped rather
+than refused — passing it would fail the whole order, including the names that
+were fine.
+
+An obtained certificate lands in the same store as a locally-signed one, under
+the same filenames, so the reverse proxy, the OpenConnect server and `show pki`
+never learn where it came from — which is what makes `ca = "acme"` a one-word
+change.
+
+```text
+sentinel show pki      # …and whether renewal is actually scheduled
+```
+
+`nix build .#checks.x86_64-linux.acme -L` verifies the whole exchange against
+[Pebble](https://github.com/letsencrypt/pebble), a real RFC 8555 server: the
+appliance registers, orders, serves the challenge on :80, and Pebble fetches it
+back — so a certificate coming out the far end proves the exchange, not merely
+that the client ran.

@@ -7039,6 +7039,10 @@ impl Appliance {
                 }
             }
         }
+        // What issuance itself needs, on top of a well-formed account: the rules
+        // that would otherwise fail hours later inside a timer, with nobody
+        // watching (roadmap C19).
+        crate::acme::validate(&self.pki)?;
 
         // Signed update channel (roadmap C13): the URL must be a fetchable
         // channel and the pinned key must be present (its cryptographic validity
@@ -7208,6 +7212,52 @@ impl Appliance {
                 ));
             }
         }
+        // An http-01 challenge is fetched over port 80, from outside. A zone
+        // that does not admit it starves the renewal — which then fails in a
+        // timer, weeks later, when the certificate is already close to expiry.
+        if self
+            .pki
+            .certificates
+            .iter()
+            .any(|c| c.ca == ACME_CA && self.pki.acme.is_some())
+        {
+            // Only a box that actually filters can be starving the challenge:
+            // with no zoned interface nothing is being filtered, and warning
+            // there would be noise on every fresh appliance.
+            let zoned: Vec<&str> = self
+                .interfaces
+                .iter()
+                .filter(|i| !i.disabled)
+                .filter_map(|i| i.zone.as_deref())
+                .collect();
+            let opened = zoned.iter().any(|zone| {
+                if self.zone_posture(zone).default_action == Some(Action::Accept) {
+                    return true;
+                }
+                self.rules.iter().any(|rule| {
+                    !rule.disabled
+                        && rule.from == *zone
+                        && rule.action == Action::Accept
+                        && match (rule.proto, rule.port) {
+                            (Some(Proto::Tcp), Some(spec)) => {
+                                let (lo, hi) = spec.bounds();
+                                (lo..=hi).contains(&80)
+                            }
+                            (None, None) => true,
+                            _ => false,
+                        }
+                })
+            });
+            if !zoned.is_empty() && !opened {
+                out.push(
+                    "pki acme: no zone admits tcp/80, so the http-01 challenge cannot reach \
+                     this box and issuance will fail in the renewal timer; add a rule \
+                     accepting tcp/80 from the zone the certificate's name resolves to"
+                        .to_string(),
+                );
+            }
+        }
+
         // Strict source validation asks that the route back to a sender leave by
         // the interface it arrived on. With a second uplink that is exactly what
         // fails: a reply may legitimately return by the other one, and the traffic

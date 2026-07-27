@@ -9,6 +9,7 @@
 //! and apply that document — and, via [`velstra_proto`] (from crates.io), talk to
 //! a running Velstra controller.
 
+mod acme;
 mod alert;
 mod api;
 mod archive;
@@ -218,6 +219,9 @@ enum Command {
     /// `sentinel-broadcast-relay.service` from the config an apply rendered, not
     /// by hand.
     BroadcastRelay,
+    /// Obtain or renew the ACME certificates the config declares (roadmap C19).
+    /// Run by `sentinel-acme.service` from its timer, not by hand.
+    AcmeRenew,
     /// List the ports a Velstra controller currently knows about.
     Ports {
         /// The controller's orchestrator/admin endpoint.
@@ -321,6 +325,7 @@ async fn main() -> Result<()> {
         Command::Alert { unit, config } => alert_unit(&unit, &config),
         Command::IdsWatch => ids::watch(),
         Command::BroadcastRelay => relay::run(),
+        Command::AcmeRenew => acme::run(),
         Command::Ports { controller } => ports(&controller).await,
         Command::Api {
             listen,
@@ -1381,14 +1386,12 @@ fn show_pki() -> Result<()> {
         );
     }
     for cert in &a.pki.certificates {
-        let status = if cert.ca == "acme" {
-            "(acme — obtained on hardware)".to_string()
-        } else {
-            cert_status(&format!(
-                "/var/lib/sentinel/pki/certs/{}/cert.crt",
-                cert.name
-            ))
-        };
+        // An obtained certificate lands in the same store as a locally-signed
+        // one, so the same status read works for both — which is the point.
+        let status = cert_status(&format!(
+            "/var/lib/sentinel/pki/certs/{}/cert.crt",
+            cert.name
+        ));
         println!(
             "certificate {}: CN={} ca={} {}",
             cert.name, cert.common_name, cert.ca, status
@@ -1401,6 +1404,24 @@ fn show_pki() -> Result<()> {
             acme.challenge.as_deref().unwrap_or("http-01"),
             acme.email
         );
+        // Whether renewal is actually scheduled. A certificate that shows a
+        // healthy expiry today and has no timer behind it is the failure this
+        // line exists to make visible.
+        if a.pki.certificates.iter().any(|c| c.ca == "acme") {
+            println!(
+                "acme renewal: {}",
+                if system::unit_active(acme::ACME_TIMER) {
+                    "scheduled"
+                } else {
+                    "NOT scheduled — `systemctl status sentinel-acme` says why"
+                }
+            );
+            for w in a.warnings() {
+                if w.contains("pki acme") {
+                    println!("warning: {w}");
+                }
+            }
+        }
     }
     Ok(())
 }
