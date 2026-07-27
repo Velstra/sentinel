@@ -2344,6 +2344,7 @@
           fw.succeed(
               """cat > /tmp/ids3.cfg <<'CFG'
           delete services ids never-block
+          set services ids block-duration 30
           commit
           save
           exit
@@ -2363,9 +2364,27 @@
           # the detector decides, it undoes itself.
           assert "s remaining" in blocks, blocks
 
-          # And it can be lifted by hand without waiting for the deadline.
+          # A wrong block has to be undoable now, not in half an hour: that is the
+          # difference between a guard rail and an outage an operator watches.
           addr = blocks.split()[0]
-          fw.succeed(f"sentinel show ids blocks | grep -q {addr}")
+          fw.succeed(f"sentinel clear ids block {addr}")
+          lifted = fw.succeed("sentinel show ids blocks")
+          assert addr not in lifted, "the block was not lifted: " + lifted
+
+          # The same source can be blocked again once the period is over: the
+          # watcher's memory of having asked expires with the block, so a manual
+          # clear is a reprieve rather than a permanent exemption nothing shows.
+          retry(blocked, timeout=180)
+
+          # Left alone this time, the block lifts itself. This is the property the
+          # feature rests on, so it is asserted rather than assumed.
+          fw.wait_until_succeeds(
+              "sentinel show ids blocks | grep -q 'no run-time blocks'", timeout=120
+          )
+
+          # And after a storm, all at once — undoing a too-broad rule one address
+          # at a time is the wrong thing to be doing while it is still firing.
+          assert "no run-time blocks" in fw.succeed("sentinel clear ids blocks")
 
           # Removing the configuration stops the detector rather than leaving it
           # running against a config file that is no longer the intent.

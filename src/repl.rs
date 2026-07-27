@@ -897,7 +897,17 @@ const COMMANDS: &[Cand] = &[
 ];
 
 // `run <Tab>` — the operational commands reachable from config mode.
-const RUN_TOP: &[Cand] = &[("show", "operational show commands")];
+const RUN_TOP: &[Cand] = &[
+    ("show", "operational show commands"),
+    ("clear", "clear operational state (run-time blocks)"),
+];
+// `run clear <Tab>`.
+const OP_CLEAR: &[Cand] = &[("ids", "intrusion-detection state")];
+// `run clear ids <Tab>`.
+const OP_CLEAR_IDS: &[Cand] = &[
+    ("block", "lift the block on one address"),
+    ("blocks", "lift every run-time block"),
+];
 const OP_SHOW_TOP: &[Cand] = &[
     ("interfaces", "live interfaces and addresses"),
     ("ip", "IPv4: route / bgp / ospf / rip"),
@@ -2677,6 +2687,8 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["run", "show", "ipv6"] => OP_IPV6,
         ["run", "show", "vpn"] => OP_VPN,
         ["run", "show", "ids"] => OP_IDS,
+        ["run", "clear"] => OP_CLEAR,
+        ["run", "clear", "ids"] => OP_CLEAR_IDS,
         _ => &[],
     }
 }

@@ -35,7 +35,7 @@
 //! `/dev/stdout` fails with ENXIO and the whole eve-log output silently does not
 //! start.)
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
@@ -376,7 +376,16 @@ pub fn watch() -> Result<()> {
         .take()
         .ok_or_else(|| anyhow::anyhow!("journalctl produced no output stream"))?;
     let reader = std::io::BufReader::new(stdout);
-    let mut blocked: BTreeSet<String> = BTreeSet::new();
+    // What has already been asked for, and until when. A noisy signature fires
+    // many times a second, and re-asking would turn one attack into a second load
+    // problem on the box meant to be handling it.
+    //
+    // It **expires with the block itself** rather than being remembered forever.
+    // Otherwise a source an operator deliberately unblocked could never be
+    // blocked again while the watcher ran — and nothing would show why. A manual
+    // `clear ids block` is therefore a reprieve for the rest of the period, not a
+    // permanent exemption; `never-block` is how you make one permanent.
+    let mut asked: BTreeMap<String, std::time::Instant> = BTreeMap::new();
     for line in std::io::BufRead::lines(reader) {
         let line = line.context("reading the alert stream")?;
         let Some(alert) = parse_alert(&line) else {
@@ -395,12 +404,15 @@ pub fn watch() -> Result<()> {
             );
             continue;
         }
-        // A noisy signature fires many times a second; asking the agent for the
-        // same block over and over would turn one attack into a second load
-        // problem on the box that is meant to be handling it.
-        if !blocked.insert(alert.src_ip.clone()) {
+        let now = std::time::Instant::now();
+        asked.retain(|_, until| *until > now);
+        if asked.contains_key(&alert.src_ip) {
             continue;
         }
+        asked.insert(
+            alert.src_ip.clone(),
+            now + std::time::Duration::from_secs(seconds),
+        );
         match crate::velstra::query(&format!("block {} {seconds}", alert.src_ip)) {
             Ok(reply) => eprintln!(
                 "blocked {} after {:?}: {}",
@@ -410,10 +422,10 @@ pub fn watch() -> Result<()> {
             ),
             Err(e) => {
                 eprintln!("could not block {}: {e:#}", alert.src_ip);
-                // Not remembered as blocked, so the next alert from the same
-                // source tries again — an agent that was briefly away must not
-                // mean that source is never blocked.
-                blocked.remove(&alert.src_ip);
+                // Forgotten, so the next alert from the same source tries again —
+                // an agent that was briefly away must not mean that source goes
+                // unblocked for the rest of the period.
+                asked.remove(&alert.src_ip);
             }
         }
     }

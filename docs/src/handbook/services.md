@@ -285,7 +285,9 @@ explains every drop.
 | `never-block` | Sources that must never be blocked. Matched as a prefix. |
 
 ```
-show ids blocks           # what is blocked right now, and for how much longer
+show ids blocks               # what is blocked right now, and for how much longer
+clear ids block 198.51.100.7  # lift one, now
+clear ids blocks              # lift all of them — after a too-broad rule fires
 ```
 
 Worth knowing:
@@ -302,3 +304,7 @@ Worth knowing:
   decision an operator makes, not a default.
 - A block never overrides the configuration: an address the config already blocks is
   left alone, so an expiry cannot quietly switch off a block you wrote.
+- **`clear ids block` is a reprieve, not an exemption.** The watcher stops re-asking
+  for a source only for the rest of that block's period; after it, a fresh alert
+  blocks it again. To keep a source reachable permanently, put it in `never-block` —
+  otherwise nothing would show why it was never blocked again.
