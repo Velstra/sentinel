@@ -32,7 +32,7 @@ authoritative list.
 | `commitconfirm` | a timed commit auto-reverts unless `confirm`ed — the safety net for editing a firewall over its own link |
 | `confighistory` | every `save` archives a revision, `show system commit` lists them, `rollback <N>` restores one |
 | `configsync` | a commit on the primary pushes the running config to the backup's API, which applies **and** persists it |
-| `api` | the REST management API drives one config model end to end; `/health` is unauthenticated, the rest is not |
+| `api` | the REST management API drives one config model end to end; `/health` is unauthenticated, the rest is not; and the web console — that it fetches nothing external, and that every `/api/v1/…` path the page calls really answers (the way a hand-written console drifts from its API) |
 
 ## Firewall (eBPF data plane)
 

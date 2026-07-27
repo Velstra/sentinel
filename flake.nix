@@ -1342,6 +1342,40 @@
               "http://127.0.0.1:8080/api/v1/status"
           )
           assert "api-fw" in status, status
+
+          # ---- the web console (roadmap C12) ------------------------------
+          # The page is markup with no data in it, and a sign-in page nobody can
+          # reach is not a sign-in page — so `/` answers without a token.
+          page = machine.succeed("curl -fsS http://127.0.0.1:8080/")
+          assert "<!doctype html>" in page.lower(), page[:200]
+          assert "Sentinel" in page
+
+          # It reaches outside for nothing. An appliance is expected to work on
+          # an isolated network, and a console that half-renders without the
+          # internet is worse than no console.
+          for external in ["http://", "https://", "<link", "<script src"]:
+              assert external not in page, f"the console fetches {external!r}"
+
+          # The real assertion: every endpoint the page calls actually answers.
+          # A hand-written console drifts from its API by having a panel point at
+          # a path that quietly 404s in front of an operator, and nothing else in
+          # the build would notice.
+          import re
+          paths = sorted(set(re.findall(r'"(/api/v1/[^"]+)"', page)))
+          assert len(paths) >= 10, f"only found {paths}"
+          for path in paths:
+              code = machine.succeed(
+                  "curl -s -o /dev/null -w '%{http_code}' "
+                  f"-H 'Authorization: Bearer {token}' http://127.0.0.1:8080{path}"
+              ).strip()
+              assert code == "200", f"the console calls {path}, which answered {code}"
+
+          # And those endpoints stay behind the token like every other one.
+          code = machine.succeed(
+              "curl -s -o /dev/null -w '%{http_code}' "
+              f"http://127.0.0.1:8080{paths[0]}"
+          ).strip()
+          assert code == "401", f"{paths[0]} served data without a token ({code})"
         '';
       };
 

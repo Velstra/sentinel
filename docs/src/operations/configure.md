@@ -557,3 +557,31 @@ shows the diff against the saved config; `commit` in this mode is session-only.
 Even before you assign anything, the real NICs show up in the config (VyOS-like),
 so they're ready to reference. The minimal factory config has no interfaces of
 its own; `show` in a fresh session lists what the hardware provides.
+
+## The web console
+
+`sentinel-api.service` serves a read-only web console at `/`, on the same port
+and behind the same bearer token as the REST API:
+
+```shell
+systemctl start sentinel-api.service     # off by default
+cat /var/lib/sentinel/api-token          # the token to sign in with
+```
+
+Then open `http://<box>:8080/`. The token is the same one the API takes, and the
+page keeps it for that browser tab only — an appliance's management token has no
+business surviving on a shared machine after the tab is closed.
+
+The console **shows; it does not edit.** Editing means submitting a whole config
+document, and a form that reassembles one from fields is exactly where a UI
+starts to diverge from the config model it is meant to be a view of. Configuration
+stays with `configure` (and with `PUT /api/v1/config` for automation) until the
+console can drive the same validated document rather than a rendering of it.
+
+Everything it displays comes from the endpoints the CLI's own `show` commands
+feed, so the console cannot report anything `sentinel show` would not — and the
+`api` check asserts that every path the page calls really answers, which is how a
+hand-written console otherwise drifts from its API.
+
+The page fetches nothing from the internet: no CDN, no font, no framework. A
+management console that half-renders on an isolated network is worse than none.
