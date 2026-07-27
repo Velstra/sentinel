@@ -290,6 +290,7 @@ struct ZoneDraft {
     default_action: Option<Action>,
     log: Option<bool>,
     source_validation: Option<SourceValidation>,
+    geoip_block: Vec<String>,
 }
 
 /// The candidate's global firewall posture. `None` fields fall back to the
@@ -307,6 +308,8 @@ struct FirewallDraft {
     fail_closed: Option<bool>,
     /// Source-address validation (uRPF) every zone inherits.
     source_validation: Option<SourceValidation>,
+    /// ISO country codes dropped everywhere (roadmap C15 GeoIP).
+    geoip_block: Vec<String>,
 }
 
 /// A partially-specified static route (keyed by its prefix).
@@ -1722,6 +1725,7 @@ impl Draft {
                 log: Some(a.firewall.log),
                 fail_closed: Some(a.firewall.fail_closed),
                 source_validation: Some(a.firewall.source_validation),
+                geoip_block: a.firewall.geoip_block.clone(),
             },
             groups: a.firewall.group.clone(),
             load_balancers: a
@@ -1756,6 +1760,7 @@ impl Draft {
                             default_action: z.default_action,
                             log: z.log,
                             source_validation: z.source_validation,
+                            geoip_block: z.geoip_block.clone(),
                         },
                     )
                 })
@@ -2996,6 +3001,12 @@ impl Session {
             ["firewall", "global", "source-validation", v] => {
                 self.draft.firewall.source_validation = Some(parse_source_validation(v)?)
             }
+            ["firewall", "global", "geoip-block", v] => {
+                for cc in v.split(',') {
+                    let cc = crate::config::normalise_country(cc)?;
+                    push_unique(&mut self.draft.firewall.geoip_block, &cc);
+                }
+            }
             ["firewall", "global", "block", v] => {
                 validate_block_entry(v)?;
                 push_unique(&mut self.draft.firewall.blocklist, v);
@@ -3021,6 +3032,12 @@ impl Session {
             }
             ["firewall", "zone", name, "source-validation", v] => {
                 self.draft.zone_mut(name).source_validation = Some(parse_source_validation(v)?)
+            }
+            ["firewall", "zone", name, "geoip-block", v] => {
+                for cc in v.split(',') {
+                    let cc = crate::config::normalise_country(cc)?;
+                    push_unique(&mut self.draft.zone_mut(name).geoip_block, &cc);
+                }
             }
             ["firewall", "zone", name, "block", v] => {
                 validate_block_entry(v)?;
@@ -4916,6 +4933,7 @@ impl Session {
                 "log" => self.draft.firewall.log = None,
                 "fail-closed" => self.draft.firewall.fail_closed = None,
                 "source-validation" => self.draft.firewall.source_validation = None,
+                "geoip-block" => self.draft.firewall.geoip_block.clear(),
                 other => bail!("firewall global has no field {other:?}"),
             },
 
@@ -4950,6 +4968,7 @@ impl Session {
                     "default-action" => z.default_action = None,
                     "log" => z.log = None,
                     "source-validation" => z.source_validation = None,
+                    "geoip-block" => z.geoip_block.clear(),
                     other => bail!("zone has no field {other:?}"),
                 }
             }
@@ -6363,6 +6382,7 @@ impl Session {
             log: self.draft.firewall.log.unwrap_or(false),
             fail_closed: self.draft.firewall.fail_closed.unwrap_or(false),
             source_validation: self.draft.firewall.source_validation.unwrap_or_default(),
+            geoip_block: self.draft.firewall.geoip_block.clone(),
             group: self.draft.groups.clone(),
         };
         let zones: BTreeMap<String, ZoneCfg> = self
@@ -6380,6 +6400,7 @@ impl Session {
                         default_action: z.default_action,
                         log: z.log,
                         source_validation: z.source_validation,
+                        geoip_block: z.geoip_block.clone(),
                     },
                 )
             })
@@ -7379,6 +7400,7 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         || fw.log.is_some()
         || fw.fail_closed.is_some()
         || fw.source_validation.is_some()
+        || !fw.geoip_block.is_empty()
         || !fw.blocklist.is_empty()
     {
         fwi.push_str("    global {\n");
@@ -7399,6 +7421,9 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         if let Some(v) = fw.source_validation {
             fwi.push_str(&format!("        source-validation {}\n", v.as_str()));
+        }
+        for cc in &fw.geoip_block {
+            fwi.push_str(&format!("        geoip-block {cc}\n"));
         }
         for e in &fw.blocklist {
             fwi.push_str(&format!("        block {e}\n"));
@@ -7424,6 +7449,9 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         if let Some(v) = z.source_validation {
             fwi.push_str(&format!("        source-validation {}\n", v.as_str()));
+        }
+        for cc in &z.geoip_block {
+            fwi.push_str(&format!("        geoip-block {cc}\n"));
         }
         for e in &z.blocklist {
             fwi.push_str(&format!("        block {e}\n"));

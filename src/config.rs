@@ -3307,6 +3307,14 @@ pub struct Firewall {
     /// known.
     #[serde(default)]
     pub fail_closed: bool,
+    /// ISO country codes whose addresses are dropped on every firewalled
+    /// interface — the global list every zone inherits (roadmap C15 GeoIP).
+    ///
+    /// This blocks **sources**: it stops those countries reaching you, not you
+    /// reaching them. The addresses come from the image's own database, so it
+    /// works on an isolated network and changes only when the image does.
+    #[serde(default, rename = "geoip-block", skip_serializing_if = "Vec::is_empty")]
+    pub geoip_block: Vec<String>,
     /// Source-address validation (uRPF) every zone inherits. `disable` by
     /// default; set it per zone to validate only where it belongs.
     #[serde(
@@ -3345,6 +3353,7 @@ impl Default for Firewall {
             log: false,
             fail_closed: false,
             source_validation: SourceValidation::Disable,
+            geoip_block: Vec::new(),
             group: Groups::default(),
         }
     }
@@ -3361,6 +3370,7 @@ impl Firewall {
             && !self.log
             && !self.fail_closed
             && self.source_validation == SourceValidation::Disable
+            && self.geoip_block.is_empty()
             && self.group.is_empty()
     }
 }
@@ -3436,6 +3446,11 @@ pub struct ZoneCfg {
     /// Log matched traffic for this zone (inherits `[firewall] log`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<bool>,
+    /// Countries dropped on this zone, **added to** the global `geoip-block`
+    /// rather than replacing it: a country blocked everywhere should not quietly
+    /// become reachable because one zone named a different one.
+    #[serde(default, rename = "geoip-block", skip_serializing_if = "Vec::is_empty")]
+    pub geoip_block: Vec<String>,
     /// Source-address validation for this zone (inherits `[firewall]
     /// source-validation`).
     #[serde(
@@ -3458,6 +3473,8 @@ pub struct ResolvedZone {
     pub default_action: Option<Action>,
     pub log: bool,
     pub source_validation: SourceValidation,
+    /// The countries this zone drops: the global list plus the zone's own.
+    pub geoip_block: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7039,6 +7056,54 @@ impl Appliance {
                 }
             }
         }
+        // GeoIP (roadmap C15): a country the image has no addresses for would
+        // block nothing while `show` listed it — the worst outcome for a feature
+        // whose whole job is to block. And the data plane's blocklist is one map
+        // across every policy, so the total across zones is what has to fit.
+        {
+            // Every declared country is checked, even one no interface uses yet:
+            // finding out it is unknown when a zone is first assigned is worse.
+            let mut wanted: Vec<String> = self.firewall.geoip_block.clone();
+            for z in self.zones.values() {
+                for cc in &z.geoip_block {
+                    if !wanted.contains(cc) {
+                        wanted.push(cc.clone());
+                    }
+                }
+            }
+            let mut size: BTreeMap<&str, usize> = BTreeMap::new();
+            for cc in &wanted {
+                size.insert(cc.as_str(), geoip_prefixes(cc)?.len());
+            }
+            // The cost is per zone: each zone's policy carries its own copy.
+            let mut total = 0usize;
+            let mut zones: Vec<&str> = self
+                .interfaces
+                .iter()
+                .filter(|i| !i.disabled)
+                .filter_map(|i| i.zone.as_deref())
+                .collect();
+            zones.sort_unstable();
+            zones.dedup();
+            for zone in zones {
+                for cc in &self.zone_posture(zone).geoip_block {
+                    total += size.get(cc.as_str()).copied().unwrap_or(0);
+                }
+            }
+            // Mirrors `velstra_common::MAX_BLOCKLIST`, the source of truth.
+            // Duplicated because Sentinel does not link the data-plane crates,
+            // and the alternative is finding the ceiling as a half-programmed
+            // firewall.
+            const MAX_BLOCKLIST: usize = 262_144;
+            if total > MAX_BLOCKLIST {
+                bail!(
+                    "firewall geoip-block: {total} prefixes across all zones exceeds the \
+                     data plane's {MAX_BLOCKLIST}; block fewer countries, or block them \
+                     on fewer zones"
+                );
+            }
+        }
+
         // What issuance itself needs, on top of a well-formed account: the rules
         // that would otherwise fail hours later inside a timer, with nobody
         // watching (roadmap C19).
@@ -7089,6 +7154,17 @@ impl Appliance {
             source_validation: z
                 .and_then(|z| z.source_validation)
                 .unwrap_or(fw.source_validation),
+            geoip_block: {
+                let mut all = fw.geoip_block.clone();
+                if let Some(z) = z {
+                    for cc in &z.geoip_block {
+                        if !all.contains(cc) {
+                            all.push(cc.clone());
+                        }
+                    }
+                }
+                all
+            },
         }
     }
 
@@ -7320,6 +7396,34 @@ impl Appliance {
                 out.push_str(&format!("  {zone:<8} {mode}\n"));
             }
         }
+        // GeoIP blocks with the number of prefixes each costs: an operator who
+        // hits the data plane's ceiling needs to see where it went.
+        let mut geo: Vec<(&str, Vec<String>)> = Vec::new();
+        for iface in &self.interfaces {
+            let Some(zone) = iface.zone.as_deref() else {
+                continue;
+            };
+            if geo.iter().any(|(z, _)| *z == zone) {
+                continue;
+            }
+            let blocked = self.zone_posture(zone).geoip_block;
+            if !blocked.is_empty() {
+                geo.push((zone, blocked));
+            }
+        }
+        if !geo.is_empty() {
+            out.push_str("geoip blocks:\n");
+            for (zone, countries) in geo {
+                let n: usize = countries
+                    .iter()
+                    .map(|cc| geoip_prefixes(cc).map(|p| p.len()).unwrap_or(0))
+                    .sum();
+                out.push_str(&format!(
+                    "  {zone:<8} {}  ({n} prefixes)\n",
+                    countries.join(",")
+                ));
+            }
+        }
         out.push_str(&format!("rules ({}):\n", self.rules.len()));
         for r in &self.rules {
             let proto_port = match (r.proto, r.port) {
@@ -7337,6 +7441,58 @@ impl Appliance {
         }
         out
     }
+}
+
+/// Where the per-country CIDR lists live. Overridden by `SENTINEL_GEOIP_DIR`,
+/// which the image's wrapper sets to the extracted database.
+pub fn geoip_dir() -> std::path::PathBuf {
+    std::env::var("SENTINEL_GEOIP_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/etc/sentinel/geoip"))
+}
+
+/// Accept a country as an ISO 3166-1 alpha-2 code, upper-cased.
+///
+/// Only the shape is checked here — whether the image actually has addresses for
+/// that country is a question for commit time, where the answer can name the
+/// database instead of a syntax rule.
+pub fn normalise_country(code: &str) -> Result<String> {
+    let cc = code.trim().to_ascii_uppercase();
+    if cc.len() != 2 || !cc.chars().all(|c| c.is_ascii_alphabetic()) {
+        bail!("{code:?} is not a two-letter country code (e.g. CN, RU)");
+    }
+    Ok(cc)
+}
+
+/// The CIDRs the image holds for `country`, both families, or an error naming the
+/// country if it has none.
+///
+/// A country the database does not cover is an **error, not an empty list**: a
+/// rule that silently blocks nothing is the worst outcome for a feature whose
+/// whole job is to block.
+pub fn geoip_prefixes(country: &str) -> Result<Vec<String>> {
+    let dir = geoip_dir();
+    let mut out = Vec::new();
+    for suffix in ["v4", "v6"] {
+        let path = dir.join(format!("{country}.{suffix}"));
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        out.extend(
+            body.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string),
+        );
+    }
+    if out.is_empty() {
+        bail!(
+            "geoip: no addresses for country {country:?} in {} — check the code, or the \
+             image's database does not cover it",
+            dir.display()
+        );
+    }
+    Ok(out)
 }
 
 /// Validate a bare IPv4 address (router-id, gateway, BGP peer — no prefix).
