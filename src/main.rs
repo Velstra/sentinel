@@ -106,6 +106,13 @@ enum Command {
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
+    /// Clear operational state (Cisco/VyOS-style): `clear ids block <ip>`,
+    /// `clear ids blocks`.
+    Clear {
+        /// The clear path words.
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
     /// Author the declarative appliance config (file-based helpers).
     Config {
         #[command(subcommand)]
@@ -284,6 +291,7 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Configure { config, no_apply } => configure(&config, no_apply),
         Command::Show { args } => show_op(&args),
+        Command::Clear { args } => clear_op(&args),
         Command::Config { action } => config_cmd(action),
         Command::Compile { file } => {
             let appliance = Appliance::load(&file)?;
@@ -1183,6 +1191,33 @@ fn show_cgnat(addr: &str) -> Result<()> {
     addr.parse::<std::net::Ipv4Addr>()
         .with_context(|| format!("{addr:?} is not an IPv4 address"))?;
     show_agent_query(&format!("cgnat {addr}"), "cgnat port blocks")
+}
+
+/// Clear operational state. Only the data plane's run-time blocks so far — the
+/// state a detector created and an operator may need to undo *now*.
+///
+/// Deliberately a separate verb from `show`: this changes what the box is doing,
+/// and `show` must stay something an operator can run without thinking.
+fn clear_op(args: &[String]) -> Result<()> {
+    let path: Vec<&str> = args.iter().map(String::as_str).collect();
+    match path.as_slice() {
+        ["ids", "block", addr] => {
+            addr.parse::<std::net::IpAddr>()
+                .with_context(|| format!("{addr:?} is not an IP address"))?;
+            show_agent_query(&format!("unblock {addr}"), "lifting the block")
+        }
+        // The false-positive case: a rule that was too broad blocked a dozen
+        // sources, and lifting them one at a time is the wrong thing to be doing
+        // while that is still happening.
+        ["ids", "blocks"] => show_agent_query("unblock all", "lifting the blocks"),
+        [] => {
+            println!("usage: clear ids block <ip> | clear ids blocks");
+            Ok(())
+        }
+        other => anyhow::bail!(
+            "unknown clear path {other:?}; try: clear ids block <ip> | clear ids blocks"
+        ),
+    }
 }
 
 /// How many alerts `show ids alerts` lists when the operator names no count.
