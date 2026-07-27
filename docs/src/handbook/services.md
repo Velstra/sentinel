@@ -195,6 +195,57 @@ Worth knowing:
 - `delete services alerts` removes the drop-ins again, so no handler is left
   pointing at an endpoint you no longer configured.
 
+## UDP broadcast relay
+
+A broadcast stops at the router. That is correct, and it is also why a printer on
+one VLAN is invisible from another, why Wake-on-LAN only works from the same
+segment, and why a game-server browser finds nothing once a flat network is
+segmented.
+
+```text
+set services broadcast-relay wol port 9
+set services broadcast-relay wol interface lan
+set services broadcast-relay wol interface guest
+```
+
+A packet arriving on one of a relay's interfaces is re-emitted on every other.
+One port per relay; at least two interfaces (a relay never emits onto the segment
+a packet came from, so with one it would carry nothing, and the commit says so).
+
+**The sender is preserved.** A relayed packet carries the original source
+address, not the router's — which is what makes request/response discovery work
+at all. A device answering an SSDP `M-SEARCH` replies *unicast* to the address it
+saw; rewrite that to the router and the question crosses the segment while every
+answer dies at the router. The symptom would read as "discovery is flaky", not as
+"the relay is broken".
+
+**Loops are broken by a marker, not by luck.** Every relayed packet leaves with a
+fixed, deliberately unusual TTL, and a packet arriving with that TTL is not
+relayed again. Without it a packet re-emitted onto B comes back on B and goes out
+to A forever. The cost is one specific TTL value that will not be relayed; real
+link-local broadcasts carry 1, 2, 4, 32, 64, 128 or 255.
+
+**The firewall has to admit the port.** The relay reads from an ordinary socket,
+so the packets have already passed the XDP firewall by the time it sees them.
+Under a deny-by-default zone they never arrive, and the relay looks broken while
+being blameless — so the commit warns, and `show` repeats the warning:
+
+```text
+set firewall rule wol-in from lan action accept proto udp port 9
+```
+
+```text
+sentinel show broadcast-relay
+```
+
+Note that a relay is a **discovery** convenience, not a path for traffic: it is
+not in the list of units whose failure raises an alert, because alerting on it
+would train you to ignore alerts that matter.
+
+`nix build .#checks.x86_64-linux.bcastrelay -L` verifies this across three VMs: a
+broadcast on one segment reaches the other, arrives carrying the original
+sender's address, and arrives exactly once.
+
 ## Intrusion detection
 
 Watch a link and raise an alert when traffic matches a rule (roadmap C11).

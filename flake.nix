@@ -646,6 +646,29 @@
             };
           };
 
+          # UDP broadcast relay (roadmap C18): carry a broadcast onto the other
+          # segments, so discovery that assumes one flat LAN keeps working across
+          # a segmented one. No package exists for this — nixpkgs ships neither
+          # udp-broadcast-relay nor its -redux successor — so it is a daemon
+          # inside sentinel. CAP_NET_RAW is what lets it re-emit a packet with
+          # the ORIGINAL sender's address, which is the difference between a
+          # relay that works and one that only carries the question. Sentinel
+          # starts/stops this on `[[services.broadcast-relay]]`.
+          systemd.services.sentinel-broadcast-relay = {
+            description = "UDP broadcast relay (sentinel)";
+            after = [
+              "network.target"
+              "sentinel-boot.service"
+            ];
+            serviceConfig = {
+              Type = "exec";
+              ExecStart = "${sentinel}/bin/sentinel broadcast-relay";
+              Restart = "on-failure";
+              RestartSec = "5s";
+              AmbientCapabilities = [ "CAP_NET_RAW" ];
+            };
+          };
+
           # Remote syslog (roadmap C12): rsyslog in the foreground against
           # Sentinel's rendered config. `-n` keeps it attached so systemd owns the
           # process; `-i NONE` skips the pid file (systemd tracks it). Sentinel
@@ -2221,6 +2244,236 @@
       # real traffic on the wire turns into an alert an operator can read — not
       # that a config file was rendered.
       #   nix build .#checks.x86_64-linux.ids -L
+      # UDP broadcast relay (roadmap C18): a broadcast stops at the router, which
+      # is correct and is also why discovery breaks the moment a flat LAN gets
+      # segmented. Three nodes are the minimum that can show the relay carrying a
+      # packet from one segment to another — and, more importantly, carrying the
+      # SENDER with it.
+      bcastrelay = pkgs.testers.runNixOSTest {
+        name = "sentinel-bcastrelay";
+        nodes = {
+          # Segment A. Shouts a broadcast that would normally go no further.
+          alpha =
+            { pkgs, lib, ... }:
+            {
+              networking.hostName = lib.mkForce "alpha";
+              networking.firewall.enable = lib.mkForce false;
+              virtualisation.vlans = [ 1 ];
+              networking.useNetworkd = true;
+              networking.useDHCP = false;
+              networking.interfaces.eth1.ipv4.addresses = [
+                {
+                  address = "10.1.0.2";
+                  prefixLength = 24;
+                }
+              ];
+              # A host on a routed segment has the router as its way out. Without
+              # it the OTHER segment's addresses are unreachable, and a kernel
+              # that cannot route back to a sender discards what it sends.
+              networking.defaultGateway = {
+                address = "10.1.0.1";
+                interface = "eth1";
+              };
+              environment.systemPackages = [ pkgs.python3 ];
+              # Bound to the segment explicitly: a broadcast otherwise follows the
+              # default route, and which interface that is depends on the test
+              # harness rather than on what we mean.
+              environment.etc."shout.py".text = ''
+                import socket, sys
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"eth1")
+                s.sendto(sys.argv[1].encode(), ("255.255.255.255", 9))
+              '';
+            };
+          # Segment B. Records every packet that reaches it, with its source, so
+          # the test can assert both that it arrived and that it arrived ONCE.
+          beta =
+            { pkgs, lib, ... }:
+            {
+              networking.hostName = lib.mkForce "beta";
+              networking.firewall.enable = lib.mkForce false;
+              virtualisation.vlans = [ 2 ];
+              networking.useNetworkd = true;
+              networking.useDHCP = false;
+              networking.interfaces.eth1.ipv4.addresses = [
+                {
+                  address = "10.2.0.2";
+                  prefixLength = 24;
+                }
+              ];
+              networking.defaultGateway = {
+                address = "10.2.0.1";
+                interface = "eth1";
+              };
+              environment.systemPackages = [ pkgs.python3 ];
+              environment.etc."catch.py".text = ''
+                import socket
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("", 9))
+                s.settimeout(8)
+                open("/tmp/listening", "w").write("ok")
+                with open("/tmp/caught", "w") as f:
+                    while True:
+                        try:
+                            data, addr = s.recvfrom(2048)
+                        except socket.timeout:
+                            break
+                        f.write(addr[0] + " " + data.decode() + "\n")
+                        f.flush()
+              '';
+            };
+          # The router between them.
+          fw =
+            { pkgs, lib, ... }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce "fw";
+              networking.firewall.enable = lib.mkForce false;
+              networking.interfaces.eth1.ipv4.addresses = [
+                {
+                  address = "10.1.0.1";
+                  prefixLength = 24;
+                }
+              ];
+              networking.interfaces.eth2.ipv4.addresses = [
+                {
+                  address = "10.2.0.1";
+                  prefixLength = 24;
+                }
+              ];
+              virtualisation.vlans = [
+                1
+                2
+              ];
+              virtualisation.memorySize = 2048;
+              boot.kernel.sysctl."net.ipv4.ip_forward" = 1;
+              environment.systemPackages = [ pkgs.python3 ];
+              environment.etc."catch.py".text = ''
+                import socket
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("", 9))
+                s.settimeout(8)
+                open("/tmp/listening", "w").write("ok")
+                with open("/tmp/caught", "w") as f:
+                    while True:
+                        try:
+                            data, addr = s.recvfrom(2048)
+                        except socket.timeout:
+                            break
+                        f.write(addr[0] + " " + data.decode() + "\n")
+                        f.flush()
+              '';
+            };
+        };
+        testScript = ''
+          start_all()
+          fw.wait_for_unit("multi-user.target")
+          fw.wait_for_unit("velstra.service")
+          alpha.wait_for_unit("multi-user.target")
+          beta.wait_for_unit("multi-user.target")
+          fw.wait_until_succeeds("ip addr show eth2 | grep -q 10.2.0.1", timeout=20)
+
+          def listen():
+              """Record everything that reaches segment B for the next 8 seconds."""
+              beta.succeed("rm -f /tmp/caught /tmp/listening")
+              beta.succeed("systemd-run --unit=catcher --collect python3 /etc/catch.py")
+              # An absent recorder and a silent segment produce the same empty
+              # file, so prove the recorder is up before anything is sent.
+              beta.wait_for_file("/tmp/listening")
+
+          def caught():
+              """What segment B heard, once the recorder has finished."""
+              beta.wait_until_fails("systemctl is-active catcher", timeout=30)
+              return beta.succeed("cat /tmp/caught")
+
+          def apply(*lines):
+              cmds = " ".join(f"'{l}'" for l in lines)
+              return fw.succeed(
+                  "su admin -c \"printf '%s\\n' " + cmds
+                  + " commit save exit | sentinel configure\" 2>&1"
+              )
+
+          with subtest("without a relay the broadcast stops at the router"):
+              apply(
+                  "set interface eth1 zone a",
+                  "set interface eth2 zone b",
+                  "set firewall zone a default-action accept",
+                  "set firewall zone b default-action accept",
+              )
+              fw.wait_for_unit("velstra.service")
+              assert "no broadcast relay" in fw.succeed("sentinel show broadcast-relay")
+              listen()
+              alpha.succeed("python3 /etc/shout.py silence")
+              assert caught() == "", "something already carried the broadcast"
+
+          with subtest("a relay needs two segments to have anything to do"):
+              # `sentinel configure` reports a refused commit in its output rather
+              # than in its exit status, so the refusal is what to assert on.
+              out = fw.succeed(
+                  "su admin -c \"printf '%s\\n' "
+                  "'set services broadcast-relay wol port 9' "
+                  "'set services broadcast-relay wol interface eth1' "
+                  "commit exit | sentinel configure\" 2>&1"
+              )
+              assert "at least two" in out, out
+              fw.fail("systemctl is-active sentinel-broadcast-relay.service")
+
+          with subtest("the relay carries the packet — and the sender with it"):
+              apply(
+                  "set services broadcast-relay wol port 9",
+                  "set services broadcast-relay wol interface eth1",
+                  "set services broadcast-relay wol interface eth2",
+                  "set services broadcast-relay wol description 'wake-on-lan across vlans'",
+              )
+              fw.wait_for_unit("sentinel-broadcast-relay.service")
+
+              status = fw.succeed("sentinel show broadcast-relay")
+              assert "running" in status and "NOT running" not in status, status
+              assert "udp/9" in status and "eth1 <-> eth2" in status, status
+
+              listen()
+              alpha.succeed("python3 /etc/shout.py discover-me")
+              heard = caught()
+              # The payload crossed the segment...
+              assert "discover-me" in heard, "the broadcast did not cross: " + repr(heard)
+              # ...carrying alpha's address, not the router's. This is the whole
+              # point: a device answering a discovery query replies unicast to the
+              # address it saw, and 10.2.0.1 would send every answer nowhere.
+              assert heard.startswith("10.1.0.2 "), (
+                  "the relay rewrote the sender: " + repr(heard)
+              )
+              # Exactly once. A relay that re-reads its own emission feeds itself,
+              # and the symptom is a segment full of one packet.
+              assert len(heard.strip().splitlines()) == 1, (
+                  "the packet was relayed more than once: " + repr(heard)
+              )
+
+          with subtest("a firewalled port is the failure it is easiest to misread"):
+              # The relay reads from an ordinary socket, so a zone that does not
+              # admit udp/9 starves it while everything about the relay looks
+              # right. The commit says so rather than leaving it to be found.
+              out = apply("delete firewall zone a default-action")
+              assert "does not admit udp/9" in out, out
+              assert "does not admit udp/9" in fw.succeed("sentinel show broadcast-relay")
+
+          with subtest("removing the relay stops the daemon"):
+              apply(
+                  "set firewall zone a default-action accept",
+                  "delete services broadcast-relay wol",
+              )
+              fw.wait_until_fails(
+                  "systemctl is-active sentinel-broadcast-relay.service", timeout=30
+              )
+              assert "no broadcast relay" in fw.succeed("sentinel show broadcast-relay")
+              listen()
+              alpha.succeed("python3 /etc/shout.py silence-again")
+              assert caught() == "", "the relay kept carrying traffic after removal"
+        '';
+      };
+
       # Source validation (uRPF, roadmap B12): a packet whose source address
       # could not have come from the interface it arrived on is dropped, and the
       # verdict comes from the box's own routing table. Two segments are the
