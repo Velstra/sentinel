@@ -16,6 +16,8 @@
 //! - `GET /api/v1/config` returns the running [`Appliance`] as JSON.
 //! - `GET /api/v1/status` and `GET /api/v1/show/*` surface the operational state
 //!   the `show` commands report.
+//! - `GET /` serves the **web console** ([`crate::webui`]) — a read-only view over
+//!   those same endpoints, so it cannot report anything the CLI would not.
 //!
 //! Auth is a bearer token (0600 file or `$SENTINEL_API_TOKEN`), required on every
 //! endpoint except `/health`. The server binds localhost by default; widen it
@@ -96,8 +98,22 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
     Router::new()
         .route("/api/v1/health", get(health))
+        // The console itself is markup with no data in it, and a sign-in page
+        // that needs a token to reach is not a sign-in page. Everything it then
+        // fetches goes through the middleware above like any other client.
+        .route("/", get(console))
+        .route("/ui", get(console))
         .merge(protected)
         .with_state(state)
+}
+
+/// `GET /` — the web console (roadmap C12).
+async fn console() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        crate::webui::page(),
+    )
+        .into_response()
 }
 
 // ---- middleware ----------------------------------------------------------

@@ -632,19 +632,22 @@ mod tests {
     /// countries, so the expansion can be asserted exactly rather than against
     /// whatever the image happens to ship.
     ///
-    /// `tag` keeps concurrent tests apart: the harness runs them in parallel, and
-    /// a shared directory means one test deleting the other's database mid-read.
-    /// The environment variable is process-wide, so tests using this must not run
-    /// at the same time as one that reads a *different* database — today they all
-    /// use this same fixture, which makes the shared variable harmless.
+    /// The variable it sets is process-wide and the harness runs tests in
+    /// parallel, so this takes a lock. Without it one test removes the variable —
+    /// or deletes the directory — while another is still reading through it, and
+    /// the resulting failure looks like the feature rather than the fixture.
     fn with_geoip<T>(tag: &str, body: impl FnOnce() -> T) -> T {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // Poisoning only means an earlier test panicked; the fixture is rebuilt
+        // from scratch below either way.
+        let _held = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("sentinel-geoip-{}-{tag}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("XA.v4"), "10.1.0.0/16\n10.2.0.0/16\n").unwrap();
         std::fs::write(dir.join("XA.v6"), "2001:db8:a::/48\n").unwrap();
         std::fs::write(dir.join("XB.v4"), "10.9.0.0/16\n").unwrap();
-        // SAFETY: the test process is single-threaded here and restores the
-        // variable before returning.
+        // SAFETY: the lock above makes this the only test touching the variable;
+        // it is restored before the lock is released.
         unsafe { std::env::set_var("SENTINEL_GEOIP_DIR", &dir) };
         let out = body();
         unsafe { std::env::remove_var("SENTINEL_GEOIP_DIR") };
