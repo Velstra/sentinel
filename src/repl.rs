@@ -1958,6 +1958,10 @@ const GLOBAL_FIELDS: &[Cand] = &[
         "source-validation",
         "reject spoofed source addresses (disable|loose|strict)",
     ),
+    (
+        "geoip-block",
+        "drop every source in a country (ISO code, e.g. CN; repeatable)",
+    ),
     ("block", "drop a source IP/CIDR everywhere"),
 ];
 const ZONE_FIELDS: &[Cand] = &[
@@ -1972,6 +1976,10 @@ const ZONE_FIELDS: &[Cand] = &[
     (
         "source-validation",
         "reject spoofed sources on this zone (disable|loose|strict)",
+    ),
+    (
+        "geoip-block",
+        "drop every source in a country on this zone (ISO code)",
     ),
     ("block", "drop a source IP/CIDR on this zone"),
 ];
@@ -2038,6 +2046,10 @@ const SOURCE_VALIDATION: &[Cand] = &[
         "...and by the interface it arrived on (BCP 38; breaks asymmetric routing)",
     ),
 ];
+/// A hint rather than a list: there are ~250 codes and offering all of them
+/// would bury the prompt. The commit names an unknown one against the image's
+/// own database, which is a better answer than a menu.
+const COUNTRY_CODES: &[Cand] = &[("<CC>", "ISO 3166-1 alpha-2 country code (CN, RU, …)")];
 const PROTOS: &[Cand] = &[("tcp", "TCP"), ("udp", "UDP")];
 const IFACE_FIELDS: &[Cand] = &[
     (
@@ -2520,6 +2532,9 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ] => BOOLS,
         ["set", "firewall", "global", "default-action"] => ACTIONS,
         ["set", "firewall", "global", "source-validation"] => SOURCE_VALIDATION,
+        ["set", "firewall", "global" | "zone", ..] if tokens.last() == Some(&"geoip-block") => {
+            COUNTRY_CODES
+        }
         ["set" | "delete", "firewall", "zone", _name] => ZONE_FIELDS,
         [
             "set",
@@ -3727,6 +3742,7 @@ mod tests {
                 "log",
                 "fail-closed",
                 "source-validation",
+                "geoip-block",
                 "block"
             ]
         );
@@ -3751,6 +3767,7 @@ mod tests {
                 "default-action",
                 "log",
                 "source-validation",
+                "geoip-block",
                 "block"
             ]
         );

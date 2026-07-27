@@ -133,6 +133,46 @@ set firewall rule guest-wifi schedule start 09:00
 set firewall rule guest-wifi schedule end 17:00
 ```
 
+## Blocking by country (GeoIP)
+
+```text
+set firewall zone wan geoip-block CN,RU
+```
+
+Every source address in those countries is dropped on that zone. The addresses
+come from a database **extracted into the image at build time**: a firewall that
+can only block a country while it can reach a geolocation service is not one you
+can put on an isolated network, and the update path for the data is the image's,
+not a second one.
+
+`set firewall global geoip-block <CC>` sets the list every zone inherits; a zone's
+own list is **added to** it, not swapped for it — a country blocked everywhere
+should not quietly become reachable because one zone named a different one.
+
+**It blocks sources, not destinations.** This stops those countries reaching you;
+it does not stop your users reaching them.
+
+A country becomes ordinary CIDRs in the same blocklist your own `block` entries go
+into, so the data plane never learns what a country is and a geo-block is counted
+as `dropped_blocklist` like any other. That has a visible cost: one country is
+thousands of prefixes (China ~8k, Russia ~13k, the United States ~155k), the
+blocklist holds 262144 across every zone, and the commit refuses a config that
+would exceed it rather than leaving a half-programmed firewall. `show firewall`
+prints what each zone's list costs:
+
+```text
+geoip blocks:
+  wan      CN,RU  (20983 prefixes)
+```
+
+A country the image has no addresses for is **refused at commit**, not treated as
+an empty list — a rule that silently blocks nothing is the worst possible outcome
+for a feature whose whole job is to block.
+
+`nix build .#checks.x86_64-linux.geoip -L` verifies it end to end against a
+substituted database: a neighbour reachable before, unreachable once its country
+is blocked, and reachable again once it is not.
+
 ## Source validation (anti-spoofing)
 
 A packet claiming a source address it could not possibly have come from is the

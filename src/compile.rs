@@ -182,6 +182,30 @@ fn is_disabled(mode: &&'static str) -> bool {
     **mode == *"disable"
 }
 
+/// A zone's blocklist with its GeoIP countries expanded into it.
+///
+/// The countries become ordinary CIDRs in the same list an operator's own entries
+/// go into, so the data plane needs no idea what a country is — one blocklist,
+/// one lookup, and `show firewall statistics` attributes a geo-block to
+/// `dropped_blocklist` like any other. The cost is a large emitted config, which
+/// is an implementation detail nobody reads; the alternative is a second matching
+/// dimension in the hot path for something a prefix list already expresses.
+///
+/// A country whose data is missing is refused at commit (`config::validate`), so
+/// by the time this runs every lookup succeeds; a failure here would mean the
+/// image changed underneath a saved config, and dropping the entry silently is
+/// the one thing a blocklist must never do — hence the panic-free `expect`-less
+/// path that simply keeps what it could resolve and lets validate speak.
+fn geo_blocklist(posture: &crate::config::ResolvedZone) -> Vec<String> {
+    let mut out = posture.blocklist.clone();
+    for country in &posture.geoip_block {
+        if let Ok(prefixes) = crate::config::geoip_prefixes(country) {
+            out.extend(prefixes);
+        }
+    }
+    out
+}
+
 #[derive(Debug, Serialize)]
 struct PortForwardOut {
     policy: u32,
@@ -419,7 +443,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                 drop_icmp: posture.block_icmp,
                 log: posture.log,
                 source_validation: posture.source_validation.as_str(),
-                blocklist: posture.blocklist,
+                blocklist: geo_blocklist(&posture),
                 port_rules,
             }
         })
@@ -603,6 +627,93 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
 mod tests {
     use super::*;
     use crate::config::Appliance;
+
+    /// Point the country database at a temporary directory holding two small
+    /// countries, so the expansion can be asserted exactly rather than against
+    /// whatever the image happens to ship.
+    ///
+    /// `tag` keeps concurrent tests apart: the harness runs them in parallel, and
+    /// a shared directory means one test deleting the other's database mid-read.
+    /// The environment variable is process-wide, so tests using this must not run
+    /// at the same time as one that reads a *different* database — today they all
+    /// use this same fixture, which makes the shared variable harmless.
+    fn with_geoip<T>(tag: &str, body: impl FnOnce() -> T) -> T {
+        let dir = std::env::temp_dir().join(format!("sentinel-geoip-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("XA.v4"), "10.1.0.0/16\n10.2.0.0/16\n").unwrap();
+        std::fs::write(dir.join("XA.v6"), "2001:db8:a::/48\n").unwrap();
+        std::fs::write(dir.join("XB.v4"), "10.9.0.0/16\n").unwrap();
+        // SAFETY: the test process is single-threaded here and restores the
+        // variable before returning.
+        unsafe { std::env::set_var("SENTINEL_GEOIP_DIR", &dir) };
+        let out = body();
+        unsafe { std::env::remove_var("SENTINEL_GEOIP_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+        out
+    }
+
+    #[test]
+    fn a_blocked_country_becomes_ordinary_cidrs_on_its_zone() {
+        let toml = r#"
+[system]
+hostname = "fw"
+
+[firewall]
+geoip-block = ["XA"]
+blocklist = ["203.0.113.7"]
+
+[zone.wan]
+geoip-block = ["XB"]
+
+[[interface]]
+name = "wan0"
+zone = "wan"
+
+[[interface]]
+name = "lan0"
+zone = "lan"
+"#;
+        let (wan, lan) = with_geoip("expand", || {
+            let appliance = Appliance::from_toml(toml).unwrap();
+            let cfg = compile(&appliance);
+            let of = |name: &str| {
+                cfg.policies
+                    .iter()
+                    .find(|p| p.name == name)
+                    .unwrap()
+                    .blocklist
+                    .clone()
+            };
+            (of("wan"), of("lan"))
+        });
+
+        // The zone's own country is ADDED to the global one, not swapped for it:
+        // a country blocked everywhere must not become reachable because a zone
+        // named a different one.
+        assert!(wan.contains(&"10.1.0.0/16".to_string()));
+        assert!(wan.contains(&"2001:db8:a::/48".to_string()));
+        assert!(wan.contains(&"10.9.0.0/16".to_string()));
+        // The operator's own entry survives alongside them.
+        assert!(wan.contains(&"203.0.113.7".to_string()));
+        // LAN inherits only the global country.
+        assert!(lan.contains(&"10.1.0.0/16".to_string()));
+        assert!(!lan.contains(&"10.9.0.0/16".to_string()));
+    }
+
+    #[test]
+    fn an_unknown_country_is_refused_rather_than_blocking_nothing() {
+        let toml = r#"
+[system]
+hostname = "fw"
+
+[firewall]
+geoip-block = ["ZZ"]
+"#;
+        let err = with_geoip("unknown", || {
+            Appliance::from_toml(toml).unwrap_err().to_string()
+        });
+        assert!(err.contains("no addresses for country"), "got: {err}");
+    }
 
     #[test]
     fn source_validation_reaches_the_zone_that_asked_for_it() {

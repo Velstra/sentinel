@@ -69,6 +69,10 @@
             --set SENTINEL_SWANCTL_BIN    ${pkgs.strongswan}/bin/swanctl \
             --set SENTINEL_OPENSSL_BIN    ${pkgs.openssl.bin}/bin/openssl \
             --set SENTINEL_LEGO_BIN       ${pkgs.lego}/bin/lego \
+            `# --set-default, not --set: this names DATA rather than a binary,
+             # and a newer database (or a test) has a legitimate reason to point
+             # somewhere else. Every executable above stays pinned.` \
+            --set-default SENTINEL_GEOIP_DIR ${geoipData} \
             --set SENTINEL_CURL_BIN       ${pkgs.curl.bin}/bin/curl \
             --set SENTINEL_MSMTP_BIN      ${pkgs.msmtp}/bin/msmtp \
             --set SENTINEL_SURICATA_SHARE ${pkgs.suricata}/etc/suricata \
@@ -176,12 +180,24 @@
         "aya-obj-0.2.2" = ayaHash;
       };
 
+      # Per-country CIDR lists (roadmap C15 GeoIP), extracted from DB-IP's free
+      # country database at BUILD time. On the appliance this is just files: a
+      # firewall that can only block a country while it can reach a geolocation
+      # service is not one you can put on an isolated network, and the update
+      # path for the data is the image's (C13), not a second one.
+      geoipData = pkgs.runCommand "sentinel-geoip" {
+        nativeBuildInputs = [ (pkgs.python3.withPackages (ps: [ ps.maxminddb ])) ];
+      } ''
+        python3 ${./scripts/geoip-extract.py} \
+          ${pkgs.dbip-country-lite}/share/dbip/dbip-country-lite.mmdb $out
+      '';
+
       # The eBPF object, compiled as a FIXED-OUTPUT derivation. `-Z build-std`
       # needs std's own build-deps, which a sealed offline sandbox can't fetch —
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-Ub+7+GstFNCtJxA1A/N1Kbm788dKGBPy5MeiPl9Tmc4=";
+      ebpfHash = "sha256-TNwZkzgn6xCsKeVdSW1WntdXYbacsXG1vxkg7TshxnU=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -2279,6 +2295,127 @@
       # real traffic on the wire turns into an alert an operator can read — not
       # that a config file was rendered.
       #   nix build .#checks.x86_64-linux.ids -L
+      # GeoIP blocking (roadmap C15): whole countries out of the image's own
+      # database, expanded into the same blocklist an operator's own entries go
+      # into. The point of the check is that the expansion really reaches the
+      # data plane and really drops a packet — a country list that compiles but
+      # blocks nothing is the failure this feature cannot have.
+      geoip = pkgs.testers.runNixOSTest {
+        name = "sentinel-geoip";
+        nodes = {
+          # Stands in for a host in the blocked country: the check overrides the
+          # database with a small one naming this segment, so the assertion is
+          # about the mechanism rather than about where 10.1.0.2 really is.
+          abroad =
+            { lib, ... }:
+            {
+              networking.hostName = lib.mkForce "abroad";
+              networking.firewall.enable = lib.mkForce false;
+              virtualisation.vlans = [ 1 ];
+              networking.useNetworkd = true;
+              networking.useDHCP = false;
+              networking.interfaces.eth1.ipv4.addresses = [
+                {
+                  address = "10.1.0.2";
+                  prefixLength = 24;
+                }
+              ];
+            };
+          fw =
+            { pkgs, lib, ... }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce "fw";
+              networking.firewall.enable = lib.mkForce false;
+              virtualisation.vlans = [ 1 ];
+              networking.interfaces.eth1.ipv4.addresses = [
+                {
+                  address = "10.1.0.1";
+                  prefixLength = 24;
+                }
+              ];
+              virtualisation.memorySize = 2048;
+              services.velstra.interface = lib.mkForce "eth1";
+              # A database with two invented countries, so the test asserts an
+              # exact expansion instead of whatever DB-IP says about 10.1.0.0/24
+              # (which is reserved space and belongs to no country at all).
+              environment.etc."geoip-test/XA.v4".text = "10.1.0.0/24\n";
+              environment.etc."geoip-test/XB.v4".text = "198.51.100.0/24\n";
+              environment.etc."geoip-test/COUNTRIES".text = "XA\nXB\n";
+              systemd.services.sentinel-boot.environment.SENTINEL_GEOIP_DIR =
+                "/etc/geoip-test";
+              environment.variables.SENTINEL_GEOIP_DIR = "/etc/geoip-test";
+              environment.systemPackages = [ pkgs.iputils ];
+            };
+        };
+        testScript = ''
+          start_all()
+          fw.wait_for_unit("multi-user.target")
+          fw.wait_for_unit("velstra.service")
+          abroad.wait_for_unit("multi-user.target")
+          fw.wait_until_succeeds("ip addr show eth1 | grep -q 10.1.0.1", timeout=20)
+
+          def apply(*lines):
+              cmds = " ".join(f"'{l}'" for l in lines)
+              return fw.succeed(
+                  "su admin -c \"printf '%s\\n' " + cmds
+                  + " commit save exit | sentinel configure\" 2>&1"
+              )
+
+          with subtest("an unknown country is refused, not silently empty"):
+              out = apply(
+                  "set interface eth1 zone wan",
+                  "set firewall zone wan default-action accept",
+                  "set firewall global geoip-block QQ",
+              )
+              assert "no addresses for country" in out, out
+
+          with subtest("the neighbour is reachable before anything blocks it"):
+              apply(
+                  "set interface eth1 zone wan",
+                  "set firewall zone wan default-action accept",
+              )
+              fw.wait_for_unit("velstra.service")
+              abroad.succeed("ping -4 -c 2 -W 5 10.1.0.1")
+
+          with subtest("a blocked country reaches the data plane as prefixes"):
+              apply("set firewall zone wan geoip-block XA")
+              fw.wait_for_unit("velstra.service")
+              # The country became ordinary CIDRs in the emitted blocklist — the
+              # data plane never learns what a country is.
+              fw.succeed("grep -q '10.1.0.0/24' /run/sentinel/velstra.toml")
+
+              # And it actually drops: the neighbour can no longer reach us.
+              abroad.fail("ping -4 -c 2 -W 3 10.1.0.1")
+
+              # `show firewall` names the zone and what the block costs, because
+              # the data plane's blocklist has a ceiling an operator can hit.
+              posture = fw.succeed("sentinel show firewall")
+              assert "geoip blocks:" in posture, posture
+              assert "wan" in posture and "XA" in posture, posture
+              assert "(1 prefixes)" in posture, posture
+
+          with subtest("a zone's countries add to the global ones"):
+              apply("set firewall global geoip-block XB")
+              fw.wait_for_unit("velstra.service")
+              fw.succeed("grep -q '198.51.100.0/24' /run/sentinel/velstra.toml")
+              # The zone's own country is still blocked: a country named globally
+              # must not displace one a zone asked for.
+              fw.succeed("grep -q '10.1.0.0/24' /run/sentinel/velstra.toml")
+              abroad.fail("ping -4 -c 2 -W 3 10.1.0.1")
+
+          with subtest("unblocking lets it back in"):
+              apply(
+                  "delete firewall zone wan geoip-block",
+                  "delete firewall global geoip-block",
+              )
+              fw.wait_for_unit("velstra.service")
+              fw.fail("grep -q '10.1.0.0/24' /run/sentinel/velstra.toml")
+              assert "geoip blocks:" not in fw.succeed("sentinel show firewall")
+              abroad.wait_until_succeeds("ping -4 -c 2 -W 5 10.1.0.1", timeout=30)
+        '';
+      };
+
       # ACME issuance (roadmap C19). The roadmap called this "deferred to
       # hardware" because a challenge needs external reachability — but Pebble is
       # a real RFC 8555 server small enough to run beside the appliance, so the
