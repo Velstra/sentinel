@@ -1573,7 +1573,7 @@ fn apply_configsync(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
 /// port to 8080. A bare IPv6 literal must be bracketed or the URL is malformed —
 /// `peer.contains(':')` alone mistook `2001:db8::1` for a `host:port` and emitted
 /// `http://2001:db8::1/…`, which every HTTP client rejects.
-fn configsync_authority(peer: &str) -> String {
+pub fn configsync_authority(peer: &str) -> String {
     if peer.starts_with('[') {
         // Already bracketed IPv6, with or without a trailing `:port`.
         peer.to_string()

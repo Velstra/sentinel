@@ -560,28 +560,55 @@ its own; `show` in a fresh session lists what the hardware provides.
 
 ## The web console
 
-`sentinel-api.service` serves a read-only web console at `/`, on the same port
-and behind the same bearer token as the REST API:
+The appliance serves a console at `http://<box>:8080/` from the same
+`sentinel-api` service as the REST API — one self-contained page, no CDN and no
+framework, so it works on an isolated network. Sign in with the management
+token (`/var/lib/sentinel/api-token`); it is kept for the browser tab and never
+written to disk.
 
-```shell
-systemctl start sentinel-api.service     # off by default
-cat /var/lib/sentinel/api-token          # the token to sign in with
+It has three working areas plus the read-only views:
+
+- **Dashboard** — service states, the live counter table, and rate graphs drawn
+  from the counters the box already reports. The graphs plot the *change* per
+  interval, because a monotonic total says nothing about now.
+- **Firewall rules** — a table of the configured rules with add, edit and
+  delete.
+- **Stack** — this appliance and its `system config-sync` peers, each with
+  whether the console can actually reach it. Selecting a member points the
+  read-only views at that box, proxied through this one.
+
+### Clicking is typing
+
+Every change the console makes is sent as the **same commands you would type**,
+to `POST /api/v1/configure`, and the editor shows the exact script before it
+runs:
+
+```text
+set firewall rule web-in from wan
+set firewall rule web-in proto tcp
+set firewall rule web-in port 443
+set firewall rule web-in action accept
 ```
 
-Then open `http://<box>:8080/`. The token is the same one the API takes, and the
-page keeps it for that browser tab only — an appliance's management token has no
-business surviving on a shared machine after the tab is closed.
+That is deliberate. A form that assembled a configuration document out of its
+fields would be a second description of the config model, free to drift from the
+first; emitting commands means every validator, refusal and commit warning that
+guards a typed change guards a clicked one — and the console can never do
+something the CLI cannot. The script is also reviewable and pasteable, so a
+change made in the browser can be handed to a colleague verbatim.
 
-The console **shows; it does not edit.** Editing means submitting a whole config
-document, and a form that reassembles one from fields is exactly where a UI
-starts to diverge from the config model it is meant to be a view of. Configuration
-stays with `configure` (and with `PUT /api/v1/config` for automation) until the
-console can drive the same validated document rather than a rendering of it.
+**Apply and save** runs `commit` and `save`; **apply without saving** runs only
+`commit`, so a change you are unsure about disappears at the next reboot. The
+result dialog shows the appliance's whole output — a refused commit is reported
+in what it *prints*, not in its exit status, so nothing here is decided from a
+status code.
 
-Everything it displays comes from the endpoints the CLI's own `show` commands
-feed, so the console cannot report anything `sentinel show` would not — and the
-`api` check asserts that every path the page calls really answers, which is how a
-hand-written console otherwise drifts from its API.
+### What it does not do
 
-The page fetches nothing from the internet: no CDN, no font, no framework. A
-management console that half-renders on an isolated network is worse than none.
+The console configures firewall rules; everything else is read-only in it and
+edited from the CLI. It is a deliberate boundary rather than a stopping point:
+each surface added here has to be worth a second way to get it wrong.
+
+Configuration is always applied on the appliance you are signed in to. A stack
+member receives it the way it always has — pushed by `config-sync` on commit —
+so there is one path a change can travel and one place it can be refused.
