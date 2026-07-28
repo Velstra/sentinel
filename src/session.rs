@@ -310,6 +310,8 @@ struct FirewallDraft {
     source_validation: Option<SourceValidation>,
     /// ISO country codes dropped everywhere (roadmap C15 GeoIP).
     geoip_block: Vec<String>,
+    /// TCP ports a SYN proxy stands in front of (roadmap C15).
+    syn_protect: Vec<crate::config::SynProtect>,
 }
 
 /// A partially-specified static route (keyed by its prefix).
@@ -1726,6 +1728,7 @@ impl Draft {
                 fail_closed: Some(a.firewall.fail_closed),
                 source_validation: Some(a.firewall.source_validation),
                 geoip_block: a.firewall.geoip_block.clone(),
+                syn_protect: a.firewall.syn_protect.clone(),
             },
             groups: a.firewall.group.clone(),
             load_balancers: a
@@ -3006,6 +3009,27 @@ impl Session {
                     let cc = crate::config::normalise_country(cc)?;
                     push_unique(&mut self.draft.firewall.geoip_block, &cc);
                 }
+            }
+            // C15 SYN proxy. Two forms: the bare port, and the port with the MSS
+            // to advertise. Re-stating a port replaces its settings rather than
+            // adding a second entry, since one port has one proxy.
+            ["firewall", "syn-protect", port] => {
+                let port = parse_syn_protect_port(port)?;
+                set_syn_protect(&mut self.draft.firewall.syn_protect, port, None);
+            }
+            ["firewall", "syn-protect", port, "mss", mss] => {
+                let port = parse_syn_protect_port(port)?;
+                let mss: u16 = mss
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("mss must be a number, got {mss:?}"))?;
+                // Refused rather than clamped: a proxy quietly advertising
+                // something other than what was written is discovered months
+                // later as a throughput mystery. 536 is the IPv4 minimum every
+                // implementation must accept, 1460 the untunnelled maximum.
+                if !(536..=1460).contains(&mss) {
+                    bail!("mss {mss} is outside 536..1460");
+                }
+                set_syn_protect(&mut self.draft.firewall.syn_protect, port, Some(mss));
             }
             ["firewall", "global", "block", v] => {
                 validate_block_entry(v)?;
@@ -4926,6 +4950,14 @@ impl Session {
                     bail!("{v:?} is not in the global blocklist");
                 }
             }
+            ["firewall", "syn-protect", port] => {
+                let port = parse_syn_protect_port(port)?;
+                let before = self.draft.firewall.syn_protect.len();
+                self.draft.firewall.syn_protect.retain(|s| s.port != port);
+                if self.draft.firewall.syn_protect.len() == before {
+                    bail!("tcp/{port} is not syn-protected");
+                }
+            }
             ["firewall", "global", field] => match *field {
                 "stateful" => self.draft.firewall.stateful = None,
                 "block-icmp" => self.draft.firewall.block_icmp = None,
@@ -6384,6 +6416,7 @@ impl Session {
             source_validation: self.draft.firewall.source_validation.unwrap_or_default(),
             geoip_block: self.draft.firewall.geoip_block.clone(),
             group: self.draft.groups.clone(),
+            syn_protect: self.draft.firewall.syn_protect.clone(),
         };
         let zones: BTreeMap<String, ZoneCfg> = self
             .draft
@@ -7429,6 +7462,14 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             fwi.push_str(&format!("        block {e}\n"));
         }
         fwi.push_str("    }\n");
+    }
+    // C15 SYN proxy — at firewall level, not under `global`: it names specific
+    // services rather than setting a posture everything inherits.
+    for sp in &draft.firewall.syn_protect {
+        match sp.mss {
+            Some(mss) => fwi.push_str(&format!("    syn-protect {} mss {mss}\n", sp.port)),
+            None => fwi.push_str(&format!("    syn-protect {}\n", sp.port)),
+        }
     }
     for (name, z) in &draft.zones {
         fwi.push_str(&format!("    zone {name} {{\n"));
@@ -8581,6 +8622,33 @@ fn remove_value(list: &mut Vec<String>, v: &str, what: &str) -> Result<()> {
 }
 
 /// Append `v` to `list` unless it's already present (idempotent `set … block`).
+/// Parse and validate a `syn-protect` port.
+fn parse_syn_protect_port(port: &str) -> Result<u16> {
+    let port: u16 = port
+        .parse()
+        .map_err(|_| anyhow::anyhow!("port must be a number, got {port:?}"))?;
+    if port == 0 {
+        bail!("port must not be 0");
+    }
+    Ok(port)
+}
+
+/// Record a protected port, replacing any settings it already had.
+///
+/// A port has one proxy, so re-stating it edits rather than duplicates —
+/// otherwise `set … mss 1400` after a bare `set …` would leave two entries and
+/// whichever the data plane read last would win.
+fn set_syn_protect(list: &mut Vec<crate::config::SynProtect>, port: u16, mss: Option<u16>) {
+    match list.iter_mut().find(|s| s.port == port) {
+        Some(existing) => {
+            if mss.is_some() {
+                existing.mss = mss;
+            }
+        }
+        None => list.push(crate::config::SynProtect { port, mss }),
+    }
+}
+
 fn push_unique(list: &mut Vec<String>, v: &str) {
     if !list.iter().any(|e| e == v) {
         list.push(v.to_string());

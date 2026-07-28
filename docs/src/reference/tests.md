@@ -1,6 +1,6 @@
 # Test suite (nixosTests)
 
-Sentinel is verified by **74 nixosTests** plus the Rust unit tests. The nixosTests
+Sentinel is verified by **75 nixosTests** plus the Rust unit tests. The nixosTests
 boot real QEMU/OVMF VMs — several of them two or three at a time on shared virtual
 segments — so they need `/dev/kvm`.
 
@@ -53,7 +53,8 @@ authoritative list.
 | Check | Proves |
 |---|---|
 | `nat` | a `[[port-forward]]` DNATs an inbound connection to an internal host; a load-balanced VIP reaches a pool in **another zone** and its reply is un-NAT'd; both still work when the internal zone denies by default |
-| `masq` | masquerade SNATs a private LAN client out of the WAN address |
+| `synproxy` | a client reaches a syn-protected server through the full cookie splice, and 200 spoofed SYNs are absorbed without one reaching it |
+| `masq` | masquerade SNATs a private LAN client out of the WAN address; a 1 MiB transfer is accounted to that client in `show top-talkers` |
 | `hairpin` | an internal client reaches a port-forwarded service via the box's **own** public IP |
 | `npt66` | stateless, checksum-neutral IPv6 prefix translation (RFC 6296) |
 | `nat64` | an IPv6-only client reaches an IPv4-only server through the box, DNS64 included |
