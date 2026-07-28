@@ -35,7 +35,7 @@ use axum::{
     http::{StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use base64::Engine;
 use serde_json::{Value, json};
@@ -95,6 +95,9 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/api/v1/config", get(get_config).put(put_config))
         .route("/api/v1/status", get(get_status))
         .route("/api/v1/show/*path", get(get_show))
+        .route("/api/v1/configure", post(post_configure))
+        .route("/api/v1/stack", get(get_stack))
+        .route("/api/v1/stack/:member/show/*path", get(get_stack_show))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
     Router::new()
         .route("/api/v1/health", get(health))
@@ -226,6 +229,141 @@ async fn get_show(UrlPath(path): UrlPath<String>) -> Result<Response, ApiError> 
     }
     let body = String::from_utf8_lossy(&out.stdout).into_owned();
     Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response())
+}
+
+/// `POST /api/v1/configure` — run configuration commands.
+///
+/// The body is the same **CLI** the operator types, one command per line, and it
+/// is run through the same `sentinel configure` the terminal runs. That is the
+/// point: the console does not assemble a config document out of form fields —
+/// it emits the identical verbs, so every validator, refusal and warning that
+/// guards a typed command guards a clicked one, and there is no second grammar
+/// to drift.
+///
+/// The caller sends its own `commit` / `save`, because "apply now" and "apply and
+/// persist" are genuinely different intentions and the endpoint must not decide
+/// which one was meant.
+///
+/// **A refused commit is reported in the output, not in the exit status** — so
+/// the whole output is always returned, and a caller that only checks `ok` will
+/// believe a rejected change succeeded.
+async fn post_configure(body: String) -> Result<Json<Value>, ApiError> {
+    if body.len() > 256 * 1024 {
+        return Err(ApiError::bad_request(anyhow!(
+            "configuration script too large"
+        )));
+    }
+    let exe = std::env::current_exe()
+        .map_err(|e| ApiError::internal(anyhow!("locating the sentinel binary: {e}")))?;
+    let mut child = std::process::Command::new(exe)
+        .arg("configure")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| ApiError::internal(anyhow!("running configure: {e}")))?;
+    {
+        use std::io::Write as _;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| ApiError::internal(anyhow!("configure has no stdin")))?;
+        stdin
+            .write_all(body.as_bytes())
+            .map_err(|e| ApiError::internal(anyhow!("feeding configure: {e}")))?;
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| ApiError::internal(anyhow!("waiting for configure: {e}")))?;
+    // Both streams: `set` errors and commit refusals go to stderr, the commit's
+    // own report to stdout, and an operator needs to read them in one place.
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    Ok(Json(json!({
+        "ok": out.status.success(),
+        "output": text,
+    })))
+}
+
+/// `GET /api/v1/stack` — this appliance and its config-sync peers.
+///
+/// A "stack" here is exactly the HA relationship the appliance already has: the
+/// peers `[system.config-sync]` pushes the running config to, reached with the
+/// same shared secret. Nothing new is invented to make a second box appear in
+/// the console — if it is a peer, it is a member, and if it is not, the console
+/// would be claiming a relationship the appliance does not actually have.
+async fn get_stack(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, ApiError> {
+    let appliance = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
+    let cs = &appliance.system.config_sync;
+    let mut members = vec![json!({
+        "name": "self",
+        "address": null,
+        "hostname": system::current_hostname(),
+        "reachable": true,
+    })];
+    for peer in &cs.peers {
+        // Reachability is a real request, not a ping: the question the operator
+        // has is whether this console can drive that member, and only an
+        // authenticated call answers it.
+        let (hostname, reachable) = match cs.secret.as_deref() {
+            Some(secret) => match peer_get(peer, "status", secret) {
+                Ok(body) => (
+                    serde_json::from_str::<Value>(&body)
+                        .ok()
+                        .and_then(|v| v.get("hostname")?.as_str().map(str::to_string)),
+                    true,
+                ),
+                Err(_) => (None, false),
+            },
+            None => (None, false),
+        };
+        members.push(json!({
+            "name": peer,
+            "address": peer,
+            "hostname": hostname,
+            "reachable": reachable,
+        }));
+    }
+    Ok(Json(json!({
+        "members": members,
+        "secret": cs.secret.is_some(),
+    })))
+}
+
+/// `GET /api/v1/stack/:member/show/*path` — a peer's `show` output, proxied.
+///
+/// Proxied rather than fetched by the browser: the console is served by one
+/// appliance and a peer's management port is usually not reachable from wherever
+/// the operator's browser is — and making it reachable, with its own token, is a
+/// worse security posture than one pane forwarding an already-authenticated
+/// request over the link the two boxes already trust each other on.
+async fn get_stack_show(
+    State(state): State<Arc<ApiState>>,
+    UrlPath((member, path)): UrlPath<(String, String)>,
+) -> Result<Response, ApiError> {
+    let appliance = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
+    let cs = &appliance.system.config_sync;
+    if !cs.peers.contains(&member) {
+        return Err(ApiError::bad_request(anyhow!(
+            "{member} is not a stack member"
+        )));
+    }
+    let secret = cs
+        .secret
+        .as_deref()
+        .ok_or_else(|| ApiError::bad_request(anyhow!("no config-sync secret is set")))?;
+    let body = peer_get(&member, &format!("show/{path}"), secret)
+        .map_err(|e| ApiError::bad_request(anyhow!("{member}: {e}")))?;
+    Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response())
+}
+
+/// One authenticated `GET` against a peer's API.
+fn peer_get(peer: &str, path: &str, secret: &str) -> anyhow::Result<String> {
+    let url = format!(
+        "http://{}/api/v1/{path}",
+        crate::net::configsync_authority(peer)
+    );
+    system::curl_get(&url, secret, 5)
 }
 
 // ---- operational helpers -------------------------------------------------
