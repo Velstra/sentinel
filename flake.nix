@@ -1365,7 +1365,10 @@
           # stack proxy's template, which are exercised on their own below.
           paths = sorted(
               p for p in set(re.findall(r'"(/api/v1/[^"]+)"', page))
-              if p.startswith("/api/v1/show/") or p in ("/api/v1/status", "/api/v1/stack")
+              # A trailing slash is a prefix the page builds a path from, not a
+              # path — the console composes ad-hoc `show` commands that way.
+              if (p.startswith("/api/v1/show/") and not p.endswith("/"))
+              or p in ("/api/v1/status", "/api/v1/stack")
           )
           assert len(paths) >= 15, f"only found {paths}"
           for path in paths:
@@ -1420,6 +1423,53 @@
           )
           assert "banana" in bad, bad
           machine.fail("grep -q banana /var/lib/sentinel/appliance.toml")
+
+          # A zone posture and a NAT entry, through the same command path the
+          # console's forms use. These are the two surfaces most consoles get
+          # wrong by growing a second config model beside the real one.
+          machine.succeed(
+              "printf '%s\n' "
+              "'set interface eth0 zone wan' "
+              "'set firewall zone wan default-action drop' "
+              "'set nat source console-masq zone wan' "
+              "commit save > /tmp/zones"
+          )
+          zones = machine.succeed(
+              "curl -sS -X POST -H 'Authorization: Bearer " + token + "' "
+              "--data-binary @/tmp/zones http://127.0.0.1:8080/api/v1/configure"
+          )
+          cfg = machine.succeed(
+              "curl -fsS -H 'Authorization: Bearer " + token + "' "
+              "http://127.0.0.1:8080/api/v1/show/configuration"
+          )
+          assert "console-masq" in cfg, zones + cfg
+          assert "default-action drop" in cfg, zones + cfg
+
+          # Removing works too, and it is `delete <path>` — the same verb the
+          # generic editor writes for every setting it shows.
+          machine.succeed(
+              "printf '%s\n' 'delete nat source console-masq' commit save > /tmp/undo"
+          )
+          machine.succeed(
+              "curl -sS -X POST -H 'Authorization: Bearer " + token + "' "
+              "--data-binary @/tmp/undo http://127.0.0.1:8080/api/v1/configure"
+          )
+          cfg = machine.succeed(
+              "curl -fsS -H 'Authorization: Bearer " + token + "' "
+              "http://127.0.0.1:8080/api/v1/show/configuration"
+          )
+          assert "console-masq" not in cfg, cfg
+
+          # A script with no commit validates and changes nothing — what the
+          # console's "validate only" button sends.
+          machine.succeed(
+              "printf '%s\n' 'set firewall rule dry-run from wan' > /tmp/dry"
+          )
+          machine.succeed(
+              "curl -sS -X POST -H 'Authorization: Bearer " + token + "' "
+              "--data-binary @/tmp/dry http://127.0.0.1:8080/api/v1/configure"
+          )
+          machine.fail("grep -q dry-run /var/lib/sentinel/appliance.toml")
 
           # The stack lists this appliance even with no peers configured, so the
           # view is never empty and an operator can tell "no peers" apart from

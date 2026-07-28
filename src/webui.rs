@@ -248,6 +248,9 @@ pub fn page() -> String {
     <h1>Sentinel</h1>
     <button data-view="dashboard">Dashboard</button>
     <button data-view="rules">Firewall rules</button>
+    <button data-view="zones">Zones</button>
+    <button data-view="nat">NAT</button>
+    <button data-view="config">Configuration</button>
     <button data-view="stack">Stack</button>
     <div id="nav"></div>
     <div style="margin-top:auto;padding:.6rem .5rem 0">
@@ -296,6 +299,81 @@ pub fn page() -> String {
       </div>
     </div>
 
+    <div id="view-zones" class="hidden">
+      <div class="card">
+        <h3>Global posture</h3>
+        <div class="grid2" id="globalform"></div>
+        <div class="row" style="margin-top:.8rem">
+          <button class="btn primary" id="saveglobal">Apply and save</button>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Zones</h3>
+        <p style="color:var(--muted);font-size:.82rem;margin:0 0 .7rem">
+          A zone exists as soon as an interface names it. Blank means "inherit
+          the global setting" — the same as leaving it out of the config.
+        </p>
+        <div style="overflow-x:auto"><table id="zonetable"></table></div>
+      </div>
+    </div>
+
+    <div id="view-nat" class="hidden">
+      <div class="card">
+        <h3>Source NAT (masquerade)</h3>
+        <div class="row" style="margin-bottom:.7rem">
+          <button class="btn primary" id="addsnat">Add</button>
+        </div>
+        <div style="overflow-x:auto"><table id="snattable"></table></div>
+      </div>
+      <div class="card">
+        <h3>Destination NAT (port forwards)</h3>
+        <div class="row" style="margin-bottom:.7rem">
+          <button class="btn primary" id="adddnat">Add</button>
+        </div>
+        <div style="overflow-x:auto"><table id="dnattable"></table></div>
+      </div>
+      <div class="card">
+        <h3>Live NAT state</h3>
+        <pre class="out" id="natshow">…</pre>
+      </div>
+    </div>
+
+    <div id="view-config" class="hidden">
+      <div class="card">
+        <h3>Run configuration commands</h3>
+        <p style="color:var(--muted);font-size:.82rem;margin:0 0 .6rem">
+          Anything the CLI accepts. This is the whole configuration surface — the
+          forms elsewhere in this console are shortcuts that write these same
+          lines.
+        </p>
+        <textarea id="cmd" rows="5" spellcheck="false"
+                  style="width:100%;font:12.5px/1.5 ui-monospace,monospace;padding:.6rem;
+                         border-radius:8px;border:1px solid var(--line);
+                         background:var(--panel);color:var(--fg)"
+                  placeholder="set interface eth0 zone wan&#10;set firewall zone wan default-action drop"></textarea>
+        <div class="row" style="margin-top:.6rem">
+          <button class="btn primary" id="runsave">Apply and save</button>
+          <button class="btn" id="runonly">Apply without saving</button>
+          <button class="btn" id="runcheck">Validate only</button>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Running configuration</h3>
+        <p style="color:var(--muted);font-size:.82rem;margin:0 0 .6rem">
+          Every setting, editable where it stands. Editing writes
+          <code>set …</code>; removing writes <code>delete …</code>.
+        </p>
+        <div class="row" style="margin-bottom:.6rem">
+          <input id="cfgfilter" placeholder="filter" style="flex:1 1 12rem">
+        </div>
+        <div style="overflow-x:auto"><table id="cfgtable"></table></div>
+      </div>
+      <div class="card">
+        <h3>Revisions</h3>
+        <div style="overflow-x:auto"><table id="revtable"></table></div>
+      </div>
+    </div>
+
     <div id="view-stack" class="hidden">
       <div class="card">
         <h3>Members</h3>
@@ -309,7 +387,14 @@ pub fn page() -> String {
     </div>
 
     <div id="view-panel" class="hidden">
-      <div class="card"><pre class="out" id="panel">…</pre></div>
+      <div class="card">
+        <div class="row" style="margin-bottom:.6rem">
+          <input id="showcmd" placeholder="run any show command, e.g. ip route bgp"
+                 style="flex:1 1 18rem">
+          <button class="btn" id="runshow">Run</button>
+        </div>
+        <pre class="out" id="panel">…</pre>
+      </div>
     </div>
   </main>
 </div>
@@ -606,12 +691,280 @@ async function run(lines, confirmFirst) {{
   await refresh();
 }}
 
+async function runScript(tail) {{
+  const lines = $("cmd").value.split("\n").map((l) => l.trim()).filter(Boolean);
+  if (!lines.length) return;
+  showResult(await configure(lines.concat(tail)));
+  await refresh();
+}}
+
 function showResult(r) {{
   // The output is shown whether or not the exit status was a success: a commit
   // the appliance REFUSED reports that in its output, not in its status, and a
   // console that only looked at `ok` would tell the operator it worked.
   $("resultout").textContent = (r.output || "").trim() || (r.ok ? "applied" : "failed");
   $("result").showModal();
+}}
+
+
+// ---- the running configuration, as a tree -------------------------------
+
+// `show configuration` prints the same curly-brace document the CLI edits, so
+// parsing it is how the console learns what exists. Reconstructing the full
+// path of every leaf is what makes a generic editor possible: a leaf's path IS
+// the `set` command, so nothing here needs to know what any setting means.
+function parseConfig(text) {{
+  const out = [];
+  const stack = [];
+  for (const raw of text.split("\n")) {{
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    if (line === "}}") {{ stack.pop(); continue; }}
+    const open = line.match(/^(.*?)\s*\{{$/);
+    if (open) {{ stack.push(open[1].trim()); continue; }}
+    const parts = line.split(/\s+/);
+    const key = parts[0];
+    const value = parts.slice(1).join(" ");
+    out.push({{ path: stack.concat([key]), value, node: stack.join(" ") }});
+  }}
+  return out;
+}}
+
+async function refreshConfig() {{
+  const t = $("cfgtable");
+  t.textContent = "";
+  t.append(el("tr", {{}}, ["setting", "value", ""].map((h) => el("th", {{ text: h }}))));
+  let leaves = [];
+  try {{ leaves = parseConfig(await text("/api/v1/show/configuration")); }}
+  catch (e) {{
+    t.append(el("tr", {{}}, [el("td", {{ colspan: "3", text: String(e.message || e) }})]));
+    return;
+  }}
+  const filter = $("cfgfilter").value.trim().toLowerCase();
+  let shown = 0;
+  for (const leaf of leaves) {{
+    const path = leaf.path.join(" ");
+    if (filter && !(path + " " + leaf.value).toLowerCase().includes(filter)) continue;
+    shown++;
+    const input = el("input", {{ value: leaf.value, style: "width:100%" }});
+    const save = el("button", {{
+      class: "btn", text: "Set",
+      onclick: () => run(["set " + path + " " + input.value.trim()]),
+    }});
+    const del = el("button", {{
+      class: "btn danger", text: "Delete",
+      onclick: () => run(["delete " + path], true),
+    }});
+    t.append(el("tr", {{}}, [
+      el("td", {{ text: path }}),
+      el("td", {{}}, [input]),
+      el("td", {{}}, [el("div", {{ class: "row" }}, [save, del])]),
+    ]));
+  }}
+  if (!shown) {{
+    t.append(el("tr", {{}}, [el("td", {{ colspan: "3", text: "nothing matches" }})]));
+  }}
+
+  // Revisions: what `show system commit` lists, with a rollback beside each.
+  const r = $("revtable");
+  r.textContent = "";
+  r.append(el("tr", {{}}, ["revision", ""].map((h) => el("th", {{ text: h }}))));
+  try {{
+    const revs = (await text("/api/v1/show/system/commit")).trimEnd().split("\n");
+    for (const line of revs) {{
+      if (!line.trim()) continue;
+      const n = (line.trim().match(/^(\d+)/) || [])[1];
+      r.append(el("tr", {{}}, [
+        el("td", {{ text: line }}),
+        el("td", {{}}, [n === undefined ? el("span", {{}}) : el("button", {{
+          class: "btn", text: "Roll back",
+          onclick: () => run(["rollback " + n], true),
+        }})]),
+      ]));
+    }}
+  }} catch (e) {{
+    r.append(el("tr", {{}}, [el("td", {{ colspan: "2", text: String(e.message || e) }})]));
+  }}
+}}
+
+// ---- zones ---------------------------------------------------------------
+
+const POSTURE = [
+  ["default-action", ["", "accept", "drop", "reject"]],
+  ["stateful", ["", "true", "false"]],
+  ["block-icmp", ["", "true", "false"]],
+  ["log", ["", "true", "false"]],
+  ["source-validation", ["", "disable", "loose", "strict"]],
+];
+
+function selectFor(field, value, onchange) {{
+  const sel = el("select", {{ onchange }});
+  for (const opt of field[1]) {{
+    const o = el("option", {{ value: opt, text: opt === "" ? "(inherit)" : opt }});
+    if (opt === (value || "")) o.setAttribute("selected", "selected");
+    sel.append(o);
+  }}
+  return sel;
+}}
+
+async function refreshZones() {{
+  let leaves = [];
+  try {{ leaves = parseConfig(await text("/api/v1/show/configuration")); }} catch (e) {{}}
+
+  // Global posture: one form, applied as a batch so a half-changed posture is
+  // never committed.
+  const g = $("globalform");
+  g.textContent = "";
+  const globals = new Map();
+  for (const l of leaves) {{
+    if (l.node === "firewall global") globals.set(l.path[l.path.length - 1], l.value);
+  }}
+  const pending = new Map();
+  for (const field of POSTURE) {{
+    if (field[0] === "source-validation" && false) continue;
+    const sel = selectFor(field, globals.get(field[0]), (e) => pending.set(field[0], e.target.value));
+    g.append(el("div", {{ class: "field" }}, [el("label", {{ text: field[0] }}), sel]));
+  }}
+  $("saveglobal").onclick = () => {{
+    const lines = [];
+    for (const [k, v] of pending) {{
+      lines.push(v ? `set firewall global ${{k}} ${{v}}` : `delete firewall global ${{k}}`);
+    }}
+    if (!lines.length) return;
+    run(lines);
+  }};
+
+  // Per-zone overrides. The zone list comes from the interfaces that name one,
+  // because that is what makes a zone exist at all.
+  const zones = new Map();
+  for (const l of leaves) {{
+    if (l.path.length >= 2 && l.path[0] === "firewall" && l.path[1] === "zone" && l.path.length >= 4) {{
+      const name = l.path[2];
+      if (!zones.has(name)) zones.set(name, {{}});
+      zones.get(name)[l.path[3]] = l.value;
+    }}
+    if (l.path[0] === "interface" && l.path[l.path.length - 1] === "zone") {{
+      if (!zones.has(l.value)) zones.set(l.value, {{}});
+    }}
+  }}
+
+  const t = $("zonetable");
+  t.textContent = "";
+  t.append(el("tr", {{}}, ["zone"].concat(POSTURE.map((f) => f[0])).concat([""])
+    .map((h) => el("th", {{ text: h }}))));
+  if (!zones.size) {{
+    t.append(el("tr", {{}}, [el("td", {{ colspan: "7", text: "no zones — give an interface a zone first" }})]));
+  }}
+  for (const [name, z] of [...zones].sort()) {{
+    const cells = [el("td", {{ text: name }})];
+    const edits = new Map();
+    for (const field of POSTURE) {{
+      const sel = selectFor(field, z[field[0]], (e) => edits.set(field[0], e.target.value));
+      cells.push(el("td", {{}}, [sel]));
+    }}
+    cells.push(el("td", {{}}, [el("div", {{ class: "row" }}, [
+      el("button", {{
+        class: "btn", text: "Apply",
+        onclick: () => {{
+          const lines = [];
+          for (const [k, v] of edits) {{
+            lines.push(v ? `set firewall zone ${{name}} ${{k}} ${{v}}`
+                         : `delete firewall zone ${{name}} ${{k}}`);
+          }}
+          if (lines.length) run(lines);
+        }},
+      }}),
+    ])]));
+    t.append(el("tr", {{}}, cells));
+  }}
+}}
+
+// ---- NAT -----------------------------------------------------------------
+
+const SNAT_FIELDS = [["zone", "Zone"], ["source", "Source"], ["translation", "Translation"]];
+const DNAT_FIELDS = [["zone", "Zone"], ["proto", "Protocol"], ["port", "Port"], ["to", "To"]];
+
+function natEntries(leaves, kind) {{
+  const out = new Map();
+  for (const l of leaves) {{
+    if (l.path[0] === "nat" && l.path[1] === kind && l.path.length >= 4) {{
+      const name = l.path[2];
+      if (!out.has(name)) out.set(name, {{ name }});
+      out.get(name)[l.path[3]] = l.value;
+    }}
+  }}
+  return [...out.values()];
+}}
+
+async function refreshNat() {{
+  $("natshow").textContent = "…";
+  try {{ $("natshow").textContent = (await text("/api/v1/show/nat")).trimEnd(); }}
+  catch (e) {{ $("natshow").textContent = String(e.message || e); }}
+
+  let leaves = [];
+  try {{ leaves = parseConfig(await text("/api/v1/show/configuration")); }} catch (e) {{}}
+
+  const build = (tableId, kind, fields) => {{
+    const t = $(tableId);
+    t.textContent = "";
+    t.append(el("tr", {{}}, ["name"].concat(fields.map((f) => f[1])).concat([""])
+      .map((h) => el("th", {{ text: h }}))));
+    const rows = natEntries(leaves, kind);
+    if (!rows.length) {{
+      t.append(el("tr", {{}}, [el("td", {{
+        colspan: String(fields.length + 2), text: "none configured",
+      }})]));
+    }}
+    for (const r of rows) {{
+      const inputs = fields.map((f) => el("input", {{ value: r[f[0]] || "" }}));
+      const apply = el("button", {{
+        class: "btn", text: "Apply",
+        onclick: () => {{
+          const lines = [];
+          fields.forEach((f, i) => {{
+            const v = inputs[i].value.trim();
+            if (v) lines.push(`set nat ${{kind}} ${{r.name}} ${{f[0]}} ${{v}}`);
+          }});
+          if (lines.length) run(lines);
+        }},
+      }});
+      const del = el("button", {{
+        class: "btn danger", text: "Delete",
+        onclick: () => run([`delete nat ${{kind}} ${{r.name}}`], true),
+      }});
+      t.append(el("tr", {{}}, [el("td", {{ text: r.name }})]
+        .concat(inputs.map((i) => el("td", {{}}, [i])))
+        .concat([el("td", {{}}, [el("div", {{ class: "row" }}, [apply, del])])])));
+    }}
+  }};
+  build("snattable", "source", SNAT_FIELDS);
+  build("dnattable", "destination", DNAT_FIELDS);
+}}
+
+// Adding starts as a blank row rather than a command: a NAT entry needs several
+// fields to be valid, and creating it one `set` at a time would ask the
+// appliance to commit a half-written entry it is right to refuse.
+function addNat(tableId, kind, fields) {{
+  const t = $(tableId);
+  const name = el("input", {{ placeholder: "name" }});
+  const inputs = fields.map((f) => el("input", {{ placeholder: f[1].toLowerCase() }}));
+  const apply = el("button", {{
+    class: "btn primary", text: "Create",
+    onclick: () => {{
+      const n = name.value.trim();
+      if (!n) {{ name.focus(); return; }}
+      const lines = [];
+      fields.forEach((f, i) => {{
+        const v = inputs[i].value.trim();
+        if (v) lines.push(`set nat ${{kind}} ${{n}} ${{f[0]}} ${{v}}`);
+      }});
+      if (lines.length) run(lines);
+    }},
+  }});
+  t.append(el("tr", {{}}, [el("td", {{}}, [name])]
+    .concat(inputs.map((i) => el("td", {{}}, [i])))
+    .concat([el("td", {{}}, [apply])])));
+  name.focus();
 }}
 
 // ---- stack ---------------------------------------------------------------
@@ -677,14 +1030,20 @@ async function refresh() {{
                                   : (!panel && b.dataset.view === view);
     b.setAttribute("aria-current", String(!!active));
   }}
-  for (const v of ["dashboard", "rules", "stack", "panel"]) {{
+  for (const v of ["dashboard", "rules", "zones", "nat", "config", "stack", "panel"]) {{
     $("view-" + v).classList.toggle("hidden", v !== view);
   }}
-  $("title").textContent = panel ? panel.t
-    : view === "rules" ? "Firewall rules" : view === "stack" ? "Stack" : "Dashboard";
+  const TITLES = {{
+    rules: "Firewall rules", zones: "Zones", nat: "NAT",
+    config: "Configuration", stack: "Stack", dashboard: "Dashboard",
+  }};
+  $("title").textContent = panel ? panel.t : (TITLES[view] || "Dashboard");
 
   if (view === "dashboard") return refreshDashboard();
   if (view === "rules") return refreshRules();
+  if (view === "zones") return refreshZones();
+  if (view === "nat") return refreshNat();
+  if (view === "config") return refreshConfig();
   if (view === "stack") return refreshStack();
   if (view === "panel" && panel) {{
     $("panel").textContent = "…";
@@ -725,6 +1084,22 @@ $("signout").onclick = () => signOut("");
 $("refresh").onclick = () => refresh();
 $("allcounters").onchange = () => refreshDashboard();
 $("addrule").onclick = () => openEditor(null);
+$("addsnat").onclick = () => addNat("snattable", "source", SNAT_FIELDS);
+$("adddnat").onclick = () => addNat("dnattable", "destination", DNAT_FIELDS);
+$("cfgfilter").oninput = () => refreshConfig();
+$("runsave").onclick = () => runScript(["commit", "save"]);
+$("runonly").onclick = () => runScript(["commit"]);
+// "Validate only" sends the commands without a commit: the appliance parses and
+// validates every one of them, and nothing is applied or written. It is how you
+// find out whether a change would be refused before it touches anything.
+$("runcheck").onclick = () => runScript([]);
+$("runshow").onclick = async () => {{
+  const words = $("showcmd").value.trim();
+  if (!words) return;
+  panel = {{ t: "show " + words, p: "/api/v1/show/" + words.split(/\s+/).map(encodeURIComponent).join("/") }};
+  view = "panel";
+  await refresh();
+}};
 $("cancel").onclick = () => $("editor").close();
 $("resultclose").onclick = () => $("result").close();
 for (const [id] of FIELDS) $(id).oninput = renderPreview;
@@ -824,6 +1199,32 @@ mod tests {
     #[test]
     fn the_result_dialog_shows_output_regardless_of_status() {
         assert!(page().contains("r.output"));
+    }
+
+    /// The claim the console makes is that anything the CLI can configure can be
+    /// configured here. A form per feature could never hold that; what does is
+    /// the generic pair — a table that turns every setting in the running
+    /// configuration into `set`/`delete`, and a box that runs commands verbatim.
+    #[test]
+    fn the_whole_config_surface_is_reachable_not_just_the_forms() {
+        let html = page();
+        assert!(html.contains("parseConfig"), "no generic config editor");
+        assert!(
+            html.contains(r#""set " + path + " ""#),
+            "settings are not editable in place"
+        );
+        assert!(
+            html.contains(r#""delete " + path"#),
+            "settings cannot be removed"
+        );
+        assert!(html.contains("runScript"), "no command box");
+    }
+
+    /// Validating without committing is the one operation that lets an operator
+    /// find out whether a change would be refused before anything is touched.
+    #[test]
+    fn commands_can_be_validated_without_applying_them() {
+        assert!(page().contains(r#"runScript([])"#));
     }
 
     /// Every graphed counter has to be one the data plane actually reports, or
