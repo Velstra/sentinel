@@ -197,7 +197,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-TNwZkzgn6xCsKeVdSW1WntdXYbacsXG1vxkg7TshxnU=";
+      ebpfHash = "sha256-dA2xh5+Jsy9KQVHRROqsidV1bY2hfi+9rD7J5LothcY=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -4367,6 +4367,218 @@
           '';
         };
 
+        # C15 SYN proxy: the firewall completes a client's handshake itself, with
+        # a cookie and no state, and only opens the real connection to the server
+        # once the client proves it can receive. A `client` on the WAN segment
+        # reaches a web `server` on the LAN segment through `fw`, whose port 443
+        # is syn-protected — so every byte of that session crossed a spliced
+        # connection whose two halves disagree about the sequence space by a fixed
+        # offset the data plane corrects on every packet.
+        #   nix build .#checks.x86_64-linux.synproxy -L
+        synproxy = pkgs.testers.runNixOSTest {
+          name = "sentinel-synproxy";
+          nodes = {
+            # The client, on the WAN side.
+            client =
+              { pkgs, ... }:
+              {
+                virtualisation.vlans = [ 1 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                  interfaces.eth1.ipv4.addresses = [
+                    {
+                      address = "10.1.0.9";
+                      prefixLength = 24;
+                    }
+                  ];
+                  # The server's segment is reached through the firewall.
+                  interfaces.eth1.ipv4.routes = [
+                    {
+                      address = "10.2.0.0";
+                      prefixLength = 24;
+                      via = "10.1.0.1";
+                    }
+                  ];
+                };
+                environment.systemPackages = [ pkgs.curl ];
+              };
+            # The protected server, on the LAN side.
+            server =
+              { pkgs, ... }:
+              {
+                virtualisation.vlans = [ 2 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                  interfaces.eth1.ipv4.addresses = [
+                    {
+                      address = "10.2.0.2";
+                      prefixLength = 24;
+                    }
+                  ];
+                  defaultGateway = {
+                    address = "10.2.0.1";
+                    interface = "eth1";
+                  };
+                };
+                systemd.services.web = {
+                  wantedBy = [ "multi-user.target" ];
+                  after = [ "network-online.target" ];
+                  script = ''
+                    mkdir -p /srv/web && echo hello-from-protected > /srv/web/index.html
+                    # Large enough that the session outlives the handshake and
+                    # every packet of it goes through sequence translation.
+                    head -c 262144 /dev/zero > /srv/web/bulk.bin
+                    exec ${pkgs.python3}/bin/python3 -m http.server 443 --directory /srv/web
+                  '';
+                };
+              };
+            fw =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "fw";
+                networking.firewall.enable = lib.mkForce false;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = "10.1.0.1";
+                    prefixLength = 24;
+                  }
+                ];
+                networking.interfaces.eth2.ipv4.addresses = [
+                  {
+                    address = "10.2.0.1";
+                    prefixLength = 24;
+                  }
+                ];
+                virtualisation.vlans = [
+                  1
+                  2
+                ];
+                virtualisation.memorySize = 2048;
+                boot.kernel.sysctl = {
+                  "net.ipv4.ip_forward" = 1;
+                  "net.ipv4.conf.all.rp_filter" = 0;
+                  "net.ipv4.conf.default.rp_filter" = 0;
+                };
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+          };
+          testScript = ''
+            import re
+
+            start_all()
+            fw.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+            server.wait_for_unit("web.service")
+            fw.wait_until_succeeds("ip addr show eth2 | grep -q 10.2.0.1", timeout=20)
+
+            # Both segments zoned, both directions permitted, and tcp/443
+            # syn-protected. The zones accept by default so that what the check
+            # proves is the proxy, not the rule engine.
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth1 zone wan' "
+                "'set interface eth2 zone lan' "
+                "'set firewall zone wan default-action accept' "
+                "'set firewall zone lan default-action accept' "
+                "'set firewall syn-protect 443' "
+                "commit save exit "
+                "| sentinel configure\" 2>&1"
+            )
+            fw.wait_for_unit("velstra.service")
+            fw.succeed("grep -q '\[\[synproxy\]\]' /run/sentinel/velstra.toml")
+            fw.succeed("grep -q 'mss = 1460' /run/sentinel/velstra.toml")
+
+            # The headline: an ordinary client reaches the protected server, which
+            # can only happen if the whole splice works — the cookie was minted and
+            # checked, the SYN was passed on, the server's answer was consumed and
+            # acknowledged, and every subsequent packet had its sequence numbers
+            # corrected in both directions.
+            client.wait_until_succeeds(
+                "curl -s --max-time 10 http://10.2.0.2:443/ | grep -q hello-from-protected",
+                timeout=60,
+            )
+
+            # A bulk transfer, so the connection lives well past the handshake:
+            # a translation that is right for the first packet and wrong later
+            # would pass the check above and fail here.
+            client.succeed(
+                "curl -s --max-time 60 -o /tmp/bulk.bin http://10.2.0.2:443/bulk.bin"
+            )
+            client.succeed("test $(stat -c %s /tmp/bulk.bin) -eq 262144")
+
+            # The counters say the proxy is what carried it, rather than the
+            # traffic having quietly bypassed it — which is exactly what a
+            # mis-keyed lookup would look like from the outside. The agent dumps
+            # them periodically, so the first read has to wait for one.
+            fw.wait_until_succeeds(
+                "sentinel show firewall statistics | grep -q synproxy_challenged",
+                timeout=60,
+            )
+            stats = fw.succeed("sentinel show firewall statistics")
+            def counter(name):
+                m = re.search(rf"^\s*{name}\s+(\d+)", stats, re.M)
+                assert m, f"no {name} in:\n{stats}"
+                return int(m.group(1))
+
+            assert counter("synproxy_challenged") >= 2, stats
+            assert counter("synproxy_admitted") >= 2, stats
+            assert counter("synproxy_spliced") >= 2, stats
+
+            # And the server was never told about the SYNs the firewall answered:
+            # the proxy admitted exactly the connections that completed, so the
+            # two counts track each other.
+            assert counter("synproxy_admitted") <= counter("synproxy_challenged"), stats
+
+            # A flood of bare SYNs from addresses that cannot answer costs the
+            # firewall replies and nothing else — no state, and nothing reaching
+            # the server. This is the property the feature exists for.
+            before = counter("synproxy_admitted")
+            client.succeed(
+                "${pkgs.python3}/bin/python3 - <<'PY'\n"
+                "import random, socket, struct\n"
+                "def csum(b):\n"
+                "    if len(b) % 2: b += b'\\0'\n"
+                "    s = sum(struct.unpack('!%dH' % (len(b)//2), b))\n"
+                "    s = (s & 0xffff) + (s >> 16)\n"
+                "    s = (s & 0xffff) + (s >> 16)\n"
+                "    return (~s) & 0xffff\n"
+                "s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)\n"
+                "dst = '10.2.0.2'\n"
+                "for i in range(200):\n"
+                "    src = '198.51.100.%d' % (1 + i % 200)\n"
+                "    sport = 20000 + i\n"
+                "    tcp = struct.pack('!HHIIBBHHH', sport, 443, random.getrandbits(32), 0, 5 << 4, 0x02, 64240, 0, 0)\n"
+                "    pseudo = socket.inet_aton(src) + socket.inet_aton(dst) + struct.pack('!BBH', 0, 6, len(tcp))\n"
+                "    tcp = tcp[:16] + struct.pack('!H', csum(pseudo + tcp)) + tcp[18:]\n"
+                "    ip = struct.pack('!BBHHHBBH', 0x45, 0, 20 + len(tcp), i, 0, 64, 6, 0)\n"
+                "    ip += socket.inet_aton(src) + socket.inet_aton(dst)\n"
+                "    ip = ip[:10] + struct.pack('!H', csum(ip)) + ip[12:]\n"
+                "    s.sendto(ip + tcp, (dst, 0))\n"
+                "PY"
+            )
+            fw.wait_until_succeeds(
+                "sentinel show firewall statistics | "
+                "awk '/synproxy_challenged/ {exit ($2 >= 200) ? 0 : 1}'",
+                timeout=30,
+            )
+            stats = fw.succeed("sentinel show firewall statistics")
+            assert counter("synproxy_admitted") == before, (
+                "a spoofed SYN was admitted to the server:\n" + stats
+            )
+
+            # …and the real client still works afterwards, so absorbing the flood
+            # cost the legitimate traffic nothing.
+            client.succeed(
+                "curl -s --max-time 10 http://10.2.0.2:443/ | grep -q hello-from-protected"
+            )
+          '';
+        };
+
         # Masquerade (source NAT) in the eBPF datapath: a 3-node line
         # client(LAN) — fw — server(WAN). A private LAN client reaches a WAN
         # server through the fw; the fw SNATs the client's source to its WAN ip at
@@ -4421,6 +4633,8 @@
                   after = [ "network-online.target" ];
                   script = ''
                     mkdir -p /srv/web && echo hello-from-server > /srv/web/index.html
+                    # A payload of a size the test can hold the accounting to.
+                    head -c 1048576 /dev/zero > /srv/web/payload.bin
                     exec ${pkgs.python3}/bin/python3 -m http.server 80 --directory /srv/web
                   '';
                 };
@@ -4534,6 +4748,51 @@
             client.succeed("curl -s --max-time 5 http://10.1.0.2:80/ >/dev/null")
             flows = fw.succeed("sentinel show flows")
             assert "10.1.0.2" in flows, f"the flow is missing: {flows}"
+
+            # Per-flow accounting (roadmap C23). The state table counts the traffic
+            # each entry carried, which is what lets "top talkers" answer the
+            # question an operator actually has when a link is full. Pull a payload
+            # of a known size so the numbers can be held to something.
+            client.succeed(
+                "curl -s --max-time 60 -o /tmp/payload.bin http://10.1.0.2:80/payload.bin"
+            )
+            client.succeed("test $(stat -c %s /tmp/payload.bin) -eq 1048576")
+
+            top = fw.succeed("sentinel show top-talkers")
+            hosts = _re.findall(r"^\s*(\d+\.\d+\.\d+\.\d+)\s", top, _re.M)
+            assert hosts, f"nothing ranked at all:\n{top}"
+
+            # The attribution is the substance of the feature. A masqueraded flow's
+            # state entry describes the REPLY, so its key's source is the web server
+            # — while the host that caused the megabyte is the client behind the
+            # NAT, which lives in the entry's NAT target. Ranking on the key would
+            # put 10.1.0.2 here and answer a question nobody asked.
+            assert hosts[0] == "10.2.0.2", (
+                f"the ranking is led by {hosts[0]}, not by the host that pulled the "
+                f"payload:\n{top}"
+            )
+
+            row = _re.search(r"^\s*10\.2\.0\.2\s+(\S+)\s+(\d+)\s+(\d+)", top, _re.M)
+            assert row, f"the client has no counters:\n{top}"
+
+            def as_bytes(text):
+                units = {"K": 1024, "M": 1024**2, "G": 1024**3}
+                return float(text[:-1]) * units[text[-1]] if text[-1] in units else float(text)
+
+            volume = as_bytes(row.group(1))
+            # A lower bound, not a count: the transfer is a megabyte of payload plus
+            # headers and acknowledgements, and an LRU table may have evicted an
+            # older flow. Asserting an exact figure would make this test fail on
+            # traffic that is perfectly correct.
+            assert volume >= 900_000, (
+                f"a 1 MiB download accounted for only {row.group(1)}:\n{top}"
+            )
+            assert int(row.group(2)) > 100, f"implausible packet count:\n{top}"
+
+            # …and the per-flow view carries the same numbers, so the two views
+            # cannot drift apart into two different stories about one table.
+            flows = fw.succeed("sentinel show flows")
+            assert "packets" in flows, f"the flow table lost its counter column:\n{flows}"
           '';
         };
 

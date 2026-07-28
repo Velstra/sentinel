@@ -984,7 +984,7 @@ fn show_op(args: &[String]) -> Result<()> {
              show babel [neighbors|routes]\n  \
              show vrrp | show bfd [sessions]\n  \
              show firewall [statistics|log]    firewall summary / counters / log\n  \
-             show flows [| top-talkers]        live state table / busiest sources\n  \
+             show flows [| top-talkers]        live state table / hosts by volume\n  \
              show nat                          NAT configuration\n  \
              show vpn [ipsec]                  IPsec security associations / connections\n  \
              show pki                          local CAs + issued certificates (expiry)\n  \
