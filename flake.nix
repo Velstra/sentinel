@@ -1361,14 +1361,84 @@
           # a path that quietly 404s in front of an operator, and nothing else in
           # the build would notice.
           import re
-          paths = sorted(set(re.findall(r'"(/api/v1/[^"]+)"', page)))
-          assert len(paths) >= 10, f"only found {paths}"
+          # Only the GET paths: the page also names the write endpoint and the
+          # stack proxy's template, which are exercised on their own below.
+          paths = sorted(
+              p for p in set(re.findall(r'"(/api/v1/[^"]+)"', page))
+              if p.startswith("/api/v1/show/") or p in ("/api/v1/status", "/api/v1/stack")
+          )
+          assert len(paths) >= 15, f"only found {paths}"
           for path in paths:
               code = machine.succeed(
                   "curl -s -o /dev/null -w '%{http_code}' "
                   f"-H 'Authorization: Bearer {token}' http://127.0.0.1:8080{path}"
               ).strip()
               assert code == "200", f"the console calls {path}, which answered {code}"
+
+          # The console changes things by sending the SAME commands an operator
+          # would type, so this proves the whole write path: a rule that did not
+          # exist appears in the running config, and the appliance's own
+          # validators saw it — a form assembling a config document instead
+          # would bypass exactly those.
+          # The console changes things by sending the SAME commands an operator
+          # would type, so this proves the whole write path: a rule that did not
+          # exist appears in the running config, and the appliance's own
+          # validators saw it — a form assembling a config document instead
+          # would bypass exactly those. The script goes in a file rather than an
+          # inline shell string: a body whose newlines are eaten by quoting
+          # arrives as one nonsense command and still exits 0.
+          machine.succeed(
+              "printf '%s\n' "
+              "'set firewall rule from-console from wan' "
+              "'set firewall rule from-console proto tcp' "
+              "'set firewall rule from-console port 8443' "
+              "'set firewall rule from-console action drop' "
+              "commit save > /tmp/script"
+          )
+          rule = machine.succeed(
+              "curl -sS -X POST -H 'Authorization: Bearer " + token + "' "
+              "--data-binary @/tmp/script http://127.0.0.1:8080/api/v1/configure"
+          )
+          shown = machine.succeed(
+              "curl -fsS -H 'Authorization: Bearer " + token + "' "
+              "http://127.0.0.1:8080/api/v1/show/configuration"
+          )
+          assert "from-console" in shown, rule + shown
+          # …and `save` really persisted it, rather than only applying it live.
+          machine.succeed("grep -q from-console /var/lib/sentinel/appliance.toml")
+
+          # A refused command must come back as output rather than as a silent
+          # success — the appliance reports a refusal in what it prints, not in
+          # its exit status, so a console trusting the status would tell the
+          # operator a rejected change had been applied.
+          machine.succeed(
+              "printf '%s\n' 'set firewall rule nonsense action banana' commit save > /tmp/bad"
+          )
+          bad = machine.succeed(
+              "curl -sS -X POST -H 'Authorization: Bearer " + token + "' "
+              "--data-binary @/tmp/bad http://127.0.0.1:8080/api/v1/configure"
+          )
+          assert "banana" in bad, bad
+          machine.fail("grep -q banana /var/lib/sentinel/appliance.toml")
+
+          # The stack lists this appliance even with no peers configured, so the
+          # view is never empty and an operator can tell "no peers" apart from
+          # "the page failed to load".
+          stack = machine.succeed(
+              "curl -fsS -H 'Authorization: Bearer " + token + "' "
+              "http://127.0.0.1:8080/api/v1/stack"
+          )
+          assert '"self"' in stack, stack
+
+          # A member the appliance has no relationship with is refused rather
+          # than proxied: the stack is exactly the config-sync peers, and
+          # inventing a member would let the console reach anywhere the box can.
+          code = machine.succeed(
+              "curl -s -o /dev/null -w '%{http_code}' "
+              "-H 'Authorization: Bearer " + token + "' "
+              "http://127.0.0.1:8080/api/v1/stack/10.9.9.9/show/version"
+          ).strip()
+          assert code == "400", f"an unknown stack member answered {code}"
 
           # And those endpoints stay behind the token like every other one.
           code = machine.succeed(

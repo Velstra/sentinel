@@ -512,6 +512,27 @@ pub fn install_token(path: &Path, secret: &str) -> Result<()> {
 /// (roadmap C21). Best-effort at the call site — a down peer must not fail the local
 /// commit. The bearer token is an argv element (no shell), so it is never expanded
 /// or logged; a short timeout keeps a commit from hanging on an unreachable peer.
+/// `GET url` with a bearer token, returning the body.
+///
+/// The stack view's one way of reaching a peer. Deliberately the same tool the
+/// config-sync push already uses rather than a second HTTP client in the
+/// binary: one place to get TLS, timeouts and proxy behaviour wrong is enough.
+/// The timeout is short — a peer that is down must make the console say so
+/// quickly, not hang the page.
+pub fn curl_get(url: &str, token: &str, timeout_secs: u32) -> Result<String> {
+    let auth = format!("Authorization: Bearer {token}");
+    let timeout = timeout_secs.to_string();
+    let out = Command::new(bin("curl"))
+        .args(["-sS", "-f", "--max-time", &timeout, "-H", &auth, url])
+        .stderr(Stdio::null())
+        .output()
+        .with_context(|| format!("running curl to {url}"))?;
+    if !out.status.success() {
+        bail!("curl GET {url} failed");
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 pub fn curl_put_config(url: &str, token: &str, body_file: &Path) -> Result<()> {
     let auth = format!("Authorization: Bearer {token}");
     let data = format!("@{}", body_file.display());
