@@ -566,13 +566,22 @@ framework, so it works on an isolated network. Sign in with the management
 token (`/var/lib/sentinel/api-token`); it is kept for the browser tab and never
 written to disk.
 
-It has three working areas plus the read-only views:
+It has these working areas plus the read-only views:
 
 - **Dashboard** — service states, the live counter table, and rate graphs drawn
   from the counters the box already reports. The graphs plot the *change* per
   interval, because a monotonic total says nothing about now.
 - **Firewall rules** — a table of the configured rules with add, edit and
   delete.
+- **Zones** — the global posture and every zone's overrides. A blank field means
+  "inherit", which is the same thing as leaving it out of the config.
+- **NAT** — source (masquerade) and destination (port-forward) entries, with the
+  live NAT state below them. A new entry is filled in as a whole row and created
+  in one commit, because a NAT entry needs several fields to be valid and the
+  appliance is right to refuse half of one.
+- **Configuration** — a command box that accepts anything the CLI does, the
+  entire running configuration as an editable table, and the revision list with
+  a rollback beside each.
 - **Stack** — this appliance and its `system config-sync` peers, each with
   whether the console can actually reach it. Selecting a member points the
   read-only views at that box, proxied through this one.
@@ -603,12 +612,35 @@ result dialog shows the appliance's whole output — a refused commit is reporte
 in what it *prints*, not in its exit status, so nothing here is decided from a
 status code.
 
-### What it does not do
+### Everything, not just the forms
 
-The console configures firewall rules; everything else is read-only in it and
-edited from the CLI. It is a deliberate boundary rather than a stopping point:
-each surface added here has to be worth a second way to get it wrong.
+The forms cover what is clicked often. What makes the console complete is the
+**Configuration** view: the running configuration is printed as the same
+document the CLI edits, so every setting in it becomes an editable row whose
+path *is* its `set` command, and removing one writes `delete <path>`. Nothing
+there needs to know what a setting means, which is why it covers the whole
+surface rather than the part someone remembered to build a form for.
+
+Beside it, the command box runs anything the CLI accepts. **Validate only**
+sends the commands with no `commit`: the appliance parses and checks every one
+of them and nothing is applied or written, which is how you find out whether a
+change would be refused before it touches anything.
+
+### Debugging
+
+- **Diagnostics** carries the data-plane and routing logs, the running config
+  and the version, and a box that runs **any** `show` command — the same
+  operational surface as the terminal.
+- The dashboard's counter table is the whole data-plane counter set, including
+  the ones still at zero if you ask for them; a counter that is *supposed* to be
+  moving and is not is usually the fastest diagnosis on the box.
+- **Revisions** lists what `show system commit` lists, and rolls back to one.
+
+### What it does not do
 
 Configuration is always applied on the appliance you are signed in to. A stack
 member receives it the way it always has — pushed by `config-sync` on commit —
 so there is one path a change can travel and one place it can be refused.
+
+The console cannot exceed the CLI, by construction: it has no way to express
+anything except a command the CLI would accept.
