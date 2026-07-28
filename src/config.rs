@@ -3326,6 +3326,27 @@ pub struct Firewall {
     /// Named address/port groups (aliases) that rules reference by name.
     #[serde(default, skip_serializing_if = "Groups::is_empty")]
     pub group: Groups,
+    /// TCP ports a SYN proxy stands in front of (roadmap C15).
+    ///
+    /// The firewall answers every SYN to these ports itself, with a cookie, and
+    /// only opens the real connection once a client returns it — so a SYN flood
+    /// costs one reply packet and no state instead of a half-open connection on
+    /// the server. Proxied connections trade window scaling, SACK and
+    /// timestamps for that; see the handbook.
+    #[serde(default, rename = "syn-protect", skip_serializing_if = "Vec::is_empty")]
+    pub syn_protect: Vec<SynProtect>,
+}
+
+/// A TCP port protected by the SYN proxy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SynProtect {
+    /// The TCP port to protect.
+    pub port: u16,
+    /// MSS the synthesised SYN-ACK advertises. Omitted means the untunnelled
+    /// Ethernet maximum; lower it where the path is smaller (a tunnel, PPPoE).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mss: Option<u16>,
 }
 
 impl SourceValidation {
@@ -3355,6 +3376,7 @@ impl Default for Firewall {
             source_validation: SourceValidation::Disable,
             geoip_block: Vec::new(),
             group: Groups::default(),
+            syn_protect: Vec::new(),
         }
     }
 }

@@ -52,6 +52,10 @@ pub struct VelstraConfig {
     port_forwards: Vec<PortForwardOut>,
     #[serde(rename = "npt66", skip_serializing_if = "Vec::is_empty")]
     npt66: Vec<Npt66Out>,
+    /// C15 SYN proxy (`[[synproxy]]`) — the TCP ports whose handshake the data
+    /// plane completes on the server's behalf.
+    #[serde(rename = "synproxy", skip_serializing_if = "Vec::is_empty")]
+    synproxy: Vec<SynProxyOut>,
     /// C22 load-balanced services (`[[service]]`) — fabric's XDP L4 load
     /// balancer, which had no way in from the appliance config.
     #[serde(rename = "service", skip_serializing_if = "Vec::is_empty")]
@@ -111,6 +115,21 @@ struct Npt66Out {
     internal: String,
     external: String,
 }
+
+/// One `[[synproxy]]` entry in the emitted velstra config — a TCP port whose
+/// handshake the data plane completes on the server's behalf.
+#[derive(Debug, Serialize)]
+struct SynProxyOut {
+    port: u16,
+    mss: u16,
+}
+
+/// The MSS a SYN proxy advertises when the appliance config does not say: a
+/// 1500-byte Ethernet MTU less the IPv4 and TCP headers. Duplicated from
+/// `velstra-config`'s own default rather than shared, because the appliance does
+/// not link the data-plane crates; the emitted config always states the value,
+/// so the two can never quietly disagree about what was configured.
+const DEFAULT_SYNPROXY_MSS: u16 = 1460;
 
 #[derive(Debug, Serialize)]
 struct Policy {
@@ -512,6 +531,18 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
     // back through the box. Reflection needs the ingress zone's public IP known at
     // compile time — skipped (with the plain forward still emitted) when the
     // ingress zone is DHCP/address-less.
+    // C15: the SYN proxy is named by port, so it needs no zone resolution — the
+    // appliance's own default MSS is filled in here rather than in the data
+    // plane, so what was decided is visible in the emitted config.
+    let synproxy: Vec<SynProxyOut> = fw
+        .syn_protect
+        .iter()
+        .map(|s| SynProxyOut {
+            port: s.port,
+            mss: s.mss.unwrap_or(DEFAULT_SYNPROXY_MSS),
+        })
+        .collect();
+
     let mut port_forwards: Vec<PortForwardOut> = Vec::new();
     for dst in appliance.nat.destination.iter().filter(|d| !d.disabled) {
         let Some(&policy) = ids.get(dst.zone.as_str()) else {
@@ -618,6 +649,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
         interfaces,
         port_forwards,
         npt66,
+        synproxy,
         services,
         conntrack_sync,
     }
@@ -1591,6 +1623,34 @@ port_group = "web"
                 .iter()
                 .all(|r| r.proto == "tcp" && r.action == "pass")
         );
+    }
+
+    /// The emitted config always states the MSS, even when the appliance config
+    /// left it out. The data plane has a default of its own, and two defaults
+    /// that could drift apart is exactly the bug that never gets found — so the
+    /// appliance decides and says so.
+    #[test]
+    fn a_syn_protected_port_is_emitted_with_the_mss_it_will_advertise() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+[[firewall.syn-protect]]
+port = 443
+[[firewall.syn-protect]]
+port = 8080
+mss = 1400
+"#;
+        let cfg = compile(&Appliance::from_toml(toml).unwrap());
+        assert_eq!(cfg.synproxy.len(), 2);
+        assert_eq!((cfg.synproxy[0].port, cfg.synproxy[0].mss), (443, 1460));
+        assert_eq!((cfg.synproxy[1].port, cfg.synproxy[1].mss), (8080, 1400));
+
+        let out = toml::to_string(&cfg).unwrap();
+        assert!(out.contains("[[synproxy]]"), "{out}");
+        assert!(out.contains("mss = 1460"), "{out}");
     }
 
     #[test]

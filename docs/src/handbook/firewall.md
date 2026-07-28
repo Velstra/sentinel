@@ -414,3 +414,85 @@ See
 [Load balancer](../operations/configure.md) for the full surface, and
 `services reverse-proxy` when you need TLS termination or HTTP-aware routing
 instead.
+
+## Seeing what is on the wire
+
+The data plane records every NAT'd connection in its state table, and each entry
+counts the traffic it accounted for. Two views read it:
+
+```text
+show flows                 # the live state table, with per-flow packets/bytes
+show top-talkers           # hosts ranked by the volume attributed to them
+```
+
+`top-talkers` ranks by **bytes**, not by connection count — a host holding four
+hundred idle keep-alives is not the reason a link is full — and still reports the
+connection count beside it, because one flow moving ten gigabytes and ten
+thousand flows moving ten gigabytes are different problems.
+
+A host is named by the traffic it **caused**. For a masqueraded connection the
+state entry describes the reply, so its source is the remote server while the
+internal client that asked for the traffic is the entry's NAT target; the
+ranking attributes it to that client. Otherwise the view would answer "which
+server sent us the most", which is rarely the question.
+
+Three limits worth knowing:
+
+- **Only NAT'd connections are counted.** Traffic the firewall passes without
+  translating (routed between two internal zones, say) has no state entry to
+  account against and does not appear.
+- **The counters are per appliance and are not replicated.** After an HA
+  failover the new active node counts the flows it forwards from zero — the
+  bytes it is reporting are the bytes it actually carried, and summing the pair
+  would otherwise double them.
+- **Byte counts are of the frame on the wire**, headers included, which is what
+  a link's capacity is measured in.
+
+## SYN-flood protection (SYN proxy)
+
+```text
+set firewall syn-protect 443
+set firewall syn-protect 8080 mss 1400
+delete firewall syn-protect 443
+```
+
+A SYN flood costs the attacker one small packet and costs the server a
+half-open connection held for tens of seconds against an address that was never
+real. `syn-protect` makes the firewall stop believing a SYN: it answers the
+handshake itself, with a cookie derived from the connection's own identity, and
+keeps **no state at all**. Only a client that actually receives that answer can
+return it, so a spoofed source never gets past — and the flood costs the
+appliance one reply packet each and nothing more.
+
+When a client does return a valid cookie, the firewall opens the real connection
+to the server and joins the two halves together. From then on the connection is
+ordinary; `show firewall statistics` reports what happened:
+
+| Counter | Meaning |
+|---|---|
+| `synproxy_challenged` | SYNs answered with a cookie. Under attack this is the flood being absorbed. |
+| `synproxy_admitted` | Clients that returned a valid cookie and reached the server. |
+| `synproxy_rejected` | ACKs carrying no cookie this appliance minted — spoofed, or expired. |
+| `synproxy_spliced` | Servers that answered and had their connection joined to a client's. |
+
+Read `challenged` and `admitted` together: a large gap between them *is* the
+attack being stopped.
+
+**What a protected connection gives up.** The firewall has to answer before it
+can ask the server what it would have agreed to, so it offers an MSS and nothing
+else — no window scaling, no SACK, no timestamps — and passes the same bare
+options on to the server, so both ends agree. In practice that caps a single
+connection's receive window at 64 KiB (about 6 MB/s on a 10 ms path) and makes
+loss recovery slower. Protect the ports where a flood is the greater risk, not
+every port.
+
+Two further limits worth knowing:
+
+- It is **TCP over IPv4** only.
+- A port-forward that also **changes** the port cannot be protected: the proxy
+  matches the two directions of a connection by the service port, which a port
+  rewrite breaks. Forwarding the address is fine — `443 → 10.0.0.10:443` works,
+  `443 → 10.0.0.10:8443` does not.
+
+The cookie key is drawn from the kernel's random source when the first protected
+port is configured, and never leaves the appliance.
