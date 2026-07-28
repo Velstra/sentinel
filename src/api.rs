@@ -247,7 +247,10 @@ async fn get_show(UrlPath(path): UrlPath<String>) -> Result<Response, ApiError> 
 /// **A refused commit is reported in the output, not in the exit status** — so
 /// the whole output is always returned, and a caller that only checks `ok` will
 /// believe a rejected change succeeded.
-async fn post_configure(body: String) -> Result<Json<Value>, ApiError> {
+async fn post_configure(
+    State(state): State<Arc<ApiState>>,
+    body: String,
+) -> Result<Json<Value>, ApiError> {
     if body.len() > 256 * 1024 {
         return Err(ApiError::bad_request(anyhow!(
             "configuration script too large"
@@ -255,8 +258,15 @@ async fn post_configure(body: String) -> Result<Json<Value>, ApiError> {
     }
     let exe = std::env::current_exe()
         .map_err(|e| ApiError::internal(anyhow!("locating the sentinel binary: {e}")))?;
-    let mut child = std::process::Command::new(exe)
-        .arg("configure")
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("configure").arg("--config").arg(&state.config_path);
+    // The API's own `--no-apply` has to reach the commands it runs, or an
+    // off-box instance edits the right file and then tries to reconfigure the
+    // machine it is running on. Same gate the PUT handler honours.
+    if !state.apply.enabled {
+        cmd.arg("--no-apply");
+    }
+    let mut child = cmd
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
