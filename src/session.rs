@@ -7119,6 +7119,47 @@ pub fn render_appliance(a: &Appliance) -> String {
     render_draft_only(&Draft::from_appliance(a), true, None)
 }
 
+/// The running configuration as the flat `set` commands that would recreate it
+/// (VyOS `show configuration commands`).
+///
+/// The brace document is what an operator reads; this is what an operator
+/// *copies* — into a ticket, a second appliance, or a diff. It is also the exact
+/// form the web console needs, which is why the rule that produces it lives here
+/// where it can be tested rather than being re-derived in a browser.
+///
+/// The rule is one line: inside a block, a leaf's **first token is the setting
+/// and the rest of the line is its value**, and the enclosing block headers are
+/// its path. That handles a block header that carries a name (`zone wan {`) and
+/// a value that contains spaces (a description) without either case being
+/// special — which is why the round-trip test below is the whole specification.
+pub fn flatten_config(rendered: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack: Vec<String> = Vec::new();
+    for raw in rendered.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line == "}" {
+            stack.pop();
+            continue;
+        }
+        if let Some(head) = line.strip_suffix('{') {
+            stack.push(head.trim().to_string());
+            continue;
+        }
+        let path = stack.join(" ");
+        if path.is_empty() {
+            // A leaf outside every block cannot be addressed by a `set` path;
+            // the renderer does not emit one, and inventing a command here
+            // would produce a line the CLI rejects.
+            continue;
+        }
+        out.push(format!("set {path} {line}"));
+    }
+    out
+}
+
 /// Render the draft in config syntax, optionally scoped to ONE top-level section
 /// (`system` / `interface` / `firewall` / `nat` / `protocols`) — the VyOS
 /// `show <path>` view. `None` renders everything.
@@ -9162,6 +9203,82 @@ fn proto_str(p: Proto) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    /// The whole specification of `flatten_config`, as a round trip: render a
+    /// config, flatten it to commands, feed those commands back through the
+    /// *real* CLI parser, and render again. The two documents must be identical.
+    ///
+    /// That proves three things at once which no narrower test would — every
+    /// line it emits is a command the CLI accepts, the path it reconstructs is
+    /// the right one, and nothing in the config is lost on the way out. It is
+    /// also why the web console can use the same rule to make every setting
+    /// editable without knowing what any of them mean.
+    #[test]
+    fn flattened_commands_rebuild_the_configuration_they_came_from() {
+        let toml = r#"
+[system]
+hostname = "edge"
+[[interface]]
+name = "eth0"
+zone = "wan"
+address = "203.0.113.2/24"
+[[interface]]
+name = "eth1"
+zone = "lan"
+address = "10.0.0.1/24"
+[firewall]
+blocklist = ["203.0.113.7"]
+[zone.lan]
+default_action = "accept"
+[[rule]]
+name = "web-in"
+from = "wan"
+to = "lan"
+proto = "tcp"
+port = "443"
+action = "accept"
+description = "published web service"
+[[nat.source]]
+name = "wan-masq"
+zone = "wan"
+[[nat.destination]]
+name = "web"
+zone = "wan"
+proto = "tcp"
+port = 443
+to = "10.0.0.10:443"
+"#;
+        let original = render_appliance(&Appliance::from_toml(toml).unwrap());
+        let commands = flatten_config(&original);
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("description published web service")),
+            "a multi-word value was split: {commands:#?}"
+        );
+
+        // Replay into an empty session, exactly as the console would.
+        let dir = std::env::temp_dir().join(format!("sentinel-flatten-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("appliance.toml");
+        let _ = std::fs::remove_file(&path);
+        let mut session = Session::load(&path).unwrap();
+        let act = crate::repl::Apply::off();
+        let mut ctx: Vec<String> = Vec::new();
+        for command in &commands {
+            assert!(
+                !crate::repl::exec_line(&mut session, &act, &mut ctx, command),
+                "{command} ended the session"
+            );
+        }
+        let rebuilt = render_appliance(&session.commit().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            rebuilt, original,
+            "the configuration did not survive being flattened to commands"
+        );
+    }
     use super::*;
 
     /// A CLI commit rebuilds the whole appliance from the draft, so a service
