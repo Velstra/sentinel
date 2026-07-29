@@ -566,6 +566,13 @@ framework, so it works on an isolated network. Sign in with the management
 token (`/var/lib/sentinel/api-token`); it is kept for the browser tab and never
 written to disk.
 
+It wears Velstra's design system — dark, terminal-derived, with Sentinel's amber
+as the product accent. The tokens are inlined rather than linked, for the same
+reason as everything else: a stylesheet the appliance cannot fetch is a console
+that renders as unstyled text at the worst possible moment. The system's display
+faces are named but not embedded, so a workstation that has them renders exactly
+as designed and everything else falls back to its system stack.
+
 It has these working areas plus the read-only views:
 
 - **Dashboard** — service states, the live counter table, and rate graphs drawn
@@ -579,12 +586,30 @@ It has these working areas plus the read-only views:
   live NAT state below them. A new entry is filled in as a whole row and created
   in one commit, because a NAT entry needs several fields to be valid and the
   appliance is right to refuse half of one.
+- **BGP** — the router's own settings and a neighbour table.
+- **IPsec** — site-to-site tunnels.
+- **WireGuard** — interfaces and their peers. The private key is generated *on
+  the appliance* (`private-key generate`), never typed into a browser.
+- **DHCP** — the servers running on each interface, and the current leases.
 - **Configuration** — a command box that accepts anything the CLI does, the
   entire running configuration as an editable table, and the revision list with
   a rollback beside each.
 - **Stack** — this appliance and its `system config-sync` peers, each with
   whether the console can actually reach it. Selecting a member points the
   read-only views at that box, proxied through this one.
+
+### Staged, then applied
+
+The console follows the appliance's own model: edits are a **candidate**, not a
+change. A form's button stages its commands, the header counts what is waiting,
+and nothing reaches the box until you press **Apply** — or **Discard**, which
+throws the lot away. That is why deleting a rule does not ask you to confirm:
+the delete is a line you can still remove.
+
+**Validate** runs the staged commands with no `commit`. The appliance parses and
+checks every one and writes nothing, which is how you learn a change would be
+refused before it touches anything. A refused Apply leaves the commands staged
+so you can fix one and try again, rather than reconstructing what you clicked.
 
 ### Clicking is typing
 
