@@ -922,6 +922,22 @@ fn show_op(args: &[String]) -> Result<()> {
         ["pki", ..] => show_pki(),
 
         // Configuration views.
+        // VyOS `show configuration commands`: the running config as the flat
+        // `set` lines that would recreate it — what you copy into a ticket, onto
+        // a second appliance, or into a diff. The rule that produces it is
+        // round-trip tested in `session`.
+        ["configuration", "commands"] => {
+            let path = std::path::Path::new(DEFAULT_CONFIG);
+            if path.exists() {
+                let rendered = session::render_appliance(&Appliance::load(path)?);
+                for line in session::flatten_config(&rendered) {
+                    println!("{line}");
+                }
+            } else {
+                println!("no saved config at {DEFAULT_CONFIG} (run `configure` + `save`)");
+            }
+            Ok(())
+        }
         ["configuration", ..] => {
             let path = std::path::Path::new(DEFAULT_CONFIG);
             if path.exists() {
@@ -937,6 +953,41 @@ fn show_op(args: &[String]) -> Result<()> {
                 print!("{}", Appliance::load(path)?.summary());
             } else {
                 println!("no saved config at {DEFAULT_CONFIG} (run `configure` + `save`)");
+            }
+            Ok(())
+        }
+
+        // DHCP (roadmap C7). networkd's built-in server keeps its leases in the
+        // per-interface state directory; dnsmasq (the DHCPv6 half) writes a
+        // lease file of its own. Both are read here rather than in the console,
+        // so the terminal and the browser report the same leases.
+        ["dhcp"] | ["dhcp", "leases"] => {
+            let mut found = false;
+            for dir in ["/var/lib/systemd/network", "/run/systemd/netif/leases"] {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        match std::fs::read_to_string(&path) {
+                            Ok(body) if !body.trim().is_empty() => {
+                                println!("{}:", path.display());
+                                print!("{body}");
+                                found = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            match std::fs::read_to_string("/run/sentinel/dhcp6/dhcp6.leases") {
+                Ok(body) if !body.trim().is_empty() => {
+                    println!("/run/sentinel/dhcp6/dhcp6.leases:");
+                    print!("{body}");
+                    found = true;
+                }
+                _ => {}
+            }
+            if !found {
+                println!("no DHCP leases (no server configured, or nothing has asked yet)");
             }
             Ok(())
         }

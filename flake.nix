@@ -1353,8 +1353,16 @@
           # It reaches outside for nothing. An appliance is expected to work on
           # an isolated network, and a console that half-renders without the
           # internet is worse than no console.
-          for external in ["http://", "https://", "<link", "<script src"]:
+          for external in ["http://", "https://", "<link", "<script src", "@import"]:
               assert external not in page, f"the console fetches {external!r}"
+
+          # The design system's tokens have to be *in* the page. The system's own
+          # font file imports them from a CDN, which an appliance cannot reach —
+          # so the faces are named with a fallback and nothing is fetched.
+          # NOT `token` — that name already holds the API bearer token here.
+          for design_token in ["--ink-900", "--signal-500", "--sentinel-500", "--radius-md"]:
+              assert design_token in page, f"the design token {design_token} is missing"
+          assert "Space Grotesk" in page and "system-ui" in page, "no font fallback"
 
           # The real assertion: every endpoint the page calls actually answers.
           # A hand-written console drifts from its API by having a panel point at
@@ -1470,6 +1478,65 @@
               "--data-binary @/tmp/dry http://127.0.0.1:8080/api/v1/configure"
           )
           machine.fail("grep -q dry-run /var/lib/sentinel/appliance.toml")
+
+          # The four service masks, each through the same command path: a BGP
+          # neighbour, an IPsec tunnel, a WireGuard interface with a peer, and a
+          # DHCP server on an interface. What is being proved is that the paths
+          # the forms write are ones the CLI accepts — a form that invented a
+          # path would be refused here rather than in front of an operator.
+          machine.succeed(
+              "printf '%s\n' "
+              "'set protocols bgp local-as 65001' "
+              "'set protocols bgp router-id 10.0.0.1' "
+              "'set protocols bgp neighbor 192.0.2.1 remote-as 65002' "
+              "'set protocols bgp neighbor 192.0.2.1 description upstream link' "
+              "'set vpn ipsec site-a local 203.0.113.2' "
+              "'set vpn ipsec site-a remote 198.51.100.2' "
+              "'set vpn ipsec site-a psk secret123' "
+              "'set vpn ipsec site-a local-subnet 10.0.0.0/24' "
+              "'set vpn ipsec site-a remote-subnet 10.9.0.0/24' "
+              "'set interface wg0 type wireguard' "
+              "'set vpn wireguard wg0 listen-port 51820' "
+              "'set vpn wireguard wg0 private-key generate' "
+              "'set interface eth0 address 10.0.0.1/24' "
+              "'set interface eth0 dhcp-server enable' "
+              "'set interface eth0 dhcp-server pool-size 50' "
+              "commit save > /tmp/masks"
+          )
+          masks = machine.succeed(
+              "curl -sS -X POST -H 'Authorization: Bearer " + token + "' "
+              "--data-binary @/tmp/masks http://127.0.0.1:8080/api/v1/configure"
+          )
+          cfg = machine.succeed(
+              "curl -fsS -H 'Authorization: Bearer " + token + "' "
+              "http://127.0.0.1:8080/api/v1/show/configuration"
+          )
+          for want in ["65002", "site-a", "wg0", "dhcp-server"]:
+              assert want in cfg, masks + cfg
+
+          # The flat command view is what the console's generic editor reads and
+          # what an operator copies. It has to name every setting with the path
+          # that would set it — including a value that contains spaces.
+          flat = machine.succeed(
+              "curl -fsS -H 'Authorization: Bearer " + token + "' "
+              "http://127.0.0.1:8080/api/v1/show/configuration/commands"
+          )
+          assert "set protocols bgp neighbor 192.0.2.1 remote-as 65002" in flat, flat
+          assert "description upstream link" in flat, flat
+
+          # Every line it prints has to be a command the CLI accepts. Replaying
+          # the whole thing is the strongest form of that: it is how a config is
+          # copied to a second appliance.
+          machine.succeed(
+              "curl -fsS -H 'Authorization: Bearer " + token + "' "
+              "http://127.0.0.1:8080/api/v1/show/configuration/commands > /tmp/replay"
+          )
+          machine.succeed("printf '%s\n' commit >> /tmp/replay")
+          replay = machine.succeed(
+              "curl -sS -X POST -H 'Authorization: Bearer " + token + "' "
+              "--data-binary @/tmp/replay http://127.0.0.1:8080/api/v1/configure"
+          )
+          assert "error" not in replay, replay
 
           # The stack lists this appliance even with no peers configured, so the
           # view is never empty and an operator can tell "no peers" apart from

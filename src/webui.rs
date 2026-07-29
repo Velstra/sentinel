@@ -25,6 +25,20 @@
 //! no console. The graphs are drawn on a canvas from the counters the box
 //! already reports.
 //!
+//! ## The design system, inlined
+//!
+//! The look is Velstra's own: the palette, type scale, spacing grid, radii and
+//! elevation are its tokens, copied in rather than imported for the reason
+//! above. It is dark only, as that system is — it defines no light ramp, and
+//! inventing one here would be designing instead of adopting.
+//!
+//! The one deliberate divergence is the typefaces. The system names Space
+//! Grotesk, IBM Plex Sans and JetBrains Mono; embedding three faces would add
+//! several hundred kilobytes to a page an operator opens during an incident,
+//! and fetching them is impossible by the same rule as everything else. So they
+//! are named first and fall back to the system stack: exact where a workstation
+//! has them, and carried by the palette and rhythm everywhere else.
+//!
 //! ## The token never touches disk
 //!
 //! The page itself is public — markup with no data in it, and a sign-in form
@@ -62,6 +76,7 @@ pub const PANELS: &[(&str, &[(&str, &str)])] = &[
             ("Interfaces", "/api/v1/show/interfaces"),
             ("Routes", "/api/v1/show/ip/route"),
             ("Neighbours", "/api/v1/show/arp"),
+            ("DHCP leases", "/api/v1/show/dhcp/leases"),
         ],
     ),
     (
@@ -131,107 +146,368 @@ pub fn page() -> String {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sentinel</title>
 <style>
+  /* ======================================================================
+     Velstra design system — tokens, inlined.
+
+     The console is one self-contained document, so the tokens live here
+     rather than behind a linked stylesheet: an appliance is expected to work on an
+     isolated network, and a stylesheet it cannot fetch is a console that
+     renders as unstyled text at the worst possible moment.
+
+     The families below name the design system's faces first and fall back to
+     the system stack, because for the same reason no webfont can be fetched
+     and none is embedded — a display face is not worth several hundred
+     kilobytes in a page an operator opens during an incident. On a
+     workstation that has them installed the console renders exactly as
+     designed; everywhere else the palette, scale and rhythm still carry it.
+
+     Dark only, as the system is: it defines no light ramp, and inventing one
+     here would be designing rather than adopting.
+     ====================================================================== */
   :root {{
-    color-scheme: light dark;
-    --bg: #f4f6f8; --panel: #ffffff; --fg: #14181d; --muted: #5d6773;
-    --line: #d5dbe2; --accent: #1f5fd0; --accent-fg: #ffffff;
-    --ok: #157f3d; --warn: #9a6700; --bad: #b42318; --rail: #10151b; --rail-fg: #c9d3de;
+    color-scheme: dark;
+
+    --ink-950: #070a10; --ink-900: #0b0e14; --ink-850: #0e121a;
+    --ink-800: #11151f; --ink-700: #161c28; --ink-600: #1d2431;
+    --ink-500: #232b3a; --ink-400: #313b4d; --ink-300: #4a566b;
+    --slate-400: #9ba6b8; --slate-100: #e6eaf2; --white: #f6f8fc;
+
+    --signal-300: #85acff; --signal-400: #5f93ff; --signal-500: #4c8dff;
+    --signal-600: #3a72e6; --signal-900: #16264f;
+    --sentinel-500: #ffb020; --sentinel-600: #e6941a; --sentinel-900: #4a3208;
+
+    --green-500: #3fb950; --amber-500: #ffb020; --red-500: #f85149;
+    --cyan-500: #39b4d6;
+
+    --bg-app: var(--ink-900); --surface: var(--ink-800);
+    --surface-raised: var(--ink-700); --surface-sunken: var(--ink-850);
+    --surface-hover: var(--ink-600);
+    --text-strong: var(--white); --text-body: var(--slate-100);
+    --text-muted: var(--slate-400); --text-faint: var(--ink-300);
+    --border: var(--ink-500); --border-strong: var(--ink-400);
+    --border-subtle: var(--ink-600);
+    --brand: var(--signal-500); --brand-hover: var(--signal-400);
+    --brand-active: var(--signal-600); --focus-ring: var(--signal-400);
+    --link: var(--signal-400);
+    --status-up: var(--green-500); --status-down: var(--red-500);
+    --status-warn: var(--amber-500); --status-info: var(--cyan-500);
+
+    /* Sentinel is the product this console belongs to, so its amber is the
+       accent that marks state and identity; signal blue stays the action
+       colour. Two roles, never interchanged. */
+    --product: var(--sentinel-500);
+    --product-strong: var(--sentinel-600);
+    --product-subtle: var(--sentinel-900);
+
+    --font-display: "Space Grotesk", "Segoe UI", system-ui, sans-serif;
+    --font-sans: "IBM Plex Sans", system-ui, -apple-system, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --fw-regular: 400; --fw-medium: 500; --fw-semibold: 600;
+    --text-2xs: .6875rem; --text-xs: .75rem; --text-sm: .8125rem;
+    --text-base: .9375rem; --text-lg: 1.25rem; --text-xl: 1.5rem;
+    --leading-tight: 1.1; --leading-snug: 1.28; --leading-normal: 1.55;
+    --leading-code: 1.45;
+    --tracking-tight: -.02em; --tracking-caps: .08em;
+
+    --space-1: .25rem; --space-2: .5rem; --space-3: .75rem; --space-4: 1rem;
+    --space-5: 1.25rem; --space-6: 1.5rem; --space-7: 2rem; --space-9: 3rem;
+    --sidebar-w: 268px;
+
+    --radius-xs: 3px; --radius-sm: 5px; --radius-md: 8px; --radius-lg: 12px;
+    --radius-pill: 999px;
+
+    --shadow-sm: 0 1px 2px rgba(0,0,0,.4);
+    --shadow-md: 0 4px 12px rgba(0,0,0,.45);
+    --shadow-lg: 0 12px 32px rgba(0,0,0,.5);
+    --edge-top: inset 0 1px 0 rgba(255,255,255,.05);
+    --glow-focus: 0 0 0 3px rgba(76,141,255,.35);
   }}
-  @media (prefers-color-scheme: dark) {{
-    :root {{
-      --bg: #0f1216; --panel: #171c22; --fg: #e4e9ef; --muted: #97a3b0;
-      --line: #262d36; --accent: #4c8dff; --accent-fg: #08111f;
-      --ok: #3fb950; --warn: #d0a215; --bad: #f85149; --rail: #0a0d11; --rail-fg: #b6c2ce;
-    }}
-  }}
-  :root[data-theme="dark"] {{
-    --bg: #0f1216; --panel: #171c22; --fg: #e4e9ef; --muted: #97a3b0;
-    --line: #262d36; --accent: #4c8dff; --accent-fg: #08111f;
-    --ok: #3fb950; --warn: #d0a215; --bad: #f85149; --rail: #0a0d11; --rail-fg: #b6c2ce;
-  }}
-  :root[data-theme="light"] {{
-    --bg: #f4f6f8; --panel: #ffffff; --fg: #14181d; --muted: #5d6773;
-    --line: #d5dbe2; --accent: #1f5fd0; --accent-fg: #ffffff;
-    --ok: #157f3d; --warn: #9a6700; --bad: #b42318; --rail: #10151b; --rail-fg: #c9d3de;
-  }}
-  * {{ box-sizing: border-box; }}
+
+  *, *::before, *::after {{ box-sizing: border-box; }}
+  html {{ -webkit-text-size-adjust: 100%; }}
   body {{
-    margin: 0; background: var(--bg); color: var(--fg);
-    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
+    margin: 0; background: var(--bg-app); color: var(--text-body);
+    font: var(--fw-regular) var(--text-base)/var(--leading-normal) var(--font-sans);
+    -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
   }}
-  code, pre {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
-  .app {{ display: grid; grid-template-columns: 240px 1fr; min-height: 100vh; }}
-  @media (max-width: 820px) {{ .app {{ grid-template-columns: 1fr; }} aside {{ position: static !important; height: auto !important; }} }}
+  h1, h2, h3 {{
+    margin: 0; color: var(--text-strong); font-family: var(--font-display);
+    font-weight: var(--fw-semibold); letter-spacing: var(--tracking-tight);
+    line-height: var(--leading-snug);
+  }}
+  p {{ margin: 0; }}
+  code, pre {{
+    font-family: var(--font-mono); font-size: var(--text-sm);
+    line-height: var(--leading-code);
+  }}
+  ::selection {{ background: rgba(76,141,255,.4); color: var(--white); }}
+  :focus-visible {{ outline: 2px solid var(--focus-ring); outline-offset: 2px; }}
+
+  /* --- shell ------------------------------------------------------------ */
+  .app {{ display: grid; grid-template-columns: var(--sidebar-w) 1fr; min-height: 100vh; }}
+  @media (max-width: 900px) {{
+    .app {{ grid-template-columns: 1fr; }}
+    aside {{ position: static !important; height: auto !important; }}
+  }}
 
   aside {{
-    background: var(--rail); color: var(--rail-fg);
+    background: var(--ink-950); border-right: 1px solid var(--border-subtle);
     position: sticky; top: 0; height: 100vh; overflow-y: auto;
-    display: flex; flex-direction: column; gap: .25rem; padding: .9rem .6rem;
+    display: flex; flex-direction: column; gap: var(--space-1);
+    padding: var(--space-5) var(--space-3);
   }}
-  aside h1 {{ font-size: .95rem; margin: .2rem .5rem 1rem; letter-spacing: .06em;
-              text-transform: uppercase; color: #fff; }}
-  aside .grp {{ font-size: .68rem; text-transform: uppercase; letter-spacing: .1em;
-                color: #7d8b99; margin: .9rem .5rem .3rem; }}
+  aside h1 {{
+    font-size: var(--text-lg); margin: var(--space-1) var(--space-3) var(--space-6);
+    display: flex; align-items: center; gap: var(--space-2);
+  }}
+  /* The product mark: a small amber block, the same device the docs use for
+     Sentinel. It is the only decoration in the rail. */
+  aside h1::before {{
+    content: ""; width: 10px; height: 18px; border-radius: var(--radius-xs);
+    background: var(--product); box-shadow: 0 0 18px -2px var(--product);
+  }}
+  aside .grp {{
+    font: var(--fw-semibold) var(--text-2xs)/1.2 var(--font-mono);
+    text-transform: uppercase; letter-spacing: var(--tracking-caps);
+    color: var(--text-faint); margin: var(--space-5) var(--space-3) var(--space-2);
+  }}
   aside button {{
-    display: block; width: 100%; text-align: left; background: none; border: 0;
-    color: inherit; font: inherit; padding: .34rem .5rem; border-radius: 6px;
-    cursor: pointer;
+    display: block; width: 100%; text-align: left; background: none;
+    border: 0; color: var(--text-muted); font: inherit; font-size: var(--text-sm);
+    padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm);
+    cursor: pointer; position: relative;
   }}
-  aside button:hover {{ background: rgba(255,255,255,.07); }}
-  aside button[aria-current="true"] {{ background: var(--accent); color: var(--accent-fg); }}
+  aside button:hover {{ background: var(--surface-hover); color: var(--text-body); }}
+  aside button[aria-current="true"] {{
+    background: var(--signal-900); color: var(--white);
+  }}
+  /* The current view is marked by a rail on its left edge rather than a fill,
+     so the eye finds it without the sidebar turning into a block of colour. */
+  aside button[aria-current="true"]::before {{
+    content: ""; position: absolute; left: 0; top: 15%; bottom: 15%;
+    width: 2px; border-radius: var(--radius-pill); background: var(--brand);
+  }}
 
-  main {{ padding: 1.1rem 1.3rem 3rem; max-width: 78rem; }}
-  .bar {{ display: flex; align-items: center; gap: .75rem; flex-wrap: wrap; margin-bottom: 1rem; }}
-  .bar h2 {{ font-size: 1.15rem; margin: 0; }}
+  main {{ padding: var(--space-6) var(--space-7) var(--space-9); max-width: 82rem; }}
+  .bar {{
+    display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap;
+    margin-bottom: var(--space-5); padding-bottom: var(--space-4);
+    border-bottom: 1px solid var(--border-subtle);
+  }}
+  .bar h2 {{ font-size: var(--text-xl); }}
   .spacer {{ margin-left: auto; }}
-  .pill {{ font-size: .75rem; padding: .1rem .5rem; border-radius: 999px;
-           border: 1px solid var(--line); color: var(--muted); }}
-  .pill.up {{ color: var(--ok); border-color: currentColor; }}
-  .pill.down {{ color: var(--bad); border-color: currentColor; }}
 
-  .card {{ border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
-           padding: .85rem 1rem; margin: 0 0 1rem; }}
-  .card > h3 {{ font-size: .72rem; text-transform: uppercase; letter-spacing: .09em;
-                color: var(--muted); margin: 0 0 .6rem; }}
-  .cards {{ display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); }}
-  .metric {{ font-size: 1.6rem; font-variant-numeric: tabular-nums; }}
-  .metric small {{ font-size: .8rem; color: var(--muted); }}
-  canvas {{ width: 100%; height: 46px; display: block; }}
-
-  pre.out {{ margin: 0; overflow-x: auto; white-space: pre; font-size: 12.5px; line-height: 1.45; }}
-  table {{ border-collapse: collapse; width: 100%; font-size: 13px; }}
-  th, td {{ text-align: left; padding: .35rem .5rem; border-bottom: 1px solid var(--line);
-            vertical-align: top; }}
-  th {{ font-size: .7rem; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); }}
-  td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
-  tr.zero td {{ color: var(--muted); }}
-
-  input, select, button.btn {{
-    font: inherit; padding: .4rem .55rem; border-radius: 7px;
-    border: 1px solid var(--line); background: var(--panel); color: var(--fg);
+  .pill {{
+    font: var(--fw-medium) var(--text-2xs)/1.6 var(--font-mono);
+    text-transform: uppercase; letter-spacing: var(--tracking-caps);
+    padding: 0 var(--space-2); border-radius: var(--radius-pill);
+    border: 1px solid var(--border); color: var(--text-muted);
   }}
-  button.btn {{ cursor: pointer; }}
-  button.primary {{ background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }}
-  button.danger {{ color: var(--bad); }}
-  .row {{ display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; }}
-  .field {{ display: flex; flex-direction: column; gap: .2rem; }}
-  .field label {{ font-size: .7rem; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); }}
-  .grid2 {{ display: grid; gap: .7rem; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); }}
+  .pill.up {{ color: var(--status-up); border-color: color-mix(in oklab, var(--status-up) 45%, transparent); }}
+  .pill.down {{ color: var(--status-down); border-color: color-mix(in oklab, var(--status-down) 45%, transparent); }}
+
+  /* --- surfaces --------------------------------------------------------- */
+  .card {{
+    border: 1px solid var(--border); border-radius: var(--radius-md);
+    background: var(--surface); box-shadow: var(--shadow-sm), var(--edge-top);
+    padding: var(--space-4) var(--space-5); margin: 0 0 var(--space-4);
+  }}
+  .card > h3 {{
+    font: var(--fw-semibold) var(--text-2xs)/1.2 var(--font-mono);
+    text-transform: uppercase; letter-spacing: var(--tracking-caps);
+    color: var(--text-muted); margin: 0 0 var(--space-3);
+  }}
+  .cards {{
+    display: grid; gap: var(--space-4);
+    grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+    margin-bottom: var(--space-4);
+  }}
+  .metric {{
+    font: var(--fw-semibold) var(--text-xl)/var(--leading-tight) var(--font-display);
+    font-variant-numeric: tabular-nums; color: var(--text-strong);
+  }}
+  .metric small {{
+    font: var(--fw-regular) var(--text-xs)/1.2 var(--font-mono);
+    color: var(--text-muted); margin-left: var(--space-2);
+  }}
+  .metric.ok {{ color: var(--status-up); }}
+  .metric.err {{ color: var(--status-down); }}
+  canvas {{ width: 100%; height: 48px; display: block; margin-top: var(--space-2); }}
+
+  pre.out {{
+    margin: 0; overflow-x: auto; white-space: pre;
+    background: var(--surface-sunken); border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm); padding: var(--space-3);
+    color: var(--text-body);
+  }}
+
+  /* --- data ------------------------------------------------------------- */
+  table {{ border-collapse: collapse; width: 100%; font-size: var(--text-sm); }}
+  th, td {{
+    text-align: left; padding: var(--space-2) var(--space-3);
+    border-bottom: 1px solid var(--border-subtle); vertical-align: middle;
+  }}
+  th {{
+    font: var(--fw-semibold) var(--text-2xs)/1.2 var(--font-mono);
+    text-transform: uppercase; letter-spacing: var(--tracking-caps);
+    color: var(--text-faint); border-bottom-color: var(--border-strong);
+    white-space: nowrap;
+  }}
+  tbody tr:hover, tr:hover {{ background: var(--surface-raised); }}
+  td.num {{ text-align: right; font-variant-numeric: tabular-nums; font-family: var(--font-mono); }}
+  tr.zero td {{ color: var(--text-faint); }}
+
+  /* --- controls --------------------------------------------------------- */
+  input, select, textarea, button.btn {{
+    font: inherit; font-size: var(--text-sm); color: var(--text-body);
+    padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm);
+    border: 1px solid var(--border-strong); background: var(--surface-sunken);
+  }}
+  input, select, textarea {{ width: 100%; min-width: 0; }}
+  input:focus, select:focus, textarea:focus {{
+    outline: none; border-color: var(--brand); box-shadow: var(--glow-focus);
+  }}
+  button.btn {{
+    cursor: pointer; background: var(--surface-raised); width: auto;
+    white-space: nowrap;
+  }}
+  button.btn:hover {{ background: var(--surface-hover); color: var(--text-strong); }}
+  button.primary {{
+    background: var(--brand); border-color: var(--brand); color: var(--ink-950);
+    font-weight: var(--fw-medium);
+  }}
+  button.primary:hover {{ background: var(--brand-hover); color: var(--ink-950); }}
+  button.danger {{ color: var(--status-down); }}
+  button.danger:hover {{ color: var(--status-down); border-color: var(--status-down); }}
+
+  .row {{ display: flex; gap: var(--space-2); flex-wrap: wrap; align-items: center; }}
+  .field {{ display: flex; flex-direction: column; gap: var(--space-1); }}
+  .field label {{
+    font: var(--fw-medium) var(--text-2xs)/1.2 var(--font-mono);
+    text-transform: uppercase; letter-spacing: var(--tracking-caps);
+    color: var(--text-muted);
+  }}
+  .grid2 {{ display: grid; gap: var(--space-3); grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); }}
   .hidden {{ display: none; }}
-  .err {{ color: var(--bad); white-space: pre-wrap; }}
-  .ok {{ color: var(--ok); }}
-  dialog {{ border: 1px solid var(--line); border-radius: 12px; background: var(--panel);
-            color: var(--fg); padding: 1rem 1.1rem; max-width: 46rem; width: calc(100% - 2rem); }}
-  dialog::backdrop {{ background: rgba(0,0,0,.45); }}
-  .script {{ background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
-             padding: .6rem .7rem; font-size: 12.5px; white-space: pre-wrap; }}
+  .err {{ color: var(--status-down); white-space: pre-wrap; }}
+  .ok {{ color: var(--status-up); }}
+
+  dialog {{
+    border: 1px solid var(--border-strong); border-radius: var(--radius-lg);
+    background: var(--surface); color: var(--text-body);
+    box-shadow: var(--shadow-lg); padding: var(--space-5) var(--space-6);
+    max-width: 48rem; width: calc(100% - var(--space-7));
+  }}
+  dialog::backdrop {{ background: rgba(7,10,16,.7); }}
+  .script {{
+    background: var(--surface-sunken); border: 1px solid var(--border);
+    border-left: 2px solid var(--product); border-radius: var(--radius-sm);
+    padding: var(--space-3); font: var(--fw-regular) var(--text-sm)/var(--leading-code) var(--font-mono);
+    white-space: pre-wrap; color: var(--text-body);
+  }}
+
+  /* The sign-in card is the whole page before there is a session, so it gets
+     the product mark and sits on the void rather than in the shell. */
+  #login {{ max-width: 27rem; margin: 14vh auto; box-shadow: var(--shadow-md), var(--edge-top); }}
+
+  /* --- brand & rail ------------------------------------------------------ */
+  .brand {{ display: flex; align-items: center; gap: var(--space-3); }}
+  .brand .mark {{
+    display: grid; place-items: center; width: 34px; height: 34px; flex: none;
+    border-radius: 12px; color: var(--ink-950);
+    background: linear-gradient(150deg, var(--sentinel-500), var(--signal-500));
+  }}
+  .brand .mark svg {{ width: 18px; height: 18px; }}
+  .wordmark {{ display: flex; flex-direction: column; gap: 1px; min-width: 0; }}
+  .wordmark .name {{
+    font: var(--fw-semibold) var(--text-base)/1.1 var(--font-display);
+    letter-spacing: -.03em; color: var(--text-strong);
+  }}
+  .wordmark .sub {{
+    font: var(--fw-regular) var(--text-2xs)/1.2 var(--font-mono);
+    color: var(--text-faint);
+  }}
+
+  .search {{
+    display: flex; align-items: center; gap: var(--space-2);
+    padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm);
+    background: var(--surface-sunken); border: 1px solid var(--border-subtle);
+  }}
+  .search svg {{ width: 14px; height: 14px; flex: none; color: var(--text-faint); }}
+  .search input {{
+    flex: 1; min-width: 0; background: transparent; border: 0; padding: 0;
+    color: var(--text-body); font-size: var(--text-sm);
+  }}
+  .search input:focus {{ outline: none; box-shadow: none; }}
+
+  nav {{ display: flex; flex-direction: column; gap: var(--space-4); }}
+  nav .group {{ display: flex; flex-direction: column; gap: 3px; }}
+  aside button.navitem {{
+    display: flex; align-items: center; gap: var(--space-2);
+  }}
+  aside button.navitem svg {{ width: 15px; height: 15px; flex: none; }}
+  aside button.navitem .meta {{
+    margin-left: auto; font: var(--fw-medium) var(--text-2xs)/1.4 var(--font-mono);
+    color: var(--text-faint);
+  }}
+
+  .cluster {{
+    margin-top: auto; display: flex; flex-direction: column; gap: var(--space-3);
+    padding: var(--space-4); background: var(--surface-sunken);
+    border: 1px solid var(--border-subtle); border-radius: 16px;
+  }}
+  .cluster .clabel {{
+    font: var(--fw-semibold) var(--text-xs)/1.2 var(--font-sans); color: var(--text-muted);
+  }}
+  .cluster button {{
+    display: flex; align-items: center; gap: var(--space-2); font-size: var(--text-sm);
+  }}
+  .cluster .role {{
+    margin-left: auto; font: var(--fw-regular) var(--text-2xs)/1.4 var(--font-mono);
+    color: var(--text-muted);
+  }}
+  .cluster .crev {{
+    font-family: var(--font-mono); font-size: var(--text-2xs); color: var(--text-faint);
+  }}
+  .dot {{
+    width: 8px; height: 8px; flex: none; border-radius: var(--radius-pill);
+    background: var(--text-faint);
+  }}
+  .dot.up {{ background: var(--status-up); box-shadow: 0 0 8px -1px var(--status-up); }}
+  .dot.down {{ background: var(--status-down); }}
+
+  /* --- header ------------------------------------------------------------ */
+  .crumbs {{ display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1 1 220px; }}
+  .crumbs .slug {{
+    font-family: var(--font-mono); font-size: var(--text-2xs); color: var(--text-faint);
+  }}
+
+  /* --- staged changes ---------------------------------------------------- */
+  .staged {{
+    display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-4);
+    border-radius: 16px; border-color: color-mix(in oklab, var(--product) 40%, var(--border));
+  }}
+  .staged .tile {{
+    display: grid; place-items: center; width: 34px; height: 34px; flex: none;
+    border-radius: 11px; background: var(--product-subtle); color: var(--product);
+  }}
+  .staged .tile svg {{ width: 17px; height: 17px; }}
+  .stagedtext {{ display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 220px; }}
+  .stagedtext .t {{ font: var(--fw-semibold) var(--text-base) var(--font-sans); color: var(--text-strong); }}
+  .stagedtext .b {{ font-size: var(--text-sm); color: var(--text-muted); }}
 </style>
 </head>
 <body>
 
-<section id="login" class="card" style="max-width:26rem;margin:14vh auto">
-  <h3>Sentinel — sign in</h3>
-  <p style="margin:.2rem 0 .8rem;color:var(--muted)">
+<section id="login" class="card">
+  <div class="brand" style="margin-bottom:var(--space-5)">
+    <span class="mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg></span>
+    <span class="wordmark">
+      <span class="name">Velstra Sentinel</span>
+      <span class="sub">Appliance console</span>
+    </span>
+  </div>
+  <p style="margin:0 0 var(--space-4);color:var(--text-muted);font-size:var(--text-sm)">
     The management token — the same bearer token the API takes. Kept for this tab
     only and never written to disk.
   </p>
@@ -245,27 +521,54 @@ pub fn page() -> String {
 
 <div class="app hidden" id="app">
   <aside>
-    <h1>Sentinel</h1>
-    <button data-view="dashboard">Dashboard</button>
-    <button data-view="rules">Firewall rules</button>
-    <button data-view="zones">Zones</button>
-    <button data-view="nat">NAT</button>
-    <button data-view="config">Configuration</button>
-    <button data-view="stack">Stack</button>
-    <div id="nav"></div>
-    <div style="margin-top:auto;padding:.6rem .5rem 0">
-      <button class="btn" id="theme" style="width:100%">Theme</button>
-      <button class="btn" id="signout" style="width:100%;margin-top:.4rem">Sign out</button>
+    <div class="brand">
+      <span class="mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg></span>
+      <span class="wordmark">
+        <span class="name">Velstra Sentinel</span>
+        <span class="sub" id="navhost">appliance console</span>
+      </span>
     </div>
+
+    <label class="search">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <input id="navsearch" placeholder="Search sections">
+    </label>
+
+    <nav id="nav"></nav>
+
+    <div class="cluster">
+      <span class="clabel">Cluster</span>
+      <div id="clusterlist"></div>
+      <span class="crev" id="clusterrev">rev —</span>
+    </div>
+
+    <button class="btn" id="signout" style="width:100%">Sign out</button>
   </aside>
 
   <main>
-    <div class="bar">
-      <h2 id="title">Dashboard</h2>
-      <span class="pill" id="host"></span>
+    <header class="bar">
+      <div class="crumbs">
+        <span class="slug" id="crumb">appliance</span>
+        <h2 id="title">Dashboard</h2>
+      </div>
       <span class="spacer"></span>
-      <span class="pill" id="target">this appliance</span>
-      <button class="btn" id="refresh">Refresh</button>
+      <span class="pill" id="stagedbadge">no staged changes</span>
+      <button class="btn" id="discard">Discard</button>
+      <button class="btn primary" id="applystaged">Apply</button>
+    </header>
+
+    <div class="card staged hidden" id="stagedcard">
+      <span class="tile"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 2 9 5-9 5-9-5 9-5z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/></svg></span>
+      <span class="stagedtext">
+        <span class="t" id="stagedtitle">Staged changes</span>
+        <span class="b">Nothing is applied until you say so. These are the exact
+          commands that will run.</span>
+      </span>
+      <span class="row" style="flex:none">
+        <button class="btn" id="validate">Validate</button>
+        <button class="btn primary" id="applystaged2">Apply and save</button>
+      </span>
+      <div class="script" id="stagedlist" style="flex:1 1 100%"></div>
     </div>
 
     <div id="view-dashboard">
@@ -338,6 +641,73 @@ pub fn page() -> String {
       </div>
     </div>
 
+    <div id="view-bgp" class="hidden">
+      <div class="card">
+        <h3>Router</h3>
+        <div class="grid2" id="bgpglobal"></div>
+        <div class="row" style="margin-top:.8rem">
+          <button class="btn primary" id="savebgp">Apply and save</button>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Neighbours</h3>
+        <div class="row" style="margin-bottom:.7rem">
+          <button class="btn primary" id="addneighbor">Add neighbour</button>
+        </div>
+        <div style="overflow-x:auto"><table id="bgptable"></table></div>
+      </div>
+      <div class="card"><h3>Session state</h3><pre class="out" id="bgpshow">…</pre></div>
+    </div>
+
+    <div id="view-ipsec" class="hidden">
+      <div class="card">
+        <h3>Site-to-site tunnels</h3>
+        <div class="row" style="margin-bottom:.7rem">
+          <button class="btn primary" id="addipsec">Add tunnel</button>
+        </div>
+        <div style="overflow-x:auto"><table id="ipsectable"></table></div>
+      </div>
+      <div class="card"><h3>Security associations</h3><pre class="out" id="ipsecshow">…</pre></div>
+    </div>
+
+    <div id="view-wireguard" class="hidden">
+      <div class="card">
+        <h3>Interfaces</h3>
+        <div class="row" style="margin-bottom:.7rem">
+          <button class="btn primary" id="addwg">Add interface</button>
+        </div>
+        <div style="overflow-x:auto"><table id="wgtable"></table></div>
+        <p style="color:var(--muted);font-size:.82rem;margin:.7rem 0 0">
+          A private key is generated on the appliance and never leaves it — the
+          key field writes <code>private-key generate</code>, not a key you typed
+          into a browser.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Peers</h3>
+        <div class="row" style="margin-bottom:.7rem">
+          <button class="btn primary" id="addwgpeer">Add peer</button>
+        </div>
+        <div style="overflow-x:auto"><table id="wgpeers"></table></div>
+      </div>
+    </div>
+
+    <div id="view-dhcp" class="hidden">
+      <div class="card">
+        <h3>Servers</h3>
+        <p style="color:var(--muted);font-size:.82rem;margin:0 0 .7rem">
+          A DHCP server hands out leases from its interface's own static subnet,
+          so the interface needs a static address first. Every interface that has
+          one is listed here.
+        </p>
+        <div class="row" style="margin-bottom:.7rem">
+          <button class="btn primary" id="adddhcp">Enable on an interface</button>
+        </div>
+        <div style="overflow-x:auto"><table id="dhcptable"></table></div>
+      </div>
+      <div class="card"><h3>Leases</h3><pre class="out" id="dhcpshow">…</pre></div>
+    </div>
+
     <div id="view-config" class="hidden">
       <div class="card">
         <h3>Run configuration commands</h3>
@@ -352,9 +722,7 @@ pub fn page() -> String {
                          background:var(--panel);color:var(--fg)"
                   placeholder="set interface eth0 zone wan&#10;set firewall zone wan default-action drop"></textarea>
         <div class="row" style="margin-top:.6rem">
-          <button class="btn primary" id="runsave">Apply and save</button>
-          <button class="btn" id="runonly">Apply without saving</button>
-          <button class="btn" id="runcheck">Validate only</button>
+          <button class="btn primary" id="runsave">Stage</button>
         </div>
       </div>
       <div class="card">
@@ -419,8 +787,7 @@ pub fn page() -> String {
   <div class="script" id="preview"></div>
   <p id="editorerr" class="err"></p>
   <div class="row" style="margin-top:.9rem">
-    <button class="btn primary" id="applysave">Apply and save</button>
-    <button class="btn" id="applyonly">Apply without saving</button>
+    <button class="btn primary" id="applysave">Stage</button>
     <button class="btn" id="cancel">Cancel</button>
   </div>
 </dialog>
@@ -440,7 +807,6 @@ const GRAPHS = [
 
 const $ = (id) => document.getElementById(id);
 const KEY = "sentinel-token";
-const THEME = "sentinel-theme";
 let token = sessionStorage.getItem(KEY) || "";
 let view = "dashboard";
 let panel = null;
@@ -636,7 +1002,7 @@ async function refreshRules() {{
     const edit = el("button", {{ class: "btn", text: "Edit", onclick: () => openEditor(r) }});
     const del = el("button", {{
       class: "btn danger", text: "Delete",
-      onclick: () => run(["delete firewall rule " + r.name], true),
+      onclick: () => stage(["delete firewall rule " + r.name], true),
     }});
     t.append(el("tr", {{}}, [
       el("td", {{ text: r.name }}),
@@ -683,18 +1049,42 @@ function openEditor(rule) {{
   $("editor").showModal();
 }}
 
-async function run(lines, confirmFirst) {{
-  if (!lines.length) return;
-  if (confirmFirst && !window.confirm(lines.join("\n") + "\n\ncommit\nsave")) return;
-  const r = await configure(lines.concat(["commit", "save"]));
-  showResult(r);
-  await refresh();
+// Editing stages, it does not apply. The appliance's own model is a candidate
+// configuration you commit or discard, and a console whose every button was a
+// commit would be a different product from the CLI beside it. So a form's
+// Apply appends its commands here, the header says how many are waiting, and
+// nothing reaches the box until Apply — or Discard throws them away, which is
+// what makes clicking safe enough not to need a confirmation on every delete.
+let staged = [];
+
+function stage(lines) {{
+  staged.push(...lines.filter(Boolean));
+  renderStaged();
 }}
 
-async function runScript(tail) {{
-  const lines = $("cmd").value.split("\n").map((l) => l.trim()).filter(Boolean);
-  if (!lines.length) return;
-  showResult(await configure(lines.concat(tail)));
+function renderStaged() {{
+  const n = staged.length;
+  $("stagedbadge").textContent = n ? n + " staged change" + (n === 1 ? "" : "s")
+                                   : "no staged changes";
+  $("stagedbadge").className = "pill" + (n ? " up" : "");
+  $("stagedcard").classList.toggle("hidden", n === 0);
+  $("stagedlist").textContent = staged.join("\n");
+  $("stagedtitle").textContent = n + " command" + (n === 1 ? "" : "s") + " staged";
+}}
+
+// `tail` is what turns a script into an intention: nothing commits, `commit`
+// applies for this boot, `commit save` also persists.
+async function applyStaged(tail) {{
+  if (!staged.length) return;
+  const r = await configure(staged.concat(tail));
+  showResult(r);
+  // Only clear once they have actually run. A refused commit leaves the
+  // commands staged, so the operator can fix one and try again rather than
+  // reconstructing what they had clicked.
+  if (r.ok && !/^error/m.test(r.output || "")) {{
+    staged = [];
+    renderStaged();
+  }}
   await refresh();
 }}
 
@@ -749,11 +1139,11 @@ async function refreshConfig() {{
     const input = el("input", {{ value: leaf.value, style: "width:100%" }});
     const save = el("button", {{
       class: "btn", text: "Set",
-      onclick: () => run(["set " + path + " " + input.value.trim()]),
+      onclick: () => stage(["set " + path + " " + input.value.trim()]),
     }});
     const del = el("button", {{
       class: "btn danger", text: "Delete",
-      onclick: () => run(["delete " + path], true),
+      onclick: () => stage(["delete " + path], true),
     }});
     t.append(el("tr", {{}}, [
       el("td", {{ text: path }}),
@@ -778,7 +1168,7 @@ async function refreshConfig() {{
         el("td", {{ text: line }}),
         el("td", {{}}, [n === undefined ? el("span", {{}}) : el("button", {{
           class: "btn", text: "Roll back",
-          onclick: () => run(["rollback " + n], true),
+          onclick: () => stage(["rollback " + n], true),
         }})]),
       ]));
     }}
@@ -831,7 +1221,7 @@ async function refreshZones() {{
       lines.push(v ? `set firewall global ${{k}} ${{v}}` : `delete firewall global ${{k}}`);
     }}
     if (!lines.length) return;
-    run(lines);
+    stage(lines);
   }};
 
   // Per-zone overrides. The zone list comes from the interfaces that name one,
@@ -871,7 +1261,7 @@ async function refreshZones() {{
             lines.push(v ? `set firewall zone ${{name}} ${{k}} ${{v}}`
                          : `delete firewall zone ${{name}} ${{k}}`);
           }}
-          if (lines.length) run(lines);
+          if (lines.length) stage(lines);
         }},
       }}),
     ])]));
@@ -925,12 +1315,12 @@ async function refreshNat() {{
             const v = inputs[i].value.trim();
             if (v) lines.push(`set nat ${{kind}} ${{r.name}} ${{f[0]}} ${{v}}`);
           }});
-          if (lines.length) run(lines);
+          if (lines.length) stage(lines);
         }},
       }});
       const del = el("button", {{
         class: "btn danger", text: "Delete",
-        onclick: () => run([`delete nat ${{kind}} ${{r.name}}`], true),
+        onclick: () => stage([`delete nat ${{kind}} ${{r.name}}`], true),
       }});
       t.append(el("tr", {{}}, [el("td", {{ text: r.name }})]
         .concat(inputs.map((i) => el("td", {{}}, [i])))
@@ -958,13 +1348,301 @@ function addNat(tableId, kind, fields) {{
         const v = inputs[i].value.trim();
         if (v) lines.push(`set nat ${{kind}} ${{n}} ${{f[0]}} ${{v}}`);
       }});
-      if (lines.length) run(lines);
+      if (lines.length) stage(lines);
     }},
   }});
   t.append(el("tr", {{}}, [el("td", {{}}, [name])]
     .concat(inputs.map((i) => el("td", {{}}, [i])))
     .concat([el("td", {{}}, [apply])])));
   name.focus();
+}}
+
+
+// ---- a generic section editor -------------------------------------------
+
+// Every one of the views below is the same shape: a set of named entries under
+// a config path, each with a handful of fields. Writing that once means the
+// forms cannot disagree with each other about how a setting is written — they
+// all emit `set <prefix> <name> <field> <value>` and `delete <prefix> <name>`.
+function entriesUnder(leaves, prefix) {{
+  const depth = prefix.length;
+  const out = new Map();
+  for (const l of leaves) {{
+    if (l.path.length < depth + 2) continue;
+    if (prefix.some((p, i) => l.path[i] !== p)) continue;
+    const name = l.path[depth];
+    if (!out.has(name)) out.set(name, {{ name }});
+    out.get(name)[l.path.slice(depth + 1).join(" ")] = l.value;
+  }}
+  return [...out.values()];
+}}
+
+// `fields` is [key, label, options?]. An `options` list renders a select, so a
+// field with a fixed vocabulary cannot be mistyped into a refusal.
+function editorTable(tableId, prefix, fields, rows, opts) {{
+  const t = $(tableId);
+  const path = prefix.join(" ");
+  t.textContent = "";
+  t.append(el("tr", {{}}, [(opts && opts.nameLabel) || "name"]
+    .concat(fields.map((f) => f[1])).concat([""])
+    .map((h) => el("th", {{ text: h }}))));
+  if (!rows.length) {{
+    t.append(el("tr", {{}}, [el("td", {{
+      colspan: String(fields.length + 2),
+      text: (opts && opts.empty) || "none configured",
+    }})]));
+  }}
+  for (const r of rows) {{
+    const inputs = fields.map((f) =>
+      f[2] ? selectFor([f[0], f[2]], r[f[0]], null) : el("input", {{ value: r[f[0]] || "" }}));
+    const apply = el("button", {{
+      class: "btn", text: "Apply",
+      onclick: () => {{
+        const lines = [];
+        fields.forEach((f, i) => {{
+          const v = (inputs[i].value || "").trim();
+          if (v) lines.push(`set ${{path}} ${{r.name}} ${{f[0]}} ${{v}}`);
+          else if (r[f[0]]) lines.push(`delete ${{path}} ${{r.name}} ${{f[0]}}`);
+        }});
+        if (lines.length) stage(lines);
+      }},
+    }});
+    const del = el("button", {{
+      class: "btn danger", text: "Delete",
+      onclick: () => stage([`delete ${{path}} ${{r.name}}`], true),
+    }});
+    t.append(el("tr", {{}}, [el("td", {{ text: r.name }})]
+      .concat(inputs.map((i) => el("td", {{}}, [i])))
+      .concat([el("td", {{}}, [el("div", {{ class: "row" }}, [apply, del])])])));
+  }}
+}}
+
+// Adding is a blank row committed in one go, never one `set` at a time: an
+// entry usually needs several fields before it is valid, and asking the
+// appliance to commit half of one earns a refusal the operator did not deserve.
+function addRow(tableId, prefix, fields, nameHint) {{
+  const t = $(tableId);
+  const path = prefix.join(" ");
+  const name = el("input", {{ placeholder: nameHint || "name" }});
+  const inputs = fields.map((f) =>
+    f[2] ? selectFor([f[0], f[2]], "", null) : el("input", {{ placeholder: f[1].toLowerCase() }}));
+  const create = el("button", {{
+    class: "btn primary", text: "Create",
+    onclick: () => {{
+      const n = name.value.trim();
+      if (!n) {{ name.focus(); return; }}
+      const lines = [];
+      fields.forEach((f, i) => {{
+        const v = (inputs[i].value || "").trim();
+        if (v) lines.push(`set ${{path}} ${{n}} ${{f[0]}} ${{v}}`);
+      }});
+      if (!lines.length) lines.push(`set ${{path}} ${{n}}`);
+      stage(lines);
+    }},
+  }});
+  t.append(el("tr", {{}}, [el("td", {{}}, [name])]
+    .concat(inputs.map((i) => el("td", {{}}, [i])))
+    .concat([el("td", {{}}, [create])])));
+  name.focus();
+}}
+
+async function leaves() {{
+  try {{ return parseConfig(await text("/api/v1/show/configuration")); }}
+  catch (e) {{ return []; }}
+}}
+
+// ---- BGP -----------------------------------------------------------------
+
+const BGP_GLOBAL = [
+  ["local-as", ["" ]], ["router-id", [""]], ["hold-time", [""]],
+  ["cluster-id", [""]], ["multipath", ["", "true", "false"]],
+  ["ebgp-require-policy", ["", "true", "false"]],
+];
+const BGP_NEIGHBOR = [
+  ["remote-as", "Remote AS"],
+  ["description", "Description"],
+  ["password", "Password"],
+  ["passive", "Passive", ["", "true", "false"]],
+  ["route-reflector-client", "RR client", ["", "true", "false"]],
+  ["bfd", "BFD", ["", "true", "false"]],
+  ["evpn", "EVPN", ["", "true", "false"]],
+  ["max-prefix", "Max prefix"],
+];
+
+async function refreshBgp() {{
+  $("bgpshow").textContent = "…";
+  try {{ $("bgpshow").textContent = (await text("/api/v1/show/ip/bgp/summary")).trimEnd(); }}
+  catch (e) {{ $("bgpshow").textContent = String(e.message || e); }}
+
+  const ls = await leaves();
+  const globals = {{}};
+  for (const l of ls) {{
+    if (l.node === "protocols bgp") globals[l.path[l.path.length - 1]] = l.value;
+  }}
+  const g = $("bgpglobal");
+  g.textContent = "";
+  const pending = new Map();
+  for (const f of BGP_GLOBAL) {{
+    const widget = f[1].length > 1
+      ? selectFor(f, globals[f[0]], (e) => pending.set(f[0], e.target.value))
+      : el("input", {{ value: globals[f[0]] || "", oninput: (e) => pending.set(f[0], e.target.value) }});
+    g.append(el("div", {{ class: "field" }}, [el("label", {{ text: f[0] }}), widget]));
+  }}
+  $("savebgp").onclick = () => {{
+    const lines = [];
+    for (const [k, v] of pending) {{
+      lines.push(v.trim() ? `set protocols bgp ${{k}} ${{v.trim()}}`
+                          : `delete protocols bgp ${{k}}`);
+    }}
+    if (lines.length) stage(lines);
+  }};
+
+  editorTable("bgptable", ["protocols", "bgp", "neighbor"], BGP_NEIGHBOR,
+    entriesUnder(ls, ["protocols", "bgp", "neighbor"]),
+    {{ nameLabel: "neighbour", empty: "no neighbours configured" }});
+}}
+
+// ---- IPsec ---------------------------------------------------------------
+
+const IPSEC = [
+  ["local", "Local address"],
+  ["remote", "Remote address"],
+  ["local-subnet", "Local subnet"],
+  ["remote-subnet", "Remote subnet"],
+  ["psk", "Pre-shared key"],
+  ["ike-version", "IKE", ["", "1", "2"]],
+  ["start-action", "Start", ["", "start", "trap", "none"]],
+];
+
+async function refreshIpsec() {{
+  $("ipsecshow").textContent = "…";
+  try {{ $("ipsecshow").textContent = (await text("/api/v1/show/vpn/ipsec")).trimEnd(); }}
+  catch (e) {{ $("ipsecshow").textContent = String(e.message || e); }}
+  editorTable("ipsectable", ["vpn", "ipsec"], IPSEC,
+    entriesUnder(await leaves(), ["vpn", "ipsec"]),
+    {{ nameLabel: "tunnel", empty: "no tunnels configured" }});
+}}
+
+// ---- WireGuard -----------------------------------------------------------
+
+const WG = [["listen-port", "Listen port"], ["private-key", "Private key"]];
+const WG_PEER = [
+  ["allowed-ips", "Allowed IPs"],
+  ["endpoint", "Endpoint"],
+  ["keepalive", "Keepalive"],
+  ["preshared-key", "Pre-shared key"],
+];
+
+async function refreshWireguard() {{
+  const ls = await leaves();
+  const tunnels = entriesUnder(ls, ["vpn", "wireguard"])
+    .map((t) => ({{ name: t.name, "listen-port": t["listen-port"], "private-key": t["private-key"] }}));
+  editorTable("wgtable", ["vpn", "wireguard"], WG, tunnels,
+    {{ nameLabel: "interface", empty: "no interfaces configured" }});
+
+  // Peers live one level deeper, so they get their own table keyed by the
+  // tunnel they belong to — a peer is only meaningful with its interface.
+  const t = $("wgpeers");
+  t.textContent = "";
+  t.append(el("tr", {{}}, ["interface", "public key"].concat(WG_PEER.map((f) => f[1])).concat([""])
+    .map((h) => el("th", {{ text: h }}))));
+  let any = false;
+  for (const tunnel of tunnels) {{
+    const peers = entriesUnder(ls, ["vpn", "wireguard", tunnel.name, "peer"]);
+    for (const p of peers) {{
+      any = true;
+      const inputs = WG_PEER.map((f) => el("input", {{ value: p[f[0]] || "" }}));
+      const apply = el("button", {{
+        class: "btn", text: "Apply",
+        onclick: () => {{
+          const lines = [];
+          WG_PEER.forEach((f, i) => {{
+            const v = inputs[i].value.trim();
+            if (v) lines.push(`set vpn wireguard ${{tunnel.name}} peer ${{p.name}} ${{f[0]}} ${{v}}`);
+          }});
+          if (lines.length) stage(lines);
+        }},
+      }});
+      const del = el("button", {{
+        class: "btn danger", text: "Delete",
+        onclick: () => stage([`delete vpn wireguard ${{tunnel.name}} peer ${{p.name}}`], true),
+      }});
+      t.append(el("tr", {{}}, [
+        el("td", {{ text: tunnel.name }}),
+        el("td", {{ text: p.name }}),
+      ].concat(inputs.map((i) => el("td", {{}}, [i])))
+       .concat([el("td", {{}}, [el("div", {{ class: "row" }}, [apply, del])])])));
+    }}
+  }}
+  if (!any) {{
+    t.append(el("tr", {{}}, [el("td", {{ colspan: "7", text: "no peers configured" }})]));
+  }}
+  $("addwgpeer").onclick = () => {{
+    if (!tunnels.length) {{ window.alert("Add a WireGuard interface first."); return; }}
+    const iface = window.prompt("Which interface?", tunnels[0].name);
+    if (!iface) return;
+    addRow("wgpeers", ["vpn", "wireguard", iface, "peer"], WG_PEER, "peer public key");
+  }};
+}}
+
+// ---- DHCP ----------------------------------------------------------------
+
+const DHCP = [
+  ["pool-offset", "Pool offset"],
+  ["pool-size", "Pool size"],
+  ["default-router", "Default router"],
+  ["dns", "DNS"],
+  ["domain", "Domain"],
+  ["lease-time", "Lease time"],
+];
+
+async function refreshDhcp() {{
+  $("dhcpshow").textContent = "…";
+  try {{ $("dhcpshow").textContent = (await text("/api/v1/show/dhcp/leases")).trimEnd(); }}
+  catch (e) {{ $("dhcpshow").textContent = String(e.message || e); }}
+
+  const ls = await leaves();
+  // A DHCP server is a block on an interface, not an entry of its own, so the
+  // rows are interfaces and the path carries the interface's name.
+  const servers = new Map();
+  for (const l of ls) {{
+    if (l.path[0] === "interface" && l.path[2] === "dhcp-server" && l.path.length >= 4) {{
+      const iface = l.path[1];
+      if (!servers.has(iface)) servers.set(iface, {{ name: iface }});
+      servers.get(iface)[l.path[3]] = l.value;
+    }}
+  }}
+  const t = $("dhcptable");
+  t.textContent = "";
+  t.append(el("tr", {{}}, ["interface"].concat(DHCP.map((f) => f[1])).concat([""])
+    .map((h) => el("th", {{ text: h }}))));
+  if (!servers.size) {{
+    t.append(el("tr", {{}}, [el("td", {{
+      colspan: String(DHCP.length + 2), text: "no DHCP server enabled",
+    }})]));
+  }}
+  for (const srv of servers.values()) {{
+    const inputs = DHCP.map((f) => el("input", {{ value: srv[f[0]] || "" }}));
+    const apply = el("button", {{
+      class: "btn", text: "Apply",
+      onclick: () => {{
+        const lines = [];
+        DHCP.forEach((f, i) => {{
+          const v = inputs[i].value.trim();
+          if (v) lines.push(`set interface ${{srv.name}} dhcp-server ${{f[0]}} ${{v}}`);
+          else if (srv[f[0]]) lines.push(`delete interface ${{srv.name}} dhcp-server ${{f[0]}}`);
+        }});
+        if (lines.length) stage(lines);
+      }},
+    }});
+    const del = el("button", {{
+      class: "btn danger", text: "Disable",
+      onclick: () => stage([`delete interface ${{srv.name}} dhcp-server`], true),
+    }});
+    t.append(el("tr", {{}}, [el("td", {{ text: srv.name }})]
+      .concat(inputs.map((i) => el("td", {{}}, [i])))
+      .concat([el("td", {{}}, [el("div", {{ class: "row" }}, [apply, del])])])));
+  }}
 }}
 
 // ---- stack ---------------------------------------------------------------
@@ -1004,38 +1682,144 @@ async function refreshStack() {{
 
 // ---- views ---------------------------------------------------------------
 
+// A minimal inline icon set. The design calls for lucide, which is fetched from
+// a CDN — impossible here for the same reason as the fonts — so these are drawn
+// in the same 24-unit stroke language rather than left out.
+const ICONS = {{
+  gauge: '<circle cx="12" cy="12" r="9"/><path d="M12 12 15.5 8.5"/>',
+  shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>',
+  zones: '<rect x="3" y="4" width="8" height="7" rx="1"/><rect x="13" y="13" width="8" height="7" rx="1"/><path d="M11 7.5h2M11 16.5h2"/>',
+  swap: '<path d="M4 8h13l-3-3M20 16H7l3 3"/>',
+  route: '<circle cx="6" cy="6" r="2"/><circle cx="18" cy="18" r="2"/><path d="M8 6h6a4 4 0 0 1 0 8H8a4 4 0 0 0 0 8"/>',
+  lock: '<rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>',
+  key: '<circle cx="8" cy="12" r="4"/><path d="M12 12h9M18 12v4"/>',
+  address: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18"/>',
+  file: '<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/>',
+  layers: '<path d="m12 2 9 5-9 5-9-5 9-5z"/><path d="m3 12 9 5 9-5"/>',
+  chart: '<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>',
+  bug: '<rect x="8" y="8" width="8" height="10" rx="4"/><path d="M8 12H4M20 12h-4M9 8 7 5M15 8l2-3M9 18l-2 3M15 18l2 3"/>',
+}};
+
+// Built by parsing markup rather than `createElementNS`: the HTML parser puts
+// `<svg>` in the right namespace by itself, and naming that namespace would put
+// an absolute URL in a page whose whole point is that it fetches nothing — a
+// self-containment check cannot tell a namespace from a request, and it should
+// not have to.
+function icon(name) {{
+  const box = document.createElement("span");
+  box.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+    (ICONS[name] || ICONS.file) + "</svg>";
+  return box.firstChild;
+}}
+
+// The editable views, in the order an operator meets them.
+const SECTIONS = [
+  {{ g: "Overview", items: [
+    {{ v: "dashboard", t: "Dashboard", i: "gauge" }},
+  ]}},
+  {{ g: "Policy", items: [
+    {{ v: "rules", t: "Firewall rules", i: "shield" }},
+    {{ v: "zones", t: "Zones", i: "zones" }},
+    {{ v: "nat", t: "NAT", i: "swap" }},
+  ]}},
+  {{ g: "Network", items: [
+    {{ v: "bgp", t: "BGP", i: "route" }},
+    {{ v: "ipsec", t: "IPsec", i: "lock" }},
+    {{ v: "wireguard", t: "WireGuard", i: "key" }},
+    {{ v: "dhcp", t: "DHCP", i: "address" }},
+  ]}},
+  {{ g: "System", items: [
+    {{ v: "config", t: "Configuration", i: "file" }},
+    {{ v: "stack", t: "Stack", i: "layers" }},
+  ]}},
+];
+
+const meta = {{}};   // section → the count shown beside it, once known
+
+function navButton(label, iconName, onclick, key) {{
+  const b = el("button", {{ class: "navitem", onclick }});
+  b.dataset.key = key;
+  b.append(icon(iconName), el("span", {{ text: label }}));
+  if (meta[key] !== undefined) b.append(el("span", {{ class: "meta", text: String(meta[key]) }}));
+  return b;
+}}
+
 function buildNav() {{
   const nav = $("nav");
+  const filter = $("navsearch").value.trim().toLowerCase();
   nav.textContent = "";
-  for (const group of NAV) {{
-    nav.append(el("div", {{ class: "grp", text: group.g }}));
-    for (const item of group.items) {{
-      nav.append(el("button", {{
-        text: item.t,
-        "data-view": "panel",
-        "data-path": item.p,
-        onclick: () => {{ view = "panel"; panel = item; refresh(); }},
-      }}));
+  for (const group of SECTIONS) {{
+    const items = group.items.filter((i) => !filter || i.t.toLowerCase().includes(filter));
+    if (!items.length) continue;
+    const box = el("div", {{ class: "group" }}, [el("span", {{ class: "grp", text: group.g }})]);
+    for (const item of items) {{
+      box.append(navButton(item.t, item.i, () => {{ view = item.v; panel = null; refresh(); }}, item.v));
     }}
+    nav.append(box);
   }}
-  for (const b of document.querySelectorAll("aside button[data-view]")) {{
-    if (b.dataset.path) continue;
-    b.onclick = () => {{ view = b.dataset.view; panel = null; refresh(); }};
+  // The read-only views keep their own group; they are what you open to look,
+  // not to change, and mixing them into the sections above would hide that.
+  for (const group of NAV) {{
+    const items = group.items.filter((i) => !filter || i.t.toLowerCase().includes(filter));
+    if (!items.length) continue;
+    const box = el("div", {{ class: "group" }}, [el("span", {{ class: "grp", text: group.g }})]);
+    for (const item of items) {{
+      const b = navButton(item.t, group.g === "Diagnostics" ? "bug" : "chart",
+        () => {{ view = "panel"; panel = item; refresh(); }}, item.p);
+      b.dataset.path = item.p;
+      box.append(b);
+    }}
+    nav.append(box);
   }}
 }}
 
+// The rail's cluster card: the same members the Stack view lists, kept where an
+// operator can see at a glance which box they are actually driving.
+async function refreshCluster() {{
+  const list = $("clusterlist");
+  list.textContent = "";
+  let data;
+  try {{ data = await (await api("/api/v1/stack")).json(); }} catch (e) {{ return; }}
+  for (const m of data.members) {{
+    const isSelf = m.name === "self";
+    const name = isSelf ? "" : m.name;
+    const b = el("button", {{
+      onclick: () => {{ target = name; refresh(); refreshCluster(); }},
+    }});
+    b.setAttribute("aria-current", String(target === name));
+    b.append(
+      el("span", {{ class: "dot " + (m.reachable ? "up" : "down") }}),
+      el("span", {{ text: m.hostname || (isSelf ? "this appliance" : m.name) }}),
+      el("span", {{ class: "role", text: isSelf ? "local" : "peer" }}),
+    );
+    list.append(b);
+  }}
+  try {{
+    const revs = (await text("/api/v1/show/system/commit")).trim().split("\n");
+    const first = revs.find((l) => /\d/.test(l));
+    $("clusterrev").textContent = first ? "rev " + first.trim().split(/\s+/)[0] : "rev —";
+  }} catch (e) {{ $("clusterrev").textContent = "rev —"; }}
+}}
+
 async function refresh() {{
-  for (const b of document.querySelectorAll("aside button[data-view]")) {{
+  for (const b of document.querySelectorAll("aside button.navitem")) {{
     const active = b.dataset.path ? (panel && b.dataset.path === panel.p)
-                                  : (!panel && b.dataset.view === view);
+                                  : (!panel && b.dataset.key === view);
     b.setAttribute("aria-current", String(!!active));
   }}
-  for (const v of ["dashboard", "rules", "zones", "nat", "config", "stack", "panel"]) {{
+  // The breadcrumb names the box being driven, so a peer's read-only view can
+  // never be mistaken for the appliance you are configuring.
+  $("crumb").textContent = (target || "this appliance") + " / " +
+    (panel ? "show" : view);
+  for (const v of ["dashboard", "rules", "zones", "nat", "bgp", "ipsec",
+                   "wireguard", "dhcp", "config", "stack", "panel"]) {{
     $("view-" + v).classList.toggle("hidden", v !== view);
   }}
   const TITLES = {{
     rules: "Firewall rules", zones: "Zones", nat: "NAT",
     config: "Configuration", stack: "Stack", dashboard: "Dashboard",
+    bgp: "BGP", ipsec: "IPsec", wireguard: "WireGuard", dhcp: "DHCP",
   }};
   $("title").textContent = panel ? panel.t : (TITLES[view] || "Dashboard");
 
@@ -1043,6 +1827,10 @@ async function refresh() {{
   if (view === "rules") return refreshRules();
   if (view === "zones") return refreshZones();
   if (view === "nat") return refreshNat();
+  if (view === "bgp") return refreshBgp();
+  if (view === "ipsec") return refreshIpsec();
+  if (view === "wireguard") return refreshWireguard();
+  if (view === "dhcp") return refreshDhcp();
   if (view === "config") return refreshConfig();
   if (view === "stack") return refreshStack();
   if (view === "panel" && panel) {{
@@ -1065,6 +1853,8 @@ function signedIn() {{
   $("login").classList.add("hidden");
   $("app").classList.remove("hidden");
   buildNav();
+  renderStaged();
+  refreshCluster();
   refresh();
   // Only the dashboard polls: a panel refreshing under a reader who is trying to
   // read it is a worse experience than a stale one they chose to refresh.
@@ -1081,18 +1871,29 @@ $("loginform").onsubmit = (e) => {{
   signedIn();
 }};
 $("signout").onclick = () => signOut("");
+$("navsearch").oninput = () => {{ buildNav(); refresh(); }};
+$("discard").onclick = () => {{ staged = []; renderStaged(); }};
+$("applystaged").onclick = () => applyStaged(["commit", "save"]);
+$("applystaged2").onclick = () => applyStaged(["commit", "save"]);
+// Validating sends the staged commands with no commit: the appliance checks
+// every one of them and writes nothing, which is how you find out that a change
+// would be refused before it touches the box.
+$("validate").onclick = () => applyStaged([]);
 $("refresh").onclick = () => refresh();
 $("allcounters").onchange = () => refreshDashboard();
 $("addrule").onclick = () => openEditor(null);
 $("addsnat").onclick = () => addNat("snattable", "source", SNAT_FIELDS);
 $("adddnat").onclick = () => addNat("dnattable", "destination", DNAT_FIELDS);
 $("cfgfilter").oninput = () => refreshConfig();
-$("runsave").onclick = () => runScript(["commit", "save"]);
-$("runonly").onclick = () => runScript(["commit"]);
-// "Validate only" sends the commands without a commit: the appliance parses and
-// validates every one of them, and nothing is applied or written. It is how you
-// find out whether a change would be refused before it touches anything.
-$("runcheck").onclick = () => runScript([]);
+$("addneighbor").onclick = () =>
+  addRow("bgptable", ["protocols", "bgp", "neighbor"], BGP_NEIGHBOR, "neighbour address");
+$("addipsec").onclick = () => addRow("ipsectable", ["vpn", "ipsec"], IPSEC, "tunnel name");
+$("addwg").onclick = () => addRow("wgtable", ["vpn", "wireguard"], WG, "interface name");
+$("adddhcp").onclick = () => {{
+  const iface = window.prompt("Enable a DHCP server on which interface?");
+  if (iface) stage([`set interface ${{iface}} dhcp-server enable`]);
+}};
+$("runsave").onclick = () => runScript();
 $("runshow").onclick = async () => {{
   const words = $("showcmd").value.trim();
   if (!words) return;
@@ -1104,29 +1905,12 @@ $("cancel").onclick = () => $("editor").close();
 $("resultclose").onclick = () => $("result").close();
 for (const [id] of FIELDS) $(id).oninput = renderPreview;
 $("r-name").oninput = renderPreview;
-$("applysave").onclick = async () => {{
+$("applysave").onclick = () => {{
   const lines = script();
   if (!lines.length) {{ $("editorerr").textContent = "A rule needs a name and at least one setting."; return; }}
   $("editor").close();
-  showResult(await configure(lines.concat(["commit", "save"])));
-  await refresh();
+  stage(lines);
 }};
-$("applyonly").onclick = async () => {{
-  const lines = script();
-  if (!lines.length) {{ $("editorerr").textContent = "A rule needs a name and at least one setting."; return; }}
-  $("editor").close();
-  showResult(await configure(lines.concat(["commit"])));
-  await refresh();
-}};
-$("theme").onclick = () => {{
-  const now = document.documentElement.getAttribute("data-theme");
-  const next = now === "dark" ? "light" : "dark";
-  document.documentElement.setAttribute("data-theme", next);
-  localStorage.setItem(THEME, next);
-}};
-const savedTheme = localStorage.getItem(THEME);
-if (savedTheme) document.documentElement.setAttribute("data-theme", savedTheme);
-
 if (token) signedIn();
 </script>
 </body>
@@ -1221,10 +2005,55 @@ mod tests {
     }
 
     /// Validating without committing is the one operation that lets an operator
-    /// find out whether a change would be refused before anything is touched.
+    /// find out whether a change would be refused before anything is touched:
+    /// the staged commands run, the appliance checks every one, and no `commit`
+    /// follows them so nothing is applied or written.
     #[test]
-    fn commands_can_be_validated_without_applying_them() {
-        assert!(page().contains(r#"runScript([])"#));
+    fn staged_commands_can_be_validated_without_applying_them() {
+        assert!(page().contains(r#"applyStaged([])"#));
+    }
+
+    /// The appliance's own model is a candidate configuration you commit or
+    /// discard. A console whose every button committed would be a different
+    /// product from the CLI beside it — and would make a mis-click a change to
+    /// a live firewall rather than a line you can throw away.
+    #[test]
+    fn edits_stage_rather_than_apply_themselves() {
+        let html = page();
+        assert!(html.contains("let staged = []"), "no staged set");
+        assert!(html.contains("function stage(lines)"), "forms do not stage");
+        assert!(
+            html.contains(r#"applyStaged(["commit", "save"])"#),
+            "nothing applies the staged commands"
+        );
+        // A refused commit must leave the work in place to be corrected.
+        assert!(
+            html.contains("if (r.ok &&"),
+            "staged commands clear unconditionally"
+        );
+    }
+
+    /// The console wears the product's design system, and the tokens have to be
+    /// *in* the page: an appliance cannot fetch a stylesheet, so a console that
+    /// referenced one would render as unstyled text exactly when it is needed.
+    #[test]
+    fn the_design_tokens_travel_with_the_page() {
+        let html = page();
+        for token in [
+            "--ink-900",
+            "--signal-500",
+            "--sentinel-500",
+            "--space-4",
+            "--radius-md",
+        ] {
+            assert!(html.contains(token), "{token} is missing from the page");
+        }
+        // Named first, never fetched — see the module header.
+        assert!(html.contains("\"Space Grotesk\""));
+        assert!(
+            html.contains("system-ui"),
+            "no fallback for a face that cannot be fetched"
+        );
     }
 
     /// Every graphed counter has to be one the data plane actually reports, or
