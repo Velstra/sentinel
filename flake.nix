@@ -66,6 +66,8 @@
             --set SENTINEL_NETWORKCTL_BIN ${pkgs.systemd}/bin/networkctl \
             --set SENTINEL_SYSTEMCTL_BIN  ${pkgs.systemd}/bin/systemctl \
             --set SENTINEL_NFT_BIN        ${pkgs.nftables}/bin/nft \
+            --set SENTINEL_TCPDUMP_BIN    ${pkgs.tcpdump}/bin/tcpdump \
+            --set SENTINEL_TIMEOUT_BIN    ${pkgs.coreutils}/bin/timeout \
             --set SENTINEL_SWANCTL_BIN    ${pkgs.strongswan}/bin/swanctl \
             --set SENTINEL_OPENSSL_BIN    ${pkgs.openssl.bin}/bin/openssl \
             --set SENTINEL_LEGO_BIN       ${pkgs.lego}/bin/lego \
@@ -1559,6 +1561,39 @@
                        "view-pki", "view-certs", "view-users", "view-ids",
                        "view-synproxy"]:
               assert view in page, f"{view} is missing from the console"
+
+          # A capture reads the wire, so it is verified against real traffic:
+          # ping the loopback while capturing on it and require the packets to
+          # be there. Bounded, so the check cannot hang on a quiet interface.
+          machine.succeed("ping -c 3 -i 0.2 127.0.0.1 >/dev/null &")
+          cap = machine.succeed(
+              "curl -sS -X POST -H 'Authorization: Bearer " + token + "' "
+              "-H 'Content-Type: application/json' "
+              "--data '{\"interface\":\"lo\",\"filter\":\"icmp\",\"packets\":3,\"seconds\":8}' "
+              "http://127.0.0.1:8080/api/v1/capture"
+          )
+          assert "ICMP echo" in cap or "packets captured" in cap, cap
+
+          # A capture on a quiet interface answers rather than hanging: "that
+          # traffic is not arriving" is a diagnosis too.
+          quiet = machine.succeed(
+              "curl -sS -X POST -H 'Authorization: Bearer " + token + "' "
+              "-H 'Content-Type: application/json' "
+              "--data '{\"interface\":\"lo\",\"filter\":\"tcp port 9999\",\"packets\":1,\"seconds\":2}' "
+              "http://127.0.0.1:8080/api/v1/capture"
+          )
+          assert "no packets matched" in quiet or "0 packets" in quiet, quiet
+
+          # A filter that would become an option is refused, not quoted and
+          # hoped for: tcpdump's -z runs a program and -w writes a file.
+          code = machine.succeed(
+              "curl -s -o /dev/null -w '%{http_code}' -X POST "
+              "-H 'Authorization: Bearer " + token + "' "
+              "-H 'Content-Type: application/json' "
+              "--data '{\"interface\":\"lo\",\"filter\":\"-z /bin/sh\"}' "
+              "http://127.0.0.1:8080/api/v1/capture"
+          ).strip()
+          assert code == "400", f"a filter that looks like an option answered {code}"
 
           # Operational commands are their own path: they change what the box is
           # doing, are nowhere in the saved config, and cannot be staged.

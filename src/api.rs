@@ -40,6 +40,7 @@ use axum::{
 use base64::Engine;
 use serde_json::{Value, json};
 
+use crate::capture;
 use crate::config::Appliance;
 use crate::repl::{self, Apply};
 use crate::session;
@@ -97,6 +98,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/api/v1/show/*path", get(get_show))
         .route("/api/v1/configure", post(post_configure))
         .route("/api/v1/clear/*path", post(post_clear))
+        .route("/api/v1/capture", post(post_capture))
         .route("/api/v1/stack", get(get_stack))
         .route("/api/v1/stack/:member/show/*path", get(get_stack_show))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
@@ -327,6 +329,32 @@ async fn post_clear(UrlPath(path): UrlPath<String>) -> Result<Response, ApiError
         })));
     }
     let body = String::from_utf8_lossy(&out.stdout).into_owned();
+    Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response())
+}
+
+/// `POST /api/v1/capture` — capture packets on an interface.
+///
+/// A `POST` although it reads nothing: it holds a process for as long as the
+/// capture runs, and a `GET` that does that is one a browser or a proxy will
+/// happily repeat. Bounded by [`capture::Capture`] before anything is run, so
+/// the endpoint cannot be asked to hold the connection open indefinitely.
+async fn post_capture(Json(req): Json<Value>) -> Result<Response, ApiError> {
+    let field = |k: &str| req.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let num = |k: &str, d: u32| req.get(k).and_then(Value::as_u64).unwrap_or(d as u64) as u32;
+    let capture = capture::Capture::new(
+        &field("interface"),
+        &field("filter"),
+        num("packets", 50),
+        num("seconds", 10),
+    )
+    .map_err(ApiError::bad_request)?;
+
+    // Blocking work on the async runtime would stall every other request for as
+    // long as the capture runs, and the whole point is that it runs for a while.
+    let body = tokio::task::spawn_blocking(move || capture::run(&capture))
+        .await
+        .map_err(|e| ApiError::internal(anyhow!("capture task: {e}")))?
+        .map_err(ApiError::bad_request)?;
     Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response())
 }
 

@@ -925,6 +925,22 @@ pub fn page() -> String {
       <div class="card"><h3>Recent alerts</h3><pre class="out" id="alertshow">…</pre></div>
     </div>
 
+    <div id="view-capture" class="hidden">
+      <div class="card addpanel">
+        <label class="field"><span>Interface</span><select id="cap-iface"></select></label>
+        <label class="field"><span>Filter</span><input id="cap-filter" placeholder="tcp port 443"></label>
+        <label class="field"><span>Packets</span><input id="cap-count" value="50"></label>
+        <label class="field"><span>Seconds</span><input id="cap-secs" value="10"></label>
+        <button class="btn primary" id="runcapture">Capture</button>
+      </div>
+      <p style="color:var(--text-muted);font-size:var(--text-sm);margin:0 0 var(--space-4)">
+        Bounded on purpose: never more than 500 packets or 60 seconds, headers
+        only, and nothing is written to disk. A capture that finds nothing is an
+        answer too.
+      </p>
+      <div class="card"><h3>Output</h3><pre class="out" id="capout">Not run yet.</pre></div>
+    </div>
+
     <div id="view-config" class="hidden">
       <div class="card">
         <h3>Revisions</h3>
@@ -1978,6 +1994,21 @@ async function refreshIds() {{
   }}
 }}
 
+// The interface list comes from the config, so the picker offers the interfaces
+// this appliance knows rather than whatever the kernel happens to have.
+async function refreshCapture() {{
+  const ls = await leaves();
+  const names = [...new Set(ls.filter((l) => l.path[0] === "interface").map((l) => l.path[1]))];
+  const sel = $("cap-iface");
+  const chosen = sel.value;
+  sel.textContent = "";
+  for (const n of names.sort()) {{
+    const o = el("option", {{ value: n, text: n }});
+    if (n === chosen) o.setAttribute("selected", "selected");
+    sel.append(o);
+  }}
+}}
+
 // The Configuration view is the revision list and nothing else: rolling back is
 // a real operation an operator needs, and it stages like every other change.
 async function refreshConfig() {{
@@ -2054,6 +2085,7 @@ const ICONS = {{
   file: '<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/>',
   layers: '<path d="m12 2 9 5-9 5-9-5 9-5z"/><path d="m3 12 9 5 9-5"/>',
   chart: '<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>',
+  search: '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>',
   bug: '<rect x="8" y="8" width="8" height="10" rx="4"/><path d="M8 12H4M20 12h-4M9 8 7 5M15 8l2-3M9 18l-2 3M15 18l2 3"/>',
 }};
 
@@ -2095,6 +2127,7 @@ const SECTIONS = [
     {{ v: "pki", t: "Authorities", i: "lock" }},
     {{ v: "certs", t: "Certificates", i: "file" }},
     {{ v: "ids", t: "Intrusion defence", i: "bug" }},
+    {{ v: "capture", t: "Packet capture", i: "search" }},
   ]}},
   {{ g: "System", items: [
     {{ v: "users", t: "Administrators", i: "key" }},
@@ -2182,7 +2215,7 @@ async function refresh() {{
     (panel ? "show" : view);
   for (const v of ["dashboard", "rules", "zones", "groups", "nat", "synproxy",
                    "interfaces", "routes", "bgp", "dhcp", "lb", "ipsec",
-                   "wireguard", "pki", "certs", "ids", "users", "config",
+                   "wireguard", "pki", "certs", "ids", "capture", "users", "config",
                    "stack", "panel"]) {{
     $("view-" + v).classList.toggle("hidden", v !== view);
   }}
@@ -2193,6 +2226,7 @@ async function refresh() {{
     groups: "Groups", synproxy: "SYN protection", interfaces: "Interfaces",
     routes: "Static routes", lb: "Load balancer", pki: "Authorities",
     certs: "Certificates", ids: "Intrusion defence", users: "Administrators",
+    capture: "Packet capture",
   }};
   $("title").textContent = panel ? panel.t : (TITLES[view] || "Dashboard");
 
@@ -2208,6 +2242,7 @@ async function refresh() {{
   if (view === "pki") return refreshPki();
   if (view === "certs") return refreshCerts();
   if (view === "ids") return refreshIds();
+  if (view === "capture") return refreshCapture();
   if (view === "users") return refreshUsers();
   if (view === "bgp") return refreshBgp();
   if (view === "ipsec") return refreshIpsec();
@@ -2299,6 +2334,31 @@ wireToggle("toggleuser", "adduserpanel", "New");
 wireToggle("togglesyn", "addsynpanel", "New");
 $("groupkind").onchange = () => refreshGroups();
 $("liftall").onclick = () => clearOp("ids/blocks");
+$("runcapture").onclick = async () => {{
+  const btn = $("runcapture");
+  // A capture takes as long as it takes; saying so beats a page that looks
+  // frozen while an operator wonders whether it started.
+  btn.disabled = true;
+  btn.textContent = "Capturing…";
+  $("capout").textContent = "Listening on " + $("cap-iface").value + "…";
+  try {{
+    const r = await api("/api/v1/capture", {{
+      method: "POST",
+      headers: {{ Authorization: "Bearer " + token, "Content-Type": "application/json" }},
+      body: JSON.stringify({{
+        interface: $("cap-iface").value,
+        filter: $("cap-filter").value,
+        packets: Number($("cap-count").value) || 50,
+        seconds: Number($("cap-secs").value) || 10,
+      }}),
+    }});
+    $("capout").textContent = (await r.text()).trimEnd();
+  }} catch (e) {{
+    $("capout").textContent = String(e.message || e);
+  }}
+  btn.disabled = false;
+  btn.textContent = "Capture";
+}};
 wireToggle("togglesnat", "addsnatpanel", "New source rule");
 wireToggle("toggleddnat", "adddnatpanel", "New port forward");
 wireToggle("togglebgp", "addbgppanel", "New neighbour");
@@ -2447,6 +2507,20 @@ mod tests {
         ] {
             assert!(html.contains(view), "{view} is missing");
         }
+    }
+
+    /// A capture holds a process open for as long as it runs, so it must be a
+    /// POST — a GET that does that is one a browser or a proxy will repeat —
+    /// and the page must say it is running rather than look frozen.
+    #[test]
+    fn a_capture_is_a_post_that_reports_it_is_running() {
+        let html = page();
+        assert!(html.contains(r#""/api/v1/capture""#));
+        assert!(html.contains(r#"method: "POST""#));
+        assert!(
+            html.contains("Capturing…"),
+            "the page looks frozen while it runs"
+        );
     }
 
     /// The appliance answers in a terminal's voice: a refusal is followed by

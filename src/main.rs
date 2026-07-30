@@ -13,6 +13,7 @@ mod acme;
 mod alert;
 mod api;
 mod archive;
+mod capture;
 mod compile;
 mod config;
 mod confirm;
@@ -108,6 +109,21 @@ enum Command {
         /// The show path words (empty shows the system status).
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
+    },
+    /// Capture packets on an interface (bounded: never more than 500 packets
+    /// or 60 seconds, and nothing is written to disk).
+    Capture {
+        /// Interface to listen on.
+        interface: String,
+        /// pcap filter expression, e.g. `tcp port 443`.
+        #[arg(default_value = "")]
+        filter: String,
+        /// Stop after this many packets.
+        #[arg(long, default_value_t = 50)]
+        count: u32,
+        /// Stop after this long.
+        #[arg(long, default_value_t = 10)]
+        seconds: u32,
     },
     /// Clear operational state (Cisco/VyOS-style): `clear ids block <ip>`,
     /// `clear ids blocks`.
@@ -301,6 +317,16 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Configure { config, no_apply } => configure(&config, no_apply),
         Command::Show { args } => show_op(&args),
+        Command::Capture {
+            interface,
+            filter,
+            count,
+            seconds,
+        } => {
+            let c = capture::Capture::new(&interface, &filter, count, seconds)?;
+            print!("{}", capture::run(&c)?);
+            Ok(())
+        }
         Command::Clear { args } => clear_op(&args),
         Command::Config { action } => config_cmd(action),
         Command::Compile { file } => {

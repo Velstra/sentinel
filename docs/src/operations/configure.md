@@ -666,6 +666,29 @@ config, so it is not staged — offering to discard it would be a lie. Adding a
 block by hand is not something the CLI can do, so the console does not offer it
 either.
 
+### Packet capture
+
+When no counter, flow or log line answers the question — because the packet
+never arrived, or arrived looking nothing like the rule was written for — the
+capture view shows the wire itself. Pick an interface, optionally a pcap filter
+(`tcp port 443`, `icmp or arp`), and run it.
+
+It is **bounded on purpose**: never more than 500 packets or 60 seconds,
+headers only, and nothing is written to disk. An unbounded capture on a busy
+firewall competes for the CPU it is meant to be diagnosing, and one started from
+a browser tab that was then closed would have nobody left to stop it. A capture
+file would be a copy of production traffic sitting on the appliance, and
+deciding when to delete it is a problem worth not having.
+
+A capture that finds nothing says so — *that traffic is not arriving* is a
+diagnosis, not a failure.
+
+The same thing from a terminal:
+
+```text
+sentinel capture eth0 "tcp port 443" --count 50 --seconds 10
+```
+
 ### Debugging
 
 - **Diagnostics** carries the data-plane and routing logs, the running config
