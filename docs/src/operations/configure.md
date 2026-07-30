@@ -586,11 +586,13 @@ It has these working areas plus the read-only views:
   live NAT state below them. A new entry is filled in as a whole row and created
   in one commit, because a NAT entry needs several fields to be valid and the
   appliance is right to refuse half of one.
-- **BGP** — the router's own settings and a neighbour table.
+- **BGP** — the router's own settings, then its neighbours.
 - **IPsec** — site-to-site tunnels.
-- **WireGuard** — interfaces and their peers. The private key is generated *on
-  the appliance* (`private-key generate`), never typed into a browser.
-- **DHCP** — the servers running on each interface, and the current leases.
+- **WireGuard** — interfaces, then the peers of whichever one you pick. Set the
+  private key to `generate` so it is made on the appliance rather than pasted
+  into a browser.
+- **DHCP** — the servers running on each interface, and the current leases. The
+  interface picker offers only interfaces that do not already have one.
 - **Configuration** — a command box that accepts anything the CLI does, the
   entire running configuration as an editable table, and the revision list with
   a rollback beside each.
@@ -610,6 +612,19 @@ the delete is a line you can still remove.
 checks every one and writes nothing, which is how you learn a change would be
 refused before it touches anything. A refused Apply leaves the commands staged
 so you can fix one and try again, rather than reconstructing what you clicked.
+
+### One object language
+
+Every section reads the same way, because every section renders through the same
+code: a toolbar, a panel that opens to add something, and the existing objects as
+rows. A row leads with a badge saying what it *is* — an action, a remote AS, a
+listening port, or `incomplete` when the object is not yet usable — then the
+fields that are actually set, each under a small label. Edit opens the same
+field grid the add panel uses, in place.
+
+Clearing a field removes the setting. That is worth knowing: it is the
+difference between a console you can add with and one you can also take away
+with.
 
 ### Everything is a control
 
