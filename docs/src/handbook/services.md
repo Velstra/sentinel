@@ -395,3 +395,38 @@ actually knows:
 The `domain` is the IPFIX observation domain — what tells this appliance's
 records from another's at a collector receiving both. The template is re-sent
 with every message, so a collector that restarts can decode the very next one.
+
+### Refusing a server by name (SNI)
+
+```text
+set services ids interface eth0
+set services ids block-on-alert true
+set services ids sni-block example.com
+```
+
+A TLS client announces the name it wants in the clear, before anything is
+encrypted. That is the one place a firewall can still see *which service* a
+connection is for — and it works when a domain group cannot: the client may have
+resolved the name over DoH, from its own cache, or not at all.
+
+A name matches itself **and everything under it**, so `example.com` also refuses
+`www.example.com` and not `notexample.com`. A leading dot is accepted and means
+the same thing.
+
+**How the refusal happens.** The detector alerts; the *data plane* blocks. What
+gets blocked is the **server**, not the client — the client asked for something
+it should not have, but the server is what must stop answering. Its replies are
+dropped, so the connection cannot proceed and the next attempt fails at the
+handshake. The block carries the same deadline as every other run-time block and
+shows up in `show ids blocks`.
+
+Three consequences to weigh before turning it on:
+
+- **It blocks an address, for everyone.** A name-level policy enforced at the IP
+  level always does. On a CDN address shared with sites you allow, that is
+  collateral — `never-block` is how you protect one.
+- **The first connection is what reveals the name**, so it is the one that fails
+  rather than being prevented. There is no way to know the name earlier.
+- **Encrypted ClientHello removes the name from the wire**, and when it is
+  widespread this stops working. It is a fact about TLS, not about this
+  appliance.

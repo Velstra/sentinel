@@ -133,7 +133,7 @@ authoritative list.
 | `acme` | a certificate is really issued — the appliance registers with a Pebble directory, serves the http-01 challenge on :80, and Pebble fetches it back before signing |
 | `bcastrelay` | a broadcast on one segment reaches another carrying the ORIGINAL sender's address — the property request/response discovery depends on — and arrives exactly once |
 | `spoofing` | a forged LAN source on the WAN link is refused by `strict` but not by `loose` (it is routable, just not there), a loopback source by both, and honest traffic keeps flowing throughout |
-| `ids` | real traffic on the wire becomes an alert an operator can read — which is also what proves the detector sees anything at all behind an XDP data plane; then that an alert blocks its source in the data plane, and that `never-block` stops it |
+| `ids` | real traffic on the wire becomes an alert an operator can read — which is also what proves the detector sees anything at all behind an XDP data plane; then that an alert blocks its source in the data plane, and that `never-block` stops it; and a TLS handshake announcing a `sni-block`ed name gets the **server** blocked, not the client |
 
 ## Rust unit tests
 
