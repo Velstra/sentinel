@@ -606,6 +606,7 @@ pub fn page() -> String {
     </label>
 
     <nav id="nav"></nav>
+    <div id="matches"></div>
 
     <div class="cluster">
       <span class="clabel">Cluster</span>
@@ -923,6 +924,22 @@ pub fn page() -> String {
       <div id="blocklist"></div>
       <div class="card"><h3>Detector</h3><pre class="out" id="idsshow">…</pre></div>
       <div class="card"><h3>Recent alerts</h3><pre class="out" id="alertshow">…</pre></div>
+    </div>
+
+    <div id="view-ha" class="hidden">
+      <div class="toolbar">
+        <span class="inline"><span>Virtual router groups</span></span>
+        <span class="spacer"></span>
+        <button class="btn" id="togglevrrp">New</button>
+      </div>
+      <div class="card addpanel hidden" id="addvrrppanel"></div>
+      <div id="vrrplist"></div>
+      <p style="color:var(--text-muted);font-size:var(--text-sm);margin:var(--space-3) 0 var(--space-6)">
+        A tracked interface is what makes failover mean something: when it goes
+        down this box lowers its own priority by the decrement, and the peer —
+        which did not lose that link — takes the address.
+      </p>
+      <div class="card"><h3>Live state</h3><pre class="out" id="vrrpshow">…</pre></div>
     </div>
 
     <div id="view-capture" class="hidden">
@@ -1354,6 +1371,7 @@ async function applyStaged(tail) {{
     staged = [];
     renderStaged();
   }}
+  await buildSearchIndex();
   await refresh();
 }}
 
@@ -1994,6 +2012,35 @@ async function refreshIds() {{
   }}
 }}
 
+const VRRP = [
+  ["interface", "Interface"],
+  ["vrid", "Virtual router ID"],
+  ["virtual-address", "Virtual address"],
+  ["priority", "Priority"],
+  ["preempt", "Preempt", ["", "true", "false"]],
+  ["track-interface", "Tracked interface"],
+  ["priority-decrement", "Priority decrement"],
+  ["advert-interval", "Advert interval (ms)"],
+];
+
+async function refreshHa() {{
+  $("vrrpshow").textContent = "…";
+  try {{ $("vrrpshow").textContent = (await text("/api/v1/show/vrrp")).trimEnd(); }}
+  catch (e) {{ $("vrrpshow").textContent = String(e.message || e); }}
+  renderObjects({{
+    listId: "vrrplist", addId: "addvrrppanel", noun: "Group",
+    fields: VRRP, nameHint: "wan-vip",
+    path: (n) => `protocols vrrp ${{n}}`,
+    rows: entriesUnder(await leaves(), ["protocols", "vrrp"]),
+    // The priority is what decides who holds the address, so it is the badge —
+    // and a group without a virtual address holds nothing at all.
+    badge: (r) => r["virtual-address"]
+      ? {{ text: "prio " + (r.priority || "100"), cls: "accept" }}
+      : {{ text: "no address", cls: "reject" }},
+    empty: "No virtual router groups configured.",
+  }});
+}}
+
 // The interface list comes from the config, so the picker offers the interfaces
 // this appliance knows rather than whatever the kernel happens to have.
 async function refreshCapture() {{
@@ -2130,6 +2177,7 @@ const SECTIONS = [
     {{ v: "capture", t: "Packet capture", i: "search" }},
   ]}},
   {{ g: "System", items: [
+    {{ v: "ha", t: "High availability", i: "layers" }},
     {{ v: "users", t: "Administrators", i: "key" }},
     {{ v: "config", t: "Revisions", i: "file" }},
     {{ v: "stack", t: "Stack", i: "layers" }},
@@ -2144,6 +2192,78 @@ function navButton(label, iconName, onclick, key) {{
   b.append(icon(iconName), el("span", {{ text: label }}));
   if (meta[key] !== undefined) b.append(el("span", {{ class: "meta", text: String(meta[key]) }}));
   return b;
+}}
+
+// Which section owns a setting. Search is only useful if a hit takes you where
+// the thing can be changed, and the path already says which section that is —
+// so the mapping lives here rather than being guessed from the words.
+const OWNERS = [
+  [["firewall", "rule"], "rules"],
+  [["firewall", "zone"], "zones"],
+  [["firewall", "global"], "zones"],
+  [["firewall", "group"], "groups"],
+  [["firewall", "syn-protect"], "synproxy"],
+  [["nat"], "nat"],
+  [["protocols", "static"], "routes"],
+  [["protocols", "bgp"], "bgp"],
+  [["protocols", "vrrp"], "ha"],
+  [["vpn", "ipsec"], "ipsec"],
+  [["vpn", "wireguard"], "wireguard"],
+  [["load-balancer"], "lb"],
+  [["pki", "ca"], "pki"],
+  [["pki", "certificate"], "certs"],
+  [["system", "login"], "users"],
+];
+
+function sectionFor(path) {{
+  // An interface's DHCP block belongs to the DHCP view, not to Interfaces —
+  // the more specific owner has to win, so this is checked first.
+  if (path[0] === "interface") return path[2] === "dhcp-server" ? "dhcp" : "interfaces";
+  for (const [prefix, view] of OWNERS) {{
+    if (prefix.every((p, i) => path[i] === p)) return view;
+  }}
+  return null;
+}}
+
+// Searching the configuration, not the section names: an operator looking for
+// an address or a port number is looking for the object that mentions it, and
+// they will not know which section that turned out to be.
+let searchIndex = [];
+
+async function buildSearchIndex() {{
+  const ls = await leaves();
+  const seen = new Set();
+  searchIndex = [];
+  for (const l of ls) {{
+    const view = sectionFor(l.path);
+    if (!view) continue;
+    // One entry per object, not per setting: twelve hits for one rule is a
+    // list nobody reads.
+    const label = l.path.slice(0, l.path[0] === "interface" ? 2 : 3).join(" ");
+    const key = view + "|" + label;
+    const haystack = (l.path.join(" ") + " " + l.value).toLowerCase();
+    const existing = seen.has(key) ? searchIndex.find((e) => e.key === key) : null;
+    if (existing) {{ existing.hay += " " + haystack; continue; }}
+    seen.add(key);
+    searchIndex.push({{ key, view, label, hay: haystack }});
+  }}
+}}
+
+function renderMatches() {{
+  const box = $("matches");
+  box.textContent = "";
+  const q = $("navsearch").value.trim().toLowerCase();
+  if (q.length < 2) return;
+  const hits = searchIndex.filter((e) => e.hay.includes(q)).slice(0, 12);
+  if (!hits.length) return;
+  box.append(el("span", {{ class: "grp", text: "Matches" }}));
+  for (const h of hits) {{
+    box.append(el("button", {{
+      class: "navitem",
+      text: h.label,
+      onclick: () => {{ view = h.view; panel = null; refresh(); }},
+    }}));
+  }}
 }}
 
 function buildNav() {{
@@ -2215,7 +2335,7 @@ async function refresh() {{
     (panel ? "show" : view);
   for (const v of ["dashboard", "rules", "zones", "groups", "nat", "synproxy",
                    "interfaces", "routes", "bgp", "dhcp", "lb", "ipsec",
-                   "wireguard", "pki", "certs", "ids", "capture", "users", "config",
+                   "wireguard", "pki", "certs", "ids", "capture", "ha", "users", "config",
                    "stack", "panel"]) {{
     $("view-" + v).classList.toggle("hidden", v !== view);
   }}
@@ -2226,7 +2346,7 @@ async function refresh() {{
     groups: "Groups", synproxy: "SYN protection", interfaces: "Interfaces",
     routes: "Static routes", lb: "Load balancer", pki: "Authorities",
     certs: "Certificates", ids: "Intrusion defence", users: "Administrators",
-    capture: "Packet capture",
+    capture: "Packet capture", ha: "High availability",
   }};
   $("title").textContent = panel ? panel.t : (TITLES[view] || "Dashboard");
 
@@ -2243,6 +2363,7 @@ async function refresh() {{
   if (view === "certs") return refreshCerts();
   if (view === "ids") return refreshIds();
   if (view === "capture") return refreshCapture();
+  if (view === "ha") return refreshHa();
   if (view === "users") return refreshUsers();
   if (view === "bgp") return refreshBgp();
   if (view === "ipsec") return refreshIpsec();
@@ -2272,6 +2393,7 @@ function signedIn() {{
   buildNav();
   renderStaged();
   refreshCluster();
+  buildSearchIndex();
   refresh();
   // Only the dashboard polls: a panel refreshing under a reader who is trying to
   // read it is a worse experience than a stale one they chose to refresh.
@@ -2288,7 +2410,7 @@ $("loginform").onsubmit = (e) => {{
   signedIn();
 }};
 $("signout").onclick = () => signOut("");
-$("navsearch").oninput = () => {{ buildNav(); refresh(); }};
+$("navsearch").oninput = () => {{ buildNav(); renderMatches(); }};
 $("togglerule").onclick = () => {{
   const panel = $("addrulepanel");
   panel.classList.toggle("hidden");
@@ -2506,6 +2628,42 @@ mod tests {
             "view-stack",
         ] {
             assert!(html.contains(view), "{view} is missing");
+        }
+    }
+
+    /// A search hit is only useful if it takes you where the thing can be
+    /// changed, and every section that owns settings has to be reachable that
+    /// way — otherwise searching finds objects it cannot open.
+    #[test]
+    fn search_maps_every_owned_setting_to_a_section() {
+        let html = page();
+        assert!(html.contains("function sectionFor"), "no owner mapping");
+        assert!(
+            html.contains("buildSearchIndex"),
+            "search does not read the config"
+        );
+        // The specific owner must win over the general one: an interface's DHCP
+        // block belongs to the DHCP view, not to Interfaces.
+        assert!(
+            html.contains(r#"path[2] === "dhcp-server" ? "dhcp" : "interfaces""#),
+            "the more specific owner does not win"
+        );
+        for view in [
+            "\"rules\"",
+            "\"zones\"",
+            "\"groups\"",
+            "\"nat\"",
+            "\"routes\"",
+            "\"bgp\"",
+            "\"ha\"",
+            "\"ipsec\"",
+            "\"wireguard\"",
+            "\"lb\"",
+            "\"pki\"",
+            "\"certs\"",
+            "\"users\"",
+        ] {
+            assert!(html.contains(view), "{view} is never a search destination");
         }
     }
 
