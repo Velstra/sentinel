@@ -905,6 +905,7 @@ const RUN_TOP: &[Cand] = &[
 const OP_CLEAR: &[Cand] = &[
     ("ids", "intrusion-detection state"),
     ("portal", "captive-portal sessions"),
+    ("port-mapping", "ports hosts on the inside opened"),
 ];
 // `run clear portal <Tab>`.
 const OP_CLEAR_PORTAL: &[Cand] = &[
@@ -1266,6 +1267,10 @@ const SERVICES_NODES: &[Cand] = &[
         "captive portal: hold a guest zone until each device is admitted",
     ),
     (
+        "port-mapping",
+        "NAT-PMP: let a host on the inside open its own inbound port",
+    ),
+    (
         "syslog",
         "ship the journal to remote collectors (rsyslog, RFC 5424)",
     ),
@@ -1291,6 +1296,20 @@ const PORTAL_FIELDS: &[Cand] = &[
         "how long one admission lasts, in seconds (default 3600)",
     ),
     ("message", "a line of text shown on the page"),
+];
+
+// `services port-mapping <Tab>`: who may ask, and where the port is opened.
+const PORTMAP_FIELDS: &[Cand] = &[
+    ("zone", "the zone whose hosts may ask (this turns it on)"),
+    ("wan-zone", "the zone a mapping is opened on — the uplink"),
+    (
+        "max-lifetime",
+        "the longest mapping handed out, in seconds (default 7200)",
+    ),
+    (
+        "allow-privileged",
+        "allow an external port below 1024 (default false)",
+    ),
 ];
 
 // `services ids <Tab>`: what to watch, what counts as inside, and the rules.
@@ -2546,6 +2565,8 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "services", "alerts", "mail"] => ALERT_MAIL_FIELDS,
         ["set", "services", "alerts", "mail", "starttls"] => BOOLS,
         ["set" | "delete", "services", "portal"] => PORTAL_FIELDS,
+        ["set" | "delete", "services", "port-mapping"] => PORTMAP_FIELDS,
+        ["set", "services", "port-mapping", "allow-privileged"] => BOOLS,
         ["set" | "delete", "services", "ids"] => IDS_NODES,
         ["set", "services", "ids", "block-on-alert"] => BOOLS,
         ["set" | "delete", "services", "syslog"] => SYSLOG_NODES,
@@ -3924,6 +3945,7 @@ mod tests {
                 "reverse-proxy",
                 "broadcast-relay",
                 "portal",
+                "port-mapping",
                 "syslog",
                 "alerts",
                 "ids"

@@ -500,3 +500,61 @@ exactly as an address can, so what a portal bounds is what an *unadmitted* devic
 may reach. It is the right tool for holding a guest network behind a passphrase
 and a set of terms; it is the wrong one for deciding who is allowed on a network
 that matters, where the answer is 802.1X or a VPN.
+
+## Port mapping (NAT-PMP)
+
+A games console, a torrent client, a video-call app: each wants a port reachable
+from outside, and each asks for one rather than waiting for somebody to
+configure it. Without an answer they fall back to relays and work badly.
+
+```text
+set services port-mapping zone lan
+set services port-mapping wan-zone wan
+set services port-mapping max-lifetime 7200
+```
+
+Two zones, and both are required: `zone` is who may ask, `wan-zone` is where the
+port is opened. They may not be the same zone — that would map a port on the
+very segment the request came from.
+
+### What a mapping is
+
+A port-forward in the same table the configuration writes to, with a deadline.
+It shows up in `show port-mapping` alongside what the appliance is configured to
+do, expires on its own, and does not survive a restart of the data plane — a
+client that still wants it asks again, which is what the protocol has it do.
+
+A `(protocol, port)` **the configuration already forwards** is refused, never
+replaced. Replacing it would redirect somebody else's service, and the mapping's
+own expiry would then delete a port-forward the operator wrote, hours later, for
+reasons nobody could reconstruct.
+
+### What is refused
+
+- **A mapping for another host** — less refused than impossible: the address a
+  port is opened to is the source address of the request, never anything the
+  request names. One device asking for a port pointed at another is how a
+  printer ends up exposed to the internet.
+- **A privileged external port**, unless `set services port-mapping
+  allow-privileged true`. A LAN host claiming 22 or 443 on the uplink is either
+  a mistake or an attempt to stand in front of something you run.
+- **Anything longer than `max-lifetime`** — granted at the ceiling instead, with
+  the real figure in the reply, which is what the protocol's lifetime field is
+  for.
+
+```text
+show port-mapping
+clear port-mapping            # close every mapping hosts opened
+clear port-mapping tcp 51820  # or just one
+```
+
+### NAT-PMP, not UPnP
+
+UPnP IGD is SOAP over HTTP with device discovery and XML descriptions — a much
+larger parser on a port every host on the segment can reach, for the same
+outcome NAT-PMP reaches in four message types. PCP (RFC 6887) is the modern
+successor and would fit the same socket and the same table; it is not built yet.
+
+This is the one service where something other than a person opens an inbound
+port, so it is off unless you switch it on, and it is worth deciding
+deliberately whether the segment you point it at should have that authority.

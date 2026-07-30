@@ -26,6 +26,7 @@ mod net;
 mod openconnect;
 mod pki;
 mod portal;
+mod portmap;
 mod proxy;
 mod relay;
 mod repl;
@@ -229,6 +230,13 @@ enum Command {
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
+    /// Serve NAT-PMP (roadmap C18). Run by `sentinel-portmap.service` from the
+    /// settings an apply rendered, not by hand.
+    PortMap {
+        /// The resolved settings the last apply rendered.
+        #[arg(long, default_value = portmap::STATE_FILE)]
+        state: PathBuf,
+    },
     /// Serve the captive portal (roadmap C20). Run by
     /// `sentinel-portal.service` from the saved config, not by hand: it binds
     /// the appliance's own address in the gated zone, and the address only
@@ -363,6 +371,7 @@ async fn main() -> Result<()> {
         Command::IdsWatch => ids::watch(),
         Command::BroadcastRelay => relay::run(),
         Command::Portal { state } => serve_portal(&state).await,
+        Command::PortMap { state } => serve_portmap(&state),
         Command::AcmeRenew => acme::run(),
         Command::Ports { controller } => ports(&controller).await,
         Command::Api {
@@ -389,6 +398,18 @@ async fn serve_portal(state: &std::path::Path) -> Result<()> {
         return Ok(());
     }
     portal::serve(portal::load(state)?).await
+}
+
+/// `sentinel port-map`: serve NAT-PMP from the settings an apply rendered.
+///
+/// A missing file is not an error, for the same reason it is not one for the
+/// portal: the unit and the file it reads are installed by the same apply.
+fn serve_portmap(state: &std::path::Path) -> Result<()> {
+    if !state.exists() {
+        eprintln!("no port mapping is configured; nothing to serve");
+        return Ok(());
+    }
+    portmap::serve(&portmap::load(state)?)
 }
 
 /// `sentinel wol <mac> [interface]`: send a Wake-on-LAN magic packet. The packet
@@ -945,6 +966,9 @@ fn show_op(args: &[String]) -> Result<()> {
         // daemon that carries it is up.
         ["broadcast-relay"] | ["broadcast-relay", "status"] => show_broadcast_relay(),
 
+        // NAT-PMP (roadmap C18): what a host on the inside has opened.
+        ["port-mapping"] | ["port-mapping", "status"] => show_portmap(),
+
         // Captive portal (roadmap C20): who is on, and what holds the rest.
         ["portal"] | ["portal", "status"] => show_portal(),
         ["portal", "sessions"] => show_portal_sessions(),
@@ -1170,6 +1194,50 @@ fn show_agent_query(command: &str, what: &str) -> Result<()> {
     }
 }
 
+/// `show port-mapping`: what is configured, and what hosts have opened.
+///
+/// The mappings come from the **agent**, which owns the table and the deadlines
+/// — the same reason `show portal sessions` does. What is listed here is what
+/// the data plane is actually forwarding, not a tally kept alongside it.
+fn show_portmap() -> Result<()> {
+    let Ok(state) = portmap::load(std::path::Path::new(portmap::STATE_FILE)) else {
+        println!("no port mapping is configured");
+        return Ok(());
+    };
+    println!("listening: {}", state.bind);
+    println!("opens on:  policy {}", state.wan_policy);
+    println!("external:  {}", state.external);
+    println!("lifetime:  up to {}s", state.max_lifetime);
+    println!(
+        "below 1024: {}",
+        if state.allow_privileged {
+            "allowed"
+        } else {
+            "refused"
+        }
+    );
+    println!(
+        "service:   {}",
+        if system::unit_active("sentinel-portmap.service") {
+            "running"
+        } else {
+            "not running"
+        }
+    );
+    println!();
+    match velstra::query_at(std::path::Path::new(portmap::AGENT_SOCKET), "mappings") {
+        Ok(reply) => print!("{reply}"),
+        Err(e) => {
+            println!("mappings unavailable: {e:#}");
+            println!(
+                "(the agent serves these on {}; check `systemctl status velstra.service`)",
+                portmap::AGENT_SOCKET
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `show portal`: what is configured, whether the page is up, and who is on.
 ///
 /// The sessions come from the **agent**, which owns the map and the deadlines. A
@@ -1391,6 +1459,17 @@ fn clear_op(args: &[String]) -> Result<()> {
         // session *is* and what `show portal sessions` lists.
         ["portal", "session", mac] => clear_portal(&format!("revoke {mac} any")),
         ["portal", "sessions"] => clear_portal("revoke all"),
+        // C18: close every port a host on the inside opened. One at a time is
+        // `clear port-mapping <tcp|udp> <port>` — but the case that actually
+        // happens is wanting them all gone at once.
+        ["port-mapping", "mappings"] | ["port-mapping"] => clear_mapping("unmap all"),
+        ["port-mapping", proto, port] => {
+            let Ok(state) = portmap::load(std::path::Path::new(portmap::STATE_FILE)) else {
+                println!("no port mapping is configured");
+                return Ok(());
+            };
+            clear_mapping(&format!("unmap {proto} {port} {}", state.wan_policy))
+        }
         [] => {
             println!(
                 "usage: clear ids block <ip> | clear ids blocks | \
@@ -1421,6 +1500,21 @@ fn clear_portal(command: &str) -> Result<()> {
                 "(the agent serves this on {}; check `systemctl status velstra.service`)",
                 portal::AGENT_SOCKET
             );
+            Ok(())
+        }
+    }
+}
+
+/// Ask the agent's **mapping** socket to close a mapping. A third socket and a
+/// third helper, because they are three different amounts of trust.
+fn clear_mapping(command: &str) -> Result<()> {
+    match velstra::query_at(std::path::Path::new(portmap::AGENT_SOCKET), command) {
+        Ok(reply) => {
+            print!("{reply}");
+            Ok(())
+        }
+        Err(e) => {
+            println!("closing that mapping failed: {e:#}");
             Ok(())
         }
     }

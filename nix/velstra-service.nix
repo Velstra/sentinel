@@ -99,11 +99,14 @@ in
         # answer what the data plane is doing. RuntimeDirectory creates (and
         # cleans up) /run/velstra for it.
         #
-        # The portal socket (C20) is separate, and deliberately: it is the only
-        # one on which anything can be opened, so the diagnostics socket keeps
-        # the property that nothing on it admits traffic. Both live in the same
-        # root-owned 0700 directory, which is what governs who may ask.
-        ExecStart = "${cfg.package}/bin/velstra run --iface ${cfg.interface} --config /run/sentinel/velstra.toml --query-socket /run/velstra/query.sock --portal-socket /run/velstra/portal.sock";
+        # The portal socket (C20) and the mapping socket (C18) are separate from
+        # it and from each other, and deliberately: the query socket can only add
+        # a drop, the portal one admits a device to a zone's ordinary rules, and
+        # the mapping one opens an inbound port. Three different amounts of
+        # trust, so three files — a service that needs one is not handed the
+        # others. All live in the same root-owned 0700 directory, which is what
+        # governs who may ask.
+        ExecStart = "${cfg.package}/bin/velstra run --iface ${cfg.interface} --config /run/sentinel/velstra.toml --query-socket /run/velstra/query.sock --portal-socket /run/velstra/portal.sock --mapping-socket /run/velstra/mapping.sock";
         RuntimeDirectory = "velstra";
         RuntimeDirectoryMode = "0700";
         Restart = "on-failure";
