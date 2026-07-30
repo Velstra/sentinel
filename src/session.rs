@@ -3545,6 +3545,18 @@ impl Session {
             // only at commit so the operator sees the mistake next to what they
             // typed, and replaced by sid rather than appended: re-issuing a rule is
             // how you edit one, and two rules sharing a sid stop the whole load.
+            // C23: refuse a server name announced in a TLS ClientHello.
+            ["services", "ids", "sni-block", v] => {
+                let name = v.trim().trim_start_matches('.').to_ascii_lowercase();
+                if name.is_empty()
+                    || !name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+                {
+                    bail!("{v:?} is not a server name");
+                }
+                push_unique(&mut self.draft.ids.sni_block, &name);
+            }
             ["services", "ids", "rule", rest @ ..] if !rest.is_empty() => {
                 // A Suricata rule always contains spaces, and the CLI splits on
                 // whitespace, so the rule is the rest of the line — the same shape
@@ -5368,6 +5380,15 @@ impl Session {
             ["services", "ids"] => self.draft.ids = Ids::default(),
             ["services", "ids", "interface"] => self.draft.ids.interfaces.clear(),
             ["services", "ids", "home-net"] => self.draft.ids.home_net.clear(),
+            ["services", "ids", "sni-block"] => self.draft.ids.sni_block.clear(),
+            ["services", "ids", "sni-block", v] => {
+                let name = v.trim().trim_start_matches('.').to_ascii_lowercase();
+                let before = self.draft.ids.sni_block.len();
+                self.draft.ids.sni_block.retain(|n| *n != name);
+                if self.draft.ids.sni_block.len() == before {
+                    bail!("{v:?} is not in sni-block");
+                }
+            }
             ["services", "ids", "rule"] => self.draft.ids.rules.clear(),
             ["services", "ids", "ruleset"] => self.draft.ids.rulesets.clear(),
             ["services", "ids", "never-block"] => self.draft.ids.never_block.clear(),

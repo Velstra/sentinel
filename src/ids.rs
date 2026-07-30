@@ -85,6 +85,38 @@ fn suricata_share() -> String {
 /// Only the rules written in the configuration land here; an operator's own
 /// ruleset files are referenced by path instead, because a ruleset is megabytes
 /// and copying it would make the config file the second copy that goes stale.
+/// Where the signature ids of generated SNI rules start.
+///
+/// High enough to be out of the way of both the shipped rulesets and anything
+/// an operator writes by hand, and contiguous so the watcher can recognise one
+/// by a range check rather than by re-parsing the rule it came from.
+pub const SNI_SID_BASE: u64 = 9_100_000;
+
+/// Escape a server name for use inside a Suricata `content:` string.
+///
+/// A name is not free text here: it lands inside a quoted rule option, and a
+/// quote or a semicolon in it would end the option and start another. Rather
+/// than escape, refuse — a server name containing either is not a name.
+fn sni_pattern(name: &str) -> Option<String> {
+    let name = name.trim().trim_start_matches('.').to_ascii_lowercase();
+    if name.is_empty() || name.len() > 253 {
+        return None;
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        return None;
+    }
+    Some(name)
+}
+
+/// The Suricata rules for this configuration: what the operator wrote, then one
+/// per `sni-block` entry.
+///
+/// The generated rules `alert` rather than `drop`, like everything else here:
+/// blocking happens in the eBPF data plane, and a second enforcement point that
+/// could disagree with the first is the thing this design avoids.
 pub fn rules_body(ids: &Ids) -> Option<String> {
     if ids.is_empty() {
         return None;
@@ -93,6 +125,22 @@ pub fn rules_body(ids: &Ids) -> Option<String> {
     for rule in &ids.rules {
         body.push_str(rule.trim());
         body.push('\n');
+    }
+    for (i, name) in ids.sni_block.iter().enumerate() {
+        let Some(pattern) = sni_pattern(name) else {
+            continue;
+        };
+        // `endswith` is what makes `example.com` also refuse `www.example.com`
+        // without also refusing `notexample.com`: the SNI is matched at its end,
+        // and a leading dot in the pattern is what an operator writes to mean
+        // "and everything under it" — which is the same match either way, so it
+        // is accepted and stripped rather than given a second meaning.
+        body.push_str(&format!(
+            "alert tls any any -> any any (msg:\"sentinel sni-block {pattern}\"; \
+             tls.sni; content:\"{pattern}\"; nocase; endswith; \
+             priority:1; sid:{}; rev:1;)\n",
+            SNI_SID_BASE + i as u64
+        ));
     }
     Some(body)
 }
@@ -392,40 +440,59 @@ pub fn watch() -> Result<()> {
             continue;
         };
         if alert.severity > ceiling || alert.severity == 0 {
+            // Silently dropping an alert makes "the detector fired but nothing
+            // happened" impossible to diagnose from the outside — which is
+            // exactly the position this was in before the line existed.
+            eprintln!(
+                "not blocking after {:?}: severity {} is outside the ceiling of {ceiling}",
+                alert.signature, alert.severity
+            );
             continue;
         }
-        if alert.src_ip.is_empty() {
+        // Which end to block is the whole difference between an intrusion and a
+        // refused destination. An attack comes *from* a source; a forbidden
+        // server name is something a client asked *for*, and the client did
+        // nothing wrong. Blocking the server as a source is what stops it: its
+        // answers never come back, so the connection cannot proceed and the next
+        // attempt fails at the handshake.
+        let target = if alert.sid >= SNI_SID_BASE {
+            &alert.dest_ip
+        } else {
+            &alert.src_ip
+        };
+        if target.is_empty() {
             continue;
         }
-        if ids.is_never_blocked(&alert.src_ip) {
+        let target = target.clone();
+        if ids.is_never_blocked(&target) {
             eprintln!(
                 "not blocking {} ({}): it is in never-block",
-                alert.src_ip, alert.signature
+                target, alert.signature
             );
             continue;
         }
         let now = std::time::Instant::now();
         asked.retain(|_, until| *until > now);
-        if asked.contains_key(&alert.src_ip) {
+        if asked.contains_key(&target) {
             continue;
         }
         asked.insert(
-            alert.src_ip.clone(),
+            target.clone(),
             now + std::time::Duration::from_secs(seconds),
         );
-        match crate::velstra::query(&format!("block {} {seconds}", alert.src_ip)) {
+        match crate::velstra::query(&format!("block {target} {seconds}")) {
             Ok(reply) => eprintln!(
                 "blocked {} after {:?}: {}",
-                alert.src_ip,
+                target,
                 alert.signature,
                 reply.trim()
             ),
             Err(e) => {
-                eprintln!("could not block {}: {e:#}", alert.src_ip);
+                eprintln!("could not block {target}: {e:#}");
                 // Forgotten, so the next alert from the same source tries again —
                 // an agent that was briefly away must not mean that source goes
                 // unblocked for the rest of the period.
-                asked.remove(&alert.src_ip);
+                asked.remove(&target);
             }
         }
     }
@@ -445,6 +512,14 @@ pub struct IdsAlert {
     /// block takes an address, and re-splitting a display string to get one back
     /// is how a port ends up in a blocklist entry.
     pub src_ip: String,
+    /// The destination address alone. An SNI refusal blocks *this* rather than
+    /// the source: the client did nothing wrong, the server it asked for is what
+    /// must not answer.
+    pub dest_ip: String,
+    /// The signature id, which is how a refusal made from `sni-block` is told
+    /// apart from every other alert. Rules an operator wrote are their own; only
+    /// ours occupy [`SNI_SID_BASE`] upward.
+    pub sid: u64,
 }
 
 /// The most recent alerts, newest last, read back out of the journal.
@@ -508,6 +583,15 @@ fn parse_alert(line: &str) -> Option<IdsAlert> {
         severity: alert.get("severity").and_then(|s| s.as_u64()).unwrap_or(0),
         src: endpoint(&v, "src_ip", "src_port"),
         dst: endpoint(&v, "dest_ip", "dest_port"),
+        dest_ip: v
+            .get("dest_ip")
+            .and_then(|a| a.as_str())
+            .unwrap_or("")
+            .to_string(),
+        sid: alert
+            .get("signature_id")
+            .and_then(|s| s.as_u64())
+            .unwrap_or(0),
         src_ip: v
             .get("src_ip")
             .and_then(|a| a.as_str())
@@ -532,6 +616,72 @@ fn endpoint(v: &serde_json::Value, addr_key: &str, port_key: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// A server name lands inside a quoted Suricata option. A quote or a
+    /// semicolon in it would end that option and start another, so a name
+    /// containing either is refused rather than escaped — it is not a name.
+    #[test]
+    fn a_server_name_cannot_break_out_of_the_rule() {
+        assert!(sni_pattern("evil.example\"; sid:1; content:\"x").is_none());
+        assert!(sni_pattern("a;b").is_none());
+        assert!(sni_pattern("").is_none());
+        assert_eq!(sni_pattern("Example.COM").as_deref(), Some("example.com"));
+        // A leading dot is how an operator writes "and everything under it",
+        // which `endswith` already means — accepted and stripped rather than
+        // given a second meaning.
+        assert_eq!(sni_pattern(".example.com").as_deref(), Some("example.com"));
+    }
+
+    /// Generated rules must occupy their own signature range: the watcher tells
+    /// an SNI refusal from every other alert by that range alone, and a
+    /// collision with a hand-written rule would make it block the wrong end.
+    #[test]
+    fn generated_rules_are_alerts_in_their_own_sid_range() {
+        let ids = Ids {
+            interfaces: vec!["eth0".into()],
+            rules: vec!["alert tcp any any -> any any (msg:\"mine\"; sid:1000;)".into()],
+            sni_block: vec!["example.com".into(), "cdn.example.net".into()],
+            ..Default::default()
+        };
+        let body = rules_body(&ids).expect("no rules rendered");
+
+        assert!(
+            body.contains("sid:1000;"),
+            "the operator's rule was dropped"
+        );
+        for (i, name) in ["example.com", "cdn.example.net"].iter().enumerate() {
+            let sid = SNI_SID_BASE + i as u64;
+            assert!(body.contains(&format!("sid:{sid};")), "{body}");
+            assert!(body.contains(&format!("content:\"{name}\"")), "{body}");
+        }
+        // Alert, never drop: blocking is the data plane's job, and a second
+        // enforcement point is what this design exists to avoid.
+        assert!(!body.contains("drop tls"), "{body}");
+        assert!(body.contains("tls.sni; content:"), "{body}");
+        assert!(
+            body.contains("endswith"),
+            "a suffix match is what was meant"
+        );
+    }
+
+    /// Which end gets blocked is the whole difference between an intrusion and
+    /// a refused destination — the client asking for a forbidden name did
+    /// nothing wrong.
+    #[test]
+    fn an_sni_alert_names_the_server_not_the_client() {
+        let line = format!(
+            r#"{{"event_type":"alert","timestamp":"t","src_ip":"10.0.0.5",
+               "dest_ip":"203.0.113.9","proto":"TCP",
+               "alert":{{"signature":"sentinel sni-block x","severity":1,
+               "signature_id":{}}}}}"#,
+            SNI_SID_BASE
+        );
+        let a = parse_alert(&line.replace('\n', " ")).expect("did not parse");
+        assert_eq!(a.sid, SNI_SID_BASE);
+        assert_eq!(a.dest_ip, "203.0.113.9");
+        assert_eq!(a.src_ip, "10.0.0.5");
+        assert!(a.sid >= SNI_SID_BASE, "not recognised as an SNI refusal");
+    }
     use super::*;
 
     fn ids(rules: &[&str]) -> Ids {
