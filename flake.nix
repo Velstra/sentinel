@@ -1559,7 +1559,7 @@
           # section is somewhere an operator has to leave the browser for.
           for view in ["view-interfaces", "view-routes", "view-groups", "view-lb",
                        "view-pki", "view-certs", "view-users", "view-ids",
-                       "view-synproxy"]:
+                       "view-synproxy", "view-capture", "view-ha"]:
               assert view in page, f"{view} is missing from the console"
 
           # A capture reads the wire, so it is verified against real traffic:
@@ -1624,6 +1624,11 @@
               "'set load-balancer web backend 10.0.0.11:8443' "
               "'set pki ca internal common-name velstra-internal-ca' "
               "'set system login ops ssh-key ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHtest' "
+              "'set protocols vrrp wan-vip interface eth0' "
+              "'set protocols vrrp wan-vip vrid 10' "
+              "'set protocols vrrp wan-vip virtual-address 203.0.113.1' "
+              "'set protocols vrrp wan-vip track-interface eth1' "
+              "'set protocols vrrp wan-vip priority-decrement 30' "
               "commit save > /tmp/sections"
           )
           sections = machine.succeed(
@@ -1635,7 +1640,7 @@
               "http://127.0.0.1:8080/api/v1/show/configuration"
           )
           for want in ["uplink", "10.0.0.254", "offices", "8443", "203.0.113.9",
-                       "internal", "ops"]:
+                       "internal", "ops", "wan-vip", "track-interface"]:
               assert want in cfg, sections + cfg
 
           # The stack lists this appliance even with no peers configured, so the

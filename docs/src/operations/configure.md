@@ -597,6 +597,11 @@ It has these working areas plus the read-only views:
   says `key only` or `password`, because which one it is matters.
 - **Intrusion defence** — the detector, recent alerts, and the run-time blocks
   with a way to lift them.
+- **High availability** — the virtual router groups, each with the interface it
+  tracks and the priority it gives up when that interface goes down. Tracking is
+  what makes failover mean something: the peer that did not lose the link takes
+  the address.
+- **Packet capture** — see below.
 - **BGP** — the router's own settings, then its neighbours.
 - **IPsec** — site-to-site tunnels.
 - **WireGuard** — interfaces, then the peers of whichever one you pick. Set the
@@ -623,6 +628,14 @@ the delete is a line you can still remove.
 checks every one and writes nothing, which is how you learn a change would be
 refused before it touches anything. A refused Apply leaves the commands staged
 so you can fix one and try again, rather than reconstructing what you clicked.
+
+### Finding things
+
+The search box in the rail searches the **configuration**, not the section
+names: type an address, a port, a zone or a name and the matches are the objects
+that mention it, each opening the section where it can be changed. Someone
+looking for `203.0.113.9` does not know, and should not have to know, whether it
+turned out to be a port forward or a load-balancer address.
 
 ### One object language
 
