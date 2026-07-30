@@ -496,3 +496,30 @@ Two further limits worth knowing:
 
 The cookie key is drawn from the kernel's random source when the first protected
 port is configured, and never leaves the appliance.
+
+## Application-layer gateways: there are none
+
+Sentinel ships **no ALGs** — no FTP helper, no SIP helper, no TFTP or PPTP
+helper. That is a decision, not a gap, and it is worth stating because other
+firewalls enable several by default.
+
+An ALG works by parsing the payload of traffic in the forwarding path and
+opening holes based on what it finds. Three things follow, and together they
+settle it:
+
+- **It parses attacker-controlled data in the most privileged place there is.**
+  The helpers in other stacks have a long history of exactly the bugs you would
+  expect from that, and each one opens a pinhole on the strength of what it
+  parsed.
+- **It stops working the moment the protocol is encrypted**, which for SIP and
+  increasingly for FTP is already the normal case. A mechanism that only helps
+  the unencrypted minority is not one to carry in the data path.
+- **Both protocols have a better answer.** FTP has passive mode; give the server
+  a fixed data-port range and forward it. SIP has TLS, and a deployment that
+  needs media traversal needs a session border controller, not a NAT guess.
+
+What this appliance offers instead is explicit: port-forwards including ranges,
+hairpin NAT so an internal client reaches a published service by its public
+address, and a stateful firewall that lets replies back without a rule. If a
+protocol needs more than that, it needs a proxy that understands it — and that
+proxy should not be inside the packet path of everything else.

@@ -148,3 +148,26 @@ sentinel show pki      # …and whether renewal is actually scheduled
 appliance registers, orders, serves the challenge on :80, and Pebble fetches it
 back — so a certificate coming out the far end proves the exchange, not merely
 that the client ran.
+
+## Which VPNs this appliance carries, and which it will not
+
+Three are supported and are the answer to essentially every case: **WireGuard**
+for site-to-site and for people, **IPsec IKEv2** where the other end is
+equipment that speaks IPsec and nothing else, and **OpenConnect** for a
+road-warrior on a network that only lets TLS out.
+
+Two are deliberately absent:
+
+- **PPTP — never.** Its authentication and encryption (MS-CHAPv2, MPPE) are
+  broken in the sense that matters: recovering the key is a service you can buy.
+  Carrying it would let someone configure a tunnel that reads as protection and
+  is not.
+- **L2TP/IPsec — no.** It is IKEv2's transport with more moving parts and worse
+  throughput, for the sake of clients that all now speak IKEv2 anyway. If you
+  need an IPsec road-warrior, use IKEv2; if you need to traverse a hostile
+  middlebox, use OpenConnect, which was built for it.
+
+**OpenVPN is a possible addition, not a commitment.** It is a reasonable
+protocol with a large installed base, and the case for it is compatibility with
+an existing deployment rather than any property WireGuard lacks. It will be
+built if that case is made, and not as a matter of course.
