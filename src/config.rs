@@ -521,11 +521,43 @@ pub struct UpdateChannel {
     pub public_key: String,
 }
 
+/// IPFIX flow export (roadmap C12). The data plane already counts every
+/// translated connection; this ships those counts to a collector so the box can
+/// answer what happened, not only what is happening.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FlowExport {
+    /// Where the collector listens, `host:port`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collector: Option<String>,
+    /// Seconds between exports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval: Option<u64>,
+    /// IPFIX observation domain — what tells one appliance's records from
+    /// another's at a collector receiving both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<u32>,
+}
+
+impl FlowExport {
+    /// Nothing configured — the whole block stays out of a saved config.
+    pub fn is_empty(&self) -> bool {
+        self.collector.is_none()
+    }
+}
+
 /// The box-wide services category (`[services.*]`). A thin grouping so DNS, NTP
 /// and the rest share one namespace instead of sprawling across the top level.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Services {
+    /// IPFIX flow export to a collector (`[services.flow-export]`).
+    #[serde(
+        default,
+        rename = "flow-export",
+        skip_serializing_if = "FlowExport::is_empty"
+    )]
+    pub flow_export: FlowExport,
     /// The LAN DNS forwarder (`[services.dns]`).
     #[serde(default, skip_serializing_if = "Dns::is_empty")]
     pub dns: Dns,

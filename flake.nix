@@ -5041,6 +5041,51 @@
             flows = fw.succeed("sentinel show flows")
             assert "10.1.0.2" in flows, f"the flow is missing: {flows}"
 
+            # C12 IPFIX flow export. A collector on the box itself, so the check
+            # is about the exporter rather than about a second machine's network.
+            fw.succeed(
+                "mkdir -p /tmp/fx && cat > /tmp/fx/collect.py <<'PY'\n"
+                "import socket, sys\n"
+                "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"
+                "s.bind(('127.0.0.1', 4739))\n"
+                "s.settimeout(90)\n"
+                "d, _ = s.recvfrom(65535)\n"
+                "open('/tmp/fx/msg', 'wb').write(d)\n"
+                "PY\n"
+                "true"
+            )
+            fw.succeed("${pkgs.python3}/bin/python3 /tmp/fx/collect.py >/tmp/fx/log 2>&1 &")
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set services flow-export collector 127.0.0.1:4739' "
+                "'set services flow-export interval 2' "
+                "'set services flow-export domain 7' "
+                "commit save exit "
+                "| sentinel configure\" 2>&1"
+            )
+            fw.wait_for_unit("velstra.service")
+            fw.succeed("grep -q '\[flow_export\]' /run/sentinel/velstra.toml")
+
+            # Traffic to export, then wait for a datagram to land.
+            client.succeed("curl -s --max-time 10 http://10.1.0.2:80/ >/dev/null")
+            fw.wait_until_succeeds("test -s /tmp/fx/msg", timeout=90)
+
+            msg = fw.succeed(
+                "${pkgs.python3}/bin/python3 -c \""
+                "d=open('/tmp/fx/msg','rb').read();"
+                "import struct;"
+                "v,ln,t,seq,dom=struct.unpack('!HHIII', d[:16]);"
+                "print(v, ln, len(d), dom, d[16:18].hex())\""
+            ).split()
+            assert msg[0] == "10", f"not IPFIX: {msg}"
+            # The stated length has to be the real one, or a collector reading
+            # two messages from one datagram finds the second in the wrong place.
+            assert msg[1] == msg[2], f"length {msg[1]} but {msg[2]} bytes: {msg}"
+            assert msg[3] == "7", f"observation domain {msg[3]}, not the configured 7"
+            # A template set (id 2) leads, so a collector that just started can
+            # decode the records behind it.
+            assert msg[4] == "0002", f"no template set: {msg}"
+
             # Per-flow accounting (roadmap C23). The state table counts the traffic
             # each entry carried, which is what lets "top talkers" answer the
             # question an operator actually has when a link is full. Pull a payload
