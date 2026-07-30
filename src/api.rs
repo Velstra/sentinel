@@ -96,6 +96,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/api/v1/status", get(get_status))
         .route("/api/v1/show/*path", get(get_show))
         .route("/api/v1/configure", post(post_configure))
+        .route("/api/v1/clear/*path", post(post_clear))
         .route("/api/v1/stack", get(get_stack))
         .route("/api/v1/stack/:member/show/*path", get(get_stack_show))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
@@ -293,6 +294,40 @@ async fn post_configure(
         "ok": out.status.success(),
         "output": text,
     })))
+}
+
+/// `POST /api/v1/clear/*path` — run an operational `clear` command.
+///
+/// Separate from `show` for the reason the CLI separates them: this changes what
+/// the box is doing. Separate from `configure` because it is not configuration —
+/// it undoes run-time state a detector created, takes effect at once, and is
+/// nowhere in the saved config, so there is nothing to stage or discard.
+async fn post_clear(UrlPath(path): UrlPath<String>) -> Result<Response, ApiError> {
+    let words: Vec<String> = path
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if words.is_empty() {
+        return Err(ApiError::bad_request(anyhow!("empty clear path")));
+    }
+    let exe = std::env::current_exe()
+        .map_err(|e| ApiError::internal(anyhow!("locating the sentinel binary: {e}")))?;
+    let out = std::process::Command::new(exe)
+        .arg("clear")
+        .args(&words)
+        .output()
+        .map_err(|e| ApiError::internal(anyhow!("running clear: {e}")))?;
+    if !out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(ApiError::bad_request(anyhow!(if msg.is_empty() {
+            "clear failed".to_string()
+        } else {
+            msg
+        })));
+    }
+    let body = String::from_utf8_lossy(&out.stdout).into_owned();
+    Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response())
 }
 
 /// `GET /api/v1/stack` — this appliance and its config-sync peers.
