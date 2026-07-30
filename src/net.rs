@@ -286,6 +286,12 @@ fn wireguard_netdev_body(name: &str, tunnel: &WireguardTunnel) -> String {
 // delegation); passing them as discrete `Option`s keeps each render path
 // explicit and each caller's intent readable.
 #[allow(clippy::too_many_arguments)]
+/// [`network_unit_body`] for an interface with no captive portal.
+///
+/// Only the tests call it now — the one production caller always knows whether
+/// the interface it is rendering carries a portal — but it keeps a dozen tests
+/// whose subject is something else from each carrying a trailing `None`.
+#[cfg(test)]
 fn network_body(
     iface: &str,
     address: Option<&str>,
@@ -301,6 +307,49 @@ fn network_body(
     mac: Option<&str>,
     description: Option<&str>,
     disabled: bool,
+) -> String {
+    network_unit_body(
+        iface,
+        address,
+        address6,
+        vlan_children,
+        macvlan_children,
+        macsec_children,
+        dhcp,
+        ra,
+        master,
+        pd,
+        mtu,
+        mac,
+        description,
+        disabled,
+        None,
+    )
+}
+
+/// [`network_body`], plus the captive-portal URI this interface's DHCP server
+/// announces (roadmap C20).
+///
+/// Split rather than folded in because exactly one interface on an appliance has
+/// a portal and every other caller would be passing `None` — including a dozen
+/// tests whose subject is something else entirely.
+#[allow(clippy::too_many_arguments)]
+fn network_unit_body(
+    iface: &str,
+    address: Option<&str>,
+    address6: Option<&str>,
+    vlan_children: &[String],
+    macvlan_children: &[String],
+    macsec_children: &[String],
+    dhcp: Option<&DhcpServer>,
+    ra: Option<&RouterAdvert>,
+    master: Option<&str>,
+    pd: Option<(&str, u8)>,
+    mtu: Option<u16>,
+    mac: Option<&str>,
+    description: Option<&str>,
+    disabled: bool,
+    portal_uri: Option<&str>,
 ) -> String {
     let v4dhcp = address == Some("dhcp");
     let v6dhcp = address6 == Some("dhcp");
@@ -405,6 +454,13 @@ fn network_body(
         // generic SendOption escape hatch (`option:type:value`).
         if let Some(domain) = &d.domain {
             body.push_str(&format!("SendOption=15:string:{domain}\n"));
+        }
+        // C20 / RFC 8910: the captive-portal URI (option 114). This is how a
+        // device *learns* there is a portal — the client's own operating system
+        // opens what is announced here — and it is the reason this appliance
+        // never has to intercept anybody's connection to show them a page.
+        if let Some(uri) = portal_uri {
+            body.push_str(&format!("SendOption=114:string:{uri}\n"));
         }
         // Static reservations become one [DHCPServerStaticLease] section each
         // (networkd keys on MAC + address; the CLI `name` is not emitted).
@@ -760,6 +816,9 @@ const SNMPD_UNIT: &str = "sentinel-snmpd.service";
 /// whole journal).
 const RSYSLOG_CONF: &str = "/run/sentinel/rsyslog.conf";
 const RSYSLOG_UNIT: &str = "sentinel-syslog.service";
+
+/// The captive-portal service (roadmap C20).
+const PORTAL_UNIT: &str = "sentinel-portal.service";
 const RSYSLOG_STATE_DIR: &str = "/var/lib/sentinel/rsyslog";
 
 /// The avahi reflector config + its Sentinel-owned unit.
@@ -1220,6 +1279,9 @@ const ALERT_WATCHED_UNITS: &[&str] = &[
     // watcher likewise: with it gone, alerts still arrive and nothing acts.
     "sentinel-ids.service",
     "sentinel-ids-watch.service",
+    // A portal that died leaves a guest zone that holds everybody and explains
+    // nothing — the gate is in the data plane and keeps working perfectly.
+    "sentinel-portal.service",
     "sentinel-nat64.service",
     "sentinel-proxy.service",
     "sentinel-ocserv.service",
@@ -1374,6 +1436,15 @@ fn apply_box_services(appliance: &Appliance) -> Result<()> {
         MACSEC_UNIT,
         Path::new(MACSEC_SETUP),
         macsec_sa_setup_body(&appliance.interfaces),
+        true,
+    )?;
+    // The captive portal (roadmap C20). The rendered state carries the
+    // passphrase, so it is a secret; installing it is what starts the service,
+    // and removing it is what stops it.
+    apply_box_service(
+        PORTAL_UNIT,
+        Path::new(crate::portal::STATE_FILE),
+        crate::portal::render(appliance),
         true,
     )?;
     // L2TPv3 pseudowires (roadmap C14): imperative `ip l2tp` setup, run after
@@ -2514,6 +2585,17 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
         }
     }
 
+    // C20: the captive portal's URI, announced in DHCP option 114 by the DHCP
+    // server on the gated zone's own interface. Derived here, once, from the
+    // same address the portal binds — a second derivation would eventually point
+    // clients at an address the portal is not listening on.
+    let portal_uri: Option<(String, String)> = crate::portal::resolve(appliance).map(|state| {
+        (
+            appliance.services.portal.zone.clone().unwrap_or_default(),
+            format!("http://{}/", state.bind),
+        )
+    });
+
     // WireGuard .netdev units (secret — the private key lives here → 0640). The
     // crypto comes from the matching `[[vpn.wireguard]]` tunnel; validation
     // guarantees one exists for every `type = "wireguard"` interface.
@@ -2606,7 +2688,7 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
                 .as_deref()
                 .map(|up| (up, i.pd_subnet.unwrap_or(0)));
             let name = network_name(&i.name);
-            let mut body = network_body(
+            let mut body = network_unit_body(
                 &i.name,
                 i.address.as_deref(),
                 i.address6.as_deref(),
@@ -2621,6 +2703,10 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
                 i.mac.as_deref(),
                 i.description.as_deref(),
                 i.disabled,
+                portal_uri
+                    .as_ref()
+                    .filter(|(zone, _)| Some(zone.as_str()) == i.zone.as_deref())
+                    .map(|(_, uri)| uri.as_str()),
             );
             // 802.1Q port membership on a VLAN-aware bridge (appended as its own
             // [BridgeVLAN] section; empty for a non-filtering port).
@@ -3183,6 +3269,62 @@ mod tests {
         assert!(u.contains("DefaultLeaseTimeSec=3600"));
         assert!(u.contains("EmitDNS=yes"));
         assert!(u.contains("DNS=10.0.0.1"));
+    }
+
+    #[test]
+    /// RFC 8910: option 114 is how a device learns there is a portal at all. If
+    /// it is missing, the gate still holds the zone and nothing tells the guest
+    /// why — which is the whole feature failing silently.
+    fn dhcp_server_announces_the_portal() {
+        let dhcp = DhcpServer {
+            pool_offset: Some(100),
+            pool_size: Some(50),
+            dns: vec![],
+            lease_time: None,
+            default_router: None,
+            domain: None,
+            static_mappings: vec![],
+        };
+        let u = network_unit_body(
+            "eth1",
+            Some("192.168.50.1/24"),
+            None,
+            &[],
+            &[],
+            &[],
+            Some(&dhcp),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            Some("http://192.168.50.1:8082/"),
+        );
+        assert!(
+            u.contains("SendOption=114:string:http://192.168.50.1:8082/"),
+            "{u}"
+        );
+        // …and a zone without a portal announces nothing, rather than an empty
+        // option a client would try to open.
+        let plain = network_body(
+            "eth1",
+            Some("192.168.50.1/24"),
+            None,
+            &[],
+            &[],
+            &[],
+            Some(&dhcp),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(!plain.contains("SendOption=114"), "{plain}");
     }
 
     #[test]

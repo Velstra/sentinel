@@ -18,11 +18,11 @@ use crate::config::{
     DhcpServer, DhcpStaticLease, Dns, Dyndns, Export, Filter, FilterRule, Firewall, Groups,
     HealthCheck, Ids, IfaceType, Interface, IpsecConnection, Isis, Lldp, LoadBalancer, Login, Mdns,
     MultiWan, Multicast, MulticastInterface, Nat, Nat64, NatDestination, NatNpt66, NatSource, Ntp,
-    OpenConnectServer, OpenConnectUser, Ospf, Ospf3, OspfInterface, Pki, Policy, PortSpec, Pppoe,
-    PrefixEntry, PrefixList, Proto, Protocols, Qos, QosDiscipline, ReverseProxy, Rip, RouterAdvert,
-    Rule, Schedule, Services, Snmp, SourceValidation, Ssh, StaticRoute, Syslog, SyslogLevel,
-    SyslogProto, SyslogTarget, System, UpdateChannel, Vpn, VrfDef, Vrrp, WanMode, WanUplink,
-    WgPeer, WireguardTunnel, ZoneCfg,
+    OpenConnectServer, OpenConnectUser, Ospf, Ospf3, OspfInterface, Pki, Policy, PortSpec, Portal,
+    Pppoe, PrefixEntry, PrefixList, Proto, Protocols, Qos, QosDiscipline, ReverseProxy, Rip,
+    RouterAdvert, Rule, Schedule, Services, Snmp, SourceValidation, Ssh, StaticRoute, Syslog,
+    SyslogLevel, SyslogProto, SyslogTarget, System, UpdateChannel, Vpn, VrfDef, Vrrp, WanMode,
+    WanUplink, WgPeer, WireguardTunnel, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -1187,6 +1187,9 @@ struct Draft {
     /// Intrusion detection (roadmap C11). Every field is a list with a working
     /// default, so the config type doubles as its own draft.
     ids: Ids,
+    /// Captive portal (roadmap C20). Every field is optional with a working
+    /// default, so — like `ids` — the config type is its own draft.
+    portal: Portal,
     dhcp_relay: DhcpRelayDraft,
     /// Multi-WAN (roadmap C6): failover/load-balance mode + the uplinks, keyed by
     /// interface in configuration order.
@@ -2185,6 +2188,7 @@ impl Draft {
                 mail: a.services.alerts.mail.clone(),
             },
             ids: a.services.ids.clone(),
+            portal: a.services.portal.clone(),
             dhcp_relay: DhcpRelayDraft {
                 interface: a.services.dhcp_relay.interface.clone(),
                 server: a.services.dhcp_relay.server.clone(),
@@ -3509,6 +3513,31 @@ impl Session {
             ["services", "syslog", "target", host, "level", v] => {
                 crate::config::validate_host(host)?;
                 self.draft.syslog_target_mut(host).level = Some(parse_syslog_level(v)?);
+            }
+
+            // services portal: the captive portal (C20). The zone is what turns
+            // it on; everything else adjusts a portal that already exists.
+            ["services", "portal", "zone", v] => {
+                self.draft.portal.zone = Some((*v).to_string());
+            }
+            ["services", "portal", "port", v] => {
+                self.draft.portal.port =
+                    Some(v.parse().with_context(|| format!("{v:?} is not a port"))?)
+            }
+            ["services", "portal", "session-timeout", v] => {
+                self.draft.portal.session_timeout = Some(
+                    v.parse()
+                        .with_context(|| format!("{v:?} is not a number of seconds"))?,
+                )
+            }
+            ["services", "portal", "passphrase", v] => {
+                self.draft.portal.passphrase = Some((*v).to_string());
+            }
+            // The message is the rest of the line, like a description: it is a
+            // sentence shown to a guest, and quoting it would be the only thing
+            // an operator got wrong about this feature.
+            ["services", "portal", "message", rest @ ..] if !rest.is_empty() => {
+                self.draft.portal.message = Some(rest.join(" "));
             }
 
             // services ids: intrusion detection (C11). Every field is a list that
@@ -5374,6 +5403,14 @@ impl Session {
                     other => bail!("services syslog target has no field {other:?}"),
                 }
             }
+            ["services", "portal"] => self.draft.portal = Portal::default(),
+            ["services", "portal", "zone"] => self.draft.portal.zone = None,
+            ["services", "portal", "port"] => self.draft.portal.port = None,
+            ["services", "portal", "session-timeout"] => self.draft.portal.session_timeout = None,
+            // Deleting the passphrase is not "no portal" — it is a click-through
+            // one, which is a mode people actually run.
+            ["services", "portal", "passphrase"] => self.draft.portal.passphrase = None,
+            ["services", "portal", "message"] => self.draft.portal.message = None,
             // services ids: all of it, one list, or one entry by value. A rule is
             // deleted by its sid as well as by its full text — nobody retypes a
             // Suricata rule verbatim to remove it.
@@ -7007,6 +7044,7 @@ impl Session {
                 },
                 ssh: self.draft.ssh.clone(),
                 ids: self.draft.ids.clone(),
+                portal: self.draft.portal.clone(),
                 alerts: Alerts {
                     webhook: self.draft.alerts.webhook.clone(),
                     mail: self.draft.alerts.mail.clone(),

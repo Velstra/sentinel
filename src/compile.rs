@@ -160,8 +160,76 @@ struct Policy {
     // Scalars above, the array-of-tables below (TOML requires this order).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     blocklist: Vec<String>,
+    /// C20: the captive-portal gate for this zone. A sub-table, so it comes
+    /// after the scalars and before the `[[policy.port_rule]]` array.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    portal: Option<PortalOut>,
     #[serde(rename = "port_rule", skip_serializing_if = "Vec::is_empty")]
     port_rules: Vec<PortRule>,
+}
+
+/// Which policy id each zone in use compiles to.
+///
+/// Assigned by sorted zone name so a recompile is deterministic — the map keys
+/// the data plane uses for conntrack and rules must not move because an
+/// interface was added. Exposed because the portal has to name a zone's policy
+/// to the agent, and a second implementation of this rule would eventually
+/// admit devices to the wrong zone.
+pub fn zone_policy_ids(appliance: &Appliance) -> BTreeMap<&str, u32> {
+    let mut zone_names: Vec<&str> = appliance
+        .interfaces
+        .iter()
+        .filter(|i| !i.disabled)
+        .filter_map(|i| i.zone.as_deref())
+        .collect();
+    zone_names.sort_unstable();
+    zone_names.dedup();
+    zone_names
+        .into_iter()
+        .enumerate()
+        .map(|(i, name)| (name, i as u32 + 1))
+        .collect()
+}
+
+/// The gate for `zone`, or `None` when it is not the zone behind the portal.
+///
+/// The addresses are the appliance's own in that zone, taken from the first
+/// enabled interface that has one — the same address the portal binds and the
+/// same one DHCP option 114 announces, because all three have to be the address
+/// the client can actually reach, and deriving them from one place is what keeps
+/// them the same.
+fn portal_gate(appliance: &Appliance, zone: &str) -> Option<PortalOut> {
+    if appliance.services.portal.zone.as_deref() != Some(zone) {
+        return None;
+    }
+    let addressed = |pick: fn(&crate::config::Interface) -> Option<&String>| {
+        appliance
+            .interfaces
+            .iter()
+            .filter(|i| !i.disabled && i.zone.as_deref() == Some(zone))
+            .find_map(|i| pick(i).map(|a| a.split('/').next().unwrap_or(a).to_string()))
+    };
+    let out = PortalOut {
+        address: addressed(|i| i.address.as_ref()),
+        address6: addressed(|i| i.address6.as_ref()),
+    };
+    // Validation refuses a portal zone with no IPv4 address, so this is the
+    // belt to that brace: emitting an empty gate would set the portal flag on a
+    // zone whose gate matches nothing, closing it around a page nobody can load.
+    if out.address.is_none() && out.address6.is_none() {
+        return None;
+    }
+    Some(out)
+}
+
+/// The appliance's own addresses in a gated zone — what a device that has not
+/// been admitted is still allowed to reach (roadmap C20).
+#[derive(Debug, Serialize)]
+struct PortalOut {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    address6: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -298,19 +366,8 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
     // entirely: it contributes no zone and gets no policy binding (so the agent
     // never attaches XDP to it). A disabled rule / NAT entry is likewise skipped
     // below.
-    let mut zone_names: Vec<&str> = appliance
-        .interfaces
-        .iter()
-        .filter(|i| !i.disabled)
-        .filter_map(|i| i.zone.as_deref())
-        .collect();
-    zone_names.sort_unstable();
-    zone_names.dedup();
-    let ids: BTreeMap<&str, u32> = zone_names
-        .iter()
-        .enumerate()
-        .map(|(i, name)| (*name, i as u32 + 1))
-        .collect();
+    let ids = zone_policy_ids(appliance);
+    let zone_names: Vec<&str> = ids.keys().copied().collect();
 
     // The IPv4 subnets a zone owns, as network CIDRs derived from its interfaces'
     // static addresses ("10.2.0.1/24" -> "10.2.0.0/24"). This is what makes a
@@ -479,6 +536,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                 log: posture.log,
                 source_validation: posture.source_validation.as_str(),
                 blocklist: geo_blocklist(&posture),
+                portal: portal_gate(appliance, zone),
                 port_rules,
             }
         })
@@ -1712,6 +1770,64 @@ mss = 1400
         let out = toml::to_string(&cfg).unwrap();
         assert!(out.contains("[[synproxy]]"), "{out}");
         assert!(out.contains("mss = 1460"), "{out}");
+    }
+
+    #[test]
+    /// The gate the data plane enforces is the zone's policy plus the
+    /// appliance's own address in it. Both halves have to reach the agent config
+    /// together, and only for the gated zone.
+    fn a_portal_gates_exactly_its_own_zone() {
+        let toml = r#"
+[system]
+hostname = "fw"
+
+[[interface]]
+name = "lan0"
+zone = "lan"
+address = "10.0.0.1/24"
+
+[[interface]]
+name = "guest0"
+zone = "guest"
+address = "192.168.50.1/24"
+address6 = "2001:db8:50::1/64"
+
+[services.portal]
+zone = "guest"
+passphrase = "sommer"
+"#;
+        let appliance = Appliance::from_toml(toml).unwrap();
+        appliance.validate().unwrap();
+        let out = compile(&appliance).to_toml().unwrap();
+
+        // The gated zone carries the appliance's own addresses…
+        assert!(out.contains("[policy.portal]"), "{out}");
+        assert!(out.contains("address = \"192.168.50.1\""), "{out}");
+        assert!(out.contains("address6 = \"2001:db8:50::1\""), "{out}");
+        // …and exactly one zone does.
+        assert_eq!(out.matches("[policy.portal]").count(), 1, "{out}");
+    }
+
+    #[test]
+    /// A portal on a zone with no interface, or with no address to bind, is
+    /// refused at commit: each of those looks the same from outside — a guest
+    /// zone nobody can get onto — and none is visible until someone tries.
+    fn a_portal_needs_a_zone_that_can_carry_it() {
+        let base = r#"
+[system]
+hostname = "fw"
+
+[[interface]]
+name = "guest0"
+zone = "guest"
+"#;
+        // No interface in that zone at all. (`from_toml` validates, so a
+        // refusal here is the same refusal a `commit` gives.)
+        let nowhere = format!("{base}\n[services.portal]\nzone = \"lounge\"\n");
+        assert!(Appliance::from_toml(&nowhere).is_err());
+        // The zone exists but has no address for the portal to listen on.
+        let addressless = format!("{base}\n[services.portal]\nzone = \"guest\"\n");
+        assert!(Appliance::from_toml(&addressless).is_err());
     }
 
     #[test]

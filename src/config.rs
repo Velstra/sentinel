@@ -611,6 +611,9 @@ pub struct Services {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub broadcast_relay: Vec<BroadcastRelay>,
+    /// Captive portal for a guest zone (`[services.portal]`, roadmap C20).
+    #[serde(default, skip_serializing_if = "Portal::is_empty")]
+    pub portal: Portal,
 }
 
 impl Services {
@@ -629,6 +632,80 @@ impl Services {
             && self.alerts.is_empty()
             && self.ids.is_empty()
             && self.broadcast_relay.is_empty()
+            && self.portal.is_empty()
+    }
+}
+
+/// A captive portal for one zone (`[services.portal]`, roadmap C20).
+///
+/// The gate itself lives in the data plane: a device on the named zone reaches
+/// the appliance and nothing else until it has been admitted, and an admission
+/// is a run-time fact with a deadline rather than a change to this file. What is
+/// configured here is the *policy around* that gate — which zone, what a visitor
+/// has to do to get in, and for how long.
+///
+/// How a device finds the portal is **RFC 8910**: the DHCP server hands out the
+/// portal's URI in option 114, and the client's own operating system opens it.
+/// There is no HTTP interception, for the reason given in the firewall handbook:
+/// intercepting means parsing and rewriting somebody's connection, and it stops
+/// working the moment that connection is TLS — which today it is.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Portal {
+    /// The zone held behind the portal. Unset ⇒ no portal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
+    /// TCP port the portal page listens on. Unset ⇒ [`DEFAULT_PORTAL_PORT`].
+    ///
+    /// Not 80: the appliance's own management surfaces already contend for the
+    /// well-known ports, and a portal announced by option 114 carries its port in
+    /// the URI, so nothing is gained by squatting on one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// What a visitor must type. Unset ⇒ **click-through**: the page states the
+    /// terms and a button admits the device.
+    ///
+    /// Kept as written rather than hashed, and deliberately: this is a shared
+    /// secret printed on a card by the door, not a credential belonging to a
+    /// person. Hashing it would stop the operator reading back what they set
+    /// while protecting nothing that is not already on that card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passphrase: Option<String>,
+    /// How long an admission lasts, in seconds. Unset ⇒
+    /// [`DEFAULT_PORTAL_SESSION`].
+    #[serde(
+        default,
+        rename = "session-timeout",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub session_timeout: Option<u64>,
+    /// A line of text shown on the page — the network's name, the terms, who to
+    /// ask. Unset ⇒ a plain welcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// The portal's default listen port. See [`Portal::port`].
+pub const DEFAULT_PORTAL_PORT: u16 = 8082;
+
+/// How long an admission lasts when the config names no length: one hour, the
+/// same bound the agent applies to a run-time block.
+pub const DEFAULT_PORTAL_SESSION: u64 = 3600;
+
+impl Portal {
+    /// True when no portal is configured — a zone is what turns it on.
+    pub fn is_empty(&self) -> bool {
+        self.zone.is_none()
+    }
+
+    /// The port the page listens on.
+    pub fn port(&self) -> u16 {
+        self.port.unwrap_or(DEFAULT_PORTAL_PORT)
+    }
+
+    /// How long one admission lasts.
+    pub fn session_timeout(&self) -> u64 {
+        self.session_timeout.unwrap_or(DEFAULT_PORTAL_SESSION)
     }
 }
 
@@ -6626,6 +6703,67 @@ impl Appliance {
         // rather than discovered at run time, because the failure is silent in the
         // worst way: Suricata that will not start, or starts with no rules, leaves
         // an operator believing the box is watched when nothing is.
+        // C20 captive portal. Everything here is refused rather than warned
+        // about, because each failure looks the same from the outside — a guest
+        // zone with no way onto the network — and none of them is visible until
+        // somebody is standing there with a laptop.
+        let portal = &self.services.portal;
+        if let Some(zone) = &portal.zone {
+            if !self
+                .interfaces
+                .iter()
+                .any(|i| i.zone.as_deref() == Some(zone))
+            {
+                bail!(
+                    "services portal zone {zone:?}: no interface is in that zone, \
+                     so there is nobody to hold at the gate"
+                );
+            }
+            // The portal binds the appliance's address in the gated zone and
+            // announces it in DHCP option 114. Without a static address there is
+            // nothing to bind and nothing to announce — and the gate would close
+            // the zone around a page nobody can reach.
+            let addressed = self
+                .interfaces
+                .iter()
+                .any(|i| i.zone.as_deref() == Some(zone) && !i.disabled && i.address.is_some());
+            if !addressed {
+                bail!(
+                    "services portal zone {zone:?}: needs an enabled interface with a \
+                     static address — that address is what the portal listens on and \
+                     what DHCP option 114 points clients at"
+                );
+            }
+            if let Some(pass) = &portal.passphrase {
+                if pass.trim().is_empty() {
+                    bail!(
+                        "services portal passphrase: empty — omit it for a \
+                         click-through portal rather than setting nothing"
+                    );
+                }
+                reject_config_token("services portal passphrase", pass)?;
+            }
+            if let Some(msg) = &portal.message {
+                validate_description(msg).context("services portal message")?;
+            }
+            if let Some(secs) = portal.session_timeout {
+                // The agent's own ceiling. Refusing here beats having every login
+                // silently granted a shorter session than the config promises.
+                if secs == 0 || secs > 86_400 {
+                    bail!(
+                        "services portal session-timeout {secs}: must be 1..=86400 \
+                         seconds — an admission that outlives the visit is an access \
+                         nobody remembers granting"
+                    );
+                }
+            }
+            if let Some(port) = portal.port {
+                if port == 0 {
+                    bail!("services portal port 0: not a port");
+                }
+            }
+        }
+
         let ids = &self.services.ids;
         if !ids.is_empty() {
             let mut seen_iface = HashSet::new();
