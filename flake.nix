@@ -1546,6 +1546,13 @@
               assert surface not in page, f"the console still exposes {surface!r}"
           assert "fillZoneSelect" in page, "zone fields are free text"
 
+          # One object language across every section — a section that grew its
+          # own renderer is how a console starts writing a setting two ways.
+          for lst in ["zonelist", "snatlist", "dnatlist", "bgplist", "ipseclist",
+                      "wglist", "wgpeerlist", "dhcplist"]:
+              assert lst in page, f"{lst} is not rendered as objects"
+          assert "editorTable" not in page, "a second renderer is back"
+
           # The stack lists this appliance even with no peers configured, so the
           # view is never empty and an operator can tell "no peers" apart from
           # "the page failed to load".
