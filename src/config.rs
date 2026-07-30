@@ -840,6 +840,12 @@ pub struct Ids {
     /// Rules written inline in the configuration, one Suricata rule per entry.
     #[serde(default, rename = "rule", skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<String>,
+    /// Server names to refuse (roadmap C23). Matched against the **SNI** a TLS
+    /// client announces, so it works for a name the client resolved somewhere
+    /// this appliance never saw — over DoH, from a cache, or as a literal
+    /// address. A leading dot matches the domain and everything under it.
+    #[serde(default, rename = "sni-block", skip_serializing_if = "Vec::is_empty")]
+    pub sni_block: Vec<String>,
     /// Absolute paths to rule files the operator put on the box (an Emerging
     /// Threats set, say). Kept as paths rather than content because a ruleset is
     /// megabytes and does not belong in a configuration file.

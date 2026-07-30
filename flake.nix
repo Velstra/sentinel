@@ -3460,6 +3460,73 @@
           # the detector decides, it undoes itself.
           assert "s remaining" in blocks, blocks
 
+          # --- C23: refusing a server by the name it announces ----------------
+          #
+          # A TLS client says which service it wants in the clear, before
+          # anything is encrypted. What is proved here is the whole chain: the
+          # generated rule fires on that name, and the block lands on the
+          # SERVER rather than on the client — the client asked for something it
+          # should not have, but the server is what must stop answering.
+          fw.succeed("sentinel clear ids blocks")
+          fw.succeed(
+              """cat > /tmp/ids-sni.cfg <<'CFG'
+          set services ids sni-block forbidden.example
+          commit
+          save
+          exit
+          CFG"""
+          )
+          fw.succeed("sed -i 's/^          //' /tmp/ids-sni.cfg")
+          fw.succeed("su admin -c 'sentinel configure < /tmp/ids-sni.cfg'")
+          # The watcher remembers what it has already asked to block for the rest
+          # of the block period — `clear ids block` is a reprieve, not an
+          # exemption — and the neighbour is in that memory from the phase above.
+          # Restarting it is how this phase starts from nothing.
+          fw.succeed("systemctl restart sentinel-ids-watch.service")
+          fw.wait_for_unit("sentinel-ids-watch.service")
+          # The generated rule is an alert in its own signature range; blocking
+          # is the data plane's job, not Suricata's.
+          fw.wait_until_succeeds("grep -q tls.sni /run/sentinel/suricata.rules", timeout=30)
+          rules = fw.succeed("cat /run/sentinel/suricata.rules")
+          assert "tls.sni" in rules and "forbidden.example" in rules, rules
+          assert "sid:9100000;" in rules, rules
+          assert not rules.startswith("drop tls"), rules
+          fw.wait_for_unit("sentinel-ids.service")
+
+          # A TLS server on the neighbour, and a handshake that announces the
+          # forbidden name. The handshake itself may well fail — that is the
+          # point — so its exit status is not what is asserted.
+          neighbour.succeed(
+              "${pkgs.openssl}/bin/openssl req -x509 -newkey rsa:2048 -nodes "
+              "-keyout /tmp/k.pem -out /tmp/c.pem -days 1 -subj /CN=forbidden.example "
+              ">/dev/null 2>&1"
+          )
+          neighbour.succeed(
+              "${pkgs.openssl}/bin/openssl s_server -quiet -accept 8443 "
+              "-cert /tmp/c.pem -key /tmp/k.pem >/dev/null 2>&1 &"
+          )
+          neighbour.wait_for_open_port(8443)
+
+          def refused(_last=False):
+              fw.succeed(
+                  # -4 on purpose: a nixosTest hostname resolves to IPv6 first,
+                  # and the block would then land on the v6 address while every
+                  # other assertion in this check speaks v4.
+                  "timeout 5 ${pkgs.openssl}/bin/openssl s_client -4 -servername "
+                  "forbidden.example -connect neighbour:8443 </dev/null "
+                  ">/dev/null 2>&1 || true"
+              )
+              return "192.168.1." in fw.succeed("sentinel show ids blocks")
+
+          retry(refused, timeout=180)
+          blocks = fw.succeed("sentinel show ids blocks")
+          # The neighbour is the server here, and it is the neighbour that got
+          # blocked — the address in the list is the one that was asked for.
+          assert "192.168.1." in blocks, blocks
+          watch = fw.succeed("journalctl -u sentinel-ids-watch.service --no-pager")
+          assert "sni-block" in watch, watch
+          fw.succeed("sentinel clear ids blocks")
+
           # A wrong block has to be undoable now, not in half an hour: that is the
           # difference between a guard rail and an outage an operator watches.
           addr = blocks.split()[0]
