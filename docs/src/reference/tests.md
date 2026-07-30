@@ -1,6 +1,6 @@
 # Test suite (nixosTests)
 
-Sentinel is verified by **75 nixosTests** plus the Rust unit tests. The nixosTests
+Sentinel is verified by **74 nixosTests** plus the Rust unit tests. The nixosTests
 boot real QEMU/OVMF VMs — several of them two or three at a time on shared virtual
 segments — so they need `/dev/kvm`.
 
@@ -98,7 +98,7 @@ authoritative list.
 | `dhcp6` | stateful DHCPv6 leases — the stateful sibling of `ra` |
 | `ra` | IPv6 Router Advertisements give a client a SLAAC address |
 | `dhcp6pd` | DHCPv6-PD requests a delegated prefix upstream (the German-ISP WAN v6 model) |
-| `dhcp-relay`, `dhcprelay` | DHCP relay across two segments, for a client whose own segment has no server |
+| `dhcprelay` | DHCP relay across two segments: a client whose own segment has no server gets a lease from the far one, with the data plane attached so the relay is proved to work *through* it |
 | `dhcprelay6` | the IPv6 sibling of the relay |
 | `dns` | the DNS forwarder resolves for the LAN against an authoritative upstream |
 | `ntp` | the box serves time to the LAN from an upstream source |
