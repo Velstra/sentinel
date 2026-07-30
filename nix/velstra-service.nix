@@ -1,14 +1,12 @@
 # NixOS module: run the Velstra eBPF/XDP data plane as a service.
 #
-# The agent config is compiled from the declarative Sentinel appliance config at
-# **build time** and placed in this generation's read-only /etc — so the whole
-# firewall is part of the immutable, rollback-able system closure. Change the
-# appliance config, rebuild, and a bad change is undone by booting the previous
-# generation.
-#
-# Not yet wired into flake.nix: it needs `services.velstra.package` — the velstra
-# agent built as a Nix package (the eBPF data plane). That packaging (nightly
-# rust + rust-src + bpf-linker in the sandbox) is the next milestone.
+# The agent config is **rendered at apply time** into /run/sentinel/velstra.toml
+# by `sentinel apply-boot` and by every `commit`, not baked into the generation.
+# That is the appliance's model: the image is immutable and rollback-able, while
+# the configuration is a document the running system reconciles to — so a firewall
+# change takes effect without a rebuild, and `commit-confirm` can undo it on a
+# timer. (An earlier version of this file described a build-time /etc config; the
+# appliance never worked that way.)
 {
   config,
   lib,
