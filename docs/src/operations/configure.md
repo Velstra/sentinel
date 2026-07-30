@@ -586,6 +586,17 @@ It has these working areas plus the read-only views:
   live NAT state below them. A new entry is filled in as a whole row and created
   in one commit, because a NAT entry needs several fields to be valid and the
   appliance is right to refuse half of one.
+- **Interfaces** — zone, addresses, MTU. The badge is the zone, because that is
+  what decides whether the firewall applies to an interface at all.
+- **Static routes**, **Groups** (address, port, domain — a group is referenced
+  by rules, so one edit here moves every rule that names it).
+- **SYN protection** — the ports whose handshake the firewall completes itself.
+- **Load balancer** — virtual addresses and their backends.
+- **Authorities** and **Certificates**.
+- **Administrators** — SSH keys and, if you insist, a hashed password. The badge
+  says `key only` or `password`, because which one it is matters.
+- **Intrusion defence** — the detector, recent alerts, and the run-time blocks
+  with a way to lift them.
 - **BGP** — the router's own settings, then its neighbours.
 - **IPsec** — site-to-site tunnels.
 - **WireGuard** — interfaces, then the peers of whichever one you pick. Set the
@@ -640,6 +651,20 @@ that assembled a configuration document instead would be a second description
 of the config model, free to drift from the first. The pending panel lists what
 will change, in words — the commands are transport, and transport is not an
 interface.
+
+### Outcomes, not transcripts
+
+The appliance answers in a terminal's voice — a refused setting is followed by
+the whole `set` grammar, which is right at a prompt and useless in a browser.
+The console reads the reply for what it says about *your* change and shows that:
+the errors, the warnings, and the confirmation. The grammar dump is dropped.
+
+### Operations are not configuration
+
+Lifting a run-time block takes effect at once and is nowhere in the saved
+config, so it is not staged — offering to discard it would be a lie. Adding a
+block by hand is not something the CLI can do, so the console does not offer it
+either.
 
 ### Debugging
 
