@@ -199,7 +199,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-dA2xh5+Jsy9KQVHRROqsidV1bY2hfi+9rD7J5LothcY=";
+      ebpfHash = "sha256-29MlHhwQpOniqKereo7WSL+jJshJVyXOrzckhCNeaQc=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -6326,6 +6326,148 @@
 
             # The server side saw the lease it handed out.
             fw.succeed("networkctl status eth1")
+          '';
+        };
+
+        # Captive portal (roadmap C20): a guest zone that holds every device
+        # until somebody has logged in. Two nodes — a `guest` on vlan 1 that
+        # takes its address by DHCP (which the gate must still admit, or nobody
+        # could ever reach the portal), and the sentinel `fw` whose eth1 is the
+        # gated zone. The far side is the fw's own eth2 address: reaching it
+        # means crossing the gate, and it needs no third machine to do so.
+        #
+        # What this proves is the whole chain in one go: the data plane holds an
+        # unadmitted device (and says so in `dropped_portal`), the portal page is
+        # reachable while everything else is not, a login puts one entry in the
+        # allow-set, and the same device then goes through. It is also the run
+        # that puts the gate in front of the **verifier** — everything else about
+        # C20 is checkable without a kernel, and that is not.
+        #   nix build .#checks.x86_64-linux.portal -L
+        portal = pkgs.testers.runNixOSTest {
+          name = "sentinel-portal";
+          nodes = {
+            guest =
+              { ... }:
+              {
+                virtualisation.vlans = [ 1 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                };
+                systemd.network.networks."10-eth1" = {
+                  matchConfig.Name = "eth1";
+                  networkConfig.DHCP = "ipv4";
+                };
+                # The portal is HTTP; a guest reaches it with a browser and this
+                # test with curl.
+                environment.systemPackages = [ pkgs.curl ];
+              };
+            fw =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "fw";
+                networking.firewall.enable = lib.mkForce false;
+                virtualisation.vlans = [
+                  1
+                  2
+                ];
+                virtualisation.memorySize = 2048;
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+          };
+          testScript = ''
+            start_all()
+            fw.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+
+            # eth1 is the guest zone, behind the portal; eth2 is the far side a
+            # held device must not reach. The zone accepts by default, so what
+            # holds the guest is the portal and nothing else — if the zone
+            # dropped, this test would pass for the wrong reason.
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth1 address 192.168.50.1/24' "
+                "'set interface eth1 zone guest' "
+                "'set interface eth2 address 10.9.0.1/24' "
+                "'set interface eth2 zone dmz' "
+                "'set firewall zone guest default-action accept' "
+                "'set firewall zone dmz default-action accept' "
+                "'set interface eth1 dhcp-server enable' "
+                "'set interface eth1 dhcp-server pool-offset 100' "
+                "'set interface eth1 dhcp-server pool-size 50' "
+                "'set interface eth1 dhcp-server dns 192.168.50.1' "
+                "'set services portal zone guest' "
+                "'set services portal passphrase sommer2026' "
+                "'set services portal message Guest wifi at reception' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            fw.wait_for_unit("velstra.service")
+            fw.wait_for_unit("sentinel-portal.service")
+
+            with subtest("the zone announces the portal in DHCP option 114"):
+                fw.wait_until_succeeds(
+                    "test -f /run/systemd/network/10-sentinel-eth1.network", timeout=20
+                )
+                netw = fw.succeed("cat /run/systemd/network/10-sentinel-eth1.network")
+                assert "SendOption=114:string:http://192.168.50.1:8082/" in netw, netw
+
+            # DHCP has to work from behind the gate — a client that cannot get an
+            # address cannot reach a portal either.
+            guest.wait_for_unit("multi-user.target")
+            guest.wait_until_succeeds(
+                "ip -4 addr show eth1 | grep -oE '192[.]168[.]50[.][0-9]+' "
+                "| grep -qv '192.168.50.1'",
+                timeout=90,
+            )
+            mac = guest.succeed("cat /sys/class/net/eth1/address").strip()
+
+            with subtest("an unadmitted device is held"):
+                guest.fail("ping -c1 -W2 10.9.0.1")
+                stats = fw.succeed("sentinel show firewall statistics")
+                assert "dropped_portal" in stats, stats
+                held = [l for l in stats.splitlines() if "dropped_portal" in l][0]
+                assert int(held.split()[-1]) > 0, held
+
+            with subtest("…and can still reach the portal"):
+                page = guest.succeed("curl -sf http://192.168.50.1:8082/")
+                assert "Guest wifi at reception" in page, page
+                assert 'name="passphrase"' in page, page
+                # RFC 8908: the device's own operating system asks this.
+                api = guest.succeed(
+                    "curl -sf http://192.168.50.1:8082/api/captive-portal"
+                )
+                assert '"captive":true' in api, api
+
+            with subtest("the wrong passphrase admits nobody"):
+                guest.fail(
+                    "curl -sf -X POST -d 'passphrase=wrong' "
+                    "http://192.168.50.1:8082/login"
+                )
+                guest.fail("ping -c1 -W2 10.9.0.1")
+
+            with subtest("a login puts the device through"):
+                done = guest.succeed(
+                    "curl -sf -X POST -d 'passphrase=sommer2026' "
+                    "http://192.168.50.1:8082/login"
+                )
+                assert "Connected" in done, done
+                guest.succeed("ping -c1 -W2 10.9.0.1")
+
+            with subtest("the appliance names the device it admitted"):
+                sessions = fw.succeed("sentinel show portal sessions")
+                assert mac in sessions, (mac, sessions)
+                api = guest.succeed(
+                    "curl -sf http://192.168.50.1:8082/api/captive-portal"
+                )
+                assert '"captive":false' in api, api
+                assert "seconds-remaining" in api, api
+
+            with subtest("and holds it again once the session is taken away"):
+                fw.succeed(f"sentinel clear portal session {mac}")
+                guest.fail("ping -c1 -W2 10.9.0.1")
           '';
         };
 
