@@ -819,6 +819,9 @@ const RSYSLOG_UNIT: &str = "sentinel-syslog.service";
 
 /// The captive-portal service (roadmap C20).
 const PORTAL_UNIT: &str = "sentinel-portal.service";
+
+/// The NAT-PMP service (roadmap C18).
+const PORTMAP_UNIT: &str = "sentinel-portmap.service";
 const RSYSLOG_STATE_DIR: &str = "/var/lib/sentinel/rsyslog";
 
 /// The avahi reflector config + its Sentinel-owned unit.
@@ -1282,6 +1285,7 @@ const ALERT_WATCHED_UNITS: &[&str] = &[
     // A portal that died leaves a guest zone that holds everybody and explains
     // nothing — the gate is in the data plane and keeps working perfectly.
     "sentinel-portal.service",
+    "sentinel-portmap.service",
     "sentinel-nat64.service",
     "sentinel-proxy.service",
     "sentinel-ocserv.service",
@@ -1446,6 +1450,15 @@ fn apply_box_services(appliance: &Appliance) -> Result<()> {
         Path::new(crate::portal::STATE_FILE),
         crate::portal::render(appliance),
         true,
+    )?;
+    // NAT-PMP (roadmap C18). No secret in it, but it names the zone a host on
+    // the inside may open a port on, which is worth the same install-and-restart
+    // treatment as everything else.
+    apply_box_service(
+        PORTMAP_UNIT,
+        Path::new(crate::portmap::STATE_FILE),
+        crate::portmap::render(appliance),
+        false,
     )?;
     // L2TPv3 pseudowires (roadmap C14): imperative `ip l2tp` setup, run after
     // networkd (which then addresses the created links). No secret.

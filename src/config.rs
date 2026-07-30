@@ -614,6 +614,13 @@ pub struct Services {
     /// Captive portal for a guest zone (`[services.portal]`, roadmap C20).
     #[serde(default, skip_serializing_if = "Portal::is_empty")]
     pub portal: Portal,
+    /// NAT-PMP port mapping (`[services.port-mapping]`, roadmap C18).
+    #[serde(
+        default,
+        rename = "port-mapping",
+        skip_serializing_if = "PortMapping::is_empty"
+    )]
+    pub port_mapping: PortMapping,
 }
 
 impl Services {
@@ -633,6 +640,65 @@ impl Services {
             && self.ids.is_empty()
             && self.broadcast_relay.is_empty()
             && self.portal.is_empty()
+            && self.port_mapping.is_empty()
+    }
+}
+
+/// NAT-PMP port mapping (`[services.port-mapping]`, roadmap C18).
+///
+/// This is the one service where a host on the **inside** opens an inbound port
+/// with no person deciding — a console or a call app asking for what it needs
+/// instead of waiting for somebody to configure it. That is a real transfer of
+/// authority, so nothing here has a default that switches it on: naming the zone
+/// allowed to ask is what turns it on, and naming the uplink is what says where
+/// the port is opened.
+///
+/// UPnP IGD is deliberately not offered. It is SOAP over HTTP with device
+/// discovery and XML descriptions, i.e. a much larger parser on a port every LAN
+/// host can reach, for the same outcome NAT-PMP reaches in four message types.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortMapping {
+    /// The zone whose hosts may ask. Unset ⇒ off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
+    /// The zone a mapping is opened on — the uplink.
+    #[serde(default, rename = "wan-zone", skip_serializing_if = "Option::is_none")]
+    pub wan_zone: Option<String>,
+    /// The longest mapping handed out, in seconds. Unset ⇒
+    /// [`DEFAULT_MAPPING_LIFETIME`]. A client asking for longer is granted this
+    /// and told so, which is what the protocol has a lifetime field for.
+    #[serde(
+        default,
+        rename = "max-lifetime",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_lifetime: Option<u64>,
+    /// Allow a host to claim an external port below 1024. Off unless asked for:
+    /// a LAN host taking port 22 or 443 on the uplink is either a mistake or an
+    /// attempt to stand in front of something the operator runs.
+    #[serde(
+        default,
+        rename = "allow-privileged",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub allow_privileged: Option<bool>,
+}
+
+/// The longest mapping handed out when the config names no ceiling: two hours,
+/// which is what PCP suggests and long enough that a client renewing at half the
+/// lifetime does so rarely.
+pub const DEFAULT_MAPPING_LIFETIME: u64 = 7200;
+
+impl PortMapping {
+    /// True when no zone may ask — a zone is what turns this on.
+    pub fn is_empty(&self) -> bool {
+        self.zone.is_none()
+    }
+
+    /// The longest mapping handed out.
+    pub fn max_lifetime(&self) -> u64 {
+        self.max_lifetime.unwrap_or(DEFAULT_MAPPING_LIFETIME)
     }
 }
 
@@ -6760,6 +6826,50 @@ impl Appliance {
             if let Some(port) = portal.port {
                 if port == 0 {
                     bail!("services portal port 0: not a port");
+                }
+            }
+        }
+
+        // C18 NAT-PMP. Both zones are refused rather than warned about: a wrong
+        // one here means either a daemon nobody can reach or — worse — mappings
+        // opened on the wrong zone, and neither shows up until somebody's
+        // console cannot connect.
+        let pm = &self.services.port_mapping;
+        if let Some(zone) = &pm.zone {
+            let Some(wan) = &pm.wan_zone else {
+                bail!(
+                    "services port-mapping: needs `wan-zone` — a mapping has to be \
+                     opened on some zone, and opening it on all of them would open \
+                     the port on the LAN too"
+                );
+            };
+            if wan == zone {
+                bail!(
+                    "services port-mapping: zone and wan-zone are both {zone:?}; \
+                     that maps a port on the very zone the request came from"
+                );
+            }
+            for (what, z) in [("zone", zone), ("wan-zone", wan)] {
+                let addressed = self
+                    .interfaces
+                    .iter()
+                    .any(|i| i.zone.as_deref() == Some(z) && !i.disabled && i.address.is_some());
+                if !addressed {
+                    bail!(
+                        "services port-mapping {what} {z:?}: needs an enabled interface \
+                         with a static address"
+                    );
+                }
+            }
+            if let Some(secs) = pm.max_lifetime {
+                // The agent's own ceiling. Refusing here beats granting a client
+                // less than the configuration promised it.
+                if secs == 0 || secs > 86_400 {
+                    bail!(
+                        "services port-mapping max-lifetime {secs}: must be 1..=86400 \
+                         seconds — an inbound port that outlives what asked for it is \
+                         a hole nobody can account for"
+                    );
                 }
             }
         }
