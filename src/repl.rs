@@ -902,7 +902,15 @@ const RUN_TOP: &[Cand] = &[
     ("clear", "clear operational state (run-time blocks)"),
 ];
 // `run clear <Tab>`.
-const OP_CLEAR: &[Cand] = &[("ids", "intrusion-detection state")];
+const OP_CLEAR: &[Cand] = &[
+    ("ids", "intrusion-detection state"),
+    ("portal", "captive-portal sessions"),
+];
+// `run clear portal <Tab>`.
+const OP_CLEAR_PORTAL: &[Cand] = &[
+    ("session", "end one device's session, by MAC"),
+    ("sessions", "end every session"),
+];
 // `run clear ids <Tab>`.
 const OP_CLEAR_IDS: &[Cand] = &[
     ("block", "lift the block on one address"),
@@ -2776,6 +2784,7 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["run", "show", "ids"] => OP_IDS,
         ["run", "clear"] => OP_CLEAR,
         ["run", "clear", "ids"] => OP_CLEAR_IDS,
+        ["run", "clear", "portal"] => OP_CLEAR_PORTAL,
         _ => &[],
     }
 }

@@ -1386,13 +1386,43 @@ fn clear_op(args: &[String]) -> Result<()> {
         // sources, and lifting them one at a time is the wrong thing to be doing
         // while that is still happening.
         ["ids", "blocks"] => show_agent_query("unblock all", "lifting the blocks"),
+        // C20: throw one device — or everybody — off the guest network without
+        // waiting for a session to expire. Named by MAC because that is what a
+        // session *is* and what `show portal sessions` lists.
+        ["portal", "session", mac] => clear_portal(&format!("revoke {mac} any")),
+        ["portal", "sessions"] => clear_portal("revoke all"),
         [] => {
-            println!("usage: clear ids block <ip> | clear ids blocks");
+            println!(
+                "usage: clear ids block <ip> | clear ids blocks | \
+                 clear portal session <mac> | clear portal sessions"
+            );
             Ok(())
         }
         other => anyhow::bail!(
-            "unknown clear path {other:?}; try: clear ids block <ip> | clear ids blocks"
+            "unknown clear path {other:?}; try: clear ids block <ip> | clear ids blocks | \
+             clear portal session <mac> | clear portal sessions"
         ),
+    }
+}
+
+/// Ask the agent's **portal** socket to end a session. Separate from
+/// [`show_agent_query`] because the two sockets are separate — the diagnostics
+/// one cannot touch a portal session, which is the point of it being a different
+/// socket.
+fn clear_portal(command: &str) -> Result<()> {
+    match velstra::query_at(std::path::Path::new(portal::AGENT_SOCKET), command) {
+        Ok(reply) => {
+            print!("{reply}");
+            Ok(())
+        }
+        Err(e) => {
+            println!("ending that session failed: {e:#}");
+            println!(
+                "(the agent serves this on {}; check `systemctl status velstra.service`)",
+                portal::AGENT_SOCKET
+            );
+            Ok(())
+        }
     }
 }
 
