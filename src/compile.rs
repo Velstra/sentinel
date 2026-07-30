@@ -56,6 +56,9 @@ pub struct VelstraConfig {
     /// plane completes on the server's behalf.
     #[serde(rename = "synproxy", skip_serializing_if = "Vec::is_empty")]
     synproxy: Vec<SynProxyOut>,
+    /// C12 IPFIX flow export (`[flow_export]`).
+    #[serde(rename = "flow_export", skip_serializing_if = "Option::is_none")]
+    flow_export: Option<FlowExportOut>,
     /// C22 load-balanced services (`[[service]]`) — fabric's XDP L4 load
     /// balancer, which had no way in from the appliance config.
     #[serde(rename = "service", skip_serializing_if = "Vec::is_empty")]
@@ -115,6 +118,19 @@ struct Npt66Out {
     internal: String,
     external: String,
 }
+
+/// The `[flow_export]` table in the emitted velstra config — the agent owns the
+/// conntrack table, so it is the agent that exports from it.
+#[derive(Debug, Serialize)]
+struct FlowExportOut {
+    collector: String,
+    interval_secs: u64,
+    observation_domain: u32,
+}
+
+/// Default export interval: often enough that a graph has shape, rarely enough
+/// that the export is not itself the traffic.
+const DEFAULT_EXPORT_INTERVAL: u64 = 30;
 
 /// One `[[synproxy]]` entry in the emitted velstra config — a TCP port whose
 /// handshake the data plane completes on the server's behalf.
@@ -650,6 +666,20 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
         port_forwards,
         npt66,
         synproxy,
+        flow_export: appliance
+            .services
+            .flow_export
+            .collector
+            .as_ref()
+            .map(|c| FlowExportOut {
+                collector: c.clone(),
+                interval_secs: appliance
+                    .services
+                    .flow_export
+                    .interval
+                    .unwrap_or(DEFAULT_EXPORT_INTERVAL),
+                observation_domain: appliance.services.flow_export.domain.unwrap_or(1),
+            }),
         services,
         conntrack_sync,
     }
@@ -1623,6 +1653,37 @@ port_group = "web"
                 .iter()
                 .all(|r| r.proto == "tcp" && r.action == "pass")
         );
+    }
+
+    /// The agent owns the conntrack table, so it is the agent that exports from
+    /// it — and the emitted config always states the interval and domain even
+    /// when the appliance config left them out, so the two cannot quietly
+    /// disagree about a value neither of them printed.
+    #[test]
+    fn flow_export_is_emitted_with_the_values_it_will_use() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[services.flow-export]
+collector = "10.0.0.50:4739"
+"#;
+        let cfg = compile(&Appliance::from_toml(toml).unwrap());
+        let fx = cfg.flow_export.as_ref().expect("no flow export emitted");
+        assert_eq!(fx.collector, "10.0.0.50:4739");
+        assert_eq!(fx.interval_secs, DEFAULT_EXPORT_INTERVAL);
+        assert_eq!(fx.observation_domain, 1);
+
+        let out = toml::to_string(&cfg).unwrap();
+        assert!(out.contains("[flow_export]"), "{out}");
+        assert!(out.contains("interval_secs = 30"), "{out}");
+    }
+
+    /// No collector, no block: an appliance that exports nothing should not
+    /// carry a table saying so.
+    #[test]
+    fn no_collector_emits_no_flow_export() {
+        let cfg = compile(&Appliance::from_toml("[system]\nhostname = \"fw\"\n").unwrap());
+        assert!(cfg.flow_export.is_none());
     }
 
     /// The emitted config always states the MSS, even when the appliance config
