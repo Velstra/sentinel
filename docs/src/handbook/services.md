@@ -359,3 +359,39 @@ Worth knowing:
   for a source only for the rest of that block's period; after it, a fresh alert
   blocks it again. To keep a source reachable permanently, put it in `never-block` —
   otherwise nothing would show why it was never blocked again.
+
+## Flow export (IPFIX)
+
+```text
+set services flow-export collector 10.0.0.50:4739
+set services flow-export interval 30
+set services flow-export domain 7
+```
+
+The data plane counts every translated connection; this ships those counts to a
+collector as IPFIX (RFC 7011), which is the difference between a firewall that
+can answer *what happened last Tuesday* and one that can only answer *what is
+happening now*.
+
+**What is exported is the change, not the total.** The state table holds a
+running total per flow and a collector adds up what it receives, so sending
+totals would count every byte again on every interval — a connection idle for an
+hour would report its whole volume sixty times. A flow whose counters did not
+move is left out entirely, because a record saying zero is a row a collector has
+to store for nothing.
+
+Three limits worth knowing, all of them consequences of what the data plane
+actually knows:
+
+- **Only translated connections appear.** Traffic the firewall passes without
+  NAT has no state entry to count against, the same limitation `show flows`
+  has.
+- **There are no timestamps.** The table holds none, and inventing "first seen"
+  from when the exporter noticed a flow would put a plausible, wrong number in
+  a record you would later reason about.
+- **A collector that is down loses those intervals.** Export is best-effort over
+  UDP and must never hold up forwarding; the next interval simply tries again.
+
+The `domain` is the IPFIX observation domain — what tells this appliance's
+records from another's at a collector receiving both. The template is re-sent
+with every message, so a collector that restarts can decode the very next one.

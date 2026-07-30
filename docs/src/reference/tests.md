@@ -54,7 +54,7 @@ authoritative list.
 |---|---|
 | `nat` | a `[[port-forward]]` DNATs an inbound connection to an internal host; a load-balanced VIP reaches a pool in **another zone** and its reply is un-NAT'd; both still work when the internal zone denies by default |
 | `synproxy` | a client reaches a syn-protected server through the full cookie splice, and 200 spoofed SYNs are absorbed without one reaching it |
-| `masq` | masquerade SNATs a private LAN client out of the WAN address; a 1 MiB transfer is accounted to that client in `show top-talkers` |
+| `masq` | masquerade SNATs a private LAN client out of the WAN address; a 1 MiB transfer is accounted to that client in `show top-talkers`; and the IPFIX exporter's datagram is a well-formed RFC 7011 message in the configured observation domain |
 | `hairpin` | an internal client reaches a port-forwarded service via the box's **own** public IP |
 | `npt66` | stateless, checksum-neutral IPv6 prefix translation (RFC 6296) |
 | `nat64` | an IPv6-only client reaches an IPv4-only server through the box, DNS64 included |

@@ -1217,6 +1217,8 @@ struct Draft {
     /// one or more backends round-robin.
     reverse_proxy: BTreeMap<String, ReverseProxyDraft>,
     broadcast_relay: BTreeMap<String, BroadcastRelayDraft>,
+    /// IPFIX flow export (roadmap C12).
+    flow_export: crate::config::FlowExport,
 }
 
 /// A partially-specified DNS forwarder (`[services.dns]`).
@@ -1731,6 +1733,7 @@ impl Draft {
                 syn_protect: a.firewall.syn_protect.clone(),
             },
             groups: a.firewall.group.clone(),
+            flow_export: a.services.flow_export.clone(),
             load_balancers: a
                 .load_balancers
                 .iter()
@@ -3469,6 +3472,35 @@ impl Session {
                 crate::config::validate_host(host)?;
                 self.draft.syslog_target_mut(host).port =
                     Some(v.parse().with_context(|| format!("invalid port {v:?}"))?);
+            }
+            // C12 IPFIX flow export.
+            ["services", "flow-export", "collector", v] => {
+                // host:port, checked here rather than at the collector: a typo
+                // that only shows up as "no graphs appeared" is a bad way to
+                // learn about it.
+                if !v.contains(':')
+                    || v.rsplit(':')
+                        .next()
+                        .is_none_or(|p| p.parse::<u16>().is_err())
+                {
+                    bail!("collector must be host:port, got {v:?}");
+                }
+                self.draft.flow_export.collector = Some((*v).to_string());
+            }
+            ["services", "flow-export", "interval", v] => {
+                let secs: u64 = v
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("interval must be seconds, got {v:?}"))?;
+                if !(1..=3600).contains(&secs) {
+                    bail!("interval {secs} is outside 1..3600 seconds");
+                }
+                self.draft.flow_export.interval = Some(secs);
+            }
+            ["services", "flow-export", "domain", v] => {
+                self.draft.flow_export.domain = Some(
+                    v.parse()
+                        .map_err(|_| anyhow::anyhow!("domain must be a number, got {v:?}"))?,
+                );
             }
             ["services", "syslog", "target", host, "proto", v] => {
                 crate::config::validate_host(host)?;
@@ -5310,6 +5342,9 @@ impl Session {
                 }
             }
             // services syslog: all forwarding, one collector, or one of its fields.
+            ["services", "flow-export"] => {
+                self.draft.flow_export = crate::config::FlowExport::default()
+            }
             ["services", "syslog"] => self.draft.syslog.clear(),
             ["services", "syslog", "target", host] => {
                 let before = self.draft.syslog.len();
@@ -7014,6 +7049,7 @@ impl Session {
                         interface: d.interfaces.clone(),
                     })
                     .collect(),
+                flow_export: self.draft.flow_export.clone(),
             },
             multiwan,
             vpn,
