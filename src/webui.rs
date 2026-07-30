@@ -5,17 +5,29 @@
 //! the CLI also prints, and every change is the *same command* an operator would
 //! type, sent to `POST /api/v1/configure`.
 //!
-//! ## Why it edits through the CLI grammar
+//! ## Operated, not typed into
 //!
-//! A management UI usually diverges from its config model the day someone adds a
-//! form field. This one cannot: a form does not build a config document, it
-//! builds `set …` lines. The appliance's own parser, validators, refusals and
-//! commit warnings then apply unchanged, and the console shows the exact script
-//! before it runs — so what was clicked is reviewable, pasteable into a
-//! terminal, and identical to what a colleague would have typed.
+//! Every control here is a native one — a select over the zones that exist, an
+//! action badge, a labelled field — and there is no command box, no command
+//! preview and no raw-path editor. An operator configures the appliance by
+//! working the objects it has.
 //!
-//! That also means the console can never do more than the CLI can, which is the
-//! property that keeps the two honest about each other.
+//! Underneath, a change still reaches the box as the commands the CLI accepts.
+//! That is not a shortcut: it is what puts a clicked edit through the same
+//! parser, the same validators, the same refusals and the same commit warnings
+//! as a typed one, and it is why the console can never do something the CLI
+//! cannot. A form that assembled a configuration document instead would be a
+//! second description of the config model, free to drift from the first.
+//!
+//! The pending panel therefore lists **what will change**, in words. The
+//! commands are transport, and transport is not an interface.
+//!
+//! ## Staged, like the appliance itself
+//!
+//! Edits are a candidate, not a change: a form stages, the header counts, and
+//! nothing reaches the box until Apply — or Discard drops it. That mirrors the
+//! CLI's own candidate-and-commit model, and it is why deleting an object does
+//! not ask for confirmation: a delete is a pending line you can still remove.
 //!
 //! ## One file, nothing fetched
 //!
@@ -495,6 +507,65 @@ pub fn page() -> String {
   .stagedtext {{ display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 220px; }}
   .stagedtext .t {{ font: var(--fw-semibold) var(--text-base) var(--font-sans); color: var(--text-strong); }}
   .stagedtext .b {{ font-size: var(--text-sm); color: var(--text-muted); }}
+
+  /* --- object rows (the policy list) ------------------------------------- */
+  .toolbar {{
+    display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3);
+    margin-bottom: var(--space-4);
+  }}
+  .inline {{ display: flex; align-items: center; gap: var(--space-2); }}
+  .inline > span {{ font-size: var(--text-sm); color: var(--text-muted); white-space: nowrap; }}
+  .inline select {{ width: auto; }}
+
+  .addpanel {{
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+    gap: var(--space-3); align-items: end; border-radius: 16px;
+    /* The amber edge marks the one surface that is about to change something. */
+    border-color: var(--sentinel-600);
+  }}
+  .addpanel .field span {{
+    font: var(--fw-medium) var(--text-xs)/1.2 var(--font-sans); color: var(--text-muted);
+    text-transform: none; letter-spacing: 0;
+  }}
+
+  .rule {{
+    display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-4);
+    padding: var(--space-4) var(--space-5); border-radius: 14px;
+    background: var(--surface); border: 1px solid var(--border-subtle);
+    margin-bottom: var(--space-2);
+    transition: border-color var(--dur-fast, 130ms) ease;
+  }}
+  .rule:hover {{ border-color: var(--border-strong); }}
+  .rule .col {{ display: flex; flex-direction: column; gap: 2px; min-width: 0; }}
+  .rule .col.grow {{ flex: 1 1 200px; }}
+  .eyebrow {{
+    font: var(--fw-regular) var(--text-2xs)/1.2 var(--font-sans); color: var(--text-faint);
+  }}
+  .mono {{ font-family: var(--font-mono); font-size: var(--text-sm); color: var(--text-body); }}
+  .mono.strong {{ color: var(--text-strong); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+  .sub {{ font-size: var(--text-2xs); color: var(--text-muted); }}
+
+  /* The action is a badge because it changes what every other field means. */
+  .act {{
+    flex: none; padding: var(--space-1) var(--space-3); border-radius: var(--radius-pill);
+    font: var(--fw-semibold) var(--text-2xs)/1.5 var(--font-mono);
+    text-transform: uppercase; letter-spacing: var(--tracking-caps);
+    border: 1px solid currentColor;
+  }}
+  .act.accept {{ color: var(--status-up); background: rgba(63,185,80,.1); }}
+  .act.drop {{ color: var(--status-down); background: rgba(248,81,73,.1); }}
+  .act.reject {{ color: var(--status-warn); background: rgba(255,176,32,.1); }}
+
+  /* --- pending changes --------------------------------------------------- */
+  .pill.warn {{ color: var(--status-warn); border-color: color-mix(in oklab, var(--status-warn) 45%, transparent); }}
+  .dot.warn {{ background: var(--status-warn); box-shadow: 0 0 8px -1px var(--status-warn); }}
+  .change {{
+    display: flex; align-items: center; gap: var(--space-3);
+    padding: var(--space-2) 0; border-bottom: 1px solid var(--border-subtle);
+  }}
+  .change:last-child {{ border-bottom: 0; }}
+  .change .what {{ flex: 1 1 auto; font-size: var(--text-sm); color: var(--text-body); }}
+  #stagedlist {{ background: none; border: 0; border-left: 0; padding: 0; white-space: normal; }}
 </style>
 </head>
 <body>
@@ -586,20 +657,45 @@ pub fn page() -> String {
     </div>
 
     <div id="view-rules" class="hidden">
-      <div class="card">
-        <h3>Rules</h3>
-        <div class="row" style="margin-bottom:.7rem">
-          <button class="btn primary" id="addrule">Add rule</button>
-          <span style="color:var(--muted);font-size:.8rem">
-            Every change is a command; you see it before it runs.
-          </span>
-        </div>
-        <div style="overflow-x:auto"><table id="ruletable"></table></div>
+      <div class="toolbar">
+        <label class="inline">
+          <span>Default policy</span>
+          <select id="defaultpolicy">
+            <option value="">(unchanged)</option>
+            <option value="drop">drop</option>
+            <option value="reject">reject</option>
+            <option value="accept">accept</option>
+          </select>
+        </label>
+        <span class="spacer"></span>
+        <button class="btn" id="togglerule">New rule</button>
       </div>
-      <div class="card">
-        <h3>Firewall overview</h3>
-        <pre class="out" id="fwshow">…</pre>
+
+      <div class="card addpanel hidden" id="addrulepanel">
+        <label class="field"><span>Name</span><input id="n-name" placeholder="web-in"></label>
+        <label class="field"><span>Action</span>
+          <select id="n-action">
+            <option value="accept">accept</option>
+            <option value="drop">drop</option>
+            <option value="reject">reject</option>
+          </select>
+        </label>
+        <label class="field"><span>From zone</span><select id="n-from"></select></label>
+        <label class="field"><span>To zone</span><select id="n-to"></select></label>
+        <label class="field"><span>Protocol</span>
+          <select id="n-proto">
+            <option value="">(any)</option>
+            <option value="tcp">tcp</option>
+            <option value="udp">udp</option>
+          </select>
+        </label>
+        <label class="field"><span>Port</span><input id="n-port" placeholder="443 or 8000-8100"></label>
+        <label class="field"><span>Source</span><input id="n-source" placeholder="0.0.0.0/0"></label>
+        <label class="field"><span>Destination</span><input id="n-dest" placeholder="10.20.0.0/24"></label>
+        <button class="btn primary" id="createrule">Add rule</button>
       </div>
+
+      <div id="rulelist"></div>
     </div>
 
     <div id="view-zones" class="hidden">
@@ -710,34 +806,11 @@ pub fn page() -> String {
 
     <div id="view-config" class="hidden">
       <div class="card">
-        <h3>Run configuration commands</h3>
-        <p style="color:var(--muted);font-size:.82rem;margin:0 0 .6rem">
-          Anything the CLI accepts. This is the whole configuration surface — the
-          forms elsewhere in this console are shortcuts that write these same
-          lines.
-        </p>
-        <textarea id="cmd" rows="5" spellcheck="false"
-                  style="width:100%;font:12.5px/1.5 ui-monospace,monospace;padding:.6rem;
-                         border-radius:8px;border:1px solid var(--line);
-                         background:var(--panel);color:var(--fg)"
-                  placeholder="set interface eth0 zone wan&#10;set firewall zone wan default-action drop"></textarea>
-        <div class="row" style="margin-top:.6rem">
-          <button class="btn primary" id="runsave">Stage</button>
-        </div>
-      </div>
-      <div class="card">
-        <h3>Running configuration</h3>
-        <p style="color:var(--muted);font-size:.82rem;margin:0 0 .6rem">
-          Every setting, editable where it stands. Editing writes
-          <code>set …</code>; removing writes <code>delete …</code>.
-        </p>
-        <div class="row" style="margin-bottom:.6rem">
-          <input id="cfgfilter" placeholder="filter" style="flex:1 1 12rem">
-        </div>
-        <div style="overflow-x:auto"><table id="cfgtable"></table></div>
-      </div>
-      <div class="card">
         <h3>Revisions</h3>
+        <p style="color:var(--text-muted);font-size:var(--text-sm);margin:0 0 var(--space-3)">
+          Every save archives a revision. Rolling back stages the change like any
+          other, so it lands only when you apply it.
+        </p>
         <div style="overflow-x:auto"><table id="revtable"></table></div>
       </div>
     </div>
@@ -771,8 +844,8 @@ pub fn page() -> String {
   <h3 style="margin:0 0 .8rem" id="editortitle">Rule</h3>
   <div class="grid2">
     <div class="field"><label for="r-name">Name</label><input id="r-name"></div>
-    <div class="field"><label for="r-from">From zone</label><input id="r-from"></div>
-    <div class="field"><label for="r-to">To zone</label><input id="r-to"></div>
+    <div class="field"><label for="r-from">From zone</label><select id="r-from"></select></div>
+    <div class="field"><label for="r-to">To zone</label><select id="r-to"></select></div>
     <div class="field"><label for="r-action">Action</label>
       <select id="r-action"><option>accept</option><option>drop</option><option>reject</option></select>
     </div>
@@ -783,8 +856,6 @@ pub fn page() -> String {
     <div class="field"><label for="r-source">Source</label><input id="r-source" placeholder="CIDR"></div>
     <div class="field"><label for="r-dest">Destination</label><input id="r-dest" placeholder="CIDR"></div>
   </div>
-  <p style="color:var(--muted);font-size:.8rem;margin:.7rem 0 .3rem">This will run:</p>
-  <div class="script" id="preview"></div>
   <p id="editorerr" class="err"></p>
   <div class="row" style="margin-top:.9rem">
     <button class="btn primary" id="applysave">Stage</button>
@@ -958,64 +1029,103 @@ async function refreshDashboard() {{
 // The rule list is read out of the running configuration, which is the same text
 // `show configuration` prints — so the table can never list a rule the appliance
 // does not have.
-function parseRules(config) {{
+// The zones an interface names — the vocabulary every zone field offers, so a
+// zone can be chosen rather than spelled. A name typed by hand is the commonest
+// way a rule ends up pointing at a zone that does not exist.
+function zoneNames(ls) {{
+  const zones = new Set();
+  for (const l of ls) {{
+    if (l.path[0] === "interface" && l.path[l.path.length - 1] === "zone") zones.add(l.value);
+    if (l.path[0] === "firewall" && l.path[1] === "zone") zones.add(l.path[2]);
+  }}
+  return [...zones].filter(Boolean).sort();
+}}
+
+function fillZoneSelect(sel, zones, current) {{
+  sel.textContent = "";
+  sel.append(el("option", {{ value: "", text: "(any)" }}));
+  for (const z of zones) {{
+    const o = el("option", {{ value: z, text: z }});
+    if (z === current) o.setAttribute("selected", "selected");
+    sel.append(o);
+  }}
+}}
+
+// Rules come out of the running configuration, so the list can never show a
+// rule the appliance does not have.
+function parseRules(leaves) {{
   const rules = new Map();
-  const re = /^\s*set firewall rule (\S+)(?: (.*))?$/;
-  let block = null;
-  for (const raw of config.split("\n")) {{
-    const line = raw.replace(/\s+$/, "");
-    let m = line.match(/^\s*rule (\S+) \{{\s*$/);
-    if (m) {{ block = m[1]; if (!rules.has(block)) rules.set(block, {{ name: block }}); continue; }}
-    if (block && /^\s*\}}\s*$/.test(line)) {{ block = null; continue; }}
-    if (block) {{
-      const f = line.trim().split(/\s+/);
-      if (f.length >= 2) rules.get(block)[f[0]] = f.slice(1).join(" ");
-      continue;
-    }}
-    m = line.match(re);
-    if (m && m[2]) {{
-      const f = m[2].split(/\s+/);
-      if (!rules.has(m[1])) rules.set(m[1], {{ name: m[1] }});
-      rules.get(m[1])[f[0]] = f.slice(1).join(" ");
-    }}
+  for (const l of leaves) {{
+    if (l.path[0] !== "firewall" || l.path[1] !== "rule" || l.path.length < 4) continue;
+    const name = l.path[2];
+    if (!rules.has(name)) rules.set(name, {{ name }});
+    rules.get(name)[l.path.slice(3).join(" ")] = l.value;
   }}
   return [...rules.values()];
 }}
 
 async function refreshRules() {{
-  $("fwshow").textContent = "…";
-  let config = "";
-  try {{ config = await text("/api/v1/show/configuration"); }}
-  catch (e) {{ $("fwshow").textContent = String(e.message || e); return; }}
-  try {{ $("fwshow").textContent = (await text("/api/v1/show/firewall")).trimEnd(); }}
-  catch (e) {{ $("fwshow").textContent = String(e.message || e); }}
+  const ls = await leaves();
+  const zones = zoneNames(ls);
+  fillZoneSelect($("n-from"), zones, "");
+  fillZoneSelect($("n-to"), zones, "");
 
-  const rules = parseRules(config);
-  const t = $("ruletable");
-  t.textContent = "";
-  t.append(el("tr", {{}}, ["name", "from", "to", "action", "proto", "port", "source", "destination", ""]
-    .map((h) => el("th", {{ text: h }}))));
+  const globals = {{}};
+  for (const l of ls) {{
+    if (l.node === "firewall global") globals[l.path[l.path.length - 1]] = l.value;
+  }}
+  $("defaultpolicy").value = "";
+  $("defaultpolicy").dataset.current = globals["default-action"] || "";
+
+  const rules = parseRules(ls);
+  const list = $("rulelist");
+  list.textContent = "";
   if (!rules.length) {{
-    t.append(el("tr", {{}}, [el("td", {{ colspan: "9", text: "no rules configured" }})]));
+    list.append(el("div", {{ class: "card", text: "No rules configured." }}));
   }}
   for (const r of rules) {{
-    const edit = el("button", {{ class: "btn", text: "Edit", onclick: () => openEditor(r) }});
+    // A rule reads as what it does, then what it matches — the order an
+    // operator scans in. The action is a badge because it is the one field
+    // whose value changes the meaning of every other one.
+    const action = r.action || "accept";
+    const badge = el("span", {{ class: "act " + action, text: action }});
+
+    const match = el("span", {{ class: "col grow" }}, [
+      el("span", {{ class: "eyebrow", text: "match" }}),
+      el("span", {{ class: "mono strong", text: (r.source || "any") + " → " + (r.destination || r.to || "any") }}),
+      el("span", {{ class: "sub", text: "in " + (r.from || "any") +
+        (r.proto ? " · " + r.proto + "/" + (r.port || "any") : "") }}),
+    ]);
+
+    const cols = [];
+    if (r.schedule) cols.push(col("schedule", r.schedule));
+    if (r.limit) cols.push(col("limit", r.limit + "/s"));
+    if (r.description) cols.push(col("note", r.description));
+
+    const edit = el("button", {{ class: "btn", text: "Edit", onclick: () => openEditor(r, zones) }});
     const del = el("button", {{
       class: "btn danger", text: "Delete",
-      onclick: () => stage(["delete firewall rule " + r.name], true),
+      onclick: () => stage("Delete firewall rule " + r.name, ["delete firewall rule " + r.name]),
     }});
-    t.append(el("tr", {{}}, [
-      el("td", {{ text: r.name }}),
-      el("td", {{ text: r.from || "" }}),
-      el("td", {{ text: r.to || "" }}),
-      el("td", {{ text: r.action || "" }}),
-      el("td", {{ text: r.proto || "" }}),
-      el("td", {{ text: r.port || "" }}),
-      el("td", {{ text: r.source || "" }}),
-      el("td", {{ text: r.destination || "" }}),
-      el("td", {{}}, [el("div", {{ class: "row" }}, [edit, del])]),
+
+    list.append(el("div", {{ class: "rule" }}, [
+      badge,
+      el("span", {{ class: "col", style: "flex:0 0 auto" }}, [
+        el("span", {{ class: "eyebrow", text: "rule" }}),
+        el("span", {{ class: "mono strong", text: r.name }}),
+      ]),
+      match,
+      ...cols,
+      el("span", {{ class: "row", style: "flex:none" }}, [edit, del]),
     ]));
   }}
+}}
+
+function col(label, value) {{
+  return el("span", {{ class: "col", style: "flex:0 0 auto" }}, [
+    el("span", {{ class: "eyebrow", text: label }}),
+    el("span", {{ class: "mono", text: value }}),
+  ]);
 }}
 
 const FIELDS = [
@@ -1034,18 +1144,17 @@ function script() {{
   return lines;
 }}
 
-function renderPreview() {{
-  const lines = script();
-  $("preview").textContent = lines.length ? lines.join("\n") : "(nothing to apply)";
-}}
-
-function openEditor(rule) {{
+function openEditor(rule, zones) {{
   $("editortitle").textContent = rule ? "Edit rule " + rule.name : "New rule";
   $("r-name").value = rule ? rule.name : "";
   $("r-name").readOnly = !!rule;
-  for (const [id, key] of FIELDS) $(id).value = (rule && rule[key]) || "";
+  fillZoneSelect($("r-from"), zones || [], rule && rule.from);
+  fillZoneSelect($("r-to"), zones || [], rule && rule.to);
+  for (const [id, key] of FIELDS) {{
+    if (id === "r-from" || id === "r-to") continue;
+    $(id).value = (rule && rule[key]) || "";
+  }}
   $("editorerr").textContent = "";
-  renderPreview();
   $("editor").showModal();
 }}
 
@@ -1055,28 +1164,51 @@ function openEditor(rule) {{
 // Apply appends its commands here, the header says how many are waiting, and
 // nothing reaches the box until Apply — or Discard throws them away, which is
 // what makes clicking safe enough not to need a confirmation on every delete.
+// Each entry is what the operator did, plus the commands that will carry it
+// out. The commands are the transport — they are how the appliance's own
+// parser, validators and refusals guard a clicked change exactly as they guard
+// a typed one — but they are not the interface. What the panel shows is the
+// change, in words.
 let staged = [];
 
-function stage(lines) {{
-  staged.push(...lines.filter(Boolean));
+function stage(label, lines) {{
+  const cmds = lines.filter(Boolean);
+  if (!cmds.length) return;
+  staged.push({{ label, cmds }});
   renderStaged();
+}}
+
+function stagedCommands() {{
+  return staged.flatMap((s) => s.cmds);
 }}
 
 function renderStaged() {{
   const n = staged.length;
-  $("stagedbadge").textContent = n ? n + " staged change" + (n === 1 ? "" : "s")
-                                   : "no staged changes";
-  $("stagedbadge").className = "pill" + (n ? " up" : "");
+  $("stagedbadge").textContent = n ? n + " pending change" + (n === 1 ? "" : "s")
+                                   : "no pending changes";
+  $("stagedbadge").className = "pill" + (n ? " warn" : "");
   $("stagedcard").classList.toggle("hidden", n === 0);
-  $("stagedlist").textContent = staged.join("\n");
-  $("stagedtitle").textContent = n + " command" + (n === 1 ? "" : "s") + " staged";
+  $("stagedtitle").textContent = n + " pending change" + (n === 1 ? "" : "s");
+
+  const list = $("stagedlist");
+  list.textContent = "";
+  staged.forEach((entry, i) => {{
+    list.append(el("div", {{ class: "change" }}, [
+      el("span", {{ class: "dot warn" }}),
+      el("span", {{ class: "what", text: entry.label }}),
+      el("button", {{
+        class: "btn", text: "Remove",
+        onclick: () => {{ staged.splice(i, 1); renderStaged(); }},
+      }}),
+    ]));
+  }});
 }}
 
 // `tail` is what turns a script into an intention: nothing commits, `commit`
 // applies for this boot, `commit save` also persists.
 async function applyStaged(tail) {{
   if (!staged.length) return;
-  const r = await configure(staged.concat(tail));
+  const r = await configure(stagedCommands().concat(tail));
   showResult(r);
   // Only clear once they have actually run. A refused commit leaves the
   // commands staged, so the operator can fix one and try again rather than
@@ -1120,42 +1252,9 @@ function parseConfig(text) {{
   return out;
 }}
 
+// The Configuration view is the revision list and nothing else: rolling back is
+// a real operation an operator needs, and it stages like every other change.
 async function refreshConfig() {{
-  const t = $("cfgtable");
-  t.textContent = "";
-  t.append(el("tr", {{}}, ["setting", "value", ""].map((h) => el("th", {{ text: h }}))));
-  let leaves = [];
-  try {{ leaves = parseConfig(await text("/api/v1/show/configuration")); }}
-  catch (e) {{
-    t.append(el("tr", {{}}, [el("td", {{ colspan: "3", text: String(e.message || e) }})]));
-    return;
-  }}
-  const filter = $("cfgfilter").value.trim().toLowerCase();
-  let shown = 0;
-  for (const leaf of leaves) {{
-    const path = leaf.path.join(" ");
-    if (filter && !(path + " " + leaf.value).toLowerCase().includes(filter)) continue;
-    shown++;
-    const input = el("input", {{ value: leaf.value, style: "width:100%" }});
-    const save = el("button", {{
-      class: "btn", text: "Set",
-      onclick: () => stage(["set " + path + " " + input.value.trim()]),
-    }});
-    const del = el("button", {{
-      class: "btn danger", text: "Delete",
-      onclick: () => stage(["delete " + path], true),
-    }});
-    t.append(el("tr", {{}}, [
-      el("td", {{ text: path }}),
-      el("td", {{}}, [input]),
-      el("td", {{}}, [el("div", {{ class: "row" }}, [save, del])]),
-    ]));
-  }}
-  if (!shown) {{
-    t.append(el("tr", {{}}, [el("td", {{ colspan: "3", text: "nothing matches" }})]));
-  }}
-
-  // Revisions: what `show system commit` lists, with a rollback beside each.
   const r = $("revtable");
   r.textContent = "";
   r.append(el("tr", {{}}, ["revision", ""].map((h) => el("th", {{ text: h }}))));
@@ -1165,10 +1264,10 @@ async function refreshConfig() {{
       if (!line.trim()) continue;
       const n = (line.trim().match(/^(\d+)/) || [])[1];
       r.append(el("tr", {{}}, [
-        el("td", {{ text: line }}),
+        el("td", {{ class: "mono", text: line }}),
         el("td", {{}}, [n === undefined ? el("span", {{}}) : el("button", {{
           class: "btn", text: "Roll back",
-          onclick: () => stage(["rollback " + n], true),
+          onclick: () => stage("Roll back to revision " + n, ["rollback " + n]),
         }})]),
       ]));
     }}
@@ -1261,7 +1360,7 @@ async function refreshZones() {{
             lines.push(v ? `set firewall zone ${{name}} ${{k}} ${{v}}`
                          : `delete firewall zone ${{name}} ${{k}}`);
           }}
-          if (lines.length) stage(lines);
+          if (lines.length) stage("Zone " + name + " posture", lines);
         }},
       }}),
     ])]));
@@ -1404,12 +1503,12 @@ function editorTable(tableId, prefix, fields, rows, opts) {{
           if (v) lines.push(`set ${{path}} ${{r.name}} ${{f[0]}} ${{v}}`);
           else if (r[f[0]]) lines.push(`delete ${{path}} ${{r.name}} ${{f[0]}}`);
         }});
-        if (lines.length) stage(lines);
+        if (lines.length) stage(`Update ${{path}} ${{r.name}}`, lines);
       }},
     }});
     const del = el("button", {{
       class: "btn danger", text: "Delete",
-      onclick: () => stage([`delete ${{path}} ${{r.name}}`], true),
+      onclick: () => stage(`Delete ${{path}} ${{r.name}}`, [`delete ${{path}} ${{r.name}}`]),
     }});
     t.append(el("tr", {{}}, [el("td", {{ text: r.name }})]
       .concat(inputs.map((i) => el("td", {{}}, [i])))
@@ -1437,7 +1536,7 @@ function addRow(tableId, prefix, fields, nameHint) {{
         if (v) lines.push(`set ${{path}} ${{n}} ${{f[0]}} ${{v}}`);
       }});
       if (!lines.length) lines.push(`set ${{path}} ${{n}}`);
-      stage(lines);
+      stage(`Create ${{path}} ${{n}}`, lines);
     }},
   }});
   t.append(el("tr", {{}}, [el("td", {{}}, [name])]
@@ -1560,12 +1659,12 @@ async function refreshWireguard() {{
             const v = inputs[i].value.trim();
             if (v) lines.push(`set vpn wireguard ${{tunnel.name}} peer ${{p.name}} ${{f[0]}} ${{v}}`);
           }});
-          if (lines.length) stage(lines);
+          if (lines.length) stage(`Update peer on ${{tunnel.name}}`, lines);
         }},
       }});
       const del = el("button", {{
         class: "btn danger", text: "Delete",
-        onclick: () => stage([`delete vpn wireguard ${{tunnel.name}} peer ${{p.name}}`], true),
+        onclick: () => stage(`Remove peer from ${{tunnel.name}}`, [`delete vpn wireguard ${{tunnel.name}} peer ${{p.name}}`]),
       }});
       t.append(el("tr", {{}}, [
         el("td", {{ text: tunnel.name }}),
@@ -1632,12 +1731,12 @@ async function refreshDhcp() {{
           if (v) lines.push(`set interface ${{srv.name}} dhcp-server ${{f[0]}} ${{v}}`);
           else if (srv[f[0]]) lines.push(`delete interface ${{srv.name}} dhcp-server ${{f[0]}}`);
         }});
-        if (lines.length) stage(lines);
+        if (lines.length) stage(`DHCP server on ${{srv.name}}`, lines);
       }},
     }});
     const del = el("button", {{
       class: "btn danger", text: "Disable",
-      onclick: () => stage([`delete interface ${{srv.name}} dhcp-server`], true),
+      onclick: () => stage(`Disable DHCP on ${{srv.name}}`, [`delete interface ${{srv.name}} dhcp-server`]),
     }});
     t.append(el("tr", {{}}, [el("td", {{ text: srv.name }})]
       .concat(inputs.map((i) => el("td", {{}}, [i])))
@@ -1872,6 +1971,32 @@ $("loginform").onsubmit = (e) => {{
 }};
 $("signout").onclick = () => signOut("");
 $("navsearch").oninput = () => {{ buildNav(); refresh(); }};
+$("togglerule").onclick = () => {{
+  const panel = $("addrulepanel");
+  panel.classList.toggle("hidden");
+  $("togglerule").textContent = panel.classList.contains("hidden") ? "New rule" : "Cancel";
+}};
+$("defaultpolicy").onchange = (e) => {{
+  const v = e.target.value;
+  if (!v) return;
+  stage("Default policy → " + v, ["set firewall global default-action " + v]);
+  e.target.value = "";
+}};
+$("createrule").onclick = () => {{
+  const name = $("n-name").value.trim();
+  if (!name) {{ $("n-name").focus(); return; }}
+  const lines = [];
+  for (const [id, key] of [["n-from", "from"], ["n-to", "to"], ["n-action", "action"],
+                           ["n-proto", "proto"], ["n-port", "port"],
+                           ["n-source", "source"], ["n-dest", "destination"]]) {{
+    const v = $(id).value.trim();
+    if (v) lines.push(`set firewall rule ${{name}} ${{key}} ${{v}}`);
+  }}
+  stage("Firewall rule " + name, lines);
+  $("addrulepanel").classList.add("hidden");
+  $("togglerule").textContent = "New rule";
+  for (const id of ["n-name", "n-port", "n-source", "n-dest"]) $(id).value = "";
+}};
 $("discard").onclick = () => {{ staged = []; renderStaged(); }};
 $("applystaged").onclick = () => applyStaged(["commit", "save"]);
 $("applystaged2").onclick = () => applyStaged(["commit", "save"]);
@@ -1881,19 +2006,16 @@ $("applystaged2").onclick = () => applyStaged(["commit", "save"]);
 $("validate").onclick = () => applyStaged([]);
 $("refresh").onclick = () => refresh();
 $("allcounters").onchange = () => refreshDashboard();
-$("addrule").onclick = () => openEditor(null);
 $("addsnat").onclick = () => addNat("snattable", "source", SNAT_FIELDS);
 $("adddnat").onclick = () => addNat("dnattable", "destination", DNAT_FIELDS);
-$("cfgfilter").oninput = () => refreshConfig();
 $("addneighbor").onclick = () =>
   addRow("bgptable", ["protocols", "bgp", "neighbor"], BGP_NEIGHBOR, "neighbour address");
 $("addipsec").onclick = () => addRow("ipsectable", ["vpn", "ipsec"], IPSEC, "tunnel name");
 $("addwg").onclick = () => addRow("wgtable", ["vpn", "wireguard"], WG, "interface name");
 $("adddhcp").onclick = () => {{
   const iface = window.prompt("Enable a DHCP server on which interface?");
-  if (iface) stage([`set interface ${{iface}} dhcp-server enable`]);
+  if (iface) stage(`Enable DHCP on ${{iface}}`, [`set interface ${{iface}} dhcp-server enable`]);
 }};
-$("runsave").onclick = () => runScript();
 $("runshow").onclick = async () => {{
   const words = $("showcmd").value.trim();
   if (!words) return;
@@ -1903,13 +2025,11 @@ $("runshow").onclick = async () => {{
 }};
 $("cancel").onclick = () => $("editor").close();
 $("resultclose").onclick = () => $("result").close();
-for (const [id] of FIELDS) $(id).oninput = renderPreview;
-$("r-name").oninput = renderPreview;
 $("applysave").onclick = () => {{
   const lines = script();
   if (!lines.length) {{ $("editorerr").textContent = "A rule needs a name and at least one setting."; return; }}
   $("editor").close();
-  stage(lines);
+  stage("Firewall rule " + $("r-name").value.trim(), lines);
 }};
 if (token) signedIn();
 </script>
@@ -1985,23 +2105,39 @@ mod tests {
         assert!(page().contains("r.output"));
     }
 
-    /// The claim the console makes is that anything the CLI can configure can be
-    /// configured here. A form per feature could never hold that; what does is
-    /// the generic pair — a table that turns every setting in the running
-    /// configuration into `set`/`delete`, and a box that runs commands verbatim.
+    /// The console is operated, not typed into. Commands are how a change
+    /// reaches the appliance — which is what puts every clicked edit through the
+    /// same parser, validators and refusals as a typed one — but they are never
+    /// the interface. If a command box or a raw-path editor comes back, this is
+    /// the test that should have to be deleted on purpose.
     #[test]
-    fn the_whole_config_surface_is_reachable_not_just_the_forms() {
+    fn the_console_offers_no_command_surface() {
         let html = page();
-        assert!(html.contains("parseConfig"), "no generic config editor");
+        assert!(!html.contains("runScript"), "a command box is back");
+        assert!(!html.contains("renderPreview"), "a command preview is back");
+        assert!(!html.contains("cfgtable"), "the raw path editor is back");
+        assert!(!html.contains("Run configuration commands"));
+        // What the pending panel shows is the change, in words.
         assert!(
-            html.contains(r#""set " + path + " ""#),
-            "settings are not editable in place"
+            html.contains("entry.label"),
+            "staged changes are not described"
         );
+    }
+
+    /// Fields with a fixed vocabulary are chosen, not spelled. A zone typed by
+    /// hand is the commonest way a rule ends up naming one that does not exist.
+    #[test]
+    fn bounded_fields_are_selects_over_the_real_vocabulary() {
+        let html = page();
         assert!(
-            html.contains(r#""delete " + path"#),
-            "settings cannot be removed"
+            html.contains("function zoneNames"),
+            "zones are not enumerated"
         );
-        assert!(html.contains("runScript"), "no command box");
+        assert!(html.contains("fillZoneSelect"), "zone fields are free text");
+        assert!(
+            html.contains(r#"<select id="n-action">"#),
+            "action is free text"
+        );
     }
 
     /// Validating without committing is the one operation that lets an operator
@@ -2021,7 +2157,10 @@ mod tests {
     fn edits_stage_rather_than_apply_themselves() {
         let html = page();
         assert!(html.contains("let staged = []"), "no staged set");
-        assert!(html.contains("function stage(lines)"), "forms do not stage");
+        assert!(
+            html.contains("function stage(label, lines)"),
+            "forms do not stage"
+        );
         assert!(
             html.contains(r#"applyStaged(["commit", "save"])"#),
             "nothing applies the staged commands"
