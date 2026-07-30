@@ -701,106 +701,102 @@ pub fn page() -> String {
     <div id="view-zones" class="hidden">
       <div class="card">
         <h3>Global posture</h3>
-        <div class="grid2" id="globalform"></div>
-        <div class="row" style="margin-top:.8rem">
-          <button class="btn primary" id="saveglobal">Apply and save</button>
-        </div>
-      </div>
-      <div class="card">
-        <h3>Zones</h3>
-        <p style="color:var(--muted);font-size:.82rem;margin:0 0 .7rem">
-          A zone exists as soon as an interface names it. Blank means "inherit
-          the global setting" — the same as leaving it out of the config.
+        <p style="color:var(--text-muted);font-size:var(--text-sm);margin:0 0 var(--space-3)">
+          What every zone inherits. A zone leaving a field unset takes the value
+          from here — the same thing as leaving it out of the config.
         </p>
-        <div style="overflow-x:auto"><table id="zonetable"></table></div>
+        <div class="addpanel" id="globalform"></div>
       </div>
+      <div id="zonelist"></div>
     </div>
 
     <div id="view-nat" class="hidden">
-      <div class="card">
-        <h3>Source NAT (masquerade)</h3>
-        <div class="row" style="margin-bottom:.7rem">
-          <button class="btn primary" id="addsnat">Add</button>
-        </div>
-        <div style="overflow-x:auto"><table id="snattable"></table></div>
+      <div class="toolbar">
+        <span class="inline"><span>Source NAT</span></span>
+        <span class="spacer"></span>
+        <button class="btn" id="togglesnat">New source rule</button>
       </div>
-      <div class="card">
-        <h3>Destination NAT (port forwards)</h3>
-        <div class="row" style="margin-bottom:.7rem">
-          <button class="btn primary" id="adddnat">Add</button>
-        </div>
-        <div style="overflow-x:auto"><table id="dnattable"></table></div>
+      <div class="card addpanel hidden" id="addsnatpanel"></div>
+      <div id="snatlist"></div>
+
+      <div class="toolbar" style="margin-top:var(--space-6)">
+        <span class="inline"><span>Destination NAT</span></span>
+        <span class="spacer"></span>
+        <button class="btn" id="toggleddnat">New port forward</button>
       </div>
-      <div class="card">
-        <h3>Live NAT state</h3>
-        <pre class="out" id="natshow">…</pre>
+      <div class="card addpanel hidden" id="adddnatpanel"></div>
+      <div id="dnatlist"></div>
+
+      <div class="card" style="margin-top:var(--space-6)">
+        <h3>Live NAT state</h3><pre class="out" id="natshow">…</pre>
       </div>
     </div>
 
     <div id="view-bgp" class="hidden">
       <div class="card">
         <h3>Router</h3>
-        <div class="grid2" id="bgpglobal"></div>
-        <div class="row" style="margin-top:.8rem">
-          <button class="btn primary" id="savebgp">Apply and save</button>
-        </div>
+        <div class="addpanel" id="bgpglobal"></div>
       </div>
-      <div class="card">
-        <h3>Neighbours</h3>
-        <div class="row" style="margin-bottom:.7rem">
-          <button class="btn primary" id="addneighbor">Add neighbour</button>
-        </div>
-        <div style="overflow-x:auto"><table id="bgptable"></table></div>
+      <div class="toolbar">
+        <span class="inline"><span>Neighbours</span></span>
+        <span class="spacer"></span>
+        <button class="btn" id="togglebgp">New neighbour</button>
       </div>
-      <div class="card"><h3>Session state</h3><pre class="out" id="bgpshow">…</pre></div>
+      <div class="card addpanel hidden" id="addbgppanel"></div>
+      <div id="bgplist"></div>
+      <div class="card" style="margin-top:var(--space-6)">
+        <h3>Session state</h3><pre class="out" id="bgpshow">…</pre>
+      </div>
     </div>
 
     <div id="view-ipsec" class="hidden">
-      <div class="card">
-        <h3>Site-to-site tunnels</h3>
-        <div class="row" style="margin-bottom:.7rem">
-          <button class="btn primary" id="addipsec">Add tunnel</button>
-        </div>
-        <div style="overflow-x:auto"><table id="ipsectable"></table></div>
+      <div class="toolbar">
+        <span class="inline"><span>Site-to-site tunnels</span></span>
+        <span class="spacer"></span>
+        <button class="btn" id="toggleipsec">New tunnel</button>
       </div>
-      <div class="card"><h3>Security associations</h3><pre class="out" id="ipsecshow">…</pre></div>
+      <div class="card addpanel hidden" id="addipsecpanel"></div>
+      <div id="ipseclist"></div>
+      <div class="card" style="margin-top:var(--space-6)">
+        <h3>Security associations</h3><pre class="out" id="ipsecshow">…</pre>
+      </div>
     </div>
 
     <div id="view-wireguard" class="hidden">
-      <div class="card">
-        <h3>Interfaces</h3>
-        <div class="row" style="margin-bottom:.7rem">
-          <button class="btn primary" id="addwg">Add interface</button>
-        </div>
-        <div style="overflow-x:auto"><table id="wgtable"></table></div>
-        <p style="color:var(--muted);font-size:.82rem;margin:.7rem 0 0">
-          A private key is generated on the appliance and never leaves it — the
-          key field writes <code>private-key generate</code>, not a key you typed
-          into a browser.
-        </p>
+      <div class="toolbar">
+        <span class="inline"><span>Interfaces</span></span>
+        <span class="spacer"></span>
+        <button class="btn" id="togglewg">New interface</button>
       </div>
-      <div class="card">
-        <h3>Peers</h3>
-        <div class="row" style="margin-bottom:.7rem">
-          <button class="btn primary" id="addwgpeer">Add peer</button>
-        </div>
-        <div style="overflow-x:auto"><table id="wgpeers"></table></div>
+      <div class="card addpanel hidden" id="addwgpanel"></div>
+      <div id="wglist"></div>
+      <p style="color:var(--text-muted);font-size:var(--text-sm);margin:var(--space-3) 0 var(--space-6)">
+        A private key is generated on the appliance — set it to
+        <code>generate</code> rather than pasting a key into a browser.
+      </p>
+
+      <div class="toolbar">
+        <span class="inline"><span>Peers</span></span>
+        <span class="spacer"></span>
+        <label class="inline"><span>on</span><select id="wgtunnel"></select></label>
+        <button class="btn" id="togglewgpeer">New peer</button>
       </div>
+      <div class="card addpanel hidden" id="addwgpeerpanel"></div>
+      <div id="wgpeerlist"></div>
     </div>
 
     <div id="view-dhcp" class="hidden">
-      <div class="card">
-        <h3>Servers</h3>
-        <p style="color:var(--muted);font-size:.82rem;margin:0 0 .7rem">
-          A DHCP server hands out leases from its interface's own static subnet,
-          so the interface needs a static address first. Every interface that has
-          one is listed here.
-        </p>
-        <div class="row" style="margin-bottom:.7rem">
-          <button class="btn primary" id="adddhcp">Enable on an interface</button>
-        </div>
-        <div style="overflow-x:auto"><table id="dhcptable"></table></div>
+      <div class="toolbar">
+        <span class="inline"><span>Servers</span></span>
+        <span class="spacer"></span>
+        <label class="inline"><span>on</span><select id="dhcpiface"></select></label>
+        <button class="btn" id="enabledhcp">Enable</button>
       </div>
+      <div id="dhcplist"></div>
+      <p style="color:var(--text-muted);font-size:var(--text-sm);margin:var(--space-3) 0 var(--space-6)">
+        A server leases from its interface's own static subnet, so the interface
+        needs a static address first.
+      </p>
       <div class="card"><h3>Leases</h3><pre class="out" id="dhcpshow">…</pre></div>
     </div>
 
@@ -1279,190 +1275,85 @@ async function refreshConfig() {{
 // ---- zones ---------------------------------------------------------------
 
 const POSTURE = [
-  ["default-action", ["", "accept", "drop", "reject"]],
-  ["stateful", ["", "true", "false"]],
-  ["block-icmp", ["", "true", "false"]],
-  ["log", ["", "true", "false"]],
-  ["source-validation", ["", "disable", "loose", "strict"]],
+  ["default-action", "Default action", ["", "accept", "drop", "reject"]],
+  ["stateful", "Stateful", ["", "true", "false"]],
+  ["block-icmp", "Block ICMP", ["", "true", "false"]],
+  ["log", "Log", ["", "true", "false"]],
+  ["source-validation", "Source validation", ["", "disable", "loose", "strict"]],
 ];
 
-function selectFor(field, value, onchange) {{
-  const sel = el("select", {{ onchange }});
-  for (const opt of field[1]) {{
-    const o = el("option", {{ value: opt, text: opt === "" ? "(inherit)" : opt }});
-    if (opt === (value || "")) o.setAttribute("selected", "selected");
-    sel.append(o);
-  }}
-  return sel;
-}}
-
 async function refreshZones() {{
-  let leaves = [];
-  try {{ leaves = parseConfig(await text("/api/v1/show/configuration")); }} catch (e) {{}}
+  const ls = await leaves();
 
-  // Global posture: one form, applied as a batch so a half-changed posture is
-  // never committed.
-  const g = $("globalform");
-  g.textContent = "";
-  const globals = new Map();
-  for (const l of leaves) {{
-    if (l.node === "firewall global") globals.set(l.path[l.path.length - 1], l.value);
+  const globals = {{}};
+  for (const l of ls) {{
+    if (l.node === "firewall global") globals[l.path[l.path.length - 1]] = l.value;
   }}
-  const pending = new Map();
-  for (const field of POSTURE) {{
-    if (field[0] === "source-validation" && false) continue;
-    const sel = selectFor(field, globals.get(field[0]), (e) => pending.set(field[0], e.target.value));
-    g.append(el("div", {{ class: "field" }}, [el("label", {{ text: field[0] }}), sel]));
-  }}
-  $("saveglobal").onclick = () => {{
-    const lines = [];
-    for (const [k, v] of pending) {{
-      lines.push(v ? `set firewall global ${{k}} ${{v}}` : `delete firewall global ${{k}}`);
-    }}
-    if (!lines.length) return;
-    stage(lines);
-  }};
+  settingsPanel("globalform", POSTURE, globals, "firewall global", "Global firewall posture");
 
-  // Per-zone overrides. The zone list comes from the interfaces that name one,
-  // because that is what makes a zone exist at all.
-  const zones = new Map();
-  for (const l of leaves) {{
-    if (l.path.length >= 2 && l.path[0] === "firewall" && l.path[1] === "zone" && l.path.length >= 4) {{
-      const name = l.path[2];
-      if (!zones.has(name)) zones.set(name, {{}});
-      zones.get(name)[l.path[3]] = l.value;
-    }}
-    if (l.path[0] === "interface" && l.path[l.path.length - 1] === "zone") {{
-      if (!zones.has(l.value)) zones.set(l.value, {{}});
-    }}
+  // A zone exists because an interface names it, so the list is the zones in
+  // use — not only the ones that happen to carry an override.
+  const overrides = new Map(entriesUnder(ls, ["firewall", "zone"]).map((z) => [z.name, z]));
+  for (const name of zoneNames(ls)) {{
+    if (!overrides.has(name)) overrides.set(name, {{ name }});
   }}
-
-  const t = $("zonetable");
-  t.textContent = "";
-  t.append(el("tr", {{}}, ["zone"].concat(POSTURE.map((f) => f[0])).concat([""])
-    .map((h) => el("th", {{ text: h }}))));
-  if (!zones.size) {{
-    t.append(el("tr", {{}}, [el("td", {{ colspan: "7", text: "no zones — give an interface a zone first" }})]));
-  }}
-  for (const [name, z] of [...zones].sort()) {{
-    const cells = [el("td", {{ text: name }})];
-    const edits = new Map();
-    for (const field of POSTURE) {{
-      const sel = selectFor(field, z[field[0]], (e) => edits.set(field[0], e.target.value));
-      cells.push(el("td", {{}}, [sel]));
-    }}
-    cells.push(el("td", {{}}, [el("div", {{ class: "row" }}, [
-      el("button", {{
-        class: "btn", text: "Apply",
-        onclick: () => {{
-          const lines = [];
-          for (const [k, v] of edits) {{
-            lines.push(v ? `set firewall zone ${{name}} ${{k}} ${{v}}`
-                         : `delete firewall zone ${{name}} ${{k}}`);
-          }}
-          if (lines.length) stage("Zone " + name + " posture", lines);
-        }},
-      }}),
-    ])]));
-    t.append(el("tr", {{}}, cells));
-  }}
+  renderObjects({{
+    listId: "zonelist", noun: "Zone",
+    fields: POSTURE,
+    path: (n) => `firewall zone ${{n}}`,
+    rows: [...overrides.values()].sort((a, b) => a.name.localeCompare(b.name)),
+    badge: (r) => ({{
+      text: r["default-action"] || "inherits",
+      cls: r["default-action"] || "",
+    }}),
+    empty: "No zones — give an interface a zone first.",
+  }});
 }}
 
 // ---- NAT -----------------------------------------------------------------
 
-const SNAT_FIELDS = [["zone", "Zone"], ["source", "Source"], ["translation", "Translation"]];
-const DNAT_FIELDS = [["zone", "Zone"], ["proto", "Protocol"], ["port", "Port"], ["to", "To"]];
-
-function natEntries(leaves, kind) {{
-  const out = new Map();
-  for (const l of leaves) {{
-    if (l.path[0] === "nat" && l.path[1] === kind && l.path.length >= 4) {{
-      const name = l.path[2];
-      if (!out.has(name)) out.set(name, {{ name }});
-      out.get(name)[l.path[3]] = l.value;
-    }}
-  }}
-  return [...out.values()];
-}}
+const SNAT = [["zone", "Zone"], ["source", "Source"], ["translation", "Translation"]];
+const DNAT = [
+  ["zone", "Zone"],
+  ["proto", "Protocol", ["", "tcp", "udp"]],
+  ["port", "Port"],
+  ["to", "To"],
+];
 
 async function refreshNat() {{
   $("natshow").textContent = "…";
   try {{ $("natshow").textContent = (await text("/api/v1/show/nat")).trimEnd(); }}
   catch (e) {{ $("natshow").textContent = String(e.message || e); }}
 
-  let leaves = [];
-  try {{ leaves = parseConfig(await text("/api/v1/show/configuration")); }} catch (e) {{}}
-
-  const build = (tableId, kind, fields) => {{
-    const t = $(tableId);
-    t.textContent = "";
-    t.append(el("tr", {{}}, ["name"].concat(fields.map((f) => f[1])).concat([""])
-      .map((h) => el("th", {{ text: h }}))));
-    const rows = natEntries(leaves, kind);
-    if (!rows.length) {{
-      t.append(el("tr", {{}}, [el("td", {{
-        colspan: String(fields.length + 2), text: "none configured",
-      }})]));
-    }}
-    for (const r of rows) {{
-      const inputs = fields.map((f) => el("input", {{ value: r[f[0]] || "" }}));
-      const apply = el("button", {{
-        class: "btn", text: "Apply",
-        onclick: () => {{
-          const lines = [];
-          fields.forEach((f, i) => {{
-            const v = inputs[i].value.trim();
-            if (v) lines.push(`set nat ${{kind}} ${{r.name}} ${{f[0]}} ${{v}}`);
-          }});
-          if (lines.length) stage(lines);
-        }},
-      }});
-      const del = el("button", {{
-        class: "btn danger", text: "Delete",
-        onclick: () => stage([`delete nat ${{kind}} ${{r.name}}`], true),
-      }});
-      t.append(el("tr", {{}}, [el("td", {{ text: r.name }})]
-        .concat(inputs.map((i) => el("td", {{}}, [i])))
-        .concat([el("td", {{}}, [el("div", {{ class: "row" }}, [apply, del])])])));
-    }}
-  }};
-  build("snattable", "source", SNAT_FIELDS);
-  build("dnattable", "destination", DNAT_FIELDS);
-}}
-
-// Adding starts as a blank row rather than a command: a NAT entry needs several
-// fields to be valid, and creating it one `set` at a time would ask the
-// appliance to commit a half-written entry it is right to refuse.
-function addNat(tableId, kind, fields) {{
-  const t = $(tableId);
-  const name = el("input", {{ placeholder: "name" }});
-  const inputs = fields.map((f) => el("input", {{ placeholder: f[1].toLowerCase() }}));
-  const apply = el("button", {{
-    class: "btn primary", text: "Create",
-    onclick: () => {{
-      const n = name.value.trim();
-      if (!n) {{ name.focus(); return; }}
-      const lines = [];
-      fields.forEach((f, i) => {{
-        const v = inputs[i].value.trim();
-        if (v) lines.push(`set nat ${{kind}} ${{n}} ${{f[0]}} ${{v}}`);
-      }});
-      if (lines.length) stage(lines);
-    }},
+  const ls = await leaves();
+  renderObjects({{
+    listId: "snatlist", addId: "addsnatpanel", noun: "Source rule",
+    fields: SNAT, nameHint: "wan-masq",
+    path: (n) => `nat source ${{n}}`,
+    rows: entriesUnder(ls, ["nat", "source"]),
+    badge: (r) => ({{ text: r.translation ? "snat" : "masquerade", cls: "accept" }}),
+    empty: "No source NAT configured.",
   }});
-  t.append(el("tr", {{}}, [el("td", {{}}, [name])]
-    .concat(inputs.map((i) => el("td", {{}}, [i])))
-    .concat([el("td", {{}}, [apply])])));
-  name.focus();
+  renderObjects({{
+    listId: "dnatlist", addId: "adddnatpanel", noun: "Port forward",
+    fields: DNAT, nameHint: "web",
+    path: (n) => `nat destination ${{n}}`,
+    rows: entriesUnder(ls, ["nat", "destination"]),
+    badge: (r) => r.port ? {{ text: (r.proto || "tcp") + "/" + r.port, cls: "accept" }}
+                         : {{ text: "incomplete", cls: "reject" }},
+    empty: "No port forwards configured.",
+  }});
 }}
 
+// ---- objects, in one language --------------------------------------------
 
-// ---- a generic section editor -------------------------------------------
-
-// Every one of the views below is the same shape: a set of named entries under
-// a config path, each with a handful of fields. Writing that once means the
-// forms cannot disagree with each other about how a setting is written — they
-// all emit `set <prefix> <name> <field> <value>` and `delete <prefix> <name>`.
+// Every configurable thing on this appliance is the same shape: a named object
+// with a handful of fields. Rendering that once is what makes a zone, a tunnel
+// and a DHCP server read alike — and it is why they cannot disagree about how a
+// setting is written, since they all go through `path(name)`.
+//
+// `fields` is [key, label, options?]. An options list becomes a select, so a
+// field with a fixed vocabulary is chosen rather than spelled.
 function entriesUnder(leaves, prefix) {{
   const depth = prefix.length;
   const out = new Map();
@@ -1476,73 +1367,134 @@ function entriesUnder(leaves, prefix) {{
   return [...out.values()];
 }}
 
-// `fields` is [key, label, options?]. An `options` list renders a select, so a
-// field with a fixed vocabulary cannot be mistyped into a refusal.
-function editorTable(tableId, prefix, fields, rows, opts) {{
-  const t = $(tableId);
-  const path = prefix.join(" ");
-  t.textContent = "";
-  t.append(el("tr", {{}}, [(opts && opts.nameLabel) || "name"]
-    .concat(fields.map((f) => f[1])).concat([""])
-    .map((h) => el("th", {{ text: h }}))));
-  if (!rows.length) {{
-    t.append(el("tr", {{}}, [el("td", {{
-      colspan: String(fields.length + 2),
-      text: (opts && opts.empty) || "none configured",
-    }})]));
+function fieldWidget(field, value) {{
+  if (!field[2]) return el("input", {{ value: value || "", placeholder: field[1].toLowerCase() }});
+  const sel = el("select", {{}});
+  for (const opt of field[2]) {{
+    const o = el("option", {{ value: opt, text: opt === "" ? "(unset)" : opt }});
+    if (opt === (value || "")) o.setAttribute("selected", "selected");
+    sel.append(o);
   }}
-  for (const r of rows) {{
-    const inputs = fields.map((f) =>
-      f[2] ? selectFor([f[0], f[2]], r[f[0]], null) : el("input", {{ value: r[f[0]] || "" }}));
-    const apply = el("button", {{
-      class: "btn", text: "Apply",
-      onclick: () => {{
-        const lines = [];
-        fields.forEach((f, i) => {{
-          const v = (inputs[i].value || "").trim();
-          if (v) lines.push(`set ${{path}} ${{r.name}} ${{f[0]}} ${{v}}`);
-          else if (r[f[0]]) lines.push(`delete ${{path}} ${{r.name}} ${{f[0]}}`);
-        }});
-        if (lines.length) stage(`Update ${{path}} ${{r.name}}`, lines);
-      }},
-    }});
-    const del = el("button", {{
-      class: "btn danger", text: "Delete",
-      onclick: () => stage(`Delete ${{path}} ${{r.name}}`, [`delete ${{path}} ${{r.name}}`]),
-    }});
-    t.append(el("tr", {{}}, [el("td", {{ text: r.name }})]
-      .concat(inputs.map((i) => el("td", {{}}, [i])))
-      .concat([el("td", {{}}, [el("div", {{ class: "row" }}, [apply, del])])])));
-  }}
+  return sel;
 }}
 
-// Adding is a blank row committed in one go, never one `set` at a time: an
-// entry usually needs several fields before it is valid, and asking the
-// appliance to commit half of one earns a refusal the operator did not deserve.
-function addRow(tableId, prefix, fields, nameHint) {{
-  const t = $(tableId);
-  const path = prefix.join(" ");
-  const name = el("input", {{ placeholder: nameHint || "name" }});
-  const inputs = fields.map((f) =>
-    f[2] ? selectFor([f[0], f[2]], "", null) : el("input", {{ placeholder: f[1].toLowerCase() }}));
-  const create = el("button", {{
-    class: "btn primary", text: "Create",
+function fieldGrid(fields, row) {{
+  const widgets = fields.map((f) => fieldWidget(f, row && row[f[0]]));
+  const grid = el("div", {{ class: "addpanel inline-edit" }});
+  fields.forEach((f, i) => {{
+    grid.append(el("label", {{ class: "field" }}, [el("span", {{ text: f[1] }}), widgets[i]]));
+  }});
+  return {{ grid, widgets }};
+}}
+
+// The commands an edit becomes: a value writes, an emptied field removes. The
+// difference matters — leaving a field blank has to mean "no longer set", not
+// "leave whatever was there".
+function fieldLines(fields, widgets, path, before) {{
+  const lines = [];
+  fields.forEach((f, i) => {{
+    const v = (widgets[i].value || "").trim();
+    if (v) lines.push(`set ${{path}} ${{f[0]}} ${{v}}`);
+    else if (before && before[f[0]]) lines.push(`delete ${{path}} ${{f[0]}}`);
+  }});
+  return lines;
+}}
+
+// One object as a card: what it is, then what it is set to, then its controls.
+// Editing opens the same field grid the add panel uses, in place — an operator
+// should not have to learn two shapes for one job.
+function objectCard(o, row) {{
+  const path = o.path(row.name);
+  const card = el("div", {{ class: "rule" }});
+
+  const head = [];
+  if (o.badge) {{
+    const b = o.badge(row);
+    if (b) head.push(el("span", {{ class: "act " + (b.cls || ""), text: b.text }}));
+  }}
+  head.push(el("span", {{ class: "col", style: "flex:0 0 auto" }}, [
+    el("span", {{ class: "eyebrow", text: o.noun }}),
+    el("span", {{ class: "mono strong", text: row.name }}),
+  ]));
+
+  const set = o.fields.filter((f) => row[f[0]]);
+  for (const f of set.slice(0, 4)) {{
+    head.push(el("span", {{ class: "col", style: "flex:0 1 auto" }}, [
+      el("span", {{ class: "eyebrow", text: f[1] }}),
+      el("span", {{ class: "mono", text: row[f[0]] }}),
+    ]));
+  }}
+  if (!set.length) {{
+    head.push(el("span", {{ class: "col grow" }}, [
+      el("span", {{ class: "sub", text: "nothing set yet" }}),
+    ]));
+  }} else {{
+    head.push(el("span", {{ class: "col grow" }}));
+  }}
+
+  const editor = el("div", {{ class: "hidden", style: "flex:1 1 100%" }});
+  const edit = el("button", {{
+    class: "btn", text: "Edit",
+    onclick: () => {{
+      if (!editor.classList.contains("hidden")) {{ editor.classList.add("hidden"); return; }}
+      editor.textContent = "";
+      const {{ grid, widgets }} = fieldGrid(o.fields, row);
+      grid.append(el("button", {{
+        class: "btn primary", text: "Stage",
+        onclick: () => stage(`${{o.noun}} ${{row.name}}`, fieldLines(o.fields, widgets, path, row)),
+      }}));
+      editor.append(grid);
+      editor.classList.remove("hidden");
+    }},
+  }});
+  const del = el("button", {{
+    class: "btn danger", text: "Delete",
+    onclick: () => stage(`Delete ${{o.noun.toLowerCase()}} ${{row.name}}`, [`delete ${{path}}`]),
+  }});
+
+  for (const part of head) card.append(part);
+  card.append(el("span", {{ class: "row", style: "flex:none" }}, [edit, del]), editor);
+  return card;
+}}
+
+// `o` carries: listId, addId, noun, fields, path(name), rows, nameHint, empty.
+function renderObjects(o) {{
+  const list = $(o.listId);
+  list.textContent = "";
+  if (!o.rows.length) {{
+    list.append(el("div", {{ class: "card", text: o.empty || ("No " + o.noun.toLowerCase() + " configured.") }}));
+  }}
+  for (const row of o.rows) list.append(objectCard(o, row));
+
+  if (!o.addId) return;
+  // The add panel is rebuilt each refresh so its selects carry the vocabulary
+  // as it is now, not as it was when the page loaded.
+  const box = $(o.addId);
+  box.textContent = "";
+  const name = el("input", {{ placeholder: o.nameHint || "name" }});
+  box.append(el("label", {{ class: "field" }}, [el("span", {{ text: "Name" }}), name]));
+  const {{ grid, widgets }} = fieldGrid(o.fields, null);
+  for (const child of [...grid.children]) box.append(child);
+  box.append(el("button", {{
+    class: "btn primary", text: "Add",
     onclick: () => {{
       const n = name.value.trim();
       if (!n) {{ name.focus(); return; }}
-      const lines = [];
-      fields.forEach((f, i) => {{
-        const v = (inputs[i].value || "").trim();
-        if (v) lines.push(`set ${{path}} ${{n}} ${{f[0]}} ${{v}}`);
-      }});
-      if (!lines.length) lines.push(`set ${{path}} ${{n}}`);
-      stage(`Create ${{path}} ${{n}}`, lines);
+      const lines = fieldLines(o.fields, widgets, o.path(n), null);
+      // An object with no fields set is still an object; the appliance decides
+      // whether that is valid, which is the whole reason to ask it.
+      stage(`${{o.noun}} ${{n}}`, lines.length ? lines : [`set ${{o.path(n)}}`]);
+      box.classList.add("hidden");
     }},
-  }});
-  t.append(el("tr", {{}}, [el("td", {{}}, [name])]
-    .concat(inputs.map((i) => el("td", {{}}, [i])))
-    .concat([el("td", {{}}, [create])])));
-  name.focus();
+  }}));
+}}
+
+function wireToggle(buttonId, panelId, label) {{
+  $(buttonId).onclick = () => {{
+    const panel = $(panelId);
+    panel.classList.toggle("hidden");
+    $(buttonId).textContent = panel.classList.contains("hidden") ? label : "Cancel";
+  }};
 }}
 
 async function leaves() {{
@@ -1553,9 +1505,9 @@ async function leaves() {{
 // ---- BGP -----------------------------------------------------------------
 
 const BGP_GLOBAL = [
-  ["local-as", ["" ]], ["router-id", [""]], ["hold-time", [""]],
-  ["cluster-id", [""]], ["multipath", ["", "true", "false"]],
-  ["ebgp-require-policy", ["", "true", "false"]],
+  ["local-as", "Local AS"], ["router-id", "Router ID"], ["hold-time", "Hold time"],
+  ["cluster-id", "Cluster ID"], ["multipath", "Multipath", ["", "true", "false"]],
+  ["ebgp-require-policy", "Require policy", ["", "true", "false"]],
 ];
 const BGP_NEIGHBOR = [
   ["remote-as", "Remote AS"],
@@ -1568,6 +1520,18 @@ const BGP_NEIGHBOR = [
   ["max-prefix", "Max prefix"],
 ];
 
+// A section-wide settings block: the same field grid, staged as one change.
+function settingsPanel(boxId, fields, current, path, label) {{
+  const box = $(boxId);
+  box.textContent = "";
+  const {{ grid, widgets }} = fieldGrid(fields, current);
+  for (const child of [...grid.children]) box.append(child);
+  box.append(el("button", {{
+    class: "btn primary", text: "Stage",
+    onclick: () => stage(label, fieldLines(fields, widgets, path, current)),
+  }}));
+}}
+
 async function refreshBgp() {{
   $("bgpshow").textContent = "…";
   try {{ $("bgpshow").textContent = (await text("/api/v1/show/ip/bgp/summary")).trimEnd(); }}
@@ -1578,27 +1542,19 @@ async function refreshBgp() {{
   for (const l of ls) {{
     if (l.node === "protocols bgp") globals[l.path[l.path.length - 1]] = l.value;
   }}
-  const g = $("bgpglobal");
-  g.textContent = "";
-  const pending = new Map();
-  for (const f of BGP_GLOBAL) {{
-    const widget = f[1].length > 1
-      ? selectFor(f, globals[f[0]], (e) => pending.set(f[0], e.target.value))
-      : el("input", {{ value: globals[f[0]] || "", oninput: (e) => pending.set(f[0], e.target.value) }});
-    g.append(el("div", {{ class: "field" }}, [el("label", {{ text: f[0] }}), widget]));
-  }}
-  $("savebgp").onclick = () => {{
-    const lines = [];
-    for (const [k, v] of pending) {{
-      lines.push(v.trim() ? `set protocols bgp ${{k}} ${{v.trim()}}`
-                          : `delete protocols bgp ${{k}}`);
-    }}
-    if (lines.length) stage(lines);
-  }};
+  settingsPanel("bgpglobal", BGP_GLOBAL, globals, "protocols bgp", "BGP router settings");
 
-  editorTable("bgptable", ["protocols", "bgp", "neighbor"], BGP_NEIGHBOR,
-    entriesUnder(ls, ["protocols", "bgp", "neighbor"]),
-    {{ nameLabel: "neighbour", empty: "no neighbours configured" }});
+  renderObjects({{
+    listId: "bgplist", addId: "addbgppanel", noun: "Neighbour",
+    fields: BGP_NEIGHBOR, nameHint: "neighbour address",
+    path: (n) => `protocols bgp neighbor ${{n}}`,
+    rows: entriesUnder(ls, ["protocols", "bgp", "neighbor"]),
+    // A neighbour without a remote AS is not yet a session, and saying so is
+    // more useful than showing an empty column.
+    badge: (r) => r["remote-as"] ? {{ text: "AS " + r["remote-as"], cls: "accept" }}
+                                 : {{ text: "incomplete", cls: "reject" }},
+    empty: "No BGP neighbours configured.",
+  }});
 }}
 
 // ---- IPsec ---------------------------------------------------------------
@@ -1617,9 +1573,15 @@ async function refreshIpsec() {{
   $("ipsecshow").textContent = "…";
   try {{ $("ipsecshow").textContent = (await text("/api/v1/show/vpn/ipsec")).trimEnd(); }}
   catch (e) {{ $("ipsecshow").textContent = String(e.message || e); }}
-  editorTable("ipsectable", ["vpn", "ipsec"], IPSEC,
-    entriesUnder(await leaves(), ["vpn", "ipsec"]),
-    {{ nameLabel: "tunnel", empty: "no tunnels configured" }});
+  renderObjects({{
+    listId: "ipseclist", addId: "addipsecpanel", noun: "Tunnel",
+    fields: IPSEC, nameHint: "tunnel name",
+    path: (n) => `vpn ipsec ${{n}}`,
+    rows: entriesUnder(await leaves(), ["vpn", "ipsec"]),
+    badge: (r) => (r.local && r.remote) ? {{ text: "ike" + (r["ike-version"] || "2"), cls: "accept" }}
+                                        : {{ text: "incomplete", cls: "reject" }},
+    empty: "No IPsec tunnels configured.",
+  }});
 }}
 
 // ---- WireGuard -----------------------------------------------------------
@@ -1634,54 +1596,35 @@ const WG_PEER = [
 
 async function refreshWireguard() {{
   const ls = await leaves();
-  const tunnels = entriesUnder(ls, ["vpn", "wireguard"])
-    .map((t) => ({{ name: t.name, "listen-port": t["listen-port"], "private-key": t["private-key"] }}));
-  editorTable("wgtable", ["vpn", "wireguard"], WG, tunnels,
-    {{ nameLabel: "interface", empty: "no interfaces configured" }});
+  const tunnels = entriesUnder(ls, ["vpn", "wireguard"]);
+  renderObjects({{
+    listId: "wglist", addId: "addwgpanel", noun: "Interface",
+    fields: WG, nameHint: "wg0",
+    path: (n) => `vpn wireguard ${{n}}`,
+    rows: tunnels,
+    badge: (r) => r["listen-port"] ? {{ text: ":" + r["listen-port"], cls: "accept" }}
+                                   : {{ text: "no port", cls: "reject" }},
+    empty: "No WireGuard interfaces configured.",
+  }});
 
-  // Peers live one level deeper, so they get their own table keyed by the
-  // tunnel they belong to — a peer is only meaningful with its interface.
-  const t = $("wgpeers");
-  t.textContent = "";
-  t.append(el("tr", {{}}, ["interface", "public key"].concat(WG_PEER.map((f) => f[1])).concat([""])
-    .map((h) => el("th", {{ text: h }}))));
-  let any = false;
-  for (const tunnel of tunnels) {{
-    const peers = entriesUnder(ls, ["vpn", "wireguard", tunnel.name, "peer"]);
-    for (const p of peers) {{
-      any = true;
-      const inputs = WG_PEER.map((f) => el("input", {{ value: p[f[0]] || "" }}));
-      const apply = el("button", {{
-        class: "btn", text: "Apply",
-        onclick: () => {{
-          const lines = [];
-          WG_PEER.forEach((f, i) => {{
-            const v = inputs[i].value.trim();
-            if (v) lines.push(`set vpn wireguard ${{tunnel.name}} peer ${{p.name}} ${{f[0]}} ${{v}}`);
-          }});
-          if (lines.length) stage(`Update peer on ${{tunnel.name}}`, lines);
-        }},
-      }});
-      const del = el("button", {{
-        class: "btn danger", text: "Delete",
-        onclick: () => stage(`Remove peer from ${{tunnel.name}}`, [`delete vpn wireguard ${{tunnel.name}} peer ${{p.name}}`]),
-      }});
-      t.append(el("tr", {{}}, [
-        el("td", {{ text: tunnel.name }}),
-        el("td", {{ text: p.name }}),
-      ].concat(inputs.map((i) => el("td", {{}}, [i])))
-       .concat([el("td", {{}}, [el("div", {{ class: "row" }}, [apply, del])])])));
-    }}
+  // Peers belong to an interface, so the interface is picked once in the
+  // toolbar rather than repeated in every row.
+  const sel = $("wgtunnel");
+  const chosen = sel.value;
+  sel.textContent = "";
+  for (const t of tunnels) {{
+    const o = el("option", {{ value: t.name, text: t.name }});
+    if (t.name === chosen) o.setAttribute("selected", "selected");
+    sel.append(o);
   }}
-  if (!any) {{
-    t.append(el("tr", {{}}, [el("td", {{ colspan: "7", text: "no peers configured" }})]));
-  }}
-  $("addwgpeer").onclick = () => {{
-    if (!tunnels.length) {{ window.alert("Add a WireGuard interface first."); return; }}
-    const iface = window.prompt("Which interface?", tunnels[0].name);
-    if (!iface) return;
-    addRow("wgpeers", ["vpn", "wireguard", iface, "peer"], WG_PEER, "peer public key");
-  }};
+  const iface = sel.value || (tunnels[0] && tunnels[0].name);
+  renderObjects({{
+    listId: "wgpeerlist", addId: "addwgpeerpanel", noun: "Peer",
+    fields: WG_PEER, nameHint: "peer public key",
+    path: (n) => `vpn wireguard ${{iface}} peer ${{n}}`,
+    rows: iface ? entriesUnder(ls, ["vpn", "wireguard", iface, "peer"]) : [],
+    empty: iface ? "No peers on " + iface + "." : "Add an interface first.",
+  }});
 }}
 
 // ---- DHCP ----------------------------------------------------------------
@@ -1701,47 +1644,38 @@ async function refreshDhcp() {{
   catch (e) {{ $("dhcpshow").textContent = String(e.message || e); }}
 
   const ls = await leaves();
-  // A DHCP server is a block on an interface, not an entry of its own, so the
+  // A DHCP server is a block on an interface, not an object of its own, so the
   // rows are interfaces and the path carries the interface's name.
   const servers = new Map();
+  const interfaces = new Set();
   for (const l of ls) {{
-    if (l.path[0] === "interface" && l.path[2] === "dhcp-server" && l.path.length >= 4) {{
-      const iface = l.path[1];
-      if (!servers.has(iface)) servers.set(iface, {{ name: iface }});
-      servers.get(iface)[l.path[3]] = l.value;
+    if (l.path[0] !== "interface") continue;
+    interfaces.add(l.path[1]);
+    if (l.path[2] === "dhcp-server" && l.path.length >= 4) {{
+      if (!servers.has(l.path[1])) servers.set(l.path[1], {{ name: l.path[1] }});
+      servers.get(l.path[1])[l.path[3]] = l.value;
     }}
   }}
-  const t = $("dhcptable");
-  t.textContent = "";
-  t.append(el("tr", {{}}, ["interface"].concat(DHCP.map((f) => f[1])).concat([""])
-    .map((h) => el("th", {{ text: h }}))));
-  if (!servers.size) {{
-    t.append(el("tr", {{}}, [el("td", {{
-      colspan: String(DHCP.length + 2), text: "no DHCP server enabled",
-    }})]));
+
+  const sel = $("dhcpiface");
+  const chosen = sel.value;
+  sel.textContent = "";
+  for (const i of [...interfaces].sort()) {{
+    if (servers.has(i)) continue;
+    const o = el("option", {{ value: i, text: i }});
+    if (i === chosen) o.setAttribute("selected", "selected");
+    sel.append(o);
   }}
-  for (const srv of servers.values()) {{
-    const inputs = DHCP.map((f) => el("input", {{ value: srv[f[0]] || "" }}));
-    const apply = el("button", {{
-      class: "btn", text: "Apply",
-      onclick: () => {{
-        const lines = [];
-        DHCP.forEach((f, i) => {{
-          const v = inputs[i].value.trim();
-          if (v) lines.push(`set interface ${{srv.name}} dhcp-server ${{f[0]}} ${{v}}`);
-          else if (srv[f[0]]) lines.push(`delete interface ${{srv.name}} dhcp-server ${{f[0]}}`);
-        }});
-        if (lines.length) stage(`DHCP server on ${{srv.name}}`, lines);
-      }},
-    }});
-    const del = el("button", {{
-      class: "btn danger", text: "Disable",
-      onclick: () => stage(`Disable DHCP on ${{srv.name}}`, [`delete interface ${{srv.name}} dhcp-server`]),
-    }});
-    t.append(el("tr", {{}}, [el("td", {{ text: srv.name }})]
-      .concat(inputs.map((i) => el("td", {{}}, [i])))
-      .concat([el("td", {{}}, [el("div", {{ class: "row" }}, [apply, del])])])));
-  }}
+
+  renderObjects({{
+    listId: "dhcplist", noun: "Server",
+    fields: DHCP, nameHint: "interface",
+    path: (n) => `interface ${{n}} dhcp-server`,
+    rows: [...servers.values()],
+    badge: (r) => r["pool-size"] ? {{ text: r["pool-size"] + " leases", cls: "accept" }}
+                                 : {{ text: "default pool", cls: "" }},
+    empty: "No DHCP server enabled.",
+  }});
 }}
 
 // ---- stack ---------------------------------------------------------------
@@ -2006,16 +1940,18 @@ $("applystaged2").onclick = () => applyStaged(["commit", "save"]);
 $("validate").onclick = () => applyStaged([]);
 $("refresh").onclick = () => refresh();
 $("allcounters").onchange = () => refreshDashboard();
-$("addsnat").onclick = () => addNat("snattable", "source", SNAT_FIELDS);
-$("adddnat").onclick = () => addNat("dnattable", "destination", DNAT_FIELDS);
-$("addneighbor").onclick = () =>
-  addRow("bgptable", ["protocols", "bgp", "neighbor"], BGP_NEIGHBOR, "neighbour address");
-$("addipsec").onclick = () => addRow("ipsectable", ["vpn", "ipsec"], IPSEC, "tunnel name");
-$("addwg").onclick = () => addRow("wgtable", ["vpn", "wireguard"], WG, "interface name");
-$("adddhcp").onclick = () => {{
-  const iface = window.prompt("Enable a DHCP server on which interface?");
-  if (iface) stage(`Enable DHCP on ${{iface}}`, [`set interface ${{iface}} dhcp-server enable`]);
-}};
+wireToggle("togglesnat", "addsnatpanel", "New source rule");
+wireToggle("toggleddnat", "adddnatpanel", "New port forward");
+wireToggle("togglebgp", "addbgppanel", "New neighbour");
+wireToggle("toggleipsec", "addipsecpanel", "New tunnel");
+wireToggle("togglewg", "addwgpanel", "New interface");
+wireToggle("togglewgpeer", "addwgpeerpanel", "New peer");
+$("wgtunnel").onchange = () => refreshWireguard();
+$("enabledhcp").onclick = () => {{
+  const iface = $("dhcpiface").value;
+  if (!iface) return;
+  stage("Enable DHCP on " + iface, [`set interface ${{iface}} dhcp-server enable`]);
+}};}};
 $("runshow").onclick = async () => {{
   const words = $("showcmd").value.trim();
   if (!words) return;
@@ -2122,6 +2058,43 @@ mod tests {
             html.contains("entry.label"),
             "staged changes are not described"
         );
+    }
+
+    /// Every configurable thing renders through one path, so a zone, a tunnel
+    /// and a DHCP server read alike and cannot disagree about how a setting is
+    /// written. A section that grew its own renderer is the drift this guards.
+    #[test]
+    fn every_section_renders_through_the_same_object_language() {
+        let html = page();
+        assert!(
+            html.contains("function objectCard"),
+            "no shared object card"
+        );
+        assert!(
+            html.contains("function renderObjects"),
+            "no shared renderer"
+        );
+        for list in [
+            "zonelist",
+            "snatlist",
+            "dnatlist",
+            "bgplist",
+            "ipseclist",
+            "wglist",
+            "wgpeerlist",
+            "dhcplist",
+        ] {
+            assert!(html.contains(list), "{list} is not rendered as objects");
+        }
+        // The table era is over; a leftover would be a second language.
+        assert!(!html.contains("editorTable"), "a table renderer is back");
+    }
+
+    /// An emptied field has to mean "no longer set", not "leave what was there"
+    /// — otherwise a setting can be added from the console but never removed.
+    #[test]
+    fn clearing_a_field_removes_the_setting() {
+        assert!(page().contains(r#"lines.push(`delete ${path} ${f[0]}`)"#));
     }
 
     /// Fields with a fixed vocabulary are chosen, not spelled. A zone typed by
