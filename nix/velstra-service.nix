@@ -98,7 +98,12 @@ in
         # read: the agent owns the eBPF maps, so it is the only process that can
         # answer what the data plane is doing. RuntimeDirectory creates (and
         # cleans up) /run/velstra for it.
-        ExecStart = "${cfg.package}/bin/velstra run --iface ${cfg.interface} --config /run/sentinel/velstra.toml --query-socket /run/velstra/query.sock";
+        #
+        # The portal socket (C20) is separate, and deliberately: it is the only
+        # one on which anything can be opened, so the diagnostics socket keeps
+        # the property that nothing on it admits traffic. Both live in the same
+        # root-owned 0700 directory, which is what governs who may ask.
+        ExecStart = "${cfg.package}/bin/velstra run --iface ${cfg.interface} --config /run/sentinel/velstra.toml --query-socket /run/velstra/query.sock --portal-socket /run/velstra/portal.sock";
         RuntimeDirectory = "velstra";
         RuntimeDirectoryMode = "0700";
         Restart = "on-failure";

@@ -919,6 +919,10 @@ const OP_SHOW_TOP: &[Cand] = &[
     ("firewall", "firewall summary / statistics / log"),
     ("nat", "NAT configuration summary"),
     ("ids", "intrusion detection: what is watched, what fired"),
+    (
+        "portal",
+        "captive portal: what holds the guest zone, and who is on",
+    ),
     ("load-balancer", "load-balanced services + their pools"),
     ("vpn", "IPsec VPN: security associations / connections"),
     ("pki", "local CAs + issued certificates (expiry)"),
@@ -1250,6 +1254,10 @@ const SERVICES_NODES: &[Cand] = &[
         "carry a UDP broadcast between segments (by name)",
     ),
     (
+        "portal",
+        "captive portal: hold a guest zone until each device is admitted",
+    ),
+    (
         "syslog",
         "ship the journal to remote collectors (rsyslog, RFC 5424)",
     ),
@@ -1262,6 +1270,21 @@ const SERVICES_NODES: &[Cand] = &[
         "intrusion detection: watch links with suricata (roadmap C11)",
     ),
 ];
+// `services portal <Tab>`: which zone is gated, and what a visitor has to do.
+const PORTAL_FIELDS: &[Cand] = &[
+    ("zone", "the zone held behind the portal (this turns it on)"),
+    ("port", "TCP port the portal page listens on (default 8082)"),
+    (
+        "passphrase",
+        "what a visitor must type (omit for click-through)",
+    ),
+    (
+        "session-timeout",
+        "how long one admission lasts, in seconds (default 3600)",
+    ),
+    ("message", "a line of text shown on the page"),
+];
+
 // `services ids <Tab>`: what to watch, what counts as inside, and the rules.
 const IDS_NODES: &[Cand] = &[
     ("interface", "a link to watch (repeatable)"),
@@ -2514,6 +2537,7 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "services", "alerts"] => ALERTS_NODES,
         ["set" | "delete", "services", "alerts", "mail"] => ALERT_MAIL_FIELDS,
         ["set", "services", "alerts", "mail", "starttls"] => BOOLS,
+        ["set" | "delete", "services", "portal"] => PORTAL_FIELDS,
         ["set" | "delete", "services", "ids"] => IDS_NODES,
         ["set", "services", "ids", "block-on-alert"] => BOOLS,
         ["set" | "delete", "services", "syslog"] => SYSLOG_NODES,
@@ -3890,6 +3914,7 @@ mod tests {
                 "dhcp-relay",
                 "reverse-proxy",
                 "broadcast-relay",
+                "portal",
                 "syslog",
                 "alerts",
                 "ids"
