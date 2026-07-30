@@ -1538,6 +1538,14 @@
           )
           assert "error" not in replay, replay
 
+          # The console is operated, not typed into: no command box, no command
+          # preview, no raw-path editor. Commands remain how a change reaches the
+          # appliance — that is what puts a clicked edit through the same
+          # validators as a typed one — but they are not the interface.
+          for surface in ["Run configuration commands", "This will run", "cfgtable"]:
+              assert surface not in page, f"the console still exposes {surface!r}"
+          assert "fillZoneSelect" in page, "zone fields are free text"
+
           # The stack lists this appliance even with no peers configured, so the
           # view is never empty and an operator can tell "no peers" apart from
           # "the page failed to load".

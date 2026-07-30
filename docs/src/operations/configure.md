@@ -611,45 +611,20 @@ checks every one and writes nothing, which is how you learn a change would be
 refused before it touches anything. A refused Apply leaves the commands staged
 so you can fix one and try again, rather than reconstructing what you clicked.
 
-### Clicking is typing
+### Everything is a control
 
-Every change the console makes is sent as the **same commands you would type**,
-to `POST /api/v1/configure`, and the editor shows the exact script before it
-runs:
+There is no command box and no place to type a path. Zones are chosen from the
+zones that exist, an action is a badge, a rule is a row you edit — the appliance
+is configured by working its objects.
 
-```text
-set firewall rule web-in from wan
-set firewall rule web-in proto tcp
-set firewall rule web-in port 443
-set firewall rule web-in action accept
-```
-
-That is deliberate. A form that assembled a configuration document out of its
-fields would be a second description of the config model, free to drift from the
-first; emitting commands means every validator, refusal and commit warning that
-guards a typed change guards a clicked one — and the console can never do
-something the CLI cannot. The script is also reviewable and pasteable, so a
-change made in the browser can be handed to a colleague verbatim.
-
-**Apply and save** runs `commit` and `save`; **apply without saving** runs only
-`commit`, so a change you are unsure about disappears at the next reboot. The
-result dialog shows the appliance's whole output — a refused commit is reported
-in what it *prints*, not in its exit status, so nothing here is decided from a
-status code.
-
-### Everything, not just the forms
-
-The forms cover what is clicked often. What makes the console complete is the
-**Configuration** view: the running configuration is printed as the same
-document the CLI edits, so every setting in it becomes an editable row whose
-path *is* its `set` command, and removing one writes `delete <path>`. Nothing
-there needs to know what a setting means, which is why it covers the whole
-surface rather than the part someone remembered to build a form for.
-
-Beside it, the command box runs anything the CLI accepts. **Validate only**
-sends the commands with no `commit`: the appliance parses and checks every one
-of them and nothing is applied or written, which is how you find out whether a
-change would be refused before it touches anything.
+Underneath, a change still travels to the box as the commands the CLI accepts,
+and that is deliberate rather than a shortcut: it is what puts a clicked edit
+through the same parser, validators, refusals and commit warnings as a typed
+one, and it is why the console can never do something the CLI cannot. A form
+that assembled a configuration document instead would be a second description
+of the config model, free to drift from the first. The pending panel lists what
+will change, in words — the commands are transport, and transport is not an
+interface.
 
 ### Debugging
 
