@@ -18,11 +18,11 @@ use crate::config::{
     DhcpServer, DhcpStaticLease, Dns, Dyndns, Export, Filter, FilterRule, Firewall, Groups,
     HealthCheck, Ids, IfaceType, Interface, IpsecConnection, Isis, Lldp, LoadBalancer, Login, Mdns,
     MultiWan, Multicast, MulticastInterface, Nat, Nat64, NatDestination, NatNpt66, NatSource, Ntp,
-    OpenConnectServer, OpenConnectUser, Ospf, Ospf3, OspfInterface, Pki, Policy, PortSpec, Portal,
-    Pppoe, PrefixEntry, PrefixList, Proto, Protocols, Qos, QosDiscipline, ReverseProxy, Rip,
-    RouterAdvert, Rule, Schedule, Services, Snmp, SourceValidation, Ssh, StaticRoute, Syslog,
-    SyslogLevel, SyslogProto, SyslogTarget, System, UpdateChannel, Vpn, VrfDef, Vrrp, WanMode,
-    WanUplink, WgPeer, WireguardTunnel, ZoneCfg,
+    OpenConnectServer, OpenConnectUser, Ospf, Ospf3, OspfInterface, Pki, Policy, PortMapping,
+    PortSpec, Portal, Pppoe, PrefixEntry, PrefixList, Proto, Protocols, Qos, QosDiscipline,
+    ReverseProxy, Rip, RouterAdvert, Rule, Schedule, Services, Snmp, SourceValidation, Ssh,
+    StaticRoute, Syslog, SyslogLevel, SyslogProto, SyslogTarget, System, UpdateChannel, Vpn,
+    VrfDef, Vrrp, WanMode, WanUplink, WgPeer, WireguardTunnel, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -1190,6 +1190,8 @@ struct Draft {
     /// Captive portal (roadmap C20). Every field is optional with a working
     /// default, so — like `ids` — the config type is its own draft.
     portal: Portal,
+    /// NAT-PMP port mapping (roadmap C18); its own draft for the same reason.
+    port_mapping: PortMapping,
     dhcp_relay: DhcpRelayDraft,
     /// Multi-WAN (roadmap C6): failover/load-balance mode + the uplinks, keyed by
     /// interface in configuration order.
@@ -2189,6 +2191,7 @@ impl Draft {
             },
             ids: a.services.ids.clone(),
             portal: a.services.portal.clone(),
+            port_mapping: a.services.port_mapping.clone(),
             dhcp_relay: DhcpRelayDraft {
                 interface: a.services.dhcp_relay.interface.clone(),
                 server: a.services.dhcp_relay.server.clone(),
@@ -3538,6 +3541,24 @@ impl Session {
             // an operator got wrong about this feature.
             ["services", "portal", "message", rest @ ..] if !rest.is_empty() => {
                 self.draft.portal.message = Some(rest.join(" "));
+            }
+
+            // services port-mapping: NAT-PMP (C18). The two zones are what turn
+            // it on: which hosts may ask, and where the port is opened.
+            ["services", "port-mapping", "zone", v] => {
+                self.draft.port_mapping.zone = Some((*v).to_string());
+            }
+            ["services", "port-mapping", "wan-zone", v] => {
+                self.draft.port_mapping.wan_zone = Some((*v).to_string());
+            }
+            ["services", "port-mapping", "max-lifetime", v] => {
+                self.draft.port_mapping.max_lifetime = Some(
+                    v.parse()
+                        .with_context(|| format!("{v:?} is not a number of seconds"))?,
+                )
+            }
+            ["services", "port-mapping", "allow-privileged", v] => {
+                self.draft.port_mapping.allow_privileged = Some(parse_bool(v)?)
             }
 
             // services ids: intrusion detection (C11). Every field is a list that
@@ -5403,6 +5424,15 @@ impl Session {
                     other => bail!("services syslog target has no field {other:?}"),
                 }
             }
+            ["services", "port-mapping"] => self.draft.port_mapping = PortMapping::default(),
+            ["services", "port-mapping", "zone"] => self.draft.port_mapping.zone = None,
+            ["services", "port-mapping", "wan-zone"] => self.draft.port_mapping.wan_zone = None,
+            ["services", "port-mapping", "max-lifetime"] => {
+                self.draft.port_mapping.max_lifetime = None
+            }
+            ["services", "port-mapping", "allow-privileged"] => {
+                self.draft.port_mapping.allow_privileged = None
+            }
             ["services", "portal"] => self.draft.portal = Portal::default(),
             ["services", "portal", "zone"] => self.draft.portal.zone = None,
             ["services", "portal", "port"] => self.draft.portal.port = None,
@@ -7045,6 +7075,7 @@ impl Session {
                 ssh: self.draft.ssh.clone(),
                 ids: self.draft.ids.clone(),
                 portal: self.draft.portal.clone(),
+                port_mapping: self.draft.port_mapping.clone(),
                 alerts: Alerts {
                     webhook: self.draft.alerts.webhook.clone(),
                     mail: self.draft.alerts.mail.clone(),

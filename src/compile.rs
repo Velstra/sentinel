@@ -1808,6 +1808,46 @@ passphrase = "sommer"
         assert_eq!(out.matches("[policy.portal]").count(), 1, "{out}");
     }
 
+    /// NAT-PMP hands a host on the inside the power to open an inbound port, so
+    /// the two zones are refused rather than defaulted: a wrong one means either
+    /// a daemon nobody can reach or mappings opened on the wrong zone.
+    #[test]
+    fn port_mapping_needs_both_zones_and_they_must_differ() {
+        let base = r#"
+[system]
+hostname = "fw"
+
+[[interface]]
+name = "lan0"
+zone = "lan"
+address = "10.0.0.1/24"
+
+[[interface]]
+name = "wan0"
+zone = "wan"
+address = "203.0.113.7/24"
+"#;
+        // Both zones, addressed, and different: accepted, and it resolves.
+        let ok = format!("{base}\n[services.port-mapping]\nzone = \"lan\"\nwan-zone = \"wan\"\n");
+        let appliance = Appliance::from_toml(&ok).unwrap();
+        let state = crate::portmap::resolve(&appliance).expect("no settings");
+        assert_eq!(state.bind.to_string(), "10.0.0.1:5351");
+        assert_eq!(state.external.to_string(), "203.0.113.7");
+        // Opened on the uplink's policy, not the asking zone's.
+        let ids = zone_policy_ids(&appliance);
+        assert_eq!(state.wan_policy, ids["wan"]);
+        assert_ne!(state.wan_policy, ids["lan"]);
+        // Off unless asked for.
+        assert!(!state.allow_privileged);
+
+        // No uplink named: a mapping would have nowhere to be opened.
+        let no_wan = format!("{base}\n[services.port-mapping]\nzone = \"lan\"\n");
+        assert!(Appliance::from_toml(&no_wan).is_err());
+        // Both the same: that maps a port on the very zone the request came from.
+        let same = format!("{base}\n[services.port-mapping]\nzone = \"lan\"\nwan-zone = \"lan\"\n");
+        assert!(Appliance::from_toml(&same).is_err());
+    }
+
     #[test]
     /// A portal on a zone with no interface, or with no address to bind, is
     /// refused at commit: each of those looks the same from outside — a guest

@@ -742,6 +742,29 @@
             };
           };
 
+          # NAT-PMP (roadmap C18): a host on the inside asking for its own
+          # inbound port. nixpkgs' miniupnpd links libiptc and so writes rules
+          # this appliance's data plane never reads — hence a daemon inside
+          # sentinel, driving the same port-forward table the configuration
+          # does, through the agent's mapping socket. Needs no capabilities:
+          # 5351 is unprivileged and everything it can achieve is one bounded,
+          # deadlined line on that socket. Sentinel starts/stops this on
+          # `[services.port-mapping]`.
+          systemd.services.sentinel-portmap = {
+            description = "NAT-PMP port mapping (sentinel)";
+            after = [
+              "network.target"
+              "sentinel-boot.service"
+              "velstra.service"
+            ];
+            serviceConfig = {
+              Type = "exec";
+              ExecStart = "${sentinel}/bin/sentinel port-map";
+              Restart = "on-failure";
+              RestartSec = "5s";
+            };
+          };
+
           # Remote syslog (roadmap C12): rsyslog in the foreground against
           # Sentinel's rendered config. `-n` keeps it attached so systemd owns the
           # process; `-i NONE` skips the pid file (systemd tracks it). Sentinel
