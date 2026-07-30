@@ -1553,6 +1553,56 @@
               assert lst in page, f"{lst} is not rendered as objects"
           assert "editorTable" not in page, "a second renderer is back"
 
+          # The console is meant to be the whole management surface; a missing
+          # section is somewhere an operator has to leave the browser for.
+          for view in ["view-interfaces", "view-routes", "view-groups", "view-lb",
+                       "view-pki", "view-certs", "view-users", "view-ids",
+                       "view-synproxy"]:
+              assert view in page, f"{view} is missing from the console"
+
+          # Operational commands are their own path: they change what the box is
+          # doing, are nowhere in the saved config, and cannot be staged.
+          machine.succeed(
+              "curl -fsS -X POST -H 'Authorization: Bearer " + token + "' "
+              "http://127.0.0.1:8080/api/v1/clear/ids/blocks"
+          )
+          code = machine.succeed(
+              "curl -s -o /dev/null -w '%{http_code}' -X POST "
+              "-H 'Authorization: Bearer " + token + "' "
+              "http://127.0.0.1:8080/api/v1/clear/nonsense"
+          ).strip()
+          assert code == "400", f"an unknown clear path answered {code}"
+
+          # A section added to the console has to be one the CLI accepts. These
+          # are written the way the console writes them, so an invented path
+          # fails here rather than in front of an operator.
+          machine.succeed(
+              "printf '%s\n' "
+              "'set interface eth0 description uplink' "
+              "'set protocols static 0.0.0.0/0 via 10.0.0.254' "
+              "'set firewall group address-group offices address 10.1.0.0/16' "
+              "'set firewall syn-protect 8443 mss 1400' "
+              "'set load-balancer web zone wan' "
+              "'set load-balancer web vip 203.0.113.9' "
+              "'set load-balancer web proto tcp' "
+              "'set load-balancer web port 443' "
+              "'set load-balancer web backend 10.0.0.11:8443' "
+              "'set pki ca internal common-name velstra-internal-ca' "
+              "'set system login ops ssh-key ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHtest' "
+              "commit save > /tmp/sections"
+          )
+          sections = machine.succeed(
+              "curl -sS -X POST -H 'Authorization: Bearer " + token + "' "
+              "--data-binary @/tmp/sections http://127.0.0.1:8080/api/v1/configure"
+          )
+          cfg = machine.succeed(
+              "curl -fsS -H 'Authorization: Bearer " + token + "' "
+              "http://127.0.0.1:8080/api/v1/show/configuration"
+          )
+          for want in ["uplink", "10.0.0.254", "offices", "8443", "203.0.113.9",
+                       "internal", "ops"]:
+              assert want in cfg, sections + cfg
+
           # The stack lists this appliance even with no peers configured, so the
           # view is never empty and an operator can tell "no peers" apart from
           # "the page failed to load".

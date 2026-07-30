@@ -800,6 +800,131 @@ pub fn page() -> String {
       <div class="card"><h3>Leases</h3><pre class="out" id="dhcpshow">…</pre></div>
     </div>
 
+    <div id="view-interfaces" class="hidden">
+      <div class="toolbar">
+        <span class="inline"><span>Interfaces</span></span>
+        <span class="spacer"></span>
+        <button class="btn" id="toggleiface">New</button>
+      </div>
+      <div class="card addpanel hidden" id="addifacepanel"></div>
+      <div id="ifacelist"></div>
+      <div class="card" style="margin-top:var(--space-6)">
+        <h3>Live state</h3><pre class="out" id="ifaceshow">…</pre>
+      </div>
+    </div>
+
+    <div id="view-routes" class="hidden">
+      <div class="toolbar">
+        <span class="inline"><span>Static routes</span></span>
+        <span class="spacer"></span>
+        <button class="btn" id="toggleroute">New</button>
+      </div>
+      <div class="card addpanel hidden" id="addroutepanel"></div>
+      <div id="routelist"></div>
+      <div class="card" style="margin-top:var(--space-6)">
+        <h3>Routing table</h3><pre class="out" id="routeshow">…</pre>
+      </div>
+    </div>
+
+    <div id="view-groups" class="hidden">
+      <div class="toolbar">
+        <label class="inline"><span>Kind</span>
+          <select id="groupkind">
+            <option value="address-group">address</option>
+            <option value="port-group">port</option>
+            <option value="domain-group">domain</option>
+          </select>
+        </label>
+        <span class="spacer"></span>
+        <button class="btn" id="togglegroup">New</button>
+      </div>
+      <div class="card addpanel hidden" id="addgrouppanel"></div>
+      <div id="grouplist"></div>
+      <p style="color:var(--text-muted);font-size:var(--text-sm);margin:var(--space-3) 0 0">
+        A group is referenced by a rule's source, destination or port field, so
+        one edit here moves every rule that names it.
+      </p>
+    </div>
+
+    <div id="view-lb" class="hidden">
+      <div class="toolbar">
+        <span class="inline"><span>Load-balanced services</span></span>
+        <span class="spacer"></span>
+        <button class="btn" id="togglelb">New</button>
+      </div>
+      <div class="card addpanel hidden" id="addlbpanel"></div>
+      <div id="lblist"></div>
+      <div class="card" style="margin-top:var(--space-6)">
+        <h3>Live state</h3><pre class="out" id="lbshow">…</pre>
+      </div>
+    </div>
+
+    <div id="view-pki" class="hidden">
+      <div class="toolbar">
+        <span class="inline"><span>Certificate authorities</span></span>
+        <span class="spacer"></span>
+        <button class="btn" id="toggleca">New</button>
+      </div>
+      <div class="card addpanel hidden" id="addcapanel"></div>
+      <div id="calist"></div>
+    </div>
+
+    <div id="view-certs" class="hidden">
+      <div class="toolbar">
+        <span class="inline"><span>Certificates</span></span>
+        <span class="spacer"></span>
+        <button class="btn" id="togglecert">New</button>
+      </div>
+      <div class="card addpanel hidden" id="addcertpanel"></div>
+      <div id="certlist"></div>
+      <div class="card" style="margin-top:var(--space-6)">
+        <h3>On disk</h3><pre class="out" id="pkishow">…</pre>
+      </div>
+    </div>
+
+    <div id="view-users" class="hidden">
+      <div class="toolbar">
+        <span class="inline"><span>Administrators</span></span>
+        <span class="spacer"></span>
+        <button class="btn" id="toggleuser">New</button>
+      </div>
+      <div class="card addpanel hidden" id="adduserpanel"></div>
+      <div id="userlist"></div>
+    </div>
+
+    <div id="view-synproxy" class="hidden">
+      <div class="toolbar">
+        <span class="inline"><span>SYN-protected ports</span></span>
+        <span class="spacer"></span>
+        <button class="btn" id="togglesyn">New</button>
+      </div>
+      <div class="card addpanel hidden" id="addsynpanel"></div>
+      <div id="synlist"></div>
+      <p style="color:var(--text-muted);font-size:var(--text-sm);margin:var(--space-3) 0 0">
+        The firewall answers every SYN to these ports itself and only opens the
+        real connection once a client returns its cookie. Protected connections
+        lose window scaling, SACK and timestamps — protect where a flood is the
+        greater risk.
+      </p>
+    </div>
+
+    <div id="view-ids" class="hidden">
+      <div class="toolbar">
+        <span class="inline"><span>Run-time blocks</span></span>
+        <span class="spacer"></span>
+        <button class="btn" id="liftall">Lift every block</button>
+      </div>
+      <p style="color:var(--text-muted);font-size:var(--text-sm);margin:0 0 var(--space-4)">
+        The detector adds these; they take effect at once and are nowhere in the
+        saved configuration, so lifting one is an operation rather than a staged
+        change. Blocking an address by hand is not something the CLI can do, so
+        it is not offered here either.
+      </p>
+      <div id="blocklist"></div>
+      <div class="card"><h3>Detector</h3><pre class="out" id="idsshow">…</pre></div>
+      <div class="card"><h3>Recent alerts</h3><pre class="out" id="alertshow">…</pre></div>
+    </div>
+
     <div id="view-config" class="hidden">
       <div class="card">
         <h3>Revisions</h3>
@@ -860,8 +985,8 @@ pub fn page() -> String {
 </dialog>
 
 <dialog id="result">
-  <h3 style="margin:0 0 .6rem">Result</h3>
-  <pre class="out" id="resultout"></pre>
+  <h3 style="margin:0 0 var(--space-4)" id="resulttitle">Applied</h3>
+  <div id="resultout"></div>
   <div class="row" style="margin-top:.9rem"><button class="btn" id="resultclose">Close</button></div>
 </dialog>
 
@@ -1209,141 +1334,72 @@ async function applyStaged(tail) {{
   // Only clear once they have actually run. A refused commit leaves the
   // commands staged, so the operator can fix one and try again rather than
   // reconstructing what they had clicked.
-  if (r.ok && !/^error/m.test(r.output || "")) {{
+  if (r.ok && !summarise(r.output).some((n) => n.kind === "bad")) {{
     staged = [];
     renderStaged();
   }}
   await refresh();
 }}
 
+// What came back, as an outcome — never as a transcript.
+//
+// The appliance answers in its own voice, and that voice is a terminal's: a
+// refusal is followed by the whole `set` grammar, which is exactly right at a
+// prompt and exactly wrong in a console. So the reply is read for the lines
+// that say something about *this* change — the errors, the warnings, and the
+// confirmation — and the grammar dump is dropped. A console that pasted it
+// would be handing an operator a manual page instead of an answer.
+function summarise(output) {{
+  const notes = [];
+  let grammar = false;
+  for (const raw of (output || "").split("\n")) {{
+    const line = raw.trim();
+    if (!line) continue;
+    // The help dump is a run of `set …` lines under an "unknown set path"
+    // error; the error itself is kept, its enclosed grammar is not.
+    if (grammar) {{
+      if (line.startsWith("set ") || line.startsWith("(") || line.startsWith("|")) continue;
+      grammar = false;
+    }}
+    if (line.startsWith("error:")) {{
+      const short = line.replace(/^error:\s*/, "");
+      if (short.startsWith("unknown set path")) {{
+        grammar = true;
+        notes.push({{ kind: "bad", text: "That setting is not one this appliance accepts." }});
+        continue;
+      }}
+      notes.push({{ kind: "bad", text: short }});
+      continue;
+    }}
+    if (line.startsWith("warning:")) {{
+      notes.push({{ kind: "warn", text: line.replace(/^warning:\s*/, "") }});
+      continue;
+    }}
+    if (line.startsWith("✔") || line.startsWith("commit:")) {{
+      notes.push({{ kind: "ok", text: line.replace(/^✔\s*/, "") }});
+    }}
+  }}
+  return notes;
+}}
+
 function showResult(r) {{
-  // The output is shown whether or not the exit status was a success: a commit
-  // the appliance REFUSED reports that in its output, not in its status, and a
-  // console that only looked at `ok` would tell the operator it worked.
-  $("resultout").textContent = (r.output || "").trim() || (r.ok ? "applied" : "failed");
+  const notes = summarise(r.output);
+  const failed = notes.some((n) => n.kind === "bad");
+  $("resulttitle").textContent = failed ? "Not applied" : "Applied";
+  const box = $("resultout");
+  box.textContent = "";
+  if (!notes.length) {{
+    notes.push({{ kind: r.ok ? "ok" : "bad", text: r.ok ? "Done." : "The appliance refused this." }});
+  }}
+  for (const n of notes) {{
+    box.append(el("div", {{ class: "change" }}, [
+      el("span", {{ class: "dot " + (n.kind === "bad" ? "down" : n.kind === "warn" ? "warn" : "up") }}),
+      el("span", {{ class: "what", text: n.text }}),
+    ]));
+  }}
   $("result").showModal();
 }}
 
-
-// ---- the running configuration, as a tree -------------------------------
-
-// `show configuration` prints the same curly-brace document the CLI edits, so
-// parsing it is how the console learns what exists. Reconstructing the full
-// path of every leaf is what makes a generic editor possible: a leaf's path IS
-// the `set` command, so nothing here needs to know what any setting means.
-function parseConfig(text) {{
-  const out = [];
-  const stack = [];
-  for (const raw of text.split("\n")) {{
-    const line = raw.trim();
-    if (!line || line.startsWith("#")) continue;
-    if (line === "}}") {{ stack.pop(); continue; }}
-    const open = line.match(/^(.*?)\s*\{{$/);
-    if (open) {{ stack.push(open[1].trim()); continue; }}
-    const parts = line.split(/\s+/);
-    const key = parts[0];
-    const value = parts.slice(1).join(" ");
-    out.push({{ path: stack.concat([key]), value, node: stack.join(" ") }});
-  }}
-  return out;
-}}
-
-// The Configuration view is the revision list and nothing else: rolling back is
-// a real operation an operator needs, and it stages like every other change.
-async function refreshConfig() {{
-  const r = $("revtable");
-  r.textContent = "";
-  r.append(el("tr", {{}}, ["revision", ""].map((h) => el("th", {{ text: h }}))));
-  try {{
-    const revs = (await text("/api/v1/show/system/commit")).trimEnd().split("\n");
-    for (const line of revs) {{
-      if (!line.trim()) continue;
-      const n = (line.trim().match(/^(\d+)/) || [])[1];
-      r.append(el("tr", {{}}, [
-        el("td", {{ class: "mono", text: line }}),
-        el("td", {{}}, [n === undefined ? el("span", {{}}) : el("button", {{
-          class: "btn", text: "Roll back",
-          onclick: () => stage("Roll back to revision " + n, ["rollback " + n]),
-        }})]),
-      ]));
-    }}
-  }} catch (e) {{
-    r.append(el("tr", {{}}, [el("td", {{ colspan: "2", text: String(e.message || e) }})]));
-  }}
-}}
-
-// ---- zones ---------------------------------------------------------------
-
-const POSTURE = [
-  ["default-action", "Default action", ["", "accept", "drop", "reject"]],
-  ["stateful", "Stateful", ["", "true", "false"]],
-  ["block-icmp", "Block ICMP", ["", "true", "false"]],
-  ["log", "Log", ["", "true", "false"]],
-  ["source-validation", "Source validation", ["", "disable", "loose", "strict"]],
-];
-
-async function refreshZones() {{
-  const ls = await leaves();
-
-  const globals = {{}};
-  for (const l of ls) {{
-    if (l.node === "firewall global") globals[l.path[l.path.length - 1]] = l.value;
-  }}
-  settingsPanel("globalform", POSTURE, globals, "firewall global", "Global firewall posture");
-
-  // A zone exists because an interface names it, so the list is the zones in
-  // use — not only the ones that happen to carry an override.
-  const overrides = new Map(entriesUnder(ls, ["firewall", "zone"]).map((z) => [z.name, z]));
-  for (const name of zoneNames(ls)) {{
-    if (!overrides.has(name)) overrides.set(name, {{ name }});
-  }}
-  renderObjects({{
-    listId: "zonelist", noun: "Zone",
-    fields: POSTURE,
-    path: (n) => `firewall zone ${{n}}`,
-    rows: [...overrides.values()].sort((a, b) => a.name.localeCompare(b.name)),
-    badge: (r) => ({{
-      text: r["default-action"] || "inherits",
-      cls: r["default-action"] || "",
-    }}),
-    empty: "No zones — give an interface a zone first.",
-  }});
-}}
-
-// ---- NAT -----------------------------------------------------------------
-
-const SNAT = [["zone", "Zone"], ["source", "Source"], ["translation", "Translation"]];
-const DNAT = [
-  ["zone", "Zone"],
-  ["proto", "Protocol", ["", "tcp", "udp"]],
-  ["port", "Port"],
-  ["to", "To"],
-];
-
-async function refreshNat() {{
-  $("natshow").textContent = "…";
-  try {{ $("natshow").textContent = (await text("/api/v1/show/nat")).trimEnd(); }}
-  catch (e) {{ $("natshow").textContent = String(e.message || e); }}
-
-  const ls = await leaves();
-  renderObjects({{
-    listId: "snatlist", addId: "addsnatpanel", noun: "Source rule",
-    fields: SNAT, nameHint: "wan-masq",
-    path: (n) => `nat source ${{n}}`,
-    rows: entriesUnder(ls, ["nat", "source"]),
-    badge: (r) => ({{ text: r.translation ? "snat" : "masquerade", cls: "accept" }}),
-    empty: "No source NAT configured.",
-  }});
-  renderObjects({{
-    listId: "dnatlist", addId: "adddnatpanel", noun: "Port forward",
-    fields: DNAT, nameHint: "web",
-    path: (n) => `nat destination ${{n}}`,
-    rows: entriesUnder(ls, ["nat", "destination"]),
-    badge: (r) => r.port ? {{ text: (r.proto || "tcp") + "/" + r.port, cls: "accept" }}
-                         : {{ text: "incomplete", cls: "reject" }},
-    empty: "No port forwards configured.",
-  }});
-}}
 
 // ---- objects, in one language --------------------------------------------
 
@@ -1400,6 +1456,18 @@ function fieldLines(fields, widgets, path, before) {{
   return lines;
 }}
 
+// A section-wide settings block: the same field grid, staged as one change.
+function settingsPanel(boxId, fields, current, path, label) {{
+  const box = $(boxId);
+  box.textContent = "";
+  const {{ grid, widgets }} = fieldGrid(fields, current);
+  for (const child of [...grid.children]) box.append(child);
+  box.append(el("button", {{
+    class: "btn primary", text: "Stage",
+    onclick: () => stage(label, fieldLines(fields, widgets, path, current)),
+  }}));
+}}
+
 // One object as a card: what it is, then what it is set to, then its controls.
 // Editing opens the same field grid the add panel uses, in place — an operator
 // should not have to learn two shapes for one job.
@@ -1424,13 +1492,9 @@ function objectCard(o, row) {{
       el("span", {{ class: "mono", text: row[f[0]] }}),
     ]));
   }}
-  if (!set.length) {{
-    head.push(el("span", {{ class: "col grow" }}, [
-      el("span", {{ class: "sub", text: "nothing set yet" }}),
-    ]));
-  }} else {{
-    head.push(el("span", {{ class: "col grow" }}));
-  }}
+  head.push(set.length
+    ? el("span", {{ class: "col grow" }})
+    : el("span", {{ class: "col grow" }}, [el("span", {{ class: "sub", text: "nothing set yet" }})]));
 
   const editor = el("div", {{ class: "hidden", style: "flex:1 1 100%" }});
   const edit = el("button", {{
@@ -1457,7 +1521,7 @@ function objectCard(o, row) {{
   return card;
 }}
 
-// `o` carries: listId, addId, noun, fields, path(name), rows, nameHint, empty.
+// `o` carries: listId, addId?, noun, fields, path(name), rows, badge?, nameHint, empty.
 function renderObjects(o) {{
   const list = $(o.listId);
   list.textContent = "";
@@ -1502,6 +1566,72 @@ async function leaves() {{
   catch (e) {{ return []; }}
 }}
 
+// ---- zones ---------------------------------------------------------------
+
+const POSTURE = [
+  ["default-action", "Default action", ["", "accept", "drop", "reject"]],
+  ["stateful", "Stateful", ["", "true", "false"]],
+  ["block-icmp", "Block ICMP", ["", "true", "false"]],
+  ["log", "Log", ["", "true", "false"]],
+  ["source-validation", "Source validation", ["", "disable", "loose", "strict"]],
+];
+
+async function refreshZones() {{
+  const ls = await leaves();
+  const globals = {{}};
+  for (const l of ls) {{
+    if (l.node === "firewall global") globals[l.path[l.path.length - 1]] = l.value;
+  }}
+  settingsPanel("globalform", POSTURE, globals, "firewall global", "Global firewall posture");
+
+  // A zone exists because an interface names it, so the list is the zones in
+  // use — not only the ones that happen to carry an override.
+  const overrides = new Map(entriesUnder(ls, ["firewall", "zone"]).map((z) => [z.name, z]));
+  for (const name of zoneNames(ls)) {{
+    if (!overrides.has(name)) overrides.set(name, {{ name }});
+  }}
+  renderObjects({{
+    listId: "zonelist", noun: "Zone", fields: POSTURE,
+    path: (n) => `firewall zone ${{n}}`,
+    rows: [...overrides.values()].sort((a, b) => a.name.localeCompare(b.name)),
+    badge: (r) => ({{ text: r["default-action"] || "inherits", cls: r["default-action"] || "" }}),
+    empty: "No zones — give an interface a zone first.",
+  }});
+}}
+
+// ---- NAT -----------------------------------------------------------------
+
+const SNAT = [["zone", "Zone"], ["source", "Source"], ["translation", "Translation"]];
+const DNAT = [
+  ["zone", "Zone"], ["proto", "Protocol", ["", "tcp", "udp"]],
+  ["port", "Port"], ["to", "To"],
+];
+
+async function refreshNat() {{
+  $("natshow").textContent = "…";
+  try {{ $("natshow").textContent = (await text("/api/v1/show/nat")).trimEnd(); }}
+  catch (e) {{ $("natshow").textContent = String(e.message || e); }}
+
+  const ls = await leaves();
+  renderObjects({{
+    listId: "snatlist", addId: "addsnatpanel", noun: "Source rule",
+    fields: SNAT, nameHint: "wan-masq",
+    path: (n) => `nat source ${{n}}`,
+    rows: entriesUnder(ls, ["nat", "source"]),
+    badge: (r) => ({{ text: r.translation ? "snat" : "masquerade", cls: "accept" }}),
+    empty: "No source NAT configured.",
+  }});
+  renderObjects({{
+    listId: "dnatlist", addId: "adddnatpanel", noun: "Port forward",
+    fields: DNAT, nameHint: "web",
+    path: (n) => `nat destination ${{n}}`,
+    rows: entriesUnder(ls, ["nat", "destination"]),
+    badge: (r) => r.port ? {{ text: (r.proto || "tcp") + "/" + r.port, cls: "accept" }}
+                         : {{ text: "incomplete", cls: "reject" }},
+    empty: "No port forwards configured.",
+  }});
+}}
+
 // ---- BGP -----------------------------------------------------------------
 
 const BGP_GLOBAL = [
@@ -1510,27 +1640,13 @@ const BGP_GLOBAL = [
   ["ebgp-require-policy", "Require policy", ["", "true", "false"]],
 ];
 const BGP_NEIGHBOR = [
-  ["remote-as", "Remote AS"],
-  ["description", "Description"],
-  ["password", "Password"],
+  ["remote-as", "Remote AS"], ["description", "Description"], ["password", "Password"],
   ["passive", "Passive", ["", "true", "false"]],
   ["route-reflector-client", "RR client", ["", "true", "false"]],
   ["bfd", "BFD", ["", "true", "false"]],
   ["evpn", "EVPN", ["", "true", "false"]],
   ["max-prefix", "Max prefix"],
 ];
-
-// A section-wide settings block: the same field grid, staged as one change.
-function settingsPanel(boxId, fields, current, path, label) {{
-  const box = $(boxId);
-  box.textContent = "";
-  const {{ grid, widgets }} = fieldGrid(fields, current);
-  for (const child of [...grid.children]) box.append(child);
-  box.append(el("button", {{
-    class: "btn primary", text: "Stage",
-    onclick: () => stage(label, fieldLines(fields, widgets, path, current)),
-  }}));
-}}
 
 async function refreshBgp() {{
   $("bgpshow").textContent = "…";
@@ -1560,10 +1676,8 @@ async function refreshBgp() {{
 // ---- IPsec ---------------------------------------------------------------
 
 const IPSEC = [
-  ["local", "Local address"],
-  ["remote", "Remote address"],
-  ["local-subnet", "Local subnet"],
-  ["remote-subnet", "Remote subnet"],
+  ["local", "Local address"], ["remote", "Remote address"],
+  ["local-subnet", "Local subnet"], ["remote-subnet", "Remote subnet"],
   ["psk", "Pre-shared key"],
   ["ike-version", "IKE", ["", "1", "2"]],
   ["start-action", "Start", ["", "start", "trap", "none"]],
@@ -1588,10 +1702,8 @@ async function refreshIpsec() {{
 
 const WG = [["listen-port", "Listen port"], ["private-key", "Private key"]];
 const WG_PEER = [
-  ["allowed-ips", "Allowed IPs"],
-  ["endpoint", "Endpoint"],
-  ["keepalive", "Keepalive"],
-  ["preshared-key", "Pre-shared key"],
+  ["allowed-ips", "Allowed IPs"], ["endpoint", "Endpoint"],
+  ["keepalive", "Keepalive"], ["preshared-key", "Pre-shared key"],
 ];
 
 async function refreshWireguard() {{
@@ -1630,12 +1742,9 @@ async function refreshWireguard() {{
 // ---- DHCP ----------------------------------------------------------------
 
 const DHCP = [
-  ["pool-offset", "Pool offset"],
-  ["pool-size", "Pool size"],
-  ["default-router", "Default router"],
-  ["dns", "DNS"],
-  ["domain", "Domain"],
-  ["lease-time", "Lease time"],
+  ["pool-offset", "Pool offset"], ["pool-size", "Pool size"],
+  ["default-router", "Default router"], ["dns", "DNS"],
+  ["domain", "Domain"], ["lease-time", "Lease time"],
 ];
 
 async function refreshDhcp() {{
@@ -1668,14 +1777,229 @@ async function refreshDhcp() {{
   }}
 
   renderObjects({{
-    listId: "dhcplist", noun: "Server",
-    fields: DHCP, nameHint: "interface",
+    listId: "dhcplist", noun: "Server", fields: DHCP,
     path: (n) => `interface ${{n}} dhcp-server`,
     rows: [...servers.values()],
     badge: (r) => r["pool-size"] ? {{ text: r["pool-size"] + " leases", cls: "accept" }}
                                  : {{ text: "default pool", cls: "" }},
     empty: "No DHCP server enabled.",
   }});
+}}
+
+// ---- interfaces, routes, groups, services, identity ----------------------
+
+const IFACE = [
+  ["zone", "Zone"], ["address", "IPv4 address"], ["address6", "IPv6 address"],
+  ["mtu", "MTU"], ["description", "Description"],
+  ["disabled", "Disabled", ["", "true", "false"]],
+];
+
+async function refreshInterfaces() {{
+  $("ifaceshow").textContent = "…";
+  try {{ $("ifaceshow").textContent = (await text("/api/v1/show/interfaces")).trimEnd(); }}
+  catch (e) {{ $("ifaceshow").textContent = String(e.message || e); }}
+  renderObjects({{
+    listId: "ifacelist", addId: "addifacepanel", noun: "Interface",
+    fields: IFACE, nameHint: "eth0",
+    path: (n) => `interface ${{n}}`,
+    rows: entriesUnder(await leaves(), ["interface"]),
+    // The zone is the badge because it decides whether anything the firewall
+    // says applies to this interface at all.
+    badge: (r) => r.zone ? {{ text: r.zone, cls: "accept" }}
+                         : {{ text: "unzoned", cls: "reject" }},
+    empty: "No interfaces declared.",
+  }});
+}}
+
+const ROUTE = [["via", "Via"], ["dev", "Device"], ["metric", "Metric"], ["vrf", "VRF"]];
+
+async function refreshRoutes() {{
+  $("routeshow").textContent = "…";
+  try {{ $("routeshow").textContent = (await text("/api/v1/show/ip/route")).trimEnd(); }}
+  catch (e) {{ $("routeshow").textContent = String(e.message || e); }}
+  renderObjects({{
+    listId: "routelist", addId: "addroutepanel", noun: "Route",
+    fields: ROUTE, nameHint: "0.0.0.0/0",
+    path: (n) => `protocols static ${{n}}`,
+    rows: entriesUnder(await leaves(), ["protocols", "static"]),
+    badge: (r) => (r.via || r.dev) ? {{ text: "static", cls: "accept" }}
+                                   : {{ text: "no next hop", cls: "reject" }},
+    empty: "No static routes configured.",
+  }});
+}}
+
+// The three group kinds differ only in the word for a member, so one view with
+// a kind picker beats three that would drift apart.
+const GROUP_MEMBER = {{ "address-group": "address", "port-group": "port", "domain-group": "domain" }};
+
+async function refreshGroups() {{
+  const kind = $("groupkind").value;
+  const member = GROUP_MEMBER[kind];
+  renderObjects({{
+    listId: "grouplist", addId: "addgrouppanel", noun: "Group",
+    fields: [[member, member.charAt(0).toUpperCase() + member.slice(1)]],
+    nameHint: "group name",
+    path: (n) => `firewall group ${{kind}} ${{n}}`,
+    rows: entriesUnder(await leaves(), ["firewall", "group", kind]),
+    badge: () => ({{ text: member, cls: "" }}),
+    empty: "No " + member + " groups configured.",
+  }});
+}}
+
+const LB = [
+  ["zone", "Zone"], ["vip", "Virtual address"],
+  ["proto", "Protocol", ["", "tcp", "udp"]], ["port", "Port"],
+  ["backend", "Backend"], ["disabled", "Disabled", ["", "true", "false"]],
+];
+
+async function refreshLb() {{
+  $("lbshow").textContent = "…";
+  try {{ $("lbshow").textContent = (await text("/api/v1/show/load-balancer")).trimEnd(); }}
+  catch (e) {{ $("lbshow").textContent = String(e.message || e); }}
+  renderObjects({{
+    listId: "lblist", addId: "addlbpanel", noun: "Service",
+    fields: LB, nameHint: "web",
+    path: (n) => `load-balancer ${{n}}`,
+    rows: entriesUnder(await leaves(), ["load-balancer"]),
+    badge: (r) => r.vip ? {{ text: r.vip + ":" + (r.port || "?"), cls: "accept" }}
+                        : {{ text: "incomplete", cls: "reject" }},
+    empty: "No load-balanced services configured.",
+  }});
+}}
+
+const CA = [
+  ["common-name", "Common name"], ["organization", "Organization"],
+  ["validity-days", "Validity (days)"], ["key-type", "Key type", ["", "ec", "rsa"]],
+];
+const CERT = [
+  ["ca", "Signed by"], ["common-name", "Common name"],
+  ["subject-alt-name", "Alt name"], ["validity-days", "Validity (days)"],
+  ["key-type", "Key type", ["", "ec", "rsa"]],
+  ["usage", "Usage", ["", "server", "client"]],
+];
+
+async function refreshPki() {{
+  renderObjects({{
+    listId: "calist", addId: "addcapanel", noun: "Authority",
+    fields: CA, nameHint: "internal",
+    path: (n) => `pki ca ${{n}}`,
+    rows: entriesUnder(await leaves(), ["pki", "ca"]),
+    badge: (r) => r["common-name"] ? {{ text: "ca", cls: "accept" }}
+                                   : {{ text: "incomplete", cls: "reject" }},
+    empty: "No certificate authorities configured.",
+  }});
+}}
+
+async function refreshCerts() {{
+  $("pkishow").textContent = "…";
+  try {{ $("pkishow").textContent = (await text("/api/v1/show/pki")).trimEnd(); }}
+  catch (e) {{ $("pkishow").textContent = String(e.message || e); }}
+  renderObjects({{
+    listId: "certlist", addId: "addcertpanel", noun: "Certificate",
+    fields: CERT, nameHint: "web",
+    path: (n) => `pki certificate ${{n}}`,
+    rows: entriesUnder(await leaves(), ["pki", "certificate"]),
+    badge: (r) => r.ca ? {{ text: r.ca, cls: "accept" }} : {{ text: "unsigned", cls: "reject" }},
+    empty: "No certificates configured.",
+  }});
+}}
+
+const USER = [["ssh-key", "SSH public key"], ["hashed-password", "Hashed password"]];
+
+async function refreshUsers() {{
+  renderObjects({{
+    listId: "userlist", addId: "adduserpanel", noun: "Administrator",
+    fields: USER, nameHint: "admin",
+    path: (n) => `system login ${{n}}`,
+    rows: entriesUnder(await leaves(), ["system", "login"]),
+    // Key-only is the default and the better posture, so it is stated rather
+    // than left as an empty column an operator has to interpret.
+    badge: (r) => r["hashed-password"] ? {{ text: "password", cls: "reject" }}
+                                       : {{ text: "key only", cls: "accept" }},
+    empty: "No administrators configured.",
+  }});
+}}
+
+async function refreshSynproxy() {{
+  renderObjects({{
+    listId: "synlist", addId: "addsynpanel", noun: "Port",
+    fields: [["mss", "MSS"]], nameHint: "443",
+    path: (n) => `firewall syn-protect ${{n}}`,
+    rows: entriesUnder(await leaves(), ["firewall", "syn-protect"]),
+    badge: (r) => ({{ text: "tcp/" + r.name, cls: "accept" }}),
+    empty: "No ports are SYN-protected.",
+  }});
+}}
+
+// An operational command: it has already happened by the time it returns, so
+// there is nothing to stage and nothing to discard.
+async function clearOp(path) {{
+  try {{
+    const r = await api("/api/v1/clear/" + path, {{ method: "POST" }});
+    showResult({{ ok: true, output: await r.text() }});
+  }} catch (e) {{
+    showResult({{ ok: false, output: String(e.message || e) }});
+  }}
+  await refreshIds();
+}}
+
+async function refreshIds() {{
+  const list = $("blocklist");
+  list.textContent = "";
+  try {{
+    const blocks = (await text("/api/v1/show/ids/blocks")).trimEnd().split("\n");
+    let any = false;
+    for (const line of blocks) {{
+      const addr = (line.match(/(\d+\.\d+\.\d+\.\d+(?:\/\d+)?)/) || [])[1];
+      if (!addr) continue;
+      any = true;
+      list.append(el("div", {{ class: "rule" }}, [
+        el("span", {{ class: "act drop", text: "blocked" }}),
+        el("span", {{ class: "col grow" }}, [
+          el("span", {{ class: "eyebrow", text: "source" }}),
+          el("span", {{ class: "mono strong", text: line.trim() }}),
+        ]),
+        el("button", {{
+          class: "btn", text: "Lift",
+          onclick: () => clearOp("ids/block/" + encodeURIComponent(addr.split("/")[0])),
+        }}),
+      ]));
+    }}
+    if (!any) list.append(el("div", {{ class: "card", text: "Nothing is blocked." }}));
+  }} catch (e) {{
+    list.append(el("div", {{ class: "card", text: String(e.message || e) }}));
+  }}
+
+  for (const [id, path] of [["idsshow", "/api/v1/show/ids"],
+                            ["alertshow", "/api/v1/show/ids/alerts"]]) {{
+    $(id).textContent = "…";
+    try {{ $(id).textContent = (await text(path)).trimEnd() || "(nothing)"; }}
+    catch (e) {{ $(id).textContent = String(e.message || e); }}
+  }}
+}}
+
+// The Configuration view is the revision list and nothing else: rolling back is
+// a real operation an operator needs, and it stages like every other change.
+async function refreshConfig() {{
+  const r = $("revtable");
+  r.textContent = "";
+  r.append(el("tr", {{}}, ["revision", ""].map((h) => el("th", {{ text: h }}))));
+  try {{
+    const revs = (await text("/api/v1/show/system/commit")).trimEnd().split("\n");
+    for (const line of revs) {{
+      if (!line.trim()) continue;
+      const n = (line.trim().match(/^(\d+)/) || [])[1];
+      r.append(el("tr", {{}}, [
+        el("td", {{ class: "mono", text: line }}),
+        el("td", {{}}, [n === undefined ? el("span", {{}}) : el("button", {{
+          class: "btn", text: "Roll back",
+          onclick: () => stage("Roll back to revision " + n, ["rollback " + n]),
+        }})]),
+      ]));
+    }}
+  }} catch (e) {{
+    r.append(el("tr", {{}}, [el("td", {{ colspan: "2", text: String(e.message || e) }})]));
+  }}
 }}
 
 // ---- stack ---------------------------------------------------------------
@@ -1754,16 +2078,27 @@ const SECTIONS = [
   {{ g: "Policy", items: [
     {{ v: "rules", t: "Firewall rules", i: "shield" }},
     {{ v: "zones", t: "Zones", i: "zones" }},
+    {{ v: "groups", t: "Groups", i: "layers" }},
     {{ v: "nat", t: "NAT", i: "swap" }},
+    {{ v: "synproxy", t: "SYN protection", i: "shield" }},
   ]}},
   {{ g: "Network", items: [
+    {{ v: "interfaces", t: "Interfaces", i: "address" }},
+    {{ v: "routes", t: "Static routes", i: "route" }},
     {{ v: "bgp", t: "BGP", i: "route" }},
+    {{ v: "dhcp", t: "DHCP", i: "address" }},
+    {{ v: "lb", t: "Load balancer", i: "swap" }},
+  ]}},
+  {{ g: "Security", items: [
     {{ v: "ipsec", t: "IPsec", i: "lock" }},
     {{ v: "wireguard", t: "WireGuard", i: "key" }},
-    {{ v: "dhcp", t: "DHCP", i: "address" }},
+    {{ v: "pki", t: "Authorities", i: "lock" }},
+    {{ v: "certs", t: "Certificates", i: "file" }},
+    {{ v: "ids", t: "Intrusion defence", i: "bug" }},
   ]}},
   {{ g: "System", items: [
-    {{ v: "config", t: "Configuration", i: "file" }},
+    {{ v: "users", t: "Administrators", i: "key" }},
+    {{ v: "config", t: "Revisions", i: "file" }},
     {{ v: "stack", t: "Stack", i: "layers" }},
   ]}},
 ];
@@ -1845,14 +2180,19 @@ async function refresh() {{
   // never be mistaken for the appliance you are configuring.
   $("crumb").textContent = (target || "this appliance") + " / " +
     (panel ? "show" : view);
-  for (const v of ["dashboard", "rules", "zones", "nat", "bgp", "ipsec",
-                   "wireguard", "dhcp", "config", "stack", "panel"]) {{
+  for (const v of ["dashboard", "rules", "zones", "groups", "nat", "synproxy",
+                   "interfaces", "routes", "bgp", "dhcp", "lb", "ipsec",
+                   "wireguard", "pki", "certs", "ids", "users", "config",
+                   "stack", "panel"]) {{
     $("view-" + v).classList.toggle("hidden", v !== view);
   }}
   const TITLES = {{
     rules: "Firewall rules", zones: "Zones", nat: "NAT",
-    config: "Configuration", stack: "Stack", dashboard: "Dashboard",
+    config: "Revisions", stack: "Stack", dashboard: "Dashboard",
     bgp: "BGP", ipsec: "IPsec", wireguard: "WireGuard", dhcp: "DHCP",
+    groups: "Groups", synproxy: "SYN protection", interfaces: "Interfaces",
+    routes: "Static routes", lb: "Load balancer", pki: "Authorities",
+    certs: "Certificates", ids: "Intrusion defence", users: "Administrators",
   }};
   $("title").textContent = panel ? panel.t : (TITLES[view] || "Dashboard");
 
@@ -1860,6 +2200,15 @@ async function refresh() {{
   if (view === "rules") return refreshRules();
   if (view === "zones") return refreshZones();
   if (view === "nat") return refreshNat();
+  if (view === "groups") return refreshGroups();
+  if (view === "synproxy") return refreshSynproxy();
+  if (view === "interfaces") return refreshInterfaces();
+  if (view === "routes") return refreshRoutes();
+  if (view === "lb") return refreshLb();
+  if (view === "pki") return refreshPki();
+  if (view === "certs") return refreshCerts();
+  if (view === "ids") return refreshIds();
+  if (view === "users") return refreshUsers();
   if (view === "bgp") return refreshBgp();
   if (view === "ipsec") return refreshIpsec();
   if (view === "wireguard") return refreshWireguard();
@@ -1940,6 +2289,16 @@ $("applystaged2").onclick = () => applyStaged(["commit", "save"]);
 $("validate").onclick = () => applyStaged([]);
 $("refresh").onclick = () => refresh();
 $("allcounters").onchange = () => refreshDashboard();
+wireToggle("toggleiface", "addifacepanel", "New");
+wireToggle("toggleroute", "addroutepanel", "New");
+wireToggle("togglegroup", "addgrouppanel", "New");
+wireToggle("togglelb", "addlbpanel", "New");
+wireToggle("toggleca", "addcapanel", "New");
+wireToggle("togglecert", "addcertpanel", "New");
+wireToggle("toggleuser", "adduserpanel", "New");
+wireToggle("togglesyn", "addsynpanel", "New");
+$("groupkind").onchange = () => refreshGroups();
+$("liftall").onclick = () => clearOp("ids/blocks");
 wireToggle("togglesnat", "addsnatpanel", "New source rule");
 wireToggle("toggleddnat", "adddnatpanel", "New port forward");
 wireToggle("togglebgp", "addbgppanel", "New neighbour");
@@ -2057,6 +2416,72 @@ mod tests {
         assert!(
             html.contains("entry.label"),
             "staged changes are not described"
+        );
+    }
+
+    /// The console is meant to be the whole management surface, so a section
+    /// missing here is a thing an operator has to leave the browser for. This
+    /// names them; adding a section means adding it here on purpose.
+    #[test]
+    fn every_configurable_area_has_a_section() {
+        let html = page();
+        for view in [
+            "view-rules",
+            "view-zones",
+            "view-groups",
+            "view-nat",
+            "view-synproxy",
+            "view-interfaces",
+            "view-routes",
+            "view-bgp",
+            "view-dhcp",
+            "view-lb",
+            "view-ipsec",
+            "view-wireguard",
+            "view-pki",
+            "view-certs",
+            "view-ids",
+            "view-users",
+            "view-config",
+            "view-stack",
+        ] {
+            assert!(html.contains(view), "{view} is missing");
+        }
+    }
+
+    /// The appliance answers in a terminal's voice: a refusal is followed by
+    /// the whole `set` grammar. That is right at a prompt and wrong in a
+    /// console — pasting it hands an operator a manual page instead of an
+    /// answer — so the reply is read for what it says about *this* change.
+    #[test]
+    fn the_appliances_reply_is_summarised_not_pasted() {
+        let html = page();
+        assert!(
+            html.contains("function summarise"),
+            "the reply is shown raw"
+        );
+        assert!(
+            html.contains("unknown set path"),
+            "the grammar dump is not filtered"
+        );
+        assert!(
+            !html.contains(r#"id="resultout"></pre>"#),
+            "the result is a transcript"
+        );
+    }
+
+    /// An operational action is not a staged change: it has already happened by
+    /// the time it returns, and offering to discard it would be a lie. It also
+    /// must not pretend to a capability the CLI lacks — there is no verb to
+    /// *add* a run-time block, so the console does not offer one.
+    #[test]
+    fn operational_actions_are_separate_from_configuration() {
+        let html = page();
+        assert!(html.contains("function clearOp"), "no operational path");
+        assert!(html.contains("/api/v1/clear/"), "clear is not reachable");
+        assert!(
+            !html.contains("Block now"),
+            "the console invents a block verb"
         );
     }
 
