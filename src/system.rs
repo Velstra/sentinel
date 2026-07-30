@@ -668,6 +668,8 @@ pub fn bin(name: &str) -> String {
         "openssl" => "SENTINEL_OPENSSL_BIN",
         "lego" => "SENTINEL_LEGO_BIN",
         "lsblk" => "SENTINEL_LSBLK_BIN",
+        "tcpdump" => "SENTINEL_TCPDUMP_BIN",
+        "timeout" => "SENTINEL_TIMEOUT_BIN",
         "install" => "SENTINEL_INSTALL_BIN",
         "mkdir" => "SENTINEL_MKDIR_BIN",
         "chmod" => "SENTINEL_CHMOD_BIN",
