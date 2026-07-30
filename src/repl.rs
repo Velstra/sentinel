@@ -1839,7 +1839,18 @@ const FIREWALL_NODES: &[Cand] = &[
     ),
     ("rule", "zone-to-zone allow/deny rules"),
     ("group", "named address/port aliases referenced by rules"),
+    (
+        "syn-protect",
+        "TCP ports whose handshake the firewall completes itself (SYN flood)",
+    ),
 ];
+// `firewall syn-protect <port> <Tab>`: the one thing a protected port can be
+// told. The port itself is a number, so there is nothing to offer at that level
+// — which is why there is no candidate list between the two.
+const SYN_PROTECT_FIELDS: &[Cand] = &[(
+    "mss",
+    "maximum segment size the synthesised SYN-ACK advertises (536-1460)",
+)];
 // `firewall group <Tab>` reveals the alias kinds.
 const GROUP_NODES: &[Cand] = &[
     (
@@ -2514,6 +2525,7 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "firewall"] => FIREWALL_NODES,
         // firewall group: the alias kinds + their member fields.
         ["set" | "delete", "firewall", "group"] => GROUP_NODES,
+        ["set" | "delete", "firewall", "syn-protect", _port] => SYN_PROTECT_FIELDS,
         [
             "set" | "delete",
             "firewall",
@@ -3551,6 +3563,17 @@ mod tests {
         candidates(tokens).iter().map(|(k, _)| *k).collect()
     }
 
+    /// Being offered at a level is half of it; the other half is that the branch
+    /// leads somewhere. A node that completes and then goes silent tells an
+    /// operator the tree ends there, which is how a setting stays unfound.
+    #[test]
+    fn a_firewall_branch_leads_somewhere() {
+        // The port itself is a number, so nothing is offered in between — but
+        // what a protected port can be told has to be discoverable.
+        assert_eq!(kw(&["set", "firewall", "syn-protect", "443"]), ["mss"]);
+        assert_eq!(kw(&["delete", "firewall", "syn-protect", "443"]), ["mss"]);
+    }
+
     #[test]
     fn completion_grammar_is_context_aware() {
         assert_eq!(
@@ -3718,7 +3741,7 @@ mod tests {
         // The firewall sub-tree is discoverable level by level (NAT is separate).
         assert_eq!(
             kw(&["set", "firewall"]),
-            ["global", "zone", "rule", "group"]
+            ["global", "zone", "rule", "group", "syn-protect"]
         );
         // The group sub-tree: alias kinds and their member fields.
         assert_eq!(
