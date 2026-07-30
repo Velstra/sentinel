@@ -430,3 +430,73 @@ Three consequences to weigh before turning it on:
 - **Encrypted ClientHello removes the name from the wire**, and when it is
   widespread this stops working. It is a fact about TLS, not about this
   appliance.
+
+## Captive portal
+
+A guest zone that holds every device until somebody has been let on. The
+appliance is reachable, nothing else is, and a login lasts an hour and then does
+not.
+
+```text
+set services portal zone guest
+set services portal passphrase sommer2026
+set services portal message Guest wifi — ask at reception for the passphrase
+set services portal session-timeout 3600
+```
+
+That is the whole configuration. The zone is what turns it on; leaving the
+passphrase out gives a **click-through** portal, where the page states the terms
+and a button admits the device.
+
+### What holds the zone
+
+The gate is in the data plane, not in a ruleset. A device that has not been
+admitted may reach **this appliance** — the portal page, the resolver — and may
+get an address by DHCP, and that is all. Anything else is dropped and counted, so
+`show firewall statistics` names it (`dropped_portal`) rather than leaving a
+guest zone that is mysteriously quiet.
+
+An admission is a run-time fact, not a configuration change: it is one entry in
+one map, carrying a deadline the agent enforces on its own. Nothing is recompiled
+per login, and nothing survives a restart of the data plane — which is the
+correct way round, because an admission that outlived the process that granted it
+would be access nobody remembers giving.
+
+Sessions are keyed by the device's **MAC**, not its address, so a DHCP lease that
+turns over does not end one. That also means a login covers IPv6: the same entry
+admits the same device on both families, and a dual-stacked guest zone is gated
+on both. Without that, IPv6 would be a way around the portal rather than a part
+of it.
+
+### How a device finds the page
+
+**RFC 8910**: the DHCP server on the gated zone hands out the portal's URI in
+option 114, and the client's own operating system opens it. The API at
+`/api/captive-portal` answers RFC 8908, so the device also learns when its
+session ends.
+
+There is **no HTTP interception**, and that is a decision rather than an
+omission. Redirecting a guest's connection means rewriting a connection that was
+not addressed to us, and it stops working entirely once that connection is TLS —
+which, for the web anybody visits, is all of it. The same position is written
+down [for ALGs](firewall.md). A device that ignores option 114 still reaches the
+portal the moment somebody types the address on the card by the door.
+
+### Seeing it
+
+```text
+show portal
+show portal sessions
+```
+
+The sessions come from the agent, which owns the map and the deadlines — so what
+you are reading is what the data plane is actually letting through, not a second
+tally kept alongside it.
+
+### What a portal is not
+
+It is not authentication of a device. A MAC can be spoofed by anyone on the link,
+exactly as an address can, so what a portal bounds is what an *unadmitted* device
+may reach. It is the right tool for holding a guest network behind a passphrase
+and a set of terms; it is the wrong one for deciding who is allowed on a network
+that matters, where the answer is 802.1X or a VPN.

@@ -25,6 +25,7 @@ mod ipsec;
 mod net;
 mod openconnect;
 mod pki;
+mod portal;
 mod proxy;
 mod relay;
 mod repl;
@@ -228,6 +229,15 @@ enum Command {
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
+    /// Serve the captive portal (roadmap C20). Run by
+    /// `sentinel-portal.service` from the saved config, not by hand: it binds
+    /// the appliance's own address in the gated zone, and the address only
+    /// exists once the network is up.
+    Portal {
+        /// The resolved portal settings the last apply rendered.
+        #[arg(long, default_value = portal::STATE_FILE)]
+        state: PathBuf,
+    },
     /// Follow the detector's alerts and block what they name (roadmap C11).
     /// Run by `sentinel-ids-watch.service` while `block-on-alert` is set, not by
     /// hand. Every block it asks for expires, and none survive an agent restart.
@@ -352,6 +362,7 @@ async fn main() -> Result<()> {
         Command::Alert { unit, config } => alert_unit(&unit, &config),
         Command::IdsWatch => ids::watch(),
         Command::BroadcastRelay => relay::run(),
+        Command::Portal { state } => serve_portal(&state).await,
         Command::AcmeRenew => acme::run(),
         Command::Ports { controller } => ports(&controller).await,
         Command::Api {
@@ -362,6 +373,22 @@ async fn main() -> Result<()> {
         } => api::serve(&listen, &config, live_apply(!no_apply), &token_file).await,
         Command::Wol { mac, interface } => wol(&mac, interface.as_deref()),
     }
+}
+
+/// `sentinel portal`: serve the captive portal the saved config describes.
+///
+/// A config with no portal is **not** an error — the unit is enabled from the
+/// same config it reads, and a race between the two should not mark a service
+/// failed on an appliance that simply has no guest zone.
+async fn serve_portal(state: &std::path::Path) -> Result<()> {
+    // A missing file is **not** an error: the unit and the file it reads are
+    // installed by the same apply, and a race between the two should not mark a
+    // service failed on an appliance that simply has no guest zone.
+    if !state.exists() {
+        eprintln!("no captive portal is configured; nothing to serve");
+        return Ok(());
+    }
+    portal::serve(portal::load(state)?).await
 }
 
 /// `sentinel wol <mac> [interface]`: send a Wake-on-LAN magic packet. The packet
@@ -918,6 +945,10 @@ fn show_op(args: &[String]) -> Result<()> {
         // daemon that carries it is up.
         ["broadcast-relay"] | ["broadcast-relay", "status"] => show_broadcast_relay(),
 
+        // Captive portal (roadmap C20): who is on, and what holds the rest.
+        ["portal"] | ["portal", "status"] => show_portal(),
+        ["portal", "sessions"] => show_portal_sessions(),
+
         // Intrusion detection (roadmap C11): what is watched, and what fired.
         ["ids"] | ["ids", "status"] => show_ids(),
         // Asked of the agent, which owns the map and the deadlines — the CLI
@@ -1133,6 +1164,57 @@ fn show_agent_query(command: &str, what: &str) -> Result<()> {
             println!(
                 "(the agent serves this on {}; check `systemctl status velstra.service`)",
                 velstra::SOCKET
+            );
+            Ok(())
+        }
+    }
+}
+
+/// `show portal`: what is configured, whether the page is up, and who is on.
+///
+/// The sessions come from the **agent**, which owns the map and the deadlines. A
+/// second answer kept here could disagree with what the data plane is actually
+/// letting through, which is the one thing this view exists to rule out.
+fn show_portal() -> Result<()> {
+    let Ok(state) = portal::load(std::path::Path::new(portal::STATE_FILE)) else {
+        println!("no captive portal is configured");
+        return Ok(());
+    };
+    println!("portal:   http://{}/", state.bind);
+    println!("zone:     policy {}", state.policy);
+    println!(
+        "entry:    {}",
+        if state.passphrase.is_some() {
+            "passphrase"
+        } else {
+            "click-through"
+        }
+    );
+    println!("session:  {}s", state.session_secs);
+    println!(
+        "service:  {}",
+        if system::unit_active("sentinel-portal.service") {
+            "running"
+        } else {
+            "not running"
+        }
+    );
+    println!();
+    show_portal_sessions()
+}
+
+/// `show portal sessions`: the devices currently admitted, from the agent.
+fn show_portal_sessions() -> Result<()> {
+    match velstra::query_at(std::path::Path::new(portal::AGENT_SOCKET), "sessions") {
+        Ok(reply) => {
+            print!("{reply}");
+            Ok(())
+        }
+        Err(e) => {
+            println!("portal sessions unavailable: {e:#}");
+            println!(
+                "(the agent serves these on {}; check `systemctl status velstra.service`)",
+                portal::AGENT_SOCKET
             );
             Ok(())
         }

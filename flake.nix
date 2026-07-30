@@ -722,6 +722,26 @@
             };
           };
 
+          # Captive portal (roadmap C20): the page a guest meets, on the
+          # appliance's own address in the gated zone. It needs no capabilities
+          # — everything it can achieve is one line on the agent's portal
+          # socket, and the gate itself is in the data plane. Sentinel
+          # starts/stops this on `[services.portal]`.
+          systemd.services.sentinel-portal = {
+            description = "Captive portal (sentinel)";
+            after = [
+              "network.target"
+              "sentinel-boot.service"
+              "velstra.service"
+            ];
+            serviceConfig = {
+              Type = "exec";
+              ExecStart = "${sentinel}/bin/sentinel portal";
+              Restart = "on-failure";
+              RestartSec = "5s";
+            };
+          };
+
           # Remote syslog (roadmap C12): rsyslog in the foreground against
           # Sentinel's rendered config. `-n` keeps it attached so systemd owns the
           # process; `-i NONE` skips the pid file (systemd tracks it). Sentinel
