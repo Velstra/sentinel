@@ -6352,6 +6352,142 @@
           '';
         };
 
+        # NAT-PMP (roadmap C18): a host on the inside opening its own inbound
+        # port. Two nodes — a `client` on the LAN that speaks the protocol from a
+        # small script, and the sentinel `fw` whose eth1 is that LAN and eth2 the
+        # uplink a mapping is opened on.
+        #
+        # What this proves is the protocol and the run-time write: the daemon
+        # answers what RFC 6886 says it should, a granted mapping really lands in
+        # the data plane's port-forward table (`show port-mapping` reads it back
+        # from the agent, not from a tally kept alongside), a privileged port is
+        # refused, and `clear` takes it away again. That the resulting
+        # port-forward then actually DNATs is `checks.nat`'s job and is not
+        # re-proven here.
+        #   nix build .#checks.x86_64-linux.portmap -L
+        portmap = pkgs.testers.runNixOSTest {
+          name = "sentinel-portmap";
+          nodes = {
+            client =
+              { ... }:
+              {
+                virtualisation.vlans = [ 1 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                  interfaces.eth1.ipv4.addresses = [
+                    {
+                      address = "10.0.0.9";
+                      prefixLength = 24;
+                    }
+                  ];
+                };
+                environment.systemPackages = [ pkgs.python3 ];
+                # Written as a file in the node's own configuration rather than
+                # printf-ed from the test script: a NAT-PMP request is packed
+                # binary, and getting it through Nix, the driver and a shell
+                # intact is a fight with quoting that proves nothing.
+                environment.etc."natpmp.py".text = ''
+                  import socket, struct, sys
+
+                  op = int(sys.argv[1])
+                  if op == 0:
+                      req = struct.pack("!BB", 0, 0)
+                  else:
+                      # version, opcode, reserved, internal, suggested, lifetime
+                      req = struct.pack(
+                          "!BBHHHI", 0, op, 0,
+                          int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]),
+                      )
+                  s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                  s.settimeout(5)
+                  s.sendto(req, ("10.0.0.1", 5351))
+                  data, _ = s.recvfrom(64)
+                  print(data.hex())
+                '';
+              };
+            fw =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "fw";
+                networking.firewall.enable = lib.mkForce false;
+                virtualisation.vlans = [
+                  1
+                  2
+                ];
+                virtualisation.memorySize = 2048;
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+          };
+          testScript = ''
+            start_all()
+            fw.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth1 address 10.0.0.1/24' "
+                "'set interface eth1 zone lan' "
+                "'set interface eth2 address 203.0.113.7/24' "
+                "'set interface eth2 zone wan' "
+                "'set firewall zone lan default-action accept' "
+                "'set services port-mapping zone lan' "
+                "'set services port-mapping wan-zone wan' "
+                "'set services port-mapping max-lifetime 3600' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            fw.wait_for_unit("sentinel-portmap.service")
+            client.wait_for_unit("multi-user.target")
+
+            def natpmp(*args):
+                return client.succeed(
+                    "python3 /etc/natpmp.py " + " ".join(str(a) for a in args)
+                ).strip()
+
+            with subtest("a client is told the appliance's external address"):
+                out = natpmp(0)
+                # version 0, opcode 128 (0 | response), result 0, then the address.
+                assert out.startswith("008000 00".replace(" ", "")), out
+                assert out.endswith("cb007107"), out  # 203.0.113.7
+
+            with subtest("a mapping is granted and lands in the data plane"):
+                # tcp (opcode 2), internal 51820, suggest the same, one hour.
+                out = natpmp(2, 51820, 51820, 3600)
+                assert out.startswith("008200 00".replace(" ", "")), out
+                # …and the response names the port it actually granted.
+                assert out[16:20] == "ca6c", out  # internal 51820
+                assert out[20:24] == "ca6c", out  # external 51820
+
+                shown = fw.succeed("sentinel show port-mapping")
+                assert "tcp/51820 -> 10.0.0.9:51820" in shown, shown
+                assert "policy" in shown, shown
+
+            with subtest("a privileged port is refused"):
+                out = natpmp(2, 443, 443, 3600)
+                # result 2, NOT_AUTHORIZED — and nothing granted with it.
+                assert out.startswith("0082 0002".replace(" ", "")), out
+                assert out[20:24] == "0000", out
+                shown = fw.succeed("sentinel show port-mapping")
+                assert "443" not in shown, shown
+
+            with subtest("a client can take its own mapping away"):
+                # Lifetime 0 is the protocol's delete (RFC 6886 3.4).
+                natpmp(2, 51820, 0, 0)
+                shown = fw.succeed("sentinel show port-mapping")
+                assert "51820" not in shown, shown
+
+            with subtest("and the operator can take them all away"):
+                natpmp(1, 5000, 5000, 3600)
+                assert "udp/5000" in fw.succeed("sentinel show port-mapping")
+                fw.succeed("sentinel clear port-mapping")
+                shown = fw.succeed("sentinel show port-mapping")
+                assert "no run-time port mappings" in shown, shown
+          '';
+        };
+
         # Captive portal (roadmap C20): a guest zone that holds every device
         # until somebody has logged in. Two nodes — a `guest` on vlan 1 that
         # takes its address by DHCP (which the gate must still admit, or nobody
