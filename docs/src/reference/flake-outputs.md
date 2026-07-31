@@ -34,6 +34,12 @@ Everything buildable in `flake.nix` (`system = x86_64-linux`).
 
 ## Checks — `nix build .#checks.x86_64-linux.<name> -L`
 
+There are **76** of them. The table below is the handful that boot a real image —
+the ones whose names an operator needs when something about installing or booting
+the appliance is wrong. Every other check is grouped by subject in
+[the test suite reference](tests.md), and `nix flake show` is the authoritative
+list either way.
+
 | Check | Asserts |
 |---|---|
 | `commit` | live runtime apply of hostname + firewall + interface address, persistence, airgapped |
@@ -43,12 +49,19 @@ Everything buildable in `flake.nix` (`system = x86_64-linux`).
 | `update` | A/B: inactive slot written + re-typed, bootloader switched |
 | `secureboot` | the signed image boots under **enforcing** Secure Boot (enrolled keys) |
 
-Run them all:
+Run those six:
 
 ```shell
 for c in commit verified-boot install install-iso update secureboot; do
   nix build ".#checks.x86_64-linux.$c" -L || break
 done
+```
+
+Run **every** check — this boots dozens of VMs and takes a long time, so it wants
+a KVM-capable machine and some patience:
+
+```shell
+nix flake check -L
 ```
 
 ## Useful eval queries
