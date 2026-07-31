@@ -2492,7 +2492,7 @@ $("enabledhcp").onclick = () => {{
   const iface = $("dhcpiface").value;
   if (!iface) return;
   stage("Enable DHCP on " + iface, [`set interface ${{iface}} dhcp-server enable`]);
-}};}};
+}};
 $("runshow").onclick = async () => {{
   const words = $("showcmd").value.trim();
   if (!words) return;
