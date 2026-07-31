@@ -1311,7 +1311,15 @@
         nodes.machine = {
           imports = [ self.nixosModules.sentinel ];
           virtualisation.memorySize = 2048;
-          environment.systemPackages = [ pkgs.curl ];
+          # `nodejs` is here for one reason: to hand the console's script to a
+          # real JavaScript parser. Everything else this check asserts about the
+          # page is about its *text* — which paths it names, what it does not
+          # fetch — and a page whose script is a syntax error passes every one of
+          # those while being completely dead in a browser. That happened.
+          environment.systemPackages = [
+            pkgs.curl
+            pkgs.nodejs
+          ];
         };
         testScript = ''
           machine.wait_for_unit("multi-user.target")
@@ -1332,6 +1340,29 @@
 
           # /health needs no auth.
           machine.succeed("curl -fsS http://127.0.0.1:8080/api/v1/health | grep -q ok")
+
+          with subtest("the console's script actually parses"):
+              # A syntax error anywhere in the block stops the whole script
+              # before its first line, so no handler is ever attached and the
+              # console silently degrades to markup: the sign-in form submits
+              # like a plain HTML form and the page returns to the login screen,
+              # which looks exactly like a rejected token.  Nothing else here
+              # would notice, because everything else reads the page as text.
+              machine.succeed(
+                  "curl -fsS http://127.0.0.1:8080/ > /tmp/console.html"
+              )
+              # Cut the block out with node itself: the appliance image has no
+              # python, and doing it with an index rather than a regex keeps
+              # backslashes out of a string that passes through Nix, the test
+              # driver and a shell before anything reads it.
+              machine.succeed(
+                  "node -e \"const f=require('fs');"
+                  "const h=f.readFileSync('/tmp/console.html','utf8');"
+                  "const a=h.indexOf('>',h.indexOf('<script'))+1;"
+                  "const b=h.indexOf('</'+'script>');"
+                  "f.writeFileSync('/tmp/console.js',h.slice(a,b));\""
+              )
+              machine.succeed("node --check /tmp/console.js")
 
           # No token → 401.
           code = machine.succeed(
