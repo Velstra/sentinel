@@ -940,6 +940,31 @@ pub fn page() -> String {
         which did not lose that link — takes the address.
       </p>
       <div class="card"><h3>Live state</h3><pre class="out" id="vrrpshow">…</pre></div>
+
+      <div class="toolbar" style="margin-top:var(--space-6)">
+        <span class="inline"><span>The pair</span></span>
+      </div>
+      <div class="card">
+        <h3>Configuration sync</h3>
+        <p style="color:var(--text-muted);font-size:var(--text-sm);margin:0 0 var(--space-4)">
+          Every commit on this box is pushed to its peers, so the standby is
+          running the configuration that was just approved rather than the one
+          somebody last remembered to copy. Both ends present the same secret.
+          A peer is <code>host</code> or <code>host:port</code>; repeat the field
+          to add more, separated by spaces.
+        </p>
+        <div class="grid" id="configsyncform"></div>
+      </div>
+      <div class="card">
+        <h3>Connection sync</h3>
+        <p style="color:var(--text-muted);font-size:var(--text-sm);margin:0 0 var(--space-4)">
+          Without this a failover is a reconnect for every session in flight:
+          the standby takes the address and then drops the traffic, because it
+          has no state for connections it never saw start. With it, the flow
+          table is pushed to the peer continuously.
+        </p>
+        <div class="grid" id="conntracksyncform"></div>
+      </div>
     </div>
 
     <div id="view-capture" class="hidden">
@@ -2023,6 +2048,17 @@ const VRRP = [
   ["advert-interval", "Advert interval (ms)"],
 ];
 
+// The two halves of a pair. Separate from VRRP on purpose: VRRP decides which
+// box holds the address, and these decide what the other box knows when it
+// does — a pair with VRRP alone fails over to a firewall that has neither the
+// configuration nor the connections.
+const CONFIG_SYNC = [
+  ["peer", "Peers"], ["secret", "Shared secret"],
+];
+const CONNTRACK_SYNC = [
+  ["peer", "Peers"], ["listen", "Listen on"], ["interval", "Interval (s)"],
+];
+
 async function refreshHa() {{
   $("vrrpshow").textContent = "…";
   try {{ $("vrrpshow").textContent = (await text("/api/v1/show/vrrp")).trimEnd(); }}
@@ -2039,6 +2075,25 @@ async function refreshHa() {{
       : {{ text: "no address", cls: "reject" }},
     empty: "No virtual router groups configured.",
   }});
+
+  // The pair's own settings live under `system`, one level, so they are read
+  // the same way BGP's router settings are rather than as objects with names.
+  const ls = await leaves();
+  const under = (node) => {{
+    const out = {{}};
+    for (const l of ls) {{
+      if (l.node === node) out[l.path[l.path.length - 1]] = l.value;
+    }}
+    return out;
+  }};
+  settingsPanel(
+    "configsyncform", CONFIG_SYNC, under("system config-sync"),
+    "system config-sync", "Configuration sync",
+  );
+  settingsPanel(
+    "conntracksyncform", CONNTRACK_SYNC, under("system conntrack-sync"),
+    "system conntrack-sync", "Connection sync",
+  );
 }}
 
 // The interface list comes from the config, so the picker offers the interfaces
