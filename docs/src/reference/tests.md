@@ -1,6 +1,6 @@
 # Test suite (nixosTests)
 
-Sentinel is verified by **74 nixosTests** plus the Rust unit tests. The nixosTests
+Sentinel is verified by **76 nixosTests** plus the Rust unit tests. The nixosTests
 boot real QEMU/OVMF VMs — several of them two or three at a time on shared virtual
 segments — so they need `/dev/kvm`.
 
@@ -132,13 +132,17 @@ authoritative list.
 | `geoip` | a neighbour is reachable, then unreachable once its country is blocked, then reachable again — with a substituted database so the assertion is about the mechanism |
 | `acme` | a certificate is really issued — the appliance registers with a Pebble directory, serves the http-01 challenge on :80, and Pebble fetches it back before signing |
 | `bcastrelay` | a broadcast on one segment reaches another carrying the ORIGINAL sender's address — the property request/response discovery depends on — and arrives exactly once |
+| `syslog` | the journal really leaves the box as RFC 5424 and a collector receives it — which is what proves the appliance can be watched from somewhere that survives it |
+| `alerts` | a unit that fails delivers a webhook and a mail, driven by systemd's own `OnFailure=` rather than by a log scrape, so the alert fires on the event and not on a message that mentions one |
 | `spoofing` | a forged LAN source on the WAN link is refused by `strict` but not by `loose` (it is routable, just not there), a loopback source by both, and honest traffic keeps flowing throughout |
 | `ids` | real traffic on the wire becomes an alert an operator can read — which is also what proves the detector sees anything at all behind an XDP data plane; then that an alert blocks its source in the data plane, and that `never-block` stops it; and a TLS handshake announcing a `sni-block`ed name gets the **server** blocked, not the client |
+| `portal` | a guest zone holds every device until somebody logs in: DHCP still works from behind the gate, the portal page is reachable while nothing else is, the wrong passphrase admits nobody, a login puts that device through, and `clear portal session` holds it again. Also the run that puts the gate in front of the **verifier** |
+| `portmap` | a host on the inside opens its own inbound port by NAT-PMP, and the mapping is read back out of the **agent** — so what is asserted is the data plane's own table, not a tally kept beside it; a privileged port is refused with nothing granted alongside the refusal, and both the protocol's delete and `clear port-mapping` take it away. That the resulting forward then DNATs is `nat`'s subject, not re-proven here |
 
 ## Rust unit tests
 
 ```shell
-cargo test                       # 274 unit tests
+cargo test                       # 380 unit tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
