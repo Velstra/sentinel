@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-08-01
+
 The release the appliance becomes usable without a terminal: a web console that
 can drive every section the CLI has, accounts to drive it as, and a large part
 of the remaining parity list — intrusion detection, a captive portal, GeoIP,
