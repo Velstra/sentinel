@@ -24,53 +24,67 @@ await test("the page loads without the script throwing", () => {
 
 // --- navigation -------------------------------------------------------------
 
+// One rail entry per call, not sixty in one.
+//
+// Opening a section makes the appliance answer every live-state pane on it, and
+// each of those is a process spawn. On a workstation the whole walk fits inside
+// one evaluate; in a build sandbox it does not, and the call times out — which
+// reports as "the page stopped answering" and looks exactly like a console that
+// hangs. Driving the loop from here bounds every call by the slowest *single*
+// section, and a failure names the entry rather than the walk.
 await test("every rail entry opens exactly one non-empty view", async () => {
-  const report = await page.evaluate(`(async () => {
-    const wait = () => new Promise((r) => setTimeout(r, 200));
-    const out = { broken: [], empty: [], count: 0 };
-    const items = () => [...document.querySelectorAll("aside button.navitem")];
-    for (let i = 0; i < items().length; i++) {
-      const b = items()[i];
+  const count = await page.evaluate(
+    `document.querySelectorAll("aside button.navitem").length`);
+  check(count > 30, `only ${count} rail entries — the rail lost sections`);
+
+  const broken = [], empty = [];
+  for (let i = 0; i < count; i++) {
+    const r = await page.evaluate(`(async () => {
+      const b = [...document.querySelectorAll("aside button.navitem")][${i}];
       const label = b.textContent.trim();
       b.click();
-      await wait();
-      out.count++;
+      await new Promise((r) => setTimeout(r, 200));
       const shown = [...document.querySelectorAll('[id^="view-"]')]
         .filter((v) => !v.classList.contains("hidden"));
-      if (shown.length !== 1) { out.broken.push(label + " showed " + shown.length + " views"); continue; }
-      if (!shown[0].innerText.trim()) out.empty.push(label);
-    }
-    return out;
-  })()`);
-  equal(report.broken, [], "rail entries that do not open one view");
-  equal(report.empty, [], "rail entries that open an empty page");
-  check(report.count > 30, `only ${report.count} rail entries — the rail lost sections`);
+      return { label, views: shown.length, text: shown.length === 1 ? shown[0].innerText.trim() : "" };
+    })()`);
+    if (r.views !== 1) broken.push(`${r.label} showed ${r.views} views`);
+    else if (!r.text) empty.push(r.label);
+  }
+  equal(broken, [], "rail entries that do not open one view");
+  equal(empty, [], "rail entries that open an empty page");
   noThrows("navigating threw");
 });
 
 await test("every tab strip switches panes and titles the page", async () => {
-  const report = await page.evaluate(`(async () => {
-    const wait = () => new Promise((r) => setTimeout(r, 200));
-    const bad = [];
-    for (const v of Object.keys(TABS)) {
-      view = v; panel = null; await refresh(); await wait();
-      const strip = document.getElementById("tabs-" + v);
-      if (!strip || strip.children.length !== TABS[v].length) {
-        bad.push(v + ": strip does not match the table");
-        continue;
-      }
-      for (const button of [...strip.children]) {
+  const strips = await page.evaluate(`Object.keys(TABS)`);
+  const bad = [];
+  for (const v of strips) {
+    const shape = await page.evaluate(`(async () => {
+      view = ${JSON.stringify(v)}; panel = null;
+      await refresh();
+      await new Promise((r) => setTimeout(r, 200));
+      const strip = document.getElementById("tabs-" + view);
+      return { tabs: strip ? strip.children.length : -1, want: TABS[view].length };
+    })()`);
+    if (shape.tabs !== shape.want) { bad.push(`${v}: strip does not match the table`); continue; }
+    // Each tab is its own call for the same reason as above.
+    for (let i = 0; i < shape.tabs; i++) {
+      const r = await page.evaluate(`(async () => {
+        const button = document.getElementById("tabs-" + ${JSON.stringify(v)}).children[${i}];
+        const name = button.textContent;
         button.click();
-        await wait();
-        const open = [...document.querySelectorAll("#view-" + v + " > .tabpane")]
+        await new Promise((r) => setTimeout(r, 200));
+        const open = [...document.querySelectorAll("#view-" + ${JSON.stringify(v)} + " > .tabpane")]
           .filter((p) => !p.classList.contains("hidden"));
-        if (open.length !== 1) bad.push(v + "/" + button.textContent + ": " + open.length + " panes");
         const heading = document.querySelector("#pagehead h2");
-        if (!heading || !heading.textContent.trim()) bad.push(v + "/" + button.textContent + ": no heading");
-      }
+        return { name, panes: open.length, heading: heading ? heading.textContent.trim() : "" };
+      })()`);
+      if (r.panes !== 1) bad.push(`${v}/${r.name}: ${r.panes} panes`);
+      if (!r.heading) bad.push(`${v}/${r.name}: no heading`);
     }
-    return bad;
-  })()`);
+  }
+  const report = bad;
   equal(report, [], "tab strips that do not switch cleanly");
   noThrows("switching tabs threw");
 });
