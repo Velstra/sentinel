@@ -3,11 +3,11 @@
     "fabric": {
       "flake": false,
       "locked": {
-        "lastModified": 1785443858,
-        "narHash": "sha256-THIuIc4/K4DCH3lUPNFYZ7zBcnIP9huu437+7U+7CiE=",
+        "lastModified": 1785609827,
+        "narHash": "sha256-hHNZwSiT6BOdUILbQCwZHgfGJ0fsleEFHAM86bMEVZw=",
         "owner": "Velstra",
         "repo": "fabric",
-        "rev": "ab3fccd1e12d48456161f0349497e99a94610e83",
+        "rev": "149614199915e36644aa473a0c48afd639290d8f",
         "type": "github"
       },
       "original": {
@@ -81,11 +81,11 @@
     "wren": {
       "flake": false,
       "locked": {
-        "lastModified": 1784979540,
-        "narHash": "sha256-nNhNTZs9ep8DGyH6XQUYyAvOVfEODA+VVJss7Ods9E4=",
+        "lastModified": 1785609889,
+        "narHash": "sha256-KxlRVBxNiOc8rCDGdmYdst/0b/oLz1rD0CiNxmEqpZI=",
         "owner": "Velstra",
         "repo": "wren",
-        "rev": "59630f4ec333d18dc0589f2b99d1b8eadfec42b8",
+        "rev": "b90837fbcf2305d5579c4544c089cd2e568fcd1f",
         "type": "github"
       },
       "original": {
