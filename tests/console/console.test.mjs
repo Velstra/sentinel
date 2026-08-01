@@ -33,26 +33,45 @@ await test("the page loads without the script throwing", () => {
 // hangs. Driving the loop from here bounds every call by the slowest *single*
 // section, and a failure names the entry rather than the walk.
 await test("every rail entry opens exactly one non-empty view", async () => {
-  const count = await page.evaluate(
-    `document.querySelectorAll("aside button.navitem").length`);
-  check(count > 30, `only ${count} rail entries — the rail lost sections`);
+  // The labels first, so a call that never comes back can be named. "The page
+  // stopped answering" is not a diagnosis; "Traffic shaping stopped answering"
+  // is one.
+  const labels = await page.evaluate(
+    `[...document.querySelectorAll("aside button.navitem")].map((b) => b.textContent.trim())`);
+  check(labels.length > 30, `only ${labels.length} rail entries — the rail lost sections`);
 
-  const broken = [], empty = [];
-  for (let i = 0; i < count; i++) {
-    const r = await page.evaluate(`(async () => {
-      const b = [...document.querySelectorAll("aside button.navitem")][${i}];
-      const label = b.textContent.trim();
-      b.click();
-      await new Promise((r) => setTimeout(r, 200));
-      const shown = [...document.querySelectorAll('[id^="view-"]')]
-        .filter((v) => !v.classList.contains("hidden"));
-      return { label, views: shown.length, text: shown.length === 1 ? shown[0].innerText.trim() : "" };
-    })()`);
-    if (r.views !== 1) broken.push(`${r.label} showed ${r.views} views`);
-    else if (!r.text) empty.push(r.label);
+  const broken = [], empty = [], slow = [];
+  for (let i = 0; i < labels.length; i++) {
+    let r;
+    const began = Date.now();
+    const say = process.env.CONSOLE_PROGRESS
+      ? (m) => console.log(`       ${m}`)
+      : () => {};
+    say(`→ ${i + 1}/${labels.length} ${labels[i]}`);
+    try {
+      r = await page.evaluate(`(async () => {
+        const b = [...document.querySelectorAll("aside button.navitem")][${i}];
+        b.click();
+        await new Promise((r) => setTimeout(r, 200));
+        const shown = [...document.querySelectorAll('[id^="view-"]')]
+          .filter((v) => !v.classList.contains("hidden"));
+        return { views: shown.length, text: shown.length === 1 ? shown[0].innerText.trim() : "" };
+      })()`);
+    } catch (e) {
+      throw new Error(`at rail entry ${i + 1}/${labels.length} (${labels[i]}): ${e.message || e}`);
+    }
+    // A section that takes half a minute to open is a defect an operator meets
+    // as "the console is broken", so it is worth saying out loud even when the
+    // walk finishes.
+    const took = Date.now() - began;
+    say(`  ${(took / 1000).toFixed(1)}s`);
+    if (took > 20000) slow.push(`${labels[i]} took ${Math.round(took / 1000)}s`);
+    if (r.views !== 1) broken.push(`${labels[i]} showed ${r.views} views`);
+    else if (!r.text) empty.push(labels[i]);
   }
   equal(broken, [], "rail entries that do not open one view");
   equal(empty, [], "rail entries that open an empty page");
+  equal(slow, [], "rail entries that take longer than an operator will wait");
   noThrows("navigating threw");
 });
 
