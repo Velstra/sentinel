@@ -58,10 +58,21 @@ export async function browser({ port = 0, width = 1600, height = 1000 } = {}) {
     "about:blank",
   ], { stdio: ["ignore", "pipe", "pipe"] });
 
+  // The browser's own last words. When it dies mid-run — out of memory in a
+  // build sandbox, a renderer crash — the only evidence is on its stderr, and
+  // a harness that discards it can only report that nothing answered.
+  const said = [];
+  const keep = (chunk) => {
+    said.push(String(chunk));
+    if (said.length > 40) said.shift();
+  };
+  proc.stdout.on("data", keep);
+  proc.stderr.on("data", keep);
+
   let socket = null, died = null;
-  proc.on("exit", (code) => { died = code; });
+  proc.on("exit", (code, signal) => { died = signal ? `signal ${signal}` : `code ${code}`; });
   for (let i = 0; i < 120 && !socket; i++) {
-    if (died !== null) throw new Error(`the browser exited before it listened (code ${died})`);
+    if (died !== null) throw new Error(`the browser exited before it listened (${died})`);
     try {
       const list = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
       const page = list.find((t) => t.type === "page");
@@ -102,6 +113,22 @@ export async function browser({ port = 0, width = 1600, height = 1000 } = {}) {
   // call here can be a walk over sixty rail entries and every one of those
   // makes the appliance shell out to its own binary for a `show`.
   const CALL_TIMEOUT = Number(process.env.CONSOLE_CALL_TIMEOUT || 300000);
+
+  // A browser that has died must not be waited out. Every pending call is
+  // failed the moment the process exits or the socket closes, with the reason
+  // and the browser's last words — otherwise a crash reports as "the page
+  // stopped answering" ten minutes later, which is the same sentence a slow
+  // page produces and sends the reader looking in the wrong place entirely.
+  const giveUp = (why) => {
+    const tail = said.join("").trim().split("\n").slice(-8).join("\n");
+    const e = new Error(why + (tail ? `\n  the browser said:\n  ${tail.split("\n").join("\n  ")}` : ""));
+    for (const [, settle] of pending) settle({ __dead: e });
+    pending.clear();
+  };
+  proc.on("exit", (code, signal) =>
+    giveUp(`the browser exited mid-run (${signal ? `signal ${signal}` : `code ${code}`})`));
+  ws.addEventListener("close", () => giveUp("the browser closed the debugging socket mid-run"));
+
   const send = (method, params = {}) =>
     new Promise((res, rej) => {
       const callId = ++id;
@@ -109,7 +136,11 @@ export async function browser({ port = 0, width = 1600, height = 1000 } = {}) {
         pending.delete(callId);
         rej(new Error(`the page stopped answering (${method} after ${CALL_TIMEOUT}ms)`));
       }, CALL_TIMEOUT);
-      pending.set(callId, (m) => { clearTimeout(timer); res(m); });
+      pending.set(callId, (m) => {
+        clearTimeout(timer);
+        if (m && m.__dead) rej(m.__dead);
+        else res(m);
+      });
       ws.send(JSON.stringify({ id: callId, method, params }));
     });
 
