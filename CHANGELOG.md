@@ -2,7 +2,81 @@
 
 ## [Unreleased]
 
+The release the appliance becomes usable without a terminal: a web console that
+can drive every section the CLI has, accounts to drive it as, and a large part
+of the remaining parity list — intrusion detection, a captive portal, GeoIP,
+CGNAT, SYN protection, ACME, flow export and remote logging.
+
 ### Added
+
+- **A web console.** Every section the CLI has is drivable from the page, and
+  the page writes **CLI commands** rather than a configuration document — so
+  there is one grammar, one validator and one audit trail, and a setting the
+  console can reach is by construction a setting the appliance understands.
+  Edits stage locally and are applied on a word from the operator; Validate
+  checks the batch without committing it. The page fetches **nothing** from
+  outside itself — no webfont, no CDN, no analytics — because an appliance is
+  expected to work on an isolated network, and a console that renders as
+  unstyled text during an incident is not a console. It is served from the
+  appliance's own API and needs no build step.
+- **Accounts and permission groups.** `[[system.group]]` writes a permission
+  down once and accounts point at it, so nobody has to remember what a
+  particular account may do. Two levels only, deliberately. A password is hashed
+  by the appliance and only the hash is stored; `POST /api/v1/login` answers with
+  that account's own token. Shell access and management access stay separate
+  grants — an account with no group can log in to the box and reach nothing
+  through the API. `show users` reports them from the saved configuration, which
+  is the authority, rather than from the token directory, which is only secrets.
+- **Intrusion detection and blocking (C11).** Suricata watches the wire; an
+  alert can block its source through the eBPF blocklist — never through
+  Suricata, so a detection engine failure cannot become a forwarding failure. A
+  block has a deadline, an operator can lift one or all of them from the CLI,
+  and `sni-block` refuses a server by the name it announces in TLS, blocking it
+  as a *source* so its answers never return.
+- **A captive portal (C20).** A guest zone holds every device until it logs in.
+  Admission is keyed by MAC, so one decision covers both address families, and
+  the appliance answers RFC 8910/8908 rather than intercepting traffic to
+  announce itself — interception is what makes portals fight with HSTS.
+- **NAT-PMP port mapping (C18).** A host on the inside can open an inbound port
+  for a while. Third-party mapping is impossible rather than merely refused, and
+  UPnP is declined on purpose.
+- **Blocking by country (C15).** `dbip-country-lite` is extracted at build time
+  and countries expand to ordinary CIDRs, so the datapath does not grow a GeoIP
+  engine — only a larger blocklist.
+- **Domain groups and rate limits (C15).** A firewall rule can match DNS names,
+  with an on-disk cache so a failed lookup does not silently empty a blocking
+  group; and a rule can carry a `limit`/`burst` token bucket.
+- **SYN protection (C15).** `syn-protect` on a port completes the handshake with
+  a cookie before the real connection is opened.
+- **Deterministic CGNAT (C16).** A fixed block of WAN ports per internal address
+  gives attribution without a translation log. `show nat cgnat` asks the agent,
+  so there is one implementation of the answer rather than two.
+- **Source validation (uRPF/BCP 38)** per zone, with the DHCP and link-local
+  exemptions a real link needs.
+- **Destination-end rules.** A rule may constrain its destination address as
+  well as its source, and a rule's destination *zone* is now enforced.
+- **ACME certificates (C19).** `ca = "acme"` really obtains certificates, in a
+  timer rather than in the commit, verified against a real ACME server.
+- **Load-balanced services (C22)**, configured from the CLI and reported by
+  `show`.
+- **Remote syslog (C12)** — the journal shipped to collectors as RFC 5424 — and
+  **IPFIX flow export**, which sends **deltas** because a collector sums what it
+  receives.
+- **Alerts (C23).** A failed unit reaches a webhook or a mailbox. The event
+  source is systemd itself rather than a grep over the journal, and the watched
+  list is deliberately narrow.
+- **A UDP broadcast relay (C18)** between segments, and **packet capture from
+  the console**, within limits.
+- **The data plane's fail-closed switch**, exposed in the CLI.
+- **IS-IS authentication** in the CLI (cleartext, HMAC-MD5, HMAC-SHA-256).
+- **The appliance answers what a value means.** `GET /api/v1/lookup/{kind}/…`
+  resolves an AS number over RDAP and a name through the resolver the box
+  already uses, cached, with reserved ranges answered without a request. It
+  belongs on the appliance rather than in the browser: a console that asks a
+  whois service directly hands the operator's network to a third party, and on
+  an isolated box it would show nothing at all.
+- **A warning for an addressed interface left without a zone** — the commonest
+  way traffic ends up governed by nothing in particular.
 - **HA conntrack sync (C9)** — `set system conntrack-sync`: mirror the eBPF
   conntrack table to peer firewalls (`listen` / `peer` / `interval`) so established
   NAT'd connections survive a VRRP failover instead of being dropped. `peer` is
@@ -20,6 +94,25 @@
   nixosTest proves a client on a server-less segment obtaining a lease from a
   far-segment DHCPv6 pool through the relay.
 
+### Fixed
+
+- **PPPoE and SNMP configuration injection is rejected**, and staged secrets are
+  written `0600` — config-sync's secret included. An IPv6 peer is bracketed, and
+  a protocol unwrap is guarded.
+- **A service claims the router-NAT namespace**, so a port forward's reply is
+  not lost to a policy-scoped conntrack miss.
+- **`show configuration` was dropping settings it owns** — permission grants, the
+  captive portal, port mapping, IS-IS authentication and the CGNAT leaves were
+  all settable and none of them came back out, so a saved configuration quietly
+  lost them. A certificate subject may now contain a space.
+- **Every `show` reads the configuration the API was pointed at**, so a console
+  serving one file while a `show` beside it reads another is no longer possible.
+- **`syn-protect` is offered where it is looked for** in the CLI.
+- **Three console defects that each looked like the console working:** Validate
+  cleared what it had just validated so the change could no longer be applied; a
+  batch whose first command would be refused applied the rest anyway; and a
+  failed read left an empty page indistinguishable from an empty configuration.
+
 ### Changed
 - **Repin fabric for the SRv6 L2 data plane (B9).** The appliance's eBPF object
   now carries the full SRv6 `End.DT2U` L2 path — headend encap (`SRV6_CONFIG` +
@@ -31,6 +124,14 @@
   primitive with no Sentinel CLI surface yet.
 
 ### Tested
+
+- **The console is driven in a real browser.** `tests/console/` clicks its way
+  through every rail entry, every create panel and every mask, and `checks.console`
+  runs it in the build sandbox — no VM, because loopback and `--no-apply` are
+  enough. Three failure modes that pass every static check and every unit test
+  live here: a function that was never written, an element a redesign removed,
+  and a command the appliance answers with "unknown set path". It found that 19
+  of 22 create panels staged a path the CLI refuses.
 - **Per-protocol routing VM checks for RIPng, Babel and IS-IS** — two-appliance
   `nixosTest`s (`checks.ripng` / `checks.babel` / `checks.isis`) that form an
   adjacency over the real Velstra datapath and verify each node learns and installs
