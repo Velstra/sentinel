@@ -1124,6 +1124,41 @@
       # the data plane stays up.
       #   nix build .#checks.x86_64-linux.commit -L
       checks.${system} = {
+        # The web console, driven in a real browser.
+        #
+        # Everything else about the console is checked by reading its text —
+        # which paths it names, what it does not fetch — and the failures that
+        # actually cost us all survive that: a function that was never defined,
+        # an element a redesign removed, a command the appliance answers with
+        # "unknown set path". The page loads, the layout is right, and the
+        # button does nothing. Only clicking it finds that out.
+        #
+        # No VM: the API binds loopback and edits a temporary TOML with
+        # `--no-apply`, so a build sandbox is enough — and a sandbox check runs
+        # in seconds where a VM takes minutes.
+        #   nix build .#checks.x86_64-linux.console -L
+        console = pkgs.runCommand "sentinel-console"
+          {
+            nativeBuildInputs = [ sentinel pkgs.nodejs pkgs.chromium pkgs.curl pkgs.bash ];
+            # Chromium wants a writable home and a place for its singleton lock.
+            HOME = "/build";
+          }
+          ''
+            set -eu
+            export CHROMIUM=${pkgs.chromium}/bin/chromium
+            export CONSOLE_PORT=18099
+            # A build sandbox is slower than a workstation, and every `show` the
+            # console asks for costs the appliance a process spawn.
+            export CONSOLE_CALL_TIMEOUT=600000
+            cp -r ${./tests/console} tests-console
+            chmod -R u+w tests-console
+            bash tests-console/run.sh ${sentinel}/bin/sentinel | tee output
+            # The runner already exits non-zero on any failed test; this catches
+            # the other way to be green — a run that asserted nothing at all.
+            grep -Eq "^[1-9][0-9]*/[1-9][0-9]* passed" output
+            cp output $out
+          '';
+
         commit = pkgs.testers.runNixOSTest {
         name = "sentinel-commit";
         nodes.machine = {
@@ -1346,6 +1381,66 @@
 
           # /health needs no auth.
           machine.succeed("curl -fsS http://127.0.0.1:8080/api/v1/health | grep -q ok")
+
+          with subtest("a read-only account may read and may not write"):
+              # Give the box a group and an account in it, through the same PUT
+              # path a commit uses.
+              rbac = (
+                  '{"system":{"hostname":"api-fw",'
+                  '"group":[{"name":"viewers","permission":"read-only"}],'
+                  '"login":[{"username":"vera","group":"viewers"}]},'
+                  '"interface":[{"name":"eth0","zone":"wan","address":"dhcp"}]}'
+              )
+              machine.succeed(
+                  f"curl -fsS -X PUT -H 'Authorization: Bearer {token}' "
+                  f"-H 'Content-Type: application/json' -d '{rbac}' "
+                  "http://127.0.0.1:8080/api/v1/config"
+              )
+              # The account's token was minted beside the machine one, 0600.
+              perms = machine.succeed(
+                  "stat -c %a /var/lib/sentinel/api-tokens/vera"
+              ).strip()
+              assert perms == "600", f"account token perms {perms} (want 600)"
+              vera = machine.succeed("cat /var/lib/sentinel/api-tokens/vera").strip()
+              assert vera and vera != token, "the account got the machine token"
+
+              # Reads: allowed.
+              machine.succeed(
+                  f"curl -fsS -H 'Authorization: Bearer {vera}' "
+                  "http://127.0.0.1:8080/api/v1/config >/dev/null"
+              )
+              # Writes: refused, and with 403 rather than 401 — the caller is
+              # known, they simply may not.
+              code = machine.succeed(
+                  f"curl -s -o /dev/null -w '%{{http_code}}' -X PUT "
+                  f"-H 'Authorization: Bearer {vera}' "
+                  "-H 'Content-Type: application/json' "
+                  "-d '{\"system\":{\"hostname\":\"taken-over\"}}' "
+                  "http://127.0.0.1:8080/api/v1/config"
+              ).strip()
+              assert code == "403", f"read-only PUT returned {code} (want 403)"
+              # …and nothing changed.
+              assert "api-fw" in machine.succeed("hostname"), machine.succeed("hostname")
+
+              # The configuration is the authority, not the file: take the group
+              # away and the same token, still on disk, opens nothing.
+              plain = (
+                  '{"system":{"hostname":"api-fw",'
+                  '"group":[{"name":"viewers","permission":"read-only"}],'
+                  '"login":[{"username":"vera"}]},'
+                  '"interface":[{"name":"eth0","zone":"wan","address":"dhcp"}]}'
+              )
+              machine.succeed(
+                  f"curl -fsS -X PUT -H 'Authorization: Bearer {token}' "
+                  f"-H 'Content-Type: application/json' -d '{plain}' "
+                  "http://127.0.0.1:8080/api/v1/config"
+              )
+              code = machine.succeed(
+                  f"curl -s -o /dev/null -w '%{{http_code}}' "
+                  f"-H 'Authorization: Bearer {vera}' "
+                  "http://127.0.0.1:8080/api/v1/config"
+              ).strip()
+              assert code == "401", f"a withdrawn account got {code} (want 401)"
 
           with subtest("the console's script actually parses"):
               # A syntax error anywhere in the block stops the whole script
