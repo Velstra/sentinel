@@ -23,10 +23,11 @@
 //! endpoint except `/health`. The server binds localhost by default; widen it
 //! with `--listen 0.0.0.0:<port>`.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, anyhow};
 use axum::{
@@ -61,6 +62,27 @@ pub struct ApiState {
     pub config_path: PathBuf,
     /// Whether/where a `PUT` applies the config to the running system.
     pub apply: Apply,
+    /// Directory holding one token file per account with management access.
+    ///
+    /// Per-account tokens rather than per-account passwords: the appliance
+    /// already stores a crypt(3) hash for shell login, and verifying one here
+    /// would mean carrying a password-hashing implementation into the request
+    /// path to gain nothing — a token is what an API client sends anyway, and a
+    /// token can be withdrawn by deleting a file.
+    pub tokens_dir: PathBuf,
+}
+
+/// Where per-account API tokens live when the machine token's directory cannot
+/// be determined. One file per account, 0600, beside the machine token.
+pub const DEFAULT_TOKENS_DIR: &str = "/var/lib/sentinel/api-tokens";
+
+/// Who is asking, and what they may do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Caller {
+    /// The account name, or `None` for the machine token.
+    pub user: Option<String>,
+    /// What this caller may do.
+    pub permission: crate::config::Permission,
 }
 
 /// Serve the REST API until the process is stopped. Loads (or generates) the
@@ -74,7 +96,22 @@ pub async fn serve(listen: &str, config: &Path, apply: Apply, token_file: &Path)
         token,
         config_path: config.to_path_buf(),
         apply,
+        // Beside the machine token, wherever that was put. Deriving it rather
+        // than hard-coding the appliance path means an off-box run — the one an
+        // operator uses to look at the console — mints its accounts somewhere it
+        // can actually write.
+        tokens_dir: token_file
+            .parent()
+            .map(|d| d.join("api-tokens"))
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_TOKENS_DIR)),
     });
+    // Mint a token for every account that has been given a group, and withdraw
+    // the ones whose account or group is gone. Done at startup rather than at
+    // apply so a token exists the first time the API runs, and re-done on every
+    // `PUT` (which restarts nothing) by the same call below.
+    if let Err(e) = sync_user_tokens(&state) {
+        eprintln!("warning: could not reconcile per-account API tokens: {e:#}");
+    }
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -99,11 +136,20 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/api/v1/configure", post(post_configure))
         .route("/api/v1/clear/*path", post(post_clear))
         .route("/api/v1/capture", post(post_capture))
+        // What the appliance can tell you about a value you are typing. The
+        // console never reaches outside itself; it asks here, and this asks the
+        // world — which is why a page served on an isolated network still works.
+        .route("/api/v1/lookup/:kind/:value", get(get_lookup))
         .route("/api/v1/stack", get(get_stack))
         .route("/api/v1/stack/:member/show/*path", get(get_stack_show))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
     Router::new()
         .route("/api/v1/health", get(health))
+        // Signing in cannot require being signed in. The account's password is
+        // checked here and the account's own token is handed back — the same
+        // token an operator could read off the box, so nothing new is granted
+        // by knowing the password, only a way to ask for it.
+        .route("/api/v1/login", post(post_login))
         // The console itself is markup with no data in it, and a sign-in page
         // that needs a token to reach is not a sign-in page. Everything it then
         // fetches goes through the middleware above like any other client.
@@ -127,23 +173,294 @@ async fn console() -> Response {
 /// Reject any request whose `Authorization: Bearer <token>` does not match the
 /// configured token. The comparison is constant-time so a wrong token leaks no
 /// timing signal about how many bytes were right.
-async fn require_token(State(state): State<Arc<ApiState>>, req: Request, next: Next) -> Response {
+async fn require_token(
+    State(state): State<Arc<ApiState>>,
+    mut req: Request,
+    next: Next,
+) -> Response {
     let provided = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
-    match provided {
-        Some(t) if ct_eq(t.as_bytes(), state.token.as_bytes()) => next.run(req).await,
-        _ => (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "missing or invalid bearer token" })),
+    let Some(token) = provided else {
+        return unauthorised();
+    };
+    let Some(caller) = resolve_caller(&state, token) else {
+        return unauthorised();
+    };
+    // A read-only caller may read anything and change nothing. The split is by
+    // **method**, not by path: every endpoint that changes something is a POST
+    // or a PUT, and enumerating paths instead would leave the next endpoint
+    // added silently writable by everyone.
+    if !caller.permission.may_write() && req.method() != axum::http::Method::GET {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": format!(
+                    "{} is read-only",
+                    caller.user.as_deref().unwrap_or("this token"),
+                ),
+            })),
         )
-            .into_response(),
+            .into_response();
     }
+    // Handlers get to know who is asking. A console that has been reloaded
+    // holds a token and nothing else — it has to be able to ask the appliance
+    // whose it is, or it cannot say who is signed in or what they may do.
+    req.extensions_mut().insert(caller);
+    next.run(req).await
+}
+
+/// The 401 every failed authentication gets, worded the same way whether the
+/// token was absent, malformed or simply wrong — a different message per case
+/// tells an attacker which half they got right.
+fn unauthorised() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({ "error": "missing or invalid bearer token" })),
+    )
+        .into_response()
+}
+
+/// Resolve a presented token to who is asking and what they may do.
+///
+/// The **machine token** is full access and has no account behind it: it is what
+/// a peer firewall presents when config-sync pushes a commit, and what an
+/// operator uses before any account exists. Everything else is an account token,
+/// and its permission comes from the account's group — so withdrawing access is
+/// either deleting the token file or changing the group, both of which are
+/// visible where somebody would look.
+pub fn resolve_caller(state: &ApiState, presented: &str) -> Option<Caller> {
+    use crate::config::Permission;
+    if ct_eq(presented.as_bytes(), state.token.as_bytes()) {
+        return Some(Caller {
+            user: None,
+            permission: Permission::ReadWrite,
+        });
+    }
+    let appliance = Appliance::load(&state.config_path).ok()?;
+    let entries = std::fs::read_dir(&state.tokens_dir).ok()?;
+    for entry in entries.flatten() {
+        let Ok(stored) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        if !ct_eq(presented.as_bytes(), stored.trim().as_bytes()) {
+            continue;
+        }
+        let user = entry.file_name().to_string_lossy().into_owned();
+        // A token file whose account or group has since gone grants nothing:
+        // the config is the authority, and the file is only the secret.
+        let login = appliance
+            .system
+            .logins
+            .iter()
+            .find(|l| l.username == user)?;
+        let group = login.group.as_deref()?;
+        let permission = appliance
+            .system
+            .groups
+            .iter()
+            .find(|g| g.name == group)?
+            .permission;
+        return Some(Caller {
+            user: Some(user),
+            permission,
+        });
+    }
+    None
+}
+
+/// Mint a token for every account with a group, and remove the files of accounts
+/// that no longer have one.
+///
+/// A token is generated once and then left alone: rotating it on every apply
+/// would log every client out whenever anything at all was committed.
+pub fn sync_user_tokens(state: &ApiState) -> Result<()> {
+    let appliance = Appliance::load(&state.config_path)?;
+    let wanted: Vec<&str> = appliance
+        .system
+        .logins
+        .iter()
+        .filter(|l| l.group.is_some())
+        .map(|l| l.username.as_str())
+        .collect();
+    if wanted.is_empty() && !state.tokens_dir.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&state.tokens_dir)
+        .with_context(|| format!("creating {}", state.tokens_dir.display()))?;
+    for user in &wanted {
+        let path = state.tokens_dir.join(user);
+        if !path.exists() {
+            load_or_create_token(&path)?;
+        }
+    }
+    // Withdraw what is no longer granted.
+    for entry in std::fs::read_dir(&state.tokens_dir)?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !wanted.iter().any(|u| *u == name) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    Ok(())
 }
 
 // ---- handlers ------------------------------------------------------------
+
+/// `POST /api/v1/login` — a username and a password for the account's token.
+///
+/// Until this existed the console asked for a bearer token, which meant that in
+/// practice one shared secret was passed around: there was no way to sign in
+/// *as* somebody, so accounts and permission groups existed on the box and
+/// nowhere else. This is the missing half — the password is checked against the
+/// account's stored hash, and what comes back is that account's own token, with
+/// its group's permission.
+///
+/// **A shell account is not a management account.** An account with no group can
+/// log in to the box and gets nothing here, and it is told exactly that: a
+/// refusal an operator cannot act on is a support ticket.
+///
+/// Failures are slowed and counted. Not a lockout — locking an administrator
+/// out of their own firewall is a denial of service anyone can trigger — but
+/// enough that guessing over the network is not a practical way in.
+async fn post_login(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let username = body
+        .get("username")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let password = body
+        .get("password")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if username.is_empty() || password.is_empty() {
+        return Err(ApiError::bad_request(anyhow!(
+            "a username and a password are needed"
+        )));
+    }
+    let state = state.clone();
+    // Off the runtime: hashing is deliberately slow, and a login must not stall
+    // the executor that is serving everybody else.
+    let outcome = tokio::task::spawn_blocking(move || sign_in(&state, &username, &password))
+        .await
+        .map_err(|e| ApiError::internal(anyhow!("login task: {e}")))?;
+    match outcome {
+        Ok(session) => Ok(Json(session)),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The whole of signing in, in one place so the refusals can be read together.
+fn sign_in(state: &ApiState, username: &str, password: &str) -> Result<Value, ApiError> {
+    // Guessing costs time whether or not the account exists, so a wrong
+    // username and a wrong password are indistinguishable from the outside.
+    let attempts = note_attempt(username);
+    std::thread::sleep(std::time::Duration::from_millis(
+        250 * attempts.min(8) as u64,
+    ));
+
+    let appliance = Appliance::load(&state.config_path)
+        .map_err(|e| ApiError::internal(anyhow!("reading the configuration: {e}")))?;
+    let login = appliance
+        .system
+        .logins
+        .iter()
+        .find(|l| l.username == username);
+
+    let refused = || {
+        ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            anyhow!("that username and password were not accepted"),
+        )
+    };
+
+    let Some(login) = login else {
+        return Err(refused());
+    };
+    let Some(stored) = login.hashed_password.as_deref() else {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            anyhow!("that account has no password set"),
+        ));
+    };
+    // An unverifiable hash is not a wrong password, and saying "wrong password"
+    // would send an operator hunting for a typo that is not there.
+    let ok = crate::passwd::verify(password, stored)
+        .map_err(|e| ApiError::new(StatusCode::UNAUTHORIZED, anyhow!("{e}")))?;
+    if !ok {
+        return Err(refused());
+    }
+    let Some(group) = login.group.as_deref() else {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            anyhow!(
+                "{username} may log in to this appliance but has no management                  access — give the account a permission group"
+            ),
+        ));
+    };
+    let Some(permission) = appliance
+        .system
+        .groups
+        .iter()
+        .find(|g| g.name == group)
+        .map(|g| g.permission)
+    else {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            anyhow!("{username} is in group {group:?}, which does not exist"),
+        ));
+    };
+
+    // The account's token, minted if this is the first time anybody asked.
+    std::fs::create_dir_all(&state.tokens_dir)
+        .map_err(|e| ApiError::internal(anyhow!("creating the token directory: {e}")))?;
+    let token = load_or_create_token(&state.tokens_dir.join(username))
+        .map_err(|e| ApiError::internal(anyhow!("minting the account's token: {e}")))?;
+    forget_attempts(username);
+    Ok(json!({
+        "token": token,
+        "user": username,
+        "permission": match permission {
+            crate::config::Permission::ReadOnly => "read-only",
+            crate::config::Permission::ReadWrite => "read-write",
+        },
+    }))
+}
+
+/// Failed sign-ins per account, and when they started.
+///
+/// In memory on purpose: a restart clears it, and an operator who has locked
+/// themselves out by fat-fingering a password should not have to find a file to
+/// get back in.
+fn attempts() -> &'static std::sync::Mutex<HashMap<String, (std::time::Instant, u32)>> {
+    static ATTEMPTS: OnceLock<std::sync::Mutex<HashMap<String, (std::time::Instant, u32)>>> =
+        OnceLock::new();
+    ATTEMPTS.get_or_init(Default::default)
+}
+
+fn note_attempt(username: &str) -> u32 {
+    let mut map = attempts().lock().unwrap();
+    let entry = map
+        .entry(username.to_string())
+        .or_insert((std::time::Instant::now(), 0));
+    // A quiet ten minutes forgives everything: the delay is meant to stop a
+    // machine grinding through a wordlist, not to punish a person.
+    if entry.0.elapsed() > std::time::Duration::from_secs(600) {
+        *entry = (std::time::Instant::now(), 0);
+    }
+    entry.1 += 1;
+    entry.1
+}
+
+fn forget_attempts(username: &str) {
+    attempts().lock().unwrap().remove(username);
+}
 
 /// `GET /api/v1/health` — liveness, no auth.
 async fn health() -> Json<Value> {
@@ -180,6 +497,12 @@ async fn put_config(
     // Same persist path as a CLI `save` (atomic write + revision archive).
     session::persist_appliance(&appliance, &state.config_path, true).map_err(ApiError::internal)?;
 
+    // An account that has just been given a group needs a token to exist, and
+    // one whose group was taken away needs its token gone — both at the moment
+    // the change is saved, not at the next restart.
+    if let Err(e) = sync_user_tokens(&state) {
+        eprintln!("warning: could not reconcile per-account API tokens: {e:#}");
+    }
     Ok(Json(json!({
         "applied": state.apply.enabled,
         "saved": true,
@@ -191,8 +514,18 @@ async fn put_config(
 
 /// `GET /api/v1/status` — hostname, service states and interfaces, the same
 /// facts `sentinel show status` reports (systemd unit state + iproute2 brief).
-async fn get_status(State(_state): State<Arc<ApiState>>) -> Json<Value> {
+async fn get_status(
+    State(_state): State<Arc<ApiState>>,
+    caller: Option<axum::Extension<Caller>>,
+) -> Json<Value> {
+    let you = caller.map(|axum::Extension(c)| {
+        json!({
+            "user": c.user,
+            "permission": if c.permission.may_write() { "read-write" } else { "read-only" },
+        })
+    });
     Json(json!({
+        "you": you,
         "hostname": system::current_hostname(),
         "services": {
             "firewall": service_state("velstra.service"),
@@ -206,7 +539,10 @@ async fn get_status(State(_state): State<Arc<ApiState>>) -> Json<Value> {
 /// `/api/v1/show/ip/route`) to the existing `show` logic by invoking the same
 /// binary's `show` subcommand and returning its text output. Re-executing the
 /// wrapped `sentinel` preserves the tool paths the show helpers rely on.
-async fn get_show(UrlPath(path): UrlPath<String>) -> Result<Response, ApiError> {
+async fn get_show(
+    State(state): State<Arc<ApiState>>,
+    UrlPath(path): UrlPath<String>,
+) -> Result<Response, ApiError> {
     let words: Vec<String> = path
         .split('/')
         .filter(|s| !s.is_empty())
@@ -220,6 +556,11 @@ async fn get_show(UrlPath(path): UrlPath<String>) -> Result<Response, ApiError> 
     let out = std::process::Command::new(exe)
         .arg("show")
         .args(&words)
+        // The API can be pointed at a config other than the built-in path, and
+        // every `show` it proxies has to read that same file — otherwise the
+        // console serves one firewall's configuration and shows another's, which
+        // renders as a page full of "nothing configured".
+        .env("SENTINEL_CONFIG", &state.config_path)
         .output()
         .map_err(|e| ApiError::internal(anyhow!("running show: {e}")))?;
     if !out.status.success() {
@@ -356,6 +697,32 @@ async fn post_capture(Json(req): Json<Value>) -> Result<Response, ApiError> {
         .map_err(|e| ApiError::internal(anyhow!("capture task: {e}")))?
         .map_err(ApiError::bad_request)?;
     Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response())
+}
+
+/// `GET /api/v1/lookup/{kind}/{value}` — what is known about a value.
+///
+/// `asn` gives the holder of an AS number, `ptr` the name behind an address.
+/// This is the appliance answering on the console's behalf: the page asks a
+/// path on this box and nothing else, so a console served on an isolated
+/// network keeps working — the lookup simply reports that nothing is known.
+///
+/// **Never an error for the caller to handle.** A field hint that turns into a
+/// red banner because a registry was slow would be worse than no hint at all,
+/// so a failed lookup is a 200 with `known: false`. Only a malformed request —
+/// an unknown kind, a value that is not the kind it claims — is a 400.
+async fn get_lookup(
+    UrlPath((kind, value)): UrlPath<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    // Off the async runtime: this shells out and may wait on a network that is
+    // not there, and a management API must not stall its executor for that.
+    let answer = tokio::task::spawn_blocking(move || crate::lookup::lookup(&kind, &value))
+        .await
+        .map_err(|e| ApiError::internal(anyhow!("lookup task: {e}")))?
+        .map_err(ApiError::bad_request)?;
+    Ok(Json(match answer {
+        Some(text) => json!({ "known": true, "answer": text }),
+        None => json!({ "known": false }),
+    }))
 }
 
 /// `GET /api/v1/stack` — this appliance and its config-sync peers.
@@ -551,6 +918,17 @@ impl ApiError {
             message: format!("{e:#}"),
         }
     }
+
+    /// A refusal that has to name its own status: signing in distinguishes
+    /// "that is not a login" (401) from "that is a login with no management
+    /// access" (403), and the difference is the whole of what an operator does
+    /// next.
+    fn new(status: StatusCode, e: anyhow::Error) -> Self {
+        Self {
+            status,
+            message: format!("{e:#}"),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -593,8 +971,114 @@ mod tests {
             token: TOKEN.to_string(),
             config_path,
             apply: Apply::off(),
+            tokens_dir: std::env::temp_dir().join("sentinel-test-tokens"),
         })
     }
+
+    /// The machine token is full access and has no account behind it — it is
+    /// what a peer firewall presents when config-sync pushes a commit, and what
+    /// an operator has before any account exists.
+    #[test]
+    fn the_machine_token_is_full_access_and_nameless() {
+        let dir = tempdir();
+        let cfg = dir.join("appliance.toml");
+        std::fs::write(&cfg, "[system]\nhostname = \"fw\"\n").unwrap();
+        let st = state(cfg);
+        let caller = resolve_caller(&st, TOKEN).expect("the machine token was refused");
+        assert_eq!(caller.user, None);
+        assert!(caller.permission.may_write());
+        // …and anything else is nobody.
+        assert!(resolve_caller(&st, "not-the-token").is_none());
+    }
+
+    /// A token file is only the secret; the **configuration** is the authority.
+    /// An account whose group was taken away therefore grants nothing, even
+    /// though its token file is still on disk and still matches.
+    #[test]
+    fn a_withdrawn_group_withdraws_access() {
+        let dir = tempdir();
+        let cfg = dir.join("appliance.toml");
+        let tokens = dir.join("tokens");
+        std::fs::create_dir_all(&tokens).unwrap();
+        std::fs::write(tokens.join("alice"), "alice-secret\n").unwrap();
+
+        let st = ApiState {
+            token: TOKEN.to_string(),
+            config_path: cfg.clone(),
+            apply: Apply::off(),
+            tokens_dir: tokens,
+        };
+
+        // With the group: read-only, and named.
+        std::fs::write(
+            &cfg,
+            "[system]\nhostname = \"fw\"\n\
+             [[system.group]]\nname = \"viewers\"\npermission = \"read-only\"\n\
+             [[system.login]]\nusername = \"alice\"\ngroup = \"viewers\"\n",
+        )
+        .unwrap();
+        let caller = resolve_caller(&st, "alice-secret").expect("alice was refused");
+        assert_eq!(caller.user.as_deref(), Some("alice"));
+        assert!(!caller.permission.may_write());
+
+        // Group removed from the account: the same token now resolves to nobody.
+        std::fs::write(
+            &cfg,
+            "[system]\nhostname = \"fw\"\n\
+             [[system.group]]\nname = \"viewers\"\npermission = \"read-only\"\n\
+             [[system.login]]\nusername = \"alice\"\n",
+        )
+        .unwrap();
+        assert!(resolve_caller(&st, "alice-secret").is_none());
+    }
+
+    /// Minting adds what has been granted and removes what has not — the second
+    /// half matters more: a token file left behind after the group was taken
+    /// away would be an access nobody can see in the configuration.
+    #[test]
+    fn tokens_appear_and_are_withdrawn_with_the_grant() {
+        let dir = tempdir();
+        let cfg = dir.join("appliance.toml");
+        let tokens = dir.join("tokens");
+        let st = ApiState {
+            token: TOKEN.to_string(),
+            config_path: cfg.clone(),
+            apply: Apply::off(),
+            tokens_dir: tokens.clone(),
+        };
+
+        std::fs::write(
+            &cfg,
+            "[system]\nhostname = \"fw\"\n\
+             [[system.group]]\nname = \"ops\"\npermission = \"read-write\"\n\
+             [[system.login]]\nusername = \"bob\"\ngroup = \"ops\"\n",
+        )
+        .unwrap();
+        sync_user_tokens(&st).unwrap();
+        let minted = std::fs::read_to_string(tokens.join("bob")).unwrap();
+        assert!(!minted.trim().is_empty());
+
+        // Minting again leaves it alone: rotating on every apply would log every
+        // client out whenever anything at all was committed.
+        sync_user_tokens(&st).unwrap();
+        assert_eq!(std::fs::read_to_string(tokens.join("bob")).unwrap(), minted);
+
+        std::fs::write(&cfg, "[system]\nhostname = \"fw\"\n").unwrap();
+        sync_user_tokens(&st).unwrap();
+        assert!(!tokens.join("bob").exists(), "the token outlived the grant");
+    }
+
+    /// A scratch directory of this test's own, since these write real files.
+    fn tempdir() -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "sentinel-rbac-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     async fn body_string(resp: Response) -> String {
         let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();

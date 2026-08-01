@@ -22,8 +22,10 @@ mod domain;
 mod ids;
 mod install;
 mod ipsec;
+mod lookup;
 mod net;
 mod openconnect;
+mod passwd;
 mod pki;
 mod portal;
 mod portmap;
@@ -48,6 +50,19 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::session::{DEFAULT_CONFIG, Session};
+
+/// The saved configuration a `show` reads.
+///
+/// `$SENTINEL_CONFIG` wins over the built-in path. The API sets it when it
+/// spawns a `show`, because the API can be pointed at a different file with
+/// `--config` — and a console that serves one configuration while every `show`
+/// beside it reads another is a console showing somebody else's firewall. On the
+/// appliance the two are the same file and nothing changes.
+fn saved_config_path() -> std::path::PathBuf {
+    std::env::var_os("SENTINEL_CONFIG")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_CONFIG))
+}
 use velstra_proto::{ListPortsRequest, velstra_orchestrator_client::VelstraOrchestratorClient};
 
 use crate::config::Appliance;
@@ -739,7 +754,8 @@ fn update_cmd(target: Option<&str>, commit: bool) -> Result<()> {
 
 /// Load the saved appliance's `[update]` channel, or bail if none is configured.
 fn load_update_channel() -> Result<config::UpdateChannel> {
-    let path = std::path::Path::new(DEFAULT_CONFIG);
+    let saved = saved_config_path();
+    let path = saved.as_path();
     let appliance = Appliance::load(path)?;
     appliance.update.ok_or_else(|| {
         anyhow::anyhow!("no [update] channel configured (set update url + public-key, then save)")
@@ -941,7 +957,8 @@ fn show_op(args: &[String]) -> Result<()> {
         ["firewall"] => {
             print!("agent:      ");
             run_show(&system::bin("systemctl"), &["is-active", "velstra.service"])?;
-            let path = std::path::Path::new(DEFAULT_CONFIG);
+            let saved = saved_config_path();
+            let path = saved.as_path();
             if path.exists() {
                 print!("{}", Appliance::load(path)?.summary());
             }
@@ -968,6 +985,9 @@ fn show_op(args: &[String]) -> Result<()> {
 
         // NAT-PMP (roadmap C18): what a host on the inside has opened.
         ["port-mapping"] | ["port-mapping", "status"] => show_portmap(),
+
+        // Who may manage this appliance, and with what permission.
+        ["users"] | ["system", "users"] => show_users(),
 
         // Captive portal (roadmap C20): who is on, and what holds the rest.
         ["portal"] | ["portal", "status"] => show_portal(),
@@ -1008,32 +1028,44 @@ fn show_op(args: &[String]) -> Result<()> {
         // a second appliance, or into a diff. The rule that produces it is
         // round-trip tested in `session`.
         ["configuration", "commands"] => {
-            let path = std::path::Path::new(DEFAULT_CONFIG);
+            let saved = saved_config_path();
+            let path = saved.as_path();
             if path.exists() {
                 let rendered = session::render_appliance(&Appliance::load(path)?);
                 for line in session::flatten_config(&rendered) {
                     println!("{line}");
                 }
             } else {
-                println!("no saved config at {DEFAULT_CONFIG} (run `configure` + `save`)");
+                println!(
+                    "no saved config at {} (run `configure` + `save`)",
+                    path.display()
+                );
             }
             Ok(())
         }
         ["configuration", ..] => {
-            let path = std::path::Path::new(DEFAULT_CONFIG);
+            let saved = saved_config_path();
+            let path = saved.as_path();
             if path.exists() {
                 print!("{}", session::render_appliance(&Appliance::load(path)?));
             } else {
-                println!("no saved config at {DEFAULT_CONFIG} (run `configure` + `save`)");
+                println!(
+                    "no saved config at {} (run `configure` + `save`)",
+                    path.display()
+                );
             }
             Ok(())
         }
         ["config"] => {
-            let path = std::path::Path::new(DEFAULT_CONFIG);
+            let saved = saved_config_path();
+            let path = saved.as_path();
             if path.exists() {
                 print!("{}", Appliance::load(path)?.summary());
             } else {
-                println!("no saved config at {DEFAULT_CONFIG} (run `configure` + `save`)");
+                println!(
+                    "no saved config at {} (run `configure` + `save`)",
+                    path.display()
+                );
             }
             Ok(())
         }
@@ -1194,6 +1226,45 @@ fn show_agent_query(command: &str, what: &str) -> Result<()> {
     }
 }
 
+/// `show users`: the accounts, their management group and what it allows.
+///
+/// Read from the **saved** configuration rather than from the token directory:
+/// the configuration is the authority on who may do what, and a token file is
+/// only the secret. Listing the files instead would show an account as having
+/// access after its group was taken away.
+fn show_users() -> Result<()> {
+    let appliance = Appliance::load(&saved_config_path())?;
+    if appliance.system.logins.is_empty() {
+        println!("no accounts configured");
+        return Ok(());
+    }
+    println!(
+        "{:<16} {:<14} {:<12} login",
+        "account", "group", "permission"
+    );
+    for login in &appliance.system.logins {
+        let permission = login
+            .group
+            .as_deref()
+            .and_then(|g| appliance.system.groups.iter().find(|x| x.name == g))
+            .map(|g| g.permission.as_str())
+            .unwrap_or("—");
+        let how = match (&login.hashed_password, login.ssh_keys.is_empty()) {
+            (Some(_), false) => "password + key",
+            (Some(_), true) => "password",
+            (None, false) => "key only",
+            (None, true) => "no credentials",
+        };
+        println!(
+            "{:<16} {:<14} {:<12} {how}",
+            login.username,
+            login.group.as_deref().unwrap_or("—"),
+            permission,
+        );
+    }
+    Ok(())
+}
+
 /// `show port-mapping`: what is configured, and what hosts have opened.
 ///
 /// The mappings come from the **agent**, which owns the table and the deadlines
@@ -1330,7 +1401,7 @@ fn show_firewall_stats() -> Result<()> {
 
 /// `show system commit`: the archived config revisions, newest first.
 fn show_revisions() -> Result<()> {
-    let revs = archive::list_revisions(std::path::Path::new(DEFAULT_CONFIG));
+    let revs = archive::list_revisions(&saved_config_path());
     if revs.is_empty() {
         println!("no archived revisions yet (a revision is saved on each `save`)");
         return Ok(());
@@ -1348,7 +1419,7 @@ fn show_revision(n: &str) -> Result<()> {
     let n: usize = n
         .parse()
         .map_err(|_| anyhow::anyhow!("revision must be a number (see `show system commit`)"))?;
-    let toml = archive::read_revision(std::path::Path::new(DEFAULT_CONFIG), n)?;
+    let toml = archive::read_revision(&saved_config_path(), n)?;
     let appliance = Appliance::from_toml(&toml)?;
     print!("{}", session::render_appliance(&appliance));
     Ok(())
@@ -1356,9 +1427,13 @@ fn show_revision(n: &str) -> Result<()> {
 
 /// The NAT section of the saved config, summarized.
 fn show_nat() -> Result<()> {
-    let path = std::path::Path::new(DEFAULT_CONFIG);
+    let saved = saved_config_path();
+    let path = saved.as_path();
     if !path.exists() {
-        println!("no saved config at {DEFAULT_CONFIG} (run `configure` + `save`)");
+        println!(
+            "no saved config at {} (run `configure` + `save`)",
+            path.display()
+        );
         return Ok(());
     }
     let a = Appliance::load(path)?;
@@ -1530,9 +1605,13 @@ const DEFAULT_IDS_ALERTS: usize = 20;
 /// here: the render skips it so the detector still starts with the rules that do
 /// exist, and this is where that gap stops being silent.
 fn show_broadcast_relay() -> Result<()> {
-    let path = std::path::Path::new(DEFAULT_CONFIG);
+    let saved = saved_config_path();
+    let path = saved.as_path();
     if !path.exists() {
-        println!("no saved config at {DEFAULT_CONFIG} (run `configure` + `save`)");
+        println!(
+            "no saved config at {} (run `configure` + `save`)",
+            path.display()
+        );
         return Ok(());
     }
     let relays = Appliance::load(path)?.services.broadcast_relay;
@@ -1567,9 +1646,13 @@ fn show_broadcast_relay() -> Result<()> {
 }
 
 fn show_ids() -> Result<()> {
-    let path = std::path::Path::new(DEFAULT_CONFIG);
+    let saved = saved_config_path();
+    let path = saved.as_path();
     if !path.exists() {
-        println!("no saved config at {DEFAULT_CONFIG} (run `configure` + `save`)");
+        println!(
+            "no saved config at {} (run `configure` + `save`)",
+            path.display()
+        );
         return Ok(());
     }
     let ids = Appliance::load(path)?.services.ids;
@@ -1621,9 +1704,13 @@ fn show_ids_alerts(limit: usize) -> Result<()> {
 }
 
 fn show_load_balancer() -> Result<()> {
-    let path = std::path::Path::new(DEFAULT_CONFIG);
+    let saved = saved_config_path();
+    let path = saved.as_path();
     if !path.exists() {
-        println!("no saved config at {DEFAULT_CONFIG} (run `configure` + `save`)");
+        println!(
+            "no saved config at {} (run `configure` + `save`)",
+            path.display()
+        );
         return Ok(());
     }
     let a = Appliance::load(path)?;
@@ -1650,9 +1737,13 @@ fn show_load_balancer() -> Result<()> {
 /// The PKI section of the saved config (roadmap C19): local CAs + issued certs,
 /// each annotated with its on-disk status/expiry, plus the ACME account.
 fn show_pki() -> Result<()> {
-    let path = std::path::Path::new(DEFAULT_CONFIG);
+    let saved = saved_config_path();
+    let path = saved.as_path();
     if !path.exists() {
-        println!("no saved config at {DEFAULT_CONFIG} (run `configure` + `save`)");
+        println!(
+            "no saved config at {} (run `configure` + `save`)",
+            path.display()
+        );
         return Ok(());
     }
     let a = Appliance::load(path)?;

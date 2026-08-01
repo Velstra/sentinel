@@ -52,6 +52,12 @@
           pkgs.makeWrapper
         ];
         PROTOC = "${pkgs.protobuf}/bin/protoc";
+        # The password tests hash with the same `openssl passwd` the appliance
+        # uses, on purpose — a hash this box cannot recompute is a login nobody
+        # can fix. The build sandbox has no PATH to find it on, so it is named
+        # here as well as in the wrapper below; without it `nix build` fails in
+        # the check phase on a dependency the binary itself resolves fine.
+        SENTINEL_OPENSSL_BIN = "${pkgs.openssl.bin}/bin/openssl";
         # Pin every external tool sentinel shells out to (live hostname/addressing
         # apply, operational `show`) to an absolute store path, and put the setuid
         # `sudo` wrapper on PATH. Without this, a `commit` on a NixOS box can fail

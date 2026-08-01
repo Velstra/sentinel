@@ -15,14 +15,14 @@ use anyhow::{Context, Result, bail};
 use crate::config::{
     Acme, Action, AlertMail, Alerts, Appliance, Bfd, Bgp, BgpAggregate, BgpNeighbor, BgpRoa,
     BgpRtr, BroadcastRelay, Ca, Certificate, ConfigSync, ConntrackSync, Dhcp6Pool, DhcpRelay,
-    DhcpServer, DhcpStaticLease, Dns, Dyndns, Export, Filter, FilterRule, Firewall, Groups,
+    DhcpServer, DhcpStaticLease, Dns, Dyndns, Export, Filter, FilterRule, Firewall, Group, Groups,
     HealthCheck, Ids, IfaceType, Interface, IpsecConnection, Isis, Lldp, LoadBalancer, Login, Mdns,
     MultiWan, Multicast, MulticastInterface, Nat, Nat64, NatDestination, NatNpt66, NatSource, Ntp,
-    OpenConnectServer, OpenConnectUser, Ospf, Ospf3, OspfInterface, Pki, Policy, PortMapping,
-    PortSpec, Portal, Pppoe, PrefixEntry, PrefixList, Proto, Protocols, Qos, QosDiscipline,
-    ReverseProxy, Rip, RouterAdvert, Rule, Schedule, Services, Snmp, SourceValidation, Ssh,
-    StaticRoute, Syslog, SyslogLevel, SyslogProto, SyslogTarget, System, UpdateChannel, Vpn,
-    VrfDef, Vrrp, WanMode, WanUplink, WgPeer, WireguardTunnel, ZoneCfg,
+    OpenConnectServer, OpenConnectUser, Ospf, Ospf3, OspfInterface, Permission, Pki, Policy,
+    PortMapping, PortSpec, Portal, Pppoe, PrefixEntry, PrefixList, Proto, Protocols, Qos,
+    QosDiscipline, ReverseProxy, Rip, RouterAdvert, Rule, Schedule, Services, Snmp,
+    SourceValidation, Ssh, StaticRoute, Syslog, SyslogLevel, SyslogProto, SyslogTarget, System,
+    UpdateChannel, Vpn, VrfDef, Vrrp, WanMode, WanUplink, WgPeer, WireguardTunnel, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -1174,6 +1174,10 @@ struct Draft {
     ssh: Ssh,
     /// Local login accounts (`[[system.login]]`), in configuration order.
     logins: Vec<Login>,
+    /// Permission groups for management access, in configuration order. Named
+    /// apart from the firewall's address/port `groups`, which are a different
+    /// thing entirely.
+    admin_groups: Vec<Group>,
     /// HA config sync (`[system.config-sync]`). A plain owned struct.
     config_sync: ConfigSync,
     /// HA conntrack sync (`[system.conntrack-sync]`, C9). A plain owned struct.
@@ -1562,8 +1566,25 @@ impl Draft {
             username: name.to_string(),
             ssh_keys: Vec::new(),
             hashed_password: None,
+            group: None,
         });
         self.logins.last_mut().unwrap()
+    }
+
+    /// Mutable access to the permission group `name`, inserting it if new.
+    ///
+    /// A group appears the moment it is named, with the safer of the two
+    /// permissions: a group created by a typo that then let its members write
+    /// would be the worst possible default.
+    fn admin_group_mut(&mut self, name: &str) -> &mut Group {
+        if let Some(i) = self.admin_groups.iter().position(|g| g.name == name) {
+            return &mut self.admin_groups[i];
+        }
+        self.admin_groups.push(Group {
+            name: name.to_string(),
+            permission: Permission::ReadOnly,
+        });
+        self.admin_groups.last_mut().unwrap()
     }
 
     /// Mutable access to the VRF `name`, inserting it if new.
@@ -2156,6 +2177,7 @@ impl Draft {
             },
             ssh: a.services.ssh.clone(),
             logins: a.system.logins.clone(),
+            admin_groups: a.system.groups.clone(),
             config_sync: a.system.config_sync.clone(),
             conntrack_sync: a.system.conntrack_sync.clone(),
             mdns: MdnsDraft {
@@ -3416,6 +3438,25 @@ impl Session {
             ["system", "login", name, "hashed-password", v] => {
                 self.draft.login_mut(name).hashed_password = Some((*v).to_string());
             }
+            // The same setting, given the way a person can give it. The
+            // plaintext is hashed here and thrown away: what reaches the draft,
+            // the file, the archive and the config-sync peers is the hash and
+            // nothing else. Asking only for `hashed-password` meant an account
+            // could not be created from anywhere but a shell with mkpasswd on
+            // it — which is to say, not from the console at all.
+            ["system", "login", name, "password", rest @ ..] if !rest.is_empty() => {
+                let hashed = crate::passwd::hash(&rest.join(" "))?;
+                self.draft.login_mut(name).hashed_password = Some(hashed);
+            }
+            // Management access is a separate grant from shell access: an
+            // account without a group can log in to the box and still reach
+            // nothing through the API or the console.
+            ["system", "login", name, "group", v] => {
+                self.draft.login_mut(name).group = Some((*v).to_string());
+            }
+            ["system", "group", name, "permission", v] => {
+                self.draft.admin_group_mut(name).permission = parse_permission(v)?;
+            }
 
             // system config-sync: push the running config to peer firewalls on
             // every commit (HA). `peer` is a host or host:port; `secret` the shared
@@ -4480,13 +4521,19 @@ impl Session {
             }
 
             // pki (roadmap C19): local CAs, issued certs, the ACME account.
-            ["pki", "ca", name, "common-name", v] => {
-                crate::config::validate_subject_component(v)?;
-                self.draft.pki_ca_mut(name).common_name = Some((*v).to_string());
+            // The rest of the line, not one token: a subject component is
+            // prose, and "Acme Corp Internal CA" is what a CA is actually
+            // called. Matching a single word answered that with "unknown set
+            // path" — a refusal that reads as "this appliance cannot do it".
+            ["pki", "ca", name, "common-name", rest @ ..] if !rest.is_empty() => {
+                let v = rest.join(" ");
+                crate::config::validate_subject_component(&v)?;
+                self.draft.pki_ca_mut(name).common_name = Some(v);
             }
-            ["pki", "ca", name, "organization", v] => {
-                crate::config::validate_subject_component(v)?;
-                self.draft.pki_ca_mut(name).organization = Some((*v).to_string());
+            ["pki", "ca", name, "organization", rest @ ..] if !rest.is_empty() => {
+                let v = rest.join(" ");
+                crate::config::validate_subject_component(&v)?;
+                self.draft.pki_ca_mut(name).organization = Some(v);
             }
             ["pki", "ca", name, "key-type", v] => {
                 if !matches!(*v, "ec" | "rsa") {
@@ -4506,9 +4553,10 @@ impl Session {
             ["pki", "certificate", name, "ca", v] => {
                 self.draft.pki_cert_mut(name).ca = Some((*v).to_string());
             }
-            ["pki", "certificate", name, "common-name", v] => {
-                crate::config::validate_subject_component(v)?;
-                self.draft.pki_cert_mut(name).common_name = Some((*v).to_string());
+            ["pki", "certificate", name, "common-name", rest @ ..] if !rest.is_empty() => {
+                let v = rest.join(" ");
+                crate::config::validate_subject_component(&v)?;
+                self.draft.pki_cert_mut(name).common_name = Some(v);
             }
             ["pki", "certificate", name, "subject-alt-name", v] => {
                 crate::config::validate_san(v)?;
@@ -5095,6 +5143,11 @@ impl Session {
                     "log" => z.log = None,
                     "source-validation" => z.source_validation = None,
                     "geoip-block" => z.geoip_block.clear(),
+                    // Without this the list could be added to and never
+                    // emptied: `delete … block` was refused, so a console
+                    // replacing the list left the old entries in force and its
+                    // change stuck, unappliable, forever.
+                    "block" => z.blocklist.clear(),
                     other => bail!("zone has no field {other:?}"),
                 }
             }
@@ -5135,6 +5188,35 @@ impl Session {
                 if self.draft.groups.address.remove(*name).is_none() {
                     bail!("no address-group {name:?}");
                 }
+            }
+            // Emptying the membership without deleting the group. The setter
+            // appends, so replacing a group's contents means clearing it first
+            // — and until now there was no way to: an address an operator
+            // believed they had removed went on matching every rule that
+            // pointed at the group.
+            ["firewall", "group", "address-group", name, "address"] => {
+                self.draft
+                    .groups
+                    .address
+                    .get_mut(*name)
+                    .ok_or_else(|| anyhow::anyhow!("no address-group {name:?}"))?
+                    .clear();
+            }
+            ["firewall", "group", "domain-group", name, "domain"] => {
+                self.draft
+                    .groups
+                    .domain
+                    .get_mut(*name)
+                    .ok_or_else(|| anyhow::anyhow!("no domain-group {name:?}"))?
+                    .clear();
+            }
+            ["firewall", "group", "port-group", name, "port"] => {
+                self.draft
+                    .groups
+                    .port
+                    .get_mut(*name)
+                    .ok_or_else(|| anyhow::anyhow!("no port-group {name:?}"))?
+                    .clear();
             }
             ["firewall", "group", "domain-group", name] => {
                 if self.draft.groups.domain.remove(*name).is_none() {
@@ -5359,9 +5441,13 @@ impl Session {
                     match *field {
                         "ssh-key" => l.ssh_keys.clear(),
                         "hashed-password" => l.hashed_password = None,
+                        "group" => l.group = None,
                         other => bail!("system login has no field {other:?}"),
                     }
                 }
+            }
+            ["system", "group", name] => {
+                self.draft.admin_groups.retain(|g| g.name != *name);
             }
             ["system", "config-sync"] => self.draft.config_sync = ConfigSync::default(),
             ["system", "config-sync", field] => {
@@ -7022,6 +7108,7 @@ impl Session {
             system: System {
                 hostname,
                 logins: self.draft.logins.clone(),
+                groups: self.draft.admin_groups.clone(),
                 config_sync: self.draft.config_sync.clone(),
                 conntrack_sync: self.draft.conntrack_sync.clone(),
             },
@@ -7301,7 +7388,12 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
     let cs_set = !cs.peers.is_empty() || cs.secret.is_some();
     let cts = &draft.conntrack_sync;
     let cts_set = !cts.is_empty();
-    if want("system") && (draft.hostname.is_some() || !draft.logins.is_empty() || cs_set || cts_set)
+    if want("system")
+        && (draft.hostname.is_some()
+            || !draft.logins.is_empty()
+            || !draft.admin_groups.is_empty()
+            || cs_set
+            || cts_set)
     {
         out.push_str("system {\n");
         if let Some(h) = &draft.hostname {
@@ -7315,6 +7407,24 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             if let Some(h) = &l.hashed_password {
                 out.push_str(&format!("        hashed-password {h}\n"));
             }
+            // The account's management grant. Leaving it out meant `show
+            // configuration` described an account that could manage the box as
+            // one that could not — and a config copied to a second appliance
+            // silently lost every permission it had been given.
+            if let Some(g) = &l.group {
+                out.push_str(&format!("        group {g}\n"));
+            }
+            out.push_str("    }\n");
+        }
+        for g in &draft.admin_groups {
+            out.push_str(&format!("    group {} {{\n", g.name));
+            out.push_str(&format!(
+                "        permission {}\n",
+                match g.permission {
+                    crate::config::Permission::ReadOnly => "read-only",
+                    crate::config::Permission::ReadWrite => "read-write",
+                }
+            ));
             out.push_str("    }\n");
         }
         if cs_set {
@@ -7812,6 +7922,16 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         if let Some(z) = &s.zone {
             nati.push_str(&format!("        zone {z}\n"));
         }
+        // Deterministic CGNAT is the difference between "this rule masquerades"
+        // and "this rule hands each inside address its own block of ports".
+        // Leaving it out of the document meant every reader of the document —
+        // the console, a copied config, a diff — saw a plain masquerade.
+        if let Some(n) = s.cgnat_block_size {
+            nati.push_str(&format!("        cgnat-block-size {n}\n"));
+        }
+        if let Some(n) = s.cgnat_base_port {
+            nati.push_str(&format!("        cgnat-base-port {n}\n"));
+        }
         nati.push_str("    }\n");
     }
     for (name, d) in &draft.nat_destination {
@@ -7989,6 +8109,15 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         if i.bfd {
             proto.push_str("        bfd true\n");
+        }
+        if let Some(t) = &i.auth_type {
+            proto.push_str(&format!("        auth-type {t}\n"));
+        }
+        if let Some(k) = &i.auth_key {
+            proto.push_str(&format!("        auth-key {k}\n"));
+        }
+        if let Some(id) = i.auth_key_id {
+            proto.push_str(&format!("        auth-key-id {id}\n"));
         }
         if let Some(vrf) = &i.vrf {
             proto.push_str(&format!("        vrf {vrf}\n"));
@@ -8519,6 +8648,55 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             }
             if r.disabled == Some(true) {
                 out.push_str("        disabled true\n");
+            }
+            out.push_str("    }\n");
+        }
+        // portal { … } and port-mapping { … }. Both were settable and neither
+        // was written here, so every reader of this document — the console, a
+        // copied config, a diff — saw an appliance with no portal on it.
+        let portal = &draft.portal;
+        if portal.zone.is_some()
+            || portal.port.is_some()
+            || portal.passphrase.is_some()
+            || portal.session_timeout.is_some()
+            || portal.message.is_some()
+        {
+            out.push_str("    portal {\n");
+            if let Some(z) = &portal.zone {
+                out.push_str(&format!("        zone {z}\n"));
+            }
+            if let Some(p) = portal.port {
+                out.push_str(&format!("        port {p}\n"));
+            }
+            if let Some(p) = &portal.passphrase {
+                out.push_str(&format!("        passphrase {p}\n"));
+            }
+            if let Some(t) = portal.session_timeout {
+                out.push_str(&format!("        session-timeout {t}\n"));
+            }
+            if let Some(m) = &portal.message {
+                out.push_str(&format!("        message {m}\n"));
+            }
+            out.push_str("    }\n");
+        }
+        let pm = &draft.port_mapping;
+        if pm.zone.is_some()
+            || pm.wan_zone.is_some()
+            || pm.max_lifetime.is_some()
+            || pm.allow_privileged.is_some()
+        {
+            out.push_str("    port-mapping {\n");
+            if let Some(z) = &pm.zone {
+                out.push_str(&format!("        zone {z}\n"));
+            }
+            if let Some(z) = &pm.wan_zone {
+                out.push_str(&format!("        wan-zone {z}\n"));
+            }
+            if let Some(v) = pm.max_lifetime {
+                out.push_str(&format!("        max-lifetime {v}\n"));
+            }
+            if let Some(v) = pm.allow_privileged {
+                out.push_str(&format!("        allow-privileged {v}\n"));
             }
             out.push_str("    }\n");
         }
@@ -9194,6 +9372,18 @@ fn parse_u32(s: &str, field: &str) -> Result<u32> {
         .map_err(|_| anyhow::anyhow!("invalid {field} {s:?} (expected a whole number)"))
 }
 
+/// Parse a management permission. Only the two levels exist, and an unknown
+/// word is refused rather than falling back to the safer one: silently granting
+/// less than the operator wrote is how a group ends up unable to do its job for
+/// reasons nobody can see in the configuration.
+fn parse_permission(s: &str) -> Result<Permission> {
+    match s {
+        "read-only" => Ok(Permission::ReadOnly),
+        "read-write" => Ok(Permission::ReadWrite),
+        other => bail!("{other:?} is not a permission (read-only | read-write)"),
+    }
+}
+
 fn parse_bool(s: &str) -> Result<bool> {
     Ok(match s {
         "true" | "on" | "yes" => true,
@@ -9344,6 +9534,17 @@ mod tests {
         let toml = r#"
 [system]
 hostname = "edge"
+# Who may manage the box, and with what permission. Here because the renderer
+# once dropped both — the console then showed an administrator as having no
+# management access, and a config copied to a second appliance lost every
+# permission it had been given, silently.
+[[system.group]]
+name = "operators"
+permission = "read-write"
+[[system.login]]
+username = "vera"
+hashed-password = "$6$Xf3Kd8Qz$abcdefghijklmnopqrstuvwxyz0123456789"
+group = "operators"
 [[interface]]
 name = "eth0"
 zone = "wan"
@@ -9382,6 +9583,15 @@ to = "10.0.0.10:443"
                 .any(|c| c.contains("description published web service")),
             "a multi-word value was split: {commands:#?}"
         );
+        for expected in [
+            "set system login vera group operators",
+            "set system group operators permission read-write",
+        ] {
+            assert!(
+                commands.iter().any(|c| c == expected),
+                "{expected:?} is not in the flattened config: {commands:#?}"
+            );
+        }
 
         // Replay into an empty session, exactly as the console would.
         let dir = std::env::temp_dir().join(format!("sentinel-flatten-{}", std::process::id()));

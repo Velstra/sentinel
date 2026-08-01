@@ -3272,6 +3272,14 @@ pub struct System {
     /// login password (console + sudo). Empty ⇒ only the image's built-in `admin`.
     #[serde(default, rename = "login", skip_serializing_if = "Vec::is_empty")]
     pub logins: Vec<Login>,
+    /// Permission groups for management access (`[[system.group]]`).
+    ///
+    /// A group is where a permission is written down once and a set of people
+    /// point at it, rather than each account carrying its own answer — which is
+    /// how an appliance ends up with one account nobody dares touch because
+    /// nobody remembers what it may do.
+    #[serde(default, rename = "group", skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<Group>,
     /// HA config sync (`[system.config-sync]`, roadmap C21): push the running config
     /// to peer firewalls on every commit. Empty ⇒ off.
     #[serde(
@@ -3419,6 +3427,54 @@ pub struct Login {
         skip_serializing_if = "Option::is_none"
     )]
     pub hashed_password: Option<String>,
+    /// The permission group this account belongs to, for **management access**
+    /// (the API and the console). Unset ⇒ the account can log in to the box but
+    /// has no management access at all: shell access and API access are separate
+    /// grants, and conflating them would hand every console operator a shell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+/// A permission group (`[[system.group]]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Group {
+    /// The group name accounts point at.
+    pub name: String,
+    /// What members may do through the management API and the console.
+    pub permission: Permission,
+}
+
+/// What a group's members may do through the management interfaces.
+///
+/// Two levels, and deliberately only two. Every finer split invites the question
+/// "may this person change *that* setting", which on a firewall is a question
+/// about the ruleset rather than about the person — and a permission model that
+/// cannot answer it honestly is worse than one that does not pretend to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Permission {
+    /// May read everything: the configuration, the status, every `show`.
+    /// May change nothing, run no capture, clear no state.
+    ReadOnly,
+    /// May do anything the CLI can: change the configuration, apply it, clear
+    /// run-time state, take a capture.
+    ReadWrite,
+}
+
+impl Permission {
+    /// Whether this permission allows a request that changes something.
+    pub fn may_write(self) -> bool {
+        matches!(self, Permission::ReadWrite)
+    }
+
+    /// The name it is written as, for messages and for `show`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Permission::ReadOnly => "read-only",
+            Permission::ReadWrite => "read-write",
+        }
+    }
 }
 
 /// Source-address validation (uRPF, RFC 3704) for a zone's interfaces.
@@ -6769,6 +6825,30 @@ impl Appliance {
         // rather than discovered at run time, because the failure is silent in the
         // worst way: Suricata that will not start, or starts with no rules, leaves
         // an operator believing the box is watched when nothing is.
+        // Management groups. Refused rather than warned about: an account
+        // pointing at a group that does not exist would be an account with no
+        // management access, which reads from the configuration as though it had
+        // some.
+        let mut seen_group = HashSet::new();
+        for g in &self.system.groups {
+            validate_hostname(&g.name).with_context(|| format!("system group {:?}", g.name))?;
+            if !seen_group.insert(g.name.as_str()) {
+                bail!("duplicate system group {:?}", g.name);
+            }
+        }
+        for login in &self.system.logins {
+            if let Some(group) = &login.group {
+                if !self.system.groups.iter().any(|g| &g.name == group) {
+                    bail!(
+                        "system login {:?}: group {group:?} is not declared — \
+                         add `set system group {group} permission read-only` or \
+                         read-write",
+                        login.username
+                    );
+                }
+            }
+        }
+
         // C20 captive portal. Everything here is refused rather than warned
         // about, because each failure looks the same from the outside — a guest
         // zone with no way onto the network — and none of them is visible until
