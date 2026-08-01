@@ -1461,14 +1461,31 @@ const SSH_FIELDS: &[Cand] = &[
     ),
 ];
 // `system login <name> <Tab>` reveals a local account's fields (VyOS-style).
+// `system group <name> <Tab>`: what its members may do.
+const GROUP_FIELDS: &[Cand] = &[(
+    "permission",
+    "what members may do through the API and console",
+)];
+const PERMISSIONS: &[Cand] = &[
+    ("read-only", "may read everything and change nothing"),
+    ("read-write", "may do anything the CLI can"),
+];
 const LOGIN_FIELDS: &[Cand] = &[
     (
         "ssh-key",
         "an OpenSSH public key allowed to log in as this user (repeatable)",
     ),
     (
+        "password",
+        "set the password; the appliance hashes it and keeps only the hash",
+    ),
+    (
         "hashed-password",
         "a crypt(3) password hash for console+sudo ($6$… from mkpasswd)",
+    ),
+    (
+        "group",
+        "the permission group this account has management access through",
     ),
 ];
 // `services mdns <Tab>` reveals the reflector fields.
@@ -1969,7 +1986,11 @@ const SYSTEM_FIELDS: &[Cand] = &[
     ("hostname", "the appliance hostname"),
     (
         "login",
-        "a local login account (by username): ssh-key / hashed-password",
+        "a local login account (by username): ssh-key / hashed-password / group",
+    ),
+    (
+        "group",
+        "a management permission group (by name): read-only or read-write",
     ),
     (
         "config-sync",
@@ -2551,6 +2572,8 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
             "enable" | "password-authentication",
         ] => BOOLS,
         ["set" | "delete", "system", "login", _name] => LOGIN_FIELDS,
+        ["set" | "delete", "system", "group", _name] => GROUP_FIELDS,
+        ["set", "system", "group", _name, "permission"] => PERMISSIONS,
         ["set" | "delete", "system", "config-sync"] => CONFIGSYNC_FIELDS,
         ["set" | "delete", "system", "conntrack-sync"] => CONNTRACKSYNC_FIELDS,
         ["set" | "delete", "services", "mdns"] => MDNS_FIELDS,
@@ -3670,7 +3693,13 @@ mod tests {
         );
         assert_eq!(
             kw(&["set", "system"]),
-            ["hostname", "login", "config-sync", "conntrack-sync"]
+            [
+                "hostname",
+                "login",
+                "group",
+                "config-sync",
+                "conntrack-sync"
+            ]
         );
         assert_eq!(kw(&["set", "system", "config-sync"]), ["peer", "secret"]);
         assert_eq!(
@@ -3989,7 +4018,7 @@ mod tests {
         assert_eq!(kw(&["set", "services", "ssh", "enable"]), ["true", "false"]);
         assert_eq!(
             kw(&["set", "system", "login", "ops"]),
-            ["ssh-key", "hashed-password"]
+            ["ssh-key", "password", "hashed-password", "group"]
         );
         assert_eq!(kw(&["set", "services", "lldp"]), ["enable", "interface"]);
         assert_eq!(
