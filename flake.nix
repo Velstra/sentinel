@@ -1142,6 +1142,19 @@
             nativeBuildInputs = [ sentinel pkgs.nodejs pkgs.chromium pkgs.curl pkgs.bash ];
             # Chromium wants a writable home and a place for its singleton lock.
             HOME = "/build";
+            # …and it wants a font. A build sandbox has none, and Chromium does
+            # not degrade when fontconfig can supply nothing at all — it aborts
+            # the renderer outright:
+            #
+            #   FATAL … SkFontMgr_FontConfigInterface.cpp:163] Not implemented.
+            #
+            # which arrives as a page that stops answering, on whichever screen
+            # happens to need text shaping first. One family is enough; the
+            # console names its own faces and falls back to the system stack, so
+            # what this pins is the *existence* of a fallback, not a look.
+            FONTCONFIG_FILE = pkgs.makeFontsConf {
+              fontDirectories = [ pkgs.dejavu_fonts ];
+            };
           }
           ''
             set -eu
@@ -1149,7 +1162,11 @@
             export CONSOLE_PORT=18099
             # A build sandbox is slower than a workstation, and every `show` the
             # console asks for costs the appliance a process spawn.
-            export CONSOLE_CALL_TIMEOUT=600000
+            export CONSOLE_CALL_TIMEOUT=300000
+            # Say where the walk is. A sandbox is slow enough that a check which
+            # prints nothing for twenty minutes and then says "the page stopped
+            # answering" names nothing at all.
+            export CONSOLE_PROGRESS=1
             cp -r ${./tests/console} tests-console
             chmod -R u+w tests-console
             bash tests-console/run.sh ${sentinel}/bin/sentinel | tee output
