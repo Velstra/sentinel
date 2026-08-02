@@ -4,6 +4,8 @@
 
 ## [0.4.2] — 2026-08-02
 
+## [0.4.2] — 2026-08-02
+
 A test fix; the appliance is unchanged.
 
 ### Fixed
