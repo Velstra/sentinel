@@ -69,6 +69,7 @@
             --set SENTINEL_HOSTNAME_BIN   ${pkgs.nettools}/bin/hostname \
             --set SENTINEL_IP_BIN         ${pkgs.iproute2}/bin/ip \
             --set SENTINEL_TC_BIN         ${pkgs.iproute2}/bin/tc \
+            --set SENTINEL_ETHTOOL_BIN    ${pkgs.ethtool}/bin/ethtool \
             --set SENTINEL_NETWORKCTL_BIN ${pkgs.systemd}/bin/networkctl \
             --set SENTINEL_SYSTEMCTL_BIN  ${pkgs.systemd}/bin/systemctl \
             --set SENTINEL_NFT_BIN        ${pkgs.nftables}/bin/nft \
@@ -205,7 +206,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-fiPke7Jg5C4WqbngyiP6GyfjpMFHHsYwj0zvQwdh3jk=";
+      ebpfHash = "sha256-WpCp1wdfX1FYaj66ELh/r+A0Y5+CFxkzMgFOxaClJJs=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -6185,6 +6186,121 @@
             # The 9997 rule's source (10.9.9.9/32) never matches the client, so the
             # LPM lookup misses it: no rule fires, nothing is logged for 9997.
             fw.fail("journalctl -u velstra.service | grep -q 'dport=9997'")
+          '';
+        };
+
+        # An IPv6 rule that names an ADDRESS must actually match on it.
+        #
+        # Until the v6 tries existed, the datapath looked the rule tries up with
+        # the address as `0` on the IPv6 path — so a rule scoped to a v6 prefix
+        # matched nothing, while `show configuration` printed it back exactly as
+        # written. A rule that reads as enforced and is not is worse than a rule
+        # that was refused.
+        #
+        # Four ports, so a single log line proves one thing each: 9990 carries a
+        # source rule that DOES match the client, 9991 a source rule for a
+        # different address that must NOT match, 9992 a destination rule for the
+        # firewall's own address, 9993 a destination rule for an address nobody
+        # uses. Under `default-action accept` only a rule can drop, so a
+        # `DROP6 … dport=9990` line cannot exist unless the source trie matched,
+        # and the ABSENCE of 9991 is what proves it matched on the address rather
+        # than on everything.
+        #   nix build .#checks.x86_64-linux.v6rules -L
+        v6rules = pkgs.testers.runNixOSTest {
+          name = "sentinel-v6rules";
+          nodes = {
+            client =
+              { lib, ... }:
+              {
+                networking.firewall.enable = lib.mkForce false;
+                networking.interfaces.eth1.ipv6.addresses = [
+                  {
+                    address = "fd00:1::2";
+                    prefixLength = 64;
+                  }
+                ];
+                virtualisation.vlans = [ 1 ];
+                environment.systemPackages = [ pkgs.netcat-openbsd ];
+              };
+            fw =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "fw";
+                networking.firewall.enable = lib.mkForce false;
+                networking.interfaces.eth1.ipv6.addresses = [
+                  {
+                    address = "fd00:1::1";
+                    prefixLength = 64;
+                  }
+                ];
+                virtualisation.vlans = [ 1 ];
+                virtualisation.memorySize = 2048;
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+          };
+          testScript = ''
+            start_all()
+            for m in (client, fw):
+                m.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+            client.wait_until_succeeds("ip -6 addr show eth1 | grep -q 'fd00:1::2'", timeout=20)
+            fw.wait_until_succeeds("ip -6 addr show eth1 | grep -q 'fd00:1::1'", timeout=20)
+
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set firewall global default-action accept' "
+                "'set interface eth1 zone wan' "
+                "'set firewall zone wan default-action accept' "
+                "'set firewall rule src-match from wan' "
+                "'set firewall rule src-match action drop' "
+                "'set firewall rule src-match proto tcp' "
+                "'set firewall rule src-match port 9990' "
+                "'set firewall rule src-match source fd00:1::2/128' "
+                "'set firewall rule src-match log true' "
+                "'set firewall rule src-other from wan' "
+                "'set firewall rule src-other action drop' "
+                "'set firewall rule src-other proto tcp' "
+                "'set firewall rule src-other port 9991' "
+                "'set firewall rule src-other source fd00:1::99/128' "
+                "'set firewall rule src-other log true' "
+                "'set firewall rule dst-match from wan' "
+                "'set firewall rule dst-match action drop' "
+                "'set firewall rule dst-match proto tcp' "
+                "'set firewall rule dst-match port 9992' "
+                "'set firewall rule dst-match destination fd00:1::1/128' "
+                "'set firewall rule dst-match log true' "
+                "'set firewall rule dst-other from wan' "
+                "'set firewall rule dst-other action drop' "
+                "'set firewall rule dst-other proto tcp' "
+                "'set firewall rule dst-other port 9993' "
+                "'set firewall rule dst-other destination fd00:1::9/128' "
+                "'set firewall rule dst-other log true' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            fw.wait_for_unit("velstra.service")
+
+            def knock(port):
+                # A connect attempt is enough: the rule drops the SYN, and what
+                # we assert on is the datapath's own log line, not the client's
+                # error — which is identical whether the packet was dropped or
+                # merely refused.
+                client.execute(f"timeout 2 nc -6 -w 1 -z fd00:1::1 {port}")
+
+            def dropped(port):
+                return fw.execute(
+                    f"journalctl -u velstra.service | grep -qE 'DROP6 .*dport={port}'"
+                )[0] == 0
+
+            for p in (9990, 9991, 9992, 9993):
+                knock(p)
+
+            assert dropped(9990), "a v6 rule scoped to the client's source did not match"
+            assert dropped(9992), "a v6 rule scoped to the firewall's address did not match"
+            # The two that prove it matched on the ADDRESS and not on everything.
+            assert not dropped(9991), "a v6 rule for a different source matched anyway"
+            assert not dropped(9993), "a v6 rule for a different destination matched anyway"
           '';
         };
 

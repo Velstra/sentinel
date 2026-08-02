@@ -143,6 +143,14 @@ pub fn nft_load(path: &Path) -> Result<()> {
 /// <spec…>` (roadmap C8 traffic shaping). `replace` is idempotent — it installs
 /// the qdisc if absent or swaps it in place without dropping the link, so a
 /// re-apply of the same spec never blips a live queue.
+/// Turn one offload feature on or off (`ethtool -K <dev> <feature> on|off`).
+pub fn ethtool_offload(dev: &str, feature: &str, on: bool) -> Result<()> {
+    run_priv(
+        "ethtool",
+        &["-K", dev, feature, if on { "on" } else { "off" }],
+    )
+}
+
 /// Set one kernel parameter now (`sysctl -w name=value`).
 ///
 /// The `/proc/sys` write directly rather than through the `sysctl` binary: one
@@ -677,6 +685,7 @@ pub fn bin(name: &str) -> String {
         "tc" => "SENTINEL_TC_BIN",
         "swanctl" => "SENTINEL_SWANCTL_BIN",
         "openssl" => "SENTINEL_OPENSSL_BIN",
+        "ethtool" => "SENTINEL_ETHTOOL_BIN",
         "lego" => "SENTINEL_LEGO_BIN",
         "lsblk" => "SENTINEL_LSBLK_BIN",
         "tcpdump" => "SENTINEL_TCPDUMP_BIN",

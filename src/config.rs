@@ -1455,6 +1455,30 @@ pub struct Dns {
         skip_serializing_if = "Option::is_none"
     )]
     pub local_domain: Option<String>,
+    /// How long a *negative* answer is cached, in seconds (dnsmasq `neg-ttl`).
+    ///
+    /// Worth its own knob because the default is to cache the upstream's SOA
+    /// minimum, which on a badly configured zone can be hours — and a name that
+    /// has just been created then stays "does not exist" for the rest of the
+    /// afternoon. Unset ⇒ dnsmasq's own behaviour.
+    #[serde(
+        default,
+        rename = "negative-ttl",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub negative_ttl: Option<u32>,
+    /// Local TXT records (`name` → text), served authoritatively.
+    ///
+    /// The use that keeps coming up is not documentation: a cluster resolving a
+    /// bare suffix — `something.svc` — gets SERVFAIL from the root and treats it
+    /// as an outage, so the site serves an empty zone for that suffix to turn
+    /// the failure into an honest "no such record".
+    #[serde(
+        default,
+        rename = "txt-record",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub txt_record: BTreeMap<String, String>,
 }
 
 impl Dns {
@@ -1467,6 +1491,8 @@ impl Dns {
             && self.dnssec.is_none()
             && self.cache_size.is_none()
             && self.local_domain.is_none()
+            && self.negative_ttl.is_none()
+            && self.txt_record.is_empty()
     }
 }
 
@@ -3722,6 +3748,19 @@ pub struct ZoneCfg {
     /// A free-text label for this zone, shown in `show`. Purely documentary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// This zone *is* the appliance: traffic that terminates on the box rather
+    /// than passing through it.
+    ///
+    /// Every other zone is a set of links. This one is a set of addresses — the
+    /// ones this box holds — so `to <local zone>` compiles to a destination
+    /// match on them. Without it, "what may reach the firewall itself" has no
+    /// expression: it is not a link, so it could not be named, and the rules
+    /// that govern management access had to be written as zone-wide posture.
+    ///
+    /// A local zone carries no interface, and validation says so rather than
+    /// asking for one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local: bool,
     /// Stateful inspection for this zone (inherits `[firewall] stateful`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stateful: Option<bool>,
@@ -3929,6 +3968,22 @@ pub struct Interface {
     /// hardware address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac: Option<String>,
+    /// Pin this interface's *name* to a NIC by its MAC (`hw-id`).
+    ///
+    /// Names are assigned in whatever order the kernel probes the devices, so
+    /// `eth2` need not be the same card after a reboot, a firmware update or a
+    /// card being swapped. On a firewall that is not cosmetic: a zone follows a
+    /// name, so a name that moves takes the policy with it.
+    #[serde(default, rename = "hw-id", skip_serializing_if = "Option::is_none")]
+    pub hw_id: Option<String>,
+    /// Per-NIC offload features (`[interface.offload] gro = true`).
+    ///
+    /// Both directions are real: turning offload on is throughput, turning it
+    /// off is the first thing anyone tries when a NIC reorders or corrupts under
+    /// load. Applied with `ethtool -K`, which is where the whole set lives —
+    /// `systemd.link` covers only some of these switches.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub offload: BTreeMap<String, bool>,
     /// For a **kernel tunnel** (`type = "gre"|"ipip"|"gretap"`, roadmap C3): the
     /// local endpoint address — the underlay source the tunnel packets leave from
     /// (an address configured on this box). Required on a tunnel; `None` on any
@@ -4481,6 +4536,56 @@ impl PortSpec {
     }
 }
 
+/// Serde for a rule's port list, so every shape an operator has already written
+/// keeps working: `port = 443` (integer), `port = "8000-8100"` (string),
+/// `port = "139,445"` (a list), `port = [80, 443]` (an array).
+///
+/// It serialises back the way it came in as far as that is possible — one plain
+/// port stays an integer — because a config that rewrites itself on every save
+/// makes every diff a lie about what changed.
+mod port_list {
+    use super::PortSpec;
+    use serde::Deserialize;
+    use serde::de::{Deserializer, Error as _};
+    use serde::ser::{SerializeSeq, Serializer};
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Wire {
+        One(u16),
+        Text(String),
+        Many(Vec<PortSpec>),
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<PortSpec>, D::Error> {
+        Ok(match Wire::deserialize(d)? {
+            Wire::One(p) => vec![PortSpec::Single(p)],
+            Wire::Text(t) => {
+                let mut out = Vec::new();
+                for one in t.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    out.push(PortSpec::parse(one).map_err(D::Error::custom)?);
+                }
+                out
+            }
+            Wire::Many(v) => v,
+        })
+    }
+
+    pub fn serialize<S: Serializer>(v: &[PortSpec], s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            [PortSpec::Single(p)] => s.serialize_u16(*p),
+            [one] => s.serialize_str(&one.to_string()),
+            many => {
+                let mut seq = s.serialize_seq(Some(many.len()))?;
+                for one in many {
+                    seq.serialize_element(one)?;
+                }
+                seq.end()
+            }
+        }
+    }
+}
+
 impl std::fmt::Display for PortSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -4550,9 +4655,17 @@ pub struct Rule {
     /// without, it is a **broad** rule that sets the from-zone's posture.
     #[serde(default)]
     pub proto: Option<Proto>,
-    /// A single port (`port = 443`) or an inclusive range (`port = "8000-8100"`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub port: Option<PortSpec>,
+    /// The destination ports this rule matches: a single port (`port = 443`), an
+    /// inclusive range (`port = "8000-8100"`), or several of either
+    /// (`port = "139,445"`).
+    ///
+    /// A list is not sugar. Services that are one service to an operator are
+    /// several ports to a firewall — SMB is 139 and 445, IPMI is a handful —
+    /// and writing them as separate rules means separate rules to keep in step
+    /// afterwards. A named `port-group` is the right answer once the same set
+    /// appears twice; this is the answer the first time.
+    #[serde(default, with = "port_list", skip_serializing_if = "Vec::is_empty")]
+    pub port: Vec<PortSpec>,
     /// Log packets matching this (port) rule, independent of the zone's `log`.
     /// Off by default; only meaningful on a port rule.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -4713,7 +4826,7 @@ impl Schedule {
 impl Rule {
     /// A broad zone rule (no proto/port) — sets the from-zone's default posture.
     pub fn is_broad(&self) -> bool {
-        self.proto.is_none() && self.port.is_none() && self.port_group.is_none()
+        self.proto.is_none() && self.port.is_empty() && self.port_group.is_none()
     }
     /// A rule the data plane carries as a `(protocol, port)` entry: a literal
     /// port or a port group on TCP/UDP, or any of the port-less protocols, which
@@ -4721,7 +4834,7 @@ impl Rule {
     pub fn is_port_rule(&self) -> bool {
         match self.proto {
             None => false,
-            Some(p) if p.has_ports() => self.port.is_some() || self.port_group.is_some(),
+            Some(p) if p.has_ports() => !self.port.is_empty() || self.port_group.is_some(),
             Some(_) => true,
         }
     }
@@ -4768,8 +4881,8 @@ impl Rule {
                 .get(g)
                 .map(|specs| specs.iter().flat_map(|p| p.ports()).collect())
                 .unwrap_or_default()
-        } else if let Some(p) = &self.port {
-            p.ports().collect()
+        } else if !self.port.is_empty() {
+            self.port.iter().flat_map(|p| p.ports()).collect()
         } else if self.proto.is_some_and(|p| !p.has_ports()) {
             // One entry at port 0: the data plane reads 0 off a packet that has
             // no ports, so this is the key that matches every packet of this
@@ -5519,15 +5632,13 @@ impl Appliance {
             }
         }
 
-        // Firewall groups (aliases): address members must be IPv4 hosts or CIDRs
-        // (the data plane matches sources by longest prefix, so a hostname can't
-        // apply); port members must be valid ports/ranges.
+        // Firewall groups (aliases): address members are hosts or CIDRs in either
+        // family — the data plane has a longest-prefix trie for each — so a
+        // hostname is what cannot apply, not IPv6.
         for (name, members) in &self.firewall.group.address {
             for m in members {
-                if validate_ipv4(m).is_err() && validate_address(m).is_err() {
-                    bail!(
-                        "firewall group address-group {name:?}: {m:?} is not an IPv4 host or CIDR"
-                    );
+                if validate_cidr_or_ip(m).is_err() {
+                    bail!("firewall group address-group {name:?}: {m:?} is not a host or CIDR");
                 }
             }
         }
@@ -5565,6 +5676,21 @@ impl Appliance {
             .iter()
             .filter_map(|i| i.zone.as_deref())
             .collect();
+        // What a NIC is pinned to, and which offload switches it names.
+        for i in &self.interfaces {
+            if let Some(mac) = &i.hw_id {
+                validate_mac(mac).with_context(|| format!("interface {:?} hw-id", i.name))?;
+            }
+            for feature in i.offload.keys() {
+                if !OFFLOAD_FEATURES.contains(&feature.as_str()) {
+                    bail!(
+                        "interface {:?}: unknown offload feature {feature:?} (known: {})",
+                        i.name,
+                        OFFLOAD_FEATURES.join(", ")
+                    );
+                }
+            }
+        }
         // Kernel parameters: a narrow allow-list on purpose. A firewall that can
         // be made unbootable from its own configuration file is a firewall whose
         // rollback cannot save you.
@@ -5586,7 +5712,10 @@ impl Appliance {
                 zone_refs.push(("to", to));
             }
             for (which, zone) in zone_refs {
-                if !zones_in_use.contains(zone.as_str()) {
+                // A local zone is the appliance itself, so it has no interface
+                // to be in use on — naming one is the whole point.
+                let is_local = self.zones.get(zone.as_str()).is_some_and(|z| z.local);
+                if !is_local && !zones_in_use.contains(zone.as_str()) {
                     bail!(
                         "rule {:?}: {which} zone {zone:?} has no interface",
                         rule.name
@@ -5596,7 +5725,7 @@ impl Appliance {
             // A port match is an inline `port`/range OR a `port-group`, never
             // both; likewise a `source` OR a `source-group`. And a port rule
             // needs a proto paired with a port (either form).
-            if rule.port.is_some() && rule.port_group.is_some() {
+            if !rule.port.is_empty() && rule.port_group.is_some() {
                 bail!("rule {:?}: set `port` or `port-group`, not both", rule.name);
             }
             // A port on a protocol that has none is a rule that would match
@@ -5604,7 +5733,7 @@ impl Appliance {
             // *code*, not a port, and the data plane reads 0 there — so the port
             // would be quietly dropped and the rule would match all of it.
             if let Some(p) = rule.proto {
-                if !p.has_ports() && (rule.port.is_some() || rule.port_group.is_some()) {
+                if !p.has_ports() && (!rule.port.is_empty() || rule.port_group.is_some()) {
                     bail!(
                         "rule {:?}: {} carries no ports — drop the port to match the \
                          protocol, or name tcp/udp",
@@ -5685,7 +5814,7 @@ impl Appliance {
             // TCP/UDP rule without a port is not a port rule at all — it only
             // changes the zone's posture, which is rarely what was meant.
             // A port-less protocol is the exception: naming it *is* the match.
-            let has_port = rule.port.is_some() || rule.port_group.is_some();
+            let has_port = !rule.port.is_empty() || rule.port_group.is_some();
             let wants_port = rule.proto.is_some_and(|p| p.has_ports());
             if has_port && rule.proto.is_none() {
                 bail!(
@@ -5700,7 +5829,7 @@ impl Appliance {
                 );
             }
             // A literal port (or range) must be in range and not inverted/too wide.
-            if let Some(port) = rule.port {
+            for port in &rule.port {
                 port.validate()
                     .with_context(|| format!("rule {:?}", rule.name))?;
             }
@@ -7793,14 +7922,14 @@ impl Appliance {
                     !rule.disabled
                         && rule.from == zone
                         && rule.action == Action::Accept
-                        && match (rule.proto, rule.port) {
-                            (Some(Proto::Udp), Some(spec)) => {
+                        && match rule.proto {
+                            Some(Proto::Udp) => rule.port.iter().any(|spec| {
                                 let (lo, hi) = spec.bounds();
                                 (lo..=hi).contains(&r.port)
-                            }
+                            }),
                             // A broad accept from the zone opens everything,
                             // including this port.
-                            (None, None) => true,
+                            None => rule.port.is_empty(),
                             _ => false,
                         }
                 });
@@ -7843,12 +7972,12 @@ impl Appliance {
                     !rule.disabled
                         && rule.from == *zone
                         && rule.action == Action::Accept
-                        && match (rule.proto, rule.port) {
-                            (Some(Proto::Tcp), Some(spec)) => {
+                        && match rule.proto {
+                            Some(Proto::Tcp) => rule.port.iter().any(|spec| {
                                 let (lo, hi) = spec.bounds();
                                 (lo..=hi).contains(&80)
-                            }
-                            (None, None) => true,
+                            }),
+                            None => rule.port.is_empty(),
                             _ => false,
                         }
                 })
@@ -7955,8 +8084,17 @@ impl Appliance {
         }
         out.push_str(&format!("rules ({}):\n", self.rules.len()));
         for r in &self.rules {
-            let proto_port = match (r.proto, r.port) {
-                (Some(p), Some(port)) => format!("  {}/{port}", proto_str(p)),
+            let proto_port = match (r.proto, r.port.as_slice()) {
+                (Some(p), []) => format!("  {}", proto_str(p)),
+                (Some(p), ports) => format!(
+                    "  {}/{}",
+                    proto_str(p),
+                    ports
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
                 _ => String::new(),
             };
             out.push_str(&format!(
@@ -8068,6 +8206,12 @@ pub(crate) fn validate_ipv6(s: &str) -> Result<()> {
 /// Validate a MAC address: six colon-separated hex octets
 /// (`"52:54:00:12:34:56"`). A security boundary too — the value is rendered
 /// verbatim into a networkd unit, so it must not smuggle other characters.
+/// The offload features an interface may name — `ethtool -K`'s own short keys,
+/// which is what an operator reading a NIC's manual has in front of them.
+pub const OFFLOAD_FEATURES: &[&str] = &[
+    "gro", "gso", "tso", "lro", "sg", "rx", "tx", "rxvlan", "txvlan", "ntuple", "rxhash",
+];
+
 pub(crate) fn validate_mac(s: &str) -> Result<()> {
     let octets: Vec<&str> = s.split(':').collect();
     if octets.len() != 6
@@ -8765,7 +8909,23 @@ pub(crate) fn validate_description(s: &str) -> Result<()> {
 /// Validate a firewall blocklist entry: a bare IPv4 (`192.0.2.5`) or an IPv4
 /// CIDR (`10.6.6.0/24`).
 pub(crate) fn validate_cidr_or_ip(s: &str) -> Result<()> {
+    // Either family. The data plane ranks each in its own longest-prefix trie,
+    // and which one a constraint belongs to follows from what it says — so an
+    // operator writing `fd12::/64` means what they mean by `10.0.0.0/8` and does
+    // not have to know there are two tries underneath.
+    let v6 = s.contains(':');
     if let Some((ip, prefix)) = s.split_once('/') {
+        if v6 {
+            ip.parse::<std::net::Ipv6Addr>()
+                .with_context(|| format!("invalid IPv6 in {s:?}"))?;
+            let prefix: u8 = prefix
+                .parse()
+                .with_context(|| format!("invalid prefix in {s:?}"))?;
+            if prefix > 128 {
+                bail!("prefix /{prefix} in {s:?} exceeds /128");
+            }
+            return Ok(());
+        }
         ip.parse::<Ipv4Addr>()
             .with_context(|| format!("invalid IPv4 in {s:?}"))?;
         let prefix: u8 = prefix
@@ -8774,6 +8934,9 @@ pub(crate) fn validate_cidr_or_ip(s: &str) -> Result<()> {
         if prefix > 32 {
             bail!("prefix /{prefix} in {s:?} exceeds /32");
         }
+    } else if v6 {
+        s.parse::<std::net::Ipv6Addr>()
+            .with_context(|| format!("invalid IP/CIDR {s:?}"))?;
     } else {
         s.parse::<Ipv4Addr>()
             .with_context(|| format!("invalid IP/CIDR {s:?}"))?;
@@ -9341,8 +9504,8 @@ proto = "tcp"
 port = "8000-8100"
 "#;
         let a = Appliance::from_toml(toml).expect("range config parses");
-        assert_eq!(a.rules[0].port, Some(PortSpec::Single(443)));
-        assert_eq!(a.rules[1].port, Some(PortSpec::Range(8000, 8100)));
+        assert_eq!(a.rules[0].port, vec![PortSpec::Single(443)]);
+        assert_eq!(a.rules[1].port, vec![PortSpec::Range(8000, 8100)]);
         let out = a.to_toml().unwrap();
         assert!(out.contains("port = 443"), "single stays integer:\n{out}");
         assert!(
@@ -9351,7 +9514,7 @@ port = "8000-8100"
         );
         // Re-parse the saved form unchanged.
         let b = Appliance::from_toml(&out).unwrap();
-        assert_eq!(b.rules[1].port, Some(PortSpec::Range(8000, 8100)));
+        assert_eq!(b.rules[1].port, vec![PortSpec::Range(8000, 8100)]);
     }
 
     #[test]
