@@ -1134,6 +1134,14 @@ pub fn page() -> String {
         <span>Password</span>
         <input id="password" type="password" autocomplete="current-password">
       </label>
+      <!-- Shown only once the appliance has said this account wants one, so an
+           account without a second factor is not asked a question it has no
+           answer to. -->
+      <label class="field hidden" id="codefield">
+        <span>One-time code</span>
+        <input id="code" inputmode="numeric" autocomplete="one-time-code"
+               maxlength="6" placeholder="000000">
+      </label>
     </div>
     <button class="btn primary" type="submit" style="width:100%">Sign in</button>
   </form>
@@ -1298,6 +1306,21 @@ pub fn page() -> String {
         </p>
         <div class="grid" id="nat64form"></div>
       </div>
+
+      <div class="section">
+        <h3>Prefix translation</h3>
+        <span class="spacer"></span>
+        <button class="btn" id="togglenpt">New translation</button>
+      </div>
+      <p class="lede inset" style="margin:0 0 var(--space-4)">
+        NPTv6 swaps one IPv6 prefix for another as a packet leaves, and back on
+        the way in. Addresses keep their host part and nothing is tracked, so
+        this is not NAT: it is renumbering at the border, which is how a network
+        with provider-assigned space keeps its own addressing inside.
+      </p>
+      <div class="card addpanel hidden" id="addnptpanel"></div>
+      <div id="nptlist"></div>
+
       <div class="card">
         <h3>Live NAT state</h3><pre class="out" id="natshow">…</pre>
       </div>
@@ -1343,6 +1366,26 @@ pub fn page() -> String {
       </div>
     </div>
 
+    <div id="view-history" class="hidden">
+      <p class="lede" style="margin:0 0 var(--space-5)">
+        What the box looked like before now. Live counters answer what is
+        happening; they cannot answer whether this was happening at three in the
+        morning last Tuesday, which is the question people actually arrive with.
+        A gap in a line is a gap in the record — the box was off, or the
+        interface went away — and is drawn as one rather than joined up.
+      </p>
+      <div class="toolbar">
+        <label class="inline"><span>Resolution</span>
+          <select id="historyres">
+            <option value="minute">Last day, by minute</option>
+            <option value="quarter">Last month, by quarter hour</option>
+            <option value="day">Two years, by day</option>
+          </select>
+        </label>
+      </div>
+      <div id="historycharts"></div>
+    </div>
+
     <div id="view-dhcp" class="hidden">
       <div class="section">
         <h3>Servers</h3>
@@ -1355,6 +1398,34 @@ pub fn page() -> String {
         A server leases from its interface's own static subnet, so the interface
         needs a static address first.
       </p>
+
+      <div class="section">
+        <h3>Reservations</h3>
+        <span class="spacer"></span>
+        <label class="inline"><span>on</span><select id="mapiface"></select></label>
+        <button class="btn" id="togglemap">New</button>
+      </div>
+      <p class="lede inset" style="margin:0 0 var(--space-4)">
+        The same address every time, for a machine that has to be findable. The
+        address must be in the server's subnet but outside its pool, or the
+        server will hand it to somebody else as well.
+      </p>
+      <div class="card addpanel hidden" id="addmappanel"></div>
+      <div id="maplist"></div>
+
+      <div class="section">
+        <h3>Router advertisements</h3>
+        <span class="spacer"></span>
+        <label class="inline"><span>on</span><select id="raiface"></select></label>
+        <button class="btn" id="enablera">Enable</button>
+      </div>
+      <p class="lede inset" style="margin:0 0 var(--space-4)">
+        How IPv6 hosts learn there is a router and what prefix to use. Managed
+        sends them to DHCPv6 for an address as well; other-config sends them
+        there for everything but the address.
+      </p>
+      <div id="ralist"></div>
+
       <div class="card"><h3>Leases</h3><pre class="out" id="dhcpshow">…</pre></div>
     </div>
 
@@ -1379,6 +1450,7 @@ pub fn page() -> String {
             <option value="address-group">address</option>
             <option value="port-group">port</option>
             <option value="domain-group">domain</option>
+            <option value="feed-group">published list</option>
           </select>
         </label>
         <span class="spacer"></span>
@@ -1413,6 +1485,15 @@ pub fn page() -> String {
       </div>
       <div class="card addpanel hidden" id="addcapanel"></div>
       <div id="calist"></div>
+      <div class="card">
+        <h3>Automatic issuance</h3>
+        <p class="lede" style="margin:0 0 var(--space-4)">
+          A certificate with <code>ca = "acme"</code> is obtained from this
+          directory instead of signed here. The appliance has to be reachable
+          for the challenge it agrees to answer.
+        </p>
+        <div class="grid" id="acmeform"></div>
+      </div>
     </div>
 
     <div id="view-certs" class="hidden">
@@ -1450,6 +1531,26 @@ pub fn page() -> String {
       </div>
       <div class="card addpanel hidden" id="addadmingrouppanel"></div>
       <div id="admingrouplist"></div>
+
+      <div class="card">
+        <h3>Where a password is checked</h3>
+        <p class="lede" style="margin:0 0 var(--space-4)">
+          A local account list is a shadow account list: it has to be kept
+          alongside the real one, and it is the one nobody remembers to remove
+          somebody from. A server here answers instead — but the local password
+          is always tried first, because the moment a directory is unreachable
+          is exactly the moment somebody needs to get in.
+        </p>
+        <div class="grid" id="aaa-form"></div>
+      </div>
+      <div class="section">
+        <h3>Authentication servers</h3>
+        <span class="spacer"></span>
+        <button class="btn" id="toggleradius">New server</button>
+      </div>
+      <div class="card addpanel hidden" id="addradiuspanel"></div>
+      <div id="radiuslist"></div>
+
       <div class="card">
         <h3>Accounts as the appliance sees them</h3>
         <pre class="out" id="usersshow">…</pre>
@@ -1570,6 +1671,22 @@ pub fn page() -> String {
       </div>
       <div class="card addpanel hidden" id="addwanpanel"></div>
       <div id="wanlist"></div>
+
+      <div class="section">
+        <h3>Steering</h3>
+        <span class="spacer"></span>
+        <button class="btn" id="togglewanpolicy">New policy</button>
+      </div>
+      <p class="lede inset" style="margin:0 0 var(--space-4)">
+        Failover answers "the uplink died, now what". Steering answers the
+        question before it: this traffic belongs on that uplink, and moves only
+        when the uplink stops being good enough for it. A video call and a backup
+        want opposite things from the same two links, and priority alone cannot
+        say so — which is why the uplinks above carry limits as well as targets.
+      </p>
+      <div class="card addpanel hidden" id="addwanpolicypanel"></div>
+      <div id="wanpolicylist"></div>
+
       <div class="card"><h3>Live state</h3><pre class="out" id="wanshow">…</pre></div>
     </div>
 
@@ -1632,6 +1749,26 @@ pub fn page() -> String {
         <div class="card addpanel hidden" id="addrmpanel"></div>
         <div id="rmlist"></div>
       </div>
+
+      <div class="tabpane hidden" data-tab="pbr">
+        <p class="lede">
+          Ordinary routing asks one question: where is this going? These rules
+          ask the others — where it came from, over which link, to which port —
+          and send the answer to a different routing table. That is how a guest
+          network leaves by the cheap uplink while everything else takes the
+          good one.
+        </p>
+        <div class="section">
+          <h3>Rules</h3>
+          <span class="spacer"></span>
+          <button class="btn" id="togglepbr">New rule</button>
+        </div>
+        <div class="card addpanel hidden" id="addpbrpanel"></div>
+        <div id="pbrlist"></div>
+        <div class="card">
+          <h3>In the kernel</h3><pre class="out" id="show-pbr">…</pre>
+        </div>
+      </div>
     </div>
 
     <div id="view-system" class="hidden">
@@ -1691,6 +1828,31 @@ pub fn page() -> String {
           remote AS is not a session.
         </p>
         <div class="card"><div class="grid" id="bgpglobal"></div></div>
+        <div class="card"><div class="grid" id="bgpconfed"></div></div>
+        <div class="card"><div class="grid" id="bgprpki"></div></div>
+        <div class="section">
+          <h3>Aggregates</h3>
+          <span class="spacer"></span>
+          <button class="btn" id="toggleagg">New aggregate</button>
+        </div>
+        <p class="lede inset" style="margin:0 0 var(--space-4)">
+          One prefix announced in place of the more specific ones inside it.
+          Summary-only suppresses those; without it both go out, which is a
+          bigger table for the same reachability.
+        </p>
+        <div class="card addpanel hidden" id="addaggpanel"></div>
+        <div id="agglist"></div>
+        <div class="section">
+          <h3>Route origin authorisations</h3>
+          <span class="spacer"></span>
+          <button class="btn" id="toggleroa">New authorisation</button>
+        </div>
+        <p class="lede inset" style="margin:0 0 var(--space-4)">
+          Which AS may originate a prefix, stated locally rather than fetched
+          from a validator. Useful where there is no RTR server to ask.
+        </p>
+        <div class="card addpanel hidden" id="addroapanel"></div>
+        <div id="roalist"></div>
         <div class="section">
           <h3>Neighbours</h3>
           <span class="spacer"></span>
@@ -1762,6 +1924,42 @@ pub fn page() -> String {
         </p>
         <div class="card"><div class="grid" id="igp-bfd"></div></div>
         <div class="card"><h3>Sessions</h3><pre class="out" id="show-bfd">…</pre></div>
+      </div>
+
+      <div class="tabpane hidden" data-tab="multicast">
+        <p class="lede">
+          Multicast is not forwarded by default: a router has to be told to
+          listen for the reports that say who wants a group. IGMP is the IPv4
+          half, MLD the IPv6 one, and an interface is either facing receivers or
+          facing the source.
+        </p>
+        <div class="card"><div class="grid" id="mcastform"></div></div>
+        <div class="section">
+          <h3>Interfaces</h3>
+          <span class="spacer"></span>
+          <button class="btn" id="togglemcastif">New</button>
+        </div>
+        <div class="card addpanel hidden" id="addmcastifpanel"></div>
+        <div id="mcastiflist"></div>
+        <div class="card">
+          <h3>Forwarding cache</h3><pre class="out" id="show-multicast">…</pre>
+        </div>
+      </div>
+
+      <div class="tabpane hidden" data-tab="vrf">
+        <p class="lede">
+          A separate routing table with its own interfaces, so two tenants can
+          use the same addresses without meeting. Route targets are what let
+          something deliberately cross between them.
+        </p>
+        <div class="section">
+          <h3>Instances</h3>
+          <span class="spacer"></span>
+          <button class="btn" id="togglevrf">New VRF</button>
+        </div>
+        <div class="card addpanel hidden" id="addvrfpanel"></div>
+        <div id="vrflist"></div>
+        <div class="card"><h3>Instances</h3><pre class="out" id="show-vrf">…</pre></div>
       </div>
 
       <div class="tabpane hidden" data-tab="table">
@@ -2082,6 +2280,125 @@ function sparkline(canvas, values) {{
   g.globalAlpha = 0.13; g.fillStyle = accent; g.fill();
 }}
 
+// A chart with a time axis and honest holes. The sparkline above cannot draw a
+// gap — it takes bare numbers — and a history whose gaps are drawn as a line
+// through them is a history that lies about the hours the box was off.
+function chart(canvas, series, opts) {{
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const g = canvas.getContext("2d");
+  g.scale(dpr, dpr);
+  g.clearRect(0, 0, w, h);
+  const all = series.flatMap((s) => s.points);
+  const times = all.map((p) => p.at);
+  if (times.length < 2) {{
+    g.fillStyle = getComputedStyle(document.documentElement)
+      .getPropertyValue("--text-muted").trim() || "#888";
+    g.font = "12px system-ui, sans-serif";
+    g.fillText("not enough history yet", 8, h / 2);
+    return;
+  }}
+  const t0 = Math.min(...times), t1 = Math.max(...times);
+  const max = Math.max(1, ...all.map((p) => (p.value == null ? 0 : p.value)));
+  const pad = 22;
+  const x = (t) => pad + ((t - t0) / Math.max(1, t1 - t0)) * (w - pad - 6);
+  const y = (v) => h - 16 - (v / max) * (h - 26);
+
+  // A baseline and a top line, so the scale is readable without a full grid.
+  const css = getComputedStyle(document.documentElement);
+  g.strokeStyle = css.getPropertyValue("--border-subtle").trim() || "#ddd";
+  g.lineWidth = 1;
+  g.beginPath(); g.moveTo(pad, h - 16); g.lineTo(w - 6, h - 16); g.stroke();
+
+  series.forEach((s, i) => {{
+    g.beginPath();
+    let drawing = false;
+    for (const p of s.points) {{
+      if (p.value == null) {{ drawing = false; continue; }}   // a gap stays a gap
+      const px = x(p.at), py = y(p.value);
+      if (drawing) g.lineTo(px, py); else {{ g.moveTo(px, py); drawing = true; }}
+    }}
+    g.strokeStyle = s.colour || (i === 0 ? "#4c8dff" : "#e0a458");
+    g.lineWidth = 1.6;
+    g.stroke();
+  }});
+
+  g.fillStyle = css.getPropertyValue("--text-muted").trim() || "#888";
+  g.font = "11px system-ui, sans-serif";
+  g.fillText(opts.top || "", 2, 12);
+  g.fillText(new Date(t0 * 1000).toLocaleString(), pad, h - 4);
+  const end = new Date(t1 * 1000).toLocaleString();
+  g.fillText(end, Math.max(pad, w - 6 - g.measureText(end).width), h - 4);
+}}
+
+// Bytes per second, said the way a person reads it.
+function perSecond(v) {{
+  const units = ["B/s", "kB/s", "MB/s", "GB/s"];
+  let n = v, i = 0;
+  while (n >= 1000 && i < units.length - 1) {{ n /= 1000; i++; }}
+  return n.toFixed(n < 10 && i > 0 ? 1 : 0) + " " + units[i];
+}}
+
+async function refreshHistory() {{
+  const res = $("historyres").value || "minute";
+  const box = $("historycharts");
+  let listing;
+  try {{
+    listing = await (await api("/api/v1/metrics")).json();
+  }} catch (e) {{
+    box.textContent = "";
+    box.append(el("p", {{ class: "sub", text: "The appliance did not answer: " + e }}));
+    return;
+  }}
+  const names = listing.series || [];
+  if (!names.length) {{
+    box.textContent = "";
+    box.append(el("p", {{ class: "sub", text:
+      "No history yet. Turn it on under System, then give it a few minutes — " +
+      "a graph needs two samples before it is a line." }}));
+    return;
+  }}
+  // Group an interface's two directions onto one chart: they are the same
+  // question asked twice, and side by side they need two glances.
+  const ifaces = new Set();
+  for (const n of names) {{
+    const m = /^iface\.(.+)\.(rx|tx)$/.exec(n);
+    if (m) ifaces.add(m[1]);
+  }}
+  box.textContent = "";
+  for (const iface of [...ifaces].sort()) {{
+    const [rx, tx] = await Promise.all([
+      api("/api/v1/metrics/" + res + "/iface." + iface + ".rx").then((r) => r.json()),
+      api("/api/v1/metrics/" + res + "/iface." + iface + ".tx").then((r) => r.json()),
+    ]);
+    const peak = Math.max(0, ...[...rx.points, ...tx.points]
+      .map((p) => p.value || 0));
+    const card = el("div", {{ class: "card" }}, [
+      el("h3", {{ text: iface }}),
+      el("p", {{ class: "sub", text: "in and out, peak " + perSecond(peak) }}),
+    ]);
+    const cv = el("canvas", {{ style: "height:120px" }});
+    card.append(cv);
+    box.append(card);
+    chart(cv, [
+      {{ points: rx.points, colour: "#4c8dff" }},
+      {{ points: tx.points, colour: "#e0a458" }},
+    ], {{ top: "in / out" }});
+  }}
+  if (names.includes("gauge.sessions")) {{
+    const s = await (await api("/api/v1/metrics/" + res + "/gauge.sessions")).json();
+    const card = el("div", {{ class: "card" }}, [
+      el("h3", {{ text: "Tracked connections" }}),
+      el("p", {{ class: "sub", text: "how many flows the data plane held" }}),
+    ]);
+    const cv = el("canvas", {{ style: "height:120px" }});
+    card.append(cv);
+    box.append(card);
+    chart(cv, [{{ points: s.points, colour: "#4c8dff" }}], {{ top: "connections" }});
+  }}
+}}
+
 async function refreshDashboard() {{
   // Services first: a red unit explains every strange number below it.
   try {{
@@ -2230,16 +2547,29 @@ async function refreshRules() {{
     "(now: " + (globals["default-action"] || "unset") + ")";
 
   const rules = parseRules(ls);
+  // What each accept rule is currently carrying. Attribution, not a hardware
+  // counter — and a rule that drops leaves no flow behind, so only accept rules
+  // can be counted this way. The column says so rather than showing a zero that
+  // reads as "never matched".
+  let hits = {{}};
+  let hitsAnswered = false;
+  try {{
+    const h = await (await api("/api/v1/rule-hits")).json();
+    hitsAnswered = !!h.answered;
+    for (const r of h.rules || []) hits[r.name] = r;
+  }} catch (e) {{ /* the rules still render; the column just says nothing */ }}
+
   const list = $("rulelist");
   list.textContent = "";
   if (!rules.length) {{
     list.append(el("p", {{ class: "empty", text: "No rules configured." }}));
   }} else {{
     const body = el("tbody", {{}});
-    rules.forEach((r, i) => body.append(ruleRow(r, i, zones)));
+    rules.forEach((r, i) => body.append(ruleRow(r, i, zones, hitsAnswered ? hits : null)));
     list.append(el("div", {{ class: "tblwrap" }}, [
       el("table", {{ class: "otbl" }}, [
-        el("thead", {{}}, [el("tr", {{}}, ["order", "action", "rule", "match", "open", "note", ""]
+        el("thead", {{}}, [el("tr", {{}},
+          ["order", "action", "rule", "match", "open", "carrying", "note", ""]
           .map((h) => el("th", {{ text: h }})))]),
         body,
       ]),
@@ -2253,7 +2583,7 @@ async function refreshRules() {{
 // scans in. The action is a badge because it is the one field whose value
 // changes the meaning of every other one, and its denials are told apart by the
 // shape of that badge rather than by its hue.
-function ruleRow(r, i, zones) {{
+function ruleRow(r, i, zones, hits) {{
   const action = r.action || "accept";
   // A disabled rule that reads like an active one is how an operator spends an
   // afternoon on a rule the firewall is not consulting.
@@ -2295,9 +2625,34 @@ function ruleRow(r, i, zones) {{
         (r.proto ? " · " + r.proto + "/" + ports : "") }}),
     ]),
     el("td", {{}}, [el("span", {{ class: "val dim", text: open }})]),
+    el("td", {{}}, carrying(r, action, hits)),
     el("td", {{}}, [el("span", {{ class: "val dim", text: note || "—" }})]),
     el("td", {{ class: "end" }}, [edit, del]),
   ]);
+}}
+
+// What a rule is carrying, or an honest reason why that cannot be said.
+//
+// A rule that drops leaves no flow behind — the packet is gone — so a zero
+// against one would read as "never matched" when it means "nothing got through
+// here", which is what the rule is *for*. Showing a dash and saying why beats
+// showing a number that invites somebody to delete the rule doing its job.
+function carrying(r, action, hits) {{
+  if (!hits) return [el("span", {{ class: "val dim", text: "—" }})];
+  if (action !== "accept") {{
+    return [el("span", {{ class: "sub", title:
+      "A rule that drops leaves no flow to count. Nothing getting through is what it is for.",
+      text: "not counted" }})];
+  }}
+  const h = hits[r.name];
+  if (!h) return [el("span", {{ class: "val dim", text: "—" }})];
+  if (h.flows === 0) {{
+    return [el("span", {{ class: "pill warn", text: "nothing" }})];
+  }}
+  return [
+    el("span", {{ class: "val", text: h.flows + (h.flows === 1 ? " flow" : " flows") }}),
+    el("span", {{ class: "sub", text: h.packets.toLocaleString() + " packets" }}),
+  ];
 }}
 
 // Every field a firewall rule has, in the order the CLI's own list gives them:
@@ -2315,7 +2670,7 @@ function ruleFields(zones) {{
     ["to", "To zone", zoneOpts],
     ["action", "Action", ["accept", "drop", "reject"]],
     ["proto", "Protocol",
-     ["", "tcp", "udp", "icmp", "icmpv6", "vrrp", "esp", "ah", "gre"]],
+     ["", "tcp", "udp", "tcp_udp", "icmp", "icmpv6", "vrrp", "esp", "ah", "gre"]],
     ["port", "Port"],
     ["port-group", "Port group"],
     ["source", "Source"],
@@ -2905,6 +3260,14 @@ const SUGGEST = {{
     return bytes.map((b) => b.toString(16).padStart(2, "0")).join(":");
   }},
   "private-key": () => "generate",
+  // A base32 secret the browser makes, so it is never carried anywhere it does
+  // not have to be. The appliance validates it on commit either way.
+  totp: () => {{
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    const raw = new Uint8Array(20);
+    crypto.getRandomValues(raw);
+    return [...raw].map((b) => alphabet[b & 31]).join("");
+  }},
 }};
 
 // The object a form is about, so its own name can be kept out of the choices
@@ -3669,6 +4032,12 @@ const SNAT = [
 const DNAT = [
   ["zone", "Zone"], ["proto", "Protocol", ["", "tcp", "udp"]],
   ["port", "Port"], ["to", "To"],
+  ["description", "Description"],
+  // Without it, a host inside reaching the public address of a service that is
+  // also inside gets no answer — the reply crosses back by a different path
+  // than it left. Turning it on is the whole fix, so it belongs on the rule.
+  ["hairpin", "Hairpin", ["", "true", "false"]],
+  ["disabled", "Disabled", ["", "true", "false"]],
 ];
 
 async function refreshNat() {{
@@ -3676,6 +4045,17 @@ async function refreshNat() {{
 
   const ls = await leaves();
   settingsPanel("nat64form", NAT64, fieldsOf(ls, "nat nat64"), "nat nat64", "NAT64");
+  renderObjects({{
+    listId: "nptlist", required: "internal", toggleId: "togglenpt",
+    toggleLabel: "New translation", addId: "addnptpanel", noun: "Translation",
+    fields: NPT66, nameHint: "uplink",
+    path: (n) => `nat npt66 ${{n}}`,
+    rows: entriesUnder(ls, ["nat", "npt66"]),
+    badge: (r) => (r.internal && r.external)
+      ? {{ text: r.internal + " → " + r.external }}
+      : {{ text: "incomplete", cls: "warn" }},
+    empty: "No prefix translations configured.",
+  }});
   renderObjects({{
     listId: "snatlist", form: FORMS.natSource, required: "zone", toggleId: "togglesnat", toggleLabel: "New source rule", addId: "addsnatpanel", noun: "Source rule",
     fields: SNAT, nameHint: "wan-masq",
@@ -3695,6 +4075,19 @@ async function refreshNat() {{
   }});
 }}
 
+// ---- Redistribution ------------------------------------------------------
+
+// Every route source the routing daemon knows — `protocol_from_name` in wren,
+// name for name. Offering three of the eight made `redistribute kernel`
+// unreachable from the console although the CLI takes it, which is how a real
+// configuration turned out to be writable in one place and not the other.
+const REDIST_SOURCES = [
+  "connected", "static", "kernel", "rip", "ospf", "isis", "babel", "bgp",
+];
+// A protocol does not redistribute itself.
+const redist = (own) =>
+  ["redistribute", "Redistribute", REDIST_SOURCES.filter((s) => s !== own), "list"];
+
 // ---- BGP -----------------------------------------------------------------
 
 const BGP_GLOBAL = [
@@ -3702,7 +4095,10 @@ const BGP_GLOBAL = [
   ["local-as", "Local AS"], ["router-id", "Router ID"],
   ["#", "What it advertises"],
   ["network", "Networks", null, "list"],
-  ["redistribute", "Redistribute", ["static", "connected", "bgp"], "list"],
+  redist("bgp"),
+  ["#", "What it tags its own routes with"],
+  ["community", "Communities"], ["large-community", "Large communities"],
+  ["ext-community", "Extended communities"],
   ["#", "How it behaves"],
   ["hold-time", "Hold time"], ["cluster-id", "Cluster ID"],
   // A count of equal-cost paths, not a yes/no — offering true/false made ECMP
@@ -3740,6 +4136,20 @@ const BGP_NEIGHBOR = [
   ["bfd-auth-type", "BFD authentication"],
   ["bfd-auth-key-id", "BFD key id"], ["bfd-auth-key", "BFD key"],
 ];
+// A confederation is one AS to the outside and several inside it, which is how
+// a large network runs iBGP without a full mesh or a reflector.
+const BGP_CONFED = [
+  ["confederation id", "Confederation AS"],
+  ["confederation member", "Member ASes", null, "list"],
+];
+// Origin validation. Without an RTR server there is still the local table
+// below, which is why the two live next to each other.
+const BGP_RPKI = [
+  ["rpki rtr", "RTR server"], ["rpki rtr-refresh", "Refresh (s)"],
+  ["rpki reject-invalid", "Reject invalid", ["", "true", "false"]],
+];
+const BGP_AGGREGATE = [["summary-only", "Suppress more specifics", ["", "true", "false"]]];
+const BGP_ROA = [["origin-as", "Origin AS"], ["max-length", "Maximum length"]];
 
 
 // ---- IPsec ---------------------------------------------------------------
@@ -3752,6 +4162,11 @@ const IPSEC = [
   ["#", "How it comes up"],
   ["psk", "Pre-shared key"], ["ike-version", "IKE", ["", "1", "2"]],
   ["start-action", "Start", ["", "start", "trap", "none"]],
+  ["#", "What the two ends agree on"],
+  // A peer that will not negotiate the appliance's defaults needs these, and
+  // without them the tunnel is a support call rather than a setting.
+  ["ike-proposal", "IKE proposal"], ["esp-proposal", "ESP proposal"],
+  ["local-id", "Local identity"], ["remote-id", "Remote identity"],
 ];
 
 async function refreshIpsec() {{
@@ -3829,6 +4244,22 @@ const DHCP = [
   ["default-router", "Default router"], ["dns", "DNS", null, "list"],
   ["domain", "Domain"], ["lease-time", "Lease time"],
 ];
+// A reservation is named, and the name is not the MAC — a machine can be
+// replaced without the reservation losing what it was for.
+const DHCP_MAPPING = [["mac", "MAC address"], ["ip", "Address"]];
+// Router advertisements. The DHCPv6 pool is a block under them, and its three
+// settings are ordinary two-word keys — `set … router-advert dhcp6-pool start`
+// is the command, so nothing here has to know it is nested.
+const RA = [
+  ["#", "What it tells them"],
+  ["prefix", "Prefix"], ["dns", "DNS", null, "list"],
+  ["router-lifetime", "Router lifetime (s)"],
+  ["#", "Where they get the rest"],
+  ["managed", "Address from DHCPv6", ["", "true", "false"]],
+  ["other-config", "Settings from DHCPv6", ["", "true", "false"]],
+  ["dhcp6-pool start", "Pool start"], ["dhcp6-pool end", "Pool end"],
+  ["dhcp6-pool lease-time", "Pool lease time"],
+];
 
 async function refreshDhcp() {{
   await showInto("dhcpshow", "/api/v1/show/dhcp/leases");
@@ -3863,6 +4294,47 @@ async function refreshDhcp() {{
     rows: [...servers.values()],
     badge: (r) => ({{ text: r["pool-size"] ? r["pool-size"] + " leases" : "default pool" }}),
     empty: "No DHCP servers configured.",
+  }});
+
+  // Reservations belong to one server, so the interface is chosen first and the
+  // rows are that server's — the same shape as a prefix list's rules.
+  const withServer = [...servers.keys()].sort().map((name) => ({{ name }}));
+  const on = $("mapiface").value || (withServer[0] || {{}}).name || "";
+  fillPicker("mapiface", withServer, on);
+  // With no server chosen the path has a hole in it, and `set interface
+  // dhcp-server static-mapping printer mac …` is a command that can only be
+  // refused — so there is nothing to press rather than something that fails.
+  $("togglemap").disabled = !on;
+  renderObjects({{
+    listId: "maplist", required: "mac", toggleId: "togglemap", toggleLabel: "New",
+    addId: "addmappanel", noun: "Reservation",
+    fields: DHCP_MAPPING, nameHint: "printer",
+    path: (n) => `interface ${{on}} dhcp-server static-mapping ${{n}}`,
+    rows: on ? entriesUnder(ls, ["interface", on, "dhcp-server", "static-mapping"]) : [],
+    badge: (r) => r.ip ? {{ text: r.ip }} : {{ text: "no address", cls: "warn" }},
+    empty: on ? "No reservations on " + on + "."
+              : "No DHCP server to reserve an address on yet.",
+  }});
+
+  // Router advertisements are a block on an interface like the server is, so
+  // the rows are the interfaces that have one.
+  const ras = new Map();
+  for (const l of ls) {{
+    if (l.path[0] !== "interface" || l.path[2] !== "router-advert") continue;
+    if (l.path.length < 4) continue;
+    if (!ras.has(l.path[1])) ras.set(l.path[1], {{ name: l.path[1] }});
+    ras.get(l.path[1])[l.path.slice(3).join(" ")] = l.value;
+  }}
+  fillPicker("raiface",
+             [...interfaces].sort().filter((i) => !ras.has(i)).map((name) => ({{ name }})),
+             $("raiface").value);
+  renderObjects({{
+    listId: "ralist", noun: "Advertisement", fields: RA,
+    path: (n) => `interface ${{n}} router-advert`,
+    rows: [...ras.values()],
+    badge: (r) => r.prefix ? {{ text: r.prefix }}
+                           : {{ text: "prefix from the interface" }},
+    empty: "No interface advertises a router.",
   }});
 }}
 
@@ -3937,7 +4409,7 @@ const IFACE = [
   ["type", "Type",
     ["", "bridge", "bond", "dummy", "pppoe", "gre", "ipip", "gretap",
      "macvlan", "macsec", "l2tpv3"]],
-  ["mtu", "MTU"], ["mac", "MAC address"], ["hw-id", "Pin to MAC"],
+  ["mtu", "MTU"], ["mss", "Clamp TCP MSS"], ["mac", "MAC address"], ["hw-id", "Pin to MAC"],
   ["#", "Offload"],
   ["offload gro", "GRO", ["", "true", "false"]],
   ["offload gso", "GSO", ["", "true", "false"]],
@@ -3946,6 +4418,10 @@ const IFACE = [
   ["offload sg", "Scatter-gather", ["", "true", "false"]],
   ["offload rx", "RX checksum", ["", "true", "false"]],
   ["offload tx", "TX checksum", ["", "true", "false"]],
+  ["offload rxvlan", "RX VLAN", ["", "true", "false"]],
+  ["offload txvlan", "TX VLAN", ["", "true", "false"]],
+  ["offload ntuple", "N-tuple filters", ["", "true", "false"]],
+  ["offload rxhash", "RX hashing", ["", "true", "false"]],
   ["#", "Addressing"],
   ["zone", "Zone"], ["address", "IPv4 address"], ["address6", "IPv6 address"],
   ["pd-from", "Prefix from"], ["pd-subnet", "Prefix subnet"],
@@ -3993,12 +4469,21 @@ async function refreshInterfaces() {{
   }});
 }}
 
-const ROUTE = [["via", "Via"], ["dev", "Device"], ["metric", "Metric"], ["vrf", "VRF"]];
+const ROUTE = [
+  ["via", "Via"], ["dev", "Device"], ["metric", "Metric"], ["vrf", "VRF"],
+  // A route with nowhere to send. Two uses: null-routing a prefix, and holding
+  // a BGP summary up whether or not anything inside it is reachable.
+  ["blackhole", "Discard", ["", "true", "false"]],
+  ["distance", "Distance"],
+];
 
 
 // The three group kinds differ only in the word for a member, so one view with
 // a kind picker beats three that would drift apart.
-const GROUP_MEMBER = {{ "address-group": "address", "port-group": "port", "domain-group": "domain" }};
+const GROUP_MEMBER = {{
+  "address-group": "address", "port-group": "port",
+  "domain-group": "domain", "feed-group": "url",
+}};
 
 async function refreshGroups() {{
   const kind = $("groupkind").value;
@@ -4017,7 +4502,8 @@ async function refreshGroups() {{
 const LB = [
   ["zone", "Zone"], ["vip", "Virtual address"],
   ["proto", "Protocol", ["", "tcp", "udp"]], ["port", "Port"],
-  ["backend", "Backends", null, "each"], ["disabled", "Disabled", ["", "true", "false"]],
+  ["backend", "Backends", null, "each"], ["description", "Description"],
+  ["disabled", "Disabled", ["", "true", "false"]],
 ];
 
 async function refreshLb() {{
@@ -4046,14 +4532,17 @@ const CERT = [
 ];
 
 async function refreshPki() {{
+  const ls = await leaves();
   renderObjects({{
     listId: "calist", form: FORMS.ca, required: "common-name", toggleId: "toggleca", toggleLabel: "New", addId: "addcapanel", noun: "Authority",
     fields: CA, nameHint: "internal",
     path: (n) => `pki ca ${{n}}`,
-    rows: entriesUnder(await leaves(), ["pki", "ca"]),
+    rows: entriesUnder(ls, ["pki", "ca"]),
     badge: (r) => r["common-name"] ? {{ text: "ca" }} : {{ text: "incomplete", cls: "warn" }},
     empty: "No certificate authorities configured.",
   }});
+  settingsPanel("acmeform", ACME, fieldsOf(ls, "pki acme"), "pki acme",
+                "Automatic issuance");
 }}
 
 async function refreshCerts() {{
@@ -4074,14 +4563,38 @@ async function refreshCerts() {{
 const USER = [
   ["password", "Password"],
   ["group", "Management group"],
+  // A second factor for the console and the API. Not for SSH — that is sshd's
+  // own configuration — and not for the serial console, which is the port
+  // somebody reaches for when everything else is broken.
+  ["totp", "One-time code secret"],
   ["ssh-key", "SSH public keys", null, "each"],
   ["hashed-password", "Password hash"],
+];
+// Where a password is checked when it is not checked here. Local always goes
+// first, which is why there is no order to configure.
+const AAA = [["default-group", "Default group"]];
+const AAA_RADIUS = [
+  ["secret", "Shared secret"], ["port", "Port"], ["timeout", "Timeout (s)"],
 ];
 const ADMIN_GROUP = [
   ["permission", "Permission", ["read-only", "read-write"]],
 ];
 
 async function refreshUsers() {{
+  const aaals = await leaves();
+  settingsPanel("aaa-form", AAA, fieldsOf(aaals, "system aaa"), "system aaa",
+                "Where a password is checked");
+  renderObjects({{
+    listId: "radiuslist", required: "secret", toggleId: "toggleradius",
+    toggleLabel: "New server", addId: "addradiuspanel", noun: "Server",
+    fields: AAA_RADIUS, nameHint: "10.0.0.50",
+    path: (n) => `system aaa radius ${{n}}`,
+    rows: entriesUnder(aaals, ["system", "aaa", "radius"]),
+    // The secret is never a badge. Everything else about the server is.
+    badge: (r) => r.secret ? {{ text: "port " + (r.port || 1812) }}
+                           : {{ text: "no secret", cls: "warn" }},
+    empty: "No authentication servers — accounts are local only.",
+  }});
   renderObjects({{
     listId: "userlist", form: FORMS.user, toggleId: "toggleuser", toggleLabel: "New", addId: "adduserpanel", noun: "Administrator",
     fields: USER, nameHint: "admin",
@@ -4202,6 +4715,15 @@ const NAT64 = [
   ["dns64", "Synthesise DNS answers", ["", "true", "false"]],
 ];
 
+// NPTv6 (roadmap C16). Both prefixes must be the same length: the translation
+// is a checksum-neutral swap of the network part, so there is nothing to map
+// unequal lengths onto.
+const NPT66 = [
+  ["interface", "Interface"],
+  ["internal", "Internal prefix"], ["external", "External prefix"],
+  ["description", "Description"],
+];
+
 const VRRP = [
   ["#", "The address being held"],
   ["interface", "Interface"], ["vrid", "Virtual router ID"],
@@ -4234,6 +4756,12 @@ const CONNTRACK_SYNC = [
 // will one day refuse something the appliance accepts.
 const SVC_DNS = [
   ["upstream", "Upstream servers", null, "list"], ["serve-on", "Serve on", null, "list"],
+  // Setting this takes the plaintext servers above out of the resolver: they
+  // become the proxy's bootstrap, answering the one question its own hostname
+  // poses rather than every question.
+  ["secure-upstream", "Encrypted upstreams", null, "each"],
+  ["allow-from", "Allow queries from", null, "each"],
+  ["dont-query", "Never forward", null, "each"],
   ["host-override", "Host overrides", null, "each"], ["blocklist", "Blocklists", null, "each"],
   ["txt-record", "TXT records", null, "each"],
   ["dnssec", "DNSSEC", ["", "no", "yes", "allow-downgrade"]],
@@ -4248,6 +4776,10 @@ const SVC_SSH = [
   ["enable", "Enabled", ["", "true", "false"]], ["port", "Port"],
   ["listen-address", "Listen address"],
   ["password-authentication", "Passwords", ["", "true", "false"]],
+  // VERBOSE is the one worth offering: it logs the fingerprint of the key that
+  // was used, which turns "somebody logged in as admin" into "this key did".
+  ["loglevel", "Log level",
+   ["", "QUIET", "FATAL", "ERROR", "INFO", "VERBOSE", "DEBUG1", "DEBUG2", "DEBUG3"]],
 ];
 const SVC_SNMP = [
   ["community", "Community"], ["listen", "Listen"], ["location", "Location"],
@@ -4294,6 +4826,12 @@ const SLTARGET = [
   ["port", "Port"], ["proto", "Protocol", ["", "udp", "tcp"]],
   ["level", "Level",
     ["", "emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"]],
+  // Empty means every facility, which is why "all" is not on this list: it is
+  // the absence of a selector, not one more thing to tick.
+  ["facility", "Facilities",
+    ["auth", "authpriv", "cron", "daemon", "ftp", "kern", "lpr", "mail", "news",
+     "syslog", "user", "uucp", "local0", "local1", "local2", "local3", "local4",
+     "local5", "local6", "local7"], "list"],
 ];
 
 
@@ -4308,16 +4846,22 @@ const IGP_OSPF = [
   ["#", "How it is preferred"],
   ["cost", "Cost"], ["router-priority", "Priority"],
   ["stub-area", "Stub areas", null, "list"], ["nssa-area", "NSSA areas", null, "list"],
+  ["totally-stubby-area", "Totally stubby areas", null, "list"],
+  ["totally-nssa-area", "Totally NSSA areas", null, "list"],
+  ["stub-default-cost", "Stub default cost"],
+  ["nssa-default-area", "NSSA default area"],
   ["#", "What it carries in"],
-  ["redistribute", "Redistribute", ["", "static", "connected", "bgp"], "list"],
+  redist("ospf"),
   ["redistribute-metric", "Redistribute metric"],
   ["#", "Who it trusts"],
   ["auth-type", "Auth", ["", "none", "text", "md5"]],
   ["auth-key", "Auth key"], ["auth-key-id", "Key id"],
+  ["auth-replay-protection", "Replay protection", ["", "true", "false"]],
   ["#", "How fast it notices"],
   ["hello-interval", "Hello (s)"], ["dead-interval", "Dead (s)"],
   ["bfd", "BFD", ["", "true", "false"]],
   ["graceful-restart", "Graceful restart", ["", "true", "false"]],
+  ["graceful-restart-period", "Restart period (s)"],
 ];
 const IGP_OSPF3 = [
   ["#", "Where it speaks"],
@@ -4327,7 +4871,11 @@ const IGP_OSPF3 = [
   ["#", "How it is preferred"],
   ["cost", "Cost"], ["router-priority", "Priority"],
   ["#", "What it carries in"],
-  ["redistribute", "Redistribute", ["static", "connected", "bgp"], "list"], ["redistribute-metric", "Redistribute metric"],
+  // Wren's OSPFv3 has `redistribute-static` and nothing else, so static is the
+  // only source it can carry. Offering the others let an operator tick one and
+  // get a refusal on Apply.
+  ["redistribute", "Redistribute", ["static"], "list"],
+  ["redistribute-metric", "Redistribute metric"],
   ["#", "How fast it notices"],
   ["bfd", "BFD", ["", "true", "false"]],
 ];
@@ -4342,7 +4890,10 @@ const IGP_ISIS = [
   ["#", "How it is preferred"],
   ["metric", "Metric"], ["priority", "Priority"],
   ["#", "What it carries in"],
-  ["redistribute", "Redistribute", ["static", "connected", "bgp"], "list"], ["redistribute-metric", "Redistribute metric"],
+  redist("isis"), ["redistribute-metric", "Redistribute metric"],
+  // Level-2 routes into level-1, which is how a level-1 area reaches anything
+  // that is not in it without a default route.
+  ["l2-to-l1-leaking", "Leak L2 into L1", ["", "true", "false"]],
   ["#", "Who it trusts"],
   ["auth-type", "Auth", ["", "none", "text", "hmac-md5", "hmac-sha256"]],
   ["auth-key", "Auth key"], ["auth-key-id", "Key id"],
@@ -4350,19 +4901,50 @@ const IGP_ISIS = [
   ["hello-interval", "Hello (s)"], ["bfd", "BFD", ["", "true", "false"]],
 ];
 const IGP_RIP = [
-  ["interface", "Interfaces", null, "list"], ["redistribute", "Redistribute", null, "list"],
+  ["interface", "Interfaces", null, "list"], redist("rip"),
   ["redistribute-metric", "Redistribute metric"],
   ["bfd", "BFD", ["", "true", "false"]], ["vrf", "VRF"],
 ];
 const IGP_RIPNG = [
-  ["interface", "Interfaces", null, "list"], ["redistribute", "Redistribute", null, "list"],
+  ["interface", "Interfaces", null, "list"], redist("rip"),
   ["redistribute-metric", "Redistribute metric"],
 ];
 const IGP_BABEL = [
   ["interface", "Interfaces", null, "list"], ["network", "Networks", null, "list"], ["router-id", "Router id"],
-  ["redistribute", "Redistribute", ["static", "connected", "bgp"], "list"], ["redistribute-metric", "Redistribute metric"],
+  redist("babel"), ["redistribute-metric", "Redistribute metric"],
   ["bfd", "BFD", ["", "true", "false"]], ["vrf", "VRF"],
 ];
+const MULTICAST = [
+  ["#", "Which half is on"],
+  ["enabled", "Enabled", ["", "true", "false"]],
+  ["igmp", "IGMP (IPv4)", ["", "true", "false"]],
+  ["mld", "MLD (IPv6)", ["", "true", "false"]],
+  ["igmp-version", "IGMP version", ["", "2", "3"]],
+  ["#", "How it asks who is listening"],
+  ["query-interval", "Query interval (s)"],
+  ["query-response-interval", "Response interval (s)"],
+  ["robustness", "Robustness"],
+];
+// An interface either faces receivers or faces where the traffic comes from.
+const MULTICAST_IFACE = [
+  ["role", "Role", ["", "downstream", "upstream", "disabled"]],
+  ["igmp-version", "IGMP version", ["", "2", "3"]],
+];
+// A VRF is a table plus the links that use it. Import and export are route
+// targets: what may cross in, and what this one offers out.
+const VRF = [
+  ["table", "Routing table id"], ["rd", "Route distinguisher"],
+  ["interface", "Interfaces", null, "list"],
+  ["import", "Import targets", null, "list"],
+  ["export", "Export targets", null, "list"],
+];
+const ACME = [
+  ["email", "Contact address"],
+  ["directory-url", "Directory URL"],
+  ["challenge", "Challenge", ["", "http-01", "dns-01"]],
+  ["agree-tos", "Terms accepted", ["", "true", "false"]],
+];
+
 const IGP_BFD = [
   ["#", "How fast it decides"],
   ["min-tx", "Min TX (ms)"], ["min-rx", "Min RX (ms)"],
@@ -4388,6 +4970,23 @@ const WAN_UPLINK = [
   ["check target", "Health check targets", null, "each"],
   ["check interval", "Probe interval (s)"], ["check timeout", "Probe timeout (s)"],
   ["check fail", "Losses to fail"], ["check rise", "Successes to recover"],
+  // Out of SLA is not the same as down: a link that answers every probe in
+  // 400 ms is up by any reachability test and useless for a call.
+  ["#", "What counts as good enough"],
+  ["check latency", "Latency limit (ms)"], ["check jitter", "Jitter limit (ms)"],
+  ["check loss", "Loss limit (%)"], ["check probes", "Probes per round"],
+];
+// Steering. Failover answers "the uplink died, now what"; this answers the
+// question before it — which traffic belongs on which uplink, and when it moves.
+const WAN_POLICY = [
+  ["uplink", "Preferred uplinks", null, "each"],
+  ["#", "What it matches"],
+  ["source", "Source"], ["destination", "Destination"],
+  ["proto", "Protocol", ["", "tcp", "udp"]],
+  ["source-port", "Source port"], ["destination-port", "Destination port"],
+  ["#", "When nothing qualifies"],
+  ["strict", "Hold rather than degrade", ["", "true", "false"]],
+  ["disabled", "Disabled", ["", "true", "false"]],
 ];
 const OC_SERVER = [
   ["#", "Where clients arrive"],
@@ -4413,15 +5012,37 @@ const RMAP_RULE = [
   ["match metric-ge", "Metric ≥"],
   ["match metric-le", "Metric ≤"],
   ["#", "What it changes"],
+  ["set next-hop", "Next hop"],
   ["set metric", "Metric"],
   ["set add-metric", "Metric delta"],
   ["set preference", "Preference"],
   ["set community", "Communities"],
   ["set add-community", "Add community"],
   ["set large-community", "Large communities"],
+  ["set add-large-community", "Add large community"],
   ["set ext-community", "Extended communities"],
+  ["set add-ext-community", "Add extended community"],
 ];
-const SYS_IDENT = [["hostname", "Hostname"]];
+// Policy routing. Ordinary routing asks where a packet is going; these ask the
+// other questions and send the answer to a different table.
+const PBR = [
+  ["table", "Routing table"],
+  ["#", "What it matches"],
+  ["source", "Source"], ["destination", "Destination"],
+  ["interface", "Arrived on"],
+  ["proto", "Protocol", ["", "tcp", "udp"]],
+  ["source-port", "Source port"], ["destination-port", "Destination port"],
+  ["#", "Where it sits"],
+  ["priority", "Priority"], ["disabled", "Disabled", ["", "true", "false"]],
+];
+
+const SYS_IDENT = [
+  ["hostname", "Hostname"],
+  // The port somebody reaches for when the network this box manages is the
+  // thing that is broken.
+  ["console device", "Serial console"], ["console speed", "Console speed"],
+  ["commit-revisions", "Revisions kept"],
+];
 const SYS_UPDATE = [["url", "Channel URL"], ["public-key", "Signing key"]];
 
 
@@ -4496,7 +5117,19 @@ async function refreshWan() {{
   // which uplink the routing table is using right now, which is the same
   // question `show ip route` answers — and the caption says so, so nobody
   // wonders why this pane looks like the routing table.
-  await showInto("wanshow", "/api/v1/show/ip/route");
+  renderObjects({{
+    listId: "wanpolicylist", required: "uplink", toggleId: "togglewanpolicy",
+    toggleLabel: "New policy", addId: "addwanpolicypanel", noun: "Steering policy",
+    fields: WAN_POLICY, nameHint: "voip",
+    path: (n) => `multiwan policy ${{n}}`,
+    rows: entriesUnder(ls, ["multiwan", "policy"]),
+    badge: (r) => r.uplink ? {{ text: String(r.uplink).split(",")[0] + " first" }}
+                           : {{ text: "no uplink", cls: "warn" }},
+    empty: "No steering policies — every uplink carries whatever failover gives it.",
+  }});
+  // What each uplink is measuring, and where steering is sending traffic. The
+  // route table alone cannot show either.
+  await showInto("wanshow", "/api/v1/show/multiwan");
 }}
 
 async function refreshOpenconnect() {{
@@ -4540,6 +5173,18 @@ function fillPicker(pickId, names, current) {{
 async function refreshRoutePolicy() {{
   const ls = await leaves();
   markTabs("routepolicy", ls);
+
+  renderObjects({{
+    listId: "pbrlist", required: "table", toggleId: "togglepbr",
+    toggleLabel: "New rule", addId: "addpbrpanel", noun: "Policy route",
+    fields: PBR, nameHint: "guests-out",
+    path: (n) => `policy route ${{n}}`,
+    rows: entriesUnder(ls, ["policy", "route"]),
+    badge: (r) => r.table ? {{ text: "table " + r.table }}
+                          : {{ text: "no table", cls: "warn" }},
+    empty: "No policy routes configured.",
+  }});
+  if (currentTab("routepolicy") === "pbr") await showInto("show-pbr", "/api/v1/show/policy/route");
 
   const lists = entriesUnder(ls, ["policy", "prefix-list"]);
   const list = chosenName("pllist-pick", "plnew", lists);
@@ -4623,6 +5268,11 @@ async function refreshRouting() {{
     ["igp-babel", IGP_BABEL, "protocols babel", "Babel"],
     ["igp-bfd", IGP_BFD, "protocols bfd", "BFD"],
     ["bgpglobal", BGP_GLOBAL, "protocols bgp", "BGP router settings"],
+    // Both write under `protocols bgp` as well: their keys carry the sub-node,
+    // so `confederation id` and `rpki rtr` are the commands they already are.
+    ["bgpconfed", BGP_CONFED, "protocols bgp", "Confederation"],
+    ["bgprpki", BGP_RPKI, "protocols bgp", "Origin validation"],
+    ["mcastform", MULTICAST, "protocols multicast", "Multicast routing"],
   ]) {{
     settingsPanel(box, fields, fieldsOf(ls, path), path, label);
   }}
@@ -4649,6 +5299,45 @@ async function refreshRouting() {{
                                  : {{ text: "incomplete", cls: "warn" }},
     empty: "No BGP neighbours configured.",
   }});
+  renderObjects({{
+    listId: "agglist", toggleId: "toggleagg", toggleLabel: "New aggregate",
+    addId: "addaggpanel", noun: "Aggregate",
+    fields: BGP_AGGREGATE, nameHint: "10.0.0.0/8",
+    path: (n) => `protocols bgp aggregate ${{n}}`,
+    rows: entriesUnder(ls, ["protocols", "bgp", "aggregate"]),
+    badge: (r) => r["summary-only"] === "true"
+      ? {{ text: "specifics suppressed" }} : {{ text: "specifics kept" }},
+    empty: "No aggregates configured.",
+  }});
+  renderObjects({{
+    listId: "roalist", required: "origin-as", toggleId: "toggleroa",
+    toggleLabel: "New authorisation", addId: "addroapanel", noun: "Authorisation",
+    fields: BGP_ROA, nameHint: "192.0.2.0/24",
+    path: (n) => `protocols bgp roa ${{n}}`,
+    rows: entriesUnder(ls, ["protocols", "bgp", "roa"]),
+    badge: (r) => r["origin-as"] ? {{ text: "AS " + r["origin-as"] }}
+                                 : {{ text: "no origin", cls: "warn" }},
+    empty: "No local authorisations.",
+  }});
+  renderObjects({{
+    listId: "mcastiflist", required: "role", toggleId: "togglemcastif",
+    toggleLabel: "New", addId: "addmcastifpanel", noun: "Interface",
+    fields: MULTICAST_IFACE, nameHint: "eth0",
+    path: (n) => `protocols multicast interface ${{n}}`,
+    rows: entriesUnder(ls, ["protocols", "multicast", "interface"]),
+    badge: (r) => r.role ? {{ text: r.role }} : {{ text: "no role", cls: "warn" }},
+    empty: "No multicast interfaces configured.",
+  }});
+  renderObjects({{
+    listId: "vrflist", required: "table", toggleId: "togglevrf",
+    toggleLabel: "New VRF", addId: "addvrfpanel", noun: "VRF",
+    fields: VRF, nameHint: "tenant-a",
+    path: (n) => `protocols vrf ${{n}}`,
+    rows: entriesUnder(ls, ["protocols", "vrf"]),
+    badge: (r) => r.table ? {{ text: "table " + r.table }}
+                          : {{ text: "no table", cls: "warn" }},
+    empty: "No VRFs configured.",
+  }});
 
   // Only the open protocol is asked what it is doing. Ten `show` calls to fill
   // panes nobody is looking at is a page that takes a second to open for
@@ -4664,6 +5353,8 @@ async function refreshRouting() {{
     ripng: [["show-ripng", "/api/v1/show/ipv6/ripng"]],
     babel: [["show-babel", "/api/v1/show/babel/neighbors"]],
     bfd: [["show-bfd", "/api/v1/show/bfd"]],
+    multicast: [["show-multicast", "/api/v1/show/multicast"]],
+    vrf: [["show-vrf", "/api/v1/show/vrf"]],
     table: [["igpshow", "/api/v1/show/ip/route"]],
   }};
   await Promise.all((LIVE[tab] || []).map(([boxId, path]) => showInto(boxId, path)));
@@ -4888,6 +5579,7 @@ function icon(name) {{
 const SECTIONS = [
   {{ g: "Overview", items: [
     {{ v: "dashboard", t: "Dashboard", i: "gauge" }},
+    {{ v: "history", t: "History", i: "gauge" }},
   ]}},
   {{ g: "Policy", items: [
     {{ v: "rules", t: "Firewall rules", i: "shield" }},
@@ -4918,8 +5610,12 @@ const SECTIONS = [
     {{ v: "routing", tab: "ripng",  t: "RIPng", i: "loop" }},
     {{ v: "routing", tab: "babel",  t: "Babel", i: "mesh" }},
     {{ v: "routing", tab: "bfd",    t: "BFD", i: "pulse" }},
+    {{ v: "routing", tab: "multicast", t: "Multicast", i: "mesh" }},
+    {{ v: "routing", tab: "vrf",    t: "VRFs", i: "list" }},
     {{ v: "routing", tab: "table",  t: "Routing table", i: "list" }},
-    {{ v: "routepolicy", t: "Route policy", i: "filter" }},
+    {{ v: "routepolicy", tab: "prefix", t: "Prefix lists", i: "filter" }},
+    {{ v: "routepolicy", tab: "maps", t: "Route maps", i: "filter" }},
+    {{ v: "routepolicy", tab: "pbr", t: "Policy routing", i: "pin" }},
     {{ v: "wan", t: "Multi-WAN", i: "swap" }},
   ]}},
   {{ g: "Security", items: [
@@ -4963,11 +5659,14 @@ const TABS = {{
     {{ k: "ripng",  t: "RIPng",   i: "loop",  n: "protocols ripng" }},
     {{ k: "babel",  t: "Babel",   i: "mesh",  n: "protocols babel" }},
     {{ k: "bfd",    t: "BFD",     i: "pulse", n: "protocols bfd" }},
+    {{ k: "multicast", t: "Multicast", i: "mesh", n: "protocols multicast" }},
+    {{ k: "vrf",    t: "VRFs",    i: "list",  n: "protocols vrf" }},
     {{ k: "table",  t: "Routing table", i: "list" }},
   ],
   routepolicy: [
     {{ k: "prefix", t: "Prefix lists", n: "policy" }},
     {{ k: "maps",   t: "Route maps" }},
+    {{ k: "pbr",    t: "Policy routing" }},
   ],
   services: [
     {{ k: "resolution",   t: "DNS and time" }},
@@ -5187,9 +5886,11 @@ const ABOUT = {{
   "services:addressing": "Addresses and names for the segments behind this box.",
   "services:publishing": "What this box puts in front of something else.",
   "services:notification": "Where the appliance speaks up, and who hears it.",
+  history: "What the box looked like before now — throughput and connections over time.",
   routepolicy: "Prefix lists and route maps — what is accepted, and what is changed.",
   "routepolicy:prefix": "Named sets of prefixes a route map or a neighbour filter points at.",
   "routepolicy:maps": "What is accepted, and what is changed on the way through.",
+  "routepolicy:pbr": "Traffic sent by where it came from rather than where it is going.",
   wan: "Which uplink carries new connections, and what happens when one fails.",
   ipsec: "Site-to-site IKEv2 tunnels.",
   wireguard: "Site-to-site WireGuard interfaces and their peers.",
@@ -5397,6 +6098,7 @@ async function refresh() {{
   if (view === "wan") return refreshWan();
   if (view === "qos") return refreshQos();
   if (view === "openconnect") return refreshOpenconnect();
+  if (view === "history") return refreshHistory();
   if (view === "routepolicy") return refreshRoutePolicy();
   if (view === "system") return refreshSystem();
   if (view === "services") return refreshServices();
@@ -5492,10 +6194,17 @@ $("loginform").onsubmit = async (e) => {{
     const r = await fetch("/api/v1/login", {{
       method: "POST",
       headers: {{ "Content-Type": "application/json" }},
-      body: JSON.stringify({{ username, password }}),
+      body: JSON.stringify({{ username, password, code: $("code").value.trim() }}),
     }});
     const body = await r.json().catch(() => ({{}}));
     if (!r.ok) {{
+      // The password was right and a code is what is missing: reveal the field
+      // and say so, rather than repeating "sign-in failed" at somebody who did
+      // nothing wrong.
+      if (/one-time code/i.test(body.error || "")) {{
+        $("codefield").classList.remove("hidden");
+        $("code").focus();
+      }}
       $("loginerr").textContent = body.error || ("Sign-in failed (HTTP " + r.status + ")");
       return;
     }}
@@ -5504,6 +6213,8 @@ $("loginform").onsubmit = async (e) => {{
     who = body.user || username;
     sessionStorage.setItem(KEY, token);
     $("password").value = "";
+    $("code").value = "";
+    $("codefield").classList.add("hidden");
     $("loginerr").textContent = "";
     signedIn();
   }} catch (err) {{
@@ -5607,11 +6318,21 @@ $("rmlist-pick").onchange = () => {{ $("rmnew").value = ""; refreshRoutePolicy()
 $("plnew").onchange = () => refreshRoutePolicy();
 $("rmnew").onchange = () => refreshRoutePolicy();
 $("qosiface").onchange = () => refreshQos();
+$("historyres").onchange = () => refreshHistory();
 $("enabledhcp").onclick = () => {{
   const iface = $("dhcpiface").value;
   if (!iface) return;
   stage("Enable DHCP on " + iface, [`set interface ${{iface}} dhcp-server enable`]);
 }};
+// `enable` takes no value, so it cannot come from a field the way every other
+// setting does — it is a verb, and this is the button that says it.
+$("enablera").onclick = () => {{
+  const iface = $("raiface").value;
+  if (!iface) return;
+  stage("Advertise a router on " + iface,
+        [`set interface ${{iface}} router-advert enable`]);
+}};
+$("mapiface").onchange = () => refreshDhcp();
 
 $("cancel").onclick = () => $("editor").close();
 $("resultclose").onclick = () => $("result").close();
@@ -5709,6 +6430,70 @@ mod tests {
         assert!(html.contains("sessionStorage.getItem(KEY)"));
         assert!(!html.contains("localStorage.getItem(KEY)"));
         assert!(!html.contains("localStorage.setItem(KEY"));
+    }
+
+    /// The console's route sources are the routing daemon's, not a subset of
+    /// them. It offered three of the eight, so a configuration that
+    /// redistributes kernel routes — an ordinary thing to do on a box with a
+    /// default route from DHCP or from a provider — could be written in the CLI
+    /// and not clicked together in the console.
+    #[test]
+    fn every_route_source_the_daemon_knows_can_be_ticked() {
+        let html = page();
+        // The list itself, not the words in it — every one of these names also
+        // occurs elsewhere on the page, so a per-word search would pass on a
+        // console that offers none of them.
+        assert!(
+            html.contains(
+                r#""connected", "static", "kernel", "rip", "ospf", "isis", "babel", "bgp","#
+            ),
+            "the console's route sources are not the routing daemon's"
+        );
+        // And every protocol's own mask draws from that list rather than from a
+        // hand-written subset, which is what had drifted.
+        for protocol in ["bgp", "ospf", "isis", "rip", "babel"] {
+            assert!(
+                html.contains(&format!("redist(\"{protocol}\")")),
+                "{protocol} still has its own redistribute list"
+            );
+        }
+    }
+
+    /// Everything the CLI can configure, the console can too. This list was
+    /// found by instrumenting the page — recording what path each mask writes
+    /// to — and comparing it with the grammar in `repl.rs` node by node. Ten
+    /// sections had no mask at all: an operator could type them and not click
+    /// them, which makes the console a partial view of the appliance rather
+    /// than a way to run it.
+    ///
+    /// A new `set` path belongs on this list. If it has no mask, this test is
+    /// where that gets noticed rather than by somebody looking for the setting.
+    #[test]
+    fn every_configurable_section_has_somewhere_to_click() {
+        let html = page();
+        for path in [
+            // Sub-nodes reached through a two-word field key.
+            "confederation id",
+            "rpki rtr",
+            "dhcp6-pool start",
+            "offload ntuple",
+            "set add-ext-community",
+            // Sections with a mask of their own.
+            "nat npt66 ",
+            "pki acme",
+            "protocols bgp aggregate ",
+            "protocols bgp roa ",
+            "protocols multicast",
+            "protocols multicast interface ",
+            "protocols vrf ",
+            "router-advert",
+            "static-mapping ",
+        ] {
+            assert!(
+                html.contains(path),
+                "nothing in the console writes {path:?}"
+            );
+        }
     }
 
     /// Editing goes through the CLI grammar. If the console ever assembled a
@@ -6110,6 +6895,10 @@ mod tests {
             "Event",
             "URL",
             "AbortController",
+            // Typed arrays and the crypto interface: a page that generates a
+            // secret in the browser needs both, and both are as much a builtin
+            // as `Array` is.
+            "Uint8Array",
         ];
         for (i, _) in script.match_indices('(') {
             let before = &script[..i];

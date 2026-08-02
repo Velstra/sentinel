@@ -595,8 +595,16 @@ fn dnsmasq_conf_body(dns: &Dns) -> Result<Option<String>> {
         return Ok(None);
     }
     let mut body = String::from("# rendered by sentinel — LAN DNS (dnsmasq)\nno-resolv\n");
-    for up in &dns.upstream {
-        body.push_str(&format!("server={up}\n"));
+    if dns.secure_upstream.is_empty() {
+        for up in &dns.upstream {
+            body.push_str(&format!("server={up}\n"));
+        }
+    } else {
+        // One upstream, and it is the local proxy that speaks TLS. The plaintext
+        // servers are still configured, but they are the proxy's *bootstrap* —
+        // leaving them here as well would quietly send queries in the clear to
+        // whichever answered first, which is the opposite of what was asked for.
+        body.push_str(&format!("server=127.0.0.1#{DNSPROXY_PORT}\n"));
     }
     for name in &dns.serve_on {
         body.push_str(&format!("interface={name}\n"));
@@ -606,6 +614,22 @@ fn dnsmasq_conf_body(dns: &Dns) -> Result<Option<String>> {
     // to clients as the DHCP/search suffix.
     if let Some(n) = dns.cache_size {
         body.push_str(&format!("cache-size={n}\n"));
+    }
+    // Who may ask. `serve-on` decides where the resolver listens; this decides
+    // which clients it answers, and the two are not the same question — an open
+    // resolver on a segment it is meant to serve is still an open resolver to
+    // everything else on that segment.
+    for who in &dns.allow_from {
+        reject_unsafe("dns allow-from", who, &['/'])?;
+        body.push_str(&format!("local-service-from={who}\n"));
+    }
+    // Never forwarded, answered NXDOMAIN here. The reverse zones for private
+    // space are why this exists: without it a PTR for an internal address goes
+    // out to a stranger, says something about the addressing, and returns
+    // nothing anyway.
+    for domain in &dns.dont_query {
+        reject_unsafe("dns dont-query", domain, &['/'])?;
+        body.push_str(&format!("server=/{domain}/\n"));
     }
     if let Some(dom) = &dns.local_domain {
         // The domain is delimited by `/` in `local=/dom/`; a `/` (or control char)
@@ -909,6 +933,77 @@ const L2TP_UNIT: &str = "sentinel-l2tp.service";
 const FWSCHED_TIMER: &str = "/run/systemd/system/sentinel-fwsched.timer";
 const FWSCHED_UNIT: &str = "sentinel-fwsched.timer";
 
+/// Encrypted DNS upstreams: the local proxy dnsmasq forwards to when
+/// `[services.dns] secure-upstream` is set. Loopback only — it exists to be
+/// dnsmasq's upstream, not to serve anybody.
+const DNSPROXY_PORT: u16 = 5353;
+const DNSPROXY_ARGS: &str = "/run/sentinel/dnsproxy.env";
+const DNSPROXY_UNIT: &str = "sentinel-dnsproxy.service";
+
+/// The proxy's arguments as a systemd environment file, or `None` when no
+/// encrypted upstream is configured.
+///
+/// `ARGS=` rather than the tool's own YAML: systemd splits an unquoted `$ARGS`
+/// into words itself, with no shell involved, so this uses dnsproxy's
+/// documented command-line flags instead of a config schema. One less thing
+/// that can be subtly wrong, and an upstream's hostname never reaches a shell.
+fn dnsproxy_args_body(dns: &Dns) -> Option<String> {
+    if dns.secure_upstream.is_empty() {
+        return None;
+    }
+    let mut args = vec![
+        "--listen=127.0.0.1".to_string(),
+        format!("--port={DNSPROXY_PORT}"),
+    ];
+    for up in &dns.secure_upstream {
+        args.push(format!("--upstream={up}"));
+    }
+    // The bootstrap. An encrypted upstream named by hostname cannot be reached
+    // until something resolves that hostname, and that something has to be
+    // plaintext — so the configured plaintext servers answer exactly one
+    // question rather than every question.
+    for b in &dns.upstream {
+        args.push(format!("--bootstrap={b}"));
+    }
+    Some(format!(
+        "# rendered by sentinel — encrypted DNS upstreams\nARGS={}\n",
+        args.join(" ")
+    ))
+}
+
+/// Reconcile the encrypted-DNS proxy to the configuration.
+fn apply_dnsproxy(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
+    let path = Path::new(DNSPROXY_ARGS);
+    match dnsproxy_args_body(&appliance.services.dns) {
+        Some(body) => {
+            let changed = file_changed(path, &body);
+            system::ensure_dir(Path::new("/run/sentinel"))?;
+            system::install_file(path, &body)?;
+            if mode == ApplyMode::Live && changed {
+                if let Err(e) = system::service_restart(DNSPROXY_UNIT) {
+                    eprintln!("warning: (re)starting {DNSPROXY_UNIT} failed: {e}");
+                }
+            }
+        }
+        None => {
+            if path.exists() {
+                if mode == ApplyMode::Live {
+                    let _ = system::service_stop(DNSPROXY_UNIT);
+                }
+                system::remove_file(path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The history sampler (roadmap: history) — a timer and the one-shot it fires.
+/// Both are rendered rather than shipped in the image, so a box that keeps no
+/// history carries no unit for it either.
+const METRICS_TIMER: &str = "/run/systemd/system/sentinel-metrics.timer";
+const METRICS_SERVICE: &str = "/run/systemd/system/sentinel-metrics.service";
+const METRICS_TIMER_UNIT: &str = "sentinel-metrics.timer";
+
 /// Render the time-based-rules timer, or `None` when no rule has a schedule. One
 /// `OnCalendar=` per distinct window boundary (start + end) across all scheduled
 /// rules, in the box's local time (matching the compiler's schedule evaluation).
@@ -961,7 +1056,11 @@ const FWSCHED_SERVICE: &str = "sentinel-fwsched.service";
 
 /// Render the domain-refresh timer, or `None` when no domain group is declared.
 fn fwdomain_timer_body(appliance: &Appliance) -> Option<String> {
-    if appliance.firewall.group.domain.is_empty() {
+    // Feed groups ride the same timer: both are a group whose members are
+    // decided somewhere else and go stale, and re-applying resolves either.
+    // Their own freshness is a TTL in the cache, so a fifteen-minute tick does
+    // not mean re-downloading somebody's list four times an hour.
+    if appliance.firewall.group.domain.is_empty() && appliance.firewall.group.feed.is_empty() {
         return None;
     }
     // `Unit=` is not optional here: a timer activates the service of its own name
@@ -969,7 +1068,7 @@ fn fwdomain_timer_body(appliance: &Appliance) -> Option<String> {
     // re-apply unit the schedule timer does, so there is one such unit, not two
     // that can drift.
     Some(format!(
-        "[Unit]\nDescription=re-resolve firewall domain groups\n\n\
+        "[Unit]\nDescription=refresh firewall domain and feed groups\n\n\
          [Timer]\nUnit={FWSCHED_SERVICE}\nOnBootSec=2min\n\
          OnUnitActiveSec={FWDOMAIN_INTERVAL}\n\n\
          [Install]\nWantedBy=timers.target\n"
@@ -1118,8 +1217,22 @@ fn rsyslog_conf_body(syslog: &Syslog) -> Result<Option<String>> {
             SyslogProto::Tcp => "tcp",
         };
         let level = t.level.unwrap_or(SyslogLevel::Info).rsyslog();
+        // `*` is every facility; naming some builds the `auth,daemon.info`
+        // selector rsyslog expects instead.
+        let selector = if t.facility.is_empty() {
+            "*".to_string()
+        } else {
+            for f in &t.facility {
+                reject_unsafe(
+                    "syslog target facility",
+                    f,
+                    &[' ', '\t', '"', '\\', '.', '*'],
+                )?;
+            }
+            t.facility.join(",")
+        };
         body.push_str(&format!(
-            "*.{level} action(type=\"omfwd\" target=\"{}\" port=\"{port}\" \
+            "{selector}.{level} action(type=\"omfwd\" target=\"{}\" port=\"{port}\" \
              protocol=\"{proto}\" template=\"RSYSLOG_SyslogProtocol23Format\" \
              queue.type=\"linkedList\" queue.size=\"10000\" \
              queue.saveOnShutdown=\"on\" action.resumeRetryCount=\"-1\")\n",
@@ -1424,6 +1537,70 @@ fn apply_fwsched(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     Ok(())
 }
 
+/// The sampler's two units, or `None` when no history is being kept.
+///
+/// One minute, and `Persistent=false`: a box that was off does not want the
+/// samples it missed replayed into the same second on boot, because that is a
+/// spike in the graph that never happened.
+fn metrics_units(appliance: &Appliance) -> Option<(String, String)> {
+    if !appliance.system.metrics.enable {
+        return None;
+    }
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "/run/current-system/sw/bin/sentinel".into());
+    let service = format!(
+        "# rendered by sentinel — history sampler\n\
+         [Unit]\nDescription=Sample counters into the appliance's history\n\
+         [Service]\nType=oneshot\nExecStart={exe} record-metrics\n"
+    );
+    let timer = "# rendered by sentinel — history sampler
+                 [Unit]
+Description=Sample counters once a minute
+                 [Timer]
+OnBootSec=60
+OnUnitActiveSec=60
+AccuracySec=5s
+Persistent=false
+                 [Install]
+WantedBy=timers.target
+"
+    .to_string();
+    Some((timer, service))
+}
+
+/// Reconcile the history sampler to the configuration.
+fn apply_metrics(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
+    let timer_path = Path::new(METRICS_TIMER);
+    let service_path = Path::new(METRICS_SERVICE);
+    match metrics_units(appliance) {
+        Some((timer, service)) => {
+            let changed = file_changed(timer_path, &timer) || file_changed(service_path, &service);
+            system::install_file(service_path, &service)?;
+            system::install_file(timer_path, &timer)?;
+            if mode == ApplyMode::Live && changed {
+                let _ = system::daemon_reload();
+                if let Err(e) = system::service_restart(METRICS_TIMER_UNIT) {
+                    eprintln!("warning: starting {METRICS_TIMER_UNIT} failed: {e}");
+                }
+            }
+        }
+        None => {
+            if timer_path.exists() {
+                if mode == ApplyMode::Live {
+                    let _ = system::service_stop(METRICS_TIMER_UNIT);
+                }
+                system::remove_file(timer_path)?;
+                system::remove_file(service_path)?;
+                if mode == ApplyMode::Live {
+                    let _ = system::daemon_reload();
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reconcile all box services (LLDP/SNMP/mDNS/dyndns/DHCP-relay) to the config.
 fn apply_box_services(appliance: &Appliance) -> Result<()> {
     let s = &appliance.services;
@@ -1528,7 +1705,11 @@ const SSH_UNIT: &str = "sshd.service";
 /// password auth when `[services.ssh] password-authentication` is set), or `None`
 /// when everything is at its default (port 22, all addresses, key-only).
 fn ssh_dropin_body(ssh: &Ssh) -> Option<String> {
-    if ssh.port.is_none() && ssh.listen_address.is_none() && !ssh.password_authentication {
+    if ssh.port.is_none()
+        && ssh.listen_address.is_none()
+        && ssh.loglevel.is_none()
+        && !ssh.password_authentication
+    {
         return None;
     }
     let mut body = String::from("# rendered by sentinel — [services.ssh]\n");
@@ -1537,6 +1718,9 @@ fn ssh_dropin_body(ssh: &Ssh) -> Option<String> {
     }
     if let Some(a) = &ssh.listen_address {
         body.push_str(&format!("ListenAddress {a}\n"));
+    }
+    if let Some(l) = &ssh.loglevel {
+        body.push_str(&format!("LogLevel {l}\n"));
     }
     if ssh.password_authentication {
         // A trailing `Match all` overrides the image's global `PasswordAuthentication
@@ -2016,26 +2200,43 @@ fn ppp_secrets_body(ifaces: &[Interface]) -> Option<String> {
     Some(body)
 }
 
-/// Render the nftables ruleset that clamps TCP MSS to the path MTU on every
-/// PPPoE interface's egress — the `--clamp-mss-to-pmtu` equivalent, in the
-/// `inet sentinel-mss` table so it never collides with any other firewall. The
+/// Every link whose TCP MSS is clamped, and to what. PPPoE is clamped to the
+/// path MTU whether or not anybody asked — its MTU is not negotiable and a
+/// wedged link is the alternative. Anything else is clamped because the
+/// operator said so, which is what a tunnel needs: the two ends agree an MSS
+/// from their own MTUs and neither knows about the encapsulation between them.
+fn mss_clamped(ifaces: &[Interface]) -> Vec<(&str, String)> {
+    ifaces
+        .iter()
+        .filter(|i| !i.disabled)
+        .filter_map(|i| match (&i.mss, is_active_pppoe(i)) {
+            // `rt mtu` is nftables for "whatever this route's MTU turns out to
+            // be" — the `--clamp-mss-to-pmtu` equivalent.
+            (Some(m), _) if m == "pmtu" => Some((i.name.as_str(), "rt mtu".to_string())),
+            (Some(m), _) => Some((i.name.as_str(), m.clone())),
+            (None, true) => Some((i.name.as_str(), "rt mtu".to_string())),
+            (None, false) => None,
+        })
+        .collect()
+}
+
+/// Render the nftables ruleset that clamps TCP MSS on egress, in the `inet
+/// sentinel-mss` table so it never collides with any other firewall. The
 /// leading `table`/`delete table` is the standard idempotent flush: re-loading
-/// this file replaces our table wholesale, and with no PPPoE interface it just
+/// this file replaces our table wholesale, and with nothing to clamp it just
 /// removes it.
-fn pppoe_mss_body(ifaces: &[Interface]) -> String {
-    let ppp: Vec<&Interface> = ifaces.iter().filter(|i| is_active_pppoe(i)).collect();
-    let mut body =
-        String::from("# rendered by sentinel — PPPoE TCP MSS clamp (clamp-mss-to-pmtu)\n");
+fn mss_clamp_body(ifaces: &[Interface]) -> String {
+    let clamped = mss_clamped(ifaces);
+    let mut body = String::from("# rendered by sentinel — TCP MSS clamp\n");
     body.push_str("table inet sentinel-mss\ndelete table inet sentinel-mss\n");
-    if ppp.is_empty() {
+    if clamped.is_empty() {
         return body;
     }
     body.push_str("table inet sentinel-mss {\n\tchain clamp {\n");
     body.push_str("\t\ttype filter hook forward priority mangle; policy accept;\n");
-    for i in &ppp {
+    for (name, to) in &clamped {
         body.push_str(&format!(
-            "\t\toifname \"{}\" tcp flags syn tcp option maxseg size set rt mtu\n",
-            i.name
+            "\t\toifname \"{name}\" tcp flags syn tcp option maxseg size set {to}\n"
         ));
     }
     body.push_str("\t}\n}\n");
@@ -2108,13 +2309,13 @@ fn apply_pppoe(appliance: &Appliance) -> Result<()> {
     // MSS clamp: render + load. Load when the ruleset changed, or whenever any
     // PPPoE interface exists (so a fresh boot re-asserts the kernel table even
     // if the file on tmpfs happens to match).
-    let mss_body = pppoe_mss_body(ifaces);
+    let mss_body = mss_clamp_body(ifaces);
     let mss_changed = file_changed(Path::new(PPPOE_MSS_NFT), &mss_body);
     system::ensure_dir(Path::new(PPPOE_RUNTIME_DIR))?;
     system::install_file(Path::new(PPPOE_MSS_NFT), &mss_body)?;
-    if mss_changed || !ppp.is_empty() {
+    if mss_changed || !mss_clamped(ifaces).is_empty() {
         if let Err(e) = system::nft_load(Path::new(PPPOE_MSS_NFT)) {
-            eprintln!("warning: loading PPPoE MSS-clamp nftables ruleset failed: {e}");
+            eprintln!("warning: loading the TCP MSS-clamp nftables ruleset failed: {e}");
         }
     }
 
@@ -2294,6 +2495,7 @@ fn multiwan_script_body(mw: &MultiWan) -> Option<String> {
     let mut failn = Vec::new();
     let mut risen = Vec::new();
     let mut ivs = Vec::new();
+    let (mut lat, mut jit, mut los, mut prb) = (vec![], vec![], vec![], vec![]);
     for (idx, u) in mw.uplinks.iter().enumerate() {
         ifs.push(shq(&u.interface));
         // A `dhcp` (or unset) gateway is resolved at runtime from the link's
@@ -2316,6 +2518,59 @@ fn multiwan_script_body(mw: &MultiWan) -> Option<String> {
         // its own cadence (see MULTIWAN_LOGIC), so a slow uplink is not dragged to
         // a fast neighbour's rate (nor the reverse).
         ivs.push(u.check.interval.unwrap_or(WAN_CHECK_INTERVAL).to_string());
+        // 0 means "not a threshold" — the daemon measures either way, but only
+        // a set threshold can disqualify a path.
+        lat.push(u.check.latency.unwrap_or(0).to_string());
+        jit.push(u.check.jitter.unwrap_or(0).to_string());
+        los.push(u.check.loss.unwrap_or(0).to_string());
+        // One ping cannot measure loss or jitter. A check with a threshold needs
+        // a sample; one without stays a single probe, as it was.
+        prb.push(
+            u.check
+                .probes
+                .unwrap_or(if u.check.has_sla() { 5 } else { 1 })
+                .to_string(),
+        );
+    }
+    // The steering policies, as parallel arrays too. `PUP` is a space-separated
+    // preference list of uplink indices, resolved here so the daemon never has
+    // to map an interface name back to a table.
+    let index_of = |iface: &str| {
+        mw.uplinks
+            .iter()
+            .position(|u| u.interface == iface)
+            .map(|i| i.to_string())
+    };
+    let (mut pnm, mut psel, mut pup, mut pstrict) = (vec![], vec![], vec![], vec![]);
+    for p in &mw.policies {
+        if p.disabled {
+            continue;
+        }
+        pnm.push(shq(&p.name));
+        let mut sel: Vec<String> = Vec::new();
+        if let Some(v) = &p.source {
+            sel.push(format!("from {v}"));
+        }
+        if let Some(v) = &p.destination {
+            sel.push(format!("to {v}"));
+        }
+        if let Some(v) = &p.proto {
+            sel.push(format!("ipproto {v}"));
+        }
+        if let Some(v) = &p.source_port {
+            sel.push(format!("sport {v}"));
+        }
+        if let Some(v) = &p.destination_port {
+            sel.push(format!("dport {v}"));
+        }
+        psel.push(shq(&sel.join(" ")));
+        pup.push(shq(&p
+            .uplinks
+            .iter()
+            .filter_map(|i| index_of(i))
+            .collect::<Vec<_>>()
+            .join(" ")));
+        pstrict.push(if p.strict { "1" } else { "0" }.to_string());
     }
     let mode = match mw.mode {
         WanMode::Failover => "failover",
@@ -2337,6 +2592,14 @@ fn multiwan_script_body(mw: &MultiWan) -> Option<String> {
     s.push_str(&format!("FAILN=({})\n", failn.join(" ")));
     s.push_str(&format!("RISEN=({})\n", risen.join(" ")));
     s.push_str(&format!("IV=({})\n", ivs.join(" ")));
+    s.push_str(&format!("LAT=({})\n", lat.join(" ")));
+    s.push_str(&format!("JIT=({})\n", jit.join(" ")));
+    s.push_str(&format!("LOS=({})\n", los.join(" ")));
+    s.push_str(&format!("PRB=({})\n", prb.join(" ")));
+    s.push_str(&format!("PNM=({})\n", pnm.join(" ")));
+    s.push_str(&format!("PSEL=({})\n", psel.join(" ")));
+    s.push_str(&format!("PUP=({})\n", pup.join(" ")));
+    s.push_str(&format!("PSTRICT=({})\n", pstrict.join(" ")));
     // The fixed control logic. Kept as a raw block so the daemon reads clearly;
     // every dynamic value is already baked into the arrays above.
     s.push_str(MULTIWAN_LOGIC);
@@ -2350,12 +2613,20 @@ fn multiwan_script_body(mw: &MultiWan) -> Option<String> {
 /// reprograms on any state change.
 const MULTIWAN_LOGIC: &str = r#"
 N=${#IF[@]}
-declare -a UP FAILC RISEC NEXT
+NP=${#PNM[@]}
+# SLA[i] is 1 while uplink i meets every threshold it was given. It is a
+# separate answer from UP[i]: a link that answers every probe in 400 ms is up by
+# any reachability test and useless for a call, and steering exists to tell the
+# two apart.
+declare -a UP SLA FAILC RISEC NEXT RTT JTR LSS
 now=$(date +%s)
 # NEXT[i] is the epoch second uplink i is next due to be probed; seeding it to
 # `now` makes every uplink due on the first pass, then each reschedules itself
 # IV[i] seconds ahead — so each uplink is probed strictly on its own interval.
-for ((i=0;i<N;i++)); do UP[i]=1; FAILC[i]=0; RISEC[i]=0; NEXT[i]=$now; done
+for ((i=0;i<N;i++)); do
+  UP[i]=1; SLA[i]=1; FAILC[i]=0; RISEC[i]=0; NEXT[i]=$now
+  RTT[i]=0; JTR[i]=0; LSS[i]=0
+done
 
 gw_of() { # echo the gateway for uplink $1 (static, or learned from the link)
   local i=$1
@@ -2380,13 +2651,62 @@ setup() {
   done
 }
 
-check() { # $1 = uplink index; 0 = healthy
-  local i=$1 t
+# Probe uplink $1 and record what it measured. Returns 0 when the uplink
+# answered at all — reachability. Whether it answered *well enough* is SLA[i],
+# set here from the same sample, because measuring twice would double the probe
+# traffic to say the same thing.
+check() {
+  local i=$1 t out loss avg mdev
+  SLA[i]=1
   [ -z "${TGT[i]}" ] && return 0   # no targets ⇒ link-state only, assume up
   for t in ${TGT[i]}; do
-    ping -I "${IF[i]}" -c1 -W "${TMO[i]}" "$t" >/dev/null 2>&1 && return 0
+    out=$(ping -I "${IF[i]}" -c "${PRB[i]}" -W "${TMO[i]}" "$t" 2>/dev/null) || continue
+    loss=$(printf '%s' "$out" | sed -n 's/.*[^0-9]\([0-9]\+\)% packet loss.*/\1/p' | head -n1)
+    # `rtt min/avg/max/mdev = 0.3/0.4/0.5/0.1 ms` — avg is field 2, mdev is 4.
+    # mdev is not jitter in the RFC sense, but it is the deviation this sample
+    # actually has and it moves for the same reasons.
+    avg=$(printf '%s' "$out" | awk -F'[ /]' '/rtt|round-trip/{printf "%.0f", $8}')
+    mdev=$(printf '%s' "$out" | awk -F'[ /]' '/rtt|round-trip/{printf "%.0f", $10}')
+    RTT[i]=${avg:-0}; JTR[i]=${mdev:-0}; LSS[i]=${loss:-0}
+    # 100% loss on one target is not an answer; try the next.
+    [ "${LSS[i]}" = 100 ] && continue
+    [ "${LAT[i]}" -gt 0 ] && [ "${RTT[i]}" -gt "${LAT[i]}" ] && SLA[i]=0
+    [ "${JIT[i]}" -gt 0 ] && [ "${JTR[i]}" -gt "${JIT[i]}" ] && SLA[i]=0
+    [ "${LOS[i]}" -gt 0 ] && [ "${LSS[i]}" -gt "${LOS[i]}" ] && SLA[i]=0
+    return 0
   done
+  SLA[i]=0
   return 1
+}
+
+# Where each steering policy should send its traffic right now: the first
+# preferred uplink that is up *and* within SLA, else the first that is merely up
+# — a degraded path still beats no path — unless the policy said otherwise.
+steer() {
+  local p i best fallback
+  for ((p=0;p<NP;p++)); do
+    best=-1; fallback=-1
+    for i in ${PUP[p]}; do
+      [ "${UP[i]}" = 1 ] || continue
+      [ "$fallback" -lt 0 ] && fallback=$i
+      if [ "${SLA[i]}" = 1 ]; then best=$i; break; fi
+    done
+    [ "$best" -lt 0 ] && [ "${PSTRICT[p]}" = 0 ] && best=$fallback
+    local prio=$(( 20000 + p ))
+    ip rule del priority "$prio" 2>/dev/null || true
+    if [ "$best" -ge 0 ]; then
+      # shellcheck disable=SC2086
+      ip rule add ${PSEL[p]} lookup "${TB[best]}" priority "$prio" 2>/dev/null || true
+      echo "${PNM[p]} ${IF[best]}" >> /run/sentinel/multiwan/steering.new 2>/dev/null || true
+    else
+      # Strict, and nothing qualified: refuse to send it rather than send it
+      # somewhere that does not meet what was asked for.
+      # shellcheck disable=SC2086
+      ip rule add ${PSEL[p]} blackhole priority "$prio" 2>/dev/null || true
+      echo "${PNM[p]} (none — held)" >> /run/sentinel/multiwan/steering.new 2>/dev/null || true
+    fi
+  done
+  mv -f /run/sentinel/multiwan/steering.new /run/sentinel/multiwan/steering 2>/dev/null || true
 }
 
 apply() {
@@ -2416,6 +2736,7 @@ apply() {
 
 setup
 apply
+steer
 while true; do
   # Re-assert each uplink's table + source rule every tick: idempotent (`route
   # replace` / `rule del`+`add`), so this self-heals an uplink whose address
@@ -2423,20 +2744,31 @@ while true; do
   setup
   now=$(date +%s)
   changed=0
+  : > /run/sentinel/multiwan/sla.new 2>/dev/null || true
   for ((i=0;i<N;i++)); do
     # Skip uplinks not yet due; each one probes only every IV[i] seconds, so its
     # fail/rise counters advance at its own cadence.
     [ "$now" -lt "${NEXT[i]}" ] && continue
     NEXT[i]=$(( now + IV[i] ))
     if check "$i"; then
+      printf '%s up=%s sla=%s rtt=%sms jitter=%sms loss=%s%%\n' \
+        "${IF[i]}" "${UP[i]}" "${SLA[i]}" "${RTT[i]}" "${JTR[i]}" "${LSS[i]}" \
+        >> /run/sentinel/multiwan/sla.new 2>/dev/null || true
       RISEC[i]=$(( RISEC[i] + 1 )); FAILC[i]=0
       if [ "${UP[i]}" = 0 ] && [ "${RISEC[i]}" -ge "${RISEN[i]}" ]; then UP[i]=1; changed=1; fi
     else
+      printf '%s up=%s sla=0 rtt=-- jitter=-- loss=100%%\n' "${IF[i]}" "${UP[i]}" \
+        >> /run/sentinel/multiwan/sla.new 2>/dev/null || true
       FAILC[i]=$(( FAILC[i] + 1 )); RISEC[i]=0
       if [ "${UP[i]}" = 1 ] && [ "${FAILC[i]}" -ge "${FAILN[i]}" ]; then UP[i]=0; changed=1; fi
     fi
   done
-  [ "$changed" = 1 ] && apply
+  # A path that fell out of SLA has not gone down, so `apply` would see no
+  # change — but every policy that prefers it has to move. Re-steering on the
+  # same tick as the measurement is what makes the difference visible.
+  if [ "$changed" = 1 ]; then apply; fi
+  steer
+  mv -f /run/sentinel/multiwan/sla.new /run/sentinel/multiwan/sla 2>/dev/null || true
   # Sleep only until the soonest uplink is next due — no fixed tick, so distinct
   # per-uplink intervals are each honoured without busy-looping.
   nxt=${NEXT[0]}
@@ -2834,6 +3166,10 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     // SSH management access (roadmap C21): the persistent authorized_keys + the
     // Port/ListenAddress drop-in; sshd (re)started only in Live mode.
     apply_ssh(appliance, mode)?;
+    apply_console(appliance, mode)?;
+    apply_metrics(appliance, mode)?;
+    apply_dnsproxy(appliance, mode)?;
+    apply_policy_routes(appliance, mode)?;
     // HA config sync (roadmap C21): the receiving side — share the token + widen
     // the API when a secret is set. The sending side (push) is driven from commit.
     apply_configsync(appliance, mode)?;
@@ -2928,6 +3264,15 @@ fn apply_offload(appliance: &Appliance) -> Result<()> {
 
 /// Where the kernel parameters from `[system.sysctl]` are written.
 const SYSCTL_DROPIN: &str = "/run/sysctl.d/70-sentinel.conf";
+/// The priority band the appliance owns for policy-routing rules. Reconciling
+/// only this band is what lets an operator (or another tool) keep rules of their
+/// own in the same table without this one deleting them.
+pub const PBR_PRIORITY_BASE: u32 = 10_000;
+const PBR_PRIORITY_END: u32 = 19_999;
+
+/// The serial-getty drop-in directory. One `serial-getty@<tty>.service.d` per
+/// configured console — the unit itself is what systemd already ships.
+const CONSOLE_DROPIN_DIR: &str = "/run/systemd/system";
 
 /// Write the configured kernel parameters and apply them.
 ///
@@ -2953,6 +3298,148 @@ fn apply_sysctl(appliance: &Appliance) -> Result<()> {
     for (key, value) in params {
         if let Err(e) = system::sysctl_write(key, value) {
             eprintln!("warning: setting {key} failed (applies on next boot): {e}");
+        }
+    }
+    Ok(())
+}
+
+/// One policy rule as the arguments `ip rule` wants, in the order it wants them.
+/// Selectors first, then where a match is sent. Returns `None` for a rule that
+/// is switched off.
+fn pbr_args(r: &crate::config::PolicyRoute, priority: u32) -> Option<Vec<String>> {
+    if r.disabled {
+        return None;
+    }
+    let mut a: Vec<String> = vec!["priority".into(), priority.to_string()];
+    if let Some(v) = &r.source {
+        a.push("from".into());
+        a.push(v.clone());
+    }
+    if let Some(v) = &r.destination {
+        a.push("to".into());
+        a.push(v.clone());
+    }
+    if let Some(v) = &r.interface {
+        a.push("iif".into());
+        a.push(v.clone());
+    }
+    if let Some(v) = &r.proto {
+        a.push("ipproto".into());
+        a.push(v.clone());
+    }
+    if let Some(v) = &r.source_port {
+        a.push("sport".into());
+        a.push(v.clone());
+    }
+    if let Some(v) = &r.destination_port {
+        a.push("dport".into());
+        a.push(v.clone());
+    }
+    // `ip rule` needs a family, and there is no "both": a rule with no address
+    // selector is installed for each family separately by the caller.
+    a.push("lookup".into());
+    a.push(r.table.to_string());
+    Some(a)
+}
+
+/// Which family a rule is about. A selector names it; without one the rule
+/// applies to both, and the caller installs it twice.
+fn pbr_families(r: &crate::config::PolicyRoute) -> Vec<&'static str> {
+    let names_v6 = |v: &Option<String>| v.as_deref().is_some_and(|x| x.contains(':'));
+    if names_v6(&r.source) || names_v6(&r.destination) {
+        vec!["-6"]
+    } else if r.source.is_some() || r.destination.is_some() {
+        vec!["-4"]
+    } else {
+        vec!["-4", "-6"]
+    }
+}
+
+/// Reconcile the kernel's routing-policy rules to the configuration.
+///
+/// Ordinary routing asks where a packet is going. These rules ask the other
+/// questions — where it came from, over which link, to which port — and send the
+/// answer to a different table. Only the appliance's own priority band is
+/// touched: a rule somebody else put in the table stays.
+fn apply_policy_routes(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
+    if mode != ApplyMode::Live {
+        return Ok(());
+    }
+    // Tear our band down first. Deleting by priority is exact and does not
+    // depend on reconstructing the selectors of a rule that has since changed.
+    if let Ok(listing) = system::ip_rule_list() {
+        for line in listing.lines() {
+            let Some((prio, _)) = line.split_once(':') else {
+                continue;
+            };
+            let Ok(p) = prio.trim().parse::<u32>() else {
+                continue;
+            };
+            if !(PBR_PRIORITY_BASE..=PBR_PRIORITY_END).contains(&p) {
+                continue;
+            }
+            let family = if line.contains("from all") && !line.contains('.') {
+                "-6"
+            } else {
+                "-4"
+            };
+            let _ = system::ip_rule(&[family, "del", "priority", &p.to_string()]);
+            // The same priority can hold one rule per family.
+            let other = if family == "-4" { "-6" } else { "-4" };
+            let _ = system::ip_rule(&[other, "del", "priority", &p.to_string()]);
+        }
+    }
+    for (i, r) in appliance.policy.routes.iter().enumerate() {
+        let priority = r
+            .priority
+            .unwrap_or(PBR_PRIORITY_BASE + i as u32)
+            .clamp(PBR_PRIORITY_BASE, PBR_PRIORITY_END);
+        let Some(args) = pbr_args(r, priority) else {
+            continue;
+        };
+        for family in pbr_families(r) {
+            let mut all: Vec<&str> = vec![family, "add"];
+            all.extend(args.iter().map(String::as_str));
+            if let Err(e) = system::ip_rule(&all) {
+                eprintln!("warning: installing policy route {:?} failed: {e}", r.name);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The serial console: a getty on the named tty at the named speed.
+///
+/// This is the port somebody reaches for when the network this box manages is
+/// the thing that is broken, so getting the baud rate wrong is not a cosmetic
+/// fault — it is the difference between a login prompt and a screen of noise.
+/// Rendered as a drop-in that overrides the unit's `ExecStart`, because the baud
+/// rate is an argument to agetty rather than a setting it reads.
+fn apply_console(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
+    let console = &appliance.system.console;
+    let (Some(device), Some(speed)) = (&console.device, console.speed) else {
+        return Ok(());
+    };
+    let dir = Path::new(CONSOLE_DROPIN_DIR).join(format!("serial-getty@{device}.service.d"));
+    let body = format!(
+        "# Written by sentinel from [system.console].\n\
+         [Service]\n\
+         ExecStart=\n\
+         ExecStart=-/sbin/agetty -o '-p -- \\\\u' --keep-baud {speed} %I $TERM\n"
+    );
+    let dropin = dir.join("50-sentinel.conf");
+    let changed = file_changed(&dropin, &body);
+    system::ensure_dir(&dir)?;
+    system::install_file(&dropin, &body)?;
+    // A getty that is already up keeps the old speed until it is restarted, and
+    // an operator who just set the speed is quite possibly not on it yet.
+    if changed && mode == ApplyMode::Live {
+        if let Err(e) = system::daemon_reload() {
+            eprintln!("warning: reloading systemd for the console failed: {e}");
+        }
+        let unit = format!("serial-getty@{device}.service");
+        if let Err(e) = system::service_restart(&unit) {
+            eprintln!("warning: restarting {unit} failed (applies on next boot): {e}");
         }
     }
     Ok(())
@@ -3159,6 +3646,7 @@ mod tests {
             pd_from: None,
             pd_subnet: None,
             mtu: None,
+            mss: None,
             mac: None,
             local: None,
             remote: None,
@@ -3297,6 +3785,7 @@ mod tests {
             pd_from: None,
             pd_subnet: None,
             mtu: None,
+            mss: None,
             mac: None,
             local: Some("10.0.0.1".into()),
             remote: Some("10.0.0.2".into()),
@@ -3553,6 +4042,9 @@ mod tests {
     #[test]
     fn dnsmasq_renders_cache_size_and_local_domain() {
         let dns = Dns {
+            allow_from: Vec::new(),
+            dont_query: Vec::new(),
+            secure_upstream: Vec::new(),
             negative_ttl: None,
             txt_record: Default::default(),
             upstream: vec!["9.9.9.9".into()],
@@ -3575,6 +4067,9 @@ mod tests {
     fn dnsmasq_rejects_injection_in_local_domain() {
         // A `/` closes the `local=/dom/` pattern early; a newline splices a line.
         let slash = Dns {
+            allow_from: Vec::new(),
+            dont_query: Vec::new(),
+            secure_upstream: Vec::new(),
             negative_ttl: None,
             txt_record: Default::default(),
             serve_on: vec!["lan0".into()],
@@ -3583,6 +4078,9 @@ mod tests {
         };
         assert!(dnsmasq_conf_body(&slash).is_err());
         let nl = Dns {
+            allow_from: Vec::new(),
+            dont_query: Vec::new(),
+            secure_upstream: Vec::new(),
             negative_ttl: None,
             txt_record: Default::default(),
             serve_on: vec!["lan0".into()],
@@ -3623,6 +4121,7 @@ mod tests {
             pd_from: None,
             pd_subnet: None,
             mtu: None,
+            mss: None,
             mac: None,
             local: None,
             remote: None,
@@ -3657,6 +4156,9 @@ mod tests {
         let mut host_override = std::collections::BTreeMap::new();
         host_override.insert("nas.lan".to_string(), "10.0.0.5".to_string());
         let dns = Dns {
+            allow_from: Vec::new(),
+            dont_query: Vec::new(),
+            secure_upstream: Vec::new(),
             negative_ttl: None,
             txt_record: Default::default(),
             upstream: vec!["9.9.9.9".into(), "2620:fe::fe".into()],
@@ -3870,6 +4372,7 @@ mod tests {
             pd_from: None,
             pd_subnet: None,
             mtu: None,
+            mss: None,
             mac: None,
             local: None,
             remote: None,
@@ -3931,6 +4434,7 @@ mod tests {
             pd_from: None,
             pd_subnet: None,
             mtu: None,
+            mss: None,
             mac: None,
             local: None,
             remote: None,
@@ -4107,6 +4611,7 @@ mod tests {
             pd_from: None,
             pd_subnet: None,
             mtu: None,
+            mss: None,
             mac: None,
             local: None,
             remote: None,
@@ -4157,6 +4662,7 @@ mod tests {
             vlan_untagged: None,
             bond_mode: None,
             mtu: Some(1492),
+            mss: None,
             mac: None,
             local: None,
             remote: None,
@@ -4211,19 +4717,206 @@ mod tests {
     #[test]
     fn pppoe_mss_body_clamps_to_pmtu_on_the_ppp_link() {
         let ifaces = vec![pppoe_iface("eth0", "u", "p")];
-        let body = pppoe_mss_body(&ifaces);
+        let body = mss_clamp_body(&ifaces);
         assert!(body.contains("table inet sentinel-mss {"), "got:\n{body}");
         assert!(
             body.contains("oifname \"ppp0\" tcp flags syn tcp option maxseg size set rt mtu"),
             "got:\n{body}"
         );
         // With no PPPoE interface the ruleset only flushes/removes the table.
-        let empty = pppoe_mss_body(&[]);
+        let empty = mss_clamp_body(&[]);
         assert!(
             empty.contains("delete table inet sentinel-mss"),
             "got:\n{empty}"
         );
         assert!(!empty.contains("maxseg"), "got:\n{empty}");
+    }
+
+    /// Steering renders into the daemon as a preference of *indices*, resolved
+    /// here so the daemon never has to map an interface name back to a table —
+    /// and so an uplink named in a policy but absent from the box drops out
+    /// rather than steering to whatever index it happened to collide with.
+    #[test]
+    fn a_steering_policy_renders_as_a_resolved_preference() {
+        use crate::config::{HealthCheck, WanPolicy, WanUplink};
+        let uplink = |iface: &str, sla: bool| WanUplink {
+            interface: iface.into(),
+            priority: None,
+            weight: None,
+            table: None,
+            gateway: None,
+            check: HealthCheck {
+                targets: vec!["9.9.9.9".into()],
+                latency: sla.then_some(80),
+                ..Default::default()
+            },
+        };
+        let mw = MultiWan {
+            mode: WanMode::Failover,
+            uplinks: vec![uplink("eth1", true), uplink("eth2", false)],
+            policies: vec![WanPolicy {
+                name: "voip".into(),
+                proto: Some("udp".into()),
+                destination_port: Some("5060".into()),
+                uplinks: vec!["eth2".into(), "eth1".into()],
+                strict: true,
+                ..Default::default()
+            }],
+        };
+        let body = multiwan_script_body(&mw).expect("uplinks render a daemon");
+
+        // The preference is in the order it was written, as indices.
+        assert!(body.contains(r#"PUP=("1 0")"#), "got:\n{body}");
+        assert!(
+            body.contains(r#"PSEL=("ipproto udp dport 5060")"#),
+            "got:\n{body}"
+        );
+        assert!(body.contains("PSTRICT=(1)"), "got:\n{body}");
+        // A threshold turns a single ping into a sample, because one probe
+        // cannot measure loss or jitter at all.
+        assert!(body.contains("PRB=(5 1)"), "got:\n{body}");
+        assert!(body.contains("LAT=(80 0)"), "got:\n{body}");
+
+        // An uplink the box does not have cannot be steered to.
+        let mut ghost = mw.clone();
+        ghost.policies[0].uplinks = vec!["eth9".into(), "eth1".into()];
+        let body = multiwan_script_body(&ghost).unwrap();
+        assert!(
+            body.contains(r#"PUP=("0")"#),
+            "a ghost uplink survived:\n{body}"
+        );
+    }
+
+    /// A policy route is selectors first, then where a match is sent — the
+    /// order `ip rule` wants. A rule with no address selector belongs to both
+    /// families, because the kernel has no rule that spans them.
+    #[test]
+    fn a_policy_route_becomes_the_rule_the_kernel_wants() {
+        use crate::config::PolicyRoute;
+        let r = PolicyRoute {
+            name: "guests".into(),
+            source: Some("10.9.0.0/24".into()),
+            table: 100,
+            ..Default::default()
+        };
+        let args = pbr_args(&r, 10_000).expect("an enabled rule renders");
+        assert_eq!(
+            args,
+            vec!["priority", "10000", "from", "10.9.0.0/24", "lookup", "100"]
+        );
+        assert_eq!(pbr_families(&r), vec!["-4"]);
+
+        // A v6 selector makes it a v6 rule…
+        let v6 = PolicyRoute {
+            source: Some("fd00::/8".into()),
+            ..r.clone()
+        };
+        assert_eq!(pbr_families(&v6), vec!["-6"]);
+
+        // …and no address selector at all means both, since the kernel has no
+        // rule that covers the two families at once.
+        let ports = PolicyRoute {
+            name: "voip".into(),
+            proto: Some("udp".into()),
+            destination_port: Some("5060".into()),
+            table: 101,
+            ..Default::default()
+        };
+        assert_eq!(pbr_families(&ports), vec!["-4", "-6"]);
+        assert_eq!(
+            pbr_args(&ports, 10_001).unwrap(),
+            vec![
+                "priority", "10001", "ipproto", "udp", "dport", "5060", "lookup", "101"
+            ]
+        );
+
+        // A rule switched off installs nothing rather than installing something
+        // that matches nothing.
+        let off = PolicyRoute {
+            disabled: true,
+            ..r
+        };
+        assert!(pbr_args(&off, 10_000).is_none());
+    }
+
+    /// The point of the whole feature: when an encrypted upstream is set, the
+    /// plaintext servers stop being upstreams. Leaving them in dnsmasq as well
+    /// would send queries in the clear to whichever answered first, which is
+    /// the opposite of what was asked for — so they become the proxy's
+    /// bootstrap, answering exactly one question instead of every question.
+    #[test]
+    fn an_encrypted_upstream_takes_the_plaintext_ones_out_of_the_resolver() {
+        let dns = Dns {
+            serve_on: vec!["eth0".into()],
+            upstream: vec!["9.9.9.9".into()],
+            secure_upstream: vec!["tls://dns.quad9.net".into()],
+            ..Default::default()
+        };
+        let conf = dnsmasq_conf_body(&dns)
+            .unwrap()
+            .expect("a resolver is served");
+        assert!(
+            conf.contains(&format!("server=127.0.0.1#{DNSPROXY_PORT}")),
+            "dnsmasq does not forward to the proxy:\n{conf}"
+        );
+        assert!(
+            !conf.contains("server=9.9.9.9"),
+            "the plaintext upstream is still an upstream:\n{conf}"
+        );
+
+        let args = dnsproxy_args_body(&dns).expect("an encrypted upstream renders a proxy");
+        assert!(args.contains("--upstream=tls://dns.quad9.net"), "{args}");
+        assert!(args.contains("--bootstrap=9.9.9.9"), "{args}");
+        assert!(
+            args.contains("--listen=127.0.0.1"),
+            "loopback only:\n{args}"
+        );
+        // systemd word-splits `$ARGS`, so every flag has to be on that one line.
+        assert!(args.lines().any(|l| l.starts_with("ARGS=")), "{args}");
+
+        // …and with none set, nothing changes and no proxy is rendered.
+        let plain = Dns {
+            secure_upstream: vec![],
+            ..dns.clone()
+        };
+        assert!(dnsproxy_args_body(&plain).is_none());
+        assert!(
+            dnsmasq_conf_body(&plain)
+                .unwrap()
+                .unwrap()
+                .contains("server=9.9.9.9"),
+            "the plaintext upstream must still be the upstream when nothing is encrypted"
+        );
+    }
+
+    /// A tunnel has to be told. The two ends agree an MSS from their own MTUs
+    /// during the handshake and neither knows about the encapsulation between
+    /// them, so the session comes up, small requests work, and the first large
+    /// response disappears — which looks like an application fault until
+    /// somebody thinks of MTU.
+    #[test]
+    fn any_interface_can_be_clamped_not_only_pppoe() {
+        let mut tunnel = pppoe_iface("eth0", "u", "p");
+        tunnel.name = "tun0".into();
+        tunnel.if_type = Some(IfaceType::Gre);
+        tunnel.pppoe = None;
+        // Unclamped, a GRE link contributes nothing: only PPPoE is automatic.
+        assert!(!mss_clamp_body(std::slice::from_ref(&tunnel)).contains("maxseg"));
+
+        tunnel.mss = Some("1360".into());
+        let body = mss_clamp_body(std::slice::from_ref(&tunnel));
+        assert!(
+            body.contains("oifname \"tun0\" tcp flags syn tcp option maxseg size set 1360"),
+            "got:\n{body}"
+        );
+
+        // …and `pmtu` means the same thing PPPoE gets, spelled out.
+        tunnel.mss = Some("pmtu".into());
+        assert!(
+            mss_clamp_body(std::slice::from_ref(&tunnel))
+                .contains("oifname \"tun0\" tcp flags syn tcp option maxseg size set rt mtu"),
+            "pmtu did not clamp to the path MTU"
+        );
     }
 
     #[test]
@@ -4237,7 +4930,7 @@ mod tests {
             ppp_secrets_body(std::slice::from_ref(&iface)).is_none(),
             "disabled pppoe must not emit credentials"
         );
-        let mss = pppoe_mss_body(std::slice::from_ref(&iface));
+        let mss = mss_clamp_body(std::slice::from_ref(&iface));
         assert!(
             !mss.contains("maxseg"),
             "disabled pppoe must not get an MSS clamp:\n{mss}"
@@ -4255,6 +4948,7 @@ mod tests {
     fn multiwan_script_renders_arrays_tables_and_failover() {
         use crate::config::{HealthCheck, MultiWan, WanMode, WanUplink};
         let mw = MultiWan {
+            policies: Vec::new(),
             mode: WanMode::Failover,
             uplinks: vec![
                 WanUplink {
@@ -4264,6 +4958,10 @@ mod tests {
                     table: None,
                     gateway: Some("10.1.0.254".into()),
                     check: HealthCheck {
+                        latency: None,
+                        jitter: None,
+                        loss: None,
+                        probes: None,
                         targets: vec!["1.1.1.1".into()],
                         interval: Some(2),
                         timeout: Some(1),
@@ -4315,6 +5013,7 @@ mod tests {
     fn multiwan_load_balance_mode_renders() {
         use crate::config::{HealthCheck, MultiWan, WanMode, WanUplink};
         let mw = MultiWan {
+            policies: Vec::new(),
             mode: WanMode::LoadBalance,
             uplinks: vec![
                 WanUplink {
@@ -4358,12 +5057,17 @@ mod tests {
             table: None,
             gateway: Some("10.0.0.254".into()),
             check: HealthCheck {
+                latency: None,
+                jitter: None,
+                loss: None,
+                probes: None,
                 targets: vec!["1.1.1.1".into()],
                 interval: Some(interval),
                 ..HealthCheck::default()
             },
         };
         let mw = MultiWan {
+            policies: Vec::new(),
             mode: WanMode::Failover,
             uplinks: vec![mk("wan0", 5), mk("wan1", 30)],
         };
@@ -4430,12 +5134,14 @@ mod tests {
         let s = Syslog {
             targets: vec![
                 SyslogTarget {
+                    facility: Vec::new(),
                     host: "10.0.0.9".into(),
                     port: None,
                     proto: None,
                     level: None,
                 },
                 SyslogTarget {
+                    facility: Vec::new(),
                     host: "logs.example.com".into(),
                     port: Some(6514),
                     proto: Some(SyslogProto::Tcp),
@@ -4483,6 +5189,7 @@ mod tests {
     fn a_syslog_host_with_an_unsafe_character_is_refused() {
         let s = Syslog {
             targets: vec![SyslogTarget {
+                facility: Vec::new(),
                 host: "10.0.0.9\" x=\"y".into(),
                 port: None,
                 proto: None,
@@ -4641,6 +5348,7 @@ mod tests {
             pd_from: None,
             pd_subnet: None,
             mtu: None,
+            mss: None,
             mac: None,
             local: None,
             remote: None,
@@ -4836,6 +5544,9 @@ mod tests {
         lan6.address6 = Some("2001:db8:64::1/64".into());
         let ifaces = vec![lan6];
         let dns = Dns {
+            allow_from: Vec::new(),
+            dont_query: Vec::new(),
+            secure_upstream: Vec::new(),
             negative_ttl: None,
             txt_record: Default::default(),
             upstream: vec!["10.64.2.2".into()],

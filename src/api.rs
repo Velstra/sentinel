@@ -133,6 +133,9 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/api/v1/config", get(get_config).put(put_config))
         .route("/api/v1/status", get(get_status))
         .route("/api/v1/show/*path", get(get_show))
+        .route("/api/v1/rule-hits", get(get_rule_hits))
+        .route("/api/v1/metrics", get(get_metrics_list))
+        .route("/api/v1/metrics/:resolution/:series", get(get_metrics))
         .route("/api/v1/configure", post(post_configure))
         .route("/api/v1/clear/*path", post(post_clear))
         .route("/api/v1/capture", post(post_capture))
@@ -308,6 +311,84 @@ pub fn sync_user_tokens(state: &ApiState) -> Result<()> {
 
 // ---- handlers ------------------------------------------------------------
 
+/// `GET /api/v1/rule-hits` — what each accept rule is currently carrying.
+///
+/// Attribution rather than a hardware counter, and the reply says so: a rule
+/// that drops leaves no flow behind, so only accept rules can be counted this
+/// way and a console that implied otherwise would invite somebody to delete a
+/// drop rule that is doing its job.
+async fn get_rule_hits(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, ApiError> {
+    let appliance = Appliance::load(&state.config_path)
+        .map_err(|e| ApiError::internal(anyhow!("reading the configuration: {e}")))?;
+    let cfg = crate::compile::compile(&appliance);
+    let table = crate::velstra::query("flows --limit 0")
+        .or_else(|_| crate::velstra::query("flows"))
+        .unwrap_or_default();
+    let flows = crate::compile::parse_flows(&table);
+    let hits = crate::compile::attribute(&cfg, &flows);
+    Ok(Json(json!({
+        "counts_only": "accept",
+        "flows": flows.len(),
+        "answered": !table.trim().is_empty(),
+        "rules": hits
+            .into_iter()
+            .map(|(name, h)| json!({ "name": name, "flows": h.flows, "packets": h.packets }))
+            .collect::<Vec<_>>(),
+    })))
+}
+
+/// `GET /api/v1/metrics` — which series are being kept.
+async fn get_metrics_list() -> Result<Json<Value>, ApiError> {
+    let root = crate::metrics::dir();
+    let root = root.as_path();
+    Ok(Json(json!({
+        "series": crate::metrics::series(root),
+        "resolutions": crate::metrics::RESOLUTIONS
+            .iter()
+            .map(|r| json!({ "name": r.name, "step": r.step, "keep": r.keep }))
+            .collect::<Vec<_>>(),
+    })))
+}
+
+/// `GET /api/v1/metrics/<resolution>/<series>` — the samples, already turned
+/// into what a chart wants.
+///
+/// The rate is derived here rather than in the browser so both the console and
+/// `show history` answer the same question the same way — and so a counter
+/// reset is a gap in one place instead of two.
+async fn get_metrics(
+    axum::extract::Path((resolution, series)): axum::extract::Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let root = crate::metrics::dir();
+    let root = root.as_path();
+    let Some(res) = crate::metrics::resolution(&resolution) else {
+        return Err(ApiError::bad_request(anyhow!(
+            "no such resolution {resolution:?}"
+        )));
+    };
+    let samples = crate::metrics::read(root, &series, res)
+        .map_err(|e| ApiError::internal(anyhow!("reading the history: {e}")))?;
+    // A gauge is a level and a counter is a total; deriving a rate from a level
+    // would draw the change in the number of sessions, which nobody wants.
+    let points: Vec<Value> = if series.starts_with("gauge.") {
+        samples
+            .iter()
+            .map(|s| json!({ "at": s.at, "value": s.value }))
+            .collect()
+    } else {
+        crate::metrics::rates(&samples, res.step * 3)
+            .into_iter()
+            .map(|(at, rate)| json!({ "at": at, "value": rate }))
+            .collect()
+    };
+    Ok(Json(json!({
+        "series": series,
+        "resolution": res.name,
+        "step": res.step,
+        "points": points,
+    })))
+}
+
 /// `POST /api/v1/login` — a username and a password for the account's token.
 ///
 /// Until this existed the console asked for a bearer token, which meant that in
@@ -339,6 +420,11 @@ async fn post_login(
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
+    let code = body
+        .get("code")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
     if username.is_empty() || password.is_empty() {
         return Err(ApiError::bad_request(anyhow!(
             "a username and a password are needed"
@@ -347,7 +433,7 @@ async fn post_login(
     let state = state.clone();
     // Off the runtime: hashing is deliberately slow, and a login must not stall
     // the executor that is serving everybody else.
-    let outcome = tokio::task::spawn_blocking(move || sign_in(&state, &username, &password))
+    let outcome = tokio::task::spawn_blocking(move || sign_in(&state, &username, &password, &code))
         .await
         .map_err(|e| ApiError::internal(anyhow!("login task: {e}")))?;
     match outcome {
@@ -356,8 +442,58 @@ async fn post_login(
     }
 }
 
+/// Ask each configured server in turn, and say whether one of them accepted.
+///
+/// The distinction that matters: a server that **rejects** has answered, and no
+/// other server is asked — a directory saying no is a decision. A server that
+/// cannot be reached has not answered, so the next one is tried, and if none
+/// answers at all that is an error rather than a refusal. Treating an
+/// unreachable directory as a wrong password locks everybody out at exactly the
+/// moment the network is already broken.
+fn ask_the_directory(
+    aaa: &crate::config::Aaa,
+    hostname: &str,
+    username: &str,
+    password: &str,
+) -> Result<bool, ApiError> {
+    let mut last: Option<String> = None;
+    for server in &aaa.radius {
+        let timeout = std::time::Duration::from_secs(server.timeout.unwrap_or(3) as u64);
+        match crate::aaa::radius_authenticate(
+            &server.server,
+            server.port.unwrap_or(1812),
+            &server.secret,
+            username,
+            password,
+            timeout,
+            hostname,
+        ) {
+            Ok(accepted) => return Ok(accepted),
+            Err(e) => {
+                eprintln!(
+                    "warning: RADIUS server {} did not answer: {e}",
+                    server.server
+                );
+                last = Some(e.to_string());
+            }
+        }
+    }
+    Err(ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        anyhow!(
+            "no authentication server answered ({}), and this account has no local password",
+            last.unwrap_or_else(|| "none configured".into())
+        ),
+    ))
+}
+
 /// The whole of signing in, in one place so the refusals can be read together.
-fn sign_in(state: &ApiState, username: &str, password: &str) -> Result<Value, ApiError> {
+fn sign_in(
+    state: &ApiState,
+    username: &str,
+    password: &str,
+    code: &str,
+) -> Result<Value, ApiError> {
     // Guessing costs time whether or not the account exists, so a wrong
     // username and a wrong password are indistinguishable from the outside.
     let attempts = note_attempt(username);
@@ -380,23 +516,63 @@ fn sign_in(state: &ApiState, username: &str, password: &str) -> Result<Value, Ap
         )
     };
 
-    let Some(login) = login else {
-        return Err(refused());
+    // Local first, then the directory. Deliberately in that order and not
+    // configurable: a box whose directory is unreachable must still be
+    // enterable by the account written on it, and that is precisely the moment
+    // the directory is likely to be unreachable.
+    let local_ok = match login.and_then(|l| l.hashed_password.as_deref()) {
+        Some(stored) => {
+            // An unverifiable hash is not a wrong password, and saying "wrong
+            // password" would send an operator hunting for a typo that is not
+            // there.
+            crate::passwd::verify(password, stored)
+                .map_err(|e| ApiError::new(StatusCode::UNAUTHORIZED, anyhow!("{e}")))?
+        }
+        None => false,
     };
-    let Some(stored) = login.hashed_password.as_deref() else {
-        return Err(ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            anyhow!("that account has no password set"),
-        ));
-    };
-    // An unverifiable hash is not a wrong password, and saying "wrong password"
-    // would send an operator hunting for a typo that is not there.
-    let ok = crate::passwd::verify(password, stored)
-        .map_err(|e| ApiError::new(StatusCode::UNAUTHORIZED, anyhow!("{e}")))?;
-    if !ok {
-        return Err(refused());
+    if !local_ok {
+        let aaa = &appliance.system.aaa;
+        if aaa.radius.is_empty() {
+            // No directory to fall back to, so the local answer is the answer.
+            return Err(if login.is_some_and(|l| l.hashed_password.is_none()) {
+                ApiError::new(
+                    StatusCode::UNAUTHORIZED,
+                    anyhow!("that account has no password set"),
+                )
+            } else {
+                refused()
+            });
+        }
+        if !ask_the_directory(aaa, &appliance.system.hostname, username, password)? {
+            return Err(refused());
+        }
     }
-    let Some(group) = login.group.as_deref() else {
+
+    // A second factor is checked after the password and never instead of it, so
+    // a wrong password and a wrong code are the same refusal from outside.
+    if let Some(secret) = login.and_then(|l| l.totp.as_deref()) {
+        if code.trim().is_empty() {
+            return Err(ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                anyhow!("{username} needs a one-time code as well as a password"),
+            ));
+        }
+        let matched = crate::aaa::totp_matches(secret, code, crate::aaa::unix_now())
+            .map_err(|e| ApiError::new(StatusCode::UNAUTHORIZED, anyhow!("{e}")))?;
+        if !matched {
+            return Err(refused());
+        }
+    }
+
+    // What the account may do. A directory account with no local entry falls
+    // back to the configured default group; without one it gets nothing, which
+    // is what stops a configured server from handing management access to
+    // everybody in the directory.
+    let group =
+        login
+            .and_then(|l| l.group.as_deref())
+            .or(appliance.system.aaa.default_group.as_deref());
+    let Some(group) = group else {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             anyhow!(
@@ -899,6 +1075,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// A handler error rendered as `{"error": <message>}` with a status code. The
 /// message is the full anyhow context chain, so a `PUT` of a bad config returns
 /// the same validation error text the CLI prints.
+#[derive(Debug)]
 struct ApiError {
     status: StatusCode,
     message: String,
@@ -973,6 +1150,122 @@ mod tests {
             apply: Apply::off(),
             tokens_dir: std::env::temp_dir().join("sentinel-test-tokens"),
         })
+    }
+
+    /// The history endpoints answer the same question `show history` does, and
+    /// in the same shape: a counter becomes a rate, a gauge stays a level, and
+    /// a counter that was reset is a gap rather than the enormous spike that
+    /// treating the wrap as a delta would draw.
+    #[tokio::test]
+    async fn the_history_endpoints_derive_rates_and_keep_gauges() {
+        let root = std::env::temp_dir().join(format!("sentinel-hist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // SAFETY: a unit test, before any other thread reads the variable.
+        unsafe { std::env::set_var("SENTINEL_METRICS_DIR", &root) };
+
+        // A counter that climbs, then is reset.
+        for (at, v) in [(1_000u64, 0u64), (1_060, 60_000), (1_120, 500)] {
+            crate::metrics::record(&root, "iface.eth0.rx", at, v).unwrap();
+        }
+        crate::metrics::record(&root, "gauge.sessions", 1_000, 42).unwrap();
+        crate::metrics::record(&root, "gauge.sessions", 1_060, 40).unwrap();
+
+        let app = router(state(seed("fw")));
+        let get = |path: String| {
+            let app = app.clone();
+            async move {
+                let r = app
+                    .oneshot(
+                        Request::builder()
+                            .uri(path)
+                            .header("Authorization", format!("Bearer {TOKEN}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let bytes = to_bytes(r.into_body(), usize::MAX).await.unwrap();
+                serde_json::from_slice::<Value>(&bytes).unwrap()
+            }
+        };
+
+        let listing = get("/api/v1/metrics".into()).await;
+        let names: Vec<&str> = listing["series"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"iface.eth0.rx"), "got {names:?}");
+
+        let rx = get("/api/v1/metrics/minute/iface.eth0.rx".into()).await;
+        let points = rx["points"].as_array().unwrap();
+        assert_eq!(points.len(), 2, "three samples make two intervals");
+        assert_eq!(
+            points[0]["value"].as_f64().unwrap(),
+            1000.0,
+            "60000 B over 60 s"
+        );
+        assert!(
+            points[1]["value"].is_null(),
+            "the counter reset must be a gap, got {:?}",
+            points[1]["value"]
+        );
+
+        // A gauge is a level: it must come back as it was stored, not as the
+        // change in it.
+        let g = get("/api/v1/metrics/minute/gauge.sessions".into()).await;
+        let gp = g["points"].as_array().unwrap();
+        assert_eq!(gp.len(), 2, "a gauge keeps every sample");
+        assert_eq!(gp[0]["value"].as_u64().unwrap(), 42);
+        assert_eq!(gp[1]["value"].as_u64().unwrap(), 40);
+
+        let bad = get("/api/v1/metrics/nonsense/iface.eth0.rx".into()).await;
+        assert!(bad["error"].is_string(), "an unknown resolution is refused");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A second factor is checked *after* the password and never instead of it,
+    /// so an account with a code is not a way to get in without one — and a
+    /// wrong code is the same refusal as a wrong password, which is what stops
+    /// somebody probing which half they got right.
+    #[test]
+    fn an_account_with_a_second_factor_needs_both() {
+        // The RFC 6238 secret, so the expected code is computable here rather
+        // than being whatever the implementation happens to produce.
+        const SECRET: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+        let hash = crate::passwd::hash("a-good-password").expect("hashing works here");
+        let path = temp_config();
+        let a = Appliance::from_toml(&format!(
+            "[system]\nhostname = \"fw\"\n\
+             [[system.group]]\nname = \"ops\"\npermission = \"read-write\"\n\
+             [[system.login]]\nusername = \"vera\"\n\
+             hashed-password = \"{hash}\"\ntotp = \"{SECRET}\"\ngroup = \"ops\"\n"
+        ))
+        .expect("the configuration parses");
+        session::persist_appliance(&a, &path, false).unwrap();
+        let st = state(path);
+
+        // The right password with no code is refused, and says what is missing.
+        let err = sign_in(&st, "vera", "a-good-password", "").expect_err("no code");
+        assert!(
+            format!("{err:?}").contains("one-time code"),
+            "the refusal does not say a code is needed: {err:?}"
+        );
+
+        // A wrong code is refused the same way a wrong password is.
+        assert!(sign_in(&st, "vera", "a-good-password", "000001").is_err());
+
+        // The right code lets them in…
+        let now = crate::aaa::unix_now();
+        let code = crate::aaa::totp_at(SECRET, now).expect("the secret decodes");
+        let session = sign_in(&st, "vera", "a-good-password", &code)
+            .unwrap_or_else(|e| panic!("both factors were refused: {e:?}"));
+        assert_eq!(session["user"], "vera");
+        assert_eq!(session["permission"], "read-write");
+
+        // …and the code alone does not, because the password is still checked.
+        assert!(sign_in(&st, "vera", "wrong", &code).is_err());
     }
 
     /// The machine token is full access and has no account behind it — it is

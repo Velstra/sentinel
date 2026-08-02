@@ -195,6 +195,32 @@ pub fn ip_route_flush_table(table: u32) -> Result<()> {
     run_priv("ip", &["route", "flush", "table", &table.to_string()])
 }
 
+/// The routing-policy rules the appliance owns, as `ip rule` prints them. Only
+/// the priority band in [`crate::net::PBR_PRIORITY_BASE`] is ours; anything else
+/// in the table belongs to the kernel or to somebody else and is left alone.
+pub fn ip_rule_list() -> Result<String> {
+    let is_root = unsafe { libc::geteuid() } == 0;
+    let ip = bin("ip");
+    let args = ["-o", "rule", "show"];
+    let output = if is_root {
+        Command::new(&ip).args(args).output()
+    } else {
+        let mut all = vec![ip.as_str()];
+        all.extend_from_slice(&args);
+        Command::new("sudo").args(&all).output()
+    };
+    let out = output.context("running ip rule show")?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Add or delete one routing-policy rule. The arguments are built by the caller
+/// from the configuration; nothing here interprets them.
+pub fn ip_rule(args: &[&str]) -> Result<()> {
+    let mut all = vec!["rule"];
+    all.extend_from_slice(args);
+    run_priv("ip", &all)
+}
+
 /// Load a rendered strongSwan swanctl config into the running `charon` daemon
 /// (roadmap C2 IPsec): `swanctl --load-all --file <path> --noprompt`. `--load-all`
 /// reconciles connections, children and secrets to exactly what the file
@@ -548,6 +574,22 @@ pub fn curl_get(url: &str, token: &str, timeout_secs: u32) -> Result<String> {
         .with_context(|| format!("running curl to {url}"))?;
     if !out.status.success() {
         bail!("curl GET {url} failed");
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Fetch a URL with no credential attached — a published list, not an appliance
+/// API. Separate from [`curl_get`] so a feed can never carry this box's token to
+/// somebody else's web server.
+pub fn curl_get_plain(url: &str, timeout_secs: u32) -> Result<String> {
+    let timeout = timeout_secs.to_string();
+    let out = Command::new(bin("curl"))
+        .args(["-sS", "-f", "--max-time", &timeout, url])
+        .stderr(Stdio::null())
+        .output()
+        .with_context(|| format!("running curl to {url}"))?;
+    if !out.status.success() {
+        bail!("fetching {url} failed");
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }

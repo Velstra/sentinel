@@ -360,6 +360,12 @@
             # synthesis. Both are Sentinel-owned units (below), off until configured.
             pkgs.tayga
             pkgs.unbound
+            # Encrypted DNS upstreams: dnsproxy speaks DNS over TLS and DNS over
+            # HTTPS, and dnsmasq — which serves the LAN — speaks neither. It runs
+            # on loopback as dnsmasq's upstream, so what leaves this box is
+            # encrypted while nothing about how clients ask changes. A
+            # Sentinel-owned unit (below), off until an upstream is configured.
+            pkgs.dnsproxy
             # OpenConnect (roadmap C17): ocserv is the AnyConnect-compatible TLS
             # VPN server. It's a Sentinel-owned unit (below), off until configured;
             # `ocserv`/`occtl` on PATH also allow manual inspection. Passwords are
@@ -895,6 +901,35 @@
           # L2TPv3 pseudowires (roadmap C14): networkd has no L2TPv3 device, so the
           # static Ethernet pseudowires are built imperatively via `ip l2tp`.
           # networkd then addresses the created links (their `.network`).
+          # Encrypted DNS upstreams. Sentinel renders the arguments — one per
+          # line, so an upstream's hostname never travels through a shell — and
+          # installing that file is what starts the proxy. Loopback only: it
+          # exists to be dnsmasq's upstream, not to answer anybody.
+          systemd.services.sentinel-dnsproxy = {
+            description = "Encrypted DNS upstreams (dnsproxy)";
+            after = [
+              "network.target"
+              "sentinel-boot.service"
+            ];
+            unitConfig.ConditionPathExists = "/run/sentinel/dnsproxy.env";
+            serviceConfig = {
+              Type = "exec";
+              EnvironmentFile = "/run/sentinel/dnsproxy.env";
+              # systemd splits an unquoted $ARGS into words itself — no shell,
+              # so an upstream's hostname is never anything but an argument.
+              ExecStart = "${pkgs.dnsproxy}/bin/dnsproxy $ARGS";
+              Restart = "on-failure";
+              RestartSec = "5s";
+              DynamicUser = true;
+              # It talks to the internet and reads one file. Nothing else.
+              ProtectSystem = "strict";
+              ProtectHome = true;
+              PrivateDevices = true;
+              NoNewPrivileges = true;
+            };
+            wantedBy = [ "multi-user.target" ];
+          };
+
           systemd.services.sentinel-l2tp = {
             description = "L2TPv3 pseudowires (sentinel/ip l2tp)";
             after = [

@@ -908,6 +908,14 @@ pub struct SyslogTarget {
     /// the journal holds, which is rarely what an operator wants on the wire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level: Option<SyslogLevel>,
+    /// Which facilities to ship, as syslog facility names (`auth`, `daemon`,
+    /// `local7`, …). Empty ⇒ all of them.
+    ///
+    /// A collector that only wants the authentication trail should not be sent
+    /// every kernel message to filter out again — and on a link that is charged
+    /// for or watched, "ship it all and sort it there" is not free.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub facility: Vec<String>,
 }
 
 /// The transport for a syslog target.
@@ -1203,6 +1211,13 @@ pub struct Ssh {
         skip_serializing_if = "Option::is_none"
     )]
     pub listen_address: Option<String>,
+    /// How much sshd says about what it is doing (`QUIET`, `FATAL`, `ERROR`,
+    /// `INFO`, `VERBOSE`, `DEBUG1`–`DEBUG3`). Unset ⇒ sshd's own default
+    /// (`INFO`). `VERBOSE` is the one worth knowing: it logs the fingerprint of
+    /// the key that was used, which is what turns "somebody logged in as admin"
+    /// into "*this* key logged in as admin".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loglevel: Option<String>,
     /// Allow password logins over SSH. Off by default — the appliance is key-only
     /// (a user's `[[system.login]]` hashed-password is for console + sudo). Turn on
     /// to also accept that password over SSH. The authorized keys themselves live
@@ -1221,6 +1236,7 @@ impl Default for Ssh {
             enable: true,
             port: None,
             listen_address: None,
+            loglevel: None,
             password_authentication: false,
         }
     }
@@ -1419,6 +1435,46 @@ pub struct Dns {
     /// resolution stays on systemd-resolved.
     #[serde(default, rename = "serve-on", skip_serializing_if = "Vec::is_empty")]
     pub serve_on: Vec<String>,
+    /// Encrypted upstreams: `tls://<host>` (DNS over TLS, RFC 7858) or
+    /// `https://<host>/dns-query` (DNS over HTTPS, RFC 8484).
+    ///
+    /// The resolver clients talk to does not change — dnsmasq still answers on
+    /// the LAN. What changes is where it asks: a local proxy that speaks TLS
+    /// takes its place as the upstream, so the queries leaving this box are no
+    /// longer readable by everything between here and the provider.
+    ///
+    /// **Setting this demotes `upstream` to bootstrap.** An encrypted upstream
+    /// named by hostname cannot be reached until something resolves that
+    /// hostname, and that something has to be plaintext. Leaving the plaintext
+    /// servers in place *as upstreams* would leak every query they still
+    /// answered, which is the opposite of what was asked for — so they answer
+    /// exactly one question, the one the encrypted upstream's own name poses.
+    ///
+    /// A `tls://` naming an address rather than a hostname works only where the
+    /// provider publishes the address in its certificate. Several do; if the
+    /// handshake fails, that is why.
+    #[serde(
+        default,
+        rename = "secure-upstream",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub secure_upstream: Vec<String>,
+    /// Which clients may ask, as hosts or CIDRs in either family. Empty ⇒ anyone
+    /// that can reach the listener.
+    ///
+    /// Not the same knob as `serve-on`, which is about *where* the resolver
+    /// listens. An open resolver on an interface that faces a provider network
+    /// is a reflection amplifier whether or not you meant to run one, and the
+    /// listener alone cannot say no to a client on that same segment.
+    #[serde(default, rename = "allow-from", skip_serializing_if = "Vec::is_empty")]
+    pub allow_from: Vec<String>,
+    /// Domains never forwarded upstream — answered `NXDOMAIN` locally instead.
+    ///
+    /// The canonical use is the reverse zones for private space: without this a
+    /// PTR lookup for an RFC 1918 address goes out to the internet, tells a
+    /// stranger about the internal addressing, and comes back empty anyway.
+    #[serde(default, rename = "dont-query", skip_serializing_if = "Vec::is_empty")]
+    pub dont_query: Vec<String>,
     /// Local DNS records: name → IP (v4 or v6). A LAN query for the name is
     /// answered authoritatively with the address instead of being forwarded —
     /// the pfSense "host override" / split-horizon convenience.
@@ -1986,6 +2042,19 @@ pub struct StaticRoute {
     /// default VRF (main table).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vrf: Option<String>,
+    /// Discard what matches instead of forwarding it. Takes no `via`/`dev` —
+    /// having nowhere to send is the point. Two uses: null-routing a prefix, and
+    /// holding a BGP summary up so it is announced whether or not anything
+    /// inside it is currently reachable.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub blackhole: bool,
+    /// Administrative distance, lower wins. Unset ⇒ the protocol's own.
+    ///
+    /// This is what makes a static route *float*: give it a distance worse than
+    /// the protocol you expect to learn the prefix from, and it sits unused
+    /// until that protocol stops offering it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distance: Option<u32>,
 }
 
 /// BGP-4 configuration: the local AS, an optional router-id, originated
@@ -2338,6 +2407,17 @@ pub struct FilterRule {
         skip_serializing_if = "Option::is_none"
     )]
     pub add_metric: Option<i64>,
+    /// Send the matching route via this address instead of wherever it said.
+    ///
+    /// Replaces the route's whole next-hop set, so a multipath route collapses
+    /// to this one gateway — which is what naming a single next hop means.
+    /// Either family: an IPv4 route via an IPv6 next hop is RFC 5549.
+    #[serde(
+        default,
+        rename = "set-next-hop",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub set_next_hop: Option<String>,
     /// Set the matching route's administrative preference to this.
     #[serde(
         default,
@@ -2416,13 +2496,71 @@ pub struct Policy {
     /// default action, compiled to Wren's top-level `[[filter]]`.
     #[serde(default, rename = "route-map", skip_serializing_if = "Vec::is_empty")]
     pub route_maps: Vec<Filter>,
+    /// Policy-based routing (`[[policy.route]]`): send traffic by where it came
+    /// from rather than where it is going.
+    #[serde(default, rename = "route", skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<PolicyRoute>,
 }
 
 impl Policy {
     /// True when no policy object is configured — lets `[policy]` be omitted.
     pub fn is_empty(&self) -> bool {
-        self.prefix_lists.is_empty() && self.route_maps.is_empty()
+        self.prefix_lists.is_empty() && self.route_maps.is_empty() && self.routes.is_empty()
     }
+}
+
+/// One policy-routing rule (`[[policy.route]]`).
+///
+/// Ordinary routing asks one question: where is this going? A policy route asks
+/// the others — where did it come from, over which link, to which port — and
+/// sends the answer to a different routing table. That is what makes a guest
+/// network leave by the cheap uplink while everything else takes the good one,
+/// and it is the piece multi-WAN needs to be more than failover.
+///
+/// Rendered as a kernel routing-policy rule (`ip rule`). The appliance owns the
+/// priority band 10000-19999 and reconciles only that band, so a rule somebody
+/// else put in the table is left alone.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyRoute {
+    /// A name for the rule, so it can be talked about and edited.
+    pub name: String,
+    /// Where the traffic has to come from (host or CIDR, either family).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Where it has to be going.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+    /// The interface it arrived on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<String>,
+    /// `tcp` or `udp` — needed before a port can be matched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proto: Option<String>,
+    /// Source port, or a `low-high` range.
+    #[serde(
+        default,
+        rename = "source-port",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub source_port: Option<String>,
+    /// Destination port, or a `low-high` range.
+    #[serde(
+        default,
+        rename = "destination-port",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub destination_port: Option<String>,
+    /// The routing table to consult for traffic that matches. Required — a rule
+    /// that does not redirect anywhere is not a policy route.
+    pub table: u32,
+    /// Where this rule sits among the others (lower is consulted first). Unset ⇒
+    /// assigned in declaration order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u32>,
+    /// Off without being deleted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
 }
 
 /// A named prefix-list (`[[policy.prefix-list]]`): an ordered set of prefix
@@ -2846,6 +2984,64 @@ pub struct MultiWan {
     /// The WAN uplinks, in configuration order.
     #[serde(default, rename = "uplink", skip_serializing_if = "Vec::is_empty")]
     pub uplinks: Vec<WanUplink>,
+    /// Steering policies (`[[multiwan.policy]]`): which traffic prefers which
+    /// uplink, and what happens when that uplink stops meeting its SLA.
+    #[serde(default, rename = "policy", skip_serializing_if = "Vec::is_empty")]
+    pub policies: Vec<WanPolicy>,
+}
+
+/// One SD-WAN steering policy.
+///
+/// Failover answers "the uplink died, now what". Steering answers the question
+/// before it: *this* traffic belongs on *that* uplink, and should move only when
+/// that uplink stops being good enough for it. A video call and a backup want
+/// opposite things from the same two links, and priority alone cannot say so.
+///
+/// The match is the same vocabulary a policy route uses, because it is the same
+/// question. What differs is the answer: a policy route names one table, this
+/// names an ordered preference and lets the daemon pick.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WanPolicy {
+    /// A name, so it can be talked about and edited.
+    pub name: String,
+    /// Where the traffic comes from (host or CIDR).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Where it is going.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+    /// `tcp` or `udp` — needed before a port can be matched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proto: Option<String>,
+    /// Source port, or a `low-high` range.
+    #[serde(
+        default,
+        rename = "source-port",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub source_port: Option<String>,
+    /// Destination port, or a `low-high` range.
+    #[serde(
+        default,
+        rename = "destination-port",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub destination_port: Option<String>,
+    /// The uplinks this traffic prefers, best first, by interface name. The
+    /// daemon sends it out the first one that is up **and** within its SLA; if
+    /// none qualifies it falls back to the first that is merely up, because a
+    /// degraded path still beats no path.
+    #[serde(default, rename = "uplink", skip_serializing_if = "Vec::is_empty")]
+    pub uplinks: Vec<String>,
+    /// Refuse to send this traffic at all rather than send it over a path that
+    /// does not meet its SLA. For the traffic where a bad answer is worse than
+    /// no answer.
+    #[serde(default, rename = "strict", skip_serializing_if = "std::ops::Not::not")]
+    pub strict: bool,
+    /// Off without being deleted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
 }
 
 /// How a [`MultiWan`] group reconciles its uplinks.
@@ -2951,6 +3147,25 @@ pub struct HealthCheck {
     /// [`WAN_CHECK_RISE`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rise: Option<u32>,
+    /// Round-trip time above which the uplink is **out of SLA**, in
+    /// milliseconds. Unset ⇒ latency is measured but never disqualifies.
+    ///
+    /// Out of SLA is not the same as down. A link that answers every probe in
+    /// 400 ms is up by any reachability test and useless for a call, and the
+    /// whole point of steering is to notice the difference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency: Option<u32>,
+    /// Variation in round-trip time above which the uplink is out of SLA, in
+    /// milliseconds. What a call hears before it hears latency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jitter: Option<u32>,
+    /// Packet loss above which the uplink is out of SLA, in percent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss: Option<u32>,
+    /// Probes sent per round when an SLA threshold is set. One ping cannot
+    /// measure loss or jitter, so a threshold needs a sample. Unset ⇒ 5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probes: Option<u32>,
 }
 
 impl HealthCheck {
@@ -2961,6 +3176,15 @@ impl HealthCheck {
             && self.timeout.is_none()
             && self.fail.is_none()
             && self.rise.is_none()
+            && self.latency.is_none()
+            && self.jitter.is_none()
+            && self.loss.is_none()
+            && self.probes.is_none()
+    }
+
+    /// Whether this check measures quality rather than only reachability.
+    pub fn has_sla(&self) -> bool {
+        self.latency.is_some() || self.jitter.is_some() || self.loss.is_some()
     }
 }
 
@@ -3358,6 +3582,127 @@ pub struct System {
         skip_serializing_if = "ConntrackSync::is_empty"
     )]
     pub conntrack_sync: ConntrackSync,
+    /// Keeping a history of what the box did (`[system.metrics]`).
+    #[serde(default, skip_serializing_if = "Metrics::is_default")]
+    pub metrics: Metrics,
+    /// Where a password is checked when it is not checked here
+    /// (`[system.aaa]`). Empty ⇒ local accounts only.
+    #[serde(default, skip_serializing_if = "Aaa::is_empty")]
+    pub aaa: Aaa,
+    /// Serial console (`[system.console]`). A box in a rack is reached over its
+    /// serial port when the network it manages is the thing that is broken, and
+    /// the speed has to match what is on the other end of the cable.
+    #[serde(default, skip_serializing_if = "Console::is_empty")]
+    pub console: Console,
+    /// How many past revisions the archive keeps (`system commit-revisions`).
+    ///
+    /// Not a constant, because how far back you can roll is a policy: a box that
+    /// is changed twice a year wants a longer memory than one that is changed
+    /// twice a day. Unset ⇒ the appliance default.
+    #[serde(
+        rename = "commit-revisions",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub commit_revisions: Option<u32>,
+}
+
+/// Keeping a history (`[system.metrics]`).
+///
+/// Live counters answer "what is happening"; they cannot answer "was this
+/// happening at three in the morning last Tuesday", which is the question an
+/// operator actually arrives with. Off by default: a box with a small or
+/// read-mostly disk should not start writing to it because a graph might be
+/// nice, and saying so is better than a knob nobody finds.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Metrics {
+    /// Record a history at all.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub enable: bool,
+}
+
+impl Metrics {
+    pub fn is_default(&self) -> bool {
+        !self.enable
+    }
+}
+
+/// Authentication that is not local (`[system.aaa]`).
+///
+/// A local account list is a shadow account list: it has to be maintained
+/// alongside the real one, and it is the one nobody remembers to remove
+/// somebody from. This is how the directory answers instead.
+///
+/// The order is deliberate and not configurable: **local first, then the
+/// servers in the order given**. A box whose directory is unreachable must
+/// still be enterable by the account written on it, and that is precisely the
+/// moment the directory is likely to be unreachable.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Aaa {
+    /// RADIUS servers, tried in order. The first that answers decides — a
+    /// reject from a reachable server is an answer, not a reason to ask the
+    /// next one.
+    #[serde(default, rename = "radius", skip_serializing_if = "Vec::is_empty")]
+    pub radius: Vec<RadiusServer>,
+    /// The permission group an account authenticated by a server gets when this
+    /// box has no local entry for it. Unset ⇒ a directory account still needs a
+    /// local `[[system.login]]` naming its group, which is the safe default:
+    /// without it, everybody in the directory would have management access the
+    /// moment a server is configured.
+    #[serde(
+        default,
+        rename = "default-group",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub default_group: Option<String>,
+}
+
+impl Aaa {
+    pub fn is_empty(&self) -> bool {
+        self.radius.is_empty() && self.default_group.is_none()
+    }
+}
+
+/// One RADIUS server (`[[system.aaa.radius]]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RadiusServer {
+    /// Its address or hostname.
+    pub server: String,
+    /// Its port. Unset ⇒ 1812.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// The shared secret. RFC 2865 hides the password with MD5 against this,
+    /// which is not encryption in any modern sense — a RADIUS server belongs on
+    /// a segment you already trust, and this is worth saying out loud rather
+    /// than leaving for somebody to discover.
+    pub secret: String,
+    /// How long to wait for an answer, in seconds. Unset ⇒ 3. A login is a
+    /// person waiting, so this is short on purpose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u32>,
+}
+
+/// Serial console (`[system.console]`). `device` is a tty on this box (`ttyS0`,
+/// `ttyAMA0`); `speed` is its baud rate. Both or neither — a speed without a
+/// device says nothing about which port it applies to.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Console {
+    /// The tty, without `/dev/` (`ttyS0`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+    /// Baud rate. The usual answers are 9600 and 115200.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<u32>,
+}
+
+impl Console {
+    pub fn is_empty(&self) -> bool {
+        self.device.is_none() && self.speed.is_none()
+    }
 }
 
 /// HA config sync (`[system.config-sync]`). On every `commit`, the running config
@@ -3488,6 +3833,14 @@ pub struct Login {
         skip_serializing_if = "Option::is_none"
     )]
     pub hashed_password: Option<String>,
+    /// A base32 TOTP secret (RFC 6238). Set ⇒ this account must give a
+    /// six-digit code as well as its password to reach the API or the console.
+    ///
+    /// Console and API only. A second factor on the serial console would lock
+    /// somebody out of the port they reach for when the network is down, and a
+    /// second factor on SSH belongs to sshd's own configuration, not here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp: Option<String>,
     /// The permission group this account belongs to, for **management access**
     /// (the API and the console). Unset ⇒ the account can log in to the box but
     /// has no management access at all: shell access and API access are separate
@@ -3716,18 +4069,31 @@ pub struct Groups {
     /// so a rule never has to know which kind of group it names.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub domain: BTreeMap<String, Vec<String>>,
+    /// Feed groups: name → HTTPS URLs of published address lists, fetched and
+    /// folded into [`Groups::address`] at apply time exactly like a domain
+    /// group. The lists worth having — bogons, exit nodes, a provider's own
+    /// prefixes — are maintained elsewhere, and one copied in by hand is wrong
+    /// within a week without anybody noticing.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub feed: BTreeMap<String, Vec<String>>,
 }
 
 impl Groups {
     /// No groups defined (lets `[firewall]` be omitted when untouched).
     pub fn is_empty(&self) -> bool {
-        self.address.is_empty() && self.port.is_empty() && self.domain.is_empty()
+        self.address.is_empty()
+            && self.port.is_empty()
+            && self.domain.is_empty()
+            && self.feed.is_empty()
     }
 
-    /// Whether `name` is a declared address **or** domain group — the two share a
-    /// namespace, since a rule references either through the same field.
+    /// Whether `name` is a declared address, domain **or** feed group — all
+    /// three share a namespace, since a rule references any of them through the
+    /// same field and the apply path folds the latter two into the first.
     pub fn has_address_like(&self, name: &str) -> bool {
-        self.address.contains_key(name) || self.domain.contains_key(name)
+        self.address.contains_key(name)
+            || self.domain.contains_key(name)
+            || self.feed.contains_key(name)
     }
 }
 
@@ -3963,6 +4329,18 @@ pub struct Interface {
     /// `None` leaves the kernel/driver default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtu: Option<u16>,
+    /// Clamp the TCP MSS of segments crossing this link, in bytes, or the string
+    /// `"pmtu"` to clamp to whatever the path MTU turns out to be.
+    ///
+    /// A tunnel is where this bites. The two ends agree an MSS from *their* MTUs
+    /// during the handshake, and neither of them knows about the encapsulation
+    /// in between — so the session establishes, small requests work, and the
+    /// first large response disappears. It looks like an application fault for
+    /// as long as it takes somebody to think of MTU. PPPoE is clamped
+    /// automatically because its MTU is not negotiable; a WireGuard or GRE link
+    /// has to be told.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mss: Option<String>,
     /// Override the link's MAC address (`"52:54:00:12:34:56"`) — MAC cloning, as
     /// some ISPs bind service to the CPE's original MAC. `None` keeps the NIC's
     /// hardware address.
@@ -4457,6 +4835,13 @@ pub enum Proto {
     Ah,
     /// GRE (IANA 47).
     Gre,
+    /// Both TCP and UDP, as one rule. VyOS spells it `tcp_udp` and it earns its
+    /// place: a service reached over either — DNS, NTP, a Samba share — is one
+    /// decision to an operator, and writing it twice means two rules to keep in
+    /// step afterwards. The data plane has no such protocol, so the compiler
+    /// emits the pair.
+    #[serde(rename = "tcp_udp", alias = "tcp-udp")]
+    TcpUdp,
 }
 
 impl Proto {
@@ -4464,7 +4849,24 @@ impl Proto {
     /// protocol alone; the data plane keys such a rule with port `0`, which is
     /// also what it reads off a packet that has no ports.
     pub fn has_ports(self) -> bool {
-        matches!(self, Proto::Tcp | Proto::Udp)
+        matches!(self, Proto::Tcp | Proto::Udp | Proto::TcpUdp)
+    }
+
+    /// What the data plane has to be programmed with. Everything is itself
+    /// except `tcp_udp`, which is a convenience of the grammar and becomes the
+    /// two rules it stands for.
+    pub fn concrete(self) -> &'static [Proto] {
+        match self {
+            Proto::TcpUdp => &[Proto::Tcp, Proto::Udp],
+            Proto::Tcp => &[Proto::Tcp],
+            Proto::Udp => &[Proto::Udp],
+            Proto::Icmp => &[Proto::Icmp],
+            Proto::Icmpv6 => &[Proto::Icmpv6],
+            Proto::Vrrp => &[Proto::Vrrp],
+            Proto::Esp => &[Proto::Esp],
+            Proto::Ah => &[Proto::Ah],
+            Proto::Gre => &[Proto::Gre],
+        }
     }
 }
 
@@ -5818,7 +6220,7 @@ impl Appliance {
             let wants_port = rule.proto.is_some_and(|p| p.has_ports());
             if has_port && rule.proto.is_none() {
                 bail!(
-                    "rule {:?}: a port needs a `proto` to key it (tcp or udp)",
+                    "rule {:?}: a port needs a `proto` to key it (tcp, udp or tcp_udp)",
                     rule.name
                 );
             }
@@ -6163,14 +6565,140 @@ impl Appliance {
         if let Some(rid) = &self.protocols.router_id {
             validate_ipv4(rid).with_context(|| "protocols router-id")?;
         }
+        // AAA. A server with no secret cannot be talked to at all, and a
+        // default group that does not exist would hand a directory account a
+        // permission nobody wrote down.
+        for r in &self.system.aaa.radius {
+            validate_host(&r.server).context("system aaa radius")?;
+            if r.secret.is_empty() {
+                bail!(
+                    "system aaa radius {:?}: needs a shared secret — without one the server \
+                     cannot check the answer and will ignore the request",
+                    r.server
+                );
+            }
+        }
+        if let Some(g) = &self.system.aaa.default_group {
+            if !self.system.groups.iter().any(|x| &x.name == g) {
+                bail!("system aaa default-group {g:?}: no such permission group");
+            }
+        }
+        for l in &self.system.logins {
+            if let Some(secret) = &l.totp {
+                crate::aaa::base32_decode(secret)
+                    .with_context(|| format!("system login {:?} totp", l.username))?;
+            }
+        }
+        // Steering: a policy that names an uplink this box does not have would
+        // silently never steer anything, which is the worst way for it to fail.
+        let mut seen_pol = std::collections::BTreeSet::new();
+        for p in &self.multiwan.policies {
+            if !seen_pol.insert(p.name.as_str()) {
+                bail!("multiwan policy {:?}: declared twice", p.name);
+            }
+            if p.uplinks.is_empty() {
+                bail!(
+                    "multiwan policy {:?}: needs at least one uplink to prefer",
+                    p.name
+                );
+            }
+            for want in &p.uplinks {
+                if !self.multiwan.uplinks.iter().any(|u| &u.interface == want) {
+                    bail!(
+                        "multiwan policy {:?}: uplink {want:?} is not a configured uplink",
+                        p.name
+                    );
+                }
+            }
+            if (p.source_port.is_some() || p.destination_port.is_some()) && p.proto.is_none() {
+                bail!(
+                    "multiwan policy {:?}: a port needs a `proto` to key it (tcp or udp)",
+                    p.name
+                );
+            }
+            for (what, v) in [("source", &p.source), ("destination", &p.destination)] {
+                if let Some(a) = v {
+                    validate_cidr_or_ip(a)
+                        .with_context(|| format!("multiwan policy {:?} {what}", p.name))?;
+                }
+            }
+            // Preferring a path that cannot be measured means the preference can
+            // never be acted on — the daemon has nothing to compare.
+            if p.strict
+                && !p
+                    .uplinks
+                    .iter()
+                    .filter_map(|i| self.multiwan.uplinks.iter().find(|u| &u.interface == i))
+                    .any(|u| u.check.has_sla())
+            {
+                bail!(
+                    "multiwan policy {:?} is strict, but none of its uplinks has an SLA \
+                     threshold to be strict about",
+                    p.name
+                );
+            }
+        }
+        // Policy routing: a rule that redirects nowhere, or matches a port
+        // without saying which protocol's port, is a rule the kernel will
+        // refuse — better to say so here, with the name in hand.
+        let mut seen_pbr = std::collections::BTreeSet::new();
+        for r in &self.policy.routes {
+            if !seen_pbr.insert(r.name.as_str()) {
+                bail!("policy route {:?}: declared twice", r.name);
+            }
+            if r.table == 0 {
+                bail!(
+                    "policy route {:?}: needs a table — a rule that redirects nowhere is not a policy route",
+                    r.name
+                );
+            }
+            // 0 and 253-255 are the kernel's own (unspec/default/main/local).
+            if (253..=255).contains(&r.table) {
+                bail!(
+                    "policy route {:?}: table {} is the kernel's own (253-255)",
+                    r.name,
+                    r.table
+                );
+            }
+            if (r.source_port.is_some() || r.destination_port.is_some()) && r.proto.is_none() {
+                bail!(
+                    "policy route {:?}: a port needs a `proto` to key it (tcp or udp)",
+                    r.name
+                );
+            }
+            for (what, v) in [("source", &r.source), ("destination", &r.destination)] {
+                if let Some(a) = v {
+                    validate_cidr_or_ip(a)
+                        .with_context(|| format!("policy route {:?} {what}", r.name))?;
+                }
+            }
+            // Both ends in one rule is fine; both *families* in one rule is not,
+            // because a kernel rule belongs to one.
+            if let (Some(s), Some(d)) = (&r.source, &r.destination) {
+                if s.contains(':') != d.contains(':') {
+                    bail!(
+                        "policy route {:?}: source and destination are different address families",
+                        r.name
+                    );
+                }
+            }
+        }
         for r in &self.protocols.statics {
             // A static route may be IPv4 or IPv6; wren installs either. The
             // nexthop family must match the prefix (no v4 via for a v6 route).
             let prefix_v6 = route_prefix_family(&r.prefix)
                 .with_context(|| format!("protocols static route {:?}", r.prefix))?;
-            if r.via.is_none() && r.dev.is_none() {
+            // A discard route is the one that legitimately has nowhere to send.
+            if r.blackhole && (r.via.is_some() || r.dev.is_some()) {
                 bail!(
-                    "protocols static route {:?}: needs a via <ip> or dev <if>",
+                    "protocols static route {:?}: a blackhole discards what it matches, \
+                     so it cannot also have a next-hop",
+                    r.prefix
+                );
+            }
+            if !r.blackhole && r.via.is_none() && r.dev.is_none() {
+                bail!(
+                    "protocols static route {:?}: needs a via <ip>, dev <if> or blackhole",
                     r.prefix
                 );
             }
@@ -6222,6 +6750,124 @@ impl Appliance {
             Ok(())
         };
         // Static routes may name a VRF (validated once the VRF set is known).
+        // AAA. A server with no secret cannot be talked to at all, and a
+        // default group that does not exist would hand a directory account a
+        // permission nobody wrote down.
+        for r in &self.system.aaa.radius {
+            validate_host(&r.server).context("system aaa radius")?;
+            if r.secret.is_empty() {
+                bail!(
+                    "system aaa radius {:?}: needs a shared secret — without one the server \
+                     cannot check the answer and will ignore the request",
+                    r.server
+                );
+            }
+        }
+        if let Some(g) = &self.system.aaa.default_group {
+            if !self.system.groups.iter().any(|x| &x.name == g) {
+                bail!("system aaa default-group {g:?}: no such permission group");
+            }
+        }
+        for l in &self.system.logins {
+            if let Some(secret) = &l.totp {
+                crate::aaa::base32_decode(secret)
+                    .with_context(|| format!("system login {:?} totp", l.username))?;
+            }
+        }
+        // Steering: a policy that names an uplink this box does not have would
+        // silently never steer anything, which is the worst way for it to fail.
+        let mut seen_pol = std::collections::BTreeSet::new();
+        for p in &self.multiwan.policies {
+            if !seen_pol.insert(p.name.as_str()) {
+                bail!("multiwan policy {:?}: declared twice", p.name);
+            }
+            if p.uplinks.is_empty() {
+                bail!(
+                    "multiwan policy {:?}: needs at least one uplink to prefer",
+                    p.name
+                );
+            }
+            for want in &p.uplinks {
+                if !self.multiwan.uplinks.iter().any(|u| &u.interface == want) {
+                    bail!(
+                        "multiwan policy {:?}: uplink {want:?} is not a configured uplink",
+                        p.name
+                    );
+                }
+            }
+            if (p.source_port.is_some() || p.destination_port.is_some()) && p.proto.is_none() {
+                bail!(
+                    "multiwan policy {:?}: a port needs a `proto` to key it (tcp or udp)",
+                    p.name
+                );
+            }
+            for (what, v) in [("source", &p.source), ("destination", &p.destination)] {
+                if let Some(a) = v {
+                    validate_cidr_or_ip(a)
+                        .with_context(|| format!("multiwan policy {:?} {what}", p.name))?;
+                }
+            }
+            // Preferring a path that cannot be measured means the preference can
+            // never be acted on — the daemon has nothing to compare.
+            if p.strict
+                && !p
+                    .uplinks
+                    .iter()
+                    .filter_map(|i| self.multiwan.uplinks.iter().find(|u| &u.interface == i))
+                    .any(|u| u.check.has_sla())
+            {
+                bail!(
+                    "multiwan policy {:?} is strict, but none of its uplinks has an SLA \
+                     threshold to be strict about",
+                    p.name
+                );
+            }
+        }
+        // Policy routing: a rule that redirects nowhere, or matches a port
+        // without saying which protocol's port, is a rule the kernel will
+        // refuse — better to say so here, with the name in hand.
+        let mut seen_pbr = std::collections::BTreeSet::new();
+        for r in &self.policy.routes {
+            if !seen_pbr.insert(r.name.as_str()) {
+                bail!("policy route {:?}: declared twice", r.name);
+            }
+            if r.table == 0 {
+                bail!(
+                    "policy route {:?}: needs a table — a rule that redirects nowhere is not a policy route",
+                    r.name
+                );
+            }
+            // 0 and 253-255 are the kernel's own (unspec/default/main/local).
+            if (253..=255).contains(&r.table) {
+                bail!(
+                    "policy route {:?}: table {} is the kernel's own (253-255)",
+                    r.name,
+                    r.table
+                );
+            }
+            if (r.source_port.is_some() || r.destination_port.is_some()) && r.proto.is_none() {
+                bail!(
+                    "policy route {:?}: a port needs a `proto` to key it (tcp or udp)",
+                    r.name
+                );
+            }
+            for (what, v) in [("source", &r.source), ("destination", &r.destination)] {
+                if let Some(a) = v {
+                    validate_cidr_or_ip(a)
+                        .with_context(|| format!("policy route {:?} {what}", r.name))?;
+                }
+            }
+            // Both ends in one rule is fine; both *families* in one rule is not,
+            // because a kernel rule belongs to one.
+            if let (Some(s), Some(d)) = (&r.source, &r.destination) {
+                if s.contains(':') != d.contains(':') {
+                    bail!(
+                        "policy route {:?}: source and destination are different address families",
+                        r.name
+                    );
+                }
+            }
+        }
         for r in &self.protocols.statics {
             check_vrf_ref(&r.vrf, &format!("static route {:?}", r.prefix))?;
         }
@@ -7835,6 +8481,29 @@ impl Appliance {
     #[allow(dead_code)]
     pub fn warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
+        // An encrypted upstream named by hostname cannot be reached until
+        // something resolves that hostname, and that something has to be
+        // plaintext. Without one the box looks like "DNS is broken" rather than
+        // like a setting is missing — so it is said here, where somebody is
+        // already reading.
+        let dns = &self.services.dns;
+        if !dns.secure_upstream.is_empty() && dns.upstream.is_empty() {
+            let by_name = dns.secure_upstream.iter().any(|u| {
+                u.trim_start_matches("tls://")
+                    .trim_start_matches("https://")
+                    .split(['/', ':'])
+                    .next()
+                    .is_some_and(|h| h.parse::<std::net::IpAddr>().is_err())
+            });
+            if by_name {
+                out.push(
+                    "services dns: an encrypted upstream is named by hostname but no plain \
+                     `upstream` is set to bootstrap it — nothing can resolve that name to \
+                     connect to it"
+                        .to_string(),
+                );
+            }
+        }
         for rule in &self.rules {
             // Only a rule that DECLARES a destination zone warns: `to` is
             // optional, and omitting it states exactly what the datapath does.
@@ -8611,7 +9280,13 @@ const BFD_AUTH_TYPES: &[&str] = &[
 /// Validate one BGP neighbour: its address/AS plus the policy knobs, with
 /// import/export referring to a declared filter (`filter_names`).
 fn validate_bgp_neighbor(n: &BgpNeighbor, filter_names: &HashSet<&str>) -> Result<()> {
-    validate_ipv4(&n.address).with_context(|| format!("protocols bgp neighbor {:?}", n.address))?;
+    // Either family: wren speaks MP-BGP, and an IPv6 peering is not exotic — on
+    // a dual-stacked network most sessions are one. Refusing it here made every
+    // v6 neighbour unconfigurable while the daemon underneath was ready for it.
+    n.address
+        .parse::<std::net::IpAddr>()
+        .map(|_| ())
+        .with_context(|| format!("protocols bgp neighbor {:?}", n.address))?;
     if n.remote_as == 0 {
         bail!(
             "protocols bgp neighbor {:?}: remote-as must be non-zero",
@@ -8675,7 +9350,10 @@ fn validate_bgp_neighbor(n: &BgpNeighbor, filter_names: &HashSet<&str>) -> Resul
         );
     }
     if let Some(src) = &n.update_source {
-        validate_ipv4(src)
+        // The session's source is an address this box holds, in whichever
+        // family the session runs.
+        src.parse::<std::net::IpAddr>()
+            .map(|_| ())
             .with_context(|| format!("protocols bgp neighbor {:?} update-source", n.address))?;
     }
     if let Some(ttl) = n.ebgp_multihop {
@@ -9118,6 +9796,7 @@ fn proto_str(p: Proto) -> &'static str {
         Proto::Esp => "esp",
         Proto::Ah => "ah",
         Proto::Gre => "gre",
+        Proto::TcpUdp => "tcp_udp",
     }
 }
 

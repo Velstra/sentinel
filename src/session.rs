@@ -66,6 +66,8 @@ struct IfaceDraft {
     vlan_untagged: Option<u16>,
     // Link tunables.
     mtu: Option<u16>,
+    /// TCP MSS clamp on this link (`<bytes>` or `pmtu`).
+    mss: Option<String>,
     mac: Option<String>,
     // Kernel tunnel (type = gre/ipip/gretap): endpoint addresses + GRE key + TTL.
     local: Option<String>,
@@ -324,6 +326,8 @@ struct StaticDraft {
     dev: Option<String>,
     metric: Option<u32>,
     vrf: Option<String>,
+    blackhole: bool,
+    distance: Option<u32>,
 }
 
 /// The candidate's BGP configuration — the full surface Wren's `[bgp]` accepts.
@@ -453,6 +457,7 @@ struct FilterRuleDraft {
     set_metric: Option<u32>,
     add_metric: Option<i64>,
     set_preference: Option<u32>,
+    set_next_hop: Option<String>,
     set_community: Vec<String>,
     add_community: Vec<String>,
     set_large_community: Vec<String>,
@@ -782,6 +787,7 @@ fn filter_to_draft(f: &Filter) -> FilterDraft {
                         set_metric: r.set_metric,
                         add_metric: r.add_metric,
                         set_preference: r.set_preference,
+                        set_next_hop: r.set_next_hop.clone(),
                         set_community: r.set_community.clone().unwrap_or_default(),
                         add_community: r.add_community.clone(),
                         set_large_community: r.set_large_community.clone().unwrap_or_default(),
@@ -907,6 +913,7 @@ fn filter_from_draft(name: &str, d: &FilterDraft) -> Result<Filter> {
                     set_metric: r.set_metric,
                     add_metric: r.add_metric,
                     set_preference: r.set_preference,
+                    set_next_hop: r.set_next_hop.clone(),
                     set_community: some_if(&r.set_community),
                     add_community: r.add_community.clone(),
                     set_large_community: some_if(&r.set_large_community),
@@ -1133,6 +1140,14 @@ struct Draft {
     /// Kernel parameters (`system sysctl <name> <value>`).
     sysctl: std::collections::BTreeMap<String, String>,
     hostname: Option<String>,
+    /// Serial console (`system console device|speed`).
+    console: crate::config::Console,
+    /// Where a password is checked when it is not checked here.
+    aaa: crate::config::Aaa,
+    /// Whether the box keeps a history of its own counters.
+    metrics: crate::config::Metrics,
+    /// How many revisions the archive keeps (`system commit-revisions`).
+    commit_revisions: Option<u32>,
     firewall: FirewallDraft,
     /// Named firewall groups (aliases) — address + port sets referenced by rules.
     groups: Groups,
@@ -1164,6 +1179,10 @@ struct Draft {
     multicast: MulticastDraft,
     /// Named prefix-lists (`[[policy.prefix-list]]`), keyed by name.
     prefix_lists: Vec<(String, PrefixListDraft)>,
+    /// Policy-routing rules (`[[policy.route]]`), keyed by name.
+    policy_routes: Vec<(String, crate::config::PolicyRoute)>,
+    /// SD-WAN steering policies (`[[multiwan.policy]]`), keyed by name.
+    wan_policies: Vec<(String, crate::config::WanPolicy)>,
     /// Named route-maps (`[[policy.route-map]]`, import/export policy), keyed by
     /// name.
     filters: Vec<(String, FilterDraft)>,
@@ -1248,6 +1267,9 @@ struct DnsDraft {
     local_domain: Option<String>,
     negative_ttl: Option<u32>,
     txt_record: BTreeMap<String, String>,
+    allow_from: Vec<String>,
+    dont_query: Vec<String>,
+    secure_upstream: Vec<String>,
 }
 
 /// A partially-specified NTP server (`[services.ntp]`).
@@ -1303,6 +1325,7 @@ struct SyslogTargetDraft {
     port: Option<u16>,
     proto: Option<SyslogProto>,
     level: Option<SyslogLevel>,
+    facility: Vec<String>,
 }
 
 /// A partially-specified alert configuration (`[services.alerts]`, roadmap C23).
@@ -1345,6 +1368,10 @@ struct UplinkDraft {
     timeout: Option<u32>,
     fail: Option<u32>,
     rise: Option<u32>,
+    latency: Option<u32>,
+    jitter: Option<u32>,
+    loss: Option<u32>,
+    probes: Option<u32>,
 }
 
 /// A partially-specified IPsec connection (`[[vpn.ipsec]]`), keyed by its name in
@@ -1480,6 +1507,56 @@ struct ReverseProxyDraft {
 
 impl Draft {
     /// Mutable access to the static route with `prefix`, inserting it if new.
+    fn radius_mut(&mut self, server: &str) -> &mut crate::config::RadiusServer {
+        if !self.aaa.radius.iter().any(|r| r.server == server) {
+            self.aaa.radius.push(crate::config::RadiusServer {
+                server: server.to_string(),
+                ..Default::default()
+            });
+        }
+        self.aaa
+            .radius
+            .iter_mut()
+            .find(|r| r.server == server)
+            .expect("just inserted")
+    }
+
+    fn wan_policy_mut(&mut self, name: &str) -> &mut crate::config::WanPolicy {
+        if !self.wan_policies.iter().any(|(n, _)| n == name) {
+            self.wan_policies.push((
+                name.to_string(),
+                crate::config::WanPolicy {
+                    name: name.to_string(),
+                    ..Default::default()
+                },
+            ));
+        }
+        &mut self
+            .wan_policies
+            .iter_mut()
+            .find(|(n, _)| n == name)
+            .expect("just inserted")
+            .1
+    }
+
+    fn policy_route_mut(&mut self, name: &str) -> &mut crate::config::PolicyRoute {
+        if !self.policy_routes.iter().any(|(n, _)| n == name) {
+            self.policy_routes.push((
+                name.to_string(),
+                crate::config::PolicyRoute {
+                    name: name.to_string(),
+                    ..Default::default()
+                },
+            ));
+        }
+        &mut self
+            .policy_routes
+            .iter_mut()
+            .find(|(n, _)| n == name)
+            .expect("just inserted")
+            .1
+    }
+
     fn static_mut(&mut self, prefix: &str) -> &mut StaticDraft {
         if let Some(i) = self.statics.iter().position(|(p, _)| p == prefix) {
             return &mut self.statics[i].1;
@@ -1575,6 +1652,7 @@ impl Draft {
             username: name.to_string(),
             ssh_keys: Vec::new(),
             hashed_password: None,
+            totp: None,
             group: None,
         });
         self.logins.last_mut().unwrap()
@@ -1756,6 +1834,10 @@ impl Draft {
     fn from_appliance(a: &Appliance) -> Self {
         Draft {
             sysctl: a.system.sysctl.clone(),
+            console: a.system.console.clone(),
+            aaa: a.system.aaa.clone(),
+            metrics: a.system.metrics.clone(),
+            commit_revisions: a.system.commit_revisions,
             hostname: Some(a.system.hostname.clone()),
             firewall: FirewallDraft {
                 stateful: Some(a.firewall.stateful),
@@ -1868,6 +1950,7 @@ impl Draft {
                             vlan_tagged: i.vlan_tagged.clone(),
                             vlan_untagged: i.vlan_untagged,
                             mtu: i.mtu,
+                            mss: i.mss.clone(),
                             mac: i.mac.clone(),
                             local: i.local.clone(),
                             remote: i.remote.clone(),
@@ -1994,6 +2077,8 @@ impl Draft {
                             dev: s.dev.clone(),
                             metric: s.metric,
                             vrf: s.vrf.clone(),
+                            blackhole: s.blackhole,
+                            distance: s.distance,
                         },
                     )
                 })
@@ -2138,6 +2223,12 @@ impl Draft {
                 .as_ref()
                 .map(bgp_to_draft)
                 .unwrap_or_default(),
+            policy_routes: a
+                .policy
+                .routes
+                .iter()
+                .map(|r| (r.name.clone(), r.clone()))
+                .collect(),
             prefix_lists: a
                 .policy
                 .prefix_lists
@@ -2166,6 +2257,9 @@ impl Draft {
                 })
                 .unwrap_or_default(),
             dns: DnsDraft {
+                secure_upstream: a.services.dns.secure_upstream.clone(),
+                allow_from: a.services.dns.allow_from.clone(),
+                dont_query: a.services.dns.dont_query.clone(),
                 negative_ttl: a.services.dns.negative_ttl,
                 txt_record: a.services.dns.txt_record.clone(),
                 upstream: a.services.dns.upstream.clone(),
@@ -2220,6 +2314,7 @@ impl Draft {
                             port: t.port,
                             proto: t.proto,
                             level: t.level,
+                            facility: t.facility.clone(),
                         },
                     )
                 })
@@ -2237,6 +2332,12 @@ impl Draft {
                 server6: a.services.dhcp_relay.server6.clone(),
             },
             multiwan_mode: (!a.multiwan.mode.is_default()).then_some(a.multiwan.mode),
+            wan_policies: a
+                .multiwan
+                .policies
+                .iter()
+                .map(|p| (p.name.clone(), p.clone()))
+                .collect(),
             uplinks: a
                 .multiwan
                 .uplinks
@@ -2250,6 +2351,10 @@ impl Draft {
                             table: u.table,
                             gateway: u.gateway.clone(),
                             targets: u.check.targets.clone(),
+                            latency: u.check.latency,
+                            jitter: u.check.jitter,
+                            loss: u.check.loss,
+                            probes: u.check.probes,
                             interval: u.check.interval,
                             timeout: u.check.timeout,
                             fail: u.check.fail,
@@ -2931,6 +3036,23 @@ impl Session {
                 let mtu: u16 = v.parse().with_context(|| format!("invalid mtu {v:?}"))?;
                 self.draft.iface_mut(name).mtu = Some(mtu);
             }
+            // `pmtu` clamps to whatever the path turns out to be; a number
+            // clamps to that number. Anything under 536 is below the minimum MSS
+            // every TCP implementation must accept, so it is a typo, not a
+            // policy.
+            ["interface", name, "mss", v] => {
+                if !v.eq_ignore_ascii_case("pmtu") {
+                    let mss: u16 = v
+                        .parse()
+                        .with_context(|| format!("interface {name} mss {v:?}: a size or `pmtu`"))?;
+                    if mss < 536 {
+                        bail!(
+                            "interface {name} mss {mss}: below the 536-byte minimum every TCP accepts"
+                        );
+                    }
+                }
+                self.draft.iface_mut(name).mss = Some(v.to_ascii_lowercase());
+            }
             ["interface", name, "mac", v] => {
                 crate::config::validate_mac(v)?;
                 self.draft.iface_mut(name).mac = Some((*v).to_string());
@@ -3208,6 +3330,24 @@ impl Session {
                     .or_default();
                 append_csv(list, v);
             }
+            ["firewall", "group", "feed-group", name, "url", v] => {
+                for one in v.split(',').map(str::trim).filter(|x| !x.is_empty()) {
+                    if !one.starts_with("https://") {
+                        bail!(
+                            "firewall group feed-group {name} url {one:?}: https only — this \
+                             list becomes firewall rules, and over plain http anything on the \
+                             path decides what this box permits"
+                        );
+                    }
+                }
+                let list = self
+                    .draft
+                    .groups
+                    .feed
+                    .entry((*name).to_string())
+                    .or_default();
+                append_csv(list, v);
+            }
             ["firewall", "group", "domain-group", name, "domain", v] => {
                 let list = self
                     .draft
@@ -3366,6 +3506,32 @@ impl Session {
                     .host_override
                     .insert((*name).to_string(), (*ip).to_string());
             }
+            // Who may ask, and what is never asked upstream. Both are lists
+            // that append rather than replace, like every other member set.
+            ["services", "dns", "secure-upstream", v] => {
+                for one in v.split(',').map(str::trim).filter(|x| !x.is_empty()) {
+                    if !(one.starts_with("tls://") || one.starts_with("https://")) {
+                        bail!(
+                            "services dns secure-upstream {one:?}: tls://<host> or \
+                             https://<host>/dns-query — the scheme is what says how it is \
+                             encrypted"
+                        );
+                    }
+                    push_unique(&mut self.draft.dns.secure_upstream, one);
+                }
+            }
+            ["services", "dns", "allow-from", v] => {
+                for one in v.split(',').map(str::trim).filter(|x| !x.is_empty()) {
+                    crate::config::validate_cidr_or_ip(one)
+                        .with_context(|| format!("services dns allow-from {one:?}"))?;
+                    push_unique(&mut self.draft.dns.allow_from, one);
+                }
+            }
+            ["services", "dns", "dont-query", v] => {
+                for one in v.split(',').map(str::trim).filter(|x| !x.is_empty()) {
+                    push_unique(&mut self.draft.dns.dont_query, one);
+                }
+            }
             // A sinkholed domain: `blocklist <domain>` (append, deduped).
             ["services", "dns", "blocklist", v] => {
                 push_unique(&mut self.draft.dns.blocklist, v);
@@ -3490,6 +3656,42 @@ impl Session {
             ["services", "ssh", "password-authentication", v] => {
                 self.draft.ssh.password_authentication = parse_bool(v)?;
             }
+            ["services", "ssh", "loglevel", v] => {
+                const LEVELS: [&str; 8] = [
+                    "QUIET", "FATAL", "ERROR", "INFO", "VERBOSE", "DEBUG1", "DEBUG2", "DEBUG3",
+                ];
+                let want = v.to_ascii_uppercase();
+                if !LEVELS.contains(&want.as_str()) {
+                    bail!(
+                        "services ssh loglevel {v:?}: expected one of {}",
+                        LEVELS.join(", ")
+                    );
+                }
+                self.draft.ssh.loglevel = Some(want);
+            }
+
+            // The serial console, and how far back the archive remembers.
+            ["system", "console", "device", v] => {
+                if v.contains('/') {
+                    bail!("system console device {v:?}: a tty name, not a path (ttyS0)");
+                }
+                self.draft.console.device = Some((*v).to_string());
+            }
+            ["system", "console", "speed", v] => {
+                self.draft.console.speed = Some(
+                    v.parse()
+                        .with_context(|| format!("system console speed {v:?}: not a baud rate"))?,
+                );
+            }
+            ["system", "commit-revisions", v] => {
+                let n: u32 = v
+                    .parse()
+                    .with_context(|| format!("system commit-revisions {v:?}: not a count"))?;
+                if n == 0 {
+                    bail!("system commit-revisions 0: keeping nothing leaves no way back");
+                }
+                self.draft.commit_revisions = Some(n);
+            }
 
             // system login: local accounts (VyOS-style). Per-user SSH keys + an
             // optional pre-hashed login password (console + sudo).
@@ -3498,6 +3700,56 @@ impl Session {
                 let login = self.draft.login_mut(name);
                 if !login.ssh_keys.contains(&key) {
                     login.ssh_keys.push(key);
+                }
+            }
+            ["system", "login", name, "totp", "generate"] => {
+                let secret = crate::aaa::totp_secret();
+                self.draft.login_mut(name).totp = Some(secret.clone());
+                // The person has to get it into an authenticator, and the URI is
+                // what a QR code encodes — so both are printed rather than
+                // leaving somebody to assemble it.
+                let host = self.draft.hostname.as_deref().unwrap_or("sentinel");
+                println!("generated a one-time-code secret for {name}: {secret}");
+                println!("  otpauth://totp/{host}:{name}?secret={secret}&issuer={host}");
+                // What the phone should be showing right now. Somebody who
+                // enrolled the wrong account finds out here rather than at the
+                // next sign-in, locked out of the appliance.
+                if let Ok(code) = crate::aaa::totp_at(&secret, crate::aaa::unix_now()) {
+                    println!("  the code right now is {code} — check the phone agrees");
+                }
+            }
+            ["system", "login", name, "totp", v] => {
+                // Refuse a secret that cannot be decoded now rather than at the
+                // next login, when the person holding the phone finds out.
+                crate::aaa::base32_decode(v)
+                    .with_context(|| format!("system login {name} totp"))?;
+                self.draft.login_mut(name).totp = Some((*v).to_string());
+            }
+            // AAA: where a password is checked when it is not checked here.
+            ["system", "metrics", "enable", v] => {
+                self.draft.metrics.enable = parse_bool(v)?;
+            }
+            ["system", "aaa", "default-group", v] => {
+                self.draft.aaa.default_group = Some((*v).to_string());
+            }
+            ["system", "aaa", "radius", server, field, v] => {
+                crate::config::validate_host(server)?;
+                let r = self.draft.radius_mut(server);
+                match *field {
+                    "secret" => r.secret = (*v).to_string(),
+                    "port" => {
+                        r.port = Some(
+                            v.parse()
+                                .with_context(|| format!("system aaa radius {server} port"))?,
+                        )
+                    }
+                    "timeout" => {
+                        r.timeout = Some(
+                            v.parse()
+                                .with_context(|| format!("system aaa radius {server} timeout"))?,
+                        )
+                    }
+                    other => bail!("system aaa radius {server}: unknown field {other:?}"),
                 }
             }
             ["system", "login", name, "hashed-password", v] => {
@@ -3622,6 +3874,31 @@ impl Session {
             ["services", "syslog", "target", host, "level", v] => {
                 crate::config::validate_host(host)?;
                 self.draft.syslog_target_mut(host).level = Some(parse_syslog_level(v)?);
+            }
+            ["services", "syslog", "target", host, "facility", v] => {
+                crate::config::validate_host(host)?;
+                const FACILITIES: [&str; 21] = [
+                    "auth", "authpriv", "cron", "daemon", "ftp", "kern", "lpr", "mail", "news",
+                    "syslog", "user", "uucp", "local0", "local1", "local2", "local3", "local4",
+                    "local5", "local6", "local7",
+                    // Not a facility but rsyslog's own word for all of them,
+                    // which is what an operator reaches for first.
+                    "all",
+                ];
+                for one in v.split(',').map(str::trim).filter(|x| !x.is_empty()) {
+                    if !FACILITIES.contains(&one) {
+                        bail!(
+                            "services syslog target {host} facility {one:?}: not a syslog facility"
+                        );
+                    }
+                    // `all` is the default and means "no selector", so it is
+                    // stored as the empty set rather than as a name.
+                    if one == "all" {
+                        self.draft.syslog_target_mut(host).facility.clear();
+                        break;
+                    }
+                    push_unique(&mut self.draft.syslog_target_mut(host).facility, one);
+                }
             }
 
             // services portal: the captive portal (C20). The zone is what turns
@@ -3841,6 +4118,53 @@ impl Session {
             ["protocols", "static", prefix, "metric", v] => {
                 self.draft.static_mut(prefix).metric =
                     Some(v.parse().with_context(|| format!("invalid metric {v:?}"))?);
+            }
+            // Policy routing (`policy route <name> …`): which traffic consults
+            // which table.
+            ["policy", "route", name, field, rest @ ..]
+                if !rest.is_empty() || !field.is_empty() =>
+            {
+                let value = rest.join(" ");
+                let r = self.draft.policy_route_mut(name);
+                match *field {
+                    "source" => r.source = Some(value),
+                    "destination" => r.destination = Some(value),
+                    "interface" => r.interface = Some(value),
+                    "proto" => {
+                        if !matches!(value.as_str(), "tcp" | "udp") {
+                            bail!("policy route {name} proto {value:?}: tcp or udp");
+                        }
+                        r.proto = Some(value);
+                    }
+                    "source-port" => r.source_port = Some(value),
+                    "destination-port" => r.destination_port = Some(value),
+                    "table" => {
+                        r.table = value
+                            .parse()
+                            .with_context(|| format!("policy route {name} table {value:?}"))?
+                    }
+                    "priority" => {
+                        r.priority = Some(
+                            value
+                                .parse()
+                                .with_context(|| format!("policy route {name} priority"))?,
+                        )
+                    }
+                    "disabled" => r.disabled = parse_bool(&value)?,
+                    other => bail!("policy route {name}: unknown field {other:?}"),
+                }
+            }
+            ["protocols", "static", prefix, "blackhole", v] => {
+                self.draft.static_mut(prefix).blackhole = parse_bool(v)?;
+            }
+            ["protocols", "static", prefix, "distance", v] => {
+                let d: u32 = v
+                    .parse()
+                    .with_context(|| format!("protocols static {prefix} distance {v:?}"))?;
+                if d > 255 {
+                    bail!("protocols static {prefix} distance {d}: 0-255");
+                }
+                self.draft.static_mut(prefix).distance = Some(d);
             }
             ["protocols", "bgp", "local-as", v] => {
                 self.draft.bgp.local_as =
@@ -4429,6 +4753,58 @@ impl Session {
                         .with_context(|| format!("invalid timeout {v:?}"))?,
                 );
             }
+            // The SLA thresholds. Out of SLA is not the same as down, which is
+            // why these sit beside `fail`/`rise` rather than replacing them.
+            ["multiwan", "uplink", iface, "check", "latency", v] => {
+                self.draft.uplink_mut(iface).latency = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid latency {v:?}"))?,
+                );
+            }
+            ["multiwan", "uplink", iface, "check", "jitter", v] => {
+                self.draft.uplink_mut(iface).jitter =
+                    Some(v.parse().with_context(|| format!("invalid jitter {v:?}"))?);
+            }
+            ["multiwan", "uplink", iface, "check", "loss", v] => {
+                let pct: u32 = v.parse().with_context(|| format!("invalid loss {v:?}"))?;
+                if pct > 100 {
+                    bail!("multiwan uplink {iface} check loss {pct}: a percentage");
+                }
+                self.draft.uplink_mut(iface).loss = Some(pct);
+            }
+            ["multiwan", "uplink", iface, "check", "probes", v] => {
+                let n: u32 = v.parse().with_context(|| format!("invalid probes {v:?}"))?;
+                if n == 0 {
+                    bail!("multiwan uplink {iface} check probes 0: nothing to measure");
+                }
+                self.draft.uplink_mut(iface).probes = Some(n);
+            }
+
+            // Steering: which traffic prefers which uplink.
+            ["multiwan", "policy", name, field, rest @ ..] if !rest.is_empty() => {
+                let value = rest.join(" ");
+                let p = self.draft.wan_policy_mut(name);
+                match *field {
+                    "source" => p.source = Some(value),
+                    "destination" => p.destination = Some(value),
+                    "proto" => {
+                        if !matches!(value.as_str(), "tcp" | "udp") {
+                            bail!("multiwan policy {name} proto {value:?}: tcp or udp");
+                        }
+                        p.proto = Some(value);
+                    }
+                    "source-port" => p.source_port = Some(value),
+                    "destination-port" => p.destination_port = Some(value),
+                    "uplink" => {
+                        for one in value.split(',').map(str::trim).filter(|x| !x.is_empty()) {
+                            push_unique(&mut p.uplinks, one);
+                        }
+                    }
+                    "strict" => p.strict = parse_bool(&value)?,
+                    "disabled" => p.disabled = parse_bool(&value)?,
+                    other => bail!("multiwan policy {name}: unknown field {other:?}"),
+                }
+            }
             ["multiwan", "uplink", iface, "check", "fail", v] => {
                 self.draft.uplink_mut(iface).fail = Some(
                     v.parse()
@@ -4835,6 +5211,7 @@ impl Session {
             "metric" => r.set_metric = None,
             "add-metric" => r.add_metric = None,
             "preference" => r.set_preference = None,
+            "next-hop" => r.set_next_hop = None,
             "community" => del_from_list(&mut r.set_community, item, "set community")?,
             "add-community" => del_from_list(&mut r.add_community, item, "set add-community")?,
             "large-community" => {
@@ -4957,6 +5334,14 @@ impl Session {
                     v.parse()
                         .with_context(|| format!("invalid preference {v:?}"))?,
                 )
+            }
+            // An address, not a name. This decides where traffic is forwarded,
+            // and a name that stopped resolving would move it without the
+            // configuration having changed.
+            "next-hop" => {
+                v.parse::<std::net::IpAddr>()
+                    .with_context(|| format!("route-map set next-hop {v:?}"))?;
+                r.set_next_hop = Some(v.to_string());
             }
             "community" => append_csv(&mut r.set_community, v),
             "add-community" => append_csv(&mut r.add_community, v),
@@ -6625,6 +7010,7 @@ impl Session {
                 vlan_tagged: d.vlan_tagged.clone(),
                 vlan_untagged: d.vlan_untagged,
                 mtu: d.mtu,
+                mss: d.mss.clone(),
                 mac: d.mac.clone(),
                 local: d.local.clone(),
                 remote: d.remote.clone(),
@@ -6820,6 +7206,8 @@ impl Session {
                 dev: d.dev.clone(),
                 metric: d.metric,
                 vrf: d.vrf.clone(),
+                blackhole: d.blackhole,
+                distance: d.distance,
             })
             .collect();
         let bgp = if self.draft.bgp.is_empty() {
@@ -7061,8 +7449,18 @@ impl Session {
                         timeout: d.timeout,
                         fail: d.fail,
                         rise: d.rise,
+                        latency: d.latency,
+                        jitter: d.jitter,
+                        loss: d.loss,
+                        probes: d.probes,
                     },
                 })
+                .collect(),
+            policies: self
+                .draft
+                .wan_policies
+                .iter()
+                .map(|(_, p)| p.clone())
                 .collect(),
         };
 
@@ -7185,6 +7583,10 @@ impl Session {
                 config_sync: self.draft.config_sync.clone(),
                 conntrack_sync: self.draft.conntrack_sync.clone(),
                 sysctl: self.draft.sysctl.clone(),
+                aaa: self.draft.aaa.clone(),
+                metrics: self.draft.metrics.clone(),
+                console: self.draft.console.clone(),
+                commit_revisions: self.draft.commit_revisions,
             },
             firewall,
             zones,
@@ -7207,9 +7609,18 @@ impl Session {
             policy: Policy {
                 prefix_lists,
                 route_maps,
+                routes: self
+                    .draft
+                    .policy_routes
+                    .iter()
+                    .map(|(_, r)| r.clone())
+                    .collect(),
             },
             services: Services {
                 dns: Dns {
+                    secure_upstream: self.draft.dns.secure_upstream.clone(),
+                    allow_from: self.draft.dns.allow_from.clone(),
+                    dont_query: self.draft.dns.dont_query.clone(),
                     negative_ttl: self.draft.dns.negative_ttl,
                     txt_record: self.draft.dns.txt_record.clone(),
                     upstream: self.draft.dns.upstream.clone(),
@@ -7254,6 +7665,7 @@ impl Session {
                             port: t.port,
                             proto: t.proto,
                             level: t.level,
+                            facility: t.facility.clone(),
                         })
                         .collect(),
                 },
@@ -7379,7 +7791,15 @@ pub fn persist_appliance(appliance: &Appliance, path: &Path, archive: bool) -> R
     std::fs::write(&tmp, &toml).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("installing {}", path.display()))?;
     if archive {
-        if let Err(e) = crate::archive::archive_config(path, &toml) {
+        // How far back an operator can roll is a policy, not a constant: a box
+        // changed twice a year wants a longer memory than one changed twice a
+        // day.
+        let keep = appliance
+            .system
+            .commit_revisions
+            .map(|n| n as usize)
+            .unwrap_or(crate::archive::ARCHIVE_KEEP);
+        if let Err(e) = crate::archive::archive_config(path, &toml, keep) {
             eprintln!("warning: could not archive this config revision: {e}");
         }
     }
@@ -9199,7 +9619,10 @@ fn parse_proto(s: &str) -> Result<Proto> {
         "esp" => Proto::Esp,
         "ah" => Proto::Ah,
         "gre" => Proto::Gre,
-        _ => bail!("invalid proto {s:?} (expected tcp, udp, icmp, icmpv6, vrrp, esp, ah or gre)"),
+        "tcp_udp" | "tcp-udp" => Proto::TcpUdp,
+        _ => bail!(
+            "invalid proto {s:?} (expected tcp, udp, tcp_udp, icmp, icmpv6, vrrp, esp, ah or gre)"
+        ),
     })
 }
 
@@ -9634,6 +10057,7 @@ fn proto_str(p: Proto) -> &'static str {
         Proto::Esp => "esp",
         Proto::Ah => "ah",
         Proto::Gre => "gre",
+        Proto::TcpUdp => "tcp_udp",
     }
 }
 
