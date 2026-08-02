@@ -1387,12 +1387,20 @@ pub struct Ntp {
     /// a declared interface carrying a static address (its subnet is `allow`ed).
     #[serde(default, rename = "serve-on", skip_serializing_if = "Vec::is_empty")]
     pub serve_on: Vec<String>,
+    /// Networks allowed to query this NTP server, written as prefixes.
+    ///
+    /// `serve-on` answers "which of my links may ask", which is the common case
+    /// and needs no arithmetic. This answers "which networks may ask" — for a
+    /// client that is not on a directly attached subnet, reached over a tunnel
+    /// or a routed segment, where naming a link cannot express it.
+    #[serde(default, rename = "allow-from", skip_serializing_if = "Vec::is_empty")]
+    pub allow_from: Vec<String>,
 }
 
 impl Ntp {
     /// True when no NTP server is configured — lets `[services.ntp]` be omitted.
     pub fn is_empty(&self) -> bool {
-        self.upstream.is_empty() && self.serve_on.is_empty()
+        self.upstream.is_empty() && self.serve_on.is_empty() && self.allow_from.is_empty()
     }
 }
 
@@ -1916,6 +1924,20 @@ pub struct Vrrp {
         default
     )]
     pub virtual_address: Vec<String>,
+    /// The interface the virtual address(es) live on, when that is *not* the
+    /// interface the advertisements go out of.
+    ///
+    /// A firewall with many tagged segments runs one election over the link it
+    /// shares with its peer and holds addresses on the segments it serves.
+    /// Without this every segment needs a virtual router and a vrid of its own,
+    /// which is a lot of protocol for one question — who is master — that has
+    /// the same answer everywhere.
+    #[serde(
+        default,
+        rename = "address-interface",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub address_interface: Option<String>,
 }
 
 /// A static route: `prefix` reached `via` a gateway and/or out `dev` an
@@ -3267,6 +3289,19 @@ pub struct Acme {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct System {
     pub hostname: String,
+    /// Kernel parameters to set (`[system.sysctl]`), as `name = "value"`.
+    ///
+    /// A deliberate escape hatch, not a feature: the settings a firewall needs
+    /// that this schema has no opinion about. `net.ipv4.ip_nonlocal_bind` is the
+    /// canonical one — a service binds a virtual address that this box does not
+    /// hold right now, which is exactly the situation a VRRP backup is in.
+    ///
+    /// Written to a drop-in and applied on commit. Only `net.*` and `vm.*` are
+    /// accepted: everything else on a firewall is a way to make the box
+    /// unbootable from a config file, and an appliance that offers that is
+    /// offering a foot-gun rather than a knob.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sysctl: BTreeMap<String, String>,
     /// Local login accounts (`[[system.login]]`, VyOS-style). Each carries the
     /// SSH public keys allowed to log in as that user and an optional pre-hashed
     /// login password (console + sudo). Empty ⇒ only the image's built-in `admin`.
@@ -3943,6 +3978,11 @@ pub struct Interface {
 pub enum IfaceType {
     Bridge,
     Bond,
+    /// A dummy device (`Kind=dummy`): a link that is always up, carrying an
+    /// address that does not depend on any cable. What a router-id, a VRRP
+    /// address that must not follow a port, or a service bound to "this box"
+    /// wants — a loopback of one's own, addressable from the network.
+    Dummy,
     /// A WireGuard tunnel device (`Kind=wireguard`). The private key, listen port
     /// and peers live in the matching [`WireguardTunnel`] under `[[vpn.wireguard]]`.
     Wireguard,
@@ -4345,6 +4385,32 @@ pub enum Action {
 pub enum Proto {
     Tcp,
     Udp,
+    /// ICMP for IPv4. Carries no port, so a rule naming it matches on the
+    /// protocol alone — "let these two zones ping each other" is a rule, not a
+    /// zone-wide switch.
+    Icmp,
+    /// ICMPv6 (IANA 58). Its own protocol, not a flavour of ICMP, and the one
+    /// that carries neighbour discovery: an IPv6 segment without it does not
+    /// work at all.
+    #[serde(rename = "icmpv6", alias = "ipv6-icmp", alias = "icmp6")]
+    Icmpv6,
+    /// VRRP (IANA 112) — what a redundant pair says to each other.
+    Vrrp,
+    /// ESP (IANA 50) — the payload half of IPsec.
+    Esp,
+    /// AH (IANA 51) — the authentication half of IPsec.
+    Ah,
+    /// GRE (IANA 47).
+    Gre,
+}
+
+impl Proto {
+    /// Whether this protocol has ports. Everything else is matched on the
+    /// protocol alone; the data plane keys such a rule with port `0`, which is
+    /// also what it reads off a packet that has no ports.
+    pub fn has_ports(self) -> bool {
+        matches!(self, Proto::Tcp | Proto::Udp)
+    }
 }
 
 /// The widest port range a single rule may span (inclusive count). A range is
@@ -4649,9 +4715,15 @@ impl Rule {
     pub fn is_broad(&self) -> bool {
         self.proto.is_none() && self.port.is_none() && self.port_group.is_none()
     }
-    /// A specific proto/port rule (a literal port/range or a port group).
+    /// A rule the data plane carries as a `(protocol, port)` entry: a literal
+    /// port or a port group on TCP/UDP, or any of the port-less protocols, which
+    /// match on the protocol alone with the port left at `0`.
     pub fn is_port_rule(&self) -> bool {
-        self.proto.is_some() && (self.port.is_some() || self.port_group.is_some())
+        match self.proto {
+            None => false,
+            Some(p) if p.has_ports() => self.port.is_some() || self.port_group.is_some(),
+            Some(_) => true,
+        }
     }
 
     /// The source constraints this rule matches, expanding a `source_group`
@@ -4698,6 +4770,11 @@ impl Rule {
                 .unwrap_or_default()
         } else if let Some(p) = &self.port {
             p.ports().collect()
+        } else if self.proto.is_some_and(|p| !p.has_ports()) {
+            // One entry at port 0: the data plane reads 0 off a packet that has
+            // no ports, so this is the key that matches every packet of this
+            // protocol under the rule's address constraints.
+            vec![0]
         } else {
             Vec::new()
         }
@@ -5488,6 +5565,17 @@ impl Appliance {
             .iter()
             .filter_map(|i| i.zone.as_deref())
             .collect();
+        // Kernel parameters: a narrow allow-list on purpose. A firewall that can
+        // be made unbootable from its own configuration file is a firewall whose
+        // rollback cannot save you.
+        for (key, value) in &self.system.sysctl {
+            if !(key.starts_with("net.") || key.starts_with("vm.")) {
+                bail!("system sysctl {key:?}: only net.* and vm.* parameters may be set here");
+            }
+            if key.contains('/') || value.contains('\n') {
+                bail!("system sysctl {key:?}: not a kernel parameter name/value");
+            }
+        }
         for rule in &self.rules {
             if let Some(d) = &rule.description {
                 validate_description(d)
@@ -5510,6 +5598,20 @@ impl Appliance {
             // needs a proto paired with a port (either form).
             if rule.port.is_some() && rule.port_group.is_some() {
                 bail!("rule {:?}: set `port` or `port-group`, not both", rule.name);
+            }
+            // A port on a protocol that has none is a rule that would match
+            // something other than what it says. ICMP's second header byte is a
+            // *code*, not a port, and the data plane reads 0 there — so the port
+            // would be quietly dropped and the rule would match all of it.
+            if let Some(p) = rule.proto {
+                if !p.has_ports() && (rule.port.is_some() || rule.port_group.is_some()) {
+                    bail!(
+                        "rule {:?}: {} carries no ports — drop the port to match the \
+                         protocol, or name tcp/udp",
+                        rule.name,
+                        proto_str(p)
+                    );
+                }
             }
             if rule.source.is_some() && rule.source_group.is_some() {
                 bail!(
@@ -5579,8 +5681,19 @@ impl Appliance {
                     rule.name
                 );
             }
+            // A port without a protocol is a rule that cannot be keyed, and a
+            // TCP/UDP rule without a port is not a port rule at all — it only
+            // changes the zone's posture, which is rarely what was meant.
+            // A port-less protocol is the exception: naming it *is* the match.
             let has_port = rule.port.is_some() || rule.port_group.is_some();
-            if rule.proto.is_some() != has_port {
+            let wants_port = rule.proto.is_some_and(|p| p.has_ports());
+            if has_port && rule.proto.is_none() {
+                bail!(
+                    "rule {:?}: a port needs a `proto` to key it (tcp or udp)",
+                    rule.name
+                );
+            }
+            if wants_port && !has_port {
                 bail!(
                     "rule {:?}: `proto` and a port (`port` or `port-group`) must be set together",
                     rule.name
@@ -5796,6 +5909,7 @@ impl Appliance {
             let proto = match lb.proto {
                 Proto::Tcp => "tcp",
                 Proto::Udp => "udp",
+                other => proto_str(other),
             };
             if !lb_keys.insert((lb.zone.as_str(), proto, lb.port)) {
                 bail!(
@@ -6296,9 +6410,36 @@ impl Appliance {
             if v.vrid == 0 {
                 bail!("protocols vrrp {:?}: vrid must be 1–255", v.name);
             }
+            // Either family. VRRP over IPv6 is RFC 5798 and the daemon speaks it;
+            // refusing it here made a valid dual-stack pair unconfigurable, which
+            // is the commonest shape on a firewall with tagged segments.
+            let mut families = std::collections::BTreeSet::new();
             for addr in &v.virtual_address {
-                validate_ipv4(addr)
-                    .with_context(|| format!("protocols vrrp vrid {} virtual-address", v.vrid))?;
+                let ip: std::net::IpAddr = addr.parse().with_context(|| {
+                    format!(
+                        "protocols vrrp {:?}: virtual-address {addr:?} is not an IP address",
+                        v.name
+                    )
+                })?;
+                families.insert(ip.is_ipv6());
+            }
+            // One virtual router carries one family: the advertisement itself is
+            // sent over one, and a group holding both would be two routers wearing
+            // one name — which is what a second `vrid` is for.
+            if families.len() > 1 {
+                bail!(
+                    "protocols vrrp {:?}: virtual-address mixes IPv4 and IPv6 —                      give each family its own group and vrid",
+                    v.name
+                );
+            }
+            // The address link, when it is named, has to be one this appliance has.
+            if let Some(ai) = &v.address_interface {
+                if !self.interfaces.iter().any(|i| &i.name == ai) {
+                    bail!(
+                        "protocols vrrp {:?}: address-interface {ai:?} is not a configured interface",
+                        v.name
+                    );
+                }
             }
         }
         // BFD global defaults: the authentication type, when set.
@@ -8808,6 +8949,12 @@ fn proto_str(p: Proto) -> &'static str {
     match p {
         Proto::Tcp => "tcp",
         Proto::Udp => "udp",
+        Proto::Icmp => "icmp",
+        Proto::Icmpv6 => "icmpv6",
+        Proto::Vrrp => "vrrp",
+        Proto::Esp => "esp",
+        Proto::Ah => "ah",
+        Proto::Gre => "gre",
     }
 }
 

@@ -449,6 +449,8 @@ struct WrenVrrp {
     priority_decrement: Option<u8>,
     #[serde(rename = "virtual-address", skip_serializing_if = "Vec::is_empty")]
     virtual_address: Vec<String>,
+    #[serde(rename = "address-interface", skip_serializing_if = "Option::is_none")]
+    address_interface: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -772,6 +774,7 @@ pub fn compile_wren(appliance: &Appliance) -> WrenConfig {
             track_interfaces: v.track_interfaces.clone(),
             priority_decrement: v.priority_decrement,
             virtual_address: v.virtual_address.clone(),
+            address_interface: v.address_interface.clone(),
         })
         .collect();
 

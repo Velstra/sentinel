@@ -194,6 +194,8 @@ fn virtual_l2_netdev_body(iface: &Interface) -> String {
                 iface.name
             )
         }
+        // A dummy link has nothing to configure beyond existing.
+        Some(IfaceType::Dummy) => format!("[NetDev]\nName={}\nKind=dummy\n", iface.name),
         // A PPPoE client is brought up by `pppd` over its parent NIC, not by a
         // networkd netdev — `apply_pppoe` owns it, so there is nothing to render
         // here (same as an interface with no type). Kernel tunnels are handled by
@@ -658,6 +660,10 @@ fn chrony_conf_body(ntp: &Ntp, ifaces: &[Interface]) -> Option<String> {
         {
             body.push_str(&format!("allow {net}\n"));
         }
+    }
+    // Networks named outright, for clients that are not on an attached subnet.
+    for net in &ntp.allow_from {
+        body.push_str(&format!("allow {net}\n"));
     }
     Some(body)
 }
@@ -2811,6 +2817,9 @@ pub fn apply_link_runtime(appliance: &Appliance) -> Result<()> {
     // Egress traffic shaping (tc qdiscs) — applied directly, after the links are
     // (re)configured so the target devices exist.
     apply_qos(appliance)?;
+    // Kernel parameters (`[system.sysctl]`) — after the links exist, because a
+    // per-interface parameter needs its interface.
+    apply_sysctl(appliance)?;
     // Multi-WAN failover daemon (roadmap C6) — rendered + (re)started last, after
     // the uplinks it steers are addressed/up.
     apply_multiwan(appliance)?;
@@ -2850,6 +2859,38 @@ pub fn apply_link_runtime(appliance: &Appliance) -> Result<()> {
 pub fn apply(appliance: &Appliance) -> Result<()> {
     apply_persistent(appliance, ApplyMode::Live)?;
     apply_link_runtime(appliance)?;
+    Ok(())
+}
+
+/// Where the kernel parameters from `[system.sysctl]` are written.
+const SYSCTL_DROPIN: &str = "/run/sysctl.d/70-sentinel.conf";
+
+/// Write the configured kernel parameters and apply them.
+///
+/// A drop-in *and* an immediate apply: the file is what makes the setting
+/// survive a reboot, the apply is what makes `commit` mean now. Failing to set
+/// one is a warning rather than a failed commit — a parameter this kernel does
+/// not have must not take the whole configuration down with it, and the file
+/// stays so a kernel that does have it picks it up next boot.
+fn apply_sysctl(appliance: &Appliance) -> Result<()> {
+    let params = &appliance.system.sysctl;
+    if params.is_empty() {
+        // Nothing configured: remove ours rather than leaving a stale file
+        // asserting settings the configuration no longer names.
+        let _ = std::fs::remove_file(SYSCTL_DROPIN);
+        return Ok(());
+    }
+    let mut body = String::from("# Written by sentinel from [system.sysctl].\n");
+    for (key, value) in params {
+        body.push_str(&format!("{key} = {value}\n"));
+    }
+    system::ensure_dir(Path::new("/run/sysctl.d"))?;
+    system::install_file(Path::new(SYSCTL_DROPIN), &body)?;
+    for (key, value) in params {
+        if let Err(e) = system::sysctl_write(key, value) {
+            eprintln!("warning: setting {key} failed (applies on next boot): {e}");
+        }
+    }
     Ok(())
 }
 
@@ -3482,6 +3523,7 @@ mod tests {
         let ntp = Ntp {
             upstream: vec!["pool.ntp.org".into(), "10.0.0.99".into()],
             serve_on: vec!["lan0".into()],
+            allow_from: Vec::new(),
         };
         let ifaces = vec![Interface {
             name: "lan0".into(),
