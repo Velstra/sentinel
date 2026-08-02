@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-08-02
+
 ## [0.4.1] — 2026-08-01
 
 A build fix: 0.4.0 shipped with an `ebpfHash` that no longer described the data
