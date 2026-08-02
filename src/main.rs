@@ -9,6 +9,7 @@
 //! and apply that document — and, via [`velstra_proto`] (from crates.io), talk to
 //! a running Velstra controller.
 
+mod aaa;
 mod acme;
 mod alert;
 mod api;
@@ -19,10 +20,12 @@ mod config;
 mod confirm;
 mod diff;
 mod domain;
+mod feed;
 mod ids;
 mod install;
 mod ipsec;
 mod lookup;
+mod metrics;
 mod net;
 mod openconnect;
 mod passwd;
@@ -127,6 +130,10 @@ enum Command {
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
+    /// Take one round of history samples. Run by the `sentinel-metrics` timer
+    /// once a minute; not something to type, but not hidden either — a timer
+    /// whose command cannot be run by hand is a timer nobody can debug.
+    RecordMetrics,
     /// Capture packets on an interface (bounded: never more than 500 packets
     /// or 60 seconds, and nothing is written to disk).
     Capture {
@@ -350,6 +357,17 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Configure { config, no_apply } => configure(&config, no_apply),
         Command::Show { args } => show_op(&args),
+        Command::RecordMetrics => {
+            let root = crate::metrics::dir();
+            let root = root.as_path();
+            let n = crate::metrics::sample_once(root, crate::aaa::unix_now())?;
+            // Quiet on success: this runs every minute, and a line a minute in
+            // the journal is a log nobody reads and a disk that fills.
+            if n == 0 {
+                eprintln!("warning: no counters could be sampled");
+            }
+            Ok(())
+        }
         Command::Capture {
             interface,
             filter,
@@ -636,7 +654,7 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
 fn apply(file: &std::path::Path, out: &std::path::Path, reload: Option<&str>) -> Result<()> {
     // Resolve domain groups before compiling: the compiler only knows addresses,
     // and this is also the periodic refresh — the timer re-runs exactly this.
-    let appliance = domain::with_resolved(&Appliance::load(file)?);
+    let appliance = feed::with_fetched(&domain::with_resolved(&Appliance::load(file)?));
     let rendered = compile::compile(&appliance).to_toml()?;
 
     if let Some(parent) = out.parent() {
@@ -672,7 +690,7 @@ fn apply_boot(
     out: &std::path::Path,
     wren_out: &std::path::Path,
 ) -> Result<()> {
-    let appliance = domain::with_resolved(&Appliance::load(config)?);
+    let appliance = feed::with_fetched(&domain::with_resolved(&Appliance::load(config)?));
 
     // Compile BOTH configs before writing either, so a compile error can't leave
     // a half-seeded system (velstra written, wren missing). Rendering is pure and
@@ -899,6 +917,176 @@ fn prompt(msg: &str) -> Result<String> {
 /// Operational-mode `show` — a vtysh/VyOS-style word tree. Routing state comes
 /// from the Wren daemon's control socket (`wren show …`); interface/ARP state
 /// from iproute2; firewall/agent state from the config + journal.
+/// `show firewall hits` — the accept rules, and what each is currently carrying.
+///
+/// Attribution, not a hardware counter: the data plane counts globally, so this
+/// asks it for the live flow table and works out which rule admitted each flow,
+/// against the *compiled* rules so the ranking is the one the data plane
+/// applies. What that buys is the question people actually have — which rules
+/// are doing nothing.
+fn show_rule_hits() -> Result<()> {
+    let saved = saved_config_path();
+    if !saved.exists() {
+        println!("no saved configuration to attribute flows to");
+        return Ok(());
+    }
+    let appliance = Appliance::load(&saved)?;
+    let cfg = crate::compile::compile(&appliance);
+    let table = velstra::query("flows --limit 0")
+        .or_else(|_| velstra::query("flows"))
+        .unwrap_or_default();
+    if table.trim().is_empty() {
+        println!("the data plane did not answer — is the agent running?");
+        return Ok(());
+    }
+    let flows = crate::compile::parse_flows(&table);
+    let hits = crate::compile::attribute(&cfg, &flows);
+    if hits.is_empty() {
+        println!("no accept rules are configured");
+        return Ok(());
+    }
+    let total: u64 = hits.values().map(|h| h.flows).sum();
+    let mut rows: Vec<(&String, &crate::compile::Hits)> = hits.iter().collect();
+    // Busiest first: the interesting end of this list is both ends, and the
+    // dead rules gather at the bottom where they read as a group.
+    rows.sort_by(|a, b| b.1.flows.cmp(&a.1.flows).then(a.0.cmp(b.0)));
+    println!("  {:<28} {:>8} {:>10}  share", "rule", "flows", "packets");
+    for (name, h) in &rows {
+        let share = if total > 0 {
+            format!("{:.0} %", h.flows as f64 * 100.0 / total as f64)
+        } else {
+            "—".into()
+        };
+        let mark = if h.flows == 0 { "  ← nothing" } else { "" };
+        println!(
+            "  {name:<28} {:>8} {:>10}  {share}{mark}",
+            h.flows, h.packets
+        );
+    }
+    let dead = rows.iter().filter(|(_, h)| h.flows == 0).count();
+    println!();
+    println!(
+        "{dead} of {} accept rules are carrying nothing right now, out of {} tracked flows.",
+        rows.len(),
+        flows.len()
+    );
+    // The one thing somebody must not conclude from a zero.
+    println!(
+        "Only accept rules appear here: a rule that drops leaves no flow behind, so it \
+         cannot be counted this way."
+    );
+    Ok(())
+}
+
+/// `show history` — which series are being kept, and how far back.
+fn show_history_list() -> Result<()> {
+    let root = crate::metrics::dir();
+    let root = root.as_path();
+    let names = crate::metrics::series(root);
+    if names.is_empty() {
+        println!("no history is being kept (turn it on with `set system metrics enable true`)");
+        return Ok(());
+    }
+    for name in names {
+        let mut spans = Vec::new();
+        for res in &crate::metrics::RESOLUTIONS {
+            let n = crate::metrics::read(root, &name, res)
+                .map(|s| s.len())
+                .unwrap_or(0);
+            if n > 0 {
+                spans.push(format!("{n} at {}", res.name));
+            }
+        }
+        println!("{name}  ({})", spans.join(", "));
+    }
+    Ok(())
+}
+
+/// `show history <series> [resolution]` — the samples themselves, as rates for
+/// a counter and as values for a gauge.
+fn show_history(series: &str, res_name: &str) -> Result<()> {
+    let root = crate::metrics::dir();
+    let root = root.as_path();
+    let Some(res) = crate::metrics::resolution(res_name) else {
+        anyhow::bail!(
+            "no such resolution {res_name:?} — one of {}",
+            crate::metrics::RESOLUTIONS
+                .iter()
+                .map(|r| r.name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    };
+    let samples = crate::metrics::read(root, series, res)?;
+    if samples.is_empty() {
+        println!("nothing recorded for {series} at {res_name} resolution");
+        return Ok(());
+    }
+    // A gauge is a level and a counter is a total. Deriving a rate from a level
+    // would draw the change in the number of sessions, which is not a thing
+    // anybody wants to look at.
+    if series.starts_with("gauge.") {
+        for s in &samples {
+            println!("{}  {}", stamp(s.at), s.value);
+        }
+        return Ok(());
+    }
+    let derived = crate::metrics::rates(&samples, res.step * 3);
+    if derived.is_empty() {
+        // One sample is a reading, not a rate. Printing nothing here reads as
+        // "there is no history", which is a different and wrong answer.
+        println!(
+            "only one sample so far for {series} — a rate needs two, so give it {}s",
+            res.step
+        );
+        return Ok(());
+    }
+    for (at, rate) in derived {
+        match rate {
+            Some(r) => println!("{}  {r:.0}/s", stamp(at)),
+            None => println!("{}  (gap)", stamp(at)),
+        }
+    }
+    Ok(())
+}
+
+/// A Unix time as something a person can read, without pulling in a date crate:
+/// the appliance already prints revision timestamps this way.
+fn stamp(at: u64) -> String {
+    crate::archive::fmt_utc(at as i64)
+}
+
+/// `show multiwan` — the uplinks' measured quality and the steering decisions
+/// that follow from it.
+fn show_multiwan() -> Result<()> {
+    let dir = std::path::Path::new("/run/sentinel/multiwan");
+    let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+
+    let sla = read("sla");
+    println!("uplinks:");
+    if sla.trim().is_empty() {
+        println!("  (the multi-WAN daemon has not reported a round yet)");
+    } else {
+        for line in sla.lines() {
+            println!("  {line}");
+        }
+    }
+
+    let steering = read("steering");
+    if !steering.trim().is_empty() {
+        println!("steering:");
+        for line in steering.lines() {
+            println!("  {line}");
+        }
+    }
+
+    let active = read("active");
+    if let Ok(idx) = active.trim().parse::<usize>() {
+        println!("active uplink index: {idx}");
+    }
+    Ok(())
+}
+
 fn show_op(args: &[String]) -> Result<()> {
     let ip = system::bin("ip");
     let v: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -951,6 +1139,30 @@ fn show_op(args: &[String]) -> Result<()> {
         ["isis", rest @ ..] => wren_show_words("isis", rest),
         ["babel", rest @ ..] => wren_show_words("babel", rest),
         ["vrrp"] => wren_show(&["vrrp"]),
+        // The routing daemon knows which VRFs it is running; the kernel knows
+        // which devices exist. Either answer is more use than none.
+        ["vrf"] | ["vrfs"] => {
+            wren_show_or(&["vrf"], &ip, &["-brief", "link", "show", "type", "vrf"])
+        }
+        // Multicast is programmed into the kernel's forwarding cache and the
+        // daemon has no query of its own for it, so the cache *is* the state:
+        // one line per (source, group) actually being forwarded.
+        ["multicast"] => run_show(&ip, &["mroute", "show"]),
+        // Policy routing: what the kernel is actually consulting, and in which
+        // order. The configuration says what should be there; this says what is.
+        ["policy", "route"] | ["policy-route"] => run_show(&ip, &["rule", "show"]),
+        // Multi-WAN: what each uplink is measuring and where each steering
+        // policy is currently sending its traffic. Both are written by the
+        // daemon each round, so this is the state as of the last probe rather
+        // than a fresh measurement — which is the honest thing to show, since a
+        // fresh one would say nothing about the trend that moved the traffic.
+        ["multiwan"] | ["wan"] => show_multiwan(),
+        // The history. `show history` alone lists what is being kept; naming a
+        // series prints it, newest last, at the resolution asked for.
+        ["history"] => show_history_list(),
+        ["history", series] => show_history(series, "minute"),
+        ["history", series, res] => show_history(series, res),
+        ["multicast", "groups"] => run_show(&ip, &["maddr", "show"]),
         ["bfd", rest @ ..] => wren_show_words("bfd", rest),
 
         // Firewall / NAT.
@@ -965,6 +1177,8 @@ fn show_op(args: &[String]) -> Result<()> {
             Ok(())
         }
         ["firewall", "statistics" | "stats"] => show_firewall_stats(),
+        // Which rules are carrying traffic, and which are carrying none.
+        ["firewall", "hits"] | ["firewall", "rules"] => show_rule_hits(),
         // C23 flow insight: the live state table, straight from the data plane.
         ["firewall", "flows"] | ["flows"] | ["connections"] | ["conntrack"] => {
             show_agent_query("flows", "flows")

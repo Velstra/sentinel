@@ -58,6 +58,12 @@ struct WrenStatic {
     metric: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     vrf: Option<String>,
+    /// A route that discards what it matches. Wren installs it as the kernel's
+    /// own blackhole type — a route with no next-hop is exactly that.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    blackhole: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    distance: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -230,6 +236,8 @@ struct WrenFilterRule {
     add_metric: Option<i64>,
     #[serde(rename = "set-preference", skip_serializing_if = "Option::is_none")]
     set_preference: Option<u32>,
+    #[serde(rename = "set-next-hop", skip_serializing_if = "Option::is_none")]
+    set_next_hop: Option<String>,
     #[serde(rename = "set-community", skip_serializing_if = "Option::is_none")]
     set_community: Option<Vec<String>>,
     #[serde(rename = "add-community", skip_serializing_if = "Vec::is_empty")]
@@ -573,6 +581,8 @@ pub fn compile_wren(appliance: &Appliance) -> WrenConfig {
             dev: s.dev.clone(),
             metric: s.metric,
             vrf: s.vrf.clone(),
+            blackhole: s.blackhole,
+            distance: s.distance,
         })
         .collect();
 
@@ -921,6 +931,7 @@ fn compile_filter(
                     set_metric: r.set_metric,
                     add_metric: r.add_metric,
                     set_preference: r.set_preference,
+                    set_next_hop: r.set_next_hop.clone(),
                     set_community: r.set_community.clone(),
                     add_community: r.add_community.clone(),
                     set_large_community: r.set_large_community.clone(),

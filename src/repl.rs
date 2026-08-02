@@ -546,7 +546,7 @@ pub(crate) fn apply_live(appliance: &crate::config::Appliance, act: &Apply) -> R
     // Domain groups become address groups here: the compiler matches addresses and
     // knows nothing about names. Resolution never fails the commit — a name that
     // will not resolve falls back to its cached answer.
-    let appliance = &crate::domain::with_resolved(appliance);
+    let appliance = &crate::feed::with_fetched(&crate::domain::with_resolved(appliance));
     let rendered = compile::compile(appliance)
         .to_toml()
         .context("compiling firewall config")?;
@@ -925,7 +925,16 @@ const OP_SHOW_TOP: &[Cand] = &[
     ("babel", "Babel neighbours / routes"),
     ("vrrp", "VRRP virtual-router state"),
     ("bfd", "BFD sessions"),
-    ("firewall", "firewall summary / statistics / log"),
+    ("vrf", "the VRFs that are running, and their devices"),
+    (
+        "multiwan",
+        "each uplink's measured quality, and where steering is sending traffic",
+    ),
+    (
+        "multicast",
+        "the multicast forwarding cache / joined groups",
+    ),
+    ("firewall", "firewall summary / statistics / hits / log"),
     ("nat", "NAT configuration summary"),
     ("ids", "intrusion detection: what is watched, what fired"),
     (
@@ -1005,12 +1014,34 @@ const TOP: &[Cand] = &[
     ),
 ];
 // `policy <Tab>` reveals the two object kinds (VyOS-style, roadmap policy).
+/// `policy route <name> <Tab>` — which traffic consults which table.
+const POLICY_ROUTE_FIELDS: &[Cand] = &[
+    (
+        "table",
+        "the routing table matching traffic consults (required)",
+    ),
+    ("source", "where it has to come from (host or CIDR)"),
+    ("destination", "where it has to be going"),
+    ("interface", "the interface it arrived on"),
+    ("proto", "tcp or udp — needed before a port can be matched"),
+    ("source-port", "source port, or a low-high range"),
+    ("destination-port", "destination port, or a low-high range"),
+    (
+        "priority",
+        "where this rule sits among the others (lower is first)",
+    ),
+    ("disabled", "off without deleting it (true|false)"),
+];
 const POLICY_NODES: &[Cand] = &[
     (
         "prefix-list",
         "a named, reusable set of prefix ranges (by name)",
     ),
     ("route-map", "an ordered match/set route policy (by name)"),
+    (
+        "route",
+        "policy routing: send traffic by where it came from (by name)",
+    ),
 ];
 // `policy prefix-list <name> rule <seq> <Tab>`.
 const PREFIX_LIST_RULE_FIELDS: &[Cand] = &[
@@ -1042,6 +1073,10 @@ const ROUTE_MAP_MATCH_FIELDS: &[Cand] = &[
 ];
 // `policy route-map <name> rule <seq> set <Tab>`.
 const ROUTE_MAP_SET_FIELDS: &[Cand] = &[
+    (
+        "next-hop",
+        "forward matching routes via this address (replaces the whole next-hop set)",
+    ),
     ("metric", "set the route's metric"),
     ("add-metric", "add a signed delta to the metric"),
     ("preference", "set the administrative preference"),
@@ -1070,6 +1105,10 @@ const MULTIWAN_NODES: &[Cand] = &[
     (
         "uplink",
         "a WAN uplink (by interface): priority, gateway, health-check",
+    ),
+    (
+        "policy",
+        "steering: which traffic prefers which uplink (by name)",
     ),
 ];
 const WAN_MODES: &[Cand] = &[
@@ -1100,12 +1139,39 @@ const UPLINK_FIELDS: &[Cand] = &[
     ),
 ];
 // `multiwan uplink <if> check <Tab>` reveals the health-check fields.
+/// `multiwan policy <name> <Tab>` — which traffic prefers which uplink.
+const WAN_POLICY_FIELDS: &[Cand] = &[
+    (
+        "uplink",
+        "preferred uplinks, best first (comma-separated interface names)",
+    ),
+    ("source", "where the traffic comes from (host or CIDR)"),
+    ("destination", "where it is going"),
+    ("proto", "tcp or udp — needed before a port can be matched"),
+    ("source-port", "source port, or a low-high range"),
+    ("destination-port", "destination port, or a low-high range"),
+    (
+        "strict",
+        "hold the traffic rather than send it over a path that misses its SLA",
+    ),
+    ("disabled", "off without deleting it (true|false)"),
+];
 const CHECK_FIELDS: &[Cand] = &[
     ("target", "an IPv4 to ping out this uplink (repeatable)"),
     ("interval", "seconds between probe rounds (default 5)"),
     ("timeout", "per-ping timeout seconds (default 2)"),
     ("fail", "consecutive losses to mark down (default 3)"),
     ("rise", "consecutive successes to mark up (default 3)"),
+    (
+        "latency",
+        "round-trip above which this uplink is out of SLA (ms)",
+    ),
+    ("jitter", "RTT variation above which it is out of SLA (ms)"),
+    ("loss", "packet loss above which it is out of SLA (percent)"),
+    (
+        "probes",
+        "pings per round — a threshold needs a sample (default 5)",
+    ),
 ];
 // `vpn <Tab>` reveals the VPN types (IPsec today; OpenVPN/road-warrior later).
 const VPN_NODES: &[Cand] = &[
@@ -1384,6 +1450,10 @@ const SYSLOG_FIELDS: &[Cand] = &[
         "level",
         "minimum severity to ship, that level and above (default info)",
     ),
+    (
+        "facility",
+        "which facilities to ship (auth, daemon, local7…; default all)",
+    ),
 ];
 const SYSLOG_PROTOS: &[Cand] = &[
     ("udp", "fire-and-forget; cannot report a failure"),
@@ -1459,6 +1529,10 @@ const SSH_FIELDS: &[Cand] = &[
         "password-authentication",
         "allow password logins over SSH (true|false; default false, key-only)",
     ),
+    (
+        "loglevel",
+        "how much sshd logs: QUIET/FATAL/ERROR/INFO/VERBOSE/DEBUG1-3",
+    ),
 ];
 // `system login <name> <Tab>` reveals a local account's fields (VyOS-style).
 // `system group <name> <Tab>`: what its members may do.
@@ -1470,6 +1544,32 @@ const PERMISSIONS: &[Cand] = &[
     ("read-only", "may read everything and change nothing"),
     ("read-write", "may do anything the CLI can"),
 ];
+/// `system aaa <Tab>` — where a password is checked when it is not checked here.
+/// `system login <name> totp <Tab>` — paste one, or let the box make one.
+const TOTP_GEN: &[Cand] = &[(
+    "generate",
+    "make a secret here and print it plus the otpauth:// URI",
+)];
+/// `system metrics <Tab>` — whether the box keeps a history of itself.
+const METRICS_FIELDS: &[Cand] = &[(
+    "enable",
+    "record throughput and sessions over time (true|false)",
+)];
+const AAA_FIELDS: &[Cand] = &[
+    (
+        "radius",
+        "a RADIUS server (by host): secret / port / timeout",
+    ),
+    (
+        "default-group",
+        "the group a directory account gets with no local entry",
+    ),
+];
+const AAA_RADIUS_FIELDS: &[Cand] = &[
+    ("secret", "the shared secret (required)"),
+    ("port", "server port (default 1812)"),
+    ("timeout", "seconds to wait for an answer (default 3)"),
+];
 const LOGIN_FIELDS: &[Cand] = &[
     (
         "ssh-key",
@@ -1478,6 +1578,10 @@ const LOGIN_FIELDS: &[Cand] = &[
     (
         "password",
         "set the password; the appliance hashes it and keeps only the hash",
+    ),
+    (
+        "totp",
+        "a base32 TOTP secret — this account then needs a code as well",
     ),
     (
         "hashed-password",
@@ -1557,6 +1661,18 @@ const DNS_FIELDS: &[Cand] = &[
     (
         "blocklist",
         "sinkhole a domain (ad/tracker/malware blocking)",
+    ),
+    (
+        "secure-upstream",
+        "an encrypted upstream: tls://<host> (DoT) or https://<host>/dns-query (DoH)",
+    ),
+    (
+        "allow-from",
+        "which clients may query (hosts/CIDRs; default: anyone that reaches it)",
+    ),
+    (
+        "dont-query",
+        "domains never forwarded upstream (answered NXDOMAIN here)",
     ),
     ("dnssec", "DNSSEC mode: yes / no / allow-downgrade"),
     ("cache-size", "max cached answers (dnsmasq cache-size)"),
@@ -1794,6 +1910,14 @@ const IMPORT_PROTOS: &[Cand] = &[
     ("babel", "filter Babel routes on import"),
 ];
 const STATIC_FIELDS: &[Cand] = &[
+    (
+        "blackhole",
+        "discard what matches instead of forwarding it (no via/dev)",
+    ),
+    (
+        "distance",
+        "administrative distance, lower wins (0-255) — how a static route floats",
+    ),
     ("via", "next-hop gateway IP"),
     ("dev", "outgoing interface (on-link route)"),
     ("metric", "route metric (lower wins)"),
@@ -1942,6 +2066,10 @@ const GROUP_NODES: &[Cand] = &[
         "a reusable set of ports/ranges (rule port-group)",
     ),
     (
+        "feed-group",
+        "a published address list, fetched over https (rule source/destination-group)",
+    ),
+    (
         "domain-group",
         "DNS names resolved to addresses (rule source/destination-group)",
     ),
@@ -1953,6 +2081,10 @@ const ADDRESS_GROUP_FIELDS: &[Cand] = &[(
 const PORT_GROUP_FIELDS: &[Cand] = &[(
     "port",
     "members: ports/ranges, comma-separated (replaces the set)",
+)];
+const FEED_GROUP_FIELDS: &[Cand] = &[(
+    "url",
+    "an https URL publishing the list (repeatable, comma-separated)",
 )];
 const DOMAIN_GROUP_FIELDS: &[Cand] = &[(
     "domain",
@@ -1995,8 +2127,21 @@ const NAT64_FIELDS: &[Cand] = &[
     ),
     ("dns64", "synthesize AAAA for v4-only names (true|false)"),
 ];
+/// `system console <Tab>` — which port, and how fast.
+const CONSOLE_FIELDS: &[Cand] = &[
+    ("device", "the tty, without /dev (ttyS0)"),
+    ("speed", "baud rate (9600, 115200)"),
+];
 const SYSTEM_FIELDS: &[Cand] = &[
     ("hostname", "the appliance hostname"),
+    (
+        "console",
+        "the serial console: `device <tty>` / `speed <baud>`",
+    ),
+    (
+        "commit-revisions",
+        "how many past revisions the archive keeps",
+    ),
     (
         "sysctl",
         "a kernel parameter (by name): `value <v>` — net.* / vm.* only",
@@ -2180,6 +2325,10 @@ const PROTOS: &[Cand] = &[
     ("tcp", "TCP"),
     ("udp", "UDP"),
     (
+        "tcp_udp",
+        "TCP and UDP — one rule for a service reached over either",
+    ),
+    (
         "icmp",
         "ICMP — no port; matches every ICMP packet the rule scopes",
     ),
@@ -2255,6 +2404,10 @@ const IFACE_FIELDS: &[Cand] = &[
         "untagged/PVID VLAN id on a vlan-aware bridge port",
     ),
     ("mtu", "link MTU in bytes (e.g. 1492 PPPoE, 9000 jumbo)"),
+    (
+        "mss",
+        "clamp TCP MSS on this link: <bytes> or `pmtu` (tunnels need it)",
+    ),
     (
         "hw-id",
         "pin this name to a NIC by its MAC, so it survives a reboot/swap",
@@ -2579,6 +2732,7 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         // interface itself only carries `type wireguard` + address/zone).
         ["set" | "delete", "vpn", "wireguard", _name] => WG_TUNNEL_FIELDS,
         ["set", "vpn", "wireguard", _name, "private-key"] => WG_KEY_GEN,
+        ["set", "system", "login", _name, "totp"] => TOTP_GEN,
         ["set" | "delete", "vpn", "wireguard", _name, "peer", _pk] => PEER_FIELDS,
         // OpenConnect road-warrior server (singleton): its fields, then a user.
         ["set" | "delete", "vpn", "openconnect"] => OPENCONNECT_FIELDS,
@@ -2666,6 +2820,11 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "services", "syslog"] => SYSLOG_NODES,
         ["set" | "delete", "services", "syslog", "target", _host] => SYSLOG_FIELDS,
         ["set" | "delete", "system", "sysctl", _name] => SYSCTL_FIELDS,
+        ["set" | "delete", "system", "aaa"] => AAA_FIELDS,
+        ["set" | "delete", "system", "metrics"] => METRICS_FIELDS,
+        ["set", "system", "metrics", "enable"] => BOOLS,
+        ["set" | "delete", "system", "aaa", "radius", _host] => AAA_RADIUS_FIELDS,
+        ["set" | "delete", "system", "console"] => CONSOLE_FIELDS,
         ["set" | "delete", "interface", _name, "offload"] => OFFLOAD_FIELDS,
         ["set", "services", "syslog", "target", _host, "proto"] => SYSLOG_PROTOS,
         ["set", "services", "syslog", "target", _host, "level"] => SYSLOG_LEVELS,
@@ -2684,6 +2843,7 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ] => ADDRESS_GROUP_FIELDS,
         ["set" | "delete", "firewall", "group", "port-group", _name] => PORT_GROUP_FIELDS,
         ["set" | "delete", "firewall", "group", "domain-group", _name] => DOMAIN_GROUP_FIELDS,
+        ["set" | "delete", "firewall", "group", "feed-group", _name] => FEED_GROUP_FIELDS,
         ["set" | "delete", "firewall", "global"] => GLOBAL_FIELDS,
         [
             "set",
@@ -2778,6 +2938,9 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "policy"] => POLICY_NODES,
         ["set" | "delete", "policy", "prefix-list", _name, "rule", _n] => PREFIX_LIST_RULE_FIELDS,
         ["set" | "delete", "policy", "route-map", _name] => ROUTE_MAP_FIELDS,
+        ["set" | "delete", "policy", "route", _name] => POLICY_ROUTE_FIELDS,
+        ["set", "policy", "route", _name, "proto"] => PORT_PROTOS,
+        ["set", "policy", "route", _name, "disabled"] => BOOLS,
         ["set", "policy", "route-map", _name, "default"] => PERMIT_DENY,
         ["set" | "delete", "policy", "route-map", _name, "rule", _n] => ROUTE_MAP_RULE_FIELDS,
         ["set", "policy", "route-map", _name, "rule", _n, "action"] => PERMIT_DENY,
@@ -2875,6 +3038,9 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set", "multiwan", "mode"] => WAN_MODES,
         ["set" | "delete", "multiwan", "uplink", _iface] => UPLINK_FIELDS,
         ["set" | "delete", "multiwan", "uplink", _iface, "check"] => CHECK_FIELDS,
+        ["set" | "delete", "multiwan", "policy", _name] => WAN_POLICY_FIELDS,
+        ["set", "multiwan", "policy", _name, "proto"] => PORT_PROTOS,
+        ["set", "multiwan", "policy", _name, "strict" | "disabled"] => BOOLS,
 
         // The vpn (IKEv2 site-to-site IPsec) sub-tree.
         ["set" | "delete", "vpn"] => VPN_NODES,
@@ -3768,6 +3934,8 @@ mod tests {
             kw(&["set", "system"]),
             [
                 "hostname",
+                "console",
+                "commit-revisions",
                 "sysctl",
                 "login",
                 "group",
@@ -3809,6 +3977,7 @@ mod tests {
                 "vlan-tagged",
                 "vlan-untagged",
                 "mtu",
+                "mss",
                 "hw-id",
                 "offload",
                 "mac",
@@ -3905,7 +4074,7 @@ mod tests {
         // The group sub-tree: alias kinds and their member fields.
         assert_eq!(
             kw(&["set", "firewall", "group"]),
-            ["address-group", "port-group", "domain-group"]
+            ["address-group", "port-group", "feed-group", "domain-group"]
         );
         assert_eq!(
             kw(&["set", "firewall", "group", "address-group", "mgmt"]),
@@ -3993,7 +4162,9 @@ mod tests {
         );
         assert_eq!(
             kw(&["set", "firewall", "rule", "web", "proto"]),
-            ["tcp", "udp", "icmp", "icmpv6", "vrrp", "esp", "ah", "gre"]
+            [
+                "tcp", "udp", "tcp_udp", "icmp", "icmpv6", "vrrp", "esp", "ah", "gre"
+            ]
         );
         // The nat sub-tree: source (masquerade) + destination (port-forward) +
         // nat64 + npt66 (NPTv6).
@@ -4077,7 +4248,7 @@ mod tests {
         assert_eq!(kw(&["set", "services", "syslog"]), ["target"]);
         assert_eq!(
             kw(&["set", "services", "syslog", "target", "10.0.0.9"]),
-            ["port", "proto", "level"]
+            ["port", "proto", "level", "facility"]
         );
         assert_eq!(
             kw(&["set", "services", "syslog", "target", "10.0.0.9", "proto"]),
@@ -4089,13 +4260,14 @@ mod tests {
                 "enable",
                 "port",
                 "listen-address",
-                "password-authentication"
+                "password-authentication",
+                "loglevel"
             ]
         );
         assert_eq!(kw(&["set", "services", "ssh", "enable"]), ["true", "false"]);
         assert_eq!(
             kw(&["set", "system", "login", "ops"]),
-            ["ssh-key", "password", "hashed-password", "group"]
+            ["ssh-key", "password", "totp", "hashed-password", "group"]
         );
         assert_eq!(kw(&["set", "services", "lldp"]), ["enable", "interface"]);
         assert_eq!(
@@ -4134,7 +4306,10 @@ mod tests {
         // Route policy lives under the top-level `policy` node (prefix-list +
         // route-map), not under `protocols`.
         assert!(kw(&["set"]).contains(&"policy"));
-        assert_eq!(kw(&["set", "policy"]), ["prefix-list", "route-map"]);
+        assert_eq!(
+            kw(&["set", "policy"]),
+            ["prefix-list", "route-map", "route"]
+        );
         // The extended BGP field set.
         let bgp = kw(&["set", "protocols", "bgp"]);
         for f in [
@@ -4185,7 +4360,10 @@ mod tests {
             ["origin-as", "max-length"]
         );
         // Routing policy (VyOS `[policy]`): prefix-list + route-map with match/set.
-        assert_eq!(kw(&["set", "policy"]), ["prefix-list", "route-map"]);
+        assert_eq!(
+            kw(&["set", "policy"]),
+            ["prefix-list", "route-map", "route"]
+        );
         assert_eq!(
             kw(&["set", "policy", "route-map", "RM"]),
             ["default", "rule"]
@@ -4332,6 +4510,7 @@ mod tests {
                 "vlan-tagged",
                 "vlan-untagged",
                 "mtu",
+                "mss",
                 "hw-id",
                 "offload",
                 "mac",

@@ -23,7 +23,8 @@ const ARCHIVE_SUBDIR: &str = "archive";
 /// Revision filename prefix; the rest is the zero-padded epoch-nanos + `.toml`.
 const ARCHIVE_PREFIX: &str = "config-";
 const ARCHIVE_SUFFIX: &str = ".toml";
-/// How many revisions to keep (older ones are pruned on each new archive).
+/// How many revisions to keep when the configuration does not say (older ones
+/// are pruned on each new archive).
 pub const ARCHIVE_KEEP: usize = 50;
 
 /// One archived revision.
@@ -54,7 +55,7 @@ fn archive_dir(config_path: &Path) -> PathBuf {
 /// archive must never fail the `save` itself, so callers log rather than
 /// propagate. The archive dir sits under `/var/lib/sentinel` (wheel-writable), so
 /// no privilege escalation is needed.
-pub fn archive_config(config_path: &Path, contents: &str) -> Result<()> {
+pub fn archive_config(config_path: &Path, contents: &str, keep: usize) -> Result<()> {
     let dir = archive_dir(config_path);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
@@ -70,16 +71,16 @@ pub fn archive_config(config_path: &Path, contents: &str) -> Result<()> {
     std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, &path).with_context(|| format!("installing {}", path.display()))?;
 
-    prune(&dir);
+    prune(&dir, keep);
     Ok(())
 }
 
-/// Remove all but the newest [`ARCHIVE_KEEP`] revisions (best-effort).
-fn prune(dir: &Path) {
+/// Remove all but the newest `keep` revisions (best-effort).
+fn prune(dir: &Path, keep: usize) {
     let mut files = revision_files(dir);
     // Newest first; drop everything past the keep window.
     files.sort_by_key(|f| std::cmp::Reverse(f.1));
-    for (path, _) in files.into_iter().skip(ARCHIVE_KEEP) {
+    for (path, _) in files.into_iter().skip(keep.max(1)) {
         let _ = std::fs::remove_file(path);
     }
 }
@@ -153,7 +154,7 @@ pub fn rollback(session: &mut Session, act: &Apply, n: usize) -> Result<()> {
     let tmp = cfg.with_extension("toml.tmp");
     std::fs::write(&tmp, &content).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, &cfg).with_context(|| format!("installing {}", cfg.display()))?;
-    archive_config(&cfg, &content)?;
+    archive_config(&cfg, &content, ARCHIVE_KEEP)?;
     session
         .discard()
         .context("reloading the rolled-back config")?;
@@ -161,7 +162,7 @@ pub fn rollback(session: &mut Session, act: &Apply, n: usize) -> Result<()> {
 }
 
 /// Format epoch seconds as `YYYY-MM-DD HH:MM:SS UTC`, dependency-free.
-fn fmt_utc(epoch_secs: i64) -> String {
+pub(crate) fn fmt_utc(epoch_secs: i64) -> String {
     let days = epoch_secs.div_euclid(86_400);
     let secs = epoch_secs.rem_euclid(86_400);
     let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
@@ -260,7 +261,7 @@ mod tests {
         for i in 0..(ARCHIVE_KEEP + 5) {
             std::fs::write(adir.join(format!("config-{i:020}.toml")), "x").unwrap();
         }
-        archive_config(&cfg, "newest").unwrap();
+        archive_config(&cfg, "newest", ARCHIVE_KEEP).unwrap();
         assert_eq!(list_revisions(&cfg).len(), ARCHIVE_KEEP);
         // The just-archived one is the newest.
         assert_eq!(read_revision(&cfg, 0).unwrap(), "newest");

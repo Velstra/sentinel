@@ -234,6 +234,11 @@ struct PortalOut {
 
 #[derive(Debug, Serialize)]
 struct PortRule {
+    /// Which configured rule this came from. Carried in memory so the appliance
+    /// can say what a live flow was admitted by, and never serialised — the data
+    /// plane keys on `(policy, proto, port, address)` and has no use for a name.
+    #[serde(skip)]
+    name: String,
     proto: &'static str,
     port: u16,
     action: &'static str,
@@ -344,6 +349,7 @@ fn proto_str(p: Proto) -> &'static str {
         Proto::Esp => "esp",
         Proto::Ah => "ah",
         Proto::Gre => "gre",
+        Proto::TcpUdp => "tcp_udp",
     }
 }
 
@@ -462,7 +468,11 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                     // `is_port_rule()` already implies a proto, but guard the unwrap
                     // so a future change to that predicate can never panic the
                     // compile: a proto-less rule simply contributes no port rules.
-                    let Some(proto) = r.proto.map(proto_str) else {
+                    // `tcp_udp` is one rule to an operator and two to the data
+                    // plane, which has no such protocol. Expanding it here means
+                    // nothing downstream has to know the grammar has a word for
+                    // "either".
+                    let Some(protos) = r.proto.map(|p| p.concrete()) else {
                         return Vec::new();
                     };
                     let action = action_str(r.action);
@@ -492,21 +502,26 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                         zoned
                     };
                     let ports = r.resolved_ports(groups);
-                    let mut out =
-                        Vec::with_capacity(sources.len() * destinations.len() * ports.len());
-                    for src in &sources {
-                        for dst in &destinations {
-                            for &port in &ports {
-                                out.push(PortRule {
-                                    proto,
-                                    port,
-                                    action,
-                                    log,
-                                    src: src.clone(),
-                                    dst: dst.clone(),
-                                    limit: r.limit,
-                                    burst: r.burst,
-                                });
+                    let mut out = Vec::with_capacity(
+                        protos.len() * sources.len() * destinations.len() * ports.len(),
+                    );
+                    for &p in protos {
+                        let proto = proto_str(p);
+                        for src in &sources {
+                            for dst in &destinations {
+                                for &port in &ports {
+                                    out.push(PortRule {
+                                        name: r.name.clone(),
+                                        proto,
+                                        port,
+                                        action,
+                                        log,
+                                        src: src.clone(),
+                                        dst: dst.clone(),
+                                        limit: r.limit,
+                                        burst: r.burst,
+                                    });
+                                }
                             }
                         }
                     }
@@ -529,6 +544,10 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                 .filter(|l| !l.disabled && l.zone == zone)
             {
                 let rule = PortRule {
+                    // Not an operator's rule: the compiler opens the VIP's port
+                    // itself, and saying so beats attributing a flow to a rule
+                    // nobody wrote.
+                    name: format!("(load-balancer {})", lb.name),
                     proto: proto_str(lb.proto),
                     port: lb.port,
                     action: "pass",
@@ -904,6 +923,108 @@ zone = "lan"
         assert!(!rendered.contains("source_validation"), "{rendered}");
     }
 
+    /// The agent renders a table, not JSON, so this reads one back — including
+    /// the header and the "… n more" footer, which must not become flows.
+    #[test]
+    fn the_agents_flow_table_parses_back() {
+        let text = "\
+  policy proto source                destination           nat                     packets    bytes
+  2      tcp   198.51.100.7:51234    10.0.0.5:443          dst→10.0.0.5:443             120    14 kB
+  2      udp   198.51.100.9:5353     10.0.0.5:53           dst→10.0.0.5:53                4   380 B
+  … 12 more (of 14 total)
+";
+        let flows = parse_flows(text);
+        assert_eq!(flows.len(), 2, "the header and the footer became flows");
+        assert_eq!(flows[0].policy, 2);
+        assert_eq!(flows[0].proto, "tcp");
+        assert_eq!(flows[0].dst_port, 443);
+        assert_eq!(flows[0].packets, 120);
+        assert_eq!(flows[1].dst_port, 53);
+    }
+
+    /// The whole point of attribution: which accept rules are carrying traffic
+    /// and which are carrying none — matched against the *compiled* rules, so
+    /// the ranking is the one the data plane applies rather than a second
+    /// implementation of it.
+    #[test]
+    fn flows_are_attributed_to_the_rule_that_admitted_them() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "eth0"
+zone = "lan"
+[[interface]]
+name = "eth1"
+zone = "wan"
+[zone.wan]
+default_action = "drop"
+[[rule]]
+name = "web-in"
+from = "wan"
+action = "accept"
+proto = "tcp"
+port = 443
+[[rule]]
+name = "office-ssh"
+from = "wan"
+source = "203.0.113.0/24"
+action = "accept"
+proto = "tcp"
+port = 22
+[[rule]]
+name = "legacy-smb"
+from = "wan"
+action = "accept"
+proto = "tcp"
+port = 445
+"#;
+        let appliance = Appliance::from_toml(toml).expect("parses");
+        let cfg = compile(&appliance);
+        let wan = cfg.policies.iter().find(|p| p.name == "wan").unwrap().id;
+
+        let flow = |dport: u16, src: &str, packets: u64| Flow {
+            policy: wan,
+            proto: "tcp".into(),
+            src: src.parse().unwrap(),
+            dst: "10.0.0.5".parse().unwrap(),
+            dst_port: dport,
+            packets,
+        };
+        let hits = attribute(
+            &cfg,
+            &[
+                flow(443, "198.51.100.7", 10),
+                flow(443, "198.51.100.8", 5),
+                // From the office, so the source-scoped rule takes it.
+                flow(22, "203.0.113.9", 3),
+            ],
+        );
+
+        assert_eq!(
+            hits["web-in"],
+            Hits {
+                flows: 2,
+                packets: 15
+            }
+        );
+        assert_eq!(
+            hits["office-ssh"],
+            Hits {
+                flows: 1,
+                packets: 3
+            }
+        );
+        // A rule carrying nothing is *present* and zero, not missing — that is
+        // the whole report.
+        assert_eq!(hits["legacy-smb"], Hits::default());
+
+        // An SSH flow from somewhere else matches no rule: the source-scoped
+        // rule does not cover it and there is no `from any` rule on 22.
+        let elsewhere = attribute(&cfg, &[flow(22, "192.0.2.1", 99)]);
+        assert_eq!(elsewhere["office-ssh"], Hits::default());
+    }
+
     /// A rule naming a protocol that has no ports must reach the data plane as a
     /// rule, not vanish into the zone's posture. Port `0` is the key the data
     /// plane reads off a packet that carries no ports, so this is what matches
@@ -938,6 +1059,51 @@ proto = "icmp"
         assert_eq!(rule.port, 0, "an ICMP rule is keyed on port 0");
         // `accept` is `pass` on the wire — the data plane's own word for it.
         assert_eq!(rule.action, "pass");
+    }
+
+    /// `tcp_udp` is one rule to an operator and two to the data plane, which
+    /// has no such protocol. It exists because a service reached over either —
+    /// DNS, NTP, a Samba share — is one decision, and writing it twice means two
+    /// rules to keep in step afterwards.
+    #[test]
+    fn tcp_udp_compiles_to_both_protocols() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "eth0"
+zone = "lan"
+[[interface]]
+name = "eth1"
+zone = "wan"
+[zone.wan]
+default_action = "drop"
+[[rule]]
+name = "dns-in"
+from = "wan"
+action = "accept"
+proto = "tcp_udp"
+port = 53
+"#;
+        let appliance = Appliance::from_toml(toml).expect("parses");
+        let cfg = compile(&appliance);
+        let rules: Vec<&str> = cfg
+            .policies
+            .iter()
+            .flat_map(|p| p.port_rules.iter())
+            .filter(|r| r.port == 53)
+            .map(|r| r.proto)
+            .collect();
+        assert_eq!(rules, ["tcp", "udp"], "one rule, both protocols");
+        // And nothing downstream ever sees the word: the data plane has no
+        // protocol number for "either".
+        assert!(
+            !cfg.policies
+                .iter()
+                .flat_map(|p| p.port_rules.iter())
+                .any(|r| r.proto == "tcp_udp"),
+            "tcp_udp reached the data plane instead of being expanded"
+        );
     }
 
     #[test]
@@ -2157,5 +2323,152 @@ zone = "lan"
         let cfg = compile(&appliance);
         assert!(cfg.conntrack_sync.is_none());
         assert!(!cfg.to_toml().unwrap().contains("conntrack_sync"));
+    }
+}
+
+// ---- attribution ----------------------------------------------------------
+
+/// One live flow, as the data plane reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Flow {
+    pub policy: u32,
+    pub proto: String,
+    pub src: std::net::IpAddr,
+    pub dst: std::net::IpAddr,
+    pub dst_port: u16,
+    pub packets: u64,
+}
+
+/// What a rule is currently carrying.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Hits {
+    pub flows: u64,
+    pub packets: u64,
+}
+
+/// Attribute live flows to the rules that admitted them.
+///
+/// Not a hardware counter — the data plane counts globally, not per rule — but
+/// the answer to the question people actually have: which rules are carrying
+/// traffic, and which are carrying none. The matching is done against the
+/// **compiled** rules rather than the configured ones, so it applies the same
+/// ranking the data plane does (longest prefix wins; on an equal prefix the
+/// stricter action) and cannot drift from what is loaded.
+///
+/// Only `accept` rules are counted, and the caller must say so. A rule that
+/// drops leaves no flow behind — the packet is gone — so a zero against a drop
+/// rule would mean "nothing got through here", which is what it is *for*, and
+/// reporting that as "never matched" would invite somebody to delete the rule
+/// that is doing its job.
+pub fn attribute(cfg: &VelstraConfig, flows: &[Flow]) -> BTreeMap<String, Hits> {
+    let mut out: BTreeMap<String, Hits> = BTreeMap::new();
+    // Every accept rule starts at zero, so a rule carrying nothing is present in
+    // the answer rather than missing from it.
+    for policy in &cfg.policies {
+        for r in &policy.port_rules {
+            if r.action == "pass" && !r.name.is_empty() {
+                out.entry(r.name.clone()).or_default();
+            }
+        }
+    }
+    for flow in flows {
+        let Some(policy) = cfg.policies.iter().find(|p| p.id == flow.policy) else {
+            continue;
+        };
+        let mut best: Option<(&PortRule, u8)> = None;
+        for r in &policy.port_rules {
+            if r.proto != flow.proto || (r.port != 0 && r.port != flow.dst_port) {
+                continue;
+            }
+            // One end per rule — the data plane ranks a source-scoped and a
+            // destination-scoped rule against each other by prefix length, and
+            // this has to agree with it.
+            let bits = match (&r.src, &r.dst) {
+                (Some(cidr), _) => match cidr_contains(cidr, flow.src) {
+                    Some(b) => b,
+                    None => continue,
+                },
+                (_, Some(cidr)) => match cidr_contains(cidr, flow.dst) {
+                    Some(b) => b,
+                    None => continue,
+                },
+                (None, None) => 0,
+            };
+            if best.is_none_or(|(_, b)| bits > b) {
+                best = Some((r, bits));
+            }
+        }
+        if let Some((r, _)) = best {
+            if r.action == "pass" && !r.name.is_empty() {
+                let e = out.entry(r.name.clone()).or_default();
+                e.flows += 1;
+                e.packets += flow.packets;
+            }
+        }
+    }
+    out
+}
+
+/// Parse the agent's flow table.
+///
+/// The agent renders a fixed-width table rather than JSON, so this reads it back
+/// — which means it has to be forgiving: a header line, a "… n more" footer and
+/// a NAT column that is only meaningful for some rows. Anything that does not
+/// parse is skipped rather than failing the whole report, because a report that
+/// vanishes on one odd line is worse than one that is short by it.
+pub fn parse_flows(text: &str) -> Vec<Flow> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 7 {
+            continue;
+        }
+        let Ok(policy) = f[0].parse::<u32>() else {
+            continue; // the header, or the footer
+        };
+        let split = |s: &str| -> Option<(std::net::IpAddr, u16)> {
+            let (ip, port) = s.rsplit_once(':')?;
+            Some((ip.parse().ok()?, port.parse().ok()?))
+        };
+        let (Some((src, _)), Some((dst, dst_port))) = (split(f[2]), split(f[3])) else {
+            continue;
+        };
+        out.push(Flow {
+            policy,
+            proto: f[1].to_string(),
+            src,
+            dst,
+            dst_port,
+            packets: f[5].parse().unwrap_or(0),
+        });
+    }
+    out
+}
+
+/// Whether `addr` is inside `cidr`, and how specific that was. `None` when it is
+/// not, or when the two are different address families.
+fn cidr_contains(cidr: &str, addr: std::net::IpAddr) -> Option<u8> {
+    let (net, len) = cidr.split_once('/')?;
+    let len: u8 = len.parse().ok()?;
+    match (net.parse().ok()?, addr) {
+        (std::net::IpAddr::V4(n), std::net::IpAddr::V4(a)) => {
+            if len > 32 {
+                return None;
+            }
+            let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+            (u32::from(n) & mask == u32::from(a) & mask).then_some(len)
+        }
+        (std::net::IpAddr::V6(n), std::net::IpAddr::V6(a)) => {
+            if len > 128 {
+                return None;
+            }
+            let mask = if len == 0 {
+                0
+            } else {
+                u128::MAX << (128 - len)
+            };
+            (u128::from(n) & mask == u128::from(a) & mask).then_some(len)
+        }
+        _ => None,
     }
 }
