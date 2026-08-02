@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-08-01
+
+A build fix: 0.4.0 shipped with an `ebpfHash` that no longer described the data
+plane it pins, so every `nixosTest` refused to build.
+
+### Fixed
+
+- **`ebpfHash` matches the pinned data plane again.** Repinning fabric to 0.4.0
+  brought in the port-mapping commit, which changes `velstra-ebpf` — so the
+  object's hash changed with it and the pin was left naming the old one. Every
+  check that boots a VM failed with `hash mismatch in fixed-output derivation`;
+  the appliance itself was never affected, because a build that cannot produce
+  the object cannot produce a wrong one either.
+
+  Worth writing down, because it will happen again: a **local** check does not
+  catch this. Nix finds the old object already in the store under the old hash
+  and never rebuilds, so the mismatch only appears on a cold store — which is
+  what CI has and a workstation does not. Verify a repin by forcing the rebuild
+  (put a deliberately wrong hash in and read the real one out of the error),
+  not by watching a check go green.
+
 ## [0.4.0] — 2026-08-01
 
 The release the appliance becomes usable without a terminal: a web console that
