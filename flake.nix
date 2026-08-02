@@ -1749,10 +1749,14 @@
 
           # The console is meant to be the whole management surface; a missing
           # section is somewhere an operator has to leave the browser for.
-          for view in ["view-interfaces", "view-routes", "view-groups", "view-lb",
+          for view in ["view-interfaces", "view-routing", "view-groups", "view-lb",
                        "view-pki", "view-certs", "view-users", "view-ids",
                        "view-synproxy", "view-capture", "view-ha"]:
               assert view in page, f"{view} is missing from the console"
+          # Routing is one section with a pane per protocol, so naming the view
+          # alone would pass while every protocol inside it had gone missing.
+          for pane in ["static", "bgp", "ospf", "isis", "rip", "babel", "bfd"]:
+              assert f'data-tab="{pane}"' in page, f"routing lost its {pane} pane"
 
           # A capture reads the wire, so it is verified against real traffic:
           # ping the loopback while capturing on it and require the packets to
