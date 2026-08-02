@@ -382,6 +382,21 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
     // A `dhcp` or address-less interface contributes nothing — `warnings()` tells
     // the operator when that leaves a `to` unenforceable.
     let zone_subnets = |zone: &str| -> Vec<String> {
+        // The appliance itself is a set of addresses, not a set of links: `to
+        // <local zone>` means "terminating here", so it compiles to this box's
+        // own addresses as host routes.
+        if appliance.zones.get(zone).is_some_and(|z| z.local) {
+            return appliance
+                .interfaces
+                .iter()
+                .filter(|i| !i.disabled)
+                .filter_map(|i| {
+                    let (addr, _) = i.address.as_deref()?.split_once('/')?;
+                    addr.parse::<std::net::Ipv4Addr>().ok()?;
+                    Some(format!("{addr}/32"))
+                })
+                .collect();
+        }
         appliance
             .interfaces
             .iter()

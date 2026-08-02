@@ -38,6 +38,21 @@ fn netdev_name(iface: &str) -> String {
     format!("{PREFIX}{iface}.netdev")
 }
 
+fn link_name(iface: &str) -> String {
+    format!("{PREFIX}{iface}.link")
+}
+
+/// The `.link` that pins a NIC's *name* to its MAC.
+///
+/// Renaming happens when the device appears, which is before anything else this
+/// appliance does — so it belongs to networkd rather than to a command we run
+/// afterwards. Matching on the permanent address (`MACAddressPolicy=none` is
+/// implied by naming a name) is what keeps `eth2` meaning the same card across
+/// a reboot, a firmware update or a swap.
+fn link_body(iface: &str, mac: &str) -> String {
+    format!("[Match]\nMACAddress={mac}\n\n[Link]\nName={iface}\n")
+}
+
 /// The `.netdev` that creates a VLAN link `iface` with the given id. `protocol`
 /// selects the tag TPID: `802.1q` (or `None` — the default C-VLAN) renders no
 /// `Protocol=` line, while `802.1ad` emits `Protocol=802.1ad` for an S-VLAN
@@ -608,6 +623,23 @@ fn dnsmasq_conf_body(dns: &Dns) -> Result<Option<String>> {
         // Sinkhole to a dead address (v4 and v6), the pfBlocker/pi-hole convention.
         body.push_str(&format!("address=/{domain}/0.0.0.0\n"));
         body.push_str(&format!("address=/{domain}/::\n"));
+    }
+    // How long a "does not exist" is remembered. Left to dnsmasq unless named:
+    // its default follows the upstream's SOA minimum, which on a badly kept zone
+    // can be hours — long enough that a name created this afternoon stays
+    // missing until tomorrow.
+    if let Some(ttl) = dns.negative_ttl {
+        body.push_str(&format!("neg-ttl={ttl}\n"));
+    }
+    // Local TXT records. `local=/name/` alongside makes the appliance
+    // authoritative for the suffix, which is the point: a resolver that gets
+    // SERVFAIL treats it as an outage, while an empty authoritative answer is
+    // an honest "no such record".
+    for (name, text) in &dns.txt_record {
+        reject_unsafe("dns txt-record name", name, &['/', ','])?;
+        reject_unsafe("dns txt-record text", text, &['\n'])?;
+        body.push_str(&format!("local=/{name}/\n"));
+        body.push_str(&format!("txt-record={name},\"{text}\"\n"));
     }
     if dns.dnssec.as_deref() == Some("yes") {
         body.push_str("dnssec\n");
@@ -2604,6 +2636,17 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
         }
     }
 
+    // `.link` units that pin a NIC's name to its MAC (`hw-id`). These act when
+    // the device appears, ahead of everything else here, which is why they are
+    // networkd's job and not a command run afterwards.
+    for i in ifaces {
+        if let Some(mac) = &i.hw_id {
+            let name = link_name(&i.name);
+            writes.push((name.clone(), link_body(&i.name, mac)));
+            keep.insert(name);
+        }
+    }
+
     // C20: the captive portal's URI, announced in DHCP option 114 by the DHCP
     // server on the gated zone's own interface. Derived here, once, from the
     // same address the portal binds — a second derivation would eventually point
@@ -2817,6 +2860,12 @@ pub fn apply_link_runtime(appliance: &Appliance) -> Result<()> {
     // Egress traffic shaping (tc qdiscs) — applied directly, after the links are
     // (re)configured so the target devices exist.
     apply_qos(appliance)?;
+    // Per-NIC offload switches — after the links are up, since ethtool needs the
+    // device. A NIC that refuses a feature is a warning, not a failed commit:
+    // offload support is a property of the driver, and a configuration that
+    // names one this card lacks must not take the firewall's policy down with
+    // it.
+    apply_offload(appliance)?;
     // Kernel parameters (`[system.sysctl]`) — after the links exist, because a
     // per-interface parameter needs its interface.
     apply_sysctl(appliance)?;
@@ -2859,6 +2908,21 @@ pub fn apply_link_runtime(appliance: &Appliance) -> Result<()> {
 pub fn apply(appliance: &Appliance) -> Result<()> {
     apply_persistent(appliance, ApplyMode::Live)?;
     apply_link_runtime(appliance)?;
+    Ok(())
+}
+
+/// Apply each interface's offload switches with `ethtool -K`.
+fn apply_offload(appliance: &Appliance) -> Result<()> {
+    for i in &appliance.interfaces {
+        for (feature, on) in &i.offload {
+            if let Err(e) = system::ethtool_offload(&i.name, feature, *on) {
+                eprintln!(
+                    "warning: setting offload {feature} on {} failed: {e}",
+                    i.name
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -3073,6 +3137,8 @@ mod tests {
         // bridge when unset (roadmap C14).
         let mv = Interface {
             name: "mv0".into(),
+            hw_id: None,
+            offload: Default::default(),
             zone: Some("lan".into()),
             address: Some("10.9.0.2/24".into()),
             address6: None,
@@ -3209,6 +3275,8 @@ mod tests {
         // and Independent=yes (a standalone device from its endpoint addresses).
         let gre = Interface {
             name: "gre0".into(),
+            hw_id: None,
+            offload: Default::default(),
             zone: Some("vpn".into()),
             address: Some("172.16.0.1/30".into()),
             address6: None,
@@ -3485,6 +3553,8 @@ mod tests {
     #[test]
     fn dnsmasq_renders_cache_size_and_local_domain() {
         let dns = Dns {
+            negative_ttl: None,
+            txt_record: Default::default(),
             upstream: vec!["9.9.9.9".into()],
             serve_on: vec!["lan0".into()],
             host_override: std::collections::BTreeMap::new(),
@@ -3505,12 +3575,16 @@ mod tests {
     fn dnsmasq_rejects_injection_in_local_domain() {
         // A `/` closes the `local=/dom/` pattern early; a newline splices a line.
         let slash = Dns {
+            negative_ttl: None,
+            txt_record: Default::default(),
             serve_on: vec!["lan0".into()],
             local_domain: Some("lan/address=/evil.com/1.2.3.4".into()),
             ..Dns::default()
         };
         assert!(dnsmasq_conf_body(&slash).is_err());
         let nl = Dns {
+            negative_ttl: None,
+            txt_record: Default::default(),
             serve_on: vec!["lan0".into()],
             local_domain: Some("lan\nserver=6.6.6.6".into()),
             ..Dns::default()
@@ -3527,6 +3601,8 @@ mod tests {
         };
         let ifaces = vec![Interface {
             name: "lan0".into(),
+            hw_id: None,
+            offload: Default::default(),
             zone: Some("lan".into()),
             address: Some("10.0.0.1/24".into()),
             address6: None,
@@ -3581,6 +3657,8 @@ mod tests {
         let mut host_override = std::collections::BTreeMap::new();
         host_override.insert("nas.lan".to_string(), "10.0.0.5".to_string());
         let dns = Dns {
+            negative_ttl: None,
+            txt_record: Default::default(),
             upstream: vec!["9.9.9.9".into(), "2620:fe::fe".into()],
             serve_on: vec!["lan0".into()],
             host_override,
@@ -3770,6 +3848,8 @@ mod tests {
     fn bridge_netdev_and_member_enslavement_render() {
         let br = Interface {
             name: "br0".into(),
+            hw_id: None,
+            offload: Default::default(),
             zone: Some("lan".into()),
             address: Some("10.0.0.1/24".into()),
             address6: None,
@@ -3829,6 +3909,8 @@ mod tests {
     fn bond_netdev_renders_kind_and_mode() {
         let bond = Interface {
             name: "bond0".into(),
+            hw_id: None,
+            offload: Default::default(),
             zone: None,
             address: None,
             address6: None,
@@ -4003,6 +4085,8 @@ mod tests {
         // A vlan-aware bridge netdev carries VLANFiltering=yes.
         let br = Interface {
             name: "br0".into(),
+            hw_id: None,
+            offload: Default::default(),
             zone: Some("lan".into()),
             address: Some("10.0.0.1/24".into()),
             address6: None,
@@ -4051,6 +4135,8 @@ mod tests {
     fn pppoe_iface(parent: &str, username: &str, password: &str) -> Interface {
         Interface {
             name: "ppp0".into(),
+            hw_id: None,
+            offload: Default::default(),
             zone: Some("wan".into()),
             address: None,
             address6: None,
@@ -4533,6 +4619,8 @@ mod tests {
     fn iface_addr(name: &str, address: &str) -> Interface {
         Interface {
             name: name.into(),
+            hw_id: None,
+            offload: Default::default(),
             zone: None,
             address: Some(address.into()),
             address6: None,
@@ -4748,6 +4836,8 @@ mod tests {
         lan6.address6 = Some("2001:db8:64::1/64".into());
         let ifaces = vec![lan6];
         let dns = Dns {
+            negative_ttl: None,
+            txt_record: Default::default(),
             upstream: vec!["10.64.2.2".into()],
             ..Dns::default()
         };

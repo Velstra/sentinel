@@ -1545,6 +1545,11 @@ const DNS_FIELDS: &[Cand] = &[
         "serve-on",
         "interfaces to listen on for LAN queries (comma-separated)",
     ),
+    ("negative-ttl", "seconds to cache a 'does not exist' answer"),
+    (
+        "txt-record",
+        "a local TXT record (by name): the text to serve",
+    ),
     (
         "host-override",
         "a local DNS record: <name> <ip> (split-horizon)",
@@ -2059,6 +2064,10 @@ const GLOBAL_FIELDS: &[Cand] = &[
     ("block", "drop a source IP/CIDR everywhere"),
 ];
 const ZONE_FIELDS: &[Cand] = &[
+    (
+        "local",
+        "this zone IS the appliance — traffic terminating here (true|false)",
+    ),
     ("description", "free-text label for this zone"),
     ("stateful", "stateful inspection for this zone (true|false)"),
     ("block-icmp", "drop inbound ICMP on this zone (true|false)"),
@@ -2149,6 +2158,21 @@ const COUNTRY_CODES: &[Cand] = &[("<CC>", "ISO 3166-1 alpha-2 country code (CN, 
 /// ICMP where a port is required is a completion that leads to a refusal.
 const SYSCTL_FIELDS: &[Cand] = &[("value", "the value to set this parameter to")];
 
+/// The offload switches a NIC may be given, in `ethtool -K`'s own short keys.
+const OFFLOAD_FIELDS: &[Cand] = &[
+    ("gro", "generic receive offload"),
+    ("gso", "generic segmentation offload"),
+    ("tso", "TCP segmentation offload"),
+    ("lro", "large receive offload"),
+    ("sg", "scatter-gather"),
+    ("rx", "receive checksum offload"),
+    ("tx", "transmit checksum offload"),
+    ("rxvlan", "receive VLAN tag hardware acceleration"),
+    ("txvlan", "transmit VLAN tag hardware acceleration"),
+    ("ntuple", "n-tuple receive filters"),
+    ("rxhash", "receive hashing"),
+];
+
 const PORT_PROTOS: &[Cand] = &[("tcp", "TCP"), ("udp", "UDP")];
 
 /// Every protocol a firewall rule can name.
@@ -2231,6 +2255,14 @@ const IFACE_FIELDS: &[Cand] = &[
         "untagged/PVID VLAN id on a vlan-aware bridge port",
     ),
     ("mtu", "link MTU in bytes (e.g. 1492 PPPoE, 9000 jumbo)"),
+    (
+        "hw-id",
+        "pin this name to a NIC by its MAC, so it survives a reboot/swap",
+    ),
+    (
+        "offload",
+        "a NIC offload switch: <gro|gso|tso|lro|sg|rx|tx|...> <true|false>",
+    ),
     (
         "mac",
         "override the link MAC (MAC cloning), e.g. 52:54:00:12:34:56",
@@ -2634,6 +2666,7 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "services", "syslog"] => SYSLOG_NODES,
         ["set" | "delete", "services", "syslog", "target", _host] => SYSLOG_FIELDS,
         ["set" | "delete", "system", "sysctl", _name] => SYSCTL_FIELDS,
+        ["set" | "delete", "interface", _name, "offload"] => OFFLOAD_FIELDS,
         ["set", "services", "syslog", "target", _host, "proto"] => SYSLOG_PROTOS,
         ["set", "services", "syslog", "target", _host, "level"] => SYSLOG_LEVELS,
 
@@ -3776,6 +3809,8 @@ mod tests {
                 "vlan-tagged",
                 "vlan-untagged",
                 "mtu",
+                "hw-id",
+                "offload",
                 "mac",
                 "qos",
                 "pppoe"
@@ -3908,6 +3943,7 @@ mod tests {
         assert_eq!(
             kw(&["set", "firewall", "zone", "wan"]),
             [
+                "local",
                 "description",
                 "stateful",
                 "block-icmp",
@@ -4296,6 +4332,8 @@ mod tests {
                 "vlan-tagged",
                 "vlan-untagged",
                 "mtu",
+                "hw-id",
+                "offload",
                 "mac",
                 "qos",
                 "pppoe"

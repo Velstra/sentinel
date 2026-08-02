@@ -3612,6 +3612,9 @@ function banner(message, kind) {{
 // ---- zones ---------------------------------------------------------------
 
 const POSTURE = [
+  // Not posture, but the first thing to know about a zone: whether it is a set
+  // of links or the appliance itself.
+  ["local", "This is the appliance", ["", "true", "false"]],
   ["default-action", "Default action", ["", "accept", "drop", "reject"]],
   ["stateful", "Stateful", ["", "true", "false"]],
   ["block-icmp", "Block ICMP", ["", "true", "false"]],
@@ -3934,7 +3937,15 @@ const IFACE = [
   ["type", "Type",
     ["", "bridge", "bond", "dummy", "pppoe", "gre", "ipip", "gretap",
      "macvlan", "macsec", "l2tpv3"]],
-  ["mtu", "MTU"], ["mac", "MAC address"],
+  ["mtu", "MTU"], ["mac", "MAC address"], ["hw-id", "Pin to MAC"],
+  ["#", "Offload"],
+  ["offload gro", "GRO", ["", "true", "false"]],
+  ["offload gso", "GSO", ["", "true", "false"]],
+  ["offload tso", "TSO", ["", "true", "false"]],
+  ["offload lro", "LRO", ["", "true", "false"]],
+  ["offload sg", "Scatter-gather", ["", "true", "false"]],
+  ["offload rx", "RX checksum", ["", "true", "false"]],
+  ["offload tx", "TX checksum", ["", "true", "false"]],
   ["#", "Addressing"],
   ["zone", "Zone"], ["address", "IPv4 address"], ["address6", "IPv6 address"],
   ["pd-from", "Prefix from"], ["pd-subnet", "Prefix subnet"],
@@ -4223,12 +4234,16 @@ const CONNTRACK_SYNC = [
 // will one day refuse something the appliance accepts.
 const SVC_DNS = [
   ["upstream", "Upstream servers", null, "list"], ["serve-on", "Serve on", null, "list"],
-  ["allow-from", "Allow from", null, "list"],
   ["host-override", "Host overrides", null, "each"], ["blocklist", "Blocklists", null, "each"],
+  ["txt-record", "TXT records", null, "each"],
   ["dnssec", "DNSSEC", ["", "no", "yes", "allow-downgrade"]],
-  ["cache-size", "Cache size"], ["local-domain", "Local domain"],
+  ["cache-size", "Cache size"], ["negative-ttl", "Negative TTL (s)"],
+  ["local-domain", "Local domain"],
 ];
-const SVC_NTP = [["upstream", "Upstream sources", null, "list"], ["serve-on", "Serve on", null, "list"]];
+const SVC_NTP = [
+  ["upstream", "Upstream sources", null, "list"], ["serve-on", "Serve on", null, "list"],
+  ["allow-from", "Allow from", null, "list"],
+];
 const SVC_SSH = [
   ["enable", "Enabled", ["", "true", "false"]], ["port", "Port"],
   ["listen-address", "Listen address"],
