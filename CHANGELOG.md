@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-08-02
+
+A test fix; the appliance is unchanged.
+
+### Fixed
+
+- **`checks.api` asserted a section the console no longer has.** Its list of
+  "every management section is reachable from the browser" still named
+  `view-routes`, which stopped existing when routing became one section with a
+  pane per protocol. The check was describing an older console and failed on a
+  correct page. The panes are now asserted alongside the view, because a
+  routing section can be present while every protocol inside it has gone —
+  and a green check that guarantees less than it claims is worse than a red one.
+
+
 ## [0.4.1] — 2026-08-02
 
 ## [0.4.1] — 2026-08-01
