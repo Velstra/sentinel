@@ -1289,6 +1289,16 @@ pub fn page() -> String {
       <div id="dnatlist"></div>
 
       <div class="card">
+        <h3>NAT64</h3>
+        <p class="lede" style="margin:0 0 var(--space-4)">
+          Give an IPv6-only network its way to the IPv4 internet: hosts resolve a
+          v4-only name to an address inside the prefix, and the appliance
+          translates. DNS64 is what makes them ask for it — without it a
+          v6-only client never learns an address in the prefix at all.
+        </p>
+        <div class="grid" id="nat64form"></div>
+      </div>
+      <div class="card">
         <h3>Live NAT state</h3><pre class="out" id="natshow">…</pre>
       </div>
     </div>
@@ -1626,6 +1636,21 @@ pub fn page() -> String {
 
     <div id="view-system" class="hidden">
       <div class="card"><h3>Identity</h3><div class="grid" id="sys-ident"></div></div>
+      <div class="section">
+        <h3>Kernel parameters</h3>
+        <span class="spacer"></span>
+        <button class="btn" id="togglesysctl">New</button>
+      </div>
+      <div class="card addpanel hidden" id="addsysctlpanel"></div>
+      <div id="sysctllist"></div>
+      <p class="lede" style="margin:var(--space-3) 0 var(--space-6)">
+        The settings this schema has no opinion about. Only <code>net.*</code>
+        and <code>vm.*</code> — everything else on a firewall is a way to make
+        the box unbootable from a file it reads at start-up.
+        <code>net.ipv4.ip_nonlocal_bind</code> is the usual one: it lets a
+        service bind a virtual address this box does not hold right now, which
+        is exactly where a VRRP backup stands.
+      </p>
       <div class="card">
         <h3>Update channel</h3>
         <p class="lede" style="margin:0 0 var(--space-4)">
@@ -2289,7 +2314,8 @@ function ruleFields(zones) {{
     ["from", "From zone", zoneOpts],
     ["to", "To zone", zoneOpts],
     ["action", "Action", ["accept", "drop", "reject"]],
-    ["proto", "Protocol", ["", "tcp", "udp"]],
+    ["proto", "Protocol",
+     ["", "tcp", "udp", "icmp", "icmpv6", "vrrp", "esp", "ah", "gre"]],
     ["port", "Port"],
     ["port-group", "Port group"],
     ["source", "Source"],
@@ -2771,6 +2797,12 @@ const VOCAB = {{
   member: () => namesUnder(["interface"]),
   interface: () => namesUnder(["interface"]),
   "track-interface": () => namesUnder(["interface"]),
+  "address-interface": () => namesUnder(["interface"]),
+  // The link the translated traffic leaves by.
+  "nat64 interface": () => namesUnder(["interface"]),
+  // The session's source is one of this appliance's own addresses. Typing it is
+  // how a neighbour ends up sourced from an address the peer does not expect.
+  "update-source": () => localAddresses(),
   certificate: () => namesUnder(["pki", "certificate"]),
   ca: () => namesUnder(["pki", "ca"]),
   group: () => namesUnder(["system", "group"]),
@@ -2782,6 +2814,24 @@ const VOCAB = {{
   "destination-group": () => namesUnder(["firewall", "group", "address-group"]),
   "port-group": () => namesUnder(["firewall", "group", "port-group"]),
 }};
+
+// Every address this appliance carries, from the configuration rather than from
+// the live link: what a session may be sourced from is what the box is
+// configured to hold, and an address that has not come up yet is still the
+// right answer.
+function localAddresses() {{
+  const out = [];
+  for (const l of lastLeaves) {{
+    if (l.path[0] !== "interface") continue;
+    const leaf = l.path[l.path.length - 1];
+    if (leaf !== "address" && leaf !== "address6") continue;
+    for (const one of String(l.value).split(/[,\s]+/)) {{
+      const bare = one.split("/")[0].trim();
+      if (bare && bare !== "dhcp" && !out.includes(bare)) out.push(bare);
+    }}
+  }}
+  return out;
+}}
 
 /// A box of choices with a value, so the rest of the form can treat it as an
 /// ordinary widget: `.value` is the comma-separated selection, which is exactly
@@ -2814,6 +2864,7 @@ function multiPick(options, current) {{
 // so an empty box reads as "this is already right" rather than as one more
 // thing to fill in — which is most of why a long form feels long.
 const DEFAULTS = {{
+  prefix: "64:ff9b::/96 — the well-known NAT64 prefix",
   mtu: "1500",
   "pppoe mru": "1492",
   ttl: "0 — inherit from the inner packet",
@@ -3621,6 +3672,7 @@ async function refreshNat() {{
   await showInto("natshow", "/api/v1/show/nat");
 
   const ls = await leaves();
+  settingsPanel("nat64form", NAT64, fieldsOf(ls, "nat nat64"), "nat nat64", "NAT64");
   renderObjects({{
     listId: "snatlist", form: FORMS.natSource, required: "zone", toggleId: "togglesnat", toggleLabel: "New source rule", addId: "addsnatpanel", noun: "Source rule",
     fields: SNAT, nameHint: "wan-masq",
@@ -3658,15 +3710,32 @@ const BGP_GLOBAL = [
 const BGP_NEIGHBOR = [
   ["#", "The session"],
   ["remote-as", "Remote AS"], ["description", "Description"],
+  ["local-as", "Local AS"],
+  ["update-source", "Source address"],
+  ["ebgp-multihop", "Multihop TTL"],
   ["passive", "Passive", ["", "true", "false"]],
+  ["shutdown", "Administratively down", ["", "true", "false"]],
+  ["hold-time", "Hold time (s)"],
   ["#", "What it carries"],
   ["evpn", "EVPN", ["", "true", "false"]],
+  ["link-state", "Link state", ["", "true", "false"]],
+  ["flowspec", "FlowSpec", ["", "true", "false"]],
+  ["srpolicy", "SR policy", ["", "true", "false"]],
+  ["extended-nexthop", "Extended next hop", ["", "true", "false"]],
+  ["add-path", "Add-path", ["", "off", "receive", "send", "both"]],
+  ["default-originate", "Originate default", ["", "true", "false"]],
   ["route-reflector-client", "RR client", ["", "true", "false"]],
   ["max-prefix", "Max prefix"],
   ["#", "What policy it is under"],
   ["import", "Inbound route map"], ["export", "Outbound route map"],
+  ["role", "Role", ["", "provider", "customer", "peer", "rs-server", "rs-client"]],
   ["#", "Trust and liveness"],
-  ["password", "Password"], ["bfd", "BFD", ["", "true", "false"]],
+  ["password", "Password"],
+  ["ao-key", "TCP-AO key"], ["ao-key-id", "TCP-AO key id"],
+  ["ttl-security", "GTSM hops"],
+  ["bfd", "BFD", ["", "true", "false"]],
+  ["bfd-auth-type", "BFD authentication"],
+  ["bfd-auth-key-id", "BFD key id"], ["bfd-auth-key", "BFD key"],
 ];
 
 
@@ -3805,7 +3874,7 @@ async function refreshDhcp() {{
 // asks for thirty things asks for nothing in particular, and the rest of these
 // masks had the same problem the interface one did.
 const FORMS = {{
-  bgpNeighbour: {{ essential: ["remote-as", "description"] }},
+  bgpNeighbour: {{ essential: ["remote-as", "description", "update-source"] }},
   ipsec: {{ essential: ["remote", "local", "psk"] }},
   wireguard: {{ essential: ["private-key", "listen-port"] }},
   wgPeer: {{ essential: ["allowed-ips", "endpoint"] }},
@@ -3837,6 +3906,8 @@ const IFACE_FORM = {{
       "": ["address6", "parent", "vlan", "description"],
       bridge: ["member", "vlan-aware"],
       bond: ["member", "bond-mode"],
+      // A dummy link is a name and an address; there is nothing else to decide.
+      dummy: ["address6", "description"],
       wireguard: [],
       pppoe: ["parent", "pppoe username", "pppoe password"],
       gre: ["local", "remote", "key"],
@@ -3861,7 +3932,7 @@ const IFACE = [
   // which lives under `vpn wireguard`, and the WireGuard section writes both
   // halves. Offering it here was a dead end whose Apply could never succeed.
   ["type", "Type",
-    ["", "bridge", "bond", "pppoe", "gre", "ipip", "gretap",
+    ["", "bridge", "bond", "dummy", "pppoe", "gre", "ipip", "gretap",
      "macvlan", "macsec", "l2tpv3"]],
   ["mtu", "MTU"], ["mac", "MAC address"],
   ["#", "Addressing"],
@@ -4104,11 +4175,28 @@ async function refreshIds() {{
   }}
 }}
 
+// NAT64 (roadmap C10). The prefix is well-known on purpose: 64:ff9b::/96 is
+// what a resolver synthesising DNS64 answers uses by default, so an appliance
+// that picks its own has to teach every client about it.
+// The kernel-parameter escape hatch. One field, because that is all it is: a
+// name the kernel knows and a value. The refusal for anything outside net.*/vm.*
+// lives in the appliance, so the console does not need its own opinion.
+const SYSCTL = [["value", "Value"]];
+
+const NAT64 = [
+  ["enabled", "Enabled", ["", "true", "false"]],
+  ["prefix", "Prefix"],
+  ["pool", "IPv4 pool"],
+  ["interface", "Interface"],
+  ["dns64", "Synthesise DNS answers", ["", "true", "false"]],
+];
+
 const VRRP = [
   ["#", "The address being held"],
   ["interface", "Interface"], ["vrid", "Virtual router ID"],
   ["virtual-address", "Virtual addresses", null, "list"],
   ["prefix-length", "Prefix length"],
+  ["address-interface", "Address interface"],
   ["#", "Who holds it"],
   ["priority", "Priority"], ["preempt", "Preempt", ["", "true", "false"]],
   ["advert-interval", "Advert interval (ms)"],
@@ -4135,6 +4223,7 @@ const CONNTRACK_SYNC = [
 // will one day refuse something the appliance accepts.
 const SVC_DNS = [
   ["upstream", "Upstream servers", null, "list"], ["serve-on", "Serve on", null, "list"],
+  ["allow-from", "Allow from", null, "list"],
   ["host-override", "Host overrides", null, "each"], ["blocklist", "Blocklists", null, "each"],
   ["dnssec", "DNSSEC", ["", "no", "yes", "allow-downgrade"]],
   ["cache-size", "Cache size"], ["local-domain", "Local domain"],
@@ -4486,6 +4575,15 @@ async function refreshSystem() {{
   const ls = await leaves();
   const under = (node) => fieldsOf(ls, node);
   settingsPanel("sys-ident", SYS_IDENT, under("system"), "system", "Identity");
+  renderObjects({{
+    listId: "sysctllist", addId: "addsysctlpanel",
+    toggleId: "togglesysctl", toggleLabel: "New",
+    noun: "Parameter", required: "value",
+    fields: SYSCTL, nameHint: "net.ipv4.ip_nonlocal_bind",
+    path: (n) => `system sysctl ${{n}}`,
+    rows: entriesUnder(ls, ["system", "sysctl"]),
+    empty: "No kernel parameters set.",
+  }});
   settingsPanel("sys-update", SYS_UPDATE, under("update"), "update", "Update channel");
   await showInto("sysshow", "/api/v1/show/version");
 }}

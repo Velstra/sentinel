@@ -338,6 +338,12 @@ fn proto_str(p: Proto) -> &'static str {
     match p {
         Proto::Tcp => "tcp",
         Proto::Udp => "udp",
+        Proto::Icmp => "icmp",
+        Proto::Icmpv6 => "icmpv6",
+        Proto::Vrrp => "vrrp",
+        Proto::Esp => "esp",
+        Proto::Ah => "ah",
+        Proto::Gre => "gre",
     }
 }
 
@@ -881,6 +887,42 @@ zone = "lan"
         let appliance = Appliance::from_toml(crate::config::EXAMPLE).unwrap();
         let rendered = compile(&appliance).to_toml().unwrap();
         assert!(!rendered.contains("source_validation"), "{rendered}");
+    }
+
+    /// A rule naming a protocol that has no ports must reach the data plane as a
+    /// rule, not vanish into the zone's posture. Port `0` is the key the data
+    /// plane reads off a packet that carries no ports, so this is what matches
+    /// every ICMP packet the rule scopes — and nothing else.
+    #[test]
+    fn a_port_less_protocol_compiles_to_a_rule_on_port_zero() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "eth0"
+zone = "lan"
+[[interface]]
+name = "eth1"
+zone = "wan"
+[zone.wan]
+default_action = "drop"
+[[rule]]
+name = "icmp-in"
+from = "wan"
+action = "accept"
+proto = "icmp"
+"#;
+        let appliance = Appliance::from_toml(toml).expect("parses");
+        let cfg = compile(&appliance);
+        let wan = cfg
+            .policies
+            .iter()
+            .find(|p| p.port_rules.iter().any(|r| r.proto == "icmp"))
+            .expect("the wan policy carries the icmp rule");
+        let rule = wan.port_rules.iter().find(|r| r.proto == "icmp").unwrap();
+        assert_eq!(rule.port, 0, "an ICMP rule is keyed on port 0");
+        // `accept` is `pass` on the wire — the data plane's own word for it.
+        assert_eq!(rule.action, "pass");
     }
 
     #[test]
