@@ -1015,6 +1015,7 @@ struct VrrpDraft {
     track_interfaces: Vec<String>,
     priority_decrement: Option<u8>,
     virtual_address: Vec<String>,
+    address_interface: Option<String>,
 }
 
 /// The candidate's global BFD timing / authentication defaults (`[protocols.bfd]`).
@@ -1126,6 +1127,8 @@ impl ExportDraft {
 /// order is preserved for stable `show` output.
 #[derive(Debug, Clone, Default)]
 struct Draft {
+    /// Kernel parameters (`system sysctl <name> <value>`).
+    sysctl: std::collections::BTreeMap<String, String>,
     hostname: Option<String>,
     firewall: FirewallDraft,
     /// Named firewall groups (aliases) — address + port sets referenced by rules.
@@ -1247,6 +1250,7 @@ struct DnsDraft {
 struct NtpDraft {
     upstream: Vec<String>,
     serve_on: Vec<String>,
+    allow_from: Vec<String>,
 }
 
 /// A partially-specified LLDP config (`[services.lldp]`).
@@ -1746,6 +1750,7 @@ impl Draft {
 
     fn from_appliance(a: &Appliance) -> Self {
         Draft {
+            sysctl: a.system.sysctl.clone(),
             hostname: Some(a.system.hostname.clone()),
             firewall: FirewallDraft {
                 stateful: Some(a.firewall.stateful),
@@ -2055,6 +2060,7 @@ impl Draft {
                             track_interfaces: v.track_interfaces.clone(),
                             priority_decrement: v.priority_decrement,
                             virtual_address: v.virtual_address.clone(),
+                            address_interface: v.address_interface.clone(),
                         },
                     )
                 })
@@ -2163,6 +2169,7 @@ impl Draft {
             ntp: NtpDraft {
                 upstream: a.services.ntp.upstream.clone(),
                 serve_on: a.services.ntp.serve_on.clone(),
+                allow_from: a.services.ntp.allow_from.clone(),
             },
             lldp: LldpDraft {
                 enable: a.services.lldp.enable,
@@ -2854,9 +2861,10 @@ impl Session {
                     "macvlan" => IfaceType::Macvlan,
                     "macsec" => IfaceType::Macsec,
                     "l2tpv3" => IfaceType::L2tpv3,
+                    "dummy" => IfaceType::Dummy,
                     other => {
                         bail!(
-                            "interface type {other:?}: expected \"bridge\", \"bond\", \"wireguard\", \"pppoe\", \"gre\", \"ipip\", \"gretap\", \"macvlan\", \"macsec\" or \"l2tpv3\""
+                            "interface type {other:?}: expected \"bridge\", \"bond\", \"dummy\", \"wireguard\", \"pppoe\", \"gre\", \"ipip\", \"gretap\", \"macvlan\", \"macsec\" or \"l2tpv3\""
                         )
                     }
                 };
@@ -3369,6 +3377,18 @@ impl Session {
                     crate::config::validate_host(u)?;
                 }
                 append_csv(&mut self.draft.ntp.upstream, v);
+            }
+            // `value` rather than a bare pair: every named thing in this grammar
+            // carries named fields, and the console's object language reads that
+            // shape. A bare `sysctl <name> <value>` would be the one node in the
+            // tree that no generic renderer could show.
+            ["system", "sysctl", key, "value", v] => {
+                self.draft
+                    .sysctl
+                    .insert((*key).to_string(), (*v).to_string());
+            }
+            ["services", "ntp", "allow-from", v] => {
+                append_csv(&mut self.draft.ntp.allow_from, v);
             }
             ["services", "ntp", "serve-on", v] => {
                 append_csv(&mut self.draft.ntp.serve_on, v);
@@ -4001,6 +4021,9 @@ impl Session {
             }
             ["protocols", "vrrp", name, "virtual-address", v] => {
                 append_csv(&mut self.draft.vrrp_mut(name).virtual_address, v);
+            }
+            ["protocols", "vrrp", name, "address-interface", v] => {
+                self.draft.vrrp_mut(name).address_interface = Some((*v).to_string());
             }
 
             // static route VRF placement.
@@ -5917,6 +5940,7 @@ impl Session {
                     "track-interface" => d.track_interfaces.clear(),
                     "priority-decrement" => d.priority_decrement = None,
                     "virtual-address" => d.virtual_address.clear(),
+                    "address-interface" => d.address_interface = None,
                     other => bail!("vrrp has no field {other:?}"),
                 }
             }
@@ -6869,6 +6893,7 @@ impl Session {
                     track_interfaces: d.track_interfaces.clone(),
                     priority_decrement: d.priority_decrement,
                     virtual_address: d.virtual_address.clone(),
+                    address_interface: d.address_interface.clone(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -7111,6 +7136,7 @@ impl Session {
                 groups: self.draft.admin_groups.clone(),
                 config_sync: self.draft.config_sync.clone(),
                 conntrack_sync: self.draft.conntrack_sync.clone(),
+                sysctl: self.draft.sysctl.clone(),
             },
             firewall,
             zones,
@@ -7147,6 +7173,7 @@ impl Session {
                 ntp: Ntp {
                     upstream: self.draft.ntp.upstream.clone(),
                     serve_on: self.draft.ntp.serve_on.clone(),
+                    allow_from: self.draft.ntp.allow_from.clone(),
                 },
                 lldp: Lldp {
                     enable: self.draft.lldp.enable,
@@ -7393,11 +7420,15 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             || !draft.logins.is_empty()
             || !draft.admin_groups.is_empty()
             || cs_set
-            || cts_set)
+            || cts_set
+            || !draft.sysctl.is_empty())
     {
         out.push_str("system {\n");
         if let Some(h) = &draft.hostname {
             out.push_str(&format!("    hostname {h}\n"));
+        }
+        for (k, v) in &draft.sysctl {
+            out.push_str(&format!("    sysctl {k} value {v}\n"));
         }
         for l in &draft.logins {
             out.push_str(&format!("    login {} {{\n", l.username));
@@ -7499,6 +7530,7 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             let s = match ty {
                 IfaceType::Bridge => "bridge",
                 IfaceType::Bond => "bond",
+                IfaceType::Dummy => "dummy",
                 IfaceType::Wireguard => "wireguard",
                 IfaceType::Pppoe => "pppoe",
                 IfaceType::Gre => "gre",
@@ -8153,6 +8185,9 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         for a in &v.virtual_address {
             proto.push_str(&format!("        virtual-address {a}\n"));
         }
+        if let Some(ai) = &v.address_interface {
+            proto.push_str(&format!("        address-interface {ai}\n"));
+        }
         proto.push_str("    }\n");
     }
     if !draft.bfd.is_empty() {
@@ -8369,7 +8404,7 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         && d.dnssec.is_none()
         && d.cache_size.is_none()
         && d.local_domain.is_none());
-    let ntp_set = !(n.upstream.is_empty() && n.serve_on.is_empty());
+    let ntp_set = !(n.upstream.is_empty() && n.serve_on.is_empty() && n.allow_from.is_empty());
     let lldp = &draft.lldp;
     let snmp = &draft.snmp;
     let mdns = &draft.mdns;
@@ -8446,6 +8481,9 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             }
             if !n.serve_on.is_empty() {
                 out.push_str(&format!("        serve-on {}\n", n.serve_on.join(",")));
+            }
+            if !n.allow_from.is_empty() {
+                out.push_str(&format!("        allow-from {}\n", n.allow_from.join(",")));
             }
             out.push_str("    }\n");
         }
@@ -9085,7 +9123,13 @@ fn parse_proto(s: &str) -> Result<Proto> {
     Ok(match s {
         "tcp" => Proto::Tcp,
         "udp" => Proto::Udp,
-        _ => bail!("invalid proto {s:?} (expected tcp|udp)"),
+        "icmp" => Proto::Icmp,
+        "icmpv6" | "ipv6-icmp" | "icmp6" => Proto::Icmpv6,
+        "vrrp" => Proto::Vrrp,
+        "esp" => Proto::Esp,
+        "ah" => Proto::Ah,
+        "gre" => Proto::Gre,
+        _ => bail!("invalid proto {s:?} (expected tcp, udp, icmp, icmpv6, vrrp, esp, ah or gre)"),
     })
 }
 
@@ -9514,6 +9558,12 @@ fn proto_str(p: Proto) -> &'static str {
     match p {
         Proto::Tcp => "tcp",
         Proto::Udp => "udp",
+        Proto::Icmp => "icmp",
+        Proto::Icmpv6 => "icmpv6",
+        Proto::Vrrp => "vrrp",
+        Proto::Esp => "esp",
+        Proto::Ah => "ah",
+        Proto::Gre => "gre",
     }
 }
 

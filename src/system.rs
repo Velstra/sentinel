@@ -143,6 +143,17 @@ pub fn nft_load(path: &Path) -> Result<()> {
 /// <spec…>` (roadmap C8 traffic shaping). `replace` is idempotent — it installs
 /// the qdisc if absent or swaps it in place without dropping the link, so a
 /// re-apply of the same spec never blips a live queue.
+/// Set one kernel parameter now (`sysctl -w name=value`).
+///
+/// The `/proc/sys` write directly rather than through the `sysctl` binary: one
+/// fewer tool to pin, and the failure — a parameter this kernel does not have —
+/// arrives as a plain "no such file", which is exactly what it is.
+pub fn sysctl_write(key: &str, value: &str) -> Result<()> {
+    let path = std::path::Path::new("/proc/sys").join(key.replace('.', "/"));
+    std::fs::write(&path, format!("{value}\n"))
+        .with_context(|| format!("writing {}", path.display()))
+}
+
 pub fn tc_qdisc_replace(dev: &str, spec: &[&str]) -> Result<()> {
     let mut args: Vec<&str> = vec!["qdisc", "replace", "dev", dev, "root"];
     args.extend_from_slice(spec);

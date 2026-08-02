@@ -1530,6 +1530,10 @@ const NTP_FIELDS: &[Cand] = &[
         "serve-on",
         "interfaces whose subnet may query us (comma-separated)",
     ),
+    (
+        "allow-from",
+        "networks allowed to query us, as prefixes (comma-separated)",
+    ),
 ];
 // `services dns <Tab>` reveals the forwarder fields (a systemd-resolved drop-in).
 const DNS_FIELDS: &[Cand] = &[
@@ -1719,6 +1723,10 @@ const VRRP_FIELDS: &[Cand] = &[
     (
         "priority-decrement",
         "priority drop while a tracked NIC is down",
+    ),
+    (
+        "address-interface",
+        "hold the address on this link instead of the one advertisements use",
     ),
     ("virtual-address", "the shared virtual IP"),
 ];
@@ -1985,6 +1993,10 @@ const NAT64_FIELDS: &[Cand] = &[
 const SYSTEM_FIELDS: &[Cand] = &[
     ("hostname", "the appliance hostname"),
     (
+        "sysctl",
+        "a kernel parameter (by name): `value <v>` — net.* / vm.* only",
+    ),
+    (
         "login",
         "a local login account (by username): ssh-key / hashed-password / group",
     ),
@@ -2132,7 +2144,30 @@ const SOURCE_VALIDATION: &[Cand] = &[
 /// would bury the prompt. The commit names an unknown one against the image's
 /// own database, which is a better answer than a menu.
 const COUNTRY_CODES: &[Cand] = &[("<CC>", "ISO 3166-1 alpha-2 country code (CN, RU, …)")];
-const PROTOS: &[Cand] = &[("tcp", "TCP"), ("udp", "UDP")];
+/// The two protocols that carry ports — what a port forward or a load-balanced
+/// service can be fronted on. Kept apart from [`PROTOS`] on purpose: offering
+/// ICMP where a port is required is a completion that leads to a refusal.
+const SYSCTL_FIELDS: &[Cand] = &[("value", "the value to set this parameter to")];
+
+const PORT_PROTOS: &[Cand] = &[("tcp", "TCP"), ("udp", "UDP")];
+
+/// Every protocol a firewall rule can name.
+const PROTOS: &[Cand] = &[
+    ("tcp", "TCP"),
+    ("udp", "UDP"),
+    (
+        "icmp",
+        "ICMP — no port; matches every ICMP packet the rule scopes",
+    ),
+    (
+        "icmpv6",
+        "ICMPv6 — its own protocol, and what neighbour discovery uses",
+    ),
+    ("vrrp", "VRRP advertisements between a redundant pair"),
+    ("esp", "IPsec ESP (the payload half)"),
+    ("ah", "IPsec AH (the authentication half)"),
+    ("gre", "GRE"),
+];
 const IFACE_FIELDS: &[Cand] = &[
     (
         "description",
@@ -2172,7 +2207,7 @@ const IFACE_FIELDS: &[Cand] = &[
     ("router-advert", "emit IPv6 Router Advertisements (SLAAC)"),
     (
         "type",
-        "bridge | bond | wireguard | pppoe | gre | ipip | gretap | macvlan | macsec | l2tpv3",
+        "bridge | bond | dummy | wireguard | pppoe | gre | ipip | gretap | macvlan | macsec | l2tpv3",
     ),
     ("local", "tunnel local endpoint IP (type gre/ipip/gretap)"),
     ("remote", "tunnel remote endpoint IP (type gre/ipip/gretap)"),
@@ -2216,6 +2251,10 @@ const ADDRESS6_HINT: &[Cand] = &[
 const IFACE_TYPES: &[Cand] = &[
     ("bridge", "an L2 switch; enslave NICs with `member`"),
     ("bond", "link aggregation; enslave NICs with `member`"),
+    (
+        "dummy",
+        "a link that is always up, for an address no cable can take away",
+    ),
     (
         "wireguard",
         "a WireGuard tunnel; keys/peers under `vpn wireguard`",
@@ -2594,6 +2633,7 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set", "services", "ids", "block-on-alert"] => BOOLS,
         ["set" | "delete", "services", "syslog"] => SYSLOG_NODES,
         ["set" | "delete", "services", "syslog", "target", _host] => SYSLOG_FIELDS,
+        ["set" | "delete", "system", "sysctl", _name] => SYSCTL_FIELDS,
         ["set", "services", "syslog", "target", _host, "proto"] => SYSLOG_PROTOS,
         ["set", "services", "syslog", "target", _host, "level"] => SYSLOG_LEVELS,
 
@@ -2641,14 +2681,14 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
 
         // The nat sub-tree (its own top-level node).
         ["set" | "delete", "load-balancer", _name] => LB_FIELDS,
-        ["set", "load-balancer", _name, "proto"] => PROTOS,
+        ["set", "load-balancer", _name, "proto"] => PORT_PROTOS,
         ["set", "load-balancer", _name, "disabled"] => BOOLS,
 
         ["set" | "delete", "nat"] => NAT_NODES,
         ["set" | "delete", "nat", "source", _name] => NAT_SOURCE_FIELDS,
         ["set", "nat", "source", _name, "disabled"] => BOOLS,
         ["set" | "delete", "nat", "destination", _name] => NAT_DEST_FIELDS,
-        ["set", "nat", "destination", _name, "proto"] => PROTOS,
+        ["set", "nat", "destination", _name, "proto"] => PORT_PROTOS,
         ["set", "nat", "destination", _name, "disabled" | "hairpin"] => BOOLS,
         ["set" | "delete", "nat", "npt66", _name] => NAT_NPT66_FIELDS,
         ["set" | "delete", "nat", "nat64"] => NAT64_FIELDS,
@@ -3695,6 +3735,7 @@ mod tests {
             kw(&["set", "system"]),
             [
                 "hostname",
+                "sysctl",
                 "login",
                 "group",
                 "config-sync",
@@ -3916,7 +3957,7 @@ mod tests {
         );
         assert_eq!(
             kw(&["set", "firewall", "rule", "web", "proto"]),
-            ["tcp", "udp"]
+            ["tcp", "udp", "icmp", "icmpv6", "vrrp", "esp", "ah", "gre"]
         );
         // The nat sub-tree: source (masquerade) + destination (port-forward) +
         // nat64 + npt66 (NPTv6).
