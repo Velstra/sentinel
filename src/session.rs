@@ -32,6 +32,8 @@ pub const DEFAULT_CONFIG: &str = "/var/lib/sentinel/appliance.toml";
 /// A partially-specified interface (fields filled in incrementally).
 #[derive(Debug, Clone, Default)]
 struct IfaceDraft {
+    hw_id: Option<String>,
+    offload: std::collections::BTreeMap<String, bool>,
     // Documentary label + administrative disable.
     description: Option<String>,
     disabled: Option<bool>,
@@ -208,7 +210,7 @@ struct RuleDraft {
     to: Option<String>,
     action: Option<Action>,
     proto: Option<Proto>,
-    port: Option<PortSpec>,
+    port: Vec<PortSpec>,
     log: Option<bool>,
     source: Option<String>,
     source_group: Option<String>,
@@ -283,6 +285,7 @@ struct NatNpt66Draft {
 /// A partially-specified per-zone posture override.
 #[derive(Debug, Clone, Default)]
 struct ZoneDraft {
+    local: bool,
     description: Option<String>,
     stateful: Option<bool>,
     block_icmp: Option<bool>,
@@ -1243,6 +1246,8 @@ struct DnsDraft {
     dnssec: Option<String>,
     cache_size: Option<u32>,
     local_domain: Option<String>,
+    negative_ttl: Option<u32>,
+    txt_record: BTreeMap<String, String>,
 }
 
 /// A partially-specified NTP server (`[services.ntp]`).
@@ -1790,6 +1795,7 @@ impl Draft {
                     (
                         name.clone(),
                         ZoneDraft {
+                            local: z.local,
                             description: z.description.clone(),
                             stateful: z.stateful,
                             block_icmp: z.block_icmp,
@@ -1809,6 +1815,8 @@ impl Draft {
                     (
                         i.name.clone(),
                         IfaceDraft {
+                            hw_id: i.hw_id.clone(),
+                            offload: i.offload.clone(),
                             description: i.description.clone(),
                             // Only carry the flag when set, so a round-trip never
                             // renders `disabled false`.
@@ -1900,7 +1908,7 @@ impl Draft {
                             to: r.to.clone(),
                             action: Some(r.action),
                             proto: r.proto,
-                            port: r.port,
+                            port: r.port.clone(),
                             log: Some(r.log),
                             source: r.source.clone(),
                             source_group: r.source_group.clone(),
@@ -2158,6 +2166,8 @@ impl Draft {
                 })
                 .unwrap_or_default(),
             dns: DnsDraft {
+                negative_ttl: a.services.dns.negative_ttl,
+                txt_record: a.services.dns.txt_record.clone(),
                 upstream: a.services.dns.upstream.clone(),
                 serve_on: a.services.dns.serve_on.clone(),
                 host_override: a.services.dns.host_override.clone(),
@@ -3130,7 +3140,14 @@ impl Session {
                 self.draft.rule_mut(name).proto = Some(parse_proto(v)?)
             }
             ["firewall", "rule", name, "port", v] => {
-                self.draft.rule_mut(name).port = Some(PortSpec::parse(v)?);
+                // A comma list is one rule matching several ports, not several
+                // rules — which is how a service that *is* several ports (SMB is
+                // 139 and 445) stays one thing to keep in step.
+                let mut specs = Vec::new();
+                for one in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    specs.push(PortSpec::parse(one)?);
+                }
+                self.draft.rule_mut(name).port = specs;
             }
             ["firewall", "rule", name, "log", v] => {
                 self.draft.rule_mut(name).log = Some(parse_bool(v)?)
@@ -3382,6 +3399,34 @@ impl Session {
             // carries named fields, and the console's object language reads that
             // shape. A bare `sysctl <name> <value>` would be the one node in the
             // tree that no generic renderer could show.
+            ["firewall", "zone", name, "local", v] => {
+                self.draft.zone_mut(name).local = parse_bool(v)?;
+            }
+            ["services", "dns", "negative-ttl", v] => {
+                self.draft.dns.negative_ttl = Some(
+                    v.parse()
+                        .with_context(|| format!("invalid negative-ttl {v:?}"))?,
+                );
+            }
+            // The text is prose, so it arrives as many tokens: join them back.
+            // A TXT record whose value could not contain a space would be a TXT
+            // record that cannot hold what people put in one.
+            ["services", "dns", "txt-record", name, rest @ ..] if !rest.is_empty() => {
+                self.draft
+                    .dns
+                    .txt_record
+                    .insert((*name).to_string(), rest.join(" "));
+            }
+            ["interface", name, "hw-id", v] => {
+                self.draft.iface_mut(name).hw_id = Some((*v).to_string());
+            }
+            ["interface", name, "offload", feature, v] => {
+                let on = parse_bool(v)?;
+                self.draft
+                    .iface_mut(name)
+                    .offload
+                    .insert((*feature).to_string(), on);
+            }
             ["system", "sysctl", key, "value", v] => {
                 self.draft
                     .sysctl
@@ -5192,7 +5237,7 @@ impl Session {
                     "to" => r.to = None,
                     "action" => r.action = None,
                     "proto" => r.proto = None,
-                    "port" => r.port = None,
+                    "port" => r.port.clear(),
                     "log" => r.log = None,
                     "source" => r.source = None,
                     "source-group" => r.source_group = None,
@@ -6530,6 +6575,8 @@ impl Session {
             .interfaces
             .iter()
             .map(|(name, d)| Interface {
+                hw_id: d.hw_id.clone(),
+                offload: d.offload.clone(),
                 name: name.clone(),
                 description: d.description.clone(),
                 disabled: d.disabled.unwrap_or(false),
@@ -6625,7 +6672,7 @@ impl Session {
                         .action
                         .ok_or_else(|| anyhow::anyhow!("rule {name:?}: action not set"))?,
                     proto: d.proto,
-                    port: d.port,
+                    port: d.port.clone(),
                     log: d.log.unwrap_or(false),
                     source: d.source.clone(),
                     source_group: d.source_group.clone(),
@@ -6659,6 +6706,7 @@ impl Session {
                 (
                     name.clone(),
                     ZoneCfg {
+                        local: z.local,
                         description: z.description.clone(),
                         stateful: z.stateful,
                         block_icmp: z.block_icmp,
@@ -7162,6 +7210,8 @@ impl Session {
             },
             services: Services {
                 dns: Dns {
+                    negative_ttl: self.draft.dns.negative_ttl,
+                    txt_record: self.draft.dns.txt_record.clone(),
                     upstream: self.draft.dns.upstream.clone(),
                     serve_on: self.draft.dns.serve_on.clone(),
                     host_override: self.draft.dns.host_override.clone(),
@@ -7516,6 +7566,8 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             && i.ttl.is_none()
             && i.qos.is_none()
             && i.pppoe.is_none()
+            && i.hw_id.is_none()
+            && i.offload.is_empty()
         {
             continue;
         }
@@ -7541,6 +7593,12 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
                 IfaceType::L2tpv3 => "l2tpv3",
             };
             out.push_str(&format!("    type {s}\n"));
+        }
+        if let Some(h) = &i.hw_id {
+            out.push_str(&format!("    hw-id {h}\n"));
+        }
+        for (feature, on) in &i.offload {
+            out.push_str(&format!("    offload {feature} {on}\n"));
         }
         if let Some(z) = &i.zone {
             out.push_str(&format!("    zone {z}\n"));
@@ -7782,6 +7840,9 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
     }
     for (name, z) in &draft.zones {
         fwi.push_str(&format!("    zone {name} {{\n"));
+        if z.local {
+            fwi.push_str("        local true\n");
+        }
         if let Some(desc) = &z.description {
             fwi.push_str(&format!("        description {desc}\n"));
         }
@@ -7857,8 +7918,11 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         if let Some(p) = r.proto {
             fwi.push_str(&format!("        proto {}\n", proto_str(p)));
         }
-        if let Some(p) = r.port {
-            fwi.push_str(&format!("        port {p}\n"));
+        // One line, comma-joined: the setter replaces the whole list, so two
+        // `port` lines would round-trip to whichever came last.
+        if !r.port.is_empty() {
+            let ports: Vec<String> = r.port.iter().map(|p| p.to_string()).collect();
+            fwi.push_str(&format!("        port {}\n", ports.join(",")));
         }
         if let Some(l) = r.log {
             fwi.push_str(&format!("        log {l}\n"));
@@ -8456,6 +8520,12 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             }
             if !d.serve_on.is_empty() {
                 out.push_str(&format!("        serve-on {}\n", d.serve_on.join(",")));
+            }
+            if let Some(t) = d.negative_ttl {
+                out.push_str(&format!("        negative-ttl {t}\n"));
+            }
+            for (name, text) in &d.txt_record {
+                out.push_str(&format!("        txt-record {name} {text}\n"));
             }
             for (name, ip) in &d.host_override {
                 out.push_str(&format!("        host-override {name} {ip}\n"));
