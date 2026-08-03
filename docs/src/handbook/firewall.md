@@ -627,3 +627,27 @@ as a count would invite somebody to delete the rule doing its job.
 
 It also only sees **now**: what the connection table holds, not what went through
 yesterday.
+
+
+## A packet the filter cannot parse
+
+```text
+set firewall global fail-closed true
+```
+
+Off by default. It governs one narrow thing: what happens to a packet the data
+plane **cannot parse at all** — a bounds failure while reading headers, decided
+before any zone is known, so it escapes the zone posture entirely.
+
+Fail-open passes it, on the reasoning that a firewall should not black-hole
+traffic because of its own parsing limits: an encapsulation the parser does not
+know is the packet's problem to explain, not a reason to drop it.
+
+**Be aware of the tension.** This appliance's own default posture is deny by
+default, and fail-open is the opposite instinct. A packet the filter cannot
+understand is, under that posture, exactly the one it should not admit. The two
+defaults disagree, deliberately and historically — if your reading of a firewall
+is that anything unexplained is denied, turn this on.
+
+It is host-wide, not per zone, because the parse fails before there is a zone to
+attribute it to.
