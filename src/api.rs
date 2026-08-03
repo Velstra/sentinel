@@ -478,6 +478,25 @@ fn ask_the_directory(
             }
         }
     }
+    for d in &aaa.ldap {
+        match crate::aaa::ldap_authenticate(
+            &d.server,
+            d.port,
+            d.tls.as_deref().unwrap_or("ldaps"),
+            &d.base_dn,
+            d.user_attribute.as_deref().unwrap_or("uid"),
+            username,
+            password,
+            d.timeout.unwrap_or(5),
+        ) {
+            Ok(crate::aaa::Directory::Accepted) => return Ok(true),
+            Ok(crate::aaa::Directory::Rejected) => return Ok(false),
+            Err(e) => {
+                eprintln!("warning: LDAP directory {} did not answer: {e}", d.server);
+                last = Some(e.to_string());
+            }
+        }
+    }
     Err(ApiError::new(
         StatusCode::SERVICE_UNAVAILABLE,
         anyhow!(

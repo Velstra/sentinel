@@ -1565,6 +1565,21 @@ const AAA_FIELDS: &[Cand] = &[
         "the group a directory account gets with no local entry",
     ),
 ];
+const AAA_LDAP_FIELDS: &[Cand] = &[
+    ("base-dn", "where the accounts live (required)"),
+    (
+        "user-attribute",
+        "the attribute naming an account (default uid; AD wants sAMAccountName)",
+    ),
+    ("tls", "ldaps (default) / starttls / none"),
+    ("port", "server port (default 636 for ldaps, else 389)"),
+    ("timeout", "seconds to wait for an answer (default 5)"),
+];
+const AAA_LDAP_TLS: &[Cand] = &[
+    ("ldaps", "TLS from the first byte, on 636"),
+    ("starttls", "upgrade on 389, and fail rather than fall back"),
+    ("none", "no TLS — the bind password goes in the clear"),
+];
 const AAA_RADIUS_FIELDS: &[Cand] = &[
     ("secret", "the shared secret (required)"),
     ("port", "server port (default 1812)"),
@@ -2824,6 +2839,8 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "system", "metrics"] => METRICS_FIELDS,
         ["set", "system", "metrics", "enable"] => BOOLS,
         ["set" | "delete", "system", "aaa", "radius", _host] => AAA_RADIUS_FIELDS,
+        ["set" | "delete", "system", "aaa", "ldap", _host] => AAA_LDAP_FIELDS,
+        ["set", "system", "aaa", "ldap", _host, "tls"] => AAA_LDAP_TLS,
         ["set" | "delete", "system", "console"] => CONSOLE_FIELDS,
         ["set" | "delete", "interface", _name, "offload"] => OFFLOAD_FIELDS,
         ["set", "services", "syslog", "target", _host, "proto"] => SYSLOG_PROTOS,

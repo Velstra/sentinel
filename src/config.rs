@@ -3646,6 +3646,10 @@ pub struct Aaa {
     /// next one.
     #[serde(default, rename = "radius", skip_serializing_if = "Vec::is_empty")]
     pub radius: Vec<RadiusServer>,
+    /// LDAP directories, tried after the RADIUS servers. The first that answers
+    /// decides.
+    #[serde(default, rename = "ldap", skip_serializing_if = "Vec::is_empty")]
+    pub ldap: Vec<LdapServer>,
     /// The permission group an account authenticated by a server gets when this
     /// box has no local entry for it. Unset ⇒ a directory account still needs a
     /// local `[[system.login]]` naming its group, which is the safe default:
@@ -3661,8 +3665,49 @@ pub struct Aaa {
 
 impl Aaa {
     pub fn is_empty(&self) -> bool {
-        self.radius.is_empty() && self.default_group.is_none()
+        self.radius.is_empty() && self.ldap.is_empty() && self.default_group.is_none()
     }
+}
+
+/// One LDAP directory (`[[system.aaa.ldap]]`).
+///
+/// A **simple bind** as the user, not a search-then-bind. Searching first needs
+/// a service account whose password then sits on the firewall, and a template
+/// DN covers the flat directories people actually point a firewall at. If a
+/// deployment genuinely needs a search, that is a later addition rather than a
+/// reason to keep a second credential here now.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LdapServer {
+    /// Its address or hostname.
+    pub server: String,
+    /// Its port. Unset ⇒ 636 for `ldaps`, 389 otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Where the accounts live — `"ou=people,dc=example,dc=com"`. The bind DN is
+    /// `<user-attribute>=<username>,<base-dn>`.
+    #[serde(rename = "base-dn")]
+    pub base_dn: String,
+    /// The attribute naming an account. Unset ⇒ `uid`; Active Directory usually
+    /// wants `sAMAccountName` or a userPrincipalName instead.
+    #[serde(
+        default,
+        rename = "user-attribute",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub user_attribute: Option<String>,
+    /// How the connection is protected: `ldaps` (default), `starttls`, or
+    /// `none`.
+    ///
+    /// `none` sends the password in the clear. It exists because a directory on
+    /// a loopback or a wire you already control is a real deployment, and
+    /// refusing it outright would push people to a worse workaround — but it is
+    /// not the default and it is not silent: `commit` says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<String>,
+    /// How long to wait for an answer, in seconds. Unset ⇒ 5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u32>,
 }
 
 /// One RADIUS server (`[[system.aaa.radius]]`).
@@ -6578,6 +6623,15 @@ impl Appliance {
                 );
             }
         }
+        for d in &self.system.aaa.ldap {
+            validate_host(&d.server).context("system aaa ldap")?;
+            if d.base_dn.is_empty() {
+                bail!(
+                    "system aaa ldap {:?}: needs a base-dn — without it there is no DN to bind as",
+                    d.server
+                );
+            }
+        }
         if let Some(g) = &self.system.aaa.default_group {
             if !self.system.groups.iter().any(|x| &x.name == g) {
                 bail!("system aaa default-group {g:?}: no such permission group");
@@ -6760,6 +6814,15 @@ impl Appliance {
                     "system aaa radius {:?}: needs a shared secret — without one the server \
                      cannot check the answer and will ignore the request",
                     r.server
+                );
+            }
+        }
+        for d in &self.system.aaa.ldap {
+            validate_host(&d.server).context("system aaa ldap")?;
+            if d.base_dn.is_empty() {
+                bail!(
+                    "system aaa ldap {:?}: needs a base-dn — without it there is no DN to bind as",
+                    d.server
                 );
             }
         }
@@ -8486,6 +8549,17 @@ impl Appliance {
         // plaintext. Without one the box looks like "DNS is broken" rather than
         // like a setting is missing — so it is said here, where somebody is
         // already reading.
+        // A directory reached without TLS is a password on the wire. It is
+        // allowed — a directory on a wire you already control is a real
+        // deployment — but never silently.
+        for d in &self.system.aaa.ldap {
+            if d.tls.as_deref() == Some("none") {
+                out.push(format!(
+                    "system aaa ldap {:?}: tls none sends the bind password in the clear",
+                    d.server
+                ));
+            }
+        }
         let dns = &self.services.dns;
         if !dns.secure_upstream.is_empty() && dns.upstream.is_empty() {
             let by_name = dns.secure_upstream.iter().any(|u| {
