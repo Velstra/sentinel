@@ -1451,6 +1451,7 @@ pub fn page() -> String {
             <option value="port-group">port</option>
             <option value="domain-group">domain</option>
             <option value="feed-group">published list</option>
+            <option value="user-group">VPN users</option>
           </select>
         </label>
         <span class="spacer"></span>
@@ -4495,7 +4496,7 @@ const ROUTE = [
 // a kind picker beats three that would drift apart.
 const GROUP_MEMBER = {{
   "address-group": "address", "port-group": "port",
-  "domain-group": "domain", "feed-group": "url",
+  "domain-group": "domain", "feed-group": "url", "user-group": "user",
 }};
 
 async function refreshGroups() {{
