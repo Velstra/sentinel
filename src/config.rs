@@ -4114,6 +4114,11 @@ pub struct Groups {
     /// so a rule never has to know which kind of group it names.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub domain: BTreeMap<String, Vec<String>>,
+    /// User groups: name → VPN usernames, resolved at apply time to whatever
+    /// addresses those people currently hold and folded into
+    /// [`Groups::address`]. A rule naming one says *who*, not where.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub user: BTreeMap<String, Vec<String>>,
     /// Feed groups: name → HTTPS URLs of published address lists, fetched and
     /// folded into [`Groups::address`] at apply time exactly like a domain
     /// group. The lists worth having — bogons, exit nodes, a provider's own
@@ -4130,6 +4135,7 @@ impl Groups {
             && self.port.is_empty()
             && self.domain.is_empty()
             && self.feed.is_empty()
+            && self.user.is_empty()
     }
 
     /// Whether `name` is a declared address, domain **or** feed group — all
@@ -4139,6 +4145,7 @@ impl Groups {
         self.address.contains_key(name)
             || self.domain.contains_key(name)
             || self.feed.contains_key(name)
+            || self.user.contains_key(name)
     }
 }
 

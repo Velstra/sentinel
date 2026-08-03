@@ -578,6 +578,34 @@ pub fn curl_get(url: &str, token: &str, timeout_secs: u32) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Ask the road-warrior VPN something, as JSON.
+///
+/// `occtl` talks to ocserv over a root-owned control socket, so this runs
+/// privileged like the other operational queries. An error means the VPN could
+/// not be asked — which the caller must not confuse with "nobody is connected".
+pub fn occtl_json(args: &[&str]) -> Result<String> {
+    let mut all = vec!["--json"];
+    all.extend_from_slice(args);
+    let is_root = unsafe { libc::geteuid() } == 0;
+    let occtl = bin("occtl");
+    let output = if is_root {
+        Command::new(&occtl).args(&all).output()
+    } else {
+        // `-n`: never prompt. This runs on every commit that has a user group,
+        // and a password prompt there would hang the commit on a box where the
+        // operator is not sitting at the terminal — including the API's. If the
+        // VPN cannot be asked without a password, it cannot be asked.
+        let mut sudoed = vec!["-n", occtl.as_str()];
+        sudoed.extend_from_slice(&all);
+        Command::new("sudo").args(&sudoed).output()
+    };
+    let out = output.context("running occtl")?;
+    if !out.status.success() {
+        bail!("occtl did not answer");
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// Bind to a directory as `dn`, with the password read from `secret_file`.
 ///
 /// Returns the process's exit status for the caller to read as an answer — 0 is
@@ -751,6 +779,7 @@ pub fn bin(name: &str) -> String {
     let var = match name {
         "hostname" => "SENTINEL_HOSTNAME_BIN",
         "ldapwhoami" => "SENTINEL_LDAPWHOAMI_BIN",
+        "occtl" => "SENTINEL_OCCTL_BIN",
         "ip" => "SENTINEL_IP_BIN",
         "networkctl" => "SENTINEL_NETWORKCTL_BIN",
         "systemctl" => "SENTINEL_SYSTEMCTL_BIN",
