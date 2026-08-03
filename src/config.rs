@@ -8614,11 +8614,19 @@ impl Appliance {
                     ));
                     continue;
                 }
-                let addressed = self.interfaces.iter().any(|i| {
-                    !i.disabled
-                        && i.zone.as_deref() == Some(to.as_str())
-                        && i.address.as_deref().is_some_and(|a| a.contains('/'))
-                });
+                // A **local** zone has no interfaces of its own — it *is* this box
+                // — so looking for an addressed interface in it always fails.
+                // The compiler already knows better: `to <local zone>` compiles
+                // to a destination match on the addresses this box holds. Without
+                // this the warning fired for every such rule, which on a real
+                // configuration meant a hundred false ones burying the true ones.
+                let local = self.zones.get(to.as_str()).is_some_and(|z| z.local);
+                let addressed = local
+                    || self.interfaces.iter().any(|i| {
+                        !i.disabled
+                            && i.zone.as_deref() == Some(to.as_str())
+                            && i.address.as_deref().is_some_and(|a| a.contains('/'))
+                    });
                 if !addressed {
                     out.push(format!(
                         "rule {:?}: `to {to}` cannot be enforced — zone {to:?} has no \
@@ -9889,6 +9897,55 @@ fn proto_str(p: Proto) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    /// A local zone has no interfaces of its own — it *is* the box — so a check
+    /// for "an addressed interface in that zone" can never pass for one. The
+    /// compiler already knows better and matches this box's own addresses, so
+    /// the warning was telling operators a rule was unenforceable while it was
+    /// being enforced. On a real configuration it fired eighty-nine times and
+    /// buried the sixty-two that were true.
+    #[test]
+    fn a_rule_toward_the_local_zone_is_not_reported_as_unenforceable() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "eth0"
+zone = "lan"
+address = "10.0.0.1/24"
+[[interface]]
+name = "eth1"
+zone = "wan"
+[zone.firewall]
+local = true
+[zone.wan]
+default_action = "drop"
+[[rule]]
+name = "ssh-in"
+from = "lan"
+to = "firewall"
+action = "accept"
+proto = "tcp"
+port = 22
+"#;
+        let a = Appliance::from_toml(toml).expect("parses");
+        let warnings = a.warnings();
+        assert!(
+            !warnings.iter().any(|w| w.contains("cannot be enforced")),
+            "a rule toward the local zone was called unenforceable: {warnings:?}"
+        );
+
+        // …and the check still works where it should: a zone with interfaces but
+        // no static address genuinely has no subnet to match.
+        let toml = toml.replace("to = \"firewall\"", "to = \"wan\"");
+        let a = Appliance::from_toml(&toml).expect("parses");
+        assert!(
+            a.warnings()
+                .iter()
+                .any(|w| w.contains("cannot be enforced")),
+            "an unaddressed destination zone stopped warning"
+        );
+    }
     use super::*;
 
     #[test]
