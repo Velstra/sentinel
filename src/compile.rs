@@ -35,10 +35,14 @@ pub struct VelstraConfig {
     #[serde(skip_serializing_if = "is_disabled")]
     source_validation: &'static str,
     /// Host-wide: drop a packet the data plane cannot parse rather than pass it.
-    /// Not a per-policy field — the parse fails before any policy is known — so it
-    /// is emitted once, at the top level. Omitted when off, which is velstra's own
-    /// default, so the emitted config stays free of noise.
-    #[serde(skip_serializing_if = "is_false")]
+    /// Not a per-policy field — the parse fails before any policy is known — so
+    /// it is emitted once, at the top level.
+    ///
+    /// **Always emitted, in both states.** It used to be omitted when off, on
+    /// the reasoning that the data plane's own default was the same — which
+    /// meant two defaults had to agree, in two repositories, for a
+    /// security-relevant decision. Stating it every time leaves one place the
+    /// answer comes from.
     fail_closed: bool,
     // Inline array of strings — still a scalar for TOML ordering, so it must
     // precede the `[[policy]]`/`[[interface]]` tables below.
@@ -2270,12 +2274,20 @@ zone = "lan"
             Appliance::from_toml(&toml).unwrap()
         };
 
-        // Off (the default): the field is absent from the emitted config, so
-        // velstra applies its own fail-open default.
+        // On by default now: this appliance denies by default, and a packet the
+        // filter cannot parse is exactly the one that posture must not admit.
         let cfg = compile(&appliance(""));
+        assert!(cfg.fail_closed);
+        let out = cfg.to_toml().unwrap();
+        assert!(out.contains("fail_closed = true"), "{out}");
+
+        // Turned off explicitly: emitted as `false` rather than omitted. The
+        // data plane has a default of its own, and letting two defaults in two
+        // repositories agree on a security decision is how they stop agreeing.
+        let cfg = compile(&appliance("fail_closed = false"));
         assert!(!cfg.fail_closed);
         let out = cfg.to_toml().unwrap();
-        assert!(!out.contains("fail_closed"), "{out}");
+        assert!(out.contains("fail_closed = false"), "{out}");
 
         // On: emitted as a top-level scalar velstra reads into its FAIL_CLOSED map.
         let cfg = compile(&appliance("fail_closed = true"));
