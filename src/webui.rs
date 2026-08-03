@@ -5076,6 +5076,9 @@ const SYS_IDENT = [
   // thing that is broken.
   ["console device", "Serial console"], ["console speed", "Console speed"],
   ["commit-revisions", "Revisions kept"],
+  // The History view tells an operator to turn this on here, so it has to be
+  // here. It was not: the console could read the history and not start it.
+  ["metrics enable", "Keep a history", ["", "true", "false"]],
 ];
 const SYS_UPDATE = [["url", "Channel URL"], ["public-key", "Signing key"]];
 
@@ -6520,6 +6523,7 @@ mod tests {
             "protocols multicast",
             "protocols multicast interface ",
             "protocols vrf ",
+            "metrics enable",
             "router-advert",
             "static-mapping ",
         ] {
