@@ -55,7 +55,14 @@ impl Apply {
 /// should exit (`exit`/`quit`). Errors are printed, not propagated, so the shell
 /// keeps running.
 pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line: &str) -> bool {
-    let args: Vec<&str> = line.split_whitespace().collect();
+    // A `#` that *starts a word* begins a comment; one inside a word does not.
+    // The shell's rule, and the reason for it: a password may contain `#` and
+    // must survive, while a pasted block of documented commands — or a saved
+    // `.cli` file with a header — must not fail on its own explanation.
+    let args: Vec<&str> = line
+        .split_whitespace()
+        .take_while(|w| !w.starts_with('#'))
+        .collect();
     let Some((&cmd, rest)) = args.split_first() else {
         return false; // blank line
     };
@@ -3916,6 +3923,31 @@ mod tests {
         // what a protected port can be told has to be discoverable.
         assert_eq!(kw(&["set", "firewall", "syn-protect", "443"]), ["mss"]);
         assert_eq!(kw(&["delete", "firewall", "syn-protect", "443"]), ["mss"]);
+    }
+
+    #[test]
+    fn a_comment_ends_a_line_but_a_hash_inside_a_word_does_not() {
+        // The shell's rule, and the reason for it: the documentation and the
+        // saved `.cli` files both carry `#` explanations, and a block pasted
+        // from either must not fail on its own header — while a password
+        // containing `#` has to survive intact.
+        fn strip(line: &str) -> Vec<&str> {
+            line.split_whitespace()
+                .take_while(|w| !w.starts_with('#'))
+                .collect()
+        }
+        assert_eq!(strip("# a whole-line comment"), Vec::<&str>::new());
+        assert_eq!(strip("   # indented too"), Vec::<&str>::new());
+        assert_eq!(
+            strip("set system hostname fw   # the rack label"),
+            ["set", "system", "hostname", "fw"]
+        );
+        // A `#` inside a word is part of the word.
+        assert_eq!(
+            strip("set system login bob password corr#ect"),
+            ["set", "system", "login", "bob", "password", "corr#ect"]
+        );
+        assert_eq!(strip(""), Vec::<&str>::new());
     }
 
     #[test]

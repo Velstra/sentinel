@@ -123,7 +123,10 @@ from outside; if no zone admits `tcp/80`, the commit says so and `show pki`
 repeats it, rather than letting the failure surface in a timer weeks later:
 
 ```text
-set firewall rule acme-challenge from wan action accept proto tcp port 80
+set firewall rule acme-challenge from wan
+set firewall rule acme-challenge action accept
+set firewall rule acme-challenge proto tcp
+set firewall rule acme-challenge port 80
 ```
 
 **Refused at commit**, because each would otherwise fail hours later inside a
