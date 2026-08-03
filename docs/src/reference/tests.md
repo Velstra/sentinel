@@ -1,6 +1,7 @@
 # Test suite (nixosTests)
 
-Sentinel is verified by **76 nixosTests** plus the Rust unit tests. The nixosTests
+Sentinel is verified by **78 nixosTests**, **432 Rust unit tests** and a
+**browser suite** that drives the web console against a running appliance. The nixosTests
 boot real QEMU/OVMF VMs — several of them two or three at a time on shared virtual
 segments — so they need `/dev/kvm`.
 
@@ -11,6 +12,20 @@ nix build .#checks.x86_64-linux.<name> -L         # run one
 
 The tables below group them by what they exercise; `nix flake show` is the
 authoritative list.
+
+The unit tests need nothing but a checkout:
+
+```shell
+cargo test                                        # 432 of them
+tests/console/run.sh                              # the browser suite
+```
+
+The browser suite is dependency-free — it drives Chromium over CDP using node's
+own WebSocket — and every test in it exists because the thing it checks was once
+broken in a way that looked fine: the page loaded, the layout was right, and the
+button did nothing. `tests/console/coverage.mjs` is the companion tool: it
+instruments the page and asks it which configuration paths it can actually
+write, which is how ten sections that could be typed and not clicked were found.
 
 ## Image & boot integrity
 
