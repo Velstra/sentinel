@@ -3995,13 +3995,19 @@ pub struct Firewall {
     /// Log matched traffic by default (zones inherit this). Off by default.
     #[serde(default)]
     pub log: bool,
-    /// Drop a packet the data plane cannot parse, instead of passing it. Off by
-    /// default — a firewall should not black-hole traffic because of its own
-    /// parsing limits. Turn it on for a strict deny-by-default posture, where a
-    /// packet the filter cannot understand is exactly the one it must not admit.
-    /// Applies to the whole box, not per zone: the parse fails before any zone is
-    /// known.
-    #[serde(default)]
+    /// Drop a packet the data plane cannot parse, instead of passing it.
+    ///
+    /// **On by default**, because this appliance denies by default and the two
+    /// have to agree: a packet the filter cannot understand is exactly the one a
+    /// deny-by-default posture must not admit. It used to be off, on the
+    /// reasoning that a firewall should not black-hole traffic because of its
+    /// own parsing limits — which is a real argument, and the reason this is a
+    /// switch rather than a constant. Turn it off if you would rather an
+    /// encapsulation the parser does not know be passed than dropped.
+    ///
+    /// Applies to the whole box, not per zone: the parse fails before any zone
+    /// is known.
+    #[serde(default = "default_true")]
     pub fail_closed: bool,
     /// ISO country codes whose addresses are dropped on every firewalled
     /// interface — the global list every zone inherits (roadmap C15 GeoIP).
@@ -4067,8 +4073,8 @@ impl Default for Firewall {
             block_icmp: false,
             blocklist: Vec::new(),
             default_action: Action::Drop,
+            fail_closed: true,
             log: false,
-            fail_closed: false,
             source_validation: SourceValidation::Disable,
             geoip_block: Vec::new(),
             group: Groups::default(),
@@ -4086,7 +4092,7 @@ impl Firewall {
             && self.blocklist.is_empty()
             && self.default_action == Action::Drop
             && !self.log
-            && !self.fail_closed
+            && self.fail_closed
             && self.source_validation == SourceValidation::Disable
             && self.geoip_block.is_empty()
             && self.group.is_empty()
