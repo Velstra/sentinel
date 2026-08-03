@@ -8621,11 +8621,16 @@ impl Appliance {
                 // this the warning fired for every such rule, which on a real
                 // configuration meant a hundred false ones burying the true ones.
                 let local = self.zones.get(to.as_str()).is_some_and(|z| z.local);
+                // Either family. The compiler binds `to <zone>` on the zone's v4
+                // *and* v6 subnets, so asking only about IPv4 called a rule
+                // unenforceable on every v6-only segment — which on a dual-stacked
+                // network is most of them.
                 let addressed = local
                     || self.interfaces.iter().any(|i| {
                         !i.disabled
                             && i.zone.as_deref() == Some(to.as_str())
-                            && i.address.as_deref().is_some_and(|a| a.contains('/'))
+                            && (i.address.as_deref().is_some_and(|a| a.contains('/'))
+                                || i.address6.as_deref().is_some_and(|a| a.contains('/')))
                     });
                 if !addressed {
                     out.push(format!(

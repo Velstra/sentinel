@@ -391,19 +391,62 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
     // names, so the destination zone has to be spelled as the prefixes it holds.
     // A `dhcp` or address-less interface contributes nothing — `warnings()` tells
     // the operator when that leaves a `to` unenforceable.
+    // The network an address sits in, as a CIDR string — the form the data plane
+    // matches on. Both families: a rule's destination carries its own family, and
+    // the data plane routes it to the v4 or v6 trie accordingly.
+    let network_of = |cidr: &str| -> Option<String> {
+        let (addr, prefix) = cidr.split_once('/')?;
+        let bits: u32 = prefix.parse().ok()?;
+        if let Ok(ip) = addr.parse::<std::net::Ipv4Addr>() {
+            if bits > 32 {
+                return None;
+            }
+            let mask = if bits == 0 {
+                0
+            } else {
+                u32::MAX << (32 - bits)
+            };
+            return Some(format!(
+                "{}/{bits}",
+                std::net::Ipv4Addr::from(u32::from(ip) & mask)
+            ));
+        }
+        let ip: std::net::Ipv6Addr = addr.parse().ok()?;
+        if bits > 128 {
+            return None;
+        }
+        let mask = if bits == 0 {
+            0
+        } else {
+            u128::MAX << (128 - bits)
+        };
+        Some(format!(
+            "{}/{bits}",
+            std::net::Ipv6Addr::from(u128::from(ip) & mask)
+        ))
+    };
+
     let zone_subnets = |zone: &str| -> Vec<String> {
         // The appliance itself is a set of addresses, not a set of links: `to
         // <local zone>` means "terminating here", so it compiles to this box's
-        // own addresses as host routes.
+        // own addresses as host routes — in both families, or a dual-stacked box
+        // could only bind rules toward half of itself.
         if appliance.zones.get(zone).is_some_and(|z| z.local) {
             return appliance
                 .interfaces
                 .iter()
                 .filter(|i| !i.disabled)
-                .filter_map(|i| {
-                    let (addr, _) = i.address.as_deref()?.split_once('/')?;
-                    addr.parse::<std::net::Ipv4Addr>().ok()?;
-                    Some(format!("{addr}/32"))
+                .flat_map(|i| [i.address.as_deref(), i.address6.as_deref()])
+                .flatten()
+                .filter_map(|cidr| {
+                    let (addr, _) = cidr.split_once('/')?;
+                    if addr.parse::<std::net::Ipv4Addr>().is_ok() {
+                        Some(format!("{addr}/32"))
+                    } else if addr.parse::<std::net::Ipv6Addr>().is_ok() {
+                        Some(format!("{addr}/128"))
+                    } else {
+                        None
+                    }
                 })
                 .collect();
         }
@@ -411,21 +454,9 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
             .interfaces
             .iter()
             .filter(|i| !i.disabled && i.zone.as_deref() == Some(zone))
-            .filter_map(|i| {
-                let (addr, prefix) = i.address.as_deref()?.split_once('/')?;
-                let ip: std::net::Ipv4Addr = addr.parse().ok()?;
-                let bits: u32 = prefix.parse().ok()?;
-                if bits > 32 {
-                    return None;
-                }
-                let mask = if bits == 0 {
-                    0
-                } else {
-                    u32::MAX << (32 - bits)
-                };
-                let net = std::net::Ipv4Addr::from(u32::from(ip) & mask);
-                Some(format!("{net}/{bits}"))
-            })
+            .flat_map(|i| [i.address.as_deref(), i.address6.as_deref()])
+            .flatten()
+            .filter_map(network_of)
             .collect()
     };
 
@@ -1063,6 +1094,86 @@ proto = "icmp"
         assert_eq!(rule.port, 0, "an ICMP rule is keyed on port 0");
         // `accept` is `pass` on the wire — the data plane's own word for it.
         assert_eq!(rule.action, "pass");
+    }
+
+    /// `to <zone>` binds on the zone's subnets — in **both** families. It used
+    /// to collect only IPv4, so on a v6-only segment the destination silently
+    /// widened to every zone: the rule still passed traffic, just far more of it
+    /// than it said. On the translated production configuration this was 31
+    /// rules, and 1392 destination constraints that were never programmed.
+    #[test]
+    fn a_destination_zone_binds_on_both_families() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "eth0"
+zone = "lan"
+address = "10.0.0.1/24"
+address6 = "2001:db8:1::1/64"
+[[interface]]
+name = "eth1"
+zone = "wan"
+[zone.wan]
+default_action = "drop"
+[[rule]]
+name = "web-in"
+from = "wan"
+to = "lan"
+action = "accept"
+proto = "tcp"
+port = 443
+"#;
+        let appliance = Appliance::from_toml(toml).expect("parses");
+        let cfg = compile(&appliance);
+        let dsts: Vec<&str> = cfg
+            .policies
+            .iter()
+            .flat_map(|p| p.port_rules.iter())
+            .filter_map(|r| r.dst.as_deref())
+            .collect();
+        assert!(
+            dsts.contains(&"10.0.0.0/24"),
+            "the v4 subnet is missing: {dsts:?}"
+        );
+        assert!(
+            dsts.contains(&"2001:db8:1::/64"),
+            "the v6 subnet is missing, so the rule widens to every zone: {dsts:?}"
+        );
+    }
+
+    /// The local zone is the box, in both families too — otherwise a dual-stacked
+    /// appliance could only bind rules toward half of itself.
+    #[test]
+    fn the_local_zone_is_this_box_in_both_families() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "eth0"
+zone = "lan"
+address = "10.0.0.1/24"
+address6 = "2001:db8:1::1/64"
+[zone.firewall]
+local = true
+[[rule]]
+name = "ssh-in"
+from = "lan"
+to = "firewall"
+action = "accept"
+proto = "tcp"
+port = 22
+"#;
+        let appliance = Appliance::from_toml(toml).expect("parses");
+        let cfg = compile(&appliance);
+        let dsts: Vec<&str> = cfg
+            .policies
+            .iter()
+            .flat_map(|p| p.port_rules.iter())
+            .filter_map(|r| r.dst.as_deref())
+            .collect();
+        assert!(dsts.contains(&"10.0.0.1/32"), "{dsts:?}");
+        assert!(dsts.contains(&"2001:db8:1::1/128"), "{dsts:?}");
     }
 
     /// `tcp_udp` is one rule to an operator and two to the data plane, which
