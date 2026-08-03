@@ -82,19 +82,23 @@ pub fn with_resolved(appliance: &Appliance) -> Appliance {
 /// The IPv4 addresses a name resolves to. Port 0 is a placeholder — the resolver
 /// wants a socket address and only the IP is kept.
 ///
-/// IPv6 answers are dropped: the rule tries match IPv4 only, so a v6 address would
-/// be programmed as a nonsense v4 prefix rather than simply not matching.
+/// **Both families.** IPv6 answers used to be dropped, because the rule tries
+/// matched IPv4 only — they no longer do. Keeping only the A records made a
+/// domain group half a group: the usual job of one is to *block* something, and
+/// a name that also has AAAA records was reachable over IPv6 the whole time,
+/// silently, which is the worst way for a block to be incomplete.
 fn resolve_one(domain: &str) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for addr in (domain, 0u16)
         .to_socket_addrs()
         .with_context(|| format!("resolving {domain}"))?
     {
-        if let std::net::IpAddr::V4(v4) = addr.ip() {
-            let cidr = format!("{v4}/32");
-            if !out.contains(&cidr) {
-                out.push(cidr);
-            }
+        let cidr = match addr.ip() {
+            std::net::IpAddr::V4(v4) => format!("{v4}/32"),
+            std::net::IpAddr::V6(v6) => format!("{v6}/128"),
+        };
+        if !out.contains(&cidr) {
+            out.push(cidr);
         }
     }
     Ok(out)
@@ -158,18 +162,22 @@ loop = ["localhost.localdomain"]
         );
     }
 
-    /// Only IPv4 is kept, and as a /32 — the rule tries are v4-only, and a bare
-    /// address would not parse where the compiler expects a host or CIDR.
+    /// Every answer is kept, as a host prefix in its own family. A bare address
+    /// would not parse where the compiler expects a host or CIDR, and dropping
+    /// the AAAA records — which this used to do — left a blocking group that did
+    /// not block over IPv6.
     #[test]
-    fn resolution_yields_v4_host_prefixes() {
-        for cidr in resolve_one("localhost").unwrap_or_default() {
-            assert!(cidr.ends_with("/32"), "{cidr} is not a host prefix");
-            assert!(
-                cidr.trim_end_matches("/32")
-                    .parse::<std::net::Ipv4Addr>()
-                    .is_ok(),
-                "{cidr} is not IPv4"
-            );
+    fn resolution_yields_host_prefixes_in_both_families() {
+        let answers = resolve_one("localhost").unwrap_or_default();
+        for cidr in &answers {
+            let (addr, len) = cidr.split_once('/').expect("a host prefix");
+            match addr.parse::<std::net::IpAddr>() {
+                Ok(std::net::IpAddr::V4(_)) => assert_eq!(len, "32", "{cidr}"),
+                Ok(std::net::IpAddr::V6(_)) => assert_eq!(len, "128", "{cidr}"),
+                Err(e) => panic!("{cidr} is not an address: {e}"),
+            }
         }
+        // localhost resolves to at least one of the two on every sane box.
+        assert!(!answers.is_empty(), "localhost resolved to nothing");
     }
 }
