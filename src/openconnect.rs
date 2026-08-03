@@ -131,7 +131,12 @@ fn ocserv_conf_body(oc: &OpenConnectServer) -> String {
     s.push_str("deny-roaming = false\n");
     s.push_str("rekey-time = 172800\n");
     s.push_str("rekey-method = ssl\n");
-    s.push_str("use-occtl = false\n");
+    // The control socket is what lets the appliance ask who is connected — for
+    // `show vpn users` and for the user groups a firewall rule can name. It is
+    // root-owned in /run, so enabling it widens nothing that root could not
+    // already do; leaving it off simply made occtl (which the image ships)
+    // useless.
+    s.push_str("use-occtl = true\n");
     s.push_str("pid-file = /run/sentinel/ocserv/ocserv.pid\n");
     s.push_str("device = vpn0\n");
     s.push_str("predictable-ips = true\n");

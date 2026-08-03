@@ -21,6 +21,7 @@ mod confirm;
 mod diff;
 mod domain;
 mod feed;
+mod identity;
 mod ids;
 mod install;
 mod ipsec;
@@ -654,7 +655,9 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
 fn apply(file: &std::path::Path, out: &std::path::Path, reload: Option<&str>) -> Result<()> {
     // Resolve domain groups before compiling: the compiler only knows addresses,
     // and this is also the periodic refresh — the timer re-runs exactly this.
-    let appliance = feed::with_fetched(&domain::with_resolved(&Appliance::load(file)?));
+    let appliance = identity::with_resolved(&feed::with_fetched(&domain::with_resolved(
+        &Appliance::load(file)?,
+    )));
     let rendered = compile::compile(&appliance).to_toml()?;
 
     if let Some(parent) = out.parent() {
@@ -690,7 +693,9 @@ fn apply_boot(
     out: &std::path::Path,
     wren_out: &std::path::Path,
 ) -> Result<()> {
-    let appliance = feed::with_fetched(&domain::with_resolved(&Appliance::load(config)?));
+    let appliance = identity::with_resolved(&feed::with_fetched(&domain::with_resolved(
+        &Appliance::load(config)?,
+    )));
 
     // Compile BOTH configs before writing either, so a compile error can't leave
     // a half-seeded system (velstra written, wren missing). Rendering is pure and
@@ -978,6 +983,23 @@ fn show_rule_hits() -> Result<()> {
     Ok(())
 }
 
+/// `show vpn users` — who is connected, and the addresses a user group resolves
+/// them to.
+fn show_vpn_users() -> Result<()> {
+    let live = crate::identity::connected();
+    if live.is_empty() {
+        println!("nobody is connected (or the VPN could not be asked)");
+        return Ok(());
+    }
+    for (user, addrs) in &live {
+        println!(
+            "{user:<24} {}",
+            addrs.iter().cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
+    Ok(())
+}
+
 /// `show history` — which series are being kept, and how far back.
 fn show_history_list() -> Result<()> {
     let root = crate::metrics::dir();
@@ -1227,6 +1249,11 @@ fn show_op(args: &[String]) -> Result<()> {
             print!("{}", system::swanctl_show(&["--list-sas"])?);
             Ok(())
         }
+        // Who is on the road-warrior VPN, and on which address. This is the
+        // appliance's only source of identity — the captive portal admits by
+        // MAC and never learns a name — so it is also what a `user-group`
+        // firewall rule resolves against.
+        ["vpn", "users"] => show_vpn_users(),
         ["vpn", "ipsec", "connections" | "conns"] | ["vpn", "connections" | "conns"] => {
             print!("{}", system::swanctl_show(&["--list-conns"])?);
             Ok(())

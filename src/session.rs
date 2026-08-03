@@ -3344,6 +3344,15 @@ impl Session {
                     .or_default();
                 append_csv(list, v);
             }
+            ["firewall", "group", "user-group", name, "user", v] => {
+                let list = self
+                    .draft
+                    .groups
+                    .user
+                    .entry((*name).to_string())
+                    .or_default();
+                append_csv(list, v);
+            }
             ["firewall", "group", "feed-group", name, "url", v] => {
                 for one in v.split(',').map(str::trim).filter(|x| !x.is_empty()) {
                     if !one.starts_with("https://") {

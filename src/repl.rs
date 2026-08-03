@@ -546,7 +546,9 @@ pub(crate) fn apply_live(appliance: &crate::config::Appliance, act: &Apply) -> R
     // Domain groups become address groups here: the compiler matches addresses and
     // knows nothing about names. Resolution never fails the commit — a name that
     // will not resolve falls back to its cached answer.
-    let appliance = &crate::feed::with_fetched(&crate::domain::with_resolved(appliance));
+    let appliance = &crate::identity::with_resolved(&crate::feed::with_fetched(
+        &crate::domain::with_resolved(appliance),
+    ));
     let rendered = compile::compile(appliance)
         .to_toml()
         .context("compiling firewall config")?;
@@ -942,7 +944,10 @@ const OP_SHOW_TOP: &[Cand] = &[
         "captive portal: what holds the guest zone, and who is on",
     ),
     ("load-balancer", "load-balanced services + their pools"),
-    ("vpn", "IPsec VPN: security associations / connections"),
+    (
+        "vpn",
+        "VPN: security associations / connections / users (who is connected)",
+    ),
     ("pki", "local CAs + issued certificates (expiry)"),
     ("configuration", "the saved configuration (config syntax)"),
     ("arp", "the ARP / neighbour table"),
@@ -2081,6 +2086,10 @@ const GROUP_NODES: &[Cand] = &[
         "a reusable set of ports/ranges (rule port-group)",
     ),
     (
+        "user-group",
+        "VPN users, resolved to the addresses they hold (rule source/destination-group)",
+    ),
+    (
         "feed-group",
         "a published address list, fetched over https (rule source/destination-group)",
     ),
@@ -2097,6 +2106,7 @@ const PORT_GROUP_FIELDS: &[Cand] = &[(
     "port",
     "members: ports/ranges, comma-separated (replaces the set)",
 )];
+const USER_GROUP_FIELDS: &[Cand] = &[("user", "a VPN username (repeatable, comma-separated)")];
 const FEED_GROUP_FIELDS: &[Cand] = &[(
     "url",
     "an https URL publishing the list (repeatable, comma-separated)",
@@ -2861,6 +2871,7 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "firewall", "group", "port-group", _name] => PORT_GROUP_FIELDS,
         ["set" | "delete", "firewall", "group", "domain-group", _name] => DOMAIN_GROUP_FIELDS,
         ["set" | "delete", "firewall", "group", "feed-group", _name] => FEED_GROUP_FIELDS,
+        ["set" | "delete", "firewall", "group", "user-group", _name] => USER_GROUP_FIELDS,
         ["set" | "delete", "firewall", "global"] => GLOBAL_FIELDS,
         [
             "set",
@@ -4091,7 +4102,13 @@ mod tests {
         // The group sub-tree: alias kinds and their member fields.
         assert_eq!(
             kw(&["set", "firewall", "group"]),
-            ["address-group", "port-group", "feed-group", "domain-group"]
+            [
+                "address-group",
+                "port-group",
+                "user-group",
+                "feed-group",
+                "domain-group"
+            ]
         );
         assert_eq!(
             kw(&["set", "firewall", "group", "address-group", "mgmt"]),

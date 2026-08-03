@@ -71,6 +71,7 @@
             --set SENTINEL_TC_BIN         ${pkgs.iproute2}/bin/tc \
             --set SENTINEL_ETHTOOL_BIN    ${pkgs.ethtool}/bin/ethtool \
             --set SENTINEL_LDAPWHOAMI_BIN ${pkgs.openldap}/bin/ldapwhoami \
+            --set SENTINEL_OCCTL_BIN      ${pkgs.ocserv}/bin/occtl \
             --set SENTINEL_NETWORKCTL_BIN ${pkgs.systemd}/bin/networkctl \
             --set SENTINEL_SYSTEMCTL_BIN  ${pkgs.systemd}/bin/systemctl \
             --set SENTINEL_NFT_BIN        ${pkgs.nftables}/bin/nft \
