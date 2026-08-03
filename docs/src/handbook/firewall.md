@@ -15,7 +15,7 @@ overrides them for one zone.
 | Field (`global` / `zone <name>`) | Meaning |
 |---|---|
 | `default-action` | Default ingress action: `accept` / `drop` / `reject`. |
-| `stateful` | Track flows so return traffic is allowed (`true`/`false`). |
+| `stateful` | Track flows so return traffic is allowed (`true`/`false`). **IPv4 only — see below.** |
 | `block-icmp` | Drop inbound ICMP by default (`true`/`false`). |
 | `log` | Log matched traffic by default (`true`/`false`). |
 | `source-validation` | Reject spoofed source addresses: `disable` / `loose` / `strict`. |
@@ -632,22 +632,49 @@ yesterday.
 ## A packet the filter cannot parse
 
 ```text
-set firewall global fail-closed true
+set firewall global fail-closed false      # to turn it off
 ```
 
-Off by default. It governs one narrow thing: what happens to a packet the data
-plane **cannot parse at all** — a bounds failure while reading headers, decided
-before any zone is known, so it escapes the zone posture entirely.
+**On by default.** It governs one narrow thing: what happens to a packet the
+data plane **cannot parse at all** — a bounds failure while reading headers,
+decided before any zone is known, so it escapes the zone posture entirely.
 
-Fail-open passes it, on the reasoning that a firewall should not black-hole
-traffic because of its own parsing limits: an encapsulation the parser does not
-know is the packet's problem to explain, not a reason to drop it.
+This appliance denies by default, and the two have to agree: a packet the filter
+cannot understand is exactly the one that posture must not admit.
 
-**Be aware of the tension.** This appliance's own default posture is deny by
-default, and fail-open is the opposite instinct. A packet the filter cannot
-understand is, under that posture, exactly the one it should not admit. The two
-defaults disagree, deliberately and historically — if your reading of a firewall
-is that anything unexplained is denied, turn this on.
+The argument for the other side is real, which is why this is a switch rather
+than a constant — a firewall should arguably not black-hole traffic because of
+its own parsing limits, and an encapsulation the parser does not know is the
+packet's problem to explain. Turn it off if you would rather such a packet be
+passed than dropped.
 
 It is host-wide, not per zone, because the parse fails before there is a zone to
-attribute it to.
+attribute it to. The value is written into the data plane's configuration in
+**both** states, so the answer comes from here rather than from a default at the
+other end agreeing with this one.
+
+
+## Stateful tracking is IPv4 only
+
+`stateful` reads as a property of the firewall. It is a property of the **IPv4**
+firewall: the data plane's flow table is keyed on four-byte addresses, and the
+IPv6 path does not consult it.
+
+What that means in practice, on a dual-stacked box:
+
+| | IPv4 | IPv6 |
+|---|---|---|
+| Outbound connection | recorded as a flow | not recorded |
+| Its reply, inbound | admitted by the flow | judged by the rules alone |
+
+So under a zone that denies by default, a reply to an **outbound IPv6**
+connection needs a rule that admits it. The identical connection over IPv4 is
+admitted by its flow record, with no rule at all. Nothing in the configuration
+says which of the two you are looking at, which is why it is written here.
+
+Outbound IPv6 itself is not filtered: the egress hook applies NPTv6 where it is
+configured and otherwise passes the packet. So nothing is silently dropped on
+the way out — the asymmetry is entirely about what comes back.
+
+Closing it means an IPv6 flow table in the data plane, on a code path that is
+already close to what the eBPF verifier will accept. Until then, write the rule.
