@@ -22,6 +22,7 @@ of SSH public keys and an optional pre-hashed login password.
 |---|---|
 | `set system login <user> ssh-key <openssh-key>` | An OpenSSH public key allowed to log in as this user (repeatable). |
 | `set system login <user> hashed-password <hash>` | A crypt(3) hash (`$6$…`) for console + sudo — never a plaintext password. |
+| `set system login <user> totp <base32-secret>` | A one-time-code secret. The account then needs a code as well as a password. |
 
 The password is for the console and `sudo`; **SSH stays key-only** unless you
 also enable password auth on the daemon (below). Generate a hash off-box:
@@ -121,3 +122,165 @@ enough to enable both directions.
 > put the sync on its own zone. Together **VRRP + config-sync + conntrack-sync**
 > make a complete stateful active/standby (or active/active-capable) HA cluster;
 > see the [HA pair example](examples.md#ha-pair).
+
+
+## A second factor
+
+An account with a `totp` secret must give a six-digit code as well as its
+password. RFC 6238, thirty-second steps, one step of tolerance either side so a
+code typed as it rolls over still works.
+
+```text
+set system login alice totp generate
+```
+
+`generate` makes the secret, prints the `otpauth://` URI a QR code encodes, and
+prints **the code that is current right now**. Check the phone agrees before you
+walk away: somebody who enrolled the wrong account finds out here rather than at
+the next sign-in, locked out.
+
+The code is checked **after** the password and never instead of it, so a wrong
+password and a wrong code are the same refusal from outside — there is nothing to
+probe.
+
+Two places it deliberately does not apply. The **serial console** has no second
+factor: it is the port you reach for when the network this box manages is the
+thing that is broken. **SSH** has none either — that belongs to sshd's own
+configuration, not here.
+
+## Where a password is checked
+
+`system aaa` says where a password is checked when it is not checked here. A
+local account list is a shadow account list: it has to be kept alongside the real
+one, and it is the one nobody remembers to remove somebody from.
+
+**The order is deliberate and not configurable: local first, then the servers in
+the order given.** A box whose directory is unreachable must still be enterable
+by the account written on it — and that is precisely the moment the directory is
+likely to be unreachable.
+
+### RADIUS
+
+| Field | Meaning |
+|---|---|
+| `secret` | The shared secret (required). |
+| `port` | Server port (default 1812). |
+| `timeout` | Seconds to wait (default 3). A login is a person waiting. |
+
+```text
+set system aaa radius 10.0.0.50 secret a-shared-secret
+set system aaa radius 10.0.0.50 timeout 2
+```
+
+PAP only. CHAP would hide the password from the wire but needs the server to
+hold it in plaintext, which is the worse trade. RFC 2865 hides the password with
+MD5 against the shared secret — **that is not encryption in any modern sense**,
+so a RADIUS server belongs on a segment you already trust.
+
+### LDAP
+
+A **simple bind as the user**, not search-then-bind: searching first needs a
+service account whose password would then live on the firewall.
+
+| Field | Meaning |
+|---|---|
+| `base-dn` | Where the accounts live (required). The bind DN is `<user-attribute>=<username>,<base-dn>`. |
+| `user-attribute` | The attribute naming an account (default `uid`; Active Directory usually wants `sAMAccountName`). |
+| `tls` | `ldaps` (default), `starttls`, or `none`. |
+| `port` | Default 636 for `ldaps`, else 389. |
+| `timeout` | Seconds to wait (default 5). |
+
+```text
+set system aaa ldap dir.example.com base-dn ou=people,dc=example,dc=com
+set system aaa ldap dir.example.com user-attribute sAMAccountName
+```
+
+`starttls` demands the upgrade and **fails rather than falling back** to
+plaintext — falling back would defeat asking for it. `none` is allowed, because
+a directory on a wire you already control is a real deployment, but `commit`
+says out loud that the bind password crosses in the clear.
+
+The username is escaped into the DN (RFC 4514). It lands inside
+`uid=<here>,ou=…`, so a name containing a comma would not be a name any more —
+it would be a different DN, chosen by whoever typed it.
+
+### Who gets in, and what they may do
+
+A directory account still needs a local `system login` entry naming its group —
+**unless** `default-group` is set:
+
+```text
+set system aaa default-group operators
+```
+
+Without that rule, configuring one server would hand management access to
+everybody in the directory.
+
+Three answers are told apart, and the difference matters. A server that
+**rejects** has answered, and no other server is asked. A server that cannot be
+**reached** has not answered, so the next is tried; if none answers at all, the
+sign-in fails with "no authentication server answered" rather than "wrong
+password". Treating an unreachable directory as a bad password locks everybody
+out at exactly the moment the network is already broken.
+
+## The serial console
+
+```text
+set system console device ttyS0
+set system console speed 115200
+```
+
+The port somebody reaches for when the network is the thing that is broken, so
+the baud rate is not cosmetic: it is the difference between a login prompt and a
+screen of noise.
+
+## How far back you can roll
+
+```text
+set system commit-revisions 100
+```
+
+How many past revisions the archive keeps. A policy, not a constant: a box
+changed twice a year wants a longer memory than one changed twice a day. Unset
+leaves the appliance default.
+
+## A history of the box itself
+
+```text
+set system metrics enable true
+```
+
+Live counters answer "what is happening". They cannot answer "was this
+happening at three in the morning last Tuesday", which is the question people
+actually arrive with.
+
+Off by default — a box with a small or read-mostly disk should not start writing
+to it because a graph might be nice. When it is on, a sampler runs once a minute
+and writes into a **ring per series**: the size on disk is decided when the file
+is created and never changes, so a history cannot fill a partition.
+
+Three resolutions, all fed from the same sampler run:
+
+| Resolution | Step | Span |
+|---|---|---|
+| `minute` | 60 s | a day |
+| `quarter` | 15 min | a month |
+| `day` | 24 h | two years |
+
+```text
+show history                          # what is kept, and how far back
+show history iface.eth0.rx            # the rates
+show history gauge.sessions day       # a coarser view
+```
+
+**Counters are stored raw and rates derived when read.** A counter that was
+reset — an interface that went away and came back, a reboot — reads lower than
+the one before it, and the honest answer is a *gap*, not the enormous spike that
+treating the wrap as a delta would draw. A hole the box was switched off for is
+not averaged across either.
+
+A `gauge.` series is a level rather than a total, so it comes back as it was
+stored: deriving a rate from the number of connections would draw the change in
+it, which nobody wants to look at.
+
+The console's **History** view draws these, and draws a gap as a gap.

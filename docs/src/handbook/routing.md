@@ -156,9 +156,126 @@ global timing defaults under `protocols bfd` (`min-tx`, `min-rx`,
   **`protocols import <proto> <route-map>`**.
 
 ```text
-set policy prefix-list LAN rule 10 prefix 10.0.0.0/8 le 24
+set policy prefix-list LAN rule 10 prefix 10.0.0.0/8
+set policy prefix-list LAN rule 10 le 24
 set policy route-map TO-PEER rule 10 action permit
 set policy route-map TO-PEER rule 10 match prefix-list LAN
 set policy route-map TO-PEER rule 20 action deny
 set protocols bgp neighbor 10.0.0.2 export TO-PEER
 ```
+
+
+## Routes that go nowhere
+
+```text
+set protocols static 203.0.113.0/24 blackhole true
+set protocols static 203.0.113.0/24 distance 254
+```
+
+A route with no next hop discards what it matches — the kernel's own blackhole
+type. Two uses: null-routing a prefix, and holding a BGP summary up so it is
+announced whether or not anything inside it is currently reachable.
+
+`distance` is the usual convention where **lower wins**. It is what makes a
+static route *float*: give it a distance worse than the protocol you expect to
+learn the prefix from, and it sits unused until that protocol stops offering it.
+
+A blackhole with a `via` is refused rather than one of them quietly winning.
+
+## Policy routing
+
+Ordinary routing asks one question: where is this going? These rules ask the
+others — where it came from, over which link, to which port — and send the answer
+to a different routing table.
+
+```text
+set policy route guests-out source 10.9.0.0/24
+set policy route guests-out table 100
+```
+
+| Field | Meaning |
+|---|---|
+| `table` | The table matching traffic consults (required). |
+| `source` / `destination` | Host or CIDR. |
+| `interface` | The interface it arrived on. |
+| `proto`, `source-port`, `destination-port` | `tcp` or `udp`, and its ports. |
+| `priority` | Where it sits among the others (lower is consulted first). |
+| `disabled` | Off without deleting it. |
+
+Rendered as kernel routing-policy rules. **The appliance owns the priority band
+10000–19999 and reconciles only that band**, so a rule somebody else put in the
+table is left alone.
+
+A rule with no address selector belongs to **both** families and is installed
+twice, because the kernel has no rule that spans them — the kind of thing that is
+invisible until half the traffic is not steered.
+
+Refused rather than handed to the kernel: a table of 0 or one of the kernel's own
+(253–255), a port with no protocol to key it, and a source and destination in
+different address families.
+
+```text
+show policy route          # what the kernel is actually consulting
+```
+
+## Sending a route somewhere else
+
+```text
+set policy route-map to-transit rule 10 set next-hop 2001:db8::1
+```
+
+Route maps could already change how a route is *chosen* — metric, preference,
+communities. This changes where it is forwarded.
+
+It replaces the route's **whole** next-hop set: a multipath route sent via one
+named gateway has one next hop by definition. A route that had none — a discard
+route — stops discarding.
+
+An address, not a hostname, and refused at commit: this decides where traffic
+goes, and a name that stopped resolving would move it without the configuration
+having changed. The families are deliberately not checked against each other — an
+IPv4 route via an IPv6 next hop is RFC 5549.
+
+## Multicast and VRFs
+
+Both have their own tab in the console and their own `show`:
+
+```text
+set protocols multicast enabled true
+set protocols multicast igmp true
+set protocols multicast interface eth0 role downstream
+
+set protocols vrf tenant-a table 100
+set protocols vrf tenant-a interface eth1
+
+show multicast          # the kernel's forwarding cache
+show vrf                # the instances that are running
+```
+
+Multicast is not forwarded by default: a router has to be told to listen for the
+reports that say who wants a group. An interface either faces receivers
+(`downstream`) or faces the source (`upstream`).
+
+## BGP: aggregates, authorisations, confederation, RPKI
+
+```text
+set protocols bgp aggregate 10.0.0.0/8 summary-only true
+set protocols bgp roa 192.0.2.0/24 origin-as 64500
+set protocols bgp confederation id 65000
+set protocols bgp rpki rtr 192.0.2.1:3323
+```
+
+An aggregate announces one prefix in place of the more specific ones inside it;
+`summary-only` suppresses those, and without it both go out — a bigger table for
+the same reachability. A local ROA says which AS may originate a prefix where
+there is no RTR server to ask.
+
+## What may be redistributed
+
+`redistribute` accepts every source the routing daemon knows: `connected`,
+`static`, `kernel`, `rip`, `ospf`, `isis`, `babel`, `bgp` — minus whichever
+protocol is doing the redistributing.
+
+OSPFv3 is the exception: the daemon has `redistribute-static` and nothing else,
+so static is the only source it can carry, and the CLI offers only that rather
+than accepting a value that would be refused on apply.

@@ -191,3 +191,64 @@ set interface eth2 macsec-key 0123…(32/64 hex)…
 set interface eth2 macsec-peer 52:54:00:de:ad:be
 set interface eth2 zone lan
 ```
+
+
+## Clamping TCP MSS
+
+```text
+set interface tun0 mss 1360
+set interface tun0 mss pmtu
+```
+
+A tunnel is where this bites. The two ends agree an MSS from *their* MTUs during
+the handshake, and neither knows about the encapsulation in between — so the
+session establishes, small requests work, and the first large response
+disappears. It looks like an application fault for as long as it takes somebody
+to think of MTU.
+
+PPPoE is clamped automatically because its MTU is not negotiable. A WireGuard or
+GRE link has to be told. `pmtu` clamps to whatever the path turns out to be;
+a number clamps to that number.
+
+## Offload
+
+Seven features were already settable; the full set the kernel exposes is now
+there: `gro`, `gso`, `tso`, `lro`, `sg`, `rx`, `tx`, `rxvlan`, `txvlan`,
+`ntuple`, `rxhash`.
+
+```text
+set interface eth0 offload gro true
+set interface eth0 offload rxhash true
+```
+
+## Router advertisements
+
+How IPv6 hosts learn there is a router and what prefix to use.
+
+```text
+set interface eth0 router-advert enable
+set interface eth0 router-advert prefix 2001:db8:1::/64
+set interface eth0 router-advert managed true
+set interface eth0 router-advert dhcp6-pool start 2001:db8:1::1000
+set interface eth0 router-advert dhcp6-pool end   2001:db8:1::2000
+```
+
+`managed` sends hosts to DHCPv6 for an address as well; `other-config` sends
+them there for everything *but* the address.
+
+`enable` takes no value — it is a verb, not a setting, which is why the console
+gives it a button rather than a field. Turning it off is deleting the block.
+
+## DHCP reservations
+
+```text
+set interface eth0 dhcp-server static-mapping printer mac 00:11:22:33:44:55
+set interface eth0 dhcp-server static-mapping printer ip 10.0.0.9
+```
+
+The same address every time, for a machine that has to be findable. The name is
+not the MAC on purpose: a machine can be replaced without the reservation losing
+what it was for.
+
+The address must be in the server's subnet but **outside its pool**, or the
+server will hand it to somebody else as well.

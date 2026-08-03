@@ -523,3 +523,107 @@ hairpin NAT so an internal client reaches a published service by its public
 address, and a stateful firewall that lets replies back without a rule. If a
 protocol needs more than that, it needs a proxy that understands it — and that
 proxy should not be inside the packet path of everything else.
+
+
+## Groups whose members are decided elsewhere
+
+An address group lists addresses. Three more kinds list something else and are
+resolved into address groups before the compiler runs — so a rule names any of
+them through the same `source-group` / `destination-group` field, and neither the
+compiler nor the data plane needs a second concept.
+
+| Kind | Members | Resolved from |
+|---|---|---|
+| `domain-group` | DNS names | a lookup, cached on disk |
+| `feed-group` | HTTPS URLs | the published list, cached on disk |
+| `user-group` | VPN usernames | who is connected right now |
+
+### Published lists
+
+```text
+set firewall group feed-group bogons url https://example.org/bogons.txt
+set firewall rule drop-bogons source-group bogons
+```
+
+The lists worth having are maintained elsewhere — bogons, exit nodes, a
+provider's own prefixes. Copied in by hand, one is wrong within a week and
+nobody notices.
+
+**HTTPS only.** This list becomes firewall rules; over plain HTTP anything on the
+path decides what the box permits. The fetch carries no credential, so a feed can
+never take this box's token to somebody else's web server.
+
+**A failed fetch keeps the last good copy.** A feed's job is usually to block. If
+a publisher's outage emptied the group, the rule would match nothing — and a rule
+that blocks nothing is a rule that allows. Stale is not the same as absent.
+
+There is a cap, and it is loud: silently keeping the first ten thousand entries
+of a blocklist is a firewall that stopped blocking things without telling
+anybody.
+
+### People
+
+```text
+set firewall group user-group admins user alice,bob
+set firewall rule admin-ssh source-group admins
+```
+
+A rule saying `10.9.0.0/24` says where somebody was, not who they are — and when
+addresses come from a pool the two drift apart the moment anybody reconnects.
+
+**Where identity comes from, and where it does not.** The only place this
+appliance learns that an address belongs to a *person* is the road-warrior VPN: a
+client authenticates with a username and is handed an address. The captive portal
+admits by MAC and never learns a name; a host on the LAN has no identity here at
+all. `show vpn users` is the map this resolves against.
+
+**There is no cache here, and that is the opposite of a feed group on purpose.**
+A feed blocks, so a stale copy is safer than an empty one. A user group usually
+*allows*, so a stale copy would keep somebody's access alive after they
+disconnected and their address went to the next person in the pool. When the VPN
+cannot be asked the group is empty, and an empty group matches nothing.
+
+A member who is simply not connected is noted at commit — not because it is a
+mistake, but because a rule that suddenly matches nothing otherwise looks like a
+firewall fault.
+
+## One rule for both protocols
+
+```text
+set firewall rule dns-in proto tcp_udp
+set firewall rule dns-in port 53
+```
+
+A service reached over either — DNS, NTP, a Samba share — is one decision to an
+operator, and writing it twice means two rules to keep in step afterwards. The
+data plane has no such protocol, so the compiler emits the pair; nothing
+downstream knows the grammar has a word for "either".
+
+## Which rules are doing anything
+
+```text
+show firewall hits
+```
+
+```text
+  rule                            flows    packets  share
+  web-in                            412     18 220  74 %
+  dns-out                            88      1 004  16 %
+  legacy-smb                          0          0  0 %  ← nothing
+```
+
+Busiest first, so the dead rules gather at the bottom where they read as a
+group. The console's rule table shows the same thing in a **carrying** column.
+
+This is **attribution, not a hardware counter**: the data plane counts globally,
+so the appliance asks for the live flow table and works out which rule admitted
+each flow — matching against the *compiled* rules, so the ranking is the one the
+data plane applies and cannot drift from what is loaded.
+
+**Only accept rules are counted.** A rule that drops leaves no flow behind — the
+packet is gone — so a zero against one would read as "never matched" when it
+means "nothing got through here", which is what the rule is *for*. Reporting that
+as a count would invite somebody to delete the rule doing its job.
+
+It also only sees **now**: what the connection table holds, not what went through
+yesterday.

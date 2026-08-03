@@ -231,7 +231,10 @@ Under a deny-by-default zone they never arrive, and the relay looks broken while
 being blameless — so the commit warns, and `show` repeats the warning:
 
 ```text
-set firewall rule wol-in from lan action accept proto udp port 9
+set firewall rule wol-in from lan
+set firewall rule wol-in action accept
+set firewall rule wol-in proto udp
+set firewall rule wol-in port 9
 ```
 
 ```text
@@ -558,3 +561,64 @@ successor and would fit the same socket and the same table; it is not built yet.
 This is the one service where something other than a person opens an inbound
 port, so it is off unless you switch it on, and it is worth deciding
 deliberately whether the segment you point it at should have that authority.
+
+
+## Encrypted DNS upstreams
+
+```text
+set services dns upstream 9.9.9.9
+set services dns secure-upstream tls://dns.quad9.net
+set services dns secure-upstream https://dns.quad9.net/dns-query
+```
+
+`tls://` is DNS over TLS (RFC 7858); `https://` is DNS over HTTPS (RFC 8484).
+
+What clients see does not change — the LAN resolver still answers. What changes
+is where it asks: a local proxy that speaks TLS becomes its upstream, so the
+queries leaving this box are no longer readable by everything in between.
+
+**Setting this demotes `upstream` to bootstrap.** The plaintext servers stop
+being upstreams and answer exactly one question — the one posed by the encrypted
+upstream's own hostname. Leaving them in place as upstreams would send queries in
+the clear to whichever answered first, which is the opposite of what was asked
+for.
+
+That leaves one trap, and `commit` warns about it: an upstream named by hostname
+with **no** plaintext server to bootstrap it can never be resolved to connect to,
+and the box then looks like "DNS is broken" rather than like a setting is
+missing. An upstream given as an address needs no bootstrap.
+
+## Who may ask, and what is never asked
+
+```text
+set services dns allow-from 10.0.0.0/8,fd00::/8
+set services dns dont-query 168.192.in-addr.arpa
+```
+
+`serve-on` decides **where** the resolver listens; `allow-from` decides **which
+clients** it answers. They are not the same question: an open resolver on a
+segment it is meant to serve is still an open resolver to everything else on
+that segment.
+
+`dont-query` names domains that are never forwarded and are answered NXDOMAIN
+here. The reverse zones for private space are why it exists: without it a PTR
+lookup for an internal address goes out to a stranger, says something about the
+addressing, and comes back empty anyway.
+
+## Syslog facilities
+
+```text
+set services syslog target 10.0.0.9 facility auth,local7
+```
+
+A collector that only wants the authentication trail should not be sent every
+kernel message to filter out again. Empty means every facility.
+
+## SSH log level
+
+```text
+set services ssh loglevel VERBOSE
+```
+
+`VERBOSE` logs the fingerprint of the key that was used, which is what turns
+"somebody logged in as admin" into "*this* key logged in as admin".
