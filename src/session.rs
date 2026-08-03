@@ -1507,6 +1507,20 @@ struct ReverseProxyDraft {
 
 impl Draft {
     /// Mutable access to the static route with `prefix`, inserting it if new.
+    fn ldap_mut(&mut self, server: &str) -> &mut crate::config::LdapServer {
+        if !self.aaa.ldap.iter().any(|d| d.server == server) {
+            self.aaa.ldap.push(crate::config::LdapServer {
+                server: server.to_string(),
+                ..Default::default()
+            });
+        }
+        self.aaa
+            .ldap
+            .iter_mut()
+            .find(|d| d.server == server)
+            .expect("just inserted")
+    }
+
     fn radius_mut(&mut self, server: &str) -> &mut crate::config::RadiusServer {
         if !self.aaa.radius.iter().any(|r| r.server == server) {
             self.aaa.radius.push(crate::config::RadiusServer {
@@ -3731,6 +3745,33 @@ impl Session {
             }
             ["system", "aaa", "default-group", v] => {
                 self.draft.aaa.default_group = Some((*v).to_string());
+            }
+            ["system", "aaa", "ldap", server, field, v] => {
+                crate::config::validate_host(server)?;
+                let d = self.draft.ldap_mut(server);
+                match *field {
+                    "base-dn" => d.base_dn = (*v).to_string(),
+                    "user-attribute" => d.user_attribute = Some((*v).to_string()),
+                    "tls" => {
+                        if !matches!(*v, "ldaps" | "starttls" | "none") {
+                            bail!("system aaa ldap {server} tls {v:?}: ldaps, starttls or none");
+                        }
+                        d.tls = Some((*v).to_string());
+                    }
+                    "port" => {
+                        d.port = Some(
+                            v.parse()
+                                .with_context(|| format!("system aaa ldap {server} port"))?,
+                        )
+                    }
+                    "timeout" => {
+                        d.timeout = Some(
+                            v.parse()
+                                .with_context(|| format!("system aaa ldap {server} timeout"))?,
+                        )
+                    }
+                    other => bail!("system aaa ldap {server}: unknown field {other:?}"),
+                }
             }
             ["system", "aaa", "radius", server, field, v] => {
                 crate::config::validate_host(server)?;

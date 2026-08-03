@@ -384,6 +384,106 @@ pub fn radius_authenticate(
     }
 }
 
+// ---- LDAP (RFC 4511 simple bind, via ldapwhoami) --------------------------
+
+/// Escape a value for use inside a DN (RFC 4514 §2.4).
+///
+/// The username goes into `uid=<here>,ou=…`, so a username containing a comma
+/// would not be a username any more — it would be a different DN, chosen by
+/// whoever typed it. That is the LDAP shape of an injection, and it is why this
+/// exists rather than a format string.
+pub fn dn_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    for (i, ch) in value.chars().enumerate() {
+        let special = matches!(ch, ',' | '+' | '"' | '\\' | '<' | '>' | ';' | '=');
+        // A space or `#` is only special at the start; a space also at the end.
+        let edge =
+            (i == 0 && (ch == ' ' || ch == '#')) || (i + ch.len_utf8() == bytes.len() && ch == ' ');
+        if special || edge {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// What a directory said about a username and password.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Directory {
+    /// The bind succeeded.
+    Accepted,
+    /// The directory answered, and the answer was no.
+    Rejected,
+}
+
+/// `ldapwhoami`'s exit status, read as an answer.
+///
+/// 0 is a successful bind. **49** is `LDAP_INVALID_CREDENTIALS` — a real answer
+/// from a reachable directory, which must not be confused with the directory
+/// being unreachable: treating an outage as a wrong password locks everybody out
+/// at the moment the network is already broken.
+pub fn directory_from_exit(code: Option<i32>) -> Result<Directory> {
+    match code {
+        Some(0) => Ok(Directory::Accepted),
+        Some(49) => Ok(Directory::Rejected),
+        Some(other) => bail!("the directory did not answer (ldap exit {other})"),
+        None => bail!("the directory query was killed before it answered"),
+    }
+}
+
+/// The URI and bind DN a query would use. Split out from the query itself so
+/// both can be checked without a directory to talk to.
+pub fn ldap_target(
+    server: &str,
+    port: Option<u16>,
+    tls: &str,
+    base_dn: &str,
+    user_attribute: &str,
+    username: &str,
+) -> (String, String) {
+    let scheme = if tls == "ldaps" { "ldaps" } else { "ldap" };
+    let port = port.unwrap_or(if scheme == "ldaps" { 636 } else { 389 });
+    // A literal IPv6 address needs brackets in a URI, or the colons in it read
+    // as the port separator.
+    let host = if server.contains(':') && !server.starts_with('[') {
+        format!("[{server}]")
+    } else {
+        server.to_string()
+    };
+    (
+        format!("{scheme}://{host}:{port}"),
+        format!("{user_attribute}={},{base_dn}", dn_escape(username)),
+    )
+}
+
+/// Ask a directory whether this username and password are good, by binding as
+/// that user.
+///
+/// The password goes in a **file**, not on the command line: `/proc` is
+/// world-readable, so `-w <password>` would show it to every local user for as
+/// long as the call takes.
+#[allow(clippy::too_many_arguments)]
+pub fn ldap_authenticate(
+    server: &str,
+    port: Option<u16>,
+    tls: &str,
+    base_dn: &str,
+    user_attribute: &str,
+    username: &str,
+    password: &str,
+    timeout: u32,
+) -> Result<Directory> {
+    let (uri, dn) = ldap_target(server, port, tls, base_dn, user_attribute, username);
+    let dir = std::path::Path::new("/run/sentinel");
+    std::fs::create_dir_all(dir).ok();
+    let secret = dir.join(format!("ldap-bind.{}", std::process::id()));
+    crate::system::stage_private(&secret, password).context("staging the bind password")?;
+    let out = crate::system::ldapwhoami(&uri, &dn, &secret, tls == "starttls", timeout);
+    let _ = std::fs::remove_file(&secret);
+    directory_from_exit(out?)
+}
+
 /// Now, as a Unix time. Split out so the TOTP check can be driven from a test.
 pub fn unix_now() -> u64 {
     SystemTime::now()
@@ -504,6 +604,72 @@ mod tests {
         assert_eq!(s.len(), 20);
         assert_eq!(base32_decode(&s).unwrap().len(), 12);
         assert_ne!(s, totp_secret(), "two secrets in a row were identical");
+    }
+
+    /// The username goes into `uid=<here>,ou=…`, so a username with a comma in
+    /// it would not be a username any more — it would be a different DN, chosen
+    /// by whoever typed it. That is the LDAP shape of an injection.
+    #[test]
+    fn a_username_cannot_rewrite_the_dn_it_goes_into() {
+        assert_eq!(dn_escape("alice"), "alice");
+        // The classic: end the RDN early and append another.
+        assert_eq!(
+            dn_escape("alice,ou=admins,dc=example,dc=com"),
+            "alice\\,ou\\=admins\\,dc\\=example\\,dc\\=com"
+        );
+        assert_eq!(dn_escape("a+b"), "a\\+b");
+        assert_eq!(dn_escape("a\\b"), "a\\\\b");
+        // Space and `#` are special only where they can be mistaken for syntax.
+        assert_eq!(dn_escape(" leading"), "\\ leading");
+        assert_eq!(dn_escape("trailing "), "trailing\\ ");
+        assert_eq!(dn_escape("mid dle"), "mid dle");
+        assert_eq!(dn_escape("#hash"), "\\#hash");
+        assert_eq!(dn_escape("no#hash"), "no#hash");
+    }
+
+    /// The URI and the DN are what the query is; both are built here so both can
+    /// be checked without a directory to talk to.
+    #[test]
+    fn the_bind_target_is_built_from_the_configuration() {
+        let (uri, dn) = ldap_target(
+            "ldap.example.com",
+            None,
+            "ldaps",
+            "ou=people,dc=example,dc=com",
+            "uid",
+            "alice",
+        );
+        assert_eq!(uri, "ldaps://ldap.example.com:636");
+        assert_eq!(dn, "uid=alice,ou=people,dc=example,dc=com");
+
+        // StartTLS runs on the plain port…
+        let (uri, _) = ldap_target("dir", None, "starttls", "dc=x", "uid", "a");
+        assert_eq!(uri, "ldap://dir:389");
+        // …and an explicit port wins over both defaults.
+        let (uri, _) = ldap_target("dir", Some(1636), "ldaps", "dc=x", "uid", "a");
+        assert_eq!(uri, "ldaps://dir:1636");
+
+        // A literal IPv6 address needs brackets, or its colons read as the port
+        // separator and the query goes somewhere else entirely.
+        let (uri, _) = ldap_target("2001:db8::5", None, "ldaps", "dc=x", "uid", "a");
+        assert_eq!(uri, "ldaps://[2001:db8::5]:636");
+
+        // Active Directory names accounts differently, and the DN follows.
+        let (_, dn) = ldap_target("d", None, "ldaps", "dc=x", "sAMAccountName", "alice");
+        assert_eq!(dn, "sAMAccountName=alice,dc=x");
+    }
+
+    /// 49 is `LDAP_INVALID_CREDENTIALS` — a real answer from a reachable
+    /// directory. Confusing it with an unreachable one is what locks everybody
+    /// out at the moment the network is already broken.
+    #[test]
+    fn a_rejection_and_an_outage_are_different_answers() {
+        assert_eq!(directory_from_exit(Some(0)).unwrap(), Directory::Accepted);
+        assert_eq!(directory_from_exit(Some(49)).unwrap(), Directory::Rejected);
+        // Anything else is "could not ask", not "wrong password".
+        assert!(directory_from_exit(Some(255)).is_err());
+        assert!(directory_from_exit(Some(1)).is_err());
+        assert!(directory_from_exit(None).is_err());
     }
 
     /// RFC 2865 §5.2 hides the password by XOR against MD5(secret ‖ prev), so

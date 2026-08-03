@@ -70,6 +70,7 @@
             --set SENTINEL_IP_BIN         ${pkgs.iproute2}/bin/ip \
             --set SENTINEL_TC_BIN         ${pkgs.iproute2}/bin/tc \
             --set SENTINEL_ETHTOOL_BIN    ${pkgs.ethtool}/bin/ethtool \
+            --set SENTINEL_LDAPWHOAMI_BIN ${pkgs.openldap}/bin/ldapwhoami \
             --set SENTINEL_NETWORKCTL_BIN ${pkgs.systemd}/bin/networkctl \
             --set SENTINEL_SYSTEMCTL_BIN  ${pkgs.systemd}/bin/systemctl \
             --set SENTINEL_NFT_BIN        ${pkgs.nftables}/bin/nft \
@@ -366,6 +367,11 @@
             # encrypted while nothing about how clients ask changes. A
             # Sentinel-owned unit (below), off until an upstream is configured.
             pkgs.dnsproxy
+            # LDAP authentication: `ldapwhoami` performs the simple bind. The
+            # appliance shells out to it the way it does to curl and openssl —
+            # a directory client with TLS and SASL is not something to reimplement
+            # for one exit code.
+            pkgs.openldap
             # OpenConnect (roadmap C17): ocserv is the AnyConnect-compatible TLS
             # VPN server. It's a Sentinel-owned unit (below), off until configured;
             # `ocserv`/`occtl` on PATH also allow manual inspection. Passwords are

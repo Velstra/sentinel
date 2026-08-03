@@ -578,6 +578,39 @@ pub fn curl_get(url: &str, token: &str, timeout_secs: u32) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Bind to a directory as `dn`, with the password read from `secret_file`.
+///
+/// Returns the process's exit status for the caller to read as an answer — 0 is
+/// a successful bind, 49 is invalid credentials, anything else means the
+/// directory did not answer. `-x` is a simple bind (not SASL); `-ZZ` demands
+/// StartTLS and fails rather than falling back to plaintext, which is the whole
+/// point of asking for it.
+pub fn ldapwhoami(
+    uri: &str,
+    dn: &str,
+    secret_file: &Path,
+    starttls: bool,
+    timeout_secs: u32,
+) -> Result<Option<i32>> {
+    let Some(secret) = secret_file.to_str() else {
+        bail!("non-UTF-8 path");
+    };
+    let timeout = timeout_secs.to_string();
+    let mut args = vec!["-x", "-H", uri, "-D", dn, "-y", secret, "-o"];
+    let net_timeout = format!("nettimeout={timeout}");
+    args.push(&net_timeout);
+    if starttls {
+        args.push("-ZZ");
+    }
+    let out = Command::new(bin("ldapwhoami"))
+        .args(&args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .with_context(|| format!("running ldapwhoami against {uri}"))?;
+    Ok(out.status.code())
+}
+
 /// Fetch a URL with no credential attached — a published list, not an appliance
 /// API. Separate from [`curl_get`] so a feed can never carry this box's token to
 /// somebody else's web server.
@@ -717,6 +750,7 @@ pub fn networkctl_reload(ifaces: &[String]) -> Result<()> {
 pub fn bin(name: &str) -> String {
     let var = match name {
         "hostname" => "SENTINEL_HOSTNAME_BIN",
+        "ldapwhoami" => "SENTINEL_LDAPWHOAMI_BIN",
         "ip" => "SENTINEL_IP_BIN",
         "networkctl" => "SENTINEL_NETWORKCTL_BIN",
         "systemctl" => "SENTINEL_SYSTEMCTL_BIN",

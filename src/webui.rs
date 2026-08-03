@@ -1546,10 +1546,23 @@ pub fn page() -> String {
       <div class="section">
         <h3>Authentication servers</h3>
         <span class="spacer"></span>
-        <button class="btn" id="toggleradius">New server</button>
+        <button class="btn" id="toggleradius">New RADIUS server</button>
       </div>
       <div class="card addpanel hidden" id="addradiuspanel"></div>
       <div id="radiuslist"></div>
+
+      <div class="section">
+        <h3>Directories</h3>
+        <span class="spacer"></span>
+        <button class="btn" id="toggleldap">New directory</button>
+      </div>
+      <p class="lede inset" style="margin:0 0 var(--space-4)">
+        A simple bind as the user, so what is needed is where the accounts live
+        and what names one. There is no service account here on purpose:
+        searching first would mean a second password living on the firewall.
+      </p>
+      <div class="card addpanel hidden" id="addldappanel"></div>
+      <div id="ldaplist"></div>
 
       <div class="card">
         <h3>Accounts as the appliance sees them</h3>
@@ -4573,6 +4586,13 @@ const USER = [
 // Where a password is checked when it is not checked here. Local always goes
 // first, which is why there is no order to configure.
 const AAA = [["default-group", "Default group"]];
+// A directory. Simple bind as the user, so what is needed is where the accounts
+// live and what names one.
+const AAA_LDAP = [
+  ["base-dn", "Base DN"], ["user-attribute", "Account attribute"],
+  ["tls", "Transport", ["ldaps", "starttls", "none"]],
+  ["port", "Port"], ["timeout", "Timeout (s)"],
+];
 const AAA_RADIUS = [
   ["secret", "Shared secret"], ["port", "Port"], ["timeout", "Timeout (s)"],
 ];
@@ -4594,6 +4614,19 @@ async function refreshUsers() {{
     badge: (r) => r.secret ? {{ text: "port " + (r.port || 1812) }}
                            : {{ text: "no secret", cls: "warn" }},
     empty: "No authentication servers — accounts are local only.",
+  }});
+  renderObjects({{
+    listId: "ldaplist", required: "base-dn", toggleId: "toggleldap",
+    toggleLabel: "New directory", addId: "addldappanel", noun: "Directory",
+    fields: AAA_LDAP, nameHint: "ldap.example.com",
+    path: (n) => `system aaa ldap ${{n}}`,
+    rows: entriesUnder(aaals, ["system", "aaa", "ldap"]),
+    // The transport is the thing worth seeing at a glance: `none` means the
+    // bind password crosses the wire in the clear.
+    badge: (r) => (r.tls || "ldaps") === "none"
+      ? {{ text: "no TLS", cls: "warn" }}
+      : {{ text: r.tls || "ldaps" }},
+    empty: "No directories configured.",
   }});
   renderObjects({{
     listId: "userlist", form: FORMS.user, toggleId: "toggleuser", toggleLabel: "New", addId: "adduserpanel", noun: "Administrator",
