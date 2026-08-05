@@ -129,16 +129,6 @@ pub fn pppoe_stop(name: &str) -> Result<()> {
     )
 }
 
-/// Load an nftables ruleset file into the running kernel (`nft -f <path>`). Used
-/// for the PPPoE TCP-MSS-clamp table; the file's leading `table`/`delete table`
-/// makes the load idempotent (it replaces our table wholesale each time).
-pub fn nft_load(path: &Path) -> Result<()> {
-    let Some(p) = path.to_str() else {
-        bail!("non-UTF-8 path");
-    };
-    run_priv("nft", &["-f", p])
-}
-
 /// (Re)attach a root egress qdisc to `dev`: `tc qdisc replace dev <dev> root
 /// <spec…>` (roadmap C8 traffic shaping). `replace` is idempotent — it installs
 /// the qdisc if absent or swaps it in place without dropping the link, so a
@@ -786,7 +776,6 @@ pub fn bin(name: &str) -> String {
         "systemd-run" => "SENTINEL_SYSTEMD_RUN_BIN",
         "journalctl" => "SENTINEL_JOURNALCTL_BIN",
         "wren" => "SENTINEL_WREN_BIN",
-        "nft" => "SENTINEL_NFT_BIN",
         "tc" => "SENTINEL_TC_BIN",
         "swanctl" => "SENTINEL_SWANCTL_BIN",
         "openssl" => "SENTINEL_OPENSSL_BIN",

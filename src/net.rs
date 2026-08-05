@@ -2115,14 +2115,12 @@ fn apply_nat64(appliance: &Appliance) -> Result<()> {
 // lookup paths by the appliance module), then (re)starts one `sentinel-pppoe@`
 // systemd instance per session. On a PPPoE (and generally tunnel) egress the
 // TCP MSS must be clamped to the path MTU, or large-segment TCP wedges behind
-// the smaller PPPoE MTU; we render an nftables ruleset that clamps MSS to PMTU
-// on each ppp interface (the VyOS/`--clamp-mss-to-pmtu` equivalent) and load it
-// with `nft`. All render+reload paths follow the same change-detect model the
+// the smaller PPPoE MTU — that clamp lives in the **data plane** now (`mss` on
+// the interface reaches the `MSS_CLAMP` map and the TC egress hook rewrites the
+// option), which is where every other packet-touching thing in this appliance
+// already was. All render+reload paths follow the same change-detect model the
 // DNS/NTP drop-ins use.
 
-/// The runtime dir for all PPPoE render artifacts (peer options, secrets, the
-/// MSS ruleset). tmpfs; re-seeded from the saved config each boot.
-const PPPOE_RUNTIME_DIR: &str = "/run/sentinel/ppp";
 /// pppd peer-option files, one per session — `pppd file <this>` reads them.
 const PPPOE_PEERS_DIR: &str = "/run/sentinel/ppp/peers";
 /// The credential files (both CHAP and PAP forms — pppd picks whichever the ISP
@@ -2130,8 +2128,6 @@ const PPPOE_PEERS_DIR: &str = "/run/sentinel/ppp/peers";
 /// `/etc/ppp/{chap,pap}-secrets` lookup paths here.
 const PPP_CHAP_SECRETS: &str = "/run/sentinel/ppp/chap-secrets";
 const PPP_PAP_SECRETS: &str = "/run/sentinel/ppp/pap-secrets";
-/// The rendered TCP-MSS-clamp nftables ruleset (loaded with `nft -f`).
-const PPPOE_MSS_NFT: &str = "/run/sentinel/ppp/mss.nft";
 
 /// Render a pppd peer-options file for a PPPoE client interface. pppd's bundled
 /// `pppoe.so` plugin rides on `parent` (the raw uplink NIC, given as `nic-<if>`);
@@ -2200,49 +2196,6 @@ fn ppp_secrets_body(ifaces: &[Interface]) -> Option<String> {
     Some(body)
 }
 
-/// Every link whose TCP MSS is clamped, and to what. PPPoE is clamped to the
-/// path MTU whether or not anybody asked — its MTU is not negotiable and a
-/// wedged link is the alternative. Anything else is clamped because the
-/// operator said so, which is what a tunnel needs: the two ends agree an MSS
-/// from their own MTUs and neither knows about the encapsulation between them.
-fn mss_clamped(ifaces: &[Interface]) -> Vec<(&str, String)> {
-    ifaces
-        .iter()
-        .filter(|i| !i.disabled)
-        .filter_map(|i| match (&i.mss, is_active_pppoe(i)) {
-            // `rt mtu` is nftables for "whatever this route's MTU turns out to
-            // be" — the `--clamp-mss-to-pmtu` equivalent.
-            (Some(m), _) if m == "pmtu" => Some((i.name.as_str(), "rt mtu".to_string())),
-            (Some(m), _) => Some((i.name.as_str(), m.clone())),
-            (None, true) => Some((i.name.as_str(), "rt mtu".to_string())),
-            (None, false) => None,
-        })
-        .collect()
-}
-
-/// Render the nftables ruleset that clamps TCP MSS on egress, in the `inet
-/// sentinel-mss` table so it never collides with any other firewall. The
-/// leading `table`/`delete table` is the standard idempotent flush: re-loading
-/// this file replaces our table wholesale, and with nothing to clamp it just
-/// removes it.
-fn mss_clamp_body(ifaces: &[Interface]) -> String {
-    let clamped = mss_clamped(ifaces);
-    let mut body = String::from("# rendered by sentinel — TCP MSS clamp\n");
-    body.push_str("table inet sentinel-mss\ndelete table inet sentinel-mss\n");
-    if clamped.is_empty() {
-        return body;
-    }
-    body.push_str("table inet sentinel-mss {\n\tchain clamp {\n");
-    body.push_str("\t\ttype filter hook forward priority mangle; policy accept;\n");
-    for (name, to) in &clamped {
-        body.push_str(&format!(
-            "\t\toifname \"{name}\" tcp flags syn tcp option maxseg size set {to}\n"
-        ));
-    }
-    body.push_str("\t}\n}\n");
-    body
-}
-
 /// Whether writing `body` to `path` would change what is already there (or the
 /// file is absent) — the same change-detect the DNS/NTP drop-ins use.
 pub(crate) fn file_changed(path: &Path, body: &str) -> bool {
@@ -2306,18 +2259,9 @@ fn apply_pppoe(appliance: &Appliance) -> Result<()> {
         }
     }
 
-    // MSS clamp: render + load. Load when the ruleset changed, or whenever any
-    // PPPoE interface exists (so a fresh boot re-asserts the kernel table even
-    // if the file on tmpfs happens to match).
-    let mss_body = mss_clamp_body(ifaces);
-    let mss_changed = file_changed(Path::new(PPPOE_MSS_NFT), &mss_body);
-    system::ensure_dir(Path::new(PPPOE_RUNTIME_DIR))?;
-    system::install_file(Path::new(PPPOE_MSS_NFT), &mss_body)?;
-    if mss_changed || !mss_clamped(ifaces).is_empty() {
-        if let Err(e) = system::nft_load(Path::new(PPPOE_MSS_NFT)) {
-            eprintln!("warning: loading the TCP MSS-clamp nftables ruleset failed: {e}");
-        }
-    }
+    // The MSS clamp used to be an nftables table rendered here. It is in the data
+    // plane now — `mss` on the interface reaches `MSS_CLAMP`, and the TC egress
+    // hook rewrites the option as the SYN leaves. Nothing to install.
 
     // (Re)start the changed/new sessions.
     for name in &restart {
@@ -4714,24 +4658,6 @@ mod tests {
         assert!(ppp_secrets_body(&[]).is_none());
     }
 
-    #[test]
-    fn pppoe_mss_body_clamps_to_pmtu_on_the_ppp_link() {
-        let ifaces = vec![pppoe_iface("eth0", "u", "p")];
-        let body = mss_clamp_body(&ifaces);
-        assert!(body.contains("table inet sentinel-mss {"), "got:\n{body}");
-        assert!(
-            body.contains("oifname \"ppp0\" tcp flags syn tcp option maxseg size set rt mtu"),
-            "got:\n{body}"
-        );
-        // With no PPPoE interface the ruleset only flushes/removes the table.
-        let empty = mss_clamp_body(&[]);
-        assert!(
-            empty.contains("delete table inet sentinel-mss"),
-            "got:\n{empty}"
-        );
-        assert!(!empty.contains("maxseg"), "got:\n{empty}");
-    }
-
     /// Steering renders into the daemon as a preference of *indices*, resolved
     /// here so the daemon never has to map an interface name back to a table —
     /// and so an uplink named in a policy but absent from the box drops out
@@ -4889,52 +4815,19 @@ mod tests {
         );
     }
 
-    /// A tunnel has to be told. The two ends agree an MSS from their own MTUs
-    /// during the handshake and neither knows about the encapsulation between
-    /// them, so the session comes up, small requests work, and the first large
-    /// response disappears — which looks like an application fault until
-    /// somebody thinks of MTU.
-    #[test]
-    fn any_interface_can_be_clamped_not_only_pppoe() {
-        let mut tunnel = pppoe_iface("eth0", "u", "p");
-        tunnel.name = "tun0".into();
-        tunnel.if_type = Some(IfaceType::Gre);
-        tunnel.pppoe = None;
-        // Unclamped, a GRE link contributes nothing: only PPPoE is automatic.
-        assert!(!mss_clamp_body(std::slice::from_ref(&tunnel)).contains("maxseg"));
-
-        tunnel.mss = Some("1360".into());
-        let body = mss_clamp_body(std::slice::from_ref(&tunnel));
-        assert!(
-            body.contains("oifname \"tun0\" tcp flags syn tcp option maxseg size set 1360"),
-            "got:\n{body}"
-        );
-
-        // …and `pmtu` means the same thing PPPoE gets, spelled out.
-        tunnel.mss = Some("pmtu".into());
-        assert!(
-            mss_clamp_body(std::slice::from_ref(&tunnel))
-                .contains("oifname \"tun0\" tcp flags syn tcp option maxseg size set rt mtu"),
-            "pmtu did not clamp to the path MTU"
-        );
-    }
-
     #[test]
     fn disabled_pppoe_renders_nothing_and_is_torn_down_like_a_removed_one() {
         let mut iface = pppoe_iface("eth0", "user@isp.de", "s3cret");
         iface.disabled = true;
         // A disabled PPPoE client is not "active": no pppd session should dial.
         assert!(!is_active_pppoe(&iface));
-        // No credentials and no MSS clamp are rendered for it.
+        // No credentials are rendered for it.
         assert!(
             ppp_secrets_body(std::slice::from_ref(&iface)).is_none(),
             "disabled pppoe must not emit credentials"
         );
-        let mss = mss_clamp_body(std::slice::from_ref(&iface));
-        assert!(
-            !mss.contains("maxseg"),
-            "disabled pppoe must not get an MSS clamp:\n{mss}"
-        );
+        // The MSS clamp moved into the data plane, so there is no ruleset to
+        // inspect here any more; `compile.rs` asserts the ceiling instead.
         // It is absent from the desired set that `apply_pppoe` builds, so the
         // teardown loop stops+removes its session exactly as for a removed one —
         // the same mechanism the enabled case leaves untouched.

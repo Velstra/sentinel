@@ -74,7 +74,6 @@
             --set SENTINEL_OCCTL_BIN      ${pkgs.ocserv}/bin/occtl \
             --set SENTINEL_NETWORKCTL_BIN ${pkgs.systemd}/bin/networkctl \
             --set SENTINEL_SYSTEMCTL_BIN  ${pkgs.systemd}/bin/systemctl \
-            --set SENTINEL_NFT_BIN        ${pkgs.nftables}/bin/nft \
             --set SENTINEL_TCPDUMP_BIN    ${pkgs.tcpdump}/bin/tcpdump \
             --set SENTINEL_TIMEOUT_BIN    ${pkgs.coreutils}/bin/timeout \
             --set SENTINEL_SWANCTL_BIN    ${pkgs.strongswan}/bin/swanctl \
@@ -208,7 +207,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-CozaGEOo3ohWyHnLHtIriGW+4MjMgmvJ7lnLWGG8Zbk=";
+      ebpfHash = "sha256-QJ9bTJIXzhTMIqh+sMNiJX3bV1SBliDcD4pmWLxEuLo=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -7944,13 +7943,18 @@
                 "ip -4 addr show ppp0 | grep -q 'inet 10[.]0[.]0[.]'", timeout=90
             )
 
-            # The MSS clamp is live in the kernel: our `inet sentinel-mss` table
-            # clamps TCP MSS to the path MTU (`maxseg ... set rt mtu`) on ppp0's
-            # egress — the VyOS `clamp-mss-to-pmtu` equivalent.
-            rules = fw.succeed("nft list ruleset")
-            assert "sentinel-mss" in rules, rules
-            assert "maxseg" in rules, rules
-            assert 'oifname "ppp0"' in rules, rules
+            # The MSS clamp is live in the *data plane*, not in a kernel packet
+            # table: the compiled config carries the ceiling for ppp0, and the
+            # agent programs it. 1452 is 1492 less an IPv4 and a TCP header.
+            #
+            # Asserted on the compiled configuration rather than on a counter
+            # because a clamp that never fires is indistinguishable from one that
+            # is not configured, and this check has no large transfer to make it
+            # fire. What it pins is that `pmtu` reaches the data plane as a
+            # number — the translation the nftables ruleset used to do in the
+            # kernel and nobody could see.
+            dataplane = fw.succeed("sentinel compile /etc/sentinel/appliance.toml")
+            assert "mss = 1452" in dataplane, dataplane
           '';
         };
 
