@@ -1450,6 +1450,7 @@ pub fn page() -> String {
             <option value="address-group">address</option>
             <option value="port-group">port</option>
             <option value="domain-group">domain</option>
+            <option value="mac-group">hardware addresses</option>
             <option value="feed-group">published list</option>
             <option value="user-group">VPN users</option>
           </select>
@@ -2769,6 +2770,7 @@ function ruleFields(zones) {{
       "router-advertisement", "neighbor-solicitation", "neighbor-advertisement"]],
     // A rule with no address applies to both families; this is how it says
     // otherwise. `out` covers traffic this box originates, and is IPv4 only.
+    ["source-mac-group", "Sender MAC group"],
     ["family", "Address family", ["", "ipv4", "ipv6"]],
     ["direction", "Direction", ["", "in", "out"]],
     ["source", "Source"],
@@ -4581,6 +4583,7 @@ const ROUTE = [
 const GROUP_MEMBER = {{
   "address-group": "address", "port-group": "port",
   "domain-group": "domain", "feed-group": "url", "user-group": "user",
+  "mac-group": "mac",
 }};
 
 async function refreshGroups() {{

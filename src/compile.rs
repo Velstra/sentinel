@@ -292,6 +292,11 @@ struct PortRule {
     /// Optional source CIDR ("10.0.0.0/24"). Omitted when the rule is `from any`.
     #[serde(skip_serializing_if = "Option::is_none")]
     src: Option<String>,
+    /// The sender's hardware address this rule is a verdict on. Never set
+    /// together with a port or an address: the data plane consults MACs once
+    /// from the Ethernet header, not as a dimension of its rule tries.
+    #[serde(rename = "src-mac", skip_serializing_if = "Option::is_none")]
+    src_mac: Option<String>,
     /// Optional destination CIDR. Omitted when the rule is `to any`. Never set
     /// together with `src` — the data plane ranks one end per rule.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -549,6 +554,39 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
             // plane keys on a single `(proto, port[, src])`). The width is capped
             // at validate time so this stays small.
             let groups = &appliance.firewall.group;
+            // A rule naming a mac-group becomes one data-plane rule per member.
+            // It carries no protocol and no port by construction — validation
+            // refuses those beside it — so it never reaches the tries at all.
+            let mac_rules: Vec<PortRule> = appliance
+                .rules
+                .iter()
+                .filter(|r| !r.disabled && r.from == zone)
+                .filter_map(|r| r.source_mac_group.as_ref().map(|g| (r, g)))
+                .flat_map(|(r, g)| {
+                    let action = action_str(r.action);
+                    groups
+                        .mac
+                        .get(g)
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(move |mac| PortRule {
+                            name: r.name.clone(),
+                            proto: "tcp",
+                            port: 0,
+                            action,
+                            log: false,
+                            src: None,
+                            dst: None,
+                            limit: None,
+                            burst: None,
+                            icmp_type: None,
+                            src_mac: Some(mac),
+                            family: None,
+                            direction: None,
+                        })
+                })
+                .collect();
             let port_rules = appliance
                 .rules
                 .iter()
@@ -632,6 +670,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                                         limit: r.limit,
                                         burst: r.burst,
                                         icmp_type,
+                                        src_mac: None,
                                         family: r.family.clone(),
                                         direction: r.direction.clone(),
                                     });
@@ -652,6 +691,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
             // another datapath special case has the advantage that the opening is
             // *visible*: it shows up in the compiled config an operator inspects.
             let mut port_rules: Vec<PortRule> = port_rules;
+            port_rules.extend(mac_rules);
             for lb in appliance
                 .load_balancers
                 .iter()
@@ -671,6 +711,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                     limit: None,
                     burst: None,
                     icmp_type: None,
+                    src_mac: None,
                     family: None,
                     direction: None,
                 };

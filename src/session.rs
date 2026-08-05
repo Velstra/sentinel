@@ -214,6 +214,7 @@ struct RuleDraft {
     proto: Option<Proto>,
     port: Vec<PortSpec>,
     icmp_type: Option<String>,
+    source_mac_group: Option<String>,
     family: Option<String>,
     direction: Option<String>,
     log: Option<bool>,
@@ -2020,6 +2021,7 @@ impl Draft {
                             proto: r.proto,
                             port: r.port.clone(),
                             icmp_type: r.icmp_type.clone(),
+                            source_mac_group: r.source_mac_group.clone(),
                             family: r.family.clone(),
                             direction: r.direction.clone(),
                             log: Some(r.log),
@@ -3310,6 +3312,9 @@ impl Session {
                 // are still being typed in either order.
                 self.draft.rule_mut(name).icmp_type = Some((*v).to_string())
             }
+            ["firewall", "rule", name, "source-mac-group", v] => {
+                self.draft.rule_mut(name).source_mac_group = Some((*v).to_string())
+            }
             ["firewall", "rule", name, "family", v] => {
                 self.draft.rule_mut(name).family = Some((*v).to_string())
             }
@@ -3383,6 +3388,14 @@ impl Session {
                     .entry((*name).to_string())
                     .or_default();
                 append_csv(list, v);
+            }
+            ["firewall", "group", "mac-group", name, "mac", v] => {
+                let mut out = Vec::new();
+                for one in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    crate::config::validate_mac(one)?;
+                    out.push(one.to_ascii_lowercase());
+                }
+                self.draft.groups.mac.insert((*name).to_string(), out);
             }
             ["firewall", "group", "feed-group", name, "url", v] => {
                 for one in v.split(',').map(str::trim).filter(|x| !x.is_empty()) {
@@ -5774,6 +5787,7 @@ impl Session {
                     "proto" => r.proto = None,
                     "port" => r.port.clear(),
                     "icmp-type" => r.icmp_type = None,
+                    "source-mac-group" => r.source_mac_group = None,
                     "family" => r.family = None,
                     "direction" => r.direction = None,
                     "log" => r.log = None,
@@ -7258,6 +7272,7 @@ impl Session {
                         .ok_or_else(|| anyhow::anyhow!("rule {name:?}: action not set"))?,
                     proto: d.proto,
                     icmp_type: d.icmp_type.clone(),
+                    source_mac_group: d.source_mac_group.clone(),
                     family: d.family.clone(),
                     direction: d.direction.clone(),
                     port: d.port.clone(),
@@ -8599,6 +8614,7 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
     if !draft.groups.address.is_empty()
         || !draft.groups.port.is_empty()
         || !draft.groups.domain.is_empty()
+        || !draft.groups.mac.is_empty()
         || !draft.groups.feed.is_empty()
         || !draft.groups.user.is_empty()
     {
@@ -8622,6 +8638,13 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             if !specs.is_empty() {
                 let ports: Vec<String> = specs.iter().map(PortSpec::to_string).collect();
                 fwi.push_str(&format!("            port {}\n", ports.join(",")));
+            }
+            fwi.push_str("        }\n");
+        }
+        for (name, macs) in &draft.groups.mac {
+            fwi.push_str(&format!("        mac-group {name} {{\n"));
+            if !macs.is_empty() {
+                fwi.push_str(&format!("            mac {}\n", macs.join(",")));
             }
             fwi.push_str("        }\n");
         }
@@ -8669,6 +8692,9 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         if let Some(t) = &r.icmp_type {
             fwi.push_str(&format!("        icmp-type {t}\n"));
+        }
+        if let Some(g) = &r.source_mac_group {
+            fwi.push_str(&format!("        source-mac-group {g}\n"));
         }
         if let Some(f) = &r.family {
             fwi.push_str(&format!("        family {f}\n"));
@@ -11074,6 +11100,8 @@ web = ["80", "443"]
 ads = ["doubleclick.net", "ads.example.com"]
 [firewall.group.user]
 admins = ["vera"]
+[firewall.group.mac]
+printers = ["aa:bb:cc:dd:ee:ff"]
 [firewall.group.feed]
 bogons = ["https://example.com/bogons.txt"]
 [[firewall.syn-protect]]
@@ -11163,6 +11191,7 @@ wan-zone = "wan"
         for expected in [
             "set firewall group feed-group bogons url https://example.com/bogons.txt",
             "set firewall group user-group admins user vera",
+            "set firewall group mac-group printers mac aa:bb:cc:dd:ee:ff",
             "set services ids sni-block tracker.example.com",
             "set services flow-export collector 10.0.0.9:2055",
             "set system console device ttyS0",

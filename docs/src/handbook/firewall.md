@@ -310,6 +310,36 @@ be told apart in the log.
 Named address / port sets you reference from rules, so one edit updates every
 rule that uses them.
 
+### Devices, not addresses
+
+A `mac-group` names hardware addresses. A device keeps its MAC when its address
+changes, and cannot spoof one past the first switch — which is what makes this
+worth having beside an address group.
+
+```text
+set firewall group mac-group printers mac aa:bb:cc:dd:ee:ff,aa:bb:cc:dd:ee:01
+set firewall rule no-printers from lan
+set firewall rule no-printers source-mac-group printers
+set firewall rule no-printers action drop
+```
+
+**A MAC rule is a verdict on the device, not a condition that combines with a
+protocol and a port.** Naming one beside a port is refused rather than half
+enforced. The reason is where the match happens: the data plane consults MACs
+**once**, from the Ethernet header, the same way it consults the blocklist —
+not as a dimension of the rule tries, which are already looked up twice per
+packet and have no room for a fifth. A rule that carried a MAC *and* a port
+would read narrow and match everything, which is worse than one that says what
+it does.
+
+Where both match, the MAC rule wins: naming the device is the more specific
+statement of the two.
+
+This is also the one place a broad `drop` is accepted. Elsewhere a rule with no
+protocol and no port is refused, because a zone's deny posture comes from its
+default action and such a rule would silently do nothing — but a MAC rule
+reaches the data plane through its own map, so it does something.
+
 ```text
 set firewall group address-group admins address 10.0.0.10,10.0.0.11
 set firewall group port-group web port 80,443,8443
