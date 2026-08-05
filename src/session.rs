@@ -8593,6 +8593,15 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         if let Some(vrf) = &s.vrf {
             proto.push_str(&format!("        vrf {vrf}\n"));
         }
+        // A blackhole route has no `via` and no `dev` — nowhere to send is the
+        // whole point — so without this it rendered as a block with no fields,
+        // which flattens to no `set` line at all and takes the route with it.
+        if s.blackhole {
+            proto.push_str("        blackhole true\n");
+        }
+        if let Some(d) = s.distance {
+            proto.push_str(&format!("        distance {d}\n"));
+        }
         proto.push_str("    }\n");
     }
     if !draft.ospf.is_empty() {
@@ -9909,6 +9918,7 @@ fn render_route_map(out: &mut String, name: &str, f: &FilterDraft) {
         }
         // set { … } — only when an attribute change is present.
         let has_set = r.set_metric.is_some()
+            || r.set_next_hop.is_some()
             || r.add_metric.is_some()
             || r.set_preference.is_some()
             || !r.set_community.is_empty()
@@ -9919,6 +9929,9 @@ fn render_route_map(out: &mut String, name: &str, f: &FilterDraft) {
             || !r.add_ext_community.is_empty();
         if has_set {
             out.push_str("            set {\n");
+            if let Some(nh) = &r.set_next_hop {
+                out.push_str(&format!("                next-hop {nh}\n"));
+            }
             if let Some(m) = r.set_metric {
                 out.push_str(&format!("                metric {m}\n"));
             }
@@ -10207,6 +10220,210 @@ to = "10.0.0.10:443"
         assert_eq!(
             rebuilt, original,
             "the configuration did not survive being flattened to commands"
+        );
+    }
+
+    /// The same round trip over the routing surface, which the fixture above
+    /// does not touch at all.
+    ///
+    /// That gap was not theoretical: `blackhole`, `distance` and `set-next-hop`
+    /// were all reachable in the config file, the CLI and the console, and none
+    /// of the three came back out of `show configuration commands`. A blackhole
+    /// route vanished *entirely* — with no `via` and no `dev` it rendered as a
+    /// block with no fields, and a block with no fields flattens to no command.
+    ///
+    /// What that costs is worth stating: these commands are what gets copied
+    /// into a ticket or onto a second appliance. A null route that quietly does
+    /// not arrive is traffic being forwarded that somebody decided to discard.
+    #[test]
+    fn the_routing_configuration_survives_the_same_round_trip() {
+        let toml = r#"
+[system]
+hostname = "edge"
+[[interface]]
+name = "eth0"
+zone = "lan"
+address = "10.0.0.1/24"
+[[interface]]
+name = "eth1"
+zone = "wan"
+address = "192.0.2.1/24"
+address6 = "2001:db8:1::1/64"
+[protocols]
+router-id = "10.0.0.1"
+
+# Nowhere to send, which is the whole point — and the shape that used to
+# disappear.
+[[protocols.static]]
+prefix = "198.51.100.0/24"
+blackhole = true
+# A floating default: worse than anything learned, so it only takes over when
+# the learned route goes away.
+[[protocols.static]]
+prefix = "203.0.113.0/24"
+via = "192.0.2.254"
+distance = 200
+[[protocols.static]]
+prefix = "10.10.0.0/16"
+via = "10.0.0.2"
+vrf = "blue"
+
+[protocols.ospf]
+redistribute = ["static"]
+stub-areas = ["0.0.0.1"]
+stub-default-cost = 10
+auth-type = "md5"
+auth-key = "ospfsecret"
+auth-key-id = 7
+hello-interval = 5
+dead-interval = 20
+[[protocols.ospf.interface]]
+name = "eth0"
+area = "0.0.0.0"
+[[protocols.ospf3.interface]]
+name = "eth1"
+area = "0.0.0.0"
+
+[protocols.rip]
+interfaces = ["eth0"]
+redistribute = ["connected"]
+[protocols.ripng]
+interfaces = ["eth1"]
+redistribute = ["static"]
+[protocols.babel]
+interfaces = ["eth0"]
+redistribute = ["connected"]
+
+[protocols.isis]
+interfaces = ["eth0"]
+system-id = "0100.0000.0001"
+area = "49.0001"
+level = "2"
+metric = 20
+network-type = "point-to-point"
+l2-to-l1-leaking = true
+bfd = true
+auth-type = "hmac-sha256"
+auth-key = "secret123"
+auth-key-id = 1
+
+[protocols.bgp]
+local-as = 65001
+network = ["10.0.0.0/24"]
+redistribute = ["connected"]
+cluster-id = "10.0.0.1"
+confederation-id = 65100
+confederation-members = [65002]
+community = ["65001:200"]
+large-community = ["65001:1:2"]
+ext-community = ["rt:65001:5"]
+multipath = 4
+rpki-reject-invalid = true
+ebgp-require-policy = true
+[[protocols.bgp.aggregate]]
+prefix = "10.0.0.0/8"
+summary-only = true
+[[protocols.bgp.roa]]
+prefix = "10.0.0.0/8"
+max-length = 24
+origin-as = 65001
+[[protocols.bgp.neighbor]]
+address = "192.0.2.2"
+remote-as = 65002
+ttl-security = 2
+max-prefix = 1000
+default-originate = true
+add-path = true
+extended-nexthop = true
+export = "to-peers"
+role = "customer"
+bfd = true
+update-source = "10.0.0.1"
+description = "upstream"
+hold-time = 90
+
+[[protocols.vrrp]]
+name = "ha"
+interface = "eth0"
+vrid = 51
+priority = 200
+track-interface = ["eth1"]
+virtual-address = ["10.0.0.254"]
+address-interface = "eth1"
+
+[[protocols.vrf]]
+name = "blue"
+table = 100
+rd = "65001:100"
+interfaces = ["eth0"]
+import = "to-peers"
+
+[protocols.bfd]
+min-tx = 300
+detect-mult = 5
+echo = true
+[protocols.multicast]
+igmp = true
+robustness = 3
+
+[[policy.prefix-list]]
+name = "customers"
+[[policy.prefix-list.rule]]
+seq = 10
+prefix = "10.0.0.0/8"
+le = 24
+[[policy.prefix-list.rule]]
+seq = 20
+prefix = "172.16.0.0/12"
+ge = 16
+[[policy.route-map]]
+name = "to-peers"
+default = "reject"
+[[policy.route-map.rule]]
+seq = 10
+match-prefix-list = "customers"
+set-metric = 100
+set-next-hop = "192.0.2.9"
+add-community = ["65001:100"]
+action = "accept"
+[[policy.route-map.rule]]
+seq = 20
+protocol = "static"
+metric-le = 50
+action = "reject"
+"#;
+        let original = render_appliance(&Appliance::from_toml(toml).unwrap());
+        let commands = flatten_config(&original);
+        for expected in [
+            "set protocols static 198.51.100.0/24 blackhole true",
+            "set protocols static 203.0.113.0/24 distance 200",
+            "set policy route-map to-peers rule 10 set next-hop 192.0.2.9",
+        ] {
+            assert!(
+                commands.iter().any(|c| c == expected),
+                "{expected:?} is not in the flattened config: {commands:#?}"
+            );
+        }
+
+        let dir = std::env::temp_dir().join(format!("sentinel-flatten-rt-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("appliance.toml");
+        let _ = std::fs::remove_file(&path);
+        let mut session = Session::load(&path).unwrap();
+        let act = crate::repl::Apply::off();
+        let mut ctx: Vec<String> = Vec::new();
+        for command in &commands {
+            assert!(
+                !crate::repl::exec_line(&mut session, &act, &mut ctx, command),
+                "{command} ended the session"
+            );
+        }
+        let rebuilt = render_appliance(&session.commit().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            rebuilt, original,
+            "the routing configuration did not survive being flattened to commands"
         );
     }
     use super::*;
