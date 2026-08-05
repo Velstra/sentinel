@@ -1357,6 +1357,10 @@ const SERVICES_NODES: &[Cand] = &[
         "notify on a failed unit: webhook and/or mail (roadmap C23)",
     ),
     (
+        "flow-export",
+        "ship flow records to an IPFIX collector (RFC 7011)",
+    ),
+    (
         "ids",
         "intrusion detection: watch links with suricata (roadmap C11)",
     ),
@@ -1420,6 +1424,19 @@ const IDS_NODES: &[Cand] = &[
     (
         "never-block",
         "a source that must never be blocked — your way in (repeatable)",
+    ),
+    (
+        "sni-block",
+        "refuse a TLS server by the name in its handshake (repeatable)",
+    ),
+];
+/// `services flow-export <Tab>` — where the flow records go.
+const FLOW_EXPORT_FIELDS: &[Cand] = &[
+    ("collector", "the IPFIX collector, host:port"),
+    ("interval", "seconds between exports (default 60)"),
+    (
+        "domain",
+        "the Observation Domain ID a collector groups this box's flows under",
     ),
 ];
 // `show ids <Tab>`.
@@ -2848,6 +2865,7 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "services", "port-mapping"] => PORTMAP_FIELDS,
         ["set", "services", "port-mapping", "allow-privileged"] => BOOLS,
         ["set" | "delete", "services", "ids"] => IDS_NODES,
+        ["set" | "delete", "services", "flow-export"] => FLOW_EXPORT_FIELDS,
         ["set", "services", "ids", "block-on-alert"] => BOOLS,
         ["set" | "delete", "services", "syslog"] => SYSLOG_NODES,
         ["set" | "delete", "services", "syslog", "target", _host] => SYSLOG_FIELDS,
@@ -4291,6 +4309,7 @@ mod tests {
                 "port-mapping",
                 "syslog",
                 "alerts",
+                "flow-export",
                 "ids"
             ]
         );
@@ -4304,7 +4323,8 @@ mod tests {
                 "block-on-alert",
                 "block-severity",
                 "block-duration",
-                "never-block"
+                "never-block",
+                "sni-block"
             ]
         );
         assert_eq!(
