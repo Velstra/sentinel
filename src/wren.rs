@@ -500,9 +500,29 @@ struct WrenMulticast {
         skip_serializing_if = "Option::is_none"
     )]
     query_response_interval: Option<u32>,
+    // A plain sub-table: after the scalars, before the array-of-tables below —
+    // once `[[multicast.interface]]` has been emitted, a `[multicast.pim]` that
+    // followed would still parse, but the serializer will not write a table
+    // after an array of them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pim: Option<WrenPim>,
     // Array-of-tables — must serialize after every scalar field of `[multicast]`.
     #[serde(rename = "interface", skip_serializing_if = "Vec::is_empty")]
     interfaces: Vec<WrenMulticastInterface>,
+}
+
+/// `[multicast.pim]` — PIM-SM with a static rendezvous point.
+#[derive(Debug, Serialize)]
+struct WrenPim {
+    enabled: bool,
+    #[serde(rename = "rp-address", skip_serializing_if = "Option::is_none")]
+    rp_address: Option<String>,
+    #[serde(rename = "hello-interval", skip_serializing_if = "Option::is_none")]
+    hello_interval: Option<u16>,
+    #[serde(rename = "spt-threshold", skip_serializing_if = "Option::is_none")]
+    spt_threshold: Option<u32>,
+    #[serde(rename = "interface", skip_serializing_if = "Vec::is_empty")]
+    interfaces: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -820,6 +840,13 @@ pub fn compile_wren(appliance: &Appliance) -> WrenConfig {
         robustness: m.robustness,
         query_interval: m.query_interval,
         query_response_interval: m.query_response_interval,
+        pim: m.pim.as_ref().map(|p| WrenPim {
+            enabled: p.enabled,
+            rp_address: p.rp_address.clone(),
+            hello_interval: p.hello_interval,
+            spt_threshold: p.spt_threshold,
+            interfaces: p.interfaces.clone(),
+        }),
         interfaces: m
             .interfaces
             .iter()

@@ -1917,6 +1917,18 @@ const MULTICAST_FIELDS: &[Cand] = &[
         "the Query Response Interval (seconds)",
     ),
     ("interface", "a NIC and its multicast role (<name> role …)"),
+    ("pim", "PIM-SM: route multicast between segments (RFC 7761)"),
+];
+/// `protocols multicast pim <Tab>` — sparse mode with a static rendezvous point.
+const PIM_FIELDS: &[Cand] = &[
+    ("enabled", "run PIM-SM (true/false)"),
+    ("rp-address", "the rendezvous point (required when enabled)"),
+    ("interface", "a NIC PIM speaks on (repeatable)"),
+    ("hello-interval", "seconds between Hellos (default 30)"),
+    (
+        "spt-threshold",
+        "kbit/s above which a group switches to the source tree (0 = at once)",
+    ),
 ];
 const MULTICAST_IFACE_FIELDS: &[Cand] = &[
     ("role", "querier / upstream / downstream"),
@@ -3071,6 +3083,8 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set", "protocols", "bfd", "echo"] => BOOLS,
         // Multicast (IGMP/MLD querier + proxy).
         ["set" | "delete", "protocols", "multicast"] => MULTICAST_FIELDS,
+        ["set" | "delete", "protocols", "multicast", "pim"] => PIM_FIELDS,
+        ["set", "protocols", "multicast", "pim", "enabled"] => BOOLS,
         ["set", "protocols", "multicast", "enabled" | "igmp" | "mld"] => BOOLS,
         [
             "set" | "delete",
