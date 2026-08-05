@@ -314,3 +314,77 @@ protocol is doing the redistributing.
 OSPFv3 is the exception: the daemon has `redistribute-static` and nothing else,
 so static is the only source it can carry, and the CLI offers only that rather
 than accepting a value that would be refused on apply.
+
+## EVPN: one tenant network across several boxes
+
+BGP carries *who is where* — a MAC learned on this box is announced to the others
+(RFC 7432 type-2), a subnet behind it as a prefix (RFC 9136 type-5). The data
+plane carries the frames, wrapped in VXLAN or Geneve toward whichever box
+announced the destination. Neither half is any use alone, so both are configured
+in one place.
+
+```text
+set protocols bgp local-as 65001
+set protocols bgp neighbor 10.0.0.2 remote-as 65001
+set protocols bgp neighbor 10.0.0.2 evpn true
+
+set evpn vtep-ip 10.0.0.1
+set evpn underlay-interface eth0
+set evpn encapsulation vxlan
+
+set evpn instance tenant-a evi 100
+set evpn instance tenant-a vni 10100
+set evpn instance tenant-a rt-import rt:65001:100
+set evpn instance tenant-a rt-export rt:65001:100
+set evpn instance tenant-a interface eth1
+```
+
+**Nothing here is learned state.** Which MAC lives behind which peer, the flood
+lists, neighbour suppression — all of it arrives at run time from the routing
+daemon. An operator who has to write down where each MAC is has not been given
+EVPN.
+
+| Field | Meaning |
+|---|---|
+| `vtep-ip` | This box's tunnel endpoint: the outer source of everything it encapsulates, and the next hop it announces itself under. Required. |
+| `underlay-interface` | The link encapsulated traffic leaves by. Required. |
+| `encapsulation` | `vxlan` (RFC 7348, UDP/4789) or `geneve` (RFC 8926, UDP/6081). Unset ⇒ VXLAN. |
+| `udp-port` | Override the destination port — for a second overlay on a network that already carries one. |
+| `mtu` | The underlay MTU, when it is not the link's own. |
+| `srv6-locator` | Use SRv6 service SIDs instead of a UDP encapsulation. |
+
+**VXLAN or Geneve.** VXLAN is what every switch speaks. Geneve carries options
+VXLAN cannot, which matters where something in the path wants to annotate a
+frame, and costs eight more bytes of every packet. If nothing in your network
+needs the options, the interoperable choice is the right one.
+
+### Segments and tenants
+
+An `instance` is a layer-2 segment: a VNI, the route targets that decide what it
+exchanges, and the local ports on it. Each named port is bound to that VNI in the
+data plane, which is what puts its frames into the segment.
+
+An `ip-vrf` is layer 3 — routing *between* segments, for a tenant with more than
+one subnet. It names a VRF that must already exist under `protocols vrf`.
+
+```text
+set protocols vrf blue table 100
+set evpn ip-vrf blue l3-vni 10999
+set evpn ip-vrf blue advertise-prefix 10.20.0.0/24
+set evpn ip-vrf blue router-mac 02:00:00:00:00:01
+```
+
+### What is refused, and why
+
+- **No BGP router.** EVPN's control plane *is* BGP; without one the overlay would
+  carry frames toward peers nobody ever announced.
+- **A route target that is not `rt:asn:value`.** The bare `65001:100` other
+  vendors accept is refused here, because the routing daemon refuses it — and a
+  target this appliance takes and the daemon then rejects is a configuration that
+  commits and does not start.
+- **A tenant port that is also the underlay.** The same interface cannot be both
+  inside and outside the tunnel.
+- **Two segments sharing a VNI**, or an `ip-vrf` whose `l3-vni` collides with one.
+  The VNI is the data plane's segment id; sharing it puts two tenants on one wire.
+- **An `ip-vrf` naming a VRF that does not exist.** A type-5 route is imported
+  into a routing table, and the table has to be there for the routes to land.

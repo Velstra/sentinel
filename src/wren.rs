@@ -110,6 +110,11 @@ struct WrenBgp {
     vrf: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rtr: Option<WrenRtr>,
+    // A plain sub-table: after the scalars of `[bgp]`, before the arrays of
+    // tables below, because the serializer will not write a table after an array
+    // of them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evpn: Option<WrenEvpn>,
     #[serde(rename = "aggregate", skip_serializing_if = "Vec::is_empty")]
     aggregate: Vec<WrenAggregate>,
     #[serde(rename = "roa", skip_serializing_if = "Vec::is_empty")]
@@ -481,6 +486,53 @@ struct WrenBfd {
     echo_interval: Option<u32>,
 }
 
+/// `[bgp.evpn]` — what the routing daemon needs to carry the overlay's control
+/// plane: this box's VTEP identity, the layer-2 instances it takes part in, and
+/// the layer-3 tenants it routes between.
+#[derive(Debug, Serialize)]
+struct WrenEvpn {
+    #[serde(rename = "vtep-ip")]
+    vtep_ip: String,
+    #[serde(rename = "srv6-locator", skip_serializing_if = "Option::is_none")]
+    srv6_locator: Option<String>,
+    // Arrays of tables serialize last, after every scalar of `[bgp.evpn]`.
+    #[serde(rename = "instance", skip_serializing_if = "Vec::is_empty")]
+    instances: Vec<WrenEvpnInstance>,
+    #[serde(rename = "ip-vrf", skip_serializing_if = "Vec::is_empty")]
+    ip_vrfs: Vec<WrenEvpnIpVrf>,
+}
+
+#[derive(Debug, Serialize)]
+struct WrenEvpnInstance {
+    evi: u16,
+    vni: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rd: Option<String>,
+    #[serde(rename = "rt-import", skip_serializing_if = "Vec::is_empty")]
+    rt_import: Vec<String>,
+    #[serde(rename = "rt-export", skip_serializing_if = "Vec::is_empty")]
+    rt_export: Vec<String>,
+    #[serde(rename = "advertise-mac", skip_serializing_if = "Vec::is_empty")]
+    advertise_mac: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct WrenEvpnIpVrf {
+    name: String,
+    #[serde(rename = "l3-vni")]
+    l3_vni: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rd: Option<String>,
+    #[serde(rename = "rt-import", skip_serializing_if = "Vec::is_empty")]
+    rt_import: Vec<String>,
+    #[serde(rename = "rt-export", skip_serializing_if = "Vec::is_empty")]
+    rt_export: Vec<String>,
+    #[serde(rename = "advertise-prefix", skip_serializing_if = "Vec::is_empty")]
+    advertise_prefix: Vec<String>,
+    #[serde(rename = "router-mac", skip_serializing_if = "Option::is_none")]
+    router_mac: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct WrenMulticast {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -626,6 +678,41 @@ pub fn compile_wren(appliance: &Appliance) -> WrenConfig {
         rtr: b.rtr.as_ref().map(|r| WrenRtr {
             server: r.server.clone(),
             refresh: r.refresh,
+        }),
+        // EVPN rides under BGP because that is where its routes live. The
+        // appliance keeps it as its own section — one VTEP identity feeding both
+        // lower halves — and it is folded in here.
+        evpn: (!appliance.evpn.is_empty()).then(|| {
+            let e = &appliance.evpn;
+            WrenEvpn {
+                vtep_ip: e.vtep_ip.clone().unwrap_or_default(),
+                srv6_locator: e.srv6_locator.clone(),
+                instances: e
+                    .instances
+                    .iter()
+                    .map(|i| WrenEvpnInstance {
+                        evi: i.evi,
+                        vni: i.vni,
+                        rd: i.rd.clone(),
+                        rt_import: i.rt_import.clone(),
+                        rt_export: i.rt_export.clone(),
+                        advertise_mac: i.advertise_mac.clone(),
+                    })
+                    .collect(),
+                ip_vrfs: e
+                    .ip_vrfs
+                    .iter()
+                    .map(|v| WrenEvpnIpVrf {
+                        name: v.name.clone(),
+                        l3_vni: v.l3_vni,
+                        rd: v.rd.clone(),
+                        rt_import: v.rt_import.clone(),
+                        rt_export: v.rt_export.clone(),
+                        advertise_prefix: v.advertise_prefix.clone(),
+                        router_mac: v.router_mac.clone(),
+                    })
+                    .collect(),
+            }
         }),
         aggregate: b
             .aggregate

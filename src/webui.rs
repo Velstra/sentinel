@@ -1621,6 +1621,49 @@ pub fn page() -> String {
       <div class="card"><h3>Recent alerts</h3><pre class="out" id="alertshow">…</pre></div>
     </div>
 
+    <div id="view-evpn" class="hidden">
+      <p class="lede">
+        One tenant network across several boxes. BGP carries <em>who is
+        where</em> — a MAC learned here is announced to the others, a subnet
+        behind it as a prefix — and the data plane carries the frames, wrapped
+        toward whichever box announced the destination. Neither half is any use
+        alone, so both are set here.
+      </p>
+      <div class="card">
+        <h3>This box</h3>
+        <p class="lede" style="margin:0 0 var(--space-4)">
+          The tunnel endpoint address is the outer source of everything this box
+          encapsulates and the next hop it announces itself under. VXLAN is what
+          every switch speaks; Geneve carries options VXLAN cannot and costs
+          eight more bytes per packet.
+        </p>
+        <div class="grid" id="evpnform"></div>
+      </div>
+      <div class="section">
+        <h3>Segments</h3>
+        <span class="spacer"></span>
+        <button class="btn" id="toggleevi">New</button>
+      </div>
+      <p class="lede">
+        A layer-2 segment and the local ports on it. The VNI is the segment's id
+        on the wire and the data plane's id for it, so two segments cannot share
+        one.
+      </p>
+      <div class="card addpanel hidden" id="addevipanel"></div>
+      <div id="evilist"></div>
+      <div class="section">
+        <h3>Tenants</h3>
+        <span class="spacer"></span>
+        <button class="btn" id="toggleipvrf">New</button>
+      </div>
+      <p class="lede">
+        Routing <em>between</em> segments, for a tenant with more than one
+        subnet. Each names a VRF that has to exist under routing.
+      </p>
+      <div class="card addpanel hidden" id="addipvrfpanel"></div>
+      <div id="ipvrflist"></div>
+    </div>
+
     <div id="view-ha" class="hidden">
       <div class="section">
         <h3>Virtual router groups</h3>
@@ -2718,6 +2761,16 @@ function ruleFields(zones) {{
      ["", "tcp", "udp", "tcp_udp", "icmp", "icmpv6", "vrrp", "esp", "ah", "gre"]],
     ["port", "Port"],
     ["port-group", "Port group"],
+    // Both families' names, since which numbering applies follows from the
+    // protocol above. A number is accepted too.
+    ["icmp-type", "ICMP type", ["", "echo-request", "echo-reply",
+      "destination-unreachable", "packet-too-big", "time-exceeded",
+      "parameter-problem", "redirect", "router-solicitation",
+      "router-advertisement", "neighbor-solicitation", "neighbor-advertisement"]],
+    // A rule with no address applies to both families; this is how it says
+    // otherwise. `out` covers traffic this box originates, and is IPv4 only.
+    ["family", "Address family", ["", "ipv4", "ipv6"]],
+    ["direction", "Direction", ["", "in", "out"]],
     ["source", "Source"],
     ["source-group", "Source group"],
     ["destination", "Destination"],
@@ -5524,6 +5577,53 @@ async function refreshServices() {{
   }}
 }}
 
+// EVPN. The identity first, then the two object kinds.
+const EVPN = [
+  ["vtep-ip", "Tunnel endpoint address"],
+  ["underlay-interface", "Underlay link"],
+  ["encapsulation", "Encapsulation", ["", "vxlan", "geneve"]],
+  ["#", "More settings"],
+  ["udp-port", "UDP port"],
+  ["mtu", "Underlay MTU"],
+  ["srv6-locator", "SRv6 locator"],
+];
+const EVPN_INSTANCE = [
+  ["evi", "Instance id"],
+  ["vni", "VNI"],
+  ["interface", "Ports on this segment", null, "each"],
+  ["#", "Route policy"],
+  ["rd", "Route distinguisher"],
+  ["rt-import", "Import targets", null, "each"],
+  ["rt-export", "Export targets", null, "each"],
+  ["advertise-mac", "Announce these MACs", null, "each"],
+];
+const EVPN_IPVRF = [
+  ["l3-vni", "L3 VNI"],
+  ["advertise-prefix", "Originate these prefixes", null, "each"],
+  ["#", "Route policy"],
+  ["rd", "Route distinguisher"],
+  ["rt-import", "Import targets", null, "each"],
+  ["rt-export", "Export targets", null, "each"],
+  ["router-mac", "Router MAC"],
+];
+
+async function refreshEvpn() {{
+  const ls = await leaves();
+  settingsPanel("evpnform", EVPN, fieldsOf(ls, "evpn"), "evpn", "This box");
+  renderObjects({{
+    listId: "evilist", toggleId: "toggleevi", toggleLabel: "New segment",
+    addId: "addevipanel", noun: "Segment", fields: EVPN_INSTANCE, nameHint: "tenant-a",
+    path: (n) => `evpn instance ${{n}}`,
+    rows: entriesUnder(ls, ["evpn", "instance"]),
+  }});
+  renderObjects({{
+    listId: "ipvrflist", toggleId: "toggleipvrf", toggleLabel: "New tenant",
+    addId: "addipvrfpanel", noun: "Tenant", fields: EVPN_IPVRF, nameHint: "blue",
+    path: (n) => `evpn ip-vrf ${{n}}`,
+    rows: entriesUnder(ls, ["evpn", "ip-vrf"]),
+  }});
+}}
+
 async function refreshHa() {{
   await showInto("vrrpshow", "/api/v1/show/vrrp");
   renderObjects({{
@@ -5732,6 +5832,9 @@ const SECTIONS = [
     {{ v: "certs", t: "Certificates", i: "file" }},
     {{ v: "ids", t: "Intrusion detection", i: "bug" }},
     {{ v: "capture", t: "Packet capture", i: "search" }},
+  ]}},
+  {{ g: "Overlay", items: [
+    {{ v: "evpn", t: "EVPN", i: "layers" }},
   ]}},
   {{ g: "Services", items: [
     {{ v: "services", tab: "resolution", t: "DNS and time", i: "layers" }},
@@ -5977,6 +6080,7 @@ const ABOUT = {{
   qos: "Shaping on the link that is congested — set it below the real line rate.",
   lb: "Virtual addresses in front of backend pools.",
   routing: "Everything that decides where a packet goes next.",
+  evpn: "One tenant network across several boxes: BGP says who is where, the data plane carries the frames.",
   "routing:ospf": "Link-state routing inside your own network, area by area.",
   "routing:ospf3": "OSPF for IPv6 — its own adjacencies, alongside the v2 process.",
   "routing:isis": "Link-state routing that carries both address families at once.",
@@ -6197,6 +6301,7 @@ async function refresh() {{
   if (view === "certs") return refreshCerts();
   if (view === "ids") return refreshIds();
   if (view === "capture") return refreshCapture();
+  if (view === "evpn") return refreshEvpn();
   if (view === "ha") return refreshHa();
   if (view === "users") return refreshUsers();
   if (view === "ipsec") return refreshIpsec();
