@@ -1616,6 +1616,27 @@ pub struct Evpn {
         skip_serializing_if = "Option::is_none"
     )]
     pub srv6_locator: Option<String>,
+    /// This box's SRv6 source address — the outer IPv6 source of everything it
+    /// encapsulates, an address out of its own locator.
+    ///
+    /// Required alongside a locator, and separate from it because the two are
+    /// different things: the routing daemon announces service SIDs *within* the
+    /// locator, and the data plane needs one concrete address to send from.
+    #[serde(
+        default,
+        rename = "srv6-source",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub srv6_source: Option<String>,
+    /// The peers this box accepts an SRv6 decapsulation from — each peer's own
+    /// source address.
+    ///
+    /// A trust list, not a reachability list. Without it anything that can reach
+    /// this box's SID could inject a frame straight onto a tenant segment,
+    /// bypassing every zone the firewall has — the same reason the VXLAN side
+    /// keeps a trusted-VTEP set.
+    #[serde(default, rename = "srv6-peer", skip_serializing_if = "Vec::is_empty")]
+    pub srv6_peers: Vec<String>,
     /// The layer-2 segments this box takes part in.
     #[serde(default, rename = "instance", skip_serializing_if = "Vec::is_empty")]
     pub instances: Vec<EvpnInstance>,
@@ -1632,6 +1653,8 @@ impl Evpn {
             && self.udp_port.is_none()
             && self.mtu.is_none()
             && self.srv6_locator.is_none()
+            && self.srv6_source.is_none()
+            && self.srv6_peers.is_empty()
             && self.instances.is_empty()
             && self.ip_vrfs.is_empty()
     }
@@ -4335,6 +4358,13 @@ pub struct Groups {
     /// [`Groups::address`]. A rule naming one says *who*, not where.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub user: BTreeMap<String, Vec<String>>,
+    /// Interface groups: named sets of links, for a rule that applies to some
+    /// of a zone's interfaces rather than all of them.
+    ///
+    /// A zone is already a named set of links, so this is for the case a zone
+    /// cannot express: two rules over different subsets of the *same* zone.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub interface: BTreeMap<String, Vec<String>>,
     /// MAC groups: hardware addresses, for a rule that names devices rather than
     /// addresses. A device keeps its MAC when its address changes, and cannot
     /// spoof one past the first switch — which is what makes this worth having
@@ -4359,6 +4389,7 @@ impl Groups {
             && self.feed.is_empty()
             && self.user.is_empty()
             && self.mac.is_empty()
+            && self.interface.is_empty()
     }
 
     /// Whether `name` is a declared address, domain **or** feed group — all
@@ -5365,6 +5396,17 @@ pub struct Rule {
         skip_serializing_if = "Option::is_none"
     )]
     pub source_mac_group: Option<String>,
+    /// Apply this rule only on the links in a `[firewall.group.interface]`.
+    ///
+    /// The interface is matched in the data plane's rule key, so a scoped rule
+    /// and an unscoped one are different entries — and the scoped one wins,
+    /// because naming the link is the more specific statement.
+    #[serde(
+        default,
+        rename = "interface-group",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub interface_group: Option<String>,
     /// Restrict this rule to one address family (`ipv4` / `ipv6`). Absent means
     /// both, which is what a rule with no address constraint has always meant.
     ///
@@ -6474,6 +6516,22 @@ impl Appliance {
                         "rule {:?}: icmp-type needs `protocol icmp` or `protocol icmpv6`",
                         rule.name
                     ),
+                }
+            }
+            if let Some(g) = &rule.interface_group {
+                match self.firewall.group.interface.get(g) {
+                    None => bail!("rule {:?}: no interface-group {g:?}", rule.name),
+                    Some(members) => {
+                        for m in members {
+                            if !self.interfaces.iter().any(|i| &i.name == m) {
+                                bail!(
+                                    "rule {:?}: interface-group {g:?} names {m:?}, \
+                                     which is not a declared interface",
+                                    rule.name
+                                );
+                            }
+                        }
+                    }
                 }
             }
             if let Some(g) = &rule.source_mac_group {
@@ -8895,6 +8953,30 @@ impl Appliance {
                 if !matches!(enc.as_str(), "vxlan" | "geneve") {
                     bail!("evpn encapsulation {enc:?}: use vxlan or geneve");
                 }
+            }
+            if let Some(loc) = &e.srv6_locator {
+                validate_cidr_or_ip(loc).with_context(|| "evpn srv6-locator")?;
+                match &e.srv6_source {
+                    None => bail!(
+                        "evpn: srv6-locator needs srv6-source — the daemon announces SIDs \
+                         within the locator, the data plane sends from one address"
+                    ),
+                    Some(src) => {
+                        validate_ipv6(src).with_context(|| "evpn srv6-source")?;
+                    }
+                }
+                if e.srv6_peers.is_empty() {
+                    bail!(
+                        "evpn: srv6-locator needs at least one srv6-peer — without a trust \
+                         list anything that reaches this box's SID can inject a frame onto a \
+                         tenant segment, past every zone"
+                    );
+                }
+            } else if e.srv6_source.is_some() || !e.srv6_peers.is_empty() {
+                bail!("evpn: srv6-source/srv6-peer without srv6-locator configures nothing");
+            }
+            for p in &e.srv6_peers {
+                validate_ipv6(p).with_context(|| "evpn srv6-peer")?;
             }
             if let Some(mac) = e.ip_vrfs.iter().find_map(|v| v.router_mac.as_deref()) {
                 validate_mac(mac).with_context(|| "evpn ip-vrf router-mac")?;

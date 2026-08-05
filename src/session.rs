@@ -215,6 +215,7 @@ struct RuleDraft {
     port: Vec<PortSpec>,
     icmp_type: Option<String>,
     source_mac_group: Option<String>,
+    interface_group: Option<String>,
     family: Option<String>,
     direction: Option<String>,
     log: Option<bool>,
@@ -2022,6 +2023,7 @@ impl Draft {
                             port: r.port.clone(),
                             icmp_type: r.icmp_type.clone(),
                             source_mac_group: r.source_mac_group.clone(),
+                            interface_group: r.interface_group.clone(),
                             family: r.family.clone(),
                             direction: r.direction.clone(),
                             log: Some(r.log),
@@ -3315,6 +3317,9 @@ impl Session {
             ["firewall", "rule", name, "source-mac-group", v] => {
                 self.draft.rule_mut(name).source_mac_group = Some((*v).to_string())
             }
+            ["firewall", "rule", name, "interface-group", v] => {
+                self.draft.rule_mut(name).interface_group = Some((*v).to_string())
+            }
             ["firewall", "rule", name, "family", v] => {
                 self.draft.rule_mut(name).family = Some((*v).to_string())
             }
@@ -3388,6 +3393,18 @@ impl Session {
                     .entry((*name).to_string())
                     .or_default();
                 append_csv(list, v);
+            }
+            ["firewall", "group", "interface-group", name, "interface", v] => {
+                let members: Vec<String> = v
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                self.draft
+                    .groups
+                    .interface
+                    .insert((*name).to_string(), members);
             }
             ["firewall", "group", "mac-group", name, "mac", v] => {
                 let mut out = Vec::new();
@@ -4742,6 +4759,7 @@ impl Session {
                     other => bail!("evpn ip-vrf has no field {other:?}"),
                 }
             }
+            ["evpn", "srv6-peer", v] => append_csv(&mut self.draft.evpn.srv6_peers, v),
             ["evpn", field, v] => {
                 let e = &mut self.draft.evpn;
                 match *field {
@@ -4753,6 +4771,7 @@ impl Session {
                     }
                     "mtu" => e.mtu = Some(v.parse().with_context(|| format!("invalid mtu {v:?}"))?),
                     "srv6-locator" => e.srv6_locator = Some((*v).to_string()),
+                    "srv6-source" => e.srv6_source = Some((*v).to_string()),
                     other => bail!("evpn has no field {other:?}"),
                 }
             }
@@ -5788,6 +5807,7 @@ impl Session {
                     "port" => r.port.clear(),
                     "icmp-type" => r.icmp_type = None,
                     "source-mac-group" => r.source_mac_group = None,
+                    "interface-group" => r.interface_group = None,
                     "family" => r.family = None,
                     "direction" => r.direction = None,
                     "log" => r.log = None,
@@ -6588,6 +6608,8 @@ impl Session {
                     "udp-port" => e.udp_port = None,
                     "mtu" => e.mtu = None,
                     "srv6-locator" => e.srv6_locator = None,
+                    "srv6-source" => e.srv6_source = None,
+                    "srv6-peer" => e.srv6_peers.clear(),
                     other => bail!("evpn has no field {other:?}"),
                 }
             }
@@ -7273,6 +7295,7 @@ impl Session {
                     proto: d.proto,
                     icmp_type: d.icmp_type.clone(),
                     source_mac_group: d.source_mac_group.clone(),
+                    interface_group: d.interface_group.clone(),
                     family: d.family.clone(),
                     direction: d.direction.clone(),
                     port: d.port.clone(),
@@ -8615,6 +8638,7 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         || !draft.groups.port.is_empty()
         || !draft.groups.domain.is_empty()
         || !draft.groups.mac.is_empty()
+        || !draft.groups.interface.is_empty()
         || !draft.groups.feed.is_empty()
         || !draft.groups.user.is_empty()
     {
@@ -8638,6 +8662,13 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             if !specs.is_empty() {
                 let ports: Vec<String> = specs.iter().map(PortSpec::to_string).collect();
                 fwi.push_str(&format!("            port {}\n", ports.join(",")));
+            }
+            fwi.push_str("        }\n");
+        }
+        for (name, members) in &draft.groups.interface {
+            fwi.push_str(&format!("        interface-group {name} {{\n"));
+            if !members.is_empty() {
+                fwi.push_str(&format!("            interface {}\n", members.join(",")));
             }
             fwi.push_str("        }\n");
         }
@@ -8695,6 +8726,9 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         if let Some(g) = &r.source_mac_group {
             fwi.push_str(&format!("        source-mac-group {g}\n"));
+        }
+        if let Some(g) = &r.interface_group {
+            fwi.push_str(&format!("        interface-group {g}\n"));
         }
         if let Some(f) = &r.family {
             fwi.push_str(&format!("        family {f}\n"));
@@ -8904,6 +8938,12 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         if let Some(v) = &e.srv6_locator {
             out.push_str(&format!("    srv6-locator {v}\n"));
+        }
+        if let Some(v) = &e.srv6_source {
+            out.push_str(&format!("    srv6-source {v}\n"));
+        }
+        if !e.srv6_peers.is_empty() {
+            out.push_str(&format!("    srv6-peer {}\n", e.srv6_peers.join(",")));
         }
         for i in &e.instances {
             out.push_str(&format!("    instance {} {{\n", i.name));
@@ -10855,6 +10895,7 @@ action = "reject"
             "set evpn instance tenant-a rt-import rt:65001:100",
             "set evpn ip-vrf blue l3-vni 10999",
             "set evpn encapsulation vxlan",
+            "set evpn instance tenant-a interface eth0",
         ] {
             assert!(
                 commands.iter().any(|c| c == expected),
@@ -11102,6 +11143,8 @@ ads = ["doubleclick.net", "ads.example.com"]
 admins = ["vera"]
 [firewall.group.mac]
 printers = ["aa:bb:cc:dd:ee:ff"]
+[firewall.group.interface]
+trusted = ["eth0"]
 [firewall.group.feed]
 bogons = ["https://example.com/bogons.txt"]
 [[firewall.syn-protect]]
@@ -11192,6 +11235,7 @@ wan-zone = "wan"
             "set firewall group feed-group bogons url https://example.com/bogons.txt",
             "set firewall group user-group admins user vera",
             "set firewall group mac-group printers mac aa:bb:cc:dd:ee:ff",
+            "set firewall group interface-group trusted interface eth0",
             "set services ids sni-block tracker.example.com",
             "set services flow-export collector 10.0.0.9:2055",
             "set system console device ttyS0",

@@ -94,6 +94,25 @@ pub struct VelstraConfig {
     /// otherwise, which is what leaves the data plane in plain routing mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     overlay: Option<OverlayOut>,
+    /// The SRv6 transport, when the overlay rides service SIDs rather than a UDP
+    /// encapsulation. Omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    srv6: Option<Srv6Out>,
+}
+
+/// `[srv6]` in the emitted data-plane config: this box's SRv6 identity and the
+/// peers it accepts a decapsulation from.
+///
+/// The peer list is a *trust* list, not a reachability one. Anything that can
+/// reach this box's SID could otherwise inject a frame straight onto a tenant
+/// segment, past every zone the firewall has.
+#[derive(Debug, Serialize)]
+struct Srv6Out {
+    local_src: String,
+    underlay_iface: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    underlay_mtu: Option<u16>,
+    peers: Vec<String>,
 }
 
 /// `[overlay]` in the emitted data-plane config: how this box wraps and unwraps
@@ -297,6 +316,10 @@ struct PortRule {
     /// from the Ethernet header, not as a dimension of its rule tries.
     #[serde(rename = "src-mac", skip_serializing_if = "Option::is_none")]
     src_mac: Option<String>,
+    /// The interface this rule applies on. Omitted when it applies everywhere
+    /// the policy does.
+    #[serde(rename = "in-interface", skip_serializing_if = "Option::is_none")]
+    in_interface: Option<String>,
     /// Optional destination CIDR. Omitted when the rule is `to any`. Never set
     /// together with `src` — the data plane ranks one end per rule.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -582,6 +605,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                             burst: None,
                             icmp_type: None,
                             src_mac: Some(mac),
+                            in_interface: None,
                             family: None,
                             direction: None,
                         })
@@ -640,6 +664,20 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                     let mut out = Vec::with_capacity(
                         protos.len() * sources.len() * destinations.len() * ports.len(),
                     );
+                    // An interface-group expands here, the way a source-group
+                    // does: the data plane keys one interface per rule, so a
+                    // rule over three links is three rules.
+                    let ifaces: Vec<Option<String>> = match &r.interface_group {
+                        Some(g) => groups
+                            .interface
+                            .get(g)
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(Some)
+                            .collect(),
+                        None => vec![None],
+                    };
                     for &p in protos {
                         let proto = proto_str(p);
                         // Resolved here rather than at parse time because
@@ -659,21 +697,24 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                         for src in &sources {
                             for dst in &destinations {
                                 for &port in &ports {
-                                    out.push(PortRule {
-                                        name: r.name.clone(),
-                                        proto,
-                                        port,
-                                        action,
-                                        log,
-                                        src: src.clone(),
-                                        dst: dst.clone(),
-                                        limit: r.limit,
-                                        burst: r.burst,
-                                        icmp_type,
-                                        src_mac: None,
-                                        family: r.family.clone(),
-                                        direction: r.direction.clone(),
-                                    });
+                                    for iface in &ifaces {
+                                        out.push(PortRule {
+                                            name: r.name.clone(),
+                                            proto,
+                                            port,
+                                            action,
+                                            log,
+                                            src: src.clone(),
+                                            dst: dst.clone(),
+                                            limit: r.limit,
+                                            burst: r.burst,
+                                            icmp_type,
+                                            src_mac: None,
+                                            in_interface: iface.clone(),
+                                            family: r.family.clone(),
+                                            direction: r.direction.clone(),
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -712,6 +753,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                     burst: None,
                     icmp_type: None,
                     src_mac: None,
+                    in_interface: None,
                     family: None,
                     direction: None,
                 };
@@ -950,7 +992,9 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
             }),
         services,
         conntrack_sync,
-        overlay: (!appliance.evpn.is_empty()).then(|| {
+        // …and only when the transport is a UDP encapsulation. An SRv6 host
+        // emits `[srv6]` instead: the data plane takes one or the other.
+        overlay: (!appliance.evpn.is_empty() && appliance.evpn.srv6_locator.is_none()).then(|| {
             let e = &appliance.evpn;
             OverlayOut {
                 local_vtep: e.vtep_ip.clone().unwrap_or_default(),
@@ -963,6 +1007,19 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                 },
                 udp_port: e.udp_port,
                 underlay_mtu: e.mtu,
+            }
+        }),
+        // Rendered only when a locator is configured. The routing daemon gets the
+        // locator (it announces SIDs within it); the data plane gets one concrete
+        // source and the peers it will decapsulate from. Emitting one without the
+        // other is what left this half-wired.
+        srv6: appliance.evpn.srv6_locator.as_ref().map(|_| {
+            let e = &appliance.evpn;
+            Srv6Out {
+                local_src: e.srv6_source.clone().unwrap_or_default(),
+                underlay_iface: e.underlay_interface.clone().unwrap_or_default(),
+                underlay_mtu: e.mtu,
+                peers: e.srv6_peers.clone(),
             }
         }),
     }
@@ -2635,6 +2692,48 @@ zone = "wan"
         // The plain uplink asked for nothing and is not a tunnel: clamping every
         // interface would shrink segments that fit perfectly.
         assert_eq!(out.matches("mss = ").count(), 2, "{out}");
+    }
+
+    /// SRv6 reaches the data plane, and it is an *alternative* to a UDP
+    /// encapsulation rather than an addition. The data plane refuses `[srv6]`
+    /// beside `[overlay]` — one overlay format per host — so an appliance that
+    /// emitted both would compile something that will not load.
+    #[test]
+    fn srv6_replaces_the_udp_encapsulation_rather_than_joining_it() {
+        let base = r#"
+[system]
+hostname = "leaf"
+[[interface]]
+name = "eth0"
+zone = "underlay"
+address = "10.0.0.1/24"
+[protocols.bgp]
+local-as = 65001
+[evpn]
+vtep-ip = "10.0.0.1"
+underlay-interface = "eth0"
+"#;
+        let vxlan = format!("{base}encapsulation = \"vxlan\"\n");
+        let out = compile(&Appliance::from_toml(&vxlan).expect("parses"))
+            .to_toml()
+            .expect("compiles");
+        assert!(out.contains("[overlay]"), "{out}");
+        assert!(!out.contains("[srv6]"), "{out}");
+
+        let srv6 = format!(
+            "{base}srv6-locator = \"2001:db8:a::/48\"\n\
+             srv6-source = \"2001:db8:a::1\"\n\
+             srv6-peer = [\"2001:db8:a::2\"]\n"
+        );
+        let out = compile(&Appliance::from_toml(&srv6).expect("parses"))
+            .to_toml()
+            .expect("compiles");
+        assert!(out.contains("[srv6]"), "{out}");
+        assert!(
+            out.contains("2001:db8:a::2"),
+            "the peer trust list is missing: {out}"
+        );
+        assert!(!out.contains("[overlay]"), "{out}");
     }
 }
 

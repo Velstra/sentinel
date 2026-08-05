@@ -1450,6 +1450,7 @@ pub fn page() -> String {
             <option value="address-group">address</option>
             <option value="port-group">port</option>
             <option value="domain-group">domain</option>
+            <option value="interface-group">links</option>
             <option value="mac-group">hardware addresses</option>
             <option value="feed-group">published list</option>
             <option value="user-group">VPN users</option>
@@ -2771,6 +2772,7 @@ function ruleFields(zones) {{
     // A rule with no address applies to both families; this is how it says
     // otherwise. `out` covers traffic this box originates, and is IPv4 only.
     ["source-mac-group", "Sender MAC group"],
+    ["interface-group", "Only on these links"],
     ["family", "Address family", ["", "ipv4", "ipv6"]],
     ["direction", "Direction", ["", "in", "out"]],
     ["source", "Source"],
@@ -4583,7 +4585,7 @@ const ROUTE = [
 const GROUP_MEMBER = {{
   "address-group": "address", "port-group": "port",
   "domain-group": "domain", "feed-group": "url", "user-group": "user",
-  "mac-group": "mac",
+  "mac-group": "mac", "interface-group": "interface",
 }};
 
 async function refreshGroups() {{
@@ -5589,6 +5591,8 @@ const EVPN = [
   ["udp-port", "UDP port"],
   ["mtu", "Underlay MTU"],
   ["srv6-locator", "SRv6 locator"],
+  ["srv6-source", "SRv6 source address"],
+  ["srv6-peer", "Accept decap from", null, "each"],
 ];
 const EVPN_INSTANCE = [
   ["evi", "Instance id"],
