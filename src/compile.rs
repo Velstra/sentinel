@@ -72,6 +72,28 @@ pub struct VelstraConfig {
     /// `[[…]]` arrays — velstra reads it order-independently.
     #[serde(skip_serializing_if = "Option::is_none")]
     conntrack_sync: Option<ConntrackSyncOut>,
+    /// The overlay this box terminates, when EVPN is configured. Omitted
+    /// otherwise, which is what leaves the data plane in plain routing mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    overlay: Option<OverlayOut>,
+}
+
+/// `[overlay]` in the emitted data-plane config: how this box wraps and unwraps
+/// tenant frames.
+///
+/// The control plane decides *where* a frame goes — that is the routing daemon's
+/// half of EVPN — and this decides *how* it travels. Only the local identity is
+/// here; which MAC lives behind which peer arrives at run time, learned rather
+/// than written.
+#[derive(Debug, Serialize)]
+struct OverlayOut {
+    local_vtep: String,
+    underlay_iface: String,
+    encap: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    udp_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    underlay_mtu: Option<u16>,
 }
 
 /// One `[[service]]` in the emitted velstra config: a VIP fronting a pool.
@@ -263,12 +285,30 @@ struct PortRule {
     /// second's worth of `limit`.
     #[serde(skip_serializing_if = "Option::is_none")]
     burst: Option<u32>,
+    /// The ICMP/ICMPv6 type, already resolved from whatever name the operator
+    /// wrote. Omitted when the rule matches every type.
+    #[serde(rename = "icmp-type", skip_serializing_if = "Option::is_none")]
+    icmp_type: Option<u8>,
+    /// Which address family this rule is for. Omitted when it is for both.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    family: Option<String>,
+    /// Which direction this rule is for. Omitted when it is for both.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    direction: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct Interface {
     name: String,
     policy: u32,
+    /// The overlay segment this port is on, when an EVPN instance names it.
+    ///
+    /// Deliberately separate from `policy`: the ruleset a port is filtered by
+    /// and the segment its frames belong to are different questions, and several
+    /// ports on one segment may want different rules. Omitted ⇒ the data plane
+    /// defaults it to `policy`, the single-tenant convenience.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vni: Option<u32>,
     /// Source-NAT (masquerade) traffic leaving this interface — set when the
     /// interface's zone has a `[[nat.source]]` rule. Omitted when false.
     #[serde(skip_serializing_if = "is_false")]
@@ -542,6 +582,20 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                     );
                     for &p in protos {
                         let proto = proto_str(p);
+                        // Resolved here rather than at parse time because
+                        // `tcp_udp` expands to several protocols and a name
+                        // means a different number in each family. Validation
+                        // has already refused a type on a protocol without any,
+                        // so a failure here cannot happen — and if it somehow
+                        // did, matching every type would be the wrong way to be
+                        // wrong, so it becomes a type nothing sends.
+                        let icmp_type = r.icmp_type.as_deref().map(|t| {
+                            crate::config::resolve_icmp_type(
+                                t,
+                                matches!(p, crate::config::Proto::Icmpv6),
+                            )
+                            .unwrap_or(u8::MAX)
+                        });
                         for src in &sources {
                             for dst in &destinations {
                                 for &port in &ports {
@@ -555,6 +609,9 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                                         dst: dst.clone(),
                                         limit: r.limit,
                                         burst: r.burst,
+                                        icmp_type,
+                                        family: r.family.clone(),
+                                        direction: r.direction.clone(),
                                     });
                                 }
                             }
@@ -591,6 +648,9 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                     dst: None,
                     limit: None,
                     burst: None,
+                    icmp_type: None,
+                    family: None,
+                    direction: None,
                 };
                 // An explicit rule the operator wrote for the same (proto, port)
                 // wins — including a `drop`, which is how you take a VIP out of
@@ -648,6 +708,14 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
             i.zone.as_deref().map(|zone| Interface {
                 name: i.name.clone(),
                 policy: ids[zone],
+                // An EVPN instance names the ports on its segment; that binding
+                // is what puts a frame from this port into that VNI.
+                vni: appliance
+                    .evpn
+                    .instances
+                    .iter()
+                    .find(|inst| inst.interfaces.iter().any(|n| n == &i.name))
+                    .map(|inst| inst.vni),
                 masquerade: masq_zones.contains_key(zone),
                 cgnat_base_port: masq_zones.get(zone).map_or(0, |l| l.0),
                 cgnat_block_size: masq_zones.get(zone).map_or(0, |l| l.1),
@@ -815,6 +883,21 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
             }),
         services,
         conntrack_sync,
+        overlay: (!appliance.evpn.is_empty()).then(|| {
+            let e = &appliance.evpn;
+            OverlayOut {
+                local_vtep: e.vtep_ip.clone().unwrap_or_default(),
+                underlay_iface: e.underlay_interface.clone().unwrap_or_default(),
+                // Unset means VXLAN, which is what every switch speaks — so the
+                // default is the interoperable one rather than the newer one.
+                encap: match e.encapsulation.as_deref() {
+                    Some("geneve") => "geneve",
+                    _ => "vxlan",
+                },
+                udp_port: e.udp_port,
+                underlay_mtu: e.mtu,
+            }
+        }),
     }
 }
 

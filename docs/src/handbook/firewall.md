@@ -133,6 +133,58 @@ set firewall rule guest-wifi schedule start 09:00
 set firewall rule guest-wifi schedule end 17:00
 ```
 
+### ICMP message types
+
+A rule that names `icmp` or `icmpv6` matches every message of that protocol.
+`icmp-type` narrows it to one:
+
+```text
+# Answer pings from the management network, and nowhere else.
+set firewall rule ping-mgmt from mgmt
+set firewall rule ping-mgmt to firewall
+set firewall rule ping-mgmt proto icmp
+set firewall rule ping-mgmt icmp-type echo-request
+set firewall rule ping-mgmt action accept
+
+# Path MTU discovery has to work, whatever else is refused.
+set firewall rule pmtu from wan
+set firewall rule pmtu proto icmpv6
+set firewall rule pmtu icmp-type packet-too-big
+set firewall rule pmtu action accept
+```
+
+A typed rule outranks an untyped one on the same protocol, the way a specific
+source outranks `from any` — so "drop ICMP, except echo-request from here" is two
+rules and reads as it sounds.
+
+**Write the name, not the number.** The two families disagree: `echo-request` is
+8 in ICMP and 128 in ICMPv6, `time-exceeded` is 11 and 3. The name is resolved
+against the rule's own protocol, so it means the same thing in both; a number
+means whatever that number means in that family. Both are accepted — the registry
+is longer than any list worth shipping — but only one of them survives being
+copied from a v4 rule to a v6 one.
+
+| Name | ICMP | ICMPv6 |
+|---|---|---|
+| `echo-request` / `echo-reply` | 8 / 0 | 128 / 129 |
+| `destination-unreachable` | 3 | 1 |
+| `packet-too-big` | — | 2 |
+| `time-exceeded` | 11 | 3 |
+| `parameter-problem` | 12 | 4 |
+| `redirect` | 5 | 137 |
+| `router-solicitation` / `router-advertisement` | 10 / 9 | 133 / 134 |
+| `neighbor-solicitation` / `neighbor-advertisement` | — | 135 / 136 |
+
+Two of these are worth not filtering out by accident. **`packet-too-big`** is how
+a sender learns the path MTU: block it and large transfers hang while small ones
+work, which is among the hardest faults to diagnose from the symptom.
+**`neighbor-solicitation`** and **`neighbor-advertisement`** are IPv6 address
+resolution — the equivalent of blocking ARP.
+
+`icmp-type` is refused on a protocol that has no types, rather than ignored: a
+rule that reads as narrow and matches everything is worse than one that does not
+commit.
+
 ## Blocking by country (GeoIP)
 
 ```text
