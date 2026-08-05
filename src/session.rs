@@ -7943,6 +7943,8 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             || cts_set
             || !draft.aaa.is_empty()
             || !draft.metrics.is_default()
+            || draft.console.device.is_some()
+            || draft.console.speed.is_some()
             || !draft.sysctl.is_empty())
     {
         out.push_str("system {\n");
@@ -8023,6 +8025,16 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         if !draft.metrics.is_default() {
             out.push_str("    metrics {\n");
             out.push_str("        enable true\n");
+            out.push_str("    }\n");
+        }
+        if draft.console.device.is_some() || draft.console.speed.is_some() {
+            out.push_str("    console {\n");
+            if let Some(d) = &draft.console.device {
+                out.push_str(&format!("        device {d}\n"));
+            }
+            if let Some(s) = draft.console.speed {
+                out.push_str(&format!("        speed {s}\n"));
+            }
             out.push_str("    }\n");
         }
         if cs_set {
@@ -8389,6 +8401,8 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
     if !draft.groups.address.is_empty()
         || !draft.groups.port.is_empty()
         || !draft.groups.domain.is_empty()
+        || !draft.groups.feed.is_empty()
+        || !draft.groups.user.is_empty()
     {
         fwi.push_str("    group {\n");
         for (name, members) in &draft.groups.address {
@@ -8410,6 +8424,20 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             if !specs.is_empty() {
                 let ports: Vec<String> = specs.iter().map(PortSpec::to_string).collect();
                 fwi.push_str(&format!("            port {}\n", ports.join(",")));
+            }
+            fwi.push_str("        }\n");
+        }
+        for (name, urls) in &draft.groups.feed {
+            fwi.push_str(&format!("        feed-group {name} {{\n"));
+            if !urls.is_empty() {
+                fwi.push_str(&format!("            url {}\n", urls.join(",")));
+            }
+            fwi.push_str("        }\n");
+        }
+        for (name, users) in &draft.groups.user {
+            fwi.push_str(&format!("        user-group {name} {{\n"));
+            if !users.is_empty() {
+                fwi.push_str(&format!("            user {}\n", users.join(",")));
             }
             fwi.push_str("        }\n");
         }
@@ -9191,6 +9219,22 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             }
             for n in &ids.never_block {
                 out.push_str(&format!("        never-block {n}\n"));
+            }
+            for n in &ids.sni_block {
+                out.push_str(&format!("        sni-block {n}\n"));
+            }
+            out.push_str("    }\n");
+        }
+        if !draft.flow_export.is_empty() {
+            out.push_str("    flow-export {\n");
+            if let Some(c) = &draft.flow_export.collector {
+                out.push_str(&format!("        collector {c}\n"));
+            }
+            if let Some(i) = draft.flow_export.interval {
+                out.push_str(&format!("        interval {i}\n"));
+            }
+            if let Some(d) = draft.flow_export.domain {
+                out.push_str(&format!("        domain {d}\n"));
             }
             out.push_str("    }\n");
         }
@@ -10622,6 +10666,179 @@ common-name = "www.example.com"
         assert_eq!(
             rebuilt, original,
             "the services configuration did not survive being flattened to commands"
+        );
+    }
+
+    /// The fourth pass: the firewall's group kinds, NAT's other shapes, the
+    /// detector, flow export and the serial console.
+    ///
+    /// This one found five more missing — `feed-group`, `user-group`,
+    /// `sni-block`, `services flow-export` and `system console` — and, while
+    /// fixing them, two of my own: the group renderer wrote `source` where the
+    /// grammar says `url` and `user`. Both were caught the same way, by feeding
+    /// the printout back in rather than by reading it.
+    #[test]
+    fn the_firewall_extras_survive_the_same_round_trip() {
+        let toml = r#"
+[system]
+hostname = "fw2"
+[system.console]
+device = "ttyS0"
+speed = 115200
+[system.update]
+url = "https://updates.example.com/"
+public-key = "file:/etc/sentinel/update.pem"
+
+[[interface]]
+name = "eth0"
+zone = "lan"
+address = "10.0.0.1/24"
+[[interface]]
+name = "eth1"
+zone = "wan"
+address = "192.0.2.1/24"
+address6 = "2001:db8:1::1/64"
+[[interface]]
+name = "eth1.20"
+parent = "eth1"
+vlan = 20
+zone = "dmz"
+address = "10.20.0.1/24"
+[[interface]]
+name = "br0"
+type = "bridge"
+members = ["eth2", "eth3"]
+zone = "lan"
+[[interface]]
+name = "eth4"
+description = "pppoe uplink NIC"
+
+[[interface]]
+name = "ppp0"
+type = "pppoe"
+parent = "eth4"
+zone = "wan"
+[interface.pppoe]
+username = "user@isp"
+password = "pw"
+
+[firewall]
+stateful = true
+fail_closed = true
+source-validation = "strict"
+[firewall.group.address]
+servers = ["10.0.0.10/32", "10.0.0.11/32"]
+[firewall.group.port]
+web = ["80", "443"]
+[firewall.group.domain]
+ads = ["doubleclick.net", "ads.example.com"]
+[firewall.group.user]
+admins = ["vera"]
+[firewall.group.feed]
+bogons = ["https://example.com/bogons.txt"]
+[[firewall.syn-protect]]
+port = 443
+mss = 1460
+
+[[rule]]
+name = "web-in"
+from = "wan"
+to = "lan"
+proto = "tcp"
+port = "443"
+action = "accept"
+log = true
+source_group = "servers"
+limit = 100
+burst = 50
+[[rule]]
+name = "office-hours"
+from = "lan"
+to = "wan"
+proto = "tcp"
+action = "accept"
+port_group = "web"
+[rule.schedule]
+days = ["mon", "tue", "wed", "thu", "fri"]
+start = "08:00"
+end = "18:00"
+[[rule]]
+name = "no-ads"
+from = "lan"
+proto = "tcp"
+port = "443"
+action = "reject"
+destination_group = "ads"
+
+[[nat.source]]
+name = "cgn"
+zone = "wan"
+cgnat-block-size = 512
+cgnat-base-port = 1024
+[[nat.destination]]
+name = "web"
+zone = "wan"
+proto = "tcp"
+port = 443
+to = "10.0.0.10:443"
+hairpin = true
+[[nat.npt66]]
+name = "v6"
+interface = "eth1"
+internal = "fd00:1::/48"
+external = "2001:db8:2::/48"
+
+[services.portal]
+zone = "lan"
+port = 8080
+passphrase = "guest"
+[services.ids]
+interface = ["eth1"]
+home-net = ["10.0.0.0/24"]
+block-on-alert = true
+ruleset = ["/var/lib/suricata/rules/et.rules"]
+sni-block = ["tracker.example.com"]
+[services.flow-export]
+collector = "10.0.0.9:2055"
+interval = 60
+[services.port-mapping]
+zone = "lan"
+wan-zone = "wan"
+"#;
+        let original = render_appliance(&Appliance::from_toml(toml).unwrap());
+        let commands = flatten_config(&original);
+        for expected in [
+            "set firewall group feed-group bogons url https://example.com/bogons.txt",
+            "set firewall group user-group admins user vera",
+            "set services ids sni-block tracker.example.com",
+            "set services flow-export collector 10.0.0.9:2055",
+            "set system console device ttyS0",
+        ] {
+            assert!(
+                commands.iter().any(|c| c == expected),
+                "{expected:?} is not in the flattened config: {commands:#?}"
+            );
+        }
+
+        let dir = std::env::temp_dir().join(format!("sentinel-flatten-fw2-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("appliance.toml");
+        let _ = std::fs::remove_file(&path);
+        let mut session = Session::load(&path).unwrap();
+        let act = crate::repl::Apply::off();
+        let mut ctx: Vec<String> = Vec::new();
+        for command in &commands {
+            assert!(
+                !crate::repl::exec_line(&mut session, &act, &mut ctx, command),
+                "{command} ended the session"
+            );
+        }
+        let rebuilt = render_appliance(&session.commit().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            rebuilt, original,
+            "the firewall extras did not survive being flattened to commands"
         );
     }
     use super::*;

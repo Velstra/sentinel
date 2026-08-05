@@ -1606,6 +1606,17 @@ pub fn page() -> String {
         it is not offered here either.
       </p>
       <div id="blocklist"></div>
+      <div class="card">
+        <h3>What is watched, and what a hit costs</h3>
+        <p class="lede" style="margin:0 0 var(--space-4)">
+          A detector with no rules detects nothing, so a ruleset or a rule is
+          required before the links mean anything. Blocking on an alert is the
+          setting worth thinking twice about: name your own way in under
+          <em>never block</em> first, or an alert on the management network takes
+          it away.
+        </p>
+        <div class="grid" id="svc-ids"></div>
+      </div>
       <div class="card"><h3>Detector</h3><pre class="out" id="idsshow">…</pre></div>
       <div class="card"><h3>Recent alerts</h3><pre class="out" id="alertshow">…</pre></div>
     </div>
@@ -2064,6 +2075,15 @@ pub fn page() -> String {
           <div class="grid" id="svc-alerts"></div>
         </div>
         <div class="card"><h3>Alert mail</h3><div class="grid" id="svc-alertmail"></div></div>
+        <div class="card">
+          <h3>Flow export (IPFIX)</h3>
+          <p class="lede" style="margin:0 0 var(--space-4)">
+            Every connection this box tracks, shipped to a collector as RFC 7011
+            records. What is sent is the change since the last export, not a
+            running total — a collector sums what it receives.
+          </p>
+          <div class="grid" id="svc-flow"></div>
+        </div>
 
         <div class="section">
           <h3>Syslog collectors</h3>
@@ -4727,6 +4747,9 @@ async function refreshIds() {{
     list.append(el("p", {{ class: "empty err", text: String(e.message || e) }}));
   }}
 
+  settingsPanel("svc-ids", SVC_IDS, fieldsOf(await leaves(), "services ids"),
+                "services ids", "Detection");
+
   for (const [id, path] of [["idsshow", "/api/v1/show/ids"],
                             ["alertshow", "/api/v1/show/ids/alerts"]]) {{
     await showInto(id, path);
@@ -4840,6 +4863,27 @@ const SVC_PORTMAP = [
   ["allow-privileged", "Below 1024", ["", "true", "false"]],
 ];
 const SVC_ALERTS = [["webhook", "Webhooks", null, "each"]];
+// Intrusion detection (roadmap C11). Repeatable fields are `each`, because a
+// second watched link or a second rule file is an addition, not a replacement.
+const SVC_IDS = [
+  ["interface", "Links to watch", null, "each"],
+  ["ruleset", "Rule files", null, "each"],
+  ["rule", "Rules", null, "each"],
+  ["#", "What counts as inside"],
+  ["home-net", "Home networks", null, "each"],
+  ["#", "Blocking on an alert"],
+  ["block-on-alert", "Block the source", ["", "true", "false"]],
+  ["never-block", "Never block", null, "each"],
+  ["block-severity", "Least severe that blocks"],
+  ["block-duration", "How long a block lasts (s)"],
+  ["sni-block", "Refuse these server names", null, "each"],
+];
+// Flow export (roadmap C12).
+const SVC_FLOW = [
+  ["collector", "Collector (host:port)"],
+  ["interval", "Seconds between exports"],
+  ["domain", "Observation domain id"],
+];
 const SVC_ALERTMAIL = [
   ["#", "The message"],
   ["to", "To"], ["from", "From"],
@@ -5413,6 +5457,7 @@ async function refreshServices() {{
     ["svc-portmap", SVC_PORTMAP, "services port-mapping", "Port mapping"],
     ["svc-alerts", SVC_ALERTS, "services alerts", "Alerts"],
     ["svc-alertmail", SVC_ALERTMAIL, "services alerts mail", "Alert mail"],
+    ["svc-flow", SVC_FLOW, "services flow-export", "Flow export"],
   ];
   for (const [box, fields, path, label] of flat) {{
     settingsPanel(box, fields, under(path), path, label);
