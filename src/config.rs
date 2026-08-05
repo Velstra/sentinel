@@ -4335,6 +4335,12 @@ pub struct Groups {
     /// [`Groups::address`]. A rule naming one says *who*, not where.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub user: BTreeMap<String, Vec<String>>,
+    /// MAC groups: hardware addresses, for a rule that names devices rather than
+    /// addresses. A device keeps its MAC when its address changes, and cannot
+    /// spoof one past the first switch — which is what makes this worth having
+    /// beside an address group.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mac: BTreeMap<String, Vec<String>>,
     /// Feed groups: name → HTTPS URLs of published address lists, fetched and
     /// folded into [`Groups::address`] at apply time exactly like a domain
     /// group. The lists worth having — bogons, exit nodes, a provider's own
@@ -4352,6 +4358,7 @@ impl Groups {
             && self.domain.is_empty()
             && self.feed.is_empty()
             && self.user.is_empty()
+            && self.mac.is_empty()
     }
 
     /// Whether `name` is a declared address, domain **or** feed group — all
@@ -5346,6 +5353,18 @@ pub struct Rule {
     /// therefore both the readable choice and the portable one.
     #[serde(default, rename = "icmp-type", skip_serializing_if = "Option::is_none")]
     pub icmp_type: Option<String>,
+    /// Match the sender's hardware address, by naming a `[firewall.group.mac]`.
+    ///
+    /// A verdict on the device, not a condition that combines with a protocol or
+    /// a port: the data plane consults MACs once from the Ethernet header rather
+    /// than as a dimension of its rule tries, and pretending otherwise would give
+    /// a rule that reads narrow and matches everything.
+    #[serde(
+        default,
+        rename = "source-mac-group",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub source_mac_group: Option<String>,
     /// Restrict this rule to one address family (`ipv4` / `ipv6`). Absent means
     /// both, which is what a rule with no address constraint has always meant.
     ///
@@ -6457,6 +6476,18 @@ impl Appliance {
                     ),
                 }
             }
+            if let Some(g) = &rule.source_mac_group {
+                if !self.firewall.group.mac.contains_key(g) {
+                    bail!("rule {:?}: no mac-group {g:?}", rule.name);
+                }
+                if rule.proto.is_some() || !rule.port.is_empty() || rule.source.is_some() {
+                    bail!(
+                        "rule {:?}: a mac-group rule is a verdict on the device — it cannot \
+                         also carry a protocol, a port or a source address",
+                        rule.name
+                    );
+                }
+            }
             if let Some(f) = &rule.family {
                 if !matches!(f.as_str(), "ipv4" | "ipv6") {
                     bail!("rule {:?}: family {f:?} is not ipv4 or ipv6", rule.name);
@@ -6580,7 +6611,14 @@ impl Appliance {
             // data plane derives a zone's deny posture from its default-action, so
             // a broad `drop`/`reject` never reaches the datapath — reject it rather
             // than let it silently do nothing.
-            if rule.is_broad() && matches!(rule.action, Action::Drop | Action::Reject) {
+            // …unless it names a mac-group. That rule *is* deliberately broad —
+            // it is a verdict on the device, not on a service — and it reaches
+            // the data plane through its own map rather than through the zone's
+            // posture, so it does something.
+            if rule.is_broad()
+                && rule.source_mac_group.is_none()
+                && matches!(rule.action, Action::Drop | Action::Reject)
+            {
                 bail!(
                     "rule {:?}: broad drop/reject rules are not supported yet — set \
                      `firewall zone {} default-action drop` instead, or give the rule proto/port",

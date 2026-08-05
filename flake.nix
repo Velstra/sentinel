@@ -207,7 +207,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-QJ9bTJIXzhTMIqh+sMNiJX3bV1SBliDcD4pmWLxEuLo=";
+      ebpfHash = "sha256-03nW/EaN1eqQRJS96+/gqmSHjDNFNhifwN/rUX8PLH0=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -6549,6 +6549,102 @@
           '';
         };
 
+        # A rule can name hardware addresses, and the address is what it matches.
+        #
+        # Three phases for the reason the ICMP-type check has three: the failure
+        # worth catching is not "the rule does nothing" but "the rule matches
+        # every packet". A datapath that consulted the MAC map and ignored the
+        # key would pass phase 2 and fail phase 3.
+        #
+        # The client's MAC is read off the running VM rather than pinned here —
+        # QEMU assigns it, and a hard-coded address would make this a test of the
+        # test harness.
+        #
+        #   nix build .#checks.x86_64-linux.macgroup -L
+        macgroup = pkgs.testers.runNixOSTest {
+          name = "sentinel-macgroup";
+          nodes = {
+            client =
+              { lib, pkgs, ... }:
+              {
+                networking.firewall.enable = lib.mkForce false;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = "10.7.0.2";
+                    prefixLength = 24;
+                  }
+                ];
+                virtualisation.vlans = [ 1 ];
+                environment.systemPackages = [ pkgs.netcat-openbsd ];
+              };
+            fw =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "fw";
+                networking.firewall.enable = lib.mkForce false;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = "10.7.0.1";
+                    prefixLength = 24;
+                  }
+                ];
+                virtualisation.vlans = [ 1 ];
+                virtualisation.memorySize = 2048;
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+          };
+          testScript = ''
+            start_all()
+            for m in (client, fw):
+                m.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+            client.wait_until_succeeds("ip addr show eth1 | grep -q 10.7.0.2", timeout=20)
+            fw.wait_until_succeeds("ip addr show eth1 | grep -q 10.7.0.1", timeout=20)
+
+            mac = client.succeed(
+                "cat /sys/class/net/eth1/address"
+            ).strip()
+            other = "02:00:00:00:00:99"
+
+            def configure(*lines):
+                body = " ".join(f"'{line}' " for line in lines)
+                fw.succeed(
+                    "su admin -c \"printf '%s\\n' " + body
+                    + "commit save exit | sentinel configure\""
+                )
+                fw.wait_for_unit("velstra.service")
+
+            def reaches():
+                return client.execute("ping -c 2 -W 2 10.7.0.1")[0] == 0
+
+            # Phase 1 — the baseline, so a failure below means something.
+            configure(
+                "set firewall global default-action accept",
+                "set interface eth1 zone wan",
+                "set firewall zone wan default-action accept",
+            )
+            assert reaches(), "the baseline did not work, so nothing below proves anything"
+
+            # Phase 2 — a group holding the client's own address.
+            configure(
+                f"set firewall group mac-group blocked mac {mac}",
+                "set firewall rule no-device from wan",
+                "set firewall rule no-device source-mac-group blocked",
+                "set firewall rule no-device action drop",
+            )
+            assert not reaches(), "a mac-group rule did not stop the device it names"
+
+            # Phase 3 — the same rule on somebody else's address. A datapath that
+            # ignored the key would still drop here.
+            configure(
+                "delete firewall group mac-group blocked",
+                f"set firewall group mac-group blocked mac {other}",
+            )
+            assert reaches(), "a mac-group naming another device dropped this one anyway"
+          '';
+        };
+
         # A rule can name an ICMP type, and the type is what it matches.
         #
         # Three phases, because the interesting failure is not "the rule does
@@ -7953,7 +8049,7 @@
             # fire. What it pins is that `pmtu` reaches the data plane as a
             # number — the translation the nftables ruleset used to do in the
             # kernel and nobody could see.
-            dataplane = fw.succeed("sentinel compile /etc/sentinel/appliance.toml")
+            dataplane = fw.succeed("sentinel compile /var/lib/sentinel/appliance.toml")
             assert "mss = 1452" in dataplane, dataplane
           '';
         };
