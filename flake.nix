@@ -208,7 +208,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-WpCp1wdfX1FYaj66ELh/r+A0Y5+CFxkzMgFOxaClJJs=";
+      ebpfHash = "sha256-CozaGEOo3ohWyHnLHtIriGW+4MjMgmvJ7lnLWGG8Zbk=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -6421,6 +6421,248 @@
             # The two that prove it matched on the ADDRESS and not on everything.
             assert not dropped(9991), "a v6 rule for a different source matched anyway"
             assert not dropped(9993), "a v6 rule for a different destination matched anyway"
+          '';
+        };
+
+        # A rule can be scoped to one address family and to one direction, and
+        # both scopes are read off the value the datapath already loaded — no
+        # second lookup, no wider key. This is what proves the bits are honoured
+        # rather than merely written.
+        #
+        # Ports carry the meaning, one each: 9080 is dropped for IPv4 only, 9081
+        # for IPv6 only, 9082 only on the way *out*. Under `default-action
+        # accept` a connection fails only if a rule matched, so each pair of
+        # assertions — the family that must be stopped and the one that must not
+        # — is what separates "the scope works" from "the rule matches
+        # everything".
+        #
+        #   nix build .#checks.x86_64-linux.rulescope -L
+        rulescope = pkgs.testers.runNixOSTest {
+          name = "sentinel-rulescope";
+          nodes = {
+            client =
+              { lib, pkgs, ... }:
+              {
+                networking.firewall.enable = lib.mkForce false;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = "10.8.0.2";
+                    prefixLength = 24;
+                  }
+                ];
+                networking.interfaces.eth1.ipv6.addresses = [
+                  {
+                    address = "fd00:8::2";
+                    prefixLength = 64;
+                  }
+                ];
+                virtualisation.vlans = [ 1 ];
+                environment.systemPackages = [ pkgs.netcat-openbsd ];
+              };
+            fw =
+              { lib, pkgs, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "fw";
+                networking.firewall.enable = lib.mkForce false;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = "10.8.0.1";
+                    prefixLength = 24;
+                  }
+                ];
+                networking.interfaces.eth1.ipv6.addresses = [
+                  {
+                    address = "fd00:8::1";
+                    prefixLength = 64;
+                  }
+                ];
+                virtualisation.vlans = [ 1 ];
+                virtualisation.memorySize = 2048;
+                services.velstra.interface = lib.mkForce "eth1";
+                environment.systemPackages = [ pkgs.netcat-openbsd ];
+              };
+          };
+          testScript = ''
+            start_all()
+            for m in (client, fw):
+                m.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+            client.wait_until_succeeds("ip addr show eth1 | grep -q 10.8.0.2", timeout=20)
+            fw.wait_until_succeeds("ip addr show eth1 | grep -q 10.8.0.1", timeout=20)
+
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set firewall global default-action accept' "
+                "'set interface eth1 zone wan' "
+                "'set firewall zone wan default-action accept' "
+                "'set firewall rule v4only from wan' "
+                "'set firewall rule v4only proto tcp' "
+                "'set firewall rule v4only port 9080' "
+                "'set firewall rule v4only family ipv4' "
+                "'set firewall rule v4only action drop' "
+                "'set firewall rule v4only log true' "
+                "'set firewall rule v6only from wan' "
+                "'set firewall rule v6only proto tcp' "
+                "'set firewall rule v6only port 9081' "
+                "'set firewall rule v6only family ipv6' "
+                "'set firewall rule v6only action drop' "
+                "'set firewall rule v6only log true' "
+                "'set firewall rule outbound from wan' "
+                "'set firewall rule outbound proto tcp' "
+                "'set firewall rule outbound port 9082' "
+                "'set firewall rule outbound direction out' "
+                "'set firewall rule outbound action drop' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            fw.wait_for_unit("velstra.service")
+
+            def knock(port, v6=False):
+                target = "fd00:8::1" if v6 else "10.8.0.1"
+                flag = "-6" if v6 else "-4"
+                client.execute(f"timeout 2 nc {flag} -w 1 -z {target} {port}")
+
+            def dropped(port, v6=False):
+                pattern = "DROP6" if v6 else "DROP"
+                return fw.execute(
+                    f"journalctl -u velstra.service | grep -qE '{pattern} .*dport={port}'"
+                )[0] == 0
+
+            for v6 in (False, True):
+                knock(9080, v6)
+                knock(9081, v6)
+
+            # Family: each rule stops its own family and leaves the other alone.
+            assert dropped(9080), "an ipv4-scoped rule did not stop an IPv4 connection"
+            assert not dropped(9080, v6=True), "an ipv4-scoped rule stopped IPv6 as well"
+            assert dropped(9081, v6=True), "an ipv6-scoped rule did not stop an IPv6 connection"
+            assert not dropped(9081), "an ipv6-scoped rule stopped IPv4 as well"
+
+            # Direction: the box's own outbound connection is refused, while the
+            # same port arriving from outside is not — which is the distinction
+            # an ingress-only firewall cannot make at all.
+            client.succeed("(nc -l -p 9082 >/dev/null 2>&1 &) ; sleep 1")
+            assert fw.execute("timeout 3 nc -w 2 -z 10.8.0.2 9082")[0] != 0, \
+                "an out-scoped rule did not stop a connection this box originated"
+            knock(9082)
+            assert not dropped(9082), "an out-scoped rule matched arriving traffic too"
+          '';
+        };
+
+        # A rule can name an ICMP type, and the type is what it matches.
+        #
+        # Three phases, because the interesting failure is not "the rule does
+        # nothing" but "the rule matches every ICMP packet": a datapath that
+        # ignored the type would pass phase 2 and fail phase 3. Phase 1 is the
+        # baseline so a ping that never worked cannot be read as a rule working.
+        #
+        #   nix build .#checks.x86_64-linux.icmptype -L
+        icmptype = pkgs.testers.runNixOSTest {
+          name = "sentinel-icmptype";
+          nodes = {
+            client =
+              { lib, ... }:
+              {
+                networking.firewall.enable = lib.mkForce false;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = "10.9.0.2";
+                    prefixLength = 24;
+                  }
+                ];
+                networking.interfaces.eth1.ipv6.addresses = [
+                  {
+                    address = "fd00:9::2";
+                    prefixLength = 64;
+                  }
+                ];
+                virtualisation.vlans = [ 1 ];
+              };
+            fw =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "fw";
+                networking.firewall.enable = lib.mkForce false;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = "10.9.0.1";
+                    prefixLength = 24;
+                  }
+                ];
+                networking.interfaces.eth1.ipv6.addresses = [
+                  {
+                    address = "fd00:9::1";
+                    prefixLength = 64;
+                  }
+                ];
+                virtualisation.vlans = [ 1 ];
+                virtualisation.memorySize = 2048;
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+          };
+          testScript = ''
+            start_all()
+            for m in (client, fw):
+                m.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+            client.wait_until_succeeds("ip addr show eth1 | grep -q 10.9.0.2", timeout=20)
+            fw.wait_until_succeeds("ip addr show eth1 | grep -q 10.9.0.1", timeout=20)
+
+            def configure(*lines):
+                body = " ".join(f"'{line}' " for line in lines)
+                fw.succeed(
+                    "su admin -c \"printf '%s\\n' " + body
+                    + "commit save exit | sentinel configure\""
+                )
+                fw.wait_for_unit("velstra.service")
+
+            def pings(target="10.9.0.1"):
+                return client.execute(f"ping -c 2 -W 2 {target}")[0] == 0
+
+            def pings6():
+                return client.execute("ping -c 2 -W 2 fd00:9::1")[0] == 0
+
+            # Phase 1 — the baseline. Nothing is configured to stop a ping, so
+            # one that fails here would make every later assertion meaningless.
+            configure(
+                "set firewall global default-action accept",
+                "set interface eth1 zone wan",
+                "set firewall zone wan default-action accept",
+            )
+            assert pings(), "the baseline ping did not work, so nothing below proves anything"
+            assert pings6(), "the baseline v6 ping did not work"
+
+            # Phase 2 — a rule that names the type the ping actually sends.
+            configure(
+                "set firewall rule no-ping from wan",
+                "set firewall rule no-ping proto icmp",
+                "set firewall rule no-ping icmp-type echo-request",
+                "set firewall rule no-ping action drop",
+            )
+            assert not pings(), "an echo-request rule did not stop a ping"
+
+            # Phase 3 — the same rule on a type the ping does NOT send. A
+            # datapath that matched on the protocol and ignored the type would
+            # still drop here, which is the whole point of asking.
+            configure(
+                "delete firewall rule no-ping icmp-type",
+                "set firewall rule no-ping icmp-type timestamp-request",
+            )
+            assert pings(), "a rule for a different ICMP type dropped the ping anyway"
+
+            # And the same distinction in the other family, where the numbering
+            # disagrees: echo-request is 128 in ICMPv6, not 8. A shared table
+            # would drop this ping and pass the one above.
+            configure(
+                "set firewall rule no-ping6 from wan",
+                "set firewall rule no-ping6 proto icmpv6",
+                "set firewall rule no-ping6 icmp-type echo-request",
+                "set firewall rule no-ping6 action drop",
+            )
+            assert not pings6(), "an icmpv6 echo-request rule did not stop a v6 ping"
+            assert pings(), "the v6 rule stopped the v4 ping as well"
           '';
         };
 

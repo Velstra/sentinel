@@ -213,6 +213,9 @@ struct RuleDraft {
     action: Option<Action>,
     proto: Option<Proto>,
     port: Vec<PortSpec>,
+    icmp_type: Option<String>,
+    family: Option<String>,
+    direction: Option<String>,
     log: Option<bool>,
     source: Option<String>,
     source_group: Option<String>,
@@ -1184,6 +1187,9 @@ struct Draft {
     bfd: BfdDraft,
     /// Multicast (IGMP/MLD querier + RFC 4605 proxy).
     multicast: MulticastDraft,
+    /// EVPN, carried whole: its shape is already the config's, and a draft that
+    /// mirrors it field by field would be a second place to forget one.
+    evpn: crate::config::Evpn,
     /// Named prefix-lists (`[[policy.prefix-list]]`), keyed by name.
     prefix_lists: Vec<(String, PrefixListDraft)>,
     /// Policy-routing rules (`[[policy.route]]`), keyed by name.
@@ -2013,6 +2019,9 @@ impl Draft {
                             action: Some(r.action),
                             proto: r.proto,
                             port: r.port.clone(),
+                            icmp_type: r.icmp_type.clone(),
+                            family: r.family.clone(),
+                            direction: r.direction.clone(),
                             log: Some(r.log),
                             source: r.source.clone(),
                             source_group: r.source_group.clone(),
@@ -2211,6 +2220,7 @@ impl Draft {
                     echo_interval: b.echo_interval,
                 })
                 .unwrap_or_default(),
+            evpn: a.evpn.clone(),
             multicast: a
                 .protocols
                 .multicast
@@ -3292,6 +3302,19 @@ impl Session {
                     specs.push(PortSpec::parse(one)?);
                 }
                 self.draft.rule_mut(name).port = specs;
+            }
+            ["firewall", "rule", name, "icmp-type", v] => {
+                // Stored as written and resolved at commit, when the rule's
+                // protocol is known: `echo-request` is 8 in ICMP and 128 in
+                // ICMPv6, so the number cannot be decided while the two fields
+                // are still being typed in either order.
+                self.draft.rule_mut(name).icmp_type = Some((*v).to_string())
+            }
+            ["firewall", "rule", name, "family", v] => {
+                self.draft.rule_mut(name).family = Some((*v).to_string())
+            }
+            ["firewall", "rule", name, "direction", v] => {
+                self.draft.rule_mut(name).direction = Some((*v).to_string())
             }
             ["firewall", "rule", name, "log", v] => {
                 self.draft.rule_mut(name).log = Some(parse_bool(v)?)
@@ -4676,6 +4699,50 @@ impl Session {
                 }
             }
 
+            // evpn — the box's own identity, then its segments and tenants.
+            ["evpn", "instance", name, "interface", v] => {
+                append_csv(&mut self.evpn_instance_mut(name).interfaces, v);
+            }
+            ["evpn", "instance", name, field, v] => {
+                let i = self.evpn_instance_mut(name);
+                match *field {
+                    "evi" => i.evi = v.parse().with_context(|| format!("invalid evi {v:?}"))?,
+                    "vni" => i.vni = v.parse().with_context(|| format!("invalid vni {v:?}"))?,
+                    "rd" => i.rd = Some((*v).to_string()),
+                    "rt-import" => append_csv(&mut i.rt_import, v),
+                    "rt-export" => append_csv(&mut i.rt_export, v),
+                    "advertise-mac" => append_csv(&mut i.advertise_mac, v),
+                    other => bail!("evpn instance has no field {other:?}"),
+                }
+            }
+            ["evpn", "ip-vrf", name, field, v] => {
+                let t = self.evpn_ip_vrf_mut(name);
+                match *field {
+                    "l3-vni" => {
+                        t.l3_vni = v.parse().with_context(|| format!("invalid vni {v:?}"))?
+                    }
+                    "rd" => t.rd = Some((*v).to_string()),
+                    "rt-import" => append_csv(&mut t.rt_import, v),
+                    "rt-export" => append_csv(&mut t.rt_export, v),
+                    "advertise-prefix" => append_csv(&mut t.advertise_prefix, v),
+                    "router-mac" => t.router_mac = Some((*v).to_string()),
+                    other => bail!("evpn ip-vrf has no field {other:?}"),
+                }
+            }
+            ["evpn", field, v] => {
+                let e = &mut self.draft.evpn;
+                match *field {
+                    "vtep-ip" => e.vtep_ip = Some((*v).to_string()),
+                    "underlay-interface" => e.underlay_interface = Some((*v).to_string()),
+                    "encapsulation" => e.encapsulation = Some((*v).to_string()),
+                    "udp-port" => {
+                        e.udp_port = Some(v.parse().with_context(|| format!("invalid port {v:?}"))?)
+                    }
+                    "mtu" => e.mtu = Some(v.parse().with_context(|| format!("invalid mtu {v:?}"))?),
+                    "srv6-locator" => e.srv6_locator = Some((*v).to_string()),
+                    other => bail!("evpn has no field {other:?}"),
+                }
+            }
             // multicast (IGMP/MLD querier + RFC 4605 proxy).
             ["protocols", "multicast", "interface", name, "role", v] => {
                 self.draft.multicast.interface_mut(name).role = Some((*v).to_string());
@@ -5706,6 +5773,9 @@ impl Session {
                     "action" => r.action = None,
                     "proto" => r.proto = None,
                     "port" => r.port.clear(),
+                    "icmp-type" => r.icmp_type = None,
+                    "family" => r.family = None,
+                    "direction" => r.direction = None,
                     "log" => r.log = None,
                     "source" => r.source = None,
                     "source-group" => r.source_group = None,
@@ -6480,6 +6550,33 @@ impl Session {
                     other => bail!("protocols bfd has no field {other:?}"),
                 }
             }
+            ["evpn"] => self.draft.evpn = crate::config::Evpn::default(),
+            ["evpn", "instance", name] => {
+                let before = self.draft.evpn.instances.len();
+                self.draft.evpn.instances.retain(|i| i.name != *name);
+                if self.draft.evpn.instances.len() == before {
+                    bail!("no evpn instance {name:?}");
+                }
+            }
+            ["evpn", "ip-vrf", name] => {
+                let before = self.draft.evpn.ip_vrfs.len();
+                self.draft.evpn.ip_vrfs.retain(|v| v.name != *name);
+                if self.draft.evpn.ip_vrfs.len() == before {
+                    bail!("no evpn ip-vrf {name:?}");
+                }
+            }
+            ["evpn", field] => {
+                let e = &mut self.draft.evpn;
+                match *field {
+                    "vtep-ip" => e.vtep_ip = None,
+                    "underlay-interface" => e.underlay_interface = None,
+                    "encapsulation" => e.encapsulation = None,
+                    "udp-port" => e.udp_port = None,
+                    "mtu" => e.mtu = None,
+                    "srv6-locator" => e.srv6_locator = None,
+                    other => bail!("evpn has no field {other:?}"),
+                }
+            }
             // multicast.
             ["protocols", "multicast"] => self.draft.multicast = MulticastDraft::default(),
             ["protocols", "multicast", "interface", name] => {
@@ -7160,6 +7257,9 @@ impl Session {
                         .action
                         .ok_or_else(|| anyhow::anyhow!("rule {name:?}: action not set"))?,
                     proto: d.proto,
+                    icmp_type: d.icmp_type.clone(),
+                    family: d.family.clone(),
+                    direction: d.direction.clone(),
                     port: d.port.clone(),
                     log: d.log.unwrap_or(false),
                     source: d.source.clone(),
@@ -7687,6 +7787,7 @@ impl Session {
         };
 
         let mut appliance = Appliance {
+            evpn: self.draft.evpn.clone(),
             system: System {
                 hostname,
                 logins: self.draft.logins.clone(),
@@ -7851,6 +7952,36 @@ impl Session {
         appliance.normalize();
         appliance.validate()?;
         Ok(appliance)
+    }
+
+    /// Mutable access to an EVPN instance by name, creating it if new.
+    fn evpn_instance_mut(&mut self, name: &str) -> &mut crate::config::EvpnInstance {
+        if let Some(i) = self
+            .draft
+            .evpn
+            .instances
+            .iter()
+            .position(|i| i.name == name)
+        {
+            return &mut self.draft.evpn.instances[i];
+        }
+        self.draft.evpn.instances.push(crate::config::EvpnInstance {
+            name: name.to_string(),
+            ..Default::default()
+        });
+        self.draft.evpn.instances.last_mut().unwrap()
+    }
+
+    /// Mutable access to an EVPN IP-VRF by name, creating it if new.
+    fn evpn_ip_vrf_mut(&mut self, name: &str) -> &mut crate::config::EvpnIpVrf {
+        if let Some(i) = self.draft.evpn.ip_vrfs.iter().position(|v| v.name == name) {
+            return &mut self.draft.evpn.ip_vrfs[i];
+        }
+        self.draft.evpn.ip_vrfs.push(crate::config::EvpnIpVrf {
+            name: name.to_string(),
+            ..Default::default()
+        });
+        self.draft.evpn.ip_vrfs.last_mut().unwrap()
     }
 
     /// Validate + activate the candidate. Returns the committed config.
@@ -8536,6 +8667,15 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             let ports: Vec<String> = r.port.iter().map(|p| p.to_string()).collect();
             fwi.push_str(&format!("        port {}\n", ports.join(",")));
         }
+        if let Some(t) = &r.icmp_type {
+            fwi.push_str(&format!("        icmp-type {t}\n"));
+        }
+        if let Some(f) = &r.family {
+            fwi.push_str(&format!("        family {f}\n"));
+        }
+        if let Some(d) = &r.direction {
+            fwi.push_str(&format!("        direction {d}\n"));
+        }
         if let Some(l) = r.log {
             fwi.push_str(&format!("        log {l}\n"));
         }
@@ -8713,6 +8853,73 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
     if want("nat") && !nati.is_empty() {
         out.push_str("nat {\n");
         out.push_str(&nati);
+        out.push_str("}\n");
+    }
+
+    // evpn { … } — its own top-level section, because one identity feeds both
+    // the routing daemon and the data plane.
+    if want("evpn") && !draft.evpn.is_empty() {
+        let e = &draft.evpn;
+        out.push_str("evpn {\n");
+        if let Some(v) = &e.vtep_ip {
+            out.push_str(&format!("    vtep-ip {v}\n"));
+        }
+        if let Some(v) = &e.underlay_interface {
+            out.push_str(&format!("    underlay-interface {v}\n"));
+        }
+        if let Some(v) = &e.encapsulation {
+            out.push_str(&format!("    encapsulation {v}\n"));
+        }
+        if let Some(v) = e.udp_port {
+            out.push_str(&format!("    udp-port {v}\n"));
+        }
+        if let Some(v) = e.mtu {
+            out.push_str(&format!("    mtu {v}\n"));
+        }
+        if let Some(v) = &e.srv6_locator {
+            out.push_str(&format!("    srv6-locator {v}\n"));
+        }
+        for i in &e.instances {
+            out.push_str(&format!("    instance {} {{\n", i.name));
+            out.push_str(&format!("        evi {}\n", i.evi));
+            out.push_str(&format!("        vni {}\n", i.vni));
+            if let Some(rd) = &i.rd {
+                out.push_str(&format!("        rd {rd}\n"));
+            }
+            // One line each, comma-joined: the setter appends, so a repeated
+            // field round-trips as one command rather than several.
+            for (k, list) in [
+                ("rt-import", &i.rt_import),
+                ("rt-export", &i.rt_export),
+                ("interface", &i.interfaces),
+                ("advertise-mac", &i.advertise_mac),
+            ] {
+                if !list.is_empty() {
+                    out.push_str(&format!("        {k} {}\n", list.join(",")));
+                }
+            }
+            out.push_str("    }\n");
+        }
+        for v in &e.ip_vrfs {
+            out.push_str(&format!("    ip-vrf {} {{\n", v.name));
+            out.push_str(&format!("        l3-vni {}\n", v.l3_vni));
+            if let Some(rd) = &v.rd {
+                out.push_str(&format!("        rd {rd}\n"));
+            }
+            for (k, list) in [
+                ("rt-import", &v.rt_import),
+                ("rt-export", &v.rt_export),
+                ("advertise-prefix", &v.advertise_prefix),
+            ] {
+                if !list.is_empty() {
+                    out.push_str(&format!("        {k} {}\n", list.join(",")));
+                }
+            }
+            if let Some(mac) = &v.router_mac {
+                out.push_str(&format!("        router-mac {mac}\n"));
+            }
+            out.push_str("    }\n");
+        }
         out.push_str("}\n");
     }
 
@@ -10571,6 +10778,29 @@ le = 24
 seq = 20
 prefix = "172.16.0.0/12"
 ge = 16
+[evpn]
+vtep-ip = "10.0.0.1"
+underlay-interface = "eth1"
+encapsulation = "vxlan"
+udp-port = 4789
+mtu = 9000
+[[evpn.instance]]
+name = "tenant-a"
+evi = 100
+vni = 10100
+rd = "10.0.0.1:100"
+rt-import = ["rt:65001:100"]
+rt-export = ["rt:65001:100"]
+interface = ["eth0"]
+advertise-mac = ["02:00:00:00:00:09"]
+[[evpn.ip-vrf]]
+name = "blue"
+l3-vni = 10999
+rt-import = ["rt:65001:999"]
+rt-export = ["rt:65001:999"]
+advertise-prefix = ["10.20.0.0/24"]
+router-mac = "02:00:00:00:00:01"
+
 [[policy.route-map]]
 name = "to-peers"
 default = "reject"
@@ -10595,6 +10825,10 @@ action = "reject"
             "set policy route-map to-peers rule 10 set next-hop 192.0.2.9",
             "set protocols multicast pim rp-address 10.0.0.9",
             "set protocols multicast pim interface eth0",
+            "set evpn instance tenant-a vni 10100",
+            "set evpn instance tenant-a rt-import rt:65001:100",
+            "set evpn ip-vrf blue l3-vni 10999",
+            "set evpn encapsulation vxlan",
         ] {
             assert!(
                 commands.iter().any(|c| c == expected),
@@ -10875,6 +11109,19 @@ proto = "tcp"
 port = "443"
 action = "reject"
 destination_group = "ads"
+# A rule that names a message type rather than a port.
+[[rule]]
+name = "ping-in"
+from = "wan"
+proto = "icmp"
+icmp-type = "echo-request"
+action = "accept"
+[[rule]]
+name = "pmtu"
+from = "wan"
+proto = "icmpv6"
+icmp-type = "packet-too-big"
+action = "accept"
 
 [[nat.source]]
 name = "cgn"
@@ -10919,6 +11166,8 @@ wan-zone = "wan"
             "set services ids sni-block tracker.example.com",
             "set services flow-export collector 10.0.0.9:2055",
             "set system console device ttyS0",
+            "set firewall rule ping-in icmp-type echo-request",
+            "set firewall rule pmtu icmp-type packet-too-big",
         ] {
             assert!(
                 commands.iter().any(|c| c == expected),

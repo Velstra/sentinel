@@ -454,6 +454,16 @@ pub struct Appliance {
     /// configs when nothing is configured.
     #[serde(default, skip_serializing_if = "Protocols::is_empty")]
     pub protocols: Protocols,
+    /// EVPN: one tenant network stretched across several boxes, with BGP as the
+    /// control plane and an encapsulation as the transport.
+    ///
+    /// Its own top-level section because it is the one setting that feeds *both*
+    /// lower halves from a single statement: the routing daemon learns which MACs
+    /// and prefixes to advertise, and the data plane learns how to wrap and
+    /// unwrap the frames. An operator writing a VTEP address twice, once for each,
+    /// is an operator with two chances to write it differently.
+    #[serde(default, skip_serializing_if = "Evpn::is_empty")]
+    pub evpn: Evpn,
     /// Box-wide network services the appliance *offers* (as opposed to filtering
     /// or routing): the DNS forwarder today, NTP / mDNS / LLDP / SNMP / … as they
     /// land. Grouped under one `[services.*]` category (the VyOS `service` model)
@@ -1550,6 +1560,154 @@ impl Dns {
             && self.negative_ttl.is_none()
             && self.txt_record.is_empty()
     }
+}
+
+/// EVPN (`[evpn]`): a layer-2 segment that spans several appliances, and the
+/// layer-3 routing between such segments.
+///
+/// **What each half does.** BGP carries who is where — a MAC learned on this box
+/// is announced to the others (RFC 7432 type-2), a subnet behind it as a prefix
+/// (RFC 9136 type-5). The data plane carries the frames, wrapped in VXLAN or
+/// Geneve toward the box that announced the destination. Neither half is useful
+/// alone, which is why they are configured together here rather than twice.
+///
+/// **Nothing here is learned state.** MAC-to-VTEP entries, flood lists and
+/// neighbour suppression arrive at run time from the routing daemon, not from a
+/// configuration file — an operator who has to write down which MAC is where has
+/// not been given EVPN.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Evpn {
+    /// This box's VTEP address — the outer source of everything it encapsulates,
+    /// and the next hop it announces itself under. Required once anything else
+    /// here is set.
+    #[serde(default, rename = "vtep-ip", skip_serializing_if = "Option::is_none")]
+    pub vtep_ip: Option<String>,
+    /// The interface encapsulated traffic leaves by. Its MAC becomes the outer
+    /// source; the underlay's MTU decides how much room the inner frame has.
+    #[serde(
+        default,
+        rename = "underlay-interface",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub underlay_interface: Option<String>,
+    /// `vxlan` (RFC 7348, UDP/4789) or `geneve` (RFC 8926, UDP/6081).
+    ///
+    /// VXLAN is what every switch speaks. Geneve carries options VXLAN cannot,
+    /// which matters where something in the path wants to annotate a frame — and
+    /// costs eight more bytes of every packet. Unset ⇒ VXLAN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encapsulation: Option<String>,
+    /// Override the destination UDP port. Unset ⇒ the encapsulation's own
+    /// (4789 / 6081). Worth having because a network that already carries VXLAN
+    /// on the standard port may need a second, separate overlay.
+    #[serde(default, rename = "udp-port", skip_serializing_if = "Option::is_none")]
+    pub udp_port: Option<u16>,
+    /// The underlay MTU, if it is not the interface's own. What it buys is a
+    /// clear failure instead of a silent one: the data plane knows how much of a
+    /// tenant frame fits and can say so.
+    #[serde(default, rename = "mtu", skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u16>,
+    /// An SRv6 locator, when the transport is SRv6 service SIDs rather than a UDP
+    /// encapsulation. Left unset by everything that uses VXLAN or Geneve.
+    #[serde(
+        default,
+        rename = "srv6-locator",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub srv6_locator: Option<String>,
+    /// The layer-2 segments this box takes part in.
+    #[serde(default, rename = "instance", skip_serializing_if = "Vec::is_empty")]
+    pub instances: Vec<EvpnInstance>,
+    /// The layer-3 tenants — routing *between* segments (RFC 9136 type-5).
+    #[serde(default, rename = "ip-vrf", skip_serializing_if = "Vec::is_empty")]
+    pub ip_vrfs: Vec<EvpnIpVrf>,
+}
+
+impl Evpn {
+    pub fn is_empty(&self) -> bool {
+        self.vtep_ip.is_none()
+            && self.underlay_interface.is_none()
+            && self.encapsulation.is_none()
+            && self.udp_port.is_none()
+            && self.mtu.is_none()
+            && self.srv6_locator.is_none()
+            && self.instances.is_empty()
+            && self.ip_vrfs.is_empty()
+    }
+}
+
+/// One layer-2 EVPN instance (`[[evpn.instance]]`): a segment, its VNI, and the
+/// local interfaces that are on it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvpnInstance {
+    /// A name for this segment, used in `show` output and nowhere on the wire.
+    pub name: String,
+    /// The EVPN instance id, as carried in the routes this box originates.
+    pub evi: u16,
+    /// The VNI the frames are tagged with. Also the data plane's segment id, so
+    /// two instances cannot share one.
+    pub vni: u32,
+    /// The Route Distinguisher that makes this box's routes for this segment
+    /// distinct from another box's. Unset ⇒ derived from the VTEP address and the
+    /// EVI, which is what an operator would have written anyway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rd: Option<String>,
+    /// Which route targets to accept into this segment.
+    #[serde(default, rename = "rt-import", skip_serializing_if = "Vec::is_empty")]
+    pub rt_import: Vec<String>,
+    /// Which route targets to stamp on what this box announces.
+    #[serde(default, rename = "rt-export", skip_serializing_if = "Vec::is_empty")]
+    pub rt_export: Vec<String>,
+    /// The local interfaces on this segment — the tenant-facing ports whose
+    /// frames are carried. Each is bound to this VNI in the data plane.
+    #[serde(default, rename = "interface", skip_serializing_if = "Vec::is_empty")]
+    pub interfaces: Vec<String>,
+    /// MACs to announce whether or not they have been seen locally. For an
+    /// address that must be reachable before it has spoken.
+    #[serde(
+        default,
+        rename = "advertise-mac",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub advertise_mac: Vec<String>,
+}
+
+/// One layer-3 EVPN tenant (`[[evpn.ip-vrf]]`): routing between segments without
+/// stretching them, which is what a tenant with more than one subnet needs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvpnIpVrf {
+    /// The VRF this tenant's routes live in — a `[[protocols.vrf]]` name.
+    pub name: String,
+    /// The VNI that identifies this tenant's routing domain on the wire.
+    #[serde(rename = "l3-vni")]
+    pub l3_vni: u32,
+    /// The Route Distinguisher. Unset ⇒ derived from the VTEP address and the
+    /// L3 VNI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rd: Option<String>,
+    #[serde(default, rename = "rt-import", skip_serializing_if = "Vec::is_empty")]
+    pub rt_import: Vec<String>,
+    #[serde(default, rename = "rt-export", skip_serializing_if = "Vec::is_empty")]
+    pub rt_export: Vec<String>,
+    /// Prefixes to originate as type-5 routes.
+    #[serde(
+        default,
+        rename = "advertise-prefix",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub advertise_prefix: Vec<String>,
+    /// The MAC a peer rewrites the inner destination to when it routes into this
+    /// tenant (RFC 9135). Unset ⇒ the underlay interface's own, which is what
+    /// symmetric IRB expects.
+    #[serde(
+        default,
+        rename = "router-mac",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub router_mac: Option<String>,
 }
 
 /// Dynamic routing configuration — the [`Protocols`] tree maps onto the Wren
@@ -5178,6 +5336,32 @@ pub struct Rule {
     /// appears twice; this is the answer the first time.
     #[serde(default, with = "port_list", skip_serializing_if = "Vec::is_empty")]
     pub port: Vec<PortSpec>,
+    /// The ICMP or ICMPv6 message type this rule matches, by name
+    /// (`echo-request`) or by number. Absent means every type, which is what a
+    /// rule naming only `icmp` has always meant.
+    ///
+    /// A name resolves against the rule's own protocol, because the two
+    /// numberings disagree: `echo-request` is 8 in ICMP and 128 in ICMPv6, and
+    /// `time-exceeded` is 11 and 3. Writing the name rather than the number is
+    /// therefore both the readable choice and the portable one.
+    #[serde(default, rename = "icmp-type", skip_serializing_if = "Option::is_none")]
+    pub icmp_type: Option<String>,
+    /// Restrict this rule to one address family (`ipv4` / `ipv6`). Absent means
+    /// both, which is what a rule with no address constraint has always meant.
+    ///
+    /// This is the answer to two rule sets sharing a name: instead of a second
+    /// namespace, a rule says which family it is for. A rule that pins an
+    /// address already implies its family and needs nothing here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    /// Restrict this rule to one direction (`in` / `out`). Absent means both.
+    ///
+    /// `out` is the only way to describe traffic **this box originates**: the
+    /// egress hook is where a locally-generated packet is seen, and rules that
+    /// only ever run on arrival cannot say anything about it. IPv4 only, because
+    /// the egress hook is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
     /// Log packets matching this (port) rule, independent of the zone's `log`.
     /// Off by default; only meaningful on a port rule.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -6251,6 +6435,45 @@ impl Appliance {
                          protocol, or name tcp/udp",
                         rule.name,
                         proto_str(p)
+                    );
+                }
+            }
+            // A type belongs to a protocol that has types. Accepting it
+            // elsewhere would read as a narrow rule and match every packet of
+            // that protocol.
+            if let Some(t) = &rule.icmp_type {
+                match rule.proto {
+                    Some(Proto::Icmp) => {
+                        resolve_icmp_type(t, false)
+                            .with_context(|| format!("rule {:?}: icmp-type", rule.name))?;
+                    }
+                    Some(Proto::Icmpv6) => {
+                        resolve_icmp_type(t, true)
+                            .with_context(|| format!("rule {:?}: icmp-type", rule.name))?;
+                    }
+                    _ => bail!(
+                        "rule {:?}: icmp-type needs `protocol icmp` or `protocol icmpv6`",
+                        rule.name
+                    ),
+                }
+            }
+            if let Some(f) = &rule.family {
+                if !matches!(f.as_str(), "ipv4" | "ipv6") {
+                    bail!("rule {:?}: family {f:?} is not ipv4 or ipv6", rule.name);
+                }
+            }
+            if let Some(d) = &rule.direction {
+                if !matches!(d.as_str(), "in" | "out") {
+                    bail!("rule {:?}: direction {d:?} is not in or out", rule.name);
+                }
+                // The egress hook is IPv4 only. A v6 rule scoped to `out` would
+                // be written and never consulted, so it is refused rather than
+                // enforcing nothing quietly.
+                if d == "out" && rule.family.as_deref() == Some("ipv6") {
+                    bail!(
+                        "rule {:?}: direction out is IPv4 only — an ipv6 rule on the way \
+                         out would never be consulted",
+                        rule.name
                     );
                 }
             }
@@ -8599,6 +8822,128 @@ impl Appliance {
                 );
             }
         }
+        // EVPN: one identity feeding two lower halves, so the checks are about
+        // agreement between them rather than about any single field.
+        if !self.evpn.is_empty() {
+            let e = &self.evpn;
+            // EVPN's routes are BGP routes. Without a BGP router there is no
+            // control plane, and the overlay would carry frames toward peers
+            // nobody ever announced.
+            if self.protocols.bgp.is_none() {
+                bail!(
+                    "evpn: no bgp router — EVPN's control plane *is* BGP; add \
+                     `protocols bgp local-as <n>` and a neighbour with `evpn true`"
+                );
+            }
+            match &e.vtep_ip {
+                None => bail!(
+                    "evpn: vtep-ip is required — it is the outer source of everything \
+                     this box encapsulates and the next hop it announces itself under"
+                ),
+                Some(ip) => validate_ipv4(ip).with_context(|| "evpn vtep-ip")?,
+            }
+            match &e.underlay_interface {
+                None => bail!(
+                    "evpn: underlay-interface is required — encapsulated traffic \
+                               has to leave by something"
+                ),
+                Some(name) => {
+                    if !self.interfaces.iter().any(|i| &i.name == name) {
+                        bail!("evpn underlay-interface {name:?}: not a declared interface");
+                    }
+                }
+            }
+            if let Some(enc) = &e.encapsulation {
+                if !matches!(enc.as_str(), "vxlan" | "geneve") {
+                    bail!("evpn encapsulation {enc:?}: use vxlan or geneve");
+                }
+            }
+            if let Some(mac) = e.ip_vrfs.iter().find_map(|v| v.router_mac.as_deref()) {
+                validate_mac(mac).with_context(|| "evpn ip-vrf router-mac")?;
+            }
+            let mut seen_vni = std::collections::BTreeSet::new();
+            for inst in &e.instances {
+                if inst.name.is_empty() {
+                    bail!("evpn instance: name must be set");
+                }
+                if inst.vni == 0 || inst.vni > 0xff_ffff {
+                    bail!(
+                        "evpn instance {:?}: vni {} is outside 1..=16777215 (24 bits)",
+                        inst.name,
+                        inst.vni
+                    );
+                }
+                // The VNI is the data plane's segment id, so two instances
+                // sharing one would put two tenants on the same wire.
+                if !seen_vni.insert(inst.vni) {
+                    bail!(
+                        "evpn instance {:?}: vni {} is already used by another instance",
+                        inst.name,
+                        inst.vni
+                    );
+                }
+                for iface in &inst.interfaces {
+                    if !self.interfaces.iter().any(|i| &i.name == iface) {
+                        bail!(
+                            "evpn instance {:?} interface {iface:?}: not a declared interface",
+                            inst.name
+                        );
+                    }
+                    // A tenant port carrying frames for a segment cannot also be
+                    // the link those frames leave by: the same interface would be
+                    // both inside and outside the tunnel.
+                    if Some(iface) == e.underlay_interface.as_ref() {
+                        bail!(
+                            "evpn instance {:?}: interface {iface:?} is also the underlay — \
+                             a port cannot be both inside and outside the tunnel",
+                            inst.name
+                        );
+                    }
+                }
+                for mac in &inst.advertise_mac {
+                    validate_mac(mac)
+                        .with_context(|| format!("evpn instance {:?} advertise-mac", inst.name))?;
+                }
+                for rt in inst.rt_import.iter().chain(&inst.rt_export) {
+                    validate_route_target(rt)
+                        .with_context(|| format!("evpn instance {:?} route target", inst.name))?;
+                }
+            }
+            for vrf in &e.ip_vrfs {
+                if vrf.l3_vni == 0 || vrf.l3_vni > 0xff_ffff {
+                    bail!(
+                        "evpn ip-vrf {:?}: l3-vni {} is outside 1..=16777215",
+                        vrf.name,
+                        vrf.l3_vni
+                    );
+                }
+                if !seen_vni.insert(vrf.l3_vni) {
+                    bail!(
+                        "evpn ip-vrf {:?}: l3-vni {} collides with another vni",
+                        vrf.name,
+                        vrf.l3_vni
+                    );
+                }
+                // A type-5 route is imported into a routing table, and the table
+                // has to exist for the routes to land anywhere.
+                if !self.protocols.vrfs.iter().any(|v| v.name == vrf.name) {
+                    bail!(
+                        "evpn ip-vrf {:?}: no such vrf — add `protocols vrf {} table <n>`",
+                        vrf.name,
+                        vrf.name
+                    );
+                }
+                for p in &vrf.advertise_prefix {
+                    validate_cidr_or_ip(p)
+                        .with_context(|| format!("evpn ip-vrf {:?} advertise-prefix", vrf.name))?;
+                }
+                for rt in vrf.rt_import.iter().chain(&vrf.rt_export) {
+                    validate_route_target(rt)
+                        .with_context(|| format!("evpn ip-vrf {:?} route target", vrf.name))?;
+                }
+            }
+        }
+
         // Last: can this configuration actually be handed to the routing daemon?
         //
         // Rendering is pure, so asking is cheap — and the answer has to be
@@ -9459,6 +9804,96 @@ const IMPORT_PROTOCOLS: &[&str] = &[
     "babel",
     "bgp",
 ];
+
+/// ICMP message types by name (RFC 792 and the IANA registry), for the names an
+/// operator actually writes in a rule.
+///
+/// Deliberately short. A firewall rule names a type to allow ping, to keep path
+/// MTU discovery working, or to let traceroute answer — the long tail of
+/// deprecated and experimental types is reachable by number, and listing them
+/// would suggest they are worth matching on.
+pub const ICMP_TYPES: &[(&str, u8)] = &[
+    ("echo-reply", 0),
+    ("destination-unreachable", 3),
+    ("source-quench", 4),
+    ("redirect", 5),
+    ("echo-request", 8),
+    ("router-advertisement", 9),
+    ("router-solicitation", 10),
+    ("time-exceeded", 11),
+    ("parameter-problem", 12),
+    ("timestamp-request", 13),
+    ("timestamp-reply", 14),
+];
+
+/// ICMPv6 message types by name (RFC 4443, 4861).
+///
+/// The names overlap with [`ICMP_TYPES`] and the numbers do not, which is the
+/// whole reason a name is resolved against the rule's protocol. Neighbour
+/// discovery is here because a rule that filters ICMPv6 without it breaks
+/// address resolution — the v6 equivalent of blocking ARP.
+pub const ICMPV6_TYPES: &[(&str, u8)] = &[
+    ("destination-unreachable", 1),
+    ("packet-too-big", 2),
+    ("time-exceeded", 3),
+    ("parameter-problem", 4),
+    ("echo-request", 128),
+    ("echo-reply", 129),
+    ("router-solicitation", 133),
+    ("router-advertisement", 134),
+    ("neighbor-solicitation", 135),
+    ("neighbor-advertisement", 136),
+    ("redirect", 137),
+];
+
+/// Resolve an `icmp-type` value against the protocol it is written on.
+///
+/// Accepts a name from the tables above or a plain number. The number is
+/// accepted because the registry is longer than any list worth shipping; the
+/// name is what should normally be written, since the two numberings disagree.
+pub fn resolve_icmp_type(value: &str, v6: bool) -> Result<u8> {
+    let table = if v6 { ICMPV6_TYPES } else { ICMP_TYPES };
+    let key = value.trim().to_ascii_lowercase();
+    if let Some((_, n)) = table.iter().find(|(name, _)| *name == key) {
+        return Ok(*n);
+    }
+    if let Ok(n) = key.parse::<u8>() {
+        return Ok(n);
+    }
+    let names: Vec<&str> = table.iter().map(|(n, _)| *n).collect();
+    bail!(
+        "{value:?} is not an {} type — use a number 0-255 or one of {names:?}",
+        if v6 { "icmpv6" } else { "icmp" }
+    )
+}
+
+/// Validate a route target as the routing daemon spells it: `rt:<asn>:<n>`,
+/// `ro:<asn>:<n>`, or the IPv4 form `rt:<a.b.c.d>:<n>` (RFC 4360).
+///
+/// The bare `65001:100` an operator knows from other vendors is **not** accepted,
+/// because the daemon does not accept it — and a route target this appliance
+/// takes and the daemon then refuses is a configuration that commits and does
+/// not start. Saying so here is the only place it can be said in time.
+pub fn validate_route_target(s: &str) -> Result<()> {
+    let mut parts = s.split(':');
+    let kind = parts.next().unwrap_or("");
+    if !matches!(kind, "rt" | "ro") {
+        bail!("{s:?} must start with rt: or ro: (it is an extended community, not a plain pair)");
+    }
+    let (admin, value) = match (parts.next(), parts.next(), parts.next()) {
+        (Some(a), Some(v), None) => (a, v),
+        _ => bail!("{s:?} must be {kind}:<asn|ipv4>:<number>"),
+    };
+    if admin.contains('.') {
+        validate_ipv4(admin).with_context(|| format!("{s:?}: administrator field"))?;
+    } else if admin.parse::<u32>().is_err() {
+        bail!("{s:?}: {admin:?} is neither an AS number nor an IPv4 address");
+    }
+    if value.parse::<u32>().is_err() {
+        bail!("{s:?}: {value:?} is not a number");
+    }
+    Ok(())
+}
 
 /// The multicast interface roles Wren accepts (its `MulticastRole`, lowercase).
 const MULTICAST_ROLES: &[&str] = &["querier", "upstream", "downstream"];

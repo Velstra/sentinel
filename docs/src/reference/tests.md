@@ -1,6 +1,6 @@
 # Test suite (nixosTests)
 
-Sentinel is verified by **79 nixosTests**, **432 Rust unit tests** and a
+Sentinel is verified by **80 nixosTests**, **440 Rust unit tests** and a
 **browser suite** that drives the web console against a running appliance. The nixosTests
 boot real QEMU/OVMF VMs — several of them two or three at a time on shared virtual
 segments — so they need `/dev/kvm`.
@@ -70,6 +70,7 @@ write, which is how ten sections that could be typed and not clicked were found.
 | `fwdomain` | a domain group resolves to addresses the rules match on, the answer is cached, and a **failed lookup keeps it** rather than emptying a blocking rule |
 | `fwschedule` | a rule with a weekly schedule is in the data plane **only** inside its window |
 | `v6exthdr` | IPv6 extension headers do not bypass a rule — the chain is walked to the real protocol |
+| `icmptype` | a rule that names an ICMP **type** matches that type and not the protocol: a ping is stopped by an `echo-request` rule and not by one for a different type, and the two families are numbered apart (`echo-request` is 8 in ICMP, 128 in ICMPv6) |
 
 ## NAT
 

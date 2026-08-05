@@ -1021,6 +1021,10 @@ const TOP: &[Cand] = &[
         "routing policy: prefix-lists + route-maps (match/set)",
     ),
     (
+        "evpn",
+        "one tenant network across several boxes: BGP control plane + VXLAN/Geneve",
+    ),
+    (
         "update",
         "signed update channel: URL + pinned release signing key",
     ),
@@ -2670,6 +2674,92 @@ const PEER_FIELDS: &[Cand] = &[
     ("keepalive", "persistent-keepalive seconds"),
     ("preshared-key", "optional pre-shared key"),
 ];
+/// `firewall rule <n> family <Tab>`.
+/// `evpn <Tab>` — the box's own overlay identity, then its segments and tenants.
+const EVPN_FIELDS: &[Cand] = &[
+    ("vtep-ip", "this box's tunnel endpoint address (required)"),
+    (
+        "underlay-interface",
+        "the link encapsulated traffic leaves by (required)",
+    ),
+    ("encapsulation", "vxlan (RFC 7348) or geneve (RFC 8926)"),
+    ("udp-port", "override the destination port (4789 / 6081)"),
+    ("mtu", "the underlay MTU, when it is not the link's own"),
+    (
+        "srv6-locator",
+        "use SRv6 service SIDs instead of a UDP encap",
+    ),
+    ("instance", "a layer-2 segment, by name"),
+    ("ip-vrf", "a layer-3 tenant, by vrf name"),
+];
+/// `evpn encapsulation <Tab>`.
+const EVPN_ENCAPS: &[Cand] = &[
+    ("vxlan", "RFC 7348, UDP/4789 — what every switch speaks"),
+    (
+        "geneve",
+        "RFC 8926, UDP/6081 — carries options, costs 8 more bytes",
+    ),
+];
+/// `evpn instance <name> <Tab>` — one stretched layer-2 segment.
+const EVPN_INSTANCE_FIELDS: &[Cand] = &[
+    ("evi", "the EVPN instance id carried in this box's routes"),
+    ("vni", "the segment id on the wire (1..16777215)"),
+    ("rd", "route distinguisher (ip:value or asn:value)"),
+    ("rt-import", "a route target to accept (rt:asn:value)"),
+    ("rt-export", "a route target to stamp on what is announced"),
+    ("interface", "a local port on this segment (repeatable)"),
+    ("advertise-mac", "announce a MAC before it has been seen"),
+];
+/// `evpn ip-vrf <name> <Tab>` — routing between segments (RFC 9136 type-5).
+const EVPN_IPVRF_FIELDS: &[Cand] = &[
+    ("l3-vni", "the routing domain's id on the wire"),
+    ("rd", "route distinguisher (ip:value or asn:value)"),
+    ("rt-import", "a route target to accept (rt:asn:value)"),
+    ("rt-export", "a route target to stamp on what is announced"),
+    (
+        "advertise-prefix",
+        "originate this prefix as a type-5 route",
+    ),
+    ("router-mac", "the MAC a peer routes into this tenant with"),
+];
+
+const RULE_FAMILIES: &[Cand] = &[("ipv4", "IPv4 only"), ("ipv6", "IPv6 only")];
+/// `firewall rule <n> direction <Tab>`.
+const RULE_DIRECTIONS: &[Cand] = &[
+    ("in", "traffic arriving on the zone's interfaces"),
+    (
+        "out",
+        "traffic leaving them, including what this box originates (IPv4 only)",
+    ),
+];
+/// `firewall rule <n> icmp-type <Tab>` — the names worth offering, both families.
+/// A number is accepted too; the registry is longer than any list worth shipping.
+const ICMP_TYPE_NAMES: &[Cand] = &[
+    ("echo-request", "a ping (icmp 8 / icmpv6 128)"),
+    ("echo-reply", "a ping answer (icmp 0 / icmpv6 129)"),
+    (
+        "destination-unreachable",
+        "no route / port closed (icmp 3 / icmpv6 1)",
+    ),
+    (
+        "packet-too-big",
+        "icmpv6 2 — path MTU discovery; blocking it breaks large transfers",
+    ),
+    ("time-exceeded", "a hop expired (icmp 11 / icmpv6 3)"),
+    (
+        "parameter-problem",
+        "a malformed header (icmp 12 / icmpv6 4)",
+    ),
+    ("redirect", "a better first hop (icmp 5 / icmpv6 137)"),
+    ("router-solicitation", "icmp 10 / icmpv6 133"),
+    ("router-advertisement", "icmp 9 / icmpv6 134"),
+    (
+        "neighbor-solicitation",
+        "icmpv6 135 — v6 address resolution; the ARP equivalent",
+    ),
+    ("neighbor-advertisement", "icmpv6 136"),
+];
+
 const RULE_FIELDS: &[Cand] = &[
     ("description", "free-text label for this rule"),
     (
@@ -2681,6 +2771,15 @@ const RULE_FIELDS: &[Cand] = &[
     ("action", "accept / drop / reject"),
     ("proto", "tcp / udp"),
     ("port", "destination port or range (e.g. 443 or 8000-8100)"),
+    (
+        "icmp-type",
+        "ICMP/ICMPv6 message type: a name (echo-request) or a number",
+    ),
+    ("family", "restrict to one address family (ipv4 / ipv6)"),
+    (
+        "direction",
+        "restrict to arriving (in) or leaving (out) traffic; out is IPv4 only",
+    ),
     ("log", "log packets matching this rule (true / false)"),
     (
         "source",
@@ -2933,6 +3032,12 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set", "firewall", "zone", _name, "source-validation"] => SOURCE_VALIDATION,
         ["set" | "delete", "firewall", "rule", _name] => RULE_FIELDS,
         ["set", "firewall", "rule", _name, "action"] => ACTIONS,
+        // Both families' names are offered: which one applies depends on the
+        // rule's `proto`, which the completion layer does not read, and an
+        // operator picking the wrong one is told so at commit.
+        ["set", "firewall", "rule", _name, "icmp-type"] => ICMP_TYPE_NAMES,
+        ["set", "firewall", "rule", _name, "family"] => RULE_FAMILIES,
+        ["set", "firewall", "rule", _name, "direction"] => RULE_DIRECTIONS,
         ["set", "firewall", "rule", _name, "proto"] => PROTOS,
         ["set", "firewall", "rule", _name, "log" | "disabled"] => BOOLS,
         ["set" | "delete", "firewall", "rule", _name, "schedule"] => SCHEDULE_FIELDS,
@@ -3082,6 +3187,10 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set", "protocols", "bfd", "auth-type"] => BFD_AUTH_TYPES,
         ["set", "protocols", "bfd", "echo"] => BOOLS,
         // Multicast (IGMP/MLD querier + proxy).
+        ["set" | "delete", "evpn"] => EVPN_FIELDS,
+        ["set", "evpn", "encapsulation"] => EVPN_ENCAPS,
+        ["set" | "delete", "evpn", "instance", _name] => EVPN_INSTANCE_FIELDS,
+        ["set" | "delete", "evpn", "ip-vrf", _name] => EVPN_IPVRF_FIELDS,
         ["set" | "delete", "protocols", "multicast"] => MULTICAST_FIELDS,
         ["set" | "delete", "protocols", "multicast", "pim"] => PIM_FIELDS,
         ["set", "protocols", "multicast", "pim", "enabled"] => BOOLS,
@@ -4019,6 +4128,7 @@ mod tests {
                 "vpn",
                 "pki",
                 "policy",
+                "evpn",
                 "update"
             ]
         );
@@ -4235,6 +4345,9 @@ mod tests {
                 "action",
                 "proto",
                 "port",
+                "icmp-type",
+                "family",
+                "direction",
                 "log",
                 "source",
                 "source-group",
@@ -4578,6 +4691,7 @@ mod tests {
                 "vpn",
                 "pki",
                 "policy",
+                "evpn",
                 "update"
             ]
         );
