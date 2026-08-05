@@ -7941,6 +7941,8 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             || !draft.admin_groups.is_empty()
             || cs_set
             || cts_set
+            || !draft.aaa.is_empty()
+            || !draft.metrics.is_default()
             || !draft.sysctl.is_empty())
     {
         out.push_str("system {\n");
@@ -7976,6 +7978,51 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
                     crate::config::Permission::ReadWrite => "read-write",
                 }
             ));
+            out.push_str("    }\n");
+        }
+        // Who may authenticate against this box, and where those accounts live.
+        // Left out, a configuration copied to a second appliance arrived with no
+        // directory at all and fell back to whatever local accounts came with
+        // it — an authentication setting that disappears is worse than one that
+        // is wrong, because nothing about the copy looks incomplete.
+        if !draft.aaa.is_empty() {
+            out.push_str("    aaa {\n");
+            for r in &draft.aaa.radius {
+                out.push_str(&format!("        radius {} {{\n", r.server));
+                out.push_str(&format!("            secret {}\n", r.secret));
+                if let Some(p) = r.port {
+                    out.push_str(&format!("            port {p}\n"));
+                }
+                if let Some(t) = r.timeout {
+                    out.push_str(&format!("            timeout {t}\n"));
+                }
+                out.push_str("        }\n");
+            }
+            for l in &draft.aaa.ldap {
+                out.push_str(&format!("        ldap {} {{\n", l.server));
+                out.push_str(&format!("            base-dn {}\n", l.base_dn));
+                if let Some(a) = &l.user_attribute {
+                    out.push_str(&format!("            user-attribute {a}\n"));
+                }
+                if let Some(t) = &l.tls {
+                    out.push_str(&format!("            tls {t}\n"));
+                }
+                if let Some(p) = l.port {
+                    out.push_str(&format!("            port {p}\n"));
+                }
+                if let Some(t) = l.timeout {
+                    out.push_str(&format!("            timeout {t}\n"));
+                }
+                out.push_str("        }\n");
+            }
+            if let Some(g) = &draft.aaa.default_group {
+                out.push_str(&format!("        default-group {g}\n"));
+            }
+            out.push_str("    }\n");
+        }
+        if !draft.metrics.is_default() {
+            out.push_str("    metrics {\n");
+            out.push_str("        enable true\n");
             out.push_str("    }\n");
         }
         if cs_set {
@@ -10424,6 +10471,157 @@ action = "reject"
         assert_eq!(
             rebuilt, original,
             "the routing configuration did not survive being flattened to commands"
+        );
+    }
+
+    /// And again over the services, VPN, PKI and account surface, which neither
+    /// of the two fixtures above touches.
+    ///
+    /// This one found `[system.aaa]` and `[system.metrics]` missing entirely.
+    /// The AAA loss is the worse of the two: a configuration copied to a second
+    /// appliance arrived with no directory at all and fell back to whatever
+    /// local accounts came with it. An authentication setting that disappears is
+    /// worse than one that is wrong, because nothing about the copy looks
+    /// incomplete.
+    #[test]
+    fn the_services_configuration_survives_the_same_round_trip() {
+        let toml = r#"
+[system]
+hostname = "svc"
+[system.metrics]
+enable = true
+[[system.aaa.radius]]
+server = "10.0.0.5"
+secret = "radsecret"
+[[system.aaa.ldap]]
+server = "ldap.example.com"
+base-dn = "dc=example,dc=com"
+
+[[interface]]
+name = "eth0"
+zone = "lan"
+address = "10.0.0.1/24"
+[interface.dhcp-server]
+range-start = "10.0.0.100"
+range-end = "10.0.0.200"
+[[interface.dhcp-server.static-mapping]]
+name = "printer"
+mac = "aa:bb:cc:dd:ee:ff"
+ip = "10.0.0.50"
+[interface.router-advert]
+enable = true
+managed = true
+[interface.qos]
+discipline = "cake"
+bandwidth = "100mbit"
+[[interface]]
+name = "eth1"
+zone = "wan"
+address = "192.0.2.1/24"
+[[interface]]
+name = "wg0"
+type = "wireguard"
+zone = "wan"
+address = "10.9.0.1/24"
+
+[services.snmp]
+community = "public"
+location = "rack 4"
+contact = "noc@example.com"
+[services.mdns]
+interface = ["eth0", "eth1"]
+[services.dyndns]
+provider = "cloudflare"
+hostname = "fw.example.com"
+login = "user"
+password = "pw"
+[services.dhcp-relay]
+interface = ["eth1"]
+server = ["10.0.0.9"]
+[[services.syslog.target]]
+host = "10.0.0.9"
+port = 514
+proto = "udp"
+[services.alerts]
+webhook = ["https://hooks.example.com/x"]
+[[services.reverse-proxy]]
+name = "site1"
+port = 443
+backends = ["10.0.0.20:8080"]
+[[services.broadcast-relay]]
+name = "games"
+port = 27015
+interface = ["eth0", "eth1"]
+
+[[nat.destination]]
+name = "web"
+zone = "wan"
+proto = "tcp"
+port = 443
+to = "10.0.0.10:443"
+[[load-balancer]]
+name = "web"
+zone = "wan"
+vip = "203.0.113.10"
+proto = "tcp"
+port = 443
+backends = ["10.0.0.11:8443"]
+[multiwan]
+mode = "failover"
+
+[[vpn.ipsec]]
+name = "tun1"
+local = "192.0.2.1"
+remote = "198.51.100.1"
+psk = "sharedsecret"
+local-subnet = "10.0.0.0/24"
+remote-subnet = "10.1.0.0/24"
+[[vpn.wireguard]]
+name = "wg0"
+private-key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+listen-port = 51820
+
+[pki]
+[[pki.ca]]
+name = "house"
+common-name = "House CA"
+[[pki.certificate]]
+name = "web"
+ca = "house"
+common-name = "www.example.com"
+"#;
+        let original = render_appliance(&Appliance::from_toml(toml).unwrap());
+        let commands = flatten_config(&original);
+        for expected in [
+            "set system aaa radius 10.0.0.5 secret radsecret",
+            "set system aaa ldap ldap.example.com base-dn dc=example,dc=com",
+            "set system metrics enable true",
+        ] {
+            assert!(
+                commands.iter().any(|c| c == expected),
+                "{expected:?} is not in the flattened config: {commands:#?}"
+            );
+        }
+
+        let dir = std::env::temp_dir().join(format!("sentinel-flatten-svc-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("appliance.toml");
+        let _ = std::fs::remove_file(&path);
+        let mut session = Session::load(&path).unwrap();
+        let act = crate::repl::Apply::off();
+        let mut ctx: Vec<String> = Vec::new();
+        for command in &commands {
+            assert!(
+                !crate::repl::exec_line(&mut session, &act, &mut ctx, command),
+                "{command} ended the session"
+            );
+        }
+        let rebuilt = render_appliance(&session.commit().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            rebuilt, original,
+            "the services configuration did not survive being flattened to commands"
         );
     }
     use super::*;
