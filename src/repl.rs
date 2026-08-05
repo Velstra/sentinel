@@ -2126,6 +2126,10 @@ const GROUP_NODES: &[Cand] = &[
         "a reusable set of ports/ranges (rule port-group)",
     ),
     (
+        "interface-group",
+        "a set of links, for a rule that applies to some of a zone (rule interface-group)",
+    ),
+    (
         "mac-group",
         "hardware addresses, for a rule that names devices (rule source-mac-group)",
     ),
@@ -2151,6 +2155,10 @@ const PORT_GROUP_FIELDS: &[Cand] = &[(
     "members: ports/ranges, comma-separated (replaces the set)",
 )];
 const USER_GROUP_FIELDS: &[Cand] = &[("user", "a VPN username (repeatable, comma-separated)")];
+const IFACE_GROUP_FIELDS: &[Cand] = &[(
+    "interface",
+    "members: interface names, comma-separated (replaces the set)",
+)];
 const MAC_GROUP_FIELDS: &[Cand] = &[(
     "mac",
     "members: hardware addresses, comma-separated (replaces the set)",
@@ -2787,6 +2795,10 @@ const RULE_FIELDS: &[Cand] = &[
         "source-mac-group",
         "match the sender's hardware address (a verdict on the device)",
     ),
+    (
+        "interface-group",
+        "apply only on these links, rather than everywhere in the zone",
+    ),
     ("family", "restrict to one address family (ipv4 / ipv6)"),
     (
         "direction",
@@ -3018,6 +3030,13 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ] => ADDRESS_GROUP_FIELDS,
         ["set" | "delete", "firewall", "group", "port-group", _name] => PORT_GROUP_FIELDS,
         ["set" | "delete", "firewall", "group", "domain-group", _name] => DOMAIN_GROUP_FIELDS,
+        [
+            "set" | "delete",
+            "firewall",
+            "group",
+            "interface-group",
+            _name,
+        ] => IFACE_GROUP_FIELDS,
         ["set" | "delete", "firewall", "group", "mac-group", _name] => MAC_GROUP_FIELDS,
         ["set" | "delete", "firewall", "group", "feed-group", _name] => FEED_GROUP_FIELDS,
         ["set" | "delete", "firewall", "group", "user-group", _name] => USER_GROUP_FIELDS,
@@ -4292,6 +4311,7 @@ mod tests {
             [
                 "address-group",
                 "port-group",
+                "interface-group",
                 "mac-group",
                 "user-group",
                 "feed-group",
@@ -4361,6 +4381,7 @@ mod tests {
                 "port",
                 "icmp-type",
                 "source-mac-group",
+                "interface-group",
                 "family",
                 "direction",
                 "log",

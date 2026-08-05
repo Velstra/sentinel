@@ -351,7 +351,9 @@ EVPN.
 | `encapsulation` | `vxlan` (RFC 7348, UDP/4789) or `geneve` (RFC 8926, UDP/6081). Unset ⇒ VXLAN. |
 | `udp-port` | Override the destination port — for a second overlay on a network that already carries one. |
 | `mtu` | The underlay MTU, when it is not the link's own. |
-| `srv6-locator` | Use SRv6 service SIDs instead of a UDP encapsulation. |
+| `srv6-locator` | Use SRv6 service SIDs instead of a UDP encapsulation. Excludes `encapsulation` — a host carries one overlay format, not both. |
+| `srv6-source` | This box's SRv6 source address, out of its own locator. Required with a locator: the daemon announces SIDs *within* the locator, the data plane sends *from* one address. |
+| `srv6-peer` | A peer this box accepts a decapsulation from. A **trust list** — without it anything that can reach this box's SID could inject a frame straight onto a tenant segment, past every zone. At least one is required. |
 
 **VXLAN or Geneve.** VXLAN is what every switch speaks. Geneve carries options
 VXLAN cannot, which matters where something in the path wants to annotate a

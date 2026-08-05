@@ -310,6 +310,39 @@ be told apart in the log.
 Named address / port sets you reference from rules, so one edit updates every
 rule that uses them.
 
+### Some of a zone, not all of it
+
+An `interface-group` names links. A zone is already a named set of links, so this
+is for the one case a zone cannot express: **two rules over different subsets of
+the same zone**.
+
+```text
+set firewall group interface-group trusted interface eth0,eth1
+set firewall rule ssh-trusted from lan
+set firewall rule ssh-trusted proto tcp
+set firewall rule ssh-trusted port 22
+set firewall rule ssh-trusted action accept
+set firewall rule ssh-trusted interface-group trusted
+```
+
+The interface is matched in the data plane's rule key, not derived from a second
+policy — splitting a zone into several policies would put a flow's two directions
+under different connection-tracking scopes, and a reply arriving on a sibling
+link would not find its own entry.
+
+So a scoped rule and an unscoped one are **different entries**, and the lookup
+asks twice: with this packet's own interface, then without. The scoped one wins,
+because naming the link is the more specific statement — the same ranking a
+specific source has over `from any`.
+
+A rule over three links becomes three data-plane rules, the way a `source-group`
+over three CIDRs does.
+
+An interface that a group names and the box does not have makes the rule apply
+**everywhere** rather than nowhere. That is the deliberate direction: a rule that
+is too broad is visible, one that is silently inert is not — and the reconfigure
+that follows the NIC appearing narrows it.
+
 ### Devices, not addresses
 
 A `mac-group` names hardware addresses. A device keeps its MAC when its address
