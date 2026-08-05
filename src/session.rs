@@ -8168,6 +8168,12 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         if let Some(mtu) = i.mtu {
             out.push_str(&format!("    mtu {mtu}\n"));
         }
+        // The MSS clamp travels with the link it clamps. A tunnel without it
+        // carries small traffic fine and hangs on anything large, which is the
+        // hardest failure on this list to recognise from the symptom.
+        if let Some(mss) = &i.mss {
+            out.push_str(&format!("    mss {mss}\n"));
+        }
         if let Some(mac) = &i.mac {
             out.push_str(&format!("    mac {mac}\n"));
         }
@@ -10839,6 +10845,158 @@ wan-zone = "wan"
         assert_eq!(
             rebuilt, original,
             "the firewall extras did not survive being flattened to commands"
+        );
+    }
+
+    /// The fifth pass: the link types that are not just a NIC with an address,
+    /// and the road-warrior VPN.
+    ///
+    /// One loss, and a quiet one — `mss`. A tunnel without its MSS clamp carries
+    /// small traffic perfectly and hangs on anything large, which is the hardest
+    /// failure on this list to recognise from the symptom.
+    #[test]
+    fn the_link_types_survive_the_same_round_trip() {
+        let toml = r#"
+[system]
+hostname = "iface"
+
+[[interface]]
+name = "eth0"
+zone = "lan"
+address = "10.0.0.1/24"
+mtu = 9000
+mss = "1400"
+mac = "02:00:00:00:00:01"
+description = "the inside"
+[[interface]]
+name = "eth1"
+zone = "wan"
+address = "192.0.2.1/24"
+address6 = "2001:db8:1::1/64"
+[[interface]]
+name = "eth2"
+disabled = true
+description = "spare"
+
+[[interface]]
+name = "eth5"
+description = "bridge member"
+vlan-tagged = [10, 20]
+vlan-untagged = 1
+[[interface]]
+name = "eth3"
+description = "bond member"
+[[interface]]
+name = "eth4"
+description = "bond member"
+[[interface]]
+name = "bond0"
+type = "bond"
+member = ["eth3", "eth4"]
+bond-mode = "802.3ad"
+zone = "lan"
+[[interface]]
+name = "br0"
+type = "bridge"
+member = ["eth5"]
+vlan-aware = true
+zone = "lan"
+[[interface]]
+name = "eth0.10"
+pd-from = "eth1"
+pd-subnet = 3
+parent = "eth0"
+vlan = 10
+vlan-protocol = "802.1ad"
+zone = "dmz"
+address = "10.10.0.1/24"
+[[interface]]
+name = "mv0"
+type = "macvlan"
+parent = "eth0"
+macvlan-mode = "bridge"
+zone = "lan"
+[[interface]]
+name = "sec0"
+type = "macsec"
+parent = "eth0"
+macsec-key = "0123456789abcdef0123456789abcdef"
+macsec-peer = "02:00:00:00:00:99"
+zone = "lan"
+[[interface]]
+name = "tun0"
+type = "gre"
+local = "192.0.2.1"
+remote = "198.51.100.1"
+key = 42
+ttl = 64
+zone = "wan"
+[[interface]]
+name = "l2tp1"
+type = "l2tpv3"
+local = "192.0.2.1"
+remote = "198.51.100.2"
+key = 7
+zone = "wan"
+[[interface]]
+name = "tun1"
+type = "ipip"
+local = "192.0.2.1"
+remote = "198.51.100.3"
+zone = "wan"
+[[interface]]
+name = "dum0"
+type = "dummy"
+address = "10.255.0.1/32"
+zone = "lan"
+
+[vpn.openconnect]
+certificate = "web"
+port = 4443
+zone = "lan"
+pool = "10.9.0.0/24"
+dns = ["10.0.0.1"]
+routes = ["10.0.0.0/8"]
+default-route = false
+[[vpn.openconnect.user]]
+name = "alice"
+password = "secretpw"
+
+[pki]
+[[pki.ca]]
+name = "house"
+common-name = "House CA"
+[[pki.certificate]]
+name = "web"
+ca = "house"
+common-name = "vpn.example.com"
+"#;
+        let original = render_appliance(&Appliance::from_toml(toml).unwrap());
+        let commands = flatten_config(&original);
+        assert!(
+            commands.iter().any(|c| c == "set interface eth0 mss 1400"),
+            "the MSS clamp is not in the flattened config: {commands:#?}"
+        );
+
+        let dir = std::env::temp_dir().join(format!("sentinel-flatten-if-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("appliance.toml");
+        let _ = std::fs::remove_file(&path);
+        let mut session = Session::load(&path).unwrap();
+        let act = crate::repl::Apply::off();
+        let mut ctx: Vec<String> = Vec::new();
+        for command in &commands {
+            assert!(
+                !crate::repl::exec_line(&mut session, &act, &mut ctx, command),
+                "{command} ended the session"
+            );
+        }
+        let rebuilt = render_appliance(&session.commit().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            rebuilt, original,
+            "the link types did not survive being flattened to commands"
         );
     }
     use super::*;
