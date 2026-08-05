@@ -335,7 +335,7 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
     let appliance = match session.commit() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("error: {e}");
+            eprintln!("error: {e:#}");
             return false;
         }
     };
@@ -398,7 +398,7 @@ fn commit_confirm_line(session: &mut Session, act: &Apply, rest: &[&str]) -> boo
         },
     };
     if let Err(e) = crate::confirm::commit_confirm(session, act, minutes) {
-        eprintln!("error: {e}");
+        eprintln!("error: {e:#}");
     }
     false
 }
@@ -441,7 +441,7 @@ fn rollback_line(session: &mut Session, act: &Apply, rest: &[&str]) -> bool {
     };
     match crate::archive::rollback(session, act, n) {
         Ok(()) => eprintln!("rolled back to revision {n} (applied live + saved)."),
-        Err(e) => eprintln!("error: {e}"),
+        Err(e) => eprintln!("error: {e:#}"),
     }
     false
 }
