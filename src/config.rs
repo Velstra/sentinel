@@ -7140,8 +7140,9 @@ impl Appliance {
             }
             for i in &ospf.interface {
                 if let Some(area) = &i.area {
-                    validate_ipv4(area)
-                        .with_context(|| format!("protocols ospf interface {:?} area", i.name))?;
+                    validate_ipv4(area).with_context(|| {
+                        format!("protocols ospf interface {:?} area (dotted quad)", i.name)
+                    })?;
                 }
             }
             for (which, areas) in [
@@ -8513,6 +8514,15 @@ impl Appliance {
                 );
             }
         }
+        // Last: can this configuration actually be handed to the routing daemon?
+        //
+        // Rendering is pure, so asking is cheap — and the answer has to be
+        // known *here*, because a commit persists before it applies. A setting
+        // the renderer refuses would otherwise be accepted, written to disk, and
+        // then fail at apply, leaving the box saved into a configuration it
+        // cannot start with. Better to refuse the setting than to accept it and
+        // discover the problem on the next boot.
+        crate::wren::compile_wren(self).to_toml()?;
         Ok(())
     }
 
