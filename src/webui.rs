@@ -1959,6 +1959,17 @@ pub fn page() -> String {
           facing the source.
         </p>
         <div class="card"><div class="grid" id="mcastform"></div></div>
+        <div class="card">
+          <h3>PIM-SM</h3>
+          <p class="lede" style="margin:0 0 var(--space-4)">
+            The querier and the proxy carry multicast <em>within</em> a segment.
+            PIM routes it <em>between</em> them: every join is sent toward the
+            rendezvous point until somebody learns who the source is, which is
+            why sparse mode has no meaning without an RP address. Each link named
+            here must also be a multicast interface below.
+          </p>
+          <div class="grid" id="mcastpim"></div>
+        </div>
         <div class="section">
           <h3>Interfaces</h3>
           <span class="spacer"></span>
@@ -5003,6 +5014,18 @@ const MULTICAST = [
   ["query-response-interval", "Response interval (s)"],
   ["robustness", "Robustness"],
 ];
+// PIM writes under `protocols multicast` too: the keys carry the sub-node, so a
+// field here is the command it already is. Separate from the querier settings
+// above because they answer different questions — the querier asks who on this
+// segment is listening, PIM decides which segment a group reaches at all.
+const MULTICAST_PIM = [
+  ["pim enabled", "Route between segments", ["", "true", "false"]],
+  ["pim rp-address", "Rendezvous point"],
+  ["pim interface", "Speaks on", null, "each"],
+  ["#", "More settings"],
+  ["pim hello-interval", "Hello interval (s)"],
+  ["pim spt-threshold", "Source-tree threshold (kbit/s)"],
+];
 // An interface either faces receivers or faces where the traffic comes from.
 const MULTICAST_IFACE = [
   ["role", "Role", ["", "downstream", "upstream", "disabled"]],
@@ -5354,6 +5377,7 @@ async function refreshRouting() {{
     ["bgpconfed", BGP_CONFED, "protocols bgp", "Confederation"],
     ["bgprpki", BGP_RPKI, "protocols bgp", "Origin validation"],
     ["mcastform", MULTICAST, "protocols multicast", "Multicast routing"],
+    ["mcastpim", MULTICAST_PIM, "protocols multicast", "PIM-SM"],
   ]) {{
     settingsPanel(box, fields, fieldsOf(ls, path), path, label);
   }}

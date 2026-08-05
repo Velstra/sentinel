@@ -256,6 +256,41 @@ Multicast is not forwarded by default: a router has to be told to listen for the
 reports that say who wants a group. An interface either faces receivers
 (`downstream`) or faces the source (`upstream`).
 
+### Between segments: PIM-SM
+
+The querier and the RFC 4605 proxy carry multicast *within* a segment. A proxy
+has one upstream and forwards whatever was asked for. **PIM-SM** (RFC 7761)
+routes it *between* segments: it picks a path per group and can have several
+neighbours.
+
+```text
+set protocols multicast interface eth0 role querier
+set protocols multicast interface eth1 role upstream
+set protocols multicast pim enabled true
+set protocols multicast pim rp-address 10.0.0.9
+set protocols multicast pim interface eth0
+set protocols multicast pim interface eth1
+```
+
+Sparse mode sends every join toward the **rendezvous point** until somebody
+learns who the source is, so `rp-address` is required — without it the daemon
+starts and routes nothing. The address is configured statically here; the
+alternatives (bootstrap-router election, Auto-RP) exist to distribute it to
+routers that were not told, which is not a problem an appliance with one
+configuration file has.
+
+Every link PIM speaks on must also be a multicast interface. The two do
+different jobs and both are needed: IGMP is what says somebody on *this* segment
+wants a group, PIM is what decides whether the group reaches the segment at all.
+
+| Field | Meaning |
+|---|---|
+| `enabled` | Run PIM-SM. |
+| `rp-address` | The rendezvous point. Required when enabled. |
+| `interface` | A link PIM speaks on. Repeatable. |
+| `hello-interval` | Seconds between Hellos (default 30). |
+| `spt-threshold` | kbit/s above which a group leaves the shared tree for the source's own. `0` switches on the first packet; unset keeps the shared tree, which holds less state. |
+
 ## BGP: aggregates, authorisations, confederation, RPKI
 
 ```text

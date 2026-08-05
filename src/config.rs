@@ -2680,8 +2680,60 @@ pub struct Multicast {
     )]
     pub query_response_interval: Option<u32>,
     /// The interfaces multicast runs on, each with a role.
+    /// PIM-SM (`[protocols.multicast.pim]`): routing multicast *between*
+    /// segments, where the querier and the RFC 4605 proxy only carry it within
+    /// one. A proxy has a single upstream and forwards whatever was asked for; a
+    /// router picks a path per group and can have several neighbours.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pim: Option<Pim>,
     #[serde(default, rename = "interface", skip_serializing_if = "Vec::is_empty")]
     pub interfaces: Vec<MulticastInterface>,
+}
+
+/// PIM-SM (`[protocols.multicast.pim]`, RFC 7761 sparse mode) with a statically
+/// configured Rendezvous Point.
+///
+/// Sparse mode with a static RP is the shape a firewall actually deploys: the
+/// alternatives (bootstrap-router election, Auto-RP) exist to distribute the RP
+/// address to routers that were not configured with it, which is not a problem
+/// an appliance with one configuration file has.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pim {
+    /// Run PIM-SM.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub enabled: bool,
+    /// The Rendezvous Point: the root of the shared tree, and where a receiver's
+    /// join is sent before anybody knows who the source is. Required when
+    /// enabled — sparse mode has no meaning without one.
+    #[serde(
+        default,
+        rename = "rp-address",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub rp_address: Option<String>,
+    /// The interfaces PIM speaks on. Each must also be a multicast interface:
+    /// PIM decides where a group goes, and IGMP is what tells it somebody on
+    /// this segment wants it.
+    #[serde(default, rename = "interface", skip_serializing_if = "Vec::is_empty")]
+    pub interfaces: Vec<String>,
+    /// Seconds between Hellos (RFC 7761 §4.11). Default 30.
+    #[serde(
+        default,
+        rename = "hello-interval",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub hello_interval: Option<u16>,
+    /// Switch a group from the shared tree to the source's own tree once it
+    /// exceeds this many kbit/s. `0` switches on the first packet; unset keeps
+    /// the shared tree, which is the conservative choice and the one that keeps
+    /// state small.
+    #[serde(
+        default,
+        rename = "spt-threshold",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub spt_threshold: Option<u32>,
 }
 
 /// One `[[protocols.multicast.interface]]`: an interface and the role it plays.
@@ -7337,6 +7389,39 @@ impl Appliance {
             if let Some(v) = mc.igmp_version {
                 if v != 2 && v != 3 {
                     bail!("protocols multicast igmp-version {v} must be 2 or 3");
+                }
+            }
+            if let Some(pim) = &mc.pim {
+                if pim.enabled {
+                    // Sparse mode is defined in terms of the shared tree, and the
+                    // shared tree is rooted at the RP. Without one there is
+                    // nowhere to send a join, so the daemon would start and
+                    // quietly route nothing.
+                    match &pim.rp_address {
+                        None => bail!(
+                            "protocols multicast pim: rp-address is required — sparse mode \
+                             sends every join toward the rendezvous point"
+                        ),
+                        Some(rp) => validate_ipv4(rp)
+                            .with_context(|| "protocols multicast pim rp-address")?,
+                    }
+                    if pim.interfaces.is_empty() {
+                        bail!("protocols multicast pim: no interface — pim has to speak somewhere");
+                    }
+                }
+                for name in &pim.interfaces {
+                    // PIM decides where a group is forwarded; IGMP is what tells
+                    // it that somebody on this segment wants the group. A link
+                    // that runs one without the other is half a router.
+                    if !mc.interfaces.iter().any(|i| &i.name == name) {
+                        bail!(
+                            "protocols multicast pim interface {name:?}: not a multicast \
+                             interface — add `protocols multicast interface {name} role <role>`"
+                        );
+                    }
+                }
+                if let Some(0) = pim.hello_interval {
+                    bail!("protocols multicast pim hello-interval must be >= 1 second");
                 }
             }
         }

@@ -1066,6 +1066,8 @@ struct MulticastDraft {
     query_response_interval: Option<u32>,
     /// Interfaces keyed by name (role + optional per-interface igmp-version).
     interfaces: Vec<(String, MulticastIfaceDraft)>,
+    /// PIM-SM, which routes multicast between segments rather than within one.
+    pim: crate::config::Pim,
 }
 
 impl MulticastDraft {
@@ -1078,6 +1080,11 @@ impl MulticastDraft {
             && self.query_interval.is_none()
             && self.query_response_interval.is_none()
             && self.interfaces.is_empty()
+            && !self.pim.enabled
+            && self.pim.rp_address.is_none()
+            && self.pim.interfaces.is_empty()
+            && self.pim.hello_interval.is_none()
+            && self.pim.spt_threshold.is_none()
     }
 
     /// Mutable access to the multicast interface `name`, inserting it if new.
@@ -2216,6 +2223,7 @@ impl Draft {
                     robustness: m.robustness,
                     query_interval: m.query_interval,
                     query_response_interval: m.query_response_interval,
+                    pim: m.pim.clone().unwrap_or_default(),
                     interfaces: m
                         .interfaces
                         .iter()
@@ -4685,6 +4693,30 @@ impl Session {
                         .with_context(|| format!("invalid igmp-version {v:?}"))?,
                 );
             }
+            // pim (routing multicast between segments, not within one).
+            ["protocols", "multicast", "pim", "interface", v] => {
+                append_csv(&mut self.draft.multicast.pim.interfaces, v);
+            }
+            ["protocols", "multicast", "pim", field, v] => {
+                let p = &mut self.draft.multicast.pim;
+                match *field {
+                    "enabled" => p.enabled = parse_bool(v)?,
+                    "rp-address" => p.rp_address = Some((*v).to_string()),
+                    "hello-interval" => {
+                        p.hello_interval = Some(
+                            v.parse()
+                                .with_context(|| format!("invalid interval {v:?}"))?,
+                        )
+                    }
+                    "spt-threshold" => {
+                        p.spt_threshold = Some(
+                            v.parse()
+                                .with_context(|| format!("invalid threshold {v:?}"))?,
+                        )
+                    }
+                    other => bail!("protocols multicast pim has no field {other:?}"),
+                }
+            }
             ["protocols", "multicast", field, v] => {
                 let m = &mut self.draft.multicast;
                 match *field {
@@ -5146,6 +5178,7 @@ impl Session {
                  set protocols vrf <name> <table <n> | rd <v> | interface <if> | import <filter> | export <filter>>\n  \
                  set protocols bfd <min-tx <ms> | min-rx <ms> | detect-mult <n> | auth-type <t> | auth-key-id <n> | auth-key <k> | echo <bool> | echo-interval <ms>>\n  \
                  set protocols multicast <enabled <bool> | igmp <bool> | mld <bool> | igmp-version <2|3> | robustness <n> | query-interval <n> | query-response-interval <n> | interface <name> <role <querier|upstream|downstream> | igmp-version <n>>>\n  \
+                 set protocols multicast pim <enabled <bool> | rp-address <ip> | interface <if> | hello-interval <s> | spt-threshold <kbit/s>>\n  \
                  set protocols export <kernel|bgp|ospf|rip|ripng|babel|isis> <filter>\n  \
                  set protocols import <proto> <filter>\n  \
                  set protocols static <prefix> vrf <name>\n  \
@@ -6472,6 +6505,25 @@ impl Session {
                     None => bail!("no multicast interface {name:?}"),
                 }
             }
+            ["protocols", "multicast", "pim"] => {
+                self.draft.multicast.pim = crate::config::Pim::default()
+            }
+            ["protocols", "multicast", "pim", "interface", v] => remove_value(
+                &mut self.draft.multicast.pim.interfaces,
+                v,
+                "a pim interface",
+            )?,
+            ["protocols", "multicast", "pim", field] => {
+                let p = &mut self.draft.multicast.pim;
+                match *field {
+                    "enabled" => p.enabled = false,
+                    "rp-address" => p.rp_address = None,
+                    "interface" => p.interfaces.clear(),
+                    "hello-interval" => p.hello_interval = None,
+                    "spt-threshold" => p.spt_threshold = None,
+                    other => bail!("protocols multicast pim has no field {other:?}"),
+                }
+            }
             ["protocols", "multicast", field] => {
                 let m = &mut self.draft.multicast;
                 match *field {
@@ -7423,6 +7475,15 @@ impl Session {
                 robustness: m.robustness,
                 query_interval: m.query_interval,
                 query_response_interval: m.query_response_interval,
+                pim: {
+                    let p = &m.pim;
+                    let set = p.enabled
+                        || p.rp_address.is_some()
+                        || !p.interfaces.is_empty()
+                        || p.hello_interval.is_some()
+                        || p.spt_threshold.is_some();
+                    set.then(|| p.clone())
+                },
                 interfaces: m
                     .interfaces
                     .iter()
@@ -8874,6 +8935,31 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             }
             if let Some(v) = d.igmp_version {
                 proto.push_str(&format!("            igmp-version {v}\n"));
+            }
+            proto.push_str("        }\n");
+        }
+        let p = &m.pim;
+        if p.enabled
+            || p.rp_address.is_some()
+            || !p.interfaces.is_empty()
+            || p.hello_interval.is_some()
+            || p.spt_threshold.is_some()
+        {
+            proto.push_str("        pim {\n");
+            if p.enabled {
+                proto.push_str("            enabled true\n");
+            }
+            if let Some(rp) = &p.rp_address {
+                proto.push_str(&format!("            rp-address {rp}\n"));
+            }
+            for i in &p.interfaces {
+                proto.push_str(&format!("            interface {i}\n"));
+            }
+            if let Some(v) = p.hello_interval {
+                proto.push_str(&format!("            hello-interval {v}\n"));
+            }
+            if let Some(v) = p.spt_threshold {
+                proto.push_str(&format!("            spt-threshold {v}\n"));
             }
             proto.push_str("        }\n");
         }
@@ -10462,6 +10548,18 @@ echo = true
 [protocols.multicast]
 igmp = true
 robustness = 3
+[[protocols.multicast.interface]]
+name = "eth0"
+role = "querier"
+[[protocols.multicast.interface]]
+name = "eth1"
+role = "upstream"
+[protocols.multicast.pim]
+enabled = true
+rp-address = "10.0.0.9"
+interface = ["eth0", "eth1"]
+hello-interval = 15
+spt-threshold = 0
 
 [[policy.prefix-list]]
 name = "customers"
@@ -10495,6 +10593,8 @@ action = "reject"
             "set protocols static 198.51.100.0/24 blackhole true",
             "set protocols static 203.0.113.0/24 distance 200",
             "set policy route-map to-peers rule 10 set next-hop 192.0.2.9",
+            "set protocols multicast pim rp-address 10.0.0.9",
+            "set protocols multicast pim interface eth0",
         ] {
             assert!(
                 commands.iter().any(|c| c == expected),
