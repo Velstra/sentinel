@@ -207,7 +207,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-03nW/EaN1eqQRJS96+/gqmSHjDNFNhifwN/rUX8PLH0=";
+      ebpfHash = "sha256-rSJufYlcKjEaNFnzBtVe/zFZT8kGWNYzkMcPD0D3mHo=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -6546,6 +6546,103 @@
                 "an out-scoped rule did not stop a connection this box originated"
             knock(9082)
             assert not dropped(9082), "an out-scoped rule matched arriving traffic too"
+          '';
+        };
+
+        # EVPN comes up between two boxes: the BGP session negotiates the EVPN
+        # address family, and both data planes carry the overlay.
+        #
+        # What this proves and what it does not, stated plainly. It proves the
+        # appliance's one `[evpn]` statement reaches *both* lower halves and that
+        # they accept it — the routing daemon peers with the address family
+        # negotiated, and the agent loads a configuration with the overlay in it.
+        # It does not carry a tenant frame end to end; that needs taps and traffic
+        # on both sides and is a larger test than this one.
+        #
+        #   nix build .#checks.x86_64-linux.evpn -L
+        evpn = pkgs.testers.runNixOSTest {
+          name = "sentinel-evpn";
+          nodes =
+            let
+              leaf = n: { lib, ... }: {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "leaf${toString n}";
+                networking.firewall.enable = lib.mkForce false;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = "10.6.0.${toString n}";
+                    prefixLength = 24;
+                  }
+                ];
+                virtualisation.vlans = [ 1 ];
+                virtualisation.memorySize = 2048;
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+            in
+            {
+              leaf1 = leaf 1;
+              leaf2 = leaf 2;
+            };
+          testScript = ''
+            start_all()
+            for m in (leaf1, leaf2):
+                m.wait_for_unit("multi-user.target")
+                m.wait_for_unit("velstra.service")
+            leaf1.wait_until_succeeds("ip addr show eth1 | grep -q 10.6.0.1", timeout=20)
+            leaf2.wait_until_succeeds("ip addr show eth1 | grep -q 10.6.0.2", timeout=20)
+
+            def configure(m, me, peer):
+                lines = [
+                    "set interface eth1 zone underlay",
+                    "set firewall zone underlay default-action accept",
+                    "set firewall global default-action accept",
+                    f"set protocols router-id 10.6.0.{me}",
+                    "set protocols bgp local-as 65001",
+                    f"set protocols bgp neighbor 10.6.0.{peer} remote-as 65001",
+                    f"set protocols bgp neighbor 10.6.0.{peer} evpn true",
+                    f"set evpn vtep-ip 10.6.0.{me}",
+                    "set evpn underlay-interface eth1",
+                    "set evpn encapsulation vxlan",
+                    "set evpn instance tenant-a evi 100",
+                    "set evpn instance tenant-a vni 10100",
+                    "set evpn instance tenant-a rt-import rt:65001:100",
+                    "set evpn instance tenant-a rt-export rt:65001:100",
+                ]
+                body = " ".join(f"'{line}' " for line in lines)
+                m.succeed(
+                    "su admin -c \"printf '%s\\n' " + body
+                    + "commit save exit | sentinel configure\""
+                )
+
+            configure(leaf1, 1, 2)
+            configure(leaf2, 2, 1)
+
+            # Both halves got the one statement. The data plane's own loader is
+            # what says the overlay is well formed, not a grep for a word.
+            for m in (leaf1, leaf2):
+                m.wait_for_unit("velstra.service")
+                # The agent's own binary, by store path: it runs as a unit and is
+                # not on an interactive PATH.
+                out = m.succeed(
+                    "${velstra}/bin/velstra validate /run/sentinel/velstra.toml"
+                )
+                assert "overlay" in out and "vxlan" in out, out
+
+            # …and the session comes up with the EVPN address family negotiated.
+            # `wait_until_succeeds` because a BGP session is not instant, and a
+            # single look would make this a test of timing.
+            leaf1.wait_until_succeeds(
+                "wren show bgp neighbors | grep -qi established", timeout=90
+            )
+            leaf2.wait_until_succeeds(
+                "wren show bgp neighbors | grep -qi established", timeout=90
+            )
+            # …and the EVI this box was configured with exists in the daemon's
+            # own EVPN view. `show bgp neighbors` prints the session, not the
+            # address families it carries — asserting on it was asking the wrong
+            # command, and it answered honestly: "Established hold 180".
+            evi = leaf1.succeed("wren show evpn")
+            assert "100" in evi, evi
           '';
         };
 
