@@ -1219,6 +1219,84 @@
             cp output $out
           '';
 
+        # The seam between this repository and the data plane's.
+        #
+        # Both sides were tested and the join was not. Sentinel asserted it
+        # emits a port-less protocol at port 0; velstra-config asserted it
+        # refuses a port rule on ICMP; nobody put the two together, so a rule
+        # naming ICMP compiled cleanly here and was rejected by the agent's own
+        # loader on the box. The feature had never worked end to end.
+        #
+        # So: build a configuration that uses the corners, compile it, and hand
+        # the result to the **pinned** data plane's `velstra validate`. Pinned
+        # matters — this is the contract with the agent that will actually be
+        # deployed, not with whatever is on a developer's disk.
+        #
+        # No VM: `validate` parses and resolves without touching the kernel.
+        #   nix build .#checks.x86_64-linux.contract -L
+        contract = pkgs.runCommand "sentinel-contract"
+          {
+            nativeBuildInputs = [ sentinel velstra pkgs.bash ];
+          }
+          ''
+            set -eu
+            printf '[system]\nhostname = "contract"\n' > appliance.toml
+            sentinel configure --config appliance.toml --no-apply <<'CLI'
+            set interface eth0 zone lan
+            set interface eth0 address 10.0.0.1/24
+            set interface eth0 address6 2001:db8:1::1/64
+            set interface eth1 zone wan
+            set firewall zone wan default-action drop
+            set firewall zone firewall local true
+            # Every port-less protocol: the shape that was rejected on the box.
+            set firewall rule icmp-in from wan
+            set firewall rule icmp-in action accept
+            set firewall rule icmp-in proto icmp
+            set firewall rule icmp6-in from wan
+            set firewall rule icmp6-in action accept
+            set firewall rule icmp6-in proto icmpv6
+            set firewall rule vrrp-in from wan
+            set firewall rule vrrp-in action accept
+            set firewall rule vrrp-in proto vrrp
+            set firewall rule esp-in from wan
+            set firewall rule esp-in action accept
+            set firewall rule esp-in proto esp
+            set firewall rule gre-in from wan
+            set firewall rule gre-in action accept
+            set firewall rule gre-in proto gre
+            # One rule for both protocols, which the compiler expands to two.
+            set firewall rule dns-in from wan
+            set firewall rule dns-in action accept
+            set firewall rule dns-in proto tcp_udp
+            set firewall rule dns-in port 53
+            # A destination zone, which binds on the zone's v4 *and* v6 subnets.
+            set firewall rule web-in from wan
+            set firewall rule web-in to lan
+            set firewall rule web-in action accept
+            set firewall rule web-in proto tcp
+            set firewall rule web-in port 443
+            # …and toward the box itself, which is an address set, not a link.
+            set firewall rule ssh-in from lan
+            set firewall rule ssh-in to firewall
+            set firewall rule ssh-in action accept
+            set firewall rule ssh-in proto tcp
+            set firewall rule ssh-in port 22
+            commit
+            save
+            CLI
+            sentinel compile appliance.toml > dataplane.toml
+            # The agent's own parser is the judge. Anything this repository can
+            # emit and that one refuses is a configuration the appliance cannot
+            # apply on a real box.
+            velstra validate dataplane.toml | tee output
+            # Both families reached the data plane, not just IPv4 — the failure
+            # this cannot be allowed to regress into is a `to <zone>` rule that
+            # silently widens to every zone.
+            grep -q '2001:db8:1::/64' dataplane.toml
+            grep -q '10.0.0.0/24' dataplane.toml
+            cp output $out
+          '';
+
         commit = pkgs.testers.runNixOSTest {
         name = "sentinel-commit";
         nodes.machine = {

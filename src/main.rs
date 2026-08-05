@@ -166,6 +166,15 @@ enum Command {
     Compile {
         /// Path to the appliance config (TOML or JSON).
         file: PathBuf,
+        /// Print the routing daemon's configuration instead of the firewall's.
+        ///
+        /// A commit renders both and writes them to `/run/sentinel`, but only the
+        /// firewall half could be produced on demand — so the routing half could
+        /// not be looked at, diffed, or handed to `wren check` without applying
+        /// it first. Anything generated for another program to read should be
+        /// printable without running that program.
+        #[arg(long)]
+        routing: bool,
     },
     /// Seed the running system from a config at boot: set the hostname and write
     /// the agent config (no reload — the agent starts after). Used by the
@@ -381,9 +390,13 @@ async fn main() -> Result<()> {
         }
         Command::Clear { args } => clear_op(&args),
         Command::Config { action } => config_cmd(action),
-        Command::Compile { file } => {
+        Command::Compile { file, routing } => {
             let appliance = Appliance::load(&file)?;
-            print!("{}", compile::compile(&appliance).to_toml()?);
+            if routing {
+                print!("{}", wren::compile_wren(&appliance).to_toml()?);
+            } else {
+                print!("{}", compile::compile(&appliance).to_toml()?);
+            }
             Ok(())
         }
         Command::Install {
