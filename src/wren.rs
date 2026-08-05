@@ -1310,8 +1310,10 @@ redistribute = ["static"]
         let out = compile_wren(&appliance).to_toml().unwrap();
         assert!(out.contains("redistribute-static = true"), "{out}");
 
-        // Any other source has no wren OSPFv3 field: it must error at render time,
-        // naming the supported set — never be silently dropped.
+        // Any other source has no wren OSPFv3 field. Reading such a
+        // configuration fails: a commit persists before it applies, so a setting
+        // the renderer cannot represent must be refused while the operator is
+        // still there to hear it — not at the apply that follows the save.
         let bad = r#"
 [system]
 hostname = "r1"
@@ -1319,7 +1321,22 @@ hostname = "r1"
 interfaces = ["eth1"]
 redistribute = ["static", "connected", "bgp"]
 "#;
-        let appliance = Appliance::from_toml(bad).unwrap();
+        let refused = Appliance::from_toml(bad).unwrap_err().to_string();
+        assert!(
+            refused.contains("connected"),
+            "an unrenderable ospf3 redistribute was accepted: {refused}"
+        );
+
+        // And the render itself refuses it, naming the supported set — which is
+        // what the check above leans on, so it is asserted directly rather than
+        // only through it.
+        let mut appliance = Appliance::from_toml(ok).unwrap();
+        appliance
+            .protocols
+            .ospf3
+            .as_mut()
+            .expect("ospf3 is configured")
+            .redistribute = vec!["static".into(), "connected".into(), "bgp".into()];
         let cfg = compile_wren(&appliance);
         // `static` still maps to the bool...
         assert!(cfg.ospf3.as_ref().unwrap().redistribute_static);
