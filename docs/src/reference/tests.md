@@ -1,6 +1,6 @@
 # Test suite (nixosTests)
 
-Sentinel is verified by **78 nixosTests**, **432 Rust unit tests** and a
+Sentinel is verified by **79 nixosTests**, **432 Rust unit tests** and a
 **browser suite** that drives the web console against a running appliance. The nixosTests
 boot real QEMU/OVMF VMs — several of them two or three at a time on shared virtual
 segments — so they need `/dev/kvm`.
@@ -19,6 +19,14 @@ The unit tests need nothing but a checkout:
 cargo test                                        # 432 of them
 tests/console/run.sh                              # the browser suite
 ```
+
+`checks.contract` is the other sandbox check, and the one that closes a seam no
+suite on either side was exercising: it builds a configuration that uses the
+corners, compiles it, and hands the result to the **pinned** data plane's own
+`velstra validate`. Pinned matters — it is the contract with the agent that will
+actually be deployed. It exists because a rule naming ICMP compiled cleanly here
+and was rejected by that loader on the box: both repositories were tested and
+the join between them was not.
 
 The browser suite is dependency-free — it drives Chromium over CDP using node's
 own WebSocket — and every test in it exists because the thing it checks was once
