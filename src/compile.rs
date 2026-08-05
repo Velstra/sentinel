@@ -22,6 +22,24 @@ use serde::Serialize;
 
 use crate::config::{Action, Appliance, Proto};
 
+/// The MSS a departing SYN may advertise on this link, if it needs a ceiling.
+///
+/// `pmtu` means "as much as this link can carry": the MTU less a 20-byte IPv4
+/// header and a 20-byte TCP header. A PPPoE session gets one without being asked,
+/// because that is the case that otherwise fails silently — the link comes up,
+/// small traffic works, and anything large hangs.
+fn mss_ceiling(i: &crate::config::Interface) -> Option<u16> {
+    const HEADERS: u16 = 40;
+    const PPPOE_MTU: u16 = 1492;
+    let mtu = i.mtu.unwrap_or(PPPOE_MTU);
+    match i.mss.as_deref() {
+        Some("pmtu") => Some(mtu.saturating_sub(HEADERS)),
+        Some(n) => n.parse().ok(),
+        None if i.if_type == Some(crate::config::IfaceType::Pppoe) => Some(PPPOE_MTU - HEADERS),
+        None => None,
+    }
+}
+
 /// The subset of Velstra's agent `FileConfig` we emit. Field names and the
 /// `policy`/`interface` array renames match Velstra's TOML schema exactly.
 #[derive(Debug, Serialize)]
@@ -309,6 +327,10 @@ struct Interface {
     /// defaults it to `policy`, the single-tenant convenience.
     #[serde(skip_serializing_if = "Option::is_none")]
     vni: Option<u32>,
+    /// Clamp the MSS a departing SYN advertises to this. Omitted when the link
+    /// does not need one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mss: Option<u16>,
     /// Source-NAT (masquerade) traffic leaving this interface — set when the
     /// interface's zone has a `[[nat.source]]` rule. Omitted when false.
     #[serde(skip_serializing_if = "is_false")]
@@ -716,6 +738,10 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                     .iter()
                     .find(|inst| inst.interfaces.iter().any(|n| n == &i.name))
                     .map(|inst| inst.vni),
+                // `pmtu` is resolved here rather than carried down: the data
+                // plane clamps to a number, and the number a tunnel needs is its
+                // MTU less the IPv4 and TCP headers.
+                mss: mss_ceiling(i),
                 masquerade: masq_zones.contains_key(zone),
                 cgnat_base_port: masq_zones.get(zone).map_or(0, |l| l.0),
                 cgnat_block_size: masq_zones.get(zone).map_or(0, |l| l.1),
@@ -2529,6 +2555,45 @@ zone = "lan"
         let cfg = compile(&appliance);
         assert!(cfg.conntrack_sync.is_none());
         assert!(!cfg.to_toml().unwrap().contains("conntrack_sync"));
+    }
+
+    /// The MSS ceiling reaches the data plane as a *number*. It used to be an
+    /// nftables ruleset saying "whatever this route's MTU turns out to be", which
+    /// put the translation in the kernel where nobody could look at it.
+    #[test]
+    fn a_tunnel_carries_its_mss_ceiling_into_the_data_plane() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "eth0"
+zone = "wan"
+address = "192.0.2.1/24"
+[[interface]]
+name = "ppp0"
+type = "pppoe"
+parent = "eth0"
+zone = "wan"
+[interface.pppoe]
+username = "u"
+password = "p"
+[[interface]]
+name = "tun0"
+type = "gre"
+local = "192.0.2.1"
+remote = "198.51.100.1"
+mss = "1360"
+zone = "wan"
+"#;
+        let appliance = Appliance::from_toml(toml).expect("parses");
+        let out = compile(&appliance).to_toml().expect("compiles");
+        // 1492 (PPPoE) less an IPv4 and a TCP header — a PPPoE link gets one
+        // without asking, because that is the case that fails silently.
+        assert!(out.contains("mss = 1452"), "{out}");
+        assert!(out.contains("mss = 1360"), "{out}");
+        // The plain uplink asked for nothing and is not a tunnel: clamping every
+        // interface would shrink segments that fit perfectly.
+        assert_eq!(out.matches("mss = ").count(), 2, "{out}");
     }
 }
 
