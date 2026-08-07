@@ -43,7 +43,9 @@ mod update;
 mod velstra;
 mod webui;
 mod wgkey;
+mod wireless;
 mod wren;
+mod wwan;
 
 use std::{
     io::{BufRead, IsTerminal},

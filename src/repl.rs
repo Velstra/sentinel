@@ -1230,8 +1230,18 @@ const OPENCONNECT_USER_FIELDS: &[Cand] = &[("password", "the client account pass
 const IPSEC_FIELDS: &[Cand] = &[
     ("local", "this box's IKE endpoint (IPv4)"),
     ("remote", "the peer's IKE endpoint (IPv4)"),
-    ("local-subnet", "local protected subnet (IPv4 CIDR)"),
-    ("remote-subnet", "remote protected subnet (IPv4 CIDR)"),
+    (
+        "local-subnet",
+        "local protected subnet (IPv4 CIDR) — required unless route-based",
+    ),
+    (
+        "remote-subnet",
+        "remote protected subnet (IPv4 CIDR) — required unless route-based",
+    ),
+    (
+        "vti",
+        "bind to a `type = vti` link, making the tunnel route-based",
+    ),
     ("psk", "pre-shared key (secret)"),
     ("ike-version", "IKE version 1 or 2 (default 2)"),
     (
@@ -2461,7 +2471,7 @@ const IFACE_FIELDS: &[Cand] = &[
     ("router-advert", "emit IPv6 Router Advertisements (SLAAC)"),
     (
         "type",
-        "bridge | bond | dummy | wireguard | pppoe | gre | ipip | gretap | macvlan | macsec | l2tpv3",
+        "bridge | bond | dummy | wireguard | pppoe | gre | ipip | gretap | macvlan | macsec | l2tpv3 | vti | wireless | wwan",
     ),
     ("local", "tunnel local endpoint IP (type gre/ipip/gretap)"),
     ("remote", "tunnel remote endpoint IP (type gre/ipip/gretap)"),
@@ -2505,7 +2515,327 @@ const IFACE_FIELDS: &[Cand] = &[
         "qos",
         "egress traffic shaping (cake / fq_codel — bufferbloat)",
     ),
+    (
+        "mirror-ingress",
+        "copy every frame arriving here to this interface (SPAN)",
+    ),
+    (
+        "mirror-egress",
+        "copy every frame leaving here to this interface (SPAN)",
+    ),
+    (
+        "vti-key",
+        "route-based IPsec link id, matched by the tunnel (type=vti)",
+    ),
+    (
+        "wireless",
+        "the radio: access-point or station, SSID, channel, band, WPA",
+    ),
+    (
+        "wwan",
+        "the cellular bearer: APN, credentials, SIM PIN, IP type",
+    ),
+    (
+        "ethernet",
+        "NIC hardware: link speed/duplex, ring buffers, interrupt coalescing",
+    ),
+    (
+        "bridge",
+        "spanning tree, timers and multicast on a type=bridge device",
+    ),
+    (
+        "bridge-port",
+        "this link's cost/priority/learning as a port of a bridge",
+    ),
+    (
+        "bond",
+        "hashing, failure detection and the preferred member (type=bond)",
+    ),
+    ("ip", "per-link IPv4 behaviour: forwarding, ARP, broadcast"),
+    (
+        "ipv6",
+        "per-link IPv6 behaviour: forwarding, link-local, DAD",
+    ),
+    (
+        "dhcp",
+        "what this link's DHCPv4 client sends (address dhcp)",
+    ),
+    (
+        "dhcpv6",
+        "what this link's DHCPv6 client sends (address6 dhcp)",
+    ),
     ("pppoe", "PPPoE client credentials (on a type=pppoe uplink)"),
+];
+/// `interface <name> wwan <Tab>` — what it takes to dial a bearer.
+const IFACE_WWAN_FIELDS: &[Cand] = &[
+    ("apn", "the APN the operator gave you (required)"),
+    ("username", "PAP/CHAP user, where the operator wants one"),
+    ("password", "PAP/CHAP password (secret)"),
+    ("pin", "the SIM PIN, 4-8 digits (secret)"),
+    ("ip-type", "ipv4 | ipv6 | ipv4v6 (the default)"),
+];
+const WWAN_IP_TYPES: &[Cand] = &[
+    ("ipv4", "IPv4 only"),
+    ("ipv6", "IPv6 only"),
+    ("ipv4v6", "both (the default)"),
+];
+/// `interface <name> wireless <Tab>`.
+const IFACE_WIRELESS_FIELDS: &[Cand] = &[
+    ("mode", "access-point (make a network) | station (join one)"),
+    ("ssid", "the network name (1-32 characters)"),
+    (
+        "country",
+        "regulatory domain as a two-letter ISO code — required on an AP",
+    ),
+    ("channel", "the channel to use; unset lets the driver pick"),
+    (
+        "band",
+        "b | g | a | n | ac | ax — carries the frequency as well",
+    ),
+    ("hide-ssid", "keep the SSID out of beacons (true|false)"),
+    (
+        "isolate-stations",
+        "stop associated clients reaching each other (true|false)",
+    ),
+    (
+        "max-stations",
+        "the most clients that may associate at once",
+    ),
+    ("wpa", "WPA — required on an access point"),
+];
+const WIRELESS_MODES: &[Cand] = &[
+    ("access-point", "this box makes the network (hostapd)"),
+    ("station", "this box joins one (wpa_supplicant)"),
+];
+const WIRELESS_BANDS: &[Cand] = &[
+    ("b", "802.11b, 2.4 GHz"),
+    ("g", "802.11g, 2.4 GHz"),
+    ("n", "802.11n, 2.4 GHz"),
+    ("a", "802.11a, 5 GHz"),
+    ("ac", "802.11ac, 5 GHz"),
+    ("ax", "802.11ax, 5 GHz"),
+];
+const WIRELESS_WPA_FIELDS: &[Cand] = &[
+    ("mode", "wpa2 | wpa3 | wpa2+wpa3 (a transition network)"),
+    ("passphrase", "the pre-shared key, 8-63 characters (secret)"),
+];
+const WIRELESS_WPA_MODES: &[Cand] = &[
+    ("wpa2", "WPA2-PSK"),
+    (
+        "wpa3",
+        "WPA3-SAE, with management-frame protection required",
+    ),
+    (
+        "wpa2+wpa3",
+        "both, so older clients can still join (protection optional)",
+    ),
+];
+/// `interface <name> ethernet <Tab>` — the NIC's own hardware.
+const IFACE_ETHERNET_FIELDS: &[Cand] = &[
+    ("speed", "force the link speed in Mbit/s (needs duplex)"),
+    ("duplex", "full | half, alongside speed"),
+    (
+        "rx-ring",
+        "receive ring-buffer depth — the answer to rx_dropped",
+    ),
+    ("tx-ring", "transmit ring-buffer depth"),
+    (
+        "rx-usecs",
+        "microseconds before a receive interrupt (0 = latency first)",
+    ),
+    ("tx-usecs", "microseconds before a transmit interrupt"),
+    (
+        "adaptive-rx",
+        "let the driver vary receive coalescing with load (true|false)",
+    ),
+    ("adaptive-tx", "the transmit counterpart (true|false)"),
+];
+const DUPLEX_MODES: &[Cand] = &[("full", "full duplex"), ("half", "half duplex")];
+/// `interface <name> bridge <Tab>` — what a bridge device itself decides.
+const IFACE_BRIDGE_FIELDS: &[Cand] = &[
+    ("stp", "run the Spanning Tree Protocol (true|false)"),
+    (
+        "priority",
+        "this bridge's STP priority, lower wins the root election",
+    ),
+    (
+        "hello-time",
+        "seconds between configuration BPDUs (with stp)",
+    ),
+    (
+        "max-age",
+        "seconds a learned topology is trusted (with stp)",
+    ),
+    (
+        "forward-delay",
+        "seconds a port listens and learns before forwarding (with stp)",
+    ),
+    (
+        "ageing-time",
+        "seconds a learned MAC stays in the forwarding table (0 = no learning)",
+    ),
+    (
+        "igmp-snooping",
+        "forward a multicast group only to the ports that asked (true|false)",
+    ),
+    (
+        "igmp-querier",
+        "send IGMP queries from the bridge itself (true|false)",
+    ),
+];
+/// `interface <name> bridge-port <Tab>` — what this link is as a port.
+const IFACE_BRIDGE_PORT_FIELDS: &[Cand] = &[
+    ("cost", "STP path cost through this port (1-65535)"),
+    (
+        "priority",
+        "STP port priority, the tie-break at equal cost (0-63)",
+    ),
+    (
+        "learning",
+        "learn source MACs here; false makes it flood-only (true|false)",
+    ),
+];
+/// `interface <name> bond <Tab>`.
+const IFACE_BOND_FIELDS: &[Cand] = &[
+    (
+        "hash-policy",
+        "how a frame picks its member: layer2 | layer2+3 | layer3+4 | encap2+3 | encap3+4",
+    ),
+    ("lacp-rate", "LACPDU interval: slow (30s) | fast (1s)"),
+    ("min-links", "members that must be up for the bond to be up"),
+    ("primary", "the member preferred while it is up"),
+    ("mii-interval", "milliseconds between carrier checks"),
+    (
+        "arp-interval",
+        "milliseconds between ARP probes — catches a link that is up and dead",
+    ),
+    (
+        "arp-target",
+        "an address ARP monitoring probes (repeatable)",
+    ),
+];
+const BOND_HASH_POLICIES: &[Cand] = &[
+    (
+        "layer2",
+        "by MAC — one conversation rides one member (default)",
+    ),
+    ("layer2+3", "by MAC and IP"),
+    (
+        "layer3+4",
+        "by IP and port — what spreads a busy pair of hosts",
+    ),
+    ("encap2+3", "by the encapsulated MAC and IP"),
+    ("encap3+4", "by the encapsulated IP and port"),
+];
+const LACP_RATES: &[Cand] = &[
+    ("slow", "an LACPDU every 30 seconds (default)"),
+    ("fast", "an LACPDU every second — failure noticed in three"),
+];
+/// `interface <name> ip <Tab>` — the IPv4 switches that belong to one link.
+const IFACE_IP_FIELDS: &[Cand] = &[
+    (
+        "disable-forwarding",
+        "do not route IPv4 out of this link (true|false)",
+    ),
+    (
+        "proxy-arp",
+        "answer ARP here for hosts that live elsewhere (true|false)",
+    ),
+    (
+        "proxy-arp-pvlan",
+        "proxy ARP between isolated ports of one private VLAN (true|false)",
+    ),
+    (
+        "arp-cache-timeout",
+        "seconds a reachable ARP entry is trusted before re-probing",
+    ),
+    (
+        "arp-filter",
+        "only answer ARP for an address on this link (true|false)",
+    ),
+    (
+        "arp-accept",
+        "learn from unsolicited/gratuitous ARP (true|false)",
+    ),
+    (
+        "arp-announce",
+        "source ARP from an address on the target's subnet (true|false)",
+    ),
+    (
+        "arp-ignore",
+        "ignore ARP for addresses configured elsewhere (true|false)",
+    ),
+    (
+        "directed-broadcast",
+        "forward subnet-directed broadcasts onto this link (true|false)",
+    ),
+];
+/// `interface <name> ipv6 <Tab>`.
+const IFACE_IP6_FIELDS: &[Cand] = &[
+    (
+        "disable-forwarding",
+        "do not route IPv6 out of this link (true|false)",
+    ),
+    (
+        "no-link-local",
+        "do not form the automatic fe80:: address (true|false)",
+    ),
+    (
+        "dad-transmits",
+        "duplicate-address-detection probes to send (0 disables)",
+    ),
+    (
+        "accept-dad",
+        "on DAD failure: 0 keep | 1 disable the address | 2 disable IPv6",
+    ),
+];
+/// `interface <name> dhcp <Tab>` — the DHCPv4 client's identity on the wire.
+const IFACE_DHCP_FIELDS: &[Cand] = &[
+    ("client-id", "what goes in option 61: mac | duid"),
+    (
+        "duid",
+        "fixed DUID for the client identifier (with client-id duid)",
+    ),
+    ("host-name", "hostname sent to the server (option 12)"),
+    ("vendor-class-id", "vendor class identifier (option 60)"),
+    ("user-class", "user class (option 77)"),
+    (
+        "no-default-route",
+        "take the address but not the default route (true|false)",
+    ),
+    (
+        "default-route-distance",
+        "metric of the default route this lease installs",
+    ),
+    (
+        "reject",
+        "refuse offers from this server address/CIDR (repeatable)",
+    ),
+];
+/// `interface <name> dhcp client-id <Tab>` — the two identifiers the network
+/// layer can actually put in option 61.
+const DHCP_CLIENT_ID: &[Cand] = &[
+    ("mac", "this link's MAC — the lease survives a reinstall"),
+    ("duid", "an RFC 4361 IAID+DUID (the default)"),
+];
+/// `interface <name> dhcpv6 <Tab>`.
+const IFACE_DHCP6_FIELDS: &[Cand] = &[
+    (
+        "duid",
+        "fixed DUID as colon-separated hex (keeps the delegated prefix)",
+    ),
+    (
+        "rapid-commit",
+        "two-message exchange instead of four (true|false)",
+    ),
+    (
+        "parameters-only",
+        "ask for DNS/NTP but not an address (true|false)",
+    ),
+    (
+        "no-release",
+        "do not RELEASE the lease when the link drops (true|false)",
+    ),
 ];
 const ADDRESS6_HINT: &[Cand] = &[
     ("auto", "accept Router Advertisements (SLAAC)"),
@@ -2549,6 +2879,18 @@ const IFACE_TYPES: &[Cand] = &[
     (
         "l2tpv3",
         "an L2TPv3 Ethernet pseudowire between `local`/`remote` IPs (`key` = tunnel id)",
+    ),
+    (
+        "vti",
+        "a route-based IPsec link (`vti-key` = its id; bind a tunnel with `vpn ipsec <n> vti`)",
+    ),
+    (
+        "wireless",
+        "a radio: `wireless mode access-point` makes a network, `station` joins one",
+    ),
+    (
+        "wwan",
+        "a cellular modem; `wwan apn <name>` dials, `address dhcp` gets the address",
     ),
 ];
 const MACVLAN_MODES: &[Cand] = &[
@@ -2924,6 +3266,72 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set", "vpn", "openconnect", "default-route" | "disabled"] => BOOLS,
         // `address6 auto` completes the SLAAC keyword.
         ["set", "interface", _name, "address6"] => ADDRESS6_HINT,
+        // Per-link kernel behaviour and DHCP-client identity: one level of
+        // fields, then a boolean wherever the field is a switch.
+        ["set" | "delete", "interface", _name, "wwan"] => IFACE_WWAN_FIELDS,
+        ["set", "interface", _name, "wwan", "ip-type"] => WWAN_IP_TYPES,
+        ["set" | "delete", "interface", _name, "wireless"] => IFACE_WIRELESS_FIELDS,
+        ["set" | "delete", "interface", _name, "wireless", "wpa"] => WIRELESS_WPA_FIELDS,
+        ["set", "interface", _name, "wireless", "mode"] => WIRELESS_MODES,
+        ["set", "interface", _name, "wireless", "band"] => WIRELESS_BANDS,
+        ["set", "interface", _name, "wireless", "wpa", "mode"] => WIRELESS_WPA_MODES,
+        [
+            "set",
+            "interface",
+            _name,
+            "wireless",
+            "hide-ssid" | "isolate-stations",
+        ] => BOOLS,
+        ["set" | "delete", "interface", _name, "ethernet"] => IFACE_ETHERNET_FIELDS,
+        ["set", "interface", _name, "ethernet", "duplex"] => DUPLEX_MODES,
+        [
+            "set",
+            "interface",
+            _name,
+            "ethernet",
+            "adaptive-rx" | "adaptive-tx",
+        ] => BOOLS,
+        ["set" | "delete", "interface", _name, "bridge"] => IFACE_BRIDGE_FIELDS,
+        ["set" | "delete", "interface", _name, "bridge-port"] => IFACE_BRIDGE_PORT_FIELDS,
+        ["set" | "delete", "interface", _name, "bond"] => IFACE_BOND_FIELDS,
+        [
+            "set",
+            "interface",
+            _name,
+            "bridge",
+            "stp" | "igmp-snooping" | "igmp-querier",
+        ] => BOOLS,
+        ["set", "interface", _name, "bridge-port", "learning"] => BOOLS,
+        ["set", "interface", _name, "bond", "hash-policy"] => BOND_HASH_POLICIES,
+        ["set", "interface", _name, "bond", "lacp-rate"] => LACP_RATES,
+        ["set" | "delete", "interface", _name, "ip"] => IFACE_IP_FIELDS,
+        ["set" | "delete", "interface", _name, "ipv6"] => IFACE_IP6_FIELDS,
+        ["set" | "delete", "interface", _name, "dhcp"] => IFACE_DHCP_FIELDS,
+        ["set" | "delete", "interface", _name, "dhcpv6"] => IFACE_DHCP6_FIELDS,
+        [
+            "set",
+            "interface",
+            _name,
+            "ip",
+            "disable-forwarding" | "proxy-arp" | "proxy-arp-pvlan" | "arp-filter" | "arp-accept"
+            | "arp-announce" | "arp-ignore" | "directed-broadcast",
+        ] => BOOLS,
+        [
+            "set",
+            "interface",
+            _name,
+            "ipv6",
+            "disable-forwarding" | "no-link-local",
+        ] => BOOLS,
+        ["set", "interface", _name, "dhcp", "no-default-route"] => BOOLS,
+        ["set", "interface", _name, "dhcp", "client-id"] => DHCP_CLIENT_ID,
+        [
+            "set",
+            "interface",
+            _name,
+            "dhcpv6",
+            "rapid-commit" | "parameters-only" | "no-release",
+        ] => BOOLS,
         // Bridge/bond value completions.
         ["set", "interface", _name, "type"] => IFACE_TYPES,
         ["set", "interface", _name, "bond-mode"] => BOND_MODES,
@@ -4216,6 +4624,19 @@ mod tests {
                 "offload",
                 "mac",
                 "qos",
+                "mirror-ingress",
+                "mirror-egress",
+                "vti-key",
+                "wireless",
+                "wwan",
+                "ethernet",
+                "bridge",
+                "bridge-port",
+                "bond",
+                "ip",
+                "ipv6",
+                "dhcp",
+                "dhcpv6",
                 "pppoe"
             ]
         );
@@ -4765,6 +5186,19 @@ mod tests {
                 "offload",
                 "mac",
                 "qos",
+                "mirror-ingress",
+                "mirror-egress",
+                "vti-key",
+                "wireless",
+                "wwan",
+                "ethernet",
+                "bridge",
+                "bridge-port",
+                "bond",
+                "ip",
+                "ipv6",
+                "dhcp",
+                "dhcpv6",
                 "pppoe"
             ]
         );

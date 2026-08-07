@@ -119,6 +119,20 @@ pub fn pppoe_restart(name: &str) -> Result<()> {
     )
 }
 
+/// (Re)start a templated unit for one radio (`sentinel-hostapd@<if>` or
+/// `sentinel-supplicant@<if>`). A restart rather than a reload: hostapd and
+/// wpa_supplicant read their config once, at start.
+pub fn radio_restart(unit: &str) -> Result<()> {
+    run_priv("systemctl", &["restart", unit])
+}
+
+/// Stop a radio's daemon (its interface is no longer configured, or changed
+/// role). Best-effort at the call site — a stop that fails because the unit was
+/// never up must not abort the reconcile.
+pub fn radio_stop(unit: &str) -> Result<()> {
+    run_priv("systemctl", &["stop", unit])
+}
+
 /// Stop and disband the `sentinel-pppoe@<name>` session (a PPPoE interface that
 /// is no longer configured). Best-effort at the call site — a stop that fails
 /// because the unit was never up must not abort the reconcile.
@@ -129,16 +143,57 @@ pub fn pppoe_stop(name: &str) -> Result<()> {
     )
 }
 
-/// (Re)attach a root egress qdisc to `dev`: `tc qdisc replace dev <dev> root
-/// <spec…>` (roadmap C8 traffic shaping). `replace` is idempotent — it installs
-/// the qdisc if absent or swaps it in place without dropping the link, so a
-/// re-apply of the same spec never blips a live queue.
 /// Turn one offload feature on or off (`ethtool -K <dev> <feature> on|off`).
 pub fn ethtool_offload(dev: &str, feature: &str, on: bool) -> Result<()> {
     run_priv(
         "ethtool",
         &["-K", dev, feature, if on { "on" } else { "off" }],
     )
+}
+
+/// Force a NIC's link speed and duplex (`ethtool -s <dev> speed N duplex D
+/// autoneg off`). The two go together — a card handed one of them keeps
+/// autonegotiating, and the link comes up at the wrong speed silently.
+pub fn ethtool_link(dev: &str, speed: u32, duplex: &str) -> Result<()> {
+    run_priv(
+        "ethtool",
+        &[
+            "-s",
+            dev,
+            "speed",
+            &speed.to_string(),
+            "duplex",
+            duplex,
+            "autoneg",
+            "off",
+        ],
+    )
+}
+
+/// Resize a NIC's ring buffers (`ethtool -G`). Either direction alone is valid.
+pub fn ethtool_ring(dev: &str, rx: Option<u32>, tx: Option<u32>) -> Result<()> {
+    let mut args: Vec<String> = vec!["-G".into(), dev.into()];
+    if let Some(n) = rx {
+        args.push("rx".into());
+        args.push(n.to_string());
+    }
+    if let Some(n) = tx {
+        args.push("tx".into());
+        args.push(n.to_string());
+    }
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_priv("ethtool", &refs)
+}
+
+/// Set a NIC's interrupt coalescing (`ethtool -C`).
+pub fn ethtool_coalesce(dev: &str, params: &[(&str, String)]) -> Result<()> {
+    let mut args: Vec<String> = vec!["-C".into(), dev.into()];
+    for (k, v) in params {
+        args.push((*k).into());
+        args.push(v.clone());
+    }
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_priv("ethtool", &refs)
 }
 
 /// Set one kernel parameter now (`sysctl -w name=value`).
@@ -151,13 +206,56 @@ pub fn ethtool_offload(dev: &str, feature: &str, on: bool) -> Result<()> {
 /// for anyone but the boot service it did not. Found by a VM check reading an ARP
 /// switch back out of the running kernel.
 ///
-/// `sysctl(8)` also handles the interface-name escaping natively, which the
-/// direct path does not: a VLAN subinterface's parameter is spelled
-/// `net.ipv4.conf.eth0/100.arp_filter`, with dot and slash traded.
+/// `sysctl(8)` also handles the interface-name escaping natively — see
+/// [`sysctl_iface_key`].
 pub fn sysctl_write(key: &str, value: &str) -> Result<()> {
     run_priv("sysctl", &["-qw", &format!("{key}={value}")])
 }
 
+/// Set one *per-interface* kernel parameter now — `dir` is the sysctl directory
+/// (`net.ipv4.conf`, `net.ipv6.conf`, `net.ipv4.neigh`), `iface` the link, `knob`
+/// the leaf.
+pub fn sysctl_write_iface(dir: &str, iface: &str, knob: &str, value: &str) -> Result<()> {
+    sysctl_write(&sysctl_iface_key(dir, iface, knob), value)
+}
+
+/// The name of a per-interface parameter, as both `sysctl(8)` and a `sysctl.d`
+/// file spell it.
+///
+/// The swap is the point. A VLAN subinterface is called `eth0.100`, and its
+/// parameter is `net.ipv4.conf.eth0/100.arp_filter` — dot and slash trade places
+/// so the name stays parseable. Spelling it the obvious way would address
+/// `/proc/sys/net/ipv4/conf/eth0/100/arp_filter`, a path that does not exist, and
+/// the setting would be silently absent on exactly the interfaces a firewall has
+/// most of.
+pub fn sysctl_iface_key(dir: &str, iface: &str, knob: &str) -> String {
+    format!("{dir}.{}.{knob}", iface.replace('.', "/"))
+}
+
+/// Attach a `clsact` qdisc, which carries an ingress and an egress filter hook
+/// without owning the root. `add` rather than `replace`, and the caller ignores
+/// the failure: replacing it would take every filter — including the datapath's
+/// own TC program — down with it, and an already-present clsact is the normal
+/// case rather than an error.
+pub fn tc_qdisc_add_clsact(dev: &str) -> Result<()> {
+    run_priv("tc", &["qdisc", "add", "dev", dev, "clsact"])
+}
+
+/// Remove one of our filters by priority, so a changed mirror does not leave the
+/// direction it used to point at still filtering.
+pub fn tc_filter_del(dev: &str, dir: &str, prio: &str) -> Result<()> {
+    run_priv("tc", &["filter", "del", "dev", dev, dir, "prio", prio])
+}
+
+/// Run an arbitrary `tc` invocation the caller has already assembled.
+pub fn tc_run(args: &[&str]) -> Result<()> {
+    run_priv("tc", args)
+}
+
+/// (Re)attach a root egress qdisc to `dev`: `tc qdisc replace dev <dev> root
+/// <spec…>` (roadmap C8 traffic shaping). `replace` is idempotent — it installs
+/// the qdisc if absent or swaps it in place without dropping the link, so a
+/// re-apply of the same spec never blips a live queue.
 pub fn tc_qdisc_replace(dev: &str, spec: &[&str]) -> Result<()> {
     let mut args: Vec<&str> = vec!["qdisc", "replace", "dev", dev, "root"];
     args.extend_from_slice(spec);
