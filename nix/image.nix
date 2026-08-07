@@ -204,22 +204,32 @@ in
       # Slot A (verity), sized to fit the closure + its hash tree. The module
       # marks these `Minimize`; auto image-sizing then leaves them at 4K, so set
       # explicit floors.
-      ${partitionIds.store}.repartConfig.SizeMinBytes = "1300M";
-      ${partitionIds.store-verity}.repartConfig.SizeMinBytes = "96M";
+      # 2560M, from 1300M: the radios (hostapd, wpa_supplicant) and the cellular
+      # stack (ModemManager, with glib/polkit/libqmi/libmbim behind it) took the
+      # closure to 1.6G. `systemd-repart` says which partition and by how much —
+      # `nix log` on the failing derivation, not the build's own tail, which
+      # truncates the line away.
+      #
+      # The verity floor moves with it. The hash tree is a fixed fraction of what
+      # it covers, so raising the store alone trades one "doesn't fit" for
+      # another one partition along — which is exactly what happened on the first
+      # attempt at this.
+      ${partitionIds.store}.repartConfig.SizeMinBytes = "2560M";
+      ${partitionIds.store-verity}.repartConfig.SizeMinBytes = "192M";
       # Slot B: reserved space, typed generic so the build's roothash extraction
       # only matches slot A. `sentinel update` fills these and re-types them to
       # the verity GUIDs above.
       "30-store-verity-b".repartConfig = {
         Type = "linux-generic";
         Label = "store-verity-b";
-        SizeMinBytes = "96M";
-        SizeMaxBytes = "96M";
+        SizeMinBytes = "192M";
+        SizeMaxBytes = "192M";
       };
       "40-store-b".repartConfig = {
         Type = "linux-generic";
         Label = "store-b";
-        SizeMinBytes = "1300M";
-        SizeMaxBytes = "1300M";
+        SizeMinBytes = "2560M";
+        SizeMaxBytes = "2560M";
       };
       # Persistent state partition (after both slots).
       "50-data".repartConfig = {
