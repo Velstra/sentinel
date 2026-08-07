@@ -868,7 +868,135 @@ fn print_plan(chosen: &[&install::Disk], raid: install::Raid) {
     }
 }
 
-/// The guided installer: choose a mode, pick the disks, confirm, install.
+/// Ask a question with a default; an empty answer takes the default.
+fn ask(msg: &str, default: &str) -> Result<String> {
+    let shown = if default.is_empty() {
+        format!("{msg}: ")
+    } else {
+        format!("{msg} [{default}]: ")
+    };
+    let got = prompt(&shown)?;
+    let got = got.trim();
+    Ok(if got.is_empty() {
+        default.to_string()
+    } else {
+        got.to_string()
+    })
+}
+
+/// Ask a yes/no question.
+fn ask_yes(msg: &str, default_yes: bool) -> Result<bool> {
+    let d = if default_yes { "Y/n" } else { "y/N" };
+    let got = prompt(&format!("{msg} [{d}]: "))?;
+    Ok(match got.trim().to_ascii_lowercase().as_str() {
+        "" => default_yes,
+        "y" | "yes" | "j" | "ja" => true,
+        _ => false,
+    })
+}
+
+/// The first settings the wizard collects, as `set …` lines.
+///
+/// Built as CLI lines and replayed through the real command parser rather than
+/// assembled into a document here. That is the whole reason this is safe to add:
+/// every value the wizard collects is judged by the same grammar and the same
+/// `validate()` an operator's own `configure` session goes through, so the
+/// wizard cannot invent a configuration the appliance would refuse — and it
+/// cannot drift from the CLI as either one changes.
+fn wizard_lines() -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+
+    println!("\n── Console and locale ──");
+    // Keyboard first, deliberately: everything typed from here on goes through
+    // it, including the account password below.
+    let kb = ask("Console keyboard layout", "us")?;
+    out.push(format!("set system keyboard {kb}"));
+    let sample = prompt("Type `hello-123` to check the layout (or Enter to skip): ")?;
+    let sample = sample.trim();
+    if !sample.is_empty() && sample != "hello-123" {
+        println!("  note: that came out as {sample:?} — the layout may not be what you expect.");
+        if !ask_yes("Keep this layout anyway?", false)? {
+            anyhow::bail!("aborted at the keyboard check");
+        }
+    }
+    let locale = ask("Locale", "en_US.UTF-8")?;
+    out.push(format!("set system locale {locale}"));
+    let tz = ask("Timezone", "UTC")?;
+    out.push(format!("set system timezone {tz}"));
+
+    println!("\n── Identity ──");
+    let host = ask("Hostname", "sentinel")?;
+    out.push(format!("set system hostname {host}"));
+
+    println!("\n── First account ──");
+    let user = ask("Username", "admin")?;
+    let pass = prompt("Password: ")?;
+    let pass = pass.trim();
+    if pass.len() < 8 {
+        anyhow::bail!("the password must be at least 8 characters");
+    }
+    out.push(format!("set system login {user} password {pass}"));
+    let key = ask("SSH public key (Enter for none)", "")?;
+    if !key.is_empty() {
+        out.push(format!("set system login {user} public-key {key}"));
+    }
+
+    println!("\n── Network ──");
+    println!("Enough to reach the box over SSH after the reboot; the rest is");
+    println!("configured from the console or the browser once it is up.");
+    let nics = system::discover_interfaces();
+    if nics.is_empty() {
+        println!("  (no NICs discovered — skipping)");
+    }
+    for nic in &nics {
+        let use_it = ask_yes(&format!("Configure {nic}?"), nic == &nics[0])?;
+        if !use_it {
+            continue;
+        }
+        let zone = ask(&format!("  {nic} zone"), "wan")?;
+        out.push(format!("set interface {nic} zone {zone}"));
+        let addr = ask(&format!("  {nic} address (CIDR or `dhcp`)"), "dhcp")?;
+        out.push(format!("set interface {nic} address {addr}"));
+        if addr != "dhcp" {
+            let gw = ask("  default gateway (Enter for none)", "")?;
+            if !gw.is_empty() {
+                out.push(format!("set protocols static 0.0.0.0/0 via {gw}"));
+            }
+        }
+        out.push(format!("set firewall zone {zone} default-action drop"));
+    }
+
+    // SSH is the point of the network step — an installed box nobody can reach
+    // is an install that has to be redone at the console.
+    out.push("set services ssh port 22".into());
+    out.push("set firewall global default-action accept".into());
+    Ok(out)
+}
+
+/// Turn the collected lines into a validated appliance document.
+fn wizard_config(lines: &[String]) -> Result<String> {
+    let dir = std::env::temp_dir().join(format!("sentinel-wizard-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).context("creating the wizard scratch directory")?;
+    let path = dir.join("appliance.toml");
+    let _ = std::fs::remove_file(&path);
+    let mut session = session::Session::load(&path)?;
+    let act = repl::Apply::off();
+    let mut ctx: Vec<String> = Vec::new();
+    for line in lines {
+        if repl::exec_line(&mut session, &act, &mut ctx, line) {
+            anyhow::bail!("the wizard ended the session at {line:?}");
+        }
+    }
+    // `commit` is what runs `validate()`. A wizard that wrote an invalid
+    // document would produce a box that will not boot into its own config.
+    let appliance = session.commit()?;
+    let toml = appliance.to_toml()?;
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(toml)
+}
+
+/// The guided installer: collect the first settings, pick the disks, confirm,
+/// install, and seed the configuration so the box comes up reachable.
 fn interactive_install(disks: &[install::Disk], source: Option<&std::path::Path>) -> Result<()> {
     list_disks(disks);
     if disks.is_empty() {
@@ -892,14 +1020,38 @@ fn interactive_install(disks: &[install::Disk], source: Option<&std::path::Path>
     let targets = resolve_picks(disks, pick.trim())?;
     let chosen = install::plan_targets(disks, &targets, raid)?;
 
+    // Everything above chose *where*; this chooses *what the box will be*. It
+    // comes before the confirmation on purpose: an operator who changes their
+    // mind halfway through the questions has erased nothing yet.
+    let lines = wizard_lines()?;
+    let toml = wizard_config(&lines)?;
+
     println!();
     print_plan(&chosen, raid);
+    println!("\nThe installed system will come up as:");
+    for line in &lines {
+        // The password is the one answer that must not be echoed back at the
+        // end of an install, where it would sit in the scrollback of whatever
+        // terminal or IPMI session did the install.
+        if line.contains(" password ") {
+            let redacted = line.rsplit_once(' ').map(|(head, _)| head).unwrap_or(line);
+            println!("  {redacted} ********");
+        } else {
+            println!("  {line}");
+        }
+    }
+
     let confirm = prompt("\nThis ERASES the selected disk(s). Type YES to proceed: ")?;
     if confirm.trim() != "YES" {
         println!("aborted.");
         return Ok(());
     }
-    install::execute(&chosen, raid, source)
+    install::execute(&chosen, raid, source)?;
+    // Seeded after the image is written, because the data partition it lands on
+    // is created by the install.
+    install::seed_config(&chosen, raid, &toml)?;
+    println!("\nInstalled. Remove the medium and reboot; the box comes up configured.");
+    Ok(())
 }
 
 /// Map numbered picks (`"1 3"`) to `/dev` paths.

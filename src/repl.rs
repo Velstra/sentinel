@@ -38,8 +38,12 @@ pub struct Apply {
 }
 
 impl Apply {
-    /// Apply disabled — validate + save only (used off-box and in tests).
-    #[cfg(test)]
+    /// Apply disabled — validate + save only.
+    ///
+    /// Used off-box, in tests, and by the installer wizard: the wizard is
+    /// building a document for a system that does not exist yet, so applying it
+    /// to the *live* medium would configure the installer rather than the
+    /// appliance being installed.
     pub fn off() -> Self {
         Self {
             velstra_out: PathBuf::from(DEFAULT_VELSTRA_OUT),
@@ -2225,6 +2229,15 @@ const CONSOLE_FIELDS: &[Cand] = &[
 ];
 const SYSTEM_FIELDS: &[Cand] = &[
     ("hostname", "the appliance hostname"),
+    (
+        "keyboard",
+        "console keyboard layout (de, us, fr, …) — everything typed there uses it",
+    ),
+    ("locale", "system locale, e.g. de_DE.UTF-8"),
+    (
+        "timezone",
+        "IANA timezone (Europe/Berlin, UTC) — every log line is stamped with it",
+    ),
     (
         "console",
         "the serial console: `device <tty>` / `speed <baud>`",
@@ -4576,6 +4589,9 @@ mod tests {
             kw(&["set", "system"]),
             [
                 "hostname",
+                "keyboard",
+                "locale",
+                "timezone",
                 "console",
                 "commit-revisions",
                 "sysctl",

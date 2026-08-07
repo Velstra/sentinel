@@ -511,6 +511,37 @@ impl Drop for MountGuard {
     }
 }
 
+/// Write a freshly built appliance configuration onto the installed system's
+/// data partition, so the box comes up configured instead of empty.
+///
+/// This is what makes the wizard worth having. Without it the operator installs,
+/// reboots into a box with no address and no account, and has to do the whole
+/// thing again at the console — which is exactly the step a guided installer
+/// exists to remove.
+///
+/// The mount is a guard: it comes off however this returns, including on the
+/// error paths, so a failed seed does not leave the installed filesystem
+/// mounted under the live medium.
+pub fn seed_config(targets: &[&Disk], raid: Raid, toml: &str) -> Result<()> {
+    let dev = match raid.mdadm_level() {
+        // The array is assembled at /dev/md/data by `prepare`; a single-disk
+        // install writes the partition directly.
+        Some(_) => "/dev/md/data".to_string(),
+        None => part_path(&targets[0].dev_path(), DATA_PART),
+    };
+    let mnt = std::path::Path::new("/run/sentinel-seed");
+    std::fs::create_dir_all(mnt).context("creating the seed mountpoint")?;
+    run("mount", &[&dev, mnt.to_str().unwrap()])?;
+    let _guard = MountGuard(mnt.to_path_buf());
+
+    let dir = mnt.join("lib/sentinel");
+    std::fs::create_dir_all(&dir).context("creating /var/lib/sentinel on the target")?;
+    let path = dir.join("appliance.toml");
+    std::fs::write(&path, toml).with_context(|| format!("writing {}", path.display()))?;
+    eprintln!("seeded {} ({} bytes)", path.display(), toml.len());
+    Ok(())
+}
+
 /// A/B update: write `image`'s sealed store into the INACTIVE slot, then make
 /// systemd-boot try it next (it rolls back to the current slot if the new one
 /// fails 3 boots). `image` may be a raw image file (loop-mounted) or a block
