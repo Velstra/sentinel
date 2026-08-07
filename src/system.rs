@@ -143,13 +143,19 @@ pub fn ethtool_offload(dev: &str, feature: &str, on: bool) -> Result<()> {
 
 /// Set one kernel parameter now (`sysctl -w name=value`).
 ///
-/// The `/proc/sys` write directly rather than through the `sysctl` binary: one
-/// fewer tool to pin, and the failure — a parameter this kernel does not have —
-/// arrives as a plain "no such file", which is exactly what it is.
+/// Through `sysctl(8)` under `run_priv`, not a direct `/proc/sys` write. The
+/// direct write is one fewer tool to pin, and it works — as root. `commit` is run
+/// by the operator, who is not root, so every live apply failed with a warning
+/// and the parameter took effect at the *next boot* instead, from the drop-in.
+/// The doc on `apply_sysctl` claimed the apply is what makes `commit` mean now;
+/// for anyone but the boot service it did not. Found by a VM check reading an ARP
+/// switch back out of the running kernel.
+///
+/// `sysctl(8)` also handles the interface-name escaping natively, which the
+/// direct path does not: a VLAN subinterface's parameter is spelled
+/// `net.ipv4.conf.eth0/100.arp_filter`, with dot and slash traded.
 pub fn sysctl_write(key: &str, value: &str) -> Result<()> {
-    let path = std::path::Path::new("/proc/sys").join(key.replace('.', "/"));
-    std::fs::write(&path, format!("{value}\n"))
-        .with_context(|| format!("writing {}", path.display()))
+    run_priv("sysctl", &["-qw", &format!("{key}={value}")])
 }
 
 pub fn tc_qdisc_replace(dev: &str, spec: &[&str]) -> Result<()> {
@@ -777,6 +783,7 @@ pub fn bin(name: &str) -> String {
         "journalctl" => "SENTINEL_JOURNALCTL_BIN",
         "wren" => "SENTINEL_WREN_BIN",
         "tc" => "SENTINEL_TC_BIN",
+        "sysctl" => "SENTINEL_SYSCTL_BIN",
         "swanctl" => "SENTINEL_SWANCTL_BIN",
         "openssl" => "SENTINEL_OPENSSL_BIN",
         "ethtool" => "SENTINEL_ETHTOOL_BIN",
