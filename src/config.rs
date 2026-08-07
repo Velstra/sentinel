@@ -3583,13 +3583,36 @@ pub struct IpsecConnection {
     /// The peer's IKE endpoint address (`remote_addrs`). Required — an IPv4.
     pub remote: String,
     /// The local protected subnet — the child SA's `local_ts` traffic selector.
-    /// Required — an IPv4 CIDR (or host).
-    #[serde(rename = "local-subnet")]
-    pub local_subnet: String,
-    /// The remote protected subnet — the child SA's `remote_ts`. Required — an
-    /// IPv4 CIDR (or host).
-    #[serde(rename = "remote-subnet")]
-    pub remote_subnet: String,
+    /// An IPv4 CIDR (or host). Required on a **policy-based** tunnel, where the
+    /// selectors are the only thing deciding what is encrypted; optional on a
+    /// route-based one (`vti`), where the routing table decides and the
+    /// selectors default to `0.0.0.0/0`.
+    #[serde(
+        default,
+        rename = "local-subnet",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub local_subnet: Option<String>,
+    /// The remote protected subnet — the child SA's `remote_ts`. Same rule as
+    /// [`IpsecConnection::local_subnet`].
+    #[serde(
+        default,
+        rename = "remote-subnet",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub remote_subnet: Option<String>,
+    /// Bind this tunnel to a `type = "vti"` interface, making it **route-based**:
+    /// what is encrypted is what the routing table sends out that link, not what
+    /// a traffic selector happens to name.
+    ///
+    /// The difference is not cosmetic. A policy-based tunnel's reach is a list of
+    /// subnets negotiated with the peer, so adding one means editing both ends and
+    /// renegotiating; a route-based tunnel's reach is a route, so it can be added,
+    /// withdrawn or learned from a routing protocol. It is also what lets the
+    /// tunnel carry a **firewall zone** — a policy-based SA has no link for a zone
+    /// to be attached to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vti: Option<String>,
     /// The pre-shared key. Secret — rendered to a 0600 secrets file, never into
     /// the swanctl.conf. Required.
     pub psk: String,
@@ -4689,6 +4712,91 @@ pub struct Interface {
     /// inherits the inner packet's TTL. `None` leaves the kernel default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl: Option<u8>,
+    /// The id of a `type = "vti"` interface, matched by the IPsec connection that
+    /// binds to it (`1`–`4294967295`). Two links may not share one: the id is how
+    /// the kernel decides which SA a packet leaving here belongs to.
+    #[serde(default, rename = "vti-key", skip_serializing_if = "Option::is_none")]
+    pub vti_key: Option<u32>,
+    /// Copy every frame **arriving** on this link to the named interface — port
+    /// mirroring, a SPAN port. What an IDS is fed from, and the first thing
+    /// anyone reaches for when the packet counters disagree with the story.
+    ///
+    /// The copy is a copy: the original still goes wherever it was going. A
+    /// destination that cannot keep up drops the mirror, not the traffic.
+    #[serde(
+        default,
+        rename = "mirror-ingress",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub mirror_ingress: Option<String>,
+    /// Copy every frame **leaving** this link to the named interface. Set
+    /// separately from [`Interface::mirror_ingress`] because one direction is
+    /// usually what is wanted — mirroring both doubles the destination's load and
+    /// makes a transit flow appear twice.
+    #[serde(
+        default,
+        rename = "mirror-egress",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub mirror_egress: Option<String>,
+    /// A cellular modem on a `type = "wwan"` link (`[interface.wwan]`) — the
+    /// bearer it dials. The address comes from `address = "dhcp"` like any other
+    /// uplink; this is only what it takes to get the bearer up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wwan: Option<Wwan>,
+    /// Wireless on a `type = "wireless"` link (`[interface.wireless]`) — the
+    /// radio's own settings, and which side of the air it is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wireless: Option<Wireless>,
+    /// NIC hardware settings applied with `ethtool` (`[interface.ethernet]`) —
+    /// link speed and duplex, ring-buffer depth and interrupt coalescing.
+    ///
+    /// Separate from [`Interface::offload`], which is also `ethtool`, because
+    /// these are not switches: each is a number the card may clamp, refuse, or
+    /// not implement at all. A card that refuses one draws a warning and the rest
+    /// still apply — the alternative is a commit that fails because of a NIC
+    /// feature nobody was relying on.
+    #[serde(default, skip_serializing_if = "Ethernet::is_empty")]
+    pub ethernet: Ethernet,
+    /// Spanning tree, timers and multicast on a `type = "bridge"` device
+    /// (`[interface.bridge]`). Set on the *bridge*, not on its ports.
+    #[serde(default, skip_serializing_if = "BridgeOptions::is_empty")]
+    pub bridge: BridgeOptions,
+    /// This link's behaviour as a **port of** a bridge (`[interface.bridge-port]`)
+    /// — its spanning-tree cost and priority, and whether it learns. Set on the
+    /// member, not on the bridge, because each port has its own.
+    #[serde(
+        default,
+        rename = "bridge-port",
+        skip_serializing_if = "BridgePort::is_empty"
+    )]
+    pub bridge_port: BridgePort,
+    /// Link-aggregation detail on a `type = "bond"` device (`[interface.bond]`)
+    /// — how frames are hashed across members, how failure is detected, and which
+    /// member is preferred. The mode itself stays `bond-mode`.
+    #[serde(default, skip_serializing_if = "BondOptions::is_empty")]
+    pub bond: BondOptions,
+    /// Per-link IPv4 behaviour (`[interface.ip]`) — forwarding, ARP and directed
+    /// broadcast. Everything here is a property of *this* link rather than of the
+    /// box, which is why it is not in `[system]`: a router forwards on its LAN and
+    /// answers ARP for absent hosts on exactly one segment, not everywhere.
+    #[serde(default, skip_serializing_if = "IpOptions::is_empty")]
+    pub ip: IpOptions,
+    /// Per-link IPv6 behaviour (`[interface.ipv6]`) — the v6 counterpart of
+    /// [`Interface::ip`], plus duplicate-address detection and the link-local
+    /// address the kernel forms unasked.
+    #[serde(default, skip_serializing_if = "Ip6Options::is_empty")]
+    pub ipv6: Ip6Options,
+    /// What this link's **DHCPv4 client** sends and accepts (`[interface.dhcp]`).
+    /// Only meaningful with `address = "dhcp"`. An ISP that identifies a line by
+    /// client-id or hostname makes these the difference between a lease and no
+    /// lease.
+    #[serde(default, skip_serializing_if = "DhcpClient::is_empty")]
+    pub dhcp: DhcpClient,
+    /// What this link's **DHCPv6 client** sends and accepts
+    /// (`[interface.dhcpv6]`). Only meaningful with `address6 = "dhcp"`.
+    #[serde(default, skip_serializing_if = "Dhcp6Client::is_empty")]
+    pub dhcpv6: Dhcp6Client,
     /// Egress traffic shaping / queue management on this interface (roadmap C8) —
     /// a `cake` shaper+AQM (the bufferbloat killer for a WAN uplink) or a
     /// `fq_codel` AQM. `None` leaves the kernel default qdisc. Declared as a
@@ -4703,6 +4811,610 @@ pub struct Interface {
     /// serialises after every scalar interface key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pppoe: Option<Pppoe>,
+}
+
+/// A cellular modem's bearer (`[interface.wwan]`).
+///
+/// The split is deliberate: this block gets the *bearer* up, and the address
+/// comes from `address = "dhcp"` the way it does on any other uplink. A modem is
+/// a WAN link that happens to dial, and treating it as its own kind of
+/// addressing would mean a second path to the same answer.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Wwan {
+    /// The APN. Required, and the one thing every operator gives you.
+    pub apn: String,
+    /// PAP/CHAP user, where the operator wants one. Most do not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// PAP/CHAP password. Secret — the rendered dial script holds it and is
+    /// written 0600.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    /// The SIM PIN, where the card has one. Secret, and worth thinking about
+    /// before setting: a wrong PIN tried three times locks the card, and a box
+    /// that retries a dial on failure is a box that will try three times.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<String>,
+    /// `"ipv4"`, `"ipv6"` or `"ipv4v6"`. Unset asks for `ipv4v6`, which every
+    /// current network offers and which no longer costs anything where it is
+    /// only half available.
+    #[serde(default, rename = "ip-type", skip_serializing_if = "Option::is_none")]
+    pub ip_type: Option<String>,
+}
+
+/// Wireless on a `type = "wireless"` link (`[interface.wireless]`).
+///
+/// Deliberately the settings an operator sets, and not every flag the radio has.
+/// VyOS exposes ~150 nodes here, of which about 130 are the HT/VHT/HE capability
+/// trees — a passthrough of hostapd's own switches, each meaningful only with a
+/// particular chipset and each able to make a working radio silently refuse to
+/// come up. What is here is what decides whether the network exists, who may
+/// join it, and on which channel.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Wireless {
+    /// `"access-point"` (this box makes the network, via hostapd) or
+    /// `"station"` (this box joins one, via wpa_supplicant). Required — the two
+    /// share almost nothing, and a radio that is neither does nothing.
+    pub mode: String,
+    /// The network name. Required in both roles: an access point announces it,
+    /// a station looks for it.
+    pub ssid: String,
+    /// The regulatory domain as an ISO 3166 pair (`"DE"`). Required on an access
+    /// point, because the channels and powers that are legal are a property of
+    /// where the box is, and a radio with no country set is restricted to the
+    /// intersection of every regime — which on 5 GHz is almost nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+    /// The channel to use. Unset lets the driver pick, which is right for a
+    /// station and wrong for an access point sharing a room with others.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<u8>,
+    /// The generation the radio runs: `"b"`, `"g"`, `"a"`, `"n"`, `"ac"` or
+    /// `"ax"`. Decides the band as well — `b`/`g`/`n` are 2.4 GHz, `a`/`ac`/`ax`
+    /// are 5 GHz — so it has to agree with `channel`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub band: Option<String>,
+    /// Do not put the SSID in beacons. Worth knowing that this hides the network
+    /// from a casual scan and from nobody else: a client that knows the name
+    /// broadcasts it while looking, so a hidden network is announced by its own
+    /// clients instead of by its access point.
+    #[serde(
+        default,
+        rename = "hide-ssid",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub hide_ssid: bool,
+    /// Stop associated clients from reaching each other over the air. A guest
+    /// network wants it; a network with a printer on it does not.
+    #[serde(
+        default,
+        rename = "isolate-stations",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub isolate_stations: bool,
+    /// The most clients that may associate at once.
+    #[serde(
+        default,
+        rename = "max-stations",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_stations: Option<u16>,
+    /// WPA. Unset means an **open** network, which commit refuses on an access
+    /// point: an unencrypted network is not a configuration choice this appliance
+    /// makes silently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wpa: Option<WirelessWpa>,
+}
+
+impl Wireless {
+    /// True when this radio makes a network rather than joining one.
+    pub fn is_access_point(&self) -> bool {
+        self.mode == "access-point"
+    }
+}
+
+/// WPA on a wireless link (`[interface.wireless.wpa]`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WirelessWpa {
+    /// `"wpa2"`, `"wpa3"`, or `"wpa2+wpa3"` for a transition network that takes
+    /// both. WPA and WEP are not offered: both are broken, and offering a broken
+    /// cipher is offering to be asked for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// The pre-shared key, 8–63 characters. A secret: the rendered radio config
+    /// contains it and is written 0600.
+    pub passphrase: String,
+}
+
+/// NIC hardware settings applied with `ethtool` (`[interface.ethernet]`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Ethernet {
+    /// Force the link speed in Mbit/s instead of autonegotiating. Needed where
+    /// the far side does not negotiate — an old switch port, a media converter,
+    /// a direct-attach cable — and a good way to break a working link otherwise.
+    /// Requires `duplex`: the two are set together or the card ignores both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<u32>,
+    /// `full` or `half`, alongside `speed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duplex: Option<String>,
+    /// Receive ring-buffer depth, in descriptors. Raising it is the first answer
+    /// to a NIC dropping packets under burst — visible as `rx_dropped` climbing
+    /// while the CPU is idle.
+    #[serde(default, rename = "rx-ring", skip_serializing_if = "Option::is_none")]
+    pub rx_ring: Option<u32>,
+    /// Transmit ring-buffer depth, in descriptors.
+    #[serde(default, rename = "tx-ring", skip_serializing_if = "Option::is_none")]
+    pub tx_ring: Option<u32>,
+    /// Microseconds the card waits before raising a receive interrupt. Higher
+    /// trades latency for fewer interrupts; on a firewall forwarding small
+    /// packets that trade is usually worth making, and `0` is what a latency-
+    /// sensitive link wants.
+    #[serde(default, rename = "rx-usecs", skip_serializing_if = "Option::is_none")]
+    pub rx_usecs: Option<u32>,
+    /// Microseconds before a transmit interrupt.
+    #[serde(default, rename = "tx-usecs", skip_serializing_if = "Option::is_none")]
+    pub tx_usecs: Option<u32>,
+    /// Let the driver vary the receive coalescing itself with load. Mutually
+    /// exclusive with a fixed `rx-usecs`: setting both means asking the driver to
+    /// both hold a number and change it.
+    #[serde(
+        default,
+        rename = "adaptive-rx",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub adaptive_rx: bool,
+    /// The transmit counterpart of [`Ethernet::adaptive_rx`].
+    #[serde(
+        default,
+        rename = "adaptive-tx",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub adaptive_tx: bool,
+}
+
+impl Ethernet {
+    /// True when this NIC keeps every hardware default.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Spanning tree, timers and multicast on a bridge (`[interface.bridge]`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeOptions {
+    /// Run the Spanning Tree Protocol. Off by default, and that is the right
+    /// default for a bridge whose ports are known: STP costs 30 seconds of
+    /// forwarding delay at every link-up. On the moment a loop is possible —
+    /// two ports to the same switch, a port an operator can patch anywhere —
+    /// it is the difference between a slow start and a broadcast storm.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stp: bool,
+    /// This bridge's spanning-tree priority (`0`–`65535`, lower wins the root
+    /// election). Only consulted with `stp`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u16>,
+    /// Seconds between configuration BPDUs. Only consulted with `stp`.
+    #[serde(
+        default,
+        rename = "hello-time",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub hello_time: Option<u32>,
+    /// Seconds a learned topology is trusted before it is re-elected. Only
+    /// consulted with `stp`.
+    #[serde(default, rename = "max-age", skip_serializing_if = "Option::is_none")]
+    pub max_age: Option<u32>,
+    /// Seconds a port spends listening and learning before it forwards. Only
+    /// consulted with `stp` — and the reason a port with STP on appears dead for
+    /// half a minute after every link-up.
+    #[serde(
+        default,
+        rename = "forward-delay",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub forward_delay: Option<u32>,
+    /// Seconds a learned MAC stays in the forwarding table. Lower notices a moved
+    /// host sooner and floods more; `0` disables learning entirely, turning the
+    /// bridge into a hub.
+    #[serde(
+        default,
+        rename = "ageing-time",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ageing_time: Option<u32>,
+    /// Watch IGMP and forward a multicast group only to the ports that asked for
+    /// it. Without it every group floods every port, which is what turns one IPTV
+    /// or discovery stream into a load on the whole segment.
+    #[serde(
+        default,
+        rename = "igmp-snooping",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub igmp_snooping: bool,
+    /// Send IGMP queries from the bridge itself. Snooping needs somebody to ask;
+    /// on a segment with no multicast router, nobody does, and the memberships
+    /// time out until the groups flood again.
+    #[serde(
+        default,
+        rename = "igmp-querier",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub igmp_querier: bool,
+}
+
+impl BridgeOptions {
+    /// True when nothing here departs from the kernel default.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// This link's behaviour as a port of a bridge (`[interface.bridge-port]`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgePort {
+    /// Spanning-tree path cost through this port (`1`–`65535`). What decides
+    /// which of two paths to the root is blocked — the whole point of setting it
+    /// by hand is to choose the link that is blocked rather than let the speed
+    /// heuristic choose it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<u32>,
+    /// Spanning-tree port priority (`0`–`63`), the tie-break when two ports have
+    /// the same cost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u16>,
+    /// Learn source MACs on this port. Off makes the port flood-only — what a
+    /// monitoring or IDS port wants, so that a device listening there cannot
+    /// attract traffic by being seen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learning: Option<bool>,
+}
+
+impl BridgePort {
+    /// True when this link is an ordinary bridge port.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Link-aggregation detail on a bond (`[interface.bond]`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BondOptions {
+    /// How a frame chooses its member: `layer2` (MAC), `layer2+3` (MAC + IP),
+    /// `layer3+4` (IP + port), `encap2+3`, `encap3+4`.
+    ///
+    /// The default `layer2` puts every frame between one pair of MACs on one
+    /// member, so a bond between two switches carries a single conversation at
+    /// the speed of one link no matter how many are in it. `layer3+4` is what
+    /// makes an aggregate behave like the sum of its parts.
+    #[serde(
+        default,
+        rename = "hash-policy",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub hash_policy: Option<String>,
+    /// LACPDU interval: `slow` (30 s, the default) or `fast` (1 s). `fast`
+    /// notices a partner that stopped speaking in three seconds instead of ninety.
+    #[serde(default, rename = "lacp-rate", skip_serializing_if = "Option::is_none")]
+    pub lacp_rate: Option<String>,
+    /// The number of members that must be up for the bond itself to be up. `0`
+    /// (the default) means one is enough — set it higher where half an aggregate
+    /// is worse than none, because the traffic it attracts will not fit.
+    #[serde(default, rename = "min-links", skip_serializing_if = "Option::is_none")]
+    pub min_links: Option<u16>,
+    /// The member preferred while it is up (active-backup and the balance-tlb/alb
+    /// modes). Without it, a failover does not fail back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<String>,
+    /// Milliseconds between MII link checks. This is carrier detection: it
+    /// notices an unplugged cable and nothing else.
+    #[serde(
+        default,
+        rename = "mii-interval",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub mii_interval: Option<u32>,
+    /// Milliseconds between ARP probes to [`BondOptions::arp_target`]. Carrier
+    /// detection misses the failure that matters most on an aggregate — a link
+    /// that is up and carries nothing, because the switch on the far side is
+    /// wedged. ARP monitoring notices it.
+    #[serde(
+        default,
+        rename = "arp-interval",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub arp_interval: Option<u32>,
+    /// The addresses ARP monitoring probes. Something that answers and is reached
+    /// *through* the bond — its own gateway, typically.
+    #[serde(default, rename = "arp-target", skip_serializing_if = "Vec::is_empty")]
+    pub arp_target: Vec<String>,
+}
+
+impl BondOptions {
+    /// True when nothing here departs from the kernel default.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Per-link IPv4 behaviour (`[interface.ip]`).
+///
+/// These are the knobs that decide what the *kernel* does with IPv4 on one link,
+/// as opposed to what the firewall does with a packet. Most of them are ARP: on a
+/// box with several NICs in the same subnet — a firewall, in other words — Linux
+/// will by default answer an ARP request on any of them and source an ARP request
+/// from whichever address it likes, which is how a redundant pair of links turns
+/// into a pair of hosts that disagree about who owns an address.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IpOptions {
+    /// Do not forward IPv4 *out of* this link. The box stays a router everywhere
+    /// else; this link only terminates traffic. A management port is the case:
+    /// reachable, and not a path through the box.
+    #[serde(
+        default,
+        rename = "disable-forwarding",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub disable_forwarding: bool,
+    /// Answer ARP on this link for addresses that live elsewhere — the box lends
+    /// its own MAC to a host that is not on this segment. What makes a router
+    /// transparent to a host with a wrong (too wide) netmask.
+    #[serde(
+        default,
+        rename = "proxy-arp",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub proxy_arp: bool,
+    /// Proxy ARP *between* ports of the same private VLAN — the isolated-ports
+    /// case, where two clients on one segment may only reach each other through
+    /// the router. Without it a proxy-ARP router refuses to answer for the segment
+    /// it heard the request on.
+    #[serde(
+        default,
+        rename = "proxy-arp-pvlan",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub proxy_arp_pvlan: bool,
+    /// How long a reachable ARP entry is trusted before it is probed again, in
+    /// seconds. Lower means a moved host or a failed-over VRRP MAC is noticed
+    /// sooner, at the cost of ARP traffic.
+    #[serde(
+        default,
+        rename = "arp-cache-timeout",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub arp_cache_timeout: Option<u32>,
+    /// Only answer ARP for an address configured *on this link* (`arp_filter`).
+    /// The default answers for any of the box's addresses, so two NICs in one
+    /// subnet both reply and the peer's cache depends on which reply arrived last.
+    #[serde(
+        default,
+        rename = "arp-filter",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub arp_filter: bool,
+    /// Learn from unsolicited (gratuitous) ARP — create a cache entry for a sender
+    /// that was not already known. Speeds up failover; also lets an unasked host
+    /// put itself in the table, so it is off by default.
+    #[serde(
+        default,
+        rename = "arp-accept",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub arp_accept: bool,
+    /// Choose the *source* address of an ARP request to be on the target's subnet
+    /// (`arp_announce = 2`) rather than whatever the outgoing route says. Keeps a
+    /// multi-homed router from announcing an address the peer cannot place.
+    #[serde(
+        default,
+        rename = "arp-announce",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub arp_announce: bool,
+    /// Only answer an ARP request whose target address is configured on the link
+    /// it arrived on (`arp_ignore = 1`) — the reply half of `arp-filter`.
+    #[serde(
+        default,
+        rename = "arp-ignore",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub arp_ignore: bool,
+    /// Forward directed broadcasts onto this link — a packet addressed to a
+    /// subnet's broadcast address from off-subnet. Wake-on-LAN across a router
+    /// wants it; it is also the amplifier half of a smurf attack, so it is off
+    /// until asked for.
+    #[serde(
+        default,
+        rename = "directed-broadcast",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub directed_broadcast: bool,
+}
+
+impl IpOptions {
+    /// True when nothing on this link departs from the kernel default, so the
+    /// whole `[interface.ip]` table can be left out of the saved configuration.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Per-link IPv6 behaviour (`[interface.ipv6]`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Ip6Options {
+    /// Do not forward IPv6 out of this link — the v6 half of
+    /// [`IpOptions::disable_forwarding`]. Set independently, because a link is
+    /// routinely a router for one family and a host for the other.
+    #[serde(
+        default,
+        rename = "disable-forwarding",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub disable_forwarding: bool,
+    /// Do not form the automatic link-local (`fe80::`) address on this link.
+    /// A link that carries only IPv4 has no use for it, and on a segment with
+    /// strict neighbour policy an address nobody configured is an address nobody
+    /// audits.
+    #[serde(
+        default,
+        rename = "no-link-local",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub no_link_local: bool,
+    /// How many Duplicate Address Detection probes to send before an address is
+    /// used. `0` skips DAD entirely — which a point-to-point link can afford and a
+    /// shared segment cannot.
+    #[serde(
+        default,
+        rename = "dad-transmits",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub dad_transmits: Option<u8>,
+    /// What to do when DAD fails: `0` keeps the address anyway, `1` disables it
+    /// (the default), `2` disables IPv6 on the link. `2` is the honest setting for
+    /// a link where a duplicate means somebody else is impersonating this router.
+    #[serde(
+        default,
+        rename = "accept-dad",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub accept_dad: Option<u8>,
+}
+
+impl Ip6Options {
+    /// True when nothing on this link departs from the kernel default.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// What this link's DHCPv4 client sends and accepts (`[interface.dhcp]`).
+///
+/// A residential or business uplink frequently keys the subscriber off one of
+/// these fields, and the failure mode when it is missing is not an error message
+/// — it is a line that never gets an address.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DhcpClient {
+    /// What goes in DHCP option 61, the client identifier: `"mac"` (hardware
+    /// type + this link's MAC) or `"duid"` (an RFC 4361 IAID+DUID).
+    ///
+    /// A choice rather than free text, because that is what actually reaches the
+    /// wire. Other vendors let an operator type an arbitrary client-id because
+    /// their client is `dhclient`; this box's network layer builds option 61
+    /// itself, and an arbitrary string handed to it is discarded without a word.
+    ///
+    /// The choice is not cosmetic. `mac` keys the lease to the NIC, so it
+    /// survives a reinstall; the default `duid` is derived from the machine-id,
+    /// so reinstalling the appliance asks for a different lease.
+    #[serde(default, rename = "client-id", skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    /// A fixed DUID for the DHCPv4 client identifier, as colon-separated hex.
+    /// Only reaches the wire with `client-id = "duid"`, which is what carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duid: Option<String>,
+    /// The hostname sent to the server (option 12) — often what appears in the
+    /// provider's portal, and what a dynamic-DNS-updating server registers.
+    #[serde(default, rename = "host-name", skip_serializing_if = "Option::is_none")]
+    pub host_name: Option<String>,
+    /// Vendor class identifier (option 60). Provider networks use it to hand a
+    /// CPE a different lease from a set-top box on the same wire.
+    #[serde(
+        default,
+        rename = "vendor-class-id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub vendor_class_id: Option<String>,
+    /// User class (option 77) — the subscriber's own label, where the operator
+    /// asked for one.
+    #[serde(
+        default,
+        rename = "user-class",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub user_class: Option<String>,
+    /// Take the address and DNS from the lease, but not the default route. For a
+    /// second uplink whose route is chosen by policy rather than by whichever
+    /// server answered first.
+    #[serde(
+        default,
+        rename = "no-default-route",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub no_default_route: bool,
+    /// The metric of the default route this lease installs. Two DHCP uplinks with
+    /// the same metric is a coin toss; distinct metrics are a primary and a
+    /// backup.
+    #[serde(
+        default,
+        rename = "default-route-distance",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub default_route_distance: Option<u32>,
+    /// Refuse offers from these servers (addresses or CIDRs). The rogue-DHCP
+    /// case, and the one where a lab server on the same wire is faster than the
+    /// real one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reject: Vec<String>,
+}
+
+impl DhcpClient {
+    /// True when this link's DHCP client is entirely stock.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// What this link's DHCPv6 client sends and accepts (`[interface.dhcpv6]`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Dhcp6Client {
+    /// A fixed DUID as colon-separated hex, replacing the one derived from this
+    /// box's machine-id. Reinstalling the appliance otherwise changes its DUID and
+    /// with it the prefix the ISP delegates — every LAN address changes because
+    /// the router was rebuilt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duid: Option<String>,
+    /// Ask for the address and the reply in one exchange (two messages instead of
+    /// four). Faster; not every server implements it.
+    #[serde(
+        default,
+        rename = "rapid-commit",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub rapid_commit: bool,
+    /// Ask only for parameters — DNS, NTP, domain — and not for an address. The
+    /// stateless case, where the address comes from SLAAC.
+    #[serde(
+        default,
+        rename = "parameters-only",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub parameters_only: bool,
+    /// Do not send a RELEASE when the link goes down. Keeps the same address
+    /// across a restart on servers that would otherwise hand it to somebody else.
+    #[serde(
+        default,
+        rename = "no-release",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub no_release: bool,
+}
+
+impl Dhcp6Client {
+    /// True when this link's DHCPv6 client is entirely stock.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// The `type` of a synthesised or client interface. `bridge`/`bond` are
@@ -4748,6 +5460,22 @@ pub enum IfaceType {
     /// Ethernet frames over IP. Created imperatively via `ip l2tp` (not networkd);
     /// `key` is the tunnel/session id shared by both ends.
     L2tpv3,
+    /// A **route-based IPsec** interface (`vti-key` is its id): a link whose
+    /// traffic is encrypted by whichever `[[vpn.ipsec]]` connection binds to it.
+    ///
+    /// Built as an `xfrm` device rather than the older `vti` netdev the name comes
+    /// from. `vti` keys on a mark, is one device per address family, and wants the
+    /// endpoints repeated on the link; `xfrm` keys on an interface id, carries both
+    /// families on one link, and is what strongSwan's `if_id_in`/`if_id_out` are
+    /// built for. The word stays `vti` because that is what the feature is called
+    /// everywhere an operator would look it up.
+    Vti,
+    /// A wireless radio. `[interface.wireless]` says which side of the air it is
+    /// on: an access point is run by hostapd, a station by wpa_supplicant.
+    Wireless,
+    /// A cellular modem. The kernel provides the net device; `[interface.wwan]`
+    /// says which bearer to dial.
+    Wwan,
 }
 
 /// PPPoE client parameters (a `type = "pppoe"` interface). The session is
@@ -5076,6 +5804,10 @@ impl Interface {
             self.if_type,
             Some(IfaceType::Bridge) | Some(IfaceType::Bond)
         )
+    }
+    /// True for a route-based IPsec interface (`type = "vti"`).
+    pub fn is_vti(&self) -> bool {
+        self.if_type == Some(IfaceType::Vti)
     }
     /// True for a dummy device (`type = "dummy"`).
     ///
@@ -6443,6 +7175,7 @@ impl Appliance {
             .filter_map(|i| i.zone.as_deref())
             .collect();
         // What a NIC is pinned to, and which offload switches it names.
+        let mut vti_keys: HashSet<u32> = HashSet::new();
         for i in &self.interfaces {
             if let Some(mac) = &i.hw_id {
                 validate_mac(mac).with_context(|| format!("interface {:?} hw-id", i.name))?;
@@ -6455,6 +7188,347 @@ impl Appliance {
                         OFFLOAD_FEATURES.join(", ")
                     );
                 }
+            }
+            // Speed and duplex are one setting in two halves: `ethtool -s`
+            // applies them together, and a card handed only one of them
+            // autonegotiates as before — the link comes up at the wrong speed
+            // with nothing reporting a problem.
+            let e = &i.ethernet;
+            if e.speed.is_some() != e.duplex.is_some() {
+                bail!(
+                    "interface {:?}: ethernet speed and duplex are set together",
+                    i.name
+                );
+            }
+            if let Some(d) = &e.duplex {
+                if !matches!(d.as_str(), "full" | "half") {
+                    bail!("interface {:?}: ethernet duplex {d:?}: full | half", i.name);
+                }
+            }
+            // Adaptive coalescing means "the driver picks"; a fixed value means
+            // "the driver holds this". Asking for both is asking for neither.
+            if (e.adaptive_rx && e.rx_usecs.is_some()) || (e.adaptive_tx && e.tx_usecs.is_some()) {
+                bail!(
+                    "interface {:?}: ethernet adaptive coalescing and a fixed usecs contradict each other",
+                    i.name
+                );
+            }
+            // Bridge and bond detail belongs to the device it describes. Set on
+            // anything else it commits and is never read — the shape this
+            // appliance refuses everywhere else.
+            if !i.bridge.is_empty() && i.if_type != Some(IfaceType::Bridge) {
+                bail!(
+                    "interface {:?}: [interface.bridge] is only meaningful on a `type = \"bridge\"` device",
+                    i.name
+                );
+            }
+            if !i.bond.is_empty() && i.if_type != Some(IfaceType::Bond) {
+                bail!(
+                    "interface {:?}: [interface.bond] is only meaningful on a `type = \"bond\"` device",
+                    i.name
+                );
+            }
+            // The STP timers are read only when STP runs, so setting one without
+            // it is a number that does nothing.
+            let b = &i.bridge;
+            if !b.stp
+                && (b.priority.is_some()
+                    || b.hello_time.is_some()
+                    || b.max_age.is_some()
+                    || b.forward_delay.is_some())
+            {
+                bail!(
+                    "interface {:?}: bridge priority/hello-time/max-age/forward-delay need `bridge stp true`",
+                    i.name
+                );
+            }
+            // A querier that snoops nothing sends queries nobody uses.
+            if b.igmp_querier && !b.igmp_snooping {
+                bail!(
+                    "interface {:?}: bridge igmp-querier needs bridge igmp-snooping",
+                    i.name
+                );
+            }
+            if let Some(p) = &i.bond.primary {
+                if !i.members.iter().any(|m| m == p) {
+                    bail!(
+                        "interface {:?}: bond primary {p:?} is not one of its members",
+                        i.name
+                    );
+                }
+            }
+            for t in &i.bond.arp_target {
+                validate_ipv4(t)
+                    .with_context(|| format!("interface {:?} bond arp-target", i.name))?;
+            }
+            // ARP monitoring probes an address; an interval with nothing to probe
+            // monitors nothing, and targets with no interval are never probed.
+            if i.bond.arp_interval.is_some() != !i.bond.arp_target.is_empty() {
+                bail!(
+                    "interface {:?}: bond arp-interval and arp-target go together",
+                    i.name
+                );
+            }
+            // A modem's bearer belongs to a modem, and a modem needs one.
+            if i.wwan.is_some() && i.if_type != Some(IfaceType::Wwan) {
+                bail!(
+                    "interface {:?}: [interface.wwan] is only meaningful on a `type = \"wwan\"` link",
+                    i.name
+                );
+            }
+            if i.if_type == Some(IfaceType::Wwan) {
+                let Some(w) = &i.wwan else {
+                    bail!(
+                        "interface {:?}: a `type = \"wwan\"` link needs [interface.wwan]",
+                        i.name
+                    );
+                };
+                if w.apn.is_empty() {
+                    bail!("interface {:?}: wwan apn is required", i.name);
+                }
+                // The APN and credentials go into an `mmcli --simple-connect`
+                // value, which is comma-separated: one inside a field would be
+                // read as the start of the next.
+                for (which, val) in [
+                    ("apn", Some(&w.apn)),
+                    ("username", w.username.as_ref()),
+                    ("password", w.password.as_ref()),
+                ] {
+                    if let Some(v) = val {
+                        if v.contains(',') || v.contains('\n') {
+                            bail!(
+                                "interface {:?}: wwan {which} may not contain a comma or newline",
+                                i.name
+                            );
+                        }
+                    }
+                }
+                // PAP/CHAP needs both halves; a password with nobody to be is a
+                // credential the modem cannot send.
+                if w.password.is_some() != w.username.is_some() {
+                    bail!(
+                        "interface {:?}: wwan username and password are set together",
+                        i.name
+                    );
+                }
+                if let Some(t) = &w.ip_type {
+                    if !matches!(t.as_str(), "ipv4" | "ipv6" | "ipv4v6") {
+                        bail!(
+                            "interface {:?}: wwan ip-type {t:?}: ipv4 | ipv6 | ipv4v6",
+                            i.name
+                        );
+                    }
+                }
+                // A SIM PIN is four to eight digits, and a wrong one is spent off
+                // a counter of three — so a malformed one is refused here rather
+                // than tried against the card.
+                if let Some(p) = &w.pin {
+                    if !(4..=8).contains(&p.len()) || !p.bytes().all(|b| b.is_ascii_digit()) {
+                        bail!("interface {:?}: wwan pin must be 4-8 digits", i.name);
+                    }
+                }
+                // The bearer gets the link up; the address comes from DHCP, the
+                // same as any other uplink. Without it the modem dials and the
+                // box has no address on it.
+                if i.address.as_deref() != Some("dhcp") && i.address6.as_deref() != Some("dhcp") {
+                    bail!(
+                        "interface {:?}: a wwan link needs `address dhcp` (or `address6 dhcp`) — the bearer does not carry the address",
+                        i.name
+                    );
+                }
+            }
+            // Wireless: the radio's settings belong to a radio, and a radio needs
+            // them. Both directions are refused, because either way round the
+            // link comes up and no network exists.
+            if i.wireless.is_some() && i.if_type != Some(IfaceType::Wireless) {
+                bail!(
+                    "interface {:?}: [interface.wireless] is only meaningful on a `type = \"wireless\"` link",
+                    i.name
+                );
+            }
+            if i.if_type == Some(IfaceType::Wireless) {
+                let Some(w) = &i.wireless else {
+                    bail!(
+                        "interface {:?}: a `type = \"wireless\"` link needs [interface.wireless]",
+                        i.name
+                    );
+                };
+                if !matches!(w.mode.as_str(), "access-point" | "station") {
+                    bail!(
+                        "interface {:?}: wireless mode {:?}: access-point | station",
+                        i.name,
+                        w.mode
+                    );
+                }
+                if w.ssid.is_empty() || w.ssid.len() > 32 {
+                    bail!(
+                        "interface {:?}: wireless ssid must be 1-32 characters",
+                        i.name
+                    );
+                }
+                if let Some(b) = &w.band {
+                    if !matches!(b.as_str(), "b" | "g" | "a" | "n" | "ac" | "ax") {
+                        bail!(
+                            "interface {:?}: wireless band {b:?}: b | g | a | n | ac | ax",
+                            i.name
+                        );
+                    }
+                }
+                if let Some(c) = &w.country {
+                    if c.len() != 2 || !c.bytes().all(|b| b.is_ascii_uppercase()) {
+                        bail!(
+                            "interface {:?}: wireless country {c:?} is not a two-letter ISO code",
+                            i.name
+                        );
+                    }
+                }
+                match &w.wpa {
+                    Some(wpa) => {
+                        if let Some(m) = &wpa.mode {
+                            if !matches!(m.as_str(), "wpa2" | "wpa3" | "wpa2+wpa3") {
+                                bail!(
+                                    "interface {:?}: wireless wpa mode {m:?}: wpa2 | wpa3 | wpa2+wpa3",
+                                    i.name
+                                );
+                            }
+                        }
+                        // The 802.11i bound, and the reason a shorter one is a
+                        // typo rather than a choice.
+                        if !(8..=63).contains(&wpa.passphrase.len()) {
+                            bail!(
+                                "interface {:?}: wireless wpa passphrase must be 8-63 characters",
+                                i.name
+                            );
+                        }
+                    }
+                    // An access point with no WPA is an open network. Refused
+                    // rather than warned: it is not a thing to arrive at by
+                    // leaving something out.
+                    None if w.is_access_point() => bail!(
+                        "interface {:?}: an access point needs [interface.wireless.wpa] — an open network has to be asked for somewhere this appliance does not offer",
+                        i.name
+                    ),
+                    None => {}
+                }
+                // A country is what makes channels and powers legal; without one
+                // the radio is held to the intersection of every regime.
+                if w.is_access_point() && w.country.is_none() {
+                    bail!(
+                        "interface {:?}: an access point needs a wireless country",
+                        i.name
+                    );
+                }
+            }
+            // A route-based IPsec link is nothing without its id — the id is the
+            // only thing tying it to an SA, so one without it is a link that
+            // comes up and carries plaintext into a black hole.
+            if i.is_vti() && i.vti_key.is_none() {
+                bail!(
+                    "interface {:?}: a `type = \"vti\"` link needs `vti-key`",
+                    i.name
+                );
+            }
+            if i.vti_key.is_some() && !i.is_vti() {
+                bail!(
+                    "interface {:?}: vti-key is only meaningful on a `type = \"vti\"` link",
+                    i.name
+                );
+            }
+            if let Some(key) = i.vti_key {
+                if !vti_keys.insert(key) {
+                    bail!(
+                        "interface {:?}: vti-key {key} is already used by another link — the kernel would not know which SA a packet belongs to",
+                        i.name
+                    );
+                }
+            }
+            // Per-link kernel behaviour: refuse the combinations that would
+            // commit cleanly and then do nothing, because each of them fails as
+            // an absence rather than an error.
+            if !i.dhcp.is_empty() && i.address.as_deref() != Some("dhcp") {
+                bail!(
+                    "interface {:?}: dhcp client options need `address dhcp`",
+                    i.name
+                );
+            }
+            if !i.dhcpv6.is_empty() && i.address6.as_deref() != Some("dhcp") {
+                bail!(
+                    "interface {:?}: dhcpv6 client options need `address6 dhcp`",
+                    i.name
+                );
+            }
+            if let Some(id) = &i.dhcp.client_id {
+                if !matches!(id.as_str(), "mac" | "duid") {
+                    bail!(
+                        "interface {:?}: dhcp client-id {id:?} is not `mac` or `duid`",
+                        i.name
+                    );
+                }
+            }
+            // A DUID only reaches the wire as the client identifier, so one
+            // configured beside `client-id mac` is a value nothing carries.
+            if let Some(duid) = &i.dhcp.duid {
+                validate_duid(duid).with_context(|| format!("interface {:?} dhcp duid", i.name))?;
+                if i.dhcp.client_id.as_deref() != Some("duid") {
+                    bail!(
+                        "interface {:?}: dhcp duid needs `dhcp client-id duid`",
+                        i.name
+                    );
+                }
+            }
+            for r in &i.dhcp.reject {
+                validate_cidr_or_ip(r)
+                    .with_context(|| format!("interface {:?} dhcp reject", i.name))?;
+            }
+            if let Some(duid) = &i.dhcpv6.duid {
+                validate_duid(duid)
+                    .with_context(|| format!("interface {:?} dhcpv6 duid", i.name))?;
+            }
+            if let Some(n) = i.ipv6.accept_dad {
+                if n > 2 {
+                    bail!(
+                        "interface {:?}: ipv6 accept-dad {n} is not 0, 1 or 2",
+                        i.name
+                    );
+                }
+            }
+            // A mirror to a link this box does not have is a monitor port that
+            // is quietly dark — the one failure mode that looks exactly like
+            // "there was no interesting traffic".
+            for (which, dst) in [
+                ("mirror-ingress", &i.mirror_ingress),
+                ("mirror-egress", &i.mirror_egress),
+            ] {
+                let Some(dst) = dst else { continue };
+                if dst == &i.name {
+                    bail!(
+                        "interface {:?}: {which} {dst:?} mirrors the link to itself",
+                        i.name
+                    );
+                }
+                if !self.interfaces.iter().any(|o| &o.name == dst) {
+                    bail!(
+                        "interface {:?}: {which} {dst:?} is not a configured interface",
+                        i.name
+                    );
+                }
+            }
+            // Proxy ARP between private-VLAN ports is a modifier on proxy ARP:
+            // on its own the kernel never consults it.
+            if i.ip.proxy_arp_pvlan && !i.ip.proxy_arp {
+                bail!(
+                    "interface {:?}: ip proxy-arp-pvlan needs ip proxy-arp",
+                    i.name
+                );
+            }
+            // Answering ARP for absent hosts and refusing to answer for anything
+            // not on this link are opposite instructions; the kernel resolves it
+            // by ignoring the proxy, so the operator would see nothing at all.
+            if i.ip.proxy_arp && i.ip.arp_ignore {
+                bail!(
+                    "interface {:?}: ip proxy-arp and ip arp-ignore contradict each other",
+                    i.name
+                );
             }
         }
         // Kernel parameters: a narrow allow-list on purpose. A firewall that can
@@ -8538,10 +9612,39 @@ impl Appliance {
             }
             validate_ipv4(&c.local).with_context(|| format!("vpn ipsec {:?} local", c.name))?;
             validate_ipv4(&c.remote).with_context(|| format!("vpn ipsec {:?} remote", c.name))?;
-            validate_cidr_or_ip(&c.local_subnet)
-                .with_context(|| format!("vpn ipsec {:?} local-subnet", c.name))?;
-            validate_cidr_or_ip(&c.remote_subnet)
-                .with_context(|| format!("vpn ipsec {:?} remote-subnet", c.name))?;
+            for (which, subnet) in [
+                ("local-subnet", &c.local_subnet),
+                ("remote-subnet", &c.remote_subnet),
+            ] {
+                match subnet {
+                    Some(s) => validate_cidr_or_ip(s)
+                        .with_context(|| format!("vpn ipsec {:?} {which}", c.name))?,
+                    // A policy-based tunnel's selectors *are* its reach: without
+                    // them charon negotiates nothing and the tunnel encrypts no
+                    // traffic at all. A route-based one takes them from the
+                    // routing table, so leaving them out is the normal case.
+                    None if c.vti.is_none() => bail!(
+                        "vpn ipsec {:?}: {which} is required on a policy-based tunnel (or bind a `vti`)",
+                        c.name
+                    ),
+                    None => {}
+                }
+            }
+            // The interface a route-based tunnel binds to has to exist and has to
+            // be one — binding to an ordinary NIC would load, and encrypt nothing.
+            if let Some(vti) = &c.vti {
+                match self.interfaces.iter().find(|i| &i.name == vti) {
+                    None => bail!(
+                        "vpn ipsec {:?}: vti {vti:?} is not a configured interface",
+                        c.name
+                    ),
+                    Some(i) if !i.is_vti() => bail!(
+                        "vpn ipsec {:?}: vti {vti:?} is not a `type = \"vti\"` interface",
+                        c.name
+                    ),
+                    Some(_) => {}
+                }
+            }
             if c.psk.is_empty() {
                 bail!("vpn ipsec {:?}: psk is required", c.name);
             }
@@ -9523,6 +10626,26 @@ pub(crate) fn validate_domain_name(s: &str) -> Result<()> {
         }
         if label.starts_with('-') || label.ends_with('-') {
             bail!("{s:?} has a label starting or ending with a hyphen");
+        }
+    }
+    Ok(())
+}
+
+/// Validate a DHCPv6 DUID: colon-separated hex octets, 2–130 of them (RFC 8415
+/// bounds the DUID at 128 bytes plus the two-byte type).
+///
+/// Worth checking rather than passing through, because a malformed DUID is not
+/// rejected by the client — it is *sent*, and the server answers a different
+/// subscriber or nobody at all. The symptom is an uplink that has no address for
+/// a reason nothing on the box reports.
+pub(crate) fn validate_duid(s: &str) -> Result<()> {
+    let octets: Vec<&str> = s.split(':').collect();
+    if octets.len() < 2 || octets.len() > 130 {
+        bail!("{s:?} is not a DUID: 2 to 130 colon-separated hex octets");
+    }
+    for o in octets {
+        if o.len() != 2 || !o.chars().all(|c| c.is_ascii_hexdigit()) {
+            bail!("{s:?} is not a DUID: {o:?} is not a hex octet");
         }
     }
     Ok(())

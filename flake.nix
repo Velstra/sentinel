@@ -356,6 +356,17 @@
             pkgs.net-snmp
             pkgs.avahi
             pkgs.ddclient
+            # The radios: hostapd builds a network, wpa_supplicant joins one. On
+            # PATH so `hostapd_cli`/`wpa_cli` are there for inspection; the units
+            # reference the store paths directly.
+            pkgs.hostapd
+            pkgs.wpa_supplicant
+            # `mmcli` for the cellular uplinks — the dial script runs it, and it
+            # is the tool for asking a modem what it thinks its state is.
+            pkgs.modemmanager
+            # `iw` reports what the radio and the regulatory domain actually
+            # allow, which is the first question when a channel is refused.
+            pkgs.iw
             # NAT64 (roadmap C10): tayga is the userspace IPv6→IPv4 translator
             # (a `nat64` tun device — no out-of-tree kernel module, unlike Jool, so
             # it runs unchanged in the image + CI VM); unbound provides DNS64 AAAA
@@ -1197,6 +1208,11 @@
             "d /run/sentinel 0755 root root -"
             "d /run/sentinel/chrony.d 0755 root root -"
             "d /run/sentinel/dnsmasq.d 0755 root root -"
+            # The radio configs carry the pre-shared key, so the directory is
+            # 0700 and each file inside it 0600.
+            "d /run/sentinel/wireless 0755 root root -"
+            "d /run/sentinel/wwan 0755 root root -"
+            "d /run/wpa_supplicant 0750 root root -"
             # PPPoE runtime dir holds the 0600 secrets + peer options (root only).
             "d /run/sentinel/ppp 0700 root root -"
             "d /run/sentinel/ppp/peers 0755 root root -"
@@ -2283,6 +2299,463 @@
       # both ends and (2) real traffic flows across the protected subnets — a ping
       # from behind `left` reaches behind `right` through the tunnel.
       #   nix build .#checks.x86_64-linux.ipsec -L
+      # A route-based IPsec tunnel: the routing table decides what is encrypted.
+      #
+      # The distinguishing assertion is the last one. A policy-based tunnel's
+      # reach is negotiated with the peer, so it cannot be changed from one side;
+      # a route-based tunnel's reach is a route, so withdrawing the route stops
+      # the traffic without IPsec being touched at all. Anything less would pass
+      # equally well against a policy-based tunnel with the same subnets.
+      #
+      #   nix build .#checks.x86_64-linux.vti -L
+      vti = pkgs.testers.runNixOSTest {
+        name = "sentinel-vti";
+        nodes =
+          let
+            gw =
+              { wanAddr, transit, protoNet }:
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce (
+                  if wanAddr == "10.0.0.1" then "left" else "right"
+                );
+                networking.firewall.enable = lib.mkForce false;
+                virtualisation.vlans = [ 1 ];
+                virtualisation.memorySize = 2048;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = wanAddr;
+                    prefixLength = 24;
+                  }
+                ];
+                # A packet decrypted out of the tunnel arrives with an inner
+                # source that strict reverse-path filtering treats as a martian.
+                boot.kernel.sysctl = {
+                  "net.ipv4.conf.all.rp_filter" = 2;
+                  "net.ipv4.conf.default.rp_filter" = 2;
+                  "net.ipv4.ip_forward" = 1;
+                };
+                # Both the transit address on the tunnel link and the protected
+                # subnet behind it are configured through Sentinel, below.
+                environment.etc."vti-test-params".text = "${transit} ${protoNet}";
+              };
+          in
+          {
+            left = gw {
+              wanAddr = "10.0.0.1";
+              transit = "10.255.0.1/30";
+              protoNet = "10.100.1.1/24";
+            };
+            right = gw {
+              wanAddr = "10.0.0.2";
+              transit = "10.255.0.2/30";
+              protoNet = "10.100.2.1/24";
+            };
+          };
+        testScript = ''
+          start_all()
+          for m in (left, right):
+              m.wait_for_unit("multi-user.target")
+              m.wait_for_unit("sentinel-boot.service")
+              m.wait_for_unit("strongswan-swanctl.service")
+          left.wait_until_succeeds("ping -c1 -W2 10.0.0.2", timeout=30)
+
+          psk = "velstra-route-based-secret"
+
+          def configure(node, *lines):
+              body = " ".join(f"'{line}' " for line in lines)
+              node.succeed(
+                  "su admin -c \"printf '%s\\n' " + body
+                  + "commit save exit | sentinel configure\""
+              )
+
+          def bring_up(node, local, remote, transit, proto, farnet):
+              # Two commits, and the split is not cosmetic: a static route naming
+              # `vti0` is handed to the routing daemon in the same pass that
+              # creates the link, and the daemon programs the FIB before networkd
+              # has made the device — `netlink: No such device`. Configuring the
+              # links first is also what an operator would do.
+              configure(
+                  node,
+                  "set firewall global default-action accept",
+                  "set interface eth1 zone wan",
+                  "set firewall zone wan default-action accept",
+                  # The protected subnet behind this gateway, on a link of its
+                  # own — the dummy type this session had to fix first.
+                  "set interface proto0 type dummy",
+                  f"set interface proto0 address {proto}",
+                  "set interface proto0 zone lan",
+                  "set firewall zone lan default-action accept",
+                  # The tunnel link. It carries a zone, which a policy-based SA
+                  # has nowhere to put.
+                  "set interface vti0 type vti",
+                  "set interface vti0 vti-key 42",
+                  f"set interface vti0 address {transit}",
+                  "set interface vti0 zone vpn",
+                  "set interface vti0 mss pmtu",
+                  "set firewall zone vpn default-action accept",
+              )
+              node.wait_until_succeeds("ip link show vti0", timeout=30)
+              configure(
+                  node,
+                  f"set vpn ipsec site local {local}",
+                  f"set vpn ipsec site remote {remote}",
+                  f"set vpn ipsec site psk {psk}",
+                  "set vpn ipsec site vti vti0",
+                  # The reach: a route, not a negotiated selector.
+                  f"set protocols static {farnet} dev vti0",
+              )
+
+          bring_up(left, "10.0.0.1", "10.0.0.2", "10.255.0.1/30", "10.100.1.1/24", "10.100.2.0/24")
+          bring_up(right, "10.0.0.2", "10.0.0.1", "10.255.0.2/30", "10.100.2.1/24", "10.100.1.0/24")
+
+          # (1) The link is a real xfrm device carrying the configured id — not a
+          # name with nothing behind it. `ip` prints the id in hex, so 42 reads
+          # back as 0x2a; asserting the decimal would fail on a correct device.
+          for m in (left, right):
+              m.wait_until_succeeds("ip link show vti0", timeout=30)
+              detail = m.succeed("ip -d link show vti0")
+              assert "xfrm" in detail, detail
+              assert f"if_id 0x{42:x}" in detail, detail
+
+          # (2) The child SA carries the id in both directions, and the selectors
+          # are open because the routing table is what decides.
+          for m in (left, right):
+              conf = m.succeed("cat /run/sentinel/swanctl/swanctl.conf")
+              assert "if_id_in = 42" in conf, conf
+              assert "if_id_out = 42" in conf, conf
+              assert "local_ts = 0.0.0.0/0" in conf, conf
+              assert psk not in conf, "psk leaked into swanctl.conf"
+
+          # (3) The tunnel establishes.
+          left.succeed("swanctl --initiate --child site 2>&1 || true")
+          left.wait_until_succeeds("swanctl --list-sas | grep -q ESTABLISHED", timeout=90)
+          right.wait_until_succeeds("swanctl --list-sas | grep -q ESTABLISHED", timeout=90)
+
+          # (4) Traffic between the protected subnets flows over the routed link.
+          def carries():
+              return left.execute("ping -c1 -W2 -I 10.100.1.1 10.100.2.1")[0] == 0
+
+          def diagnosis(m, name):
+              out = f"\n--- {name} ---\n"
+              for cmd in [
+                  "ip -4 addr show",
+                  "ip -4 route show",
+                  "ip -d link show vti0",
+                  "ip xfrm policy",
+                  "ip xfrm state",
+                  "ip -s link show vti0",
+                  "swanctl --list-sas",
+              ]:
+                  out += f"$ {cmd}\n" + m.execute(cmd)[1] + "\n"
+              return out
+
+          if not carries():
+              # One more chance in case the SA had only just installed, then say
+              # what the box actually looks like rather than "timed out".
+              left.sleep(5)
+          assert carries(), (
+              "the tunnel did not carry traffic between the protected subnets"
+              + diagnosis(left, "left")
+              + diagnosis(right, "right")
+          )
+          right.wait_until_succeeds("ping -c1 -W2 -I 10.100.2.1 10.100.1.1", timeout=90)
+
+          # (5) charon installed no route of its own — the box's own default is
+          # still the box's. A 0.0.0.0/0 selector with `install_routes = yes`
+          # would have put one in table 220 and taken every packet with it.
+          for m in (left, right):
+              assert "default" not in m.succeed("ip route show table 220 2>&1 || true")
+
+          # (6) The point of the whole thing: withdraw the route and the traffic
+          # stops, with the SA untouched. A policy-based tunnel cannot do this
+          # from one side — its reach was negotiated with the peer.
+          configure(left, "delete protocols static 10.100.2.0/24")
+          left.wait_until_fails("ping -c1 -W2 -I 10.100.1.1 10.100.2.1", timeout=30)
+          left.succeed("swanctl --list-sas | grep -q ESTABLISHED")
+
+          # And putting it back brings the traffic back, still without IPsec
+          # renegotiating.
+          configure(left, "set protocols static 10.100.2.0/24 dev vti0")
+          left.wait_until_succeeds("ping -c1 -W2 -I 10.100.1.1 10.100.2.1", timeout=60)
+        '';
+      };
+
+      # A wireless access point and a station that joins it, over two simulated
+      # radios (`mac80211_hwsim`). Real hostapd, real wpa_supplicant, real
+      # association and a real WPA2 handshake — the only thing simulated is the
+      # air between them.
+      #
+      # The assertion that matters is the last: a client associates and carries
+      # IP traffic. Reading the rendered hostapd.conf back would prove the
+      # renderer ran, which is not the same as a network existing.
+      #
+      #   nix build .#checks.x86_64-linux.wireless -L
+      wireless = pkgs.testers.runNixOSTest {
+        name = "sentinel-wireless";
+        nodes.fw =
+          { lib, pkgs, ... }:
+          {
+            imports = [ self.nixosModules.sentinel ];
+            networking.hostName = lib.mkForce "fw";
+            networking.firewall.enable = lib.mkForce false;
+            virtualisation.vlans = [ 1 ];
+            virtualisation.memorySize = 2048;
+            # Two simulated radios: wlan0 becomes the access point Sentinel
+            # configures, wlan1 the client that has to be able to join it.
+            boot.kernelModules = [ "mac80211_hwsim" ];
+            boot.extraModprobeConfig = "options mac80211_hwsim radios=2";
+            environment.systemPackages = [
+              pkgs.wpa_supplicant
+              pkgs.iw
+            ];
+          };
+        testScript = ''
+          start_all()
+          fw.wait_for_unit("multi-user.target")
+          fw.wait_for_unit("sentinel-boot.service")
+          fw.wait_until_succeeds("ip link show wlan0", timeout=60)
+          fw.wait_until_succeeds("ip link show wlan1", timeout=60)
+
+          psk = "correcthorsebattery"
+
+          fw.succeed(
+              "su admin -c \"printf '%s\\n' "
+              "'set firewall global default-action accept' "
+              "'set interface wlan0 type wireless' "
+              "'set interface wlan0 zone lan' "
+              "'set interface wlan0 address 10.0.10.1/24' "
+              "'set firewall zone lan default-action accept' "
+              "'set interface wlan0 wireless mode access-point' "
+              "'set interface wlan0 wireless ssid velstra' "
+              "'set interface wlan0 wireless country DE' "
+              "'set interface wlan0 wireless channel 1' "
+              "'set interface wlan0 wireless band g' "
+              f"'set interface wlan0 wireless wpa passphrase {psk}' "
+              "commit save exit "
+              "| sentinel configure\""
+          )
+
+          # The rendered config carries the key, so it is 0600 and its directory
+          # 0700 — there is no separate secrets file to split a radio's key into.
+          fw.wait_until_succeeds(
+              "test -f /run/sentinel/wireless/wlan0.conf", timeout=30
+          )
+          mode = fw.succeed("stat -c %a /run/sentinel/wireless/wlan0.conf").strip()
+          assert mode == "600", f"the radio config is {mode}, not 600"
+          # Listable on purpose: the reconcile enumerates this directory to
+          # retire a radio, and `commit` does not run as root. The key is
+          # protected by the file mode above, not by hiding the file names.
+          dirmode = fw.succeed("stat -c %a /run/sentinel/wireless").strip()
+          assert dirmode == "755", f"the radio directory is {dirmode}, not 755"
+
+          # hostapd is up and the interface is in AP mode. `iw` is what reports
+          # the mode the driver is actually in, rather than what was asked for.
+          fw.wait_for_unit("sentinel-hostapd@wlan0.service")
+          fw.wait_until_succeeds("iw dev wlan0 info | grep -q 'type AP'", timeout=60)
+
+          # The client radio moves into its own network namespace first.
+          #
+          # Both radios are on this one host, so without the split the kernel
+          # would deliver 10.0.10.1 locally and the ping below would pass with
+          # the radios switched off. In a namespace of its own there is no route
+          # between them but the air.
+          fw.succeed("ip netns add sta")
+          phy = fw.succeed("iw dev wlan1 info | awk '/wiphy/ {print $2}'").strip()
+          fw.succeed(f"iw phy phy{phy} set netns name sta")
+          fw.succeed("ip netns exec sta ip link set wlan1 up")
+
+          # A client joins with the passphrase, over the air.
+          # `wpa_passphrase` emits only a `network={}` block, so the control
+          # socket has to be added or `wpa_cli` has nothing to talk to. The
+          # appliance's own station config writes it; this throwaway client is
+          # built by hand and does not get it for free.
+          fw.succeed(
+              "mkdir -p /tmp/sta && "
+              + "echo 'ctrl_interface=/run/wpa_supplicant' > /tmp/sta/wpa.conf && "
+              + f"wpa_passphrase velstra {psk} >> /tmp/sta/wpa.conf"
+          )
+          fw.succeed(
+              "ip netns exec sta wpa_supplicant -B -i wlan1 -c /tmp/sta/wpa.conf"
+          )
+          fw.wait_until_succeeds(
+              "ip netns exec sta wpa_cli -i wlan1 status | grep -q 'wpa_state=COMPLETED'",
+              timeout=90,
+          )
+          # hostapd saw the association from its own side, which is the proof the
+          # handshake completed rather than that the client believes it did.
+          sta = fw.succeed("iw dev wlan0 station dump")
+          assert "Station" in sta, sta
+
+          # And it carries IP traffic. The association is the handshake; this is
+          # the network.
+          fw.succeed("ip netns exec sta ip addr add 10.0.10.2/24 dev wlan1")
+          fw.wait_until_succeeds(
+              "ip netns exec sta ping -c2 -W2 10.0.10.1", timeout=60
+          )
+
+          # Removing the radio stops its daemon and takes the config with it — a
+          # radio that cannot be turned off is a network nobody meant to run.
+          fw.succeed(
+              "su admin -c \"printf '%s\\n' "
+              "'delete interface wlan0 wireless' "
+              "'delete interface wlan0 type' "
+              "commit save exit | sentinel configure\""
+          )
+          fw.wait_until_fails("test -f /run/sentinel/wireless/wlan0.conf", timeout=30)
+          fw.wait_until_fails(
+              "systemctl is-active sentinel-hostapd@wlan0.service", timeout=30
+          )
+        '';
+      };
+
+      # The cellular dial script, against a stand-in for `mmcli`.
+      #
+      # A virtual machine has no modem, so what this proves is bounded and worth
+      # stating: the *script* is exercised end to end through its systemd unit —
+      # which modem it picks, whether it unlocks the SIM, what it dials, and
+      # whether it re-dials — against a double that answers the way `mmcli`
+      # does. That real ModemManager output matches the double's is the one thing
+      # left for hardware.
+      #
+      # The double reports TWO modems and puts the configured interface on the
+      # second, so "found by its interface" is a real assertion rather than a
+      # coincidence of both being zero.
+      #
+      #   nix build .#checks.x86_64-linux.wwan -L
+      wwan = pkgs.testers.runNixOSTest {
+        name = "sentinel-wwan";
+        nodes.fw =
+          { lib, pkgs, ... }:
+          let
+            fakeMmcli = pkgs.writeShellScriptBin "mmcli" ''
+              log=/tmp/mmcli.log
+              state=/tmp/mm.state
+              echo "$@" >> "$log"
+              [ -f "$state" ] || echo locked > "$state"
+              if [ "$1" = "-L" ]; then
+                echo "    /org/freedesktop/ModemManager1/Modem/0 [Acme] OtherModem"
+                echo "    /org/freedesktop/ModemManager1/Modem/1 [Acme] TheModem"
+                exit 0
+              fi
+              if [ "$1" = "-m" ]; then
+                m=$2; shift 2
+                case "$1" in
+                  --output-keys)
+                    echo "modem.generic.state                      : $(cat $state)"
+                    echo "modem.generic.sim                        : /org/freedesktop/ModemManager1/SIM/7"
+                    echo "modem.generic.ports.value[1]             : cdc-wdm0 (qmi)"
+                    # Only modem 1 carries the interface the configuration names.
+                    if [ "$m" = "1" ]; then
+                      echo "modem.generic.ports.value[2]             : wwan0 (net)"
+                    else
+                      echo "modem.generic.ports.value[2]             : wwan9 (net)"
+                    fi
+                    exit 0;;
+                  --simple-connect=*)
+                    echo connected > "$state"; exit 0;;
+                esac
+                exit 0
+              fi
+              if [ "$1" = "-i" ]; then
+                echo registered > "$state"; exit 0
+              fi
+              exit 0
+            '';
+          in
+          {
+            imports = [ self.nixosModules.sentinel ];
+            networking.hostName = lib.mkForce "fw";
+            networking.firewall.enable = lib.mkForce false;
+            virtualisation.vlans = [ 1 ];
+            virtualisation.memorySize = 2048;
+            # The stand-in wins over the real ModemManager on the unit's PATH.
+            systemd.services."sentinel-wwan@".path = lib.mkForce [
+              fakeMmcli
+              pkgs.gnused
+              pkgs.gnugrep
+              pkgs.coreutils
+            ];
+            environment.systemPackages = [ fakeMmcli ];
+          };
+        testScript = ''
+          start_all()
+          fw.wait_for_unit("multi-user.target")
+          fw.wait_for_unit("sentinel-boot.service")
+
+          # The net device a modem would have provided.
+          fw.succeed("ip link add wwan0 type dummy && ip link set wwan0 up")
+
+          fw.succeed(
+              "su admin -c \"printf '%s\\n' "
+              "'set firewall global default-action accept' "
+              "'set interface wwan0 type wwan' "
+              "'set interface wwan0 zone wan' "
+              "'set firewall zone wan default-action accept' "
+              "'set interface wwan0 address dhcp' "
+              "'set interface wwan0 wwan apn internet' "
+              "'set interface wwan0 wwan pin 1234' "
+              "commit save exit "
+              "| sentinel configure\""
+          )
+
+          # The script is a secret: it holds the APN password and the SIM PIN.
+          mode = fw.succeed("stat -c %a /run/sentinel/wwan/wwan0.sh").strip()
+          assert mode == "600", f"the dial script is {mode}, not 600"
+
+          fw.wait_for_unit("sentinel-wwan@wwan0.service")
+          fw.wait_until_succeeds("grep -q -- '--simple-connect' /tmp/mmcli.log", timeout=60)
+          # Not `log`: the test driver already has a global of that name, and the
+          # type checker refuses the shadow before the VM ever starts.
+          calls = fw.succeed("cat /tmp/mmcli.log")
+
+          # (1) It dialled the modem that carries the configured interface, not
+          # the first one it found. Modem 0 has wwan9; only modem 1 has wwan0.
+          assert "-m 1 --simple-connect=apn=internet,ip-type=ipv4v6" in calls, calls
+          assert "-m 0 --simple-connect" not in calls, calls
+
+          # (2) The SIM was unlocked through the SIM's own path. Using the modem
+          # index works when there is one modem with one SIM and unlocks the
+          # wrong card when there is not — the double gives the SIM a different
+          # number so the two cannot be confused.
+          assert "-i /org/freedesktop/ModemManager1/SIM/7 --pin=1234" in calls, calls
+
+          # (3) A dropped bearer is re-dialled. The uplink that dials once is the
+          # uplink that is down until somebody notices.
+          before = calls.count("--simple-connect")
+          fw.succeed("echo registered > /tmp/mm.state")
+          fw.wait_until_succeeds(
+              f"test $(grep -c -- '--simple-connect' /tmp/mmcli.log) -gt {before}",
+              timeout=90,
+          )
+
+          # (4) With no PIN configured, none is sent — an attempt is spent off a
+          # counter of three.
+          fw.succeed("rm -f /tmp/mmcli.log && echo registered > /tmp/mm.state")
+          fw.succeed(
+              "su admin -c \"printf '%s\\n' "
+              "'delete interface wwan0 wwan pin' "
+              "commit save exit | sentinel configure\""
+          )
+          fw.wait_until_succeeds("grep -q -- '--simple-connect' /tmp/mmcli.log", timeout=60)
+          assert "--pin" not in fw.succeed("cat /tmp/mmcli.log")
+
+          # (5) Removing the bearer stops the dial and takes the script with it.
+          fw.succeed(
+              "su admin -c \"printf '%s\\n' "
+              "'delete interface wwan0 wwan' "
+              "'delete interface wwan0 type' "
+              "'delete interface wwan0 address' "
+              "commit save exit | sentinel configure\""
+          )
+          fw.wait_until_fails("test -f /run/sentinel/wwan/wwan0.sh", timeout=30)
+          fw.wait_until_fails(
+              "systemctl is-active sentinel-wwan@wwan0.service", timeout=30
+          )
+        '';
+      };
+
       ipsec = pkgs.testers.runNixOSTest {
         name = "sentinel-ipsec";
         nodes =
@@ -6849,6 +7322,252 @@
           '';
         };
 
+        # Per-link IPv4/IPv6 behaviour and DHCP-client identity reach the kernel.
+        #
+        # This one is worth a VM rather than a unit test because the settings
+        # leave the appliance by two different roads: what systemd-networkd has a
+        # directive for goes into the `.network` unit, and the ARP switches it has
+        # none for go into a sysctl drop-in. A unit test can assert what was
+        # written; only a running kernel can say whether both roads arrive.
+        #
+        # Proxy ARP is asserted behaviourally — a client resolves an address that
+        # is not on its segment and gets the firewall's MAC — because reading
+        # `proxy_arp` back proves the write, not the effect.
+        #
+        #   nix build .#checks.x86_64-linux.linkbehaviour -L
+        linkbehaviour = pkgs.testers.runNixOSTest {
+          name = "sentinel-linkbehaviour";
+          nodes = {
+            # A deliberately too-wide netmask: the client believes 10.7.9.5 is on
+            # its own wire and ARPs for it, which is the only way proxy ARP is
+            # ever reached.
+            client =
+              { lib, ... }:
+              {
+                networking.firewall.enable = lib.mkForce false;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = "10.7.0.2";
+                    prefixLength = 16;
+                  }
+                ];
+                virtualisation.vlans = [ 1 ];
+              };
+            # The DHCP server the firewall's second link leases from. It hands
+            # 10.8.0.50 to a client identifying itself as `line-42` and anything
+            # else an address from the pool — so the address the firewall ends up
+            # with says whether option 61 went on the wire.
+            server =
+              { lib, pkgs, ... }:
+              {
+                networking.firewall.enable = lib.mkForce false;
+                networking.useDHCP = false;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = "10.8.0.1";
+                    prefixLength = 24;
+                  }
+                ];
+                virtualisation.vlans = [ 2 ];
+                services.dnsmasq = {
+                  enable = true;
+                  settings = {
+                    port = 0;
+                    interface = "eth1";
+                    bind-interfaces = true;
+                    dhcp-range = [ "10.8.0.100,10.8.0.150,12h" ];
+                    # The reservation is written at run time (below) from the
+                    # firewall's own MAC, because that is the identifier being
+                    # tested and hard-coding a NixOS test MAC would break
+                    # confusingly the day the node order changes.
+                    conf-dir = "/run/dnsmasq-extra";
+                  };
+                };
+                # dnsmasq refuses to start if its conf-dir does not exist, and a
+                # tmpfs one does not survive a boot.
+                systemd.tmpfiles.rules = [ "d /run/dnsmasq-extra 0755 root root -" ];
+                environment.systemPackages = [ pkgs.dnsmasq ];
+              };
+            fw =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "fw";
+                networking.firewall.enable = lib.mkForce false;
+                # eth1's address is set through Sentinel below, not here. Once
+                # Sentinel writes a `.network` for a link it owns that link
+                # entirely, and a NixOS-configured address on the same interface
+                # simply disappears — which is what the first run of this check
+                # discovered.
+                virtualisation.vlans = [
+                  1
+                  2
+                ];
+                virtualisation.memorySize = 2048;
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+          };
+          testScript = ''
+            start_all()
+            for m in (client, server, fw):
+                m.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+            client.wait_until_succeeds("ip addr show eth1 | grep -q 10.7.0.2", timeout=20)
+            server.wait_for_unit("dnsmasq.service")
+
+            fw_mac = fw.succeed("cat /sys/class/net/eth1/address").strip()
+
+            def configure(*lines):
+                body = " ".join(f"'{line}' " for line in lines)
+                fw.succeed(
+                    "su admin -c \"printf '%s\\n' " + body
+                    + "commit save exit | sentinel configure\""
+                )
+                fw.wait_for_unit("velstra.service")
+
+            def neighbours():
+                # A fresh resolution each time; a cached entry would answer for
+                # the previous phase.
+                client.succeed("ip neigh flush dev eth1")
+                client.execute("ping -c 2 -W 2 10.7.9.5")
+                return client.succeed("ip neigh show dev eth1")
+
+            def diagnosis():
+                return (
+                    "\nclient neighbours:\n" + neighbours()
+                    + "\nfw proxy_arp: " + fw.succeed("cat /proc/sys/net/ipv4/conf/eth1/proxy_arp")
+                    + "fw forwarding: " + fw.succeed("cat /proc/sys/net/ipv4/conf/eth1/forwarding")
+                    + "fw routes:\n" + fw.succeed("ip -4 route show")
+                    + "fw unit:\n" + fw.succeed("cat /run/systemd/network/10-sentinel-eth1.network")
+                )
+
+            # Phase 1 — the baseline. The firewall has a route to 10.7.9.0/24 out
+            # a link of its own, and still must not answer for it, because proxy
+            # ARP is off.
+            configure(
+                "set firewall global default-action accept",
+                "set interface eth1 zone lan",
+                "set interface eth1 address 10.7.0.1/24",
+                "set firewall zone lan default-action accept",
+                "set interface dum0 type dummy",
+                "set interface dum0 address 10.7.9.1/24",
+                "set interface dum0 zone lan",
+            )
+            # The dummy must exist and carry its route before anything below
+            # means anything: proxy ARP is only reached when the firewall has a
+            # route to the target out a *different* link. This wait is also what
+            # caught `type = "dummy"` rendering no .netdev at all.
+            fw.wait_until_succeeds("ip -4 route show | grep -q '10.7.9.0/24 dev dum0'", timeout=30)
+            fw.wait_until_succeeds("ip addr show eth1 | grep -q 10.7.0.1", timeout=30)
+            # A router forwards unless told otherwise, and says so per link
+            # rather than trusting whatever networkd's default happens to be.
+            assert fw.succeed("cat /proc/sys/net/ipv4/conf/eth1/forwarding").strip() == "1"
+            assert fw_mac not in neighbours(), "the firewall answered ARP for another segment without being asked to"
+
+            # Phase 2 — proxy ARP on, and the same resolution now lands on the
+            # firewall's own MAC.
+            configure("set interface eth1 ip proxy-arp true")
+            assert fw_mac in neighbours(), (
+                "proxy-arp did not make the firewall answer for the other segment" + diagnosis()
+            )
+
+            # Phase 3 — the switches networkd has no directive for. These travel
+            # as a sysctl drop-in, so reading them back is reading the other road.
+            configure(
+                "set interface eth1 ip arp-filter true",
+                "set interface eth1 ip arp-accept true",
+                "set interface eth1 ip arp-announce true",
+                "set interface eth1 ip arp-cache-timeout 30",
+                "set interface eth1 ip directed-broadcast true",
+                "set interface eth1 ipv6 disable-forwarding true",
+                "set interface eth1 ipv6 dad-transmits 2",
+                "set interface eth1 ipv6 accept-dad 2",
+            )
+            for path, want in [
+                ("/proc/sys/net/ipv4/conf/eth1/proxy_arp", "1"),
+                ("/proc/sys/net/ipv4/conf/eth1/arp_filter", "1"),
+                ("/proc/sys/net/ipv4/conf/eth1/arp_accept", "1"),
+                ("/proc/sys/net/ipv4/conf/eth1/arp_announce", "2"),
+                ("/proc/sys/net/ipv4/conf/eth1/bc_forwarding", "1"),
+                ("/proc/sys/net/ipv4/neigh/eth1/base_reachable_time_ms", "30000"),
+                ("/proc/sys/net/ipv6/conf/eth1/forwarding", "0"),
+                ("/proc/sys/net/ipv6/conf/eth1/dad_transmits", "2"),
+                ("/proc/sys/net/ipv6/conf/eth1/accept_dad", "2"),
+            ]:
+                got = fw.succeed(f"cat {path}").strip()
+                assert got == want, (
+                    f"{path} is {got}, expected {want}\n--- br0.netdev ---\n{brdev}"
+                    + "\n--- ip -d link show br0 ---\n"
+                    + fw.execute("ip -d link show br0")[1]
+                    + "\n--- networkctl status br0 ---\n"
+                    + fw.execute("networkctl status br0")[1]
+                )
+
+            # The drop-in is what makes them survive a reboot; the immediate write
+            # is what makes `commit` mean now. Both, or the setting is a surprise
+            # at the next boot in one direction or the other.
+            dropin = fw.succeed("cat /run/sysctl.d/70-sentinel.conf")
+            assert "net.ipv4.conf.eth1.arp_filter = 1" in dropin, dropin
+
+            # Phase 4 — a link with no automatic fe80:: address at all.
+            configure("set interface dum0 ipv6 no-link-local true")
+            fw.wait_until_fails("ip -6 addr show dev dum0 | grep -q fe80::", timeout=30)
+
+            # Phase 5 — the DHCP client's identity really goes on the wire.
+            #
+            # The server reserves an address for one exact client-id: hardware
+            # type 01 followed by the firewall's MAC, which is what option 61
+            # carries under `client-id mac` and under nothing else. The default
+            # identifier is a DUID, so getting the reserved address is proof the
+            # setting reached the wire rather than merely the configuration.
+            eth2_mac = fw.succeed("cat /sys/class/net/eth2/address").strip()
+            server.succeed(
+                "mkdir -p /run/dnsmasq-extra && "
+                + f"echo 'dhcp-host=id:01:{eth2_mac},10.8.0.50' > /run/dnsmasq-extra/reserved.conf && "
+                + "systemctl restart dnsmasq"
+            )
+            server.wait_for_unit("dnsmasq.service")
+            configure(
+                "set interface eth2 zone lan",
+                "set interface eth2 address dhcp",
+                "set interface eth2 dhcp client-id mac",
+                "set interface eth2 dhcp host-name fw",
+                "set interface eth2 dhcp default-route-distance 210",
+            )
+            fw.wait_until_succeeds("ip addr show eth2 | grep -q 10.8.0.50", timeout=90)
+            # The hostname is the other half of the same exchange, and the server
+            # is the only place it can be observed.
+            leases = server.succeed("cat /var/lib/dnsmasq/dnsmasq.leases")
+            assert "10.8.0.50" in leases and "fw" in leases, leases
+            # The metric came from the lease, not from a default.
+            fw.succeed("ip -4 route show default dev eth2 | grep -q 'metric 210'")
+
+            # Phase 6 — port mirroring. A copy of eth1's traffic is queued for
+            # transmission on dum0, a link that carries none of it otherwise, so
+            # its counter moving is the mirror and nothing else.
+            #
+            # `tx`, not `rx`: `mirred egress mirror` sends the copy *out* of the
+            # destination. A dummy device's transmit is a no-op that still counts,
+            # which is exactly what makes it a usable target here.
+            def mirrored():
+                return int(fw.succeed("cat /sys/class/net/dum0/statistics/tx_packets").strip())
+
+            configure("set interface eth1 mirror-ingress dum0")
+            before = mirrored()
+            client.succeed("ping -c 5 -W 2 10.7.0.1")
+            after = mirrored()
+            assert after > before, f"nothing was mirrored to dum0 ({before} -> {after})"
+
+            # And it stops when the configuration says so — a mirror that cannot
+            # be turned off is a monitor port that fills a disk.
+            configure("delete interface eth1 mirror-ingress")
+            stopped = mirrored()
+            client.succeed("ping -c 5 -W 2 10.7.0.1")
+            still = mirrored()
+            assert still == stopped, f"the mirror kept running after being deleted ({stopped} -> {still})"
+          '';
+        };
+
         # A rule can name an ICMP type, and the type is what it matches.
         #
         # Three phases, because the interesting failure is not "the rule does
@@ -8828,6 +9547,25 @@
                 "'set interface bond0 bond-mode active-backup' "
                 "'set interface bond0 member eth2' "
                 "'set interface eth2' "
+                # The detail: spanning tree and its timers, MAC ageing, multicast
+                # snooping and a querier on the bridge; cost/priority/learning on
+                # the port; hashing, failure detection and the preferred member on
+                # the bond.
+                "'set interface br0 bridge stp true' "
+                "'set interface br0 bridge priority 4096' "
+                "'set interface br0 bridge hello-time 2' "
+                "'set interface br0 bridge max-age 20' "
+                "'set interface br0 bridge forward-delay 4' "
+                "'set interface br0 bridge ageing-time 120' "
+                "'set interface br0 bridge igmp-snooping true' "
+                "'set interface br0 bridge igmp-querier true' "
+                "'set interface eth1 bridge-port cost 100' "
+                "'set interface eth1 bridge-port priority 32' "
+                "'set interface eth1 bridge-port learning false' "
+                "'set interface bond0 bond hash-policy layer3+4' "
+                "'set interface bond0 bond min-links 1' "
+                "'set interface bond0 bond primary eth2' "
+                "'set interface bond0 bond mii-interval 100' "
                 "commit save exit "
                 "| sentinel configure\""
             )
@@ -8840,6 +9578,8 @@
             brdev = fw.succeed("cat /run/systemd/network/10-sentinel-br0.netdev")
             assert "Kind=bridge" in brdev, brdev
             assert "VLANFiltering=yes" in brdev, brdev
+            assert "STP=yes" in brdev, brdev
+            assert "MulticastQuerier=yes" in brdev, brdev
             bonddev = fw.succeed("cat /run/systemd/network/10-sentinel-bond0.netdev")
             assert "Kind=bond" in bonddev, bonddev
             assert "Mode=active-backup" in bonddev, bonddev
@@ -8859,6 +9599,54 @@
             fw.wait_until_succeeds(
                 "grep -qi 'Bonding Mode: fault-tolerance' /proc/net/bonding/bond0", timeout=30
             )
+
+            # The detail reached the kernel, read back from where the kernel keeps
+            # it rather than from the unit that asked for it. A rendered directive
+            # is evidence the renderer ran, not that the device took it.
+            #
+            # The bridge timers are in units of 1/100 s in sysfs — 2 seconds reads
+            # back as 200 — which is exactly the kind of conversion a unit test
+            # cannot catch.
+            # Printed unconditionally: when one of these disagrees the answer is
+            # in the file and the device, and a failure message that has to
+            # survive a multi-line assert is a bad place to keep it.
+            print("--- br0.netdev ---\n" + brdev)
+            print("--- ip -d link show br0 ---\n" + fw.execute("ip -d link show br0")[1])
+            print("--- bridge sysfs ---\n" + fw.execute("grep -r . /sys/class/net/br0/bridge/ 2>/dev/null | head -40")[1])
+
+            # Wait out the spanning-tree convergence before reading anything
+            # back. A bridge in a topology change ages its forwarding table at
+            # `2 x forward_delay` instead of the configured time — 802.1D, so the
+            # database re-learns after the topology moved — and reading
+            # `ageing_time` during that window returns 800, not the 12000 that was
+            # asked for. The setting is applied the whole time; the kernel is
+            # overriding it, and the override ends with the topology-change timer
+            # (max_age + forward_delay).
+            fw.wait_until_succeeds(
+                "ip -d link show br0 | grep -q 'topology_change 0'", timeout=60
+            )
+
+            for path, want in [
+                ("/sys/class/net/br0/bridge/stp_state", "1"),
+                ("/sys/class/net/br0/bridge/priority", "4096"),
+                ("/sys/class/net/br0/bridge/hello_time", "200"),
+                ("/sys/class/net/br0/bridge/max_age", "2000"),
+                ("/sys/class/net/br0/bridge/forward_delay", "400"),
+                ("/sys/class/net/br0/bridge/ageing_time", "12000"),
+                ("/sys/class/net/br0/bridge/multicast_snooping", "1"),
+                ("/sys/class/net/br0/bridge/multicast_querier", "1"),
+                ("/sys/class/net/eth1/brport/path_cost", "100"),
+                ("/sys/class/net/eth1/brport/priority", "32"),
+                ("/sys/class/net/eth1/brport/learning", "0"),
+                ("/sys/class/net/bond0/bonding/min_links", "1"),
+            ]:
+                got = fw.succeed(f"cat {path}").strip()
+                assert got == want, f"{path} is {got}, expected {want}"
+
+            # The bond's own settings read back as a word plus its number.
+            assert "layer3+4" in fw.succeed("cat /sys/class/net/bond0/bonding/xmit_hash_policy")
+            assert "eth2" in fw.succeed("cat /sys/class/net/bond0/bonding/primary")
+            assert "100" == fw.succeed("cat /sys/class/net/bond0/bonding/miimon").strip()
           '';
         };
 

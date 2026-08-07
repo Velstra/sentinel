@@ -18,10 +18,10 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::config::{
-    Appliance, DhcpRelay, DhcpServer, Dns, Dyndns, IfaceType, Interface, Lldp, Mdns, MultiWan,
-    Nat64, Ntp, Qos, QosDiscipline, RouterAdvert, Snmp, Ssh, Syslog, SyslogLevel, SyslogProto,
-    WAN_CHECK_FAIL, WAN_CHECK_INTERVAL, WAN_CHECK_RISE, WAN_CHECK_TIMEOUT, WanMode,
-    WireguardTunnel,
+    Appliance, BridgePort, Dhcp6Client, DhcpClient, DhcpRelay, DhcpServer, Dns, Dyndns, IfaceType,
+    Interface, Ip6Options, IpOptions, Lldp, Mdns, MultiWan, Nat64, Ntp, Qos, QosDiscipline,
+    RouterAdvert, Snmp, Ssh, Syslog, SyslogLevel, SyslogProto, WAN_CHECK_FAIL, WAN_CHECK_INTERVAL,
+    WAN_CHECK_RISE, WAN_CHECK_TIMEOUT, WanMode, WireguardTunnel,
 };
 use crate::system::{self, NETWORKD_RUNTIME_DIR};
 
@@ -188,8 +188,20 @@ fn bridge_vlan_body(tagged: &[u16], untagged: Option<u16>) -> String {
     body
 }
 
+/// The `.netdev` for a virtual L2 device: a bridge (`Kind=bridge`) or a bond
+/// (`Kind=bond` + `[Bond] Mode=`, default `active-backup`). Members attach via
+/// their own `.network` (`Bridge=`/`Bond=`), not here.
+/// A millisecond interval as systemd's time syntax wants it. networkd's
+/// `…Sec=` settings take a span, not a number of seconds, so a bond's
+/// millisecond interval has to say so — `100` would mean a hundred *seconds*,
+/// which for a link monitor is the difference between noticing a failure and
+/// not.
+fn millis(ms: u32) -> String {
+    format!("{ms}ms")
+}
+
 /// The interfaces whose device this box creates through the virtual-L2 netdev
-/// renderer: bridges, bonds and dummies.
+/// renderer: bridges, bonds, dummies and route-based IPsec links.
 ///
 /// A function rather than an inline filter because getting it wrong is silent —
 /// the interface configures, validates and renders a `.network` unit, and the
@@ -197,33 +209,92 @@ fn bridge_vlan_body(tagged: &[u16], untagged: Option<u16>) -> String {
 fn virtual_l2_netdev_ifaces(ifaces: &[Interface]) -> Vec<&Interface> {
     ifaces
         .iter()
-        .filter(|i| i.is_virtual_l2() || i.is_dummy())
+        .filter(|i| i.is_virtual_l2() || i.is_dummy() || i.is_vti())
         .collect()
 }
 
-/// The `.netdev` for a virtual L2 device: a bridge (`Kind=bridge`) or a bond
-/// (`Kind=bond` + `[Bond] Mode=`, default `active-backup`). Members attach via
-/// their own `.network` (`Bridge=`/`Bond=`), not here.
 fn virtual_l2_netdev_body(iface: &Interface) -> String {
     match iface.if_type {
         Some(IfaceType::Bridge) => {
             let mut body = format!("[NetDev]\nName={}\nKind=bridge\n", iface.name);
+            let b = &iface.bridge;
             // A VLAN-aware bridge does 802.1Q filtering in the switch; the member
             // ports carry their tagged/untagged VLANs in `[BridgeVLAN]` sections.
+            // Spanning tree, the timers it uses and multicast snooping share the
+            // same `[Bridge]` section, so the header is opened once.
+            if iface.vlan_aware == Some(true) || !b.is_empty() {
+                body.push_str("\n[Bridge]\n");
+            }
             if iface.vlan_aware == Some(true) {
-                body.push_str("\n[Bridge]\nVLANFiltering=yes\n");
+                body.push_str("VLANFiltering=yes\n");
+            }
+            if b.stp {
+                body.push_str("STP=yes\n");
+            }
+            if let Some(p) = b.priority {
+                body.push_str(&format!("Priority={p}\n"));
+            }
+            for (val, key) in [
+                (b.hello_time, "HelloTimeSec"),
+                (b.max_age, "MaxAgeSec"),
+                (b.forward_delay, "ForwardDelaySec"),
+                (b.ageing_time, "AgeingTimeSec"),
+            ] {
+                if let Some(v) = val {
+                    body.push_str(&format!("{key}={v}\n"));
+                }
+            }
+            if b.igmp_snooping {
+                body.push_str("MulticastSnooping=yes\n");
+            }
+            if b.igmp_querier {
+                body.push_str("MulticastQuerier=yes\n");
             }
             body
         }
         Some(IfaceType::Bond) => {
             let mode = iface.bond_mode.as_deref().unwrap_or("active-backup");
-            format!(
+            let mut body = format!(
                 "[NetDev]\nName={}\nKind=bond\n\n[Bond]\nMode={mode}\n",
                 iface.name
-            )
+            );
+            let b = &iface.bond;
+            if let Some(h) = &b.hash_policy {
+                body.push_str(&format!("TransmitHashPolicy={h}\n"));
+            }
+            if let Some(r) = &b.lacp_rate {
+                body.push_str(&format!("LACPTransmitRate={r}\n"));
+            }
+            if let Some(n) = b.min_links {
+                body.push_str(&format!("MinLinks={n}\n"));
+            }
+            if let Some(ms) = b.mii_interval {
+                body.push_str(&format!("MIIMonitorSec={}\n", millis(ms)));
+            }
+            // ARP monitoring notices the failure carrier detection misses: a link
+            // that is up and carries nothing.
+            if let Some(ms) = b.arp_interval {
+                body.push_str(&format!("ARPIntervalSec={}\n", millis(ms)));
+            }
+            for t in &b.arp_target {
+                body.push_str(&format!("ARPIPTargets={t}\n"));
+            }
+            body
         }
         // A dummy link has nothing to configure beyond existing.
         Some(IfaceType::Dummy) => format!("[NetDev]\nName={}\nKind=dummy\n", iface.name),
+        // A route-based IPsec link. `Independent=yes` because there is no
+        // underlying device to offload to and none to inherit state from: the
+        // link is up when the SA is, not when some NIC is. `InterfaceId` is what
+        // the tunnel's `if_id_in`/`if_id_out` match, and validation has already
+        // insisted on it.
+        Some(IfaceType::Vti) => format!(
+            "[NetDev]\nName={}\nKind=xfrm\n\n[Xfrm]\nInterfaceId={}\nIndependent=yes\n",
+            iface.name,
+            iface.vti_key.unwrap_or_default()
+        ),
+        // A wireless radio is a real NIC the kernel already provides; hostapd or
+        // wpa_supplicant runs on it. Nothing to create, so no netdev.
         // A PPPoE client is brought up by `pppd` over its parent NIC, not by a
         // networkd netdev — `apply_pppoe` owns it, so there is nothing to render
         // here (same as an interface with no type). Kernel tunnels are handled by
@@ -231,6 +302,8 @@ fn virtual_l2_netdev_body(iface: &Interface) -> String {
         None
         | Some(
             IfaceType::Pppoe
+            | IfaceType::Wireless
+            | IfaceType::Wwan
             | IfaceType::Wireguard
             | IfaceType::Gre
             | IfaceType::Ipip
@@ -354,7 +427,34 @@ fn network_body(
         description,
         disabled,
         None,
+        &LinkTunables::default(),
     )
+}
+
+/// The per-link kernel switches and DHCP-client identity of one interface,
+/// borrowed together.
+///
+/// One struct rather than a dozen more positional parameters: the render
+/// function already takes fifteen, and four independent blocks arriving as
+/// `bool, bool, Option<u32>, bool, bool, …` is a call site where a transposed
+/// pair of booleans compiles and quietly configures the wrong link behaviour.
+#[derive(Default, Clone, Copy)]
+pub struct LinkTunables<'a> {
+    /// `[interface.ip]` — IPv4 forwarding, ARP and directed broadcast.
+    pub ip: Option<&'a IpOptions>,
+    /// `[interface.ipv6]` — IPv6 forwarding, link-local and DAD.
+    pub ipv6: Option<&'a Ip6Options>,
+    /// `[interface.dhcp]` — what the DHCPv4 client sends and accepts.
+    pub dhcp: Option<&'a DhcpClient>,
+    /// `[interface.dhcpv6]` — what the DHCPv6 client sends and accepts.
+    pub dhcpv6: Option<&'a Dhcp6Client>,
+    /// `[interface.bridge-port]` — this link's cost, priority and learning as a
+    /// port of whichever bridge enslaves it.
+    pub bridge_port: Option<&'a BridgePort>,
+    /// True when the bond that enslaves this link names it as its `primary`.
+    /// Derived on the *bond* and written on the *member*, because that is where
+    /// networkd wants it.
+    pub bond_primary: bool,
 }
 
 /// [`network_body`], plus the captive-portal URI this interface's DHCP server
@@ -380,7 +480,9 @@ fn network_unit_body(
     description: Option<&str>,
     disabled: bool,
     portal_uri: Option<&str>,
+    tun: &LinkTunables<'_>,
 ) -> String {
+    let bond_primary = tun.bond_primary;
     let v4dhcp = address == Some("dhcp");
     let v6dhcp = address6 == Some("dhcp");
     // An operator description becomes a comment header on the unit — documentary
@@ -415,6 +517,12 @@ fn network_unit_body(
     if let Some(m) = master {
         body.push_str(&format!("{m}\n"));
     }
+    // The bond's preferred member. Configured on the bond (`bond primary eth3`)
+    // and written here, on eth3, because networkd asks the member whether it is
+    // the primary rather than asking the bond which member is.
+    if bond_primary {
+        body.push_str("PrimarySlave=yes\n");
+    }
     for child in vlan_children {
         body.push_str(&format!("VLAN={child}\n"));
     }
@@ -443,11 +551,117 @@ fn network_unit_body(
     if pd.is_some() {
         body.push_str("DHCPPrefixDelegation=yes\n");
     }
+    // Per-link kernel behaviour networkd has a directive for. Still inside
+    // [Network], so it has to be written before any sub-section opens — the ARP
+    // switches it has no directive for are sysctls, written by `link_sysctls`.
+    //
+    // Forwarding is written in **both** directions rather than only when it is
+    // switched off. This box is a router, and a router that says nothing about
+    // forwarding is at the mercy of whatever networkd's own default happens to
+    // be — which is how a link ends up with `forwarding: 0` after a reconfigure,
+    // despite the boot script having set the global `ip_forward`. A VM check
+    // found exactly that, and the symptom is a link that carries traffic to the
+    // box and none through it.
+    if let Some(p) = tun.ip {
+        let on = if p.disable_forwarding { "no" } else { "yes" };
+        body.push_str(&format!("IPv4Forwarding={on}\n"));
+        if p.proxy_arp {
+            body.push_str("IPv4ProxyARP=yes\n");
+        }
+        if p.proxy_arp_pvlan {
+            body.push_str("IPv4ProxyARPPrivateVLAN=yes\n");
+        }
+    }
+    if let Some(p) = tun.ipv6 {
+        let on = if p.disable_forwarding { "no" } else { "yes" };
+        body.push_str(&format!("IPv6Forwarding={on}\n"));
+        if p.no_link_local {
+            body.push_str("LinkLocalAddressing=no\n");
+        }
+        if let Some(n) = p.dad_transmits {
+            body.push_str(&format!("IPv6DuplicateAddressDetection={n}\n"));
+        }
+    }
+
+    // This link as a port of a bridge. Its own `[Bridge]` section in the
+    // *network* unit, distinct from the bridge device's `[Bridge]` in the netdev
+    // — same name, opposite ends of the relationship.
+    if let Some(p) = tun.bridge_port.filter(|p| !p.is_empty()) {
+        body.push_str("\n[Bridge]\n");
+        if let Some(c) = p.cost {
+            body.push_str(&format!("Cost={c}\n"));
+        }
+        if let Some(v) = p.priority {
+            body.push_str(&format!("Priority={v}\n"));
+        }
+        if let Some(l) = p.learning {
+            body.push_str(&format!("Learning={}\n", if l { "yes" } else { "no" }));
+        }
+    }
+
+    // What this link's DHCPv4 client sends and accepts. Emitted from the block
+    // alone rather than from `address = "dhcp"`: commit already refuses one
+    // without the other, so the two can never disagree here, and reading the
+    // address again would be a second place to get that rule slightly wrong.
+    if let Some(d) = tun.dhcp.filter(|d| !d.is_empty()) {
+        body.push_str("\n[DHCPv4]\n");
+        // `ClientIdentifier=`, not `SendOption=61:…`. Option 61 is one the
+        // network layer builds itself, so an arbitrary one handed to it is
+        // discarded — a VM check watching the server's log found the option
+        // simply absent, with the configuration reporting success.
+        if let Some(id) = &d.client_id {
+            body.push_str(&format!("ClientIdentifier={id}\n"));
+        }
+        if let Some(duid) = &d.duid {
+            body.push_str("DUIDType=raw\n");
+            body.push_str(&format!("DUIDRawData={duid}\n"));
+        }
+        if let Some(h) = &d.host_name {
+            body.push_str(&format!("Hostname={h}\n"));
+        }
+        if let Some(v) = &d.vendor_class_id {
+            body.push_str(&format!("VendorClassIdentifier={v}\n"));
+        }
+        if let Some(u) = &d.user_class {
+            body.push_str(&format!("UserClass={u}\n"));
+        }
+        if d.no_default_route {
+            body.push_str("UseGateway=no\n");
+        }
+        if let Some(m) = d.default_route_distance {
+            body.push_str(&format!("RouteMetric={m}\n"));
+        }
+        if !d.reject.is_empty() {
+            body.push_str(&format!("DenyList={}\n", d.reject.join(" ")));
+        }
+    }
 
     // A DHCPv6 client (WAN uplink): solicit immediately rather than waiting for
     // a Router Advertisement, so a prefix delegation is requested up front.
-    if v6dhcp {
-        body.push_str("\n[DHCPv6]\nWithoutRA=solicit\n");
+    // `parameters-only` changes that to an information request — the stateless
+    // case, where the address comes from SLAAC and only DNS/NTP are asked for.
+    let d6 = tun.dhcpv6.filter(|d| !d.is_empty());
+    if v6dhcp || d6.is_some() {
+        body.push_str("\n[DHCPv6]\n");
+        if v6dhcp {
+            let mode = match d6 {
+                Some(d) if d.parameters_only => "information-request",
+                _ => "solicit",
+            };
+            body.push_str(&format!("WithoutRA={mode}\n"));
+        }
+        if let Some(d) = d6 {
+            if let Some(duid) = &d.duid {
+                body.push_str("DUIDType=raw\n");
+                body.push_str(&format!("DUIDRawData={duid}\n"));
+            }
+            if d.rapid_commit {
+                body.push_str("RapidCommit=yes\n");
+            }
+            if d.no_release {
+                body.push_str("SendRelease=no\n");
+            }
+        }
     }
     // The prefix-delegation downstream: take subnet `id` out of the uplink's
     // delegated prefix and advertise the resulting /64 to this interface's LAN.
@@ -2402,6 +2616,91 @@ fn apply_qos(appliance: &Appliance) -> Result<()> {
     Ok(())
 }
 
+/// Where the applied mirror spec per source interface is remembered, so a
+/// reconcile can tell a changed mirror from an unchanged one and a removed
+/// mirror from one that was never there.
+const MIRROR_RUNTIME_DIR: &str = "/run/sentinel/mirror";
+
+/// The `tc` arguments that mirror one direction of `src` to `dst`.
+///
+/// `clsact` rather than a root qdisc, deliberately: it offers an ingress *and* an
+/// egress hook without owning the root, so mirroring coexists with the CAKE or
+/// fq_codel shaper an interface may already have — and with the datapath's own
+/// TC program, which attaches to the same qdisc.
+fn mirror_filter_args<'a>(src: &'a str, dir: &'a str, dst: &'a str) -> Vec<&'a str> {
+    vec![
+        "filter", "replace", "dev", src, dir, "protocol", "all", "prio", "49999", "matchall",
+        "action", "mirred", "egress", "mirror", "dev", dst,
+    ]
+}
+
+/// Reconcile port mirroring to `appliance`.
+///
+/// Best-effort per interface, like QoS: a destination that is not up yet must not
+/// fail the whole commit, and the mirror re-applies on the next one.
+fn apply_mirror(appliance: &Appliance) -> Result<()> {
+    system::ensure_dir(Path::new(MIRROR_RUNTIME_DIR))?;
+    let mut desired: HashSet<String> = HashSet::new();
+    for i in &appliance.interfaces {
+        let mut spec = String::new();
+        for (dir, dst) in [("ingress", &i.mirror_ingress), ("egress", &i.mirror_egress)] {
+            if let Some(dst) = dst {
+                spec.push_str(&format!("{dir} {dst}\n"));
+            }
+        }
+        if spec.is_empty() {
+            continue;
+        }
+        desired.insert(i.name.clone());
+        let path = Path::new(MIRROR_RUNTIME_DIR).join(&i.name);
+        if file_changed(&path, &spec) {
+            // `add`, not `replace`: replacing the qdisc would take the filters
+            // and the datapath's own TC program down with it. An already-present
+            // clsact is the normal case and not an error.
+            let _ = system::tc_qdisc_add_clsact(&i.name);
+            // Both directions are re-asserted whenever either changed, and the
+            // stale one is removed first — otherwise turning a mirror around
+            // would leave the old direction filtering forever.
+            for dir in ["ingress", "egress"] {
+                let _ = system::tc_filter_del(&i.name, dir, "49999");
+            }
+            let mut applied = true;
+            for (dir, dst) in [("ingress", &i.mirror_ingress), ("egress", &i.mirror_egress)] {
+                let Some(dst) = dst else { continue };
+                if let Err(e) = system::tc_run(&mirror_filter_args(&i.name, dir, dst)) {
+                    eprintln!(
+                        "warning: mirroring {} {dir} to {dst} failed (applies on next commit/boot): {e}",
+                        i.name
+                    );
+                    applied = false;
+                }
+            }
+            // The stamp is what a later reconcile compares against, so recording
+            // a spec that did not take would mean the next commit sees no change
+            // and never retries — the mirror would stay dark until the setting
+            // was edited. A destination that is not up yet is the normal reason
+            // for this, and it is up by the next commit.
+            if applied {
+                system::install_file(&path, &spec)?;
+            }
+        } else {
+            system::install_file(&path, &spec)?;
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(MIRROR_RUNTIME_DIR) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !desired.contains(&name) {
+                for dir in ["ingress", "egress"] {
+                    let _ = system::tc_filter_del(&name, dir, "49999");
+                }
+                system::remove_file(&e.path())?;
+            }
+        }
+    }
+    Ok(())
+}
+
 // --- Multi-WAN (roadmap C6) ------------------------------------------------
 //
 // Several WAN uplinks reconciled into failover or load-balancing with per-uplink
@@ -2817,6 +3116,14 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
         .filter_map(|i| i.parent.as_deref())
         .collect();
 
+    // The members named as a bond's `primary`. Collected from the bonds, applied
+    // to the members — the relationship is configured on one end and written on
+    // the other.
+    let bond_primaries: HashSet<&str> = ifaces
+        .iter()
+        .filter_map(|i| i.bond.primary.as_deref())
+        .collect();
+
     // Map each parent interface to the VLAN child links riding on it.
     let mut children: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for i in ifaces {
@@ -3004,6 +3311,7 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
                     || i.is_tunnel()
                     || i.is_macvlan()
                     || i.is_macsec()
+                    || i.is_vti()
                     || macsec_children.contains_key(i.name.as_str())
                     || macvlan_children.contains_key(i.name.as_str())
                     || master_of.contains_key(i.name.as_str())
@@ -3013,6 +3321,13 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
                     || i.mtu.is_some()
                     || i.mac.is_some()
                     || i.qos.is_some()
+                    // Without these an interface configured *only* with per-link
+                    // behaviour would get no `.network` unit, and the half of
+                    // that behaviour networkd owns would silently not happen.
+                    || !i.ip.is_empty()
+                    || !i.ipv6.is_empty()
+                    || !i.dhcp.is_empty()
+                    || !i.dhcpv6.is_empty()
                     || i.disabled
                     || children.contains_key(i.name.as_str())
                     || pppoe_parents.contains(i.name.as_str()))
@@ -3063,6 +3378,14 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
                     .as_ref()
                     .filter(|(zone, _)| Some(zone.as_str()) == i.zone.as_deref())
                     .map(|(_, uri)| uri.as_str()),
+                &LinkTunables {
+                    ip: Some(&i.ip),
+                    ipv6: Some(&i.ipv6),
+                    dhcp: Some(&i.dhcp),
+                    dhcpv6: Some(&i.dhcpv6),
+                    bridge_port: Some(&i.bridge_port),
+                    bond_primary: bond_primaries.contains(i.name.as_str()),
+                },
             );
             // 802.1Q port membership on a VLAN-aware bridge (appended as its own
             // [BridgeVLAN] section; empty for a non-filtering port).
@@ -3158,6 +3481,9 @@ pub fn apply_link_runtime(appliance: &Appliance) -> Result<()> {
     // Egress traffic shaping (tc qdiscs) — applied directly, after the links are
     // (re)configured so the target devices exist.
     apply_qos(appliance)?;
+    // After QoS, because both touch `tc` on the same devices and mirroring adds
+    // a qdisc the shaper must not have just replaced out from under it.
+    apply_mirror(appliance)?;
     // Per-NIC offload switches — after the links are up, since ethtool needs the
     // device. A NIC that refuses a feature is a warning, not a failed commit:
     // offload support is a property of the driver, and a configuration that
@@ -3177,6 +3503,13 @@ pub fn apply_link_runtime(appliance: &Appliance) -> Result<()> {
     // ocpasswd, then the ocserv unit (re)started, after the WAN the server binds
     // is up and after the PKI leaf it serves was minted by apply_persistent.
     crate::openconnect::apply(appliance)?;
+    // The radios. After the links exist, because hostapd binds an interface the
+    // kernel has to have already.
+    crate::wireless::apply(appliance)?;
+    // The cellular uplinks, last: the modem's net device only exists once
+    // ModemManager has probed it, and its address comes from DHCP like any
+    // other uplink's.
+    crate::wwan::apply(appliance)?;
     // L7 reverse proxy / load balancer (roadmap C22) — rendered haproxy.cfg +
     // per-frontend TLS bundles, then the haproxy unit (re)started, after the WAN
     // it binds is up and after the PKI leaf it terminates with was minted by
@@ -3209,7 +3542,14 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
     Ok(())
 }
 
-/// Apply each interface's offload switches with `ethtool -K`.
+/// Apply each interface's offload switches with `ethtool -K`, and its hardware
+/// settings with `-s`/`-G`/`-C`.
+///
+/// Every one of these is best-effort on purpose. A NIC that does not implement
+/// ring resizing, or refuses a coalescing value, or has no notion of a forced
+/// speed — a virtio device has none of the three — must not take a whole
+/// configuration down with it. Each failure warns and names the setting; the rest
+/// still apply.
 fn apply_offload(appliance: &Appliance) -> Result<()> {
     for i in &appliance.interfaces {
         for (feature, on) in &i.offload {
@@ -3220,8 +3560,49 @@ fn apply_offload(appliance: &Appliance) -> Result<()> {
                 );
             }
         }
+        let e = &i.ethernet;
+        if let (Some(speed), Some(duplex)) = (e.speed, e.duplex.as_deref()) {
+            if let Err(err) = system::ethtool_link(&i.name, speed, duplex) {
+                eprintln!(
+                    "warning: forcing {speed}/{duplex} on {} failed: {err}",
+                    i.name
+                );
+            }
+        }
+        if e.rx_ring.is_some() || e.tx_ring.is_some() {
+            if let Err(err) = system::ethtool_ring(&i.name, e.rx_ring, e.tx_ring) {
+                eprintln!("warning: resizing rings on {} failed: {err}", i.name);
+            }
+        }
+        let coalesce = coalesce_params(e);
+        if !coalesce.is_empty() {
+            if let Err(err) = system::ethtool_coalesce(&i.name, &coalesce) {
+                eprintln!("warning: setting coalescing on {} failed: {err}", i.name);
+            }
+        }
     }
     Ok(())
+}
+
+/// The `ethtool -C` arguments implied by an interface's `[interface.ethernet]`,
+/// in a fixed order so a re-apply is byte-identical.
+fn coalesce_params(e: &crate::config::Ethernet) -> Vec<(&'static str, String)> {
+    let mut out: Vec<(&'static str, String)> = Vec::new();
+    if let Some(n) = e.rx_usecs {
+        out.push(("rx-usecs", n.to_string()));
+    }
+    if let Some(n) = e.tx_usecs {
+        out.push(("tx-usecs", n.to_string()));
+    }
+    // Written only when switched on: `off` is the kernel default, and asserting
+    // it would fight a driver that has no adaptive mode to switch off.
+    if e.adaptive_rx {
+        out.push(("adaptive-rx", "on".into()));
+    }
+    if e.adaptive_tx {
+        out.push(("adaptive-tx", "on".into()));
+    }
+    out
 }
 
 /// Where the kernel parameters from `[system.sysctl]` are written.
@@ -3245,15 +3626,23 @@ const CONSOLE_DROPIN_DIR: &str = "/run/systemd/system";
 /// stays so a kernel that does have it picks it up next boot.
 fn apply_sysctl(appliance: &Appliance) -> Result<()> {
     let params = &appliance.system.sysctl;
-    if params.is_empty() {
+    let per_link = link_sysctls(appliance);
+    if params.is_empty() && per_link.is_empty() {
         // Nothing configured: remove ours rather than leaving a stale file
         // asserting settings the configuration no longer names.
         let _ = std::fs::remove_file(SYSCTL_DROPIN);
         return Ok(());
     }
-    let mut body = String::from("# Written by sentinel from [system.sysctl].\n");
+    let mut body =
+        String::from("# Written by sentinel from [system.sysctl] and per-interface settings.\n");
     for (key, value) in params {
         body.push_str(&format!("{key} = {value}\n"));
+    }
+    for (dir, iface, knob, value) in &per_link {
+        body.push_str(&format!(
+            "{} = {value}\n",
+            system::sysctl_iface_key(dir, iface, knob)
+        ));
     }
     system::ensure_dir(Path::new("/run/sysctl.d"))?;
     system::install_file(Path::new(SYSCTL_DROPIN), &body)?;
@@ -3262,7 +3651,63 @@ fn apply_sysctl(appliance: &Appliance) -> Result<()> {
             eprintln!("warning: setting {key} failed (applies on next boot): {e}");
         }
     }
+    for (dir, iface, knob, value) in &per_link {
+        if let Err(e) = system::sysctl_write_iface(dir, iface, knob, value) {
+            eprintln!(
+                "warning: setting {dir}.{iface}.{knob} failed (applies at next link-up): {e}"
+            );
+        }
+    }
     Ok(())
+}
+
+/// The per-interface kernel parameters implied by `[interface.ip]` and
+/// `[interface.ipv6]`, as `(directory, interface, knob, value)`.
+///
+/// These are the ones systemd-networkd has no directive for — the ARP switches
+/// and the neighbour timer. The rest of both blocks is rendered into the
+/// `.network` unit, where it belongs; splitting on "does networkd express it"
+/// rather than on "is it IPv4" keeps each setting in the one place that owns it,
+/// instead of having networkd and a sysctl file quietly disagree.
+fn link_sysctls(appliance: &Appliance) -> Vec<(&'static str, String, &'static str, String)> {
+    let mut out = Vec::new();
+    for i in &appliance.interfaces {
+        let p = &i.ip;
+        let name = &i.name;
+        for (on, knob) in [
+            (p.arp_filter, "arp_filter"),
+            (p.arp_accept, "arp_accept"),
+            (p.directed_broadcast, "bc_forwarding"),
+        ] {
+            if on {
+                out.push(("net.ipv4.conf", name.clone(), knob, "1".to_string()));
+            }
+        }
+        // `arp_announce`/`arp_ignore` are levels, not switches. The configuration
+        // offers the useful level rather than the number: 2 ("use an address on
+        // the target's subnet") and 1 ("only answer for this link") are what the
+        // multi-homed case wants, and the intermediate levels exist mostly to
+        // describe the kernel's own history.
+        if p.arp_announce {
+            out.push(("net.ipv4.conf", name.clone(), "arp_announce", "2".into()));
+        }
+        if p.arp_ignore {
+            out.push(("net.ipv4.conf", name.clone(), "arp_ignore", "1".into()));
+        }
+        // The neighbour timer is in milliseconds under `neigh`, not `conf`.
+        if let Some(secs) = p.arp_cache_timeout {
+            out.push((
+                "net.ipv4.neigh",
+                name.clone(),
+                "base_reachable_time_ms",
+                (u64::from(secs) * 1000).to_string(),
+            ));
+        }
+        if let Some(n) = i.ipv6.accept_dad {
+            out.push(("net.ipv6.conf", name.clone(), "accept_dad", n.to_string()));
+        }
+    }
+    out
 }
 
 /// One policy rule as the arguments `ip rule` wants, in the order it wants them.
@@ -3588,6 +4033,19 @@ mod tests {
             name: "mv0".into(),
             hw_id: None,
             offload: Default::default(),
+            vti_key: None,
+            wireless: None,
+            wwan: None,
+            ethernet: Default::default(),
+            bridge: Default::default(),
+            bridge_port: Default::default(),
+            bond: Default::default(),
+            mirror_ingress: None,
+            mirror_egress: None,
+            ip: Default::default(),
+            ipv6: Default::default(),
+            dhcp: Default::default(),
+            dhcpv6: Default::default(),
             zone: Some("lan".into()),
             address: Some("10.9.0.2/24".into()),
             address6: None,
@@ -3727,6 +4185,19 @@ mod tests {
             name: "gre0".into(),
             hw_id: None,
             offload: Default::default(),
+            vti_key: None,
+            wireless: None,
+            wwan: None,
+            ethernet: Default::default(),
+            bridge: Default::default(),
+            bridge_port: Default::default(),
+            bond: Default::default(),
+            mirror_ingress: None,
+            mirror_egress: None,
+            ip: Default::default(),
+            ipv6: Default::default(),
+            dhcp: Default::default(),
+            dhcpv6: Default::default(),
             zone: Some("vpn".into()),
             address: Some("172.16.0.1/30".into()),
             address6: None,
@@ -3874,6 +4345,7 @@ mod tests {
             None,
             false,
             Some("http://192.168.50.1:8082/"),
+            &LinkTunables::default(),
         );
         assert!(
             u.contains("SendOption=114:string:http://192.168.50.1:8082/"),
@@ -4063,6 +4535,19 @@ mod tests {
             name: "lan0".into(),
             hw_id: None,
             offload: Default::default(),
+            vti_key: None,
+            wireless: None,
+            wwan: None,
+            ethernet: Default::default(),
+            bridge: Default::default(),
+            bridge_port: Default::default(),
+            bond: Default::default(),
+            mirror_ingress: None,
+            mirror_egress: None,
+            ip: Default::default(),
+            ipv6: Default::default(),
+            dhcp: Default::default(),
+            dhcpv6: Default::default(),
             zone: Some("lan".into()),
             address: Some("10.0.0.1/24".into()),
             address6: None,
@@ -4314,6 +4799,19 @@ mod tests {
             name: "br0".into(),
             hw_id: None,
             offload: Default::default(),
+            vti_key: None,
+            wireless: None,
+            wwan: None,
+            ethernet: Default::default(),
+            bridge: Default::default(),
+            bridge_port: Default::default(),
+            bond: Default::default(),
+            mirror_ingress: None,
+            mirror_egress: None,
+            ip: Default::default(),
+            ipv6: Default::default(),
+            dhcp: Default::default(),
+            dhcpv6: Default::default(),
             zone: Some("lan".into()),
             address: Some("10.0.0.1/24".into()),
             address6: None,
@@ -4376,6 +4874,19 @@ mod tests {
             name: "bond0".into(),
             hw_id: None,
             offload: Default::default(),
+            vti_key: None,
+            wireless: None,
+            wwan: None,
+            ethernet: Default::default(),
+            bridge: Default::default(),
+            bridge_port: Default::default(),
+            bond: Default::default(),
+            mirror_ingress: None,
+            mirror_egress: None,
+            ip: Default::default(),
+            ipv6: Default::default(),
+            dhcp: Default::default(),
+            dhcpv6: Default::default(),
             zone: None,
             address: None,
             address6: None,
@@ -4553,6 +5064,19 @@ mod tests {
             name: "br0".into(),
             hw_id: None,
             offload: Default::default(),
+            vti_key: None,
+            wireless: None,
+            wwan: None,
+            ethernet: Default::default(),
+            bridge: Default::default(),
+            bridge_port: Default::default(),
+            bond: Default::default(),
+            mirror_ingress: None,
+            mirror_egress: None,
+            ip: Default::default(),
+            ipv6: Default::default(),
+            dhcp: Default::default(),
+            dhcpv6: Default::default(),
             zone: Some("lan".into()),
             address: Some("10.0.0.1/24".into()),
             address6: None,
@@ -4604,6 +5128,19 @@ mod tests {
             name: "ppp0".into(),
             hw_id: None,
             offload: Default::default(),
+            vti_key: None,
+            wireless: None,
+            wwan: None,
+            ethernet: Default::default(),
+            bridge: Default::default(),
+            bridge_port: Default::default(),
+            bond: Default::default(),
+            mirror_ingress: None,
+            mirror_egress: None,
+            ip: Default::default(),
+            ipv6: Default::default(),
+            dhcp: Default::default(),
+            dhcpv6: Default::default(),
             zone: Some("wan".into()),
             address: None,
             address6: None,
@@ -5239,6 +5776,19 @@ mod tests {
             name: name.into(),
             hw_id: None,
             offload: Default::default(),
+            vti_key: None,
+            wireless: None,
+            wwan: None,
+            ethernet: Default::default(),
+            bridge: Default::default(),
+            bridge_port: Default::default(),
+            bond: Default::default(),
+            mirror_ingress: None,
+            mirror_egress: None,
+            ip: Default::default(),
+            ipv6: Default::default(),
+            dhcp: Default::default(),
+            dhcpv6: Default::default(),
             zone: None,
             address: Some(address.into()),
             address6: None,
@@ -5272,6 +5822,169 @@ mod tests {
         }
     }
 
+    /// The two halves of the per-link blocks land in the two places that own
+    /// them: what networkd has a directive for goes in the `.network` unit, the
+    /// ARP switches it has none for go in the sysctl drop-in. The point of
+    /// asserting both together is that neither half may quietly become the empty
+    /// set.
+    #[test]
+    fn per_link_options_split_between_networkd_and_sysctl() {
+        let ip = IpOptions {
+            disable_forwarding: true,
+            proxy_arp: true,
+            proxy_arp_pvlan: true,
+            arp_cache_timeout: Some(30),
+            arp_filter: true,
+            arp_accept: true,
+            arp_announce: true,
+            arp_ignore: false,
+            directed_broadcast: true,
+        };
+        let ipv6 = Ip6Options {
+            disable_forwarding: true,
+            no_link_local: true,
+            dad_transmits: Some(2),
+            accept_dad: Some(2),
+        };
+        let dhcp = DhcpClient {
+            client_id: Some("duid".into()),
+            duid: Some("00:03:00:01:02:00:00:00:00:02".into()),
+            host_name: Some("fw".into()),
+            vendor_class_id: Some("sentinel".into()),
+            user_class: Some("residential".into()),
+            no_default_route: true,
+            default_route_distance: Some(210),
+            reject: vec!["192.0.2.9".into(), "198.51.100.0/24".into()],
+        };
+        let dhcpv6 = Dhcp6Client {
+            duid: Some("00:03:00:01:02:00:00:00:00:01".into()),
+            rapid_commit: true,
+            parameters_only: true,
+            no_release: true,
+        };
+        let u = network_unit_body(
+            "wan0",
+            Some("dhcp"),
+            Some("dhcp"),
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            &LinkTunables {
+                ip: Some(&ip),
+                ipv6: Some(&ipv6),
+                dhcp: Some(&dhcp),
+                dhcpv6: Some(&dhcpv6),
+                ..Default::default()
+            },
+        );
+        for want in [
+            "IPv4Forwarding=no",
+            "IPv4ProxyARP=yes",
+            "IPv4ProxyARPPrivateVLAN=yes",
+            "IPv6Forwarding=no",
+            "LinkLocalAddressing=no",
+            "IPv6DuplicateAddressDetection=2",
+            "ClientIdentifier=duid",
+            "DUIDRawData=00:03:00:01:02:00:00:00:00:02",
+            "Hostname=fw",
+            "VendorClassIdentifier=sentinel",
+            "UserClass=residential",
+            "UseGateway=no",
+            "RouteMetric=210",
+            "DenyList=192.0.2.9 198.51.100.0/24",
+            "WithoutRA=information-request",
+            "DUIDType=raw",
+            "DUIDRawData=00:03:00:01:02:00:00:00:00:01",
+            "RapidCommit=yes",
+            "SendRelease=no",
+        ] {
+            assert!(u.contains(want), "{want:?} missing from:\n{u}");
+        }
+        // Every [Network] directive has to precede the first sub-section, or it
+        // lands in [DHCPv4] and is ignored.
+        let first_section = u.find("\n[DHCPv4]").expect("a [DHCPv4] section");
+        assert!(u[..first_section].contains("IPv4ProxyARP=yes"));
+
+        // The ARP switches have no networkd directive and must not be invented.
+        assert!(
+            !u.contains("arp_filter"),
+            "sysctls leaked into the unit:\n{u}"
+        );
+
+        let mut a = Appliance::from_toml("[system]\nhostname = \"fw\"\n").unwrap();
+        let mut i = iface_addr("wan0", "dhcp");
+        i.ip = ip;
+        i.ipv6 = ipv6;
+        a.interfaces = vec![i];
+        let sys: Vec<String> = link_sysctls(&a)
+            .into_iter()
+            .map(|(dir, iface, knob, v)| format!("{dir}.{iface}.{knob}={v}"))
+            .collect();
+        assert_eq!(
+            sys,
+            [
+                "net.ipv4.conf.wan0.arp_filter=1",
+                "net.ipv4.conf.wan0.arp_accept=1",
+                "net.ipv4.conf.wan0.bc_forwarding=1",
+                "net.ipv4.conf.wan0.arp_announce=2",
+                // seconds in the configuration, milliseconds in the kernel
+                "net.ipv4.neigh.wan0.base_reachable_time_ms=30000",
+                "net.ipv6.conf.wan0.accept_dad=2",
+            ]
+        );
+    }
+
+    /// The bridge's own settings reach its `.netdev`, under one `[Bridge]`
+    /// header shared with VLAN filtering.
+    #[test]
+    fn a_bridge_netdev_carries_its_spanning_tree_and_multicast_settings() {
+        let a = Appliance::from_toml(
+            r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "br0"
+type = "bridge"
+address = "10.0.0.1/24"
+[interface.bridge]
+stp = true
+priority = 4096
+hello-time = 2
+max-age = 20
+forward-delay = 4
+ageing-time = 120
+igmp-snooping = true
+igmp-querier = true
+"#,
+        )
+        .unwrap();
+        let body = virtual_l2_netdev_body(&a.interfaces[0]);
+        for want in [
+            "Kind=bridge",
+            "[Bridge]",
+            "STP=yes",
+            "Priority=4096",
+            "HelloTimeSec=2",
+            "MaxAgeSec=20",
+            "ForwardDelaySec=4",
+            "AgeingTimeSec=120",
+            "MulticastSnooping=yes",
+            "MulticastQuerier=yes",
+        ] {
+            assert!(body.contains(want), "{want:?} missing from:\n{body}");
+        }
+        assert_eq!(body.matches("[Bridge]").count(), 1, "{body}");
+    }
+
     /// A dummy link needs a `.netdev` written for it or the device never exists.
     ///
     /// The renderer had always known how to write `Kind=dummy`; the predicate
@@ -5294,6 +6007,21 @@ mod tests {
             .collect();
         assert_eq!(names, ["dum0", "br0"]);
         assert!(virtual_l2_netdev_body(&ifaces[0]).contains("Kind=dummy"));
+    }
+
+    /// A VLAN subinterface is `eth0.100`, and the kernel spells its sysctls with
+    /// the dot and the slash swapped. Getting this wrong writes to a path that
+    /// does not exist — on a firewall, most of its interfaces.
+    #[test]
+    fn a_vlan_subinterface_sysctl_swaps_the_dot_and_the_slash() {
+        assert_eq!(
+            system::sysctl_iface_key("net.ipv4.conf", "eth0.100", "arp_filter"),
+            "net.ipv4.conf.eth0/100.arp_filter"
+        );
+        assert_eq!(
+            system::sysctl_iface_key("net.ipv4.conf", "eth0", "arp_filter"),
+            "net.ipv4.conf.eth0.arp_filter"
+        );
     }
 
     #[test]

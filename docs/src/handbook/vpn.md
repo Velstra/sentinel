@@ -11,7 +11,8 @@ services draw on.
 | Field | Meaning |
 |---|---|
 | `local` / `remote` | This box's / the peer's IKE endpoint (IPv4). |
-| `local-subnet` / `remote-subnet` | Protected subnets (IPv4 CIDR). |
+| `local-subnet` / `remote-subnet` | Protected subnets (IPv4 CIDR). Required unless the tunnel is route-based. |
+| `vti` | Bind to a `type = "vti"` link, making the tunnel **route-based**. |
 | `psk` | Pre-shared key (secret). |
 | `ike-version` | `1` or `2` (default 2). |
 | `ike-proposal` / `esp-proposal` | Cipher proposals (default `aes256-sha256-modp2048`). |
@@ -25,6 +26,56 @@ set vpn ipsec branch local-subnet 10.0.0.0/24
 set vpn ipsec branch remote-subnet 10.1.0.0/24
 set vpn ipsec branch psk <pre-shared-key>
 ```
+
+### Route-based tunnels (VTI)
+
+A policy-based tunnel — the one above — encrypts what its traffic selectors
+name. Its reach is a list of subnets negotiated with the peer, so adding one
+means editing both ends and renegotiating.
+
+A route-based tunnel encrypts what the routing table sends out a link:
+
+```text
+set interface vti0 type vti
+set interface vti0 vti-key 42
+set interface vti0 zone vpn
+set interface vti0 address 10.255.0.1/30
+set interface vti0 mss pmtu
+
+set vpn ipsec branch local 203.0.113.1
+set vpn ipsec branch remote 198.51.100.1
+set vpn ipsec branch psk <pre-shared-key>
+set vpn ipsec branch vti vti0
+
+set protocols static 10.1.0.0/24 dev vti0
+```
+
+Three things follow from the tunnel having a link, and they are the reason to
+prefer it:
+
+- **The reach is a route.** It can be added, withdrawn, or *learned* — run BGP or
+  OSPF over `vti0` and the tunnel carries whatever the peer advertises, with no
+  IPsec renegotiation.
+- **The tunnel can carry a firewall zone.** A policy-based SA has no link for a
+  zone to be attached to, so its traffic cannot be filtered as its own zone.
+  `vti0` is an interface like any other: give it a zone and the rules apply.
+- **It can be clamped.** `mss pmtu` is not optional advice here — encapsulation
+  costs MTU, both ends agree an MSS from *their* interfaces, and the result is a
+  tunnel that carries small traffic perfectly and hangs on anything large.
+
+`vti-key` is the link's id, and it is what the tunnel matches: two links may not
+share one, because the id is how the kernel decides which SA a packet leaving
+the link belongs to. Leaving `local-subnet`/`remote-subnet` unset opens the
+selectors to `0.0.0.0/0`, which is what "the routing table decides" means; you
+may still set them to refuse to carry something the routes would otherwise hand
+over.
+
+Built as a Linux **xfrm** interface rather than the older `vti` netdev the name
+comes from: `vti` keys on a mark, needs one device per address family, and wants
+the endpoints repeated on the link, while `xfrm` keys on an interface id, carries
+both families on one link, and is what strongSwan's `if_id_in`/`if_id_out` are
+built for. The word stays `vti` because that is what the feature is called
+everywhere an operator would look it up.
 
 ## WireGuard
 
