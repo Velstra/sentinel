@@ -204,13 +204,7 @@ in
       # Slot A (verity), sized to fit the closure + its hash tree. The module
       # marks these `Minimize`; auto image-sizing then leaves them at 4K, so set
       # explicit floors.
-      # 2048M, raised from 1300M: the radios (hostapd, wpa_supplicant) and the
-      # cellular stack (ModemManager, which brings glib/polkit/libqmi/libmbim)
-      # pushed the closure past the old floor, and `systemd-repart` reports that
-      # as a bare non-zero exit with nothing to read. Slot B below must match —
-      # an A/B pair whose halves differ in size is an update that fits going one
-      # way and not the other.
-      ${partitionIds.store}.repartConfig.SizeMinBytes = "2048M";
+      ${partitionIds.store}.repartConfig.SizeMinBytes = "1300M";
       ${partitionIds.store-verity}.repartConfig.SizeMinBytes = "96M";
       # Slot B: reserved space, typed generic so the build's roothash extraction
       # only matches slot A. `sentinel update` fills these and re-types them to
@@ -224,8 +218,8 @@ in
       "40-store-b".repartConfig = {
         Type = "linux-generic";
         Label = "store-b";
-        SizeMinBytes = "2048M";
-        SizeMaxBytes = "2048M";
+        SizeMinBytes = "1300M";
+        SizeMaxBytes = "1300M";
       };
       # Persistent state partition (after both slots).
       "50-data".repartConfig = {
