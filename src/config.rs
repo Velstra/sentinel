@@ -3795,6 +3795,27 @@ pub struct Acme {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct System {
     pub hostname: String,
+    /// The console keyboard layout (`"de"`, `"us"`, `"fr"`, …).
+    ///
+    /// First among these three on purpose: everything an operator types at the
+    /// console goes through it, and a passphrase entered on the wrong layout is
+    /// a box that cannot be unlocked. Applies to the physical and serial
+    /// consoles; an SSH session brings its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyboard: Option<String>,
+    /// The system locale (`"de_DE.UTF-8"`, `"en_GB.UTF-8"`, …). Decides how
+    /// dates, numbers and messages are rendered for anything that asks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locale: Option<String>,
+    /// The IANA timezone (`"Europe/Berlin"`, `"UTC"`, …).
+    ///
+    /// It matters more here than on a desktop: every log line, every firewall
+    /// hit, every certificate expiry and every scheduled rule is stamped with
+    /// it, and correlating an incident across boxes whose clocks read different
+    /// zones is a well-known way to lose an hour. `UTC` is the safe default and
+    /// what an unset value leaves in place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
     /// Kernel parameters to set (`[system.sysctl]`), as `name = "value"`.
     ///
     /// A deliberate escape hatch, not a feature: the settings a firewall needs
@@ -7529,6 +7550,52 @@ impl Appliance {
                     "interface {:?}: ip proxy-arp and ip arp-ignore contradict each other",
                     i.name
                 );
+            }
+        }
+        // Console keyboard, locale and timezone.
+        //
+        // Checked against what this system actually provides rather than
+        // against a table compiled into the binary: the set of keymaps comes
+        // from the console-data package and the set of zones from tzdata, both
+        // of which move independently of this appliance. A list here would
+        // eventually refuse a zone that exists, which is worse than not
+        // checking — and it would do so at commit, on a box the operator is
+        // already logged into.
+        if let Some(tz) = &self.system.timezone {
+            if tz.contains("..") || tz.starts_with('/') || tz.contains('\0') {
+                bail!("system timezone {tz:?} is not a zone name");
+            }
+            let path = std::path::Path::new("/usr/share/zoneinfo").join(tz);
+            // Absent zoneinfo (a container, a test) is not evidence the zone is
+            // wrong, so the check only fires when there is something to check
+            // against.
+            if std::path::Path::new("/usr/share/zoneinfo").is_dir() && !path.is_file() {
+                bail!(
+                    "system timezone {tz:?}: no such zone (see /usr/share/zoneinfo, e.g. Europe/Berlin)"
+                );
+            }
+        }
+        if let Some(k) = &self.system.keyboard {
+            if k.is_empty()
+                || !k
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            {
+                bail!("system keyboard {k:?}: a keymap name like `de` or `us`");
+            }
+        }
+        if let Some(l) = &self.system.locale {
+            // `xx_YY.CHARSET`, or one of the two that name no territory.
+            let ok = l == "C" || l == "POSIX" || {
+                let (lang, _) = l.split_once('.').unwrap_or((l.as_str(), ""));
+                let (a, b) = lang.split_once('_').unwrap_or(("", ""));
+                a.len() == 2
+                    && b.len() >= 2
+                    && a.bytes().all(|c| c.is_ascii_lowercase())
+                    && b.bytes().all(|c| c.is_ascii_uppercase())
+            };
+            if !ok {
+                bail!("system locale {l:?}: expected e.g. `de_DE.UTF-8`, `C` or `POSIX`");
             }
         }
         // Kernel parameters: a narrow allow-list on purpose. A firewall that can

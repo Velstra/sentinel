@@ -3452,6 +3452,7 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     // Port/ListenAddress drop-in; sshd (re)started only in Live mode.
     apply_ssh(appliance, mode)?;
     apply_console(appliance, mode)?;
+    apply_locale(appliance, mode)?;
     apply_metrics(appliance, mode)?;
     apply_dnsproxy(appliance, mode)?;
     apply_policy_routes(appliance, mode)?;
@@ -3822,6 +3823,44 @@ fn apply_policy_routes(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
 /// fault — it is the difference between a login prompt and a screen of noise.
 /// Rendered as a drop-in that overrides the unit's `ExecStart`, because the baud
 /// rate is an argument to agetty rather than a setting it reads.
+/// Where the console keymap and the locale are written for the next boot.
+///
+/// A drop-in *and* a live apply, the pair every other setting here uses: the
+/// file is what survives a reboot, the apply is what makes `commit` mean now.
+const VCONSOLE_CONF: &str = "/run/systemd/vconsole.conf";
+const LOCALE_CONF: &str = "/run/systemd/locale.conf";
+
+/// Apply the console keyboard, the locale and the timezone.
+///
+/// Best-effort on each: a keymap this image does not ship, or a `timedatectl`
+/// that refuses, must not take a whole commit down — the firewall rules in the
+/// same commit matter more than the console layout. Each failure names the
+/// setting.
+fn apply_locale(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
+    let sys = &appliance.system;
+    if let Some(k) = &sys.keyboard {
+        system::install_file(Path::new(VCONSOLE_CONF), &format!("KEYMAP={k}\n"))?;
+        if mode == ApplyMode::Live {
+            if let Err(e) = system::load_keymap(k) {
+                eprintln!("warning: loading keymap {k} failed (applies at next boot): {e}");
+            }
+        }
+    }
+    if let Some(l) = &sys.locale {
+        system::install_file(Path::new(LOCALE_CONF), &format!("LANG={l}\n"))?;
+    }
+    // The timezone is a symlink `timedatectl` owns, so there is no drop-in to
+    // write — the live call is the whole of it, and it persists on its own.
+    if let Some(tz) = &sys.timezone {
+        if mode == ApplyMode::Live {
+            if let Err(e) = system::set_timezone(tz) {
+                eprintln!("warning: setting timezone {tz} failed: {e}");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn apply_console(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     let console = &appliance.system.console;
     let (Some(device), Some(speed)) = (&console.device, console.speed) else {

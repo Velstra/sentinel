@@ -5005,6 +5005,9 @@ const SVC_MDNS = [["interface", "Interfaces", null, "list"]];
 const SVC_DYNDNS = [
   ["provider", "Provider", ["", "dyndns2", "cloudflare", "duckdns", "noip"]],
   ["server", "Server"], ["hostname", "Hostname"],
+  ["keyboard", "Console keyboard"],
+  ["locale", "Locale"],
+  ["timezone", "Timezone"],
   ["login", "Login"], ["password", "Password"], ["interface", "Interface"],
 ];
 const SVC_DHCPRELAY = [

@@ -50,6 +50,18 @@ pub fn set_hostname(name: &str) -> Result<()> {
     run_priv("hostname", &[name])
 }
 
+/// Set the console keyboard layout live (`loadkeys`), so it applies without a
+/// reboot the way every other committed setting does.
+pub fn load_keymap(name: &str) -> Result<()> {
+    run_priv("loadkeys", &[name])
+}
+
+/// Set the system timezone (`timedatectl set-timezone`). Unlike the hostname,
+/// NixOS does not block this one: the zone is a symlink `timedatectl` owns.
+pub fn set_timezone(zone: &str) -> Result<()> {
+    run_priv("timedatectl", &["set-timezone", zone])
+}
+
 /// Reload the velstra data plane so it picks up a freshly written config.
 pub fn reload_velstra(unit: &str) -> Result<()> {
     run_priv("systemctl", &["reload-or-restart", unit])
@@ -881,6 +893,8 @@ pub fn bin(name: &str) -> String {
         "journalctl" => "SENTINEL_JOURNALCTL_BIN",
         "wren" => "SENTINEL_WREN_BIN",
         "tc" => "SENTINEL_TC_BIN",
+        "loadkeys" => "SENTINEL_LOADKEYS_BIN",
+        "timedatectl" => "SENTINEL_TIMEDATECTL_BIN",
         "sysctl" => "SENTINEL_SYSCTL_BIN",
         "swanctl" => "SENTINEL_SWANCTL_BIN",
         "openssl" => "SENTINEL_OPENSSL_BIN",
