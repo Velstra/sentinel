@@ -1,0 +1,68 @@
+# Drive the guided installer the way an operator does: wait for each question,
+# then answer that question.
+#
+# A blind stream of answers into a pty cannot tell "the wizard asked something
+# else" from "the wizard asked nothing at all" — both look like a timeout with
+# no clue attached. This waits for every prompt in turn and, when one does not
+# come, says which one it was still waiting for. That is the difference between
+# a red check and a diagnosis.
+#
+# The disk number is not hardcoded: it comes from $PICK, which the test reads
+# off the wizard's own candidate listing.
+
+# Prompts are instant; the install that follows the last answer is not.
+set timeout 120
+log_user 1
+
+proc answer {what reply} {
+    expect {
+        $what   { send -- "$reply\r" }
+        timeout { puts "\nSTALLED — no prompt matching: $what"; exit 3 }
+        eof     { puts "\nEXITED — while waiting for: $what"; exit 4 }
+    }
+}
+
+spawn sentinel install
+
+# Where to install. Asked first on purpose: an operator who changes their mind
+# during the questions below has erased nothing yet.
+answer "Mode "                "1"
+answer "Select disk number"   "$env(PICK)"
+
+# Console and locale. The keyboard comes before the password, and the sample
+# string is what stops a password being set on a layout nobody checked.
+answer "Console keyboard layout" "de"
+answer "to check the layout"     "hello-123"
+answer "Locale"                  "de_DE.UTF-8"
+answer "Timezone"                "Europe/Berlin"
+
+# Identity and the first account.
+answer "Hostname"        "fw-wizard"
+answer "Username"        "operator"
+answer "Password:"       "correcthorsebattery"
+answer "SSH public key"  ""
+
+# Enough network to reach the box over SSH after the reboot.
+answer "Configure "       "y"
+answer "zone"             "wan"
+answer "address"          "10.9.9.9/24"
+answer "default gateway"  "10.9.9.1"
+
+# The wizard asks about every NIC it finds, and how many that is depends on the
+# machine. Decline the rest rather than assuming a count — a fixed list of
+# answers silently slides out of step on a box with a second interface.
+expect {
+    "Configure "          { send -- "n\r"; exp_continue }
+    "Type YES to proceed" { send -- "YES\r" }
+    timeout { puts "\nSTALLED — no confirmation prompt"; exit 3 }
+    eof     { puts "\nEXITED — before the confirmation"; exit 4 }
+}
+
+# From here it is cloning ~2.9G onto the target; wait on the process, not a prompt.
+set timeout 900
+expect {
+    eof     {}
+    timeout { puts "\nSTALLED — the install itself never finished"; exit 5 }
+}
+catch wait result
+exit [lindex $result 3]
