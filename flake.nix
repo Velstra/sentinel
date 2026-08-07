@@ -4768,6 +4768,115 @@
         # verity store to clone) — the real live-boot flow. Verifies the target
         # gets the cloned layout and a bootable ESP.
         #   nix build .#checks.x86_64-linux.install-iso -L
+        # The guided installer, driven end to end.
+        #
+        # The wizard only starts on a terminal — a deliberate guard, so it cannot
+        # be triggered from a script — so the answers are fed through a pty
+        # (`script -qec`) rather than a pipe. Without that it falls back to
+        # listing disks and the check would pass having tested nothing.
+        #
+        # What this proves is that the answers reach the *installed* system's
+        # configuration: the wizard's whole reason to exist is that the box comes
+        # up configured instead of empty, and everything short of reading the
+        # seeded document back is proof the wizard ran, not that it worked.
+        #
+        # What it cannot prove is the reboot and the SSH login after it. Rebooting
+        # into the installed image hangs under OVMF in this harness — the same
+        # limit `checks.update` documents — so that half waits for hardware or a
+        # harness that can. Said here rather than left for someone to assume.
+        #
+        #   nix build .#checks.x86_64-linux.wizard -L
+        wizard = pkgs.testers.runNixOSTest {
+          name = "sentinel-wizard";
+          nodes.machine =
+            { pkgs, ... }:
+            {
+              imports = [ ./nix/iso.nix ];
+              _module.args = {
+                sentinelPkg = sentinel;
+                inherit sentinelImageRaw;
+              };
+              virtualisation = {
+                memorySize = 2048;
+                mountHostNixStore = true;
+                # Must exceed the raw appliance image (two 2560M store slots +
+                # their verity trees + ESP ≈ 5.6G) — the install clones it whole.
+                emptyDiskImages = [ 8000 ]; # vdb — the install target
+              };
+              environment.systemPackages = [ pkgs.expect ];
+            };
+          testScript = ''
+            machine.wait_for_unit("multi-user.target")
+
+            # Without a terminal `install` just lists the candidate disks and
+            # returns. Read the number off that listing the way an operator
+            # reads it off the screen, rather than assuming where vdb lands.
+            listing = machine.succeed("sentinel install < /dev/null")
+            picks = [
+                line.split("]")[0].strip().lstrip("[")
+                for line in listing.splitlines()
+                if "/dev/vdb" in line
+            ]
+            assert len(picks) == 1, listing
+
+            with subtest("the wizard runs on a terminal and installs"):
+                # `expect` gives it a pty and answers one question at a time
+                # (see the script for why that beats piping a list of answers).
+                # Without a pty the wizard never starts and this would silently
+                # be testing the disk lister.
+                #
+                # Bounded inside the guest, under the driver's own per-command
+                # timeout, so that the transcript below is still readable when
+                # it stalls — a driver-level kill throws it away.
+                rc, _ = machine.execute(
+                    f"SENTINEL_INSTALL_SOURCE=${sentinelImageRaw} PICK={picks[0]} "
+                    f"timeout 1200 expect -f ${./nix/drive-wizard.exp} "
+                    f"> /tmp/wizard.log 2>&1",
+                    timeout=1500,
+                )
+                # Not `log`: the driver has a global of that name and its type
+                # check refuses the shadow before the VM starts.
+                transcript = machine.succeed("cat /tmp/wizard.log")
+                assert rc == 0, f"the wizard exited {rc}; transcript:\n{transcript}"
+                machine.succeed("udevadm settle")
+                # Nowhere in the session — not echoed while it is typed, and not
+                # printed back in the summary. An install is done over whatever
+                # console is at hand, and the password must not be left sitting
+                # in that scrollback. `expect` logs everything the pty emits, so
+                # a single `in` over the whole transcript covers both.
+                assert "correcthorsebattery" not in transcript, transcript
+                assert "Password:" in transcript, transcript
+
+            with subtest("the answers reached the installed system's configuration"):
+                machine.succeed("mkdir -p /mnt/data && mount /dev/vdb6 /mnt/data")
+                cfg = machine.succeed("cat /mnt/data/lib/sentinel/appliance.toml")
+                for want in [
+                    'hostname = "fw-wizard"',
+                    'keyboard = "de"',
+                    'locale = "de_DE.UTF-8"',
+                    'timezone = "Europe/Berlin"',
+                    'name = "operator"',
+                    '10.9.9.9/24',
+                    'zone = "wan"',
+                ]:
+                    assert want in cfg, f"{want!r} missing from the seeded config:\n{cfg}"
+                # The password is stored hashed, never in plain text — the wizard
+                # goes through the same `system login` path the CLI does.
+                assert "correcthorsebattery" not in cfg, cfg
+                machine.succeed("umount /mnt/data")
+
+            with subtest("the seeded configuration is one the appliance accepts"):
+                # Round-trip it through the real parser: a wizard that wrote a
+                # document the box refuses at boot would be worse than no wizard.
+                machine.succeed("mount /dev/vdb6 /mnt/data")
+                machine.succeed(
+                    "sentinel configure --no-apply --config /mnt/data/lib/sentinel/appliance.toml "
+                    "<<< 'show' | grep -q 'hostname fw-wizard'"
+                )
+                machine.succeed("umount /mnt/data")
+          '';
+        };
+
         install-iso = pkgs.testers.runNixOSTest {
           name = "sentinel-install-iso";
           nodes.machine = {
@@ -4781,7 +4890,9 @@
               memorySize = 2048;
               # The bundled image lives in the host store; the live env reads it.
               mountHostNixStore = true;
-              emptyDiskImages = [ 5000 ]; # vdb — the install target
+              # Must exceed the raw appliance image (two 2560M store slots +
+              # their verity trees + ESP ≈ 5.6G) — the install clones it whole.
+              emptyDiskImages = [ 8000 ]; # vdb — the install target
             };
           };
           testScript = ''
