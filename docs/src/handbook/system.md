@@ -284,3 +284,31 @@ stored: deriving a rate from the number of connections would draw the change in
 it, which nobody wants to look at.
 
 The console's **History** view draws these, and draws a gap as a gap.
+
+## Keyboard, locale and timezone
+
+```text
+set system keyboard de
+set system locale de_DE.UTF-8
+set system timezone Europe/Berlin
+```
+
+`keyboard` is the layout of the physical and serial consoles. It comes first of
+the three for a practical reason: everything an operator types at the console
+goes through it, and a passphrase entered on the wrong layout is a box that
+cannot be unlocked. An SSH session brings its own layout and is unaffected.
+
+`timezone` matters more on a firewall than on a desktop. Every log line, every
+firewall hit, every certificate expiry and every scheduled rule is stamped with
+it, and correlating an incident across two boxes whose clocks read different
+zones is a reliable way to lose an hour. Unset leaves UTC in place, which is the
+safe answer if you are not sure.
+
+The zone is checked against `/usr/share/zoneinfo` on this machine rather than
+against a list compiled into the appliance: the set of zones moves with tzdata,
+and a built-in list would eventually refuse a zone that exists — at commit, on a
+box you are already logged into.
+
+All three apply on commit and survive a reboot. A keymap this image does not
+ship draws a warning rather than failing the commit: the firewall rules in the
+same commit matter more than the console layout.

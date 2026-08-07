@@ -69,6 +69,8 @@
             --set SENTINEL_HOSTNAME_BIN   ${pkgs.nettools}/bin/hostname \
             --set SENTINEL_IP_BIN         ${pkgs.iproute2}/bin/ip \
             --set SENTINEL_TC_BIN         ${pkgs.iproute2}/bin/tc \
+            --set SENTINEL_LOADKEYS_BIN   ${pkgs.kbd}/bin/loadkeys \
+            --set SENTINEL_TIMEDATECTL_BIN ${pkgs.systemd}/bin/timedatectl \
             --set SENTINEL_SYSCTL_BIN     ${pkgs.procps}/bin/sysctl \
             --set SENTINEL_ETHTOOL_BIN    ${pkgs.ethtool}/bin/ethtool \
             --set SENTINEL_LDAPWHOAMI_BIN ${pkgs.openldap}/bin/ldapwhoami \
@@ -1454,6 +1456,29 @@
 
           # Hostname changed live.
           machine.succeed("hostname | grep -x fw-a")
+
+          # The console keyboard, the locale and the timezone reach the running
+          # system, not just the saved document. The timezone is the one that
+          # matters most: every log line, every firewall hit and every
+          # certificate expiry is stamped with it, so a box whose clock reads
+          # the wrong zone costs an hour the next time an incident is
+          # correlated across two of them.
+          machine.succeed(
+              "su admin -c \"printf '%s\\n' "
+              "'set system keyboard de' "
+              "'set system locale de_DE.UTF-8' "
+              "'set system timezone Europe/Berlin' "
+              "commit save exit | sentinel configure\""
+          )
+          machine.succeed("timedatectl show -p Timezone --value | grep -x Europe/Berlin")
+          # The drop-in is what survives a reboot; the live `loadkeys` above is
+          # what makes the commit mean now.
+          machine.succeed("grep -q '^KEYMAP=de$' /run/systemd/vconsole.conf")
+          machine.succeed("grep -q '^LANG=de_DE.UTF-8$' /run/systemd/locale.conf")
+          # And they come back out of the configuration the way they went in.
+          machine.succeed(
+              "sentinel configure --no-apply <<< 'show' | grep -q 'timezone Europe/Berlin'"
+          )
           # Live visibility (the VyOS feel): a fresh shell's dynamic prompt
           # mechanism ($(hostname)) yields the new name immediately — no relogin.
           machine.succeed("su admin -c 'echo $(hostname)' | grep -x fw-a")

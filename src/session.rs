@@ -1214,6 +1214,11 @@ struct Draft {
     /// Kernel parameters (`system sysctl <name> <value>`).
     sysctl: std::collections::BTreeMap<String, String>,
     hostname: Option<String>,
+    /// Console keyboard layout, system locale and timezone
+    /// (`system keyboard|locale|timezone`).
+    keyboard: Option<String>,
+    locale: Option<String>,
+    timezone: Option<String>,
     /// Serial console (`system console device|speed`).
     console: crate::config::Console,
     /// Where a password is checked when it is not checked here.
@@ -1931,6 +1936,9 @@ impl Draft {
             metrics: a.system.metrics.clone(),
             commit_revisions: a.system.commit_revisions,
             hostname: Some(a.system.hostname.clone()),
+            keyboard: a.system.keyboard.clone(),
+            locale: a.system.locale.clone(),
+            timezone: a.system.timezone.clone(),
             firewall: FirewallDraft {
                 stateful: Some(a.firewall.stateful),
                 block_icmp: Some(a.firewall.block_icmp),
@@ -2868,6 +2876,12 @@ impl Session {
         match args {
             // Host-wide settings.
             ["system", "hostname", v] => self.draft.hostname = Some((*v).to_string()),
+            // Console keyboard, locale and timezone. Validated at commit against
+            // what the system actually has, rather than against a list this
+            // appliance would have to keep in step with tzdata.
+            ["system", "keyboard", v] => self.draft.keyboard = Some((*v).to_string()),
+            ["system", "locale", v] => self.draft.locale = Some((*v).to_string()),
+            ["system", "timezone", v] => self.draft.timezone = Some((*v).to_string()),
 
             // Interfaces (incl. VLAN subinterfaces).
             // Bare `set interface <name>` just declares the node (a NIC with no
@@ -6046,6 +6060,9 @@ impl Session {
     pub fn delete(&mut self, args: &[&str]) -> Result<()> {
         match args {
             ["system", "hostname"] => self.draft.hostname = None,
+            ["system", "keyboard"] => self.draft.keyboard = None,
+            ["system", "locale"] => self.draft.locale = None,
+            ["system", "timezone"] => self.draft.timezone = None,
 
             ["interface", name] => {
                 let before = self.draft.interfaces.len();
@@ -8498,6 +8515,9 @@ impl Session {
             evpn: self.draft.evpn.clone(),
             system: System {
                 hostname,
+                keyboard: self.draft.keyboard.clone(),
+                locale: self.draft.locale.clone(),
+                timezone: self.draft.timezone.clone(),
                 logins: self.draft.logins.clone(),
                 groups: self.draft.admin_groups.clone(),
                 config_sync: self.draft.config_sync.clone(),
@@ -8850,6 +8870,15 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         out.push_str("system {\n");
         if let Some(h) = &draft.hostname {
             out.push_str(&format!("    hostname {h}\n"));
+        }
+        for (val, kw) in [
+            (&draft.keyboard, "keyboard"),
+            (&draft.locale, "locale"),
+            (&draft.timezone, "timezone"),
+        ] {
+            if let Some(v) = val {
+                out.push_str(&format!("    {kw} {v}\n"));
+            }
         }
         for (k, v) in &draft.sysctl {
             out.push_str(&format!("    sysctl {k} value {v}\n"));
@@ -12265,6 +12294,9 @@ wan-zone = "wan"
         let toml = r#"
 [system]
 hostname = "iface"
+keyboard = "de"
+locale = "de_DE.UTF-8"
+timezone = "Europe/Berlin"
 
 [[interface]]
 name = "eth0"
@@ -12448,6 +12480,8 @@ common-name = "vpn.example.com"
         // has to know each of them by name — the exact shape that has silently
         // dropped settings six times now.
         for want in [
+            "set system keyboard de",
+            "set system timezone Europe/Berlin",
             "set interface eth0 ip proxy-arp true",
             "set interface eth0 ipv6 accept-dad 2",
             "set interface eth1 dhcp client-id duid",
