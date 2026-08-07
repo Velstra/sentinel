@@ -5077,6 +5077,15 @@ impl Interface {
             Some(IfaceType::Bridge) | Some(IfaceType::Bond)
         )
     }
+    /// True for a dummy device (`type = "dummy"`).
+    ///
+    /// Deliberately *not* folded into [`Interface::is_virtual_l2`]: that
+    /// predicate also decides whether an interface may carry `member`s, and a
+    /// dummy enslaves nothing. It shares only the fact that both need a
+    /// `.netdev` written for them.
+    pub fn is_dummy(&self) -> bool {
+        self.if_type == Some(IfaceType::Dummy)
+    }
     /// True for a PPPoE client interface (`type = "pppoe"`).
     pub fn is_pppoe(&self) -> bool {
         self.if_type == Some(IfaceType::Pppoe)

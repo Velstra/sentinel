@@ -188,6 +188,19 @@ fn bridge_vlan_body(tagged: &[u16], untagged: Option<u16>) -> String {
     body
 }
 
+/// The interfaces whose device this box creates through the virtual-L2 netdev
+/// renderer: bridges, bonds and dummies.
+///
+/// A function rather than an inline filter because getting it wrong is silent —
+/// the interface configures, validates and renders a `.network` unit, and the
+/// device simply is not there.
+fn virtual_l2_netdev_ifaces(ifaces: &[Interface]) -> Vec<&Interface> {
+    ifaces
+        .iter()
+        .filter(|i| i.is_virtual_l2() || i.is_dummy())
+        .collect()
+}
+
 /// The `.netdev` for a virtual L2 device: a bridge (`Kind=bridge`) or a bond
 /// (`Kind=bond` + `[Bond] Mode=`, default `active-backup`). Members attach via
 /// their own `.network` (`Bridge=`/`Bond=`), not here.
@@ -2949,13 +2962,18 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
         }
     }
 
-    // Bridge / bond .netdev units (virtual L2 devices this box synthesises).
-    for i in ifaces {
-        if i.is_virtual_l2() {
-            let name = netdev_name(&i.name);
-            writes.push((name.clone(), virtual_l2_netdev_body(i)));
-            keep.insert(name);
-        }
+    // Bridge / bond / dummy .netdev units (devices this box synthesises).
+    //
+    // `is_dummy()` and not `is_virtual_l2()`: the renderer below has always known
+    // how to write `Kind=dummy`, but nothing ever asked it to, because the
+    // predicate that decides who gets a `.netdev` is the same one that decides
+    // who may enslave members — and a dummy enslaves nothing. So a dummy
+    // interface validated, rendered a `.network` unit, and the device was never
+    // created. Found by a VM check that needed a second link to route out of.
+    for i in virtual_l2_netdev_ifaces(ifaces) {
+        let name = netdev_name(&i.name);
+        writes.push((name.clone(), virtual_l2_netdev_body(i)));
+        keep.insert(name);
     }
 
     // Kernel tunnel .netdev units (GRE / IPIP / GRETAP point-to-point, roadmap C3).
@@ -5252,6 +5270,30 @@ mod tests {
             description: None,
             disabled: false,
         }
+    }
+
+    /// A dummy link needs a `.netdev` written for it or the device never exists.
+    ///
+    /// The renderer had always known how to write `Kind=dummy`; the predicate
+    /// deciding who gets a `.netdev` was the one deciding who may enslave
+    /// members, and a dummy enslaves nothing. So `type = "dummy"` validated,
+    /// rendered a `.network` unit, and produced no link — visible only as
+    /// `networkctl reconfigure dum0: No such device` in a warning.
+    #[test]
+    fn a_dummy_link_is_among_the_devices_this_box_creates() {
+        let mut dum = iface_addr("dum0", "10.255.0.1/32");
+        dum.if_type = Some(IfaceType::Dummy);
+        let mut br = iface_addr("br0", "10.0.0.1/24");
+        br.if_type = Some(IfaceType::Bridge);
+        let plain = iface_addr("eth0", "10.1.0.1/24");
+        let ifaces = vec![dum, br, plain];
+
+        let names: Vec<&str> = virtual_l2_netdev_ifaces(&ifaces)
+            .iter()
+            .map(|i| i.name.as_str())
+            .collect();
+        assert_eq!(names, ["dum0", "br0"]);
+        assert!(virtual_l2_netdev_body(&ifaces[0]).contains("Kind=dummy"));
     }
 
     #[test]
