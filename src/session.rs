@@ -14,15 +14,17 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::{
     Acme, Action, AlertMail, Alerts, Appliance, Bfd, Bgp, BgpAggregate, BgpNeighbor, BgpRoa,
-    BgpRtr, BroadcastRelay, Ca, Certificate, ConfigSync, ConntrackSync, Dhcp6Pool, DhcpRelay,
-    DhcpServer, DhcpStaticLease, Dns, Dyndns, Export, Filter, FilterRule, Firewall, Group, Groups,
-    HealthCheck, Ids, IfaceType, Interface, IpsecConnection, Isis, Lldp, LoadBalancer, Login, Mdns,
-    MultiWan, Multicast, MulticastInterface, Nat, Nat64, NatDestination, NatNpt66, NatSource, Ntp,
-    OpenConnectServer, OpenConnectUser, Ospf, Ospf3, OspfInterface, Permission, Pki, Policy,
+    BgpRtr, BondOptions, BridgeOptions, BridgePort, BroadcastRelay, Ca, Certificate, ConfigSync,
+    ConntrackSync, Dhcp6Client, Dhcp6Pool, DhcpClient, DhcpRelay, DhcpServer, DhcpStaticLease, Dns,
+    Dyndns, Ethernet, Export, Filter, FilterRule, Firewall, Group, Groups, HealthCheck, Ids,
+    IfaceType, Interface, Ip6Options, IpOptions, IpsecConnection, Isis, Lldp, LoadBalancer, Login,
+    Mdns, MultiWan, Multicast, MulticastInterface, Nat, Nat64, NatDestination, NatNpt66, NatSource,
+    Ntp, OpenConnectServer, OpenConnectUser, Ospf, Ospf3, OspfInterface, Permission, Pki, Policy,
     PortMapping, PortSpec, Portal, Pppoe, PrefixEntry, PrefixList, Proto, Protocols, Qos,
     QosDiscipline, ReverseProxy, Rip, RouterAdvert, Rule, Schedule, Services, Snmp,
     SourceValidation, Ssh, StaticRoute, Syslog, SyslogLevel, SyslogProto, SyslogTarget, System,
-    UpdateChannel, Vpn, VrfDef, Vrrp, WanMode, WanUplink, WgPeer, WireguardTunnel, ZoneCfg,
+    UpdateChannel, Vpn, VrfDef, Vrrp, WanMode, WanUplink, WgPeer, WireguardTunnel, Wireless,
+    WirelessWpa, Wwan, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -69,6 +71,24 @@ struct IfaceDraft {
     /// TCP MSS clamp on this link (`<bytes>` or `pmtu`).
     mss: Option<String>,
     mac: Option<String>,
+    // Per-link kernel behaviour and DHCP-client identity. These four carry no
+    // "partially specified" state a draft would have to model — every field is
+    // already an `Option` or a `bool` that defaults to the kernel's own choice —
+    // so the draft holds the committed types rather than four parallel `*Draft`
+    // structs that would differ from them only in name.
+    vti_key: Option<u32>,
+    wireless: Option<WirelessDraft>,
+    wwan: Option<WwanDraft>,
+    ethernet: Ethernet,
+    bridge: BridgeOptions,
+    bridge_port: BridgePort,
+    bond: BondOptions,
+    mirror_ingress: Option<String>,
+    mirror_egress: Option<String>,
+    ip: IpOptions,
+    ipv6: Ip6Options,
+    dhcp: DhcpClient,
+    dhcpv6: Dhcp6Client,
     // Kernel tunnel (type = gre/ipip/gretap): endpoint addresses + GRE key + TTL.
     local: Option<String>,
     remote: Option<String>,
@@ -103,6 +123,19 @@ impl IfaceDraft {
         self.pppoe.get_or_insert_with(PppoeDraft::default)
     }
 
+    /// Mutable access to the wireless sub-draft, inserting a default if not yet
+    /// present — the first `wireless` field creates the radio, mirroring
+    /// `pppoe_mut`.
+    fn wireless_mut(&mut self) -> &mut WirelessDraft {
+        self.wireless.get_or_insert_with(WirelessDraft::default)
+    }
+
+    /// Mutable access to the cellular sub-draft, inserting a default if not yet
+    /// present.
+    fn wwan_mut(&mut self) -> &mut WwanDraft {
+        self.wwan.get_or_insert_with(WwanDraft::default)
+    }
+
     /// Mutable access to the QoS sub-draft, inserting a default if not yet
     /// present — the first `qos` field creates it, mirroring `pppoe_mut`.
     fn qos_mut(&mut self) -> &mut QosDraft {
@@ -134,6 +167,35 @@ struct PppoeDraft {
     service_name: Option<String>,
     ac_name: Option<String>,
     mru: Option<u16>,
+}
+
+/// A partially-specified cellular bearer. `apn` is required on the committed
+/// type, so it is optional here and materialises to an empty string that
+/// `validate` rejects by name.
+#[derive(Debug, Clone, Default)]
+struct WwanDraft {
+    apn: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+    pin: Option<String>,
+    ip_type: Option<String>,
+}
+
+/// A partially-specified wireless radio. `mode` and `ssid` are required on the
+/// committed type, so they are optional here and materialise to empty strings
+/// that `validate` rejects by name — the same shape [`PppoeDraft`] uses.
+#[derive(Debug, Clone, Default)]
+struct WirelessDraft {
+    mode: Option<String>,
+    ssid: Option<String>,
+    country: Option<String>,
+    channel: Option<u8>,
+    band: Option<String>,
+    hide_ssid: bool,
+    isolate_stations: bool,
+    max_stations: Option<u16>,
+    wpa_mode: Option<String>,
+    wpa_passphrase: Option<String>,
 }
 
 /// A partially-specified DHCP server (fields filled in incrementally).
@@ -1399,6 +1461,7 @@ struct IpsecDraft {
     remote: Option<String>,
     local_subnet: Option<String>,
     remote_subnet: Option<String>,
+    vti: Option<String>,
     psk: Option<String>,
     ike_version: Option<u8>,
     ike_proposal: Option<String>,
@@ -1981,6 +2044,36 @@ impl Draft {
                             mtu: i.mtu,
                             mss: i.mss.clone(),
                             mac: i.mac.clone(),
+                            vti_key: i.vti_key,
+                            wwan: i.wwan.as_ref().map(|w| WwanDraft {
+                                apn: Some(w.apn.clone()),
+                                username: w.username.clone(),
+                                password: w.password.clone(),
+                                pin: w.pin.clone(),
+                                ip_type: w.ip_type.clone(),
+                            }),
+                            wireless: i.wireless.as_ref().map(|w| WirelessDraft {
+                                mode: Some(w.mode.clone()),
+                                ssid: Some(w.ssid.clone()),
+                                country: w.country.clone(),
+                                channel: w.channel,
+                                band: w.band.clone(),
+                                hide_ssid: w.hide_ssid,
+                                isolate_stations: w.isolate_stations,
+                                max_stations: w.max_stations,
+                                wpa_mode: w.wpa.as_ref().and_then(|x| x.mode.clone()),
+                                wpa_passphrase: w.wpa.as_ref().map(|x| x.passphrase.clone()),
+                            }),
+                            ethernet: i.ethernet.clone(),
+                            bridge: i.bridge.clone(),
+                            bridge_port: i.bridge_port.clone(),
+                            bond: i.bond.clone(),
+                            mirror_ingress: i.mirror_ingress.clone(),
+                            mirror_egress: i.mirror_egress.clone(),
+                            ip: i.ip.clone(),
+                            ipv6: i.ipv6.clone(),
+                            dhcp: i.dhcp.clone(),
+                            dhcpv6: i.dhcpv6.clone(),
                             local: i.local.clone(),
                             remote: i.remote.clone(),
                             tunnel_key: i.tunnel_key,
@@ -2409,8 +2502,9 @@ impl Draft {
                         IpsecDraft {
                             local: Some(c.local.clone()),
                             remote: Some(c.remote.clone()),
-                            local_subnet: Some(c.local_subnet.clone()),
-                            remote_subnet: Some(c.remote_subnet.clone()),
+                            local_subnet: c.local_subnet.clone(),
+                            remote_subnet: c.remote_subnet.clone(),
+                            vti: c.vti.clone(),
                             psk: Some(c.psk.clone()),
                             ike_version: c.ike_version,
                             ike_proposal: c.ike_proposal.clone(),
@@ -3013,9 +3107,12 @@ impl Session {
                     "macsec" => IfaceType::Macsec,
                     "l2tpv3" => IfaceType::L2tpv3,
                     "dummy" => IfaceType::Dummy,
+                    "vti" => IfaceType::Vti,
+                    "wireless" => IfaceType::Wireless,
+                    "wwan" => IfaceType::Wwan,
                     other => {
                         bail!(
-                            "interface type {other:?}: expected \"bridge\", \"bond\", \"dummy\", \"wireguard\", \"pppoe\", \"gre\", \"ipip\", \"gretap\", \"macvlan\", \"macsec\" or \"l2tpv3\""
+                            "interface type {other:?}: expected \"bridge\", \"bond\", \"dummy\", \"wireguard\", \"pppoe\", \"gre\", \"ipip\", \"gretap\", \"macvlan\", \"macsec\", \"l2tpv3\", \"vti\", \"wireless\" or \"wwan\""
                         )
                     }
                 };
@@ -3092,6 +3189,367 @@ impl Session {
             ["interface", name, "mac", v] => {
                 crate::config::validate_mac(v)?;
                 self.draft.iface_mut(name).mac = Some((*v).to_string());
+            }
+
+            // The cellular bearer. The first field creates the block.
+            ["interface", name, "wwan", "apn", v] => {
+                if v.is_empty() || v.contains(',') {
+                    bail!("interface {name} wwan apn {v:?}: non-empty, no comma");
+                }
+                self.draft.iface_mut(name).wwan_mut().apn = Some((*v).to_string());
+            }
+            ["interface", name, "wwan", "username", v] => {
+                self.draft.iface_mut(name).wwan_mut().username = Some((*v).to_string());
+            }
+            ["interface", name, "wwan", "password", v] => {
+                self.draft.iface_mut(name).wwan_mut().password = Some((*v).to_string());
+            }
+            ["interface", name, "wwan", "pin", v] => {
+                if !(4..=8).contains(&v.len()) || !v.bytes().all(|b| b.is_ascii_digit()) {
+                    bail!("interface {name} wwan pin: 4-8 digits");
+                }
+                self.draft.iface_mut(name).wwan_mut().pin = Some((*v).to_string());
+            }
+            ["interface", name, "wwan", "ip-type", v] => {
+                if !matches!(*v, "ipv4" | "ipv6" | "ipv4v6") {
+                    bail!("interface {name} wwan ip-type {v:?}: ipv4 | ipv6 | ipv4v6");
+                }
+                self.draft.iface_mut(name).wwan_mut().ip_type = Some((*v).to_string());
+            }
+
+            // Wireless. The first field creates the block, the way the first
+            // `pppoe` field does; commit checks what a radio in each role needs.
+            ["interface", name, "wireless", "mode", v] => {
+                if !matches!(*v, "access-point" | "station") {
+                    bail!("interface {name} wireless mode {v:?}: access-point | station");
+                }
+                self.draft.iface_mut(name).wireless_mut().mode = Some((*v).to_string());
+            }
+            ["interface", name, "wireless", "ssid", v] => {
+                if v.is_empty() || v.len() > 32 {
+                    bail!("interface {name} wireless ssid: 1-32 characters");
+                }
+                self.draft.iface_mut(name).wireless_mut().ssid = Some((*v).to_string());
+            }
+            ["interface", name, "wireless", "country", v] => {
+                let c = v.to_ascii_uppercase();
+                if c.len() != 2 || !c.bytes().all(|b| b.is_ascii_uppercase()) {
+                    bail!("interface {name} wireless country {v:?}: a two-letter ISO code");
+                }
+                self.draft.iface_mut(name).wireless_mut().country = Some(c);
+            }
+            ["interface", name, "wireless", "channel", v] => {
+                let c: u8 = v
+                    .parse()
+                    .ok()
+                    .filter(|c| *c > 0)
+                    .with_context(|| format!("interface {name} wireless channel {v:?}"))?;
+                self.draft.iface_mut(name).wireless_mut().channel = Some(c);
+            }
+            ["interface", name, "wireless", "band", v] => {
+                if !matches!(*v, "b" | "g" | "a" | "n" | "ac" | "ax") {
+                    bail!("interface {name} wireless band {v:?}: b | g | a | n | ac | ax");
+                }
+                self.draft.iface_mut(name).wireless_mut().band = Some((*v).to_string());
+            }
+            ["interface", name, "wireless", "hide-ssid", v] => {
+                self.draft.iface_mut(name).wireless_mut().hide_ssid = parse_bool(v)?;
+            }
+            ["interface", name, "wireless", "isolate-stations", v] => {
+                self.draft.iface_mut(name).wireless_mut().isolate_stations = parse_bool(v)?;
+            }
+            ["interface", name, "wireless", "max-stations", v] => {
+                let n: u16 = v
+                    .parse()
+                    .with_context(|| format!("interface {name} wireless max-stations {v:?}"))?;
+                self.draft.iface_mut(name).wireless_mut().max_stations = Some(n);
+            }
+            ["interface", name, "wireless", "wpa", "mode", v] => {
+                if !matches!(*v, "wpa2" | "wpa3" | "wpa2+wpa3") {
+                    bail!("interface {name} wireless wpa mode {v:?}: wpa2 | wpa3 | wpa2+wpa3");
+                }
+                self.draft.iface_mut(name).wireless_mut().wpa_mode = Some((*v).to_string());
+            }
+            ["interface", name, "wireless", "wpa", "passphrase", v] => {
+                if !(8..=63).contains(&v.len()) {
+                    bail!("interface {name} wireless wpa passphrase: 8-63 characters");
+                }
+                self.draft.iface_mut(name).wireless_mut().wpa_passphrase = Some((*v).to_string());
+            }
+
+            // NIC hardware, applied with `ethtool`. A card that refuses one of
+            // these warns rather than failing the commit — see `apply_ethernet`.
+            ["interface", name, "ethernet", "speed", v] => {
+                let s: u32 = v
+                    .parse()
+                    .with_context(|| format!("interface {name} ethernet speed {v:?}: Mbit/s"))?;
+                self.draft.iface_mut(name).ethernet.speed = Some(s);
+            }
+            ["interface", name, "ethernet", "duplex", v] => {
+                if !matches!(*v, "full" | "half") {
+                    bail!("interface {name} ethernet duplex {v:?}: full | half");
+                }
+                self.draft.iface_mut(name).ethernet.duplex = Some((*v).to_string());
+            }
+            [
+                "interface",
+                name,
+                "ethernet",
+                field @ ("rx-ring" | "tx-ring" | "rx-usecs" | "tx-usecs"),
+                v,
+            ] => {
+                let n: u32 = v.parse().with_context(|| {
+                    format!("interface {name} ethernet {field} {v:?}: a number")
+                })?;
+                let e = &mut self.draft.iface_mut(name).ethernet;
+                match *field {
+                    "rx-ring" => e.rx_ring = Some(n),
+                    "tx-ring" => e.tx_ring = Some(n),
+                    "rx-usecs" => e.rx_usecs = Some(n),
+                    _ => e.tx_usecs = Some(n),
+                }
+            }
+            ["interface", name, "ethernet", "adaptive-rx", v] => {
+                self.draft.iface_mut(name).ethernet.adaptive_rx = parse_bool(v)?;
+            }
+            ["interface", name, "ethernet", "adaptive-tx", v] => {
+                self.draft.iface_mut(name).ethernet.adaptive_tx = parse_bool(v)?;
+            }
+
+            // Bridge, bridge-port and bond detail. Numbers are parsed here so a
+            // typo is refused where it was typed; the cross-field rules (STP
+            // timers without STP, a primary that is not a member) are checked at
+            // commit, where the whole device is visible.
+            ["interface", name, "bridge", "stp", v] => {
+                self.draft.iface_mut(name).bridge.stp = parse_bool(v)?;
+            }
+            ["interface", name, "bridge", "igmp-snooping", v] => {
+                self.draft.iface_mut(name).bridge.igmp_snooping = parse_bool(v)?;
+            }
+            ["interface", name, "bridge", "igmp-querier", v] => {
+                self.draft.iface_mut(name).bridge.igmp_querier = parse_bool(v)?;
+            }
+            ["interface", name, "bridge", "priority", v] => {
+                let p: u16 = v
+                    .parse()
+                    .with_context(|| format!("interface {name} bridge priority {v:?}: 0-65535"))?;
+                self.draft.iface_mut(name).bridge.priority = Some(p);
+            }
+            [
+                "interface",
+                name,
+                "bridge",
+                field @ ("hello-time" | "max-age" | "forward-delay" | "ageing-time"),
+                v,
+            ] => {
+                let secs: u32 = v
+                    .parse()
+                    .with_context(|| format!("interface {name} bridge {field} {v:?}: seconds"))?;
+                let b = &mut self.draft.iface_mut(name).bridge;
+                match *field {
+                    "hello-time" => b.hello_time = Some(secs),
+                    "max-age" => b.max_age = Some(secs),
+                    "forward-delay" => b.forward_delay = Some(secs),
+                    _ => b.ageing_time = Some(secs),
+                }
+            }
+            ["interface", name, "bridge-port", "cost", v] => {
+                let c: u32 = v
+                    .parse()
+                    .ok()
+                    .filter(|c| (1..=65535).contains(c))
+                    .with_context(|| format!("interface {name} bridge-port cost {v:?}: 1-65535"))?;
+                self.draft.iface_mut(name).bridge_port.cost = Some(c);
+            }
+            ["interface", name, "bridge-port", "priority", v] => {
+                let p: u16 = v.parse().ok().filter(|p| *p <= 63).with_context(|| {
+                    format!("interface {name} bridge-port priority {v:?}: 0-63")
+                })?;
+                self.draft.iface_mut(name).bridge_port.priority = Some(p);
+            }
+            ["interface", name, "bridge-port", "learning", v] => {
+                self.draft.iface_mut(name).bridge_port.learning = Some(parse_bool(v)?);
+            }
+            ["interface", name, "bond", "hash-policy", v] => {
+                if !matches!(
+                    *v,
+                    "layer2" | "layer2+3" | "layer3+4" | "encap2+3" | "encap3+4"
+                ) {
+                    bail!(
+                        "interface {name} bond hash-policy {v:?}: layer2 | layer2+3 | layer3+4 | encap2+3 | encap3+4"
+                    );
+                }
+                self.draft.iface_mut(name).bond.hash_policy = Some((*v).to_string());
+            }
+            ["interface", name, "bond", "lacp-rate", v] => {
+                if !matches!(*v, "slow" | "fast") {
+                    bail!("interface {name} bond lacp-rate {v:?}: slow | fast");
+                }
+                self.draft.iface_mut(name).bond.lacp_rate = Some((*v).to_string());
+            }
+            ["interface", name, "bond", "min-links", v] => {
+                let n: u16 = v
+                    .parse()
+                    .with_context(|| format!("interface {name} bond min-links {v:?}: a count"))?;
+                self.draft.iface_mut(name).bond.min_links = Some(n);
+            }
+            ["interface", name, "bond", "primary", v] => {
+                self.draft.iface_mut(name).bond.primary = Some((*v).to_string());
+            }
+            [
+                "interface",
+                name,
+                "bond",
+                field @ ("mii-interval" | "arp-interval"),
+                v,
+            ] => {
+                let ms: u32 = v.parse().with_context(|| {
+                    format!("interface {name} bond {field} {v:?}: milliseconds")
+                })?;
+                let b = &mut self.draft.iface_mut(name).bond;
+                if *field == "mii-interval" {
+                    b.mii_interval = Some(ms);
+                } else {
+                    b.arp_interval = Some(ms);
+                }
+            }
+            ["interface", name, "bond", "arp-target", v] => {
+                validate_ipv4(v)?;
+                let b = &mut self.draft.iface_mut(name).bond;
+                if !b.arp_target.iter().any(|t| t == v) {
+                    b.arp_target.push((*v).to_string());
+                }
+            }
+
+            ["interface", name, "vti-key", v] => {
+                let key: u32 = v
+                    .parse()
+                    .ok()
+                    .filter(|k| *k != 0)
+                    .with_context(|| format!("interface {name} vti-key {v:?}: 1-4294967295"))?;
+                self.draft.iface_mut(name).vti_key = Some(key);
+            }
+
+            // Port mirroring. The destination is validated at commit — a mirror
+            // to a link this box does not have is a monitor port that is quietly
+            // dark, which is worse than no mirror at all.
+            ["interface", name, "mirror-ingress", v] => {
+                self.draft.iface_mut(name).mirror_ingress = Some((*v).to_string());
+            }
+            ["interface", name, "mirror-egress", v] => {
+                self.draft.iface_mut(name).mirror_egress = Some((*v).to_string());
+            }
+
+            // Per-link IPv4 behaviour. These are kernel switches, not firewall
+            // policy — the firewall decides whether a packet may pass, these
+            // decide whether the link is a router, whose ARP it answers and which
+            // address it announces itself under.
+            ["interface", name, "ip", "disable-forwarding", v] => {
+                self.draft.iface_mut(name).ip.disable_forwarding = parse_bool(v)?;
+            }
+            ["interface", name, "ip", "proxy-arp", v] => {
+                self.draft.iface_mut(name).ip.proxy_arp = parse_bool(v)?;
+            }
+            ["interface", name, "ip", "proxy-arp-pvlan", v] => {
+                self.draft.iface_mut(name).ip.proxy_arp_pvlan = parse_bool(v)?;
+            }
+            ["interface", name, "ip", "arp-cache-timeout", v] => {
+                let secs: u32 = v.parse().with_context(|| {
+                    format!("interface {name} ip arp-cache-timeout {v:?}: seconds")
+                })?;
+                if secs == 0 {
+                    bail!("interface {name} ip arp-cache-timeout 0: an entry would never be valid");
+                }
+                self.draft.iface_mut(name).ip.arp_cache_timeout = Some(secs);
+            }
+            ["interface", name, "ip", "arp-filter", v] => {
+                self.draft.iface_mut(name).ip.arp_filter = parse_bool(v)?;
+            }
+            ["interface", name, "ip", "arp-accept", v] => {
+                self.draft.iface_mut(name).ip.arp_accept = parse_bool(v)?;
+            }
+            ["interface", name, "ip", "arp-announce", v] => {
+                self.draft.iface_mut(name).ip.arp_announce = parse_bool(v)?;
+            }
+            ["interface", name, "ip", "arp-ignore", v] => {
+                self.draft.iface_mut(name).ip.arp_ignore = parse_bool(v)?;
+            }
+            ["interface", name, "ip", "directed-broadcast", v] => {
+                self.draft.iface_mut(name).ip.directed_broadcast = parse_bool(v)?;
+            }
+
+            // Per-link IPv6 behaviour.
+            ["interface", name, "ipv6", "disable-forwarding", v] => {
+                self.draft.iface_mut(name).ipv6.disable_forwarding = parse_bool(v)?;
+            }
+            ["interface", name, "ipv6", "no-link-local", v] => {
+                self.draft.iface_mut(name).ipv6.no_link_local = parse_bool(v)?;
+            }
+            ["interface", name, "ipv6", "dad-transmits", v] => {
+                let n: u8 = v.parse().with_context(|| {
+                    format!("interface {name} ipv6 dad-transmits {v:?}: a count")
+                })?;
+                self.draft.iface_mut(name).ipv6.dad_transmits = Some(n);
+            }
+            // 0 use anyway / 1 disable the address / 2 disable IPv6 on the link.
+            ["interface", name, "ipv6", "accept-dad", v] => {
+                let n: u8 = v.parse().ok().filter(|n| *n <= 2).with_context(|| {
+                    format!("interface {name} ipv6 accept-dad {v:?}: 0, 1 or 2")
+                })?;
+                self.draft.iface_mut(name).ipv6.accept_dad = Some(n);
+            }
+
+            // What the DHCPv4 client on this link sends and accepts.
+            ["interface", name, "dhcp", "client-id", v] => {
+                if !matches!(*v, "mac" | "duid") {
+                    bail!("interface {name} dhcp client-id {v:?}: `mac` or `duid`");
+                }
+                self.draft.iface_mut(name).dhcp.client_id = Some((*v).to_string());
+            }
+            ["interface", name, "dhcp", "duid", v] => {
+                crate::config::validate_duid(v)?;
+                self.draft.iface_mut(name).dhcp.duid = Some(v.to_ascii_lowercase());
+            }
+            ["interface", name, "dhcp", "host-name", v] => {
+                crate::config::validate_hostname(v)?;
+                self.draft.iface_mut(name).dhcp.host_name = Some((*v).to_string());
+            }
+            ["interface", name, "dhcp", "vendor-class-id", v] => {
+                self.draft.iface_mut(name).dhcp.vendor_class_id = Some((*v).to_string());
+            }
+            ["interface", name, "dhcp", "user-class", v] => {
+                self.draft.iface_mut(name).dhcp.user_class = Some((*v).to_string());
+            }
+            ["interface", name, "dhcp", "no-default-route", v] => {
+                self.draft.iface_mut(name).dhcp.no_default_route = parse_bool(v)?;
+            }
+            ["interface", name, "dhcp", "default-route-distance", v] => {
+                let m: u32 = v.parse().with_context(|| {
+                    format!("interface {name} dhcp default-route-distance {v:?}: a metric")
+                })?;
+                self.draft.iface_mut(name).dhcp.default_route_distance = Some(m);
+            }
+            ["interface", name, "dhcp", "reject", v] => {
+                crate::config::validate_cidr_or_ip(v)?;
+                let d = self.draft.iface_mut(name);
+                if !d.dhcp.reject.iter().any(|r| r == v) {
+                    d.dhcp.reject.push((*v).to_string());
+                }
+            }
+
+            // What the DHCPv6 client on this link sends and accepts.
+            ["interface", name, "dhcpv6", "duid", v] => {
+                crate::config::validate_duid(v)?;
+                self.draft.iface_mut(name).dhcpv6.duid = Some(v.to_ascii_lowercase());
+            }
+            ["interface", name, "dhcpv6", "rapid-commit", v] => {
+                self.draft.iface_mut(name).dhcpv6.rapid_commit = parse_bool(v)?;
+            }
+            ["interface", name, "dhcpv6", "parameters-only", v] => {
+                self.draft.iface_mut(name).dhcpv6.parameters_only = parse_bool(v)?;
+            }
+            ["interface", name, "dhcpv6", "no-release", v] => {
+                self.draft.iface_mut(name).dhcpv6.no_release = parse_bool(v)?;
             }
 
             // Kernel tunnel endpoints/tunables (a `type = gre|ipip|gretap` link,
@@ -5016,6 +5474,11 @@ impl Session {
                 crate::config::validate_cidr_or_ip(v)?;
                 self.draft.ipsec_mut(name).remote_subnet = Some((*v).to_string());
             }
+            // Binding a tunnel to a link is what makes it route-based; commit
+            // checks the link exists and is one.
+            ["vpn", "ipsec", name, "vti", v] => {
+                self.draft.ipsec_mut(name).vti = Some((*v).to_string());
+            }
             ["vpn", "ipsec", name, "psk", v] => {
                 self.draft.ipsec_mut(name).psk = Some((*v).to_string());
             }
@@ -5622,6 +6085,174 @@ impl Session {
             }
             ["interface", name, "mtu"] => self.iface(name)?.mtu = None,
             ["interface", name, "mac"] => self.iface(name)?.mac = None,
+            // Deleting a whole per-link block restores the kernel's defaults for
+            // every switch in it; deleting one field restores just that one.
+            ["interface", name, "vti-key"] => self.iface(name)?.vti_key = None,
+            ["interface", name, "wwan"] => self.iface(name)?.wwan = None,
+            ["interface", name, "wwan", field] => {
+                let Some(w) = self.iface(name)?.wwan.as_mut() else {
+                    bail!("interface {name:?} has no wwan config");
+                };
+                match *field {
+                    "username" => w.username = None,
+                    "password" => w.password = None,
+                    "pin" => w.pin = None,
+                    "ip-type" => w.ip_type = None,
+                    "apn" => bail!(
+                        "wwan apn is required; `delete interface {name} wwan` removes the bearer"
+                    ),
+                    other => bail!("interface wwan has no field {other:?}"),
+                }
+            }
+            ["interface", name, "wireless"] => self.iface(name)?.wireless = None,
+            ["interface", name, "wireless", field] => {
+                let Some(w) = self.iface(name)?.wireless.as_mut() else {
+                    bail!("interface {name:?} has no wireless config");
+                };
+                match *field {
+                    "country" => w.country = None,
+                    "channel" => w.channel = None,
+                    "band" => w.band = None,
+                    "hide-ssid" => w.hide_ssid = false,
+                    "isolate-stations" => w.isolate_stations = false,
+                    "max-stations" => w.max_stations = None,
+                    "wpa" => {
+                        w.wpa_mode = None;
+                        w.wpa_passphrase = None;
+                    }
+                    "mode" | "ssid" => bail!(
+                        "wireless {field} is required; `delete interface {name} wireless` removes the radio"
+                    ),
+                    other => bail!("interface wireless has no field {other:?}"),
+                }
+            }
+            ["interface", name, "ethernet"] => self.iface(name)?.ethernet = Ethernet::default(),
+            ["interface", name, "ethernet", field] => {
+                let e = &mut self.iface(name)?.ethernet;
+                match *field {
+                    "speed" => e.speed = None,
+                    "duplex" => e.duplex = None,
+                    "rx-ring" => e.rx_ring = None,
+                    "tx-ring" => e.tx_ring = None,
+                    "rx-usecs" => e.rx_usecs = None,
+                    "tx-usecs" => e.tx_usecs = None,
+                    "adaptive-rx" => e.adaptive_rx = false,
+                    "adaptive-tx" => e.adaptive_tx = false,
+                    other => bail!("interface ethernet has no field {other:?}"),
+                }
+            }
+            ["interface", name, "bridge"] => self.iface(name)?.bridge = BridgeOptions::default(),
+            ["interface", name, "bridge", field] => {
+                let b = &mut self.iface(name)?.bridge;
+                match *field {
+                    "stp" => b.stp = false,
+                    "priority" => b.priority = None,
+                    "hello-time" => b.hello_time = None,
+                    "max-age" => b.max_age = None,
+                    "forward-delay" => b.forward_delay = None,
+                    "ageing-time" => b.ageing_time = None,
+                    "igmp-snooping" => b.igmp_snooping = false,
+                    "igmp-querier" => b.igmp_querier = false,
+                    other => bail!("interface bridge has no field {other:?}"),
+                }
+            }
+            ["interface", name, "bridge-port"] => {
+                self.iface(name)?.bridge_port = BridgePort::default()
+            }
+            ["interface", name, "bridge-port", field] => {
+                let p = &mut self.iface(name)?.bridge_port;
+                match *field {
+                    "cost" => p.cost = None,
+                    "priority" => p.priority = None,
+                    "learning" => p.learning = None,
+                    other => bail!("interface bridge-port has no field {other:?}"),
+                }
+            }
+            ["interface", name, "bond"] => self.iface(name)?.bond = BondOptions::default(),
+            ["interface", name, "bond", field] => {
+                let b = &mut self.iface(name)?.bond;
+                match *field {
+                    "hash-policy" => b.hash_policy = None,
+                    "lacp-rate" => b.lacp_rate = None,
+                    "min-links" => b.min_links = None,
+                    "primary" => b.primary = None,
+                    "mii-interval" => b.mii_interval = None,
+                    "arp-interval" => b.arp_interval = None,
+                    "arp-target" => b.arp_target.clear(),
+                    other => bail!("interface bond has no field {other:?}"),
+                }
+            }
+            ["interface", name, "bond", "arp-target", v] => {
+                let b = &mut self.iface(name)?.bond;
+                let before = b.arp_target.len();
+                b.arp_target.retain(|t| t != v);
+                if b.arp_target.len() == before {
+                    bail!("interface {name:?} bond does not probe {v:?}");
+                }
+            }
+            ["interface", name, "mirror-ingress"] => self.iface(name)?.mirror_ingress = None,
+            ["interface", name, "mirror-egress"] => self.iface(name)?.mirror_egress = None,
+            ["interface", name, "ip"] => self.iface(name)?.ip = IpOptions::default(),
+            ["interface", name, "ip", field] => {
+                let i = &mut self.iface(name)?.ip;
+                match *field {
+                    "disable-forwarding" => i.disable_forwarding = false,
+                    "proxy-arp" => i.proxy_arp = false,
+                    "proxy-arp-pvlan" => i.proxy_arp_pvlan = false,
+                    "arp-cache-timeout" => i.arp_cache_timeout = None,
+                    "arp-filter" => i.arp_filter = false,
+                    "arp-accept" => i.arp_accept = false,
+                    "arp-announce" => i.arp_announce = false,
+                    "arp-ignore" => i.arp_ignore = false,
+                    "directed-broadcast" => i.directed_broadcast = false,
+                    other => bail!("interface ip has no field {other:?}"),
+                }
+            }
+            ["interface", name, "ipv6"] => self.iface(name)?.ipv6 = Ip6Options::default(),
+            ["interface", name, "ipv6", field] => {
+                let i = &mut self.iface(name)?.ipv6;
+                match *field {
+                    "disable-forwarding" => i.disable_forwarding = false,
+                    "no-link-local" => i.no_link_local = false,
+                    "dad-transmits" => i.dad_transmits = None,
+                    "accept-dad" => i.accept_dad = None,
+                    other => bail!("interface ipv6 has no field {other:?}"),
+                }
+            }
+            ["interface", name, "dhcp"] => self.iface(name)?.dhcp = DhcpClient::default(),
+            ["interface", name, "dhcp", field] => {
+                let d = &mut self.iface(name)?.dhcp;
+                match *field {
+                    "client-id" => d.client_id = None,
+                    "duid" => d.duid = None,
+                    "host-name" => d.host_name = None,
+                    "vendor-class-id" => d.vendor_class_id = None,
+                    "user-class" => d.user_class = None,
+                    "no-default-route" => d.no_default_route = false,
+                    "default-route-distance" => d.default_route_distance = None,
+                    "reject" => d.reject.clear(),
+                    other => bail!("interface dhcp has no field {other:?}"),
+                }
+            }
+            ["interface", name, "dhcp", "reject", v] => {
+                let d = &mut self.iface(name)?.dhcp;
+                let before = d.reject.len();
+                d.reject.retain(|x| x != v);
+                if d.reject.len() == before {
+                    bail!("interface {name:?} does not reject {v:?}");
+                }
+            }
+            ["interface", name, "dhcpv6"] => self.iface(name)?.dhcpv6 = Dhcp6Client::default(),
+            ["interface", name, "dhcpv6", field] => {
+                let d = &mut self.iface(name)?.dhcpv6;
+                match *field {
+                    "duid" => d.duid = None,
+                    "rapid-commit" => d.rapid_commit = false,
+                    "parameters-only" => d.parameters_only = false,
+                    "no-release" => d.no_release = false,
+                    other => bail!("interface dhcpv6 has no field {other:?}"),
+                }
+            }
             ["interface", name, "local"] => self.iface(name)?.local = None,
             ["interface", name, "remote"] => self.iface(name)?.remote = None,
             ["interface", name, "key"] => self.iface(name)?.tunnel_key = None,
@@ -6791,7 +7422,13 @@ impl Session {
                     "local-id" => d.local_id = None,
                     "remote-id" => d.remote_id = None,
                     "start-action" => d.start_action = None,
-                    "local" | "remote" | "local-subnet" | "remote-subnet" | "psk" => bail!(
+                    // Unbinding turns a route-based tunnel back into a
+                    // policy-based one, which then needs its selectors — commit
+                    // says so rather than this deletion refusing.
+                    "vti" => d.vti = None,
+                    "local-subnet" => d.local_subnet = None,
+                    "remote-subnet" => d.remote_subnet = None,
+                    "local" | "remote" | "psk" => bail!(
                         "vpn ipsec {name:?}: {field} is required — delete the whole connection \
                          (`delete vpn ipsec {name}`) to remove it"
                     ),
@@ -7247,6 +7884,38 @@ impl Session {
                 mtu: d.mtu,
                 mss: d.mss.clone(),
                 mac: d.mac.clone(),
+                vti_key: d.vti_key,
+                wwan: d.wwan.as_ref().map(|w| Wwan {
+                    apn: w.apn.clone().unwrap_or_default(),
+                    username: w.username.clone(),
+                    password: w.password.clone(),
+                    pin: w.pin.clone(),
+                    ip_type: w.ip_type.clone(),
+                }),
+                wireless: d.wireless.as_ref().map(|w| Wireless {
+                    mode: w.mode.clone().unwrap_or_default(),
+                    ssid: w.ssid.clone().unwrap_or_default(),
+                    country: w.country.clone(),
+                    channel: w.channel,
+                    band: w.band.clone(),
+                    hide_ssid: w.hide_ssid,
+                    isolate_stations: w.isolate_stations,
+                    max_stations: w.max_stations,
+                    wpa: w.wpa_passphrase.as_ref().map(|p| WirelessWpa {
+                        mode: w.wpa_mode.clone(),
+                        passphrase: p.clone(),
+                    }),
+                }),
+                ethernet: d.ethernet.clone(),
+                bridge: d.bridge.clone(),
+                bridge_port: d.bridge_port.clone(),
+                bond: d.bond.clone(),
+                mirror_ingress: d.mirror_ingress.clone(),
+                mirror_egress: d.mirror_egress.clone(),
+                ip: d.ip.clone(),
+                ipv6: d.ipv6.clone(),
+                dhcp: d.dhcp.clone(),
+                dhcpv6: d.dhcpv6.clone(),
                 local: d.local.clone(),
                 remote: d.remote.clone(),
                 tunnel_key: d.tunnel_key,
@@ -7726,8 +8395,9 @@ impl Session {
                     name: name.clone(),
                     local: d.local.clone().unwrap_or_default(),
                     remote: d.remote.clone().unwrap_or_default(),
-                    local_subnet: d.local_subnet.clone().unwrap_or_default(),
-                    remote_subnet: d.remote_subnet.clone().unwrap_or_default(),
+                    local_subnet: d.local_subnet.clone(),
+                    remote_subnet: d.remote_subnet.clone(),
+                    vti: d.vti.clone(),
                     psk: d.psk.clone().unwrap_or_default(),
                     ike_version: d.ike_version,
                     ike_proposal: d.ike_proposal.clone(),
@@ -8327,6 +8997,24 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             && i.pppoe.is_none()
             && i.hw_id.is_none()
             && i.offload.is_empty()
+            // `mss` was missing here: an interface whose only setting was a clamp
+            // rendered as nothing at all, so the setting the previous commit
+            // taught `show configuration commands` to print was still dropped
+            // whenever it stood alone.
+            && i.mss.is_none()
+            && i.vti_key.is_none()
+            && i.wireless.is_none()
+            && i.wwan.is_none()
+            && i.ethernet.is_empty()
+            && i.bridge.is_empty()
+            && i.bridge_port.is_empty()
+            && i.bond.is_empty()
+            && i.mirror_ingress.is_none()
+            && i.mirror_egress.is_none()
+            && i.ip.is_empty()
+            && i.ipv6.is_empty()
+            && i.dhcp.is_empty()
+            && i.dhcpv6.is_empty()
         {
             continue;
         }
@@ -8350,6 +9038,9 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
                 IfaceType::Macvlan => "macvlan",
                 IfaceType::Macsec => "macsec",
                 IfaceType::L2tpv3 => "l2tpv3",
+                IfaceType::Vti => "vti",
+                IfaceType::Wireless => "wireless",
+                IfaceType::Wwan => "wwan",
             };
             out.push_str(&format!("    type {s}\n"));
         }
@@ -8406,6 +9097,229 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         if let Some(mac) = &i.mac {
             out.push_str(&format!("    mac {mac}\n"));
+        }
+        if let Some(k) = i.vti_key {
+            out.push_str(&format!("    vti-key {k}\n"));
+        }
+        if let Some(w) = &i.wwan {
+            for (val, kw) in [
+                (&w.apn, "apn"),
+                (&w.username, "username"),
+                (&w.password, "password"),
+                (&w.pin, "pin"),
+                (&w.ip_type, "ip-type"),
+            ] {
+                if let Some(v) = val {
+                    out.push_str(&format!("    wwan {kw} {v}\n"));
+                }
+            }
+        }
+        if let Some(w) = &i.wireless {
+            // `mode` and `ssid` are required on the committed type but optional
+            // in the draft, so a half-built radio still renders what it has.
+            for (val, kw) in [(&w.mode, "mode"), (&w.ssid, "ssid")] {
+                if let Some(v) = val {
+                    out.push_str(&format!("    wireless {kw} {v}\n"));
+                }
+            }
+            if let Some(c) = &w.country {
+                out.push_str(&format!("    wireless country {c}\n"));
+            }
+            if let Some(c) = w.channel {
+                out.push_str(&format!("    wireless channel {c}\n"));
+            }
+            if let Some(b) = &w.band {
+                out.push_str(&format!("    wireless band {b}\n"));
+            }
+            for (on, kw) in [
+                (w.hide_ssid, "hide-ssid"),
+                (w.isolate_stations, "isolate-stations"),
+            ] {
+                if on {
+                    out.push_str(&format!("    wireless {kw} true\n"));
+                }
+            }
+            if let Some(n) = w.max_stations {
+                out.push_str(&format!("    wireless max-stations {n}\n"));
+            }
+            if let Some(m) = &w.wpa_mode {
+                out.push_str(&format!("    wireless wpa mode {m}\n"));
+            }
+            if let Some(p) = &w.wpa_passphrase {
+                out.push_str(&format!("    wireless wpa passphrase {p}\n"));
+            }
+        }
+        {
+            let e = &i.ethernet;
+            for (val, kw) in [
+                (e.speed, "speed"),
+                (e.rx_ring, "rx-ring"),
+                (e.tx_ring, "tx-ring"),
+                (e.rx_usecs, "rx-usecs"),
+                (e.tx_usecs, "tx-usecs"),
+            ] {
+                if let Some(v) = val {
+                    out.push_str(&format!("    ethernet {kw} {v}\n"));
+                }
+            }
+            if let Some(d) = &e.duplex {
+                out.push_str(&format!("    ethernet duplex {d}\n"));
+            }
+            for (on, kw) in [
+                (e.adaptive_rx, "adaptive-rx"),
+                (e.adaptive_tx, "adaptive-tx"),
+            ] {
+                if on {
+                    out.push_str(&format!("    ethernet {kw} true\n"));
+                }
+            }
+        }
+        {
+            let b = &i.bridge;
+            for (on, kw) in [
+                (b.stp, "stp"),
+                (b.igmp_snooping, "igmp-snooping"),
+                (b.igmp_querier, "igmp-querier"),
+            ] {
+                if on {
+                    out.push_str(&format!("    bridge {kw} true\n"));
+                }
+            }
+            if let Some(p) = b.priority {
+                out.push_str(&format!("    bridge priority {p}\n"));
+            }
+            for (val, kw) in [
+                (b.hello_time, "hello-time"),
+                (b.max_age, "max-age"),
+                (b.forward_delay, "forward-delay"),
+                (b.ageing_time, "ageing-time"),
+            ] {
+                if let Some(v) = val {
+                    out.push_str(&format!("    bridge {kw} {v}\n"));
+                }
+            }
+        }
+        {
+            let p = &i.bridge_port;
+            if let Some(c) = p.cost {
+                out.push_str(&format!("    bridge-port cost {c}\n"));
+            }
+            if let Some(v) = p.priority {
+                out.push_str(&format!("    bridge-port priority {v}\n"));
+            }
+            if let Some(l) = p.learning {
+                out.push_str(&format!("    bridge-port learning {l}\n"));
+            }
+        }
+        {
+            let b = &i.bond;
+            for (val, kw) in [
+                (&b.hash_policy, "hash-policy"),
+                (&b.lacp_rate, "lacp-rate"),
+                (&b.primary, "primary"),
+            ] {
+                if let Some(v) = val {
+                    out.push_str(&format!("    bond {kw} {v}\n"));
+                }
+            }
+            if let Some(n) = b.min_links {
+                out.push_str(&format!("    bond min-links {n}\n"));
+            }
+            for (val, kw) in [
+                (b.mii_interval, "mii-interval"),
+                (b.arp_interval, "arp-interval"),
+            ] {
+                if let Some(v) = val {
+                    out.push_str(&format!("    bond {kw} {v}\n"));
+                }
+            }
+            for t in &b.arp_target {
+                out.push_str(&format!("    bond arp-target {t}\n"));
+            }
+        }
+        if let Some(dst) = &i.mirror_ingress {
+            out.push_str(&format!("    mirror-ingress {dst}\n"));
+        }
+        if let Some(dst) = &i.mirror_egress {
+            out.push_str(&format!("    mirror-egress {dst}\n"));
+        }
+        // Per-link kernel behaviour and DHCP-client identity. Only what departs
+        // from the kernel's own default is written, so an interface that was
+        // never told any of this renders exactly as before.
+        {
+            let p = &i.ip;
+            for (on, kw) in [
+                (p.disable_forwarding, "disable-forwarding"),
+                (p.proxy_arp, "proxy-arp"),
+                (p.proxy_arp_pvlan, "proxy-arp-pvlan"),
+                (p.arp_filter, "arp-filter"),
+                (p.arp_accept, "arp-accept"),
+                (p.arp_announce, "arp-announce"),
+                (p.arp_ignore, "arp-ignore"),
+                (p.directed_broadcast, "directed-broadcast"),
+            ] {
+                if on {
+                    out.push_str(&format!("    ip {kw} true\n"));
+                }
+            }
+            if let Some(t) = p.arp_cache_timeout {
+                out.push_str(&format!("    ip arp-cache-timeout {t}\n"));
+            }
+        }
+        {
+            let p = &i.ipv6;
+            for (on, kw) in [
+                (p.disable_forwarding, "disable-forwarding"),
+                (p.no_link_local, "no-link-local"),
+            ] {
+                if on {
+                    out.push_str(&format!("    ipv6 {kw} true\n"));
+                }
+            }
+            if let Some(n) = p.dad_transmits {
+                out.push_str(&format!("    ipv6 dad-transmits {n}\n"));
+            }
+            if let Some(n) = p.accept_dad {
+                out.push_str(&format!("    ipv6 accept-dad {n}\n"));
+            }
+        }
+        {
+            let d = &i.dhcp;
+            for (val, kw) in [
+                (&d.client_id, "client-id"),
+                (&d.duid, "duid"),
+                (&d.host_name, "host-name"),
+                (&d.vendor_class_id, "vendor-class-id"),
+                (&d.user_class, "user-class"),
+            ] {
+                if let Some(v) = val {
+                    out.push_str(&format!("    dhcp {kw} {v}\n"));
+                }
+            }
+            if d.no_default_route {
+                out.push_str("    dhcp no-default-route true\n");
+            }
+            if let Some(m) = d.default_route_distance {
+                out.push_str(&format!("    dhcp default-route-distance {m}\n"));
+            }
+            for r in &d.reject {
+                out.push_str(&format!("    dhcp reject {r}\n"));
+            }
+        }
+        {
+            let d = &i.dhcpv6;
+            if let Some(duid) = &d.duid {
+                out.push_str(&format!("    dhcpv6 duid {duid}\n"));
+            }
+            for (on, kw) in [
+                (d.rapid_commit, "rapid-commit"),
+                (d.parameters_only, "parameters-only"),
+                (d.no_release, "no-release"),
+            ] {
+                if on {
+                    out.push_str(&format!("    dhcpv6 {kw} true\n"));
+                }
+            }
         }
         if let Some(local) = &i.local {
             out.push_str(&format!("    local {local}\n"));
@@ -9816,6 +10730,9 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             if let Some(v) = &c.remote_subnet {
                 out.push_str(&format!("        remote-subnet {v}\n"));
             }
+            if let Some(v) = &c.vti {
+                out.push_str(&format!("        vti {v}\n"));
+            }
             if let Some(v) = &c.psk {
                 out.push_str(&format!("        psk {v}\n"));
             }
@@ -10974,6 +11891,13 @@ name = "wg0"
 type = "wireguard"
 zone = "wan"
 address = "10.9.0.1/24"
+[[interface]]
+name = "vti0"
+type = "vti"
+vti-key = 42
+zone = "lan"
+address = "10.255.0.1/30"
+mss = "pmtu"
 
 [services.snmp]
 community = "public"
@@ -11027,6 +11951,12 @@ remote = "198.51.100.1"
 psk = "sharedsecret"
 local-subnet = "10.0.0.0/24"
 remote-subnet = "10.1.0.0/24"
+[[vpn.ipsec]]
+name = "branch"
+local = "192.0.2.1"
+remote = "198.51.100.2"
+psk = "anothersecret"
+vti = "vti0"
 [[vpn.wireguard]]
 name = "wg0"
 private-key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
@@ -11270,6 +12200,60 @@ wan-zone = "wan"
         );
     }
 
+    /// Every interface type the config file accepts is also settable from the
+    /// CLI and rendered back.
+    ///
+    /// The list lives in three places — the enum, the CLI's `set … type` match
+    /// and the renderer's — and nothing tied them together. `vti` was added to
+    /// the enum and the renderer and not to the setter, which made it
+    /// file-configurable and CLI-unreachable: a whole interface type that could
+    /// be written into `appliance.toml` and never typed. The round-trip fixture
+    /// caught it by accident; this catches it on purpose, and for every type.
+    #[test]
+    fn every_interface_type_is_reachable_from_the_cli() {
+        let types = [
+            "bridge",
+            "bond",
+            "dummy",
+            "wireguard",
+            "pppoe",
+            "gre",
+            "ipip",
+            "gretap",
+            "macvlan",
+            "macsec",
+            "l2tpv3",
+            "vti",
+            "wireless",
+            "wwan",
+        ];
+        for ty in types {
+            let dir =
+                std::env::temp_dir().join(format!("sentinel-iftype-{}-{ty}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join("appliance.toml");
+            let _ = std::fs::remove_file(&path);
+            let mut session = Session::load(&path).unwrap();
+            let act = crate::repl::Apply::off();
+            let mut ctx: Vec<String> = Vec::new();
+            for command in [
+                "set system hostname fw",
+                &format!("set interface x0 type {ty}"),
+            ] {
+                assert!(
+                    !crate::repl::exec_line(&mut session, &act, &mut ctx, command),
+                    "{command} ended the session"
+                );
+            }
+            let shown = render_draft_only(&session.draft, true, Some("interface"));
+            assert!(
+                shown.contains(&format!("type {ty}")),
+                "`set interface x0 type {ty}` did not reach the configuration:\n{shown}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     /// The fifth pass: the link types that are not just a NIC with an address,
     /// and the road-warrior VPN.
     ///
@@ -11290,24 +12274,67 @@ mtu = 9000
 mss = "1400"
 mac = "02:00:00:00:00:01"
 description = "the inside"
+[interface.ip]
+proxy-arp = true
+proxy-arp-pvlan = true
+arp-cache-timeout = 30
+arp-filter = true
+arp-accept = true
+arp-announce = true
+directed-broadcast = true
+[interface.ipv6]
+disable-forwarding = true
+no-link-local = true
+dad-transmits = 2
+accept-dad = 2
 [[interface]]
 name = "eth1"
 zone = "wan"
-address = "192.0.2.1/24"
-address6 = "2001:db8:1::1/64"
+address = "dhcp"
+address6 = "dhcp"
+[interface.ip]
+disable-forwarding = true
+arp-ignore = true
+[interface.dhcp]
+client-id = "duid"
+duid = "00:03:00:01:02:00:00:00:00:02"
+host-name = "fw"
+vendor-class-id = "sentinel"
+user-class = "residential"
+no-default-route = true
+default-route-distance = 210
+reject = ["192.0.2.9", "198.51.100.0/24"]
+[interface.dhcpv6]
+duid = "00:03:00:01:02:00:00:00:00:01"
+rapid-commit = true
+parameters-only = true
+no-release = true
 [[interface]]
 name = "eth2"
 disabled = true
 description = "spare"
+mirror-ingress = "eth0"
+mirror-egress = "eth0"
 
 [[interface]]
 name = "eth5"
 description = "bridge member"
 vlan-tagged = [10, 20]
 vlan-untagged = 1
+[interface.bridge-port]
+cost = 100
+priority = 32
+learning = false
 [[interface]]
 name = "eth3"
 description = "bond member"
+[interface.ethernet]
+speed = 1000
+duplex = "full"
+rx-ring = 4096
+tx-ring = 4096
+rx-usecs = 50
+adaptive-tx = true
 [[interface]]
 name = "eth4"
 description = "bond member"
@@ -11317,12 +12344,29 @@ type = "bond"
 member = ["eth3", "eth4"]
 bond-mode = "802.3ad"
 zone = "lan"
+[interface.bond]
+hash-policy = "layer3+4"
+lacp-rate = "fast"
+min-links = 1
+primary = "eth3"
+mii-interval = 100
+arp-interval = 2000
+arp-target = ["10.0.0.1"]
 [[interface]]
 name = "br0"
 type = "bridge"
 member = ["eth5"]
 vlan-aware = true
 zone = "lan"
+[interface.bridge]
+stp = true
+priority = 4096
+hello-time = 2
+max-age = 20
+forward-delay = 15
+ageing-time = 300
+igmp-snooping = true
+igmp-querier = true
 [[interface]]
 name = "eth0.10"
 pd-from = "eth1"
@@ -11399,6 +12443,33 @@ common-name = "vpn.example.com"
             commands.iter().any(|c| c == "set interface eth0 mss 1400"),
             "the MSS clamp is not in the flattened config: {commands:#?}"
         );
+        // Spot-check one setting out of each per-link block, because these four
+        // arrive from the file as sub-tables and leave through a renderer that
+        // has to know each of them by name — the exact shape that has silently
+        // dropped settings six times now.
+        for want in [
+            "set interface eth0 ip proxy-arp true",
+            "set interface eth0 ipv6 accept-dad 2",
+            "set interface eth1 dhcp client-id duid",
+            "set interface eth1 dhcp duid 00:03:00:01:02:00:00:00:00:02",
+            "set interface eth1 dhcp reject 198.51.100.0/24",
+            "set interface eth1 dhcpv6 duid 00:03:00:01:02:00:00:00:00:01",
+            "set interface eth2 mirror-ingress eth0",
+            "set interface br0 bridge stp true",
+            "set interface br0 bridge igmp-querier true",
+            "set interface eth5 bridge-port cost 100",
+            "set interface eth3 ethernet speed 1000",
+            "set interface eth3 ethernet rx-ring 4096",
+            "set interface eth3 ethernet adaptive-tx true",
+            "set interface bond0 bond hash-policy layer3+4",
+            "set interface bond0 bond primary eth3",
+            "set interface bond0 bond arp-target 10.0.0.1",
+        ] {
+            assert!(
+                commands.iter().any(|c| c == want),
+                "{want:?} is not in the flattened config: {commands:#?}"
+            );
+        }
 
         let dir = std::env::temp_dir().join(format!("sentinel-flatten-if-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
@@ -12084,7 +13155,7 @@ backends = ["10.0.0.11:8443"]
         let c = &a.vpn.ipsec[0];
         assert_eq!(c.name, "site");
         assert_eq!(c.local, "203.0.113.1");
-        assert_eq!(c.remote_subnet, "10.1.0.0/24");
+        assert_eq!(c.remote_subnet.as_deref(), Some("10.1.0.0/24"));
         assert_eq!(c.psk, "super-secret-key");
         assert_eq!(c.start_action.as_deref(), Some("trap"));
 

@@ -19,7 +19,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::config::{
-    Appliance, DEFAULT_ESP_PROPOSAL, DEFAULT_IKE_PROPOSAL, DEFAULT_IPSEC_START_ACTION,
+    Appliance, DEFAULT_ESP_PROPOSAL, DEFAULT_IKE_PROPOSAL, DEFAULT_IPSEC_START_ACTION, Interface,
     IpsecConnection,
 };
 use crate::system;
@@ -55,7 +55,17 @@ fn remote_id(c: &IpsecConnection) -> &str {
 /// Render the swanctl `connections { … }` block for `conns` (+ the trailing
 /// `include` of the secrets file). Every value has already passed validation, so
 /// it carries only the safe charset — there is nothing to escape here.
-fn swanctl_conf_body(conns: &[IpsecConnection]) -> String {
+fn swanctl_conf_body(conns: &[IpsecConnection], ifaces: &[Interface]) -> String {
+    // A route-based tunnel names its link; the child SA needs that link's id.
+    // Resolved here, once, from the same list validation checked against — so a
+    // name that got through cannot fail to resolve.
+    let vti_id = |c: &IpsecConnection| -> Option<u32> {
+        let name = c.vti.as_deref()?;
+        ifaces
+            .iter()
+            .find(|i| i.name == name)
+            .and_then(|i| i.vti_key)
+    };
     let mut s = String::from("# rendered by sentinel — IPsec (strongSwan swanctl), roadmap C2\n");
     s.push_str("connections {\n");
     for c in conns {
@@ -66,6 +76,7 @@ fn swanctl_conf_body(conns: &[IpsecConnection]) -> String {
             .start_action
             .as_deref()
             .unwrap_or(DEFAULT_IPSEC_START_ACTION);
+        let vti_id = vti_id(c);
         s.push_str(&format!("    conn-{} {{\n", c.name));
         s.push_str(&format!("        version = {version}\n"));
         s.push_str(&format!("        local_addrs = {}\n", c.local));
@@ -81,13 +92,26 @@ fn swanctl_conf_body(conns: &[IpsecConnection]) -> String {
         s.push_str("        }\n");
         s.push_str("        children {\n");
         s.push_str(&format!("            {} {{\n", c.name));
-        s.push_str(&format!("                local_ts = {}\n", c.local_subnet));
-        s.push_str(&format!(
-            "                remote_ts = {}\n",
-            c.remote_subnet
-        ));
+        // On a route-based tunnel the routing table decides what is encrypted, so
+        // the selectors open to everything and narrowing them is optional. On a
+        // policy-based one they are the whole reach, and validation has already
+        // insisted on them.
+        let any = if c.vti.is_some() { "0.0.0.0/0" } else { "" };
+        let local_ts = c.local_subnet.as_deref().unwrap_or(any);
+        let remote_ts = c.remote_subnet.as_deref().unwrap_or(any);
+        s.push_str(&format!("                local_ts = {local_ts}\n"));
+        s.push_str(&format!("                remote_ts = {remote_ts}\n"));
         s.push_str(&format!("                esp_proposals = {esp}\n"));
         s.push_str("                mode = tunnel\n");
+        // Route-based: both directions carry the bound link's id, so the kernel
+        // knows which interface a decrypted packet arrived on and which SA an
+        // outbound one belongs to. One id for both because a single link is both
+        // ends of the same tunnel here; separate ids exist for the case where the
+        // two directions are different interfaces, which this does not offer.
+        if let Some(id) = vti_id {
+            s.push_str(&format!("                if_id_in = {id}\n"));
+            s.push_str(&format!("                if_id_out = {id}\n"));
+        }
         s.push_str(&format!("                start_action = {start}\n"));
         s.push_str("            }\n");
         s.push_str("        }\n");
@@ -134,7 +158,7 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
         // one to unload the connections from charon, then remove the artifacts.
         if conf_path.exists() {
             system::ensure_dir(Path::new(SWANCTL_RUNTIME_DIR))?;
-            system::install_file(conf_path, &swanctl_conf_body(&[]))?;
+            system::install_file(conf_path, &swanctl_conf_body(&[], &[]))?;
             system::install_ipsec_secret(secrets_path, &swanctl_secrets_body(&[]))?;
             if let Err(e) = system::swanctl_load(conf_path) {
                 eprintln!("warning: clearing swanctl config failed: {e}");
@@ -146,7 +170,7 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
     }
 
     system::ensure_dir(Path::new(SWANCTL_RUNTIME_DIR))?;
-    let conf = swanctl_conf_body(conns);
+    let conf = swanctl_conf_body(conns, &appliance.interfaces);
     let secrets = swanctl_secrets_body(conns);
     let changed = file_changed(conf_path, &conf) || file_changed(secrets_path, &secrets);
     system::install_file(conf_path, &conf)?;
@@ -172,8 +196,9 @@ mod tests {
             name: "site-a".into(),
             local: "203.0.113.1".into(),
             remote: "198.51.100.1".into(),
-            local_subnet: "10.0.0.0/24".into(),
-            remote_subnet: "10.1.0.0/24".into(),
+            local_subnet: Some("10.0.0.0/24".into()),
+            remote_subnet: Some("10.1.0.0/24".into()),
+            vti: None,
             psk: "topsecret".into(),
             ike_version: None,
             ike_proposal: None,
@@ -186,7 +211,7 @@ mod tests {
 
     #[test]
     fn conf_renders_connection_children_and_defaults() {
-        let body = swanctl_conf_body(&[conn()]);
+        let body = swanctl_conf_body(&[conn()], &[]);
         assert!(body.contains("conn-site-a {"), "{body}");
         assert!(body.contains("version = 2"), "{body}");
         assert!(body.contains("local_addrs = 203.0.113.1"), "{body}");
@@ -237,7 +262,7 @@ mod tests {
             start_action: Some("trap".into()),
             ..conn()
         };
-        let body = swanctl_conf_body(&[c]);
+        let body = swanctl_conf_body(&[c], &[]);
         assert!(body.contains("version = 1"), "{body}");
         assert!(
             body.contains("proposals = aes128-sha256-modp2048"),
@@ -252,9 +277,63 @@ mod tests {
         assert!(body.contains("start_action = trap"), "{body}");
     }
 
+    /// A tunnel bound to a link is route-based: both directions carry the link's
+    /// id, and the selectors open to everything because the routing table is what
+    /// decides.
+    #[test]
+    fn a_bound_tunnel_is_route_based() {
+        // Built from TOML rather than a struct literal: the point of the test is
+        // that a configuration an operator could write renders as route-based,
+        // and `Interface` has no Default to fake one with.
+        let a = Appliance::from_toml(
+            r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "vti0"
+type = "vti"
+vti-key = 42
+address = "10.255.0.1/30"
+"#,
+        )
+        .unwrap();
+        let link = a.interfaces.clone();
+        let c = IpsecConnection {
+            vti: Some("vti0".into()),
+            local_subnet: None,
+            remote_subnet: None,
+            ..conn()
+        };
+        let body = swanctl_conf_body(&[c], &link);
+        assert!(body.contains("if_id_in = 42"), "{body}");
+        assert!(body.contains("if_id_out = 42"), "{body}");
+        assert!(body.contains("local_ts = 0.0.0.0/0"), "{body}");
+        assert!(body.contains("remote_ts = 0.0.0.0/0"), "{body}");
+
+        // Narrowing is still allowed — a route-based tunnel may refuse to carry
+        // what its routes would otherwise hand it.
+        let narrowed = IpsecConnection {
+            vti: Some("vti0".into()),
+            local_subnet: Some("10.0.0.0/24".into()),
+            remote_subnet: None,
+            ..conn()
+        };
+        let body = swanctl_conf_body(&[narrowed], &link);
+        assert!(body.contains("local_ts = 10.0.0.0/24"), "{body}");
+        assert!(body.contains("remote_ts = 0.0.0.0/0"), "{body}");
+    }
+
+    /// An unbound tunnel is policy-based and carries no interface id at all — a
+    /// stray `if_id` would bind it to a link that does not exist.
+    #[test]
+    fn an_unbound_tunnel_carries_no_interface_id() {
+        let body = swanctl_conf_body(&[conn()], &[]);
+        assert!(!body.contains("if_id"), "{body}");
+    }
+
     #[test]
     fn empty_connections_render_an_empty_block() {
-        let body = swanctl_conf_body(&[]);
+        let body = swanctl_conf_body(&[], &[]);
         assert!(body.contains("connections {"), "{body}");
         assert!(!body.contains("conn-"), "{body}");
     }

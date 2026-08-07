@@ -1,6 +1,6 @@
 # Test suite (nixosTests)
 
-Sentinel is verified by **83 nixosTests**, **440 Rust unit tests** and a
+Sentinel is verified by **87 nixosTests**, **457 Rust unit tests** and a
 **browser suite** that drives the web console against a running appliance. The nixosTests
 boot real QEMU/OVMF VMs — several of them two or three at a time on shared virtual
 segments — so they need `/dev/kvm`.
@@ -16,7 +16,7 @@ authoritative list.
 The unit tests need nothing but a checkout:
 
 ```shell
-cargo test                                        # 432 of them
+cargo test                                        # 457 of them
 tests/console/run.sh                              # the browser suite
 ```
 
@@ -115,6 +115,10 @@ write, which is how ten sections that could be typed and not clicked were found.
 | `l2tp` | a static L2TPv3 Ethernet pseudowire over the underlay |
 | `tunnel` | kernel GRE tunnels between two appliances |
 | `linkopts` | per-interface MTU (jumbo frames / PPPoE) and MAC cloning reach the link |
+| `linkbehaviour` | per-link forwarding, ARP and DHCP-client identity reach the kernel, and a mirror carries traffic |
+| `vti` | a route-based IPsec tunnel: the link is a real `xfrm` device, the child SA carries its id both ways, and **withdrawing the route stops the traffic with the SA untouched** — which a policy-based tunnel cannot do from one side |
+| `wireless` | an access point and a station over two simulated radios: hostapd puts the link in AP mode, a client associates **over the air** with the passphrase, and — from its own network namespace, so the kernel cannot short-circuit the path — carries IP traffic |
+| `wwan` | the cellular dial script through its unit, against a stand-in for `mmcli` that reports **two** modems: which one is dialled, that the SIM is unlocked through its own path rather than the modem index, and that a dropped bearer is re-dialled |
 | `dualstack` | one interface carries an independent static IPv4 **and** IPv6 address |
 
 ## Address & name services
