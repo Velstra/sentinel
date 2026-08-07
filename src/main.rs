@@ -884,6 +884,43 @@ fn ask(msg: &str, default: &str) -> Result<String> {
     })
 }
 
+/// Ask for a secret: prompt, read one line, but do not echo what is typed.
+///
+/// An install is done over whatever console is at hand — a serial line, an IPMI
+/// session, someone's laptop over a shoulder — and an echoed admin password
+/// stays in that scrollback long after the install is finished. `getpass(3)`
+/// behaviour, done by hand so it costs no dependency: drop `ECHO` for the read
+/// and put the terminal back exactly as it was, including when the read fails.
+fn prompt_secret(msg: &str) -> Result<String> {
+    use std::io::Write;
+    print!("{msg}");
+    std::io::stdout().flush().ok();
+
+    let fd = libc::STDIN_FILENO;
+    let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+    // Not a terminal (a piped answer file) — there is no echo to turn off.
+    let is_term = unsafe { libc::tcgetattr(fd, &mut saved) } == 0;
+    if is_term {
+        let mut quiet = saved;
+        quiet.c_lflag &= !libc::ECHO;
+        // TCSANOW, not TCSAFLUSH: flushing would discard input that arrived
+        // between the prompt and this call, which is precisely the answer.
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) };
+    }
+
+    let mut line = String::new();
+    let read = std::io::stdin().read_line(&mut line);
+
+    if is_term {
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &saved) };
+        // The newline the user typed was swallowed with the echo; put it back so
+        // the next prompt starts on its own line.
+        println!();
+    }
+    read.context("reading input")?;
+    Ok(line)
+}
+
 /// Ask a yes/no question.
 fn ask_yes(msg: &str, default_yes: bool) -> Result<bool> {
     let d = if default_yes { "Y/n" } else { "y/N" };
@@ -930,7 +967,7 @@ fn wizard_lines() -> Result<Vec<String>> {
 
     println!("\n── First account ──");
     let user = ask("Username", "admin")?;
-    let pass = prompt("Password: ")?;
+    let pass = prompt_secret("Password: ")?;
     let pass = pass.trim();
     if pass.len() < 8 {
         anyhow::bail!("the password must be at least 8 characters");
