@@ -1030,7 +1030,113 @@
           # tunnels into it. Its own /etc/swanctl config stays empty — Sentinel
           # loads the appliance's connections from /run/sentinel/swanctl via the
           # loader's `--file`, so the immutable /etc never needs to change.
+          # networkd does not remove what it did not create.
+          #
+          # Both of these default to *yes*: networkd deletes routes and policy
+          # rules that are not in a `.network` file, whenever it (re)configures a
+          # link — which is every commit. On this box that is exactly wrong twice
+          # over. The routing daemon owns the FIB, so every static route, every
+          # redistributed prefix and every route a protocol learned is "foreign"
+          # to networkd; and Sentinel owns the policy-rule band at 10000-19999,
+          # so multi-WAN failover and policy routing are foreign too.
+          #
+          # Found by a route-based IPsec check: the routing daemon reported the
+          # static route programmed, with no error, and the kernel did not have
+          # it. networkd had reconfigured the link a moment later and taken it.
+          # The failure leaves nothing behind to find — no log line, no error, a
+          # daemon that believes it succeeded.
+          systemd.network.config.networkConfig = {
+            ManageForeignRoutes = false;
+            ManageForeignRoutingPolicyRules = false;
+          };
+
+          # The radios (roadmap: `set interfaces wireless`). One templated unit
+          # per role, both idle at boot (`wantedBy = [ ]`): Sentinel renders the
+          # config and starts the right one from `wireless::apply`, the way the
+          # PPPoE sessions and ocserv are driven. A radio whose hardware is not
+          # present simply never has its unit started.
+          #
+          # `Restart=on-failure` with no start-rate limit: a fresh commit can race
+          # the driver bringing the interface up, and a radio that gave up after
+          # five tries is a network that is missing for no reason anybody can see.
+          systemd.services."sentinel-hostapd@" = {
+            description = "Wireless access point on %i (hostapd)";
+            after = [
+              "network.target"
+              "sentinel-boot.service"
+            ];
+            wantedBy = [ ];
+            serviceConfig = {
+              Type = "exec";
+              ExecStart = "${pkgs.hostapd}/bin/hostapd /run/sentinel/wireless/%i.conf";
+              Restart = "on-failure";
+              RestartSec = 5;
+              StartLimitIntervalSec = 0;
+            };
+          };
+          systemd.services."sentinel-supplicant@" = {
+            description = "Wireless station on %i (wpa_supplicant)";
+            after = [
+              "network.target"
+              "sentinel-boot.service"
+            ];
+            wantedBy = [ ];
+            serviceConfig = {
+              Type = "exec";
+              ExecStart =
+                "${pkgs.wpa_supplicant}/bin/wpa_supplicant -c /run/sentinel/wireless/%i.conf -i %i";
+              Restart = "on-failure";
+              RestartSec = 5;
+              StartLimitIntervalSec = 0;
+            };
+            # wpa_supplicant wants its control-socket directory to exist.
+            unitConfig.ConditionPathExists = "/run/sentinel/wireless/%i.conf";
+          };
+
+          # Cellular uplinks. ModemManager probes the modem and provides the net
+          # device; Sentinel renders the dial script and runs it from this unit.
+          # There is no config file for a bearer — connecting is an imperative
+          # act — which is why this is a script rather than a rendered .conf.
+          networking.modemmanager.enable = true;
+          systemd.services."sentinel-wwan@" = {
+            description = "Cellular bearer on %i (ModemManager)";
+            after = [
+              "network.target"
+              "ModemManager.service"
+              "sentinel-boot.service"
+            ];
+            wantedBy = [ ];
+            path = [ pkgs.modemmanager ];
+            serviceConfig = {
+              Type = "exec";
+              ExecStart = "/bin/sh /run/sentinel/wwan/%i.sh";
+              Restart = "on-failure";
+              RestartSec = 10;
+              StartLimitIntervalSec = 0;
+            };
+            unitConfig.ConditionPathExists = "/run/sentinel/wwan/%i.sh";
+          };
+
           services.strongswan-swanctl.enable = true;
+          # charon does NOT install routes of its own.
+          #
+          # A route-based tunnel's traffic selectors are `0.0.0.0/0` — the routing
+          # table is what decides what goes in — and charon's default is to install
+          # a route for the remote selector in table 220. For a route-based tunnel
+          # that route is a default route, and it would quietly take precedence
+          # over the box's own.
+          #
+          # Off unconditionally rather than only when a route-based tunnel exists,
+          # for the reason this appliance refuses second owners everywhere else:
+          # Sentinel owns the routing table (static routes, policy routes in its
+          # own priority band, multi-WAN failover), and `strongswan.conf` is read
+          # at daemon start, so a per-commit toggle would mean restarting charon —
+          # dropping every live SA — to change a routing policy.
+          services.strongswan-swanctl.strongswan.extraConfig = ''
+            charon {
+              install_routes = no
+            }
+          '';
 
           # OpenConnect (roadmap C17): ocserv terminates TLS road-warrior clients
           # from the rendered /run/sentinel/ocserv/ocserv.conf. Present but idle —
