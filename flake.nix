@@ -69,6 +69,7 @@
             --set SENTINEL_HOSTNAME_BIN   ${pkgs.nettools}/bin/hostname \
             --set SENTINEL_IP_BIN         ${pkgs.iproute2}/bin/ip \
             --set SENTINEL_TC_BIN         ${pkgs.iproute2}/bin/tc \
+            --set SENTINEL_SYSCTL_BIN     ${pkgs.procps}/bin/sysctl \
             --set SENTINEL_ETHTOOL_BIN    ${pkgs.ethtool}/bin/ethtool \
             --set SENTINEL_LDAPWHOAMI_BIN ${pkgs.openldap}/bin/ldapwhoami \
             --set SENTINEL_OCCTL_BIN      ${pkgs.ocserv}/bin/occtl \
