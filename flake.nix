@@ -44,7 +44,9 @@
       # --- the sentinel CLI (stable rustc is fine) ---------------------------
       sentinel = pkgs.rustPlatform.buildRustPackage {
         pname = "sentinel";
-        version = "0.1.0";
+        # From Cargo.toml, so the boot menu and `show version` cannot disagree —
+        # the medium said 0.1.0 while the CLI on it said 0.4.2.
+        version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
         src = ./.;
         cargoLock.lockFile = ./Cargo.lock;
         nativeBuildInputs = [
@@ -70,6 +72,8 @@
             --set SENTINEL_IP_BIN         ${pkgs.iproute2}/bin/ip \
             --set SENTINEL_TC_BIN         ${pkgs.iproute2}/bin/tc \
             --set SENTINEL_LOADKEYS_BIN   ${pkgs.kbd}/bin/loadkeys \
+            --set SENTINEL_LOGINCTL_BIN   ${pkgs.systemd}/bin/loginctl \
+            --set SENTINEL_SELF_BIN       $out/bin/.sentinel-wrapped \
             --set SENTINEL_TIMEDATECTL_BIN ${pkgs.systemd}/bin/timedatectl \
             --set SENTINEL_SYSCTL_BIN     ${pkgs.procps}/bin/sysctl \
             --set SENTINEL_ETHTOOL_BIN    ${pkgs.ethtool}/bin/ethtool \
@@ -1420,6 +1424,96 @@
             grep -q '10.0.0.0/24' dataplane.toml
             cp output $out
           '';
+
+        # What the box actually ships with, not a test-friendly variant of it.
+        #
+        # Every other check writes `networking.firewall.enable = mkForce false`
+        # into its nodes, and that one line hid two real faults for as long as
+        # the checks existed: the image shipped NixOS's own firewall underneath
+        # the appliance's (ping passed a zone with `block-icmp true`, and a
+        # listening SSH port and web console were dropped), and the data plane
+        # attached to a build-time constant rather than to the configured
+        # uplink, so on a box whose NIC was not called `eth0` the firewall did
+        # not run at all. Neither fault is visible in a node that has been
+        # adjusted to make testing easier.
+        shipped = pkgs.testers.runNixOSTest {
+          name = "sentinel-shipped";
+          nodes.machine = {
+            imports = [ self.nixosModules.sentinel ];
+            virtualisation.memorySize = 2048;
+            # To try the password the way an operator does, over the wire.
+            environment.systemPackages = [ pkgs.sshpass ];
+          };
+          testScript = ''
+            machine.wait_for_unit("multi-user.target")
+
+            with subtest("a password set in the CLI works over SSH"):
+                # Nothing checked that the credential an operator creates can
+                # actually be used to log in. Setting a password, enabling
+                # password authentication and getting "permission denied" is a
+                # failure the CLI reports as three separate successes.
+                machine.succeed(
+                    "sentinel configure <<EOF\n"
+                    "set system hostname pw-test\n"
+                    "set services ssh password-authentication true\n"
+                    "set system login tester password correcthorsebattery\n"
+                    "commit\n"
+                    "EOF"
+                )
+                machine.wait_for_open_port(22)
+                rc, out = machine.execute(
+                    "sshpass -p correcthorsebattery ssh -v -o StrictHostKeyChecking=no "
+                    "-o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password "
+                    "-o PubkeyAuthentication=no tester@127.0.0.1 true 2>&1"
+                )
+                if rc != 0:
+                    print(out[-1500:])
+                    print(machine.succeed("journalctl -u sshd -n 40 --no-pager || true"))
+                    print(machine.succeed(
+                        "sshd -T -C user=tester,host=localhost,addr=127.0.0.1 "
+                        "| grep -iE 'allow|deny|authenticationmethods|permitroot' || true"
+                    ))
+                assert rc == 0, f"password login refused (exit {rc})"
+
+            with subtest("there is one firewall on this box, and it is ours"):
+                # NixOS's own firewall must not be running underneath: it answers
+                # ICMP and drops every port the appliance config knows nothing
+                # about, and none of that appears in `show`.
+                machine.fail("systemctl is-active firewall.service")
+                machine.fail("systemctl is-active nftables.service")
+
+            nic = machine.succeed("ls /sys/class/net | grep -v lo | head -1").strip()
+            assert nic, "the test VM has no NIC to configure"
+
+            with subtest("the data plane attaches to the configured uplink"):
+                machine.succeed(
+                    "sentinel configure <<EOF\n"
+                    "set system hostname shipped\n"
+                    f"set interface {nic} zone wan\n"
+                    "commit\n"
+                    "save\n"
+                    "EOF"
+                )
+                # Written from the config, not baked into the image. The old
+                # constant was `eth0`, so a box whose NIC is called anything
+                # else kept the agent pointed at nothing.
+                env = machine.succeed("cat /run/sentinel/velstra.env")
+                assert f"VELSTRA_IFACE={nic}" in env, env
+
+            with subtest("a commit says so when the firewall is not running"):
+                # Point the uplink at a link the box does not have. The apply has
+                # to warn: a commit that reports success while the rules are not
+                # being enforced is a false statement on this of all products.
+                out = machine.succeed(
+                    "sentinel configure <<EOF 2>&1\n"
+                    f"delete interface {nic}\n"
+                    "set interface nosuchlink0 zone wan\n"
+                    "commit\n"
+                    "EOF"
+                )
+                assert "not filtering" in out, out
+          '';
+        };
 
         commit = pkgs.testers.runNixOSTest {
         name = "sentinel-commit";
@@ -4626,6 +4720,43 @@
 
             machine.wait_for_unit("multi-user.target")
 
+            with subtest("networkd read the config that was already on the disk"):
+                # The boot-time apply writes networkd units and deliberately does
+                # NOT reload networkd — it relies on running first and letting
+                # networkd read them on its own start. Nothing ever checked that
+                # assumption, and a box that boots with an interface configured
+                # for DHCP and comes up without an address is what it looks like
+                # when it does not hold.
+                machine.wait_for_unit("systemd-networkd.service")
+                nic = machine.succeed("ls /sys/class/net | grep -v lo | head -1").strip()
+                machine.succeed(
+                    "sentinel configure <<EOF\n"
+                    f"set interface {nic} zone wan\n"
+                    f"set interface {nic} address dhcp\n"
+                    "commit\n"
+                    "save\n"
+                    "EOF"
+                )
+                machine.succeed(f"test -e /run/systemd/network/*{nic}*.network")
+                # Reboot with that config already in place: this is the path an
+                # installed box takes on its first start.
+                machine.shutdown()
+                machine.start()
+                machine.wait_for_unit("systemd-networkd.service")
+                machine.wait_for_unit("sentinel-boot.service")
+                status = machine.succeed(f"networkctl status {nic} || true")
+                assert "/run/systemd/network" in status, (
+                    "networkd is not using the unit the boot-time apply wrote:\n" + status
+                )
+
+            with subtest("the console offers a login"):
+                # The rest of this file talks to the machine over the driver's
+                # serial backdoor, which is there whether or not a console login
+                # exists — so a box that boots perfectly and then shows nobody a
+                # prompt passes every other assertion here. Ask for the getty by
+                # name.
+                machine.wait_for_unit("getty@tty1.service")
+
             with subtest("verified boot: volatile root + dm-verity store"):
                 machine.succeed("findmnt --kernel --type tmpfs /")
                 verity = machine.succeed("dmsetup info --target verity usr")
@@ -4819,6 +4950,16 @@
             ]
             assert len(picks) == 1, listing
 
+            with subtest("the full-screen installer draws on a terminal"):
+                # What an operator meets when the ISO boots. Either the frame
+                # appears or it does not — no transcript of questions can say.
+                rc, out = machine.execute(
+                    "timeout 120 expect -f ${./nix/probe-wizard-tui.exp} 2>&1 "
+                    "| tr '\\r' '\\n'",
+                    timeout=180,
+                )
+                assert rc == 0, f"the full-screen installer exited {rc}:\n{out}"
+
             with subtest("the wizard runs on a terminal and installs"):
                 # `expect` gives it a pty and answers one question at a time
                 # (see the script for why that beats piping a list of answers).
@@ -4830,13 +4971,16 @@
                 # it stalls — a driver-level kill throws it away.
                 rc, _ = machine.execute(
                     f"SENTINEL_INSTALL_SOURCE=${sentinelImageRaw} PICK={picks[0]} "
-                    f"timeout 1200 expect -f ${./nix/drive-wizard.exp} "
-                    f"> /tmp/wizard.log 2>&1",
+                    "timeout 1200 expect -f ${./nix/drive-wizard.exp} "
+                    "> /tmp/wizard.log 2>&1",
                     timeout=1500,
                 )
                 # Not `log`: the driver has a global of that name and its type
                 # check refuses the shadow before the VM starts.
-                transcript = machine.succeed("cat /tmp/wizard.log")
+                # Not `cat`: the driver emulates carriage returns by dropping
+                # everything before them, so a pty transcript would arrive as a
+                # column of blank lines with only the last prompt left.
+                transcript = machine.succeed("tr '\\r' '\\n' < /tmp/wizard.log")
                 assert rc == 0, f"the wizard exited {rc}; transcript:\n{transcript}"
                 machine.succeed("udevadm settle")
                 # Nowhere in the session — not echoed while it is typed, and not
@@ -4849,7 +4993,13 @@
 
             with subtest("the answers reached the installed system's configuration"):
                 machine.succeed("mkdir -p /mnt/data && mount /dev/vdb6 /mnt/data")
-                cfg = machine.succeed("cat /mnt/data/lib/sentinel/appliance.toml")
+                # At the partition ROOT, because the installed system mounts this
+                # partition *at* /var/lib/sentinel — so this path is exactly
+                # /var/lib/sentinel/appliance.toml, the one the box reads at
+                # boot. Asserting where the installer happened to write instead
+                # of where the system looks is what let a whole install's worth
+                # of answers go missing while this check stayed green.
+                cfg = machine.succeed("cat /mnt/data/appliance.toml")
                 for want in [
                     'hostname = "fw-wizard"',
                     'keyboard = "de"',
@@ -4870,7 +5020,7 @@
                 # document the box refuses at boot would be worse than no wizard.
                 machine.succeed("mount /dev/vdb6 /mnt/data")
                 machine.succeed(
-                    "sentinel configure --no-apply --config /mnt/data/lib/sentinel/appliance.toml "
+                    "sentinel configure --no-apply --config /mnt/data/appliance.toml "
                     "<<< 'show' | grep -q 'hostname fw-wizard'"
                 )
                 machine.succeed("umount /mnt/data")
@@ -6925,6 +7075,97 @@
 
             # The un-ruled default-dropped port produced no log line.
             fw.fail("journalctl -u velstra.service | grep -q 'dport=9998'")
+          '';
+        };
+
+        # Every source prefix LENGTH must match, not just the convenient ones.
+        #
+        # `srcfilter` proves a /32 source works and `fwgroups` proves a /24 does,
+        # so a break confined to some lengths hides between them. Testing on real
+        # hardware turned up exactly that shape — /30 and shorter matched, /31 and
+        # /32 did not — which no existing check could have caught, because none
+        # varies the length while holding everything else still.
+        #
+        # One port per length, all four rules identical bar the prefix, under
+        # `default-action accept` so only a rule can drop. Each carries `log`, so
+        # a `DROP … dport=<port>` line is proof that that length's trie entry was
+        # found; a missing line is proof it was not.
+        #   nix build .#checks.x86_64-linux.srcprefix -L
+        srcprefix = pkgs.testers.runNixOSTest {
+          name = "sentinel-srcprefix";
+          nodes = {
+            client =
+              { pkgs, ... }:
+              {
+                virtualisation.vlans = [ 1 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                  interfaces.eth1.ipv4.addresses = [
+                    {
+                      address = "10.1.0.5";
+                      prefixLength = 24;
+                    }
+                  ];
+                };
+                environment.systemPackages = [ pkgs.curl ];
+              };
+            fw =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "fw";
+                networking.firewall.enable = lib.mkForce false;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = "10.1.0.1";
+                    prefixLength = 24;
+                  }
+                ];
+                virtualisation.vlans = [ 1 ];
+                virtualisation.memorySize = 2048;
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+          };
+          testScript = ''
+            start_all()
+            fw.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+            fw.wait_until_succeeds("ip addr show eth1 | grep -q 10.1.0.1", timeout=20)
+            client.wait_for_unit("multi-user.target")
+            client.wait_until_succeeds("ip addr show eth1 | grep -q 10.1.0.5", timeout=20)
+
+            # The client is 10.1.0.5, so every one of these blocks contains it.
+            cases = [("24", "10.1.0.0/24", 9924),
+                     ("30", "10.1.0.4/30", 9930),
+                     ("31", "10.1.0.4/31", 9931),
+                     ("32", "10.1.0.5/32", 9932)]
+
+            lines = ["set interface eth1 zone wan",
+                     "set firewall zone wan default-action accept"]
+            for name, cidr, port in cases:
+                lines += [f"set firewall rule len{name} from wan",
+                          f"set firewall rule len{name} to wan",
+                          f"set firewall rule len{name} action drop",
+                          f"set firewall rule len{name} proto tcp",
+                          f"set firewall rule len{name} port {port}",
+                          f"set firewall rule len{name} source {cidr}",
+                          f"set firewall rule len{name} log true"]
+            script = " ".join(f"'{l}' " for l in lines)
+            fw.succeed("su admin -c \"printf '%s\\n' " + script + "commit save exit | sentinel configure\"")
+            fw.wait_for_unit("velstra.service")
+            for case in cases:
+                fw.succeed(f"grep -q 'src = \"{case[1]}\"' /run/sentinel/velstra.toml")
+
+            # One retry loop per length: a SYN can be lost in the reload window,
+            # so each attempt re-sends before it gives up on that length.
+            for name, cidr, port in cases:
+                def hit(_, port=port):
+                    client.execute(f"curl -s --max-time 2 -o /dev/null http://10.1.0.1:{port}/ || true")
+                    return fw.execute(f"journalctl -u velstra.service | grep -qE 'DROP .*dport={port}'")[0] == 0
+                with subtest(f"a /{name} source prefix matches"):
+                    retry(hit)
           '';
         };
 

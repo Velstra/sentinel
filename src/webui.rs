@@ -1276,6 +1276,13 @@ pub fn page() -> String {
         </p>
         <div class="addpanel" id="globalform"></div>
       </div>
+
+      <div class="section">
+        <h3>Zones</h3>
+        <span class="spacer"></span>
+        <button class="btn" id="togglezone">New zone</button>
+      </div>
+      <div class="card addpanel hidden" id="addzonepanel"></div>
       <div id="zonelist"></div>
     </div>
 
@@ -2760,7 +2767,7 @@ function ruleFields(zones) {{
     ["to", "To zone", zoneOpts],
     ["action", "Action", ["accept", "drop", "reject"]],
     ["proto", "Protocol",
-     ["", "tcp", "udp", "tcp_udp", "icmp", "icmpv6", "vrrp", "esp", "ah", "gre"]],
+     ["", "tcp", "udp", "tcp_udp", "icmp", "icmpv6", "vrrp", "esp", "ah", "gre", "ospf", "pim"]],
     ["port", "Port"],
     ["port-group", "Port group"],
     // Both families' names, since which numbering applies follows from the
@@ -4114,10 +4121,17 @@ async function refreshZones() {{
   }}
   renderObjects({{
     listId: "zonelist", noun: "Zone", fields: POSTURE,
+    // A zone had to be brought into being by naming it on an interface, which
+    // is backwards for the one object the whole firewall is addressed by: rules
+    // say `from wan`, so `wan` has to be creatable before anything can point at
+    // it. `default-action` is required because a zone with no posture is the
+    // one thing a firewall should never be talked into.
+    form: FORMS.zone, required: "default-action",
+    toggleId: "togglezone", toggleLabel: "New zone", addId: "addzonepanel",
     path: (n) => `firewall zone ${{n}}`,
     rows: [...overrides.values()].sort((a, b) => a.name.localeCompare(b.name)),
     badge: (r) => ({{ text: r["default-action"] || "inherits", cls: r["default-action"] || "" }}),
-    empty: "No zones — give an interface a zone first.",
+    empty: "No zones yet — create one, then give an interface its name.",
   }});
 }}
 
@@ -4460,6 +4474,7 @@ const FORMS = {{
   wgPeer: {{ essential: ["allowed-ips", "endpoint"] }},
   loadBalancer: {{ essential: ["zone", "vip", "port", "backend"] }},
   natSource: {{ essential: ["zone", "description"] }},
+  zone: {{ essential: ["default-action", "block-icmp"] }},
   natDest: {{ essential: ["zone", "proto", "port", "to"] }},
   route: {{ essential: ["via", "dev"] }},
   uplink: {{ essential: ["priority", "gateway", "check target"] }},
@@ -6608,6 +6623,7 @@ $("runcapture").onclick = async () => {{
   btn.disabled = false;
   btn.textContent = "Capture";
 }};
+wireToggle("togglezone", "addzonepanel", "New zone");
 wireToggle("togglesnat", "addsnatpanel", "New source rule");
 wireToggle("toggleddnat", "adddnatpanel", "New port forward");
 wireToggle("togglebgp", "addbgppanel", "New neighbour");

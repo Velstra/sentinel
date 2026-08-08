@@ -2014,6 +2014,49 @@ fn apply_logins(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     use std::collections::BTreeSet;
     let logins = &appliance.system.logins;
 
+    // An interface the box does not have. The installer names links as the
+    // *live medium* saw them, and a config written there can arrive on hardware
+    // that calls them something else — at which point the networkd unit matches
+    // nothing, the link stays down, and everything reports success.
+    {
+        let present = system::discover_interfaces();
+        for iface in appliance
+            .interfaces
+            .iter()
+            .filter(|i| i.zone.is_some() || i.address.is_some())
+            // Only links the box is supposed to already have: everything we
+            // create ourselves (VLANs, bridges, bonds, tunnels, wireguard,
+            // PPPoE, dummies) is legitimately absent until it is made.
+            .filter(|i| i.if_type.is_none() && i.parent.is_none() && i.vlan.is_none())
+            .filter(|i| !present.contains(&i.name))
+        {
+            eprintln!(
+                "warning: this box has no interface {:?}, so nothing was configured for \
+                 it (no address, no DHCP). `show interfaces` lists the real names.",
+                iface.name
+            );
+        }
+    }
+
+    // A password that cannot be used is worth a sentence. This appliance is
+    // key-only unless asked otherwise, so `set system login <u> password …`
+    // quietly produces a credential SSH will refuse — and the operator finds
+    // out by being locked out, which is the worst possible time.
+    if mode == ApplyMode::Live && !appliance.services.ssh.password_authentication {
+        for login in logins
+            .iter()
+            .filter(|l| l.hashed_password.is_some() && l.ssh_keys.is_empty())
+        {
+            eprintln!(
+                "warning: {} has a password but no SSH key, and this appliance accepts \
+                 keys only — that password will not work over SSH. Allow it with \
+                 `set services ssh password-authentication true`, or give the account \
+                 a key with `set system login {} public-key <key>`.",
+                login.username, login.username
+            );
+        }
+    }
+
     // Render each configured user's authorized_keys file (root-owned, 0644).
     let mut wanted: BTreeSet<String> = BTreeSet::new();
     for login in logins {
@@ -2034,7 +2077,14 @@ fn apply_logins(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
         }
 
         // Account + password are live-only side effects on the OS user database.
-        if mode == ApplyMode::Live {
+        // Created at boot as well, not only on a commit. "At boot the accounts
+        // already exist" holds for a box that has been configured at least once
+        // — and is exactly wrong for a freshly installed one, whose first boot
+        // is its first apply. The account the operator created in the installer
+        // did not exist, so the password they set could not be used.
+        // `ensure_login_account` checks before it creates, and setting the same
+        // hash twice is a no-op, so this is safe to run every boot.
+        {
             system::ensure_login_account(&login.username)?;
             if let Some(hash) = &login.hashed_password {
                 system::set_login_password(&login.username, hash)?;
@@ -2063,6 +2113,13 @@ fn apply_logins(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
 // here. The env file overrides the unit's default `SENTINEL_API_LISTEN`.
 const API_TOKEN: &str = "/var/lib/sentinel/api-token";
 const API_ENV: &str = "/run/sentinel/api.env";
+// The interface the data plane attaches its XDP hook to. Written from the
+// appliance config, because that is where an operator says which link is the
+// uplink — it used to be baked into the image at build time, which meant that
+// on any box whose NIC was not literally named `eth0` the agent failed to start
+// and the firewall silently did not run at all.
+const AGENT_ENV: &str = "/run/sentinel/velstra.env";
+const AGENT_UNIT: &str = "velstra.service";
 const API_UNIT: &str = "sentinel-api.service";
 
 /// Reconcile the receiving side of HA config sync to `[system.config-sync]`: a
@@ -2071,31 +2128,74 @@ const API_UNIT: &str = "sentinel-api.service";
 /// touches the unit; at boot the API starts on its own with the files in place.
 fn apply_configsync(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     let cs = &appliance.system.config_sync;
-    match &cs.secret {
-        Some(secret) => {
-            system::install_token(Path::new(API_TOKEN), secret)?;
-            let env = "SENTINEL_API_LISTEN=0.0.0.0:8080\n";
-            let changed = file_changed(Path::new(API_ENV), env);
-            system::install_file(Path::new(API_ENV), env)?;
-            if mode == ApplyMode::Live {
-                // EnvironmentFile is read at start; restart to pick up a widened
-                // listen / rotated token, else just ensure it is running.
-                let r = if changed {
+    if let Some(secret) = &cs.secret {
+        system::install_token(Path::new(API_TOKEN), secret)?;
+    }
+    apply_api(appliance, mode)
+}
+
+/// Reconcile the one HTTP server the box runs: the web console and the REST API
+/// behind it (`[services.web]`), which is also what HA config sync pushes to.
+///
+/// Both wants land here rather than in two places, because they are one server
+/// and one listen address — two writers of `api.env` would take turns undoing
+/// each other, and which of them ran last would decide whether the console was
+/// reachable.
+fn apply_api(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
+    let web = &appliance.services.web;
+    let sync = appliance.system.config_sync.secret.is_some();
+
+    let listen = match (web.enable, sync) {
+        (false, false) => None,
+        // Config sync alone: off-box on the port peers push to.
+        (false, true) => Some("0.0.0.0:8080".to_string()),
+        (true, false) => Some(web.bind()),
+        // Both: the operator's port, but reachable — a console bound to
+        // localhost would silently stop peers from pushing here.
+        (true, true) => {
+            let port = web.port.unwrap_or(8080);
+            match web.listen_address.as_deref() {
+                Some(a) if a != "127.0.0.1" && a != "::1" => Some(web.bind()),
+                _ => Some(format!("0.0.0.0:{port}")),
+            }
+        }
+    };
+
+    match listen {
+        Some(addr) => {
+            let env = format!("SENTINEL_API_LISTEN={addr}\n");
+            let changed = file_changed(Path::new(API_ENV), &env);
+            system::install_file(Path::new(API_ENV), &env)?;
+            // Started at boot as well, not only on a commit: the unit carries no
+            // `wantedBy`, so nothing else brings it up, and a console that
+            // disappears on the first reboot is worse than one that was never
+            // offered.
+            let r = if mode == ApplyMode::Live {
+                // EnvironmentFile is read at start, so a changed address needs a
+                // restart rather than a start.
+                if changed {
                     system::service_restart(API_UNIT)
                 } else {
                     system::service_start(API_UNIT)
-                };
-                if let Err(e) = r {
-                    eprintln!("warning: (re)starting {API_UNIT} failed: {e}");
                 }
+            } else {
+                system::service_start_nowait(API_UNIT)
+            };
+            if let Err(e) = r {
+                eprintln!("warning: (re)starting {API_UNIT} failed: {e}");
             }
         }
         None => {
+            // Stop it only if we are the one who asked for it. The env file is
+            // that record: without it the unit was started by something else —
+            // an operator, or a check — and stopping it here means the server
+            // kills itself while answering the very request that applied this
+            // config, which is what `PUT /config` did.
             if Path::new(API_ENV).exists() {
+                system::remove_file(Path::new(API_ENV))?;
                 if mode == ApplyMode::Live {
                     let _ = system::service_stop(API_UNIT);
                 }
-                system::remove_file(Path::new(API_ENV))?;
             }
         }
     }
@@ -3104,6 +3204,57 @@ fn apply_multiwan(appliance: &Appliance) -> Result<()> {
 /// networkd already up) it additionally reloads networkd and restarts the changed
 /// co-services so the change lands immediately. The link-dependent runtime state
 /// (incl. PPPoE) is deferred to [`apply_link_runtime`].
+/// The link the data plane hooks. The first zoned interface the box actually
+/// has, so a config naming a link that is not there cannot leave the agent
+/// pointed at nothing.
+fn agent_uplink(appliance: &Appliance) -> Option<String> {
+    let present = system::discover_interfaces();
+    let zoned: Vec<&str> = appliance
+        .interfaces
+        .iter()
+        .filter(|i| i.zone.is_some())
+        .map(|i| i.name.as_str())
+        .collect();
+    zoned
+        .iter()
+        .find(|n| present.iter().any(|p| p == *n))
+        .or(zoned.first())
+        .map(|n| n.to_string())
+}
+
+/// Tell the agent's unit which link to attach to, and restart it when that
+/// changes. Without this the choice was a build-time constant.
+fn apply_agent_iface(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
+    let Some(iface) = agent_uplink(appliance) else {
+        // Worth saying out loud: with no interface to attach to, the data plane
+        // does not run, and a box whose firewall is not running looks exactly
+        // like one whose rules all permit.
+        if mode == ApplyMode::Live {
+            eprintln!(
+                "warning: no interface has a zone, so the firewall data plane has \
+                 nothing to attach to and is not filtering. Give the uplink a zone: \
+                 `set interface <name> zone <zone>`."
+            );
+        }
+        return Ok(());
+    };
+    if mode == ApplyMode::Live && !system::discover_interfaces().contains(&iface) {
+        eprintln!(
+            "warning: this box has no interface {iface:?}, so the firewall data plane \
+             cannot attach and is not filtering. `show interfaces` lists the real names."
+        );
+    }
+    let env = format!("VELSTRA_IFACE={iface}\n");
+    let changed = file_changed(Path::new(AGENT_ENV), &env);
+    system::install_file(Path::new(AGENT_ENV), &env)?;
+    if changed && mode == ApplyMode::Live {
+        if let Err(e) = system::service_restart(AGENT_UNIT) {
+            eprintln!("warning: restarting {AGENT_UNIT} failed: {e}");
+        }
+    }
+    Ok(())
+}
+
 pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     let ifaces = &appliance.interfaces;
 
@@ -3452,13 +3603,25 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     // Port/ListenAddress drop-in; sshd (re)started only in Live mode.
     apply_ssh(appliance, mode)?;
     apply_console(appliance, mode)?;
-    apply_locale(appliance, mode)?;
+    apply_locale(appliance)?;
     apply_metrics(appliance, mode)?;
     apply_dnsproxy(appliance, mode)?;
     apply_policy_routes(appliance, mode)?;
     // HA config sync (roadmap C21): the receiving side — share the token + widen
     // the API when a secret is set. The sending side (push) is driven from commit.
+    apply_agent_iface(appliance, mode)?;
     apply_configsync(appliance, mode)?;
+    // A commit that reports success while the firewall is not running is a false
+    // statement on this of all products.
+    if mode == ApplyMode::Live
+        && appliance.interfaces.iter().any(|i| i.zone.is_some())
+        && !system::unit_active(AGENT_UNIT)
+    {
+        eprintln!(
+            "warning: {AGENT_UNIT} is not running, so these rules are not being \
+             enforced. `systemctl status {AGENT_UNIT}` says why."
+        );
+    }
     Ok(())
 }
 
@@ -3836,26 +3999,34 @@ const LOCALE_CONF: &str = "/run/systemd/locale.conf";
 /// that refuses, must not take a whole commit down — the firewall rules in the
 /// same commit matter more than the console layout. Each failure names the
 /// setting.
-fn apply_locale(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
+/// Public entry point for the console-only re-apply (`sentinel apply-console`).
+pub fn apply_console_settings(appliance: &Appliance) -> Result<()> {
+    apply_locale(appliance)
+}
+
+fn apply_locale(appliance: &Appliance) -> Result<()> {
     let sys = &appliance.system;
+    // Loaded in both modes, not just live. The file below is under /run, which
+    // is a tmpfs, and this runs after systemd-vconsole-setup has already read
+    // its own — so at boot the drop-in changes nothing at all. Writing it and
+    // stopping there is why an installed box kept coming up on the layout the
+    // operator had just replaced.
     if let Some(k) = &sys.keyboard {
         system::install_file(Path::new(VCONSOLE_CONF), &format!("KEYMAP={k}\n"))?;
-        if mode == ApplyMode::Live {
-            if let Err(e) = system::load_keymap(k) {
-                eprintln!("warning: loading keymap {k} failed (applies at next boot): {e}");
-            }
+        if let Err(e) = system::load_keymap(k) {
+            eprintln!("warning: loading keymap {k} failed: {e}");
         }
     }
     if let Some(l) = &sys.locale {
         system::install_file(Path::new(LOCALE_CONF), &format!("LANG={l}\n"))?;
     }
     // The timezone is a symlink `timedatectl` owns, so there is no drop-in to
-    // write — the live call is the whole of it, and it persists on its own.
+    // write — the call is the whole of it. Same reasoning as the keymap: on an
+    // image-based appliance /etc does not survive, so it has to be set every
+    // boot, not only when an operator commits.
     if let Some(tz) = &sys.timezone {
-        if mode == ApplyMode::Live {
-            if let Err(e) = system::set_timezone(tz) {
-                eprintln!("warning: setting timezone {tz} failed: {e}");
-            }
+        if let Err(e) = system::set_timezone(tz) {
+            eprintln!("warning: setting timezone {tz} failed: {e}");
         }
     }
     Ok(())

@@ -534,9 +534,14 @@ pub fn seed_config(targets: &[&Disk], raid: Raid, toml: &str) -> Result<()> {
     run("mount", &[&dev, mnt.to_str().unwrap()])?;
     let _guard = MountGuard(mnt.to_path_buf());
 
-    let dir = mnt.join("lib/sentinel");
-    std::fs::create_dir_all(&dir).context("creating /var/lib/sentinel on the target")?;
-    let path = dir.join("appliance.toml");
+    // The data partition IS /var/lib/sentinel on the installed system — it is
+    // mounted there, so the config belongs at the partition's root. Writing
+    // `lib/sentinel/` under it put the operator's answers at
+    // /var/lib/sentinel/lib/sentinel/appliance.toml, where nothing looks: the
+    // box booted, found no config, copied the factory default over the top, and
+    // every answer given during the install — password, keymap, hostname,
+    // network — was gone by the first login prompt.
+    let path = mnt.join("appliance.toml");
     std::fs::write(&path, toml).with_context(|| format!("writing {}", path.display()))?;
     eprintln!("seeded {} ({} bytes)", path.display(), toml.len());
     Ok(())
