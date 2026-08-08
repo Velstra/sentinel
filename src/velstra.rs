@@ -36,8 +36,36 @@ pub fn query(command: &str) -> Result<String> {
     query_at(Path::new(SOCKET), command)
 }
 
-/// [`query`] against an explicit path, so a test can point at its own socket.
+/// [`query`] against an explicit path, escalating once if the socket is shut.
+///
+/// The agent's sockets are root-only on purpose, and every caller of this — the
+/// flow table, rule attribution, port mappings, portal sessions — was therefore
+/// closed to the operator account, each reporting it as the agent being absent.
+/// Escalate here rather than at each call site, and rather than widening a
+/// socket that can change what the data plane does.
 pub fn query_at(path: &Path, command: &str) -> Result<String> {
+    match query_direct(path, command) {
+        Ok(reply) => Ok(reply),
+        // As root there is nobody left to ask, so the error is the answer.
+        Err(e) if crate::system::is_root() => Err(e),
+        Err(e) => {
+            let Some(sock) = path.to_str() else {
+                return Err(e);
+            };
+            let out = crate::system::escalated_output(
+                "sentinel-self",
+                &["agent-query", "--socket", sock, command],
+            );
+            match out {
+                Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).into_owned()),
+                _ => Err(e),
+            }
+        }
+    }
+}
+
+/// The socket conversation itself, without escalation.
+fn query_direct(path: &Path, command: &str) -> Result<String> {
     if !path.exists() {
         bail!("{} does not exist", path.display());
     }

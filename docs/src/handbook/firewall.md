@@ -415,6 +415,29 @@ This tracks a name, not a service. A large site behind many rotating addresses, 
 one sharing an address with sites you do not mean to match, is a poor fit — for
 DNS-level blocking use `service dns` blocklists instead.
 
+## Protocols a rule can match
+
+`proto` is not limited to TCP and UDP:
+
+```
+set firewall rule ping from wan
+set firewall rule ping proto icmp
+set firewall rule ping action accept
+```
+
+`icmp` and `icmpv6` carry no port — a rule naming one matches every packet of
+that protocol under its policy, subject to the rule's addresses. That is how the
+box is made to answer a ping while the zone's default action stays `drop`.
+
+The rest: `tcp`, `udp`, `tcp_udp` (both on one port), `vrrp`, `esp`, `ah`, `gre`.
+
+`block-icmp` is a different thing and easy to confuse with this. It is an
+*extra* drop, applied before the rules, and it only changes the outcome on a
+zone whose default action is `accept` — "let everything through, except ICMP".
+On a zone that already defaults to `drop`, `block-icmp false` does not permit
+anything; the default action still drops. `show firewall zones` states, per
+zone, which of the two is deciding.
+
 ## NAT
 
 `nat` has four kinds of translation:

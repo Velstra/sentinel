@@ -20,7 +20,7 @@
 //!   those same endpoints, so it cannot report anything the CLI would not.
 //!
 //! Auth is a bearer token (0600 file or `$SENTINEL_API_TOKEN`), required on every
-//! endpoint except `/health`. The server binds localhost by default; widen it
+//! endpoint except `/api/v1/health`. The server binds localhost by default; widen it
 //! with `--listen 0.0.0.0:<port>`.
 
 use std::collections::HashMap;
@@ -56,7 +56,7 @@ pub const DEFAULT_TOKEN_PATH: &str = "/var/lib/sentinel/api-token";
 /// Shared handler state: the bearer token, the running-config path, and how a
 /// `PUT` applies the config live (the same [`Apply`] a CLI `commit` uses).
 pub struct ApiState {
-    /// The bearer token every request (except `/health`) must present.
+    /// The bearer token every request (except `/api/v1/health`) must present.
     pub token: String,
     /// The running/boot config a `GET` reads and a `PUT` writes.
     pub config_path: PathBuf,
@@ -126,7 +126,7 @@ pub async fn serve(listen: &str, config: &Path, apply: Apply, token_file: &Path)
     Ok(())
 }
 
-/// Build the API router. `/health` is unauthenticated; everything else sits
+/// Build the API router. `/api/v1/health` is unauthenticated; everything else sits
 /// behind the bearer-token middleware.
 pub fn router(state: Arc<ApiState>) -> Router {
     let protected = Router::new()

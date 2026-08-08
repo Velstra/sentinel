@@ -14,6 +14,35 @@
   ...
 }:
 {
+  # PAM must be *able* to check a password, even though sshd will not offer
+  # password authentication until the running config says so.
+  #
+  # NixOS derives sshd's PAM stack from the build-time setting:
+  #   unixAuth = if settings.PasswordAuthentication == true then true else false
+  # and this image sets that to false (key-only is the right default). The
+  # result was a runtime switch that could not work: `set services ssh
+  # password-authentication true` flips sshd's own setting through a drop-in,
+  # sshd then asks PAM, and PAM has no unix module left to ask. Every password
+  # was refused with a correct hash in the shadow file and `sshd -T` reporting
+  # `passwordauthentication yes`.
+  #
+  # This does not weaken the default: sshd still refuses password auth until
+  # the appliance config enables it. It only stops the image from deciding, at
+  # build time, something the operator is supposed to decide at runtime.
+  security.pam.services.sshd.unixAuth = lib.mkForce true;
+
+  # There is exactly one firewall on this box, and it is the one the operator
+  # configures. NixOS ships its own nftables firewall enabled by default, and on
+  # an appliance that is a second, invisible filter underneath the real one:
+  # `allowPing` defaults to true, so ICMP passed a zone with `block-icmp true`,
+  # and `allowedTCPPorts` is empty, so an SSH port and a web console that were
+  # both listening were dropped before they were ever consulted. None of it is
+  # expressible in the appliance's own config, and none of it appears in `show`.
+  #
+  # Every VM check already disables it — which is why the checks never saw any
+  # of that: they ran a configuration the shipped image does not have.
+  networking.firewall.enable = lib.mkForce false;
+
   # networking.hostName is set from the appliance config in flake.nix (so a
   # `commit` that changes the hostname changes the system), not here.
 

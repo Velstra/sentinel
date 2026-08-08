@@ -1,0 +1,52 @@
+# Prove the full-screen installer really draws in the live environment.
+#
+# It is what an operator meets first when the ISO boots, and it is the one part
+# of the installer that cannot be checked by reading a transcript of questions:
+# either the frame appears on the terminal or it does not. So this asks for one
+# thing only — the first page — and then leaves by the route that touches no
+# disk. The questions themselves are driven, in full, by drive-wizard.exp
+# against the line-by-line front end, which ends in the same answers.
+
+set timeout 90
+log_user 1
+
+# The size has to be set on the pty *before* the process starts: it reads the
+# window size once at startup to decide whether it can draw at all, and an
+# `stty` after the spawn loses that race — the installer has already fallen
+# back to asking one question at a time.
+set stty_init "rows 30 columns 100"
+
+# The test driver's shell runs with TERM=dumb, and the installer refuses to draw
+# on a dumb terminal — correctly. A real console is TERM=linux, so that is what
+# this has to present; without it the probe measures the fallback instead of the
+# thing it exists to check.
+set env(TERM) linux
+
+# Report what a spawned process actually sees, before asking anything of the
+# installer. The size is the one input that decides whether it draws at all, so
+# when this probe fails the first question is always "how big did it think the
+# console was" — and answering that from the transcript beats guessing.
+if {[info exists env(TERM)]} { puts "TERM=$env(TERM)" } else { puts "TERM is unset" }
+spawn stty size
+expect eof
+puts "--- the size above is what the installer will read ---"
+
+spawn sentinel install
+
+expect {
+    "Installation target" {}
+    timeout { puts "\nSTALLED — the full-screen installer never drew its first page"; exit 3 }
+    eof     { puts "\nEXITED — before drawing anything"; exit 4 }
+}
+
+# Esc on the first page leaves. Nothing has been chosen, so nothing is touched —
+# and the message saying so is the assertion.
+send -- "\033"
+expect {
+    "nothing was written" {}
+    timeout { puts "\nSTALLED — Esc did not leave the installer"; exit 5 }
+    eof     { puts "\nEXITED — without saying it wrote nothing"; exit 6 }
+}
+
+catch wait result
+exit [lindex $result 3]

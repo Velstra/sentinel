@@ -76,6 +76,33 @@ in
   boot.initrd.systemd.enable = true;
 
   # The slot-A UKI is `sentinel-a+3.efi` (3 boot tries before it's deemed bad).
+  # The name in the installed system's boot menu. systemd-boot shows a UKI's
+  # PRETTY_NAME, which NixOS builds from these — left alone it reads "NixOS
+  # 25.05", which says nothing about the appliance that was installed.
+  #
+  # A notch weaker than mkForce: the VM test framework pins some of these with
+  # mkForce, and two definitions of equal strength are a conflict rather than an
+  # override.
+  system.nixos.distroName = lib.mkOverride 60 "Velstra Sentinel";
+  system.nixos.distroId = lib.mkOverride 60 "velstra-sentinel";
+
+  # NixOS composes PRETTY_NAME as "<name> <release> (<codeName>)" and both of
+  # the latter are read-only, so setting the name alone still leaves the boot
+  # menu reading "Velstra Sentinel 25.05 (Warbler)". This is the appliance's own
+  # identity file; IMAGE_ID and IMAGE_VERSION are kept because the A/B update
+  # machinery reads them.
+  environment.etc."os-release".text = lib.mkForce ''
+    NAME="Velstra Sentinel"
+    ID=velstra-sentinel
+    ID_LIKE=nixos
+    PRETTY_NAME="Velstra Sentinel"
+    ANSI_COLOR="0;36"
+    IMAGE_ID=${config.system.image.id}
+    IMAGE_VERSION=${toString config.system.image.version}
+    VERSION_ID=${toString config.system.image.version}
+    DEFAULT_HOSTNAME=sentinel
+  '';
+
   boot.uki.name = "sentinel-a";
   boot.uki.version = lib.mkForce null; # no `_<version>` infix; keep the name clean
   boot.uki.tries = 3;

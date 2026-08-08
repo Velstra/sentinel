@@ -9,6 +9,10 @@
 #
 # The disk number is not hardcoded: it comes from $PICK, which the test reads
 # off the wizard's own candidate listing.
+#
+# `--text` on purpose: the full-screen installer is the default, and it is
+# covered by its own probe. This drives the line-by-line front end, which is
+# what a console too small or too dumb for the other one falls back to.
 
 # Prompts are instant; the install that follows the last answer is not.
 set timeout 120
@@ -22,7 +26,7 @@ proc answer {what reply} {
     }
 }
 
-spawn sentinel install
+spawn sentinel install --text
 
 # Where to install. Asked first on purpose: an operator who changes their mind
 # during the questions below has erased nothing yet.
@@ -42,7 +46,9 @@ answer "Username"        "operator"
 answer "Password:"       "correcthorsebattery"
 answer "SSH public key"  ""
 
-# Enough network to reach the box over SSH after the reboot.
+# The network step is optional; this drives the case that takes it, because
+# that is the one with something to check afterwards.
+answer "Configure an interface now" "y"
 answer "Configure "       "y"
 answer "zone"             "wan"
 answer "address"          "10.9.9.9/24"
@@ -50,13 +56,16 @@ answer "default gateway"  "10.9.9.1"
 
 # The wizard asks about every NIC it finds, and how many that is depends on the
 # machine. Decline the rest rather than assuming a count — a fixed list of
-# answers silently slides out of step on a box with a second interface.
+# answers silently slides out of step on a box with a second interface. The SSH
+# question comes after the last of them, so it ends this loop.
 expect {
-    "Configure "          { send -- "n\r"; exp_continue }
-    "Type YES to proceed" { send -- "YES\r" }
-    timeout { puts "\nSTALLED — no confirmation prompt"; exit 3 }
-    eof     { puts "\nEXITED — before the confirmation"; exit 4 }
+    "Configure " { send -- "n\r"; exp_continue }
+    "Permit SSH" { send -- "y\r" }
+    timeout { puts "\nSTALLED — no SSH question after the interfaces"; exit 3 }
+    eof     { puts "\nEXITED — during the interface questions"; exit 4 }
 }
+
+answer "Type YES to proceed" "YES"
 
 # From here it is cloning ~2.9G onto the target; wait on the process, not a prompt.
 set timeout 900
