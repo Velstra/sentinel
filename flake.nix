@@ -214,7 +214,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-rSJufYlcKjEaNFnzBtVe/zFZT8kGWNYzkMcPD0D3mHo=";
+      ebpfHash = "sha256-N3D0MtzdmL/l/wmxrdFaPE6y+s7AzAgfLxwrO5EE6rA=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -7075,6 +7075,122 @@
 
             # The un-ruled default-dropped port produced no log line.
             fw.fail("journalctl -u velstra.service | grep -q 'dport=9998'")
+          '';
+        };
+
+        # Deny-by-default must not gag the box.
+        #
+        # A zone's `default-action` says what the box will accept. The egress hook
+        # was applying it to traffic *leaving* as well, so the moment anything
+        # caused that hook to attach — a rule carrying `direction out`, NAT, a
+        # shaper — a deny-by-default zone dropped every packet the box itself
+        # sent, its own administrative replies included. On real hardware one
+        # unrelated `direction out` rule on port 9106 took the whole appliance off
+        # the network; the only way back was commit-confirm's auto-revert.
+        #
+        # Two halves, because the bug had two faces: the box must still answer
+        # what it admits (the lockout), and it must still be able to *start* a
+        # conversation of its own (no DNS, no NTP, no ACME without it).
+        #   nix build .#checks.x86_64-linux.egress -L
+        egress = pkgs.testers.runNixOSTest {
+          name = "sentinel-egress";
+          nodes = {
+            client =
+              { pkgs, ... }:
+              {
+                virtualisation.vlans = [ 1 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                  interfaces.eth1.ipv4.addresses = [
+                    {
+                      address = "10.1.0.2";
+                      prefixLength = 24;
+                    }
+                  ];
+                };
+                services.httpd.enable = true;
+                services.httpd.adminAddr = "root@localhost";
+                services.httpd.virtualHosts.localhost.listen = [
+                  {
+                    ip = "*";
+                    port = 80;
+                  }
+                ];
+                environment.systemPackages = [ pkgs.curl ];
+              };
+            fw =
+              { lib, pkgs, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "fw";
+                networking.firewall.enable = lib.mkForce false;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = "10.1.0.1";
+                    prefixLength = 24;
+                  }
+                ];
+                virtualisation.vlans = [ 1 ];
+                virtualisation.memorySize = 2048;
+                services.velstra.interface = lib.mkForce "eth1";
+                environment.systemPackages = [ pkgs.curl ];
+              };
+          };
+          testScript = ''
+            start_all()
+            fw.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+            fw.wait_until_succeeds("ip addr show eth1 | grep -q 10.1.0.1", timeout=20)
+            client.wait_for_unit("multi-user.target")
+            client.wait_for_unit("httpd.service")
+            client.wait_until_succeeds("ip addr show eth1 | grep -q 10.1.0.2", timeout=20)
+
+            # Deny by default, one admitted service, and one rule about leaving
+            # traffic that has nothing to do with either.
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth1 zone wan' "
+                "'set firewall zone wan default-action drop' "
+                "'set firewall rule admin from wan' "
+                "'set firewall rule admin action accept' "
+                "'set firewall rule admin proto tcp' "
+                "'set firewall rule admin port 8080' "
+                "'set firewall rule leaving from wan' "
+                "'set firewall rule leaving action accept' "
+                "'set firewall rule leaving proto tcp' "
+                "'set firewall rule leaving port 9106' "
+                "'set firewall rule leaving direction out' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            fw.wait_for_unit("velstra.service")
+            # The rule really did attach the egress hook -- otherwise this check
+            # would pass without ever exercising the path that broke.
+            fw.wait_until_succeeds("tc qdisc show dev eth1 | grep -q clsact", timeout=20)
+
+            with subtest("the box still answers what it admits"):
+                # LibreSSL's nc -- what the appliance carries -- takes the listen
+                # port positionally; `-p` is the *source* port there, so the
+                # familiar spelling would have listened on nothing at all.
+                fw.execute("(setsid nc -l -k 8080 >/dev/null 2>&1 < /dev/null &)")
+                fw.wait_until_succeeds("ss -ltn | grep -q ':8080'", timeout=20)
+                client.wait_until_succeeds("nc -z -w 3 10.1.0.1 8080", timeout=30)
+
+            with subtest("and can still start a conversation of its own"):
+                # Deny-by-default is about what arrives. Time, DNS and certificate
+                # renewal all depend on this direction working.
+                fw.wait_until_succeeds(
+                    "curl -s --max-time 5 -o /dev/null http://10.1.0.2/", timeout=30)
+
+            with subtest("ICMP still needs a rule, and says so"):
+                # The egress hook records a flow for TCP and UDP only, so an echo
+                # reply arrives at ingress with nothing vouching for it. That is a
+                # real limit, not an oversight of this check: `ping` from the box
+                # under deny-by-default needs a rule of its own. Asserted so the
+                # day it changes, this says so out loud.
+                fw.fail("ping -c2 -W2 10.1.0.2")
           '';
         };
 
