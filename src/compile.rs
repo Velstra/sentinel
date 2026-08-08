@@ -443,6 +443,8 @@ fn proto_str(p: Proto) -> &'static str {
         Proto::Esp => "esp",
         Proto::Ah => "ah",
         Proto::Gre => "gre",
+        Proto::Ospf => "ospf",
+        Proto::Pim => "pim",
         Proto::TcpUdp => "tcp_udp",
     }
 }

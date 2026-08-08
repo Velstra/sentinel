@@ -79,6 +79,30 @@ in
       '';
     };
 
+    # The console keymap, put back after systemd has had its say.
+    #
+    # systemd owns the virtual console: it runs systemd-vconsole-setup at boot
+    # and again from a udev rule whenever a console appears, each time writing
+    # the image's keymap. A layout chosen in the installer was therefore loaded
+    # and then reset, every time. Disabling NixOS's console module removed the
+    # reset — and the login prompt with it, because getty never came up. So
+    # order after it and follow it instead: PartOf means this runs again each
+    # time vconsole-setup does, and the operator's choice has the last word.
+    systemd.services.sentinel-console = {
+      description = "Apply the appliance's console keyboard, locale and timezone";
+      wantedBy = [ "multi-user.target" ];
+      after = [
+        "systemd-vconsole-setup.service"
+        "sentinel-boot.service"
+      ];
+      partOf = [ "systemd-vconsole-setup.service" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = "${cfg.sentinel}/bin/sentinel apply-console --config /var/lib/sentinel/appliance.toml";
+      };
+    };
+
     systemd.services.velstra = {
       description = "Velstra eBPF/XDP data plane";
       wantedBy = [ "multi-user.target" ];
@@ -93,6 +117,8 @@ in
       # trip systemd's start rate limiter and lock the data plane out
       # (start-limit-hit). Restart=on-failure below still self-heals real crashes.
       startLimitIntervalSec = 0;
+      # The fallback when no zoned interface has been configured yet.
+      environment.VELSTRA_IFACE = cfg.interface;
       serviceConfig = {
         # The query socket (C23) is what `show flows` / `show firewall statistics`
         # read: the agent owns the eBPF maps, so it is the only process that can
@@ -106,7 +132,13 @@ in
         # trust, so three files — a service that needs one is not handed the
         # others. All live in the same root-owned 0700 directory, which is what
         # governs who may ask.
-        ExecStart = "${cfg.package}/bin/velstra run --iface ${cfg.interface} --config /run/sentinel/velstra.toml --query-socket /run/velstra/query.sock --portal-socket /run/velstra/portal.sock --mapping-socket /run/velstra/mapping.sock";
+        # The uplink comes from the appliance config at runtime (sentinel writes
+        # it here on every apply), not from a build-time constant: an image
+        # baked with `eth0` never attached on a box whose NIC is called
+        # anything else, and the firewall then simply did not run. The option
+        # below stays as the fallback for a box with no zoned interface yet.
+        EnvironmentFile = "-/run/sentinel/velstra.env";
+        ExecStart = "${cfg.package}/bin/velstra run --iface \${VELSTRA_IFACE} --config /run/sentinel/velstra.toml --query-socket /run/velstra/query.sock --portal-socket /run/velstra/portal.sock --mapping-socket /run/velstra/mapping.sock";
         RuntimeDirectory = "velstra";
         RuntimeDirectoryMode = "0700";
         Restart = "on-failure";

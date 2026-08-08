@@ -583,6 +583,9 @@ pub struct Services {
     /// SSH management access (`[services.ssh]`).
     #[serde(default, skip_serializing_if = "Ssh::is_empty")]
     pub ssh: Ssh,
+    /// Web console + REST management API (`[services.web]`).
+    #[serde(default, skip_serializing_if = "WebConsole::is_empty")]
+    pub web: WebConsole,
     /// mDNS reflector (`[services.mdns]`).
     #[serde(default, skip_serializing_if = "Mdns::is_empty")]
     pub mdns: Mdns,
@@ -641,6 +644,7 @@ impl Services {
             && self.lldp.is_empty()
             && self.snmp.is_empty()
             && self.ssh.is_empty()
+            && self.web.is_empty()
             && self.mdns.is_empty()
             && self.dyndns.is_empty()
             && self.dhcp_relay.is_empty()
@@ -1261,6 +1265,50 @@ impl Ssh {
             && self.port.is_none()
             && self.listen_address.is_none()
             && !self.password_authentication
+    }
+}
+
+/// The web console and REST management API (`[services.web]`).
+///
+/// One server: the browser console and the REST API the CLI's own `configure`
+/// path is mirrored on. Off by default — a firewall does not open a management
+/// surface to the network unless it is asked to — and bound to localhost when
+/// enabled without an address, so turning it on is not the same as exposing it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebConsole {
+    /// Serve the console. Off by default.
+    #[serde(default)]
+    pub enable: bool,
+    /// The TCP port to serve on. Unset ⇒ 8080.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// The local address to bind. Unset ⇒ 127.0.0.1, i.e. reachable only from
+    /// the box itself. Give an address the box holds to reach it from a
+    /// management network, or `0.0.0.0` for every address.
+    #[serde(
+        rename = "listen-address",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub listen_address: Option<String>,
+}
+
+impl WebConsole {
+    /// True when nothing was asked for, so `[services.web]` can be omitted.
+    pub fn is_empty(&self) -> bool {
+        !self.enable && self.port.is_none() && self.listen_address.is_none()
+    }
+
+    /// The address the server binds, defaults applied.
+    pub fn bind(&self) -> String {
+        let addr = self.listen_address.as_deref().unwrap_or("127.0.0.1");
+        let port = self.port.unwrap_or(8080);
+        if addr.contains(':') {
+            format!("[{addr}]:{port}")
+        } else {
+            format!("{addr}:{port}")
+        }
     }
 }
 
@@ -5903,6 +5951,15 @@ pub enum Proto {
     Ah,
     /// GRE (IANA 47).
     Gre,
+    /// OSPF (IANA 89) — what an OSPFv2/OSPFv3 adjacency is made of. It rides
+    /// directly on IP, so no TCP or UDP rule can describe it: without a name of
+    /// its own, a box running an IGP behind `default-action drop` had no way to
+    /// admit its own neighbours, and `set protocols ospf …` produced a router
+    /// whose hellos its own firewall discarded.
+    Ospf,
+    /// PIM (IANA 103) — multicast join/prune, its own IP protocol for the same
+    /// reason, and configurable here for the same one.
+    Pim,
     /// Both TCP and UDP, as one rule. VyOS spells it `tcp_udp` and it earns its
     /// place: a service reached over either — DNS, NTP, a Samba share — is one
     /// decision to an operator, and writing it twice means two rules to keep in
@@ -5934,6 +5991,8 @@ impl Proto {
             Proto::Esp => &[Proto::Esp],
             Proto::Ah => &[Proto::Ah],
             Proto::Gre => &[Proto::Gre],
+            Proto::Ospf => &[Proto::Ospf],
+            Proto::Pim => &[Proto::Pim],
         }
     }
 }
@@ -9027,6 +9086,21 @@ impl Appliance {
             }
         }
 
+        // Web console: same shape as sshd's. The port defaults to 8080 and the
+        // bind address to localhost, so an enabled console is not an exposed one
+        // until an address is named.
+        let web = &self.services.web;
+        if let Some(p) = web.port {
+            if p == 0 {
+                bail!("services web port: must be 1-65535");
+            }
+        }
+        if let Some(addr) = &web.listen_address {
+            if validate_ipv4(addr).is_err() && validate_ipv6(addr).is_err() {
+                bail!("services web listen-address {addr:?}: not an IPv4/IPv6 address");
+            }
+        }
+
         // Local login accounts ([[system.login]]): a POSIX-ish username, single-line
         // OpenSSH keys (written verbatim into a per-user authorized_keys, so a
         // newline would inject a second key line), and a crypt(3) hashed password
@@ -10257,6 +10331,13 @@ impl Appliance {
 
     /// The resolved posture for a zone: the zone's own override (`[zone.<name>]`)
     /// falling back to the global `[firewall]` defaults. Used by the compiler.
+    /// The zones that carry a posture block. A block may name a zone no
+    /// interface is in; that block does nothing, and a view that lists zones
+    /// should still show it rather than let it sit there unnoticed.
+    pub fn firewall_zone_names(&self) -> Vec<String> {
+        self.zones.keys().cloned().collect()
+    }
+
     pub fn zone_posture(&self, zone: &str) -> ResolvedZone {
         let z = self.zones.get(zone);
         let fw = &self.firewall;
@@ -11745,6 +11826,8 @@ fn proto_str(p: Proto) -> &'static str {
         Proto::Esp => "esp",
         Proto::Ah => "ah",
         Proto::Gre => "gre",
+        Proto::Ospf => "ospf",
+        Proto::Pim => "pim",
         Proto::TcpUdp => "tcp_udp",
     }
 }

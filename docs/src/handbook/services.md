@@ -50,6 +50,42 @@ set services snmp allow 10.0.0.0/24
 set services mdns interface eth1,eth2
 ```
 
+## Web console
+
+The browser console and the REST API behind it are one server, and it is **off
+by default**. A firewall does not open a management surface to the network
+because it was installed; it does so because somebody asked.
+
+```
+set services web enable true
+set services web port 8443
+set services web listen-address 10.0.0.1
+```
+
+Without `listen-address` it binds `127.0.0.1`, which means the box itself and
+nothing else — enabling the console and exposing it are two separate decisions.
+Give it an address the box holds to reach it from a management network, or
+`0.0.0.0` for every address. The port defaults to 8080.
+
+Reaching it also needs a way through the firewall, and the appliance denies
+inbound by default. That rule is yours to write, so that nothing opens a
+management port on your behalf:
+
+```
+set firewall rule web-console from mgmt
+set firewall rule web-console proto tcp
+set firewall rule web-console port 8443
+set firewall rule web-console action accept
+```
+
+Then browse to `https://10.0.0.1:8443`. The same bearer token the REST API uses
+is minted into `/var/lib/sentinel/api-token` on first start.
+
+HA config sync (`system config-sync`) uses this same server to receive pushes
+from a peer. When both are on, the console keeps the port you chose but is bound
+so peers can still reach it — a console pinned to localhost would otherwise stop
+config sync without saying so.
+
 ## Dynamic DNS
 
 Keep a hostname's record current (ddclient).

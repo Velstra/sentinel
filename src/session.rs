@@ -23,8 +23,8 @@ use crate::config::{
     PortMapping, PortSpec, Portal, Pppoe, PrefixEntry, PrefixList, Proto, Protocols, Qos,
     QosDiscipline, ReverseProxy, Rip, RouterAdvert, Rule, Schedule, Services, Snmp,
     SourceValidation, Ssh, StaticRoute, Syslog, SyslogLevel, SyslogProto, SyslogTarget, System,
-    UpdateChannel, Vpn, VrfDef, Vrrp, WanMode, WanUplink, WgPeer, WireguardTunnel, Wireless,
-    WirelessWpa, Wwan, ZoneCfg,
+    UpdateChannel, Vpn, VrfDef, Vrrp, WanMode, WanUplink, WebConsole, WgPeer, WireguardTunnel,
+    Wireless, WirelessWpa, Wwan, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -1279,6 +1279,7 @@ struct Draft {
     /// SSH daemon settings (`[services.ssh]`). A plain owned struct (no partial
     /// state to track), carried through the draft as-is.
     ssh: Ssh,
+    web: WebConsole,
     /// Local login accounts (`[[system.login]]`), in configuration order.
     logins: Vec<Login>,
     /// Permission groups for management access, in configuration order. Named
@@ -2424,6 +2425,7 @@ impl Draft {
                 allow: a.services.snmp.allow.clone(),
             },
             ssh: a.services.ssh.clone(),
+            web: a.services.web.clone(),
             logins: a.system.logins.clone(),
             admin_groups: a.system.groups.clone(),
             config_sync: a.system.config_sync.clone(),
@@ -2661,9 +2663,45 @@ pub struct Session {
     path: PathBuf,
     /// Unsaved/uncommitted edits since the last load/commit.
     dirty: bool,
+    /// The running configuration as this session found it, so a change made by
+    /// another session is recognisable as such.
+    seen_running: Option<String>,
 }
 
 impl Session {
+    /// Where a commit records what it applied, so a *second* session can tell
+    /// that the box has moved on.
+    ///
+    /// `commit` changes the running system and writes no configuration file —
+    /// only `save` does — so until now nothing distinguished "nobody has
+    /// touched this" from "somebody committed a different firewall five minutes
+    /// ago". Two operators, one box, and the second one's `save` silently
+    /// undoing the first one's work is the failure that follows.
+    pub const RUNNING: &'static str = "/run/sentinel/running.toml";
+
+    /// The running snapshot as it is on disk right now, if there is one.
+    fn running_snapshot() -> Option<String> {
+        std::fs::read_to_string(Self::RUNNING).ok()
+    }
+
+    /// What another session has committed since this one started, if anything.
+    /// `None` when nothing has changed under us.
+    pub fn committed_elsewhere(&self) -> Option<String> {
+        let now = Self::running_snapshot()?;
+        match &self.seen_running {
+            Some(seen) if *seen == now => None,
+            // No snapshot when we started and one now: somebody committed.
+            _ => Some(now),
+        }
+    }
+
+    /// Record what we have just applied, so our own commit does not read as
+    /// somebody else's.
+    pub fn note_committed(&mut self, toml: &str) {
+        let _ = crate::system::install_config_file(Path::new(Self::RUNNING), toml);
+        self.seen_running = Some(toml.to_string());
+    }
+
     /// Open a session, loading `path` as the candidate if it exists.
     pub fn load(path: &Path) -> Result<Self> {
         let draft = if path.exists() {
@@ -2675,6 +2713,9 @@ impl Session {
             draft,
             path: path.to_path_buf(),
             dirty: false,
+            // The box's running configuration as this session found it. Anything
+            // different later was put there by somebody else.
+            seen_running: Self::running_snapshot(),
         })
     }
 
@@ -2696,6 +2737,7 @@ impl Session {
             draft: Draft::default(),
             path: PathBuf::from("/dev/null"),
             dirty: false,
+            seen_running: None,
         }
     }
 
@@ -4212,6 +4254,23 @@ impl Session {
             ["services", "ssh", "password-authentication", v] => {
                 self.draft.ssh.password_authentication = parse_bool(v)?;
             }
+            // services web: the browser console and the REST API behind it. Off
+            // by default and bound to localhost when it is not; naming an
+            // address is the deliberate step that exposes it.
+            ["services", "web", "enable", v] => {
+                self.draft.web.enable = parse_bool(v)?;
+            }
+            ["services", "web", "port", v] => {
+                self.draft.web.enable = true;
+                self.draft.web.port =
+                    Some(v.parse().map_err(|_| {
+                        anyhow::anyhow!("services web port {v:?}: not a 1-65535 port")
+                    })?);
+            }
+            ["services", "web", "listen-address", v] => {
+                self.draft.web.enable = true;
+                self.draft.web.listen_address = Some((*v).to_string());
+            }
             ["services", "ssh", "loglevel", v] => {
                 const LEVELS: [&str; 8] = [
                     "QUIET", "FATAL", "ERROR", "INFO", "VERBOSE", "DEBUG1", "DEBUG2", "DEBUG3",
@@ -5714,8 +5773,17 @@ impl Session {
                 self.draft.update_mut().public_key = Some(rest.join(" "));
             }
 
-            _ => bail!(
-                "unknown set path. The config tree (Tab/`?` explores each level):\n  \
+            // A path the grammar knows but that stops before its value is not an
+            // unknown path, and answering it with the whole tree buries the one
+            // word that was missing.
+            _ => {
+                let mut probe: Vec<&str> = vec!["set"];
+                probe.extend_from_slice(args);
+                if let Some(hint) = crate::repl::missing_value_hint(&probe) {
+                    bail!("{hint}");
+                }
+                bail!(
+                    "unknown set path. The config tree (Tab/`?` explores each level):\n  \
                  set system hostname <name>\n  \
                  set interface <name> zone <zone>\n  \
                  set interface <name> address <dhcp|CIDR>\n  \
@@ -5732,7 +5800,7 @@ impl Session {
                  set firewall zone <name> block <IP|CIDR>\n  \
                  set firewall rule <name> <from|to> <zone>\n  \
                  set firewall rule <name> action <accept|drop|reject>\n  \
-                 set firewall rule <name> <proto tcp|udp | port <n|lo-hi> | log <true|false> | source <cidr>>\n  \
+                 set firewall rule <name> <proto tcp|udp|tcp_udp|icmp|icmpv6|vrrp|esp|ah|gre | port <n|lo-hi> | log <true|false> | source <cidr>>\n  \
                  set nat source <name> zone <zone>\n  \
                  set nat destination <name> <zone <z> | proto <p> | port <n> | to <ip[:port]>>\n  \
                  set nat nat64 <enabled <true|false> | prefix <64:ff9b::/96> | pool <v4-cidr> | interface <if> | dns64 <true|false>>\n  \
@@ -5770,7 +5838,8 @@ impl Session {
                  set pki certificate <name> <ca <ca-name|acme> | common-name <cn> | subject-alt-name <DNS:host|IP:addr> | key-type <ec|rsa> | usage <server|client> | validity-days <n>>\n  \
                  set pki acme <email <addr> | directory-url <https-url> | challenge <http-01|dns-01> | agree-tos <bool>>\n  \
                  set update <url <https-url|file-url> | public-key <PEM|file:path>>"
-            ),
+                )
+            }
         }
         self.dirty = true;
         Ok(())
@@ -6702,6 +6771,13 @@ impl Session {
             }
             // `delete services ssh` resets the daemon to defaults (enabled, key-only,
             // port 22). `delete services ssh <field>` clears one field.
+            ["services", "web"] => self.draft.web = WebConsole::default(),
+            ["services", "web", field] => match *field {
+                "enable" => self.draft.web.enable = false,
+                "port" => self.draft.web.port = None,
+                "listen-address" => self.draft.web.listen_address = None,
+                other => anyhow::bail!("services web: no field {other:?}"),
+            },
             ["services", "ssh"] => self.draft.ssh = Ssh::default(),
             ["services", "ssh", field] => {
                 let s = &mut self.draft.ssh;
@@ -7783,6 +7859,29 @@ impl Session {
     /// **saved** config on disk (the last `save`d state). Empty when nothing
     /// changed. System-provided but unconfigured interfaces (no role/address)
     /// are excluded so they don't show up as spurious additions.
+    /// Compare the candidate against what the box is *running*, rather than
+    /// against the saved file.
+    ///
+    /// The two differ whenever somebody has committed without saving — which is
+    /// the normal way to try something out, and therefore the normal way for
+    /// two sessions to end up looking at different boxes.
+    pub fn compare_running(&self) -> Result<String> {
+        let Some(running) = Self::running_snapshot() else {
+            bail!(
+                "nothing has been committed on this box since it booted, so there is \
+                 no running configuration to compare against — `compare` uses the \
+                 saved one"
+            );
+        };
+        let baseline = Draft::from_appliance(&Appliance::from_toml(&running)?);
+        let old = render_draft(&baseline, true);
+        let new = render_draft(&self.draft, true);
+        if old == new {
+            return Ok(String::new());
+        }
+        Ok(crate::diff::unified(&old, &new))
+    }
+
     pub fn compare(&self) -> Result<String> {
         let baseline = if self.path.exists() {
             Draft::from_appliance(&Appliance::load(&self.path)?)
@@ -8588,6 +8687,7 @@ impl Session {
                     allow: self.draft.snmp.allow.clone(),
                 },
                 ssh: self.draft.ssh.clone(),
+                web: self.draft.web.clone(),
                 ids: self.draft.ids.clone(),
                 portal: self.draft.portal.clone(),
                 port_mapping: self.draft.port_mapping.clone(),
@@ -8757,9 +8857,7 @@ pub fn persist_appliance(appliance: &Appliance, path: &Path, archive: bool) -> R
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     let toml = appliance.to_toml()?;
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, &toml).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("installing {}", path.display()))?;
+    crate::system::install_config_file(path, &toml)?;
     if archive {
         // How far back an operator can roll is a policy, not a constant: a box
         // changed twice a year wants a longer memory than one changed twice a
@@ -10337,6 +10435,7 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
     let dyndns = &draft.dyndns;
     let relay = &draft.dhcp_relay;
     let ssh = &draft.ssh;
+    let web = &draft.web;
     let lldp_set = lldp.enable || !lldp.interface.is_empty();
     let snmp_set = snmp.community.is_some()
         || snmp.listen.is_some()
@@ -10344,6 +10443,7 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         || snmp.contact.is_some()
         || !snmp.allow.is_empty();
     let ssh_set = !ssh.is_empty();
+    let web_set = !web.is_empty();
     let mdns_set = !mdns.interface.is_empty();
     let dyndns_set = dyndns.provider.is_some()
         || dyndns.server.is_some()
@@ -10365,6 +10465,7 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         || lldp_set
         || snmp_set
         || ssh_set
+        || web_set
         || mdns_set
         || dyndns_set
         || relay_set
@@ -10461,6 +10562,19 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             }
             if ssh.password_authentication {
                 out.push_str("        password-authentication true\n");
+            }
+            out.push_str("    }\n");
+        }
+        if web_set {
+            out.push_str("    web {\n");
+            if web.enable {
+                out.push_str("        enable true\n");
+            }
+            if let Some(p) = web.port {
+                out.push_str(&format!("        port {p}\n"));
+            }
+            if let Some(a) = &web.listen_address {
+                out.push_str(&format!("        listen-address {a}\n"));
             }
             out.push_str("    }\n");
         }
@@ -11080,6 +11194,8 @@ fn parse_proto(s: &str) -> Result<Proto> {
         "esp" => Proto::Esp,
         "ah" => Proto::Ah,
         "gre" => Proto::Gre,
+        "ospf" => Proto::Ospf,
+        "pim" => Proto::Pim,
         "tcp_udp" | "tcp-udp" => Proto::TcpUdp,
         _ => bail!(
             "invalid proto {s:?} (expected tcp, udp, tcp_udp, icmp, icmpv6, vrrp, esp, ah or gre)"
@@ -11522,6 +11638,8 @@ fn proto_str(p: Proto) -> &'static str {
         Proto::Esp => "esp",
         Proto::Ah => "ah",
         Proto::Gre => "gre",
+        Proto::Ospf => "ospf",
+        Proto::Pim => "pim",
         Proto::TcpUdp => "tcp_udp",
     }
 }
@@ -12557,6 +12675,7 @@ backends = ["10.0.0.11:8443"]
             draft,
             path: std::path::PathBuf::from("/nonexistent"),
             dirty: true,
+            seen_running: None,
         };
         let rebuilt = session.materialize().expect("materialize");
         assert_eq!(rebuilt.system.hostname, "renamed");
@@ -13314,6 +13433,7 @@ backends = ["10.0.0.11:8443"]
             draft: Draft::from_appliance(&a),
             path: PathBuf::from("/dev/null"),
             dirty: false,
+            seen_running: None,
         };
         let b = round.materialize().expect("re-materialises");
         assert_eq!(
@@ -13728,6 +13848,7 @@ backends = ["10.0.0.11:8443"]
             draft: Draft::from_appliance(&a),
             path: PathBuf::from("/dev/null"),
             dirty: false,
+            seen_running: None,
         };
         let b = round.materialize().expect("re-materialises");
         let (oc0, oc1) = (
@@ -13840,6 +13961,7 @@ backends = ["10.0.0.11:8443"]
             draft: Draft::from_appliance(&a),
             path: PathBuf::from("/dev/null"),
             dirty: false,
+            seen_running: None,
         };
         let b = round.materialize().expect("re-materialises");
         let mv0b = b.interfaces.iter().find(|i| i.name == "mv0").unwrap();
@@ -14676,6 +14798,7 @@ backends = ["10.0.0.11:8443"]
             draft: Draft::from_appliance(&a),
             path: PathBuf::from("/dev/null"),
             dirty: false,
+            seen_running: None,
         };
         let b = round.materialize().expect("re-materialises");
         assert_eq!(b.policy.prefix_lists.len(), 1);
@@ -15030,6 +15153,7 @@ backends = ["10.0.0.11:8443"]
             draft: Draft::from_appliance(&a),
             path: PathBuf::from("/dev/null"),
             dirty: false,
+            seen_running: None,
         }
         .show_only("update");
         assert!(
@@ -15084,6 +15208,7 @@ backends = ["10.0.0.11:8443"]
             draft: Draft::from_appliance(&a),
             path: PathBuf::from("/dev/null"),
             dirty: false,
+            seen_running: None,
         };
         let b = round.materialize().expect("re-materialises");
         assert_eq!(

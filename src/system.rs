@@ -481,6 +481,39 @@ pub fn install_file(path: &Path, contents: &str) -> Result<()> {
     sudo("install", &["-m", "0644", tmp_s, dst_s])
 }
 
+/// Install the appliance configuration at `path`, atomically, escalating when
+/// the caller cannot write the directory itself.
+///
+/// `save` and `commit` are run by an operator account, not by root, and the
+/// config lives in a root-owned directory — so a plain write fails with nothing
+/// but "writing …/appliance.toml.tmp" to show for it. Try the direct atomic
+/// write first (root, and the API service, take that path), then stage and
+/// install under sudo.
+///
+/// Installed 0640 root:wheel: the file carries hashed passwords and VPN
+/// secrets, and `wheel` is the group an operator account is in — the same
+/// membership that lets them escalate here in the first place.
+pub fn install_config_file(path: &Path, contents: &str) -> Result<()> {
+    let tmp = path.with_extension("toml.tmp");
+    if std::fs::write(&tmp, contents).is_ok() {
+        if std::fs::rename(&tmp, path).is_ok() {
+            return Ok(());
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+    let staged = Path::new("/run/sentinel").join(".appliance.toml.tmp");
+    stage_private(&staged, contents)?;
+    let (Some(src), Some(dst)) = (staged.to_str(), path.to_str()) else {
+        bail!("non-UTF-8 path");
+    };
+    sudo("install", &["-m", "0640", "-g", "wheel", src, dst]).with_context(|| {
+        format!(
+            "installing {} (needs root, or an account in the wheel group)",
+            path.display()
+        )
+    })
+}
+
 /// Install a secret file `contents` at a (root-owned) `path` readable by
 /// systemd-networkd but no one else — mode **0640, group `systemd-network`**.
 /// A WireGuard `.netdev` carries an inline `PrivateKey=`, so it must not be
@@ -605,6 +638,26 @@ pub fn service_stop(unit: &str) -> Result<()> {
 /// `restart`, `start` is a no-op when the unit is already up. Used to (re)assert
 /// `sshd` after an `enable` toggle so a `commit` that only added a key doesn't cut
 /// live admin sessions.
+/// End the caller's own login session, so leaving the CLI leaves the box.
+///
+/// An operator who exits configuration mode should not be dropped at a shell
+/// that the next person to walk up to the console inherits. Only meaningful
+/// inside a real login session — `loginctl` is asked for the session by id, and
+/// a caller that has none simply gets an error and stays put.
+pub fn terminate_own_session() -> Result<()> {
+    let id = std::env::var("XDG_SESSION_ID").context("not inside a login session")?;
+    run_priv("loginctl", &["terminate-session", &id])
+}
+
+/// Enqueue a start for `unit` without waiting for the job to finish.
+///
+/// The boot-time reconcile runs *inside* `sentinel-boot.service`, and the units
+/// it starts order themselves after that same service. A synchronous start
+/// would deadlock: the job waits for a service that is waiting for the job.
+pub fn service_start_nowait(unit: &str) -> Result<()> {
+    run_priv("systemctl", &["--no-block", "start", unit])
+}
+
 pub fn service_start(unit: &str) -> Result<()> {
     run_priv("systemctl", &["start", unit])
 }
@@ -882,6 +935,14 @@ pub fn networkctl_reload(ifaces: &[String]) -> Result<()> {
 /// of "Failed to execute /run/current-system/sw/..." on a `commit`). Off-box
 /// (dev, tests) the vars are unset and we fall back to the bare name on `$PATH`.
 pub fn bin(name: &str) -> String {
+    if name == "sentinel-self" {
+        if let Ok(v) = std::env::var("SENTINEL_SELF_BIN") {
+            return v;
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            return exe.to_string_lossy().into_owned();
+        }
+    }
     let var = match name {
         "hostname" => "SENTINEL_HOSTNAME_BIN",
         "ldapwhoami" => "SENTINEL_LDAPWHOAMI_BIN",
@@ -891,9 +952,13 @@ pub fn bin(name: &str) -> String {
         "systemctl" => "SENTINEL_SYSTEMCTL_BIN",
         "systemd-run" => "SENTINEL_SYSTEMD_RUN_BIN",
         "journalctl" => "SENTINEL_JOURNALCTL_BIN",
+        // Our own path, so the escalated re-invocation runs this build and not
+        // whatever `sentinel` a $PATH lookup under sudo might find.
+        "sentinel-self" => "SENTINEL_SELF_BIN",
         "wren" => "SENTINEL_WREN_BIN",
         "tc" => "SENTINEL_TC_BIN",
         "loadkeys" => "SENTINEL_LOADKEYS_BIN",
+        "loginctl" => "SENTINEL_LOGINCTL_BIN",
         "timedatectl" => "SENTINEL_TIMEDATECTL_BIN",
         "sysctl" => "SENTINEL_SYSCTL_BIN",
         "swanctl" => "SENTINEL_SWANCTL_BIN",
@@ -946,6 +1011,36 @@ pub fn bin(name: &str) -> String {
 /// pkttyagent: No such file or directory" straight to the terminal (bypassing
 /// our stdio redirect, since it writes to the tty) and fails. Running via `sudo`
 /// executes as root, which never touches polkit.
+/// Run a read-only diagnostic under `sudo` when the caller is not root, with
+/// the output going to the terminal.
+///
+/// The daemons' control sockets are root-only on purpose — the query socket can
+/// add a drop, the portal one admits a device, the mapping one opens a port —
+/// so widening them for the sake of `show` would trade a real boundary for
+/// convenience. Escalating instead costs nothing here (an operator account is
+/// in `wheel`, which already has passwordless sudo) and keeps the sockets shut.
+pub fn escalated_output(cmd: &str, args: &[&str]) -> Result<std::process::Output> {
+    let resolved = bin(cmd);
+    let is_root = unsafe { libc::geteuid() } == 0;
+    if is_root {
+        return Command::new(&resolved)
+            .args(args)
+            .output()
+            .with_context(|| format!("running {resolved}"));
+    }
+    let mut all = vec![resolved.as_str()];
+    all.extend_from_slice(args);
+    Command::new("sudo")
+        .args(&all)
+        .output()
+        .with_context(|| format!("running `sudo {}`", all.join(" ")))
+}
+
+/// Whether this process is root, so a caller can say *why* it is escalating.
+pub fn is_root() -> bool {
+    (unsafe { libc::geteuid() }) == 0
+}
+
 fn run_priv(cmd: &str, args: &[&str]) -> Result<()> {
     let is_root = unsafe { libc::geteuid() } == 0;
     if is_root {

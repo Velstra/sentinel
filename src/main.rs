@@ -24,6 +24,7 @@ mod feed;
 mod identity;
 mod ids;
 mod install;
+mod installer_tui;
 mod ipsec;
 mod lookup;
 mod metrics;
@@ -200,6 +201,30 @@ enum Command {
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
+    /// Ask the data plane agent's query socket and print the reply.
+    ///
+    /// Internal: `show` re-invokes this under sudo when the socket is not
+    /// readable, so the socket stays root-only while the diagnostics still work
+    /// for an operator account.
+    #[command(hide = true)]
+    AgentQuery {
+        /// The query the agent understands (`stats`, `flows`, `top`, …).
+        command: String,
+        /// Which agent socket to ask (the data plane's by default).
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Re-apply the console keyboard, locale and timezone from the saved config.
+    ///
+    /// Its own command because systemd owns the virtual console and re-runs
+    /// `systemd-vconsole-setup` whenever one appears — which resets the keymap
+    /// to the image's. This runs after it, and again whenever it runs, so the
+    /// layout an operator chose is the one that survives.
+    ApplyConsole {
+        /// The active appliance config to read the settings from.
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    },
     /// Compile + install the Velstra agent config, then reload the data plane.
     Apply {
         /// Path to the appliance config (TOML or JSON).
@@ -227,6 +252,10 @@ enum Command {
         /// Actually perform the (destructive) install instead of a dry-run.
         #[arg(long)]
         commit: bool,
+        /// Ask the questions one at a time instead of drawing the full-screen
+        /// installer. Chosen automatically on a console it cannot be drawn on.
+        #[arg(long)]
+        text: bool,
     },
     /// A/B update: write a new appliance image into the inactive slot and boot
     /// it next (auto-rollback to the current slot if it fails).
@@ -406,7 +435,8 @@ async fn main() -> Result<()> {
             raid,
             source,
             commit,
-        } => install_cmd(&targets, raid.into(), source, commit),
+            text,
+        } => install_cmd(&targets, raid.into(), source, commit, text),
         Command::Update { target, commit } => update_cmd(target.as_deref(), commit),
         Command::ApplyBoot {
             config,
@@ -414,6 +444,12 @@ async fn main() -> Result<()> {
             wren_out,
         } => apply_boot(&config, &out, &wren_out),
         Command::ApplyBootLate { config } => apply_boot_late(&config),
+        Command::AgentQuery { command, socket } => {
+            let path = socket.unwrap_or_else(|| PathBuf::from(velstra::SOCKET));
+            print!("{}", velstra::query_at(&path, &command)?);
+            Ok(())
+        }
+        Command::ApplyConsole { config } => net::apply_console_settings(&Appliance::load(&config)?),
         Command::Apply { file, out, reload } => apply(&file, &out, reload.as_deref()),
         Command::ConfirmRollback { config } => confirm_rollback(&config),
         Command::Alert { unit, config } => alert_unit(&unit, &config),
@@ -661,6 +697,16 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
                 break;
             }
         }
+        // Answer for what was refused. Scripts and the REST API judge by exit
+        // status, and printing an error while exiting 0 told them a change had
+        // been made that had not.
+        let failed = repl::failed_lines();
+        if failed > 0 {
+            anyhow::bail!(
+                "{failed} line(s) were refused — see the errors above; nothing they \
+                 asked for was applied"
+            );
+        }
     }
     Ok(())
 }
@@ -805,6 +851,7 @@ fn install_cmd(
     raid: install::Raid,
     source: Option<PathBuf>,
     commit: bool,
+    force_text: bool,
 ) -> Result<()> {
     // A bundled source image may come from the flag or the environment (the ISO
     // sets $SENTINEL_INSTALL_SOURCE).
@@ -813,7 +860,7 @@ fn install_cmd(
 
     if targets.is_empty() {
         if std::io::stdin().is_terminal() {
-            return interactive_install(&disks, source.as_deref());
+            return interactive_install(&disks, source.as_deref(), force_text);
         }
         // Non-interactive with no target: just list candidates.
         list_disks(&disks);
@@ -940,14 +987,111 @@ fn ask_yes(msg: &str, default_yes: bool) -> Result<bool> {
 /// `validate()` an operator's own `configure` session goes through, so the
 /// wizard cannot invent a configuration the appliance would refuse — and it
 /// cannot drift from the CLI as either one changes.
-fn wizard_lines() -> Result<Vec<String>> {
+///
+/// Both front ends — the full-screen installer and the line-by-line one — end
+/// here, so the two cannot produce different configurations from the same
+/// answers.
+fn wizard_lines_from(a: &installer_tui::Answers) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
+    out.push(format!("set system keyboard {}", a.keyboard));
+    out.push(format!("set system locale {}", a.locale));
+    out.push(format!("set system timezone {}", a.timezone));
+    out.push(format!("set system hostname {}", a.hostname));
+    out.push(format!(
+        "set system login {} password {}",
+        a.username, a.password
+    ));
+    if !a.ssh_key.is_empty() {
+        out.push(format!(
+            "set system login {} public-key {}",
+            a.username, a.ssh_key
+        ));
+    }
+    // Without a permission group the account can log in and can do nothing in
+    // the web console — it is refused with "no management access". The installer
+    // creates the box's only account; leaving it unable to manage the box is not
+    // a decision anyone made on purpose.
+    out.push("set system group operators permission read-write".into());
+    out.push(format!("set system login {} group operators", a.username));
+    out.push("set services ssh port 22".into());
+    // The appliance is key-only by design, which is right — but the wizard asks
+    // for a password and only *offers* a key. An operator who has no key to
+    // paste at an install console (the common case: they are standing at the
+    // machine) would get a box that refuses the very password it just made them
+    // choose, and no way in but the console. So: a key was given, keep key-only;
+    // no key, the password has to work or the account is decorative.
+    if a.ssh_key.is_empty() {
+        out.push("set services ssh password-authentication true".into());
+    }
+
+    // The network step is optional. Left alone, the installer writes no
+    // interface at all and the box is set up from the console.
+    let configured: Vec<&installer_tui::NicPlan> = a.nics.iter().filter(|n| n.configure).collect();
+    for nic in &configured {
+        out.push(format!("set interface {} zone {}", nic.name, nic.zone));
+        out.push(format!(
+            "set interface {} address {}",
+            nic.name, nic.address
+        ));
+        if nic.address != "dhcp" && !nic.gateway.is_empty() {
+            out.push(format!(
+                "set protocols static 0.0.0.0/0 via {}",
+                nic.gateway
+            ));
+        }
+    }
+
+    // The installer sets no firewall policy — that is the operator's to decide,
+    // and a firewall appliance that ships wide open because of its own installer
+    // would be the worst possible default. The one exception is asked for
+    // explicitly: the appliance denies inbound by default, so an address
+    // configured above would otherwise leave the box installed and unreachable.
+    // One rule, one port, one zone.
+    if a.permit_ssh {
+        let mut zones: Vec<&str> = configured.iter().map(|n| n.zone.as_str()).collect();
+        zones.sort_unstable();
+        zones.dedup();
+        for zone in zones {
+            let rule = format!("install-ssh-{zone}");
+            out.push(format!("set firewall rule {rule} from {zone}"));
+            out.push(format!("set firewall rule {rule} proto tcp"));
+            out.push(format!("set firewall rule {rule} port 22"));
+            out.push(format!("set firewall rule {rule} action accept"));
+        }
+    }
+    out
+}
+
+/// The line-by-line front end: the same questions, asked one at a time.
+///
+/// Kept for the consoles the full-screen installer cannot be drawn on — a
+/// terminal too small, a dumb TTY, a serial line that mangles the alternate
+/// screen — and reachable on purpose with `--text`.
+fn collect_text(
+    disks: &[install::Disk],
+    nics: &[String],
+) -> Result<Option<installer_tui::Answers>> {
+    list_disks(disks);
+
+    println!("\nInstall mode:");
+    println!("  [1] single disk");
+    println!("  [2] RAID0  (stripe — capacity, no redundancy, 2+ disks)");
+    println!("  [3] RAID1  (mirror — redundancy, 2+ disks)");
+    println!("  [4] RAID10 (striped mirror, 4+ disks)");
+    let raid = match prompt("Mode [1-4]: ")?.trim() {
+        "1" => install::Raid::None,
+        "2" => install::Raid::Stripe,
+        "3" => install::Raid::Mirror,
+        "4" => install::Raid::Mirror10,
+        other => anyhow::bail!("invalid mode {other:?}"),
+    };
+    let pick = prompt("Select disk number(s), space-separated: ")?;
+    let picks = resolve_picks(disks, pick.trim())?;
 
     println!("\n── Console and locale ──");
     // Keyboard first, deliberately: everything typed from here on goes through
     // it, including the account password below.
-    let kb = ask("Console keyboard layout", "us")?;
-    out.push(format!("set system keyboard {kb}"));
+    let keyboard = ask("Console keyboard layout", "us")?;
     let sample = prompt("Type `hello-123` to check the layout (or Enter to skip): ")?;
     let sample = sample.trim();
     if !sample.is_empty() && sample != "hello-123" {
@@ -957,57 +1101,73 @@ fn wizard_lines() -> Result<Vec<String>> {
         }
     }
     let locale = ask("Locale", "en_US.UTF-8")?;
-    out.push(format!("set system locale {locale}"));
-    let tz = ask("Timezone", "UTC")?;
-    out.push(format!("set system timezone {tz}"));
+    let timezone = ask("Timezone", "UTC")?;
 
     println!("\n── Identity ──");
-    let host = ask("Hostname", "sentinel")?;
-    out.push(format!("set system hostname {host}"));
+    let hostname = ask("Hostname", "sentinel")?;
 
     println!("\n── First account ──");
-    let user = ask("Username", "admin")?;
-    let pass = prompt_secret("Password: ")?;
-    let pass = pass.trim();
-    if pass.len() < 8 {
+    let username = ask("Username", "admin")?;
+    let password = prompt_secret("Password: ")?;
+    let password = password.trim().to_string();
+    if password.len() < 8 {
         anyhow::bail!("the password must be at least 8 characters");
     }
-    out.push(format!("set system login {user} password {pass}"));
-    let key = ask("SSH public key (Enter for none)", "")?;
-    if !key.is_empty() {
-        out.push(format!("set system login {user} public-key {key}"));
-    }
+    let ssh_key = ask("SSH public key (Enter for none)", "")?;
 
-    println!("\n── Network ──");
-    println!("Enough to reach the box over SSH after the reboot; the rest is");
-    println!("configured from the console or the browser once it is up.");
-    let nics = system::discover_interfaces();
-    if nics.is_empty() {
-        println!("  (no NICs discovered — skipping)");
-    }
-    for nic in &nics {
-        let use_it = ask_yes(&format!("Configure {nic}?"), nic == &nics[0])?;
-        if !use_it {
+    println!("\n── Network (optional) ──");
+    println!("Only needed if the box should be reachable over SSH right after the");
+    println!("reboot; otherwise skip this and set the network up from the console.");
+    let mut plans: Vec<installer_tui::NicPlan> = Vec::new();
+    let mut permit_ssh = false;
+    let want_net = !nics.is_empty() && ask_yes("Configure an interface now?", false)?;
+    for (i, nic) in nics.iter().enumerate() {
+        let configure = want_net && ask_yes(&format!("Configure {nic}?"), i == 0)?;
+        if !configure {
+            plans.push(installer_tui::NicPlan {
+                name: nic.clone(),
+                configure: false,
+                zone: "wan".into(),
+                address: "dhcp".into(),
+                gateway: String::new(),
+            });
             continue;
         }
         let zone = ask(&format!("  {nic} zone"), "wan")?;
-        out.push(format!("set interface {nic} zone {zone}"));
-        let addr = ask(&format!("  {nic} address (CIDR or `dhcp`)"), "dhcp")?;
-        out.push(format!("set interface {nic} address {addr}"));
-        if addr != "dhcp" {
-            let gw = ask("  default gateway (Enter for none)", "")?;
-            if !gw.is_empty() {
-                out.push(format!("set protocols static 0.0.0.0/0 via {gw}"));
-            }
-        }
-        out.push(format!("set firewall zone {zone} default-action drop"));
+        let address = ask(&format!("  {nic} address (CIDR or `dhcp`)"), "dhcp")?;
+        let gateway = if address == "dhcp" {
+            String::new()
+        } else {
+            ask("  default gateway (Enter for none)", "")?
+        };
+        plans.push(installer_tui::NicPlan {
+            name: nic.clone(),
+            configure: true,
+            zone,
+            address,
+            gateway,
+        });
+    }
+    if plans.iter().any(|n| n.configure) {
+        // Without this the box comes up installed and unreachable: the appliance
+        // denies inbound by default, so the address just configured would buy
+        // nothing. It is the only firewall setting the installer makes.
+        permit_ssh = ask_yes("Permit SSH from that zone (one rule, port 22 only)?", true)?;
     }
 
-    // SSH is the point of the network step — an installed box nobody can reach
-    // is an install that has to be redone at the console.
-    out.push("set services ssh port 22".into());
-    out.push("set firewall global default-action accept".into());
-    Ok(out)
+    Ok(Some(installer_tui::Answers {
+        raid,
+        picks,
+        keyboard,
+        locale,
+        timezone,
+        hostname,
+        username,
+        password,
+        ssh_key,
+        nics: plans,
+        permit_ssh,
+    }))
 }
 
 /// Turn the collected lines into a validated appliance document.
@@ -1034,37 +1194,63 @@ fn wizard_config(lines: &[String]) -> Result<String> {
 
 /// The guided installer: collect the first settings, pick the disks, confirm,
 /// install, and seed the configuration so the box comes up reachable.
-fn interactive_install(disks: &[install::Disk], source: Option<&std::path::Path>) -> Result<()> {
-    list_disks(disks);
+///
+/// Two front ends, one set of answers. The full-screen one is the default; the
+/// line-by-line one takes over on a console it cannot be drawn on, so an install
+/// is never blocked by the prettier of the two.
+fn interactive_install(
+    disks: &[install::Disk],
+    source: Option<&std::path::Path>,
+    force_text: bool,
+) -> Result<()> {
     if disks.is_empty() {
+        list_disks(disks);
         return Ok(());
     }
+    let nics = system::discover_interfaces();
 
-    println!("\nInstall mode:");
-    println!("  [1] single disk");
-    println!("  [2] RAID0  (stripe — capacity, no redundancy, 2+ disks)");
-    println!("  [3] RAID1  (mirror — redundancy, 2+ disks)");
-    println!("  [4] RAID10 (striped mirror, 4+ disks)");
-    let raid = match prompt("Mode [1-4]: ")?.trim() {
-        "1" => install::Raid::None,
-        "2" => install::Raid::Stripe,
-        "3" => install::Raid::Mirror,
-        "4" => install::Raid::Mirror10,
-        other => anyhow::bail!("invalid mode {other:?}"),
+    // The full-screen installer confirms on its own review page; the
+    // line-by-line one prints the plan and asks for YES below.
+    // Say why, when it is not the operator's choice. A silent fallback looks
+    // exactly like the full-screen installer being missing, which is a long way
+    // from the truth and takes a long time to find out.
+    let obstacle = if force_text {
+        Some(String::new())
+    } else {
+        full_screen_obstacle()
+    };
+    let (answers, confirmed) = match &obstacle {
+        Some(reason) => {
+            if !reason.is_empty() {
+                eprintln!(
+                    "note: asking one question at a time because {reason}.\n      \
+                     The full-screen installer needs a larger console."
+                );
+            }
+            (collect_text(disks, &nics)?, false)
+        }
+        None => (installer_tui::run(disks, &nics)?, true),
+    };
+    let Some(answers) = answers else {
+        println!("aborted — nothing was written.");
+        return Ok(());
     };
 
-    let pick = prompt("Select disk number(s), space-separated: ")?;
-    let targets = resolve_picks(disks, pick.trim())?;
-    let chosen = install::plan_targets(disks, &targets, raid)?;
+    let targets: Vec<String> = answers
+        .picks
+        .iter()
+        .filter_map(|i| disks.get(*i))
+        .map(|d| d.dev_path())
+        .collect();
+    let chosen = install::plan_targets(disks, &targets, answers.raid)?;
 
-    // Everything above chose *where*; this chooses *what the box will be*. It
-    // comes before the confirmation on purpose: an operator who changes their
-    // mind halfway through the questions has erased nothing yet.
-    let lines = wizard_lines()?;
+    // Everything above chose *where* and *what*; this is the last point before
+    // anything is erased.
+    let lines = wizard_lines_from(&answers);
     let toml = wizard_config(&lines)?;
 
     println!();
-    print_plan(&chosen, raid);
+    print_plan(&chosen, answers.raid);
     println!("\nThe installed system will come up as:");
     for line in &lines {
         // The password is the one answer that must not be echoed back at the
@@ -1078,35 +1264,153 @@ fn interactive_install(disks: &[install::Disk], source: Option<&std::path::Path>
         }
     }
 
-    let confirm = prompt("\nThis ERASES the selected disk(s). Type YES to proceed: ")?;
-    if confirm.trim() != "YES" {
-        println!("aborted.");
-        return Ok(());
+    if !confirmed {
+        let confirm = prompt("\nThis ERASES the selected disk(s). Type YES to proceed: ")?;
+        if confirm.trim() != "YES" {
+            println!("aborted.");
+            return Ok(());
+        }
     }
-    install::execute(&chosen, raid, source)?;
+    install::execute(&chosen, answers.raid, source)?;
     // Seeded after the image is written, because the data partition it lands on
     // is created by the install.
-    install::seed_config(&chosen, raid, &toml)?;
+    install::seed_config(&chosen, answers.raid, &toml)?;
     println!("\nInstalled. Remove the medium and reboot; the box comes up configured.");
     Ok(())
 }
 
+/// Why the full-screen installer cannot be drawn here, if it cannot. A serial
+/// console is 80×24 and fine; a terminal that reports smaller, or reports
+/// nothing, gets the line-by-line front end instead of a scrambled screen.
+fn full_screen_obstacle() -> Option<String> {
+    if std::env::var("TERM").map(|t| t == "dumb").unwrap_or(false) {
+        return Some("TERM=dumb".into());
+    }
+    match installer_tui::console_size() {
+        Some((cols, rows))
+            if cols >= installer_tui::MIN_COLS && rows >= installer_tui::MIN_ROWS =>
+        {
+            None
+        }
+        Some((cols, rows)) => Some(format!(
+            "the console reports {cols}x{rows}, and {}x{} is the minimum",
+            installer_tui::MIN_COLS,
+            installer_tui::MIN_ROWS
+        )),
+        None => Some("the console size could not be read".into()),
+    }
+}
+
 /// Map numbered picks (`"1 3"`) to `/dev` paths.
-fn resolve_picks(disks: &[install::Disk], picks: &str) -> Result<Vec<String>> {
+fn resolve_picks(disks: &[install::Disk], picks: &str) -> Result<Vec<usize>> {
     let mut out = Vec::new();
     for tok in picks.split_whitespace() {
         let i: usize = tok
             .parse()
             .map_err(|_| anyhow::anyhow!("not a number: {tok:?}"))?;
-        let d = disks
-            .get(i.wrapping_sub(1))
-            .ok_or_else(|| anyhow::anyhow!("no disk [{i}]"))?;
-        out.push(d.dev_path());
+        let idx = i.wrapping_sub(1);
+        if disks.get(idx).is_none() {
+            anyhow::bail!("no disk [{i}]");
+        }
+        out.push(idx);
     }
     if out.is_empty() {
         anyhow::bail!("no disks selected");
     }
     Ok(out)
+}
+
+/// The XDP attachment mode of the link the data plane is on, as the kernel
+/// reports it: `native` (driver hook), `generic` (software fallback) or
+/// `offload` (on the NIC).
+fn xdp_mode() -> Option<String> {
+    let iface = std::fs::read_to_string("/run/sentinel/velstra.env")
+        .ok()?
+        .trim()
+        .strip_prefix("VELSTRA_IFACE=")?
+        .to_string();
+    let out = std::process::Command::new(system::bin("ip"))
+        .args(["-details", "link", "show", &iface])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mode = if text.contains("xdpoffload") {
+        "offload"
+    } else if text.contains("xdpgeneric") {
+        "generic (software path — this NIC has no driver XDP hook)"
+    } else if text.contains("xdp") {
+        "native"
+    } else {
+        return None;
+    };
+    Some(format!("{mode} on {iface}"))
+}
+
+/// `show firewall zones` — the zones, their member interfaces, and the posture
+/// each one ends up with.
+fn show_zones() -> Result<()> {
+    let saved = saved_config_path();
+    if !saved.exists() {
+        println!("no saved configuration");
+        return Ok(());
+    }
+    let a = Appliance::load(&saved)?;
+
+    // A zone exists because an interface names it. The posture block is
+    // optional and may name a zone no interface is in — that block simply has
+    // no effect, and saying so is more useful than hiding it.
+    let mut names: Vec<String> = a.interfaces.iter().filter_map(|i| i.zone.clone()).collect();
+    names.extend(a.firewall_zone_names());
+    names.sort();
+    names.dedup();
+
+    if names.is_empty() {
+        println!("no zones — a zone exists once an interface is given one:");
+        println!("  set interface <name> zone <zone>");
+        return Ok(());
+    }
+
+    for name in &names {
+        let members: Vec<&str> = a
+            .interfaces
+            .iter()
+            .filter(|i| i.zone.as_deref() == Some(name.as_str()))
+            .map(|i| i.name.as_str())
+            .collect();
+        let p = a.zone_posture(name);
+        let (action, source) = match p.default_action {
+            Some(x) => (format!("{x:?}").to_lowercase(), "set on this zone"),
+            None => (
+                format!("{:?}", a.firewall.default_action).to_lowercase(),
+                "inherited from firewall global",
+            ),
+        };
+        println!("zone {name}");
+        if members.is_empty() {
+            println!("    interfaces  (none — this zone has a posture but no members,");
+            println!("                 so nothing is in it and no rule may name it)");
+        } else {
+            println!("    interfaces  {}", members.join(", "));
+        }
+        println!("    default     {action}  ({source})");
+        println!(
+            "    stateful    {}   block-icmp {}   log {}",
+            p.stateful, p.block_icmp, p.log
+        );
+        // The question this view exists to answer.
+        let icmp = if p.block_icmp {
+            "dropped (block-icmp is on)"
+        } else if action == "accept" {
+            "answered"
+        } else {
+            "dropped by the default action above. `block-icmp false` only means no \
+             *extra* ICMP drop — to answer, permit it: `set firewall rule ping \
+             from <zone>` + `proto icmp` + `action accept`"
+        };
+        println!("    ping        {icmp}");
+        println!();
+    }
+    Ok(())
 }
 
 /// Print a prompt and read one line from stdin.
@@ -1324,6 +1628,13 @@ fn show_op(args: &[String]) -> Result<()> {
             run_show(&system::bin("systemctl"), &["is-active", "velstra.service"])?;
             print!("routing:    ");
             run_show(&system::bin("systemctl"), &["is-active", "wren.service"])?;
+            // Which XDP mode the hook is in. `xdpgeneric` is the software path
+            // — correct, and an order of magnitude slower than a driver hook —
+            // and nothing said so, which is a poor way to learn why a firewall
+            // is not reaching line rate.
+            if let Some(mode) = xdp_mode() {
+                println!("datapath:   {mode}");
+            }
             println!("interfaces:");
             run_show(&ip, &["-brief", "address", "show"])
         }
@@ -1402,6 +1713,12 @@ fn show_op(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
+        // What a zone actually is, in one place: which links are in it, and the
+        // posture that results — inherited or set. Two different things are
+        // called "zone" (an interface's membership, and an optional posture
+        // block), and nothing brought them together, so a box could be filtering
+        // exactly as configured and look misconfigured.
+        ["firewall", "zones"] | ["zones"] => show_zones(),
         ["firewall", "statistics" | "stats"] => show_firewall_stats(),
         // Which rules are carrying traffic, and which are carrying none.
         ["firewall", "hits"] | ["firewall", "rules"] => show_rule_hits(),
@@ -1624,10 +1941,21 @@ fn run_checked(cmd: &str, args: &[&str]) -> Result<()> {
 
 /// `wren show <words>` against the routing daemon's control socket.
 fn wren_show(words: &[&str]) -> Result<()> {
-    let wren = system::bin("wren");
     let mut a = vec!["show"];
     a.extend(words);
-    run_checked(&wren, &a)
+    // Escalated: wren's control socket is root-only, so every routing `show`
+    // failed for the operator account the installer creates — with a raw
+    // "Permission denied (os error 13)" and a store path, which reads like a
+    // broken daemon rather than a missing privilege.
+    let out = system::escalated_output("wren", &a)?;
+    print!("{}", String::from_utf8_lossy(&out.stdout));
+    if !out.status.success() {
+        anyhow::bail!(
+            "wren failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// `wren show <first> <rest…>` with vtysh-style plural aliases mapped onto

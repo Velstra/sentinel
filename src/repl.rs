@@ -4,6 +4,8 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
+use std::io::IsTerminal;
+
 use anyhow::{Context, Result, anyhow};
 use rustyline::{
     Helper, completion::Completer, completion::Pair, highlight::Highlighter, hint::Hinter,
@@ -67,6 +69,20 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
         .split_whitespace()
         .take_while(|w| !w.starts_with('#'))
         .collect();
+
+    // `service` is what VyOS calls this subtree and what people type; the config
+    // file's table is `[services]`, so the tree is spelled that way. Accept the
+    // singular — but ONLY where a subtree name belongs. Rewriting the word
+    // wherever it appears also rewrote it inside a rule description, which is
+    // free text, and silently changed what an operator had written.
+    let mut args = args;
+    if args.len() > 1
+        && matches!(args[0], "set" | "delete" | "show" | "edit" | "comment")
+        && args[1] == "service"
+    {
+        args[1] = "services";
+    }
+    let args = args;
     let Some((&cmd, rest)) = args.split_first() else {
         return false; // blank line
     };
@@ -93,6 +109,20 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
             session.delete(&view)
         }
         "show" => {
+            // What you are looking at is *your* candidate. If somebody else has
+            // committed since you started, say so here — this is where an
+            // operator looks to find out what the box is doing, and letting them
+            // read a stale answer is how two people undo each other's work.
+            if session.committed_elsewhere().is_some() {
+                eprintln!(
+                    "{}",
+                    ui::yellow(
+                        "note: another session has committed since you started. What follows \
+                         is your candidate, not what the box is running — `compare running` \
+                         shows the difference, `discard` adopts theirs."
+                    )
+                );
+            }
             let full = with_ctx(rest);
             match full.first() {
                 None => print!("{}", session.show()),
@@ -171,6 +201,16 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
                     ui::yellow("warning: uncommitted edits (use `commit`/`save`, or `discard`)")
                 );
             }
+            // Leaving the CLI leaves the box. Anything else hands the next
+            // person who walks up to the console a logged-in shell with the
+            // configuration of a firewall behind it. Best-effort and only
+            // inside a real login session: run from a script or a pipe, there
+            // is no session to end and this is a no-op.
+            if std::io::stdin().is_terminal() {
+                if let Err(e) = crate::system::terminate_own_session() {
+                    eprintln!("{}", ui::dim(&format!("(not logging out: {e})")));
+                }
+            }
             return true;
         }
         "help" => {
@@ -191,8 +231,22 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
     };
     if let Err(e) = result {
         eprintln!("{} {e}", ui::red("error:"));
+        FAILED_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     false
+}
+
+/// How many lines this process has refused.
+///
+/// A non-interactive `configure` printed each refusal and then exited 0, so
+/// every caller that judged by exit status — a script, and the REST API, which
+/// reports `"ok": <exit status>` — announced success for a configuration that
+/// was never made.
+static FAILED_LINES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The number of refused lines so far, for a caller that has to answer for them.
+pub fn failed_lines() -> usize {
+    FAILED_LINES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The child keywords the grammar offers directly beneath `path` (an absolute
@@ -336,6 +390,20 @@ fn unknown_command(cmd: &str, rest: &[&str], ctx: &[String]) -> anyhow::Error {
 /// plane, and set the hostname live. No rebuild, no reboot. Never exits the
 /// shell. Returns `false`.
 fn commit(session: &mut Session, act: &Apply) -> bool {
+    // Somebody else got here first. Not refused — an operator may well mean to
+    // replace what the other session did — but never silent: this commit
+    // replaces the running configuration wholesale, including the parts they
+    // changed and this session never saw.
+    if session.committed_elsewhere().is_some() {
+        eprintln!(
+            "{}",
+            ui::yellow(
+                "warning: another session has committed since you started. This commit \
+                 replaces what they applied, including changes you have not seen — \
+                 `compare running` first if that is not what you mean."
+            )
+        );
+    }
     let appliance = match session.commit() {
         Ok(a) => a,
         Err(e) => {
@@ -365,6 +433,27 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
     // persist — `save` writes the boot config so a change survives reboot.
     let old_host = system::current_hostname();
     eprintln!("commit: {summary}; applying to the running system…");
+    // The console and the REST API read the *saved* file, so a commit alone
+    // never reaches them: an account granted management access with `commit`
+    // still cannot sign in, and the console keeps showing the configuration
+    // before the change. Say so rather than let it be discovered.
+    if appliance.services.web.enable && session.dirty() {
+        eprintln!(
+            "{}",
+            ui::yellow(
+                "note: the web console reads the saved configuration, so it still shows \
+                 the previous one — `save` to make them match"
+            )
+        );
+    }
+    // Record what this commit applied, so the *next* session can tell the box
+    // has moved on. Only when it was really applied — an off-box `--no-apply`
+    // edit changed nothing about what is running.
+    if act.enabled {
+        if let Ok(toml) = appliance.to_toml() {
+            session.note_committed(&toml);
+        }
+    }
     if let Err(e) = apply_live(&appliance, act) {
         eprintln!("{} applying config: {e}", ui::red("error:"));
         return false;
@@ -419,11 +508,12 @@ fn do_compare(session: &Session, rest: &[&str]) -> Result<()> {
     };
     let diff = match rest {
         [] => session.compare()?,
+        ["running"] => session.compare_running()?,
         [n] => session.compare_revision(rev(n)?)?,
         [n, m] => session.compare_revisions(rev(n)?, rev(m)?)?,
         _ => {
             return Err(anyhow!(
-                "compare [<rev> [<rev>]] — 0, 1 or 2 revision numbers"
+                "compare [running | <rev> [<rev>]] — against the running config, or 0-2 revisions"
             ));
         }
     };
@@ -791,6 +881,29 @@ const CMD_HELP: &[CmdHelp] = &[
 ];
 
 /// The grouped, aligned `help` overview.
+/// What a path that stops short still wants, if the grammar knows.
+///
+/// `set services web enable` is not an unknown path — it is a known one with
+/// its value missing. Answering that with the whole config tree buries the one
+/// word that was needed under ninety lines that were not.
+pub(crate) fn missing_value_hint(tokens: &[&str]) -> Option<String> {
+    let cands = candidates(tokens);
+    if cands.is_empty() {
+        return None;
+    }
+    let shown: Vec<&str> = cands.iter().take(8).map(|(k, _)| *k).collect();
+    let more = if cands.len() > shown.len() {
+        format!(", … ({} in total)", cands.len())
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "`{}` needs a value. Expected: {}{more}",
+        tokens.join(" "),
+        shown.join(", ")
+    ))
+}
+
 pub fn help_overview() -> String {
     use std::fmt::Write;
     let w = CMD_HELP.iter().map(|c| c.usage.len()).max().unwrap_or(0);
@@ -1344,6 +1457,10 @@ const SERVICES_NODES: &[Cand] = &[
     ("lldp", "LLDP link-layer discovery (lldpd)"),
     ("snmp", "read-only SNMP agent (net-snmp)"),
     ("ssh", "SSH management access (openssh, key-only)"),
+    (
+        "web",
+        "web console + REST management API (off by default, localhost)",
+    ),
     ("mdns", "mDNS reflector between segments (avahi)"),
     ("dyndns", "dynamic-DNS client (ddclient)"),
     (
@@ -1565,6 +1682,18 @@ const SNMP_FIELDS: &[Cand] = &[
 ];
 // `services ssh <Tab>` reveals the SSH DAEMON fields (per-user keys live under
 // `system login`).
+const WEB_FIELDS: &[Cand] = &[
+    (
+        "enable",
+        "serve the web console (true|false; default false)",
+    ),
+    ("port", "TCP port to serve on (default 8080)"),
+    (
+        "listen-address",
+        "local address to bind (default 127.0.0.1 - the box itself only)",
+    ),
+];
+
 const SSH_FIELDS: &[Cand] = &[
     ("enable", "run the SSH daemon (true|false; default true)"),
     ("port", "TCP port sshd listens on (default 22)"),
@@ -2426,24 +2555,23 @@ const PORT_PROTOS: &[Cand] = &[("tcp", "TCP"), ("udp", "UDP")];
 
 /// Every protocol a firewall rule can name.
 const PROTOS: &[Cand] = &[
-    ("tcp", "TCP"),
-    ("udp", "UDP"),
-    (
-        "tcp_udp",
-        "TCP and UDP — one rule for a service reached over either",
-    ),
+    ("tcp", "TCP — with `port`, a specific service"),
+    ("udp", "UDP — with `port`, a specific service"),
+    ("tcp_udp", "both TCP and UDP on the same port"),
     (
         "icmp",
-        "ICMP — no port; matches every ICMP packet the rule scopes",
+        "ICMP (IPv4) — no port; this is how ping is permitted",
     ),
     (
         "icmpv6",
-        "ICMPv6 — its own protocol, and what neighbour discovery uses",
+        "ICMPv6 — no port; IPv6 does not work without neighbour discovery",
     ),
-    ("vrrp", "VRRP advertisements between a redundant pair"),
-    ("esp", "IPsec ESP (the payload half)"),
-    ("ah", "IPsec AH (the authentication half)"),
-    ("gre", "GRE"),
+    ("vrrp", "VRRP advertisements (IANA 112)"),
+    ("esp", "IPsec ESP (IANA 50)"),
+    ("ah", "IPsec AH (IANA 51)"),
+    ("gre", "GRE (IANA 47)"),
+    ("ospf", "OSPF (IANA 89) — what an OSPFv2/v3 adjacency is made of"),
+    ("pim", "PIM (IANA 103) — multicast join/prune"),
 ];
 const IFACE_FIELDS: &[Cand] = &[
     (
@@ -3210,6 +3338,8 @@ const PH_IPV4_CIDR: Cand = ("<A.B.C.D/M>", "an IPv4 prefix (address/length)");
 const PH_IPV6_CIDR: Cand = ("<X:X::X:X/M>", "an IPv6 prefix (address/length)");
 const PH_IPV4_TO: Cand = ("<A.B.C.D:port>", "an internal target — ip or ip:port");
 const PH_PORT: Cand = ("<1-65535>", "a TCP/UDP port");
+/// The same placeholder as a static slice, for the grammar table.
+const PORT_VALUE: &[Cand] = &[PH_PORT];
 const PH_PORT_RANGE: Cand = ("<port|lo-hi>", "a port or range (e.g. 443 or 8000-8100)");
 const PH_ASN: Cand = ("<1-4294967295>", "an AS number");
 const PH_VLAN: Cand = ("<1-4094>", "a VLAN id");
@@ -3257,7 +3387,7 @@ fn matches_for<'a>(all: &'a [(String, String)], prefix: &str) -> Vec<(&'a str, &
 /// already-complete `tokens` before it. The interface/rule/zone/nat **name**
 /// positions, the zone-value positions and every free-form **value** position
 /// (which get `<…>` placeholders) are filled dynamically — see [`dyn_candidates`].
-fn candidates(tokens: &[&str]) -> &'static [Cand] {
+pub(crate) fn candidates(tokens: &[&str]) -> &'static [Cand] {
     match tokens {
         [] => COMMANDS,
         // `help <Tab>` completes the command names.
@@ -3392,8 +3522,11 @@ fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set", "services", "dns", "dnssec"] => DNSSEC_MODES,
         ["set" | "delete", "services", "ntp"] => NTP_FIELDS,
         ["set" | "delete", "services", "lldp"] => LLDP_FIELDS,
+        ["set", "services", "web", "enable"] => BOOLS,
+        ["set", "services", "web", "port"] => PORT_VALUE,
         ["set", "services", "lldp", "enable"] => BOOLS,
         ["set" | "delete", "services", "snmp"] => SNMP_FIELDS,
+        ["set" | "delete", "services", "web"] => WEB_FIELDS,
         ["set" | "delete", "services", "ssh"] => SSH_FIELDS,
         [
             "set",
@@ -4136,6 +4269,7 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
         // ---- services value leaves -------------------------------------------
         ["set", "services", "dns" | "ntp", "upstream"] => own_cands(&[PH_IPV4, PH_IPV6]),
         ["set", "services", "snmp", "listen"] => own_cands(&[PH_IPV4]),
+        ["set", "services", "web", "listen-address"] => own_cands(&[PH_IPV4]),
         ["set", "services", "ssh", "listen-address"] => own_cands(&[PH_IPV4]),
         ["set", "system", "login", _name, "ssh-key"] => own_cands(&[PH_KEY]),
         ["set", "system", "config-sync", "peer"] => own_cands(&[PH_IPV4]),
@@ -4847,7 +4981,8 @@ mod tests {
         assert_eq!(
             kw(&["set", "firewall", "rule", "web", "proto"]),
             [
-                "tcp", "udp", "tcp_udp", "icmp", "icmpv6", "vrrp", "esp", "ah", "gre"
+                "tcp", "udp", "tcp_udp", "icmp", "icmpv6", "vrrp", "esp", "ah", "gre",
+                "ospf", "pim"
             ]
         );
         // The nat sub-tree: source (masquerade) + destination (port-forward) +
@@ -4900,6 +5035,7 @@ mod tests {
                 "lldp",
                 "snmp",
                 "ssh",
+                "web",
                 "mdns",
                 "dyndns",
                 "dhcp-relay",
