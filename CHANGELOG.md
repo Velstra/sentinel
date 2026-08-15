@@ -2,6 +2,44 @@
 
 ## [Unreleased]
 
+### Added
+
+- **`show version` says which image is running, not just which version number
+  somebody typed.** An A/B update that demonstrably replaced the running system
+  — new slot, new dm-verity root hash, new store path for every binary —
+  printed the identical two lines before and after, which on a box that updates
+  A/B leaves its one identifying command unable to answer. It now prints the
+  dm-verity root hash of the running `/usr` (the value the kernel is actually
+  enforcing, so it changes if and only if the image does) with the slot backing
+  it, and the Nix store path hash of each running binary underneath. Twelve hex
+  characters is short enough to read over the phone. A boot with no verity —
+  a VM, the installer medium, a dev build — says so plainly instead of printing
+  a number that looks like an answer.
+
+- **The appliance says when its clock cannot be trusted.** A box that boots
+  years slow routes and filters exactly as usual while every log timestamp is
+  wrong, every certificate expiry is judged against a date that has not
+  happened, and every scheduled firewall rule opens its window on the wrong
+  day. `show version` now carries a `clock:` line and `show status` repeats it
+  while it is bad; the judgement is the kernel's own clock-discipline flag —
+  the same signal `timedatectl` reports — and a reading that also looks
+  implausible is quoted as corroboration, never as the reason. A commit
+  carrying a time-based rule warns on the spot, and the timer that re-applies
+  at each window boundary writes the same warning to the journal. Nothing is
+  corrected automatically.
+
+- **`commit` warns when it has just changed the way you reach the box and
+  nothing has been saved.** A commit applies to the running system and a `save`
+  writes the boot config, so a changed SSH key, login password, SSH daemon, web
+  console or firewall decision on the management path is undone by the next
+  reboot — and by the next commit, which reloads from the saved file. The
+  warning names the paths that changed, says the next boot loads the saved
+  configuration instead, and says `save` is what makes it stick. It is a
+  warning, never a refusal. Which paths count is derived from the configuration
+  model rather than listed, so a setting added under an account, an
+  administration service or a management-port rule is covered the day it is
+  added.
+
 ## [0.4.2] — 2026-08-02
 
 ## [0.4.2] — 2026-08-02

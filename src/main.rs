@@ -15,6 +15,7 @@ mod alert;
 mod api;
 mod archive;
 mod capture;
+mod clock;
 mod compile;
 mod config;
 mod confirm;
@@ -24,9 +25,11 @@ mod feed;
 mod grammar_walk;
 mod identity;
 mod ids;
+mod image;
 mod install;
 mod installer_tui;
 mod ipsec;
+mod lockout;
 mod lookup;
 mod metrics;
 mod net;
@@ -720,6 +723,13 @@ fn apply(file: &std::path::Path, out: &std::path::Path, reload: Option<&str>) ->
     let appliance = identity::with_resolved(&feed::with_fetched(&domain::with_resolved(
         &Appliance::load(file)?,
     )));
+    // This is the path `sentinel-fwsched.service` runs at every window
+    // boundary, so it is where a schedule is decided by the clock. Saying so
+    // here puts it in the journal beside the re-apply that acted on it, which
+    // is where somebody asking "why did that port not open" will be looking.
+    if let Some(w) = clock::schedule_warning(&appliance) {
+        eprintln!("warning: {w}");
+    }
     let rendered = compile::compile(&appliance).to_toml()?;
 
     if let Some(parent) = out.parent() {
@@ -1636,6 +1646,15 @@ fn show_op(args: &[String]) -> Result<()> {
             if let Some(mode) = xdp_mode() {
                 println!("datapath:   {mode}");
             }
+            // Only when it is wrong. A box whose clock is fine has nothing to
+            // say here and status lines nobody needs are how the ones that
+            // matter get skipped; a box whose clock nothing has ever set is
+            // mis-stamping every log line and mis-timing every scheduled rule,
+            // and that belongs on the screen an operator opens first.
+            let time = clock::current();
+            if time.synchronised == Some(false) {
+                println!("clock:      {}", time.describe());
+            }
             println!("interfaces:");
             run_show(&ip, &["-brief", "address", "show"])
         }
@@ -1884,7 +1903,16 @@ fn show_op(args: &[String]) -> Result<()> {
                 println!("(not available)");
             }
             print!("kernel:     ");
-            run_show(&system::bin("uname"), &["-sr"])
+            run_show(&system::bin("uname"), &["-sr"])?;
+            // The version numbers above are hand-set and so cannot tell two
+            // builds apart; these are derived from the running system and do.
+            // On a box that updates A/B that is the whole question, so they
+            // are printed every time rather than behind a flag.
+            let id = image::current();
+            println!("{:<12}{}", "image:", id.describe());
+            println!("{:<12}{}", "binaries:", id.binaries_line());
+            println!("{:<12}{}", "clock:", clock::current().describe());
+            Ok(())
         }
 
         // Back-compat spellings.

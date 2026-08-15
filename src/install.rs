@@ -490,9 +490,10 @@ fn prepare_disk(source: &str, target: &str, raid: Raid) -> Result<()> {
     // Give the disk a fresh **disk** GUID so it doesn't collide with the source
     // medium — but do NOT randomize the *partition* GUIDs. The dm-verity store
     // relies on the systemd Discoverable Partitions convention: the verity and
-    // store partition UUIDs are derived from the roothash (no explicit
-    // `usrhash=` on the kernel cmdline), so systemd auto-binds `/dev/mapper/usr`
-    // by matching them at boot. `sgdisk --randomize-guids` would overwrite those
+    // store partition UUIDs are derived from the roothash the UKI carries as
+    // `usrhash=`, so systemd auto-binds `/dev/mapper/usr` by matching them at
+    // boot — it never needs to be told which partitions to use, and that is why
+    // the GUIDs are load-bearing. `sgdisk --randomize-guids` would overwrite those
     // roothash-derived UUIDs, so the installed system could never activate the
     // verity device — it would time out waiting for `/dev/mapper/usr` and drop to
     // emergency mode (while a directly-booted image, with the UUIDs intact, works
@@ -538,17 +539,22 @@ fn prepare_disk(source: &str, target: &str, raid: Raid) -> Result<()> {
 
 /// A store slot: its verity-hash + store partition numbers, and the systemd-boot
 /// entry name its UKI is filed under in /EFI/Linux.
-struct Slot {
-    name: &'static str,
-    verity_part: u32,
-    store_part: u32,
+///
+/// Visible to the crate because the slot layout is also what tells `show
+/// version` which half of the disk the running image came from — see
+/// [`crate::image`]. One definition, so the updater and the report can never
+/// disagree about which partition is which.
+pub struct Slot {
+    pub name: &'static str,
+    pub verity_part: u32,
+    pub store_part: u32,
 }
-const SLOT_A: Slot = Slot {
+pub const SLOT_A: Slot = Slot {
     name: "sentinel-a",
     verity_part: 2,
     store_part: 3,
 };
-const SLOT_B: Slot = Slot {
+pub const SLOT_B: Slot = Slot {
     name: "sentinel-b",
     verity_part: 4,
     store_part: 5,

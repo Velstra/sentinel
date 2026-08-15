@@ -465,6 +465,13 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
             )
         );
     }
+    // Both baselines the lockout warning compares against, read before anything
+    // moves: the saved file is what the next boot loads, and the running
+    // snapshot is what an *earlier* commit applied — which this commit is about
+    // to overwrite with its own.
+    let saved_before = crate::config::Appliance::load(session.config_path()).ok();
+    let running_before = Session::running_snapshot()
+        .and_then(|toml| crate::config::Appliance::from_toml(&toml).ok());
     let appliance = match session.commit() {
         Ok(a) => a,
         Err(e) => {
@@ -479,6 +486,13 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
         appliance.rules.len()
     );
     for w in appliance.warnings() {
+        eprintln!("{} {w}", ui::yellow("warning:"));
+    }
+    // Not a property of the configuration — a property of the box it is being
+    // committed to — so it is said here rather than in `warnings()`, which is
+    // pure. This is the moment the operator asked for a schedule to take
+    // effect, and the moment to say the box does not know what time it is.
+    if let Some(w) = crate::clock::schedule_warning(&appliance) {
         eprintln!("{} {w}", ui::yellow("warning:"));
     }
 
@@ -536,6 +550,16 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
         ui::green("✔"),
         ui::dim("(not persisted — `save` to keep across reboot)")
     );
+    // Last, and only when this commit really changed the way in: the line above
+    // says "not persisted" about every commit, which is exactly why it stops
+    // being read. `commit-confirm` deliberately does not do this — its whole
+    // mechanism is a timer that puts the saved config back, so an unsaved
+    // change to management access is what the operator asked for.
+    if let Some(u) =
+        crate::lockout::unsaved_access(saved_before.as_ref(), running_before.as_ref(), &appliance)
+    {
+        eprint!("{} {}", ui::yellow("warning:"), u.message());
+    }
     false
 }
 
