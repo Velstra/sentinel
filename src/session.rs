@@ -2694,7 +2694,7 @@ impl Session {
     pub const RUNNING: &'static str = "/run/sentinel/running.toml";
 
     /// The running snapshot as it is on disk right now, if there is one.
-    fn running_snapshot() -> Option<String> {
+    pub(crate) fn running_snapshot() -> Option<String> {
         std::fs::read_to_string(Self::RUNNING).ok()
     }
 
@@ -9252,6 +9252,24 @@ pub fn render_appliance(a: &Appliance) -> String {
 /// a value that contains spaces (a description) without either case being
 /// special — which is why the round-trip test below is the whole specification.
 pub fn flatten_config(rendered: &str) -> Vec<String> {
+    flatten_pairs(rendered)
+        .into_iter()
+        .map(|(path, value)| match value.is_empty() {
+            true => format!("set {path}"),
+            false => format!("set {path} {value}"),
+        })
+        .collect()
+}
+
+/// The same walk as [`flatten_config`], but keeping each leaf's **path** apart
+/// from its **value** instead of joining them into one command.
+///
+/// A caller that wants to talk *about* a setting rather than replay it needs the
+/// two separately: the path is what names the setting to an operator, and the
+/// value is what tells whether it changed. Re-splitting a `set` line afterwards
+/// is not possible in general — a value may contain spaces — so the split has to
+/// happen here, where the block structure is still known.
+pub fn flatten_pairs(rendered: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut stack: Vec<String> = Vec::new();
     for raw in rendered.lines() {
@@ -9274,7 +9292,8 @@ pub fn flatten_config(rendered: &str) -> Vec<String> {
             // would produce a line the CLI rejects.
             continue;
         }
-        out.push(format!("set {path} {line}"));
+        let (setting, value) = line.split_once(' ').unwrap_or((line, ""));
+        out.push((format!("{path} {setting}"), value.to_string()));
     }
     out
 }

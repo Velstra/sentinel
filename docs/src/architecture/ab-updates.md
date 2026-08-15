@@ -62,6 +62,32 @@ This bless mechanism is verified live (`Marked boot as 'good'`) in the
 The running ESP is auto-mounted at `/boot` (systemd-gpt-auto, read-only); the
 updater remounts it read-write in place rather than re-mounting the device.
 
+## Which image am I running?
+
+`show version` answers it, and it answers with the image's own identity rather
+than with a number somebody typed:
+
+```text
+image:      3f8a1c92e7b4 (dm-verity /usr, slot sentinel-b)
+binaries:   sentinel 1qxk9v2m  wren r7d0k3ap  velstra p2v7yr4c
+```
+
+The first field is the **dm-verity root hash** of the running `/usr`, which the
+UKI puts on the kernel command line as `usrhash=`. The kernel refuses to mount
+the store unless every block under it hashes back to that value, so it changes if
+and only if the image changes — two builds can never print the same, and one
+build can never print two things. Twelve hex characters is enough to compare over
+the phone; `cat /proc/cmdline` has the whole hash.
+
+The second line is the Nix store path hash of each running binary, which is a
+hash of that binary's build inputs. It is what identifies a build on a boot with
+no verity at all (a VM test, the installer medium), and there `show version` says
+plainly that the image itself is unidentified rather than printing something that
+looks like an answer.
+
+Version *numbers* are still printed above both, because people read them — they
+just cannot tell two builds apart on their own.
+
 ## Verifying it
 
 The `update` test verifies this **structurally** (slot B written + re-typed,

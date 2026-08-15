@@ -312,3 +312,31 @@ box you are already logged into.
 All three apply on commit and survive a reboot. A keymap this image does not
 ship draws a warning rather than failing the commit: the firewall rules in the
 same commit matter more than the console layout.
+
+## When the clock cannot be trusted
+
+A zone only decides how the time is *written down*. Whether it is right at all is
+a separate question, and one the box will not stay quiet about: a firewall that
+boots with its clock years slow routes and filters exactly as usual while every
+log timestamp is wrong, every certificate expiry is judged against a date that
+has not happened, and every scheduled rule opens its window on the wrong day.
+
+`show version` says so on its `clock:` line, and `show status` repeats it — but
+only while it is true, so a healthy box carries no extra line:
+
+```text
+clock:      2021-01-14 03:22:57 UTC — NOT synchronised: no time source has set
+            this clock, so log timestamps, certificate expiry and time-based
+            rules are all unreliable
+```
+
+The judgement is the kernel's own clock-discipline flag, which the time daemon
+clears once it has actually reached a server — the same signal `timedatectl`
+reports, so the two never disagree. A reading that also looks implausible (it is
+earlier than a file this appliance itself wrote) is quoted alongside as
+corroboration; it is never the reason on its own, because a clock can be wrong
+while synchronised and right while unsynchronised.
+
+Nothing is corrected automatically. Point the box at a time source
+([NTP](services.md)) — an appliance that silently moved its own clock would turn
+a fault you can see into one you cannot.

@@ -133,6 +133,11 @@ set firewall rule guest-wifi schedule start 09:00
 set firewall rule guest-wifi schedule end 17:00
 ```
 
+A window is only as good as the clock it is measured against, so a commit that
+carries a schedule onto a box whose clock nothing has synchronised says so, and
+the same warning is written to the journal at each window boundary when the timer
+re-applies. See [when the clock cannot be trusted](system.md#when-the-clock-cannot-be-trusted).
+
 ### ICMP message types
 
 A rule that names `icmp` or `icmpv6` matches every message of that protocol.

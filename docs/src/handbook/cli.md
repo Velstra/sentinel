@@ -62,6 +62,25 @@ key.
 | `confirm` | Keep a `commit-confirm` change (cancel the pending rollback). |
 | `rollback <N>` | Revert the running system to archived revision `N` (`0` = newest) and persist it. |
 
+A commit that changed **management access** — an account's key or password, the
+SSH daemon or the web console, or a firewall decision on the path to them — says
+so when it has not been saved, and names what changed:
+
+```text
+admin@fw-a*# commit
+✔ commit ok: applied live (not persisted — `save` to keep across reboot)
+warning: this commit changed management access and has not been saved.
+  changed: system login admin ssh-key
+  The next boot loads the saved configuration instead, where that setting still has
+  the previous value — if that is how you reach this box, the way in goes back
+  with it. `save` writes this configuration to disk, so what you just committed
+  is what boots.
+```
+
+It is a warning, not a refusal: locking yourself out on purpose (a lab box, a
+scripted provision) is allowed. `commit-confirm` does not print it — reverting to
+the saved config is what its timer is for.
+
 Every `save` archives a timestamped revision under
 `/var/lib/sentinel/archive/` (the newest 50 are kept). `show system commit`
 lists them; `compare <N>` diffs the candidate against a revision, and
@@ -93,7 +112,7 @@ Outside of edits, `sentinel show …` (or `run show …` inside a session, or ju
 | `show arp` | The ARP / neighbour table. |
 | `show configuration` | The saved configuration, in config syntax. |
 | `show log [velstra\|wren]` | Recent service log. |
-| `show version` | Software versions. |
+| `show version` | Software versions, which image is running (verity root hash + slot), and whether the clock is synchronised. |
 
 The rest of this handbook is a tour of the config tree, section by section,
 each with the commands it exposes and a worked example. The final chapter,

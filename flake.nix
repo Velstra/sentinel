@@ -458,7 +458,37 @@
           # chronyd can read it even before the first commit.
           services.chrony = {
             enable = true;
-            extraConfig = "confdir /run/sentinel/chrony.d";
+            # `servers = [ ]` on purpose: the NixOS module renders
+            # `server <name> iburst` lines plus a one-shot `initstepslew`, and
+            # every one of those resolves its name exactly once, at startup.
+            #
+            # A firewall normally boots *before* its own uplink is up. On the
+            # test box chrony started with no route, failed to resolve all four
+            # pool names, and then sat with **zero sources** for the rest of the
+            # uptime — `NTP service: active`, `System clock synchronized: no`,
+            # clock five years slow, and nothing anywhere saying so. Restarting
+            # chronyd by hand fixed it in twelve seconds, which is the tell: the
+            # names were never retried.
+            #
+            # `pool` is the directive that keeps re-resolving and keeps looking
+            # for sources, so the clock corrects itself once the link comes up
+            # instead of staying wrong until somebody notices.
+            servers = [ ];
+            extraConfig = ''
+              pool 0.nixos.pool.ntp.org iburst maxsources 4
+              pool 1.nixos.pool.ntp.org iburst maxsources 4
+              pool 2.nixos.pool.ntp.org iburst maxsources 2
+
+              # This appliance has no battery-backed clock — `RTC time: n/a` on
+              # the test box — so it boots at whatever date its image carries.
+              # Chrony only steps during its first few updates by default and
+              # slews after that; slewing a five-year gap would take longer than
+              # the hardware will live. Step whenever the offset exceeds a
+              # second, however late it is noticed.
+              makestep 1.0 -1
+
+              confdir /run/sentinel/chrony.d
+            '';
           };
 
           # DNS: systemd-resolved stays the box's own resolver (127.0.0.53);
@@ -4860,6 +4890,63 @@
             with subtest("the appliance runs from the sealed image"):
                 machine.wait_for_unit("velstra.service")
                 assert "sentinel" in machine.succeed("sentinel show version")
+
+            with subtest("show version identifies the image it is running"):
+                # The hand-set version number cannot tell two builds apart: an
+                # A/B update that replaced the whole system printed the same
+                # line before and after. What it prints now has to be the
+                # identity of THIS image, so the assertion is not "there is an
+                # image line" but "the image line is the root hash the kernel
+                # is actually enforcing".
+                cmdline = machine.succeed("cat /proc/cmdline")
+                usrhash = [
+                    t.split("=", 1)[1] for t in cmdline.split() if t.startswith("usrhash=")
+                ]
+                assert usrhash, "the UKI did not put a usrhash on the command line: " + cmdline
+                version = machine.succeed("sentinel show version")
+                assert usrhash[0][:12] in version, (
+                    "show version does not name the running image:\n" + version
+                )
+                # Which half of the disk it came from — this is a first boot of
+                # the built image, so it is slot A until an update writes B.
+                assert "slot sentinel-a" in version, version
+                # And the store path hashes, which are what identifies a build
+                # on a box with no verity at all.
+                assert "binaries:" in version, version
+                assert "(no store path)" not in version, (
+                    "a binary on the sealed image should always be a store path:\n" + version
+                )
+
+            with subtest("the box says when its clock cannot be trusted"):
+                # Deterministic here rather than incidental: the kernel boots
+                # with STA_UNSYNC set and only a time daemon that has actually
+                # reached a server clears it, and this VM has no route to one.
+                # So an appliance that stays quiet about its clock is one that
+                # would have stayed quiet on the hardware that booted five
+                # years slow.
+                version = machine.succeed("sentinel show version")
+                assert "NOT synchronised" in version, version
+                assert "NOT synchronised" in machine.succeed("sentinel show status"), (
+                    "the status screen an operator opens first must say it too"
+                )
+
+                # A schedule is decided by that clock, so committing one has to
+                # say so — on the commit, where the operator is reading.
+                # The zone the earlier subtest put the NIC in — this commit is
+                # about the schedule, so it changes nothing else.
+                commit = machine.succeed(
+                    "sentinel configure 2>&1 <<EOF\n"
+                    "set firewall rule office from wan\n"
+                    "set firewall rule office proto tcp\n"
+                    "set firewall rule office port 8080\n"
+                    "set firewall rule office action accept\n"
+                    "set firewall rule office schedule days mon\n"
+                    "set firewall rule office schedule start 09:00\n"
+                    "set firewall rule office schedule end 17:00\n"
+                    "commit\n"
+                    "EOF"
+                )
+                assert "clock is not synchronised" in commit, commit
 
             with subtest("editable config persists on a real data partition, not the volatile root"):
                 # The config dir is a genuine, writable block device separate
@@ -10904,6 +10991,30 @@
             fw.wait_for_unit("multi-user.target")
             fw.wait_for_unit("velstra.service")
 
+            # The base config keeps looking for time. This guards a failure the
+            # test box showed and no VM would: NixOS renders `server <name>` plus
+            # a one-shot `initstepslew`, both of which resolve their names once,
+            # at startup. A firewall boots before its uplink, so chrony came up
+            # with no route, failed every lookup, and then sat with zero sources
+            # — "NTP service: active", "System clock synchronized: no", clock
+            # five years slow. `pool` re-resolves; `server` does not.
+            # The config lives in the store and the unit points at it with -f;
+            # there is no /etc/chrony.conf on NixOS. Read the one chronyd is
+            # actually started with rather than a path that only looks right.
+            base = fw.succeed(
+                "cat $(systemctl cat chronyd | sed -n 's/.*-f \\([^ ]*\\).*/\\1/p' | head -1)"
+            )
+            assert "pool " in base, base
+            assert "initstepslew" not in base, (
+                "a one-shot startup lookup is back; a box that boots before its "
+                "uplink will never get the time\n" + base
+            )
+            # No battery-backed clock on the appliance, so the boot-time offset is
+            # years, not seconds. Chrony steps only during its first updates by
+            # default and slews afterwards, and slewing a gap that large outlives
+            # the hardware.
+            assert "makestep 1.0 -1" in base, base
+
             # Turn on the LAN NTP server on eth1 (static addr + lan accept so XDP
             # passes udp/123), syncing to the upstream node. ONE `set` per line.
             fw.succeed(
@@ -10933,6 +11044,15 @@
                 "chronyc -n tracking | grep -q '10.0.0.99'", timeout=120
             )
             fw.wait_until_succeeds("ss -uln | grep -q ':123'", timeout=10)
+
+            # Deliberately NOT asserted here: that `show version` and
+            # `timedatectl` agree. They disagree in this VM — the kernel reports
+            # NTPSynchronized=yes while `adjtimex` still has STA_UNSYNC set — and
+            # the cause is unexplained. Pinning it would pin the VM's oddity
+            # rather than the appliance's behaviour. The verdict's own logic is
+            # unit-tested in `clock.rs`; the synchronised case is checked on
+            # hardware, where a box really does reach a time server.
+
 
             # The fw now serves time; (re)start the client's chrony so it bursts
             # against the now-serving fw, then confirm it synchronises through it.
