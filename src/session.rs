@@ -907,10 +907,20 @@ fn bgp_from_draft(d: &BgpDraft) -> Result<Bgp> {
                 })
             })
             .collect::<Result<Vec<_>>>()?,
-        rtr: d.rtr.server.as_ref().map(|server| BgpRtr {
-            server: server.clone(),
-            refresh: d.rtr.refresh,
-        }),
+        // A refresh interval on its own has nothing to refresh. Dropping it
+        // here silently was worse than refusing it: the session displayed the
+        // setting, the commit accepted it, and the saved file did not have it.
+        rtr: match (d.rtr.server.as_ref(), d.rtr.refresh) {
+            (Some(server), refresh) => Some(BgpRtr {
+                server: server.clone(),
+                refresh,
+            }),
+            (None, Some(_)) => bail!(
+                "protocols bgp rpki rtr-refresh: there is no validating cache to \
+                 refresh — set `protocols bgp rpki rtr <host:port>` as well"
+            ),
+            (None, None) => None,
+        },
         rpki_reject_invalid: d.rpki_reject_invalid,
         ebgp_require_policy: d.ebgp_require_policy,
         vrf: d.vrf.clone(),
@@ -2470,7 +2480,11 @@ impl Draft {
                 server: a.services.dhcp_relay.server.clone(),
                 server6: a.services.dhcp_relay.server6.clone(),
             },
-            multiwan_mode: (!a.multiwan.mode.is_default()).then_some(a.multiwan.mode),
+            // Carried in whenever there is a multi-WAN group at all, default or
+            // not. Reading it back only when it was non-default meant a session
+            // that set the default saw a line the reloaded configuration did
+            // not, and `compare` reported a difference no commit could settle.
+            multiwan_mode: (!a.multiwan.is_empty()).then_some(a.multiwan.mode),
             wan_policies: a
                 .multiwan
                 .policies
@@ -4485,12 +4499,20 @@ impl Session {
                 // host:port, checked here rather than at the collector: a typo
                 // that only shows up as "no graphs appeared" is a bad way to
                 // learn about it.
-                if !v.contains(':')
-                    || v.rsplit(':')
-                        .next()
-                        .is_none_or(|p| p.parse::<u16>().is_err())
-                {
-                    bail!("collector must be host:port, got {v:?}");
+                // An IPv6 literal is full of colons, so "has a colon and ends
+                // in a number" called `fd00::1` a host:port with port 1. The
+                // address form has to be bracketed, exactly as it is in a URL.
+                let host_port = match v.strip_prefix('[') {
+                    Some(rest) => rest.split_once("]:"),
+                    None if v.matches(':').count() == 1 => v.split_once(':'),
+                    None => None,
+                };
+                match host_port {
+                    Some((h, p)) if !h.is_empty() && p.parse::<u16>().is_ok() => {}
+                    _ => bail!(
+                        "collector must be host:port (an IPv6 address in brackets, \
+                         e.g. [2001:db8::1]:4739), got {v:?}"
+                    ),
                 }
                 self.draft.flow_export.collector = Some((*v).to_string());
             }
@@ -4940,7 +4962,7 @@ impl Session {
                 append_csv(&mut self.draft.ospf.interfaces, v);
             }
             ["protocols", "ospf", "area", v] => {
-                self.draft.ospf.area = Some((*v).to_string());
+                self.draft.ospf.area = Some(area_id(v)?);
             }
             ["protocols", "ospf", "cost", v] => {
                 self.draft.ospf.cost =
@@ -4957,7 +4979,7 @@ impl Session {
             ["protocols", "ospf3", "interface", v] => {
                 append_csv(&mut self.draft.ospf3.interfaces, v);
             }
-            ["protocols", "ospf3", "area", v] => self.draft.ospf3.area = Some((*v).to_string()),
+            ["protocols", "ospf3", "area", v] => self.draft.ospf3.area = Some(area_id(v)?),
             ["protocols", "ospf3", "cost", v] => {
                 self.draft.ospf3.cost =
                     Some(v.parse().with_context(|| format!("invalid cost {v:?}"))?);
@@ -5057,8 +5079,7 @@ impl Session {
                 "area",
                 id,
             ] => {
-                *self.draft.ospf_family_mut(proto).interface_area_mut(name) =
-                    Some((*id).to_string());
+                *self.draft.ospf_family_mut(proto).interface_area_mut(name) = Some(area_id(id)?);
             }
             [
                 "protocols",
@@ -5110,7 +5131,13 @@ impl Session {
                     "totally-nssa-area" => &mut d.totally_nssa_areas,
                     _ => &mut d.nssa_default_areas,
                 };
-                append_csv(set, v);
+                // Each entry is an area id, so `0` is accepted here too.
+                for one in v.split(',').map(str::trim).filter(|x| !x.is_empty()) {
+                    let id = area_id(one)?;
+                    if !set.contains(&id) {
+                        set.push(id);
+                    }
+                }
             }
             ["protocols", "ospf", "stub-default-cost", v] => {
                 self.draft.ospf.stub_default_cost =
@@ -5633,6 +5660,26 @@ impl Session {
                     .peer_mut(pk)
                     .persistent_keepalive = Some(k);
             }
+            // The same verb the private key takes, for the same reason: the key
+            // is 32 bytes of randomness and nothing else, so asking an operator
+            // to produce one is asking them to find a source of randomness they
+            // trust — and every convenient answer to that is a bad one. Printed
+            // rather than kept quiet: this half is *shared*, and it has to be
+            // carried to the far end by hand.
+            [
+                "vpn",
+                "wireguard",
+                name,
+                "peer",
+                pk,
+                "preshared-key",
+                "generate",
+            ] => {
+                validate_wg_key(pk)?;
+                let key = crate::wgkey::generate_preshared_key()?;
+                println!("generated wireguard pre-shared key for {name} peer {pk}: {key}");
+                self.draft.wireguard_mut(name).peer_mut(pk).preshared_key = Some(key);
+            }
             ["vpn", "wireguard", name, "peer", pk, "preshared-key", v] => {
                 validate_wg_key(pk)?;
                 validate_wg_key(v)?;
@@ -5833,7 +5880,7 @@ impl Session {
                  set vpn ipsec <name> <local <ip> | remote <ip> | local-subnet <cidr> | remote-subnet <cidr> | psk <key>>\n  \
                  set vpn ipsec <name> <ike-version <1|2> | ike-proposal <p> | esp-proposal <p> | local-id <id> | remote-id <id> | start-action <start|trap|none>>\n  \
                  set vpn wireguard <ifname> <private-key <key|generate> | listen-port <port>>\n  \
-                 set vpn wireguard <ifname> peer <pubkey> <allowed-ips <cidr,...> | endpoint <host:port> | keepalive <s> | preshared-key <key>>\n  \
+                 set vpn wireguard <ifname> peer <pubkey> <allowed-ips <cidr,...> | endpoint <host:port> | keepalive <s> | preshared-key <key|generate>>\n  \
                  set pki ca <name> <common-name <cn> | organization <o> | key-type <ec|rsa> | validity-days <n>>\n  \
                  set pki certificate <name> <ca <ca-name|acme> | common-name <cn> | subject-alt-name <DNS:host|IP:addr> | key-type <ec|rsa> | usage <server|client> | validity-days <n>>\n  \
                  set pki acme <email <addr> | directory-url <https-url> | challenge <http-01|dns-01> | agree-tos <bool>>\n  \
@@ -6212,6 +6259,16 @@ impl Session {
                     other => bail!("interface wireless has no field {other:?}"),
                 }
             }
+            ["interface", name, "wireless", "wpa", field] => {
+                let Some(w) = self.iface(name)?.wireless.as_mut() else {
+                    bail!("interface {name:?} has no wireless config");
+                };
+                match *field {
+                    "mode" => w.wpa_mode = None,
+                    "passphrase" => w.wpa_passphrase = None,
+                    other => bail!("interface wireless wpa has no field {other:?}"),
+                }
+            }
             ["interface", name, "ethernet"] => self.iface(name)?.ethernet = Ethernet::default(),
             ["interface", name, "ethernet", field] => {
                 let e = &mut self.iface(name)?.ethernet;
@@ -6343,6 +6400,14 @@ impl Session {
             ["interface", name, "remote"] => self.iface(name)?.remote = None,
             ["interface", name, "key"] => self.iface(name)?.tunnel_key = None,
             ["interface", name, "ttl"] => self.iface(name)?.ttl = None,
+            ["interface", name, "offload"] => self.iface(name)?.offload.clear(),
+            ["interface", name, "offload", feature] => {
+                let i = self.iface(name)?;
+                if i.offload.remove(*feature).is_none() {
+                    bail!("interface {name:?} has no offload setting {feature:?}");
+                }
+            }
+            ["interface", name, "mss"] => self.iface(name)?.mss = None,
             ["interface", name, "qos"] => self.iface(name)?.qos = None,
             ["interface", name, "qos", field] => {
                 let i = self.iface(name)?;
@@ -6437,12 +6502,54 @@ impl Session {
             }
 
             // firewall global …
+            // Whole top-level sections. Eight of the thirteen could already be
+            // cleared in one line and five could not, for no reason an operator
+            // could see — and the way to start a configuration over is to empty
+            // the part you are redoing, not to hunt its fields one at a time.
+            ["firewall"] => {
+                self.draft.firewall = FirewallDraft::default();
+                self.draft.zones.clear();
+                self.draft.rules.clear();
+                self.draft.groups = Groups::default();
+            }
+            ["nat"] => {
+                self.draft.nat_source.clear();
+                self.draft.nat_destination.clear();
+                self.draft.nat_npt66.clear();
+                self.draft.nat64 = Nat64Draft::default();
+            }
+            ["load-balancer"] => self.draft.load_balancers.clear(),
+            // Every interface's configuration, not the interfaces themselves:
+            // the box still has the NICs it has, and they come back unassigned.
+            ["interface"] => self.draft.interfaces.clear(),
+            // `system` is the one section that is not a heap of settings: it
+            // holds the hostname the commit requires and the accounts that can
+            // sign in. Emptying it in one word is how an operator locks
+            // themselves out of the appliance they are standing in front of.
+            ["system"] => bail!(
+                "system holds the hostname and the accounts that can log in; \
+                 delete what you mean (`delete system login <user>`, \
+                 `delete system config-sync`, …) rather than all of it"
+            ),
             ["firewall", "global", "block", v] => {
                 let before = self.draft.firewall.blocklist.len();
                 self.draft.firewall.blocklist.retain(|e| e != v);
                 if self.draft.firewall.blocklist.len() == before {
                     bail!("{v:?} is not in the global blocklist");
                 }
+            }
+            ["firewall", "syn-protect", port, "mss"] => {
+                let port = parse_syn_protect_port(port)?;
+                let Some(e) = self
+                    .draft
+                    .firewall
+                    .syn_protect
+                    .iter_mut()
+                    .find(|e| e.port == port)
+                else {
+                    bail!("port {port} is not syn-protected");
+                };
+                e.mss = None;
             }
             ["firewall", "syn-protect", port] => {
                 let port = parse_syn_protect_port(port)?;
@@ -6500,6 +6607,7 @@ impl Session {
                     // replacing the list left the old entries in force and its
                     // change stuck, unappliable, forever.
                     "block" => z.blocklist.clear(),
+                    "local" => z.local = false,
                     other => bail!("zone has no field {other:?}"),
                 }
             }
@@ -6573,6 +6681,62 @@ impl Session {
                     .port
                     .get_mut(*name)
                     .ok_or_else(|| anyhow::anyhow!("no port-group {name:?}"))?
+                    .clear();
+            }
+            // The four remaining alias kinds. Their memberships could be added
+            // to and never emptied, and the group itself could not be removed
+            // at all — so a feed URL or a MAC an operator believed they had
+            // taken out went on deciding what the firewall permitted.
+            ["firewall", "group", "user-group", name] => {
+                if self.draft.groups.user.remove(*name).is_none() {
+                    bail!("no user-group {name:?}");
+                }
+            }
+            ["firewall", "group", "user-group", name, "user"] => {
+                self.draft
+                    .groups
+                    .user
+                    .get_mut(*name)
+                    .ok_or_else(|| anyhow::anyhow!("no user-group {name:?}"))?
+                    .clear();
+            }
+            ["firewall", "group", "interface-group", name] => {
+                if self.draft.groups.interface.remove(*name).is_none() {
+                    bail!("no interface-group {name:?}");
+                }
+            }
+            ["firewall", "group", "interface-group", name, "interface"] => {
+                self.draft
+                    .groups
+                    .interface
+                    .get_mut(*name)
+                    .ok_or_else(|| anyhow::anyhow!("no interface-group {name:?}"))?
+                    .clear();
+            }
+            ["firewall", "group", "mac-group", name] => {
+                if self.draft.groups.mac.remove(*name).is_none() {
+                    bail!("no mac-group {name:?}");
+                }
+            }
+            ["firewall", "group", "mac-group", name, "mac"] => {
+                self.draft
+                    .groups
+                    .mac
+                    .get_mut(*name)
+                    .ok_or_else(|| anyhow::anyhow!("no mac-group {name:?}"))?
+                    .clear();
+            }
+            ["firewall", "group", "feed-group", name] => {
+                if self.draft.groups.feed.remove(*name).is_none() {
+                    bail!("no feed-group {name:?}");
+                }
+            }
+            ["firewall", "group", "feed-group", name, "url"] => {
+                self.draft
+                    .groups
+                    .feed
+                    .get_mut(*name)
+                    .ok_or_else(|| anyhow::anyhow!("no feed-group {name:?}"))?
                     .clear();
             }
             ["firewall", "group", "domain-group", name] => {
@@ -6733,7 +6897,9 @@ impl Session {
                     "serve-on" => d.serve_on.clear(),
                     "host-override" => d.host_override.clear(),
                     "blocklist" => d.blocklist.clear(),
+                    "txt-record" => d.txt_record.clear(),
                     "dnssec" => d.dnssec = None,
+                    "negative-ttl" => d.negative_ttl = None,
                     "cache-size" => d.cache_size = None,
                     "local-domain" => d.local_domain = None,
                     other => bail!("services dns has no field {other:?}"),
@@ -6745,6 +6911,7 @@ impl Session {
                 match *field {
                     "upstream" => n.upstream.clear(),
                     "serve-on" => n.serve_on.clear(),
+                    "allow-from" => n.allow_from.clear(),
                     other => bail!("services ntp has no field {other:?}"),
                 }
             }
@@ -6804,7 +6971,10 @@ impl Session {
                 if let Some(l) = self.draft.logins.iter_mut().find(|l| l.username == *name) {
                     match *field {
                         "ssh-key" => l.ssh_keys.clear(),
-                        "hashed-password" => l.hashed_password = None,
+                        // `password` is what an operator types to set one; the
+                        // stored form is the hash, so both words remove it.
+                        "password" | "hashed-password" => l.hashed_password = None,
+                        "totp" => l.totp = None,
                         "group" => l.group = None,
                         other => bail!("system login has no field {other:?}"),
                     }
@@ -6812,6 +6982,19 @@ impl Session {
             }
             ["system", "group", name] => {
                 self.draft.admin_groups.retain(|g| g.name != *name);
+            }
+            ["system", "commit-revisions"] => self.draft.commit_revisions = None,
+            ["system", "console"] => self.draft.console = crate::config::Console::default(),
+            ["system", "console", field] => {
+                let c = &mut self.draft.console;
+                match *field {
+                    "device" => c.device = None,
+                    "speed" => c.speed = None,
+                    other => bail!("system console has no field {other:?}"),
+                }
+            }
+            ["system", "group", name, "permission"] => {
+                bail!("a group is its permission; `delete system group {name}` removes it")
             }
             ["system", "config-sync"] => self.draft.config_sync = ConfigSync::default(),
             ["system", "config-sync", field] => {
@@ -6871,7 +7054,24 @@ impl Session {
                     "port" => t.port = None,
                     "proto" => t.proto = None,
                     "level" => t.level = None,
+                    "facility" => t.facility.clear(),
                     other => bail!("services syslog target has no field {other:?}"),
+                }
+            }
+            ["services", "flow-export", field] => {
+                let f = &mut self.draft.flow_export;
+                match *field {
+                    "collector" => f.collector = None,
+                    "interval" => f.interval = None,
+                    "domain" => f.domain = None,
+                    other => bail!("services flow-export has no field {other:?}"),
+                }
+            }
+            ["services", "dns", "txt-record", name] => {
+                let before = self.draft.dns.txt_record.len();
+                self.draft.dns.txt_record.retain(|n, _| n != name);
+                if self.draft.dns.txt_record.len() == before {
+                    bail!("no txt-record for {name:?}");
                 }
             }
             ["services", "port-mapping"] => self.draft.port_mapping = PortMapping::default(),
@@ -7046,6 +7246,29 @@ impl Session {
                 self.draft.export = ExportDraft::default();
             }
             ["protocols", "router-id"] => self.draft.router_id = None,
+            // One attribute of a static route, rather than the whole route.
+            // Without these, changing a next-hop meant deleting the route and
+            // typing it again.
+            ["protocols", "static", prefix, field] => {
+                let Some(r) = self
+                    .draft
+                    .statics
+                    .iter_mut()
+                    .find(|(p, _)| p == prefix)
+                    .map(|(_, r)| r)
+                else {
+                    bail!("no static route {prefix:?}");
+                };
+                match *field {
+                    "via" => r.via = None,
+                    "dev" => r.dev = None,
+                    "metric" => r.metric = None,
+                    "distance" => r.distance = None,
+                    "blackhole" => r.blackhole = false,
+                    "vrf" => r.vrf = None,
+                    other => bail!("static route has no field {other:?}"),
+                }
+            }
             ["protocols", "static", prefix] => {
                 let before = self.draft.statics.len();
                 self.draft.statics.retain(|(p, _)| p != prefix);
@@ -7142,6 +7365,35 @@ impl Session {
                 self.draft.prefix_lists.clear();
                 self.draft.filters.clear();
             }
+            // Policy-based routing: a whole rule, or one of its fields.
+            ["policy", "route", name] => {
+                let before = self.draft.policy_routes.len();
+                self.draft.policy_routes.retain(|(n, _)| n != name);
+                if self.draft.policy_routes.len() == before {
+                    bail!("no policy route {name:?}");
+                }
+            }
+            ["policy", "route", name, field] => {
+                let Some((_, r)) = self.draft.policy_routes.iter_mut().find(|(n, _)| n == name)
+                else {
+                    bail!("no policy route {name:?}");
+                };
+                match *field {
+                    "source" => r.source = None,
+                    "destination" => r.destination = None,
+                    "interface" => r.interface = None,
+                    "proto" => r.proto = None,
+                    "source-port" => r.source_port = None,
+                    "destination-port" => r.destination_port = None,
+                    "priority" => r.priority = None,
+                    "disabled" => r.disabled = false,
+                    "table" => bail!(
+                        "policy route {name} table is what the rule is for; \
+                         `delete policy route {name}` removes the rule"
+                    ),
+                    other => bail!("policy route has no field {other:?}"),
+                }
+            }
             ["policy", "prefix-list", name] => {
                 let before = self.draft.prefix_lists.len();
                 self.draft.prefix_lists.retain(|(n, _)| n != name);
@@ -7212,6 +7464,16 @@ impl Session {
             ["policy", "route-map", name, "rule", n, "set", field, item] => {
                 let r = self.route_map_rule_mut(name, parse_seq(n)?)?;
                 Self::del_route_map_set(r, field, Some(item))?;
+            }
+            // A per-interface area, back to the section default.
+            [
+                "protocols",
+                proto @ ("ospf" | "ospf3"),
+                "interface",
+                name,
+                "area",
+            ] => {
+                *self.draft.ospf_family_mut(proto).interface_area_mut(name) = None;
             }
             ["protocols", "ospf"] => self.draft.ospf = OspfDraft::default(),
             ["protocols", "ospf", field] => Self::del_ospf_field(&mut self.draft.ospf, field)?,
@@ -7285,13 +7547,6 @@ impl Session {
                     other => bail!("vrrp has no field {other:?}"),
                 }
             }
-            // static route per-field delete (currently only `vrf`).
-            ["protocols", "static", prefix, "vrf"] => {
-                match self.draft.statics.iter_mut().find(|(p, _)| p == prefix) {
-                    Some((_, d)) => d.vrf = None,
-                    None => bail!("no static route {prefix:?}"),
-                }
-            }
             // bfd global defaults.
             ["protocols", "bfd"] => self.draft.bfd = BfdDraft::default(),
             ["protocols", "bfd", field] => {
@@ -7321,6 +7576,45 @@ impl Session {
                 self.draft.evpn.ip_vrfs.retain(|v| v.name != *name);
                 if self.draft.evpn.ip_vrfs.len() == before {
                     bail!("no evpn ip-vrf {name:?}");
+                }
+            }
+            ["evpn", "instance", name, field] => {
+                let Some(i) = self
+                    .draft
+                    .evpn
+                    .instances
+                    .iter_mut()
+                    .find(|i| i.name == *name)
+                else {
+                    bail!("no evpn instance {name:?}");
+                };
+                match *field {
+                    "vni" => i.vni = 0,
+                    "evi" => i.evi = 0,
+                    "rd" => i.rd = None,
+                    "interface" => i.interfaces.clear(),
+                    "advertise-mac" => i.advertise_mac.clear(),
+                    "route-target" => {
+                        i.rt_import.clear();
+                        i.rt_export.clear();
+                    }
+                    other => bail!("evpn instance has no field {other:?}"),
+                }
+            }
+            ["evpn", "ip-vrf", name, field] => {
+                let Some(v) = self.draft.evpn.ip_vrfs.iter_mut().find(|v| v.name == *name) else {
+                    bail!("no evpn ip-vrf {name:?}");
+                };
+                match *field {
+                    "l3-vni" => v.l3_vni = 0,
+                    "rd" => v.rd = None,
+                    "advertise-prefix" => v.advertise_prefix.clear(),
+                    "router-mac" => v.router_mac = None,
+                    "route-target" => {
+                        v.rt_import.clear();
+                        v.rt_export.clear();
+                    }
+                    other => bail!("evpn ip-vrf has no field {other:?}"),
                 }
             }
             ["evpn", field] => {
@@ -7444,6 +7738,41 @@ impl Session {
                 self.draft.multiwan_mode = None;
                 self.draft.uplinks.clear();
             }
+            ["multiwan", "policy", name] => {
+                let before = self.draft.wan_policies.len();
+                self.draft.wan_policies.retain(|(n, _)| n != name);
+                if self.draft.wan_policies.len() == before {
+                    bail!("no multiwan policy {name:?}");
+                }
+            }
+            ["multiwan", "policy", name, "uplink", v] => {
+                let Some((_, p)) = self.draft.wan_policies.iter_mut().find(|(n, _)| n == name)
+                else {
+                    bail!("no multiwan policy {name:?}");
+                };
+                let before = p.uplinks.len();
+                p.uplinks.retain(|u| u != v);
+                if p.uplinks.len() == before {
+                    bail!("multiwan policy {name:?} does not prefer uplink {v:?}");
+                }
+            }
+            ["multiwan", "policy", name, field] => {
+                let Some((_, p)) = self.draft.wan_policies.iter_mut().find(|(n, _)| n == name)
+                else {
+                    bail!("no multiwan policy {name:?}");
+                };
+                match *field {
+                    "source" => p.source = None,
+                    "destination" => p.destination = None,
+                    "proto" => p.proto = None,
+                    "source-port" => p.source_port = None,
+                    "destination-port" => p.destination_port = None,
+                    "uplink" => p.uplinks.clear(),
+                    "strict" => p.strict = false,
+                    "disabled" => p.disabled = false,
+                    other => bail!("multiwan policy has no field {other:?}"),
+                }
+            }
             ["multiwan", "mode"] => self.draft.multiwan_mode = None,
             ["multiwan", "uplink", iface] => {
                 let before = self.draft.uplinks.len();
@@ -7459,6 +7788,10 @@ impl Session {
                 d.timeout = None;
                 d.fail = None;
                 d.rise = None;
+                d.latency = None;
+                d.jitter = None;
+                d.loss = None;
+                d.probes = None;
             }
             ["multiwan", "uplink", iface, "check", "target", v] => {
                 let d = self.uplink(iface)?;
@@ -7476,6 +7809,10 @@ impl Session {
                     "timeout" => d.timeout = None,
                     "fail" => d.fail = None,
                     "rise" => d.rise = None,
+                    "latency" => d.latency = None,
+                    "jitter" => d.jitter = None,
+                    "loss" => d.loss = None,
+                    "probes" => d.probes = None,
                     other => bail!("multiwan health-check has no field {other:?}"),
                 }
             }
@@ -7590,6 +7927,10 @@ impl Session {
                     bail!("vpn openconnect has no route {v:?}");
                 }
             }
+            ["vpn", "openconnect", "user", name, "password"] => bail!(
+                "an OpenConnect account is its password; \
+                 `delete vpn openconnect user {name}` removes the account"
+            ),
             ["vpn", "openconnect", "user", name] => {
                 let oc = self.openconnect()?;
                 if oc.users.remove(*name).is_none() {
@@ -8953,21 +9294,14 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
     let cs_set = !cs.peers.is_empty() || cs.secret.is_some();
     let cts = &draft.conntrack_sync;
     let cts_set = !cts.is_empty();
-    if want("system")
-        && (draft.hostname.is_some()
-            || !draft.logins.is_empty()
-            || !draft.admin_groups.is_empty()
-            || cs_set
-            || cts_set
-            || !draft.aaa.is_empty()
-            || !draft.metrics.is_default()
-            || draft.console.device.is_some()
-            || draft.console.speed.is_some()
-            || !draft.sysctl.is_empty())
-    {
-        out.push_str("system {\n");
+    // Body first, wrapper afterwards. The gate that used to stand here listed
+    // the fields it knew about and had fallen behind the body: a box
+    // configured with nothing but a timezone, a keyboard layout or a
+    // commit-revision count printed no system section at all.
+    if want("system") {
+        let mut sys = String::new();
         if let Some(h) = &draft.hostname {
-            out.push_str(&format!("    hostname {h}\n"));
+            sys.push_str(&format!("    hostname {h}\n"));
         }
         for (val, kw) in [
             (&draft.keyboard, "keyboard"),
@@ -8975,39 +9309,46 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             (&draft.timezone, "timezone"),
         ] {
             if let Some(v) = val {
-                out.push_str(&format!("    {kw} {v}\n"));
+                sys.push_str(&format!("    {kw} {v}\n"));
             }
+        }
+        // How many committed revisions the box keeps. It has always been
+        // settable and saved; leaving it out of the rendering meant the
+        // retention an operator had chosen was invisible everywhere the
+        // configuration is read back.
+        if let Some(n) = draft.commit_revisions {
+            sys.push_str(&format!("    commit-revisions {n}\n"));
         }
         for (k, v) in &draft.sysctl {
-            out.push_str(&format!("    sysctl {k} value {v}\n"));
+            sys.push_str(&format!("    sysctl {k} value {v}\n"));
         }
         for l in &draft.logins {
-            out.push_str(&format!("    login {} {{\n", l.username));
+            sys.push_str(&format!("    login {} {{\n", l.username));
             for k in &l.ssh_keys {
-                out.push_str(&format!("        ssh-key {k}\n"));
+                sys.push_str(&format!("        ssh-key {k}\n"));
             }
             if let Some(h) = &l.hashed_password {
-                out.push_str(&format!("        hashed-password {h}\n"));
+                sys.push_str(&format!("        hashed-password {h}\n"));
             }
             // The account's management grant. Leaving it out meant `show
             // configuration` described an account that could manage the box as
             // one that could not — and a config copied to a second appliance
             // silently lost every permission it had been given.
             if let Some(g) = &l.group {
-                out.push_str(&format!("        group {g}\n"));
+                sys.push_str(&format!("        group {g}\n"));
             }
-            out.push_str("    }\n");
+            sys.push_str("    }\n");
         }
         for g in &draft.admin_groups {
-            out.push_str(&format!("    group {} {{\n", g.name));
-            out.push_str(&format!(
+            sys.push_str(&format!("    group {} {{\n", g.name));
+            sys.push_str(&format!(
                 "        permission {}\n",
                 match g.permission {
                     crate::config::Permission::ReadOnly => "read-only",
                     crate::config::Permission::ReadWrite => "read-write",
                 }
             ));
-            out.push_str("    }\n");
+            sys.push_str("    }\n");
         }
         // Who may authenticate against this box, and where those accounts live.
         // Left out, a configuration copied to a second appliance arrived with no
@@ -9015,79 +9356,83 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         // it — an authentication setting that disappears is worse than one that
         // is wrong, because nothing about the copy looks incomplete.
         if !draft.aaa.is_empty() {
-            out.push_str("    aaa {\n");
+            sys.push_str("    aaa {\n");
             for r in &draft.aaa.radius {
-                out.push_str(&format!("        radius {} {{\n", r.server));
-                out.push_str(&format!("            secret {}\n", r.secret));
+                sys.push_str(&format!("        radius {} {{\n", r.server));
+                sys.push_str(&format!("            secret {}\n", r.secret));
                 if let Some(p) = r.port {
-                    out.push_str(&format!("            port {p}\n"));
+                    sys.push_str(&format!("            port {p}\n"));
                 }
                 if let Some(t) = r.timeout {
-                    out.push_str(&format!("            timeout {t}\n"));
+                    sys.push_str(&format!("            timeout {t}\n"));
                 }
-                out.push_str("        }\n");
+                sys.push_str("        }\n");
             }
             for l in &draft.aaa.ldap {
-                out.push_str(&format!("        ldap {} {{\n", l.server));
-                out.push_str(&format!("            base-dn {}\n", l.base_dn));
+                sys.push_str(&format!("        ldap {} {{\n", l.server));
+                sys.push_str(&format!("            base-dn {}\n", l.base_dn));
                 if let Some(a) = &l.user_attribute {
-                    out.push_str(&format!("            user-attribute {a}\n"));
+                    sys.push_str(&format!("            user-attribute {a}\n"));
                 }
                 if let Some(t) = &l.tls {
-                    out.push_str(&format!("            tls {t}\n"));
+                    sys.push_str(&format!("            tls {t}\n"));
                 }
                 if let Some(p) = l.port {
-                    out.push_str(&format!("            port {p}\n"));
+                    sys.push_str(&format!("            port {p}\n"));
                 }
                 if let Some(t) = l.timeout {
-                    out.push_str(&format!("            timeout {t}\n"));
+                    sys.push_str(&format!("            timeout {t}\n"));
                 }
-                out.push_str("        }\n");
+                sys.push_str("        }\n");
             }
             if let Some(g) = &draft.aaa.default_group {
-                out.push_str(&format!("        default-group {g}\n"));
+                sys.push_str(&format!("        default-group {g}\n"));
             }
-            out.push_str("    }\n");
+            sys.push_str("    }\n");
         }
         if !draft.metrics.is_default() {
-            out.push_str("    metrics {\n");
-            out.push_str("        enable true\n");
-            out.push_str("    }\n");
+            sys.push_str("    metrics {\n");
+            sys.push_str("        enable true\n");
+            sys.push_str("    }\n");
         }
         if draft.console.device.is_some() || draft.console.speed.is_some() {
-            out.push_str("    console {\n");
+            sys.push_str("    console {\n");
             if let Some(d) = &draft.console.device {
-                out.push_str(&format!("        device {d}\n"));
+                sys.push_str(&format!("        device {d}\n"));
             }
             if let Some(s) = draft.console.speed {
-                out.push_str(&format!("        speed {s}\n"));
+                sys.push_str(&format!("        speed {s}\n"));
             }
-            out.push_str("    }\n");
+            sys.push_str("    }\n");
         }
         if cs_set {
-            out.push_str("    config-sync {\n");
+            sys.push_str("    config-sync {\n");
             if !cs.peers.is_empty() {
-                out.push_str(&format!("        peer {}\n", cs.peers.join(",")));
+                sys.push_str(&format!("        peer {}\n", cs.peers.join(",")));
             }
             if let Some(s) = &cs.secret {
-                out.push_str(&format!("        secret {s}\n"));
+                sys.push_str(&format!("        secret {s}\n"));
             }
-            out.push_str("    }\n");
+            sys.push_str("    }\n");
         }
         if cts_set {
-            out.push_str("    conntrack-sync {\n");
+            sys.push_str("    conntrack-sync {\n");
             if let Some(l) = &cts.listen {
-                out.push_str(&format!("        listen {l}\n"));
+                sys.push_str(&format!("        listen {l}\n"));
             }
             if !cts.peers.is_empty() {
-                out.push_str(&format!("        peer {}\n", cts.peers.join(",")));
+                sys.push_str(&format!("        peer {}\n", cts.peers.join(",")));
             }
             if let Some(iv) = cts.interval {
-                out.push_str(&format!("        interval {iv}\n"));
+                sys.push_str(&format!("        interval {iv}\n"));
             }
-            out.push_str("    }\n");
+            sys.push_str("    }\n");
         }
-        out.push_str("}\n");
+        if !sys.is_empty() {
+            out.push_str("system {\n");
+            out.push_str(&sys);
+            out.push_str("}\n");
+        }
     }
     // Interfaces are top-level (like VyOS), between `system` and `firewall`.
     for (name, i) in &draft.interfaces {
@@ -10411,6 +10756,32 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         for (name, f) in &draft.filters {
             render_route_map(&mut pol, name, f);
         }
+        // Policy-based routing. It was saved and applied but never printed, so
+        // a box that sent some of its traffic down a different table described
+        // itself as one that did not.
+        for (name, r) in &draft.policy_routes {
+            pol.push_str(&format!("    route {name} {{\n"));
+            for (val, kw) in [
+                (&r.source, "source"),
+                (&r.destination, "destination"),
+                (&r.interface, "interface"),
+                (&r.proto, "proto"),
+                (&r.source_port, "source-port"),
+                (&r.destination_port, "destination-port"),
+            ] {
+                if let Some(v) = val {
+                    pol.push_str(&format!("        {kw} {v}\n"));
+                }
+            }
+            pol.push_str(&format!("        table {}\n", r.table));
+            if let Some(p) = r.priority {
+                pol.push_str(&format!("        priority {p}\n"));
+            }
+            if r.disabled {
+                pol.push_str("        disabled true\n");
+            }
+            pol.push_str("    }\n");
+        }
         if !pol.is_empty() {
             out.push_str("policy {\n");
             out.push_str(&pol);
@@ -10424,8 +10795,10 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
     let dns_set = !(d.upstream.is_empty()
         && d.serve_on.is_empty()
         && d.host_override.is_empty()
+        && d.txt_record.is_empty()
         && d.blocklist.is_empty()
         && d.dnssec.is_none()
+        && d.negative_ttl.is_none()
         && d.cache_size.is_none()
         && d.local_domain.is_none());
     let ntp_set = !(n.upstream.is_empty() && n.serve_on.is_empty() && n.allow_from.is_empty());
@@ -10454,220 +10827,210 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
     let relay_set =
         !relay.interface.is_empty() || !relay.server.is_empty() || !relay.server6.is_empty();
     let rproxy = &draft.reverse_proxy;
-    let rproxy_set = !rproxy.is_empty();
     let bcast = &draft.broadcast_relay;
-    let bcast_set = !bcast.is_empty();
     let syslog_set = !draft.syslog.is_empty();
     let alerts_set = !draft.alerts.webhook.is_empty() || !draft.alerts.mail.is_empty();
     let ids_set = !draft.ids.is_empty();
-    let any_service = dns_set
-        || ntp_set
-        || lldp_set
-        || snmp_set
-        || ssh_set
-        || web_set
-        || mdns_set
-        || dyndns_set
-        || relay_set
-        || rproxy_set
-        || bcast_set
-        || syslog_set
-        || alerts_set
-        || ids_set;
-    if want("services") && any_service {
-        out.push_str("services {\n");
+    // Rendered body first, wrapper afterwards: a services sub-block added
+    // below can no longer be missed by a gate up here. It was — portal,
+    // port-mapping and several DNS fields were settable, saved and applied,
+    // and `show configuration` printed no services section at all, so a
+    // review, a diff and a config copied to a second appliance all described
+    // a box without them.
+    if want("services") {
+        let mut svc = String::new();
         if dns_set {
-            out.push_str("    dns {\n");
+            svc.push_str("    dns {\n");
             if !d.upstream.is_empty() {
-                out.push_str(&format!("        upstream {}\n", d.upstream.join(",")));
+                svc.push_str(&format!("        upstream {}\n", d.upstream.join(",")));
             }
             if !d.serve_on.is_empty() {
-                out.push_str(&format!("        serve-on {}\n", d.serve_on.join(",")));
+                svc.push_str(&format!("        serve-on {}\n", d.serve_on.join(",")));
             }
             if let Some(t) = d.negative_ttl {
-                out.push_str(&format!("        negative-ttl {t}\n"));
+                svc.push_str(&format!("        negative-ttl {t}\n"));
             }
             for (name, text) in &d.txt_record {
-                out.push_str(&format!("        txt-record {name} {text}\n"));
+                svc.push_str(&format!("        txt-record {name} {text}\n"));
             }
             for (name, ip) in &d.host_override {
-                out.push_str(&format!("        host-override {name} {ip}\n"));
+                svc.push_str(&format!("        host-override {name} {ip}\n"));
             }
             for domain in &d.blocklist {
-                out.push_str(&format!("        blocklist {domain}\n"));
+                svc.push_str(&format!("        blocklist {domain}\n"));
             }
             if let Some(mode) = &d.dnssec {
-                out.push_str(&format!("        dnssec {mode}\n"));
+                svc.push_str(&format!("        dnssec {mode}\n"));
             }
             if let Some(n) = d.cache_size {
-                out.push_str(&format!("        cache-size {n}\n"));
+                svc.push_str(&format!("        cache-size {n}\n"));
             }
             if let Some(dom) = &d.local_domain {
-                out.push_str(&format!("        local-domain {dom}\n"));
+                svc.push_str(&format!("        local-domain {dom}\n"));
             }
-            out.push_str("    }\n");
+            svc.push_str("    }\n");
         }
         if ntp_set {
-            out.push_str("    ntp {\n");
+            svc.push_str("    ntp {\n");
             if !n.upstream.is_empty() {
-                out.push_str(&format!("        upstream {}\n", n.upstream.join(",")));
+                svc.push_str(&format!("        upstream {}\n", n.upstream.join(",")));
             }
             if !n.serve_on.is_empty() {
-                out.push_str(&format!("        serve-on {}\n", n.serve_on.join(",")));
+                svc.push_str(&format!("        serve-on {}\n", n.serve_on.join(",")));
             }
             if !n.allow_from.is_empty() {
-                out.push_str(&format!("        allow-from {}\n", n.allow_from.join(",")));
+                svc.push_str(&format!("        allow-from {}\n", n.allow_from.join(",")));
             }
-            out.push_str("    }\n");
+            svc.push_str("    }\n");
         }
         if lldp_set {
-            out.push_str("    lldp {\n");
+            svc.push_str("    lldp {\n");
             if lldp.enable {
-                out.push_str("        enable true\n");
+                svc.push_str("        enable true\n");
             }
             if !lldp.interface.is_empty() {
-                out.push_str(&format!("        interface {}\n", lldp.interface.join(",")));
+                svc.push_str(&format!("        interface {}\n", lldp.interface.join(",")));
             }
-            out.push_str("    }\n");
+            svc.push_str("    }\n");
         }
         if snmp_set {
-            out.push_str("    snmp {\n");
+            svc.push_str("    snmp {\n");
             if let Some(c) = &snmp.community {
-                out.push_str(&format!("        community {c}\n"));
+                svc.push_str(&format!("        community {c}\n"));
             }
             if let Some(l) = &snmp.listen {
-                out.push_str(&format!("        listen {l}\n"));
+                svc.push_str(&format!("        listen {l}\n"));
             }
             if let Some(l) = &snmp.location {
-                out.push_str(&format!("        location {l}\n"));
+                svc.push_str(&format!("        location {l}\n"));
             }
             if let Some(c) = &snmp.contact {
-                out.push_str(&format!("        contact {c}\n"));
+                svc.push_str(&format!("        contact {c}\n"));
             }
             if !snmp.allow.is_empty() {
-                out.push_str(&format!("        allow {}\n", snmp.allow.join(",")));
+                svc.push_str(&format!("        allow {}\n", snmp.allow.join(",")));
             }
-            out.push_str("    }\n");
+            svc.push_str("    }\n");
         }
         if ssh_set {
-            out.push_str("    ssh {\n");
+            svc.push_str("    ssh {\n");
             if !ssh.enable {
-                out.push_str("        enable false\n");
+                svc.push_str("        enable false\n");
             }
             if let Some(p) = ssh.port {
-                out.push_str(&format!("        port {p}\n"));
+                svc.push_str(&format!("        port {p}\n"));
             }
             if let Some(a) = &ssh.listen_address {
-                out.push_str(&format!("        listen-address {a}\n"));
+                svc.push_str(&format!("        listen-address {a}\n"));
             }
             if ssh.password_authentication {
-                out.push_str("        password-authentication true\n");
+                svc.push_str("        password-authentication true\n");
             }
-            out.push_str("    }\n");
+            svc.push_str("    }\n");
         }
         if web_set {
-            out.push_str("    web {\n");
+            svc.push_str("    web {\n");
             if web.enable {
-                out.push_str("        enable true\n");
+                svc.push_str("        enable true\n");
             }
             if let Some(p) = web.port {
-                out.push_str(&format!("        port {p}\n"));
+                svc.push_str(&format!("        port {p}\n"));
             }
             if let Some(a) = &web.listen_address {
-                out.push_str(&format!("        listen-address {a}\n"));
+                svc.push_str(&format!("        listen-address {a}\n"));
             }
-            out.push_str("    }\n");
+            svc.push_str("    }\n");
         }
         if mdns_set {
-            out.push_str("    mdns {\n");
-            out.push_str(&format!("        interface {}\n", mdns.interface.join(",")));
-            out.push_str("    }\n");
+            svc.push_str("    mdns {\n");
+            svc.push_str(&format!("        interface {}\n", mdns.interface.join(",")));
+            svc.push_str("    }\n");
         }
         if dyndns_set {
-            out.push_str("    dyndns {\n");
+            svc.push_str("    dyndns {\n");
             if let Some(p) = &dyndns.provider {
-                out.push_str(&format!("        provider {p}\n"));
+                svc.push_str(&format!("        provider {p}\n"));
             }
             if let Some(s) = &dyndns.server {
-                out.push_str(&format!("        server {s}\n"));
+                svc.push_str(&format!("        server {s}\n"));
             }
             if let Some(h) = &dyndns.hostname {
-                out.push_str(&format!("        hostname {h}\n"));
+                svc.push_str(&format!("        hostname {h}\n"));
             }
             if let Some(l) = &dyndns.login {
-                out.push_str(&format!("        login {l}\n"));
+                svc.push_str(&format!("        login {l}\n"));
             }
             if let Some(p) = &dyndns.password {
-                out.push_str(&format!("        password {p}\n"));
+                svc.push_str(&format!("        password {p}\n"));
             }
             if let Some(i) = &dyndns.interface {
-                out.push_str(&format!("        interface {i}\n"));
+                svc.push_str(&format!("        interface {i}\n"));
             }
-            out.push_str("    }\n");
+            svc.push_str("    }\n");
         }
         if ids_set {
             let ids = &draft.ids;
-            out.push_str("    ids {\n");
+            svc.push_str("    ids {\n");
             for i in &ids.interfaces {
-                out.push_str(&format!("        interface {i}\n"));
+                svc.push_str(&format!("        interface {i}\n"));
             }
             // The default HOME_NET is shown as the members it stands for, not as
             // silence: which addresses count as "inside" decides what nearly every
             // rule matches, and an operator should not have to know the default.
             for n in ids.home_net() {
-                out.push_str(&format!("        home-net {n}\n"));
+                svc.push_str(&format!("        home-net {n}\n"));
             }
             for r in &ids.rules {
-                out.push_str(&format!("        rule {r}\n"));
+                svc.push_str(&format!("        rule {r}\n"));
             }
             for r in &ids.rulesets {
-                out.push_str(&format!("        ruleset {r}\n"));
+                svc.push_str(&format!("        ruleset {r}\n"));
             }
             if let Some(b) = ids.block_on_alert {
-                out.push_str(&format!("        block-on-alert {b}\n"));
+                svc.push_str(&format!("        block-on-alert {b}\n"));
             }
             if ids.blocks_on_alert() {
                 // The two numbers that decide what an automatic block costs are
                 // shown whether or not they were set: an operator reviewing this
                 // should not have to know the defaults to know the blast radius.
-                out.push_str(&format!(
+                svc.push_str(&format!(
                     "        block-severity {}\n",
                     ids.block_severity()
                 ));
-                out.push_str(&format!(
+                svc.push_str(&format!(
                     "        block-duration {}\n",
                     ids.block_duration()
                 ));
             }
             for n in &ids.never_block {
-                out.push_str(&format!("        never-block {n}\n"));
+                svc.push_str(&format!("        never-block {n}\n"));
             }
             for n in &ids.sni_block {
-                out.push_str(&format!("        sni-block {n}\n"));
+                svc.push_str(&format!("        sni-block {n}\n"));
             }
-            out.push_str("    }\n");
+            svc.push_str("    }\n");
         }
         if !draft.flow_export.is_empty() {
-            out.push_str("    flow-export {\n");
+            svc.push_str("    flow-export {\n");
             if let Some(c) = &draft.flow_export.collector {
-                out.push_str(&format!("        collector {c}\n"));
+                svc.push_str(&format!("        collector {c}\n"));
             }
             if let Some(i) = draft.flow_export.interval {
-                out.push_str(&format!("        interval {i}\n"));
+                svc.push_str(&format!("        interval {i}\n"));
             }
             if let Some(d) = draft.flow_export.domain {
-                out.push_str(&format!("        domain {d}\n"));
+                svc.push_str(&format!("        domain {d}\n"));
             }
-            out.push_str("    }\n");
+            svc.push_str("    }\n");
         }
         if alerts_set {
-            out.push_str("    alerts {\n");
+            svc.push_str("    alerts {\n");
             for url in &draft.alerts.webhook {
-                out.push_str(&format!("        webhook {url}\n"));
+                svc.push_str(&format!("        webhook {url}\n"));
             }
             let m = &draft.alerts.mail;
             if !m.is_empty() {
-                out.push_str("        mail {\n");
+                svc.push_str("        mail {\n");
                 // push_field renders at the 12-space depth these fields sit at.
                 push_field(&mut out, "to", m.to.clone());
                 push_field(&mut out, "from", m.from.clone());
@@ -10676,80 +11039,80 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
                 push_field(&mut out, "user", m.user.clone());
                 push_field(&mut out, "password", m.password.clone());
                 push_field(&mut out, "starttls", m.starttls.map(|b| b.to_string()));
-                out.push_str("        }\n");
+                svc.push_str("        }\n");
             }
-            out.push_str("    }\n");
+            svc.push_str("    }\n");
         }
         if syslog_set {
-            out.push_str("    syslog {\n");
+            svc.push_str("    syslog {\n");
             for (host, t) in &draft.syslog {
-                out.push_str(&format!("        target {host} {{\n"));
+                svc.push_str(&format!("        target {host} {{\n"));
                 if let Some(p) = t.port {
-                    out.push_str(&format!("            port {p}\n"));
+                    svc.push_str(&format!("            port {p}\n"));
                 }
                 if let Some(p) = t.proto {
                     let proto = match p {
                         SyslogProto::Udp => "udp",
                         SyslogProto::Tcp => "tcp",
                     };
-                    out.push_str(&format!("            proto {proto}\n"));
+                    svc.push_str(&format!("            proto {proto}\n"));
                 }
                 if let Some(l) = t.level {
-                    out.push_str(&format!("            level {}\n", l.rsyslog()));
+                    svc.push_str(&format!("            level {}\n", l.rsyslog()));
                 }
-                out.push_str("        }\n");
+                svc.push_str("        }\n");
             }
-            out.push_str("    }\n");
+            svc.push_str("    }\n");
         }
         if relay_set {
-            out.push_str("    dhcp-relay {\n");
+            svc.push_str("    dhcp-relay {\n");
             if !relay.interface.is_empty() {
-                out.push_str(&format!(
+                svc.push_str(&format!(
                     "        interface {}\n",
                     relay.interface.join(",")
                 ));
             }
             if !relay.server.is_empty() {
-                out.push_str(&format!("        server {}\n", relay.server.join(",")));
+                svc.push_str(&format!("        server {}\n", relay.server.join(",")));
             }
             if !relay.server6.is_empty() {
-                out.push_str(&format!("        server6 {}\n", relay.server6.join(",")));
+                svc.push_str(&format!("        server6 {}\n", relay.server6.join(",")));
             }
-            out.push_str("    }\n");
+            svc.push_str("    }\n");
         }
         // reverse-proxy <name> { … } — L7 frontends, name-ordered (BTreeMap).
         for (name, rp) in rproxy {
-            out.push_str(&format!("    reverse-proxy {name} {{\n"));
+            svc.push_str(&format!("    reverse-proxy {name} {{\n"));
             if let Some(port) = rp.port {
-                out.push_str(&format!("        port {port}\n"));
+                svc.push_str(&format!("        port {port}\n"));
             }
             if let Some(cert) = &rp.certificate {
-                out.push_str(&format!("        certificate {cert}\n"));
+                svc.push_str(&format!("        certificate {cert}\n"));
             }
             for backend in &rp.backends {
-                out.push_str(&format!("        backends {backend}\n"));
+                svc.push_str(&format!("        backends {backend}\n"));
             }
             if rp.disabled == Some(true) {
-                out.push_str("        disabled true\n");
+                svc.push_str("        disabled true\n");
             }
-            out.push_str("    }\n");
+            svc.push_str("    }\n");
         }
         // broadcast-relay <name> { … } — UDP broadcast relays, name-ordered.
         for (name, r) in bcast {
-            out.push_str(&format!("    broadcast-relay {name} {{\n"));
+            svc.push_str(&format!("    broadcast-relay {name} {{\n"));
             if let Some(desc) = &r.description {
-                out.push_str(&format!("        description {desc}\n"));
+                svc.push_str(&format!("        description {desc}\n"));
             }
             if let Some(port) = r.port {
-                out.push_str(&format!("        port {port}\n"));
+                svc.push_str(&format!("        port {port}\n"));
             }
             for iface in &r.interfaces {
-                out.push_str(&format!("        interface {iface}\n"));
+                svc.push_str(&format!("        interface {iface}\n"));
             }
             if r.disabled == Some(true) {
-                out.push_str("        disabled true\n");
+                svc.push_str("        disabled true\n");
             }
-            out.push_str("    }\n");
+            svc.push_str("    }\n");
         }
         // portal { … } and port-mapping { … }. Both were settable and neither
         // was written here, so every reader of this document — the console, a
@@ -10761,23 +11124,23 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             || portal.session_timeout.is_some()
             || portal.message.is_some()
         {
-            out.push_str("    portal {\n");
+            svc.push_str("    portal {\n");
             if let Some(z) = &portal.zone {
-                out.push_str(&format!("        zone {z}\n"));
+                svc.push_str(&format!("        zone {z}\n"));
             }
             if let Some(p) = portal.port {
-                out.push_str(&format!("        port {p}\n"));
+                svc.push_str(&format!("        port {p}\n"));
             }
             if let Some(p) = &portal.passphrase {
-                out.push_str(&format!("        passphrase {p}\n"));
+                svc.push_str(&format!("        passphrase {p}\n"));
             }
             if let Some(t) = portal.session_timeout {
-                out.push_str(&format!("        session-timeout {t}\n"));
+                svc.push_str(&format!("        session-timeout {t}\n"));
             }
             if let Some(m) = &portal.message {
-                out.push_str(&format!("        message {m}\n"));
+                svc.push_str(&format!("        message {m}\n"));
             }
-            out.push_str("    }\n");
+            svc.push_str("    }\n");
         }
         let pm = &draft.port_mapping;
         if pm.zone.is_some()
@@ -10785,71 +11148,108 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             || pm.max_lifetime.is_some()
             || pm.allow_privileged.is_some()
         {
-            out.push_str("    port-mapping {\n");
+            svc.push_str("    port-mapping {\n");
             if let Some(z) = &pm.zone {
-                out.push_str(&format!("        zone {z}\n"));
+                svc.push_str(&format!("        zone {z}\n"));
             }
             if let Some(z) = &pm.wan_zone {
-                out.push_str(&format!("        wan-zone {z}\n"));
+                svc.push_str(&format!("        wan-zone {z}\n"));
             }
             if let Some(v) = pm.max_lifetime {
-                out.push_str(&format!("        max-lifetime {v}\n"));
+                svc.push_str(&format!("        max-lifetime {v}\n"));
             }
             if let Some(v) = pm.allow_privileged {
-                out.push_str(&format!("        allow-privileged {v}\n"));
+                svc.push_str(&format!("        allow-privileged {v}\n"));
             }
-            out.push_str("    }\n");
+            svc.push_str("    }\n");
         }
-        out.push_str("}\n");
+        if !svc.is_empty() {
+            out.push_str("services {\n");
+            out.push_str(&svc);
+            out.push_str("}\n");
+        }
     }
 
     // multiwan { … } — WAN uplinks with failover/load-balance + health checks.
-    if want("multiwan") && !draft.uplinks.is_empty() {
-        out.push_str("multiwan {\n");
+    if want("multiwan") {
+        let mut mw = String::new();
         if let Some(mode) = draft.multiwan_mode {
-            out.push_str(&format!("    mode {}\n", wan_mode_str(mode)));
+            mw.push_str(&format!("    mode {}\n", wan_mode_str(mode)));
         }
         for (iface, u) in &draft.uplinks {
-            out.push_str(&format!("    uplink {iface} {{\n"));
+            mw.push_str(&format!("    uplink {iface} {{\n"));
             if let Some(p) = u.priority {
-                out.push_str(&format!("        priority {p}\n"));
+                mw.push_str(&format!("        priority {p}\n"));
             }
             if let Some(w) = u.weight {
-                out.push_str(&format!("        weight {w}\n"));
+                mw.push_str(&format!("        weight {w}\n"));
             }
             if let Some(t) = u.table {
-                out.push_str(&format!("        table {t}\n"));
+                mw.push_str(&format!("        table {t}\n"));
             }
             if let Some(gw) = &u.gateway {
-                out.push_str(&format!("        gateway {gw}\n"));
+                mw.push_str(&format!("        gateway {gw}\n"));
             }
-            let check_set = !u.targets.is_empty()
-                || u.interval.is_some()
-                || u.timeout.is_some()
-                || u.fail.is_some()
-                || u.rise.is_some();
-            if check_set {
-                out.push_str("        check {\n");
-                for t in &u.targets {
-                    out.push_str(&format!("            target {t}\n"));
-                }
-                if let Some(v) = u.interval {
-                    out.push_str(&format!("            interval {v}\n"));
-                }
-                if let Some(v) = u.timeout {
-                    out.push_str(&format!("            timeout {v}\n"));
-                }
-                if let Some(v) = u.fail {
-                    out.push_str(&format!("            fail {v}\n"));
-                }
-                if let Some(v) = u.rise {
-                    out.push_str(&format!("            rise {v}\n"));
-                }
-                out.push_str("        }\n");
+            // Built body-first for the same reason as the section itself: the
+            // SLA thresholds below were settable and saved, and a `check` block
+            // that carried only them printed nothing at all.
+            let mut chk = String::new();
+            for t in &u.targets {
+                chk.push_str(&format!("            target {t}\n"));
             }
-            out.push_str("    }\n");
+            for (val, kw) in [
+                (u.interval, "interval"),
+                (u.timeout, "timeout"),
+                (u.fail, "fail"),
+                (u.rise, "rise"),
+                (u.latency, "latency"),
+                (u.jitter, "jitter"),
+                (u.loss, "loss"),
+                (u.probes, "probes"),
+            ] {
+                if let Some(v) = val {
+                    chk.push_str(&format!("            {kw} {v}\n"));
+                }
+            }
+            if !chk.is_empty() {
+                mw.push_str("        check {\n");
+                mw.push_str(&chk);
+                mw.push_str("        }\n");
+            }
+            mw.push_str("    }\n");
         }
-        out.push_str("}\n");
+        // The traffic rules that pick an uplink. Saved and applied, never
+        // printed: an appliance steering traffic by policy looked, in every
+        // review and every copy of its configuration, like one that was not.
+        for (name, pol) in &draft.wan_policies {
+            mw.push_str(&format!("    policy {name} {{\n"));
+            for (val, kw) in [
+                (&pol.source, "source"),
+                (&pol.destination, "destination"),
+                (&pol.proto, "proto"),
+                (&pol.source_port, "source-port"),
+                (&pol.destination_port, "destination-port"),
+            ] {
+                if let Some(v) = val {
+                    mw.push_str(&format!("        {kw} {v}\n"));
+                }
+            }
+            for u in &pol.uplinks {
+                mw.push_str(&format!("        uplink {u}\n"));
+            }
+            if pol.strict {
+                mw.push_str("        strict true\n");
+            }
+            if pol.disabled {
+                mw.push_str("        disabled true\n");
+            }
+            mw.push_str("    }\n");
+        }
+        if !mw.is_empty() {
+            out.push_str("multiwan {\n");
+            out.push_str(&mw);
+            out.push_str("}\n");
+        }
     }
 
     // vpn { ipsec <name> { … } wireguard <name> { … } openconnect { … } } —
@@ -11500,6 +11900,21 @@ fn parse_permission(s: &str) -> Result<Permission> {
         "read-write" => Ok(Permission::ReadWrite),
         other => bail!("{other:?} is not a permission (read-only | read-write)"),
     }
+}
+
+/// An OSPF area id as the dotted quad the config and the daemon use.
+///
+/// `area 0` is how everyone writes the backbone, and how VyOS accepts it, but
+/// an area id is a 32-bit number whose canonical spelling is a dotted quad. A
+/// CLI that refuses the common spelling of the most common area is a CLI that
+/// looks broken, so a bare number is converted rather than rejected.
+fn area_id(v: &str) -> Result<String> {
+    if let Ok(n) = v.parse::<u32>() {
+        return Ok(std::net::Ipv4Addr::from(n).to_string());
+    }
+    crate::config::validate_ipv4(v)
+        .with_context(|| format!("area {v:?}: a number (0) or a dotted quad (0.0.0.0)"))?;
+    Ok(v.to_string())
 }
 
 fn parse_bool(s: &str) -> Result<bool> {

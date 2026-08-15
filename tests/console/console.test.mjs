@@ -6,9 +6,14 @@
 // nothing. Read the failures as "an operator cannot do X", not as unit noise.
 
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { browser, signIn, sleep, test, check, equal, summary } from "./harness.mjs";
+import { instrument, walkAll, collect, sectionFields } from "./coverage.mjs";
 
+// Note: this shadows the global `URL` for the whole file — resolve paths next
+// to this file with `fileURLToPath(import.meta.url)`, never with `new URL()`.
 const URL = process.env.CONSOLE_URL || "http://127.0.0.1:8088/";
+const HERE = fileURLToPath(new globalThis.URL(".", import.meta.url));
 const TOKEN = process.env.CONSOLE_TOKEN || "testtoken";
 const CONFIG = process.env.CONSOLE_CONFIG;   // the toml the API is editing
 
@@ -32,67 +37,89 @@ await test("the page loads without the script throwing", () => {
 // reports as "the page stopped answering" and looks exactly like a console that
 // hangs. Driving the loop from here bounds every call by the slowest *single*
 // section, and a failure names the entry rather than the walk.
-await test("every rail entry opens exactly one non-empty view", async () => {
-  // The labels first, so a call that never comes back can be named. "The page
-  // stopped answering" is not a diagnosis; "Traffic shaping stopped answering"
-  // is one.
-  const labels = await page.evaluate(
+await test("every section opens exactly one non-empty view", async () => {
+  // The rail names categories, and the category's own pages sit in a strip in
+  // the content. Walking only the rail would now check twelve doors and none of
+  // the rooms behind them, so the walk descends: click a category, then click
+  // every entry of the strip it revealed.
+  const cats = await page.evaluate(
     `[...document.querySelectorAll("aside button.navitem")].map((b) => b.textContent.trim())`);
-  check(labels.length > 30, `only ${labels.length} rail entries — the rail lost sections`);
+  check(cats.length > 8, `only ${cats.length} categories — the rail lost sections`);
 
   const broken = [], empty = [], slow = [];
-  for (let i = 0; i < labels.length; i++) {
-    let r;
-    const began = Date.now();
-    const say = process.env.CONSOLE_PROGRESS
-      ? (m) => console.log(`       ${m}`)
-      : () => {};
-    say(`→ ${i + 1}/${labels.length} ${labels[i]}`);
-    try {
-      r = await page.evaluate(`(async () => {
-        const b = [...document.querySelectorAll("aside button.navitem")][${i}];
-        b.click();
-        await new Promise((r) => setTimeout(r, 200));
-        const shown = [...document.querySelectorAll('[id^="view-"]')]
-          .filter((v) => !v.classList.contains("hidden"));
-        return { views: shown.length, text: shown.length === 1 ? shown[0].innerText.trim() : "" };
-      })()`);
-    } catch (e) {
-      throw new Error(`at rail entry ${i + 1}/${labels.length} (${labels[i]}): ${e.message || e}`);
+  let visited = 0;
+  const say = process.env.CONSOLE_PROGRESS ? (m) => console.log(`       ${m}`) : () => {};
+
+  for (let c = 0; c < cats.length; c++) {
+    const n = await page.evaluate(`(async () => {
+      [...document.querySelectorAll("aside button.navitem")][${c}].click();
+      await new Promise((r) => setTimeout(r, 250));
+      return document.querySelectorAll("#sectionstrip .secitem").length || 1;
+    })()`);
+    for (let i = 0; i < n; i++) {
+      const began = Date.now();
+      say(`→ ${cats[c]} ${i + 1}/${n}`);
+      let r;
+      try {
+        r = await page.evaluate(`(async () => {
+          const strip = [...document.querySelectorAll("#sectionstrip .secitem")];
+          const label = strip[${i}] ? strip[${i}].textContent.trim() : ${JSON.stringify(cats[c])};
+          if (strip[${i}]) { strip[${i}].click(); await new Promise((r) => setTimeout(r, 250)); }
+          const shown = [...document.querySelectorAll('[id^="view-"]')]
+            .filter((v) => !v.classList.contains("hidden"));
+          return { label, views: shown.length, text: shown.length === 1 ? shown[0].innerText.trim() : "" };
+        })()`);
+      } catch (e) {
+        throw new Error(`in ${cats[c]}, entry ${i + 1}/${n}: ${e.message || e}`);
+      }
+      visited++;
+      const took = Date.now() - began;
+      if (took > 20000) slow.push(`${r.label} took ${Math.round(took / 1000)}s`);
+      if (r.views !== 1) broken.push(`${r.label} showed ${r.views} views`);
+      else if (!r.text) empty.push(r.label);
     }
-    // A section that takes half a minute to open is a defect an operator meets
-    // as "the console is broken", so it is worth saying out loud even when the
-    // walk finishes.
-    const took = Date.now() - began;
-    say(`  ${(took / 1000).toFixed(1)}s`);
-    if (took > 20000) slow.push(`${labels[i]} took ${Math.round(took / 1000)}s`);
-    if (r.views !== 1) broken.push(`${labels[i]} showed ${r.views} views`);
-    else if (!r.text) empty.push(labels[i]);
   }
-  equal(broken, [], "rail entries that do not open one view");
-  equal(empty, [], "rail entries that open an empty page");
-  equal(slow, [], "rail entries that take longer than an operator will wait");
+  // The categories are few on purpose; the pages behind them are not, and a
+  // count that collapses is how a lost section would hide behind a short rail.
+  check(visited > 30, `only ${visited} sections were reachable in total`);
+  equal(broken, [], "sections that do not open one view");
+  equal(empty, [], "sections that open an empty page");
+  equal(slow, [], "sections that take longer than an operator will wait");
   noThrows("navigating threw");
 });
 
+// A divided view — routing, with a pane per protocol — used to print its panes
+// twice: once in the category strip above the heading and once in a strip of
+// its own below it. There is one strip now, and it is the section strip, so
+// that is what this drives. The question is unchanged: does every pane of a
+// divided view open on its own and get named at the top of the page.
 await test("every tab strip switches panes and titles the page", async () => {
   const strips = await page.evaluate(`Object.keys(TABS)`);
   const bad = [];
   for (const v of strips) {
+    // Every pane is listed in the one strip, and the strip is what a person
+    // clicks — a pane the strip cannot reach is a pane that does not exist.
     const shape = await page.evaluate(`(async () => {
       view = ${JSON.stringify(v)}; panel = null;
       await refresh();
       await new Promise((r) => setTimeout(r, 200));
-      const strip = document.getElementById("tabs-" + view);
-      return { tabs: strip ? strip.children.length : -1, want: TABS[view].length };
+      const strip = [...document.querySelectorAll("#sectionstrip .secitem")];
+      const labels = strip.map((b) => b.textContent.trim());
+      const missing = TABS[view].filter((t) => !labels.includes(t.t));
+      return { tabs: TABS[view].length, missing: missing.map((t) => t.k) };
     })()`);
-    if (shape.tabs !== shape.want) { bad.push(`${v}: strip does not match the table`); continue; }
+    if (shape.missing.length) {
+      bad.push(`${v}: the strip does not reach ${shape.missing.join(", ")}`);
+      continue;
+    }
     // Each tab is its own call for the same reason as above.
     for (let i = 0; i < shape.tabs; i++) {
       const r = await page.evaluate(`(async () => {
-        const button = document.getElementById("tabs-" + ${JSON.stringify(v)}).children[${i}];
-        const name = button.textContent;
-        button.click();
+        const t = TABS[${JSON.stringify(v)}][${i}];
+        const strip = [...document.querySelectorAll("#sectionstrip .secitem")];
+        const button = strip.find((b) => b.textContent.trim() === t.t);
+        const name = button ? button.textContent.trim() : t.k;
+        if (button) button.click();
         await new Promise((r) => setTimeout(r, 200));
         const open = [...document.querySelectorAll("#view-" + ${JSON.stringify(v)} + " > .tabpane")]
           .filter((p) => !p.classList.contains("hidden"));
@@ -106,6 +133,30 @@ await test("every tab strip switches panes and titles the page", async () => {
   const report = bad;
   equal(report, [], "tab strips that do not switch cleanly");
   noThrows("switching tabs threw");
+});
+
+// One navigation, not two. The category's pages are listed above the heading;
+// nothing below it may list them again, or an operator has two rows of buttons
+// for one decision and no way to tell which of them they are standing in.
+await test("a page carries its navigation once", async () => {
+  const doubled = await page.evaluate(`(async () => {
+    const out = [];
+    for (const v of Object.keys(TABS)) {
+      view = v; panel = null; await refresh();
+      await new Promise((r) => setTimeout(r, 200));
+      const strip = [...document.querySelectorAll("#sectionstrip .secitem")]
+        .map((b) => b.textContent.trim());
+      // Anything on the page itself that offers the same destinations.
+      const pane = document.getElementById("view-" + v);
+      const echoes = [...pane.querySelectorAll("button")]
+        .filter((b) => b.offsetParent !== null)
+        .map((b) => b.textContent.trim())
+        .filter((t) => strip.includes(t));
+      if (echoes.length > 1) out.push(v + ": " + echoes.join(", "));
+    }
+    return out;
+  })()`);
+  equal(doubled, [], "views that repeat their own navigation");
 });
 
 // --- creating things --------------------------------------------------------
@@ -166,7 +217,16 @@ await test("a name with no settings is refused here, not by the appliance", asyn
       toggle.click(); await wait();
       const name = box.querySelector("input");
       if (name) name.value = "probe1";
-      [...box.querySelectorAll("button")].find((b) => /add/i.test(b.textContent)).click();
+      // The panel is rendered by an async refresh, so its Add button can be a
+      // beat late. Waiting for it is the difference between a real finding and
+      // a stray TypeError on a busy machine.
+      let add = null;
+      for (let i = 0; i < 20 && !add; i++) {
+        add = [...box.querySelectorAll("button")].find((b) => /add/i.test(b.textContent));
+        if (!add) await wait();
+      }
+      if (!add) return { missing: "the panel has no Add button" };
+      add.click();
       await wait();
       const err = box.querySelector(".formerr");
       return {
@@ -175,7 +235,10 @@ await test("a name with no settings is refused here, not by the appliance", asyn
         bare: stagedCommands().length === 1 && !/ .+ .+/.test(stagedCommands()[0].replace(/^set /, "")),
       };
     })()`);
-    if (r.missing) { bad.push(`${panel}: no New button or panel`); continue; }
+    if (r.missing) {
+      bad.push(`${panel}: ${typeof r.missing === "string" ? r.missing : "no New button or panel"}`);
+      continue;
+    }
     if (r.skipped) continue;
     // Either it refused with a sentence, or it staged a command with a setting
     // in it. What it must never do is stage a bare path.
@@ -236,8 +299,14 @@ await test("what a create panel stages is a command the appliance parses", async
     ["routepolicy", "pbr", "togglepbr", "addpbrpanel", "guests-out",
       { "Routing table": "100", "Source": "10.9.0.0/24" }],
     ["wan", null, "togglewan", "addwanpanel", "wan0", { "Gateway": "192.0.2.1" }],
+    // A policy names an uplink, and the field offers the uplinks this box has
+    // rather than asking for one to be spelled from memory — so there has to be
+    // one to offer. Staged, not committed: what is staged is configuration as
+    // far as every picker in this console is concerned.
     ["wan", null, "togglewanpolicy", "addwanpolicypanel", "voip",
-      { "Preferred uplinks": "wan0" }],
+      { "Preferred uplinks": "wan0" },
+      `stage("Uplink wan0", ["set multiwan uplink wan0 gateway 192.0.2.1"]);
+       await refresh();`],
     ["ipsec", null, "toggleipsec", "addipsecpanel", "branch",
       { "Remote address": "203.0.113.9", "Local address": "192.0.2.2" }],
     ["wireguard", null, "togglewg", "addwgpanel", "wg1",
@@ -266,7 +335,13 @@ await test("what a create panel stages is a command the appliance parses", async
 
   const bad = [];
   for (const [view, tab, toggle, panel, name, fields, setup] of cases) {
-    const r = await page.evaluate(`(async () => {
+    // Each case on its own: a panel that throws — or an appliance that stops
+    // answering on one of the thirty-six — used to end the whole loop with a
+    // bare timeout and no way to tell which panel was being filled in.
+    const started = Date.now();
+    let r;
+    try {
+      r = await page.evaluate(`(async () => {
       const wait = () => new Promise((r) => setTimeout(r, 250));
       staged = []; renderStaged();
       view = ${JSON.stringify(view)}; panel = null;
@@ -285,9 +360,20 @@ await test("what a create panel stages is a command the appliance parses", async
         const f = [...box.querySelectorAll(".field")]
           .find((l) => l.querySelector("span").firstChild.textContent.trim() === label);
         if (!f) return { error: "no field named " + label };
-        f.querySelector("input, select").value = value;
+        // A repeatable setting whose answers the appliance already knows is a
+        // set of tick boxes, not a box to type in. It carries a value of its
+        // own — the comma-separated selection — so it is filled the same way.
+        const control = f.querySelector(".pick, .switch") || f.querySelector("input, select");
+        if (!control) return { error: "no control under " + label };
+        control.value = value;
       }
-      [...box.querySelectorAll("button")].find((b) => /add/i.test(b.textContent)).click();
+      let add = null;
+      for (let i = 0; i < 20 && !add; i++) {
+        add = [...box.querySelectorAll("button")].find((b) => /add/i.test(b.textContent));
+        if (!add) await wait();
+      }
+      if (!add) return { error: "the panel has no Add button" };
+      add.click();
       await wait();
       const cmds = stagedCommands();
       if (!cmds.length) return { error: "nothing staged: " + (box.querySelector(".formerr") || {}).textContent };
@@ -295,6 +381,10 @@ await test("what a create panel stages is a command the appliance parses", async
       const reply = await configure(cmds);
       return { staged: cmds, output: reply.output };
     })()`);
+    } catch (e) {
+      bad.push(`${panel}: ${e.message} (after ${Math.round((Date.now() - started) / 1000)}s)`);
+      continue;
+    }
     if (r.error) { bad.push(`${panel}: ${r.error}`); continue; }
     if (/unknown set path|unknown delete path/.test(r.output || "")) {
       bad.push(`${panel}: the appliance does not know that path — ${r.staged.join("; ")}`);
@@ -313,7 +403,7 @@ await test("a settings mask stages only what changed", async () => {
     const field = (label) => [...document.querySelectorAll("#igp-ospf .field")]
       .find((l) => l.querySelector("span").textContent === label).querySelector("input, select");
     field("Cost").value = "77";
-    [...document.querySelectorAll("#igp-ospf button")].find((b) => b.textContent === "Stage").click();
+    [...document.querySelectorAll("#igp-ospf button")].find((b) => b.textContent.startsWith("Stage")).click();
     await wait();
     return stagedCommands();
   })()`);
@@ -323,14 +413,17 @@ await test("a settings mask stages only what changed", async () => {
 await test("applying writes the appliance's configuration file", async () => {
   check(!!CONFIG, "CONSOLE_CONFIG is not set, so there is nothing to read back");
   const before = readFileSync(CONFIG, "utf8");
+  // Wait for the appliance's answer rather than for a fixed number of seconds:
+  // an apply that is merely slow is not the same failure as one that never
+  // reports, and a fixed wait calls the first the second.
   const result = await page.evaluate(`(async () => {
     const wait = (ms) => new Promise((r) => setTimeout(r, ms || 400));
+    const said = () => document.getElementById("resultout").innerText.trim();
+    document.getElementById("resultout").textContent = "";   // an older answer is not this one
     document.getElementById("applystaged").click();
-    await wait(2500);
-    return {
-      left: stagedCommands(),
-      said: document.getElementById("resultout").innerText,
-    };
+    for (let i = 0; i < 120 && !said(); i++) await wait(500);
+    await wait(500);
+    return { left: stagedCommands(), said: said() };
   })()`);
   const after = readFileSync(CONFIG, "utf8");
   check(after !== before, `the file did not change. The appliance said:\n${result.said}`);
@@ -356,7 +449,7 @@ await test("emptying a field removes the setting", async () => {
     [...document.querySelectorAll("#igp-ospf .field")]
       .find((l) => l.querySelector("span").textContent === "Cost")
       .querySelector("input").value = "";
-    [...document.querySelectorAll("#igp-ospf button")].find((b) => b.textContent === "Stage").click();
+    [...document.querySelectorAll("#igp-ospf button")].find((b) => b.textContent.startsWith("Stage")).click();
     await wait();
     const out = stagedCommands();
     document.getElementById("applystaged").click();
@@ -364,6 +457,101 @@ await test("emptying a field removes the setting", async () => {
     return out;
   })()`);
   equal(staged, ["delete protocols ospf cost"], "clearing a field did not delete the setting");
+});
+
+// A mask that offers a setting the appliance does not have is not a cosmetic
+// fault: the field stages a command that can only be refused, and a refusal is
+// the whole batch's, so touching it once stopped everything staged beside it
+// from being applied too. The global firewall block had two — `local` and
+// `description`, which say something about a *zone* and nothing about the
+// appliance-wide posture — because it was built from the zone's own table.
+await test("every setting the global firewall posture offers is one the appliance has", async () => {
+  const r = await page.evaluate(`(async () => {
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms || 400));
+    staged = []; dirty.clear(); renderStaged();
+    view = "zones"; panel = null; await refresh(); await wait(600);
+    const box = document.getElementById("globalform");
+    // Every field filled, so every one of them writes a command. What the value
+    // is does not matter — this is asking whether the *path* exists.
+    for (const w of box.querySelectorAll("select, input")) {
+      if (w.tagName === "SELECT") {
+        const opt = [...w.options].find((o) => o.value);
+        if (opt) w.value = opt.value;
+      } else if (w.type === "checkbox") {
+        w.checked = true;
+      } else {
+        w.value = "probe";
+      }
+    }
+    [...box.querySelectorAll("button")].find((b) => b.textContent.startsWith("Stage")).click();
+    await wait(400);
+    const cmds = stagedCommands();
+    // No commit, so nothing is applied and the appliance answers only about
+    // whether it knows what it was asked for.
+    const reply = cmds.length ? await configure(cmds) : { output: "" };
+    staged = []; dirty.clear(); renderStaged();
+    return { cmds, output: reply.output };
+  })()`);
+  check(r.cmds.length > 3, `the mask staged almost nothing: ${JSON.stringify(r.cmds)}`);
+  check(!/unknown set path/.test(r.output || ""),
+    `the mask offers a setting the appliance does not have:\n  ${r.cmds.join("\n  ")}`);
+});
+
+await test("a refused change no longer stops the ones staged beside it", async () => {
+  check(!!CONFIG, "CONSOLE_CONFIG is not set, so there is nothing to read back");
+  const outcome = await page.evaluate(`(async () => {
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms || 400));
+    staged = []; dirty.clear(); renderStaged();
+    stage("Interface eth1", ["set interface eth1 description saved-anyway"]);
+    stage("A setting that does not exist", ["set firewall nonsense true"]);
+    document.getElementById("resultout").textContent = "";
+    document.getElementById("applystaged").click();
+    for (let i = 0; i < 90 && !document.getElementById("resultout").textContent.trim(); i++) await wait(500);
+    await wait(600);
+    const said = document.getElementById("resultout").innerText;
+    const title = document.getElementById("resulttitle").textContent;
+    const d = document.getElementById("result"); if (d.open) d.close();
+    const left = stagedCommands();
+    staged = []; dirty.clear(); renderStaged();
+    return { title, said, left };
+  })()`);
+  const config = readFileSync(CONFIG, "utf8");
+  check(/saved-anyway/.test(config),
+    `the good change was not saved. The appliance said:\n${outcome.said}`);
+  check(/accepts|refus/i.test(outcome.said),
+    `the refusal was not reported: ${outcome.said}`);
+  // A refusal an operator cannot place is one they cannot act on: with several
+  // changes waiting, "that setting is not one this appliance accepts" does not
+  // say which of them to correct.
+  check(outcome.said.includes("A setting that does not exist"),
+    `the dialog does not say which staged change was refused:\n${outcome.said}`);
+  equal(outcome.left.length, 2, "a batch that was refused in part was thrown away");
+});
+
+await test("applying runs the batch once, not twice", async () => {
+  // Applying used to validate first and then apply, so every command ran twice
+  // on the appliance and every apply cost two round trips.
+  const runs = await page.evaluate(`(async () => {
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms || 400));
+    staged = []; dirty.clear(); renderStaged();
+    let posts = 0;
+    const real = window.fetch;
+    window.fetch = (url, opts) => {
+      if (String(url).includes("/api/v1/configure")) posts++;
+      return real(url, opts);
+    };
+    stage("Interface eth1", ["set interface eth1 description one-run"]);
+    document.getElementById("resultout").textContent = "";
+    document.getElementById("applystaged").click();
+    for (let i = 0; i < 90 && !document.getElementById("resultout").textContent.trim(); i++) await wait(500);
+    await wait(600);
+    window.fetch = real;
+    const title = document.getElementById("resulttitle").textContent;
+    const d = document.getElementById("result"); if (d.open) d.close();
+    return { posts, title };
+  })()`);
+  equal(runs.title, "Applied", "the change was not applied");
+  equal(runs.posts, 1, "the appliance was asked to run the batch more than once");
 });
 
 // --- reading ----------------------------------------------------------------
@@ -413,6 +601,33 @@ await test("Apply with nothing staged says so instead of doing nothing", async (
   check(/staged/i.test(said), `Apply said nothing at all (banner: ${JSON.stringify(said)})`);
 });
 
+// A dialog is the only thing in this console that animates rather than simply
+// appearing, and an entrance animation has one catastrophic failure mode: it
+// starts the surface transparent and something stops it getting to the end, so
+// the operator is looking at a modal they cannot read. That is worth a check of
+// its own — it cannot be seen in the source, and it depends on the browser
+// supporting the entry syntax rather than on our CSS being right.
+await test("the dialog an operator is answering is actually visible", async () => {
+  const seen = await page.evaluate(`(async () => {
+    const d = document.getElementById("result");
+    if (d.open) d.close();
+    d.showModal();
+    await new Promise((r) => setTimeout(r, 600));
+    const s = getComputedStyle(d);
+    const out = { opacity: s.opacity, props: s.transitionProperty, dur: s.transitionDuration };
+    d.close();
+    return out;
+  })()`);
+  check(Number(seen.opacity) === 1,
+    `the dialog settled at opacity ${seen.opacity} — an entrance that never finishes hides it`);
+  // And the ingredients, at the one place they can be read back: what moves is
+  // opacity and transform, and it is over before a third of a second.
+  check(/opacity/.test(seen.props) && /transform/.test(seen.props),
+    `the dialog transitions ${seen.props} — it should be opacity and transform`);
+  const longest = Math.max(...(seen.dur || "0s").split(",").map((d) => parseFloat(d) * 1000));
+  check(longest > 0 && longest <= 300, `the dialog takes ${longest}ms — UI motion stays under 300ms`);
+});
+
 await test("a typed-in mask shows that the change is not staged yet", async () => {
   const shown = await page.evaluate(`(async () => {
     const wait = () => new Promise((r) => setTimeout(r, 300));
@@ -436,6 +651,11 @@ await test("every routing protocol reads the same way", async () => {
   // BGP in its own view with its own strip was the exterior protocol looking
   // like a different product from the six interior ones — and saying nothing
   // about them. One strip, one skeleton: a lede, settings, and live state.
+  //
+  // The explanation is now asked of the page header rather than of the pane.
+  // Both used to carry one, in almost the same words, directly above and below
+  // the heading; the one that survives is the one under the title, which is
+  // where a screen says where you are.
   const report = await page.evaluate(`(async () => {
     const wait = () => new Promise((r) => setTimeout(r, 300));
     const out = { tabs: [], missing: [] };
@@ -445,7 +665,14 @@ await test("every routing protocol reads the same way", async () => {
         .filter((p) => !p.classList.contains("hidden"))[0];
       if (!pane) { out.missing.push(t.k + ": no pane"); continue; }
       out.tabs.push(t.k);
-      if (!pane.querySelector(".lede")) out.missing.push(t.k + ": no explanation");
+      const said = document.querySelector("#pagehead .headtext p");
+      if (!said || !said.textContent.trim()) out.missing.push(t.k + ": no explanation");
+      // An "inset" lede explains the section it stands under — the aggregates,
+      // the RP address. What may not come back is a pane-wide one, which is the
+      // page's own sentence printed a second time under the heading.
+      if (pane.querySelector(":scope > .lede:not(.inset)")) {
+        out.missing.push(t.k + ": says it twice");
+      }
       if (!pane.querySelector("pre.out")) out.missing.push(t.k + ": no live state");
       if (!pane.querySelector(".cmd")) out.missing.push(t.k + ": does not say what it ran");
       // Every protocol is configurable in the same shape. The routing table is
@@ -465,7 +692,7 @@ await test("wherever you are in routing, every other protocol is one click away"
   const seen = await page.evaluate(`(async () => {
     const wait = () => new Promise((r) => setTimeout(r, 250));
     view = "routing"; tabs.routing = "bgp"; panel = null; await refresh(); await wait();
-    return [...document.getElementById("tabs-routing").children].map((b) => b.textContent.trim());
+    return [...document.querySelectorAll("#sectionstrip .secitem")].map((b) => b.textContent.trim());
   })()`);
   for (const protocol of ["BGP", "OSPFv2", "OSPFv3", "IS-IS", "RIP", "RIPng", "Babel", "BFD"]) {
     check(seen.some((t) => t.startsWith(protocol)),
@@ -474,13 +701,18 @@ await test("wherever you are in routing, every other protocol is one click away"
 });
 
 await test("the routing entries do not all wear the same mark", async () => {
-  const marks = await page.evaluate(`(() => {
-    const group = [...document.querySelectorAll("nav .group")]
-      .find((g) => g.querySelector(".grouphead").textContent.startsWith("Routing"));
-    return [...group.querySelectorAll(".navitem svg")].map((svg) => svg.innerHTML);
+  // The protocols are no longer rail entries; they are the routing category's
+  // own strip. The question is unchanged -- ten identical glyphs is a list you
+  // read by position rather than by sight -- so it is asked of the strip above
+  // the heading, which is the one navigation a page carries and where the icons
+  // now live.
+  const marks = await page.evaluate(`(async () => {
+    view = "routing"; panel = null; await refresh();
+    await new Promise((r) => setTimeout(r, 300));
+    return [...document.querySelectorAll("#sectionstrip .secitem svg")]
+      .map((s) => s.innerHTML);
   })()`);
-  check(marks.length >= 10, `the routing group is short: ${marks.length} entries`);
-  // Ten identical glyphs is a list you read by position rather than by sight.
+  check(marks.length >= 10, `the routing strip is short: ${marks.length} entries`);
   check(new Set(marks).size >= 7,
     `only ${new Set(marks).size} distinct marks across ${marks.length} routing entries`);
 });
@@ -553,7 +785,14 @@ await test("an AS number is answered by the appliance, not by the browser", asyn
     const input = field.querySelector("input");
     input.value = "65001";
     input.dispatchEvent(new Event("change"));
-    await wait();
+    // The hint arrives when the appliance answers, so wait for the answer
+    // rather than for a fixed moment: a loaded box is slower than a quiet one,
+    // and a sleep long enough for both is a sleep everyone pays for.
+    for (let i = 0; i < 40; i++) {
+      const t = field.querySelector(".hint").textContent;
+      if (t) return t;
+      await wait(250);
+    }
     return field.querySelector(".hint").textContent;
   })()`);
   check(/private/i.test(hint), `AS 65001 is not explained: ${JSON.stringify(hint)}`);
@@ -809,6 +1048,229 @@ await test("a setting with a fixed vocabulary is chosen, not typed", async () =>
   }
 });
 
+// --- a form that asks rather than dictates ----------------------------------
+
+// The complaint this answers is "far too many fields where you have to type
+// something". Every one of these was a box: a weekday list typed as `mon,tue`,
+// a time typed as `09:00`, a port typed from memory, a rate with no unit on it.
+await test("a firewall rule is asked for in groups, not as twenty boxes", async () => {
+  const shape = await page.evaluate(`(async () => {
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms || 400));
+    view = "rules"; panel = null; await refresh(); await wait(600);
+    const t = document.getElementById("togglerule");
+    if (!/cancel/i.test(t.textContent)) t.click();
+    await wait(400);
+    const box = document.getElementById("addrulepanel");
+    const field = (label) => [...box.querySelectorAll(".field")]
+      .find((f) => f.querySelector("span").firstChild.textContent.trim() === label);
+    // The protocol decides what a rule even has, and the schedule and the rate
+    // only exist on a rule that has one.
+    const proto = field("Protocol").querySelector("select");
+    proto.value = "tcp"; proto.dispatchEvent(new Event("change"));
+    await wait(300);
+    const kind = (label) => {
+      const f = field(label);
+      if (!f) return "missing";
+      if (f.querySelector(".pick")) return "ticks:" + f.querySelectorAll(".pickone").length;
+      if (f.querySelector(".combo")) return "offers:" + f.querySelectorAll(".choice").length;
+      if (f.querySelector(".num")) return "unit:" + f.querySelector(".unit").textContent;
+      const i = f.querySelector("input");
+      return i ? i.type || "text" : (f.querySelector("select") ? "select" : "?");
+    };
+    return {
+      groups: [...box.querySelectorAll("h4.fieldgroup")].map((h) => h.textContent.trim()),
+      days: kind("Open on days"), opens: kind("Opens at"), closes: kind("Closes at"),
+      port: kind("Port"), source: kind("Source"), destination: kind("Destination"),
+      limit: kind("New flows"), burst: kind("Burst"),
+    };
+  })()`);
+  check(shape.groups.length >= 4,
+    `the rule mask has no headings: ${JSON.stringify(shape.groups)}`);
+  equal(shape.days, "ticks:7", "the open days are still typed");
+  equal(shape.opens, "time", "the opening time is still typed");
+  equal(shape.closes, "time", "the closing time is still typed");
+  equal(shape.limit, "unit:packets/s", "the rate limit does not say what it counts");
+  equal(shape.burst, "unit:packets", "the burst does not say what it counts");
+  // Offered, not imposed: a port may legitimately be `8000-8100`, so the box
+  // still takes anything and the well-known services hang off it.
+  check(shape.port.startsWith("offers:"), `the port offers nothing: ${shape.port}`);
+  check(shape.source.startsWith("offers:"), `the source offers nothing: ${shape.source}`);
+  check(shape.destination.startsWith("offers:"),
+    `the destination offers nothing: ${shape.destination}`);
+});
+
+// A schedule is three leaves of one thing, and the CLI has no way to remove one
+// of them: `delete … schedule days` is answered with "unknown delete path", and
+// a refusal takes every command staged beside it. The console used to write it.
+await test("emptying a rule's schedule removes the window the appliance has", async () => {
+  const r = await page.evaluate(`(async () => {
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms || 400));
+    staged = []; dirty.clear(); renderStaged();
+    // A rule with a real schedule on it, so there is something to empty.
+    await configure(["set firewall rule sched-probe from wan",
+                     "set firewall rule sched-probe action accept",
+                     "set firewall rule sched-probe proto tcp",
+                     "set firewall rule sched-probe port 443",
+                     "set firewall rule sched-probe schedule days mon,tue",
+                     // Unpadded on purpose: the appliance's own parser takes
+                     // 9:00 as readily as 09:00, and a control that will not
+                     // hold what the CLI wrote would show an empty box for a
+                     // window that exists.
+                     "set firewall rule sched-probe schedule start 9:00",
+                     "set firewall rule sched-probe schedule end 17:5",
+                     // Saved as well as committed, which is what Apply does:
+                     // show configuration reads the file, so a commit that was
+                     // not saved is a rule the console cannot see.
+                     "commit", "save"]);
+    view = "rules"; panel = null; await refresh(); await wait(700);
+    const rule = parseRules(lastLeaves).find((x) => x.name === "sched-probe");
+    if (!rule) return { error: "the probe rule did not come back" };
+    openEditor(rule, zoneNames(lastLeaves));
+    await wait(400);
+    const field = (label) => [...document.getElementById("editorfields").querySelectorAll(".field")]
+      .find((f) => f.querySelector("span").firstChild.textContent.trim() === label);
+    const held = [field("Opens at").querySelector("input").value,
+                  field("Closes at").querySelector("input").value];
+    // Untick every day, which is how an operator says "this is not on a
+    // schedule any more".
+    for (const box of field("Open on days").querySelectorAll("input[type=checkbox]")) {
+      box.checked = false;
+    }
+    field("Opens at").querySelector("input").value = "";
+    field("Closes at").querySelector("input").value = "";
+    const lines = script();
+    document.getElementById("editor").close();
+    const reply = await configure(
+      [...lines, "delete firewall rule sched-probe", "commit", "save"]);
+    staged = []; dirty.clear(); renderStaged();
+    return { lines, held, output: reply.output };
+  })()`);
+  check(!r.error, r.error || "");
+  equal(r.held, ["09:00", "17:05"],
+    "a window the CLI wrote unpadded is not shown, and would be deleted on the next Stage");
+  check(r.lines.includes("delete firewall rule sched-probe schedule"),
+    `the schedule is not removed as one thing: ${JSON.stringify(r.lines)}`);
+  check(!r.lines.some((l) => /schedule (days|start|end)$/.test(l)),
+    `a delete of a leaf the appliance cannot remove: ${JSON.stringify(r.lines)}`);
+  check(!/unknown delete path/.test(r.output || ""),
+    `the appliance refused what the console wrote:\n  ${r.lines.join("\\n  ")}\n  ${r.output}`);
+});
+
+// Four hundred timezones is not a dropdown and is not a memory test either.
+// The answers come from the appliance, because the *validator* reads them off
+// that filesystem too — a table compiled in here would drift out of step with
+// the box's own idea of which zones exist.
+await test("a closed set the appliance knows is offered rather than typed", async () => {
+  const r = await page.evaluate(`(async () => {
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms || 400));
+    view = "system"; panel = null; await refresh(); await wait(600);
+    const field = (label) => [...document.querySelectorAll("#view-system .field")]
+      .find((f) => f.querySelector("span").firstChild.textContent.trim() === label);
+    // The lists arrive asynchronously; a picker that has not been filled yet is
+    // the plain box it degrades to, which is not what this is checking.
+    for (let i = 0; i < 30; i++) {
+      const list = field("Time zone").querySelector("input").getAttribute("list");
+      if (list && document.getElementById(list) && document.getElementById(list).children.length) break;
+      await wait(150);
+    }
+    const offered = (label) => {
+      const input = field(label).querySelector("input");
+      const id = input && input.getAttribute("list");
+      const list = id && document.getElementById(id);
+      return list ? [...list.children].map((o) => o.value) : [];
+    };
+    const speed = field("Console speed").querySelector("select");
+    return {
+      zones: offered("Time zone"),
+      keymaps: offered("Console keyboard").length,
+      locales: offered("Locale").length,
+      speeds: speed ? [...speed.options].map((o) => o.value).filter(Boolean) : null,
+    };
+  })()`);
+  // What is asserted is the contract, not the contents: the console offers what
+  // THIS machine has. The zone list is read from `/usr/share/zoneinfo`, the
+  // keymaps from the keymap directories, the locales from `locale -a` — the
+  // same places the commit-time validator reads, so the console can never offer
+  // a zone the appliance would refuse, nor refuse to offer one it would take.
+  //
+  // A build sandbox has none of those, and there the honest answer is a plain
+  // box you type into — which is what this used to fail on. So each half is
+  // checked against what the appliance actually answered.
+  const has = (n) => n > 0;
+  if (has(r.zones.length)) {
+    check(r.zones.length > 100, `only ${r.zones.length} timezones offered`);
+    check(r.zones.includes("UTC"), "UTC is not among the zones offered");
+  }
+  if (has(r.keymaps)) check(r.keymaps > 10, `only ${r.keymaps} keymaps offered`);
+  // …and the whole test cannot pass vacuously: the console speed is a set this
+  // binary carries, so it is offered on every machine there is.
+  // Five rates and nothing else: a serial console is the one of the four that
+  // is short enough to be a dropdown outright.
+  equal(r.speeds, ["9600", "19200", "38400", "57600", "115200"],
+    "the console speed is not the closed set it is");
+});
+
+// Sixteen dropdowns down a page, half of them labelled the same as the other
+// half, is one question asked about nine things — which is a table.
+await test("the route filters read as the table they are", async () => {
+  const r = await page.evaluate(`(async () => {
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms || 400));
+    staged = []; dirty.clear(); renderStaged();
+    view = "routing"; tabs.routing = "filters"; panel = null; await refresh(); await wait(700);
+    const box = document.getElementById("redistfilters");
+    const table = box.querySelector("table.mtx");
+    if (!table) return { error: "no table" };
+    // Still writable: the arrangement changed, not what the mask can do.
+    const cell = [...table.querySelectorAll("select")][0];
+    const option = [...cell.options].find((o) => o.value);
+    if (option) { cell.value = option.value; cell.dispatchEvent(new Event("change")); }
+    await wait(200);
+    [...box.querySelectorAll("button")].find((b) => b.textContent.startsWith("Stage")).click();
+    await wait(300);
+    const cmds = stagedCommands();
+    const reply = cmds.length ? await configure(cmds) : { output: "" };
+    staged = []; dirty.clear(); renderStaged();
+    return {
+      cols: [...table.querySelectorAll("thead th")].map((h) => h.textContent.trim()),
+      rows: [...table.querySelectorAll("tbody tr")].map((tr) => tr.querySelector("th").textContent.trim()),
+      cmds, output: reply.output,
+    };
+  })()`);
+  check(!r.error, r.error || "");
+  equal(r.cols, ["Route source", "Coming in", "Going back out"],
+    "the table does not say which way each column goes");
+  check(r.rows.length === 9, `${r.rows.length} route sources, expected nine`);
+  check(r.cmds.length > 0, "the table stages nothing — it is a picture of a mask");
+  check(!/unknown set path/.test(r.output || ""),
+    `the table writes a path the appliance does not have: ${r.cmds.join("; ")}`);
+});
+
+// One object, one shape. The editor used to take the mask apart and re-lay the
+// fields in a grid of its own, so creating a rule was a four-column form and
+// editing the same rule was twenty rows in a single column.
+await test("a rule is the same form whether it is being made or changed", async () => {
+  const r = await page.evaluate(`(async () => {
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms || 400));
+    view = "rules"; panel = null; await refresh(); await wait(600);
+    const t = document.getElementById("togglerule");
+    if (!/cancel/i.test(t.textContent)) t.click();
+    await wait(300);
+    const panelGroups = [...document.querySelectorAll("#addrulepanel h4.fieldgroup")]
+      .map((h) => h.textContent.trim());
+    const rule = parseRules(lastLeaves)[0];
+    openEditor(rule, zoneNames(lastLeaves));
+    await wait(400);
+    const fields = document.getElementById("editorfields");
+    const dialogGroups = [...fields.querySelectorAll("h4.fieldgroup")].map((h) => h.textContent.trim());
+    const grid = fields.querySelector(".mask > .grid");
+    const columns = grid ? getComputedStyle(grid).gridTemplateColumns.split(" ").length : 0;
+    document.getElementById("editor").close();
+    return { panelGroups, dialogGroups, columns };
+  })()`);
+  equal(r.dialogGroups, r.panelGroups, "the two forms for one rule are grouped differently");
+  check(r.columns > 1, `the editor lays the mask out in ${r.columns} column`);
+});
+
 await test("validating leaves the change staged and applyable", async () => {
   // Validate used to clear the panel: the check said "fine" and then the change
   // could no longer be applied.
@@ -819,7 +1281,7 @@ await test("validating leaves the change staged and applyable", async () => {
     [...document.querySelectorAll("#igp-ospf .field")]
       .find((l) => l.querySelector("span").firstChild.textContent.trim() === "Cost")
       .querySelector("input").value = "55";
-    [...document.querySelectorAll("#igp-ospf button")].find((b) => b.textContent === "Stage").click();
+    [...document.querySelectorAll("#igp-ospf button")].find((b) => b.textContent.startsWith("Stage")).click();
     await wait(400);
     const before = stagedCommands();
     document.getElementById("validate").click();
@@ -830,6 +1292,164 @@ await test("validating leaves the change staged and applyable", async () => {
   })()`);
   equal(after.still, after.before, "validating threw the staged change away");
   check(/would|accept/i.test(after.title), `the dialog claims it applied: ${after.title}`);
+});
+
+// Every control, in every section, actually operated.
+//
+// The section walk proves each page *renders*. This proves the things on it
+// *work*: a dropdown, a posture checkbox, a switch. Each writes into the staged
+// list, so what a control wants to write can be read off the console's own
+// state and handed to the appliance — a control that stages a command the CLI
+// refuses is a button that looks like it did something and did not, which is
+// the failure this whole suite exists to catch.
+//
+// Second to last on purpose: it visits every section and clears the staged list
+// as it goes, so it reloads the page when it is done rather than handing the
+// next test a console it has been rummaging through.
+await test("every control stages a command the appliance accepts", async () => {
+  // One call per page, not one call for the whole console.
+  //
+  // Opening a page makes the appliance answer every live-state pane on it, and
+  // each of those costs it a process spawn. A single evaluate over all of them
+  // fits on a workstation and does not in a build sandbox, where it runs into
+  // the call timeout and reports as "the page stopped answering" — a console
+  // that hangs, which is not what happened.
+  const cats = await page.evaluate(
+    `[...document.querySelectorAll("aside button.navitem")].length`);
+  const staged = [];
+  for (let c = 0; c < cats; c++) {
+    const pages = await page.evaluate(`(async () => {
+      [...document.querySelectorAll("aside button.navitem")][${c}].click();
+      await new Promise((r) => setTimeout(r, 200));
+      return document.querySelectorAll("#sectionstrip .secitem").length || 1;
+    })()`);
+    for (let p = 0; p < pages; p++) {
+      const out = await page.evaluate(`(async () => {
+        const wait = (ms) => new Promise((r) => setTimeout(r, ms || 40));
+        const out = [];
+        const drain = () => {
+          for (const e of staged) for (const c of e.cmds || []) out.push(String(c));
+          staged = []; dirty.clear(); renderStaged();
+        };
+        const strip = document.querySelectorAll("#sectionstrip .secitem");
+        if (strip[${p}]) { strip[${p}].click(); await wait(200); }
+        for (const sel of [...document.querySelectorAll("select")]) {
+          for (const opt of [...sel.options]) {
+            if (!opt.value) continue;
+            sel.value = opt.value;
+            sel.dispatchEvent(new Event("change", { bubbles: true }));
+            await wait(25);
+            drain();
+          }
+        }
+        for (const box of [...document.querySelectorAll("input[type=checkbox]")]) {
+          box.checked = !box.checked;
+          box.dispatchEvent(new Event("change", { bubbles: true }));
+          await wait(25);
+          drain();
+        }
+        return out;
+      })()`).catch(() => []);
+      staged.push(...out);
+    }
+  }
+
+  check(staged.length > 10, `only ${staged.length} controls did anything at all`);
+
+  // Through the same endpoint the console's own Apply uses, and in the same
+  // shape: the CLI, one command per line. No `commit`, so every line is parsed
+  // and validated and the session is then thrown away.
+  const body = staged.join("\n") + "\n";
+  const verdict = await page.evaluate(`(async () => {
+    const r = await fetch("/api/v1/configure", {
+      method: "POST",
+      headers: { "Content-Type": "text/plain", Authorization: "Bearer " + token },
+      body: ${JSON.stringify(body)},
+    });
+    return await r.text();
+  })()`);
+  // A line that needs company — a rule's port wants a proto — is the model
+  // doing its job, not a broken control: this operates each control on its own,
+  // which no operator does.
+  const refused = (verdict.match(/error: [^\n"]+/g) || []).filter(
+    (e) => !/together|require|need|must be|is required|not a declared|no such|not supported/i.test(e));
+  check(refused.length === 0,
+    `${refused.length} staged commands were refused:\n  ` + refused.slice(0, 8).join("\n  "));
+
+  // Leave the console as we found it.
+  await page.goto(URL);
+  await signIn(page, TOKEN);
+});
+
+// How much of the appliance the console can actually configure.
+//
+// This exists because the number was being guessed. An earlier pass put it at
+// 62% using an instrument that only saw the generic field tables — the global
+// firewall posture read as missing while sitting one click away — and a figure
+// that under-counts is worse than none: it invents gaps and hides real ones.
+//
+// So both halves are now measured rather than asserted. The CLI half is
+// `cli-fields.txt`, written by the grammar walk from the same completion tables
+// Tab and `?` read (see `the_cli_field_inventory_is_current`). The console half
+// is the console reporting on itself: its three mask builders and `stage` are
+// wrapped, then every category, page, tab and control is opened and operated.
+//
+// Both halves also have to count the same things, and getting that wrong is
+// what the number mostly measured to begin with. Counting a position's *values*
+// as fields — `accept`, `drop`, `tcp`, `802.1ad` — read 46%. Reading a mask's
+// key whole instead of by its last word — `pppoe username` against the CLI's
+// `username` — read 74%. Measuring a console that had been left blind, because
+// the walk stubbed the configuration along with the live panes, read 97%.
+//
+// Seeing straight, it is all of it: every settable path in the grammar has a
+// field, a picker or a button in the console.
+//
+// So the floor is the whole thing. A setting the CLI grows and the console does
+// not is a defect, not a backlog item — and it cannot land quietly, because the
+// inventory beside this is golden and has to be regenerated in the same breath.
+await test("the console reaches most of what the CLI can configure", async () => {
+  // Its own pass, last, on a page of its own: the recording wrappers replace
+  // three of the console's functions, and an earlier attempt to install them
+  // once at the top and let every test feed the inventory broke the tests that
+  // create an account — a measurement that changes what it measures is not one.
+  await page.goto(URL);
+  await signIn(page, TOKEN);
+  await instrument(page);
+  await walkAll(page);
+  const { seen } = await collect(page);
+  const reached = sectionFields(seen);
+
+  const wanted = readFileSync(HERE + "cli-fields.txt", "utf8")
+    .split("\n").map((l) => l.trim()).filter(Boolean);
+  check(wanted.length > 400, `the CLI inventory has only ${wanted.length} entries`);
+
+  const bySection = new Map();
+  for (const pair of wanted) {
+    const section = pair.split(" ")[0];
+    const s = bySection.get(section) || { have: 0, want: 0, missing: [] };
+    s.want++;
+    if (reached.has(pair)) s.have++;
+    else s.missing.push(pair.split(" ")[1]);
+    bySection.set(section, s);
+  }
+  const have = [...bySection.values()].reduce((a, s) => a + s.have, 0);
+  const pct = Math.round((have / wanted.length) * 100);
+
+  // Printed always, so the number is a fact in the log rather than something
+  // to be re-derived by hand later.
+  console.log(`  console covers ${have}/${wanted.length} CLI fields (${pct}%)`);
+  for (const [section, s] of [...bySection].sort((a, b) => a[1].have / a[1].want - b[1].have / b[1].want)) {
+    const miss = s.missing.slice(0, 6).join(", ");
+    console.log(`    ${String(section).padEnd(14)} ${String(s.have).padStart(3)}/${String(s.want).padEnd(3)}` +
+      (s.missing.length ? `  missing: ${miss}${s.missing.length > 6 ? ", …" : ""}` : ""));
+  }
+
+  const short = [...bySection]
+    .filter(([, s]) => s.missing.length)
+    .map(([section, s]) => `${section}: ${s.missing.join(", ")}`);
+  check(short.length === 0,
+    `the console has no way to set ${wanted.length - have} of the CLI's settings:\n  `
+    + short.join("\n  "));
 });
 
 await test("nothing threw during the whole run", () => noThrows("the console threw"));

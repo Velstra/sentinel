@@ -638,23 +638,16 @@ pub struct Services {
 
 impl Services {
     /// True when no service is configured — lets `[services]` be omitted.
+    ///
+    /// Asked of the serializer rather than of a hand-kept list of sub-blocks.
+    /// The list version had fallen behind: `flow-export` was missing from it,
+    /// so an appliance whose only service was IPFIX export accepted the
+    /// setting, showed it, ran with it — and wrote a saved configuration
+    /// without it, losing the collector at the next boot. Anything that
+    /// serializes to nothing is empty, by construction, for every sub-block
+    /// added from here on.
     pub fn is_empty(&self) -> bool {
-        self.dns.is_empty()
-            && self.ntp.is_empty()
-            && self.lldp.is_empty()
-            && self.snmp.is_empty()
-            && self.ssh.is_empty()
-            && self.web.is_empty()
-            && self.mdns.is_empty()
-            && self.dyndns.is_empty()
-            && self.dhcp_relay.is_empty()
-            && self.reverse_proxy.is_empty()
-            && self.syslog.is_empty()
-            && self.alerts.is_empty()
-            && self.ids.is_empty()
-            && self.broadcast_relay.is_empty()
-            && self.portal.is_empty()
-            && self.port_mapping.is_empty()
+        toml::to_string(self).is_ok_and(|s| s.trim().is_empty())
     }
 }
 
@@ -1694,17 +1687,12 @@ pub struct Evpn {
 }
 
 impl Evpn {
+    /// Asked of the serializer, for the reason spelled out at
+    /// [`Services::is_empty`]: a hand-kept list of fields falls behind the
+    /// struct, and what it forgets disappears from the saved configuration
+    /// without anything looking wrong.
     pub fn is_empty(&self) -> bool {
-        self.vtep_ip.is_none()
-            && self.underlay_interface.is_none()
-            && self.encapsulation.is_none()
-            && self.udp_port.is_none()
-            && self.mtu.is_none()
-            && self.srv6_locator.is_none()
-            && self.srv6_source.is_none()
-            && self.srv6_peers.is_empty()
-            && self.instances.is_empty()
-            && self.ip_vrfs.is_empty()
+        toml::to_string(self).is_ok_and(|s| s.trim().is_empty())
     }
 }
 
@@ -3259,8 +3247,15 @@ impl Nat64 {
 pub struct MultiWan {
     /// `failover` (one active uplink, the rest standby — the lowest `priority`
     /// number wins) or `load-balance` (spread flows across every healthy uplink
-    /// by `weight`). Defaults to `failover`; skipped on output when default.
-    #[serde(default, skip_serializing_if = "WanMode::is_default")]
+    /// by `weight`). Defaults to `failover`.
+    ///
+    /// Written out even when it *is* the default. Skipping it there meant
+    /// `set multiwan mode failover` was displayed by the candidate and then
+    /// dropped by the save, so the configuration a session showed and the
+    /// configuration the box kept disagreed for as long as the session lasted.
+    /// The whole `[multiwan]` table is still omitted when nothing is set
+    /// (see [`MultiWan::is_empty`]).
+    #[serde(default)]
     pub mode: WanMode,
     /// The WAN uplinks, in configuration order.
     #[serde(default, rename = "uplink", skip_serializing_if = "Vec::is_empty")]
@@ -10611,6 +10606,27 @@ impl Appliance {
     /// A human-readable summary for `config show`.
     pub fn summary(&self) -> String {
         let mut out = format!("hostname: {}\n", self.system.hostname);
+        // What happens to a packet no rule mentions is the single most important
+        // fact about a firewall, and this summary did not carry it: an operator
+        // read the rule list and had to open `show firewall zones`, or the
+        // configuration, to find out whether the box was dropping or accepting
+        // everything else.
+        out.push_str(&format!(
+            "default:    {}   stateful {}   block-icmp {}   log {}{}\n",
+            match self.firewall.default_action {
+                Action::Accept => "accept",
+                Action::Drop => "drop",
+                Action::Reject => "reject",
+            },
+            self.firewall.stateful,
+            self.firewall.block_icmp,
+            self.firewall.log,
+            if self.firewall.fail_closed {
+                "   fail-closed true"
+            } else {
+                ""
+            },
+        ));
         out.push_str(&format!("interfaces ({}):\n", self.interfaces.len()));
         for i in &self.interfaces {
             out.push_str(&format!(
@@ -11478,7 +11494,7 @@ fn validate_filter_action(a: &str) -> Result<()> {
 
 /// A community tag is a well-known name or an `asn:value`-shaped token (this is
 /// a shape check; the Wren daemon does the definitive parse).
-fn validate_community(c: &str) -> Result<()> {
+pub(crate) fn validate_community(c: &str) -> Result<()> {
     const WELL_KNOWN: &[&str] = &["no-export", "no-advertise", "no-export-subconfed"];
     if WELL_KNOWN.contains(&c) {
         return Ok(());

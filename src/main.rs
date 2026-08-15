@@ -2440,6 +2440,14 @@ fn show_ids() -> Result<()> {
         if running { "running" } else { "NOT running" }
     );
     println!("watching: {}", ids.interfaces.join(", "));
+    // Where the detector sits, said once, here. The firewall runs in XDP and an
+    // allowed packet ends on XDP_PASS, so AF_PACKET taps exactly what was
+    // admitted — a rule written for a port the firewall drops can never fire,
+    // and an operator waiting for that alert has no way to tell it apart from a
+    // rule that does not match.
+    println!(
+        "sees:     traffic the firewall admitted (a dropped packet never reaches the detector)"
+    );
     println!("home-net: {}", ids.home_net().join(", "));
     println!("rules from the configuration: {}", ids.rules.len());
     for path in &ids.rulesets {
