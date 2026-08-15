@@ -214,7 +214,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-N3D0MtzdmL/l/wmxrdFaPE6y+s7AzAgfLxwrO5EE6rA=";
+      ebpfHash = "sha256-zSKvKvHRf68TgAHddE4qHxFXF+Ok0fkQc7ZqlWfvUGs=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -2300,6 +2300,15 @@
           # restart). shutdown()+start() reuses the same disk images, so the root
           # comes up fresh (wiped /run) while the /var/lib/sentinel partition — and
           # the saved config on it — persists, exactly as on a real power cycle.
+          # The identity an operator's known_hosts pins. `/` is a tmpfs on the
+          # shipped image, so a host key kept at the default /etc/ssh location is
+          # regenerated at every boot -- a live box booted at 15:57 and minted a
+          # fresh key at 15:57:36. Every reboot then greets every operator with
+          # REMOTE HOST IDENTIFICATION HAS CHANGED, and an operator taught to
+          # clear that warning will clear it for a real impersonation too.
+          before = machine.succeed(
+              "ssh-keygen -lf /var/lib/sentinel/ssh/ssh_host_ed25519_key.pub").split()[1]
+
           machine.shutdown()
           machine.start()
 
@@ -2307,6 +2316,12 @@
           machine.wait_for_unit("sentinel-boot.service")
           machine.wait_for_unit("velstra.service")
           machine.wait_for_unit("wren.service")
+
+          after = machine.succeed(
+              "ssh-keygen -lf /var/lib/sentinel/ssh/ssh_host_ed25519_key.pub").split()[1]
+          assert before == after, f"ssh host key changed across a reboot: {before} -> {after}"
+          # And it is the key sshd actually offers, not merely a file lying around.
+          machine.succeed("sshd -T | grep -q '^hostkey /var/lib/sentinel/ssh/ssh_host_ed25519_key$'")
 
           # The saved config survived on the persistent partition, unchanged.
           machine.succeed("grep -q 'hostname = \"fw-reboot\"' /var/lib/sentinel/appliance.toml")
@@ -2997,17 +3012,58 @@
 
           # (2) Traffic flows across the protected subnets: a ping sourced from
           # behind `left` reaches the address behind `right`, through the tunnel.
-          left.wait_until_succeeds(
-              "ping -c1 -W2 -I 10.100.1.1 10.100.2.1", timeout=90
-          )
-          right.wait_until_succeeds(
-              "ping -c1 -W2 -I 10.100.2.1 10.100.1.1", timeout=90
-          )
+          #
+          # A packet that never left and a packet that was dropped look identical
+          # from here, and they have opposite causes: the route decides whether
+          # the packet is offered to the XFRM policy at all. So the failure says
+          # which, rather than only that ninety seconds passed.
+          def through_tunnel(node, src, dst):
+              try:
+                  node.wait_until_succeeds(f"ping -c1 -W2 -I {src} {dst}", timeout=60)
+              except Exception:
+                  raise Exception(
+                      f"{src} -> {dst} never crossed the tunnel\n"
+                      + "--- ping ---\n" + node.execute(f"ping -c1 -W2 -I {src} {dst}")[1]
+                      + "\n--- route lookup ---\n"
+                      + node.execute(f"ip route get {dst} from {src}")[1]
+                      + "\n--- routes, every table ---\n"
+                      + node.execute("ip route show table all")[1]
+                      + "\n--- xfrm policy ---\n" + node.execute("ip xfrm policy")[1]
+                      + "\n--- xfrm state ---\n" + node.execute("ip xfrm state")[1]
+                      + "\n--- swanctl --list-sas ---\n"
+                      + node.execute("swanctl --list-sas")[1]
+                  )
+
+          through_tunnel(left, "10.100.1.1", "10.100.2.1")
+          through_tunnel(right, "10.100.2.1", "10.100.1.1")
+
+          # (3) The route that made (2) possible, and its source address.
+          #
+          # charon is told not to install routes (Sentinel owns the routing
+          # table), so Sentinel installs them — and it sources them from inside
+          # the protected subnet on purpose: sourced from the WAN instead, a
+          # locally-generated packet would miss its own out policy and leave the
+          # box UNENCRYPTED. That is why the source is asserted and not just the
+          # destination.
+          route = left.succeed("ip route show 10.100.2.0/24")
+          assert "via 10.0.0.2" in route, route
+          assert "src 10.100.1.1" in route, route
+          # And a locally-generated packet — no `-I` — really does take it.
+          left.succeed("ping -c1 -W2 10.100.2.1")
 
           # `sentinel show vpn ipsec` (operational mode) proxies to
           # swanctl --list-sas.
           out = left.succeed("su admin -c 'sentinel show vpn ipsec'")
           assert "ESTABLISHED" in out, out
+
+          # (4) Removing the tunnel removes its route. A route to the far subnet
+          # that outlives the policy sends that traffic to the peer's WAN
+          # address in the clear, which is worse than not reaching it at all.
+          left.succeed(
+              "su admin -c \"printf '%s\\n' 'delete vpn ipsec site' "
+              "commit save exit | sentinel configure\""
+          )
+          left.wait_until_fails("ip route show 10.100.2.0/24 | grep -q via", timeout=30)
         '';
       };
 
@@ -3703,8 +3759,20 @@
                   + " commit save exit | sentinel configure\" 2>&1"
               )
 
+          def refuse(*lines):
+              # A refused commit exits non-zero (it has since the day a script
+              # judging by exit status was told a change had been made that had
+              # not), so a test whose *point* is the refusal cannot use succeed.
+              cmds = " ".join(f"'{l}'" for l in lines)
+              status, out = fw.execute(
+                  "su admin -c \"printf '%s\\n' " + cmds
+                  + " commit save exit | sentinel configure\" 2>&1"
+              )
+              assert status != 0, f"the commit was expected to be refused:\\n{out}"
+              return out
+
           with subtest("an unknown country is refused, not silently empty"):
-              out = apply(
+              out = refuse(
                   "set interface eth1 zone wan",
                   "set firewall zone wan default-action accept",
                   "set firewall global geoip-block QQ",
@@ -3822,6 +3890,18 @@
                   + " commit save exit | sentinel configure\" 2>&1"
               )
 
+          def refuse(*lines):
+              # A refused commit exits non-zero (it has since the day a script
+              # judging by exit status was told a change had been made that had
+              # not), so a test whose *point* is the refusal cannot use succeed.
+              cmds = " ".join(f"'{l}'" for l in lines)
+              status, out = fw.execute(
+                  "su admin -c \"printf '%s\\n' " + cmds
+                  + " commit save exit | sentinel configure\" 2>&1"
+              )
+              assert status != 0, f"the commit was expected to be refused:\\n{out}"
+              return out
+
           with subtest("a directory to talk to"):
               ca.succeed("mkdir -p /var/lib/pebble")
               ca.succeed(
@@ -3844,7 +3924,7 @@
               # Without accepting the terms there is no way to obtain anything;
               # lego would say so hours later, inside the renewal timer, where
               # nobody is watching.
-              out = apply(
+              out = refuse(
                   "set pki acme email admin@example.com",
                   "set pki acme directory-url https://ca:14000/dir",
                   "set pki certificate web ca acme",
@@ -3856,7 +3936,7 @@
               # An address cannot be certified over http-01 either. Stated in
               # full: the refusal above saved nothing, so there is no half-built
               # certificate left behind to build on.
-              out = apply(
+              out = refuse(
                   "set pki acme email admin@example.com",
                   "set pki acme agree-tos true",
                   "set pki certificate web ca acme",
@@ -4076,14 +4156,15 @@
               assert caught() == "", "something already carried the broadcast"
 
           with subtest("a relay needs two segments to have anything to do"):
-              # `sentinel configure` reports a refused commit in its output rather
-              # than in its exit status, so the refusal is what to assert on.
-              out = fw.succeed(
+              # A refused commit exits non-zero, so a test whose point is the
+              # refusal reads the status as well as the text.
+              rc, out = fw.execute(
                   "su admin -c \"printf '%s\\n' "
                   "'set services broadcast-relay wol port 9' "
                   "'set services broadcast-relay wol interface eth1' "
                   "commit exit | sentinel configure\" 2>&1"
               )
+              assert rc != 0, out
               assert "at least two" in out, out
               fw.fail("systemctl is-active sentinel-broadcast-relay.service")
 
@@ -4092,7 +4173,12 @@
                   "set services broadcast-relay wol port 9",
                   "set services broadcast-relay wol interface eth1",
                   "set services broadcast-relay wol interface eth2",
-                  "set services broadcast-relay wol description 'wake-on-lan across vlans'",
+                  # No inner quotes: `apply` wraps each line in single quotes for
+                  # the shell, so a line carrying its own would be split into
+                  # three printf arguments -- three lines -- and the CLI would
+                  # be handed `across` and `vlans` as commands. The description
+                  # setter joins the rest of the line anyway.
+                  "set services broadcast-relay wol description wake-on-lan across vlans",
               )
               fw.wait_for_unit("sentinel-broadcast-relay.service")
 
@@ -4312,7 +4398,11 @@
                   "'set firewall zone wan source-validation strict' "
                   "'set multiwan uplink eth1 priority 1' "
                   "'set multiwan uplink eth2 priority 2' "
-                  "commit exit | sentinel configure\" 2>&1"
+                  # `save` as well as `commit`: a session loads the *saved*
+                  # configuration, so uplinks that were only committed are
+                  # invisible to the next one — which is where the subtest below
+                  # went looking for them.
+                  "commit save exit | sentinel configure\" 2>&1"
               )
               assert "source-validation strict" in out, out
 
@@ -4369,7 +4459,10 @@
           # Output to a file rather than into `grep -q`: grep exits on the first
           # match and the writer takes SIGPIPE, which makes the assertion fail at
           # random depending on who ran first.
-          fw.succeed(
+          # And refused in the exit status, not only in the text: a script that
+          # is told "commit ok" for a commit that did not happen goes on to the
+          # next thing.
+          fw.fail(
               "su admin -c \"printf '%s\\n' "
               "'set services ids interface eth1' commit exit "
               "| sentinel configure\" > /tmp/norules.out 2>&1"
@@ -4802,11 +4895,15 @@
               mountHostNixStore = false;
               useEFIBoot = true;
               memorySize = 2048;
-              # Three blank targets: vdb (single), vdc + vdd (RAID1). ~5 GiB each
-              # (> the 4 GiB minimum, room for the ~1.3 GiB sealed store).
+              # Three blank targets: vdb (single), vdc + vdd (RAID1), each big
+              # enough for the whole cloned layout (two 2560M store slots +
+              # their verity trees + ESP ≈ 5.6G) — `sgdisk --replicate` writes
+              # the source table verbatim, so anything smaller cannot take it.
+              # Plus vde, deliberately too small, to prove that is refused.
               emptyDiskImages = [
-                5000
-                5000
+                8000
+                8000
+                8000
                 5000
               ];
               fileSystems = lib.mkVMOverride { };
@@ -4844,6 +4941,26 @@
                   # command starts the interactive wizard and waits for input.
                   listing = machine.succeed("sentinel install < /dev/null")
                   assert "/dev/vdb" in listing, listing
+
+              with subtest("a disk too small for the layout is refused, not erased"):
+                  # vde clears the hand-kept 4 GiB floor and still cannot hold
+                  # the source's partition table. The failure that matters is
+                  # not the refusal but *when* it happens: `sgdisk --replicate`
+                  # discovers the mismatch after `wipefs`, which is how this
+                  # once left a blank disk and no install.
+                  # sgdisk is not on the appliance PATH (the installer resolves
+                  # it out of its own closure), so the disk is read raw: the GPT
+                  # lives in the first 34 sectors.
+                  gpt = "dd if=/dev/vde bs=512 count=34 2>/dev/null | md5sum"
+                  before = machine.succeed(gpt)
+                  rc, out = machine.execute("sentinel install /dev/vde --commit 2>&1")
+                  assert rc != 0, out
+                  assert "needs" in out, out
+                  # Untouched: nothing was written, and the report never claimed
+                  # the disk had been left blank.
+                  assert "BLANK" not in out, out
+                  assert machine.succeed(gpt) == before, out
+                  assert machine.succeed("lsblk -nro NAME /dev/vde").split() == ["vde"]
 
               with subtest("single-disk install clones the sealed layout"):
                   machine.succeed("sentinel install /dev/vdb --commit")
@@ -5133,6 +5250,47 @@
                   machine.succeed("test -f /mnt/esp/EFI/Linux/sentinel-b+3.efi")
                   assert "sentinel-b" in machine.succeed("cat /mnt/esp/loader/loader.conf")
                   machine.succeed("umount /mnt/esp")
+
+              # A slot is not identified by where it sits but by its partition
+              # GUIDs: systemd looks for the pair the image's root hash produces.
+              # Cloning the bytes and leaving the reserved slot's own randomly
+              # assigned GUIDs gives a slot whose contents are right and which
+              # nothing can find -- the initrd then waits for a device that never
+              # appears. On the bench that took an updated appliance off the
+              # network for good: it HUNG rather than failing, so it never reset,
+              # so the boot counter never decremented and the rollback this test
+              # checks for never fired. Everything above still passed.
+              with subtest("slot B carries the identity of the image it holds"):
+                  # lsblk rather than sgdisk: the appliance reaches sgdisk by an
+                  # absolute store path, the test shell has no such PATH entry.
+                  guid = lambda n: machine.succeed(f"lsblk -nro PARTUUID {disk}{n}").strip().lower()
+                  assert guid(4) == guid(2), (
+                      f"slot B verity GUID {guid(4)} does not match the image's {guid(2)}")
+                  assert guid(5) == guid(3), (
+                      f"slot B store GUID {guid(5)} does not match the image's {guid(3)}")
+
+              # And the proof that costs a reboot: come up on the slot the update
+              # just made default. Every assertion above holds for an update that
+              # writes a slot nothing can boot -- which is why they all held.
+              with subtest("the appliance actually boots the slot it switched to"):
+                  machine.shutdown()
+                  machine.start()
+                  machine.wait_for_unit("multi-user.target")
+                  # What is asserted is that it came up and works, not which of
+                  # the two store partitions the kernel attached. This test
+                  # re-seals the *running* image, so both pairs hold the same
+                  # bytes and — now that slot B carries the image's identity —
+                  # the same GUIDs; which one systemd picks is then not a
+                  # meaningful question. A real update carries a different image,
+                  # whose hash gives it different GUIDs, and the subtest above is
+                  # what covers that.
+                  machine.succeed("sentinel show version")
+                  machine.wait_for_unit("velstra.service")
+                  # The attached store really is one of the two slots, verity
+                  # intact — a mismatched pair would have failed to open at all.
+                  backing = machine.succeed("lsblk -nsro NAME /dev/mapper/usr")
+                  assert f"{src}3" in backing or f"{src}5" in backing, (
+                      f"/usr is backed by neither slot: {backing.strip()!r}")
           '';
         };
 
@@ -5922,15 +6080,36 @@
             fw.succeed("grep -q '\[\[synproxy\]\]' /run/sentinel/velstra.toml")
             fw.succeed("grep -q 'mss = 1460' /run/sentinel/velstra.toml")
 
+            def challenged():
+                text = fw.succeed("sentinel show firewall statistics")
+                m = re.search(r"^\s*synproxy_challenged\s+(\d+)", text, re.M)
+                return int(m.group(1)) if m else 0
+
             # The headline: an ordinary client reaches the protected server, which
             # can only happen if the whole splice works — the cookie was minted and
             # checked, the SYN was passed on, the server's answer was consumed and
             # acknowledged, and every subsequent packet had its sequence numbers
             # corrected in both directions.
-            client.wait_until_succeeds(
-                "curl -s --max-time 10 http://10.2.0.2:443/ | grep -q hello-from-protected",
-                timeout=60,
-            )
+            #
+            # Kept up until a connection is demonstrably *challenged*, because the
+            # commit above only wrote the file: the agent re-reads it a moment
+            # later, and a connection made inside that window goes straight
+            # through and proves nothing. It reached the server either way, which
+            # is why waiting for the fetch to work is not enough — on a fast
+            # machine the very first attempt succeeded unproxied, and the counts
+            # below then came up one short of what two connections should give.
+            for _attempt in range(30):
+                base = challenged()
+                status, fetched = client.execute(
+                    "curl -s --max-time 10 http://10.2.0.2:443/ | grep -q hello-from-protected"
+                )
+                if status == 0 and challenged() > base:
+                    break
+                fw.sleep(2)
+            else:
+                raise AssertionError(
+                    "no connection both reached the server and was challenged by the proxy"
+                )
 
             # A bulk transfer, so the connection lives well past the handshake:
             # a translation that is right for the first packet and wrong later
@@ -5949,10 +6128,24 @@
                 timeout=60,
             )
             stats = fw.succeed("sentinel show firewall statistics")
+            # Reads whatever `stats` holds *now* — the assertions further down
+            # re-read it deliberately, and a counter that closed over one
+            # snapshot would compare that snapshot with itself.
             def counter(name):
                 m = re.search(rf"^\s*{name}\s+(\d+)", stats, re.M)
                 assert m, f"no {name} in:\n{stats}"
                 return int(m.group(1))
+
+            # The agent publishes these on a timer, so a single read can land on
+            # a snapshot taken between the two connections and show one of each.
+            # The counters only ever grow, so re-read until they have caught up
+            # rather than asserting on whichever dump happened to be current.
+            for _ in range(30):
+                if min(counter("synproxy_challenged"), counter("synproxy_admitted"),
+                       counter("synproxy_spliced")) >= 2:
+                    break
+                fw.sleep(2)
+                stats = fw.succeed("sentinel show firewall statistics")
 
             assert counter("synproxy_challenged") >= 2, stats
             assert counter("synproxy_admitted") >= 2, stats
@@ -6426,7 +6619,16 @@
                     "| sentinel configure\""
                 )
                 n.wait_for_unit("velstra.service")
-                n.succeed("journalctl -u velstra.service | grep -q 'conntrack-sync: listening'")
+                # The block reaching the agent's config is immediate and settles
+                # nothing about timing; the socket is bound a moment later, after
+                # the datapath has loaded. `wait_until_succeeds`, because the unit
+                # is active from the first instruction of the process and the
+                # backups were being asked a quarter of a second after that.
+                n.succeed("grep -q '\\[conntrack_sync\\]' /run/sentinel/velstra.toml")
+                n.wait_until_succeeds(
+                    "journalctl -u velstra.service | grep -q 'conntrack-sync: listening'",
+                    timeout=30,
+                )
 
             # The headline flow: the LAN client reaches the web server THROUGH the fw,
             # which masquerades it and records a conntrack entry for the NAT'd flow.
@@ -6650,7 +6852,17 @@
 
               # And the underlying NIC carries MACsec frames (EtherType 0x88e5), not
               # cleartext ICMP.
-              a.succeed("${pkgs.tcpdump}/bin/tcpdump -i eth1 -c 3 -w /tmp/cap 'ether proto 0x88e5' &")
+              # Backgrounded *and* detached from the test driver's pipe: the
+              # driver reads a command's output to end-of-file, so a background
+              # job that inherits stdout holds the call open until it exits —
+              # and this one is waiting for frames the next line has not sent
+              # yet. That deadlock ended the check at the hour mark with no
+              # assertion having failed.
+              a.succeed(
+                  "${pkgs.tcpdump}/bin/tcpdump -i eth1 -c 3 -w /tmp/cap "
+                  "'ether proto 0x88e5' >/dev/null 2>&1 &"
+              )
+              a.sleep(2)   # let it attach, or it misses the only traffic there is
               a.succeed("ping -c3 -W2 10.9.0.2")
               a.wait_until_succeeds(
                   "${pkgs.tcpdump}/bin/tcpdump -r /tmp/cap 2>/dev/null | grep -qi macsec", timeout=20
@@ -7078,6 +7290,158 @@
           '';
         };
 
+        # OSPFv2 against a THIRD-PARTY speaker, not against ourselves.
+        #
+        # Every other routing check peers wren with wren, so both ends share
+        # whatever assumption is wrong and the check is green regardless. This
+        # one was red for a long time, and behind the single symptom — an
+        # adjacency that never reached Full, or reached it and fell over a
+        # minute later — sat three unrelated faults, each invisible to a
+        # wren-to-wren test because both ends made the same mistake:
+        #
+        #   * an LSA's `length` and `ls_checksum` were left at zero in the
+        #     database (both are computed while encoding, which does not write
+        #     them back). A Database Description sends stored headers verbatim,
+        #     so FRR read a declared length of zero — `ospf_lsaseq_examin:
+        #     malformed LSA header #1` — and dropped the packet. Both ends sat
+        #     in Exchange until the dead interval.
+        #   * neighbours were keyed by Router ID everywhere, where RFC 2328 §10
+        #     identifies them by source address on a broadcast link. Every node
+        #     here carries the harness's 192.168.1.x address beside its own, so
+        #     FRR runs an OSPF interface per address and sends a Hello from
+        #     each; collapsed onto one entry, the one that lists no neighbours
+        #     read as 1-Way and knocked the adjacency back to Init.
+        #   * withdrawing a route deleted it from the kernel even when wren had
+        #     never installed it. When OSPF withdrew its view of the segment it
+        #     was speaking on, the delete took the interface's *connected* route
+        #     with it: the box lost the route to its own subnet, stopped hearing
+        #     the neighbour, and declared it dead — a minute after coming up.
+        #
+        # Hence the shape of this check: reaching Full is not enough, it has to
+        # still be Full a minute later, and a route has to cross it.
+        #   nix build .#checks.x86_64-linux.ospfinterop -L
+        ospfinterop = pkgs.testers.runNixOSTest {
+          name = "sentinel-ospfinterop";
+          nodes = {
+            peer =
+              { pkgs, ... }:
+              {
+                virtualisation.vlans = [ 1 ];
+                networking = {
+                  useNetworkd = true;
+                  useDHCP = false;
+                  firewall.enable = false;
+                  interfaces.eth1.ipv4.addresses = [
+                    {
+                      address = "10.7.0.2";
+                      prefixLength = 24;
+                    }
+                  ];
+                };
+                services.frr = {
+                  ospfd.enable = true;
+                  config = ''
+                    interface eth1
+                     ip ospf area 0.0.0.0
+                    !
+                    router ospf
+                     ospf router-id 10.7.0.2
+                     redistribute static
+                    !
+                    ip route 203.0.113.0/24 blackhole
+                  '';
+                };
+                environment.systemPackages = [ pkgs.frr ];
+              };
+            fw =
+              { lib, ... }:
+              {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce "fw";
+                networking.firewall.enable = lib.mkForce false;
+                networking.interfaces.eth1.ipv4.addresses = [
+                  {
+                    address = "10.7.0.1";
+                    prefixLength = 24;
+                  }
+                ];
+                virtualisation.vlans = [ 1 ];
+                virtualisation.memorySize = 2048;
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+          };
+          testScript = ''
+            start_all()
+            fw.wait_for_unit("multi-user.target")
+            fw.wait_for_unit("velstra.service")
+            fw.wait_for_unit("wren.service")
+            fw.wait_until_succeeds("ip addr show eth1 | grep -q 10.7.0.1", timeout=20)
+            peer.wait_for_unit("multi-user.target")
+            peer.wait_for_unit("frr.service")
+            peer.wait_until_succeeds("ip addr show eth1 | grep -q 10.7.0.2", timeout=20)
+
+            # The zone is left accepting: this asks about OSPF, not about which
+            # rule admits it (that is `checks.srcfilter`'s job, and on this image
+            # `proto ospf` is what a deny-by-default zone would need).
+            fw.succeed(
+                "su admin -c \"printf '%s\\n' "
+                "'set interface eth1 zone wan' "
+                "'set firewall zone wan default-action accept' "
+                "'set protocols router-id 10.7.0.1' "
+                "'set protocols ospf area 0.0.0.0' "
+                "'set protocols ospf interface eth1 area 0.0.0.0' "
+                "commit save exit "
+                "| sentinel configure\""
+            )
+            fw.wait_for_unit("wren.service")
+
+            # Before asking about the adjacency, prove both ends are actually
+            # speaking OSPF. A check that goes red because a config line did not
+            # land teaches the wrong lesson about the thing it names.
+            with subtest("both ends are configured and see each other"):
+                fw.succeed("grep -q '\\[ospf\\]' /run/sentinel/wren.toml")
+                fw.succeed("grep -q 'eth1' /run/sentinel/wren.toml")
+                peer.succeed("vtysh -c 'show ip ospf interface eth1' | grep -q 'Area 0.0.0.0'")
+                # A neighbour in ANY state proves the hellos cross. What comes
+                # after is the state machine's problem, not the wiring's.
+                fw.wait_until_succeeds("wren show ospf neighbors | grep -q 10.7.0.2", timeout=90)
+                peer.wait_until_succeeds(
+                    "vtysh -c 'show ip ospf neighbor' | grep -q 10.7.0.1", timeout=90)
+
+            with subtest("the adjacency reaches Full and stays there"):
+                # Generous, because OSPF's own timers are: hello 10s, dead 40s,
+                # and a DR election on a broadcast segment takes a wait interval.
+                fw.wait_until_succeeds(
+                    "wren show ospf neighbors | grep -q Full", timeout=120)
+                peer.wait_until_succeeds(
+                    "vtysh -c 'show ip ospf neighbor' | grep -q Full", timeout=120)
+                # Staying there is the point: the hardware symptom was a neighbour
+                # that reached Exchange, dropped to Init and started over. A
+                # single sample cannot tell that apart from a healthy adjacency.
+                peer.succeed("sleep 60")
+                fw.succeed("wren show ospf neighbors | grep -q Full")
+                peer.succeed("vtysh -c 'show ip ospf neighbor' | grep -q Full")
+
+            with subtest("and a route actually crosses it"):
+                fw.wait_until_succeeds(
+                    "ip route show proto ospf | grep -q 203.0.113.0/24", timeout=90)
+
+            with subtest("and it comes back after the appliance restarts"):
+                # The peer keeps running, so it still holds the LSAs this
+                # appliance originated before the restart — and hands them
+                # straight back when asked. Answering a request only on the
+                # branch that installs left those on the request list forever:
+                # the adjacency reached Loading and stopped there, and no route
+                # crossed it. Two fresh routers never show this, which is why
+                # every check above passed while a real box could not peer.
+                fw.succeed("systemctl restart wren")
+                fw.wait_until_succeeds(
+                    "wren show ospf neighbors | grep -q Full", timeout=120)
+                fw.wait_until_succeeds(
+                    "ip route show proto ospf | grep -q 203.0.113.0/24", timeout=90)
+          '';
+        };
+
         # Deny-by-default must not gag the box.
         #
         # A zone's `default-action` says what the box will accept. The egress hook
@@ -7166,9 +7530,14 @@
                 "| sentinel configure\""
             )
             fw.wait_for_unit("velstra.service")
-            # The rule really did attach the egress hook -- otherwise this check
-            # would pass without ever exercising the path that broke.
-            fw.wait_until_succeeds("tc qdisc show dev eth1 | grep -q clsact", timeout=20)
+            # The hook really *runs* -- otherwise this check would pass without
+            # ever exercising the path that broke. `tx_packets` is bumped by the
+            # egress program and by nothing else, so a non-zero count is proof;
+            # a `clsact` qdisc, which is what this used to look for, sits there
+            # empty on a box whose hook was never attached.
+            fw.wait_until_succeeds(
+                "sentinel show firewall statistics | awk '/tx_packets/{exit $2==0}'",
+                timeout=30)
 
             with subtest("the box still answers what it admits"):
                 # LibreSSL's nc -- what the appliance carries -- takes the listen
@@ -7184,13 +7553,33 @@
                 fw.wait_until_succeeds(
                     "curl -s --max-time 5 -o /dev/null http://10.1.0.2/", timeout=30)
 
-            with subtest("ICMP still needs a rule, and says so"):
-                # The egress hook records a flow for TCP and UDP only, so an echo
-                # reply arrives at ingress with nothing vouching for it. That is a
-                # real limit, not an oversight of this check: `ping` from the box
-                # under deny-by-default needs a rule of its own. Asserted so the
-                # day it changes, this says so out loud.
-                fw.fail("ping -c2 -W2 10.1.0.2")
+            with subtest("and can ping, which is what anyone tries first"):
+                # The egress hook records ICMP too, keyed the way the ingress hook
+                # keys it, so the echo reply is vouched for. It used not to, and a
+                # box that could not ping its own gateway under its own default
+                # posture sent everyone hunting for a network fault that was not
+                # there.
+                fw.succeed("ping -c2 -W2 10.1.0.2")
+
+            with subtest("a stateful deny-by-default zone brings the hook by itself"):
+                # Everything above rode a `direction out` rule, which attaches the
+                # hook as a side effect. Take it away and the box must still be
+                # able to hold up its end of a conversation it started — that is
+                # what `stateful` says, and on hardware it was not true: DNS, NTP,
+                # ACME, the update channel and config-sync all went out and were
+                # never answered.
+                fw.succeed(
+                    "su admin -c \"printf '%s\\n' "
+                    "'delete firewall rule leaving' "
+                    "commit save exit "
+                    "| sentinel configure\""
+                )
+                fw.wait_until_succeeds(
+                    "sentinel show firewall statistics | awk '/tx_packets/{exit $2==0}'",
+                    timeout=30)
+                fw.wait_until_succeeds(
+                    "curl -s --max-time 5 -o /dev/null http://10.1.0.2/", timeout=30)
+                fw.succeed("ping -c2 -W2 10.1.0.2")
           '';
         };
 
@@ -7472,13 +7861,24 @@
                 "| sentinel configure\""
             )
             fw.wait_for_unit("velstra.service")
+            # The datapath attaches about a second after the unit goes active,
+            # and the journal cannot say whether it has: a commit restarts the
+            # agent, so "attached to eth1" is already there from the instance
+            # before. Ask the link. Without this the *first* knock — and only
+            # the first — met a firewall that was not there yet.
+            fw.wait_until_succeeds("ip link show eth1 | grep -q xdp", timeout=30)
 
             def knock(port):
                 # A connect attempt is enough: the rule drops the SYN, and what
                 # we assert on is the datapath's own log line, not the client's
                 # error — which is identical whether the packet was dropped or
                 # merely refused.
-                client.execute(f"timeout 2 nc -6 -w 1 -z fd00:1::1 {port}")
+                #
+                # `-s`, because a rule scoped to a source is only tested if the
+                # packet really carries that source. The harness puts a second,
+                # global address on every node, and which of the two the client
+                # picks is the resolver's business, not this test's.
+                client.execute(f"timeout 2 nc -6 -s fd00:1::2 -w 1 -z fd00:1::1 {port}")
 
             def dropped(port):
                 return fw.execute(
@@ -7488,8 +7888,17 @@
             for p in (9990, 9991, 9992, 9993):
                 knock(p)
 
-            assert dropped(9990), "a v6 rule scoped to the client's source did not match"
-            assert dropped(9992), "a v6 rule scoped to the firewall's address did not match"
+            def why():
+                return (
+                    "\nclient source selection: "
+                    + client.execute("ip -6 route get fd00:1::1")[1]
+                    + "\nclient addresses:\n" + client.execute("ip -6 addr show eth1")[1]
+                    + "\nDROP6 lines the firewall logged:\n"
+                    + fw.execute("journalctl -u velstra.service | grep DROP6")[1]
+                )
+
+            assert dropped(9990), "a v6 rule scoped to the client's source did not match" + why()
+            assert dropped(9992), "a v6 rule scoped to the firewall's address did not match" + why()
             # The two that prove it matched on the ADDRESS and not on everything.
             assert not dropped(9991), "a v6 rule for a different source matched anyway"
             assert not dropped(9993), "a v6 rule for a different destination matched anyway"
@@ -7552,7 +7961,13 @@
                 virtualisation.vlans = [ 1 ];
                 virtualisation.memorySize = 2048;
                 services.velstra.interface = lib.mkForce "eth1";
-                environment.systemPackages = [ pkgs.netcat-openbsd ];
+                # `bpftool` only for the diagnosis below: a rule that does not
+                # fire is either absent from the trie or keyed differently, and
+                # nothing outside the map can tell those apart.
+                environment.systemPackages = [
+                  pkgs.netcat-openbsd
+                  pkgs.bpftools
+                ];
               };
           };
           testScript = ''
@@ -7585,10 +8000,35 @@
                 "'set firewall rule outbound port 9082' "
                 "'set firewall rule outbound direction out' "
                 "'set firewall rule outbound action drop' "
+                # Two more, to hold the family-scoped rule against a rule of the
+                # same shape that differs only in naming an address: a rule that
+                # does not fire tells you nothing on its own, and these say
+                # whether the miss belongs to the scope or to the lookup.
+                "'set firewall rule addr-src from wan' "
+                "'set firewall rule addr-src proto tcp' "
+                "'set firewall rule addr-src port 9083' "
+                "'set firewall rule addr-src source 10.8.0.2/32' "
+                "'set firewall rule addr-src action drop' "
+                "'set firewall rule addr-src log true' "
+                "'set firewall rule plain from wan' "
+                "'set firewall rule plain proto tcp' "
+                "'set firewall rule plain port 9084' "
+                "'set firewall rule plain action drop' "
+                "'set firewall rule plain log true' "
                 "commit save exit "
                 "| sentinel configure\""
             )
             fw.wait_for_unit("velstra.service")
+            # The unit is active a second before the datapath is attached, and a
+            # packet sent into that gap meets a firewall that is not there yet —
+            # which is why the *first* knock, and only the first, kept reading as
+            # a rule that does not work.
+            #
+            # Asked of the link rather than of the journal on purpose: a commit
+            # restarts the agent, so "attached to eth1" is already in the journal
+            # from the instance before this one and grepping for it succeeds
+            # immediately. The link either carries a program now or it does not.
+            fw.wait_until_succeeds("ip link show eth1 | grep -q xdp", timeout=30)
 
             def knock(port, v6=False):
                 target = "fd00:8::1" if v6 else "10.8.0.1"
@@ -7601,12 +8041,33 @@
                     f"journalctl -u velstra.service | grep -qE '{pattern} .*dport={port}'"
                 )[0] == 0
 
+            def why():
+                # A rule that did not fire is either absent from the loaded
+                # policy, excluded by its own scope, or never asked — and the
+                # three look identical from a missing log line.
+                return (
+                    "\nthe agent's loaded policy:\n"
+                    + fw.execute("cat /run/sentinel/velstra.toml")[1]
+                    + "\ncounters:\n" + fw.execute("sentinel show firewall statistics")[1]
+                    + "\nevery drop the firewall logged:\n"
+                    + fw.execute("journalctl -u velstra.service | grep -E 'DROP'")[1]
+                    + "\nPORT_RULES as the kernel holds it:\n"
+                    + fw.execute("bpftool map dump name PORT_RULES")[1]
+                )
+
             for v6 in (False, True):
                 knock(9080, v6)
                 knock(9081, v6)
+            knock(9083)
+            knock(9084)
+
+            # A rule that names an address and one that does not, both IPv4,
+            # both arriving: whichever of these fails says where to look.
+            assert dropped(9083), "a rule naming a source address did not match" + why()
+            assert dropped(9084), "a rule naming no address at all did not match" + why()
 
             # Family: each rule stops its own family and leaves the other alone.
-            assert dropped(9080), "an ipv4-scoped rule did not stop an IPv4 connection"
+            assert dropped(9080), "an ipv4-scoped rule did not stop an IPv4 connection" + why()
             assert not dropped(9080, v6=True), "an ipv4-scoped rule stopped IPv6 as well"
             assert dropped(9081, v6=True), "an ipv6-scoped rule did not stop an IPv6 connection"
             assert not dropped(9081), "an ipv6-scoped rule stopped IPv4 as well"
@@ -7988,12 +8449,16 @@
                 ("/proc/sys/net/ipv6/conf/eth1/accept_dad", "2"),
             ]:
                 got = fw.succeed(f"cat {path}").strip()
+                # These travel as a sysctl drop-in that networkd never sees, so
+                # the drop-in and the link's own unit are the two places the
+                # answer can have gone missing.
                 assert got == want, (
-                    f"{path} is {got}, expected {want}\n--- br0.netdev ---\n{brdev}"
-                    + "\n--- ip -d link show br0 ---\n"
-                    + fw.execute("ip -d link show br0")[1]
-                    + "\n--- networkctl status br0 ---\n"
-                    + fw.execute("networkctl status br0")[1]
+                    f"{path} is {got}, expected {want}\n--- 70-sentinel.conf ---\n"
+                    + fw.execute("cat /run/sysctl.d/70-sentinel.conf")[1]
+                    + "\n--- 10-sentinel-eth1.network ---\n"
+                    + fw.execute("cat /run/systemd/network/10-sentinel-eth1.network")[1]
+                    + "\n--- networkctl status eth1 ---\n"
+                    + fw.execute("networkctl status eth1")[1]
                 )
 
             # The drop-in is what makes them survive a reboot; the immediate write
@@ -8162,6 +8627,30 @@
                 "set firewall rule no-ping icmp-type timestamp-request",
             )
             assert pings(), "a rule for a different ICMP type dropped the ping anyway"
+
+            # Phase 3b — echo-REPLY, which is ICMP type 0. The key reserves 0 for
+            # "every type", so before the constraint was stored biased by one, a
+            # rule naming echo-reply compiled to exactly the same entry as a rule
+            # naming no type at all: written to catch ping answers, it dropped the
+            # ping too, and every other ICMP message with it. Type 13 above cannot
+            # find that -- only the type that collides with the sentinel value can.
+            configure(
+                "delete firewall rule no-ping icmp-type",
+                "set firewall rule no-ping icmp-type echo-reply",
+            )
+            assert pings(), "a rule naming echo-reply dropped an echo-request"
+
+            # ...and it is a real constraint, not one that matches nothing: put it
+            # back on the type the ping does send and the drop returns.
+            configure(
+                "delete firewall rule no-ping icmp-type",
+                "set firewall rule no-ping icmp-type echo-request",
+            )
+            assert not pings(), "the rule stopped matching altogether"
+            configure(
+                "delete firewall rule no-ping icmp-type",
+                "set firewall rule no-ping icmp-type timestamp-request",
+            )
 
             # And the same distinction in the other family, where the numbering
             # disagrees: echo-request is 128 in ICMPv6, not 8. A shared table
@@ -11070,6 +11559,155 @@
             '';
           };
 
+        # The other half of routing policy. `checks.policy` proves an *export*
+        # route-map decides what a peer is told; this one proves the three
+        # mechanisms beside it, none of which had a test:
+        #
+        #   * an **import** filter on a neighbour — the peer offers a prefix and
+        #     this box declines to install it, which is a different code path
+        #     from declining to send one;
+        #   * a **VRF** — a static route with `vrf blue` has to land in table 100
+        #     and *not* in the main table, or the separation is decorative;
+        #   * **redistribution through an export filter** — `redistribute static`
+        #     plus `protocols export bgp <filter>` has to carry the permitted
+        #     static and withhold the other.
+        #
+        #   nix build .#checks.x86_64-linux.routingimport -L
+        routingimport =
+          let
+            node = hostname: addr: {
+              lib,
+              ...
+            }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce hostname;
+              networking.firewall.enable = lib.mkForce false;
+              networking.interfaces.eth1.ipv4.addresses = [
+                {
+                  address = addr;
+                  prefixLength = 24;
+                }
+              ];
+              virtualisation.vlans = [ 1 ];
+              virtualisation.memorySize = 2048;
+              services.velstra.interface = lib.mkForce "eth1";
+            };
+          in
+          pkgs.testers.runNixOSTest {
+            name = "sentinel-routingimport";
+            nodes = {
+              rp1 = node "rp1" "10.10.0.1";
+              rp2 = node "rp2" "10.10.0.2";
+            };
+            testScript = ''
+              start_all()
+              for m in (rp1, rp2):
+                  m.wait_for_unit("multi-user.target")
+                  m.wait_for_unit("velstra.service")
+                  m.wait_for_unit("wren.service")
+              rp1.wait_until_succeeds("ip addr show eth1 | grep -q 10.10.0.1", timeout=20)
+              rp2.wait_until_succeeds("ip addr show eth1 | grep -q 10.10.0.2", timeout=20)
+
+              # rp1 offers everything it has, with no policy of its own: whatever
+              # rp2 ends up without, rp2 declined.
+              rp1.succeed(
+                  "su admin -c \"printf '%s\\n' "
+                  "'set firewall global default-action accept' "
+                  "'set interface eth1 zone wan' "
+                  "'set protocols router-id 10.10.0.1' "
+                  "'set protocols bgp local-as 65001' "
+                  "'set protocols bgp network 10.20.0.0/24' "
+                  "'set protocols bgp network 10.30.0.0/24' "
+                  "'set protocols bgp network 192.168.0.0/24' "
+                  "'set protocols bgp neighbor 10.10.0.2 remote-as 65002' "
+                  "commit save exit "
+                  "| sentinel configure\""
+              )
+              rp1.wait_for_unit("wren.service")
+
+              # rp2 takes only 10/8 up to a /24, and stamps what it takes with a
+              # metric — so the filter is doing more than pass/drop.
+              #
+              # It also carries a VRF and two statics it redistributes through an
+              # export filter, which is the third mechanism under test.
+              rp2.succeed(
+                  "su admin -c \"printf '%s\\n' "
+                  "'set firewall global default-action accept' "
+                  "'set interface eth1 zone wan' "
+                  "'set protocols router-id 10.10.0.2' "
+                  "'set policy prefix-list ONLY10 rule 10 prefix 10.0.0.0/8' "
+                  "'set policy prefix-list ONLY10 rule 10 le 24' "
+                  "'set policy route-map TAKE10 default deny' "
+                  "'set policy route-map TAKE10 rule 10 action permit' "
+                  "'set policy route-map TAKE10 rule 10 match prefix-list ONLY10' "
+                  "'set policy route-map TAKE10 rule 10 set preference 55' "
+                  "'set protocols vrf blue table 100' "
+                  "'set protocols static 10.99.0.0/24 via 10.10.0.1' "
+                  "'set protocols static 10.99.0.0/24 vrf blue' "
+                  "'set protocols static 10.77.0.0/24 via 10.10.0.1' "
+                  "'set protocols static 172.16.0.0/24 via 10.10.0.1' "
+                  "'set protocols bgp local-as 65002' "
+                  "'set protocols bgp redistribute static' "
+                  "'set protocols export bgp TAKE10' "
+                  "'set protocols bgp neighbor 10.10.0.1 remote-as 65001' "
+                  "'set protocols bgp neighbor 10.10.0.1 import TAKE10' "
+                  "commit save exit "
+                  "| sentinel configure\""
+              )
+              rp2.wait_for_unit("wren.service")
+
+              # The compile under test: the filter reached wren, the prefix-list
+              # `le 24` became wren's range syntax, and the filter is attached to
+              # the neighbour on the IMPORT side.
+              rp2.succeed("grep -q 'name = \"TAKE10\"' /run/sentinel/wren.toml")
+              rp2.succeed("grep -q '10.0.0.0/8{8,24}' /run/sentinel/wren.toml")
+              rp2.succeed("grep -q 'import = \"TAKE10\"' /run/sentinel/wren.toml")
+              rp2.succeed("grep -q 'set-preference = 55' /run/sentinel/wren.toml")
+
+              # --- the import filter --------------------------------------------
+              # rp2 installs the two permitted prefixes...
+              rp2.wait_until_succeeds(
+                  "ip -4 route show proto bgp | grep -q '10.20.0.0/24'", timeout=90
+              )
+              rp2.wait_until_succeeds(
+                  "ip -4 route show proto bgp | grep -q '10.30.0.0/24'", timeout=90
+              )
+              # ...and not the third. It arrived in the same update as the two
+              # above, so its absence is the filter and not slow convergence.
+              rp2.succeed("! ip -4 route show proto bgp | grep -q '192.168.0.0/24'")
+              # The attribute the filter set is on the route as received: a filter
+              # that only ever dropped would pass the two assertions above. The
+              # kernel route is the wrong place to look — its `metric` is the
+              # protocol's administrative distance, not anything BGP carried —
+              # so this asks the RIB.
+              rp2.succeed("sentinel show ip bgp | grep '10.20.0.0/24' | grep -q 'localpref 55'")
+
+              # --- the VRF -------------------------------------------------------
+              # The static declared `vrf blue` is in table 100 and nowhere else. A
+              # VRF whose routes also sit in the main table separates nothing.
+              rp2.wait_until_succeeds(
+                  "ip -4 route show table 100 | grep -q '10.99.0.0/24'", timeout=60
+              )
+              rp2.succeed("! ip -4 route show table main | grep -q '10.99.0.0/24'")
+              # ...while a static without a VRF is in the main table, so the
+              # assertion above is about the VRF and not about statics in general.
+              rp2.succeed("ip -4 route show table main | grep -q '10.77.0.0/24'")
+
+              # --- redistribution through an export filter -----------------------
+              # rp2 redistributes its statics, but only through TAKE10: rp1 learns
+              # the 10/8 one and never hears about 172.16/24.
+              rp1.wait_until_succeeds(
+                  "ip -4 route show proto bgp | grep -q '10.77.0.0/24'", timeout=90
+              )
+              rp1.succeed("! ip -4 route show proto bgp | grep -q '172.16.0.0/24'")
+
+              # Both ends agree the session is up, so nothing above passed because
+              # the peering never formed.
+              rp1.succeed("wren show bgp neighbors | grep -qi established")
+              rp2.succeed("wren show bgp neighbors | grep -qi established")
+            '';
+          };
         # Routing: two Sentinel appliances form an OSPFv2 point-to-point adjacency
         # and each learns the other's redistributed network — proof the Wren OSPF
         # path is wired through the same `set protocols …` CLI. ospf1 originates
@@ -11720,7 +12358,10 @@
             assert "rev-b" in rev0b, rev0b
 
             # An out-of-range rollback is refused cleanly; nothing changes.
-            out = machine.succeed(
+            # Refused means refused *in the exit status* too: a script that asks
+            # for something impossible and reports success is how a caller ends
+            # up believing a rollback happened.
+            out = machine.fail(
                 "su admin -c \"printf '%s\\n' 'rollback 999' exit | sentinel configure\" 2>&1"
             )
             assert "no revision 999" in out, out
@@ -11781,11 +12422,12 @@
 
             # A group still referenced by a rule can't be committed away — the rule
             # would dangle, and validation catches it.
-            out = machine.succeed(
+            status, out = machine.execute(
                 "su admin -c \"printf '%s\\n' "
                 "'delete firewall group address-group mgmt' commit exit "
                 "| sentinel configure\" 2>&1"
             )
+            assert status != 0, out
             assert "not a declared address or domain group" in out, out
 
             # Dropping the rule first, then the groups, commits cleanly.
