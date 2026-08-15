@@ -60,15 +60,65 @@ impl Apply {
 /// Run one command line against the session. Returns `true` when the session
 /// should exit (`exit`/`quit`). Errors are printed, not propagated, so the shell
 /// keeps running.
+/// Split a command line into words.
+///
+/// Whitespace separates, a `"` groups, and `\"` inside a group is a literal
+/// quote. Without the grouping, a value containing a space could not be typed at
+/// all: `set pki ca house common-name "Velstra Test CA"` arrived as five words
+/// and the quotes ended up *inside* the value, where the subject validator
+/// rightly refused them. Every free-text field — a description, a portal
+/// message, an SNMP location — was unreachable the same way.
+///
+/// A `#` that *starts a word* begins a comment; one inside a word does not, and
+/// one inside quotes is text. The reason for the rule: a password may contain
+/// `#` and must survive, while a pasted block of documented commands — or a
+/// saved `.cli` file with a header — must not fail on its own explanation.
+fn split_line(line: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut word = String::new();
+    let mut have_word = false;
+    let mut quoted = false;
+    let mut escape = false;
+    for c in line.chars() {
+        if escape {
+            word.push(c);
+            escape = false;
+            continue;
+        }
+        match c {
+            '\\' if quoted => escape = true,
+            // A quote groups only where a word *begins*. One inside a word is an
+            // ordinary character, because it already was: a Suricata rule says
+            // `msg:"…"` and a saved `.cli` carries it verbatim, so treating that
+            // quote as grouping would silently strip it and change the rule. The
+            // capability that was missing is `description "two words"`, and that
+            // is what this adds — nothing more.
+            '"' if !have_word || quoted => {
+                quoted = !quoted;
+                have_word = true; // `""` is an empty word, not no word
+            }
+            c if c.is_whitespace() && !quoted => {
+                if have_word {
+                    out.push(std::mem::take(&mut word));
+                    have_word = false;
+                }
+            }
+            '#' if !quoted && !have_word => return out, // a comment starts here
+            c => {
+                word.push(c);
+                have_word = true;
+            }
+        }
+    }
+    if have_word {
+        out.push(word);
+    }
+    out
+}
+
 pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line: &str) -> bool {
-    // A `#` that *starts a word* begins a comment; one inside a word does not.
-    // The shell's rule, and the reason for it: a password may contain `#` and
-    // must survive, while a pasted block of documented commands — or a saved
-    // `.cli` file with a header — must not fail on its own explanation.
-    let args: Vec<&str> = line
-        .split_whitespace()
-        .take_while(|w| !w.starts_with('#'))
-        .collect();
+    let owned = split_line(line);
+    let args: Vec<&str> = owned.iter().map(String::as_str).collect();
 
     // `service` is what VyOS calls this subtree and what people type; the config
     // file's table is `[services]`, so the tree is spelled that way. Accept the
@@ -249,6 +299,17 @@ pub fn failed_lines() -> usize {
     FAILED_LINES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Record a refusal that did not travel back as an `Err` from [`exec_line`].
+///
+/// `commit`, `commit-confirm` and `rollback` return early — they decide for
+/// themselves whether to leave the session, so their result cannot be the
+/// dispatcher's `Result`. That put them outside the accounting above, and a
+/// *commit* refused by validation is the refusal a script most needs to hear
+/// about: `sentinel configure` printed the error and exited 0.
+pub(crate) fn note_refusal() {
+    FAILED_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The child keywords the grammar offers directly beneath `path` (an absolute
 /// config path, i.e. relative to the top of the tree). Reuses the completion
 /// tables so `edit`/context-entry validity stays in lockstep with Tab/`?`.
@@ -408,6 +469,7 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
         Ok(a) => a,
         Err(e) => {
             eprintln!("error: {e:#}");
+            note_refusal();
             return false;
         }
     };
@@ -456,6 +518,7 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
     }
     if let Err(e) = apply_live(&appliance, act) {
         eprintln!("{} applying config: {e}", ui::red("error:"));
+        note_refusal();
         return false;
     }
     if appliance.system.hostname != old_host {
@@ -486,12 +549,14 @@ fn commit_confirm_line(session: &mut Session, act: &Apply, rest: &[&str]) -> boo
             Ok(m) if m >= 1 => m,
             _ => {
                 eprintln!("error: commit-confirm <minutes> must be a positive integer");
+                note_refusal();
                 return false;
             }
         },
     };
     if let Err(e) = crate::confirm::commit_confirm(session, act, minutes) {
         eprintln!("error: {e:#}");
+        note_refusal();
     }
     false
 }
@@ -531,11 +596,15 @@ fn do_compare(session: &Session, rest: &[&str]) -> Result<()> {
 fn rollback_line(session: &mut Session, act: &Apply, rest: &[&str]) -> bool {
     let Some(n) = rest.first().and_then(|s| s.parse::<usize>().ok()) else {
         eprintln!("error: rollback <N> needs a revision number (see `run show system commit`)");
+        note_refusal();
         return false;
     };
     match crate::archive::rollback(session, act, n) {
         Ok(()) => eprintln!("rolled back to revision {n} (applied live + saved)."),
-        Err(e) => eprintln!("error: {e:#}"),
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            note_refusal();
+        }
     }
     false
 }
@@ -1182,6 +1251,11 @@ const PREFIX_LIST_RULE_FIELDS: &[Cand] = &[
     ("ge", "match prefixes at least this long"),
     ("le", "match prefixes at most this long"),
 ];
+// `policy prefix-list <name> <Tab>`. Without this the level was silent: an
+// operator who named a prefix-list was shown nothing at all, so `rule` — the
+// only thing that can follow — had to be known in advance or read out of the
+// source.
+const PREFIX_LIST_FIELDS: &[Cand] = &[("rule", "a rule, keyed by a sequence number (<seq>)")];
 // `policy route-map <name> <Tab>`.
 const ROUTE_MAP_FIELDS: &[Cand] = &[
     ("default", "action when no rule matches (permit / deny)"),
@@ -2570,7 +2644,10 @@ const PROTOS: &[Cand] = &[
     ("esp", "IPsec ESP (IANA 50)"),
     ("ah", "IPsec AH (IANA 51)"),
     ("gre", "GRE (IANA 47)"),
-    ("ospf", "OSPF (IANA 89) — what an OSPFv2/v3 adjacency is made of"),
+    (
+        "ospf",
+        "OSPF (IANA 89) — what an OSPFv2/v3 adjacency is made of",
+    ),
     ("pim", "PIM (IANA 103) — multicast join/prune"),
 ];
 const IFACE_FIELDS: &[Cand] = &[
@@ -3450,6 +3527,25 @@ pub(crate) fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "interface", _name, "ip"] => IFACE_IP_FIELDS,
         ["set" | "delete", "interface", _name, "ipv6"] => IFACE_IP6_FIELDS,
         ["set" | "delete", "interface", _name, "dhcp"] => IFACE_DHCP_FIELDS,
+        // Words that mean a field here and a value elsewhere, so the
+        // name-based fallback cannot decide them.
+        ["set", "interface", _name, "dhcp", "reject"] => &[PH_IPV4_CIDR],
+        ["set", "interface", _name, "dhcp" | "dhcpv6", "duid"] => {
+            &[("<duid>", "an RFC 4361 IAID+DUID")]
+        }
+        ["set", "interface", _name, "mac"] => &[PH_MAC],
+        ["set", "firewall", "group", "mac-group", _n, "mac"] => &[PH_MAC],
+        ["set", "vpn", "ipsec", _n, "vti"] => &[("<ifname>", "a vti interface name")],
+        ["set", "nat", "destination", _n, "to"] => &[PH_IPV4_TO],
+        ["set", "firewall", "rule", _n, "schedule", "start" | "end"] => V_TIME_OF_DAY,
+        ["set", "services", "dns", "host-override"] => {
+            &[("<host> <A.B.C.D>", "a name and the address it resolves to")]
+        }
+        ["set", "services", "dns", "txt-record"] => &[("<name> <text>", "a name and its text")],
+        // `from`/`to` name zones in a firewall rule and mailboxes here, so the
+        // name-based fallback cannot decide them.
+        ["set", "services", "alerts", "mail", "from" | "to"] => &[("<email>", "an email address")],
+        ["set", "services", "ids", "rule"] => &[("<suricata rule>", "one whole Suricata rule")],
         ["set" | "delete", "interface", _name, "dhcpv6"] => IFACE_DHCP6_FIELDS,
         [
             "set",
@@ -3692,6 +3788,7 @@ pub(crate) fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ] => BOOLS,
         // Routing policy (VyOS-style `[policy]`): prefix-lists + route-maps.
         ["set" | "delete", "policy"] => POLICY_NODES,
+        ["set" | "delete", "policy", "prefix-list", _name] => PREFIX_LIST_FIELDS,
         ["set" | "delete", "policy", "prefix-list", _name, "rule", _n] => PREFIX_LIST_RULE_FIELDS,
         ["set" | "delete", "policy", "route-map", _name] => ROUTE_MAP_FIELDS,
         ["set" | "delete", "policy", "route", _name] => POLICY_ROUTE_FIELDS,
@@ -3834,6 +3931,159 @@ pub(crate) fn candidates(tokens: &[&str]) -> &'static [Cand] {
     }
 }
 
+// One-element tables, so a hint can be returned as the `&'static [Cand]` the
+// completion works in.
+const V_IPV4: &[Cand] = &[PH_IPV4];
+const V_IPV6: &[Cand] = &[PH_IPV6];
+const V_CIDR: &[Cand] = &[PH_IPV4_CIDR];
+const V_PORT: &[Cand] = &[PH_PORT];
+const V_NUMBER: &[Cand] = &[PH_NUMBER];
+const V_SECONDS: &[Cand] = &[PH_SECONDS];
+const V_MILLIS: &[Cand] = &[("<ms>", "a duration in milliseconds")];
+const V_KEY: &[Cand] = &[PH_KEY];
+const V_NAME: &[Cand] = &[PH_NAME];
+const V_MAC: &[Cand] = &[PH_MAC];
+const V_URL: &[Cand] = &[PH_URL];
+const V_IFACE: &[Cand] = &[("<ifname>", "an interface name")];
+const V_ZONE: &[Cand] = &[("<zone>", "a zone name")];
+const V_AREA: &[Cand] = &[("<area-id>", "an area id (0, 0.0.0.0, …)")];
+const V_RT: &[Cand] = &[("<asn:value>", "a route target / distinguisher")];
+const V_FQDN: &[Cand] = &[("<fqdn>", "a hostname")];
+const V_CC: &[Cand] = &[("<CC>", "a two-letter country code")];
+const V_TIME_OF_DAY: &[Cand] = &[("<HH:MM>", "a time of day")];
+const V_DAYS: &[Cand] = &[("<mon,tue,…>", "comma-separated week days")];
+const V_SYSID: &[Cand] = &[("<xxxx.xxxx.xxxx>", "an IS-IS system id")];
+const V_PREFIX: &[Cand] = &[("<prefix>", "an address prefix (addr/len)")];
+
+/// The type of value a field takes, named from the field itself.
+///
+/// Consulted only where the tree above says nothing. Deliberately a closed
+/// list: a field that is not in it gets no hint, so a *complete* line — `…
+/// action accept` — is never made to look as though it still wants a value.
+fn value_hint(field: &str) -> &'static [Cand] {
+    // Shapes first: whole families share a suffix, and a rule ages better than
+    // two dozen names.
+    if field.ends_with("-interval")
+        || field.ends_with("-time")
+        || field.ends_with("-timeout")
+        || field.ends_with("-lifetime")
+        || field.ends_with("-ttl")
+        || field.ends_with("-period")
+        || field.ends_with("-delay")
+    {
+        return V_SECONDS;
+    }
+    if field.ends_with("-port") {
+        return V_PORT;
+    }
+    if field.ends_with("-key") {
+        return V_KEY;
+    }
+    if field.ends_with("-key-id") || field.ends_with("-id") && field != "system-id" {
+        return V_NUMBER;
+    }
+    match field {
+        // switches
+        "gro" | "gso" | "lro" | "tso" | "sg" | "tx" | "rx" | "rxhash" | "rxvlan" | "txvlan"
+        | "ntuple" | "blackhole" | "agree-tos" | "dont-query" | "local" => BOOLS,
+        // 0, 1 or 2 — not a switch, whatever the name suggests.
+        "accept-dad" => V_NUMBER,
+        // addresses and prefixes
+        "rp-address" | "vtep-ip" | "target" | "arp-target" | "relay" | "router-id" => V_IPV4,
+        "srv6-locator" => V_IPV6,
+        "network" | "advertise-prefix" | "home-net" | "never-block" | "sni-block"
+        | "allow-from" | "allow" | "source" | "destination" => V_CIDR,
+        "address" => V_CIDR,
+        "prefix" => V_PREFIX,
+        "macsec-peer" | "router-mac" | "hw-id" | "advertise-mac" => V_MAC,
+        "interface" | "passive-interface" | "track-interface" | "mirror-ingress"
+        | "mirror-egress" | "underlay-interface" | "address-interface" | "primary" | "serve-on"
+        | "uplink" => V_IFACE,
+        "zone" | "wan-zone" => V_ZONE,
+        // numbers
+        "port" => V_PORT,
+        "interval" | "timeout" | "max-age" => V_SECONDS,
+        "ike-version" => &[("<1|2>", "IKEv1 or IKEv2")],
+        "priority"
+        | "cost"
+        | "metric"
+        | "weight"
+        | "limit"
+        | "burst"
+        | "distance"
+        | "probes"
+        | "loss"
+        | "jitter"
+        | "latency"
+        | "mss"
+        | "mtu"
+        | "vni"
+        | "evi"
+        | "l3-vni"
+        | "table"
+        | "commit-revisions"
+        | "rise"
+        | "fail"
+        | "speed"
+        | "channel"
+        | "robustness"
+        | "vrid"
+        | "detect-mult"
+        | "multipath"
+        | "prefix-length"
+        | "validity-days"
+        | "ttl-security"
+        | "ebgp-multihop"
+        | "max-prefix"
+        | "max-length"
+        | "redistribute-metric"
+        | "stub-default-cost"
+        | "spt-threshold"
+        | "cache-size"
+        | "max-stations"
+        | "min-links"
+        | "dad-transmits"
+        | "rx-ring"
+        | "tx-ring"
+        | "rx-usecs"
+        | "tx-usecs"
+        | "priority-decrement"
+        | "router-priority"
+        | "bandwidth"
+        | "block-severity"
+        | "block-duration"
+        | "cgnat-block-size"
+        | "cgnat-base-port"
+        | "igmp-version"
+        | "default-route-distance"
+        | "min-links-up" => V_NUMBER,
+        "min-rx" | "min-tx" => V_MILLIS,
+        // text-ish
+        "secret" | "passphrase" | "hashed-password" | "psk" | "pin" | "ao-key" | "auth-key"
+        | "bfd-auth-key" | "macsec-key" | "vti-key" => V_KEY,
+        "url" | "secure-upstream" => V_URL,
+        "domain" | "local-domain" | "host-name" | "common-name" | "subject-alt-name" => V_FQDN,
+        "country" => V_CC,
+
+        "days" => V_DAYS,
+        "system-id" => V_SYSID,
+        "area"
+        | "stub-area"
+        | "nssa-area"
+        | "nssa-default-area"
+        | "totally-nssa-area"
+        | "totally-stubby-area" => V_AREA,
+        "rd" | "rt-import" | "rt-export" | "community" | "large-community" | "ext-community"
+        | "cluster-id" => V_RT,
+        "group" | "interface-group" | "source-mac-group" | "ca" | "ruleset" | "collector"
+        | "facility" | "loglevel" | "device" | "keyboard" | "locale" | "timezone" | "apn"
+        | "ssid" | "user" | "username" | "login" | "organization" | "message" | "value"
+        | "description" | "user-class" | "vendor-class-id" | "service-name" | "ac-name"
+        | "ike-proposal" | "esp-proposal" | "local-id" | "remote-id" | "blocklist" => V_NAME,
+        _ => &[],
+    }
+}
+
 /// Live config names the completer offers for the name positions, refreshed
 /// from the session after each command.
 #[derive(Default)]
@@ -3876,7 +4126,7 @@ fn own_cands(slice: &[Cand]) -> Vec<(String, String)> {
 /// `(keyword, description)` pairs. New grammar leaves adopt the same pattern:
 /// add an arm returning `own_cands(&[PH_…])` (a value) or the live names plus a
 /// `<name>` placeholder (a keyed instance).
-fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
+pub(crate) fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
     // Reference an existing zone (a value position).
     let zones = |label: &'static str| -> Vec<(String, String)> {
         names
@@ -4402,7 +4652,23 @@ fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, String)> {
         [.., "password"] => own_cands(&[PH_KEY]),
         [.., "description"] => own_cands(&[PH_TEXT]),
 
-        _ => own_cands(candidates(tokens)),
+        // Last resort: a value goes here and no arm above says what kind, so
+        // name the type from the field. Without this, `?` at 265 positions in
+        // the tree showed nothing at all — which reads as "the path ends
+        // here", not as "type something", so the only way to learn what a
+        // field wanted was to guess or to read the source.
+        //
+        // Deliberately here and not in [`candidates`]: that one also answers
+        // "is this a node I can `edit` into?", and a value hint there turns
+        // every field into a level to descend.
+        _ => {
+            let stat = candidates(tokens);
+            if stat.is_empty() {
+                own_cands(value_hint(tokens.last().copied().unwrap_or_default()))
+            } else {
+                own_cands(stat)
+            }
+        }
     }
 }
 
@@ -4651,6 +4917,67 @@ mod tests {
         // what a protected port can be told has to be discoverable.
         assert_eq!(kw(&["set", "firewall", "syn-protect", "443"]), ["mss"]);
         assert_eq!(kw(&["delete", "firewall", "syn-protect", "443"]), ["mss"]);
+    }
+
+    #[test]
+    fn a_quoted_value_keeps_its_spaces_and_loses_its_quotes() {
+        // Every free-text field — a certificate subject, a description, a portal
+        // message — was unreachable before this: the words arrived separately and
+        // the quotes ended up inside the value.
+        assert_eq!(
+            split_line(r#"set pki ca house common-name "Velstra Test CA""#),
+            [
+                "set",
+                "pki",
+                "ca",
+                "house",
+                "common-name",
+                "Velstra Test CA"
+            ]
+        );
+        // A quote inside a quoted value, and an empty value.
+        assert_eq!(
+            split_line(r#"set x y "a \"b\" c""#),
+            ["set", "x", "y", r#"a "b" c"#]
+        );
+        // A quote that does NOT begin a word is an ordinary character. This is
+        // the whole compatibility rule: a Suricata rule reads
+        // `msg:"velstra ids echo request";` and every word of it has to arrive
+        // exactly as written, quotes included, or the rule that gets loaded is
+        // not the rule that was typed.
+        assert_eq!(
+            split_line(
+                r#"set services ids rule alert icmp any any -> any any (msg:"an echo"; itype:8;)"#
+            ),
+            [
+                "set",
+                "services",
+                "ids",
+                "rule",
+                "alert",
+                "icmp",
+                "any",
+                "any",
+                "->",
+                "any",
+                "any",
+                r#"(msg:"an"#,
+                r#"echo";"#,
+                "itype:8;)"
+            ]
+        );
+        assert_eq!(split_line(r#"set x y """#), ["set", "x", "y", ""]);
+        // Unquoted behaviour is unchanged, comment rule included.
+        assert_eq!(split_line("  set  a   b  "), ["set", "a", "b"]);
+        assert_eq!(split_line("set a b # why"), ["set", "a", "b"]);
+        assert_eq!(
+            split_line("set system login bob password corr#ect"),
+            ["set", "system", "login", "bob", "password", "corr#ect"]
+        );
+        // A `#` inside quotes is text, not a comment.
+        assert_eq!(split_line(r#"set x y "a # b""#), ["set", "x", "y", "a # b"]);
+        assert_eq!(split_line("# whole line"), Vec::<String>::new());
+        assert_eq!(split_line(""), Vec::<String>::new());
     }
 
     #[test]
@@ -4981,8 +5308,8 @@ mod tests {
         assert_eq!(
             kw(&["set", "firewall", "rule", "web", "proto"]),
             [
-                "tcp", "udp", "tcp_udp", "icmp", "icmpv6", "vrrp", "esp", "ah", "gre",
-                "ospf", "pim"
+                "tcp", "udp", "tcp_udp", "icmp", "icmpv6", "vrrp", "esp", "ah", "gre", "ospf",
+                "pim"
             ]
         );
         // The nat sub-tree: source (masquerade) + destination (port-forward) +
@@ -5611,6 +5938,51 @@ mod tests {
         assert!(path.exists(), "save persisted the config");
         // exit returns true.
         assert!(exec_line(&mut s, &act, &mut ctx, "exit"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A commit refused by validation has to reach the exit status.
+    ///
+    /// `set` and `delete` travelled back to the dispatcher as an `Err` and were
+    /// counted; `commit` returns early, so a configuration the model rejected
+    /// printed its error and `sentinel configure` exited 0 — the exact failure
+    /// the counter was introduced to end, left behind in the one command whose
+    /// refusal matters most.
+    #[test]
+    fn a_refused_commit_is_counted_like_a_refused_line() {
+        let dir = std::env::temp_dir().join(format!("sentinel-refused-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = Session::load(&dir.join("a.toml")).unwrap();
+        let act = Apply::off();
+        let mut ctx = Vec::new();
+
+        let before = failed_lines();
+        // A rule pointing at a group nobody declared: accepted line by line,
+        // refused as a whole at commit.
+        assert!(!exec_line(
+            &mut s,
+            &act,
+            &mut ctx,
+            "set firewall rule web from lan"
+        ));
+        assert!(!exec_line(
+            &mut s,
+            &act,
+            &mut ctx,
+            "set firewall rule web action accept"
+        ));
+        assert!(!exec_line(
+            &mut s,
+            &act,
+            &mut ctx,
+            "set firewall rule web source-group nosuch"
+        ));
+        assert!(!exec_line(&mut s, &act, &mut ctx, "commit"));
+        assert!(
+            failed_lines() > before,
+            "a refused commit left the exit status saying the change was made"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
