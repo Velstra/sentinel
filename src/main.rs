@@ -21,6 +21,7 @@ mod confirm;
 mod diff;
 mod domain;
 mod feed;
+mod grammar_walk;
 mod identity;
 mod ids;
 mod install;
