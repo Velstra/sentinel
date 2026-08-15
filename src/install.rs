@@ -146,9 +146,56 @@ pub fn human_size(bytes: u64) -> String {
     }
 }
 
-/// The minimum disk size we'll install onto: the sealed store (~1.3 GiB) plus
-/// ESP, verity hash, and a usable data partition, with slack.
+/// A floor below which no build of the appliance could ever fit — enough to
+/// reject an obviously wrong disk without reading anything.
+///
+/// It is deliberately NOT the real requirement: that is the source medium's own
+/// layout, which grows whenever the sealed store does, and is measured from the
+/// source by [`source_layout_bytes`] before a single byte is erased. A constant
+/// kept by hand falls behind the image it describes, and the way it fails is to
+/// admit a disk, wipe it, and only then discover the partitions do not fit.
 pub const MIN_TARGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// The number of bytes a target must have for the source layout to be written
+/// onto it: the end of the source's last partition, plus the 33 sectors the
+/// backup GPT header occupies at the very end of the disk.
+///
+/// Parsed from `sgdisk -p` output — pure, so the arithmetic is testable without
+/// a disk. Returns `None` if the listing carries no partition rows at all.
+fn parse_layout_bytes(sgdisk_print: &str) -> Option<u64> {
+    let sector = sgdisk_print
+        .lines()
+        .find_map(|l| l.split_once("Sector size (logical/physical):"))
+        .and_then(|(_, rest)| rest.trim().split(['/', ' ']).next()?.parse::<u64>().ok())
+        .unwrap_or(512);
+    // Partition rows begin with the partition number; every other line either
+    // has a non-numeric first field or too few fields to be one.
+    let last_end = sgdisk_print
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let [num, _start, end, ..] = f.as_slice() else {
+                return None;
+            };
+            num.parse::<u32>().ok()?;
+            end.parse::<u64>().ok()
+        })
+        .max()?;
+    // The backup GPT sits in the last 33 sectors; `sgdisk --move-second-header`
+    // has to have somewhere to put it.
+    Some((last_end + 1 + 33) * sector)
+}
+
+/// Ask `sgdisk` what the source layout needs, in bytes. See [`parse_layout_bytes`].
+fn source_layout_bytes(source: &str) -> Result<u64> {
+    let out = Command::new(system::bin("sgdisk"))
+        .args(["-p", source])
+        .output()
+        .with_context(|| format!("reading the partition layout of {source}"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    parse_layout_bytes(&text)
+        .ok_or_else(|| anyhow::anyhow!("{source} reports no partitions to clone"))
+}
 
 /// Validate a target selection against a RAID level: enough disks, each big
 /// enough, none removable. Returns the chosen disks in order, or an error
@@ -218,6 +265,25 @@ pub fn part_path(disk: &str, n: u32) -> String {
 
 /// Run an external tool (resolved to its absolute path), inheriting stdio,
 /// failing on a non-zero exit.
+/// The GPT unique GUID of one partition, as `sgdisk` reports it.
+///
+/// Needed because a verity slot is not identified by where it sits on the disk
+/// but by this GUID: systemd derives the pair it looks for from the image's
+/// root hash, so the partitions carrying an image must carry the GUIDs that
+/// hash produces. Cloning the bytes without them yields a slot whose contents
+/// are right and which nothing can find.
+fn partition_guid(disk: &str, part: u32) -> Result<String> {
+    let out = Command::new(system::bin("sgdisk"))
+        .args([&format!("-i{part}"), disk])
+        .output()
+        .with_context(|| format!("reading the GUID of {disk} partition {part}"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .find_map(|l| l.split_once("Partition unique GUID: "))
+        .map(|(_, guid)| guid.trim().to_string())
+        .ok_or_else(|| anyhow::anyhow!("no unique GUID for {disk} partition {part}"))
+}
+
 fn run(cmd: &str, args: &[&str]) -> Result<()> {
     let status = Command::new(system::bin(cmd))
         .args(args)
@@ -320,6 +386,23 @@ pub fn execute(
         let dev = t.dev_path();
         if dev == source {
             bail!("refusing to install onto the source medium {dev}");
+        }
+    }
+
+    // Pre-flight: every target must be big enough for the source's own layout.
+    // `sgdisk --replicate` writes the source's partition table verbatim, so a
+    // disk that is merely over `MIN_TARGET_BYTES` is not enough — and finding
+    // that out inside `prepare_disk` means finding it out after `wipefs`, which
+    // is how this check came to exist.
+    let need = source_layout_bytes(&source)?;
+    for t in targets {
+        if t.size < need {
+            bail!(
+                "disk {} is {} — the appliance layout on {source} needs {}",
+                t.dev_path(),
+                human_size(t.size),
+                human_size(need)
+            );
         }
     }
 
@@ -603,13 +686,26 @@ pub fn update(image: &std::path::Path, commit: bool) -> Result<()> {
     };
     clone(SLOT_A.verity_part, inactive.verity_part)?;
     clone(SLOT_A.store_part, inactive.store_part)?;
+
+    // The *identity* of the slot, not only its contents. systemd finds a verity
+    // pair by partition GUID -- the two halves of the image's root hash -- so a
+    // slot holding the new image while keeping the old slot's randomly assigned
+    // GUIDs is a slot the initrd cannot find. It then waits for a device that
+    // will never appear: the box hangs rather than failing, so it never resets,
+    // so the boot counter never decrements and the automatic rollback never
+    // fires. That is exactly how an updated appliance went dark on the bench.
+    let src_verity = partition_guid(&srcdev, SLOT_A.verity_part)?;
+    let src_store = partition_guid(&srcdev, SLOT_A.store_part)?;
     // Re-type the inactive (reserved-generic) partitions to the verity GUIDs so
-    // the initrd's veritysetup considers them.
+    // the initrd's veritysetup considers them, and give them the source's
+    // unique GUIDs so it can identify which image they hold.
     run(
         "sgdisk",
         &[
             &format!("--typecode={}:{USR_VERITY_TYPE}", inactive.verity_part),
             &format!("--typecode={}:{USR_TYPE}", inactive.store_part),
+            &format!("--partition-guid={}:{src_verity}", inactive.verity_part),
+            &format!("--partition-guid={}:{src_store}", inactive.store_part),
             &disk,
         ],
     )?;
@@ -817,6 +913,50 @@ sr0       1073741824 rom  1
         assert!(msg.contains("mkfs failed"), "{msg}");
         // Makes the blank/not-bootable state unambiguous.
         assert!(msg.contains("BLANK"), "{msg}");
+    }
+
+    #[test]
+    fn layout_bytes_measures_the_end_of_the_last_partition() {
+        // Abridged `sgdisk -p` of an appliance medium: an ESP, both verity
+        // slots, and the data partition last.
+        let printed = "\
+Disk /dev/vda: 12582912 sectors, 6.0 GiB
+Sector size (logical/physical): 512/512 bytes
+Disk identifier (GUID): 2E4C1F0A-0000-4000-8000-000000000001
+Partition table holds up to 128 entries
+First usable sector is 34, last usable sector is 12582878
+
+Number  Start (sector)    End (sector)  Size       Code  Name
+   1            2048          264191   128.0 MiB   EF00  esp
+   2          264192          657407   192.0 MiB   8300  store-verity-a
+   3          657408         5900799   2.5 GiB     8300  store-a
+   6        11534336        11796479   128.0 MiB   8300  data
+";
+        // The last partition ends at 11796479, and the backup GPT needs the 33
+        // sectors after it.
+        let want = (11_796_479u64 + 1 + 33) * 512;
+        assert_eq!(parse_layout_bytes(printed), Some(want));
+        // Which is more than the hand-kept floor — the very reason the floor is
+        // not the check that guards the erase.
+        assert!(want > MIN_TARGET_BYTES);
+    }
+
+    #[test]
+    fn layout_bytes_ignores_a_listing_without_partitions() {
+        assert_eq!(
+            parse_layout_bytes("Disk /dev/vdb: 100 sectors\nNumber  Start (sector)\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn layout_bytes_honours_a_4k_sector_size() {
+        let printed = "\
+Sector size (logical/physical): 4096/4096 bytes
+Number  Start (sector)    End (sector)  Size       Code  Name
+   1            2048          264191   1.0 GiB     EF00  esp
+";
+        assert_eq!(parse_layout_bytes(printed), Some((264_191u64 + 34) * 4096));
     }
 
     fn disk(name: &str, gib: u64, removable: bool) -> Disk {
