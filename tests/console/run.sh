@@ -35,8 +35,11 @@ hostname = "console-test"
 TOML
 echo "consoletoken" > "$work/token"
 
+# Output kept, and a refusal is fatal. One line the appliance will not take
+# aborts the whole script — so a seed that silently failed left an appliance
+# with nothing on it, and every test that reads something read an empty box.
 SENTINEL_CONFIG="$work/config.toml" "$bin" configure \
-  --config "$work/config.toml" --no-apply >/dev/null 2>&1 <<'CLI'
+  --config "$work/config.toml" --no-apply > "$work/seed.log" 2>&1 <<'CLI'
 set interface eth0 zone lan
 set interface eth1 zone wan
 set interface eth0 address 10.0.0.1/24
@@ -54,9 +57,24 @@ set interface wg0 type wireguard
 set vpn wireguard wg0 listen-port 51820
 set vpn wireguard wg0 private-key AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=
 set services ssh port 22
+# One of every object whose form only exists once the object does: a route map
+# and a prefix list have settings of their own, and a DHCP server and a router
+# advertisement have a row that can be turned off. On an appliance without them
+# those masks are correctly absent — and a walk over that appliance reports them
+# as things the console cannot do.
+set interface eth0 address6 fd00:a::1/64
+set interface eth0 dhcp-server enable
+set interface eth0 router-advert enable
+set policy prefix-list customers rule 10 prefix 10.0.0.0/8
+set policy route-map to-transit rule 10 action permit
 commit
 save
 CLI
+if ! grep -q "commit ok" "$work/seed.log"; then
+  echo "the seed configuration was refused — the tests would run on an empty appliance:" >&2
+  cat "$work/seed.log" >&2
+  exit 1
+fi
 
 "$bin" api --listen "127.0.0.1:$port" --config "$work/config.toml" \
   --token-file "$work/token" --no-apply >"$work/api.log" 2>&1 &

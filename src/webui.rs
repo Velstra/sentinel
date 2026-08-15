@@ -257,7 +257,12 @@ pub fn page() -> String {
     --text-base: .875rem; --text-lg: 1.125rem; --text-xl: 1.5rem;
     --leading-tight: 1.1; --leading-snug: 1.28; --leading-normal: 1.55;
     --leading-code: 1.45;
-    --tracking-tight: -.02em; --tracking-caps: .08em;
+    /* Tracking is a function of size, not one number for the whole page: as
+       type grows the counters open up and the letters read too far apart, and
+       as it shrinks they close and want a little air. Three steps — display,
+       heading, body — plus the caps run, which is a different job. */
+    --tracking-display: -.025em; --tracking-tight: -.015em;
+    --tracking-body: 0em; --tracking-small: .01em; --tracking-caps: .08em;
 
     --space-1: .25rem; --space-2: .5rem; --space-3: .75rem; --space-4: 1rem;
     --space-5: 1.25rem; --space-6: 1.5rem; --space-7: 2rem; --space-9: 3rem;
@@ -286,8 +291,17 @@ pub fn page() -> String {
        one light source is what makes a console read as a surface. */
     --wash: radial-gradient(1200px 520px at 82% -14%, rgba(76,141,255,.13), transparent 60%);
 
+    /* Motion, of which this console has deliberately little: an operator sees
+       these screens all day, and the rule is that anything opened dozens of
+       times a day either moves imperceptibly or not at all. What does move
+       borrows its curve rather than inventing one — a hand-rolled bezier is
+       how an interface ends up with five nearly identical ones that disagree.
+       `--ease-out` is the strong UI ease-out (entering and leaving),
+       `--ease-in-out` is for something moving on screen, and hover and colour
+       keep the browser's own `ease`, which is what that case wants. */
     --dur-fast: 130ms; --dur-base: 200ms;
-    --ease: cubic-bezier(.2,.7,.3,1);
+    --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+    --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
   }}
 
   /* ======================================================================
@@ -318,9 +332,13 @@ pub fn page() -> String {
   }}
   h1, h2, h3 {{
     margin: 0; color: var(--text-strong); font-family: var(--font-display);
-    font-weight: var(--fw-semibold); letter-spacing: var(--tracking-tight);
+    font-weight: var(--fw-semibold); letter-spacing: var(--tracking-body);
     line-height: var(--leading-snug);
   }}
+  /* The three headings that are actually larger than the body. Everything else
+     called h1/h2/h3 is body-sized or a small-caps rule, and tightening those
+     only made them harder to read. */
+  aside h1, .bar h2, .section h3 {{ letter-spacing: var(--tracking-tight); }}
   p {{ margin: 0; }}
   code, pre {{
     font-family: var(--font-mono); font-size: var(--text-sm);
@@ -420,6 +438,7 @@ pub fn page() -> String {
   .page .headtext {{ flex: 1 1 26rem; min-width: 0; }}
   .page h2 {{
     font: var(--fw-semibold) 1.5rem/var(--leading-tight) var(--font-display);
+    letter-spacing: var(--tracking-display);
     margin: 0 0 var(--space-2);
   }}
   /* Tables are read, not admired: a sticky header so the columns stay named
@@ -618,6 +637,56 @@ pub fn page() -> String {
     color: var(--text-strong); border-color: var(--brand);
     background: color-mix(in srgb, var(--brand) 10%, transparent);
   }}
+  /* A setting with two states and the condition of not having been set.
+     Unset is deliberately inert — a hairline track, the knob at rest, no fill —
+     because "off" is a decision somebody made and "not set" is not, and a
+     control that draws them the same way is a control that lies about which
+     one is in front of you. */
+  .switch {{ display: inline-flex; align-items: center; gap: var(--space-2); }}
+  /* The value, kept out of sight: one control to operate, one value to read.
+     `display: none` rather than a clipped box, so it is out of the tab order
+     and the accessibility tree without being told to be, and so anything that
+     walks the page for controls finds the switch and not a second one behind
+     it. A hidden `<select>` still answers to `.value`, which is all this is. */
+  .switch .carrier {{ display: none; }}
+  .knob {{
+    position: relative; flex: none; width: 34px; height: 20px; padding: 0;
+    border: 1px solid var(--border-strong); border-radius: var(--radius-pill);
+    background: var(--surface-sunken); cursor: pointer;
+    transition: background var(--dur-fast) ease, border-color var(--dur-fast) ease;
+  }}
+  .knob::after {{
+    content: ""; position: absolute; inset: 2px auto 2px 2px;
+    width: 14px; border-radius: var(--radius-pill); background: var(--text-faint);
+    transition: transform var(--dur-fast) var(--ease-out),
+                background var(--dur-fast) ease;
+  }}
+  .knob[data-state="unset"] {{ border-style: dashed; }}
+  .knob[data-state="false"] {{ border-color: var(--border-strong); }}
+  .knob[data-state="false"]::after {{ background: var(--text-muted); }}
+  .knob[data-state="true"] {{ background: var(--brand); border-color: var(--brand); }}
+  .knob[data-state="true"]::after {{
+    background: var(--on-brand); transform: translateX(14px);
+  }}
+  .knob:hover {{ border-color: var(--brand); }}
+  /* One switch carries one decision; the way back to "not set" must be there
+     without adding a second bordered control beside every one of them. */
+  .switch .suggest {{ margin-left: 0; border-color: transparent; background: none; }}
+  .switch .suggest:hover {{ border-color: var(--brand); background: var(--surface-raised); }}
+  .switchstate {{
+    font: var(--fw-regular) var(--text-2xs)/1.4 var(--font-mono);
+    color: var(--text-faint); letter-spacing: var(--tracking-small);
+    white-space: nowrap;
+  }}
+  /* A whole number and what it is counted in. The unit rides the value rather
+     than the label, so the label can say what the setting is and the box can
+     say what the figure means. */
+  .num {{ display: inline-flex; align-items: center; gap: var(--space-2); }}
+  .unit {{
+    font: var(--fw-regular) var(--text-2xs)/1.4 var(--font-mono);
+    color: var(--text-faint); letter-spacing: var(--tracking-small);
+    white-space: nowrap;
+  }}
   .suggest {{
     margin-left: var(--space-2); padding: 0 var(--space-2);
     border: 1px solid var(--border-strong); border-radius: var(--radius-pill);
@@ -626,6 +695,76 @@ pub fn page() -> String {
     text-transform: none; letter-spacing: 0;
   }}
   .suggest:hover {{ color: var(--text-strong); border-color: var(--brand); }}
+  /* A box you type into, with the answers this appliance already holds one
+     click away. The `<datalist>` is still there — typing filters it — but a
+     datalist shows nothing until somebody types, so the offer was kept only
+     for the operator who already knew it was there. The control says so. */
+  .combo {{ position: relative; display: inline-flex; align-items: center; gap: var(--space-2); }}
+  .combo > .caret {{
+    flex: none; padding: var(--space-1) var(--space-2); line-height: 1;
+    border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
+    background: var(--surface-raised); color: var(--text-muted); cursor: pointer;
+    font: var(--fw-medium) var(--text-sm)/1 var(--font-mono);
+  }}
+  .combo > .caret:hover {{ color: var(--text-strong); border-color: var(--brand); }}
+  .combo > .menu {{
+    position: absolute; z-index: 5; top: calc(100% + var(--space-1)); left: 0;
+    display: flex; flex-direction: column; min-width: 100%; padding: var(--space-1);
+    border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
+    background: var(--surface-raised); box-shadow: var(--shadow-md);
+  }}
+  .combo .choice {{
+    border: 0; background: none; cursor: pointer; text-align: left;
+    padding: var(--space-1) var(--space-2); color: var(--text-body);
+    font: var(--fw-regular) var(--text-sm)/1.6 var(--font-mono); white-space: nowrap;
+  }}
+  .combo .choice:hover {{ background: var(--surface-sunken); color: var(--text-strong); }}
+  /* A list with its usual answers under it. The chips sit below the box rather
+     than beside it because they are as long as the values they stand for, and
+     a row of them squeezed into a column meant for one value wraps to three
+     lines that look like a second field. Ticked and unticked are drawn the
+     same way a `.pickone` is — the same gesture, so the same appearance. */
+  .chips {{ display: flex; flex-direction: column; gap: var(--space-2); align-items: stretch; }}
+  .chiprow {{ display: flex; flex-wrap: wrap; gap: var(--space-1); }}
+  .chip {{
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--border); border-radius: var(--radius-sm);
+    background: var(--surface-sunken); color: var(--text-muted); cursor: pointer;
+    font: var(--fw-regular) var(--text-2xs)/1.5 var(--font-mono);
+  }}
+  .chip:hover {{ color: var(--text-body); border-color: var(--border-strong); }}
+  .chip.on {{
+    color: var(--text-strong); border-color: var(--brand);
+    background: color-mix(in srgb, var(--brand) 10%, transparent);
+  }}
+  /* A time of day is a time of day: the platform's own control, sized to what
+     it holds, so it does not read as a wide empty box somebody forgot. */
+  input[type="time"] {{ font-variant-numeric: tabular-nums; }}
+  /* One question asked about several things: the row says what, the column
+     says which way, and the control in the cell is the answer. The headers do
+     the labelling, so the field inside carries none — a label repeated down
+     nine rows is the table's own first column said twice. */
+  /* Sized to what it holds, not to the page: a route map name in a box six
+     hundred pixels wide is the same mistake as a port in one, and the point of
+     the table was to take up less room, not to spread the same sixteen
+     controls across more of it. */
+  .mtx {{ border-collapse: collapse; width: auto; }}
+  .mtx th {{
+    padding: var(--space-2) var(--space-3); text-align: left;
+    color: var(--text-muted); font: var(--fw-medium) var(--text-2xs)/1.4 var(--font-mono);
+    text-transform: uppercase; letter-spacing: var(--tracking-caps);
+    border-bottom: 1px solid var(--border);
+  }}
+  .mtx td {{ padding: var(--space-2) var(--space-3); vertical-align: top; }}
+  .mtx tbody tr + tr td, .mtx tbody tr + tr th {{ border-top: 1px solid var(--border); }}
+  .mtx th.mtxrow {{
+    white-space: nowrap; color: var(--text-body); text-transform: none;
+    letter-spacing: normal; border-bottom: 0;
+    font: var(--fw-regular) var(--text-sm)/1.6 var(--font-sans);
+  }}
+  .mtx td .field {{ margin: 0; }}
+  .mtx td .field select, .mtx td .field input {{ width: 260px; max-width: 260px; }}
+  .mtx td .sub {{ color: var(--text-faint); }}
   .req {{
     margin-left: var(--space-2); color: var(--product-strong);
     font: var(--fw-medium) var(--text-2xs)/1.2 var(--font-mono);
@@ -635,7 +774,7 @@ pub fn page() -> String {
   /* What the value means, under the value. Small and quiet: it is an aid, and
      an aid that competes with the field is a distraction. */
   .hint {{ font: var(--fw-regular) var(--text-2xs)/1.4 var(--font-mono);
-    color: var(--text-faint);
+    color: var(--text-faint); letter-spacing: var(--tracking-small);
     /* Wrapping, not truncation: the answer is the whole point, and half a
        range ("10.0.0.0 – 10.255…") is worse than no answer at all. */
     overflow-wrap: anywhere;
@@ -674,8 +813,33 @@ pub fn page() -> String {
     background: var(--surface); color: var(--text-body);
     box-shadow: var(--shadow-lg); padding: var(--space-5) var(--space-6);
     max-width: 48rem; width: calc(100% - var(--space-7));
+    /* A dialog is the one thing here that arrives rather than appears: it
+       covers the page an operator was reading, and a full-screen surface that
+       teleports in reads as a page change. It is also occasional — the answer
+       to Apply, or the editor — so it can afford the two hundred milliseconds
+       a rail control cannot. Opacity and transform only, no origin (a modal is
+       not anchored to what opened it), and it leaves the way it came. */
+    opacity: 0; transform: scale(.97);
+    transition: opacity var(--dur-base) var(--ease-out),
+                transform var(--dur-base) var(--ease-out),
+                overlay var(--dur-base) allow-discrete,
+                display var(--dur-base) allow-discrete;
   }}
-  dialog::backdrop {{ background: rgba(7,10,16,.7); }}
+  /* The rule editor holds a whole mask, and a mask is columns. At 48rem it got
+     one of them and became a twenty-row questionnaire — the same object the add
+     panel lays out four abreast. Wide enough for three, and no wider: a modal
+     that fills the screen has stopped being a modal. */
+  dialog#editor {{ max-width: 66rem; }}
+  dialog[open] {{ opacity: 1; transform: scale(1); }}
+  @starting-style {{ dialog[open] {{ opacity: 0; transform: scale(.97); }} }}
+  dialog::backdrop {{
+    background: rgba(7,10,16,0);
+    transition: background var(--dur-base) var(--ease-out),
+                overlay var(--dur-base) allow-discrete,
+                display var(--dur-base) allow-discrete;
+  }}
+  dialog[open]::backdrop {{ background: rgba(7,10,16,.7); }}
+  @starting-style {{ dialog[open]::backdrop {{ background: rgba(7,10,16,0); }} }}
   .script {{
     background: var(--surface-sunken); border: 1px solid var(--border);
     border-left: 2px solid var(--product); border-radius: var(--radius-sm);
@@ -698,7 +862,7 @@ pub fn page() -> String {
   .wordmark {{ display: flex; flex-direction: column; gap: 1px; min-width: 0; }}
   .wordmark .name {{
     font: var(--fw-semibold) var(--text-base)/1.1 var(--font-display);
-    letter-spacing: -.03em; color: var(--text-strong);
+    letter-spacing: var(--tracking-tight); color: var(--text-strong);
   }}
   .wordmark .sub {{
     font: var(--fw-regular) var(--text-2xs)/1.2 var(--font-mono);
@@ -728,6 +892,84 @@ pub fn page() -> String {
   aside button.navitem .meta {{
     margin-left: auto; font: var(--fw-medium) var(--text-2xs)/1.4 var(--font-mono);
     color: var(--text-faint);
+  }}
+
+  /* A category carries its own colour, and only on its mark: the icon and the
+     edge that shows where you are. Tinting the label too would turn the rail
+     into a paint chart and stop the colour meaning anything -- it is here to
+     tell twelve areas apart at a glance, not to decorate. */
+  aside button.navitem.cat {{ padding-block: var(--space-2); }}
+  aside button.navitem.cat svg {{ color: var(--cat); width: 17px; height: 17px; }}
+  aside button.navitem.cat.on {{ color: var(--text-strong); background: var(--surface-raised); }}
+  aside button.navitem.cat.on::before {{ background: var(--cat); }}
+  aside button.navitem.cat:hover svg {{ filter: brightness(1.25); }}
+
+  /* The pages inside the category, in the content rather than the rail. It sits
+     above the heading because it is what the heading is one of.
+
+     This is the only navigation a page carries. A divided view — routing, with
+     a pane per protocol — used to print its panes a second time in a strip of
+     its own directly underneath, which is two rows of buttons for one decision
+     and no way to tell which of them you are standing in. The panes are pages
+     of the category like any other, so they are listed here, once, with the
+     marks that used to justify the second row: an icon per page and a dot on
+     the ones that already carry configuration. */
+  .secstrip {{
+    display: flex; flex-wrap: wrap; gap: var(--space-1);
+    padding: 0 var(--space-6); margin-bottom: var(--space-2);
+  }}
+  .secstrip:empty {{ display: none; }}
+  .secstrip .secitem {{
+    display: inline-flex; align-items: center; gap: var(--space-2);
+    background: none; border: 0; border-bottom: 2px solid transparent;
+    padding: var(--space-2) var(--space-3); cursor: pointer;
+    font: var(--fw-medium) var(--text-sm)/1.2 var(--font-sans); color: var(--text-muted);
+  }}
+  .secstrip .secitem svg {{ width: 14px; height: 14px; flex: none; opacity: .8; }}
+  .secstrip .secitem:hover {{ color: var(--text-strong); }}
+  .secstrip .secitem.on {{ color: var(--text-strong); border-bottom-color: var(--cat); }}
+  /* Configured is not a status, and a mark that borrowed the colour of "up"
+     would tell an operator something the appliance never said. */
+  .secstrip .secitem .live {{
+    width: 5px; height: 5px; border-radius: 50%;
+    background: var(--text-faint); flex: none;
+  }}
+
+  /* The dashboard's top row. A tile is a number and what it counts; the colour
+     is the same one its category carries in the rail, so the eye can follow a
+     tile to the page that explains it. */
+  .stats {{
+    display: grid; gap: var(--space-3); margin-bottom: var(--space-4);
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  }}
+  .stat {{
+    position: relative; display: flex; flex-direction: column; gap: 2px;
+    padding: var(--space-4); background: var(--surface); border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm); overflow: hidden;
+  }}
+  .stat::before {{
+    content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--cat);
+  }}
+  .stat .slabel {{
+    font: var(--fw-semibold) var(--text-2xs)/1.2 var(--font-sans);
+    letter-spacing: .08em; text-transform: uppercase; color: var(--text-muted);
+  }}
+  .stat .svalue {{
+    font: var(--fw-semibold) var(--text-2xl)/1.1 var(--font-sans);
+    color: var(--text-strong); font-variant-numeric: tabular-nums;
+  }}
+  .stat .sfoot {{ font: var(--text-xs)/1.3 var(--font-sans); color: var(--text-faint); }}
+
+  /* Two cards side by side where there is room, stacked where there is not. */
+  /* Eine Zeile einer Befehlsausgabe, nicht eine Zahl: linksbündig, monospace
+     und ohne Umbruch -- die Karte scrollt, statt die Zeile zu zerlegen. */
+  td.line {{
+    font: var(--text-xs)/1.5 var(--font-mono); color: var(--text-muted);
+    white-space: pre; text-align: left;
+  }}
+  .dashgrid {{
+    display: grid; gap: var(--space-3); margin-bottom: var(--space-4);
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
   }}
 
   .cluster {{
@@ -847,44 +1089,6 @@ pub fn page() -> String {
   .change .what {{ flex: 1 1 auto; font-size: var(--text-sm); color: var(--text-body); }}
   #stagedlist {{ background: none; border: 0; border-left: 0; padding: 0; white-space: normal; }}
 
-  /* --- tabs --------------------------------------------------------------
-     A section with seven protocols under it is a scroll, not a page. Tabs make
-     the one being worked on the whole screen and keep its siblings one click
-     away — and each tab is also a rail entry, so the nav and the strip are two
-     ways into the same place rather than two different structures. */
-  .tabs {{
-    display: flex; gap: var(--space-1); flex-wrap: wrap;
-    margin: 0 0 var(--space-5); padding: 0 0 1px;
-    border-bottom: 1px solid var(--border-subtle);
-    /* Horizontal scrolling drags a vertical scrollbar along with it in every
-       engine that has one, and a 3px stub under a tab strip reads as a defect. */
-    overflow-x: auto; overflow-y: hidden;
-  }}
-  .tabs button {{
-    position: relative; cursor: pointer; background: none; border: 0;
-    display: inline-flex; align-items: center; gap: var(--space-2);
-    color: var(--text-muted); font: inherit; font-size: var(--text-sm);
-    padding: var(--space-2) var(--space-3) var(--space-3);
-    border-radius: var(--radius-sm) var(--radius-sm) 0 0;
-  }}
-  .tabs button svg {{ width: 14px; height: 14px; flex: none; opacity: .8; }}
-  .tabs button:hover {{ color: var(--text-body); background: var(--surface-hover); }}
-  .tabs button.on {{ color: var(--text-strong); font-weight: var(--fw-medium); }}
-  .tabs button.on::after {{
-    content: ""; position: absolute; left: var(--space-2); right: var(--space-2);
-    bottom: -1px; height: 2px; border-radius: var(--radius-pill);
-    background: var(--brand);
-  }}
-  /* A tab that already carries configuration says so, so an operator can see
-     which of seven protocols is actually running without opening all seven. */
-  /* A tab that already carries configuration says so — with a neutral mark.
-     Configured is not a status, and a setting that borrows the colour of "up"
-     tells an operator something the appliance never said. */
-  .tabs button .live {{
-    display: inline-block; width: 5px; height: 5px; margin-left: var(--space-2);
-    border-radius: 50%; background: var(--text-faint); vertical-align: middle;
-  }}
-
   /* --- rail groups --------------------------------------------------------
      Collapsible, because Routing alone is eleven entries once every protocol
      is listed, and a rail you have to scroll past is one you stop reading. */
@@ -902,7 +1106,10 @@ pub fn page() -> String {
   nav .grouphead:hover {{ color: var(--text-muted); }}
   nav .grouphead svg {{
     width: 12px; height: 12px; margin-left: auto;
-    transition: transform var(--dur-fast) var(--ease);
+    /* The chevron turns where it stands, which is movement on screen rather
+       than an entrance — and it is a rail control, so it stays under the
+       imperceptible mark. */
+    transition: transform var(--dur-fast) var(--ease-in-out);
   }}
   nav .group.closed .grouphead svg {{ transform: rotate(-90deg); }}
   nav .group.closed .navitem {{ display: none; }}
@@ -913,8 +1120,8 @@ pub fn page() -> String {
     border: 1px solid var(--border); border-radius: var(--radius-lg);
     background: var(--surface); box-shadow: var(--shadow-sm), var(--edge-top);
     padding: var(--space-4) var(--space-5);
-    transition: border-color var(--dur-fast) var(--ease),
-                box-shadow var(--dur-fast) var(--ease);
+    transition: border-color var(--dur-fast) ease,
+                box-shadow var(--dur-fast) ease;
   }}
   .kpi:hover {{ border-color: var(--border-strong); box-shadow: var(--shadow-md); }}
   .kpi .klabel {{
@@ -991,6 +1198,13 @@ pub fn page() -> String {
   /* What belongs under a heading that stands in the margin keeps the content
      edge, so the page reads as two columns even where the markup is a stack. */
   .inset {{ margin-left: calc(var(--gutter) + var(--gutter-gap)); }}
+  /* …and where there is no margin column to keep the edge of — inside a modal,
+     which has its own edges and no room for a 208px one — the headings go back
+     above what they name and nothing is indented. `inset` would have done half
+     of this and pushed the whole mask sideways doing it. */
+  .flush .spread {{ grid-template-columns: minmax(0, 1fr); }}
+  .flush .spread > * {{ grid-column: 1; }}
+  .flush .spread > .margin {{ margin-bottom: var(--space-3); }}
   /* A rail, a gutter and a table of six columns do not fit on a laptop held
      sideways. Below the width where the margin column would start eating the
      content, the label simply goes back above what it names. */
@@ -1062,6 +1276,10 @@ pub fn page() -> String {
   .field.w-s input, .field.w-s select {{ max-width: 124px; }}
   .field.w-m input, .field.w-m select {{ max-width: 208px; }}
   .field.w-l {{ grid-column: span 2; }}
+  /* A switch is as wide as a switch. It sits in the column it was given and
+     stops there, rather than stretching a two-state control across a track
+     sized for an address. */
+  .field.w-auto > .switch {{ align-self: start; }}
 
   /* --- the settings mask -------------------------------------------------
      A mask is a stack of groups; a group is a spread. The container it is put
@@ -1086,8 +1304,8 @@ pub fn page() -> String {
   /* …but only where the mask opened the gutter itself. A mask inside a panel
      that is already indented has no margin column, so its foot has nothing to
      line up with. */
-  .inset .maskfoot, .spread .maskfoot,
-  .inset .formerr, .spread .formerr {{ margin-left: 0; }}
+  .inset .maskfoot, .spread .maskfoot, .flush .maskfoot,
+  .inset .formerr, .spread .formerr, .flush .formerr {{ margin-left: 0; }}
   @media (max-width: 1180px) {{
     .maskhost:has(.mask > .spread) > .maskfoot,
     .maskhost:has(.mask > .spread) > .formerr {{ margin-left: 0; }}
@@ -1106,8 +1324,25 @@ pub fn page() -> String {
   .spread .spread > *, .inset .spread > * {{ grid-column: 1; }}
   .spread .spread > .margin, .inset .spread > .margin {{ margin-bottom: var(--space-3); }}
 
+  /* Reduced motion means fewer and gentler, not none. What is dropped is
+     movement — the chevron's rotation, the dialog's scale — while the fades
+     that tell an operator a surface arrived are kept, and kept short. Turning
+     every transition off wholesale takes away the explanation along with the
+     motion. */
   @media (prefers-reduced-motion: reduce) {{
-    * {{ transition: none !important; animation: none !important; }}
+    nav .grouphead svg {{ transition: none; }}
+    /* The knob still changes side — that is the state, not decoration — but it
+       stops sliding there. The colour still moves, because that is what says
+       the switch took the press. */
+    .knob::after {{ transition: background var(--dur-fast) ease; }}
+    dialog {{
+      transform: none;
+      transition: opacity var(--dur-fast) ease,
+                  overlay var(--dur-fast) allow-discrete,
+                  display var(--dur-fast) allow-discrete;
+    }}
+    dialog[open] {{ transform: none; }}
+    @starting-style {{ dialog[open] {{ transform: none; }} }}
   }}
 </style>
 </head>
@@ -1227,11 +1462,42 @@ pub fn page() -> String {
       <div class="script" id="stagedlist" style="flex:1 1 100%"></div>
     </div>
 
+    <div class="secstrip" id="sectionstrip"></div>
     <div class="page" id="pagehead"></div>
 
     <div id="view-dashboard">
+      <!-- What the box is, in numbers, before any chart. An operator opening a
+           router console wants to know the size of the thing they are looking
+           at -- how many links, how many routes, how many rules -- and a page
+           that opens with a time series answers a question they have not asked
+           yet. -->
+      <div class="stats" id="stats"></div>
       <div class="cards" id="services"></div>
+      <div class="dashgrid">
+        <div class="card">
+          <h3>Interfaces</h3>
+          <div style="overflow-x:auto"><table id="dashlinks"></table></div>
+        </div>
+        <div class="card">
+          <h3>System</h3>
+          <table id="dashsystem"></table>
+        </div>
+      </div>
       <div class="cards" id="graphs"></div>
+      <div class="dashgrid">
+        <div class="card">
+          <h3>Routes</h3>
+          <div style="overflow-x:auto"><table id="dashroutes"></table></div>
+        </div>
+        <div class="card">
+          <h3>Rules carrying traffic</h3>
+          <div style="overflow-x:auto"><table id="dashrules"></table></div>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Recent log</h3>
+        <div style="overflow-x:auto"><pre class="out" id="dashlog"></pre></div>
+      </div>
       <div class="card">
         <h3>Counters</h3>
         <label class="check">
@@ -1374,13 +1640,6 @@ pub fn page() -> String {
     </div>
 
     <div id="view-history" class="hidden">
-      <p class="lede" style="margin:0 0 var(--space-5)">
-        What the box looked like before now. Live counters answer what is
-        happening; they cannot answer whether this was happening at three in the
-        morning last Tuesday, which is the question people actually arrive with.
-        A gap in a line is a gap in the record — the box was off, or the
-        interface went away — and is drawn as one rather than joined up.
-      </p>
       <div class="toolbar">
         <label class="inline"><span>Resolution</span>
           <select id="historyres">
@@ -1631,13 +1890,6 @@ pub fn page() -> String {
     </div>
 
     <div id="view-evpn" class="hidden">
-      <p class="lede">
-        One tenant network across several boxes. BGP carries <em>who is
-        where</em> — a MAC learned here is announced to the others, a subnet
-        behind it as a prefix — and the data plane carries the frames, wrapped
-        toward whichever box announced the destination. Neither half is any use
-        alone, so both are set here.
-      </p>
       <div class="card">
         <h3>This box</h3>
         <p class="lede" style="margin:0 0 var(--space-4)">
@@ -1718,12 +1970,6 @@ pub fn page() -> String {
 
 
     <div id="view-qos" class="hidden">
-      <p class="lede" style="margin:0 0 var(--space-4)">
-        Shaping belongs on the link that is actually congested — the uplink, on
-        the way out. Set the bandwidth slightly <em>below</em> what the line
-        really carries: the point is to hold the queue here, where it can be
-        managed, instead of in the modem, where it cannot.
-      </p>
       <label class="field" style="max-width:20rem">
         <span>Interface</span><select id="qosiface"></select>
       </label>
@@ -1768,11 +2014,6 @@ pub fn page() -> String {
     </div>
 
     <div id="view-openconnect" class="hidden">
-      <p class="lede" style="margin:0 0 var(--space-5)">
-        The road-warrior server: a client connects with a username and password
-        and lands in the zone named below. IPsec and WireGuard next door are
-        site-to-site — this is the one people carry.
-      </p>
       <div class="card"><h3>Server</h3><div class="grid" id="oc-server"></div></div>
       <div class="section">
         <h3>Accounts</h3>
@@ -1792,14 +2033,8 @@ pub fn page() -> String {
          could be created at all. The list is picked once, above, the way a
          WireGuard interface is. -->
     <div id="view-routepolicy" class="hidden">
-      <div class="tabs" id="tabs-routepolicy"></div>
 
       <div class="tabpane hidden" data-tab="prefix">
-        <p class="lede">
-          A named set of prefixes a route map or a neighbour filter points at.
-          Rules are read in sequence order, and <code>ge</code>/<code>le</code>
-          widen one to a range of lengths. A list exists once it has a rule.
-        </p>
         <div class="toolbar">
           <label class="inline"><span>List</span><select id="pllist-pick"></select></label>
           <input id="plnew" placeholder="or a new list name" style="max-width:14rem">
@@ -1811,11 +2046,6 @@ pub fn page() -> String {
       </div>
 
       <div class="tabpane hidden" data-tab="maps">
-        <p class="lede">
-          What is accepted, and what is changed on the way through. Each rule
-          matches and then sets; the map's default decides what happens to a
-          route no rule matched.
-        </p>
         <div class="toolbar">
           <label class="inline"><span>Map</span><select id="rmlist-pick"></select></label>
           <input id="rmnew" placeholder="or a new map name" style="max-width:14rem">
@@ -1828,13 +2058,6 @@ pub fn page() -> String {
       </div>
 
       <div class="tabpane hidden" data-tab="pbr">
-        <p class="lede">
-          Ordinary routing asks one question: where is this going? These rules
-          ask the others — where it came from, over which link, to which port —
-          and send the answer to a different routing table. That is how a guest
-          network leaves by the cheap uplink while everything else takes the
-          good one.
-        </p>
         <div class="section">
           <h3>Rules</h3>
           <span class="spacer"></span>
@@ -1881,13 +2104,8 @@ pub fn page() -> String {
          speaks seven of them must not stack seven forms on one scroll, and the
          rail lists the same seven so either way in lands on the same page. -->
     <div id="view-routing" class="hidden">
-      <div class="tabs" id="tabs-routing"></div>
 
       <div class="tabpane hidden" data-tab="static">
-        <p class="lede">
-          Routes written by hand. They win over anything a protocol learns, which
-          is what makes them useful and what makes a forgotten one hard to find.
-        </p>
         <div class="section">
           <h3>Routes</h3>
           <span class="spacer"></span>
@@ -1899,14 +2117,7 @@ pub fn page() -> String {
       </div>
 
       <div class="tabpane hidden" data-tab="bgp">
-        <p class="lede">
-          The exterior protocol: who this appliance is to another network, the
-          neighbours it says it to, and what came of that. A neighbour without a
-          remote AS is not a session.
-        </p>
         <div class="card"><div class="grid" id="bgpglobal"></div></div>
-        <div class="card"><div class="grid" id="bgpconfed"></div></div>
-        <div class="card"><div class="grid" id="bgprpki"></div></div>
         <div class="section">
           <h3>Aggregates</h3>
           <span class="spacer"></span>
@@ -1942,86 +2153,49 @@ pub fn page() -> String {
       </div>
 
       <div class="tabpane hidden" data-tab="ospf">
-        <p class="lede">
-          The interior protocol most networks are built on: a link-state view of
-          one area, or several joined at this box. It is off until it is given an
-          interface to speak on.
-        </p>
         <div class="card"><div class="grid" id="igp-ospf"></div></div>
         <div class="card"><h3>Neighbours</h3><pre class="out" id="show-ospf">…</pre></div>
       </div>
 
       <div class="tabpane hidden" data-tab="ospf3">
-        <p class="lede">
-          OSPF for IPv6. It is a separate protocol with its own adjacencies, not
-          an address family of the one above — running both is normal.
-        </p>
         <div class="card"><div class="grid" id="igp-ospf3"></div></div>
         <div class="card"><h3>Neighbours</h3><pre class="out" id="show-ospf3">…</pre></div>
       </div>
 
       <div class="tabpane hidden" data-tab="isis">
-        <p class="lede">
-          Link-state routing that carries both address families over one set of
-          adjacencies. The system ID and area are what an adjacency is formed on,
-          so they are set before an interface is added.
-        </p>
         <div class="card"><div class="grid" id="igp-isis"></div></div>
         <div class="card"><h3>Adjacencies</h3><pre class="out" id="show-isis">…</pre></div>
       </div>
 
       <div class="tabpane hidden" data-tab="rip">
-        <p class="lede">
-          Distance-vector, and bounded to fifteen hops by design. It is here for
-          the networks that still speak it, not as a first choice.
-        </p>
         <div class="card"><div class="grid" id="igp-rip"></div></div>
         <div class="card"><h3>State</h3><pre class="out" id="show-rip">…</pre></div>
       </div>
 
       <div class="tabpane hidden" data-tab="ripng">
-        <p class="lede">RIP for IPv6, with the same reach and the same limits.</p>
         <div class="card"><div class="grid" id="igp-ripng"></div></div>
         <div class="card"><h3>State</h3><pre class="out" id="show-ripng">…</pre></div>
       </div>
 
       <div class="tabpane hidden" data-tab="babel">
-        <p class="lede">
-          Distance-vector built for links that come and go — wireless, and meshes
-          where the cost of a path is not the number of hops.
-        </p>
         <div class="card"><div class="grid" id="igp-babel"></div></div>
         <div class="card"><h3>State</h3><pre class="out" id="show-babel">…</pre></div>
       </div>
 
       <div class="tabpane hidden" data-tab="bfd">
-        <p class="lede">
-          Sub-second failure detection the protocols beside it subscribe to with
-          their own <code>bfd</code> field. On its own it detects nothing.
-        </p>
         <div class="card"><div class="grid" id="igp-bfd"></div></div>
         <div class="card"><h3>Sessions</h3><pre class="out" id="show-bfd">…</pre></div>
       </div>
 
       <div class="tabpane hidden" data-tab="multicast">
-        <p class="lede">
-          Multicast is not forwarded by default: a router has to be told to
-          listen for the reports that say who wants a group. IGMP is the IPv4
-          half, MLD the IPv6 one, and an interface is either facing receivers or
-          facing the source.
-        </p>
         <div class="card"><div class="grid" id="mcastform"></div></div>
-        <div class="card">
-          <h3>PIM-SM</h3>
-          <p class="lede" style="margin:0 0 var(--space-4)">
-            The querier and the proxy carry multicast <em>within</em> a segment.
-            PIM routes it <em>between</em> them: every join is sent toward the
-            rendezvous point until somebody learns who the source is, which is
-            why sparse mode has no meaning without an RP address. Each link named
-            here must also be a multicast interface below.
-          </p>
-          <div class="grid" id="mcastpim"></div>
-        </div>
+        <p class="lede inset" style="margin:0 0 var(--space-4)">
+          The querier carries multicast <em>within</em> a segment; PIM routes it
+          <em>between</em> them. Every join is sent toward the rendezvous point
+          until somebody learns who the source is, which is why sparse mode has
+          no meaning without an RP address — and each link PIM speaks on must
+          also be a multicast interface below.
+        </p>
         <div class="section">
           <h3>Interfaces</h3>
           <span class="spacer"></span>
@@ -2035,11 +2209,6 @@ pub fn page() -> String {
       </div>
 
       <div class="tabpane hidden" data-tab="vrf">
-        <p class="lede">
-          A separate routing table with its own interfaces, so two tenants can
-          use the same addresses without meeting. Route targets are what let
-          something deliberately cross between them.
-        </p>
         <div class="section">
           <h3>Instances</h3>
           <span class="spacer"></span>
@@ -2050,12 +2219,16 @@ pub fn page() -> String {
         <div class="card"><h3>Instances</h3><pre class="out" id="show-vrf">…</pre></div>
       </div>
 
+      <div class="tabpane hidden" data-tab="filters">
+        <div class="card"><div class="grid" id="redistfilters"></div></div>
+        <!-- What these settings decide, read back: the table is the outcome of
+             what was let in. Same command as the Routing table tab, which is
+             the point — that tab asks what the box knows, this one asks what
+             these filters did to it. -->
+        <div class="card"><h3>Live state</h3><pre class="out" id="filtershow">…</pre></div>
+      </div>
+
       <div class="tabpane hidden" data-tab="table">
-        <p class="lede">
-          What the protocols above actually agreed on. A route is here once, no
-          matter how many of them offered it — this is the answer, not the
-          argument.
-        </p>
         <div class="card"><h3>Routing table</h3><pre class="out" id="igpshow">…</pre></div>
       </div>
     </div>
@@ -2064,44 +2237,25 @@ pub fn page() -> String {
          way an operator thinks about them: what answers questions, what lets
          you in, what hands out addresses, what publishes, what tells you. -->
     <div id="view-services" class="hidden">
-      <div class="tabs" id="tabs-services"></div>
 
       <div class="tabpane hidden" data-tab="resolution">
-        <p class="lede">
-          Each of these is off until it is given something to do — an upstream, an
-          interface, a target. Staging a field and committing is what starts the
-          service; clearing the fields is what stops it.
-        </p>
         <div class="card"><h3>DNS resolver</h3><div class="grid" id="svc-dns"></div></div>
         <div class="card"><h3>NTP</h3><div class="grid" id="svc-ntp"></div></div>
       </div>
 
       <div class="tabpane hidden" data-tab="management">
-        <p class="lede">
-          How the box itself is reached and read. Every one of these is a way in
-          or a way out — none of them should be listening on an untrusted zone.
-        </p>
         <div class="card"><h3>SSH access</h3><div class="grid" id="svc-ssh"></div></div>
         <div class="card"><h3>SNMP (read-only)</h3><div class="grid" id="svc-snmp"></div></div>
         <div class="card"><h3>LLDP</h3><div class="grid" id="svc-lldp"></div></div>
       </div>
 
       <div class="tabpane hidden" data-tab="addressing">
-        <p class="lede">
-          Addresses and names for the segments behind this box — relayed to a
-          server elsewhere, reflected across segments, or published upstream.
-        </p>
         <div class="card"><h3>DHCP relay</h3><div class="grid" id="svc-dhcprelay"></div></div>
         <div class="card"><h3>Dynamic DNS</h3><div class="grid" id="svc-dyndns"></div></div>
         <div class="card"><h3>mDNS reflector</h3><div class="grid" id="svc-mdns"></div></div>
       </div>
 
       <div class="tabpane hidden" data-tab="publishing">
-        <p class="lede">
-          What this box puts in front of something else: a name terminated here,
-          a broadcast carried across a segment boundary, a guest held at a login,
-          a port an inside host asked for.
-        </p>
         <div class="section">
           <h3>Reverse proxy</h3>
           <span class="spacer"></span>
@@ -2125,11 +2279,6 @@ pub fn page() -> String {
       </div>
 
       <div class="tabpane hidden" data-tab="notification">
-        <p class="lede">
-          Where this appliance speaks up. An alert is sent when a watched unit
-          fails; the journal is forwarded continuously, whether or not anything
-          is wrong.
-        </p>
         <div class="card">
           <h3>Alerts</h3>
           <p class="lede" style="margin-bottom:var(--space-4)">
@@ -2162,15 +2311,20 @@ pub fn page() -> String {
       <div class="card addpanel">
         <label class="field"><span>Interface</span><select id="cap-iface"></select></label>
         <label class="field"><span>Filter</span><input id="cap-filter" placeholder="tcp port 443"></label>
-        <label class="field"><span>Packets</span><input id="cap-count" value="50"></label>
-        <label class="field"><span>Seconds</span><input id="cap-secs" value="10"></label>
+        <!-- Both are bounded by the appliance, so the boxes are bounded too:
+             the arrow keys step through the range and 600 seconds cannot be
+             typed into a field the capture would refuse. -->
+        <label class="field w-s"><span>Packets</span>
+          <input id="cap-count" type="number" inputmode="numeric" min="1" max="500" value="50">
+        </label>
+        <label class="field w-s"><span>Seconds</span>
+          <span class="num">
+            <input id="cap-secs" type="number" inputmode="numeric" min="1" max="60" value="10">
+            <span class="unit">s</span>
+          </span>
+        </label>
         <button class="btn primary" id="runcapture">Capture</button>
       </div>
-      <p class="lede" style="margin:0 0 var(--space-4)">
-        Bounded on purpose: never more than 500 packets or 60 seconds, headers
-        only, and nothing is written to disk. A capture that finds nothing is an
-        answer too.
-      </p>
       <div class="card"><h3>Output</h3><pre class="out" id="capout">Not run yet.</pre></div>
     </div>
 
@@ -2209,10 +2363,15 @@ pub fn page() -> String {
   <h3 style="margin:0 0 .8rem" id="editortitle">Rule</h3>
   <!-- The fields are built from the same table the add panel uses, so a rule
        cannot be creatable with a setting that is not editable afterwards. -->
-  <div class="field" style="margin-bottom:var(--space-4)">
-    <label for="r-name">Name</label><input id="r-name">
-  </div>
-  <div class="grid" id="editorfields"></div>
+  <!-- The same markup every field in a mask has, because this one now sits in
+       one: a `.field` whose label is a `<span>`. It was a `<div>` with a
+       `<label for>` beside it, and anything walking the mask's fields for their
+       names — the browser suite does — found a field with no name in it. -->
+  <label class="field w-m" id="r-namefield"><span>Name</span><input id="r-name"></label>
+  <!-- `flush`, because a modal has no margin column: the group headings go
+       back above what they name, and nothing is pushed sideways to line up
+       with a gutter that is not there. -->
+  <div class="flush" id="editorfields"></div>
   <p id="editorerr" class="err"></p>
   <div class="row" style="margin-top:.9rem">
     <button class="btn primary" id="applysave">Stage</button>
@@ -2496,6 +2655,119 @@ async function refreshHistory() {{
   }}
 }}
 
+// The dashboard's top row: the size of the box, from what the appliance already
+// answers. Each tile is one question an operator asks before anything else --
+// how many links are up, how many routes are held, how many rules are written,
+// how many flows are open. They are counted from the same `show` output the
+// pages below use, so a tile can never disagree with the page it summarises.
+function statTile(label, value, foot, colour) {{
+  const t = el("div", {{ class: "stat" }});
+  t.style.setProperty("--cat", colour);
+  t.append(
+    el("span", {{ class: "slabel", text: label }}),
+    el("span", {{ class: "svalue", text: value }}),
+    el("span", {{ class: "sfoot", text: foot || "" }}),
+  );
+  return t;
+}}
+
+// `ip -br`-style output: name, state, then addresses. Parsed rather than shown
+// raw because the dashboard is a summary -- the raw form is one click away
+// under Network, and duplicating it here would make two places to read.
+function parseLinks(out) {{
+  const links = [];
+  for (const line of (out || "").split("\n")) {{
+    const f = line.trim().split(/\s+/);
+    if (f.length < 2 || f[0] === "lo") continue;
+    const [name, state, ...addrs] = f;
+    if (!/^(UP|DOWN|UNKNOWN)$/.test(state)) continue;
+    links.push({{ name, state, addrs: addrs.filter((a) => a.includes("/") && !a.startsWith("fe80")) }});
+  }}
+  return links;
+}}
+
+async function refreshDashboardExtras() {{
+  const stats = $("stats");
+  const tiles = [];
+
+  // Links.
+  let links = [];
+  try {{ links = parseLinks(await text("/api/v1/show/interfaces")); }} catch (e) {{}}
+  const up = links.filter((l) => l.state === "UP").length;
+  if (links.length) {{
+    tiles.push(statTile("Interfaces", String(links.length),
+      up + " up / " + (links.length - up) + " down", "#38bdf8"));
+  }}
+  const lt = $("dashlinks");
+  lt.textContent = "";
+  if (links.length) {{
+    lt.append(el("tr", {{}}, [
+      el("th", {{ text: "Interface" }}), el("th", {{ text: "State" }}), el("th", {{ text: "Address" }}),
+    ]));
+    for (const l of links.slice(0, 8)) {{
+      lt.append(el("tr", {{}}, [
+        el("td", {{ text: l.name }}),
+        el("td", {{}}, [el("span", {{ class: "pill " + (l.state === "UP" ? "ok" : "warn"), text: l.state }})]),
+        el("td", {{ class: "num", text: l.addrs.join(" ") || "—" }}),
+      ]));
+    }}
+  }}
+
+  // Routes.
+  let routes = [];
+  try {{
+    routes = (await text("/api/v1/show/ip/route")).split("\n").filter((l) => l.trim());
+  }} catch (e) {{}}
+  if (routes.length) tiles.push(statTile("Routes", String(routes.length), "in the kernel", "#a78bfa"));
+  const rt = $("dashroutes");
+  rt.textContent = "";
+  for (const line of routes.slice(0, 8)) rt.append(el("tr", {{}}, [el("td", {{ class: "line", text: line }})]));
+  if (!routes.length) rt.append(el("tr", {{}}, [el("td", {{ text: "No routes yet." }})]));
+
+  // Rules, and which of them are carrying anything.
+  try {{
+    const fw = await text("/api/v1/show/firewall");
+    const m = fw.match(/rules \((\d+)\)/);
+    if (m) tiles.push(statTile("Firewall rules", m[1], "written", "#f59e0b"));
+  }} catch (e) {{}}
+  const rr = $("dashrules");
+  rr.textContent = "";
+  try {{
+    const hits = (await text("/api/v1/show/firewall/hits")).split("\n").filter((l) => l.trim());
+    for (const line of hits.slice(0, 9)) rr.append(el("tr", {{}}, [el("td", {{ class: "line", text: line }})]));
+  }} catch (e) {{
+    // A rule-hit table needs the agent's socket; saying so beats an empty box.
+    rr.append(el("tr", {{}}, [el("td", {{ text: "The data plane did not answer: " + (e.message || e) }})]));
+  }}
+
+  // Open flows.
+  try {{
+    const flows = await text("/api/v1/show/firewall/flows");
+    const m = flows.match(/(\d+)\s+flow/);
+    if (m) tiles.push(statTile("Connections", m[1], "tracked right now", "#34d399"));
+  }} catch (e) {{}}
+
+  stats.textContent = "";
+  for (const t of tiles) stats.append(t);
+
+  // What the box itself is.
+  const sys = $("dashsystem");
+  sys.textContent = "";
+  try {{
+    const v = await text("/api/v1/show/version");
+    for (const line of v.split("\n").filter((l) => l.trim()).slice(0, 6)) {{
+      const [k, ...rest] = line.split(/:\s+/);
+      sys.append(el("tr", {{}}, [el("td", {{ text: k }}), el("td", {{ class: "num", text: rest.join(": ") }})]));
+    }}
+  }} catch (e) {{}}
+
+  // The last thing that happened, so the page ends with news rather than a table.
+  try {{
+    const log = await text("/api/v1/show/firewall/log");
+    $("dashlog").textContent = log.split("\n").slice(-12).join("\n") || "Nothing logged yet.";
+  }} catch (e) {{ $("dashlog").textContent = "The log could not be read: " + (e.message || e); }}
+}}
+
 async function refreshDashboard() {{
   // Services first: a red unit explains every strange number below it.
   try {{
@@ -2525,6 +2797,15 @@ async function refreshDashboard() {{
       ]));
     }}
   }} catch (e) {{ /* the counters below still work; the pill shows the failure */ }}
+
+  // The tiles and tables above the graphs, each from its own `show`.
+  // Not awaited: the tiles come from six separate `show` calls and the graphs
+  // below must not wait on the slowest of them. A rejection here would
+  // otherwise be an unhandled one -- a dashboard that quietly stops filling in.
+  refreshDashboardExtras().catch((e) => {{
+    $("stats").textContent = "";
+    $("stats").append(el("div", {{ class: "card", text: "The summary could not be read: " + (e.message || e) }}));
+  }});
 
   let counters;
   try {{ counters = parseCounters(await text("/api/v1/show/firewall/statistics")); }}
@@ -2760,12 +3041,25 @@ function carrying(r, action, hits) {{
 //
 // The zone vocabulary is passed in rather than typed: a rule naming a zone that
 // does not exist is the commonest way one silently matches nothing.
+//
+// Grouped like every other mask on this appliance, and for the same reason:
+// twenty boxes in one run under no heading is a form an operator fills in from
+// the top rather than a rule they are writing. The order is the order the
+// sentence goes in — what it does, what it matches, when it is open, how much
+// it lets through, and what it is called.
+const RULE_DAYS = [
+  {{ value: "mon", label: "Mon" }}, {{ value: "tue", label: "Tue" }},
+  {{ value: "wed", label: "Wed" }}, {{ value: "thu", label: "Thu" }},
+  {{ value: "fri", label: "Fri" }}, {{ value: "sat", label: "Sat" }},
+  {{ value: "sun", label: "Sun" }},
+];
 function ruleFields(zones) {{
   const zoneOpts = ["", ...zones];
   return [
     ["from", "From zone", zoneOpts],
     ["to", "To zone", zoneOpts],
     ["action", "Action", ["accept", "drop", "reject"]],
+    ["#", "What it matches"],
     ["proto", "Protocol",
      ["", "tcp", "udp", "tcp_udp", "icmp", "icmpv6", "vrrp", "esp", "ah", "gre", "ospf", "pim"]],
     ["port", "Port"],
@@ -2776,28 +3070,62 @@ function ruleFields(zones) {{
       "destination-unreachable", "packet-too-big", "time-exceeded",
       "parameter-problem", "redirect", "router-solicitation",
       "router-advertisement", "neighbor-solicitation", "neighbor-advertisement"]],
-    // A rule with no address applies to both families; this is how it says
-    // otherwise. `out` covers traffic this box originates, and is IPv4 only.
-    ["source-mac-group", "Sender MAC group"],
-    ["interface-group", "Only on these links"],
-    ["family", "Address family", ["", "ipv4", "ipv6"]],
-    ["direction", "Direction", ["", "in", "out"]],
     ["source", "Source"],
     ["source-group", "Source group"],
     ["destination", "Destination"],
     ["destination-group", "Destination group"],
-    ["limit", "New flows per second"],
-    ["burst", "Burst"],
+    // Each of these names a *group*, not the thing itself: the appliance takes
+    // `firewall group mac-group <name>` here and refuses a MAC, and the same
+    // for the links — which is why neither is a set of tick boxes over this
+    // box's interfaces however much the label sounds like one.
+    ["source-mac-group", "Sender MAC group"],
+    ["interface-group", "Only on these links"],
+    // A rule with no address applies to both families; this is how it says
+    // otherwise. `out` covers traffic this box originates, and is IPv4 only.
+    ["family", "Address family", ["", "ipv4", "ipv6"]],
+    ["direction", "Direction", ["", "in", "out"]],
     // The schedule is three leaves under one word, and `set … schedule days …`
-    // is exactly the command the CLI takes.
-    ["schedule days", "Open on days"],
+    // is exactly the command the CLI takes. `pick` rather than `list`: the
+    // appliance *assigns* the days, so the line that writes them must not be
+    // preceded by a delete — see [`fieldLines`].
+    ["#", "When it is open"],
+    ["schedule days", "Open on days", RULE_DAYS, "pick"],
     ["schedule start", "Opens at"],
     ["schedule end", "Closes at"],
+    ["#", "How much it lets through"],
+    ["limit", "New flows"],
+    ["burst", "Burst"],
+    ["#", "What it is called, and whether it is on"],
     ["log", "Log matches", ["", "true", "false"]],
     ["disabled", "Disabled", ["", "true", "false"]],
     ["description", "Description"],
   ];
 }}
+
+// What a rule asks for depends on the protocol, because the appliance does. A
+// port on a protocol that carries none is refused — "icmp carries no ports" —
+// an ICMP type "needs protocol icmp or icmpv6", and a rate limit or a schedule
+// "is only valid on a port rule". Offering all of it against every protocol is
+// how a rule form asks for a rule nobody could commit.
+const PORTED = ["tcp", "udp", "tcp_udp"];
+const keyed = (now) => !!now.proto;
+const RULE_ONLY = {{
+  key: "proto",
+  map: {{
+    port: PORTED, "port-group": PORTED,
+    "icmp-type": ["icmp", "icmpv6"],
+    // A rule keyed by protocol, which is what `is_port_rule` means: a port on
+    // TCP or UDP, or a protocol that carries no ports and is the match itself.
+    // The port is beside these, so it is not asked for twice.
+    limit: keyed, burst: keyed,
+    "schedule days": keyed, "schedule start": keyed, "schedule end": keyed,
+  }},
+}};
+
+// The editor is the whole rule, not a fold of it — it is opened deliberately,
+// for one rule, and there is nothing behind it to reveal. It still asks only
+// what the protocol has.
+const RULE_EDIT = {{ only: RULE_ONLY }};
 
 // What the editor is currently editing: the fields it was built from, their
 // widgets, and the rule as it was — the last of these is what makes an emptied
@@ -2810,15 +3138,29 @@ function script() {{
   return fieldLines(editing.fields, editing.widgets, "firewall rule " + name, editing.before);
 }}
 
+// One rule, one shape. The dialog used to unpick the mask and re-lay its fields
+// in a grid of its own, so the same rule was a four-column mask when it was
+// being created and a single column of twenty rows when it was being edited —
+// two forms for one object, and the operator learning both. It holds the mask
+// now, exactly as the add panel does, and is wide enough to be one.
 function openEditor(rule, zones) {{
   $("editortitle").textContent = rule ? "Edit rule " + rule.name : "New rule";
   $("r-name").value = rule ? rule.name : "";
   $("r-name").readOnly = !!rule;
   const fields = ruleFields(zones || []);
-  const {{ grid, widgets }} = fieldGrid(fields, rule);
+  const {{ grid, widgets }} = fieldGrid(fields, rule, null, RULE_EDIT);
   const box = $("editorfields");
+  // Held before the box is emptied: after the second open the name field is a
+  // child of the mask this is about to throw away, and emptying first would
+  // detach it and leave `$("r-namefield")` answering null.
+  const named = $("r-namefield");
   box.textContent = "";
-  for (const child of [...grid.children]) box.append(child);
+  maskHost(box);
+  // The name leads the mask rather than standing above it, which is where the
+  // add panel puts it: two forms for one rule differing only in where its name
+  // went is still two forms.
+  grid.firstElementChild.prepend(named);
+  box.append(grid);
   editing = {{ fields, widgets, before: rule }};
   $("editorerr").textContent = "";
   $("editor").showModal();
@@ -2893,34 +3235,83 @@ async function applyStaged(tail) {{
     return;
   }}
   banner("");
-  // The appliance runs a batch line by line and commits whatever survived, so
-  // one bad command used to leave the box half-changed while the dialog said
-  // "Not applied". Applying now checks first and only commits a batch that
-  // came back clean — the operator sees the refusal with nothing changed.
-  if (tail.includes("commit")) {{
-    const dry = await configure(stagedCommands());
-    if (!dry.ok || summarise(dry.output).some((n) => n.kind === "bad")) {{
-      showResult(dry, false);
-      return;
-    }}
-  }}
+  // The batch runs once, and the appliance's own report is the answer.
+  //
+  // Applying used to run every command twice: once with no `commit` to see
+  // whether the batch "would be refused", and then again for real. The check
+  // could not know anything the real run would not — it ran the same lines
+  // against the same configuration — so all it bought was a second execution
+  // of the whole batch on every single apply. What it cost was worse: any
+  // reply with an `error:` line in it stopped the apply outright, so one
+  // refused command meant the changes staged *beside* it were never applied
+  // either, and since the refusal names the setting but not which staged
+  // change contained it, an operator with several waiting could be left unable
+  // to save any of them. The appliance runs a batch line by line, commits what
+  // survived and says what it refused; that report is what to show.
+  //
+  // Checking first is still here — it is what Validate is, and an operator who
+  // wants to know before touching the box presses it. What is gone is the
+  // hidden second run that every apply paid for and that could refuse a change
+  // the appliance was willing to take.
+  //
   // Validating runs the same commands with no `commit`, so nothing is applied
   // — and the staged list must survive it. Clearing on a *validate* was the
   // worst possible bug in this panel: the check said "fine", the panel emptied
   // itself, and the change an operator had just been told was good could no
   // longer be applied.
   const committed = tail.includes("commit");
-  const r = await configure(stagedCommands().concat(tail));
-  showResult(r, committed);
+  let r;
+  try {{
+    r = await configure(stagedCommands().concat(tail));
+  }} catch (e) {{
+    // An apply that never reached the appliance has to say so. Left to throw,
+    // the page swallowed it: no dialog, no banner, the changes still staged —
+    // an operator pressing Apply and being answered with nothing at all.
+    showResult({{ ok: false, output: "error: " + (e.message || e) }}, committed);
+    return;
+  }}
+  const refused = !r.ok || summarise(r.output).some((n) => n.kind === "bad");
+  showResult(r, committed, refused ? await culprit() : null);
   // Only clear once they have actually run. A refused commit leaves the
   // commands staged, so the operator can fix one and try again rather than
   // reconstructing what they had clicked.
-  if (committed && r.ok && !summarise(r.output).some((n) => n.kind === "bad")) {{
+  if (committed && !refused) {{
     staged = [];
     renderStaged();
   }}
   await buildSearchIndex();
   await refresh();
+}}
+
+// Which staged change the appliance refused.
+//
+// The reply says what was wrong and never which line said it, and "That
+// setting is not one this appliance accepts" is an unanswerable sentence when
+// six changes are waiting: the operator cannot tell which one to correct, so
+// the batch stays broken and nothing they do afterwards can be applied either.
+//
+// So the batch is replayed a change at a time — same lines, same order, no
+// `commit`, so nothing is applied — and the first prefix that draws a refusal
+// names the change that carries it. Only ever after a refusal, and only while
+// the list is short enough for that to be quick: this is a hint that costs a
+// few seconds in the one case where an operator is stuck, not something every
+// apply pays for.
+async function culprit() {{
+  if (staged.length < 2 || staged.length > 12) return null;
+  const sofar = [];
+  for (const entry of staged) {{
+    sofar.push(...entry.cmds);
+    let r;
+    try {{
+      r = await configure(sofar);
+    }} catch (e) {{
+      return null;   // a hint is never worth losing the answer over
+    }}
+    if (!r.ok || summarise(r.output).some((n) => n.kind === "bad")) return entry.label;
+  }}
+  // The lines that survived were committed and saved, so a replay can come back
+  // clean — better to say nothing than to blame the wrong change.
+  return null;
 }}
 
 // What came back, as an outcome — never as a transcript.
@@ -2964,7 +3355,7 @@ function summarise(output) {{
   return notes;
 }}
 
-function showResult(r, committed) {{
+function showResult(r, committed, blamed) {{
   const notes = summarise(r.output);
   const failed = notes.some((n) => n.kind === "bad");
   // The appliance runs the commands it can and reports what it could not: a
@@ -2993,6 +3384,12 @@ function showResult(r, committed) {{
     notes.unshift({{ kind: "warn", text:
       "Some of this was applied and saved before the refusal — the appliance " +
       "runs what it can. Check the section before applying again." }});
+  }}
+  // Which of the waiting changes it came from. First, because a refusal an
+  // operator cannot place is one they cannot act on.
+  if (blamed) {{
+    notes.unshift({{ kind: "bad", text: "The refusal came from: " + blamed +
+      " — remove or correct that change, the rest are still staged." }});
   }}
   for (const n of notes) {{
     box.append(el("div", {{ class: "change" }}, [
@@ -3102,6 +3499,27 @@ function cidrHint(value) {{
   return "";
 }}
 
+// `host:port` read back, so the halves can be told apart at a glance. A v6
+// endpoint carries colons of its own and is written `[fd00::1]:51820`, which is
+// the one case a naive split gets wrong and then says something confident and
+// untrue about.
+function endpointHint(value) {{
+  const text = value.trim();
+  if (!text) return "";
+  const bracketed = text.match(/^\[(.+)\]:(\d+)$/);
+  const plain = bracketed ? null : text.match(/^([^:]+):(\d+)$/);
+  const m = bracketed || plain;
+  if (!m) {{
+    return text.includes(":") && !bracketed
+      ? "an IPv6 endpoint is written [address]:port"
+      : "needs a port — host:port";
+  }}
+  const port = Number(m[2]);
+  if (port < 1 || port > 65535) return "the port is out of range";
+  const named = WELL_KNOWN_PORTS[port] ? ", usually " + WELL_KNOWN_PORTS[port] : "";
+  return m[1] + " on port " + port + named;
+}}
+
 function portHint(value) {{
   const text = value.trim();
   if (!text) return "";
@@ -3114,6 +3532,28 @@ function portHint(value) {{
   if (!Number.isInteger(n) || n < 1 || n > 65535) return "";
   return WELL_KNOWN_PORTS[n] ? "usually " + WELL_KNOWN_PORTS[n] : "";
 }}
+
+/// What the box's own list has to say, for a setting the appliance validates
+/// against a set the console cannot see.
+///
+/// A bare `<datalist>` shows nothing until somebody types, so an operator who
+/// did not already know the answers is looking at a plain box. This says the
+/// answers are there and how many, and once there is something in the box it
+/// says whether the appliance would take it — at the keyboard rather than at
+/// commit, on a box somebody is already logged into.
+const choiceHint = (kind, noun) => (value) => {{
+  const options = choiceCache[kind];
+  if (!options || !options.length) return "";
+  const text = value.trim();
+  if (!text) {{
+    return options.length + " " + noun + "s on this appliance — type to narrow the list";
+  }}
+  if (options.includes(text)) return "";
+  const lower = text.toLowerCase();
+  const near = options.filter((o) => o.toLowerCase().includes(lower)).slice(0, 3);
+  return near.length ? "did you mean " + near.join(", ") + "?"
+                     : "this appliance has no " + noun + " by that name";
+}};
 
 function countryHint(value) {{
   const codes = value.split(/[,\s]+/).filter(Boolean);
@@ -3202,8 +3642,11 @@ const HINTS = {{
   via: addressHint, gateway: addressHint, vip: addressHint,
   "virtual-address": addressHint, remote: addressHint, local: addressHint,
   check: addressHint, relay: addressHint,
-  port: portHint, "listen-port": portHint,
+  port: portHint, "listen-port": portHint, endpoint: endpointHint,
   "geoip-block": countryHint,
+  timezone: choiceHint("timezone", "zone"),
+  keyboard: choiceHint("keyboard", "keymap"),
+  locale: choiceHint("locale", "locale"),
   "validity-days": validityHint, mtu: mtuHint, mru: mtuHint,
 }};
 
@@ -3211,18 +3654,27 @@ const HINTS = {{
 // asynchronous ones cross the network, and a keystroke is not a question.
 function wireHint(field, widget, box, values) {{
   const compute = HINTS[field[0]];
-  if (!compute) return;
+  // What the appliance does with an empty box, where that is a sentence rather
+  // than a value. It stands under the field, not in it: a placeholder is as
+  // wide as its box and a sentence in one is a sentence with its end cut off.
+  // Only while the box is empty — once there is a value, what the default was
+  // is no longer what happens. Not under a dropdown: its unset entry says the
+  // same thing already, and twice is once too often.
+  const gloss = widget.tagName === "SELECT" ? "" : defaultGloss(field[0]);
+  if (!compute && !gloss) return () => {{}};
   let timer = null;
   const run = () => {{
     const value = widget.value || "";
+    const idle = value ? "" : gloss;
+    if (!compute) {{ box.textContent = idle; return; }}
     let answer;
     try {{ answer = compute(value, values ? values() : {{}}); }} catch (e) {{ answer = ""; }}
     if (answer && typeof answer.then === "function") {{
-      box.textContent = "";
-      answer.then((text) => {{ if (widget.value === value) box.textContent = text || ""; }});
+      box.textContent = idle;
+      answer.then((text) => {{ if (widget.value === value) box.textContent = text || idle; }});
       return;
     }}
-    box.textContent = answer || "";
+    box.textContent = answer || idle;
   }};
   widget.addEventListener("input", () => {{
     clearTimeout(timer);
@@ -3230,6 +3682,10 @@ function wireHint(field, widget, box, values) {{
   }});
   widget.addEventListener("change", run);
   run();
+  // Handed back so a hint whose answer arrives after the render can be redrawn
+  // without dispatching an event at the widget: an event would reach the mask's
+  // own listener too, and the mask would mark itself changed by somebody.
+  return run;
 }}
 
 // What already exists, for the fields that point at it.
@@ -3238,6 +3694,25 @@ function wireHint(field, widget, box, values) {{
 // interfaces this appliance has, not typing a name and finding out at commit
 // time that they misremembered it. The vocabulary is read from the same
 // configuration every mask is built from.
+// The same entries a view would list, plus the ones that exist only as a staged
+// change. A name typed into a picker is a thing that exists as far as the
+// operator is concerned; a rule editor that will not open until the container
+// has been *applied* makes "name a map, then give it a rule" two visits and one
+// commit, and says nothing about why the button is dead in between.
+function entriesWithStaged(rows, prefix) {{
+  const out = rows.slice();
+  const have = new Set(out.map((r) => r.name));
+  const head = "set " + prefix.join(" ") + " ";
+  for (const entry of staged) {{
+    for (const command of entry.cmds) {{
+      if (!command.startsWith(head)) continue;
+      const name = command.slice(head.length).split(/\s+/)[0];
+      if (name && !have.has(name)) {{ have.add(name); out.push({{ name }}); }}
+    }}
+  }}
+  return out;
+}}
+
 function namesUnder(prefix) {{
   const names = entriesUnder(lastLeaves, prefix).map((r) => r.name);
   // What is staged counts too. In this console a change exists as soon as it is
@@ -3267,7 +3742,9 @@ const VOCAB = {{
   // The session's source is one of this appliance's own addresses. Typing it is
   // how a neighbour ends up sourced from an address the peer does not expect.
   "update-source": () => localAddresses(),
-  certificate: () => namesUnder(["pki", "certificate"]),
+  // `acme` is not a certificate somebody named; it is the appliance's own, and
+  // the grammar offers it wherever a certificate is asked for.
+  certificate: () => [...namesUnder(["pki", "certificate"]), "acme"],
   ca: () => namesUnder(["pki", "ca"]),
   group: () => namesUnder(["system", "group"]),
   "match prefix-list": () => namesUnder(["policy", "prefix-list"]),
@@ -3277,7 +3754,54 @@ const VOCAB = {{
   "source-group": () => namesUnder(["firewall", "group", "address-group"]),
   "destination-group": () => namesUnder(["firewall", "group", "address-group"]),
   "port-group": () => namesUnder(["firewall", "group", "port-group"]),
+  "interface-group": () => namesUnder(["firewall", "group", "interface-group"]),
+  "source-mac-group": () => namesUnder(["firewall", "group", "mac-group"]),
+  "default-group": () => namesUnder(["system", "group"]),
+  // Every remaining setting whose value has to be the name of a link this
+  // appliance has. A key that carries its path — `bond primary`, `pim
+  // interface` — is spelled out, because the first word of those is the block
+  // they sit in and says nothing about what may go in the box.
+  dev: () => namesUnder(["interface"]),
+  "bond primary": () => namesUnder(["interface"]),
+  "mirror-ingress": () => namesUnder(["interface"]),
+  "mirror-egress": () => namesUnder(["interface"]),
+  "pd-from": () => namesUnder(["interface"]),
+  "serve-on": () => namesUnder(["interface"]),
+  "passive-interface": () => namesUnder(["interface"]),
+  "underlay-interface": () => namesUnder(["interface"]),
+  "pim interface": () => namesUnder(["interface"]),
+  vti: () => namesUnder(["interface"]),
+  vrf: () => namesUnder(["protocols", "vrf"]),
+  "wan-zone": () => zoneNames(lastLeaves),
+  // The uplinks multi-WAN knows, so a policy points at one that exists rather
+  // than at an interface name that was never made an uplink.
+  uplink: () => namesUnder(["multiwan", "uplink"]),
 }};
+
+// Where a setting's name means something else than it does everywhere else.
+// `import` is a route map under a BGP neighbour and under `protocols`; under a
+// VRF the same word takes a route target — `65001:100` — and offering the box's
+// route maps there was a picker whose every answer the appliance refuses.
+// Longest matching path wins, and `null` means the field is free text after all.
+const PATH_VOCAB = {{
+  "protocols vrf": {{ import: null, export: null }},
+  // And the other way about: a word too general to answer anywhere becomes an
+  // answerable one here. A user group holds the remote-access accounts this
+  // box has; `user` elsewhere is a login on somebody else's SMTP relay.
+  "firewall group user-group": {{
+    user: () => namesUnder(["vpn", "openconnect", "user"]),
+  }},
+}};
+function vocabularyFor(key) {{
+  let best = null;
+  for (const prefix of Object.keys(PATH_VOCAB)) {{
+    if (!fieldPath.startsWith(prefix)) continue;
+    if (!(key in PATH_VOCAB[prefix])) continue;
+    if (best === null || prefix.length >= best.length) best = prefix;
+  }}
+  if (best !== null) return PATH_VOCAB[best][key];
+  return VOCAB[key] || VOCAB[String(key).split(" ")[0]] || null;
+}}
 
 // Every address this appliance carries, from the configuration rather than from
 // the live link: what a session may be sourced from is what the box is
@@ -3305,11 +3829,15 @@ function multiPick(options, current) {{
   const chosen = new Set((current || "").split(/[,\s]+/).filter(Boolean));
   const boxes = [];
   for (const option of options) {{
-    const tick = el("input", {{ type: "checkbox", value: option }});
-    tick.checked = chosen.has(option);
+    // A tick box may be labelled with something other than what it writes: the
+    // days a rule is open are `mon`…`sun` to the appliance and Mon…Sun to
+    // anybody reading them.
+    const value = optValue(option);
+    const tick = el("input", {{ type: "checkbox", value }});
+    tick.checked = chosen.has(value);
     tick.onchange = () => box.dispatchEvent(new Event("change"));
     boxes.push(tick);
-    box.append(el("label", {{ class: "pickone" }}, [tick, el("span", {{ text: option }})]));
+    box.append(el("label", {{ class: "pickone" }}, [tick, el("span", {{ text: optLabel(option) }})]));
   }}
   if (!options.length) {{
     box.append(el("span", {{ class: "sub", text: "nothing to choose from yet" }}));
@@ -3328,7 +3856,6 @@ function multiPick(options, current) {{
 // so an empty box reads as "this is already right" rather than as one more
 // thing to fill in — which is most of why a long form feels long.
 const DEFAULTS = {{
-  prefix: "64:ff9b::/96 — the well-known NAT64 prefix",
   mtu: "1500",
   "pppoe mru": "1492",
   ttl: "0 — inherit from the inner packet",
@@ -3337,11 +3864,307 @@ const DEFAULTS = {{
   "key-type": "ec",
   "listen-port": "51820",
   "macvlan-mode": "bridge",
-  priority: "100",
-  "advert-interval": "1000",
   weight: "1",
   mode: "failover",
+  // Everything below is read off the appliance's own source rather than
+  // remembered from a vendor's documentation: a placeholder that names a
+  // default an operator then cannot reproduce is worse than an empty box.
+  "hold-time": "180",             // config.rs: proposed in OPEN
+  "bond-mode": "active-backup",   // net.rs
+  "cache-size": "150",            // dnsmasq's own
+  "cgnat-base-port": "32768",     // DEFAULT_CGNAT_BASE_PORT
+  "block-duration": "3600",       // DEFAULT_IDS_BLOCK_SECONDS
+  "block-severity": "1",          // DEFAULT_IDS_BLOCK_SEVERITY
+  "ike-proposal": "aes256-sha256-modp2048",   // DEFAULT_IKE_PROPOSAL
+  "esp-proposal": "aes256-sha256-modp2048",   // DEFAULT_ESP_PROPOSAL
+  "ike-version": "2",             // ipsec.rs
+  "start-action": "start",        // DEFAULT_IPSEC_START_ACTION
+  // Named rather than spelled out: the page may not carry an absolute URL, and
+  // the directory it stands for is DEFAULT_ACME_DIRECTORY.
+  "directory-url": "Let's Encrypt production",
+  "ao-key-id": "100",             // config.rs: SendID/RecvID
+  "bfd-auth-key-id": "1",
+  "min-tx": "300", "min-rx": "300", "detect-mult": "3",
+  "echo-interval": "100",
+  "check interval": "5", "check timeout": "2",
+  "check fail": "3", "check rise": "3",
+  "pd-subnet": "0",
+  "user-attribute": "uid",        // api.rs
+  "ip-type": "ipv4v6",            // wwan.rs
+  "wireless band": "g",           // wireless.rs
+  "wireless wpa mode": "wpa2",    // wireless.rs
+  "dhcp6-pool lease-time": "12h",  // DHCP6_DEFAULT_LEASE
+  dnssec: "no",                   // net.rs
+  provider: "dyndns2",            // net.rs
+  challenge: "http-01",           // acme.rs
+  // Not constants, but still what happens when the box is left empty — and
+  // that is the question a placeholder answers.
+  "cluster-id": "the router id",
+  "default-router": "the server's own address",   // net.rs: option 3 unset
+  "commit-revisions": "50",                       // archive.rs: ARCHIVE_KEEP
 }};
+
+// Defaults that are only true in one place. `priority` means four different
+// things in this console — a VRRP election, an IS-IS router priority, an
+// uplink's order, a routing rule's slot — and one number in the placeholder
+// beside all four was true beside one of them. Longest matching path wins.
+const PATH_DEFAULTS = {{
+  "protocols vrrp": {{ priority: "100", "advert-interval": "1000" }},
+  "protocols ospf": {{
+    "hello-interval": "10", "dead-interval": "40",
+    "graceful-restart-period": "120", "redistribute-metric": "20",
+  }},
+  "protocols ospf3": {{ "instance-id": "0", "redistribute-metric": "20" }},
+  "protocols bfd": {{ "auth-key-id": "1" }},
+  // A burst left alone is one second's worth of the limit, which is what
+  // "a hundred a second" already means to the person who typed it.
+  "firewall rule": {{ burst: "one second's worth of the limit" }},
+  "services reverse-proxy": {{ port: "443" }},
+  "services portal": {{ port: "8082", "session-timeout": "3600" }},
+  "services syslog": {{ port: "514" }},
+  "services ssh": {{ port: "22" }},
+  "services flow-export": {{ interval: "30", domain: "1" }},
+  "system conntrack-sync": {{ port: "5429", interval: "1" }},
+  "system aaa radius": {{ port: "1812", timeout: "3" }},
+  "system aaa ldap": {{
+    timeout: "5", tls: "ldaps", port: "636 with ldaps, 389 otherwise",
+  }},
+  "vpn openconnect": {{ port: "443" }},
+  "nat nat64": {{ prefix: "64:ff9b::/96 — the well-known NAT64 prefix" }},
+  // Which one it is follows from the encapsulation above it, so the field says
+  // both rather than naming the one that happens to be commoner.
+  evpn: {{ "udp-port": "4789 with VXLAN, 6081 with Geneve" }},
+  // The posture, from the Firewall struct's own serde defaults. A zone's is
+  // not a constant at all — it is whatever the global posture says — and one
+  // table saying "off by default" beside both is the console answering a
+  // question it was not asked.
+  "firewall global": {{
+    "default-action": "drop", stateful: "on", "block-icmp": "off",
+    log: "off", "fail-closed": "on", "source-validation": "disable",
+  }},
+  "firewall zone": {{
+    "default-action": "the global posture", stateful: "the global posture",
+    "block-icmp": "the global posture", log: "the global posture",
+    "source-validation": "the global posture",
+  }},
+  "pki ca": {{ "validity-days": "3650" }},
+  "pki certificate": {{ "validity-days": "825" }},
+}};
+
+// The path the mask being built writes into, so a default can be true of one
+// place without being claimed everywhere. Set around a render, like
+// `fieldSubject`.
+let fieldPath = "";
+
+/// What the appliance uses when this field is left alone, or "" where nothing
+/// in the source names one. An honest blank, never the label again.
+function defaultOf(key) {{
+  // Longest match wins, and it has to: `protocols ospf` is a prefix of
+  // `protocols ospf3`, so first-match order would hand OSPFv3 the numbers
+  // written down for OSPFv2.
+  let best = "";
+  for (const prefix of Object.keys(PATH_DEFAULTS)) {{
+    if (!fieldPath.startsWith(prefix)) continue;
+    if (PATH_DEFAULTS[prefix][key] === undefined) continue;
+    if (prefix.length >= best.length) best = prefix;
+  }}
+  if (best) return PATH_DEFAULTS[best][key];
+  return DEFAULTS[key] || "";
+}}
+
+/// The part of a default that fits in the box, or "" where none of it does.
+///
+/// A default is sometimes a value and sometimes a sentence about one — a
+/// tunnel's TTL is `0`, and what 0 *means* is that the inner packet's TTL is
+/// inherited. A placeholder is as wide as its field, so a sentence in one is a
+/// sentence with its end cut off: the TTL box read "defaults to 0 -", which
+/// says nothing and looks like the appliance stopped mid-word. So the box
+/// carries the value and [`defaultGloss`] hands the rest to the hint under it.
+function defaultHead(key) {{
+  const full = defaultOf(key);
+  if (!full) return "";
+  const cut = full.indexOf(" — ");
+  const head = cut === -1 ? full : full.slice(0, cut);
+  // A default with no value in it at all — "the global posture", "the router
+  // id" — has no head, and a placeholder guessed out of one is worse than an
+  // empty box.
+  return head.includes(" ") ? "" : head;
+}}
+
+/// The whole of a default, for the hint, where the box could only carry part of
+/// it. "" where the placeholder already says all there is to say.
+function defaultGloss(key) {{
+  const full = defaultOf(key);
+  return full.includes(" ") ? defaultLabel(full) : "";
+}}
+
+// A shape, not a default: what a value of this kind looks like, for the few
+// settings whose format is not guessable from the label. Taken from the
+// grammar's own placeholders (`<asn:value>`, `<host:port>`, …) rather than
+// invented, and shown as an example so it can never be read as a value.
+const EXAMPLES = {{
+  community: "65001:100", "large-community": "65001:100:200",
+  "ext-community": "rt:65001:100",
+  "set community": "65001:100", "set large-community": "65001:100:200",
+  "set ext-community": "rt:65001:100",
+  "set add-community": "65001:100", "set add-large-community": "65001:100:200",
+  "set add-ext-community": "rt:65001:100",
+  rd: "65001:100", "rt-import": "65001:100", "rt-export": "65001:100",
+  // A VRF's import and export are route targets, not route maps — see
+  // PATH_VOCAB, which is what stops the box offering the wrong thing.
+  import: "65001:100", export: "65001:100",
+  "system-id": "0100.1001.0001", area: "49.0001",
+  "nssa-area": "0.0.0.1", "stub-area": "0.0.0.1",
+  "totally-stubby-area": "0.0.0.1", "totally-nssa-area": "0.0.0.1",
+  "nssa-default-area": "0.0.0.1",
+  collector: "10.0.0.9:2055", "rpki rtr": "10.0.0.9:3323",
+  endpoint: "203.0.113.9:51820", backends: "10.0.0.5:8080",
+  "schedule start": "08:00", "schedule end": "18:00",
+  "schedule days": "mon,tue,wed,thu,fri",
+  "host-override": "printer.example.com 10.0.0.9",
+  "txt-record": "_acme-challenge.example.com token",
+  "subject-alt-name": "DNS:vpn.example.com",
+  "geoip-block": "CN,RU", block: "198.51.100.0/24",
+  "dhcp duid": "00:03:00:01:02:00:00:00:00:01",
+  "dhcpv6 duid": "00:03:00:01:02:00:00:00:00:01",
+  // The tzdb has four hundred names in it. A dropdown of four hundred is not a
+  // control anybody can use — that wants a search box, which is more than this
+  // pass — so it stays a field, with the shape of an answer in it.
+  timezone: "Europe/Berlin",
+  locale: "en_US.UTF-8", keyboard: "de", "console device": "ttyS0",
+  // tc's own spelling, which the appliance validates as written. `interval`
+  // only reaches this where no default claims it, which is the shaping mask.
+  bandwidth: "100mbit", interval: "5ms", target: "5ms",
+  "macsec-peer": "02:00:00:00:00:01", "hw-id": "02:00:00:00:00:01",
+  "wireless country": "DE",
+}};
+
+// The same word, a different shape, depending on where it is being set. An
+// OSPF area is `0.0.0.0` or a number; an IS-IS area is an NET address prefix
+// like `49.0001`, and one example beside both was wrong beside one of them.
+// Longest matching path wins, as with the defaults.
+const PATH_EXAMPLES = {{
+  "protocols ospf": {{ area: "0.0.0.0" }},
+  "protocols ospf3": {{ area: "0.0.0.0" }},
+  "protocols isis": {{ area: "49.0001" }},
+}};
+function exampleOf(key) {{
+  let best = "";
+  for (const prefix of Object.keys(PATH_EXAMPLES)) {{
+    if (!fieldPath.startsWith(prefix)) continue;
+    if (PATH_EXAMPLES[prefix][key] === undefined) continue;
+    if (prefix.length >= best.length) best = prefix;
+  }}
+  if (best) return PATH_EXAMPLES[best][key];
+  return EXAMPLES[key] || "";
+}}
+
+// The whole numbers. A bounded integer is not free-form text: the appliance
+// already knows what may go in it, so the box knows too — the range comes from
+// the CLI grammar's own placeholder (`<1-65535>`, `<1-4094>`, `<68-9216>`, …),
+// and where the grammar declares only "a number" no upper bound is invented.
+// `unit` is what the figure is counted in, shown beside the box instead of
+// inside the label: a unit belongs to the value, not to its name.
+const NUM = {{
+  // ports
+  port: [1, 65535], "listen-port": [1, 65535], "source-port": [1, 65535],
+  "destination-port": [1, 65535], "udp-port": [1, 65535],
+  "cgnat-base-port": [1, 65535], "cgnat-block-size": [1, 65535],
+  // AS numbers
+  "local-as": [1, 4294967295], "remote-as": [1, 4294967295],
+  "origin-as": [1, 4294967295], "confederation id": [1, 4294967295],
+  // link sizes
+  mtu: [68, 9216, "bytes"], "pppoe mru": [68, 9216, "bytes"],
+  vlan: [1, 4094], "vlan-untagged": [1, 4094],
+  ttl: [0, 255], "ebgp-multihop": [0, 255, "hops"], "ttl-security": [0, 255, "hops"],
+  key: [0, 4294967295],
+  ge: [0, 128], le: [0, 128], "match metric-ge": [0, 128],
+  "match metric-le": [0, 128], "prefix-length": [0, 128],
+  "pd-subnet": [0, 255],
+  // times
+  "hold-time": [0, 65535, "s"], "hello-interval": [1, null, "s"],
+  "dead-interval": [1, null, "s"], "graceful-restart-period": [1, null, "s"],
+  "pim hello-interval": [1, null, "s"], "query-interval": [1, null, "s"],
+  "query-response-interval": [1, null, "s"], "max-lifetime": [0, null, "s"],
+  "router-lifetime": [0, null, "s"], "negative-ttl": [0, null, "s"],
+  "session-timeout": [0, null, "s"], "block-duration": [0, null, "s"],
+  "rpki rtr-refresh": [1, null, "s"], "ip arp-cache-timeout": [1, null, "s"],
+  "bridge ageing-time": [0, null, "s"], "bridge forward-delay": [0, null, "s"],
+  "bridge hello-time": [1, null, "s"], "bridge max-age": [1, null, "s"],
+  "check interval": [1, null, "s"], "check timeout": [1, null, "s"],
+  "validity-days": [1, null, "days"],
+  "min-tx": [1, null, "ms"], "min-rx": [1, null, "ms"],
+  "echo-interval": [1, null, "ms"], "advert-interval": [1, null, "ms"],
+  "bond mii-interval": [0, null, "ms"], "bond arp-interval": [0, null, "ms"],
+  "check jitter": [0, null, "ms"], "check latency": [0, null, "ms"],
+  "ethernet rx-usecs": [0, null, "µs"], "ethernet tx-usecs": [0, null, "µs"],
+  // counts and weights
+  cost: [0, 65535], metric: [0, null], "redistribute-metric": [0, null],
+  "set metric": [0, null], "set add-metric": [0, null],
+  "set preference": [0, null], distance: [1, 255],
+  priority: [0, null], "router-priority": [0, 255],
+  "bridge priority": [0, 65535], "bridge-port priority": [0, 63],
+  "bridge-port cost": [1, null], weight: [1, null],
+  "priority-decrement": [1, 254], vrid: [1, 255],
+  "detect-mult": [1, 255], "auth-key-id": [0, 255],
+  "ao-key-id": [0, 255], "bfd-auth-key-id": [0, 255],
+  "check fail": [1, null], "check rise": [1, null], "check probes": [1, null],
+  "check loss": [0, 100, "%"], multipath: [1, null, "paths"],
+  "max-prefix": [1, null, "prefixes"], "max-length": [0, 128],
+  "stub-default-cost": [0, null], table: [0, 4294967295],
+  "commit-revisions": [1, null], "cache-size": [0, null],
+  "pool-size": [1, null], "pool-offset": [0, null],
+  "bond min-links": [0, null], robustness: [1, 255],
+  "ipv6 dad-transmits": [0, null], "instance-id": [0, 255],
+  evi: [1, null], vni: [1, 16777215], "l3-vni": [1, 16777215],
+  "dhcp default-route-distance": [1, 255],
+  "ethernet rx-ring": [1, null], "ethernet tx-ring": [1, null],
+  "ethernet speed": [10, null, "Mbit/s"], "console speed": [1200, null, "baud"],
+  "wireless channel": [0, 196], "wireless max-stations": [1, null],
+  "pim spt-threshold": [0, null, "kbit/s"],
+  mss: [1, null, "bytes"], "block-severity": [1, 4],
+  timeout: [1, null, "s"], limit: [1, null], burst: [1, null],
+  // `interval` is milliseconds in one mask and seconds in two others, so it
+  // gets the box and the range but no unit: a unit guessed is a unit wrong.
+  interval: [1, null],
+  keepalive: [1, null, "s"],
+}};
+
+// Where a setting that is a figure almost everywhere may be something else.
+// A firewall rule's port is `443` or `8000-8100`, and a box that only takes
+// digits makes the second one unsayable — which is the opposite of the point.
+// Traffic shaping speaks tc's own language — `100mbit`, `5ms` — and those are
+// not figures either, however much they look like one with a unit stuck on.
+const RANGED = {{
+  "firewall rule": ["port"],
+  interface: ["interval"],
+}};
+function ranged(key) {{
+  for (const prefix of Object.keys(RANGED)) {{
+    if (fieldPath.startsWith(prefix) && RANGED[prefix].includes(key)) return true;
+  }}
+  return false;
+}}
+
+// And the other way round: a word that is text almost everywhere and a bounded
+// figure in one place. `domain` is a DNS domain on a DHCP server and a 32-bit
+// observation domain in the flow exporter, so the range belongs to the path.
+const PATH_NUM = {{
+  "services flow-export": {{ domain: [0, 4294967295] }},
+  // A rule's rate limit is packets a second and its burst is packets; the same
+  // two words under `interface … qos` are an fq_codel backlog, which is a
+  // depth and not a rate. One unit beside both would be wrong beside one.
+  "firewall rule": {{ limit: [1, null, "packets/s"], burst: [1, null, "packets"] }},
+  // Ports per host and the port they start at: figures with a range the
+  // appliance already bounds, and a unit that says which of the two is which.
+  "nat source": {{ "cgnat-block-size": [1, 65535, "ports"] }},
+}};
+function boundsOf(key) {{
+  for (const prefix of Object.keys(PATH_NUM)) {{
+    if (fieldPath.startsWith(prefix) && PATH_NUM[prefix][key]) return PATH_NUM[prefix][key];
+  }}
+  return NUM[key] || null;
+}}
 
 // Values the console can offer rather than make an operator produce. A MAC is
 // generated here; a WireGuard key is the word `generate`, because the appliance
@@ -3355,11 +4178,17 @@ const NARROW = [
   "port", "vlan-id", "cost", "mtu", "metric", "weight", "priority", "ttl",
   "distance", "limit", "burst", "hello-interval", "dead-interval",
   "advert-interval", "listen-port", "pool-size", "validity-days", "key-bits",
-  "seq", "table", "vrf", "asn", "local-as", "remote-as", "area", "router-id",
-  "system-id", "vrid", "block-size", "cgnat-block-size", "timeout",
+  "seq", "table", "vrf", "asn", "local-as", "remote-as", "area",
+  "vrid", "block-size", "cgnat-block-size", "timeout",
 ];
 const WIDTH = {{}};
 for (const k of NARROW) WIDTH[k] = "w-s";
+// A figure with a known range needs room for the figure and no more.
+for (const k of Object.keys(NUM)) WIDTH[k] = "w-s";
+// And a value with two halves in it needs the run: a name and an address, a
+// record and its content. In a column sized for a port they are typed into a
+// box that shows a third of what is in it.
+for (const k of ["host-override", "txt-record"]) WIDTH[k] = "w-l";
 
 const SUGGEST = {{
   mac: () => {{
@@ -3369,6 +4198,10 @@ const SUGGEST = {{
     return bytes.map((b) => b.toString(16).padStart(2, "0")).join(":");
   }},
   "private-key": () => "generate",
+  // The appliance mints this one too, and prints it — a pre-shared key has to
+  // be carried to the far end, so it is deliberately not a secret this box
+  // keeps to itself.
+  "preshared-key": () => "generate",
   // A base32 secret the browser makes, so it is never carried anywhere it does
   // not have to be. The appliance validates it on commit either way.
   totp: () => {{
@@ -3379,9 +4212,500 @@ const SUGGEST = {{
   }},
 }};
 
+// Settings whose answer is usually one of a handful the appliance already knows
+// — but not necessarily. A router id is normally one of this box's addresses and
+// is legally any 32-bit value; a tunnel is normally sourced from an address
+// configured here and may be sourced from one that is not yet. A picker would
+// make the unusual answer unsayable, so these are offered rather than imposed:
+// the box's own answers drop down, and anything else can still be typed.
+// Named so one list can serve every field that offers the same thing: a
+// `<datalist>` is addressed by id, and a fresh one per box would be sixty
+// copies of the same six addresses.
+/// The network an interface address sits in, which is what a firewall rule or a
+/// BGP `network` statement is written with — an operator holds `10.0.0.1/24` in
+/// their head and has to hand-carry it to `10.0.0.0/24` every time.
+function networkOf(cidr) {{
+  const [addr, bitsText] = String(cidr).split("/");
+  const bits = Number(bitsText);
+  if (!addr || !Number.isInteger(bits)) return "";
+  if (addr.includes(":")) return v6Network(addr, bits);
+  const octets = addr.split(".").map(Number);
+  if (octets.length !== 4 || octets.some((o) => !Number.isInteger(o) || o > 255)) return "";
+  if (bits < 0 || bits > 32) return "";
+  const base = ((octets[0] << 24) >>> 0) + (octets[1] << 16) + (octets[2] << 8) + octets[3];
+  const first = bits === 0 ? 0 : (base & ~((Math.pow(2, 32 - bits)) - 1)) >>> 0;
+  return [24, 16, 8, 0].map((sh) => (first >>> sh) & 255).join(".") + "/" + bits;
+}}
+
+/// The same, for IPv6. Written out byte by byte rather than with a shortcut for
+/// prefixes that fall on a group boundary: /56 does not, and a rule offering a
+/// prefix that is nearly the right one is worse than offering none.
+function v6Network(addr, bits) {{
+  if (bits < 0 || bits > 128) return "";
+  const [head, tail] = addr.split("::");
+  const part = (s) => (s ? s.split(":").filter(Boolean) : []);
+  const left = part(head), right = tail === undefined ? [] : part(tail);
+  if (tail === undefined && left.length !== 8) return "";
+  const groups = tail === undefined
+    ? left
+    : [...left, ...Array(8 - left.length - right.length).fill("0"), ...right];
+  if (groups.length !== 8 || groups.some((g) => !/^[0-9a-fA-F]{{1,4}}$/.test(g))) return "";
+  const bytes = [];
+  for (const g of groups) {{
+    const n = parseInt(g, 16);
+    bytes.push((n >> 8) & 255, n & 255);
+  }}
+  for (let i = 0; i < 16; i++) {{
+    const keep = Math.min(8, Math.max(0, bits - i * 8));
+    bytes[i] &= keep === 8 ? 255 : (0xff << (8 - keep)) & 255;
+  }}
+  const out = [];
+  for (let i = 0; i < 16; i += 2) out.push(((bytes[i] << 8) | bytes[i + 1]).toString(16));
+  // Compressed the way anybody would write it: the longest run of zero groups
+  // becomes `::`, since an uncompressed prefix in a picker is a prefix nobody
+  // recognises as the one they configured.
+  let bestAt = -1, bestRun = 0, at = -1, run = 0;
+  out.forEach((g, i) => {{
+    if (g === "0") {{ if (at === -1) at = i; run++; if (run > bestRun) {{ bestRun = run; bestAt = at; }} }}
+    else {{ at = -1; run = 0; }}
+  }});
+  const text = bestRun > 1
+    ? out.slice(0, bestAt).join(":") + "::" + out.slice(bestAt + bestRun).join(":")
+    : out.join(":");
+  return text + "/" + bits;
+}}
+
+/// Every prefix this appliance is configured to sit in, which is what a rule
+/// about "the office network" or "the guest network" is actually written with.
+function configuredSubnets() {{
+  const out = [];
+  for (const l of lastLeaves) {{
+    if (l.path[0] !== "interface") continue;
+    const leaf = l.path[l.path.length - 1];
+    if (leaf !== "address" && leaf !== "address6") continue;
+    for (const one of String(l.value).split(/[,\s]+/)) {{
+      if (!one.includes("/")) continue;
+      const net = networkOf(one.trim());
+      if (net && !out.includes(net)) out.push(net);
+    }}
+  }}
+  return out;
+}}
+
+/// The subnets, with `any` in front of them. A rule that matches everything is
+/// the commonest rule there is, and `any` is the word the appliance takes for
+/// it — leaving it to be remembered is how a rule ends up with a blank that
+/// means the same thing and reads as an unfinished form.
+const anySubnet = () => ["any", ...configuredSubnets()];
+
+/// The addresses this appliance has promised to particular machines.
+///
+/// A port forward points at a host, and the hosts this box can honestly name
+/// are its DHCP *reservations* — not its leases. A lease is by definition an
+/// address that will be something else next week, and a port forward aimed at
+/// one is a port forward that breaks quietly; the console offering it would be
+/// recommending the mistake.
+function reservedHosts() {{
+  const byName = new Map();
+  for (const l of lastLeaves) {{
+    if (l.path[0] !== "interface" || l.path[2] !== "dhcp-server") continue;
+    if (l.path[3] !== "static-mapping" || l.path[5] !== "ip") continue;
+    byName.set(String(l.value), l.path[4]);
+  }}
+  return [...byName].map(([ip, name]) => ({{ value: ip, label: ip + " · " + name }}));
+}}
+
+/// The ports that have a name, as the name and the number together. Sorted by
+/// number, because that is the order somebody scanning for "the low one" reads.
+function wellKnownPorts() {{
+  return Object.keys(WELL_KNOWN_PORTS)
+    .map(Number)
+    .sort((a, b) => a - b)
+    .map((n) => ({{ value: String(n), label: n + " · " + WELL_KNOWN_PORTS[n] }}));
+}}
+
+// The communities this appliance takes by name. RFC 1997's three and no more:
+// `blackhole` and `graceful-shutdown` are real communities with real meanings
+// and this box does not know either word, so a chip offering one would be the
+// console recommending a value its own validator refuses. Kept honest by
+// `every_community_offered_is_one_the_appliance_takes`.
+const WELL_KNOWN_COMMUNITIES = ["no-export", "no-advertise", "no-export-subconfed"];
+
+const OFFERS = {{ address: localAddresses }};
+const OFFERED = {{
+  "router-id": "address",
+  // Unset, it is the router id — which is itself usually one of these.
+  "cluster-id": "address",
+  "vtep-ip": "address",
+  "srv6-source": "address",
+  // The address a tunnel leaves by, and the one a service listens on.
+  local: "address",
+  listen: "address",
+  "listen-address": "address",
+}};
+
+// The same idea, where what may be offered depends on which mask the field is
+// in. A firewall rule's `port` may be `8000-8100`, so it is the one place the
+// setting is text rather than a bounded figure — and the one place an operator
+// is naming a *service* rather than counting. `to` is a zone on a rule and the
+// machine a forward points at under `nat destination`, and a table keyed by
+// name alone would offer this box's DHCP reservations in both. Longest prefix
+// wins, as everywhere else that a path decides what a word means.
+const PATH_OFFERS = {{
+  "firewall rule": {{
+    port: wellKnownPorts,
+    source: anySubnet, destination: anySubnet,
+  }},
+  "nat destination": {{ to: reservedHosts }},
+}};
+function offersFor(key) {{
+  let best = null;
+  for (const prefix of Object.keys(PATH_OFFERS)) {{
+    if (!fieldPath.startsWith(prefix)) continue;
+    if (!(key in PATH_OFFERS[prefix])) continue;
+    if (best === null || prefix.length >= best.length) best = prefix;
+  }}
+  if (best === null) return null;
+  const make = PATH_OFFERS[best][key];
+  return make ? make() : null;
+}}
+
+// Lists whose usual answers are worth having beside the box, added to what is
+// there rather than replacing it. See [`chipsWidget`] for why these are not
+// tick boxes: every one of them is legally open, and a picker would make the
+// unusual answer unsayable.
+const CHIPPED = {{
+  // No chips for the large and extended communities: neither has values with
+  // a meaning anybody agreed on — they are `<asn>:<n>:<n>` and `rt:<asn>:<n>`,
+  // local conventions all the way down — and a chip offering one would be this
+  // console recommending a number it made up.
+  "protocols bgp": {{ network: configuredSubnets, community: () => WELL_KNOWN_COMMUNITIES }},
+  "policy route-map": {{
+    "set community": () => WELL_KNOWN_COMMUNITIES,
+    "set add-community": () => WELL_KNOWN_COMMUNITIES,
+  }},
+  // Who may ask this box a question. The appliance takes prefixes here, not
+  // zone names — so what is offered is the prefixes the zones actually sit in,
+  // which is what "let the office network use the resolver" means when it is
+  // written down. Anything else is still typed, since the answer is legally any
+  // prefix and is sometimes one this box is not itself on.
+  "services dns": {{ "allow-from": configuredSubnets }},
+  "services ntp": {{ "allow-from": configuredSubnets }},
+  "services snmp": {{ allow: configuredSubnets }},
+}};
+function chipsFor(key) {{
+  let best = null;
+  for (const prefix of Object.keys(CHIPPED)) {{
+    if (!fieldPath.startsWith(prefix)) continue;
+    if (!(key in CHIPPED[prefix])) continue;
+    if (best === null || prefix.length >= best.length) best = prefix;
+  }}
+  if (best === null) return null;
+  const options = CHIPPED[best][key]();
+  return options.length ? options : null;
+}}
+
+// Settings that are a time of day. The appliance takes `HH:MM` and nothing
+// else, which is exactly what this control produces — and it produces it in
+// whatever way the operator's own platform does clocks, rather than making
+// them guess whether this box wants `9:00`, `09:00` or `9am`.
+const TIMES = ["schedule start", "schedule end"];
+
+// Settings whose answers are a closed set the appliance knows and this page
+// deliberately does not: the zones tzdata installed, the keymaps the console
+// package carries, the locales glibc built. Four hundred timezones in a
+// `<select>` is a control nobody can use and a page that takes measurably
+// longer to build, and four hundred in a table compiled into this console is a
+// list that goes stale against the box's own validator. So the box is asked,
+// and the answers land in a `<datalist>`: type to narrow it, or open it and
+// pick, and anything else the appliance would take can still be typed.
+const CHOICES = {{ timezone: "timezone", keyboard: "keyboard", locale: "locale" }};
+// Asked once per session. The answer is a property of the image, so re-asking
+// on every render would be a request per keystroke's worth of re-layout.
+const choiceCache = {{}};
+// What to redraw when a list finally lands. The fetch outlives the render that
+// started it, so the field that asked has already been built and said what it
+// could — which, before the answers arrive, is nothing.
+const choiceWaiters = {{}};
+function onChoices(kind, fn) {{
+  if (choiceCache[kind]) {{ fn(); return; }}
+  (choiceWaiters[kind] = choiceWaiters[kind] || []).push(fn);
+}}
+
+/// The id of the shared `<datalist>` for a closed set, filled from the
+/// appliance the first time something asks for it.
+///
+/// The id is returned straight away and the options arrive when they arrive: a
+/// `<datalist>` is addressed by id, so a list that fills a moment later fills
+/// every box already pointing at it. A box whose answers never arrive — an
+/// appliance with no zoneinfo, a walk that never let the fetch finish — is the
+/// plain box it has always been, which is the correct thing to degrade to.
+function choiceList(kind) {{
+  const id = "choices-" + kind;
+  let list = $(id);
+  if (!list) {{
+    list = el("datalist", {{ id }});
+    document.body.append(list);
+  }}
+  if (choiceCache[kind]) {{
+    if (list.children.length !== choiceCache[kind].length) {{
+      list.textContent = "";
+      for (const one of choiceCache[kind]) list.append(el("option", {{ value: one }}));
+    }}
+    return id;
+  }}
+  if (choiceCache[kind] === undefined) {{
+    // Marked as asked before the request goes out, or a mask with three of
+    // these fields in it asks three times.
+    choiceCache[kind] = null;
+    api("/api/v1/choices/" + encodeURIComponent(kind))
+      .then((r) => r.json())
+      .then((body) => {{
+        choiceCache[kind] = body.options || [];
+        const now = $(id);
+        if (now) {{
+          now.textContent = "";
+          for (const one of choiceCache[kind]) now.append(el("option", {{ value: one }}));
+        }}
+        for (const fn of choiceWaiters[kind] || []) {{ try {{ fn(); }} catch (e) {{}} }}
+        choiceWaiters[kind] = [];
+      }})
+      // Silently: this is an offer, and a red banner because a picker could not
+      // be filled would be the console complaining about its own convenience.
+      .catch(() => {{ choiceCache[kind] = []; }});
+  }}
+  return id;
+}}
+
+/// The id of the shared suggestion list for `name`, refreshed from the
+/// configuration as it stands now, or "" where there is nothing to suggest.
+function offerList(name) {{
+  const options = (OFFERS[name] || (() => []))();
+  const id = "offer-" + name;
+  let list = $(id);
+  if (!options.length) {{
+    if (list) list.remove();
+    return "";
+  }}
+  if (!list) {{
+    list = el("datalist", {{ id }});
+    document.body.append(list);
+  }}
+  list.textContent = "";
+  for (const one of options) list.append(el("option", {{ value: one }}));
+  return id;
+}}
+
 // The object a form is about, so its own name can be kept out of the choices
 // it offers. Set around a render rather than threaded through every call.
 let fieldSubject = "";
+
+/// A setting with two states and a third condition: not set at all.
+///
+/// A dropdown of "", "true", "false" made every one of these read as a
+/// question with three answers, when the question is "is this on?" and the
+/// third state is "you have not said". So the state is a switch, and not
+/// having said is its own resting appearance — greyed, knob left, and the word
+/// beside it says so rather than claiming "off". Operating it commits to on or
+/// off; `use default` puts it back to unsaid, which is the only way an
+/// operator can hand the decision back to the appliance.
+///
+/// The `<select>` inside carries the value. It is the same three options the
+/// field always had, so everything that reads a widget — staging, the tests
+/// that fill a mask — goes on seeing one control with a `.value`, and the
+/// switch is what a person operates.
+function switchWidget(key, value, name) {{
+  const box = el("span", {{ class: "switch" }});
+  const carrier = el("select", {{ class: "carrier" }});
+  for (const option of ["", "true", "false"]) {{
+    const o = el("option", {{ value: option }});
+    if (option === (value || "")) o.setAttribute("selected", "selected");
+    carrier.append(o);
+  }}
+  // A `<label>` cannot name a button, so the switch carries its own name.
+  const knob = el("button", {{
+    class: "knob", type: "button", role: "switch", "aria-label": name || key,
+  }});
+  const state = el("span", {{ class: "switchstate" }});
+  const clear = el("button", {{ class: "suggest", type: "button", text: "use default" }});
+  // What the appliance does with this one left alone: a word for a constant,
+  // a phrase where the answer is another setting.
+  const known = defaultOf(key);
+  const unset = !known ? "not set"
+    : known === "on" || known === "off" ? "not set — " + known + " by default"
+    : "not set — " + known;
+  const paint = () => {{
+    const v = carrier.value;
+    knob.setAttribute("data-state", v || "unset");
+    knob.setAttribute("aria-checked", v === "true" ? "true" : "false");
+    state.textContent = v === "true" ? "on" : v === "false" ? "off" : unset;
+    clear.classList.toggle("hidden", !v);
+  }};
+  const put = (v) => {{
+    carrier.value = v;
+    paint();
+    box.dispatchEvent(new Event("change"));
+  }};
+  // On pointer-down, not on the click: the press is when the decision is made,
+  // and a control that waits for the release to move feels like it is thinking.
+  knob.onpointerdown = (e) => {{
+    // Prevented so the press does not select the text beside it — and focus
+    // moved by hand, because preventing the press is also what would have
+    // stopped the button being focused at all.
+    e.preventDefault();
+    knob.focus();
+    put(carrier.value === "true" ? "false" : "true");
+  }};
+  knob.onclick = (e) => e.preventDefault();
+  knob.onkeydown = (e) => {{
+    if (e.key !== " " && e.key !== "Enter") return;
+    e.preventDefault();
+    put(carrier.value === "true" ? "false" : "true");
+  }};
+  clear.onclick = (e) => {{ e.preventDefault(); put(""); }};
+  // Anything that sets the carrier directly — a test filling a mask, the
+  // coverage walk — still moves the switch.
+  carrier.addEventListener("change", paint);
+  Object.defineProperty(box, "value", {{
+    get: () => carrier.value,
+    set: (v) => {{ carrier.value = String(v || ""); paint(); }},
+  }});
+  box.append(carrier, knob, state, clear);
+  paint();
+  return box;
+}}
+
+/// A whole number the appliance bounds, with its unit beside it.
+///
+/// The bounds are the grammar's, so the box refuses what the CLI would refuse —
+/// at the keyboard rather than at commit — and the arrow keys and the spinner
+/// step through the range. The unit sits next to the figure instead of inside
+/// the label, because it belongs to the value.
+function numberWidget(key, value, bounds) {{
+  const [min, max, unit] = bounds;
+  // A bare grey figure is how a default reads in a box that only takes figures.
+  // Only the figure: a box this narrow holds a number and not the sentence
+  // around one, and the sentence is under the field where it fits.
+  const input = el("input", {{
+    type: "number", inputmode: "numeric", value: value || "",
+    placeholder: defaultHead(key),
+  }});
+  if (min !== null && min !== undefined) input.setAttribute("min", String(min));
+  if (max !== null && max !== undefined) input.setAttribute("max", String(max));
+  if (!unit) return input;
+  const box = el("span", {{ class: "num" }}, [input, el("span", {{ class: "unit", text: unit }})]);
+  Object.defineProperty(box, "value", {{
+    get: () => input.value,
+    set: (v) => {{ input.value = v; }},
+  }});
+  for (const kind of ["input", "change"]) {{
+    input.addEventListener(kind, () => box.dispatchEvent(new Event(kind)));
+  }}
+  return box;
+}}
+
+/// A box you type into, with the answers this appliance already has beside it.
+///
+/// A router id must be one of this box's own addresses in every configuration
+/// anybody actually runs, and is legally any 32-bit value — so a picker would
+/// make the unusual answer unsayable and a bare box makes the usual one a
+/// memory test. The `<datalist>` was meant to be the middle ground and is not
+/// one: it shows nothing until somebody types, so the offer only ever reached
+/// an operator who already knew what to type. The list is given a control.
+/// An option is either a bare value or a value with a name for it: a port
+/// picker that lists `443` says less than one that lists `443 · https`, and
+/// what goes in the box is still `443`.
+const optValue = (o) => (o && typeof o === "object" ? o.value : o);
+const optLabel = (o) => (o && typeof o === "object" ? o.label : o);
+
+function comboWidget(input, options) {{
+  const box = el("span", {{ class: "combo" }}, [input]);
+  const menu = el("div", {{ class: "menu hidden" }});
+  const close = () => menu.classList.add("hidden");
+  for (const option of options) {{
+    const one = optValue(option);
+    menu.append(el("button", {{
+      class: "choice", type: "button", text: optLabel(option),
+      onclick: (e) => {{
+        e.preventDefault();
+        input.value = one;
+        close();
+        // Through the input, so everything listening to the field — the hint,
+        // the mask that folds by what is chosen, the not-staged-yet mark —
+        // hears a value arriving the same way it hears one typed.
+        for (const kind of ["input", "change"]) input.dispatchEvent(new Event(kind));
+      }},
+    }}));
+  }}
+  box.append(el("button", {{
+    class: "caret", type: "button", text: "▾",
+    title: "What this appliance already holds",
+    onclick: (e) => {{ e.preventDefault(); menu.classList.toggle("hidden"); }},
+  }}), menu);
+  // Leaving the field closes it: a menu left open over the next row is a menu
+  // about a field nobody is looking at any more.
+  box.addEventListener("focusout", (e) => {{
+    if (!box.contains(e.relatedTarget)) close();
+  }});
+  Object.defineProperty(box, "value", {{
+    get: () => input.value,
+    set: (v) => {{ input.value = String(v === null || v === undefined ? "" : v); }},
+  }});
+  for (const kind of ["input", "change"]) {{
+    input.addEventListener(kind, () => box.dispatchEvent(new Event(kind)));
+  }}
+  return box;
+}}
+
+/// A list you type into, with the usual answers as chips beside it.
+///
+/// The middle ground a picker cannot reach and a bare box will not offer. A
+/// BGP community is legally any 32-bit pair and is `no-export` nine times out
+/// of ten; the networks a router originates are usually the ones configured on
+/// it and occasionally are not. Tick boxes would make the tenth case unsayable
+/// and a bare box makes the nine a memory test, so the offers *add themselves*
+/// to whatever is in the box rather than replacing it — which is the one
+/// behaviour a `combo` cannot have, because a list is not one value.
+function chipsWidget(input, options) {{
+  const box = el("span", {{ class: "chips" }}, [input]);
+  const row = el("span", {{ class: "chiprow" }});
+  const parts = () => input.value.split(",").map((s) => s.trim()).filter(Boolean);
+  const chips = [];
+  for (const option of options) {{
+    const one = optValue(option);
+    const chip = el("button", {{
+      class: "chip", type: "button", text: optLabel(option),
+      // Not "add": a chip an operator ticked on by mistake has to come off
+      // again, and the only other way is to find it in a comma-separated line.
+      onclick: (e) => {{
+        e.preventDefault();
+        const have = parts();
+        const at = have.indexOf(one);
+        if (at === -1) have.push(one); else have.splice(at, 1);
+        input.value = have.join(",");
+        for (const kind of ["input", "change"]) input.dispatchEvent(new Event(kind));
+      }},
+    }});
+    chips.push([chip, one]);
+    row.append(chip);
+  }}
+  const paint = () => {{
+    const have = new Set(parts());
+    for (const [chip, one] of chips) chip.classList.toggle("on", have.has(one));
+  }};
+  input.addEventListener("input", paint);
+  input.addEventListener("change", paint);
+  box.append(row);
+  Object.defineProperty(box, "value", {{
+    get: () => input.value,
+    set: (v) => {{ input.value = String(v === null || v === undefined ? "" : v); paint(); }},
+  }});
+  for (const kind of ["input", "change"]) {{
+    input.addEventListener(kind, () => box.dispatchEvent(new Event(kind)));
+  }}
+  paint();
+  return box;
+}}
 
 function fieldWidget(field, value) {{
   // A heading, not a setting: eighteen inputs in one flat grid is a form nobody
@@ -3389,14 +4713,23 @@ function fieldWidget(field, value) {{
   // about the protocol — where it speaks, how fast, who it trusts.
   if (field[0] === "#") return null;
   // A field that points at something the appliance already has is a choice,
-  // not a spelling test.
-  let vocabulary = VOCAB[field[0]] ? VOCAB[field[0]]() : null;
+  // not a spelling test. A key that carries its path — `import bgp`, `export
+  // ospf` — is answered by the first word: what may go there is decided by the
+  // setting, not by which protocol it is about. Except where the path says
+  // otherwise, which is what `vocabularyFor` is looking up.
+  const vocab = vocabularyFor(field[0]);
+  let vocabulary = vocab ? vocab() : null;
   // Nothing may point at itself: a bond offered as its own member is a choice
   // whose only outcome is the appliance saying no.
   if (vocabulary && fieldSubject) {{
     vocabulary = vocabulary.filter((option) => option !== fieldSubject);
   }}
   if (vocabulary) {{
+    // Whatever is set is offered, even where the vocabulary does not know it:
+    // a picker that quietly drops a value it cannot account for turns "I edited
+    // the description" into "I deleted the time zone", and the operator finds
+    // out from the diff.
+    if (value && !vocabulary.includes(value)) vocabulary = [value, ...vocabulary];
     // A repeatable setting is ticked, a single one is chosen. Which it is comes
     // from the field itself — OSPF speaks on several interfaces, a VRRP group
     // holds its address on exactly one.
@@ -3410,20 +4743,98 @@ function fieldWidget(field, value) {{
     return sel;
   }}
   if (field[2] && field[3]) return multiPick(field[2].filter(Boolean), value);
+  // Two states and "not said" is not a dropdown of three words.
+  if (isBool(field[2])) return switchWidget(field[0], value, field[1]);
   if (!field[2]) {{
-    const fallback = DEFAULTS[field[0]];
-    return el("input", {{
+    // A time of day is not free text and not a figure: the platform already has
+    // a control for one, and it is the only one that cannot be typed wrong.
+    //
+    // With one caution. The appliance's own parser takes `9:00` as readily as
+    // `09:00`, and a `type=time` input refuses anything unpadded — it would
+    // have shown an empty box for a window somebody had configured, and then
+    // staged a delete of it. So the value is padded on the way in, and a value
+    // that is not a time at all keeps the plain box it came from rather than
+    // disappearing into a control that will not hold it.
+    if (TIMES.includes(field[0])) {{
+      const hhmm = String(value || "").match(/^(\d{{1,2}}):(\d{{1,2}})$/);
+      if (!value || hhmm) {{
+        const padded = hhmm
+          ? hhmm[1].padStart(2, "0") + ":" + hhmm[2].padStart(2, "0") : "";
+        return el("input", {{ type: "time", value: padded }});
+      }}
+    }}
+    // A repeatable setting is a list typed as one line, so it is not a figure
+    // even where each item is one.
+    const bounds = boundsOf(field[0]);
+    if (!field[3] && bounds && !ranged(field[0])) {{
+      return numberWidget(field[0], value, bounds);
+    }}
+    // The placeholder carries the appliance's own default, or an example of the
+    // shape where the format is not obvious, or nothing. Never the label again:
+    // "hold time" under a box labelled "Hold time" is a word doing no work.
+    // The value of the default, not the sentence about it: what a box this wide
+    // cannot hold goes under the field, where it can be read to the end.
+    const fallback = defaultHead(field[0]);
+    const shape = exampleOf(field[0]);
+    const box = el("input", {{
       value: value || "",
-      placeholder: fallback ? "default " + fallback : field[1].toLowerCase(),
+      placeholder: fallback ? defaultLabel(fallback) : shape ? "e.g. " + shape : "",
     }});
+    // A closed set too long to be a dropdown: the box keeps the keyboard and
+    // the appliance's own answers drop out of it.
+    if (CHOICES[field[0]]) {{
+      box.setAttribute("list", choiceList(CHOICES[field[0]]));
+      return box;
+    }}
+    // A list with usual answers gets them as chips, which add rather than
+    // replace — see [`chipsWidget`].
+    const chips = field[3] ? chipsFor(field[0]) : null;
+    if (chips) return chipsWidget(box, chips);
+    // What the appliance would answer with, offered from the box itself. Not a
+    // `<select>`: these are suggestions, and the field still takes anything the
+    // CLI takes — a router id is usually one of this box's addresses and is
+    // legally any 32-bit value.
+    const scoped = field[3] ? null : offersFor(field[0]);
+    const offers = scoped || (OFFERED[field[0]]
+      ? (OFFERS[OFFERED[field[0]]] || (() => []))() : []);
+    if (!offers.length) return box;
+    // The shared `<datalist>` only exists for the offers that are named in
+    // `OFFERS`; a path-scoped one is the menu on the control and nothing else,
+    // since a list keyed by field name alone would be the wrong list on the
+    // next mask that has a `port` in it.
+    if (!scoped) {{
+      const offered = offerList(OFFERED[field[0]]);
+      if (offered) box.setAttribute("list", offered);
+    }}
+    return comboWidget(box, offers);
   }}
   const sel = el("select", {{}});
-  for (const opt of field[2]) {{
-    const o = el("option", {{ value: opt, text: opt === "" ? "(unset)" : opt }});
+  const fallback = defaultOf(field[0]);
+  // Whatever is set is offered, even where the list does not have it: a
+  // WireGuard link's `type` is set by the VPN section and is deliberately not
+  // in this list, and a dropdown that quietly falls back to its first entry
+  // would read as unset — and then stage a command deleting it.
+  const options = value && !field[2].includes(value) ? [value, ...field[2]] : field[2];
+  for (const opt of options) {{
+    const o = el("option", {{
+      value: opt,
+      text: opt === "" ? (fallback ? defaultLabel(fallback) : "(unset)") : opt,
+    }});
     if (opt === (value || "")) o.setAttribute("selected", "selected");
     sel.append(o);
   }}
   return sel;
+}}
+
+// "default 1500" for a value, "defaults to \u2026" for a phrase: a default is
+// sometimes another setting rather than a constant, and "default the router id"
+// is not a sentence anybody wrote on purpose.
+const defaultLabel = (v) => (v.includes(" ") ? "defaults to " + v : "default " + v);
+
+// A field whose choices are exactly yes and no, however the table spells them.
+function isBool(options) {{
+  if (!options || options.length !== 3) return false;
+  return options[0] === "" && options.includes("true") && options.includes("false");
 }}
 
 // A form that asks for everything asks for nothing in particular.
@@ -3434,6 +4845,19 @@ function fieldWidget(field, value) {{
 // both to everybody is why creating an interface felt like filling in a form
 // about somebody else's network. Everything hidden is still there, one click
 // away, and can be set later or never.
+//
+// `only` answers a different question, and it is the one "More settings" got
+// wrong: not what is worth deciding first, but what this thing *has*. A plain
+// ethernet link has no PPPoE password however deep you dig, and the appliance
+// says so — `pppoe credentials require type = "pppoe"` — so a mask that offers
+// one is describing a box that does not exist. Each entry names the values of
+// `only.key` the setting applies to, or tests the whole form where it depends
+// on more than one field. `only.watch` is what re-runs the test.
+//
+// Two rules keep this honest. A setting that is already set stays on screen
+// whatever the type says, because hiding a value somebody configured is how a
+// console starts lying about the box; and nothing becomes unreachable, because
+// choosing the type reveals its settings and every type can be chosen.
 function fieldGrid(fields, row, required, form) {{
   const widgets = fields.map((f) => fieldWidget(f, row && row[f[0]]));
   // The mask is a stack of groups, and a group is a spread: its heading stands
@@ -3456,6 +4880,56 @@ function fieldGrid(fields, row, required, form) {{
     return out;
   }};
   const boxes = [];   // the element per field or group, so it can be hidden
+  // A mask whose fields are one question asked about several things, laid out
+  // as the table it already is. Sixteen dropdowns down a page under two
+  // headings is the same information as nine rows and two columns, in twice
+  // the room and without saying which of the sixteen is which — the labels
+  // repeat ("BGP", "BGP") because the *heading* is carrying half the meaning,
+  // and a heading is a long way from the ninth control under it.
+  //
+  // The field table is untouched: the matrix says how to fold it, and a key
+  // like `import bgp` is found by its column and its row. It is the same
+  // widgets, the same staging, the same `fieldLines` — only the arrangement.
+  if (form && form.matrix) {{
+    const spec = form.matrix;
+    const at = new Map();
+    fields.forEach((f, i) => at.set(f[0], i));
+    const head = el("tr", {{}}, [
+      el("th", {{ text: spec.corner || "" }}),
+      ...spec.cols.map((c) => el("th", {{ text: c[1] }})),
+    ]);
+    const rows = el("tbody", {{}});
+    for (const [rowKey, rowLabel] of spec.rows) {{
+      const tr = el("tr", {{}}, [el("th", {{ class: "mtxrow", text: rowLabel }})]);
+      for (const col of spec.cols) {{
+        const i = at.get(col[0] + " " + rowKey);
+        const cell = el("td", {{}});
+        if (i === undefined) {{
+          // Not a gap in the console: the appliance has no such setting, and a
+          // blank box that stages nothing would be a worse way of saying so.
+          cell.append(el("span", {{ class: "sub", text: "—" }}));
+        }} else {{
+          const hint = el("span", {{ class: "hint" }});
+          const cellBox = el("label", {{ class: "field w-m" }}, [widgets[i], hint]);
+          boxes[i] = cellBox;
+          cell.append(cellBox);
+          wireHint(fields[i], widgets[i], hint, values);
+        }}
+        tr.append(cell);
+      }}
+      rows.append(tr);
+    }}
+    // Every field needs a box, including the headings the table replaces: the
+    // fold below walks both lists in step.
+    fields.forEach((f, i) => {{ if (!boxes[i]) boxes[i] = el("div", {{}}); }});
+    // Onto the mask, not into its first row: a row is a grid of 232px columns,
+    // and a table dropped into one of them is a table 232px wide with the other
+    // nine tenths of it behind a scrollbar.
+    grid.append(el("div", {{ class: "tblwrap" }}, [
+      el("table", {{ class: "mtx" }}, [el("thead", {{}}, [head]), rows]),
+    ]));
+    return {{ grid, widgets, more: null, refresh: () => {{}} }};
+  }}
   fields.forEach((f, i) => {{
     if (!widgets[i]) {{
       body = el("div", {{ class: "grid" }});
@@ -3471,16 +4945,30 @@ function fieldGrid(fields, row, required, form) {{
     }}
     // The one field that has to be filled says so where it is, not only in the
     // message you get after pressing the button.
-    const label = el("span", {{ text: f[1] }});
+    // The unit belongs to the value, so where the box carries it the label
+    // stops saying it too: "Refresh (s)" beside a box that already says `s` is
+    // the same word twice.
+    const unit = widgets[i].classList && widgets[i].classList.contains("num")
+      ? (boundsOf(f[0]) || [])[2] : null;
+    const label = el("span", {{
+      text: unit && f[1].endsWith(" (" + unit + ")")
+        ? f[1].slice(0, -(unit.length + 3)) : f[1],
+    }});
     if (required && f[0] === required) label.append(el("span", {{ class: "req", text: "required" }}));
     const hint = el("span", {{ class: "hint" }});
     // A `<label>` around a set of `<label>`s makes every click in the dead
     // space tick the first checkbox — nested labels are invalid, and the outer
-    // one adopts the first control in tree order.
-    const multi = widgets[i].classList && widgets[i].classList.contains("pick");
-    // A set of tick boxes needs the run; a single figure does not.
-    const size = multi ? " w-l" : (WIDTH[f[0]] ? " " + WIDTH[f[0]] : " w-m");
-    const box = el(multi ? "div" : "label", {{ class: "field" + size }}, [label, widgets[i], hint]);
+    // one adopts the first control in tree order. A switch is the same problem
+    // the other way round: the only labelable thing inside it is the hidden
+    // value, so a click on the row would open a dropdown nobody can see.
+    const kind = (widgets[i].classList && widgets[i].className) || "";
+    const owns = kind.includes("pick") || kind.includes("switch");
+    // A set of tick boxes needs the run; a single figure does not, and neither
+    // does a switch — two states take less room than a sentence, not more.
+    const size = kind.includes("pick") || kind.includes("chips") ? " w-l"
+      : kind.includes("switch") ? " w-auto"
+      : (WIDTH[f[0]] ? " " + WIDTH[f[0]] : " w-m");
+    const box = el(owns ? "div" : "label", {{ class: "field" + size }}, [label, widgets[i], hint]);
     // A value the console can produce, offered rather than demanded.
     if (SUGGEST[f[0]]) {{
       label.append(el("button", {{
@@ -3494,13 +4982,27 @@ function fieldGrid(fields, row, required, form) {{
     }}
     body.append(box);
     boxes.push(box);
-    wireHint(f, widgets[i], hint, values);
+    const repaint = wireHint(f, widgets[i], hint, values);
+    // A field filled from the appliance has nothing to say until the answer
+    // comes back, and by then nobody is listening. This is how it gets a
+    // second chance to say it.
+    if (CHOICES[f[0]]) onChoices(CHOICES[f[0]], repaint);
   }});
 
-  // Which fields are on screen right now.
-  let showAll = !form;
+  // Which fields are on screen right now. A form that gates by kind without
+  // naming an `essential` few is not folded at all — it is the whole mask, with
+  // the settings this kind of thing does not have left out.
+  let showAll = !form || !form.essential;
+  // Does this setting exist on the thing being edited at all?
+  const applies = (key, now) => {{
+    const rule = form && form.only && form.only.map[key];
+    if (!rule) return true;
+    if (typeof rule === "function") return !!rule(now, row);
+    return rule.includes(now[form.only.key] || "");
+  }};
   const apply = () => {{
     if (!form) return;
+    const now = values();
     const chooser = form.byValue
       ? widgets[fields.findIndex((f) => f[0] === form.byValue.key)]
       : null;
@@ -3516,17 +5018,22 @@ function fieldGrid(fields, row, required, form) {{
       }}
       // Something already set stays visible however it was set: hiding a value
       // an operator can see in the config is how a console starts lying.
-      const on = showAll || visible.has(f[0]) || !!(row && row[f[0]]) ||
-                 !!(widgets[i].value && !DEFAULTS[f[0]]);
+      const set = !!(row && row[f[0]]) || !!(widgets[i].value && !defaultOf(f[0]));
+      const on = set || ((showAll || visible.has(f[0])) && applies(f[0], now));
       boxes[i].classList.toggle("hidden", !on);
       if (on) headHasOne = true;
     }});
     if (lastHead) lastHead.classList.toggle("hidden", !headHasOne);
   }};
-  if (form && form.byValue) {{
-    const chooser = widgets[fields.findIndex((f) => f[0] === form.byValue.key)];
-    if (chooser) chooser.addEventListener("change", apply);
-  }}
+  // What the shape of the mask depends on. Both events: a kind is chosen from a
+  // dropdown, and `dhcp` is typed into an address.
+  const watched = new Set();
+  if (form && form.byValue) watched.add(form.byValue.key);
+  if (form && form.only) for (const k of (form.only.watch || [form.only.key])) watched.add(k);
+  fields.forEach((f, i) => {{
+    if (!widgets[i] || !watched.has(f[0])) return;
+    for (const kind of ["change", "input"]) widgets[i].addEventListener(kind, apply);
+  }});
   // A field whose hint depends on another one has to hear about it: ticking a
   // member is what tells the MTU what it will be.
   fields.forEach((f, i) => {{
@@ -3541,7 +5048,8 @@ function fieldGrid(fields, row, required, form) {{
   return {{
     grid, widgets,
     // The control that reveals the rest, for a caller that wants to place it.
-    more: form
+    // A mask with nothing folded away has nothing to reveal.
+    more: form && form.essential
       ? el("button", {{
           class: "btn", type: "button", text: "More settings",
           onclick: (e) => {{
@@ -3556,32 +5064,49 @@ function fieldGrid(fields, row, required, form) {{
   }};
 }}
 
+// Settings the appliance cannot remove one at a time, and what it removes
+// instead. A rule's schedule is three leaves of one thing — days, a start and
+// an end — and the CLI has no `delete … schedule days`, because a window with
+// no days is not a window. Emptying any of the three therefore stages `delete
+// … schedule`, which is the command that exists; without this the console
+// wrote one the appliance can only refuse, and the refusal took the rest of
+// the batch with it.
+const CLEARS = {{
+  "schedule days": "schedule",
+  "schedule start": "schedule",
+  "schedule end": "schedule",
+}};
+
 // The commands an edit becomes: a value writes, an emptied field removes. The
 // difference matters — leaving a field blank has to mean "no longer set", not
 // "leave whatever was there".
 function fieldLines(fields, widgets, path, before) {{
   const lines = [];
+  const push = (line) => {{ if (!lines.includes(line)) lines.push(line); }};
   fields.forEach((f, i) => {{
     if (!widgets[i]) return;   // a heading writes nothing
     const v = (widgets[i].value || "").trim();
     const had = (before && before[f[0]]) || "";
     if (!v) {{
-      if (had) lines.push(`delete ${{path}} ${{f[0]}}`);
+      if (had) push(`delete ${{path}} ${{CLEARS[f[0]] || f[0]}}`);
       return;
     }}
     if (v === had) return;
     // A repeatable setting *adds*. Editing "CN,RU" down to "CN" by setting the
     // new value would leave RU blocked and nothing on screen would say so, so
-    // the list is cleared first and then written.
-    if (f[3] && had) lines.push(`delete ${{path}} ${{f[0]}}`);
+    // the list is cleared first and then written. Not `pick`: that one names a
+    // setter the appliance *assigns* — a rule's open days are replaced by the
+    // command that writes them — and clearing first would delete the schedule
+    // this line is halfway through rewriting.
+    if (f[3] && f[3] !== "pick" && had) push(`delete ${{path}} ${{f[0]}}`);
     // Some of them take the list in one command; others take one value per
     // command, and writing a comma into those is a refusal.
     if (f[3] === "each") {{
       for (const one of v.split(",").map((one) => one.trim()).filter(Boolean)) {{
-        lines.push(`set ${{path}} ${{f[0]}} ${{one}}`);
+        push(`set ${{path}} ${{f[0]}} ${{one}}`);
       }}
     }} else {{
-      lines.push(`set ${{path}} ${{f[0]}} ${{v}}`);
+      push(`set ${{path}} ${{f[0]}} ${{v}}`);
     }}
   }});
   return lines;
@@ -3597,6 +5122,7 @@ function settingsPanel(boxId, fields, current, path, label, form) {{
   const box = $(boxId);
   box.textContent = "";
   dirty.delete(boxId);
+  fieldPath = path;
   // A mask with headings shows its first group and folds the rest away, unless
   // the caller says otherwise — the first group is what somebody came to set,
   // and the rest is why the page looked like a questionnaire.
@@ -3632,8 +5158,42 @@ function settingsPanel(boxId, fields, current, path, label, form) {{
     }};
   }}
   const foot = el("div", {{ class: "maskfoot" }}, [button, mark]);
+  foot.dataset.label = label;
   if (more) foot.append(more);
   box.append(foot);
+  nameStageButtons();
+}}
+
+/// What each Stage button on the page commits.
+///
+/// A page that holds one mask needs no more than "Stage": there is nothing else
+/// it could mean. A page that holds several writes several different nodes, and
+/// three identical buttons down one scroll is a page where an operator cannot
+/// tell what any of them will do — so on those, and only on those, the button
+/// says the name of the block it belongs to.
+///
+/// Deferred, because the masks of a page are rendered one after another and the
+/// first of them cannot yet see the others.
+let namingStages = false;
+function nameStageButtons() {{
+  if (namingStages) return;
+  namingStages = true;
+  setTimeout(() => {{
+    namingStages = false;
+    for (const pane of document.querySelectorAll('[id^="view-"]')) {{
+      // Only the section-wide masks. An object's own editor and its "New" panel
+      // are opened deliberately, one at a time, and already say which object
+      // they are about — renaming their buttons would take that away.
+      const feet = [...pane.querySelectorAll(".maskfoot")]
+        .filter((f) => f.dataset.label)
+        .filter((f) => !f.closest(".tabpane") || !f.closest(".tabpane").classList.contains("hidden"));
+      for (const foot of feet) {{
+        const button = foot.querySelector(".btn.primary");
+        if (!button) continue;
+        button.textContent = feet.length > 1 ? "Stage " + foot.dataset.label : "Stage";
+      }}
+    }}
+  }}, 0);
 }}
 
 // A container that holds a mask lays out nothing itself: the mask brings its own
@@ -3644,8 +5204,20 @@ function maskHost(box) {{
   box.classList.add("maskhost");
 }}
 
-// The keys of a mask's first group — everything before the second heading.
+// The keys of a mask's first group.
+//
+// A mask may lead with fields that belong to no heading — EVPN's tunnel
+// endpoint and encapsulation, the links intrusion detection watches — and those
+// are its first group. Skipping to the first *heading* put exactly the settings
+// somebody opened the page for behind "More settings" and left the rare ones on
+// screen, which is the fold upside down.
 function firstGroup(fields) {{
+  const lead = [];
+  for (const f of fields) {{
+    if (f[0] === "#") break;
+    lead.push(f[0]);
+  }}
+  if (lead.length) return lead;
   const out = [];
   let seen = 0;
   for (const f of fields) {{
@@ -3696,6 +5268,7 @@ function objectColumns(o) {{
 function objectCard(o, row, cols, span) {{
   const path = o.path(row.name);
   fieldSubject = row.name;
+  fieldPath = path;
 
   const b = o.badge ? o.badge(row) : null;
   const tr = el("tr", {{ class: (b && b.cls) || "" }});
@@ -3724,6 +5297,7 @@ function objectCard(o, row, cols, span) {{
       if (!editrow.classList.contains("hidden")) {{ editrow.classList.add("hidden"); return; }}
       cell.textContent = "";
       fieldSubject = row.name;
+      fieldPath = path;
       const {{ grid, widgets, more }} = fieldGrid(o.fields, row, null, o.form);
       const stageit = el("button", {{
         class: "btn primary", text: "Stage",
@@ -3745,9 +5319,17 @@ function objectCard(o, row, cols, span) {{
       editrow.classList.remove("hidden");
     }},
   }});
+  // Most objects are removed by deleting them. A few the appliance switches off
+  // with a verb of its own — a DHCP server and a router advertisement are turned
+  // on by one, so they are turned off by the other — and a console that spells
+  // the same act a second way is a second grammar to keep in step.
+  const off = o.off && o.off(row);
   const del = el("button", {{
-    class: "btn danger", text: "Delete",
-    onclick: () => stage(`Delete ${{o.noun.toLowerCase()}} ${{row.name}}`, [`delete ${{path}}`]),
+    class: "btn danger", text: off ? off.label : "Delete",
+    onclick: () => stage(
+      off ? `${{off.label}} ${{o.noun.toLowerCase()}} ${{row.name}}`
+          : `Delete ${{o.noun.toLowerCase()}} ${{row.name}}`,
+      off ? off.lines : [`delete ${{path}}`]),
   }});
   tr.append(el("td", {{ class: "end" }}, [edit, del]));
   return [tr, editrow];
@@ -3767,7 +5349,7 @@ function spreadify() {{
   for (const pane of panes) {{
     let inset = false, first = true;
     for (const node of [...pane.children]) {{
-      if (node.classList.contains("tabpane") || node.classList.contains("tabs")) continue;
+      if (node.classList.contains("tabpane")) continue;
       const head = node.querySelector(":scope > h3");
       // A panel that is about to change something keeps its own frame: it is
       // the one surface on a page that is not a reading of the configuration.
@@ -3866,7 +5448,10 @@ function renderAddPanel(o) {{
   const box = $(o.addId);
   box.textContent = "";
   maskHost(box);
-  const name = el("input", {{ placeholder: o.nameHint || "name" }});
+  fieldPath = o.path("<n>");
+  // No `nameHint`, no placeholder: "name" under a box labelled Name is the
+  // label again, which is the one thing a placeholder must never be.
+  const name = el("input", {{ placeholder: o.nameHint || "" }});
   const {{ grid, widgets, more }} = fieldGrid(o.fields, null, o.required, o.form);
   // The name leads the mask rather than standing above it: it is the first
   // thing asked for, not a separate step before the form starts.
@@ -4102,9 +5687,19 @@ const POSTURE = [
   ["description", "Description"],
 ];
 
-// The global block adds the one setting a zone cannot have: what happens to a
-// packet the data plane cannot parse at all.
-const GLOBAL_POSTURE = POSTURE.concat([
+// The global block is the same posture minus the two settings that only mean
+// something about a zone — whether that zone *is* the appliance, and the label
+// somebody gave it — plus the one a zone cannot have: what happens to a packet
+// the data plane cannot parse at all.
+//
+// Sharing the zone's table wholesale offered `local` and `description` here,
+// and `set firewall global local true` is a path the appliance does not have.
+// One touch of that field put a command in the batch that could only be
+// refused — and a refusal is the whole batch's, so the changes staged beside it
+// could not be applied either, until the operator worked out which of them was
+// to blame. A console must not offer a setting the CLI has no home for.
+const ZONE_ONLY = ["local", "description"];
+const GLOBAL_POSTURE = POSTURE.filter((f) => !ZONE_ONLY.includes(f[0])).concat([
   ["fail-closed", "Drop unparseable packets", ["", "true", "false"]],
 ]);
 
@@ -4141,12 +5736,20 @@ async function refreshZones() {{
 // with "unknown set path", so filling either one failed the whole apply.
 const SNAT = [
   ["zone", "Zone"], ["description", "Description"],
-  ["cgnat-block-size", "CGNAT ports per host"],
-  ["cgnat-base-port", "CGNAT first port"],
+  // Deterministic CGNAT: how many ports each inside address gets, and where
+  // the first block starts. Both are figures the appliance bounds and one of
+  // them has a constant behind it, so both are stepped rather than typed.
+  ["#", "Carrier-grade NAT"],
+  ["cgnat-block-size", "Ports per host"],
+  ["cgnat-base-port", "First port"],
+  ["#", "Whether it is on"],
   ["disabled", "Disabled", ["", "true", "false"]],
 ];
 const DNAT = [
   ["zone", "Zone"], ["proto", "Protocol", ["", "tcp", "udp"]],
+  // The port the outside world knocks on, and the machine inside that answers.
+  // The second offers this box's DHCP reservations — see [`reservedHosts`] for
+  // why a lease is deliberately not among them.
   ["port", "Port"], ["to", "To"],
   ["description", "Description"],
   // Without it, a host inside reaching the public address of a service that is
@@ -4212,15 +5815,35 @@ const BGP_GLOBAL = [
   ["#", "What it advertises"],
   ["network", "Networks", null, "list"],
   redist("bgp"),
+  // Lists, and declared as such: the appliance *appends* each of these, so a
+  // field that wrote one value at a time left the community an operator had
+  // just removed still tagged on every route this box originates. `list` is
+  // also what puts the well-known ones on the page as chips.
   ["#", "What it tags its own routes with"],
-  ["community", "Communities"], ["large-community", "Large communities"],
-  ["ext-community", "Extended communities"],
+  ["community", "Communities", null, "list"],
+  ["large-community", "Large communities", null, "list"],
+  ["ext-community", "Extended communities", null, "list"],
   ["#", "How it behaves"],
   ["hold-time", "Hold time"], ["cluster-id", "Cluster ID"],
   // A count of equal-cost paths, not a yes/no — offering true/false made ECMP
   // unconfigurable and the refusal took the rest of the batch with it.
   ["multipath", "Multipath"],
   ["ebgp-require-policy", "Require policy", ["", "true", "false"]],
+  // A confederation is one AS to the outside and several inside it, which is how
+  // a large network runs iBGP without a full mesh or a reflector.
+  //
+  // These and the RPKI settings below write under `protocols bgp` like
+  // everything above them — `confederation id` and `rpki rtr` are the commands
+  // they already are. They were three masks with three Stage buttons on one
+  // screen, and nothing on it said which button committed which half.
+  ["#", "Confederation"],
+  ["confederation id", "Confederation AS"],
+  ["confederation member", "Member ASes", null, "list"],
+  // Origin validation. Without an RTR server there is still the local table of
+  // authorisations further down the page, which is why both are here.
+  ["#", "Origin validation"],
+  ["rpki rtr", "RTR server"], ["rpki rtr-refresh", "Refresh"],
+  ["rpki reject-invalid", "Reject invalid", ["", "true", "false"]],
 ];
 const BGP_NEIGHBOR = [
   ["#", "The session"],
@@ -4247,22 +5870,13 @@ const BGP_NEIGHBOR = [
   ["#", "Trust and liveness"],
   ["password", "Password"],
   ["ao-key", "TCP-AO key"], ["ao-key-id", "TCP-AO key id"],
-  ["ttl-security", "GTSM hops"],
+  // The unit is on the box, so the label stops saying it: "GTSM hops" beside a
+  // figure already marked `hops` is the same word twice.
+  ["ttl-security", "GTSM (hops)"],
   ["bfd", "BFD", ["", "true", "false"]],
-  ["bfd-auth-type", "BFD authentication"],
+  ["bfd-auth-type", "BFD authentication",
+    ["", "simple", "keyed-md5", "meticulous-md5", "keyed-sha1", "meticulous-sha1"]],
   ["bfd-auth-key-id", "BFD key id"], ["bfd-auth-key", "BFD key"],
-];
-// A confederation is one AS to the outside and several inside it, which is how
-// a large network runs iBGP without a full mesh or a reflector.
-const BGP_CONFED = [
-  ["confederation id", "Confederation AS"],
-  ["confederation member", "Member ASes", null, "list"],
-];
-// Origin validation. Without an RTR server there is still the local table
-// below, which is why the two live next to each other.
-const BGP_RPKI = [
-  ["rpki rtr", "RTR server"], ["rpki rtr-refresh", "Refresh (s)"],
-  ["rpki reject-invalid", "Reject invalid", ["", "true", "false"]],
 ];
 const BGP_AGGREGATE = [["summary-only", "Suppress more specifics", ["", "true", "false"]]];
 const BGP_ROA = [["origin-as", "Origin AS"], ["max-length", "Maximum length"]];
@@ -4306,6 +5920,10 @@ async function refreshIpsec() {{
 const WG = [["listen-port", "Listen port"], ["private-key", "Private key"]];
 const WG_PEER = [
   ["allowed-ips", "Allowed IPs", null, "list"], ["endpoint", "Endpoint"],
+  // The pre-shared key is the second half of the same decision the private key
+  // is, and the appliance mints both from the same word. Offering `generate`
+  // beside one and not the other was the console making the optional layer of
+  // post-quantum protection the one an operator has to produce by hand.
   ["keepalive", "Keepalive"], ["preshared-key", "Pre-shared key"],
 ];
 
@@ -4410,6 +6028,8 @@ async function refreshDhcp() {{
   renderObjects({{
     listId: "dhcplist", noun: "Server", fields: DHCP,
     path: (n) => `interface ${{n}} dhcp-server`,
+    off: (r) => ({{ label: "Turn off",
+                   lines: [`set interface ${{r.name}} dhcp-server disable`] }}),
     rows: [...servers.values()],
     badge: (r) => ({{ text: r["pool-size"] ? r["pool-size"] + " leases" : "default pool" }}),
     empty: "No DHCP servers configured.",
@@ -4450,6 +6070,8 @@ async function refreshDhcp() {{
   renderObjects({{
     listId: "ralist", noun: "Advertisement", fields: RA,
     path: (n) => `interface ${{n}} router-advert`,
+    off: (r) => ({{ label: "Turn off",
+                   lines: [`set interface ${{r.name}} router-advert disable`] }}),
     rows: [...ras.values()],
     badge: (r) => r.prefix ? {{ text: r.prefix }}
                            : {{ text: "prefix from the interface" }},
@@ -4488,30 +6110,9 @@ const FORMS = {{
   ocUser: {{ essential: ["password"] }},
   syn: {{ essential: ["mss"] }},
   group: {{ essential: ["permission"] }},
-  rule: {{ essential: ["from", "to", "action", "proto", "port", "source", "destination"] }},
-}};
-
-const IFACE_FORM = {{
-  essential: ["type", "zone", "address"],
-  byValue: {{
-    key: "type",
-    map: {{
-      // No type: an ordinary NIC, or a VLAN on one — which is a parent and an
-      // id and nothing more, so both are here rather than behind "more".
-      "": ["address6", "parent", "vlan", "description"],
-      bridge: ["member", "vlan-aware"],
-      bond: ["member", "bond-mode"],
-      // A dummy link is a name and an address; there is nothing else to decide.
-      dummy: ["address6", "description"],
-      wireguard: [],
-      pppoe: ["parent", "pppoe username", "pppoe password"],
-      gre: ["local", "remote", "key"],
-      ipip: ["local", "remote"],
-      gretap: ["local", "remote", "key"],
-      macvlan: ["parent", "macvlan-mode"],
-      macsec: ["parent", "macsec-key", "macsec-peer"],
-      l2tpv3: ["local", "remote", "key"],
-    }},
+  rule: {{
+    essential: ["from", "to", "action", "proto", "port", "source", "destination"],
+    only: RULE_ONLY,
   }},
 }};
 
@@ -4553,20 +6154,26 @@ const IFACE = [
   ["bond-mode", "Bond mode",
     ["", "active-backup", "802.3ad", "balance-rr", "balance-xor", "broadcast",
      "balance-tlb", "balance-alb"]],
-  // Two different things called VLAN, which is why they were confusing sitting
-  // under one heading: *this* interface being a VLAN on a parent, and this
-  // interface being a bridge (or a port on one) that filters VLANs.
+  // Two different things called VLAN, which is why they were confusing under
+  // one heading: *this* interface being a VLAN on a parent, and this interface
+  // being a bridge (or a port on one) that filters VLANs. They are three
+  // groups now, and a link is only asked the one it could answer.
   ["#", "This interface is a VLAN"],
   ["vlan", "VLAN id"],
   ["vlan-protocol", "Tag protocol", ["", "802.1q", "802.1ad"]],
-  ["#", "VLAN filtering on a bridge"],
+  // The bridge's own switch. Its ports' tags are with the rest of what belongs
+  // to a port, further down: one is set on the bridge and the others on each
+  // member, and standing them under one heading is what made two different
+  // things called VLAN read as one confusing setting.
+  ["#", "VLAN filtering on this bridge"],
   ["vlan-aware", "Filter VLANs on this bridge", ["", "true", "false"]],
-  ["vlan-tagged", "Tagged ids on this bridge port"],
-  ["vlan-untagged", "Untagged id on this bridge port"],
   ["#", "Tunnel endpoints"],
   ["local", "Local"], ["remote", "Remote"], ["key", "Key"], ["ttl", "TTL"],
-  ["#", "MACVLAN and MACsec"],
+  // Two kinds of link, not one setting with three fields: a MACVLAN takes a
+  // mode and a MACsec device takes a key and a peer, and no link is both.
+  ["#", "MACVLAN"],
   ["macvlan-mode", "MACVLAN mode", ["", "bridge", "private", "vepa", "passthru"]],
+  ["#", "MACsec"],
   ["macsec-key", "MACsec key"], ["macsec-peer", "MACsec peer"],
   ["#", "PPPoE credentials"],
   ["pppoe username", "Username"], ["pppoe password", "Password"],
@@ -4615,6 +6222,8 @@ const IFACE = [
   ["bridge-port cost", "STP path cost"],
   ["bridge-port priority", "STP port priority"],
   ["bridge-port learning", "Learn MACs here", ["", "true", "false"]],
+  ["vlan-tagged", "Tagged ids on this bridge port"],
+  ["vlan-untagged", "Untagged id on this bridge port"],
   ["#", "Bond (on the bond device)"],
   ["bond hash-policy", "Hash policy",
     ["", "layer2", "layer2+3", "layer3+4", "encap2+3", "encap3+4"]],
@@ -4659,6 +6268,128 @@ const IFACE = [
   ["dhcpv6 parameters-only", "Parameters only (no address)", ["", "true", "false"]],
   ["dhcpv6 no-release", "Do not RELEASE on link down", ["", "true", "false"]],
 ];
+
+// Which links are ports of a bridge, and which of a VLAN-aware one.
+//
+// A port's spanning-tree cost and its VLAN membership are settings of the
+// *port*, and the appliance refuses both anywhere else — "vlan-tagged/
+// vlan-untagged require membership of a vlan-aware bridge" — so they are asked
+// of a link some bridge names as a member, and of no other. Staged changes
+// count: putting eth2 into br0 and then giving it a path cost is one piece of
+// work, and a console that made it two would be arguing with itself.
+function bridgeMembership() {{
+  const kind = new Map(), members = new Map(), aware = new Map();
+  const note = (name, leaf, value) => {{
+    if (leaf === "type") kind.set(name, value);
+    else if (leaf === "vlan-aware") aware.set(name, value);
+    else if (leaf === "member") {{
+      members.set(name, (members.get(name) || [])
+        .concat(String(value).split(/[,\s]+/).filter(Boolean)));
+    }}
+  }};
+  for (const l of lastLeaves) {{
+    if (l.path[0] !== "interface" || l.path.length !== 3) continue;
+    note(l.path[1], l.path[2], l.value);
+  }}
+  for (const entry of staged) {{
+    for (const command of entry.cmds) {{
+      const w = String(command).trim().split(/\s+/);
+      if (w[0] !== "set" || w[1] !== "interface" || w.length !== 5) continue;
+      note(w[2], w[3], w[4]);
+    }}
+  }}
+  const ports = new Set(), tagged = new Set();
+  for (const [name, list] of members) {{
+    if (kind.get(name) !== "bridge") continue;
+    for (const m of list) {{
+      ports.add(m);
+      if (aware.get(name) === "true") tagged.add(m);
+    }}
+  }}
+  return {{ ports, tagged }};
+}}
+
+const isBridgePort = (now, row) =>
+  !!row && bridgeMembership().ports.has(row.name);
+const isVlanPort = (now, row) =>
+  !!row && bridgeMembership().tagged.has(row.name);
+
+// Every setting written under one word — `pppoe username`, `bridge stp` —
+// belongs to the kind of link that word names. Read off the table rather than
+// listed a second time, so a setting added there cannot be left ungated.
+const ifaceFamily = (prefix, kinds) => Object.fromEntries(
+  IFACE.filter((f) => f[0].startsWith(prefix + " ")).map((f) => [f[0], kinds]));
+
+// The kernel tunnels. `key` is not on all of them: IPIP carries none, and the
+// appliance says so rather than ignoring it.
+const TUNNEL = ["gre", "ipip", "gretap", "l2tpv3"];
+const KEYED_TUNNEL = ["gre", "gretap", "l2tpv3"];
+
+const IFACE_FORM = {{
+  essential: ["type", "zone", "address"],
+  byValue: {{
+    key: "type",
+    map: {{
+      // No type: an ordinary NIC, or a VLAN on one — which is a parent and an
+      // id and nothing more, so both are here rather than behind "more".
+      "": ["address6", "parent", "vlan", "description"],
+      bridge: ["member", "vlan-aware"],
+      bond: ["member", "bond-mode"],
+      // A dummy link is a name and an address; there is nothing else to decide.
+      dummy: ["address6", "description"],
+      wireguard: [],
+      pppoe: ["parent", "pppoe username", "pppoe password"],
+      gre: ["local", "remote", "key"],
+      ipip: ["local", "remote"],
+      gretap: ["local", "remote", "key"],
+      macvlan: ["parent", "macvlan-mode"],
+      macsec: ["parent", "macsec-key", "macsec-peer"],
+      l2tpv3: ["local", "remote", "key"],
+    }},
+  }},
+  // What a link of this kind has at all — every line here is a refusal the
+  // appliance already makes, so the mask asks for exactly what could be
+  // committed. Before this, an ordinary ethernet port under "More settings"
+  // was asked for a VLAN id, a bridge port's tags, a tunnel's endpoints, a
+  // MACVLAN mode, a MACsec key and a PPPoE login, all at once.
+  only: {{
+    key: "type",
+    // The address decides two families of their own: a DHCP client's options
+    // are dead weight on a link with a static address.
+    watch: ["type", "address", "address6"],
+    map: {{
+      // A parent is the link something rides on: a VLAN's trunk, a PPPoE
+      // session's NIC, the interface a MACVLAN or MACsec device is made from.
+      parent: ["", "pppoe", "macvlan", "macsec"],
+      vlan: [""],
+      "vlan-protocol": [""],
+      member: ["bridge", "bond"],
+      "bond-mode": ["bond"],
+      "vlan-aware": ["bridge"],
+      "vlan-tagged": isVlanPort,
+      "vlan-untagged": isVlanPort,
+      local: TUNNEL, remote: TUNNEL, ttl: TUNNEL, key: KEYED_TUNNEL,
+      "macvlan-mode": ["macvlan"],
+      "macsec-key": ["macsec"], "macsec-peer": ["macsec"],
+      "vti-key": ["vti"],
+      // A name pinned to a card by its MAC is a fact about a card. A bridge is
+      // not one, and neither is a tunnel.
+      "hw-id": [""],
+      ...ifaceFamily("pppoe", ["pppoe"]),
+      ...ifaceFamily("wwan", ["wwan"]),
+      ...ifaceFamily("wireless", ["wireless"]),
+      ...ifaceFamily("ethernet", [""]),
+      ...ifaceFamily("bridge", ["bridge"]),
+      ...ifaceFamily("bond", ["bond"]),
+      ...ifaceFamily("bridge-port", isBridgePort),
+      // "Only meaningful with address = dhcp", says the appliance's own model,
+      // and the heading says it too — so the group appears when that is what
+      // the address is.
+      ...ifaceFamily("dhcp", (now) => (now.address || "").trim() === "dhcp"),
+      ...ifaceFamily("dhcpv6", (now) => (now.address6 || "").trim() === "dhcp"),
+    }},
+  }},
+}};
 
 async function refreshInterfaces() {{
   await showInto("ifaceshow", "/api/v1/show/interfaces");
@@ -4784,8 +6515,10 @@ const AAA = [["default-group", "Default group"]];
 // live and what names one.
 const AAA_LDAP = [
   ["base-dn", "Base DN"], ["user-attribute", "Account attribute"],
-  ["tls", "Transport", ["ldaps", "starttls", "none"]],
-  ["port", "Port"], ["timeout", "Timeout (s)"],
+  // Unset is `ldaps`, so it is on the list: a control with no way back to the
+  // appliance's own answer makes the operator guess which of three it was.
+  ["tls", "Transport", ["", "ldaps", "starttls", "none"]],
+  ["port", "Port"], ["timeout", "Timeout"],
 ];
 const AAA_RADIUS = [
   ["secret", "Shared secret"], ["port", "Port"], ["timeout", "Timeout (s)"],
@@ -4984,19 +6717,28 @@ const CONNTRACK_SYNC = [
 // table offers under that node — derived from it rather than retyped, because a
 // console that knows a different set of fields than the CLI is a console that
 // will one day refuse something the appliance accepts.
+// Twelve boxes at once for a resolver whose whole job, most days, is "ask
+// these servers, answer on these links". The rest — what it will not forward,
+// what it answers out of its own pocket, how long it keeps an answer — is real
+// and is one click away.
 const SVC_DNS = [
+  ["#", "Where it asks, and who it answers"],
   ["upstream", "Upstream servers", null, "list"], ["serve-on", "Serve on", null, "list"],
+  ["local-domain", "Local domain"],
+  ["#", "What it will not do"],
+  ["allow-from", "Allow queries from", null, "each"],
+  ["dont-query", "Never forward", null, "each"],
+  ["blocklist", "Blocklists", null, "each"],
+  ["#", "What it answers itself"],
+  ["host-override", "Host overrides", null, "each"],
+  ["txt-record", "TXT records", null, "each"],
+  ["#", "Privacy and caching"],
   // Setting this takes the plaintext servers above out of the resolver: they
   // become the proxy's bootstrap, answering the one question its own hostname
   // poses rather than every question.
   ["secure-upstream", "Encrypted upstreams", null, "each"],
-  ["allow-from", "Allow queries from", null, "each"],
-  ["dont-query", "Never forward", null, "each"],
-  ["host-override", "Host overrides", null, "each"], ["blocklist", "Blocklists", null, "each"],
-  ["txt-record", "TXT records", null, "each"],
   ["dnssec", "DNSSEC", ["", "no", "yes", "allow-downgrade"]],
   ["cache-size", "Cache size"], ["negative-ttl", "Negative TTL (s)"],
-  ["local-domain", "Local domain"],
 ];
 const SVC_NTP = [
   ["upstream", "Upstream sources", null, "list"], ["serve-on", "Serve on", null, "list"],
@@ -5020,9 +6762,10 @@ const SVC_MDNS = [["interface", "Interfaces", null, "list"]];
 const SVC_DYNDNS = [
   ["provider", "Provider", ["", "dyndns2", "cloudflare", "duckdns", "noip"]],
   ["server", "Server"], ["hostname", "Hostname"],
-  ["keyboard", "Console keyboard"],
-  ["locale", "Locale"],
-  ["timezone", "Timezone"],
+  // No keyboard, locale or time zone here: those are `system` settings and had
+  // been copied in, so touching one built `set services dyndns timezone …` —
+  // a path the appliance does not have, and a refusal takes the whole batch
+  // with it. They are on the System page, which is where they are written.
   ["login", "Login"], ["password", "Password"], ["interface", "Interface"],
 ];
 const SVC_DHCPRELAY = [
@@ -5175,25 +6918,28 @@ const MULTICAST = [
   ["mld", "MLD (IPv6)", ["", "true", "false"]],
   ["igmp-version", "IGMP version", ["", "2", "3"]],
   ["#", "How it asks who is listening"],
-  ["query-interval", "Query interval (s)"],
-  ["query-response-interval", "Response interval (s)"],
+  ["query-interval", "Query interval"],
+  ["query-response-interval", "Response interval"],
   ["robustness", "Robustness"],
-];
-// PIM writes under `protocols multicast` too: the keys carry the sub-node, so a
-// field here is the command it already is. Separate from the querier settings
-// above because they answer different questions — the querier asks who on this
-// segment is listening, PIM decides which segment a group reaches at all.
-const MULTICAST_PIM = [
+  // PIM writes under `protocols multicast` too: the keys carry the sub-node, so
+  // a field here is the command it already is. Its own group, because it answers
+  // a different question — the querier asks who on this segment is listening,
+  // PIM decides which segment a group reaches at all — but not its own mask,
+  // because a second Stage button beside the first says nothing about which of
+  // them commits what.
+  ["#", "Between segments (PIM-SM)"],
   ["pim enabled", "Route between segments", ["", "true", "false"]],
   ["pim rp-address", "Rendezvous point"],
   ["pim interface", "Speaks on", null, "each"],
-  ["#", "More settings"],
-  ["pim hello-interval", "Hello interval (s)"],
-  ["pim spt-threshold", "Source-tree threshold (kbit/s)"],
+  ["pim hello-interval", "Hello interval"],
+  ["pim spt-threshold", "Source-tree threshold"],
 ];
 // An interface either faces receivers or faces where the traffic comes from.
 const MULTICAST_IFACE = [
-  ["role", "Role", ["", "downstream", "upstream", "disabled"]],
+  // The three the appliance takes, from MULTICAST_ROLES. `disabled` was offered
+  // here and is not one of them: picking it produced a command that could only
+  // be refused, and a refusal takes the rest of the batch with it.
+  ["role", "Role", ["", "querier", "upstream", "downstream"]],
   ["igmp-version", "IGMP version", ["", "2", "3"]],
 ];
 // A VRF is a table plus the links that use it. Import and export are route
@@ -5264,6 +7010,41 @@ const OC_SERVER = [
 ];
 const OC_USER = [["password", "Password"]];
 const PLIST_RULE = [["prefix", "Prefix"], ["ge", "Length ≥"], ["le", "Length ≤"]];
+
+// What crosses between the protocols and the kernel, and which route map decides
+// it. This is where a redistribution is actually filtered: a protocol's own
+// `redistribute` says *that* it offers its routes, and these say which of them
+// survive on the way in and on the way back out.
+//
+// Named by protocol on purpose — `import bgp` is the command — and the value is
+// a route map, so the field offers the maps this box has rather than asking for
+// one to be spelled from memory.
+const REDIST_FILTERS = [
+  ["#", "Coming in, before the routing table takes it"],
+  ["import connected", "Connected"], ["import static", "Static"],
+  ["import kernel", "Kernel"], ["import bgp", "BGP"],
+  ["import ospf", "OSPFv2"], ["import isis", "IS-IS"],
+  ["import rip", "RIP"], ["import ripng", "RIPng"], ["import babel", "Babel"],
+  ["#", "Going back out to a protocol or to the kernel"],
+  ["export kernel", "Kernel"], ["export bgp", "BGP"],
+  ["export ospf", "OSPFv2"], ["export isis", "IS-IS"],
+  ["export rip", "RIP"], ["export ripng", "RIPng"], ["export babel", "Babel"],
+];
+// One question — which route map does this go through — asked about nine route
+// sources in two directions, so it is laid out as the table it is. Connected
+// and static routes have no export cell because there is nothing to export
+// them *to*: you send routes to a protocol, and neither of those is one.
+const REDIST_FILTER_TABLE = {{
+  matrix: {{
+    corner: "Route source",
+    cols: [["import", "Coming in"], ["export", "Going back out"]],
+    rows: [
+      ["connected", "Connected"], ["static", "Static"], ["kernel", "Kernel"],
+      ["bgp", "BGP"], ["ospf", "OSPFv2"], ["isis", "IS-IS"],
+      ["rip", "RIP"], ["ripng", "RIPng"], ["babel", "Babel"],
+    ],
+  }},
+}};
 // The map itself has one setting; everything else is a numbered rule under it.
 const RMAP = [["default", "Default", ["", "permit", "deny"]]];
 // A rule matches, then changes. The nested `match`/`set` blocks are ordinary
@@ -5274,7 +7055,8 @@ const RMAP_RULE = [
   ["#", "What it matches"],
   ["match prefix-list", "Prefix list"],
   ["match prefix", "Prefix pattern"],
-  ["match protocol", "Protocol"],
+  ["match protocol", "Protocol",
+    ["", "connected", "static", "kernel", "bgp", "ospf", "isis", "rip", "babel"]],
   ["match metric-ge", "Metric ≥"],
   ["match metric-le", "Metric ≤"],
   ["#", "What it changes"],
@@ -5282,8 +7064,11 @@ const RMAP_RULE = [
   ["set metric", "Metric"],
   ["set add-metric", "Metric delta"],
   ["set preference", "Preference"],
-  ["set community", "Communities"],
-  ["set add-community", "Add community"],
+  // The first replaces the set and the second adds to it — the appliance's own
+  // distinction — so one is a `pick` (written whole, no clearing first) and the
+  // other a `list` (cleared, then written). Both offer the well-known names.
+  ["set community", "Communities", null, "pick"],
+  ["set add-community", "Add community", null, "list"],
   ["set large-community", "Large communities"],
   ["set add-large-community", "Add large community"],
   ["set ext-community", "Extended communities"],
@@ -5304,9 +7089,19 @@ const PBR = [
 
 const SYS_IDENT = [
   ["hostname", "Hostname"],
+  // Where the box is and how its console is typed on. The time zone is the one
+  // an operator notices: every log line and every certificate date is read
+  // through it, and a box left on UTC is read wrong rather than not at all.
+  ["timezone", "Time zone"],
+  ["keyboard", "Console keyboard"],
+  ["locale", "Locale"],
   // The port somebody reaches for when the network this box manages is the
-  // thing that is broken.
-  ["console device", "Serial console"], ["console speed", "Console speed"],
+  // thing that is broken. The speed is a closed set and a short one — a serial
+  // console runs at one of five rates and has done for thirty years — so it is
+  // the one of these four that can be a dropdown outright.
+  ["console device", "Serial console"],
+  ["console speed", "Console speed",
+   ["", "9600", "19200", "38400", "57600", "115200"]],
   ["commit-revisions", "Revisions kept"],
   // The History view tells an operator to turn this on here, so it has to be
   // here. It was not: the console could read the history and not start it.
@@ -5341,7 +7136,10 @@ const QOS = [
   ["diffserv", "Diffserv",
     ["", "besteffort", "precedence", "diffserv3", "diffserv4", "diffserv8"]],
   ["#", "The queue itself"],
-  ["target", "Target (ms)"], ["interval", "Interval (ms)"], ["limit", "Queue limit"],
+  // No "(ms)" on either label: the value carries its own unit — `5ms`, `100us`
+  // — because tc does, and a label naming one unit beside a box that takes
+  // several is the console telling the operator something untrue.
+  ["target", "Target"], ["interval", "Interval"], ["limit", "Queue limit"],
 ];
 
 async function refreshQos() {{
@@ -5455,7 +7253,7 @@ async function refreshRoutePolicy() {{
   }});
   if (currentTab("routepolicy") === "pbr") await showInto("show-pbr", "/api/v1/show/policy/route");
 
-  const lists = entriesUnder(ls, ["policy", "prefix-list"]);
+  const lists = entriesWithStaged(entriesUnder(ls, ["policy", "prefix-list"]), ["policy", "prefix-list"]);
   const list = chosenName("pllist-pick", "plnew", lists);
   fillPicker("pllist-pick", lists, list);
   renderObjects({{
@@ -5472,7 +7270,7 @@ async function refreshRoutePolicy() {{
   }});
   $("togglepl").disabled = !list;
 
-  const maps = entriesUnder(ls, ["policy", "route-map"]);
+  const maps = entriesWithStaged(entriesUnder(ls, ["policy", "route-map"]), ["policy", "route-map"]);
   const map = chosenName("rmlist-pick", "rmnew", maps);
   fillPicker("rmlist-pick", maps, map);
   // With no map chosen the path has a hole in it, and `set policy route-map
@@ -5528,7 +7326,7 @@ async function refreshRouting() {{
   // Every protocol's settings mask, filled whether or not it is the open tab:
   // the marks on the strip are what tell an operator which protocols are
   // running, and they come from the same read.
-  for (const [box, fields, path, label] of [
+  for (const [box, fields, path, label, shape] of [
     ["igp-ospf", IGP_OSPF, "protocols ospf", "OSPFv2"],
     ["igp-ospf3", IGP_OSPF3, "protocols ospf3", "OSPFv3"],
     ["igp-isis", IGP_ISIS, "protocols isis", "IS-IS"],
@@ -5537,14 +7335,12 @@ async function refreshRouting() {{
     ["igp-babel", IGP_BABEL, "protocols babel", "Babel"],
     ["igp-bfd", IGP_BFD, "protocols bfd", "BFD"],
     ["bgpglobal", BGP_GLOBAL, "protocols bgp", "BGP router settings"],
-    // Both write under `protocols bgp` as well: their keys carry the sub-node,
-    // so `confederation id` and `rpki rtr` are the commands they already are.
-    ["bgpconfed", BGP_CONFED, "protocols bgp", "Confederation"],
-    ["bgprpki", BGP_RPKI, "protocols bgp", "Origin validation"],
     ["mcastform", MULTICAST, "protocols multicast", "Multicast routing"],
-    ["mcastpim", MULTICAST_PIM, "protocols multicast", "PIM-SM"],
+    // Both halves write under `protocols`, and their keys carry which half —
+    // `import bgp`, `export kernel` — so one panel is one node.
+    ["redistfilters", REDIST_FILTERS, "protocols", "Route filters", REDIST_FILTER_TABLE],
   ]) {{
-    settingsPanel(box, fields, fieldsOf(ls, path), path, label);
+    settingsPanel(box, fields, fieldsOf(ls, path), path, label, shape);
   }}
 
   // The two protocols that have objects as well as settings.
@@ -5625,6 +7421,7 @@ async function refreshRouting() {{
     bfd: [["show-bfd", "/api/v1/show/bfd"]],
     multicast: [["show-multicast", "/api/v1/show/multicast"]],
     vrf: [["show-vrf", "/api/v1/show/vrf"]],
+    filters: [["filtershow", "/api/v1/show/ip/route"]],
     table: [["igpshow", "/api/v1/show/ip/route"]],
   }};
   await Promise.all((LIVE[tab] || []).map(([boxId, path]) => showInto(boxId, path)));
@@ -5690,13 +7487,18 @@ async function refreshServices() {{
 }}
 
 // EVPN. The identity first, then the two object kinds.
+// The three that make this box a VTEP lead the mask, and the rest are grouped
+// by what they are about. The heading here used to read "More settings", which
+// is the name of the *button* that reveals it — a page with a heading and a
+// control of the same name says nothing about either and reads as a mistake.
 const EVPN = [
   ["vtep-ip", "Tunnel endpoint address"],
   ["underlay-interface", "Underlay link"],
   ["encapsulation", "Encapsulation", ["", "vxlan", "geneve"]],
-  ["#", "More settings"],
+  ["#", "The tunnel it builds"],
   ["udp-port", "UDP port"],
   ["mtu", "Underlay MTU"],
+  ["#", "SRv6, where the underlay carries segments instead"],
   ["srv6-locator", "SRv6 locator"],
   ["srv6-source", "SRv6 source address"],
   ["srv6-peer", "Accept decap from", null, "each"],
@@ -5855,6 +7657,7 @@ async function refreshStack() {{
 // in the same 24-unit stroke language rather than left out.
 const ICONS = {{
   gauge: '<circle cx="12" cy="12" r="9"/><path d="M12 12 15.5 8.5"/>',
+  chip: '<rect x="7" y="7" width="10" height="10" rx="1"/><path d="M10 3v4M14 3v4M10 17v4M14 17v4M3 10h4M3 14h4M17 10h4M17 14h4"/>',
   shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>',
   zones: '<rect x="3" y="4" width="8" height="7" rx="1"/><rect x="13" y="13" width="8" height="7" rx="1"/><path d="M11 7.5h2M11 16.5h2"/>',
   swap: '<path d="M4 8h13l-3-3M20 16H7l3 3"/>',
@@ -5897,20 +7700,22 @@ function icon(name) {{
 
 // The editable views, in the order an operator meets them.
 const SECTIONS = [
-  {{ g: "Overview", items: [
+  {{ g: "Overview", i: "gauge", c: "#34d399", items: [
     {{ v: "dashboard", t: "Dashboard", i: "gauge" }},
-    {{ v: "history", t: "History", i: "gauge" }},
+    {{ v: "history", t: "History", i: "chart" }},
   ]}},
-  {{ g: "Policy", items: [
+  {{ g: "Policy", i: "shield", c: "#f59e0b", items: [
     {{ v: "rules", t: "Firewall rules", i: "shield" }},
     {{ v: "zones", t: "Zones", i: "zones" }},
     {{ v: "groups", t: "Groups", i: "layers" }},
     {{ v: "nat", t: "NAT", i: "swap" }},
-    {{ v: "synproxy", t: "SYN protection", i: "shield" }},
+    {{ v: "synproxy", t: "SYN protection", i: "pulse" }},
   ]}},
-  {{ g: "Network", items: [
+  {{ g: "Network", i: "address", c: "#38bdf8", items: [
     {{ v: "interfaces", t: "Interfaces", i: "address" }},
-    {{ v: "dhcp", t: "DHCP", i: "address" }},
+    // Not `address` again: two pages of a category wearing one glyph is a strip
+    // read by position rather than by sight.
+    {{ v: "dhcp", t: "DHCP", i: "list" }},
     {{ v: "qos", t: "Traffic shaping", i: "gauge" }},
     {{ v: "lb", t: "Load balancer", i: "swap" }},
   ]}},
@@ -5920,7 +7725,7 @@ const SECTIONS = [
   // operator chasing a route should not have to know which of those answered.
   // Every protocol is named in the rail: a box that speaks seven of them and
   // shows one is a box an operator will assume cannot do the other six.
-  {{ g: "Routing", items: [
+  {{ g: "Routing", i: "globe", c: "#a78bfa", items: [
     {{ v: "routing", tab: "static", t: "Static routes", i: "pin" }},
     {{ v: "routing", tab: "bgp",    t: "BGP", i: "globe" }},
     {{ v: "routing", tab: "ospf",   t: "OSPFv2", i: "star" }},
@@ -5931,14 +7736,15 @@ const SECTIONS = [
     {{ v: "routing", tab: "babel",  t: "Babel", i: "mesh" }},
     {{ v: "routing", tab: "bfd",    t: "BFD", i: "pulse" }},
     {{ v: "routing", tab: "multicast", t: "Multicast", i: "mesh" }},
-    {{ v: "routing", tab: "vrf",    t: "VRFs", i: "list" }},
+    {{ v: "routing", tab: "vrf",    t: "VRFs", i: "zones" }},
+    {{ v: "routing", tab: "filters", t: "Route filters", i: "list" }},
     {{ v: "routing", tab: "table",  t: "Routing table", i: "list" }},
-    {{ v: "routepolicy", tab: "prefix", t: "Prefix lists", i: "filter" }},
+    {{ v: "routepolicy", tab: "prefix", t: "Prefix lists", i: "layers" }},
     {{ v: "routepolicy", tab: "maps", t: "Route maps", i: "filter" }},
-    {{ v: "routepolicy", tab: "pbr", t: "Policy routing", i: "pin" }},
+    {{ v: "routepolicy", tab: "pbr", t: "Policy routing", i: "route" }},
     {{ v: "wan", t: "Multi-WAN", i: "swap" }},
   ]}},
-  {{ g: "Security", items: [
+  {{ g: "Security", i: "lock", c: "#fb7185", items: [
     {{ v: "ipsec", t: "IPsec", i: "lock" }},
     {{ v: "wireguard", t: "WireGuard", i: "key" }},
     {{ v: "openconnect", t: "Remote access", i: "lock" }},
@@ -5947,17 +7753,17 @@ const SECTIONS = [
     {{ v: "ids", t: "Intrusion detection", i: "bug" }},
     {{ v: "capture", t: "Packet capture", i: "search" }},
   ]}},
-  {{ g: "Overlay", items: [
+  {{ g: "Overlay", i: "layers", c: "#2dd4bf", items: [
     {{ v: "evpn", t: "EVPN", i: "layers" }},
   ]}},
-  {{ g: "Services", items: [
+  {{ g: "Services", i: "swap", c: "#22d3ee", items: [
     {{ v: "services", tab: "resolution", t: "DNS and time", i: "layers" }},
     {{ v: "services", tab: "management", t: "Management access", i: "key" }},
     {{ v: "services", tab: "addressing", t: "Addressing", i: "address" }},
     {{ v: "services", tab: "publishing", t: "Publishing", i: "swap" }},
     {{ v: "services", tab: "notification", t: "Logging and alerts", i: "bug" }},
   ]}},
-  {{ g: "System", items: [
+  {{ g: "System", i: "chip", c: "#c084fc", items: [
     {{ v: "system", t: "System", i: "gauge" }},
     {{ v: "ha", t: "High availability", i: "layers" }},
     {{ v: "users", t: "Administrators", i: "key" }},
@@ -5966,25 +7772,28 @@ const SECTIONS = [
   ]}},
 ];
 
-// The tabs a divided view is made of, and the config node each one owns.
+// The panes a divided view is made of, and the config node each one owns.
 //
-// The rail lists the same tabs as ordinary entries, so this table is what keeps
-// the two agreeing: one place says what the parts are, the strip and the rail
-// both read it, and a part added to one appears in the other.
+// The strip above the heading lists these as ordinary pages of the category, so
+// this table is what keeps the two agreeing: one place says what the parts are,
+// and a part added here appears there. The name is the name the strip prints —
+// a destination has one, and a page that was "Filters" in one table and "Route
+// filters" in the other was one page wearing two.
 const TABS = {{
   routing: [
-    {{ k: "static", t: "Static",  i: "pin",   n: "protocols static" }},
-    {{ k: "bgp",    t: "BGP",     i: "globe", n: "protocols bgp" }},
-    {{ k: "ospf",   t: "OSPFv2",  i: "star",  n: "protocols ospf" }},
-    {{ k: "ospf3",  t: "OSPFv3",  i: "star",  n: "protocols ospf3" }},
-    {{ k: "isis",   t: "IS-IS",   i: "hex",   n: "protocols isis" }},
-    {{ k: "rip",    t: "RIP",     i: "loop",  n: "protocols rip" }},
-    {{ k: "ripng",  t: "RIPng",   i: "loop",  n: "protocols ripng" }},
-    {{ k: "babel",  t: "Babel",   i: "mesh",  n: "protocols babel" }},
-    {{ k: "bfd",    t: "BFD",     i: "pulse", n: "protocols bfd" }},
-    {{ k: "multicast", t: "Multicast", i: "mesh", n: "protocols multicast" }},
-    {{ k: "vrf",    t: "VRFs",    i: "list",  n: "protocols vrf" }},
-    {{ k: "table",  t: "Routing table", i: "list" }},
+    {{ k: "static", t: "Static routes", n: "protocols static" }},
+    {{ k: "bgp",    t: "BGP",     n: "protocols bgp" }},
+    {{ k: "ospf",   t: "OSPFv2",  n: "protocols ospf" }},
+    {{ k: "ospf3",  t: "OSPFv3",  n: "protocols ospf3" }},
+    {{ k: "isis",   t: "IS-IS",   n: "protocols isis" }},
+    {{ k: "rip",    t: "RIP",     n: "protocols rip" }},
+    {{ k: "ripng",  t: "RIPng",   n: "protocols ripng" }},
+    {{ k: "babel",  t: "Babel",   n: "protocols babel" }},
+    {{ k: "bfd",    t: "BFD",     n: "protocols bfd" }},
+    {{ k: "multicast", t: "Multicast", n: "protocols multicast" }},
+    {{ k: "vrf",    t: "VRFs",    n: "protocols vrf" }},
+    {{ k: "filters", t: "Route filters", n: ["protocols import", "protocols export"] }},
+    {{ k: "table",  t: "Routing table" }},
   ],
   routepolicy: [
     {{ k: "prefix", t: "Prefix lists", n: "policy" }},
@@ -5998,6 +7807,18 @@ const TABS = {{
     {{ k: "publishing",   t: "Publishing" }},
     {{ k: "notification", t: "Logging and alerts" }},
   ],
+}};
+
+// Farbe und Symbol der Live-Gruppen. Die Rust-Tabelle, die sie aufzählt, soll
+// nichts über ihr Aussehen wissen -- deshalb hier, nach Namen nachgeschlagen.
+const NAVMETA = {{
+  Firewall:    ["shield", "#f59e0b"],
+  NAT:         ["swap", "#38bdf8"],
+  Network:     ["address", "#38bdf8"],
+  Routing:     ["globe", "#a78bfa"],
+  Security:    ["lock", "#fb7185"],
+  VPN:         ["key", "#fb7185"],
+  Diagnostics: ["bug", "#94a3b8"],
 }};
 
 let tabs = {{}};        // view → the tab open in it
@@ -6014,26 +7835,14 @@ function viewKey() {{
   return t ? view + ":" + t : view;
 }}
 
+// A divided view shows one of its panes. Which one is a navigation question,
+// and it is answered in exactly one place — the strip above the heading, which
+// lists this category's pages whether they are separate views or panes of one.
+// A second row of buttons saying the same thing was two navigations for one
+// decision, and an operator could not tell which of them they were "in".
 function renderTabs(v) {{
-  const host = $("tabs-" + v);
-  const items = tabsOf(v);
-  if (!host || !items) return;
   const cur = currentTab(v);
-  const marks = tabMarks[v] || new Set();
-  host.textContent = "";
-  for (const it of items) {{
-    const b = el("button", {{
-      class: it.k === cur ? "on" : "",
-      onclick: () => {{ tabs[v] = it.k; refresh(); }},
-    }});
-    // The same mark the rail uses, so the strip and the rail read as one thing.
-    if (it.i) b.append(icon(it.i));
-    b.append(el("span", {{ text: it.t }}));
-    // A dot on the tabs that are actually running: seven protocols, and the
-    // one question worth answering before opening any of them is which.
-    if (marks.has(it.k)) b.append(el("span", {{ class: "live", title: "configured" }}));
-    host.append(b);
-  }}
+  if (!cur) return;
   for (const pane of document.querySelectorAll("#view-" + v + " > .tabpane")) {{
     pane.classList.toggle("hidden", pane.dataset.tab !== cur);
   }}
@@ -6047,10 +7856,14 @@ function markTabs(v, ls) {{
   if (!items) return;
   const marks = new Set();
   for (const it of items) {{
-    if (it.n && ls.some((l) => l.node === it.n)) marks.add(it.k);
+    // A tab may stand for more than one node — the route filters are two — and
+    // a mark on either is a mark on the tab.
+    const nodes = it.n ? [].concat(it.n) : [];
+    if (nodes.some((n) => ls.some((l) => l.node === n))) marks.add(it.k);
   }}
   tabMarks[v] = marks;
-  renderTabs(v);
+  // The marks live on the strip, which is the one navigation there is.
+  renderSectionStrip();
 }}
 
 const meta = {{}};   // section → the count shown beside it, once known
@@ -6191,38 +8004,41 @@ const ABOUT = {{
   synproxy: "Which listeners have their handshake completed by the appliance.",
   interfaces: "Links, addresses and the zone each one belongs to.",
   dhcp: "Addresses handed out on each segment, and the reservations that are not.",
-  qos: "Shaping on the link that is congested — set it below the real line rate.",
+  qos: "Shaping belongs on the link that is actually congested, on the way out. Set the bandwidth slightly below what the line really carries: the point is to hold the queue here, where it can be managed, instead of in the modem, where it cannot.",
   lb: "Virtual addresses in front of backend pools.",
   routing: "Everything that decides where a packet goes next.",
-  evpn: "One tenant network across several boxes: BGP says who is where, the data plane carries the frames.",
-  "routing:ospf": "Link-state routing inside your own network, area by area.",
-  "routing:ospf3": "OSPF for IPv6 — its own adjacencies, alongside the v2 process.",
-  "routing:isis": "Link-state routing that carries both address families at once.",
-  "routing:rip": "Distance-vector, fifteen hops, and here for the networks that still speak it.",
+  evpn: "One tenant network across several boxes: BGP carries who is where — a MAC learned here is announced to the others — and the data plane carries the frames toward whichever box announced the destination. Neither half is any use alone, so both are set here.",
+  "routing:ospf": "The interior protocol most networks are built on: a link-state view of one area, or several joined at this box. It is off until it is given an interface to speak on.",
+  "routing:ospf3": "OSPF for IPv6 — a separate protocol with its own adjacencies, not an address family of the one beside it. Running both is normal.",
+  "routing:isis": "Link-state routing that carries both address families over one set of adjacencies. The system ID and area are what an adjacency is formed on, so they are set before an interface is added.",
+  "routing:rip": "Distance-vector, and bounded to fifteen hops by design. It is here for the networks that still speak it, not as a first choice.",
   "routing:ripng": "RIP for IPv6, with the same reach and the same limits.",
-  "routing:babel": "Distance-vector for links that come and go — wireless and meshes.",
-  "routing:bfd": "Sub-second liveness the other protocols subscribe to.",
-  "routing:table": "What the protocols agreed on, as the kernel will use it.",
-  "routing:static": "Routes written by hand, which win over anything learned.",
-  "routing:bgp": "The exterior protocol: neighbours, what is advertised, and what came back.",
-  "services:resolution": "Answering names, and agreeing what time it is.",
-  "services:management": "How this box is reached and read from outside itself.",
-  "services:addressing": "Addresses and names for the segments behind this box.",
-  "services:publishing": "What this box puts in front of something else.",
-  "services:notification": "Where the appliance speaks up, and who hears it.",
-  history: "What the box looked like before now — throughput and connections over time.",
+  "routing:babel": "Distance-vector built for links that come and go — wireless, and meshes where the cost of a path is not the number of hops.",
+  "routing:bfd": "Sub-second failure detection the protocols beside it subscribe to with their own bfd field. On its own it detects nothing.",
+  "routing:multicast": "Multicast is not forwarded until this box is told to listen for the reports that say who wants a group. IGMP is the IPv4 half, MLD the IPv6 one, and an interface either faces receivers or faces the source.",
+  "routing:vrf": "A separate routing table with its own interfaces, so two tenants can use the same addresses without meeting. Route targets are what let something deliberately cross between them.",
+  "routing:filters": "Which routes cross between the protocols and this box's routing table, and which route map decides. A protocol's own redistribution offers its routes; these say which of them are taken, and which go back out.",
+  "routing:table": "What the protocols above actually agreed on. A route is here once however many of them offered it — this is the answer, not the argument.",
+  "routing:static": "Routes written by hand. They win over anything a protocol learns, which is what makes them useful and what makes a forgotten one hard to find.",
+  "routing:bgp": "The exterior protocol: who this appliance is to another network, the neighbours it says it to, and what came of that. A neighbour without a remote AS is not a session.",
+  "services:resolution": "Answering names, and agreeing what time it is. Each is off until it is given something to do — staging a field and committing is what starts it, and clearing the fields is what stops it.",
+  "services:management": "How this box is reached and read from outside itself. Every one of these is a way in or a way out, and none of them should be listening on an untrusted zone.",
+  "services:addressing": "Addresses and names for the segments behind this box — relayed to a server elsewhere, reflected across segments, or published upstream.",
+  "services:publishing": "What this box puts in front of something else: a name terminated here, a broadcast carried across a segment boundary, a guest held at a login, a port an inside host asked for.",
+  "services:notification": "Where the appliance speaks up, and who hears it. An alert is sent when a watched unit fails; the journal is forwarded continuously, whether or not anything is wrong.",
+  history: "What the box looked like before now. Live counters cannot say whether this was also happening at three in the morning last Tuesday — and a gap in a line is a gap in the record, drawn as one rather than joined up.",
   routepolicy: "Prefix lists and route maps — what is accepted, and what is changed.",
-  "routepolicy:prefix": "Named sets of prefixes a route map or a neighbour filter points at.",
-  "routepolicy:maps": "What is accepted, and what is changed on the way through.",
-  "routepolicy:pbr": "Traffic sent by where it came from rather than where it is going.",
+  "routepolicy:prefix": "Named sets of prefixes a route map or a neighbour filter points at. Rules are read in sequence order, ge and le widen one to a range of lengths, and a list exists once it has a rule.",
+  "routepolicy:maps": "What is accepted, and what is changed on the way through. Each rule matches and then sets; the map's default decides what happens to a route no rule matched.",
+  "routepolicy:pbr": "Traffic sent by where it came from, over which link and to which port, rather than by where it is going. That is how a guest network leaves by the cheap uplink while everything else takes the good one.",
   wan: "Which uplink carries new connections, and what happens when one fails.",
   ipsec: "Site-to-site IKEv2 tunnels.",
   wireguard: "Site-to-site WireGuard interfaces and their peers.",
-  openconnect: "The road-warrior server people carry on a laptop.",
+  openconnect: "The road-warrior server: a client connects with a username and password and lands in the zone named below. IPsec and WireGuard are site-to-site — this is the one people carry.",
   pki: "Local certificate authorities.",
   certs: "Issued certificates and what they are used for.",
   ids: "Detection, and what an alert is allowed to do about it.",
-  capture: "See the wire itself — bounded, and never written to disk.",
+  capture: "See the wire itself: never more than 500 packets or 60 seconds, headers only, and nothing written to disk. A capture that finds nothing is an answer too.",
   services: "The box services: resolution, time, management access, notification.",
   system: "Identity, and where signed images come from.",
   ha: "The pair: who holds the address, and what the other box knows when it does.",
@@ -6298,44 +8114,118 @@ function buildNav() {{
   const filter = $("navsearch").value.trim().toLowerCase();
   nav.textContent = "";
   const key = viewKey();
+
+  // Searching is the one time the rail lists single sections: a hit has to be
+  // clickable where it was found, and making the operator first guess the
+  // category it lives under would defeat the search.
+  if (filter) {{
+    for (const group of SECTIONS) {{
+      const items = group.items.filter((i) => i.t.toLowerCase().includes(filter));
+      if (!items.length) continue;
+      const box = el("div", {{ class: "group" }}, [el("span", {{ class: "grp", text: group.g }})]);
+      for (const item of items) {{
+        const k = item.tab ? item.v + ":" + item.tab : item.v;
+        const b = navButton(item.t, item.i, () => goto(k), k);
+        if (k === key && !panel) b.classList.add("on");
+        box.append(b);
+      }}
+      nav.append(box);
+    }}
+    for (const group of NAV) {{
+      const items = group.items.filter((i) => i.t.toLowerCase().includes(filter));
+      if (!items.length) continue;
+      const box = el("div", {{ class: "group" }}, [el("span", {{ class: "grp", text: group.g }})]);
+      for (const item of items) {{
+        const b = navButton(item.t, "chart", () => {{ view = "panel"; panel = item; refresh(); }}, item.p);
+        b.dataset.path = item.p;
+        box.append(b);
+      }}
+      nav.append(box);
+    }}
+    if (!nav.children.length) {{
+      nav.append(el("div", {{ class: "group" }}, [
+        el("span", {{ class: "grp", text: "No section matches" }}),
+        el("button", {{
+          class: "navitem", text: "Clear the search",
+          onclick: () => {{ $("navsearch").value = ""; buildNav(); renderMatches(); }},
+        }}),
+      ]));
+    }}
+    return;
+  }}
+
+  // Otherwise the rail is the categories and nothing else. A router's console
+  // is opened to reach one area and work there; a rail that names every one of
+  // sixty-nine pages at once makes the operator read the whole product before
+  // they can start. The category's own pages are one strip away, in the content
+  // where the work is -- so nothing is further than two clicks, and the rail
+  // stays short enough to hold a system summary underneath it.
+  const cfg = el("div", {{ class: "group" }}, [el("span", {{ class: "grp", text: "Configure" }})]);
   for (const group of SECTIONS) {{
-    const items = group.items.filter((i) => !filter || i.t.toLowerCase().includes(filter));
-    if (!items.length) continue;
-    const itemKey = (i) => i.tab ? i.v + ":" + i.tab : i.v;
-    // A search filters the rail down to what matched, so folding it away then
-    // would hide the answer.
-    const box = groupBox(group.g, !!filter || items.some((i) => itemKey(i) === key));
-    for (const item of items) {{
-      const b = navButton(item.t, item.i, () => goto(itemKey(item)), itemKey(item));
-      if (itemKey(item) === key && !panel) b.classList.add("on");
-      box.append(b);
-    }}
-    nav.append(box);
+    const first = group.items[0];
+    const k = first.tab ? first.v + ":" + first.tab : first.v;
+    const b = navButton(group.g, group.i || "list", () => goto(k), "cat:" + group.g);
+    if (group.c) b.style.setProperty("--cat", group.c);
+    b.classList.add("cat");
+    if (!panel && group.items.some((i) => (i.tab ? i.v + ":" + i.tab : i.v) === key)) b.classList.add("on");
+    cfg.append(b);
   }}
-  // The read-only views keep their own group; they are what you open to look,
-  // not to change, and mixing them into the sections above would hide that.
+  nav.append(cfg);
+
+  const live = el("div", {{ class: "group" }}, [el("span", {{ class: "grp", text: "Look" }})]);
   for (const group of NAV) {{
-    const items = group.items.filter((i) => !filter || i.t.toLowerCase().includes(filter));
-    if (!items.length) continue;
-    const box = groupBox(group.g, !!filter || (!!panel && items.some((i) => i.p === panel.p)));
-    for (const item of items) {{
-      const b = navButton(item.t, group.g === "Diagnostics" ? "bug" : "chart",
-        () => {{ view = "panel"; panel = item; refresh(); }}, item.p);
-      b.dataset.path = item.p;
-      box.append(b);
-    }}
-    nav.append(box);
+    const [ic, colour] = NAVMETA[group.g] || ["chart", "#94a3b8"];
+    const first = group.items[0];
+    const b = navButton(group.g, ic, () => {{ view = "panel"; panel = first; refresh(); }}, "live:" + group.g);
+    b.style.setProperty("--cat", colour);
+    b.classList.add("cat");
+    if (panel && group.items.some((i) => i.p === panel.p)) b.classList.add("on");
+    live.append(b);
   }}
-  // A filter that matches nothing used to leave the rail empty and say nothing,
-  // which reads as a console that has lost its own sections.
-  if (filter && !nav.children.length) {{
-    nav.append(el("div", {{ class: "group" }}, [
-      el("span", {{ class: "grp", text: "No section matches" }}),
-      el("button", {{
-        class: "navitem", text: "Clear the search",
-        onclick: () => {{ $("navsearch").value = ""; buildNav(); renderMatches(); }},
-      }}),
-    ]));
+  nav.append(live);
+}}
+
+// Which category the current page belongs to, and what else is in it. The rail
+// names the category; this is what turns that into the pages themselves.
+function currentCategory() {{
+  const key = viewKey();
+  if (panel) {{
+    for (const g of NAV) if (g.items.some((i) => i.p === panel.p))
+      return {{ name: g.g, live: true, items: g.items.map((i) => ({{ t: i.t, go: () => {{ view = "panel"; panel = i; refresh(); }}, on: i.p === panel.p }})) }};
+    return null;
+  }}
+  for (const g of SECTIONS) {{
+    if (!g.items.some((i) => (i.tab ? i.v + ":" + i.tab : i.v) === key)) continue;
+    return {{ name: g.g, colour: g.c, items: g.items.map((i) => {{
+      const k = i.tab ? i.v + ":" + i.tab : i.v;
+      // A page that is a pane of a divided view can say whether it already
+      // carries configuration: seven protocols, and the question worth
+      // answering before opening any of them is which of them is running.
+      const marked = !!(i.tab && (tabMarks[i.v] || new Set()).has(i.tab));
+      return {{ t: i.t, i: i.i, go: () => goto(k), on: k === key, marked }};
+    }}) }};
+  }}
+  return null;
+}}
+
+// The one navigation inside a category: its pages, whichever of them are
+// separate views and whichever are panes of a divided one. It carries the marks
+// the rail cannot — an icon per page, and a dot on the ones already configured.
+function renderSectionStrip() {{
+  const host = $("sectionstrip");
+  if (!host) return;
+  host.textContent = "";
+  const cat = currentCategory();
+  // One page in a category needs no strip: a chooser with a single choice is
+  // furniture, not navigation.
+  if (!cat || cat.items.length < 2) return;
+  if (cat.colour) host.style.setProperty("--cat", cat.colour);
+  for (const it of cat.items) {{
+    const b = el("button", {{ class: "secitem" + (it.on ? " on" : ""), onclick: it.go }});
+    if (it.i) b.append(icon(it.i));
+    b.append(el("span", {{ text: it.t }}));
+    if (it.marked) b.append(el("span", {{ class: "live", title: "configured" }}));
+    host.append(b);
   }}
 }}
 
@@ -6371,6 +8261,7 @@ async function refreshCluster() {{
 }}
 
 async function refresh() {{
+  renderSectionStrip();
   renderPageHeader();
   renderTabs(view);
   const key = viewKey();
@@ -6641,8 +8532,12 @@ wireToggle("togglerm", "addrmpanel", "New rule");
 $("wgtunnel").onchange = () => refreshWireguard();
 $("pllist-pick").onchange = () => {{ $("plnew").value = ""; refreshRoutePolicy(); }};
 $("rmlist-pick").onchange = () => {{ $("rmnew").value = ""; refreshRoutePolicy(); }};
-$("plnew").onchange = () => refreshRoutePolicy();
-$("rmnew").onchange = () => refreshRoutePolicy();
+// `oninput`, not `onchange`: a text field only fires change when it is left,
+// so naming a map and reaching straight for "New rule" -- the path an operator
+// actually takes -- never refreshed, and the button sat disabled with nothing
+// saying why.
+$("plnew").oninput = () => refreshRoutePolicy();
+$("rmnew").oninput = () => refreshRoutePolicy();
 $("qosiface").onchange = () => refreshQos();
 $("historyres").onchange = () => refreshHistory();
 $("enabledhcp").onclick = () => {{
@@ -6725,6 +8620,66 @@ mod tests {
             assert!(
                 !html.contains(external),
                 "the page reaches outside for {external:?}"
+            );
+        }
+    }
+
+    // The motion rules, as a rule rather than as a habit.
+    //
+    // Every line here is a thing that reads as sloppy on an appliance an
+    // operator stares at all day: a transition that animates whatever happens
+    // to change, an ease-in that delays the moment being watched, something
+    // that pops out of nothing, a UI animation long enough to wait for. They
+    // are cheap to reintroduce by copying a snippet from elsewhere, which is
+    // exactly why they are pinned.
+    #[test]
+    fn the_console_keeps_its_motion_rules() {
+        let html = page();
+        let css = html
+            .split_once("<style>")
+            .and_then(|(_, rest)| rest.split_once("</style>"))
+            .map(|(css, _)| css.to_string())
+            .expect("the page has a stylesheet");
+
+        assert!(
+            !css.contains("transition: all"),
+            "`transition: all` animates whatever happens to change — name the properties"
+        );
+        assert!(
+            !css.contains("scale(0)"),
+            "nothing appears from nothing: enter from scale(.95)-ish with opacity 0"
+        );
+        // `ease-in` alone, not `ease-in-out`: the first delays the moment the
+        // user is looking at, the second is the sanctioned curve for movement.
+        assert!(
+            !css.replace("ease-in-out", "").contains("ease-in"),
+            "`ease-in` starts slow exactly where the eye is — use ease-out"
+        );
+        assert!(
+            css.contains("prefers-reduced-motion"),
+            "reduced motion is not optional"
+        );
+        // Gentler, not gone: a blanket kill removes the fades that explain a
+        // surface arriving along with the movement that was the problem.
+        assert!(
+            !css.contains("transition: none !important"),
+            "reduced motion means fewer and gentler animations, not none at all"
+        );
+        // Every duration a person waits for, in one place, all under the mark.
+        for (token, ms) in [("--dur-fast", 130u32), ("--dur-base", 200)] {
+            assert!(
+                css.contains(&format!("{token}: {ms}ms")),
+                "{token} is no longer {ms}ms — UI motion stays under 300ms"
+            );
+        }
+        // Curves are taken from the reference set, not approximated.
+        for curve in [
+            "--ease-out: cubic-bezier(0.23, 1, 0.32, 1)",
+            "--ease-in-out: cubic-bezier(0.77, 0, 0.175, 1)",
+        ] {
+            assert!(
+                css.contains(curve),
+                "the motion tokens no longer hold {curve}"
             );
         }
     }
@@ -6830,7 +8785,7 @@ mod tests {
         let html = page();
         assert!(html.contains("/api/v1/configure"));
         // Every edit becomes `set <path> <field> <value>` — the CLI's own verb.
-        assert!(html.contains("lines.push(`set ${path} ${f[0]} ${v}`)"));
+        assert!(html.contains("push(`set ${path} ${f[0]} ${v}`)"));
         assert!(html.contains("firewall rule "));
         assert!(
             !html.contains("PUT"),
@@ -7044,7 +8999,48 @@ mod tests {
     /// — otherwise a setting can be added from the console but never removed.
     #[test]
     fn clearing_a_field_removes_the_setting() {
-        assert!(page().contains(r#"lines.push(`delete ${path} ${f[0]}`)"#));
+        assert!(page().contains(r#"push(`delete ${path} ${CLEARS[f[0]] || f[0]}`)"#));
+    }
+
+    /// …with the setting the appliance actually has. A rule's schedule is three
+    /// leaves of one thing and the CLI has no `delete … schedule days`, so
+    /// emptying the days has to remove the window — the console used to write
+    /// the command that does not exist, and its refusal took the whole batch.
+    #[test]
+    fn a_setting_that_cannot_be_removed_alone_removes_what_it_belongs_to() {
+        let html = page();
+        for leaf in ["schedule days", "schedule start", "schedule end"] {
+            assert!(
+                html.contains(&format!("\"{leaf}\": \"schedule\"")),
+                "{leaf} still stages a delete of a path the appliance does not have"
+            );
+        }
+    }
+
+    /// A value the console offers has to be one the appliance takes.
+    ///
+    /// The chips beside a community list were written from what the RFCs
+    /// define, which is a longer list than what this box validates: two of the
+    /// five were words it refuses at commit. An offer the appliance rejects is
+    /// worse than no offer — it is the console recommending the mistake.
+    #[test]
+    fn every_community_offered_is_one_the_appliance_takes() {
+        let html = page();
+        let (_, rest) = html
+            .split_once("const WELL_KNOWN_COMMUNITIES = [")
+            .expect("the community chips are gone");
+        let (list, _) = rest.split_once(']').expect("unterminated list");
+        let offered: Vec<&str> = list
+            .split(',')
+            .map(|s| s.trim().trim_matches('"'))
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert!(!offered.is_empty(), "no communities offered at all");
+        for one in offered {
+            crate::config::validate_community(one).unwrap_or_else(|e| {
+                panic!("the console offers {one:?}, which this box refuses: {e}")
+            });
+        }
     }
 
     /// Fields with a fixed vocabulary are chosen, not spelled. A zone typed by
@@ -7098,7 +9094,7 @@ mod tests {
         // so must a *validate*, which applies nothing at all. Clearing on a
         // validate meant the check said "fine" and then emptied the panel.
         assert!(
-            html.contains("if (committed && r.ok &&"),
+            html.contains("if (committed && !refused)"),
             "staged commands clear even when nothing was applied"
         );
         assert!(
@@ -7373,10 +9369,8 @@ mod tests {
     fn configured_is_not_a_status() {
         let html = page();
         assert!(
-            html.contains(
-                "border-radius: 50%; background: var(--text-faint); vertical-align: middle;"
-            ),
-            "the mark on a configured tab took a signal colour again"
+            html.contains("border-radius: 50%;\n    background: var(--text-faint); flex: none;"),
+            "the mark on a configured page took a signal colour again"
         );
         assert!(
             html.contains(r#"badge: (r) => ({ text: "tcp/" + r.name }),"#),

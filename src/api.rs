@@ -143,6 +143,10 @@ pub fn router(state: Arc<ApiState>) -> Router {
         // console never reaches outside itself; it asks here, and this asks the
         // world — which is why a page served on an isolated network still works.
         .route("/api/v1/lookup/:kind/:value", get(get_lookup))
+        // …and what the appliance can tell you about itself. A timezone or a
+        // keymap is a closed set this box knows and this binary deliberately
+        // does not, so the picker for one is filled from here.
+        .route("/api/v1/choices/:kind", get(get_choices))
         .route("/api/v1/stack", get(get_stack))
         .route("/api/v1/stack/:member/show/*path", get(get_stack_show))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
@@ -719,15 +723,27 @@ async fn get_status(
             "permission": if c.permission.may_write() { "read-write" } else { "read-only" },
         })
     });
-    Json(json!({
-        "you": you,
-        "hostname": system::current_hostname(),
-        "services": {
-            "firewall": service_state("velstra.service"),
-            "routing": service_state("wren.service"),
-        },
-        "interfaces": brief_interfaces(),
-    }))
+    // Three child processes, off the runtime — this is the endpoint the console
+    // polls every five seconds, so it is the one most able to hold a worker.
+    let facts = tokio::task::spawn_blocking(|| {
+        json!({
+            "hostname": system::current_hostname(),
+            "services": {
+                "firewall": service_state("velstra.service"),
+                "routing": service_state("wren.service"),
+            },
+            "interfaces": brief_interfaces(),
+        })
+    })
+    .await
+    .unwrap_or_else(|_| json!({}));
+    let mut out = json!({ "you": you });
+    if let (Some(o), Some(f)) = (out.as_object_mut(), facts.as_object()) {
+        for (k, v) in f {
+            o.insert(k.clone(), v.clone());
+        }
+    }
+    Json(out)
 }
 
 /// `GET /api/v1/show/*path` — proxy an operational show (e.g.
@@ -748,16 +764,27 @@ async fn get_show(
     }
     let exe = std::env::current_exe()
         .map_err(|e| ApiError::internal(anyhow!("locating the sentinel binary: {e}")))?;
-    let out = std::process::Command::new(exe)
-        .arg("show")
-        .args(&words)
-        // The API can be pointed at a config other than the built-in path, and
-        // every `show` it proxies has to read that same file — otherwise the
-        // console serves one firewall's configuration and shows another's, which
-        // renders as a page full of "nothing configured".
-        .env("SENTINEL_CONFIG", &state.config_path)
-        .output()
-        .map_err(|e| ApiError::internal(anyhow!("running show: {e}")))?;
+    // Off the runtime. Running a child process to completion is a blocking wait,
+    // and doing it on a worker thread holds that worker for as long as the child
+    // lives. A console opening a section asks for every live-state pane on it at
+    // once, so a handful of panes was enough to hold every worker there was —
+    // and then a sign-in, or a hint, or the next page simply never got an
+    // answer. The API looked hung under exactly the load it is built for.
+    let config_path = state.config_path.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(exe)
+            .arg("show")
+            .args(&words)
+            // The API can be pointed at a config other than the built-in path,
+            // and every `show` it proxies has to read that same file — otherwise
+            // the console serves one firewall's configuration and shows
+            // another's, which renders as a page full of "nothing configured".
+            .env("SENTINEL_CONFIG", &config_path)
+            .output()
+    })
+    .await
+    .map_err(|e| ApiError::internal(anyhow!("running show: {e}")))?
+    .map_err(|e| ApiError::internal(anyhow!("running show: {e}")))?;
     if !out.status.success() {
         let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Err(ApiError::bad_request(anyhow!(if msg.is_empty() {
@@ -797,33 +824,37 @@ async fn post_configure(
     }
     let exe = std::env::current_exe()
         .map_err(|e| ApiError::internal(anyhow!("locating the sentinel binary: {e}")))?;
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("configure").arg("--config").arg(&state.config_path);
-    // The API's own `--no-apply` has to reach the commands it runs, or an
-    // off-box instance edits the right file and then tries to reconfigure the
-    // machine it is running on. Same gate the PUT handler honours.
-    if !state.apply.enabled {
-        cmd.arg("--no-apply");
-    }
-    let mut child = cmd
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| ApiError::internal(anyhow!("running configure: {e}")))?;
-    {
-        use std::io::Write as _;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| ApiError::internal(anyhow!("configure has no stdin")))?;
-        stdin
-            .write_all(body.as_bytes())
-            .map_err(|e| ApiError::internal(anyhow!("feeding configure: {e}")))?;
-    }
-    let out = child
-        .wait_with_output()
-        .map_err(|e| ApiError::internal(anyhow!("waiting for configure: {e}")))?;
+    let config_path = state.config_path.clone();
+    let no_apply = !state.apply.enabled;
+    // Off the runtime, for the reason spelled out at `get_show`: a commit is the
+    // longest child process this API runs.
+    let out = tokio::task::spawn_blocking(move || -> std::io::Result<std::process::Output> {
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("configure").arg("--config").arg(&config_path);
+        // The API's own `--no-apply` has to reach the commands it runs, or an
+        // off-box instance edits the right file and then tries to reconfigure
+        // the machine it is running on. Same gate the PUT handler honours.
+        if no_apply {
+            cmd.arg("--no-apply");
+        }
+        let mut child = cmd
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        {
+            use std::io::Write as _;
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| std::io::Error::other("configure has no stdin"))?;
+            stdin.write_all(body.as_bytes())?;
+        }
+        child.wait_with_output()
+    })
+    .await
+    .map_err(|e| ApiError::internal(anyhow!("running configure: {e}")))?
+    .map_err(|e| ApiError::internal(anyhow!("running configure: {e}")))?;
     // Both streams: `set` errors and commit refusals go to stderr, the commit's
     // own report to stdout, and an operator needs to read them in one place.
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -851,11 +882,15 @@ async fn post_clear(UrlPath(path): UrlPath<String>) -> Result<Response, ApiError
     }
     let exe = std::env::current_exe()
         .map_err(|e| ApiError::internal(anyhow!("locating the sentinel binary: {e}")))?;
-    let out = std::process::Command::new(exe)
-        .arg("clear")
-        .args(&words)
-        .output()
-        .map_err(|e| ApiError::internal(anyhow!("running clear: {e}")))?;
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(exe)
+            .arg("clear")
+            .args(&words)
+            .output()
+    })
+    .await
+    .map_err(|e| ApiError::internal(anyhow!("running clear: {e}")))?
+    .map_err(|e| ApiError::internal(anyhow!("running clear: {e}")))?;
     if !out.status.success() {
         let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Err(ApiError::bad_request(anyhow!(if msg.is_empty() {
@@ -918,6 +953,28 @@ async fn get_lookup(
         Some(text) => json!({ "known": true, "answer": text }),
         None => json!({ "known": false }),
     }))
+}
+
+/// `GET /api/v1/choices/:kind` — the values this appliance has for a setting.
+///
+/// `kind` is `timezone`, `keyboard` or `locale`: the three settings whose valid
+/// values come from packages that move on their own schedule, which is why the
+/// commit-time validator reads them off this filesystem rather than out of a
+/// table. The console asks the same question so its picker cannot go stale in a
+/// way the validator has not.
+///
+/// An empty list is a perfectly good answer — a container with no zoneinfo has
+/// nothing to offer — and the field it fills is a box you can still type into.
+/// Only an unknown `kind` is an error.
+async fn get_choices(UrlPath(kind): UrlPath<String>) -> Result<Json<Value>, ApiError> {
+    // Off the async runtime: a keymap tree is a few thousand `stat` calls and
+    // `locale -a` is a child process, and neither belongs on an executor that
+    // is also serving the console.
+    let options = tokio::task::spawn_blocking(move || crate::system::choices(&kind))
+        .await
+        .map_err(|e| ApiError::internal(anyhow!("choices task: {e}")))?
+        .map_err(ApiError::bad_request)?;
+    Ok(Json(json!({ "options": options })))
 }
 
 /// `GET /api/v1/stack` — this appliance and its config-sync peers.
@@ -1424,6 +1481,35 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(body_string(resp).await.contains("ok"));
+    }
+
+    /// The closed sets the console's pickers are filled from. Behind the token
+    /// like everything else, an unknown kind is a 400 rather than an empty
+    /// list — a picker that is quietly empty because the console asked for
+    /// something that does not exist is the failure that looks like success.
+    #[tokio::test]
+    async fn choices_answer_with_a_list_and_refuse_a_kind_they_do_not_have() {
+        let st = state(seed("seed-host"));
+        let resp = router(st.clone())
+            .oneshot(get("/api/v1/choices/timezone", Some(TOKEN)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let parsed: Value = serde_json::from_str(&body).expect("json");
+        assert!(parsed["options"].is_array(), "{body}");
+
+        let resp = router(st.clone())
+            .oneshot(get("/api/v1/choices/timezone", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let resp = router(st)
+            .oneshot(get("/api/v1/choices/nonsense", Some(TOKEN)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

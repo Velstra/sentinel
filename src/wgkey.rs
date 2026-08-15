@@ -31,6 +31,19 @@ pub fn generate_keypair() -> Result<(String, String)> {
     ))
 }
 
+/// A fresh pre-shared key, in the same encoding every other WireGuard key uses.
+///
+/// Not a keypair: a pre-shared key is symmetric — the same 32 bytes at both
+/// ends — so there is no public half to derive and nothing to clamp. It is
+/// generated here rather than in the console for the same reason the private
+/// key is: a browser minting an appliance's key material would be this project
+/// inventing its own crypto in the one place it has no need to.
+pub fn generate_preshared_key() -> Result<String> {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).context("getrandom")?;
+    Ok(STANDARD.encode(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -41,6 +54,16 @@ mod tests {
         // the private key yields — the `wg pubkey` relationship.
         let (private, public) = generate_keypair().expect("generate");
         assert_eq!(public_from_private(&private).expect("derive"), public);
+    }
+
+    #[test]
+    fn a_generated_preshared_key_is_one_the_cli_would_accept() {
+        // The same validator `set … preshared-key <key>` runs: 32 bytes, base64.
+        // A generator whose output the setter next to it refuses is a `generate`
+        // that only works until somebody edits the value it produced.
+        let key = generate_preshared_key().expect("generate");
+        assert_eq!(decode_key(&key).expect("decode").len(), 32);
+        assert_ne!(key, generate_preshared_key().expect("generate"));
     }
 
     #[test]
