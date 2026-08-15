@@ -57,7 +57,6 @@ fn archive_dir(config_path: &Path) -> PathBuf {
 /// no privilege escalation is needed.
 pub fn archive_config(config_path: &Path, contents: &str, keep: usize) -> Result<()> {
     let dir = archive_dir(config_path);
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -66,11 +65,37 @@ pub fn archive_config(config_path: &Path, contents: &str, keep: usize) -> Result
     // Zero-pad so lexical order == chronological order for the foreseeable range.
     let name = format!("{ARCHIVE_PREFIX}{nanos:020}{ARCHIVE_SUFFIX}");
     let path = dir.join(&name);
-    // Atomic: temp + rename, so a reader never sees a half-written revision.
-    let tmp = dir.join(format!(".{name}.tmp"));
-    std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).with_context(|| format!("installing {}", path.display()))?;
 
+    // Write it as ourselves if we can, and escalate if we cannot — the same
+    // shape as the config file's own install, and for the same reason. The
+    // comment above used to assert that this directory is wheel-writable; on a
+    // real appliance it is the mount point of the data partition, whose root the
+    // installer made root:root, and the tmpfiles rule that would have widened it
+    // never applies to an already-mounted filesystem. So every commit an
+    // operator made printed "could not archive this config revision" and left
+    // the revision history empty — `rollback` had nothing to roll back to, and
+    // the only sign was a warning nobody has to read.
+    if std::fs::create_dir_all(&dir).is_ok() {
+        // Atomic: temp + rename, so a reader never sees a half-written revision.
+        let tmp = dir.join(format!(".{name}.tmp"));
+        if std::fs::write(&tmp, contents).is_ok() {
+            if std::fs::rename(&tmp, &path).is_ok() {
+                prune(&dir, keep);
+                return Ok(());
+            }
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+    let staged = Path::new("/run/sentinel").join(".archive.toml.tmp");
+    crate::system::stage_private(&staged, contents)?;
+    let (Some(d), Some(src), Some(dst)) = (dir.to_str(), staged.to_str(), path.to_str()) else {
+        anyhow::bail!("non-UTF-8 path");
+    };
+    crate::system::sudo("install", &["-d", "-m", "0755", d])
+        .with_context(|| format!("creating {d}"))?;
+    crate::system::sudo("install", &["-m", "0644", src, dst])
+        .with_context(|| format!("installing {dst}"))?;
+    let _ = std::fs::remove_file(&staged);
     prune(&dir, keep);
     Ok(())
 }
@@ -81,7 +106,16 @@ fn prune(dir: &Path, keep: usize) {
     // Newest first; drop everything past the keep window.
     files.sort_by_key(|f| std::cmp::Reverse(f.1));
     for (path, _) in files.into_iter().skip(keep.max(1)) {
-        let _ = std::fs::remove_file(path);
+        if std::fs::remove_file(&path).is_ok() {
+            continue;
+        }
+        // A revision written through the escalating path above is root-owned, so
+        // an operator cannot unlink it directly. Without this the window an
+        // operator set would be the one number in `system commit-revisions` that
+        // did nothing.
+        if let Some(p) = path.to_str() {
+            let _ = crate::system::sudo("rm", &["-f", p]);
+        }
     }
 }
 
@@ -146,14 +180,17 @@ pub fn rollback(session: &mut Session, act: &Apply, n: usize) -> Result<()> {
         crate::repl::apply_live(&appliance, act).context("applying the revision")?;
     }
 
-    // Persist it as the current saved config (atomic) and archive the rollback
-    // as a new revision, then reload the candidate so `show` reflects it.
+    // Persist it as the current saved config and archive the rollback as a new
+    // revision, then reload the candidate so `show` reflects it.
+    //
+    // Through the same installer `save` uses, rather than writing the file
+    // here: the saved config is root-owned, so an operator's rollback wrote
+    // nothing and said "Permission denied" — while the commit that followed it
+    // succeeded, which made the failure look like noise.
     if let Some(parent) = cfg.parent() {
-        std::fs::create_dir_all(parent)?;
+        let _ = std::fs::create_dir_all(parent);
     }
-    let tmp = cfg.with_extension("toml.tmp");
-    std::fs::write(&tmp, &content).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, &cfg).with_context(|| format!("installing {}", cfg.display()))?;
+    crate::system::install_config_file(&cfg, &content)?;
     archive_config(&cfg, &content, ARCHIVE_KEEP)?;
     session
         .discard()
