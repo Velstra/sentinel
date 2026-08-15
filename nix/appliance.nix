@@ -70,6 +70,26 @@
   services.openssh = {
     enable = true;
     ports = lib.mkForce [ ];
+    # Host keys have to outlive a reboot, and on the shipped image `/` is a
+    # tmpfs — so the default /etc/ssh location quietly regenerates them at every
+    # boot. A live box confirmed it: booted 15:57, host key created 15:57:36.
+    #
+    # That is worse than an inconvenience. Every reboot greets every operator
+    # with REMOTE HOST IDENTIFICATION HAS CHANGED, and an operator who has been
+    # taught to clear the warning and carry on will clear it for a real
+    # impersonation too. The one persistent partition is /var/lib/sentinel, so
+    # the keys are generated into it once and reused from then on.
+    hostKeys = [
+      {
+        path = "/var/lib/sentinel/ssh/ssh_host_ed25519_key";
+        type = "ed25519";
+      }
+      {
+        path = "/var/lib/sentinel/ssh/ssh_host_rsa_key";
+        type = "rsa";
+        bits = 4096;
+      }
+    ];
     # Per-user keys: sshd substitutes %u with the login name, so Sentinel renders
     # /run/sentinel-ssh/authorized_keys.<user> from each [[system.login]].
     authorizedKeysFiles = [ "/run/sentinel-ssh/authorized_keys.%u" ];
@@ -91,6 +111,12 @@
   # Before networkd, so this does not delay a routable network).
   systemd.services.sshd.after = [ "sentinel-boot.service" ];
   systemd.services.sshd.wants = [ "sentinel-boot.service" ];
+  # The host keys now live on the persistent partition, and sshd generates any
+  # that are missing on its first start. If it ran before that partition were
+  # mounted it would generate a fresh pair onto the tmpfs underneath the
+  # mountpoint — reintroducing the churn this is meant to end, and hiding it
+  # behind a directory that looks right afterwards.
+  systemd.services.sshd.unitConfig.RequiresMountsFor = "/var/lib/sentinel";
 
   users.users.admin = {
     isNormalUser = true;
@@ -183,6 +209,17 @@
   environment.systemPackages = with pkgs; [
     iproute2
     nettools
+    # `wg show` — the only way to see a tunnel's handshakes, endpoints and
+    # transfer counters. The appliance configures WireGuard through networkd and
+    # never shells out to this, but an operator diagnosing a tunnel that will not
+    # come up has nothing else to look at.
+    wireguard-tools
+    # The same openssl the PKI already issues with (the `sentinel` wrapper points
+    # at it through SENTINEL_OPENSSL_BIN) — put on PATH so an operator can read
+    # back what the box handed out. An appliance that issues certificates and
+    # cannot show you the expiry, the SANs or whether a leaf chains to its CA
+    # asks you to trust it on the strength of a summary line.
+    openssl
   ];
 
   # A short greeting so it's clear how to start.
@@ -217,6 +254,11 @@
     # /var/lib/sentinel) — Sentinel writes the files via sudo; sentinel-boot
     # re-renders them from the saved config each boot.
     "d /run/sentinel-ssh 0755 root root -"
+    # The sshd host keys (see services.openssh.hostKeys below). Its own dir,
+    # root:root 0700, rather than /var/lib/sentinel itself: that one is
+    # group-writable by wheel so `configure` can save, and an operator who can
+    # replace the host key can impersonate the appliance to every other operator.
+    "d /var/lib/sentinel/ssh 0700 root root -"
     # The compiled agent config the admin's `commit` writes + the agent reads.
     # /run is tmpfs (recreated each boot); wheel-writable so `configure` (run as
     # admin, not root) can install it.
