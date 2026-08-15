@@ -1,6 +1,6 @@
 # Test suite (nixosTests)
 
-Sentinel is verified by **87 nixosTests**, **457 Rust unit tests** and a
+Sentinel is verified by **93 nixosTests**, **478 Rust unit tests** and a
 **browser suite** that drives the web console against a running appliance. The nixosTests
 boot real QEMU/OVMF VMs — several of them two or three at a time on shared virtual
 segments — so they need `/dev/kvm`.
@@ -16,7 +16,7 @@ authoritative list.
 The unit tests need nothing but a checkout:
 
 ```shell
-cargo test                                        # 457 of them
+cargo test                                        # 460 of them
 tests/console/run.sh                              # the browser suite
 ```
 
@@ -57,6 +57,15 @@ write, which is how ten sections that could be typed and not clicked were found.
 | `configsync` | a commit on the primary pushes the running config to the backup's API, which applies **and** persists it |
 | `api` | the REST management API drives one config model end to end; `/health` is unauthenticated, the rest is not; and the web console — that it fetches nothing external, that every `/api/v1/…` path the page calls really answers, that a rule clicked into being is applied *and* persisted through the same commands the CLI runs, that a zone posture, a NAT entry, a BGP neighbour, an IPsec tunnel, a WireGuard interface and a DHCP server are all written through that one path, that `show configuration commands` replays into the same configuration it came from, that a script with no `commit` changes nothing, that a packet capture sees real ICMP on the loopback and refuses a filter that would become a tcpdump option, that a refused command comes back as output rather than as a silent success, and that the stack refuses a member the appliance has no relationship with |
 
+### Also here
+
+| Check | Proves |
+|---|---|
+| `console` | the web console in a **real browser**: every section opens, a create panel stages a command the CLI accepts, applying writes the file, a wrong password is refused and says so |
+| `contract` | the compiled agent config keeps the shape the data plane reads |
+| `shipped` | what the image actually carries |
+| `wizard` | the installer's click-through, answered end to end |
+
 ## Firewall (eBPF data plane)
 
 | Check | Proves |
@@ -74,6 +83,14 @@ write, which is how ten sections that could be typed and not clicked were found.
 | `rulescope` | a rule scoped to one address family stops that family and leaves the other alone, and one scoped to `out` refuses a connection **this box originates** while the same port arriving from outside is untouched |
 | `evpn` | the appliance's one `[evpn]` statement reaches **both** lower halves: two boxes bring up a BGP session with the EVPN address family negotiated, and each data plane's own loader accepts the overlay it was given |
 | `macgroup` | a rule naming a `mac-group` stops the device whose address it holds, and a group naming a different device does not — so the match is on the address, not on everything |
+
+### Also here
+
+| Check | Proves |
+|---|---|
+| `egress` | deny-by-default must not gag the box: it still answers what it admits, can start a conversation of its own, can ping — and a stateful deny-by-default zone brings the egress hook with it, with no rule helping |
+| `srcprefix` | every source-prefix **length** matches, not just the convenient ones |
+| `v6rules` | a rule scoped to IPv6 lands in its own trie and does not open the v4 one |
 
 ## NAT
 
@@ -104,6 +121,8 @@ write, which is how ten sections that could be typed and not clicked were found.
 | `vrrp` | two boxes share a virtual IP; the higher priority owns it and hands it over on loss |
 | `staticv6` | static routes are dual-stack — a v6 prefix reaches the kernel IPv6 FIB |
 | `multiwan` | health-checked uplink failover plus policy routing across two upstreams |
+| `routingimport` | the half `policy` does not cover: an **import** filter declines to install what the peer offers, a VRF's static is in its own table and nowhere else, and redistribution rides an export filter |
+| `ospfinterop` | OSPFv2 against **FRR** rather than against ourselves — reaches Full, is still Full a minute later, and a route crosses it |
 
 ## Interfaces & L2
 
@@ -173,7 +192,7 @@ write, which is how ten sections that could be typed and not clicked were found.
 ## Rust unit tests
 
 ```shell
-cargo test                       # 380 unit tests
+cargo test                       # 478 unit tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
