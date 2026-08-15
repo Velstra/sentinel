@@ -62,6 +62,160 @@ pub fn set_timezone(zone: &str) -> Result<()> {
     run_priv("timedatectl", &["set-timezone", zone])
 }
 
+/// The answers this system actually has for a setting whose values are a closed
+/// set the appliance does not compile in.
+///
+/// The commit-time validator for a timezone deliberately checks against
+/// `/usr/share/zoneinfo` rather than against a table in this binary, because
+/// tzdata and the keymap package move independently of the appliance and a
+/// table here would eventually refuse a zone that exists. A console offering a
+/// picker built from a table would have the same bug one step earlier — it
+/// would fail to *offer* a zone that exists — so the picker is built from the
+/// same place the validator reads.
+///
+/// Never an error for the caller: a system with no zoneinfo (a container, a
+/// workstation running the tests) has no answers, and the field is then an
+/// ordinary box you type into. That is exactly what it was before.
+pub fn choices(kind: &str) -> Result<Vec<String>> {
+    let mut out = match kind {
+        "timezone" => zone_names(),
+        "keyboard" => keymap_names(),
+        "locale" => locale_names(),
+        other => bail!("unknown choices {other:?} (timezone | keyboard | locale)"),
+    };
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// Every zone under `/usr/share/zoneinfo`, named the way the setting is written.
+///
+/// `posix/` and `right/` are the same zones over again under two different leap
+/// second models, and the tables next to them (`zone.tab`, `tzdata.zi`) are not
+/// zones at all — a name with a dot in it never is.
+fn zone_names() -> Vec<String> {
+    let root = Path::new("/usr/share/zoneinfo");
+    let mut out = Vec::new();
+    walk_zones(root, root, &mut out, 0);
+    out
+}
+
+fn walk_zones(root: &Path, dir: &Path, out: &mut Vec<String>, depth: usize) {
+    // Three levels is every zone tzdata has (`America/Indiana/Knox`); a fourth
+    // would only be a link loop.
+    if depth > 3 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || name.contains('.') {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            if depth == 0 && (name == "posix" || name == "right") {
+                continue;
+            }
+            walk_zones(root, &path, out, depth + 1);
+            continue;
+        }
+        // `localtime` and `posixrules` are this machine's own choices rather
+        // than zones anybody would set.
+        if name == "localtime" || name == "posixrules" {
+            continue;
+        }
+        if let Ok(rel) = path.strip_prefix(root) {
+            out.push(rel.to_string_lossy().into_owned());
+        }
+    }
+}
+
+/// Every console keymap this system carries, by the name `loadkeys` takes.
+///
+/// Two packages put them in two places — `kbd` under `/usr/share/kbd/keymaps`,
+/// console-data under `/usr/share/keymaps` — and both are read, because which
+/// one an image has is not something the console should have an opinion about.
+fn keymap_names() -> Vec<String> {
+    let mut out = Vec::new();
+    for root in ["/usr/share/kbd/keymaps", "/usr/share/keymaps"] {
+        walk_keymaps(Path::new(root), &mut out, 0);
+    }
+    out
+}
+
+fn walk_keymaps(dir: &Path, out: &mut Vec<String>, depth: usize) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_keymaps(&path, out, depth + 1);
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // `de.map.gz` is loaded as `de`: the name before the first dot is what
+        // the setting holds, and it is what the validator allows.
+        let Some(stem) = name.split('.').next() else {
+            continue;
+        };
+        if !name.contains(".map") || stem.is_empty() {
+            continue;
+        }
+        if stem
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            out.push(stem.to_string());
+        }
+    }
+}
+
+/// The locales this system has built, from `locale -a`.
+///
+/// Asked of glibc rather than read off a path, because where the built locales
+/// live is a glibc build option and `locale -a` is the one answer that is true
+/// on every image. A box without the tool simply has nothing to offer.
+fn locale_names() -> Vec<String> {
+    let Ok(out) = Command::new("locale")
+        .arg("-a")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        // The validator takes `xx_YY.CHARSET`, `C` and `POSIX` and nothing
+        // else, so `locale -a`'s aliases (`german`, `en_US` without a charset)
+        // are dropped rather than offered and then refused.
+        .filter(|l| {
+            *l == "C" || *l == "POSIX" || {
+                let (lang, charset) = l.split_once('.').unwrap_or((l, ""));
+                let (a, b) = lang.split_once('_').unwrap_or(("", ""));
+                !charset.is_empty()
+                    && a.len() == 2
+                    && b.len() >= 2
+                    && a.bytes().all(|c| c.is_ascii_lowercase())
+                    && b.bytes().all(|c| c.is_ascii_uppercase())
+            }
+        })
+        .map(str::to_string)
+        .collect()
+}
+
 /// Reload the velstra data plane so it picks up a freshly written config.
 pub fn reload_velstra(unit: &str) -> Result<()> {
     run_priv("systemctl", &["reload-or-restart", unit])
@@ -325,6 +479,35 @@ pub fn ip_rule(args: &[&str]) -> Result<()> {
     let mut all = vec!["rule"];
     all.extend_from_slice(args);
     run_priv("ip", &all)
+}
+
+/// Add, replace or delete one route. Like [`ip_rule`], the arguments are the
+/// caller's — this only supplies the privilege.
+pub fn ip_route(args: &[&str]) -> Result<()> {
+    let mut all = vec!["route"];
+    all.extend_from_slice(args);
+    run_priv("ip", &all)
+}
+
+/// The addresses the box currently holds, as `ip -o addr show` prints them.
+///
+/// Read from the kernel rather than from the configuration on purpose: an
+/// address can arrive from DHCP, from a peer, or from something outside
+/// Sentinel entirely, and a caller asking "what am I actually reachable as"
+/// wants the answer, not the intent.
+pub fn ip_addr_list() -> Result<String> {
+    let is_root = unsafe { libc::geteuid() } == 0;
+    let ip = bin("ip");
+    let args = ["-o", "addr", "show"];
+    let output = if is_root {
+        Command::new(&ip).args(args).output()
+    } else {
+        let mut all = vec![ip.as_str()];
+        all.extend_from_slice(&args);
+        Command::new("sudo").args(&all).output()
+    };
+    let out = output.context("running ip addr show")?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Load a rendered strongSwan swanctl config into the running `charon` daemon
@@ -1028,12 +1211,65 @@ pub fn escalated_output(cmd: &str, args: &[&str]) -> Result<std::process::Output
             .output()
             .with_context(|| format!("running {resolved}"));
     }
-    let mut all = vec![resolved.as_str()];
+    // Try it plainly first. Most of what this runs only needs a socket the
+    // caller may already be allowed to open, and escalating regardless turns a
+    // read into a privilege request for no reason.
+    //
+    // Never for a re-invocation of *this* binary, though: the only reason to run
+    // ourselves again is to gain privilege, the caller has already made the
+    // unprivileged attempt, and running it once more as the same user reproduces
+    // the same failure — which escalates again, and again, one process deeper
+    // each time. That is not hypothetical: `show flows` on a workstation with no
+    // agent socket forked 1481 nested `sentinel agent-query` processes and
+    // wedged the API that spawned the first one.
+    let direct = if plain_attempt_is_useful(cmd) {
+        Command::new(&resolved).args(args).output().ok()
+    } else {
+        None
+    };
+    if let Some(out) = &direct {
+        if out.status.success() {
+            return Ok(direct.unwrap());
+        }
+    }
+
+    let mut all = vec!["-n", resolved.as_str()];
     all.extend_from_slice(args);
-    Command::new("sudo")
+    // `-n`: never prompt. Without it, a `sudo` configured to ask — for a
+    // password, or on a workstation for a fingerprint — blocks until *its*
+    // timeout, and every caller here is a read that something is waiting on.
+    // A `show` that sat for thirty-two seconds before admitting it could not
+    // escalate is how the console came to look like it had hung: the routing
+    // section makes one such call per protocol.
+    let escalated = Command::new("sudo")
         .args(&all)
         .output()
-        .with_context(|| format!("running `sudo {}`", all.join(" ")))
+        .with_context(|| format!("running `sudo {}`", all.join(" ")))?;
+    if escalated.status.success() {
+        return Ok(escalated);
+    }
+    // Neither worked. The unescalated attempt is the more useful of the two to
+    // report: it names what the command itself objected to, where sudo only
+    // says it declined to ask. When there was no such attempt, sudo's own
+    // refusal is all there is.
+    match direct {
+        Some(out) => Ok(out),
+        None => Ok(escalated),
+    }
+}
+
+/// Whether running `cmd` unprivileged, before escalating, can tell us anything.
+///
+/// It can for a system tool: `ip`, `networkctl` and the rest answer plenty of
+/// read-only questions as an ordinary user, and asking for privilege first would
+/// turn every one of them into a privilege request.
+///
+/// It cannot for `sentinel-self`. A re-invocation of this binary exists *only*
+/// to be root — the caller reached for it because its own unprivileged attempt
+/// failed — so the plain attempt is that same failure, run again, in a child
+/// that will escalate again when it fails.
+fn plain_attempt_is_useful(cmd: &str) -> bool {
+    cmd != "sentinel-self"
 }
 
 /// Whether this process is root, so a caller can say *why* it is escalating.
@@ -1060,7 +1296,7 @@ fn run_priv(cmd: &str, args: &[&str]) -> Result<()> {
 /// admin is passwordless-wheel, so this is seamless; `sudo` is a transparent
 /// passthrough when already root. The command itself is passed by absolute path
 /// so sudo execs it directly, bypassing `secure_path` lookup entirely.
-fn sudo(cmd: &str, args: &[&str]) -> Result<()> {
+pub(crate) fn sudo(cmd: &str, args: &[&str]) -> Result<()> {
     let resolved = bin(cmd);
     let mut all = vec![resolved.as_str()];
     all.extend_from_slice(args);
@@ -1072,4 +1308,108 @@ fn sudo(cmd: &str, args: &[&str]) -> Result<()> {
         bail!("`sudo {}` failed (exit {:?})", all.join(" "), status.code());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A workstation with no agent socket once answered `show flows` with 1481
+    // nested `sentinel agent-query` processes, and the API that spawned the
+    // first one stopped answering anything at all. The cause was this one
+    // decision: the escalation helper tried the command plainly before asking
+    // for privilege, and for a re-invocation of ourselves "plainly" means the
+    // failure that asked for the escalation, which asks again.
+    #[test]
+    fn a_self_reinvocation_is_never_tried_unprivileged_first() {
+        assert!(!plain_attempt_is_useful("sentinel-self"));
+        // System tools keep the cheap path: most of what they are asked is
+        // readable without privilege, and escalating first would ask for root
+        // to run `ip -brief address show`.
+        for tool in ["ip", "networkctl", "systemctl", "journalctl"] {
+            assert!(plain_attempt_is_useful(tool), "{tool}");
+        }
+    }
+
+    /// The picker only helps if what it offers is what the validator takes. A
+    /// list containing `posix/Europe/Berlin` or `zone.tab` would be a set of
+    /// choices half of which the appliance refuses at commit.
+    #[test]
+    fn every_timezone_offered_is_one_the_validator_would_take() {
+        let zones = choices("timezone").expect("timezone");
+        // A machine without tzdata has nothing to offer and that is a correct
+        // answer, so the assertions are about what *is* there.
+        for zone in &zones {
+            assert!(!zone.contains(".."), "{zone}");
+            assert!(!zone.starts_with('/'), "{zone}");
+            assert!(
+                !zone.contains('.'),
+                "{zone}: not a zone, a table beside one"
+            );
+            assert!(
+                !zone.starts_with("posix/") && !zone.starts_with("right/"),
+                "{zone}: the same zone under another leap-second model"
+            );
+            assert!(
+                std::path::Path::new("/usr/share/zoneinfo")
+                    .join(zone)
+                    .is_file(),
+                "{zone}: offered but not installed"
+            );
+        }
+        if std::path::Path::new("/usr/share/zoneinfo/Europe/Berlin").is_file() {
+            assert!(zones.iter().any(|z| z == "Europe/Berlin"));
+            assert!(zones.iter().any(|z| z == "UTC"));
+        }
+    }
+
+    /// The same, for the keymaps: `de.map.gz` is offered as `de`, because `de`
+    /// is what `loadkeys` takes and what `system keyboard` validates.
+    #[test]
+    fn a_keymap_is_offered_by_the_name_the_setting_holds() {
+        for name in choices("keyboard").expect("keyboard") {
+            assert!(!name.contains('.'), "{name}: still carries its extension");
+            assert!(
+                name.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+                "{name}: the validator would refuse this"
+            );
+        }
+    }
+
+    /// Sorted and without repeats. Two packages install the same keymap under
+    /// two roots, and a picker that lists `de` twice is a picker that looks
+    /// broken in the one place its whole job is to look trustworthy.
+    #[test]
+    fn choices_come_back_sorted_and_once_each() {
+        for kind in ["timezone", "keyboard", "locale"] {
+            let got = choices(kind).expect(kind);
+            let mut want = got.clone();
+            want.sort();
+            want.dedup();
+            assert_eq!(got, want, "{kind}");
+        }
+        assert!(choices("nonsense").is_err());
+    }
+
+    /// A box that has none of these — a container, a workstation running the
+    /// tests, an image built without the keymap package — answers with an empty
+    /// list rather than failing. The console then leaves the field as the
+    /// ordinary box you type into that it has always been, which is the right
+    /// thing to degrade to: an appliance the console cannot enumerate is not an
+    /// appliance whose timezone cannot be set.
+    #[test]
+    fn a_system_without_the_data_offers_nothing_rather_than_failing() {
+        let nowhere = std::path::Path::new("/nonexistent/velstra/no-such-tree");
+        let mut zones = Vec::new();
+        walk_zones(nowhere, nowhere, &mut zones, 0);
+        assert!(zones.is_empty());
+        let mut keymaps = Vec::new();
+        walk_keymaps(nowhere, &mut keymaps, 0);
+        assert!(keymaps.is_empty());
+        // And the caller still gets Ok: an empty answer is an answer.
+        for kind in ["timezone", "keyboard", "locale"] {
+            assert!(choices(kind).is_ok(), "{kind}");
+        }
+    }
 }
