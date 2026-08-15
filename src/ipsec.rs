@@ -33,6 +33,17 @@ const SWANCTL_CONF: &str = "/run/sentinel/swanctl/swanctl.conf";
 /// The rendered `secrets` file (PSKs). 0600 root:root — charon runs as root, so
 /// the key never needs to leave root.
 const SWANCTL_SECRETS: &str = "/run/sentinel/swanctl/secrets.conf";
+/// The routes [`tunnel_routes`] last installed, one `<subnet> <peer>` per line.
+///
+/// Needed because a removed tunnel must take its route with it: a route to the
+/// far subnet that outlives the policy sends that traffic to the peer's WAN
+/// address **in the clear**. Kept on tmpfs deliberately — after a reboot the
+/// routes are gone too, so an empty file and an empty routing table agree.
+///
+/// Beside the swanctl directory rather than inside it: that one is 0700 root
+/// (it holds the PSKs) and `commit` runs as the admin, which cannot traverse
+/// it — so the list read back empty and a removed tunnel kept its route.
+const ROUTES_STATE: &str = "/run/sentinel/ipsec-routes";
 
 /// Whether writing `body` to `path` would change what is already there (or the
 /// file is absent) — the same change-detect the other appliers use.
@@ -40,6 +51,121 @@ fn file_changed(path: &Path, body: &str) -> bool {
     std::fs::read_to_string(path)
         .map(|c| c != body)
         .unwrap_or(true)
+}
+
+/// The routes a set of connections needs, as `ip route` argument lists.
+///
+/// charon is told **not** to install routes (`install_routes = no` in the
+/// appliance's `strongswan.conf`): Sentinel owns the routing table, and a
+/// route-based tunnel's selectors are `0.0.0.0/0`, so charon's own route would
+/// be a default route quietly outranking the box's. The consequence is that
+/// nothing else installed them either, and a policy-based tunnel came up
+/// perfectly — SAs established, selectors correct — while carrying nothing: a
+/// packet with no route is never offered to the XFRM policy at all.
+///
+/// Two deliberate limits:
+///
+/// * **Policy-based only.** A route-based tunnel (`vti`) is reached through its
+///   own interface and the operator's own routes; the objection above stands.
+/// * **`src` is required.** Without it the kernel sources a locally-generated
+///   packet from the outgoing (WAN) address, which does not match `local_ts` —
+///   so it would leave the box **unencrypted** rather than through the tunnel.
+///   A route that turns a failure into a plaintext leak is worse than no route,
+///   so a connection whose local subnet the box holds no address in gets none.
+///   Traffic *forwarded* from behind the firewall already carries a matching
+///   source and is what a site-to-site tunnel is for.
+fn tunnel_routes(conns: &[IpsecConnection], addrs: &str) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    for c in conns {
+        if c.vti.is_some() {
+            continue;
+        }
+        let (Some(remote_net), Some(local_net)) = (&c.remote_subnet, &c.local_subnet) else {
+            continue;
+        };
+        // A default route through a tunnel is the case the objection above is
+        // about — never install one from here.
+        if remote_net == "0.0.0.0/0" || remote_net == "::/0" {
+            continue;
+        }
+        let Some(src) = local_address_in(addrs, local_net) else {
+            continue;
+        };
+        out.push(vec![
+            "replace".into(),
+            remote_net.clone(),
+            "via".into(),
+            c.remote.clone(),
+            "src".into(),
+            src,
+        ]);
+    }
+    out
+}
+
+/// Reconcile the kernel's routes to `wanted`, deleting whatever the previous
+/// apply installed and is no longer wanted. Best-effort, like the swanctl load:
+/// a route the operator removed by hand must not turn a commit into a failure.
+fn reconcile_routes(wanted: &[Vec<String>]) -> Result<()> {
+    let previous = std::fs::read_to_string(ROUTES_STATE).unwrap_or_default();
+    // `<subnet> <peer>` is enough to delete a route; the source address is not
+    // part of a route's identity.
+    let keep: Vec<String> = wanted
+        .iter()
+        .map(|r| format!("{} {}", r[1], r[3]))
+        .collect();
+    for line in previous.lines().filter(|l| !l.trim().is_empty()) {
+        if keep.iter().any(|k| k == line) {
+            continue;
+        }
+        let mut f = line.split_whitespace();
+        if let (Some(net), Some(peer)) = (f.next(), f.next()) {
+            if let Err(e) = system::ip_route(&["del", net, "via", peer]) {
+                eprintln!("warning: removing the route to {net} failed: {e}");
+            }
+        }
+    }
+    for r in wanted {
+        let args: Vec<&str> = r.iter().map(String::as_str).collect();
+        if let Err(e) = system::ip_route(&args) {
+            eprintln!("warning: installing the route to {} failed: {e}", r[1]);
+        }
+    }
+    let state = keep.join("\n");
+    if state.is_empty() {
+        system::remove_file(Path::new(ROUTES_STATE))?;
+    } else {
+        system::install_file(Path::new(ROUTES_STATE), &format!("{state}\n"))?;
+    }
+    Ok(())
+}
+
+/// An address the box holds inside `subnet`, from `ip -o addr show` output.
+///
+/// Pure so the parsing and the containment arithmetic are testable without a
+/// kernel. IPv4 only, which is what the policy-based tunnel surface accepts.
+fn local_address_in(addrs: &str, subnet: &str) -> Option<String> {
+    let (net, bits) = subnet.split_once('/')?;
+    let bits: u32 = bits.parse().ok()?;
+    let net: std::net::Ipv4Addr = net.parse().ok()?;
+    // `/0` would shift by 32, which is undefined for u32; it also cannot be a
+    // tunnel's local subnet in any useful sense.
+    if bits == 0 || bits > 32 {
+        return None;
+    }
+    let mask = u32::MAX << (32 - bits);
+    let want = u32::from(net) & mask;
+    addrs.lines().find_map(|l| {
+        // `2: eth1    inet 10.0.0.1/24 brd … scope global eth1\…`
+        let mut f = l.split_whitespace();
+        let cidr = loop {
+            if f.next()? == "inet" {
+                break f.next()?;
+            }
+        };
+        let addr: std::net::Ipv4Addr = cidr.split('/').next()?.parse().ok()?;
+        (u32::from(addr) & mask == want).then(|| addr.to_string())
+    })
 }
 
 /// The local IKE identity for `c` (its `local-id`, else the `local` address).
@@ -166,6 +292,9 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
             system::remove_file(conf_path)?;
             system::remove_file(secrets_path)?;
         }
+        // Unconditionally: the routes outlive the config file they came from,
+        // and leaving them is the plaintext case [`ROUTES_STATE`] describes.
+        reconcile_routes(&[])?;
         return Ok(());
     }
 
@@ -183,6 +312,12 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
             eprintln!("warning: loading swanctl config failed (applies on next commit/boot): {e}");
         }
     }
+    // And the routes that make the loaded policy reachable. Read the addresses
+    // from the kernel rather than the configuration: the address inside a
+    // protected subnet may have come from DHCP or from a link Sentinel does not
+    // own, and what matters is the one the box actually holds.
+    let addrs = system::ip_addr_list().unwrap_or_default();
+    reconcile_routes(&tunnel_routes(conns, &addrs))?;
     Ok(())
 }
 
@@ -207,6 +342,70 @@ mod tests {
             remote_id: None,
             start_action: None,
         }
+    }
+
+    /// `ip -o addr show` as the kernel prints it, abridged.
+    const ADDRS: &str = "\
+1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever
+2: eth1    inet 203.0.113.1/24 brd 203.0.113.255 scope global eth1\\       valid_lft forever
+3: proto0    inet 10.0.0.1/24 brd 10.0.0.255 scope global proto0\\       valid_lft forever
+";
+
+    #[test]
+    fn a_policy_based_tunnel_gets_a_route_sourced_from_its_own_subnet() {
+        let routes = tunnel_routes(&[conn()], ADDRS);
+        assert_eq!(
+            routes,
+            vec![vec![
+                "replace".to_string(),
+                "10.1.0.0/24".into(),
+                "via".into(),
+                "198.51.100.1".into(),
+                // Not the WAN address: sourced from the WAN the packet would
+                // miss its own out policy and leave unencrypted.
+                "src".into(),
+                "10.0.0.1".into(),
+            ]]
+        );
+    }
+
+    #[test]
+    fn no_address_in_the_local_subnet_means_no_route() {
+        // The box holds nothing in 192.168.9.0/24, so a locally-generated
+        // packet could only be sourced from the WAN — which the tunnel's own
+        // selectors would not match. Refusing the route keeps that traffic
+        // failing instead of leaving in the clear.
+        let mut c = conn();
+        c.local_subnet = Some("192.168.9.0/24".into());
+        assert!(tunnel_routes(&[c], ADDRS).is_empty());
+    }
+
+    #[test]
+    fn a_route_based_tunnel_and_a_default_selector_get_no_route() {
+        let mut vti = conn();
+        vti.vti = Some("vti0".into());
+        assert!(tunnel_routes(&[vti], ADDRS).is_empty());
+
+        let mut all = conn();
+        all.remote_subnet = Some("0.0.0.0/0".into());
+        assert!(tunnel_routes(&[all], ADDRS).is_empty());
+    }
+
+    #[test]
+    fn local_address_lookup_respects_the_mask() {
+        assert_eq!(
+            local_address_in(ADDRS, "10.0.0.0/24").as_deref(),
+            Some("10.0.0.1")
+        );
+        // A /16 that contains it, and a /24 next door that does not.
+        assert_eq!(
+            local_address_in(ADDRS, "10.0.0.0/16").as_deref(),
+            Some("10.0.0.1")
+        );
+        assert_eq!(local_address_in(ADDRS, "10.0.1.0/24"), None);
+        // `/0` matches everything and so identifies nothing.
+        assert_eq!(local_address_in(ADDRS, "0.0.0.0/0"), None);
+        assert_eq!(local_address_in(ADDRS, "nonsense"), None);
     }
 
     #[test]
