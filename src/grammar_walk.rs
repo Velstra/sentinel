@@ -981,3 +981,288 @@ fn the_cli_field_inventory_is_current() {
          added: {added:?}\n  gone:  {gone:?}"
     );
 }
+
+/// Every setting the CLI accepts comes back out of `show configuration commands`.
+///
+/// [`every_settable_path_is_accepted_shown_persisted_and_deletable`] proves a
+/// setting reaches the *file*. This asks the other half: does it reach the
+/// **commands** — the flat `set` lines an operator copies into a ticket or onto
+/// a second appliance, and the exact form the web console reads and writes?
+///
+/// The two are not the same question, and the difference has bitten. Permission
+/// grants were saved, shown in the brace document and lost by the flattener; a
+/// blackhole route rendered as a block with no fields, and a block with no
+/// fields flattens to no command at all. Both were invisible to a file-level
+/// test. The hand-written round trips in `session.rs` cover five fixtures'
+/// worth of the tree; this one covers the tree, from the grammar itself, so a
+/// setting added tomorrow is tested tomorrow.
+///
+/// What breaks if it fails: a configuration copied off the box arrives on the
+/// next one missing settings, with no error anywhere — a firewall that is
+/// quietly more open than the one it was copied from.
+#[test]
+fn every_settable_path_survives_show_configuration_commands() {
+    use crate::session::{flatten_config, render_appliance};
+
+    let leaves = walk_leaves();
+    let dir = std::env::temp_dir().join(format!("sentinel-walk-flat-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut grounds: Vec<(Vec<&'static str>, Ground)> = Vec::new();
+    let mut lost: Vec<String> = Vec::new();
+    let mut rejected: Vec<String> = Vec::new();
+    let mut ok = 0usize;
+
+    for leaf in &leaves {
+        let extra = context_for(&leaf.path);
+        let idx = match grounds.iter().position(|(k, _)| *k == extra) {
+            Some(i) => i,
+            None => {
+                let g = ground(&dir, grounds.len(), &extra);
+                grounds.push((extra.clone(), g));
+                grounds.len() - 1
+            }
+        };
+        let base_path = grounds[idx].1.path.clone();
+        let Ok(toks) = accepted_line(leaf, &base_path) else {
+            // Acceptance is the other test's business; a line nobody can type
+            // has nothing to say about flattening.
+            continue;
+        };
+        let view: Vec<&str> = toks.iter().map(String::as_str).collect();
+        let mut s = Session::load(&base_path).unwrap();
+        if s.set(&view).is_err() {
+            continue;
+        }
+        let Ok(appliance) = s.commit() else {
+            continue; // a setting that needs company — recorded by the other test
+        };
+        let line = format!("set {}", toks.join(" "));
+        let original = render_appliance(&appliance);
+        let commands = flatten_config(&original);
+
+        let replay_path = dir.join("replay.toml");
+        let _ = std::fs::remove_file(&replay_path);
+        let mut fresh = Session::load(&replay_path).unwrap();
+        let mut refused: Vec<String> = Vec::new();
+        for cmd in &commands {
+            let args: Vec<&str> = cmd.split_whitespace().skip(1).collect();
+            if let Err(e) = fresh.set(&args) {
+                refused.push(format!("{cmd} — {e}"));
+            }
+        }
+        if !refused.is_empty() {
+            rejected.push(format!("{line}\n      {}", refused.join("\n      ")));
+            continue;
+        }
+        if fresh.commit().is_err() {
+            rejected.push(format!("{line} — the replayed commands do not commit"));
+            continue;
+        }
+        // Compared as **saved configurations**, not as two renderings of one.
+        // A field the renderer forgets is missing from both sides of a
+        // rendered comparison, which then agrees about a setting that has been
+        // dropped; the file is where the setting either is or is not.
+        let want = dir.join("want.toml");
+        let got = dir.join("got.toml");
+        let _ = std::fs::remove_file(&want);
+        let _ = std::fs::remove_file(&got);
+        s.save(Some(&want)).expect("save the original");
+        fresh.save(Some(&got)).expect("save the replay");
+        let want_toml = std::fs::read_to_string(&want).unwrap();
+        let got_toml = std::fs::read_to_string(&got).unwrap();
+        if want_toml == got_toml {
+            ok += 1;
+            continue;
+        }
+        let missing: Vec<String> = want_toml
+            .lines()
+            .filter(|l| !got_toml.lines().any(|g| g == *l))
+            .map(str::to_string)
+            .collect();
+        let extra: Vec<String> = got_toml
+            .lines()
+            .filter(|l| !want_toml.lines().any(|w| w == *l))
+            .map(str::to_string)
+            .collect();
+        lost.push(format!(
+            "{line}\n      lost: {}\n      gained: {}",
+            missing.join(" | "),
+            extra.join(" | ")
+        ));
+    }
+
+    let report = std::path::PathBuf::from("target/grammar-walk-flatten.txt");
+    let mut f = std::fs::File::create(&report).unwrap();
+    writeln!(
+        f,
+        "leaves: {}  clean: {}  lost: {}  rejected: {}",
+        leaves.len(),
+        ok,
+        lost.len(),
+        rejected.len()
+    )
+    .unwrap();
+    for l in lost.iter().chain(rejected.iter()) {
+        writeln!(f, "{l}").unwrap();
+    }
+    eprintln!("flatten walk report: {}", report.display());
+
+    assert!(
+        lost.is_empty() && rejected.is_empty(),
+        "{} settings do not survive `show configuration commands` and {} produce a \
+         command the CLI refuses (report: {}):\n{}",
+        lost.len(),
+        rejected.len(),
+        report.display(),
+        lost.iter()
+            .chain(rejected.iter())
+            .take(30)
+            .map(|l| format!("  {l}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// Every top-level section can also be *looked at* on its own.
+///
+/// `show <section>` is how an operator inspects one part of a candidate without
+/// reading the whole document, and the set of sections it accepts is a list
+/// written out by hand beside the tree — so it falls behind the tree. Two of
+/// the thirteen had: `set load-balancer …` and `set evpn …` both configure,
+/// commit and render perfectly well, and `show load-balancer` came back
+/// "error: unknown section", naming eleven others. An operator reading that has
+/// no way to tell a section they cannot look at from a section that does not
+/// exist.
+///
+/// Driven from the same completion the walk uses, so a section added tomorrow
+/// is checked tomorrow rather than whenever somebody remembers the list.
+#[test]
+fn every_top_level_section_can_be_shown_on_its_own() {
+    let names = seeded_names();
+    let sections: Vec<String> = dyn_candidates(&["set"], &names)
+        .into_iter()
+        .map(|(k, _)| k)
+        .filter(|k| !is_ph(k))
+        .collect();
+    assert!(
+        sections.len() > 8,
+        "only {} top-level sections?",
+        sections.len()
+    );
+
+    let dir = std::env::temp_dir().join(format!("sentinel-walk-show-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let g = ground(&dir, 0, &[]);
+    let s = Session::load(&g.path).unwrap();
+
+    let bad: Vec<String> = sections
+        .iter()
+        .filter(|section| s.show_only(section).starts_with("error:"))
+        .map(|section| format!("show {section} — {}", s.show_only(section).trim()))
+        .collect();
+    assert!(
+        bad.is_empty(),
+        "a section that can be configured but not shown:\n  {}",
+        bad.join("\n  ")
+    );
+}
+
+/// An interface whose *only* setting is one field is still shown.
+///
+/// `show configuration` hides interfaces that carry no configuration, so that a
+/// box with twelve NICs and two in use does not print ten empty blocks. The
+/// test for "carries no configuration" is a single hand-written conjunction of
+/// forty-odd `is_none()`s, one per settable field — and a field added without a
+/// clause there is a field that makes an interface *invisible* whenever it
+/// stands alone. It has happened: `mss` was missing, so an interface whose only
+/// setting was a TCP clamp rendered as nothing at all, and the clamp was lost
+/// by every copy of the configuration.
+///
+/// The walk builds each interface setting on its own — the interface is then
+/// stripped of the zone and addresses the ground gave it, so what is left is
+/// the one field under test — and asks whether the interface is printed.
+#[test]
+fn an_interface_with_only_one_setting_is_still_shown() {
+    use crate::session::render_appliance;
+
+    let leaves = walk_leaves();
+    let dir = std::env::temp_dir().join(format!("sentinel-walk-lonely-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut grounds: Vec<(Vec<&'static str>, Ground)> = Vec::new();
+    let mut invisible: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+
+    for leaf in &leaves {
+        if leaf.path.get(1).map(String::as_str) != Some("interface") {
+            continue;
+        }
+        // The three settings the ground itself supplies are stripped below, so
+        // they cannot be the field under test.
+        let field = leaf.path.get(3).map(String::as_str).unwrap_or_default();
+        if matches!(field, "zone" | "address" | "address6") {
+            continue;
+        }
+        let extra = context_for(&leaf.path);
+        let idx = match grounds.iter().position(|(k, _)| *k == extra) {
+            Some(i) => i,
+            None => {
+                let g = ground(&dir, grounds.len(), &extra);
+                grounds.push((extra.clone(), g));
+                grounds.len() - 1
+            }
+        };
+        let base_path = grounds[idx].1.path.clone();
+        let Ok(toks) = accepted_line(leaf, &base_path) else {
+            continue;
+        };
+        // A switch turned to `false` and a `disable` are both "not set": they
+        // leave nothing behind, and an interface carrying nothing is right to
+        // stay hidden.
+        if toks.last().map(String::as_str) == Some("false") || toks.iter().any(|t| t == "disable") {
+            continue;
+        }
+        let view: Vec<&str> = toks.iter().map(String::as_str).collect();
+        let mut s = Session::load(&base_path).unwrap();
+        if s.set(&view).is_err() {
+            continue;
+        }
+        let Ok(mut appliance) = s.commit() else {
+            continue;
+        };
+        let Some(mut iface) = appliance
+            .interfaces
+            .iter()
+            .find(|i| i.name == "eth0")
+            .cloned()
+        else {
+            continue;
+        };
+        iface.zone = None;
+        iface.address = None;
+        iface.address6 = None;
+        // Rendered on its own: no zone, no address, nothing but the setting the
+        // line under test put there.
+        appliance.interfaces = vec![iface];
+        checked += 1;
+        if !render_appliance(&appliance).contains("interface eth0 {") {
+            invisible.push(format!("set {}", toks.join(" ")));
+        }
+    }
+
+    assert!(
+        checked > 100,
+        "only {checked} interface settings were reached — the walker is broken"
+    );
+    assert!(
+        invisible.is_empty(),
+        "{} interface settings make the interface disappear from \
+         `show configuration` when they stand alone:\n  {}",
+        invisible.len(),
+        invisible.join("\n  ")
+    );
+}

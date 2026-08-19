@@ -41,15 +41,19 @@
 //!
 //! The look is Velstra's own: the palette, type scale, spacing grid, radii and
 //! elevation are its tokens, copied in rather than imported for the reason
-//! above. It is dark only, as that system is — it defines no light ramp, and
-//! inventing one here would be designing instead of adopting.
+//! above. The source system is dark only; the light ramp further down is this
+//! console's own derivation, re-pointing the semantic tokens and nothing else,
+//! because an enterprise console is used in daylight beside other documents.
+//! (An earlier version of this header said no light ramp would be invented —
+//! that predates the block that invented one.)
 //!
-//! The one deliberate divergence is the typefaces. The system names Space
-//! Grotesk, IBM Plex Sans and JetBrains Mono; embedding three faces would add
-//! several hundred kilobytes to a page an operator opens during an incident,
-//! and fetching them is impossible by the same rule as everything else. So they
-//! are named first and fall back to the system stack: exact where a workstation
-//! has them, and carried by the palette and rhythm everywhere else.
+//! The typefaces diverge the other way since the 2026-08 smoothing pass: the
+//! *platform's* face leads every stack and the system's named faces (Space
+//! Grotesk, IBM Plex Sans, JetBrains Mono) are fallbacks. They used to lead —
+//! exact on a workstation that had them, rougher everywhere else, since a
+//! third-party face is not tuned for the local rasteriser the way the
+//! platform's own is. Nothing is embedded and nothing is fetched, by the same
+//! rule as everything else on the page.
 //!
 //! ## The token never touches disk
 //!
@@ -249,12 +253,22 @@ pub fn page() -> String {
     --product-strong: var(--sentinel-600);
     --product-subtle: var(--sentinel-900);
 
-    --font-display: "Space Grotesk", "Segoe UI", system-ui, sans-serif;
-    --font-sans: "IBM Plex Sans", system-ui, -apple-system, sans-serif;
+    /* The platform's own face first. Every OS ships one that is tuned for
+       its rasteriser — optical sizing, hinting, the lot — and a third-party
+       face that happens to be installed renders *rougher* than the system one,
+       not more designed. The named faces stay as fallbacks for a system whose
+       default is genuinely poor. */
+    --font-display: system-ui, -apple-system, "Space Grotesk", "Segoe UI", sans-serif;
+    --font-sans: system-ui, -apple-system, "IBM Plex Sans", "Segoe UI", sans-serif;
     --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
     --fw-regular: 400; --fw-medium: 500; --fw-semibold: 600;
     --text-2xs: .6875rem; --text-xs: .75rem; --text-sm: .8125rem;
     --text-base: .875rem; --text-lg: 1.125rem; --text-xl: 1.5rem;
+    /* The stat tiles have asked for this size since they were written; it was
+       never defined, the whole `font:` shorthand naming it was silently
+       invalid, and every headline number on the dashboard rendered at body
+       size. The one figure a tile exists to show was its smallest text. */
+    --text-2xl: 1.75rem;
     --leading-tight: 1.1; --leading-snug: 1.28; --leading-normal: 1.55;
     --leading-code: 1.45;
     /* Tracking is a function of size, not one number for the whole page: as
@@ -275,16 +289,21 @@ pub fn page() -> String {
        measure is shared rather than invented twice. */
     --gutter: 180px; --gutter-gap: 28px;
 
-    /* Square. Hairlines and space carry the structure here, not nested boxes
-       with soft corners — a rounded rectangle inside a rounded rectangle is
-       two frames around content that needed none. Only what is genuinely round
-       (a status dot) keeps a radius. */
-    --radius-xs: 0px; --radius-sm: 0px; --radius-md: 0px; --radius-lg: 0px;
+    /* Soft, in one ramp. The structure is still hairlines and space — the
+       radii are small enough that nothing reads as a bubble — but a control an
+       operator touches all day should not have the corners of a spreadsheet
+       cell. Ordered by what a thing is: chips take xs, controls sm, panes md,
+       cards lg. (This supersedes the earlier all-square decision on purpose:
+       squareness made the console read as a terminal, and a terminal is what
+       the CLI is for.) */
+    --radius-xs: 4px; --radius-sm: 6px; --radius-md: 10px; --radius-lg: 14px;
     --radius-pill: 999px;
 
-    --shadow-sm: 0 1px 2px rgba(0,0,0,.4);
-    --shadow-md: 0 4px 12px rgba(0,0,0,.45);
-    --shadow-lg: 0 12px 32px rgba(0,0,0,.5);
+    /* Wider and lighter than before: a shadow is one light source doing its
+       job, not an outline drawn in black. */
+    --shadow-sm: 0 1px 3px rgba(0,0,0,.28);
+    --shadow-md: 0 6px 18px rgba(0,0,0,.32);
+    --shadow-lg: 0 18px 44px rgba(0,0,0,.42);
     --edge-top: inset 0 1px 0 rgba(255,255,255,.05);
     --glow-focus: 0 0 0 3px rgba(76,141,255,.35);
     /* A single cool wash behind the shell. Flat charcoal reads as a terminal;
@@ -327,6 +346,9 @@ pub fn page() -> String {
     margin: 0; background: var(--bg-app); color: var(--text-body);
     background-image: var(--wash); background-repeat: no-repeat;
     background-attachment: fixed;
+    /* Light-on-dark text blooms; grayscale antialiasing takes the fringing
+       off and is most of what "smoother type" turns out to mean. */
+    -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
     font: var(--fw-regular) var(--text-base)/var(--leading-normal) var(--font-sans);
     -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
   }}
@@ -497,20 +519,24 @@ pub fn page() -> String {
   .pill {{
     font: var(--fw-medium) var(--text-2xs)/1.6 var(--font-mono);
     text-transform: uppercase; letter-spacing: var(--tracking-caps);
-    padding: 0 var(--space-2); border-radius: var(--radius-sm);
+    padding: 0 var(--space-2); border-radius: var(--radius-pill);
     border: 1px solid var(--border); color: var(--text-muted);
   }}
+  /* "No pending changes" is the console's resting state, and the resting
+     state does not get a framed announcement in the header — it whispers.
+     The frame belongs to the amber pill that appears when there IS news. */
+  .pill.rest {{ border-color: transparent; color: var(--text-faint); }}
   .pill.up {{ color: var(--status-up); border-color: color-mix(in oklab, var(--status-up) 45%, transparent); }}
   .pill.down {{ color: var(--status-down); border-color: color-mix(in oklab, var(--status-down) 45%, transparent); }}
 
   /* --- surfaces --------------------------------------------------------- */
   .card {{
-    border: 1px solid var(--border); border-radius: var(--radius-lg);
+    border: 1px solid var(--border-subtle); border-radius: var(--radius-lg);
     background: var(--surface); box-shadow: var(--shadow-sm), var(--edge-top);
     padding: var(--space-5); margin: 0 0 var(--space-4);
   }}
   .card > h3 {{
-    font: var(--fw-semibold) var(--text-2xs)/1.2 var(--font-mono);
+    font: var(--fw-semibold) var(--text-2xs)/1.2 var(--font-sans);
     text-transform: uppercase; letter-spacing: var(--tracking-caps);
     color: var(--text-muted); margin: 0 0 var(--space-3);
   }}
@@ -534,6 +560,22 @@ pub fn page() -> String {
   .metric.err {{ color: var(--status-down); }}
   canvas {{ width: 100%; height: 48px; display: block; margin-top: var(--space-2); }}
 
+  /* A pane that scrolls sideways gets a thin bar, not the browser's gutter
+     furniture — the stub under the interfaces table was the heaviest line in
+     its card. Firefox first, then the WebKit parts. */
+  pre.out, .tblwrap, .scroll-x {{
+    scrollbar-width: thin;
+    scrollbar-color: var(--ink-400) transparent;
+  }}
+  pre.out::-webkit-scrollbar, .tblwrap::-webkit-scrollbar,
+  .scroll-x::-webkit-scrollbar {{ height: 6px; width: 6px; }}
+  pre.out::-webkit-scrollbar-thumb, .tblwrap::-webkit-scrollbar-thumb,
+  .scroll-x::-webkit-scrollbar-thumb {{
+    background: var(--ink-400); border-radius: var(--radius-pill);
+  }}
+  pre.out::-webkit-scrollbar-track, .tblwrap::-webkit-scrollbar-track,
+  .scroll-x::-webkit-scrollbar-track {{ background: transparent; }}
+
   pre.out {{
     margin: 0; overflow: auto; max-height: 32rem; white-space: pre;
     background: var(--surface-sunken); border: 1px solid var(--border-subtle);
@@ -548,21 +590,35 @@ pub fn page() -> String {
     border-bottom: 1px solid var(--border-subtle); vertical-align: middle;
   }}
   th {{
-    font: var(--fw-semibold) var(--text-2xs)/1.2 var(--font-mono);
+    font: var(--fw-semibold) var(--text-2xs)/1.2 var(--font-sans);
     text-transform: uppercase; letter-spacing: var(--tracking-caps);
     color: var(--text-faint); border-bottom-color: var(--border-strong);
     white-space: nowrap;
   }}
   tbody tr:hover, tr:hover {{ background: var(--surface-raised); }}
   td.num {{ text-align: right; font-variant-numeric: tabular-nums; font-family: var(--font-mono); }}
+  /* A value that is a sentence — the image identity, a list of addresses —
+     is prose, and right-aligned wrapped prose is unreadable in exact
+     proportion to its importance. Numerals keep `num`; words get this. */
+  td.val {{
+    font-family: var(--font-mono); font-size: var(--text-sm);
+    text-align: left; overflow-wrap: anywhere; color: var(--text-body);
+  }}
+  /* pre-line keeps one address per line; `anywhere` stays on so an address
+     longer than the column still breaks instead of dragging a scrollbar in —
+     between the two, a break inside one address is the rarer event. */
+  td.val.lines {{ white-space: pre-line; }}
   tr.zero td {{ color: var(--text-faint); }}
 
   /* --- controls --------------------------------------------------------- */
   input, select, textarea, button.btn {{
     font: inherit; font-size: var(--text-sm); color: var(--text-body);
     padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm);
-    border: 1px solid var(--border-strong); background: var(--surface-sunken);
+    border: 1px solid var(--border); background: var(--surface-sunken);
+    transition: border-color var(--dur-fast) ease, background var(--dur-fast) ease,
+                box-shadow var(--dur-fast) ease;
   }}
+  input:hover, select:hover, textarea:hover {{ border-color: var(--border-strong); }}
   input, select, textarea {{ width: 100%; min-width: 0; }}
   /* A tick box is not a text field: full width turns it into a stretched box
      with its label orphaned on the next line. */
@@ -580,6 +636,16 @@ pub fn page() -> String {
   button.btn {{
     cursor: pointer; background: var(--surface-raised); width: auto;
     white-space: nowrap;
+    transition: background var(--dur-fast) ease, color var(--dur-fast) ease,
+                border-color var(--dur-fast) ease,
+                transform var(--dur-fast) var(--ease-out);
+  }}
+  /* The press is acknowledged on the way DOWN. Feedback that waits for the
+     release reads as lag, and this is the one transform the motion rules
+     allow everywhere: it happens under the pointer, at the pointer's moment. */
+  button.btn:active {{ transform: scale(.97); }}
+  @media (prefers-reduced-motion: reduce) {{
+    button.btn:active {{ transform: none; }}
   }}
   button.btn:hover {{ background: var(--surface-hover); color: var(--text-strong); }}
   button.primary {{
@@ -938,9 +1004,11 @@ pub fn page() -> String {
   /* The dashboard's top row. A tile is a number and what it counts; the colour
      is the same one its category carries in the rail, so the eye can follow a
      tile to the page that explains it. */
+  /* The same tracks as .cards above it: two tile bands whose columns do not
+     line up read as two unrelated pages sharing a scroll position. */
   .stats {{
-    display: grid; gap: var(--space-3); margin-bottom: var(--space-4);
-    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    display: grid; gap: var(--space-4); margin-bottom: var(--space-4);
+    grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr));
   }}
   .stat {{
     position: relative; display: flex; flex-direction: column; gap: 2px;
@@ -1097,7 +1165,7 @@ pub fn page() -> String {
   nav .grouphead {{
     display: flex; align-items: center; gap: var(--space-2); width: 100%;
     background: none; cursor: pointer; color: var(--text-faint);
-    font: var(--fw-semibold) var(--text-2xs)/1.2 var(--font-mono);
+    font: var(--fw-semibold) var(--text-2xs)/1.2 var(--font-sans);
     text-transform: uppercase; letter-spacing: var(--tracking-caps);
     padding: var(--space-3) var(--space-3) var(--space-2);
     margin: var(--space-4) 0 var(--space-1);
@@ -1117,7 +1185,7 @@ pub fn page() -> String {
   /* --- dashboard tiles ---------------------------------------------------- */
   .kpi {{
     display: flex; flex-direction: column; gap: var(--space-1);
-    border: 1px solid var(--border); border-radius: var(--radius-lg);
+    border: 1px solid var(--border-subtle); border-radius: var(--radius-lg);
     background: var(--surface); box-shadow: var(--shadow-sm), var(--edge-top);
     padding: var(--space-4) var(--space-5);
     transition: border-color var(--dur-fast) ease,
@@ -1125,11 +1193,19 @@ pub fn page() -> String {
   }}
   .kpi:hover {{ border-color: var(--border-strong); box-shadow: var(--shadow-md); }}
   .kpi .klabel {{
-    font: var(--fw-semibold) var(--text-2xs)/1.2 var(--font-mono);
+    font: var(--fw-semibold) var(--text-2xs)/1.2 var(--font-sans);
     text-transform: uppercase; letter-spacing: var(--tracking-caps);
     color: var(--text-muted);
   }}
   .kpi .kfoot {{ font-size: var(--text-xs); color: var(--text-faint); }}
+  /* State at conversation volume. The dot and the word carry the code —
+     red still means down — but a display-size "inactive" made an expected
+     state the loudest thing on the page, and a page that shouts its normal
+     state has nothing left for an abnormal one. */
+  .kpi .metric {{
+    font-size: var(--text-lg); font-weight: var(--fw-medium);
+    letter-spacing: var(--tracking-tight);
+  }}
 
   /* --- section headings inside a view ------------------------------------- */
   /* A heading and the control beside it belong on one line, centred — on a
@@ -1170,7 +1246,9 @@ pub fn page() -> String {
     align-content: start;
     background: none; border: 0; box-shadow: none;
     border-top: 1px solid var(--border-subtle);
-    padding: var(--space-7) 0 var(--space-5);
+    /* A band earns its height from its fields, not from its chrome: 2rem of
+       lead over a group holding one control was more heading than mask. */
+    padding: var(--space-5) 0 var(--space-4);
     margin: 0;
   }}
   .spread.first {{ border-top: 0; padding-top: var(--space-2); }}
@@ -1179,11 +1257,11 @@ pub fn page() -> String {
   .margin {{ min-width: 0; padding-top: 2px; }}
   .margin > h3 {{
     display: block; margin: 0;
-    font: var(--fw-semibold) var(--text-2xs)/1.35 var(--font-mono);
+    font: var(--fw-semibold) var(--text-2xs)/1.35 var(--font-sans);
     text-transform: uppercase; letter-spacing: var(--tracking-caps);
     color: var(--text-muted);
     padding-bottom: var(--space-2);
-    border-bottom: 1px solid var(--border-strong);
+    border-bottom: 1px solid var(--border);
   }}
   .margin > .cmd {{
     display: block; margin: var(--space-3) 0 0;
@@ -1221,7 +1299,10 @@ pub fn page() -> String {
      replaces degraded as it grew — twelve cards are twelve little forms to be
      read across, and nothing above them says what the values mean. A board
      gets better with length rather than worse. */
-  .tblwrap {{ overflow-x: auto; }}
+  /* overflow-y hidden as well: `auto` on one axis drags a vertical stub
+     along on some platforms, and a table never needs to scroll inside its
+     own card vertically — the page does that. */
+  .tblwrap {{ overflow-x: auto; overflow-y: hidden; }}
   table.otbl {{ table-layout: auto; min-width: 100%; }}
   /* Not sticky here: the app bar is already pinned, and a second pinned strip
      sliding underneath it is a column head an operator cannot read. */
@@ -1244,6 +1325,18 @@ pub fn page() -> String {
   }}
   table.otbl td.end {{ text-align: right; white-space: nowrap; width: 1%; }}
   table.otbl td.end .btn {{ margin-left: var(--space-2); }}
+  /* Row actions are furniture, not content. Forty rules meant eighty framed
+     buttons — a wall of chrome beside three columns of information. At rest
+     they are words; the frame appears under the pointer, where it means
+     something. Focus keeps its ring, so the keyboard loses nothing. */
+  table.otbl td.end .btn {{
+    background: transparent; border-color: transparent; color: var(--text-muted);
+  }}
+  table.otbl td.end .btn:hover {{
+    background: var(--surface-hover); border-color: var(--border);
+    color: var(--text-strong);
+  }}
+  table.otbl td.end .btn:focus-visible {{ border-color: var(--brand); }}
   /* Administratively off: still listed, visibly not in force. */
   table.otbl tr.off > td {{ opacity: .55; }}
   table.otbl .val {{
@@ -1476,7 +1569,7 @@ pub fn page() -> String {
       <div class="dashgrid">
         <div class="card">
           <h3>Interfaces</h3>
-          <div style="overflow-x:auto"><table id="dashlinks"></table></div>
+          <div class="tblwrap"><table id="dashlinks"></table></div>
         </div>
         <div class="card">
           <h3>System</h3>
@@ -1487,16 +1580,16 @@ pub fn page() -> String {
       <div class="dashgrid">
         <div class="card">
           <h3>Routes</h3>
-          <div style="overflow-x:auto"><table id="dashroutes"></table></div>
+          <div class="tblwrap"><table id="dashroutes"></table></div>
         </div>
         <div class="card">
           <h3>Rules carrying traffic</h3>
-          <div style="overflow-x:auto"><table id="dashrules"></table></div>
+          <div class="tblwrap"><table id="dashrules"></table></div>
         </div>
       </div>
       <div class="card">
         <h3>Recent log</h3>
-        <div style="overflow-x:auto"><pre class="out" id="dashlog"></pre></div>
+        <div class="tblwrap"><pre class="out" id="dashlog"></pre></div>
       </div>
       <div class="card">
         <h3>Counters</h3>
@@ -1504,7 +1597,7 @@ pub fn page() -> String {
           <input type="checkbox" id="allcounters">
           <span>Show counters that are still zero</span>
         </label>
-        <div style="overflow-x:auto"><table id="counters"></table></div>
+        <div class="tblwrap"><table id="counters"></table></div>
       </div>
     </div>
 
@@ -2251,6 +2344,14 @@ pub fn page() -> String {
 
       <div class="tabpane hidden" data-tab="addressing">
         <div class="card"><h3>DHCP relay</h3><div class="grid" id="svc-dhcprelay"></div></div>
+        <div class="card"><h3>PPPoE server</h3><div class="grid" id="svc-pppoeserver"></div></div>
+        <div class="section">
+          <h3>PPPoE subscribers</h3>
+          <span class="spacer"></span>
+          <button class="btn" id="togglepppoeuser">New subscriber</button>
+        </div>
+        <div class="card addpanel hidden" id="addpppoeuserpanel"></div>
+        <div id="pppoeusers"></div>
         <div class="card"><h3>Dynamic DNS</h3><div class="grid" id="svc-dyndns"></div></div>
         <div class="card"><h3>mDNS reflector</h3><div class="grid" id="svc-mdns"></div></div>
       </div>
@@ -2335,14 +2436,14 @@ pub fn page() -> String {
           Every save archives a revision. Rolling back stages the change like any
           other, so it lands only when you apply it.
         </p>
-        <div style="overflow-x:auto"><table id="revtable"></table></div>
+        <div class="tblwrap"><table id="revtable"></table></div>
       </div>
     </div>
 
     <div id="view-stack" class="hidden">
       <div class="card">
         <h3>Members</h3>
-        <div style="overflow-x:auto"><table id="stacktable"></table></div>
+        <div class="tblwrap"><table id="stacktable"></table></div>
         <p class="lede" style="margin:var(--space-3) 0 0">
           A member is a <code>system config-sync peer</code> — the boxes this one
           already pushes its running config to. Selecting one points the read-only
@@ -2708,7 +2809,10 @@ async function refreshDashboardExtras() {{
       lt.append(el("tr", {{}}, [
         el("td", {{ text: l.name }}),
         el("td", {{}}, [el("span", {{ class: "pill " + (l.state === "UP" ? "ok" : "warn"), text: l.state }})]),
-        el("td", {{ class: "num", text: l.addrs.join(" ") || "—" }}),
+        // One address per line. Joined with spaces they wrap mid-token at
+        // whatever width the column happens to have, and a v6 address broken
+        // inside a hex group cannot be read back or compared.
+        el("td", {{ class: "val lines", text: l.addrs.join("\n") || "—" }}),
       ]));
     }}
   }}
@@ -2757,7 +2861,7 @@ async function refreshDashboardExtras() {{
     const v = await text("/api/v1/show/version");
     for (const line of v.split("\n").filter((l) => l.trim()).slice(0, 6)) {{
       const [k, ...rest] = line.split(/:\s+/);
-      sys.append(el("tr", {{}}, [el("td", {{ text: k }}), el("td", {{ class: "num", text: rest.join(": ") }})]));
+      sys.append(el("tr", {{}}, [el("td", {{ text: k }}), el("td", {{ class: "val", text: rest.join(": ") }})]));
     }}
   }} catch (e) {{}}
 
@@ -2997,11 +3101,22 @@ function ruleRow(r, i, zones, hits) {{
       ...(off ? [el("span", {{ class: "pill warn", text: "disabled" }})] : []),
     ]),
     el("td", {{}}, [el("span", {{ class: "val", text: r.name }})]),
-    el("td", {{}}, [
-      el("span", {{ class: "val", text: source + " → " + dest }}),
-      el("span", {{ class: "sub", text: (r.from || "any") + " → " + (r.to || "any") +
-        (r.proto ? " · " + r.proto + "/" + ports : "") }}),
-    ]),
+    // The strong line is whichever half constrains something. A rule that
+    // names addresses or groups is audited by them, so they lead and the
+    // zones follow underneath. But most rules constrain only zones — and for
+    // those the old order put "any → any" in bold with the entire meaning of
+    // the rule (wan → lan · tcp/443) in the fine print. A line that restates
+    // the default earns no place at all, let alone the lead.
+    el("td", {{}}, (source === "any" && dest === "any")
+      ? [
+          el("span", {{ class: "val", text: (r.from || "any") + " → " + (r.to || "any") +
+            (r.proto ? " · " + r.proto + "/" + ports : "") }}),
+        ]
+      : [
+          el("span", {{ class: "val", text: source + " → " + dest }}),
+          el("span", {{ class: "sub", text: (r.from || "any") + " → " + (r.to || "any") +
+            (r.proto ? " · " + r.proto + "/" + ports : "") }}),
+        ]),
     el("td", {{}}, [el("span", {{ class: "val dim", text: open }})]),
     el("td", {{}}, carrying(r, action, hits)),
     el("td", {{}}, [el("span", {{ class: "val dim", text: note || "—" }})]),
@@ -3194,7 +3309,7 @@ function renderStaged() {{
   const n = staged.length;
   $("stagedbadge").textContent = n ? n + " pending change" + (n === 1 ? "" : "s")
                                    : "no pending changes";
-  $("stagedbadge").className = "pill" + (n ? " warn" : "");
+  $("stagedbadge").className = "pill" + (n ? " warn" : " rest");
   $("stagedcard").classList.toggle("hidden", n === 0);
   $("stagedtitle").textContent = n + " pending change" + (n === 1 ? "" : "s");
 
@@ -5825,6 +5940,12 @@ const BGP_GLOBAL = [
   ["ext-community", "Extended communities", null, "list"],
   ["#", "How it behaves"],
   ["hold-time", "Hold time"], ["cluster-id", "Cluster ID"],
+  // A3. The per-neighbour `flowspec` switch further down only negotiates the
+  // address family — it learns the rules. This is what acts on them, and it is
+  // separate because letting a peer drop traffic here is a different decision
+  // from agreeing to hear about it.
+  ["flowspec-enforce", "Enforce FlowSpec", ["", "true", "false"]],
+  ["flowspec-min-prefix", "FlowSpec prefix floor"],
   // A count of equal-cost paths, not a yes/no — offering true/false made ECMP
   // unconfigurable and the refusal took the rest of the batch with it.
   ["multipath", "Multipath"],
@@ -6130,7 +6251,7 @@ const IFACE = [
   ["type", "Type",
     ["", "bridge", "bond", "dummy", "pppoe", "gre", "ipip", "gretap",
      "macvlan", "macsec", "l2tpv3", "vti", "wireless", "wwan"]],
-  ["mtu", "MTU"], ["mss", "Clamp TCP MSS"], ["mac", "MAC address"], ["hw-id", "Pin to MAC"],
+  ["mtu", "MTU"], ["mss", "Clamp TCP MSS"], ["ingress-limit", "Ingress limit (Mbit/s)"], ["mac", "MAC address"], ["hw-id", "Pin to MAC"],
   ["#", "Offload"],
   ["offload gro", "GRO", ["", "true", "false"]],
   ["offload gso", "GSO", ["", "true", "false"]],
@@ -6771,6 +6892,20 @@ const SVC_DYNDNS = [
 const SVC_DHCPRELAY = [
   ["interface", "Interfaces", null, "list"],
   ["server", "Server (v4)", null, "list"], ["server6", "Server (v6)", null, "list"],
+];
+// The BNG role (C17). The subscriber list is objects rather than fields, so it
+// gets its own panel below; these are the concentrator's own settings.
+const SVC_PPPOE_SERVER = [
+  ["interface", "Serve on"], ["local-address", "Gateway address"],
+  ["pool-start", "First pool address"], ["max-sessions", "Max sessions"],
+  ["dns", "Offer DNS", null, "list"],
+  ["service-name", "Service name"], ["ac-name", "Concentrator name"],
+  ["mtu", "Session MTU"],
+];
+// A subscriber of the concentrator above. `password` is a secret the appliance
+// redacts on read, so the field is write-only in the ordinary way.
+const PPPOE_USER = [
+  ["password", "Password"], ["address", "Fixed address"],
 ];
 const SVC_PORTAL = [
   ["zone", "Gated zone"], ["port", "Port"], ["passphrase", "Passphrase"],
@@ -7439,6 +7574,7 @@ async function refreshServices() {{
     ["svc-mdns", SVC_MDNS, "services mdns", "mDNS reflector"],
     ["svc-dyndns", SVC_DYNDNS, "services dyndns", "Dynamic DNS"],
     ["svc-dhcprelay", SVC_DHCPRELAY, "services dhcp-relay", "DHCP relay"],
+    ["svc-pppoeserver", SVC_PPPOE_SERVER, "services pppoe-server", "PPPoE server"],
     ["svc-portal", SVC_PORTAL, "services portal", "Captive portal"],
     ["svc-portmap", SVC_PORTMAP, "services port-mapping", "Port mapping"],
     ["svc-alerts", SVC_ALERTS, "services alerts", "Alerts"],
@@ -7449,6 +7585,15 @@ async function refreshServices() {{
     settingsPanel(box, fields, under(path), path, label);
   }}
 
+  renderObjects({{
+    listId: "pppoeusers", required: "password", toggleId: "togglepppoeuser",
+    toggleLabel: "New subscriber", addId: "addpppoeuserpanel", noun: "Subscriber",
+    fields: PPPOE_USER, nameHint: "alice",
+    path: (n) => `services pppoe-server user ${{n}}`,
+    rows: entriesUnder(ls, ["services", "pppoe-server", "user"]),
+    badge: (r) => r.address ? {{ text: r.address }} : {{ text: "from pool" }},
+    empty: "No subscribers configured.",
+  }});
   renderObjects({{
     listId: "rplist", form: FORMS.reverseProxy, required: "backends", toggleId: "togglerp", toggleLabel: "New frontend", addId: "addrppanel", noun: "Frontend",
     fields: RPROXY, nameHint: "web",
@@ -7915,6 +8060,7 @@ const OWNERS = [
   [["services", "mdns"], "services:addressing"],
   [["services", "dyndns"], "services:addressing"],
   [["services", "dhcp-relay"], "services:addressing"],
+  [["services", "pppoe-server"], "services:addressing"],
   [["services", "reverse-proxy"], "services:publishing"],
   [["services", "broadcast-relay"], "services:publishing"],
   [["services", "portal"], "services:publishing"],
@@ -9407,11 +9553,16 @@ mod tests {
         ] {
             assert!(html.contains(token), "{token} is missing from the page");
         }
-        // Named first, never fetched — see the module header.
-        assert!(html.contains("\"Space Grotesk\""));
+        // The platform face leads and the named faces remain as fallbacks —
+        // see the module header. Both are asserted so neither half of that
+        // sentence can silently stop being true.
         assert!(
-            html.contains("system-ui"),
-            "no fallback for a face that cannot be fetched"
+            html.contains("--font-sans: system-ui"),
+            "the platform face no longer leads the stack"
+        );
+        assert!(
+            html.contains("\"Space Grotesk\""),
+            "the design system's face fell out of the stack entirely"
         );
     }
 

@@ -7,7 +7,7 @@
 //! fields can be set one at a time (so the draft holds optionals) and are
 //! materialized into a validated [`Appliance`] at commit/save time.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -20,8 +20,8 @@ use crate::config::{
     IfaceType, Interface, Ip6Options, IpOptions, IpsecConnection, Isis, Lldp, LoadBalancer, Login,
     Mdns, MultiWan, Multicast, MulticastInterface, Nat, Nat64, NatDestination, NatNpt66, NatSource,
     Ntp, OpenConnectServer, OpenConnectUser, Ospf, Ospf3, OspfInterface, Permission, Pki, Policy,
-    PortMapping, PortSpec, Portal, Pppoe, PrefixEntry, PrefixList, Proto, Protocols, Qos,
-    QosDiscipline, ReverseProxy, Rip, RouterAdvert, Rule, Schedule, Services, Snmp,
+    PortMapping, PortSpec, Portal, Pppoe, PppoeServer, PrefixEntry, PrefixList, Proto, Protocols,
+    Qos, QosDiscipline, ReverseProxy, Rip, RouterAdvert, Rule, Schedule, Services, Snmp,
     SourceValidation, Ssh, StaticRoute, Syslog, SyslogLevel, SyslogProto, SyslogTarget, System,
     UpdateChannel, Vpn, VrfDef, Vrrp, WanMode, WanUplink, WebConsole, WgPeer, WireguardTunnel,
     Wireless, WirelessWpa, Wwan, ZoneCfg,
@@ -42,6 +42,12 @@ struct IfaceDraft {
     zone: Option<String>,
     address: Option<String>,
     address6: Option<String>,
+    /// Port security (B12): the MAC this port is bound to, and the addresses it
+    /// may send from.
+    bind_mac: Option<String>,
+    bind_addresses: Vec<String>,
+    /// B13: what this port may send, in megabits per second.
+    ingress_limit: Option<u32>,
     pd_from: Option<String>,
     pd_subnet: Option<u8>,
     parent: Option<String>,
@@ -401,6 +407,10 @@ struct StaticDraft {
 #[derive(Debug, Clone, Default)]
 struct BgpDraft {
     local_as: Option<u32>,
+    /// A3: whether the rules peers advertise are enforced, and the broadest
+    /// prefix one may carry.
+    flowspec_enforce: Option<bool>,
+    flowspec_min_prefix: Option<u8>,
     router_id: Option<String>,
     hold_time: Option<u16>,
     network: Vec<String>,
@@ -755,6 +765,10 @@ fn bgp_to_draft(b: &Bgp) -> BgpDraft {
         local_as: Some(b.local_as),
         router_id: b.router_id.clone(),
         hold_time: b.hold_time,
+        // Only carried when set, so a round-trip never renders the default back
+        // as though somebody had chosen it.
+        flowspec_enforce: b.flowspec_enforce.then_some(true),
+        flowspec_min_prefix: b.flowspec_min_prefix,
         network: b.network.clone(),
         redistribute: b.redistribute.clone(),
         cluster_id: b.cluster_id.clone(),
@@ -877,6 +891,8 @@ fn bgp_from_draft(d: &BgpDraft) -> Result<Bgp> {
             .ok_or_else(|| anyhow::anyhow!("protocols bgp: local-as not set"))?,
         router_id: d.router_id.clone(),
         hold_time: d.hold_time,
+        flowspec_enforce: d.flowspec_enforce.unwrap_or(false),
+        flowspec_min_prefix: d.flowspec_min_prefix,
         network: d.network.clone(),
         redistribute: d.redistribute.clone(),
         cluster_id: d.cluster_id.clone(),
@@ -1315,6 +1331,10 @@ struct Draft {
     /// NAT-PMP port mapping (roadmap C18); its own draft for the same reason.
     port_mapping: PortMapping,
     dhcp_relay: DhcpRelayDraft,
+    /// The PPPoE concentrator (roadmap C17). Carried as the config type, like
+    /// the portal and the port mapper: nothing about it needs a partially-built
+    /// form, so a second shape would only be a second thing to keep in step.
+    pppoe_server: PppoeServer,
     /// Multi-WAN (roadmap C6): failover/load-balance mode + the uplinks, keyed by
     /// interface in configuration order.
     multiwan_mode: Option<WanMode>,
@@ -1600,6 +1620,25 @@ struct ReverseProxyDraft {
 }
 
 impl Draft {
+    /// Mutable access to the PPPoE subscriber named `name`, inserting it if new.
+    ///
+    /// Kept in the order they were declared rather than sorted: a subscriber
+    /// list is read as the operator wrote it, and re-ordering it on every edit
+    /// makes a diff of the saved config say things nobody changed.
+    fn pppoe_user_mut(&mut self, name: &str) -> &mut crate::config::PppoeUser {
+        if !self.pppoe_server.users.iter().any(|u| u.name == name) {
+            self.pppoe_server.users.push(crate::config::PppoeUser {
+                name: name.to_string(),
+                ..Default::default()
+            });
+        }
+        self.pppoe_server
+            .users
+            .iter_mut()
+            .find(|u| u.name == name)
+            .expect("just inserted")
+    }
+
     /// Mutable access to the static route with `prefix`, inserting it if new.
     fn ldap_mut(&mut self, server: &str) -> &mut crate::config::LdapServer {
         if !self.aaa.ldap.iter().any(|d| d.server == server) {
@@ -2016,6 +2055,9 @@ impl Draft {
                             disabled: i.disabled.then_some(true),
                             zone: i.zone.clone(),
                             address: i.address.clone(),
+                            bind_mac: i.bind_mac.clone(),
+                            bind_addresses: i.bind_addresses.clone(),
+                            ingress_limit: i.ingress_limit,
                             address6: i.address6.clone(),
                             pd_from: i.pd_from.clone(),
                             pd_subnet: i.pd_subnet,
@@ -2475,6 +2517,7 @@ impl Draft {
             ids: a.services.ids.clone(),
             portal: a.services.portal.clone(),
             port_mapping: a.services.port_mapping.clone(),
+            pppoe_server: a.services.pppoe_server.clone(),
             dhcp_relay: DhcpRelayDraft {
                 interface: a.services.dhcp_relay.interface.clone(),
                 server: a.services.dhcp_relay.server.clone(),
@@ -2961,6 +3004,32 @@ impl Session {
             ["interface", name, "address", v] => {
                 validate_address(v)?;
                 self.draft.iface_mut(name).address = Some((*v).to_string());
+            }
+            // Port security (B12). Two leaves rather than one because they are
+            // independently useful: a tap gets both, a trunk port to a switch
+            // might reasonably get neither.
+            ["interface", name, "ingress-limit", v] => {
+                let mbit: u32 = v
+                    .parse()
+                    .with_context(|| format!("invalid ingress-limit {v:?}"))?;
+                if mbit == 0 {
+                    anyhow::bail!(
+                        "an ingress-limit of 0 would stop the port entirely; \
+                         `delete interface {name} ingress-limit` removes the ceiling"
+                    );
+                }
+                self.draft.iface_mut(name).ingress_limit = Some(mbit);
+            }
+            ["interface", name, "port-security", "mac", v] => {
+                crate::config::validate_mac(v)?;
+                self.draft.iface_mut(name).bind_mac = Some(v.to_lowercase());
+            }
+            ["interface", name, "port-security", "address", v] => {
+                validate_bind_address(v)?;
+                let e = self.draft.iface_mut(name);
+                if !e.bind_addresses.iter().any(|a| a == v) {
+                    e.bind_addresses.push((*v).to_string());
+                }
             }
             ["interface", name, "address6", v] => {
                 if *v != "auto" && *v != "dhcp" {
@@ -4702,6 +4771,51 @@ impl Session {
                 self.draft.alerts.mail.starttls = Some(parse_bool(v)?)
             }
 
+            // services pppoe-server (roadmap C17): the BNG role — this box as
+            // the access concentrator rather than the subscriber.
+            ["services", "pppoe-server", "interface", v] => {
+                self.draft.pppoe_server.interface = Some((*v).to_string());
+            }
+            ["services", "pppoe-server", "local-address", v] => {
+                validate_ipv4(v)?;
+                self.draft.pppoe_server.local_address = Some((*v).to_string());
+            }
+            ["services", "pppoe-server", "pool-start", v] => {
+                validate_ipv4(v)?;
+                self.draft.pppoe_server.pool_start = Some((*v).to_string());
+            }
+            ["services", "pppoe-server", "max-sessions", v] => {
+                let n: u16 = v
+                    .parse()
+                    .with_context(|| format!("invalid max-sessions {v:?}"))?;
+                if n == 0 {
+                    anyhow::bail!("max-sessions of 0 would answer every subscriber and serve none");
+                }
+                self.draft.pppoe_server.max_sessions = Some(n);
+            }
+            ["services", "pppoe-server", "dns", v] => {
+                for one in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    validate_ipv4(one)?;
+                }
+                append_csv(&mut self.draft.pppoe_server.dns, v);
+            }
+            ["services", "pppoe-server", "service-name", v] => {
+                self.draft.pppoe_server.service_name = Some((*v).to_string());
+            }
+            ["services", "pppoe-server", "ac-name", v] => {
+                self.draft.pppoe_server.ac_name = Some((*v).to_string());
+            }
+            ["services", "pppoe-server", "mtu", v] => {
+                self.draft.pppoe_server.mtu =
+                    Some(v.parse().with_context(|| format!("invalid mtu {v:?}"))?);
+            }
+            ["services", "pppoe-server", "user", name, "password", v] => {
+                self.draft.pppoe_user_mut(name).password = (*v).to_string();
+            }
+            ["services", "pppoe-server", "user", name, "address", v] => {
+                validate_ipv4(v)?;
+                self.draft.pppoe_user_mut(name).address = Some((*v).to_string());
+            }
             // services dhcp-relay: box-wide DHCP relay agent (isc dhcrelay).
             ["services", "dhcp-relay", "interface", v] => {
                 append_csv(&mut self.draft.dhcp_relay.interface, v);
@@ -4842,6 +4956,22 @@ impl Session {
                     v.parse()
                         .with_context(|| format!("invalid hold-time {v:?}"))?,
                 );
+            }
+            // A3. Two leaves rather than one: whether to act on what peers
+            // advertise, and how broad a rule they may ask for, are separate
+            // decisions — an operator who turns enforcement on has not thereby
+            // agreed to accept a `0.0.0.0/0` from anybody.
+            ["protocols", "bgp", "flowspec-enforce", v] => {
+                self.draft.bgp.flowspec_enforce = Some(parse_bool(v)?);
+            }
+            ["protocols", "bgp", "flowspec-min-prefix", v] => {
+                let bits: u8 = v
+                    .parse()
+                    .with_context(|| format!("invalid flowspec-min-prefix {v:?}"))?;
+                if bits > 32 {
+                    anyhow::bail!("flowspec-min-prefix is 0..=32 (IPv4 prefix bits)");
+                }
+                self.draft.bgp.flowspec_min_prefix = Some(bits);
             }
             ["protocols", "bgp", "cluster-id", v] => {
                 self.draft.bgp.cluster_id = Some((*v).to_string());
@@ -6191,6 +6321,19 @@ impl Session {
             ["interface", name, "disabled"] => self.iface(name)?.disabled = None,
             ["interface", name, "address"] => self.iface(name)?.address = None,
             ["interface", name, "address6"] => self.iface(name)?.address6 = None,
+            ["interface", name, "ingress-limit"] => self.iface(name)?.ingress_limit = None,
+            ["interface", name, "port-security"] => {
+                let e = self.iface(name)?;
+                e.bind_mac = None;
+                e.bind_addresses.clear();
+            }
+            ["interface", name, "port-security", "mac"] => self.iface(name)?.bind_mac = None,
+            ["interface", name, "port-security", "address"] => {
+                self.iface(name)?.bind_addresses.clear();
+            }
+            ["interface", name, "port-security", "address", v] => {
+                self.iface(name)?.bind_addresses.retain(|a| a != v);
+            }
             ["interface", name, "pd-from"] => self.iface(name)?.pd_from = None,
             ["interface", name, "pd-subnet"] => self.iface(name)?.pd_subnet = None,
             ["interface", name, "zone"] => self.iface(name)?.zone = None,
@@ -7167,6 +7310,49 @@ impl Session {
                     other => bail!("services alerts mail has no field {other:?}"),
                 }
             }
+            ["services", "pppoe-server"] => {
+                self.draft.pppoe_server = crate::config::PppoeServer::default()
+            }
+            ["services", "pppoe-server", "user", name] => {
+                let before = self.draft.pppoe_server.users.len();
+                self.draft.pppoe_server.users.retain(|u| u.name != *name);
+                if self.draft.pppoe_server.users.len() == before {
+                    bail!("no pppoe-server user {name:?}");
+                }
+            }
+            ["services", "pppoe-server", "user", name, field] => {
+                let user = self
+                    .draft
+                    .pppoe_server
+                    .users
+                    .iter_mut()
+                    .find(|u| u.name == *name)
+                    .ok_or_else(|| anyhow::anyhow!("no pppoe-server user {name:?}"))?;
+                match *field {
+                    // Not "clear the password": a subscriber with an empty
+                    // secret is one anybody can be, so the whole entry goes.
+                    "password" => bail!(
+                        "a subscriber without a password is one anybody can be; \
+                         delete services pppoe-server user {name} instead"
+                    ),
+                    "address" => user.address = None,
+                    other => bail!("pppoe-server user has no field {other:?}"),
+                }
+            }
+            ["services", "pppoe-server", field] => {
+                let p = &mut self.draft.pppoe_server;
+                match *field {
+                    "interface" => p.interface = None,
+                    "local-address" => p.local_address = None,
+                    "pool-start" => p.pool_start = None,
+                    "max-sessions" => p.max_sessions = None,
+                    "dns" => p.dns.clear(),
+                    "service-name" => p.service_name = None,
+                    "ac-name" => p.ac_name = None,
+                    "mtu" => p.mtu = None,
+                    other => bail!("services pppoe-server has no field {other:?}"),
+                }
+            }
             ["services", "dhcp-relay"] => self.draft.dhcp_relay = DhcpRelayDraft::default(),
             ["services", "dhcp-relay", field] => {
                 let r = &mut self.draft.dhcp_relay;
@@ -7348,6 +7534,8 @@ impl Session {
                     "local-as" => b.local_as = None,
                     "router-id" => b.router_id = None,
                     "hold-time" => b.hold_time = None,
+                    "flowspec-enforce" => b.flowspec_enforce = None,
+                    "flowspec-min-prefix" => b.flowspec_min_prefix = None,
                     "cluster-id" => b.cluster_id = None,
                     "multipath" => b.multipath = None,
                     "network" => b.network.clear(),
@@ -8181,8 +8369,12 @@ impl Session {
     /// `show <path>` view. Unknown sections yield an error line.
     pub fn show_only(&self, section: &str) -> String {
         match section {
+            // Every section the tree can configure. `load-balancer` and `evpn`
+            // were missing here while being settable, committable and
+            // renderable — `show load-balancer` answered "unknown section",
+            // which reads like the feature does not exist.
             "system" | "interface" | "interfaces" | "firewall" | "nat" | "protocols" | "policy"
-            | "services" | "multiwan" | "vpn" | "pki" | "update" => {
+            | "services" | "multiwan" | "vpn" | "pki" | "update" | "load-balancer" | "evpn" => {
                 let out = render_draft_only(&self.draft, false, Some(section));
                 if out.is_empty() {
                     format!("(no {section} configuration)\n")
@@ -8191,7 +8383,9 @@ impl Session {
                 }
             }
             other => format!(
-                "error: unknown section {other:?} (system | interfaces | firewall | nat | protocols | policy | services | multiwan | vpn | pki | update)\n"
+                "error: unknown section {other:?} (system | interfaces | firewall | nat | \
+                 load-balancer | protocols | policy | services | multiwan | vpn | pki | evpn | \
+                 update)\n"
             ),
         }
     }
@@ -8297,6 +8491,9 @@ impl Session {
                 zone: d.zone.clone(),
                 address: d.address.clone(),
                 address6: d.address6.clone(),
+                bind_mac: d.bind_mac.clone(),
+                bind_addresses: d.bind_addresses.clone(),
+                ingress_limit: d.ingress_limit,
                 pd_from: d.pd_from.clone(),
                 pd_subnet: d.pd_subnet,
                 parent: d.parent.clone(),
@@ -9061,6 +9258,7 @@ impl Session {
                     password: self.draft.dyndns.password.clone(),
                     interface: self.draft.dyndns.interface.clone(),
                 },
+                pppoe_server: self.draft.pppoe_server.clone(),
                 dhcp_relay: DhcpRelay {
                     interface: self.draft.dhcp_relay.interface.clone(),
                     server: self.draft.dhcp_relay.server.clone(),
@@ -9272,17 +9470,32 @@ pub fn flatten_config(rendered: &str) -> Vec<String> {
 pub fn flatten_pairs(rendered: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut stack: Vec<String> = Vec::new();
+    // Whether each open block has produced a line yet. A block that closes
+    // having produced none is still a fact about the configuration — a BGP
+    // aggregate that is not summary-only has nothing *inside* it, and dropping
+    // it here meant the copy of the configuration advertised every specific the
+    // original had been told to summarise. Such a block flattens to the bare
+    // path that creates it.
+    let mut filled: Vec<bool> = Vec::new();
     for raw in rendered.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         if line == "}" {
+            let empty = !filled.pop().unwrap_or(true);
+            if empty && !stack.is_empty() {
+                out.push((stack.join(" "), String::new()));
+            }
             stack.pop();
+            if let Some(parent) = filled.last_mut() {
+                *parent = true;
+            }
             continue;
         }
         if let Some(head) = line.strip_suffix('{') {
             stack.push(head.trim().to_string());
+            filled.push(false);
             continue;
         }
         let path = stack.join(" ");
@@ -9291,6 +9504,9 @@ pub fn flatten_pairs(rendered: &str) -> Vec<(String, String)> {
             // the renderer does not emit one, and inventing a command here
             // would produce a line the CLI rejects.
             continue;
+        }
+        if let Some(here) = filled.last_mut() {
+            *here = true;
         }
         let (setting, value) = line.split_once(' ').unwrap_or((line, ""));
         out.push((format!("{path} {setting}"), value.to_string()));
@@ -9348,6 +9564,16 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             }
             if let Some(h) = &l.hashed_password {
                 sys.push_str(&format!("        hashed-password {h}\n"));
+            }
+            // The second factor, on the same terms as the password hash beside
+            // it: the appliance stores secrets in its configuration and prints
+            // them (a PSK, a WireGuard private key), and this one used to be
+            // the exception. A copied configuration therefore let the account
+            // in on a password alone — and an account whose *only* setting was
+            // its one-time-code secret rendered as an empty block and
+            // disappeared from the copy entirely.
+            if let Some(t) = &l.totp {
+                sys.push_str(&format!("        totp {t}\n"));
             }
             // The account's management grant. Leaving it out meant `show
             // configuration` described an account that could manage the box as
@@ -9454,11 +9680,29 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
     }
     // Interfaces are top-level (like VyOS), between `system` and `firewall`.
+    //
+    // A bare interface that another one *enslaves* — a bridge port, a bond
+    // member, a VLAN/tunnel parent — is not an unconfigured placeholder even
+    // though it carries no settings of its own: it is the declaration the
+    // member reference is checked against. Dropped from the rendering, the
+    // commands rebuilt a bridge whose members did not exist, and the copy would
+    // not commit.
+    let enslaved: BTreeSet<&str> = draft
+        .interfaces
+        .iter()
+        .flat_map(|(_, i)| {
+            i.members
+                .iter()
+                .map(String::as_str)
+                .chain(i.parent.as_deref())
+        })
+        .collect();
     for (name, i) in &draft.interfaces {
         if !want("interface") {
             break;
         }
         if skip_empty_ifaces
+            && !enslaved.contains(name.as_str())
             && i.description.is_none()
             && i.disabled != Some(true)
             && i.zone.is_none()
@@ -9488,6 +9732,15 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             && i.pppoe.is_none()
             && i.hw_id.is_none()
             && i.offload.is_empty()
+            // Port security (B12) and the ingress policer (B13) were missing
+            // here for the same reason `mss` was: a port whose only setting is
+            // the MAC it is bound to, the addresses it may send from, or its
+            // ceiling in megabits is configured — and rendered as nothing, so
+            // every copy of the configuration lost the binding that was the
+            // whole point of the port.
+            && i.bind_mac.is_none()
+            && i.bind_addresses.is_empty()
+            && i.ingress_limit.is_none()
             // `mss` was missing here: an interface whose only setting was a clamp
             // rendered as nothing at all, so the setting the previous commit
             // taught `show configuration commands` to print was still dropped
@@ -9549,6 +9802,15 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         if let Some(a6) = &i.address6 {
             out.push_str(&format!("    address6 {a6}\n"));
+        }
+        if let Some(mbit) = i.ingress_limit {
+            out.push_str(&format!("    ingress-limit {mbit}\n"));
+        }
+        if let Some(m) = &i.bind_mac {
+            out.push_str(&format!("    port-security mac {m}\n"));
+        }
+        for a in &i.bind_addresses {
+            out.push_str(&format!("    port-security address {a}\n"));
         }
         if let Some(up) = &i.pd_from {
             out.push_str(&format!("    pd-from {up}\n"));
@@ -9898,6 +10160,13 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         if let Some(d) = &i.dhcp_server {
             out.push_str("    dhcp-server {\n");
+            // The switch itself, printed even though the block already implies
+            // it. A server left on its defaults rendered as a block with no
+            // lines inside, and a block with no lines flattens to no command at
+            // all — so a configuration copied off the box arrived with no DHCP
+            // server on that interface and nothing to say one had been asked
+            // for.
+            out.push_str("        enable\n");
             if let Some(off) = d.pool_offset {
                 out.push_str(&format!("        pool-offset {off}\n"));
             }
@@ -9930,6 +10199,10 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         }
         if let Some(r) = &i.router_advert {
             out.push_str("    router-advert {\n");
+            // As with `dhcp-server` above: an advertiser on its defaults is a
+            // block with nothing in it, which flattens to nothing, and the copy
+            // of the configuration hands IPv6 hosts no addresses.
+            out.push_str("        enable\n");
             if !r.prefixes.is_empty() {
                 out.push_str(&format!("        prefix {}\n", r.prefixes.join(",")));
             }
@@ -10695,6 +10968,12 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         if let Some(h) = b.hold_time {
             proto.push_str(&format!("        hold-time {h}\n"));
         }
+        if b.flowspec_enforce == Some(true) {
+            proto.push_str("        flowspec-enforce true\n");
+        }
+        if let Some(bits) = b.flowspec_min_prefix {
+            proto.push_str(&format!("        flowspec-min-prefix {bits}\n"));
+        }
         if let Some(c) = &b.cluster_id {
             proto.push_str(&format!("        cluster-id {c}\n"));
         }
@@ -11050,14 +11329,20 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             let m = &draft.alerts.mail;
             if !m.is_empty() {
                 svc.push_str("        mail {\n");
+                // Into `svc` — the services body — and not into `out`. Into
+                // `out` they landed *before* `services {` was even opened, so
+                // every mail field was printed outside every block: unreachable
+                // by any `set` path, dropped by `flatten_config`, and lost the
+                // moment a configuration was copied off the box. The alerts
+                // then went nowhere on the copy, silently.
                 // push_field renders at the 12-space depth these fields sit at.
-                push_field(&mut out, "to", m.to.clone());
-                push_field(&mut out, "from", m.from.clone());
-                push_field(&mut out, "relay", m.relay.clone());
-                push_field(&mut out, "port", m.port.map(|p| p.to_string()));
-                push_field(&mut out, "user", m.user.clone());
-                push_field(&mut out, "password", m.password.clone());
-                push_field(&mut out, "starttls", m.starttls.map(|b| b.to_string()));
+                push_field(&mut svc, "to", m.to.clone());
+                push_field(&mut svc, "from", m.from.clone());
+                push_field(&mut svc, "relay", m.relay.clone());
+                push_field(&mut svc, "port", m.port.map(|p| p.to_string()));
+                push_field(&mut svc, "user", m.user.clone());
+                push_field(&mut svc, "password", m.password.clone());
+                push_field(&mut svc, "starttls", m.starttls.map(|b| b.to_string()));
                 svc.push_str("        }\n");
             }
             svc.push_str("    }\n");
@@ -11078,6 +11363,58 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
                 }
                 if let Some(l) = t.level {
                     svc.push_str(&format!("            level {}\n", l.rsyslog()));
+                }
+                // Which facilities this target receives. It is settable, saved
+                // and built into the rsyslog selector — and it used not to be
+                // printed, so a configuration copied off the box arrived
+                // shipping *every* facility to a collector that had been asked
+                // for two.
+                if !t.facility.is_empty() {
+                    svc.push_str(&format!("            facility {}\n", t.facility.join(",")));
+                }
+                svc.push_str("        }\n");
+            }
+            svc.push_str("    }\n");
+        }
+        let bng = &draft.pppoe_server;
+        if !bng.is_empty() {
+            svc.push_str("    pppoe-server {\n");
+            if let Some(i) = &bng.interface {
+                svc.push_str(&format!("        interface {i}\n"));
+            }
+            if let Some(a) = &bng.local_address {
+                svc.push_str(&format!("        local-address {a}\n"));
+            }
+            if let Some(a) = &bng.pool_start {
+                svc.push_str(&format!("        pool-start {a}\n"));
+            }
+            if let Some(n) = bng.max_sessions {
+                svc.push_str(&format!("        max-sessions {n}\n"));
+            }
+            if !bng.dns.is_empty() {
+                svc.push_str(&format!("        dns {}\n", bng.dns.join(",")));
+            }
+            if let Some(n) = &bng.service_name {
+                svc.push_str(&format!("        service-name {n}\n"));
+            }
+            if let Some(n) = &bng.ac_name {
+                svc.push_str(&format!("        ac-name {n}\n"));
+            }
+            if let Some(m) = bng.mtu {
+                svc.push_str(&format!("        mtu {m}\n"));
+            }
+            for u in &bng.users {
+                svc.push_str(&format!("        user {} {{\n", u.name));
+                // In full, like every other secret this renderer prints — the
+                // IPsec PSK, the WireGuard private key, the PPPoE *client*
+                // password two blocks up. It used to print `****`, which is
+                // not a redaction here: `****` is a password the CLI accepts,
+                // so replaying `show configuration commands` onto a second
+                // appliance set every subscriber's password to four asterisks
+                // and nothing said so.
+                svc.push_str(&format!("            password {}\n", u.password));
+                if let Some(a) = &u.address {
+                    svc.push_str(&format!("            address {a}\n"));
                 }
                 svc.push_str("        }\n");
             }
@@ -12078,6 +12415,22 @@ fn proto_str(p: Proto) -> &'static str {
     }
 }
 
+/// An address a port may be bound to: a bare IPv4 or IPv6 address, never a
+/// prefix.
+///
+/// A CIDR is refused rather than silently truncated: `10.0.0.5/24` looks like it
+/// binds a subnet, and a binding that quietly meant only `10.0.0.5` would be a
+/// port security control that does not do what it reads as.
+fn validate_bind_address(v: &str) -> anyhow::Result<()> {
+    if v.contains('/') {
+        anyhow::bail!("{v:?} is a prefix; bind one address at a time");
+    }
+    if v.parse::<std::net::IpAddr>().is_err() {
+        anyhow::bail!("{v:?} is not an IP address");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -12174,6 +12527,102 @@ to = "10.0.0.10:443"
         assert_eq!(
             rebuilt, original,
             "the configuration did not survive being flattened to commands"
+        );
+    }
+
+    /// A bridge port with no settings of its own still comes out of
+    /// `show configuration commands`.
+    ///
+    /// The renderer hides interfaces that carry no configuration, so a box with
+    /// twelve NICs and two in use does not print ten empty blocks. A bridge
+    /// port carries none — that is what a bridge port *is*, an interface whose
+    /// whole job is to be named by the bridge — and hiding it meant the
+    /// commands rebuilt a bridge whose members had never been declared. The
+    /// copy then refused to commit, naming an interface the operator could see
+    /// in front of them on the original box.
+    #[test]
+    fn a_bridge_port_with_no_settings_of_its_own_survives_the_round_trip() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "eth1"
+[[interface]]
+name = "eth2"
+[[interface]]
+name = "br0"
+type = "bridge"
+member = ["eth1", "eth2"]
+zone = "lan"
+address = "10.0.0.1/24"
+[zone.lan]
+default_action = "accept"
+"#;
+        let original = render_appliance(&Appliance::from_toml(toml).unwrap());
+        let commands = flatten_config(&original);
+        assert!(
+            commands.iter().any(|c| c == "set interface eth1"),
+            "the port itself has to be declared: {commands:#?}"
+        );
+
+        let dir = std::env::temp_dir().join(format!("sentinel-brport-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("appliance.toml");
+        let _ = std::fs::remove_file(&path);
+        let mut session = Session::load(&path).unwrap();
+        for command in &commands {
+            let toks: Vec<&str> = command.split_whitespace().skip(1).collect();
+            session
+                .set(&toks)
+                .unwrap_or_else(|e| panic!("{command}: {e:#}"));
+        }
+        let rebuilt = render_appliance(
+            &session
+                .commit()
+                .expect("the rebuilt bridge commits — its members exist"),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(rebuilt, original);
+    }
+
+    /// The configuration the appliance ships with parses, validates, and comes
+    /// back out of `show configuration commands` unchanged.
+    ///
+    /// `example-appliance.toml` is not documentation: `flake.nix` bakes it into
+    /// the image as the **factory configuration** a freshly installed box boots
+    /// with. Nothing else in the fast test loop reads it, so a field renamed in
+    /// `config.rs` — or a value the validator learned to refuse — takes it out
+    /// silently, and the first sign is an installed appliance that comes up
+    /// with no configuration at all. Under a fail-closed default that is a box
+    /// that cannot be reached to fix.
+    ///
+    /// The round trip is here for the second half of that: the factory config
+    /// is also the first thing anybody copies off a new box, and a setting that
+    /// does not survive being flattened is one the copy quietly does without.
+    #[test]
+    fn the_shipped_factory_configuration_parses_and_survives_a_round_trip() {
+        let toml = include_str!("../example-appliance.toml");
+        let appliance = Appliance::from_toml(toml)
+            .expect("example-appliance.toml is the factory config — it must parse and validate");
+
+        let original = render_appliance(&appliance);
+        let commands = flatten_config(&original);
+        let dir = std::env::temp_dir().join(format!("sentinel-factory-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("appliance.toml");
+        let _ = std::fs::remove_file(&path);
+        let mut session = Session::load(&path).unwrap();
+        for command in &commands {
+            let toks: Vec<&str> = command.split_whitespace().skip(1).collect();
+            session
+                .set(&toks)
+                .unwrap_or_else(|e| panic!("{command}: {e:#}"));
+        }
+        let rebuilt = render_appliance(&session.commit().expect("the replay commits"));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            rebuilt, original,
+            "the factory configuration did not survive `show configuration commands`"
         );
     }
 
@@ -12451,14 +12900,13 @@ name = "eth0"
 zone = "lan"
 address = "10.0.0.1/24"
 [interface.dhcp-server]
-range-start = "10.0.0.100"
-range-end = "10.0.0.200"
+pool-offset = 100
+pool-size = 100
 [[interface.dhcp-server.static-mapping]]
 name = "printer"
 mac = "aa:bb:cc:dd:ee:ff"
 ip = "10.0.0.50"
 [interface.router-advert]
-enable = true
 managed = true
 [interface.qos]
 discipline = "cake"
@@ -12603,7 +13051,7 @@ hostname = "fw2"
 [system.console]
 device = "ttyS0"
 speed = 115200
-[system.update]
+[update]
 url = "https://updates.example.com/"
 public-key = "file:/etc/sentinel/update.pem"
 
@@ -12623,9 +13071,13 @@ vlan = 20
 zone = "dmz"
 address = "10.20.0.1/24"
 [[interface]]
+name = "eth2"
+[[interface]]
+name = "eth3"
+[[interface]]
 name = "br0"
 type = "bridge"
-members = ["eth2", "eth3"]
+member = ["eth2", "eth3"]
 zone = "lan"
 [[interface]]
 name = "eth4"

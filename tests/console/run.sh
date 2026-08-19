@@ -13,14 +13,15 @@ here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 bin=${1:-}
 
+# Built, not merely found. Preferring an existing binary made this suite report
+# on whatever was compiled last: two runs in a row said the console could not set
+# a setting that had been added to it, because the page under test was the one
+# from before the change. A cargo build that has nothing to do costs a second;
+# a suite that quietly tests yesterday's binary costs an afternoon.
 if [ -z "$bin" ]; then
-  if [ -x "$root/target/debug/sentinel" ]; then bin="$root/target/debug/sentinel"
-  elif [ -x "$root/target/release/sentinel" ]; then bin="$root/target/release/sentinel"
-  else
-    echo "building sentinel…" >&2
-    (cd "$root" && cargo build -q)
-    bin="$root/target/debug/sentinel"
-  fi
+  echo "building sentinel…" >&2
+  (cd "$root" && cargo build -q)
+  bin="$root/target/debug/sentinel"
 fi
 
 work=$(mktemp -d)

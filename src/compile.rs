@@ -370,6 +370,16 @@ struct Interface {
     cgnat_base_port: u16,
     #[serde(skip_serializing_if = "is_zero_u16")]
     cgnat_block_size: u16,
+    /// B13: what this port may send, in megabits per second. Omitted on a port
+    /// nobody capped.
+    #[serde(rename = "rate-limit-mbit", skip_serializing_if = "Option::is_none")]
+    ingress_limit: Option<u32>,
+    /// Port security (roadmap B12): the identity this port is bound to. Both
+    /// omitted on a port nobody bound, which is every uplink.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bind_mac: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    bind_addresses: Vec<String>,
 }
 
 fn is_zero_u16(v: &u16) -> bool {
@@ -830,6 +840,9 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                 masquerade: masq_zones.contains_key(zone),
                 cgnat_base_port: masq_zones.get(zone).map_or(0, |l| l.0),
                 cgnat_block_size: masq_zones.get(zone).map_or(0, |l| l.1),
+                ingress_limit: i.ingress_limit,
+                bind_mac: i.bind_mac.clone(),
+                bind_addresses: i.bind_addresses.clone(),
             })
         })
         .collect();

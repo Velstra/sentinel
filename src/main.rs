@@ -765,8 +765,13 @@ fn apply_boot(
     out: &std::path::Path,
     wren_out: &std::path::Path,
 ) -> Result<()> {
+    // load_lenient, not load: this is the boot-time apply of the saved config,
+    // and the one place an unknown key must not keep the box from coming up. A
+    // rollback to an older image whose saved config carries a newer field would
+    // otherwise boot unconfigured. `config check` and every interactive path
+    // stay strict — see Appliance::load_lenient.
     let appliance = identity::with_resolved(&feed::with_fetched(&domain::with_resolved(
-        &Appliance::load(config)?,
+        &Appliance::load_lenient(config)?,
     )));
 
     // Compile BOTH configs before writing either, so a compile error can't leave
@@ -811,7 +816,9 @@ fn apply_boot(
 /// before the links existed — tc egress qdiscs (QoS), the Multi-WAN policy
 /// routes, and the IPsec SAs. Run by the `sentinel-boot-late` service.
 fn apply_boot_late(config: &std::path::Path) -> Result<()> {
-    let appliance = Appliance::load(config)?;
+    // Lenient for the same reason as apply_boot: the second boot stage applies
+    // the same saved config, and must survive an unknown key just the same.
+    let appliance = Appliance::load_lenient(config)?;
     net::apply_link_runtime(&appliance)
 }
 
@@ -1746,6 +1753,9 @@ fn show_op(args: &[String]) -> Result<()> {
         ["firewall", "flows"] | ["flows"] | ["connections"] | ["conntrack"] => {
             show_agent_query("flows", "flows")
         }
+        // A3: what a BGP peer has asked this box to drop, and — just as
+        // important — what it asked for that is not being enforced.
+        ["firewall", "flowspec"] | ["flowspec"] => show_agent_query("flowspec", "flowspec rules"),
         ["firewall", "top-talkers" | "top"] | ["top-talkers"] => {
             show_agent_query("top", "top talkers")
         }

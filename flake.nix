@@ -214,7 +214,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-zSKvKvHRf68TgAHddE4qHxFXF+Ok0fkQc7ZqlWfvUGs=";
+      ebpfHash = "sha256-igiyfwbIWD1OPnEOtEr83BS5B9kmAAQhUl6/o0REqV4=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -523,6 +523,37 @@
             serviceConfig = {
               Type = "exec";
               ExecStart = "${pkgs.ppp}/bin/pppd file /run/sentinel/ppp/peers/%i nodetach";
+              Restart = "on-failure";
+              RestartSec = "5s";
+            };
+          };
+          # PPPoE server (roadmap C17): the BNG role — this box terminating
+          # subscriber sessions rather than dialling one. `pppoe-server` listens
+          # on the subscriber-facing link and hands each session it accepts to
+          # its own `pppd`, which is why the two halves of PPPoE here share
+          # their credentials file and differ only in which end they are.
+          #
+          # Not `wantedBy` anything: sentinel starts it when the configuration
+          # says to serve, and stops it when that goes away. A unit that came up
+          # on its own would answer PADI on a box whose `show configuration`
+          # mentions no concentrator.
+          systemd.services.sentinel-pppoe-server = {
+            description = "PPPoE server / access concentrator (sentinel)";
+            after = [
+              "network.target"
+              "sentinel-boot.service"
+            ];
+            # `pppoe-server` execs `pppd` per session, so pppd has to be on its
+            # PATH; the sessions read /etc/ppp/{chap,pap}-secrets, which the
+            # symlinks below point at sentinel's 0600 rendered file.
+            path = [ pkgs.ppp ];
+            serviceConfig = {
+              Type = "exec";
+              EnvironmentFile = "/run/sentinel/pppoe-server.env";
+              # Unbraced on purpose: systemd splits that form into words, which
+              # is what makes the rendered argument list an argument list rather
+              # than one long argument.
+              ExecStart = "${pkgs.rpPPPoE}/bin/pppoe-server $PPPOE_SERVER_ARGS";
               Restart = "on-failure";
               RestartSec = "5s";
             };
@@ -4261,6 +4292,505 @@
       # verdict comes from the box's own routing table. Two segments are the
       # minimum that can tell `strict` from `loose` apart: with one interface
       # every foreign source is simply unroutable, which loose catches too.
+      # Port security (roadmap B12): a port bound to one identity refuses
+      # everything else. Its sibling `spoofing` asks whether a source address
+      # routes back the way it came; this asks the question uRPF cannot —
+      # whether the sender is the one the port was given to. Two guests on one
+      # subnet both pass uRPF perfectly.
+      # A3 second half: a BGP peer advertises a FlowSpec rule and this box
+      # *enforces* it. wren has streamed that feed for a while; until now nothing
+      # consumed it, so a rule arrived, was shown by `show bgp flowspec`, and not
+      # one packet was dropped because of it.
+      flowspec = pkgs.testers.runNixOSTest {
+        name = "sentinel-flowspec";
+        nodes = {
+          # The originator. Plain wren rather than an appliance: what is being
+          # tested is the *receiving* side, and the CLI has no way to originate a
+          # flow rule, so the config is written by hand exactly as wren's own
+          # smoke test writes it.
+          origin =
+            { pkgs, lib, ... }:
+            {
+              networking.hostName = lib.mkForce "origin";
+              networking.firewall.enable = lib.mkForce false;
+              virtualisation.vlans = [ 1 ];
+              networking.useNetworkd = true;
+              networking.useDHCP = false;
+              networking.interfaces.eth1.ipv4.addresses = [
+                {
+                  address = "10.7.0.1";
+                  prefixLength = 24;
+                }
+              ];
+              environment.systemPackages = [ wrenPkg ];
+              # Written by the test, so the rule can be advertised and withdrawn
+              # while the machine is running.
+              systemd.services.origin-wren = {
+                # Not started at boot: its config is written by the test, and a
+                # unit that crash-loops before then trips systemd's start
+                # limiter and refuses the first real start.
+                wantedBy = [ ];
+                after = [ "network.target" ];
+                startLimitIntervalSec = 0;
+                serviceConfig = {
+                  ExecStart = "${wrenPkg}/bin/wren --config /etc/origin-wren.toml --backend memory --socket /run/origin-wren.sock";
+                  Restart = "on-failure";
+                  RestartSec = 1;
+                };
+              };
+            };
+          fw =
+            { lib, ... }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce "fw";
+              networking.firewall.enable = lib.mkForce false;
+              virtualisation.vlans = [ 1 ];
+              virtualisation.memorySize = 2048;
+              networking.interfaces.eth1.ipv4.addresses = [
+                {
+                  address = "10.7.0.2";
+                  prefixLength = 24;
+                }
+              ];
+              services.velstra.interface = lib.mkForce "eth1";
+            };
+        };
+        testScript = ''
+          start_all()
+          fw.wait_for_unit("multi-user.target")
+          fw.wait_for_unit("velstra.service")
+          origin.wait_for_unit("multi-user.target")
+          fw.wait_until_succeeds("ip addr show eth1 | grep -q 10.7.0.2", timeout=20)
+          origin.wait_until_succeeds("ip addr show eth1 | grep -q 10.7.0.1", timeout=20)
+
+          BASE = """router-id = "10.7.0.1"
+          [bgp]
+          enabled = true
+          local-as = 65010
+          [[bgp.neighbor]]
+          address = "10.7.0.2"
+          remote-as = 65010
+          flowspec = true
+          """
+
+          # The rule: discard ICMP to the appliance itself. ICMP because it needs
+          # no listener on the far side, so a dropped ping is the data plane's
+          # doing and not a service that was never running.
+          RULE = """
+          [bgp.flowspec]
+          [[bgp.flowspec.rule]]
+          dest = "10.7.0.2/32"
+          protocol = [1]
+          action = "discard"
+          """
+
+          def originate(with_rule):
+              body = BASE + (RULE if with_rule else "")
+              origin.succeed(
+                  "cat > /etc/origin-wren.toml <<'EOF'\n"
+                  + "\n".join(l.strip() for l in body.splitlines())
+                  + "\nEOF"
+              )
+              origin.succeed("systemctl restart origin-wren.service")
+
+          def apply(*lines):
+              cmds = " ".join(f"'{l}'" for l in lines)
+              fw.succeed(
+                  "su admin -c \"printf '%s\\n' " + cmds
+                  + " commit save exit | sentinel configure\""
+              )
+
+          with subtest("the peering comes up with nothing advertised"):
+              originate(False)
+              apply(
+                  "set interface eth1 zone wan",
+                  "set firewall zone wan default-action accept",
+                  "set firewall global default-action accept",
+                  "set protocols router-id 10.7.0.2",
+                  "set protocols bgp local-as 65010",
+                  "set protocols bgp neighbor 10.7.0.1 remote-as 65010",
+                  "set protocols bgp neighbor 10.7.0.1 flowspec true",
+                  "set protocols bgp flowspec-enforce true",
+              )
+              fw.wait_for_unit("wren.service")
+              fw.wait_for_unit("velstra.service")
+              # The switch reached the agent's command line. Without this the
+              # rest of the test could pass for the wrong reason — with nothing
+              # enforcing anything and the ping failing for some other cause.
+              fw.succeed("grep -q -- '--flowspec' /run/sentinel/velstra.env")
+              fw.wait_until_succeeds(
+                  "wren show bgp neighbors | grep -qi established", timeout=90
+              )
+              # And the box is reachable, so the drop below is a change.
+              origin.wait_until_succeeds("ping -c 2 -W 5 10.7.0.2", timeout=30)
+
+          with subtest("an advertised rule is enforced, not merely displayed"):
+              originate(True)
+              # It arrives at the routing daemon first…
+              fw.wait_until_succeeds(
+                  "wren show bgp flowspec | grep -q 10.7.0.2", timeout=90
+              )
+              # …and then stops being a matter of display.
+              origin.wait_until_fails("ping -c 2 -W 5 10.7.0.2", timeout=60)
+              # And the box can say so. A feed being consumed and enforcing
+              # nothing looks exactly like one that is not being consumed, and
+              # the difference is what somebody needs during an attack.
+              out = fw.succeed("su admin -c 'sentinel show firewall flowspec'")
+              assert "1 rule(s) in force" in out, out
+              assert "10.7.0.2/32" in out, out
+
+          with subtest("withdrawing it gives the traffic back"):
+              # The other half of the same claim: a rule that is withdrawn and
+              # keeps dropping is not enforcement, it is a leak.
+              originate(False)
+              origin.wait_until_succeeds("ping -c 3 -W 5 10.7.0.2", timeout=90)
+
+          with subtest("what is refused is named rather than approximated"):
+              # A rule the data plane cannot express must not be enforced as
+              # something narrower or wider. Both ends named is the clearest
+              # case: dropping either half changes which traffic is discarded.
+              body = BASE + """
+              [bgp.flowspec]
+              [[bgp.flowspec.rule]]
+              source = "10.7.0.1/32"
+              dest = "10.7.0.2/32"
+              protocol = [1]
+              action = "discard"
+              """
+              origin.succeed(
+                  "cat > /etc/origin-wren.toml <<'EOF'\n"
+                  + "\n".join(l.strip() for l in body.splitlines())
+                  + "\nEOF"
+              )
+              origin.succeed("systemctl restart origin-wren.service")
+              # The *refusal* line, not the summary that also contains the words
+              # "not enforced" — a looser grep here passed while the refusal was
+              # never reaching the box's own answer at all.
+              fw.wait_until_succeeds(
+                  "journalctl -u velstra --no-pager | grep -q 'flowspec not enforced'",
+                  timeout=90,
+              )
+              # Named on the box too, not only in a journal that rotates.
+              out = fw.succeed("su admin -c 'sentinel show firewall flowspec'")
+              assert "NOT enforced" in out, out
+              assert "constrains one end" in out, out
+              # …and the traffic still flows, because refusing is not dropping.
+              origin.succeed("ping -c 2 -W 5 10.7.0.2")
+        '';
+      };
+
+      # B13: a port's send ceiling, enforced in the data plane. Policing rather
+      # than shaping, and on the *ingress* of the box — the direction a noisy
+      # neighbour congests, and the one no amount of queueing on the way out
+      # would fix.
+      portrate = pkgs.testers.runNixOSTest {
+        name = "sentinel-portrate";
+        nodes = {
+          # The tenant, with more to say than it is allowed to.
+          guest =
+            { pkgs, lib, ... }:
+            {
+              networking.hostName = lib.mkForce "guest";
+              networking.firewall.enable = lib.mkForce false;
+              virtualisation.vlans = [ 1 ];
+              networking.useNetworkd = true;
+              networking.useDHCP = false;
+              networking.interfaces.eth1.ipv4.addresses = [
+                {
+                  address = "10.3.0.2";
+                  prefixLength = 24;
+                }
+              ];
+              environment.systemPackages = [ pkgs.iperf3 ];
+            };
+          fw =
+            { lib, pkgs, ... }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce "fw";
+              networking.firewall.enable = lib.mkForce false;
+              virtualisation.vlans = [ 1 ];
+              virtualisation.memorySize = 2048;
+              networking.interfaces.eth1.ipv4.addresses = [
+                {
+                  address = "10.3.0.1";
+                  prefixLength = 24;
+                }
+              ];
+              environment.systemPackages = [ pkgs.iperf3 ];
+              services.velstra.interface = lib.mkForce "eth1";
+              # A plain long-lived server. `systemd-run` with `-D` fights systemd
+              # over who owns the process, and `-1` exits after one client — both
+              # of which this test needs not to happen between measurements.
+              systemd.services.iperf3 = {
+                wantedBy = [ "multi-user.target" ];
+                serviceConfig = {
+                  ExecStart = "${pkgs.iperf3}/bin/iperf3 -s";
+                  Restart = "always";
+                };
+              };
+            };
+        };
+        testScript = ''
+          start_all()
+          fw.wait_for_unit("multi-user.target")
+          fw.wait_for_unit("velstra.service")
+          fw.wait_for_unit("iperf3.service")
+          guest.wait_for_unit("multi-user.target")
+          fw.wait_until_succeeds("ip addr show eth1 | grep -q 10.3.0.1", timeout=20)
+
+          def apply(*lines):
+              cmds = " ".join(f"'{l}'" for l in lines)
+              fw.succeed(
+                  "su admin -c \"printf '%s\\n' " + cmds
+                  + " commit save exit | sentinel configure\""
+              )
+
+          def throttled(_=0):
+              """Frames the data plane refused for being over the port's budget."""
+              fw.wait_until_succeeds(
+                  "sentinel show firewall statistics > /tmp/stats; "
+                  "grep -c dropped_port_rate /tmp/stats",
+                  timeout=90,
+              )
+              out = fw.succeed("cat /tmp/stats")
+              for line in out.splitlines():
+                  if "dropped_port_rate" in line:
+                      return int(line.split()[-1])
+              raise Exception("no dropped_port_rate counter:\n" + out)
+
+          def megabits(seconds=4):
+              """What the guest actually gets through, in Mbit/s.
+
+              Read off iperf3's own summary rather than computed here: the
+              number that matters is what crossed the wire, and awk is on every
+              one of these machines where a JSON parser is not.
+              """
+              out = guest.succeed(
+                  f"iperf3 -c 10.3.0.1 -t {seconds} -f m | "
+                  "awk '/sender/ {for (i = 1; i <= NF; i++) "
+                  "if ($i == \"Mbits/sec\") print int($(i - 1))}'"
+              )
+              return int(out.split()[0])
+
+          with subtest("an uncapped port is not policed"):
+              apply(
+                  "set interface eth1 zone lan",
+                  "set firewall zone lan default-action accept",
+                  "set firewall global default-action accept",
+              )
+              fw.wait_for_unit("velstra.service")
+              fw.fail("grep -q rate-limit-mbit /run/sentinel/velstra.toml")
+              before = throttled(0)
+              guest.succeed("ping -c 2 -W 5 10.3.0.1")
+              assert throttled(0) == before, "an uncapped port was throttled"
+
+          with subtest("a ceiling reaches the data plane"):
+              apply("set interface eth1 ingress-limit 10")
+              fw.wait_for_unit("velstra.service")
+              fw.succeed("grep -q 'rate-limit-mbit = 10' /run/sentinel/velstra.toml")
+
+          with subtest("and it bites"):
+              # A ceiling that lets everything through is not a ceiling. iperf3
+              # from the guest is the honest measurement: the number it reports is
+              # what actually crossed the wire, not what the box says it allowed.
+              guest.wait_until_succeeds("nc -z 10.3.0.1 5201", timeout=60)
+              rate = megabits()
+              assert rate < 25, f"a 10 Mbit ceiling passed {rate} Mbit/s"
+              assert throttled(0) > 0, "nothing was counted as over budget"
+
+          with subtest("taking the ceiling away gives the port back"):
+              apply("delete interface eth1 ingress-limit")
+              fw.wait_for_unit("velstra.service")
+              fw.fail("grep -q rate-limit-mbit /run/sentinel/velstra.toml")
+              guest.wait_until_succeeds("nc -z 10.3.0.1 5201", timeout=30)
+              rate = megabits()
+              assert rate > 50, f"an uncapped port only managed {rate} Mbit/s"
+        '';
+      };
+
+      portsec = pkgs.testers.runNixOSTest {
+        name = "sentinel-portsec";
+        nodes = {
+          # The tenant. Forges from its own port, which is the whole threat
+          # model: the far end of a tap is not trusted to say who it is.
+          guest =
+            { pkgs, lib, ... }:
+            {
+              networking.hostName = lib.mkForce "guest";
+              networking.firewall.enable = lib.mkForce false;
+              virtualisation.vlans = [ 1 ];
+              networking.useNetworkd = true;
+              networking.useDHCP = false;
+              networking.interfaces.eth1.ipv4.addresses = [
+                {
+                  address = "10.1.0.2";
+                  prefixLength = 24;
+                }
+              ];
+              networking.interfaces.eth1.ipv6.addresses = [
+                {
+                  address = "fd00:1::2";
+                  prefixLength = 64;
+                }
+              ];
+              environment.systemPackages = [ (pkgs.python3.withPackages (ps: [ ps.scapy ])) ];
+            };
+          fw =
+            { lib, ... }:
+            {
+              imports = [ self.nixosModules.sentinel ];
+              networking.hostName = lib.mkForce "fw";
+              networking.firewall.enable = lib.mkForce false;
+              virtualisation.vlans = [ 1 ];
+              virtualisation.memorySize = 2048;
+              networking.interfaces.eth1.ipv4.addresses = [
+                {
+                  address = "10.1.0.1";
+                  prefixLength = 24;
+                }
+              ];
+              networking.interfaces.eth1.ipv6.addresses = [
+                {
+                  address = "fd00:1::1";
+                  prefixLength = 64;
+                }
+              ];
+              # Off, so that a drop observed here is the data plane's and not the
+              # kernel's — the same reason the spoofing test disables it.
+              boot.kernel.sysctl = {
+                "net.ipv4.conf.all.rp_filter" = 0;
+                "net.ipv4.conf.default.rp_filter" = 0;
+              };
+              services.velstra.interface = lib.mkForce "eth1";
+            };
+        };
+        testScript = ''
+          start_all()
+          fw.wait_for_unit("multi-user.target")
+          fw.wait_for_unit("velstra.service")
+          guest.wait_for_unit("multi-user.target")
+          fw.wait_until_succeeds("ip addr show eth1 | grep -q 10.1.0.1", timeout=20)
+
+          def refused(_=0):
+              """Packets the data plane refused because the port is not theirs."""
+              fw.wait_until_succeeds(
+                  "sentinel show firewall statistics > /tmp/stats; "
+                  "grep -c dropped_not_yours /tmp/stats",
+                  timeout=90,
+              )
+              out = fw.succeed("cat /tmp/stats")
+              for line in out.splitlines():
+                  if "dropped_not_yours" in line:
+                      return int(line.split()[-1])
+              raise Exception("no dropped_not_yours counter:\n" + out)
+
+          def wait_refused(at_least):
+              fw.wait_until_succeeds(
+                  "sentinel show firewall statistics > /tmp/stats; "
+                  f"test $(awk '/dropped_not_yours/ {{print $NF}}' /tmp/stats) -ge {at_least}",
+                  timeout=30,
+              )
+
+          def scapy(guest_code):
+              guest.succeed(
+                  "python3 -c \"from scapy.all import *; " + guest_code + "\""
+              )
+
+          def apply(*lines):
+              cmds = " ".join(f"'{l}'" for l in lines)
+              fw.succeed(
+                  "su admin -c \"printf '%s\\n' " + cmds
+                  + " commit save exit | sentinel configure\""
+              )
+
+          mac = guest.succeed("cat /sys/class/net/eth1/address").strip()
+
+          with subtest("an unbound port is nobody's to police"):
+              apply(
+                  "set interface eth1 zone wan",
+                  "set firewall zone wan default-action accept",
+              )
+              fw.wait_for_unit("velstra.service")
+              # Nothing about binding reaches the data plane, and the guest is
+              # free to claim any address it likes.
+              fw.fail("grep -q bind_mac /run/sentinel/velstra.toml")
+              before = refused(0)
+              scapy("send(IP(src='10.1.0.99',dst='10.1.0.1')/ICMP(), count=3, iface='eth1', verbose=0)")
+              assert refused(0) == before, "an unbound port refused something"
+
+          with subtest("a bound port still carries its own guest"):
+              apply(
+                  f"set interface eth1 port-security mac {mac}",
+                  "set interface eth1 port-security address 10.1.0.2",
+              )
+              fw.wait_for_unit("velstra.service")
+              fw.succeed("grep -q bind_mac /run/sentinel/velstra.toml")
+              # The binding is what the guest actually is, so nothing changes for
+              # it. Asserted first: a port-security feature that breaks the
+              # legitimate tenant is worse than none.
+              guest.succeed("ping -c 2 -W 5 10.1.0.1")
+
+          with subtest("a forged address is refused"):
+              before = refused(0)
+              scapy("send(IP(src='10.1.0.99',dst='10.1.0.1')/ICMP(), count=3, iface='eth1', verbose=0)")
+              wait_refused(before + 1)
+
+          with subtest("a forged MAC is refused"):
+              before = refused(0)
+              scapy(
+                  "sendp(Ether(src='02:de:ad:be:ef:01')/IP(src='10.1.0.2',dst='10.1.0.1')/ICMP(), "
+                  "count=3, iface='eth1', verbose=0)"
+              )
+              wait_refused(before + 1)
+
+          # IPv6 was the half that was never enforced: the control plane computed
+          # PORT_ENFORCE_V6, wrote it into the binding, and the data plane never
+          # read the flag. A port that declared IPv6 addresses therefore reported
+          # source enforcement it did not have. The test covered exactly what the
+          # code covered, which is how it survived.
+          with subtest("a bound port still carries its guest's IPv6"):
+              apply("set interface eth1 port-security address fd00:1::2")
+              fw.wait_for_unit("velstra.service")
+              guest.wait_until_succeeds("ping -6 -c 2 -W 5 fd00:1::1", timeout=30)
+
+          with subtest("a forged IPv6 source is refused"):
+              before = refused(0)
+              scapy(
+                  "send(IPv6(src='fd00:1::99',dst='fd00:1::1')/ICMPv6EchoRequest(), "
+                  "count=3, iface='eth1', verbose=0)"
+              )
+              wait_refused(before + 1)
+
+          with subtest("neighbour discovery still works from link-local"):
+              # The one place IPv6 differs in kind: a host derives its own
+              # link-local address, so no platform can have put it in the bound
+              # set. Enforcing the set strictly would drop the packets that make
+              # IPv6 work, which is an outage rather than a defence.
+              before = refused(0)
+              scapy(
+                  "sendp(Ether(src='" + mac + "')/IPv6(src='fe80::dead:beef',dst='ff02::1')"
+                  "/ICMPv6ND_NS(tgt='fd00:1::1'), count=3, iface='eth1', verbose=0)"
+              )
+              assert refused(0) == before, "link-local neighbour discovery was refused"
+
+          with subtest("the binding survives a round trip"):
+              out = fw.succeed("su admin -c 'sentinel show configuration'")
+              assert f"port-security mac {mac}" in out, out
+              assert "port-security address 10.1.0.2" in out, out
+              assert "port-security address fd00:1::2" in out, out
+
+          with subtest("unbinding gives the port back"):
+              apply("delete interface eth1 port-security")
+              fw.wait_for_unit("velstra.service")
+              fw.fail("grep -q bind_mac /run/sentinel/velstra.toml")
+              before = refused(0)
+              scapy("send(IP(src='10.1.0.99',dst='10.1.0.1')/ICMP(), count=3, iface='eth1', verbose=0)")
+              assert refused(0) == before, "an unbound port still refused something"
+        '';
+      };
+
       spoofing = pkgs.testers.runNixOSTest {
         name = "sentinel-spoofing";
         nodes = {
@@ -9904,6 +10434,107 @@
         # TCP-MSS-clamp nftables table (the `--clamp-mss-to-pmtu` equivalent) is
         # loaded into the kernel.
         #   nix build .#checks.x86_64-linux.pppoe -L
+        # C17, the other half: this appliance as the access concentrator, with
+        # another appliance dialling it. Its sibling `pppoe` proves our client
+        # against a stock rp-pppoe concentrator, which is an interop claim and
+        # worth keeping; this one proves the pair, which is the claim a BNG makes.
+        #   nix build .#checks.x86_64-linux.bng -L
+        bng = pkgs.testers.runNixOSTest {
+          name = "sentinel-bng";
+          nodes =
+            let
+              appliance = host: { lib, ... }: {
+                imports = [ self.nixosModules.sentinel ];
+                networking.hostName = lib.mkForce host;
+                networking.firewall.enable = lib.mkForce false;
+                virtualisation.vlans = [ 1 ];
+                virtualisation.memorySize = 2048;
+                # The subscriber segment carries no L3 address on either side:
+                # PPPoE discovery and session are L2, and the addresses come out
+                # of the concentrator's pool. `services.velstra.interface` names
+                # it only because the agent needs some link to attach to.
+                systemd.network.networks."10-eth1" = {
+                  matchConfig.Name = "eth1";
+                  networkConfig.LinkLocalAddressing = "no";
+                  linkConfig.RequiredForOnline = false;
+                };
+                services.velstra.interface = lib.mkForce "eth1";
+              };
+            in
+            {
+              bng = appliance "bng";
+              sub = appliance "sub";
+            };
+          testScript = ''
+            start_all()
+            for m in (bng, sub):
+                m.wait_for_unit("multi-user.target")
+                m.succeed("ip link set eth1 up")
+
+            def apply(m, *lines):
+                cmds = " ".join(f"'{l}'" for l in lines)
+                m.succeed(
+                    "su admin -c \"printf '%s\\n' " + cmds
+                    + " commit save exit | sentinel configure\""
+                )
+
+            with subtest("a concentrator half-configured does not answer at all"):
+                # Answering PADI and then failing every session looks to a
+                # subscriber exactly like a broken line rather than a box nobody
+                # finished setting up.
+                apply(bng, "set services pppoe-server interface eth1")
+                bng.fail("systemctl is-active sentinel-pppoe-server.service")
+
+            with subtest("a configured concentrator serves"):
+                apply(
+                    bng,
+                    "set services pppoe-server local-address 10.90.0.1",
+                    "set services pppoe-server pool-start 10.90.0.100",
+                    "set services pppoe-server ac-name bng-1",
+                    "set services pppoe-server dns 10.90.0.1",
+                    "set services pppoe-server user alice password s3cret",
+                )
+                bng.wait_for_unit("sentinel-pppoe-server.service")
+                # The subscriber's row names this concentrator rather than `*`:
+                # a secrets row is a table row, not a direction.
+                out = bng.succeed("cat /run/sentinel/ppp/chap-secrets")
+                assert '"alice"\t"bng-1"' in out, out
+
+            with subtest("a subscriber dials in and is given an address"):
+                apply(
+                    sub,
+                    "set interface ppp0 type pppoe",
+                    "set interface ppp0 parent eth1",
+                    "set interface ppp0 pppoe username alice",
+                    "set interface ppp0 pppoe password s3cret",
+                )
+                sub.wait_for_unit("sentinel-pppoe@ppp0.service")
+                sub.wait_until_succeeds(
+                    "ip -4 addr show ppp0 | grep -q 10.90.0.100", timeout=90
+                )
+                # Both directions: a session that carries traffic one way is a
+                # session that has not been tested.
+                sub.succeed("ping -c 2 -W 5 10.90.0.1")
+                bng.succeed("ping -c 2 -W 5 10.90.0.100")
+
+            with subtest("the wrong secret is refused"):
+                # The concentrator authenticates rather than handing an address
+                # to whoever asks — which is the difference between a BNG and an
+                # open relay.
+                apply(sub, "set interface ppp0 pppoe password wrong")
+                sub.wait_until_fails("ping -c 2 -W 5 10.90.0.1", timeout=90)
+                apply(sub, "set interface ppp0 pppoe password s3cret")
+                sub.wait_until_succeeds("ping -c 3 -W 5 10.90.0.1", timeout=120)
+
+            with subtest("taking the concentrator away stops it answering"):
+                apply(bng, "delete services pppoe-server")
+                bng.fail("systemctl is-active sentinel-pppoe-server.service")
+                # And it says so in the configuration rather than only in a unit.
+                out = bng.succeed("su admin -c 'sentinel show configuration'")
+                assert "pppoe-server" not in out, out
+          '';
+        };
+
         pppoe = pkgs.testers.runNixOSTest {
           name = "sentinel-pppoe";
           nodes = {

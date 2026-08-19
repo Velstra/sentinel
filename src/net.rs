@@ -19,9 +19,9 @@ use anyhow::{Context, Result};
 
 use crate::config::{
     Appliance, BridgePort, Dhcp6Client, DhcpClient, DhcpRelay, DhcpServer, Dns, Dyndns, IfaceType,
-    Interface, Ip6Options, IpOptions, Lldp, Mdns, MultiWan, Nat64, Ntp, Qos, QosDiscipline,
-    RouterAdvert, Snmp, Ssh, Syslog, SyslogLevel, SyslogProto, WAN_CHECK_FAIL, WAN_CHECK_INTERVAL,
-    WAN_CHECK_RISE, WAN_CHECK_TIMEOUT, WanMode, WireguardTunnel,
+    Interface, Ip6Options, IpOptions, Lldp, Mdns, MultiWan, Nat64, Ntp, PppoeServer, Qos,
+    QosDiscipline, RouterAdvert, Snmp, Ssh, Syslog, SyslogLevel, SyslogProto, WAN_CHECK_FAIL,
+    WAN_CHECK_INTERVAL, WAN_CHECK_RISE, WAN_CHECK_TIMEOUT, WanMode, WireguardTunnel,
 };
 use crate::system::{self, NETWORKD_RUNTIME_DIR};
 
@@ -2120,6 +2120,9 @@ const API_ENV: &str = "/run/sentinel/api.env";
 // and the firewall silently did not run at all.
 const AGENT_ENV: &str = "/run/sentinel/velstra.env";
 const AGENT_UNIT: &str = "velstra.service";
+/// The routing daemon's control socket, which is also where its FlowSpec feed
+/// comes from. One socket, one daemon.
+const WREN_SOCKET: &str = "/run/wren/wren.sock";
 const API_UNIT: &str = "sentinel-api.service";
 
 /// Reconcile the receiving side of HA config sync to `[system.config-sync]`: a
@@ -2455,6 +2458,18 @@ const PPPOE_PEERS_DIR: &str = "/run/sentinel/ppp/peers";
 /// `/etc/ppp/{chap,pap}-secrets` lookup paths here.
 const PPP_CHAP_SECRETS: &str = "/run/sentinel/ppp/chap-secrets";
 const PPP_PAP_SECRETS: &str = "/run/sentinel/ppp/pap-secrets";
+/// The pppd options every accepted subscriber session runs with (C17), and the
+/// concentrator's own arguments as an environment file its unit reads.
+///
+/// Beside the other rendered files rather than in the `ppp/` directory next to
+/// the credentials, and the reason is not tidiness: that directory is 0700 and
+/// `sentinel` runs as the admin account, so a `Path::exists()` inside it answers
+/// "no" for a file that is plainly there. Neither of these holds a secret — the
+/// passwords are in `chap-secrets` — so keeping them where the process can read
+/// them removes a whole class of wrong answer rather than working around it.
+const PPPOE_SERVER_OPTIONS: &str = "/run/sentinel/pppoe-server-options";
+const PPPOE_SERVER_ARGS: &str = "/run/sentinel/pppoe-server.env";
+const PPPOE_SERVER_UNIT: &str = "sentinel-pppoe-server.service";
 
 /// Render a pppd peer-options file for a PPPoE client interface. pppd's bundled
 /// `pppoe.so` plugin rides on `parent` (the raw uplink NIC, given as `nic-<if>`);
@@ -2508,9 +2523,10 @@ fn pppoe_peer_body(iface: &Interface) -> String {
 /// PPPoE interface). The same body is written to both the CHAP and PAP paths, so
 /// whichever auth the ISP negotiates finds the credential. `None` when no PPPoE
 /// interface is configured.
-fn ppp_secrets_body(ifaces: &[Interface]) -> Option<String> {
+fn ppp_secrets_body(ifaces: &[Interface], bng: &PppoeServer) -> Option<String> {
     let ppp: Vec<&Interface> = ifaces.iter().filter(|i| is_active_pppoe(i)).collect();
-    if ppp.is_empty() {
+    let serving = bng.runnable();
+    if ppp.is_empty() && !(serving && !bng.users.is_empty()) {
         return None;
     }
     let mut body =
@@ -2520,7 +2536,59 @@ fn ppp_secrets_body(ifaces: &[Interface]) -> Option<String> {
             body.push_str(&format!("\"{}\"\t*\t\"{}\"\t*\n", p.username, p.password));
         }
     }
+    // The subscribers this box accepts (roadmap C17). Their **server** field is
+    // this concentrator's name rather than `*`, and the session options set
+    // `name` to match. A secrets row is a table row and not a direction: with
+    // `*` here, an ISP login this box uses upstream would also be a login into
+    // it, which is not a thing anybody configured and not a thing they would
+    // find by reading either half.
+    //
+    // The fourth field is the address the subscriber may have. Naming one both
+    // authorises and assigns it; `*` leaves the address to the pool.
+    if serving && !bng.users.is_empty() {
+        let ac = server_name(bng);
+        body.push_str("# subscribers of this box's own concentrator\n");
+        for u in &bng.users {
+            let addr = u.address.as_deref().unwrap_or("*");
+            body.push_str(&format!(
+                "\"{}\"\t\"{ac}\"\t\"{}\"\t{addr}\n",
+                u.name, u.password
+            ));
+        }
+    }
     Some(body)
+}
+
+/// The name this concentrator answers to and authenticates as. The configured
+/// `ac-name`, or the box's hostname — which is what an operator would expect to
+/// see in a subscriber's log.
+fn server_name(bng: &PppoeServer) -> String {
+    bng.ac_name.clone().unwrap_or_else(system::current_hostname)
+}
+
+/// The pppd options every accepted session runs with.
+///
+/// Addresses are **not** here: `pppoe-server` puts `<local>:<remote>` on each
+/// session's command line, and a second opinion in this file would be one that
+/// silently wins or silently loses depending on pppd's option order.
+fn pppoe_server_options_body(bng: &PppoeServer) -> String {
+    let mtu = bng.mtu.unwrap_or(1492);
+    let mut body = String::from("# rendered by sentinel — PPPoE server session options\n");
+    // `auth` and nothing weaker: a concentrator that accepts an unauthenticated
+    // session is one that hands an address to whoever asks.
+    body.push_str("auth\n");
+    body.push_str(&format!("name \"{}\"\n", server_name(bng)));
+    body.push_str(&format!("mtu {mtu}\nmru {mtu}\n"));
+    for d in &bng.dns {
+        body.push_str(&format!("ms-dns {d}\n"));
+    }
+    // A subscriber's link is not this box's way out: a default route learned
+    // from a session would point the concentrator at one of its own customers.
+    body.push_str("nodefaultroute\n");
+    // A dead session holds an address out of the pool until something notices,
+    // so something notices.
+    body.push_str("lcp-echo-interval 20\nlcp-echo-failure 3\n");
+    body
 }
 
 /// Whether writing `body` to `path` would change what is already there (or the
@@ -2571,9 +2639,11 @@ fn apply_pppoe(appliance: &Appliance) -> Result<()> {
 
     // Credentials (CHAP + PAP). A change re-dials every session (any could use
     // the changed line). Removed when no PPPoE interface remains.
-    match ppp_secrets_body(ifaces) {
+    let mut secrets_changed = false;
+    match ppp_secrets_body(ifaces, &appliance.services.pppoe_server) {
         Some(body) => {
             let changed = file_changed(Path::new(PPP_CHAP_SECRETS), &body);
+            secrets_changed = changed;
             system::install_ppp_secret(Path::new(PPP_CHAP_SECRETS), &body)?;
             system::install_ppp_secret(Path::new(PPP_PAP_SECRETS), &body)?;
             if changed {
@@ -2598,7 +2668,85 @@ fn apply_pppoe(appliance: &Appliance) -> Result<()> {
             );
         }
     }
+
+    apply_pppoe_server(appliance, secrets_changed)
+}
+
+/// The concentrator's own session options and unit (roadmap C17).
+///
+/// Separate from the client loop above and sharing only the secrets file, which
+/// is the one thing the two halves genuinely have in common. `secrets_changed`
+/// comes from that shared write: a subscriber whose password was just edited
+/// must not keep its session on the old one.
+fn apply_pppoe_server(appliance: &Appliance, secrets_changed: bool) -> Result<()> {
+    let bng = &appliance.services.pppoe_server;
+    if !bng.runnable() {
+        // Whether one is running is asked of **systemd**, not of the rendered
+        // file. The files live in the 0700 directory that holds the credentials,
+        // and `sentinel` runs as the admin account rather than as root: a
+        // `Path::exists()` there answers "no" for a file that is plainly present,
+        // because the process may not stat inside the directory at all. That
+        // false negative left a concentrator answering PADI after its
+        // configuration had been deleted, and it is not a thing a test of the
+        // rendering could have caught. `systemctl is-active` needs no privilege.
+        if system::unit_active(PPPOE_SERVER_UNIT) {
+            // Said out loud: a concentrator going away takes every subscriber
+            // with it, and an operator who removed one line should see that
+            // rather than discover it from a support call.
+            println!("pppoe-server: no concentrator configured; stopping it");
+            if let Err(e) = system::service_stop(PPPOE_SERVER_UNIT) {
+                eprintln!("warning: stopping {PPPOE_SERVER_UNIT}: {e}");
+            }
+            // Best-effort, and for the same reason: the removal is tidiness, and
+            // the unit being stopped is what actually matters.
+            let _ = system::remove_file(Path::new(PPPOE_SERVER_OPTIONS));
+            let _ = system::remove_file(Path::new(PPPOE_SERVER_ARGS));
+        }
+        return Ok(());
+    }
+
+    let options = pppoe_server_options_body(bng);
+    let args = pppoe_server_args_body(bng);
+    let changed = file_changed(Path::new(PPPOE_SERVER_OPTIONS), &options)
+        || file_changed(Path::new(PPPOE_SERVER_ARGS), &args)
+        || secrets_changed;
+    system::install_file(Path::new(PPPOE_SERVER_OPTIONS), &options)?;
+    system::install_file(Path::new(PPPOE_SERVER_ARGS), &args)?;
+    if changed {
+        // Restart, not reload: `pppoe-server` reads its arguments once, at
+        // start. Live sessions go with it, which is why the change detection
+        // above is per-file rather than "something in the config moved".
+        if let Err(e) = system::service_restart(PPPOE_SERVER_UNIT) {
+            eprintln!(
+                "warning: (re)starting {PPPOE_SERVER_UNIT} failed \
+                 (applies on next start): {e}"
+            );
+        }
+    }
     Ok(())
+}
+
+/// The concentrator's command-line arguments, as an environment file the unit
+/// splices in.
+///
+/// A file rather than a fixed `ExecStart`, for the same reason the data plane's
+/// interface is one: which link to serve on and which addresses to hand out are
+/// decisions an operator makes at run time, and a unit rebuilt to change them
+/// would need a new image.
+fn pppoe_server_args_body(bng: &PppoeServer) -> String {
+    let iface = bng.interface.as_deref().unwrap_or_default();
+    let local = bng.local_address.as_deref().unwrap_or_default();
+    let pool = bng.pool_start.as_deref().unwrap_or_default();
+    let max = bng.max_sessions.unwrap_or(64);
+    let mut args = format!(
+        "-F -I {iface} -L {local} -R {pool} -N {max} -C \"{}\"",
+        server_name(bng)
+    );
+    if let Some(sn) = &bng.service_name {
+        args.push_str(&format!(" -S \"{sn}\""));
+    }
+    args.push_str(&format!(" -O {PPPOE_SERVER_OPTIONS}"));
+    format!("PPPOE_SERVER_ARGS={args}\n")
 }
 
 // --- QoS / traffic shaping (roadmap C8) ------------------------------------
@@ -3244,7 +3392,24 @@ fn apply_agent_iface(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
              cannot attach and is not filtering. `show interfaces` lists the real names."
         );
     }
-    let env = format!("VELSTRA_IFACE={iface}\n");
+    // A3: whether the agent enforces what BGP peers advertise, as arguments the
+    // unit splices in. Written here rather than baked into the unit for the same
+    // reason the interface is: it is a decision an operator makes at run time,
+    // and a unit rebuilt to change it would need a new image.
+    let bgp = &appliance.protocols.bgp;
+    let flowspec = match bgp.as_ref().filter(|b| b.flowspec_enforce) {
+        Some(b) => {
+            let floor = b.flowspec_min_prefix.unwrap_or(8);
+            format!(
+                "VELSTRA_FLOWSPEC_ARGS=--flowspec --wren-socket {WREN_SOCKET}                  --flowspec-min-prefix {floor}\n"
+            )
+        }
+        // Empty rather than absent: systemd drops an empty `$VAR` from the
+        // command line entirely, so this is how the arguments go away again when
+        // enforcement is turned off.
+        None => "VELSTRA_FLOWSPEC_ARGS=\n".to_string(),
+    };
+    let env = format!("VELSTRA_IFACE={iface}\n{flowspec}");
     let changed = file_changed(Path::new(AGENT_ENV), &env);
     system::install_file(Path::new(AGENT_ENV), &env)?;
     if changed && mode == ApplyMode::Live {
@@ -4242,6 +4407,9 @@ mod tests {
         let mv = Interface {
             name: "mv0".into(),
             hw_id: None,
+            bind_mac: None,
+            bind_addresses: Vec::new(),
+            ingress_limit: None,
             offload: Default::default(),
             vti_key: None,
             wireless: None,
@@ -4394,6 +4562,9 @@ mod tests {
         let gre = Interface {
             name: "gre0".into(),
             hw_id: None,
+            bind_mac: None,
+            bind_addresses: Vec::new(),
+            ingress_limit: None,
             offload: Default::default(),
             vti_key: None,
             wireless: None,
@@ -4744,6 +4915,9 @@ mod tests {
         let ifaces = vec![Interface {
             name: "lan0".into(),
             hw_id: None,
+            bind_mac: None,
+            bind_addresses: Vec::new(),
+            ingress_limit: None,
             offload: Default::default(),
             vti_key: None,
             wireless: None,
@@ -5008,6 +5182,9 @@ mod tests {
         let br = Interface {
             name: "br0".into(),
             hw_id: None,
+            bind_mac: None,
+            bind_addresses: Vec::new(),
+            ingress_limit: None,
             offload: Default::default(),
             vti_key: None,
             wireless: None,
@@ -5083,6 +5260,9 @@ mod tests {
         let bond = Interface {
             name: "bond0".into(),
             hw_id: None,
+            bind_mac: None,
+            bind_addresses: Vec::new(),
+            ingress_limit: None,
             offload: Default::default(),
             vti_key: None,
             wireless: None,
@@ -5273,6 +5453,9 @@ mod tests {
         let br = Interface {
             name: "br0".into(),
             hw_id: None,
+            bind_mac: None,
+            bind_addresses: Vec::new(),
+            ingress_limit: None,
             offload: Default::default(),
             vti_key: None,
             wireless: None,
@@ -5337,6 +5520,9 @@ mod tests {
         Interface {
             name: "ppp0".into(),
             hw_id: None,
+            bind_mac: None,
+            bind_addresses: Vec::new(),
+            ingress_limit: None,
             offload: Default::default(),
             vti_key: None,
             wireless: None,
@@ -5414,13 +5600,14 @@ mod tests {
     #[test]
     fn ppp_secrets_body_lists_credentials_only_for_pppoe() {
         let ifaces = vec![pppoe_iface("eth0", "user@isp.de", "s3cret")];
-        let body = ppp_secrets_body(&ifaces).expect("a pppoe interface yields secrets");
+        let body = ppp_secrets_body(&ifaces, &PppoeServer::default())
+            .expect("a pppoe interface yields secrets");
         assert!(
             body.contains("\"user@isp.de\"\t*\t\"s3cret\"\t*"),
             "got:\n{body}"
         );
         // No PPPoE interface → no secrets file at all.
-        assert!(ppp_secrets_body(&[]).is_none());
+        assert!(ppp_secrets_body(&[], &PppoeServer::default()).is_none());
     }
 
     /// Steering renders into the daemon as a preference of *indices*, resolved
@@ -5588,7 +5775,7 @@ mod tests {
         assert!(!is_active_pppoe(&iface));
         // No credentials are rendered for it.
         assert!(
-            ppp_secrets_body(std::slice::from_ref(&iface)).is_none(),
+            ppp_secrets_body(std::slice::from_ref(&iface), &PppoeServer::default()).is_none(),
             "disabled pppoe must not emit credentials"
         );
         // The MSS clamp moved into the data plane, so there is no ruleset to
@@ -5599,7 +5786,120 @@ mod tests {
         let mut enabled = pppoe_iface("eth0", "user@isp.de", "s3cret");
         enabled.disabled = false;
         assert!(is_active_pppoe(&enabled));
-        assert!(ppp_secrets_body(std::slice::from_ref(&enabled)).is_some());
+        assert!(
+            ppp_secrets_body(std::slice::from_ref(&enabled), &PppoeServer::default()).is_some()
+        );
+    }
+
+    fn bng(users: &[(&str, &str, Option<&str>)]) -> PppoeServer {
+        PppoeServer {
+            interface: Some("eth1".into()),
+            local_address: Some("10.90.0.1".into()),
+            pool_start: Some("10.90.0.100".into()),
+            users: users
+                .iter()
+                .map(|(n, p, a)| crate::config::PppoeUser {
+                    name: (*n).to_string(),
+                    password: (*p).to_string(),
+                    address: a.map(str::to_string),
+                })
+                .collect(),
+            ..PppoeServer::default()
+        }
+    }
+
+    #[test]
+    fn a_concentrator_needs_a_link_an_address_and_a_pool_before_it_runs() {
+        // Answering PADI and then failing every session looks to a subscriber
+        // exactly like a broken line rather than an unconfigured box.
+        let mut half = PppoeServer {
+            interface: Some("eth1".into()),
+            ..PppoeServer::default()
+        };
+        assert!(!half.runnable(), "a link alone is not a concentrator");
+        half.local_address = Some("10.90.0.1".into());
+        assert!(!half.runnable(), "no pool to hand out");
+        half.pool_start = Some("10.90.0.100".into());
+        assert!(half.runnable());
+    }
+
+    #[test]
+    fn a_subscriber_row_names_this_concentrator_as_its_server() {
+        // A secrets row is a table row, not a direction. With `*` in the server
+        // field an ISP login this box uses upstream would also be a login *into*
+        // it — which nobody configured and nobody would find by reading either
+        // half.
+        let mut server = bng(&[("alice", "s3cret", None)]);
+        server.ac_name = Some("bng-1".into());
+        let body = ppp_secrets_body(&[], &server).expect("subscribers yield credentials");
+        assert!(
+            body.contains("\"alice\"\t\"bng-1\"\t\"s3cret\"\t*"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("\"alice\"\t*"),
+            "the row is not direction-free: {body}"
+        );
+    }
+
+    #[test]
+    fn a_fixed_address_rides_in_the_row_that_authorises_it() {
+        let mut server = bng(&[("bob", "pw", Some("10.90.0.7"))]);
+        server.ac_name = Some("bng-1".into());
+        let body = ppp_secrets_body(&[], &server).unwrap();
+        assert!(body.contains("10.90.0.7"), "{body}");
+    }
+
+    #[test]
+    fn both_halves_share_one_secrets_file_without_sharing_a_row() {
+        let mut server = bng(&[("alice", "s3cret", None)]);
+        server.ac_name = Some("bng-1".into());
+        let client = pppoe_iface("eth0", "user@isp.de", "isp-pw");
+        let body = ppp_secrets_body(std::slice::from_ref(&client), &server).unwrap();
+        assert!(
+            body.contains("\"user@isp.de\"\t*"),
+            "the client row is gone: {body}"
+        );
+        assert!(
+            body.contains("\"alice\"\t\"bng-1\""),
+            "the server row is gone: {body}"
+        );
+    }
+
+    #[test]
+    fn the_session_options_carry_no_addresses() {
+        // `pppoe-server` puts `<local>:<remote>` on each session's command line.
+        // A second opinion here would silently win or lose on option order.
+        let body = pppoe_server_options_body(&bng(&[]));
+        assert!(!body.contains("10.90.0.1"), "{body}");
+        assert!(
+            body.contains("auth"),
+            "an unauthenticated concentrator: {body}"
+        );
+        assert!(body.contains("nodefaultroute"), "{body}");
+    }
+
+    #[test]
+    fn the_arguments_name_the_link_the_gateway_and_the_pool() {
+        let args = pppoe_server_args_body(&bng(&[]));
+        assert!(args.contains("-I eth1"), "{args}");
+        assert!(args.contains("-L 10.90.0.1"), "{args}");
+        assert!(args.contains("-R 10.90.0.100"), "{args}");
+        assert!(
+            args.contains("-N 64"),
+            "the default session ceiling is gone: {args}"
+        );
+    }
+
+    #[test]
+    fn a_service_name_is_offered_only_when_one_was_asked_for() {
+        // Announcing a service name a subscriber did not ask for is how a PADI
+        // goes unanswered.
+        let plain = pppoe_server_args_body(&bng(&[]));
+        assert!(!plain.contains("-S"), "{plain}");
+        let mut named = bng(&[]);
+        named.service_name = Some("velstra".into());
+        assert!(pppoe_server_args_body(&named).contains("-S \"velstra\""));
     }
 
     #[test]
@@ -5985,6 +6285,9 @@ mod tests {
         Interface {
             name: name.into(),
             hw_id: None,
+            bind_mac: None,
+            bind_addresses: Vec::new(),
+            ingress_limit: None,
             offload: Default::default(),
             vti_key: None,
             wireless: None,

@@ -101,6 +101,7 @@ interface host-name
 interface hw-id
 interface igmp-querier
 interface igmp-snooping
+interface ingress-limit
 interface interval
 interface ip
 interface ip-type
@@ -303,6 +304,8 @@ protocols export
 protocols ext-community
 protocols extended-nexthop
 protocols flowspec
+protocols flowspec-enforce
+protocols flowspec-min-prefix
 protocols graceful-restart
 protocols graceful-restart-period
 protocols hello-interval
@@ -376,6 +379,8 @@ protocols via
 protocols virtual-address
 protocols vrf
 protocols vrid
+services ac-name
+services address
 services allow
 services allow-from
 services allow-privileged
@@ -391,6 +396,7 @@ services community
 services contact
 services description
 services disabled
+services dns
 services dnssec
 services domain
 services dont-query
@@ -405,17 +411,21 @@ services interval
 services level
 services listen
 services listen-address
+services local-address
 services local-domain
 services location
 services login
 services loglevel
 services max-lifetime
+services max-sessions
 services message
+services mtu
 services negative-ttl
 services never-block
 services passphrase
 services password
 services password-authentication
+services pool-start
 services port
 services proto
 services provider
@@ -426,6 +436,7 @@ services secure-upstream
 services serve-on
 services server
 services server6
+services service-name
 services session-timeout
 services sni-block
 services starttls
