@@ -1,14 +1,36 @@
 name: CI
 
+# The appliance is proved by booting it, so most of this file is about getting a
+# hosted runner into a state where it can boot a VM at all.
+#
+#   check        — cargo fmt/clippy/test/build. Every push and pull request,
+#                  no KVM, a couple of minutes.
+#   nixos-tests  — a curated cross-section of the nixosTests, per pull request.
+#   nixos-full   — nightly: every `checks.x86_64-linux.*` attribute in the flake,
+#                  discovered from the flake rather than listed here, sharded so
+#                  each leg runs a handful. There are 90-odd of them and each one
+#                  boots at least one VM; running them all on every push would
+#                  take hours and running them in one job would take longer than
+#                  a job is allowed to live.
+#   images       — nightly: the disk image and the installer ISO. Nothing else
+#                  builds them, so without this they rot silently between
+#                  releases.
+
 on:
   push:
     branches: [main, master]
   pull_request:
   schedule:
-    # Nightly: run the FULL `nix flake check` (all ~40 VM tests). This is the
-    # exhaustive integration proof; the per-PR job below runs only a curated
-    # subset so pushes stay fast.
     - cron: "0 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege by default; no job here writes anything back to the repo.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,51 +40,55 @@ jobs:
   # every push/PR and does NOT need KVM.
   check:
     name: fmt, clippy, test, build
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       # No system protoc needed: velstra-proto vendors its own.
+      # There is no rustfmt.toml here, so stable rustfmt is the whole story and
+      # `--check` is a real gate (unlike the wren repository, where it is not).
+      #
+      # Do not set CARGO_TARGET_DIR in this job: `grammar_walk` writes its report
+      # to a relative `target/`, and moving the target directory turns that test
+      # into a "No such file or directory" panic that has nothing to do with the
+      # grammar.
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
-      - run: cargo build --release
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --release --locked
 
   # Integration proof: the nixosTests boot real VMs and exercise the appliance
-  # end-to-end, so they genuinely need hardware virtualization. GitHub-hosted
-  # `ubuntu-24.04` runners expose /dev/kvm (nested virt), which the Nix VM tests
-  # use. We run a curated, representative subset in a matrix so the legs run in
-  # parallel and the job stays reasonable on every PR.
+  # end-to-end, so they genuinely need hardware virtualization. A curated subset
+  # runs in a matrix on every pull request; the whole set runs nightly.
   #
-  # To add more coverage per-PR, append the check's attrname (from
-  # `checks.x86_64-linux.<name>` in flake.nix) to the matrix below. The complete
-  # set (~40 tests) runs nightly via the `flake-check-full` job, or locally with
-  # `nix flake check -L`.
+  # To add coverage per-PR, append the check's attrname (from
+  # `checks.x86_64-linux.<name>` in flake.nix) to the matrix below.
   nixos-tests:
     name: "nixosTest: ${{ matrix.check }}"
-    # Skip on the nightly schedule — the full run below covers everything.
     if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         # Curated cross-section: commit pipeline, reboot persistence, the REST
-        # API, on-box PKI, DNS, LLDP, one routing protocol (BGP), and NAT64.
-        # Every name here is a real `checks.x86_64-linux.<name>` attribute.
+        # API, the web console, on-box PKI, DNS, LLDP, one routing protocol
+        # (BGP), NAT and the firewall's own datapath.
         check:
           - commit
           - reboot
           - api
+          - console
           - pki
           - dns
           - lldp
           - bgp
-          - nat64
+          - nat
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # nixosTests build a full NixOS VM (kernel + qemu + system closure), which
       # needs far more than a stock runner's free disk. Reclaim the space the
       # hosted image wastes on toolchains we don't use.
@@ -72,51 +98,195 @@ jobs:
             /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
           sudo docker image prune --all --force || true
           df -h /
-      # Hard requirement: without /dev/kvm the VM tests can't boot. Fail loudly
-      # rather than silently skipping — a "green" run without KVM proves nothing.
-      - name: Verify KVM is available
+      # /dev/kvm is present on hosted x86 Linux runners, but it is root:kvm 0660
+      # and this user is not in that group — so a job that skips this finds a
+      # device it cannot open, and qemu falls back to emulation slow enough to
+      # time every test out. GitHub calls nested virtualization
+      # unsupported-but-present: if an image ever drops it, this step fails
+      # loudly rather than letting a VM-less run report success.
+      - name: Make KVM usable
         run: |
-          if [ ! -e /dev/kvm ]; then
-            echo "::error::/dev/kvm is missing — nixosTests require hardware virtualization."
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          if [ ! -w /dev/kvm ]; then
+            echo "::error::/dev/kvm is not writable — the VM tests cannot boot."
+            ls -l /dev/kvm || true
             exit 1
           fi
           ls -l /dev/kvm
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/nix-installer-action@v22
         with:
           extra-conf: |
             experimental-features = nix-command flakes
             system-features = nixos-test benchmark big-parallel kvm
-      # No magic-nix-cache: nixosTest closures are multi-GB and 8 matrix legs
+      # No magic-nix-cache: nixosTest closures are multi-GB and the matrix legs
       # exhaust the GitHub Actions cache rate limit (HTTP 418). nix pulls from
       # cache.nixos.org directly instead.
       - name: "nix build .#checks.x86_64-linux.${{ matrix.check }}"
         run: nix build -L ".#checks.x86_64-linux.${{ matrix.check }}"
 
-  # Nightly exhaustive run: every check in the flake. Only fires on the cron
-  # schedule so it never blocks a PR.
-  flake-check-full:
-    name: full nix flake check (nightly)
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-24.04
+  # Ask the flake what its checks are, and split them into shards.
+  #
+  # Listing them here instead would mean a check that nobody remembers to add is
+  # a check that never runs — which is the failure this whole file exists to
+  # prevent. Sharding rather than one-job-per-check because each job pays for
+  # its own Nix installation and closure download; a shard pays once and then
+  # runs eight VM tests.
+  enumerate:
+    name: enumerate the flake's checks
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.split.outputs.shards }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - uses: DeterminateSystems/nix-installer-action@v22
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+      - id: split
+        run: |
+          set -euo pipefail
+          names=$(nix eval --raw .#checks.x86_64-linux \
+            --apply 'cs: builtins.concatStringsSep " " (builtins.attrNames cs)')
+          echo "the flake has $(wc -w <<< "$names") checks:"
+          echo "$names" | tr ' ' '\n' | sed 's/^/  /'
+          read -ra all <<< "$names"
+          shards=12
+          groups=()
+          for ((i = 0; i < shards; i++)); do
+            g=""
+            # Round-robin rather than consecutive: the expensive checks (the
+            # installer, the image ones) sit next to each other alphabetically,
+            # and dealing them out spreads them over the legs.
+            for ((j = i; j < ${#all[@]}; j += shards)); do g="${g:+$g }${all[j]}"; done
+            groups+=("$g")
+          done
+          printf '%s\n' "${groups[@]}" \
+            | jq -R . \
+            | jq -sc 'to_entries | map({shard: ((.key + 1) | tostring), checks: .value})' \
+            > shards.json
+          cat shards.json
+          echo "shards=$(cat shards.json)" >> "$GITHUB_OUTPUT"
+
+  nixos-full:
+    name: "nixosTest shard ${{ matrix.shard }}/12"
+    needs: enumerate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.enumerate.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v7
+      # nixosTests build a full NixOS VM (kernel + qemu + system closure), which
+      # needs far more than a stock runner's free disk. Reclaim the space the
+      # hosted image wastes on toolchains we don't use.
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
           sudo docker image prune --all --force || true
           df -h /
-      - name: Verify KVM is available
+      # /dev/kvm is present on hosted x86 Linux runners, but it is root:kvm 0660
+      # and this user is not in that group — so a job that skips this finds a
+      # device it cannot open, and qemu falls back to emulation slow enough to
+      # time every test out. GitHub calls nested virtualization
+      # unsupported-but-present: if an image ever drops it, this step fails
+      # loudly rather than letting a VM-less run report success.
+      - name: Make KVM usable
         run: |
-          if [ ! -e /dev/kvm ]; then
-            echo "::error::/dev/kvm is missing — nixosTests require hardware virtualization."
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          if [ ! -w /dev/kvm ]; then
+            echo "::error::/dev/kvm is not writable — the VM tests cannot boot."
+            ls -l /dev/kvm || true
             exit 1
           fi
           ls -l /dev/kvm
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/nix-installer-action@v22
         with:
           extra-conf: |
             experimental-features = nix-command flakes
             system-features = nixos-test benchmark big-parallel kvm
-      # No magic-nix-cache (GitHub Actions cache rate limit at nixosTest scale).
-      - run: nix flake check -L
+      # One `nix build` per check rather than one for all of them: a shard that
+      # fails should say which check failed and still try the rest, and a single
+      # build of the whole shard stops at the first.
+      - name: Run this shard's checks
+        run: |
+          set -uo pipefail
+          checks="${{ matrix.checks }}"
+          failed=()
+          for c in $checks; do
+            echo "::group::$c"
+            if nix build -L ".#checks.x86_64-linux.$c"; then
+              echo "PASS: $c"
+            else
+              echo "FAIL: $c"
+              failed+=("$c")
+            fi
+            # A booted VM's closure is gigabytes and the runner has tens of them
+            # of disk. Drop this build's root, and collect only when the disk is
+            # actually tight — a `nix store gc` after every check would also
+            # throw away the shared nixpkgs the next one is about to want.
+            rm -f result
+            avail=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+            if [ "${avail:-0}" -lt 12 ]; then
+              echo "only ${avail}G left — collecting garbage"
+              nix store gc --quiet || true
+            fi
+            df -h / | tail -1
+            echo "::endgroup::"
+          done
+          if (( ${#failed[@]} )); then
+            echo "::error::failed checks: ${failed[*]}"
+            exit 1
+          fi
+
+  images:
+    name: disk image + installer ISO (nightly)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+      # nixosTests build a full NixOS VM (kernel + qemu + system closure), which
+      # needs far more than a stock runner's free disk. Reclaim the space the
+      # hosted image wastes on toolchains we don't use.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker image prune --all --force || true
+          df -h /
+      # The image builders run a VM of their own to lay the filesystem down, so
+      # this job wants KVM for the same reason the test jobs do.
+      - name: Make KVM usable
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          if [ ! -w /dev/kvm ]; then
+            echo "::error::/dev/kvm is not writable — the image build will crawl or fail."
+            ls -l /dev/kvm || true
+            exit 1
+          fi
+          ls -l /dev/kvm
+      - uses: DeterminateSystems/nix-installer-action@v22
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            system-features = nixos-test benchmark big-parallel kvm
+      # Built, measured, and thrown away. Publishing them is the release
+      # workflow's job; this one only answers "does it still build".
+      - run: nix build -L .#sentinel-image && du -sh "$(readlink -f result)" && rm -f result
+      - run: nix build -L .#sentinel-iso && du -sh "$(readlink -f result)" && rm -f result

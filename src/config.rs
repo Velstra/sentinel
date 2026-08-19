@@ -517,7 +517,6 @@ pub struct Appliance {
 /// the whole distribution path — in production it is baked into the immutable
 /// image; carrying it in config here lets an operator pin their own channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct UpdateChannel {
     /// Base URL of the update channel — the directory holding `manifest.json`
     /// (+ its `.sig`) and the images it names. Must be `https://` (or `file://`
@@ -535,7 +534,6 @@ pub struct UpdateChannel {
 /// translated connection; this ships those counts to a collector so the box can
 /// answer what happened, not only what is happening.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct FlowExport {
     /// Where the collector listens, `host:port`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -559,7 +557,6 @@ impl FlowExport {
 /// The box-wide services category (`[services.*]`). A thin grouping so DNS, NTP
 /// and the rest share one namespace instead of sprawling across the top level.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Services {
     /// IPFIX flow export to a collector (`[services.flow-export]`).
     #[serde(
@@ -592,6 +589,13 @@ pub struct Services {
     /// Dynamic-DNS client (`[services.dyndns]`).
     #[serde(default, skip_serializing_if = "Dyndns::is_empty")]
     pub dyndns: Dyndns,
+    /// PPPoE server — the BNG role (`[services.pppoe-server]`, roadmap C17).
+    #[serde(
+        default,
+        rename = "pppoe-server",
+        skip_serializing_if = "PppoeServer::is_empty"
+    )]
+    pub pppoe_server: PppoeServer,
     /// DHCP relay agent (`[services.dhcp-relay]`).
     #[serde(
         default,
@@ -664,7 +668,6 @@ impl Services {
 /// discovery and XML descriptions, i.e. a much larger parser on a port every LAN
 /// host can reach, for the same outcome NAT-PMP reaches in four message types.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PortMapping {
     /// The zone whose hosts may ask. Unset ⇒ off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -723,7 +726,6 @@ impl PortMapping {
 /// intercepting means parsing and rewriting somebody's connection, and it stops
 /// working the moment that connection is TLS — which today it is.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Portal {
     /// The zone held behind the portal. Unset ⇒ no portal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -794,7 +796,6 @@ impl Portal {
 /// Sentinel owns — not a log scrape. A pattern match on the journal would fire on
 /// a message that merely mentions a failure, and would miss one that never logged.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Alerts {
     /// Endpoints to POST a JSON alert to. Repeatable; `https` or `http`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -818,7 +819,6 @@ pub const DEFAULT_ALERT_MAIL_PORT: u16 = 587;
 /// Mail delivery for alerts (`[services.alerts.mail]`), realised by **msmtp** —
 /// a send-only SMTP client, so the appliance never runs a listening mail server.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AlertMail {
     /// The recipient. Unset ⇒ no mail is sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -883,7 +883,6 @@ pub const DEFAULT_CGNAT_BASE_PORT: u16 = 32768;
 /// (`omfwd`) — the journal is already the single sink every Sentinel service logs
 /// to, so there is nothing to re-plumb.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Syslog {
     /// Where to ship. Empty ⇒ forwarding is off (the local journal is unaffected
     /// either way — this adds a copy, it never redirects).
@@ -899,7 +898,6 @@ impl Syslog {
 
 /// One syslog collector (`[[services.syslog.target]]`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SyslogTarget {
     /// The collector's address or hostname.
     pub host: String,
@@ -986,7 +984,6 @@ pub const DEFAULT_IDS_HOME_NET: &[&str] = &[
 /// `show firewall` cannot explain. Blocking belongs to the data plane that already
 /// owns the policy, so an alert here is evidence, not an action.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Ids {
     /// Interfaces to watch. Empty ⇒ intrusion detection is off.
     #[serde(default, rename = "interface", skip_serializing_if = "Vec::is_empty")]
@@ -1113,7 +1110,6 @@ pub const DEFAULT_REVERSE_PROXY_PORT: u16 = 443;
 /// load-balancer (fabric) is the separate high-throughput path; this is the L7
 /// tier that does TLS termination + HTTP-aware routing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ReverseProxy {
     /// Frontend name — the HAProxy `frontend`/`backend` id + the log tag.
     /// Required; `[A-Za-z0-9_-]` (rendered as a config section name).
@@ -1146,7 +1142,6 @@ impl ReverseProxy {
 /// owns its lifecycle: off unless enabled). `show`-able with `lldpctl`. Empty by
 /// default (no discovery).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Lldp {
     /// Turn LLDP on. Without it the daemon stays stopped (the appliance ships no
     /// neighbour discovery by default).
@@ -1170,7 +1165,6 @@ impl Lldp {
 /// monitoring station. Read-only by construction (an `rocommunity`; no write
 /// community is ever rendered). Empty by default; a `community` turns it on.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Snmp {
     /// The v2c read-only community string (the shared secret a poller presents).
     /// Rendered into a 0640 `snmpd.conf`, never world-readable.
@@ -1201,7 +1195,6 @@ pub struct Snmp {
 /// persistent `/var/lib/sentinel/ssh/` so they survive a reboot and sshd reads
 /// them on its normal start (no unit-ordering dance).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Ssh {
     /// Run the SSH daemon. Defaults to `true` (an appliance is managed over SSH);
     /// set `false` to stop it (e.g. a box reachable only on the console).
@@ -1268,7 +1261,6 @@ impl Ssh {
 /// surface to the network unless it is asked to — and bound to localhost when
 /// enabled without an address, so turning it on is not the same as exposing it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct WebConsole {
     /// Serve the console. Off by default.
     #[serde(default)]
@@ -1321,7 +1313,6 @@ impl Snmp {
 /// one VLAN is discoverable from another. Built on the image's `avahi-daemon` in
 /// reflector mode (Sentinel owns its lifecycle). Empty by default.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Mdns {
     /// Interfaces to reflect mDNS between. At least two are needed for a reflector
     /// to have anything to bridge; each must be a declared interface.
@@ -1348,7 +1339,6 @@ impl Mdns {
 /// answering an SSDP `M-SEARCH` replies unicast to the address it saw, and if
 /// that were the router the answer would never reach the asker.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct BroadcastRelay {
     /// A name for this relay, used in `show` and to address it from the CLI.
     pub name: String,
@@ -1371,7 +1361,6 @@ pub struct BroadcastRelay {
 /// pointed at the box's (possibly dynamic) WAN address, built on the image's
 /// `ddclient`. Empty by default; a `hostname` turns it on.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Dyndns {
     /// The ddclient protocol (the provider), e.g. `"dyndns2"`, `"cloudflare"`,
     /// `"namecheap"`. Unset ⇒ `dyndns2` (the de-facto default protocol).
@@ -1415,7 +1404,6 @@ impl Dyndns {
 /// runs no pool itself), built on the image's isc `dhcrelay`. Empty by default;
 /// an upstream `server` turns it on.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct DhcpRelay {
     /// Interfaces the relay listens/relays on — both the client-facing segment(s)
     /// and the link toward the server. Each must be a declared interface, and
@@ -1444,7 +1432,6 @@ impl DhcpRelay {
 /// image's chrony (no extra unit): the box syncs to `upstream` time sources and
 /// serves clients on the subnets of the `serve-on` interfaces. Empty by default.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Ntp {
     /// Upstream NTP sources the box syncs to (IPs or hostnames, e.g.
     /// `"pool.ntp.org"`).
@@ -1475,7 +1462,6 @@ impl Ntp {
 /// default (no forwarder); the presence of an upstream + a serving interface is
 /// what turns it on.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Dns {
     /// Upstream resolvers the box forwards client queries to (IPv4 or IPv6).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1617,7 +1603,6 @@ impl Dns {
 /// configuration file — an operator who has to write down which MAC is where has
 /// not been given EVPN.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Evpn {
     /// This box's VTEP address — the outer source of everything it encapsulates,
     /// and the next hop it announces itself under. Required once anything else
@@ -1699,7 +1684,6 @@ impl Evpn {
 /// One layer-2 EVPN instance (`[[evpn.instance]]`): a segment, its VNI, and the
 /// local interfaces that are on it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct EvpnInstance {
     /// A name for this segment, used in `show` output and nowhere on the wire.
     pub name: String,
@@ -1736,7 +1720,6 @@ pub struct EvpnInstance {
 /// One layer-3 EVPN tenant (`[[evpn.ip-vrf]]`): routing between segments without
 /// stretching them, which is what a tenant with more than one subnet needs.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct EvpnIpVrf {
     /// The VRF this tenant's routes live in — a `[[protocols.vrf]]` name.
     pub name: String,
@@ -1774,7 +1757,6 @@ pub struct EvpnIpVrf {
 /// top-level category (like [`Nat`]) because routing is a distinct concern from
 /// filtering: Velstra moves/​filters packets, Wren computes the routes.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Protocols {
     /// The router id (a 32-bit id, written as an IPv4 address). Also the default
     /// BGP router-id when `[protocols.bgp] router-id` is unset.
@@ -1855,7 +1837,6 @@ impl Protocols {
 /// router-id is the global `[protocols] router-id`. Every field maps 1:1 onto
 /// the Wren daemon's `[ospf]` block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Ospf {
     /// Interfaces OSPF runs on (all in [`Ospf::area`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1997,7 +1978,6 @@ pub struct Ospf {
 
 /// One OSPF/OSPFv3 interface placed in a specific area (`[[…ospf.interface]]`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct OspfInterface {
     /// The interface name.
     pub name: String,
@@ -2009,7 +1989,6 @@ pub struct OspfInterface {
 /// OSPFv3 (IPv6) configuration — the IPv6 sibling of [`Ospf`]. OSPFv3 adds an
 /// Instance ID but has no authentication / stub-area / timer knobs of its own.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Ospf3 {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interfaces: Vec<String>,
@@ -2062,7 +2041,6 @@ pub struct Ospf3 {
 /// grammar restricts them accordingly, and emission only writes the fields the
 /// target protocol accepts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Rip {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interfaces: Vec<String>,
@@ -2093,7 +2071,6 @@ pub struct Rip {
 /// IS-IS configuration: the interfaces, this router's identity (system-id / area)
 /// and level, with optional network-type and redistribution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Isis {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interfaces: Vec<String>,
@@ -2170,7 +2147,6 @@ pub struct Isis {
 /// A VRRP virtual router (RFC 5798) — first-hop redundancy / firewall HA: a
 /// group of routers share a virtual IP, the highest-priority one owning it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Vrrp {
     /// A name addressing this virtual router in the CLI (tag-node); not passed to
     /// the daemon, which keys on `interface`+`vrid`.
@@ -2242,7 +2218,6 @@ pub struct Vrrp {
 /// A static route: `prefix` reached `via` a gateway and/or out `dev` an
 /// interface, with an optional `metric`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct StaticRoute {
     /// Destination network in CIDR form (`"0.0.0.0/0"`, `"10.20.0.0/16"`).
     pub prefix: String,
@@ -2278,7 +2253,6 @@ pub struct StaticRoute {
 /// networks, redistribution, policy knobs and the peer list. The full surface
 /// maps 1:1 onto the Wren daemon's `[bgp]` block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Bgp {
     /// The local autonomous system number (32-bit / 4-octet ASN).
     #[serde(rename = "local-as")]
@@ -2295,6 +2269,26 @@ pub struct Bgp {
     /// Route sources redistributed into BGP (`"static"`, `"connected"`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub redistribute: Vec<String>,
+    /// Enforce the FlowSpec rules learned from peers in the data plane (roadmap
+    /// A3). Off by default, and deliberately: it means letting a BGP peer drop
+    /// traffic on this box, which is a decision an operator makes rather than
+    /// one they discover. Negotiating the address family (per neighbour) only
+    /// *learns* the rules — this is what acts on them.
+    #[serde(
+        default,
+        rename = "flowspec-enforce",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub flowspec_enforce: bool,
+    /// The broadest prefix an advertised FlowSpec rule may carry; anything
+    /// broader is refused and named in the log. Unset ⇒ /8, which stops a peer
+    /// having a bad day from taking the site off the air with one `0.0.0.0/0`.
+    #[serde(
+        default,
+        rename = "flowspec-min-prefix",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub flowspec_min_prefix: Option<u8>,
     /// The route reflector CLUSTER_ID (dotted quad); defaults to the router-id.
     #[serde(
         default,
@@ -2373,7 +2367,6 @@ pub struct Bgp {
 
 /// One BGP address aggregate (`[[protocols.bgp.aggregate]]`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct BgpAggregate {
     /// The covering prefix to advertise, as `addr/len`.
     pub prefix: String,
@@ -2388,7 +2381,6 @@ pub struct BgpAggregate {
 
 /// One static RPKI ROA (`[[protocols.bgp.roa]]`, RFC 6811).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct BgpRoa {
     /// The authorised prefix, as `addr/len`.
     pub prefix: String,
@@ -2406,7 +2398,6 @@ pub struct BgpRoa {
 
 /// An RTR validating cache to fetch RPKI ROAs from (`[protocols.bgp.rtr]`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct BgpRtr {
     /// The cache's `host:port` (the RTR port is conventionally 3323).
     pub server: String,
@@ -2417,7 +2408,6 @@ pub struct BgpRtr {
 
 /// A BGP peer: its address, remote AS and the full per-neighbor policy surface.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct BgpNeighbor {
     /// Peer IP address.
     pub address: String,
@@ -2567,7 +2557,6 @@ pub struct BgpNeighbor {
 /// a default action, referenced by name from a neighbour's `import` / `export`.
 /// Maps onto Wren's top-level `[[filter]]` block.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Filter {
     /// The filter's name, referenced from a neighbour's import/export.
     pub name: String,
@@ -2582,7 +2571,6 @@ pub struct Filter {
 /// One rule of a [`Filter`] (`[[protocols.filter.rule]]`). Conditions present are
 /// ANDed; `set-*`/`add-*` modify a matching route before `action` is taken.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct FilterRule {
     /// The rule sequence number (VyOS `rule <N>`): rules are evaluated in
     /// ascending `seq` order, first match wins. Defaults to 0 for a legacy rule
@@ -2703,7 +2691,6 @@ fn is_zero_u32(n: &u32) -> bool {
 /// prefix-lists are reusable match helpers a route-map rule names via
 /// `match prefix-list`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Policy {
     /// Named prefix-lists (`[[policy.prefix-list]]`) — reusable sets of prefix
     /// ranges a route-map rule matches with `match prefix-list <name>`.
@@ -2738,7 +2725,6 @@ impl Policy {
 /// priority band 10000-19999 and reconciles only that band, so a rule somebody
 /// else put in the table is left alone.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PolicyRoute {
     /// A name for the rule, so it can be talked about and edited.
     pub name: String,
@@ -2787,7 +2773,6 @@ pub struct PolicyRoute {
 /// this list. Entries are permit-only (a deny is expressed by a route-map rule
 /// `action deny`, not inside the list).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PrefixList {
     /// The list name, referenced by a route-map rule's `match prefix-list`.
     pub name: String,
@@ -2798,7 +2783,6 @@ pub struct PrefixList {
 
 /// One entry of a [`PrefixList`] (`[[policy.prefix-list.rule]]`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PrefixEntry {
     /// The rule sequence number (ordering; VyOS-style).
     pub seq: u32,
@@ -2817,7 +2801,6 @@ pub struct PrefixEntry {
 /// BFD (RFC 5880) global timing / authentication defaults (`[protocols.bfd]`).
 /// Shared by every BFD session a protocol starts. Maps onto Wren's `[bfd]`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Bfd {
     /// Desired Min TX Interval in milliseconds (default 300).
     #[serde(default, rename = "min-tx", skip_serializing_if = "Option::is_none")]
@@ -2861,7 +2844,6 @@ pub struct Bfd {
 /// Multicast (`[protocols.multicast]`): the IGMP/MLD querier (RFC 3376) and the
 /// RFC 4605 proxy. Maps onto Wren's `[multicast]` block.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Multicast {
     /// Whether multicast (IGMP/MLD) is enabled.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -2915,7 +2897,6 @@ pub struct Multicast {
 /// address to routers that were not configured with it, which is not a problem
 /// an appliance with one configuration file has.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Pim {
     /// Run PIM-SM.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -2955,7 +2936,6 @@ pub struct Pim {
 
 /// One `[[protocols.multicast.interface]]`: an interface and the role it plays.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct MulticastInterface {
     /// The interface name.
     pub name: String,
@@ -2975,7 +2955,6 @@ pub struct MulticastInterface {
 /// A VRF instance (`[[protocols.vrf]]`): a named, isolated routing table. Maps
 /// onto Wren's `[[vrf]]` block.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct VrfDef {
     /// The VRF's name, referenced by static routes and per-protocol `vrf` fields.
     pub name: String,
@@ -2998,7 +2977,6 @@ pub struct VrfDef {
 /// Export redistribution filters (`[protocols.export]`): which named filter gates
 /// routes leaving the RIB to each consumer. Maps onto Wren's `[export]`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Export {
     /// Filter applied to best-path routes before the kernel forwarding table.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3029,7 +3007,6 @@ pub struct Export {
 /// masquerade) and destination NAT (`[[nat.destination]]`, port-forward),
 /// mirroring the VyOS `nat source` / `nat destination` model.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Nat {
     /// Source NAT: masquerade traffic egressing a zone to that zone's egress IP
     /// (the classic WAN uplink). Enforced in the data plane (Phase 4b).
@@ -3065,7 +3042,6 @@ impl Nat {
 /// internal IPv6 source leaving is rewritten to the external prefix, and an
 /// external destination arriving is rewritten back — stateless, checksum-neutral.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct NatNpt66 {
     pub name: String,
     /// A free-text label, shown in `show`. Purely documentary.
@@ -3086,7 +3062,6 @@ pub const NAT64_WELL_KNOWN_PREFIX: &str = "64:ff9b::/96";
 /// A source-NAT (masquerade) rule: SNAT all traffic egressing `zone` to that
 /// zone's egress address. The classic WAN masquerade.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct NatSource {
     pub name: String,
     /// A free-text label, shown in `show`. Purely documentary.
@@ -3125,7 +3100,6 @@ pub struct NatSource {
 /// `"ip:port"`). The reply is SNAT'd back automatically and the firewall is
 /// opened for it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct NatDestination {
     pub name: String,
     /// A free-text label, shown in `show`. Purely documentary.
@@ -3158,7 +3132,6 @@ pub struct NatDestination {
 /// This is fabric's XDP load balancer, which the appliance had no way to reach —
 /// the data plane has had `[[service]]` since phase 3, but nothing emitted it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct LoadBalancer {
     pub name: String,
     /// A free-text label, shown in `show`. Purely documentary.
@@ -3194,7 +3167,6 @@ pub struct LoadBalancer {
 /// secure default (ALGs mangle payloads, break TLS/SIP-over-TLS and are a
 /// recurring CVE source). Applications that need NAT traversal use STUN/ICE/TURN.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Nat64 {
     /// Turn NAT64 on. Off by default; the pool (and, for DNS64, a serving
     /// interface) must also be set. Skipped from output when false.
@@ -3243,7 +3215,6 @@ impl Nat64 {
 /// default route via its gateway), a small daemon pings the uplink's targets,
 /// and the winning uplink(s) become the `main`-table default. Empty by default.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct MultiWan {
     /// `failover` (one active uplink, the rest standby — the lowest `priority`
     /// number wins) or `load-balance` (spread flows across every healthy uplink
@@ -3277,7 +3248,6 @@ pub struct MultiWan {
 /// question. What differs is the answer: a policy route names one table, this
 /// names an ordered preference and lets the daemon pick.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct WanPolicy {
     /// A name, so it can be talked about and edited.
     pub name: String,
@@ -3369,7 +3339,6 @@ impl MultiWan {
 
 /// One WAN uplink in a [`MultiWan`] group.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct WanUplink {
     /// The egress interface (a declared `[[interface]]`).
     pub interface: String,
@@ -3404,7 +3373,6 @@ pub struct WanUplink {
 /// uplink down and `rise` consecutive successes mark it back up. Empty `targets`
 /// ⇒ the uplink is assumed up whenever its link is (no active probing).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct HealthCheck {
     /// IPv4 addresses pinged out the uplink (any one reachable ⇒ up).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -3469,7 +3437,6 @@ impl HealthCheck {
 /// so VPN types share one `[vpn.*]` namespace instead of sprawling across the
 /// top level. Empty by default.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Vpn {
     /// IKEv2 site-to-site IPsec connections (`[[vpn.ipsec]]`), rendered to a
     /// strongSwan swanctl.conf + a 0600 PSK secrets file.
@@ -3509,7 +3476,6 @@ pub const DEFAULT_OPENCONNECT_PORT: u16 = 443;
 /// (served by `ocserv`) plus a 0600 `ocpasswd` file for the user credentials.
 /// The server certificate is a leaf issued by the on-box PKI (C19).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct OpenConnectServer {
     /// Administratively disable the server without deleting its config (parks it
     /// like `interface … disabled`). Off by default.
@@ -3561,7 +3527,6 @@ impl OpenConnectServer {
 
 /// One OpenConnect client credential (`[[vpn.openconnect.user]]`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct OpenConnectUser {
     /// Login name. Required; `[A-Za-z0-9_.-]` (rendered into a line-based
     /// password file).
@@ -3577,7 +3542,6 @@ pub struct OpenConnectUser {
 /// `net.rs` into the interface's `.netdev` (`[WireGuard]` + `[WireGuardPeer]`
 /// sections), which is a secret (private key) installed 0640 root:systemd-network.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct WireguardTunnel {
     /// The interface this tunnel configures — must name a declared
     /// `type = "wireguard"` interface.
@@ -3616,7 +3580,6 @@ pub const DEFAULT_IPSEC_START_ACTION: &str = "start";
 /// Route-based (XFRM-interface) mode with a firewall zone, road-warrior
 /// responders (`%any` remotes + EAP) and certificate auth are follow-ups.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct IpsecConnection {
     /// Connection name — the swanctl connection id and the secrets tag. Required;
     /// restricted to `[A-Za-z0-9_-]` since it is rendered as a config section key.
@@ -3705,7 +3668,6 @@ pub struct IpsecConnection {
 /// persistent `/var/lib/sentinel/pki` store; only the declarative definitions
 /// live in the config. Empty by default.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Pki {
     /// Local certificate authorities (`[[pki.ca]]`) — each self-signed, its key
     /// (0600) + cert generated into `/var/lib/sentinel/pki/ca/<name>/`.
@@ -3747,7 +3709,6 @@ pub const DEFAULT_ACME_DIRECTORY: &str = "https://acme-v02.api.letsencrypt.org/d
 /// its key (0600) + cert live under `/var/lib/sentinel/pki/ca/<name>/` and are
 /// never regenerated once present.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Ca {
     /// CA name — the store subdirectory and the `ca` reference from a
     /// certificate. Required; restricted to `[A-Za-z0-9_-]` since it names a
@@ -3776,7 +3737,6 @@ pub struct Ca {
 /// key (0600) + cert are generated into `/var/lib/sentinel/pki/certs/<name>/`;
 /// for `ca = "acme"` the cert is obtained from the [`Acme`] account instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Certificate {
     /// Certificate name — the store subdirectory. Required; `[A-Za-z0-9_-]`.
     pub name: String,
@@ -3815,7 +3775,6 @@ pub struct Certificate {
 /// challenge) and is performed on hardware; in the appliance the account
 /// descriptor is rendered so the config round-trips and the wiring is in place.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Acme {
     /// The ACME contact email (account registration + expiry notices). Required.
     pub email: String,
@@ -3935,7 +3894,6 @@ pub struct System {
 /// read-mostly disk should not start writing to it because a graph might be
 /// nice, and saying so is better than a knob nobody finds.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Metrics {
     /// Record a history at all.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -3959,7 +3917,6 @@ impl Metrics {
 /// still be enterable by the account written on it, and that is precisely the
 /// moment the directory is likely to be unreachable.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Aaa {
     /// RADIUS servers, tried in order. The first that answers decides — a
     /// reject from a reachable server is an answer, not a reason to ask the
@@ -3997,7 +3954,6 @@ impl Aaa {
 /// deployment genuinely needs a search, that is a later addition rather than a
 /// reason to keep a second credential here now.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct LdapServer {
     /// Its address or hostname.
     pub server: String,
@@ -4032,7 +3988,6 @@ pub struct LdapServer {
 
 /// One RADIUS server (`[[system.aaa.radius]]`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RadiusServer {
     /// Its address or hostname.
     pub server: String,
@@ -4054,7 +4009,6 @@ pub struct RadiusServer {
 /// `ttyAMA0`); `speed` is its baud rate. Both or neither — a speed without a
 /// device says nothing about which port it applies to.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Console {
     /// The tty, without `/dev/` (`ttyS0`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4078,7 +4032,6 @@ impl Console {
 /// this box runs its own API (on `:8080`, token = the secret) so a peer can push to
 /// it. Firewall rules gate who may reach that port.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ConfigSync {
     /// Peer firewalls to push the config to — `host` or `host:port` (default port
     /// 8080). Repeatable.
@@ -4108,7 +4061,6 @@ impl ConfigSync {
 /// The sync stream is **unauthenticated** (like pfsync), so it must run over a
 /// trusted/dedicated sync link; firewall rules gate who may reach the port.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ConntrackSync {
     /// Address the data plane binds to receive peer state — `host` or `host:port`
     /// (default port `5429`). When peers are set but `listen` is omitted, the box
@@ -4182,7 +4134,6 @@ fn with_default_port(host: &str, port: u16) -> String {
 /// keys and (pre-hashed) password are set. The password is for console + sudo;
 /// SSH stays key-only unless `[services.ssh] password-authentication` is on.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Login {
     /// The account name (POSIX: starts with a letter, then letters/digits/`-`/`_`).
     pub username: String,
@@ -4216,7 +4167,6 @@ pub struct Login {
 
 /// A permission group (`[[system.group]]`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Group {
     /// The group name accounts point at.
     pub name: String,
@@ -4294,7 +4244,6 @@ impl SourceValidation {
 /// These map onto Velstra's per-policy `stateful` / `drop_icmp` / `blocklist`
 /// — capabilities the data plane already enforces.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Firewall {
     /// Stateful inspection: track allowed flows so return traffic comes back
     /// without an explicit rule. On by default (a real firewall default).
@@ -4361,7 +4310,6 @@ pub struct Firewall {
 
 /// A TCP port protected by the SYN proxy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SynProtect {
     /// The TCP port to protect.
     pub port: u16,
@@ -4425,7 +4373,6 @@ impl Firewall {
 /// to one data-plane rule per member (addresses stay as CIDRs — a `/24` is one
 /// LPM entry, not 256 hosts), so groups cost nothing extra in the data plane.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Groups {
     /// Address groups: name → hosts/CIDRs. Referenced by a rule's `source_group`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -4502,7 +4449,6 @@ pub const MAX_RULE_EXPANSION: usize = 4096;
 /// [`Firewall`] defaults when unset, so you can (for example) block ICMP on
 /// `wan` but allow it on `lan`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ZoneCfg {
     /// A free-text label for this zone, shown in `show`. Purely documentary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4591,6 +4537,35 @@ pub struct Interface {
     /// `"dhcp"` or a CIDR like `"10.0.0.1/24"`. `None` if not yet configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
+    /// Port security (roadmap B12): the hardware address this port is bound to.
+    ///
+    /// Frames arriving with any other source MAC are dropped by the data plane.
+    /// Meant for a port whose far end is not trusted to say who it is — a VM's
+    /// tap, a container veth. `None` on an uplink, where the far end is a whole
+    /// network and no single address is right.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_mac: Option<String>,
+    /// What this port may **send into the box**, in megabits per second
+    /// (roadmap B13). Unset ⇒ no ceiling.
+    ///
+    /// Policing, not shaping, and deliberately named apart from `[qos]`: a qdisc
+    /// queues what *leaves* on this link and smooths it, while this drops what
+    /// arrives over budget. On a tenant port the second is the one that matters
+    /// — a guest that floods costs every other guest on the fabric, and no
+    /// amount of queueing on the way out fixes that.
+    #[serde(
+        default,
+        rename = "ingress-limit",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ingress_limit: Option<u32>,
+    /// Port security: the addresses this port may send from.
+    ///
+    /// A list, because one port legitimately has several. Each family is
+    /// enforced only if at least one address of that family is bound, so binding
+    /// an IPv4 address does not silently black-hole a dual-stack guest's IPv6.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bind_addresses: Vec<String>,
     /// The interface's IPv6 address — a static CIDR (`"2001:db8:1::1/64"`),
     /// `"auto"` (accept Router Advertisements / SLAAC), or `"dhcp"` (DHCPv6
     /// client — the typical WAN uplink, which can also request a delegated
@@ -4884,7 +4859,6 @@ pub struct Interface {
 /// a WAN link that happens to dial, and treating it as its own kind of
 /// addressing would mean a second path to the same answer.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Wwan {
     /// The APN. Required, and the one thing every operator gives you.
     pub apn: String,
@@ -4916,7 +4890,6 @@ pub struct Wwan {
 /// come up. What is here is what decides whether the network exists, who may
 /// join it, and on which channel.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Wireless {
     /// `"access-point"` (this box makes the network, via hostapd) or
     /// `"station"` (this box joins one, via wpa_supplicant). Required — the two
@@ -4981,7 +4954,6 @@ impl Wireless {
 
 /// WPA on a wireless link (`[interface.wireless.wpa]`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct WirelessWpa {
     /// `"wpa2"`, `"wpa3"`, or `"wpa2+wpa3"` for a transition network that takes
     /// both. WPA and WEP are not offered: both are broken, and offering a broken
@@ -4995,7 +4967,6 @@ pub struct WirelessWpa {
 
 /// NIC hardware settings applied with `ethtool` (`[interface.ethernet]`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Ethernet {
     /// Force the link speed in Mbit/s instead of autonegotiating. Needed where
     /// the far side does not negotiate — an old switch port, a media converter,
@@ -5050,7 +5021,6 @@ impl Ethernet {
 
 /// Spanning tree, timers and multicast on a bridge (`[interface.bridge]`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct BridgeOptions {
     /// Run the Spanning Tree Protocol. Off by default, and that is the right
     /// default for a bridge whose ports are known: STP costs 30 seconds of
@@ -5121,7 +5091,6 @@ impl BridgeOptions {
 
 /// This link's behaviour as a port of a bridge (`[interface.bridge-port]`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct BridgePort {
     /// Spanning-tree path cost through this port (`1`–`65535`). What decides
     /// which of two paths to the root is blocked — the whole point of setting it
@@ -5149,7 +5118,6 @@ impl BridgePort {
 
 /// Link-aggregation detail on a bond (`[interface.bond]`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct BondOptions {
     /// How a frame chooses its member: `layer2` (MAC), `layer2+3` (MAC + IP),
     /// `layer3+4` (IP + port), `encap2+3`, `encap3+4`.
@@ -5217,7 +5185,6 @@ impl BondOptions {
 /// from whichever address it likes, which is how a redundant pair of links turns
 /// into a pair of hosts that disagree about who owns an address.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct IpOptions {
     /// Do not forward IPv4 *out of* this link. The box stays a router everywhere
     /// else; this link only terminates traffic. A management port is the case:
@@ -5313,7 +5280,6 @@ impl IpOptions {
 
 /// Per-link IPv6 behaviour (`[interface.ipv6]`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Ip6Options {
     /// Do not forward IPv6 out of this link — the v6 half of
     /// [`IpOptions::disable_forwarding`]. Set independently, because a link is
@@ -5367,7 +5333,6 @@ impl Ip6Options {
 /// these fields, and the failure mode when it is missing is not an error message
 /// — it is a line that never gets an address.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct DhcpClient {
     /// What goes in DHCP option 61, the client identifier: `"mac"` (hardware
     /// type + this link's MAC) or `"duid"` (an RFC 4361 IAID+DUID).
@@ -5440,7 +5405,6 @@ impl DhcpClient {
 
 /// What this link's DHCPv6 client sends and accepts (`[interface.dhcpv6]`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Dhcp6Client {
     /// A fixed DUID as colon-separated hex, replacing the one derived from this
     /// box's machine-id. Reinstalling the appliance otherwise changes its DUID and
@@ -5572,6 +5536,111 @@ pub struct Pppoe {
     pub mru: Option<u16>,
 }
 
+/// The PPPoE **server** (`[services.pppoe-server]`, roadmap C17) — the other end
+/// of [`Pppoe`], and the role a box takes when it is the access concentrator
+/// rather than a subscriber.
+///
+/// One `pppoe-server` listens on a subscriber-facing link; each session it
+/// accepts is handed to its own `pppd`, which authenticates the subscriber
+/// against the local user list and gives it an address out of the pool. So the
+/// two halves of PPPoE in this appliance share their machinery — the same
+/// `pppd`, the same secrets files — and differ in which end of the conversation
+/// they are.
+///
+/// **Server credentials are kept apart from client ones.** A `chap-secrets`
+/// entry is a table row, not a direction: `alice * secret *` both lets this box
+/// log in *as* alice and lets an incoming alice log in *to* it. The server side
+/// therefore names itself (`name <ac-name>` in the session options) and its user
+/// rows name that server, so an ISP login this box uses upstream can never be
+/// used to dial into it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PppoeServer {
+    /// The subscriber-facing interface to serve on. Required to run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<String>,
+    /// The address this box holds inside every session — the subscriber's
+    /// gateway. Required to run.
+    #[serde(
+        default,
+        rename = "local-address",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub local_address: Option<String>,
+    /// The first address handed to a subscriber. `pppoe-server` allocates
+    /// upwards from here, one per session.
+    #[serde(
+        default,
+        rename = "pool-start",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pool_start: Option<String>,
+    /// How many sessions may be up at once, which is also how many addresses the
+    /// pool holds. Unset ⇒ 64.
+    #[serde(
+        default,
+        rename = "max-sessions",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_sessions: Option<u16>,
+    /// Resolvers handed to subscribers over IPCP. Empty ⇒ none offered, and a
+    /// subscriber then needs its own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns: Vec<String>,
+    /// The PPPoE service name this concentrator offers. Unset ⇒ it answers a
+    /// client asking for any service, which is what most subscribers send.
+    #[serde(
+        default,
+        rename = "service-name",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub service_name: Option<String>,
+    /// The access-concentrator name announced in PADO, and the name this box
+    /// authenticates *as* — see the note on credentials above. Unset ⇒ the
+    /// hostname.
+    #[serde(default, rename = "ac-name", skip_serializing_if = "Option::is_none")]
+    pub ac_name: Option<String>,
+    /// The MTU/MRU offered inside a session. Unset ⇒ 1492, the classic value
+    /// once PPPoE's 8 bytes come off a 1500-byte Ethernet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u16>,
+    /// The subscribers this concentrator will accept.
+    #[serde(default, rename = "user", skip_serializing_if = "Vec::is_empty")]
+    pub users: Vec<PppoeUser>,
+}
+
+impl PppoeServer {
+    /// True when nothing is configured — lets the whole section be omitted.
+    pub fn is_empty(&self) -> bool {
+        self.interface.is_none()
+            && self.local_address.is_none()
+            && self.pool_start.is_none()
+            && self.users.is_empty()
+    }
+
+    /// Whether this box should be running a concentrator at all. Deliberately
+    /// stricter than "somebody typed something": without a link, an address of
+    /// our own and a pool to hand out, a `pppoe-server` would answer PADI and
+    /// then fail every session — which looks to a subscriber exactly like a
+    /// broken line rather than an unconfigured one.
+    pub fn runnable(&self) -> bool {
+        self.interface.is_some() && self.local_address.is_some() && self.pool_start.is_some()
+    }
+}
+
+/// One subscriber of the [`PppoeServer`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PppoeUser {
+    /// The login the subscriber presents (PAP or CHAP; whichever it negotiates).
+    pub name: String,
+    /// Its secret. Rendered to the 0600 secrets file, never to a world-readable
+    /// options file.
+    pub password: String,
+    /// A fixed address for this subscriber instead of one out of the pool. Unset
+    /// ⇒ the next free pool address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+}
+
 /// The Linux bonding modes networkd accepts (`[Bond] Mode=`).
 pub const BOND_MODES: &[&str] = &[
     "balance-rr",
@@ -5656,7 +5725,6 @@ pub struct RouterAdvert {
 /// server bound to the interface. Both endpoints must be in the same /64 as an
 /// advertised prefix; the RA's M flag (forced on) is what makes clients ask.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Dhcp6Pool {
     /// First address of the pool, e.g. `"2001:db8:1::100"`.
     pub start: String,
@@ -5728,7 +5796,6 @@ pub struct DhcpServer {
 /// hardware address is `mac`. Rendered to a networkd `[DHCPServerStaticLease]`
 /// (`MACAddress=` + `Address=`); the `name` is a documentary CLI handle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct DhcpStaticLease {
     pub name: String,
     pub mac: String,
@@ -6299,7 +6366,6 @@ pub struct Rule {
 /// box's **local** time, `"HH:MM"`, and the window does not span midnight
 /// (`start < end`). `days` lists the weekdays it applies on.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct Schedule {
     /// Weekdays the window is open on (at least one).
     pub days: Vec<Day>,
@@ -6467,22 +6533,102 @@ impl Rule {
     }
 }
 
+/// What an unrecognised configuration key means to a parse.
+///
+/// The distinction the old `#[serde(deny_unknown_fields)]` could not draw,
+/// because it was a compile-time property of the structs and the same structs
+/// are read by both a strict `config check` and a must-not-fail boot apply. See
+/// [`Appliance::parse_toml`].
+enum UnknownKeys {
+    /// An unknown key fails the parse, naming the key. For anything a person
+    /// initiates.
+    Reject,
+    /// An unknown key is logged and dropped. For a boot-time apply of a saved
+    /// config, where an unconfigured appliance is the worse outcome.
+    Warn,
+}
+
 impl Appliance {
     /// Parse and validate a config from TOML text.
     pub fn from_toml(toml_text: &str) -> Result<Self> {
-        let mut appliance: Appliance = toml::from_str(toml_text).context("parsing TOML config")?;
+        Self::parse_toml(toml_text, UnknownKeys::Reject)
+    }
+
+    /// Parse and validate a config from JSON text.
+    pub fn from_json(json_text: &str) -> Result<Self> {
+        Self::parse_json(json_text, UnknownKeys::Reject)
+    }
+
+    /// Parse TOML, deciding what an unrecognised key means with `unknown`.
+    ///
+    /// The strictness that catches a typo used to live on the structs, as
+    /// `#[serde(deny_unknown_fields)]` on every one — which is right for a
+    /// person editing a config and catastrophic for a machine applying a saved
+    /// one. A `deny` is compile-time: it cannot tell `config check` (where an
+    /// unknown key is a mistake to refuse) from a boot-time apply (where an
+    /// unknown key must not keep the appliance from coming up). So strictness
+    /// moved here, to the caller's choice, and the structs merely *ignore* what
+    /// they do not know — `serde_ignored` reports each ignored path and this
+    /// decides whether that is a refusal or a warning.
+    fn parse_toml(toml_text: &str, unknown: UnknownKeys) -> Result<Self> {
+        let mut ignored = Vec::new();
+        let de = toml::Deserializer::new(toml_text);
+        let mut appliance: Appliance =
+            serde_ignored::deserialize(de, |path| ignored.push(path.to_string()))
+                .context("parsing TOML config")?;
+        Self::account_for_unknown(&ignored, unknown)?;
         appliance.normalize();
         appliance.validate()?;
         Ok(appliance)
     }
 
-    /// Parse and validate a config from JSON text.
-    pub fn from_json(json_text: &str) -> Result<Self> {
+    /// The JSON half of [`Self::parse_toml`].
+    fn parse_json(json_text: &str, unknown: UnknownKeys) -> Result<Self> {
+        let mut ignored = Vec::new();
+        let mut de = serde_json::Deserializer::from_str(json_text);
         let mut appliance: Appliance =
-            serde_json::from_str(json_text).context("parsing JSON config")?;
+            serde_ignored::deserialize(&mut de, |path| ignored.push(path.to_string()))
+                .context("parsing JSON config")?;
+        de.end().context("trailing data after JSON config")?;
+        Self::account_for_unknown(&ignored, unknown)?;
         appliance.normalize();
         appliance.validate()?;
         Ok(appliance)
+    }
+
+    /// Turn the set of keys the schema did not recognise into a refusal or a
+    /// warning, per `mode`.
+    fn account_for_unknown(ignored: &[String], mode: UnknownKeys) -> Result<()> {
+        if ignored.is_empty() {
+            return Ok(());
+        }
+        match mode {
+            // "unknown field" is the phrasing the strict path has always used —
+            // an operator greps for it, and a test asserts it — so it is kept
+            // verbatim even though the check now lives here rather than in serde.
+            UnknownKeys::Reject => {
+                let names = ignored
+                    .iter()
+                    .map(|p| format!("`{p}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!("unknown field {names}: not a setting this version of Sentinel knows");
+            }
+            // A saved config is being applied, not checked. Name each dropped
+            // key on stderr — systemd carries it into the journal, so a rollback
+            // that silently ignored a newer field still leaves a trail — and
+            // keep the rest of the configuration, which is the whole point:
+            // coming up and warning beats coming up blank.
+            UnknownKeys::Warn => {
+                for path in ignored {
+                    eprintln!(
+                        "warning: ignoring configuration key `{path}`, which this version of \
+                         Sentinel does not recognise (written by a newer version?)"
+                    );
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Fill in inferred VLAN `parent`/`vlan` from a `<parent>.<id>` interface name
@@ -6518,6 +6664,30 @@ impl Appliance {
             Self::from_json(&text)
         } else {
             Self::from_toml(&text)
+        }
+    }
+
+    /// Load a **saved** configuration for a boot-time apply, tolerating keys this
+    /// version does not know.
+    ///
+    /// The strict [`Self::load`] is right everywhere a person is asking a
+    /// question — `config check`, `show`, an interactive edit — because there an
+    /// unknown key is a mistake to surface. It is wrong at the one place the
+    /// appliance applies its *own* saved config on the way up: a key the schema
+    /// does not recognise there is almost always a field a newer image wrote and
+    /// this one has not learned, and refusing it turns an A/B rollback — the
+    /// thing reached for when a box is already in trouble — into a box that
+    /// comes up with no configuration at all. This warns about each such key (to
+    /// the journal) and applies the rest. A genuinely malformed config still
+    /// fails, because only *unknown keys* are tolerated, never a value that does
+    /// not parse or does not validate.
+    pub fn load_lenient(path: &Path) -> Result<Self> {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            Self::parse_json(&text, UnknownKeys::Warn)
+        } else {
+            Self::parse_toml(&text, UnknownKeys::Warn)
         }
     }
 
@@ -9219,6 +9389,25 @@ impl Appliance {
         if let Some(iface) = &dd.interface {
             if !self.interfaces.iter().any(|i| &i.name == iface) {
                 bail!("services dyndns interface {iface:?}: not a declared interface");
+            }
+        }
+
+        // PPPoE server: a subscriber is its password. The delete path already
+        // refuses to take one away — "a subscriber without a password is one
+        // anybody can be" — but the create path let one be born without: naming
+        // any other field (`… user alice address 10.0.0.5`) made the account,
+        // and the empty secret went straight into `chap-secrets` as a row that
+        // authenticates on an empty password.
+        for u in &self.services.pppoe_server.users {
+            if u.name.trim().is_empty() {
+                bail!("services pppoe-server: a subscriber name must not be empty");
+            }
+            if u.password.is_empty() {
+                bail!(
+                    "services pppoe-server: user {:?} password is required — a subscriber \
+                     without a password is one anybody can be",
+                    u.name
+                );
             }
         }
 
@@ -12664,6 +12853,161 @@ mru = 1492
                 "community = \"public\"\nlisten = \"udp:161\\nrwcommunity x\""
             ))
             .is_err()
+        );
+    }
+
+    /// A setting the schema does not have is refused, not ignored.
+    ///
+    /// Ninety-five of the config structs already said `deny_unknown_fields`;
+    /// the twelve that did not were the ones an operator writes by hand most —
+    /// the document root, `[system]`, `[[interface]]`, `[[rule]]`,
+    /// `[interface.dhcp-server]`. A key those did not know was dropped in
+    /// silence and `sentinel config check` still answered "is valid", so a rule
+    /// written `prot = "tcp"` matched every protocol, and a DHCP pool written
+    /// `range-start` was no pool at all. Both of those were live in this
+    /// repository's own test fixtures — which is what the silence costs: the
+    /// tests had drifted off the schema and still passed.
+    ///
+    /// Each case pairs the typo with the spelling that works, so the test
+    /// cannot pass merely because the whole document became invalid.
+    #[test]
+    fn a_misspelled_setting_in_the_config_file_is_refused_not_ignored() {
+        let doc = |extra: &str| {
+            format!(
+                "[system]\nhostname = \"fw\"\n\
+                 [[interface]]\nname = \"eth0\"\nzone = \"lan\"\naddress = \"10.0.0.1/24\"\n\
+                 [zone.lan]\ndefault_action = \"accept\"\n{extra}\n"
+            )
+        };
+        let cases: [(&str, &str); 5] = [
+            // The document root.
+            ("[firewal]\nstateful = true", "[firewall]\nstateful = true"),
+            // `[system]`, one letter out.
+            (
+                "[system.consle]\ndevice = \"ttyS0\"",
+                "[system.console]\ndevice = \"ttyS0\"",
+            ),
+            // A firewall rule: the field that says which protocol it matches.
+            (
+                "[[rule]]\nname = \"r\"\nfrom = \"lan\"\naction = \"drop\"\nprot = \"tcp\"\nport = \"22\"",
+                "[[rule]]\nname = \"r\"\nfrom = \"lan\"\naction = \"drop\"\nproto = \"tcp\"\nport = \"22\"",
+            ),
+            // A DHCP pool, spelled the way another appliance spells it.
+            (
+                "[[interface]]\nname = \"eth1\"\nzone = \"lan\"\naddress = \"10.1.0.1/24\"\n\
+                 [interface.dhcp-server]\nrange-start = \"10.1.0.100\"",
+                "[[interface]]\nname = \"eth1\"\nzone = \"lan\"\naddress = \"10.1.0.1/24\"\n\
+                 [interface.dhcp-server]\npool-offset = 100",
+            ),
+            // A bridge's ports, in the plural that reads more naturally.
+            (
+                "[[interface]]\nname = \"eth1\"\n[[interface]]\nname = \"br0\"\n\
+                 type = \"bridge\"\nmembers = [\"eth1\"]",
+                "[[interface]]\nname = \"eth1\"\n[[interface]]\nname = \"br0\"\n\
+                 type = \"bridge\"\nmember = [\"eth1\"]",
+            ),
+        ];
+        for (bad, good) in cases {
+            let ok = Appliance::from_toml(&doc(good));
+            assert!(ok.is_ok(), "the correct spelling must parse: {ok:?}");
+            let err = match Appliance::from_toml(&doc(bad)) {
+                Ok(_) => panic!("a key the schema does not have was accepted:\n{}", doc(bad)),
+                Err(e) => format!("{e:#}"),
+            };
+            assert!(
+                err.contains("unknown field"),
+                "the refusal should name the key: {err}"
+            );
+        }
+    }
+
+    /// A saved config carrying a key this version does not know still comes up
+    /// at boot, with the rest of it applied and a warning about the key.
+    ///
+    /// This is the rollback case: an A/B downgrade lands on an older image whose
+    /// schema is missing a field the newer image wrote. The strict path (above)
+    /// refuses it — right for `config check`, wrong for boot, where the choice
+    /// is between "come up and warn" and "come up blank". A field that does not
+    /// PARSE, or a value that does not VALIDATE, must still fail even here; only
+    /// an unrecognised *key* is tolerated.
+    #[test]
+    fn a_saved_config_with_a_key_from_a_newer_version_still_loads_leniently() {
+        // A valid document plus one key no schema of this version has, at the
+        // document root and inside a nested table, so both traversal cases are
+        // covered.
+        let text = "[system]\nhostname = \"fw\"\n\
+                    quantum_entangler = true\n\
+                    [[interface]]\nname = \"eth0\"\nzone = \"lan\"\naddress = \"10.0.0.1/24\"\n\
+                    [zone.lan]\ndefault_action = \"accept\"\nwarp_factor = 9\n";
+
+        // Strict refuses it.
+        assert!(
+            Appliance::from_toml(text).is_err(),
+            "the strict path must still reject an unknown key"
+        );
+
+        // Lenient accepts it, and what it kept is the known configuration.
+        let a = Appliance::parse_toml(text, UnknownKeys::Warn)
+            .expect("the lenient path dropped a valid config over an unknown key");
+        assert_eq!(a.system.hostname, "fw");
+        assert_eq!(a.interfaces.len(), 1);
+        assert_eq!(a.interfaces[0].name, "eth0");
+        assert!(a.zones.contains_key("lan"));
+
+        // But leniency is only about unknown *keys*: a value that cannot parse
+        // still fails, or the boot path would apply a config it misread.
+        let bad_value = "[system]\nhostname = \"fw\"\n\
+                         [[interface]]\nname = \"eth0\"\nzone = \"lan\"\naddress = \"not-an-ip\"\n";
+        assert!(
+            Appliance::parse_toml(bad_value, UnknownKeys::Warn).is_err(),
+            "lenient must not swallow a value that does not parse or validate"
+        );
+    }
+
+    /// A PPPoE subscriber cannot exist without a password.
+    ///
+    /// The CLI creates the account from whichever field is set first, so
+    /// `set services pppoe-server user alice address 10.0.0.5` used to make a
+    /// subscriber whose password was the empty string — and that went into
+    /// `chap-secrets` as a row that authenticates on an empty secret. Anybody
+    /// who knows the login is that subscriber. The delete path had refused to
+    /// remove a password for exactly this reason since the feature landed; the
+    /// create path had never been asked.
+    #[test]
+    fn a_pppoe_subscriber_without_a_password_is_refused() {
+        let with = |password: &str| {
+            format!(
+                r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "eth0"
+zone = "lan"
+address = "10.0.0.1/24"
+[services.pppoe-server]
+interface = "eth0"
+local-address = "10.9.0.1"
+pool-start = "10.9.0.10"
+max-sessions = 32
+[[services.pppoe-server.user]]
+name = "alice"
+password = "{password}"
+address = "10.9.0.5"
+"#
+            )
+        };
+        let good = Appliance::from_toml(&with("s3cret"));
+        assert!(
+            good.is_ok(),
+            "a subscriber with a password is fine: {good:?}"
+        );
+
+        let err = Appliance::from_toml(&with(""))
+            .expect_err("a subscriber with an empty password must be refused")
+            .to_string();
+        assert!(
+            err.contains("pppoe-server") && err.contains("alice"),
+            "the refusal has to name the subscriber: {err}"
         );
     }
 

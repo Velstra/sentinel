@@ -138,7 +138,11 @@ in
         # anything else, and the firewall then simply did not run. The option
         # below stays as the fallback for a box with no zoned interface yet.
         EnvironmentFile = "-/run/sentinel/velstra.env";
-        ExecStart = "${cfg.package}/bin/velstra run --iface \${VELSTRA_IFACE} --config /run/sentinel/velstra.toml --query-socket /run/velstra/query.sock --portal-socket /run/velstra/portal.sock --mapping-socket /run/velstra/mapping.sock";
+        # `$VELSTRA_FLOWSPEC_ARGS` unbraced on purpose: systemd splits that
+        # form into words and drops it entirely when empty, which is how A3
+        # enforcement goes on and off without rebuilding the unit. The braced
+        # form would pass one argument containing spaces.
+        ExecStart = "${cfg.package}/bin/velstra run --iface \${VELSTRA_IFACE} --config /run/sentinel/velstra.toml --query-socket /run/velstra/query.sock --portal-socket /run/velstra/portal.sock --mapping-socket /run/velstra/mapping.sock $VELSTRA_FLOWSPEC_ARGS";
         RuntimeDirectory = "velstra";
         RuntimeDirectoryMode = "0700";
         Restart = "on-failure";

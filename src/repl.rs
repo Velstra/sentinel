@@ -1566,6 +1566,10 @@ const SERVICES_NODES: &[Cand] = &[
         "relay DHCP to an upstream server (isc dhcrelay)",
     ),
     (
+        "pppoe-server",
+        "terminate subscriber PPPoE sessions (the BNG role)",
+    ),
+    (
         "reverse-proxy",
         "L7 reverse proxy / load balancer (haproxy, by name)",
     ),
@@ -1899,6 +1903,34 @@ const DYNDNS_FIELDS: &[Cand] = &[
     ),
 ];
 // `services dhcp-relay <Tab>` reveals the relay fields.
+/// `services pppoe-server <Tab>` — the other end of a `type = pppoe` interface.
+const PPPOE_SERVER_FIELDS: &[Cand] = &[
+    ("interface", "the subscriber-facing link to serve on"),
+    (
+        "local-address",
+        "this box's address inside every session (the subscriber's gateway)",
+    ),
+    ("pool-start", "the first address handed to a subscriber"),
+    ("max-sessions", "how many sessions may be up at once"),
+    (
+        "dns",
+        "resolvers offered to subscribers (comma-separated IPv4)",
+    ),
+    ("service-name", "the PPPoE service name offered in PADO"),
+    (
+        "ac-name",
+        "the access-concentrator name, and who this box authenticates as",
+    ),
+    ("mtu", "the MTU/MRU offered inside a session (default 1492)"),
+    ("user", "a subscriber this concentrator accepts, by login"),
+];
+
+/// `services pppoe-server user <name> <Tab>`.
+const PPPOE_USER_FIELDS: &[Cand] = &[
+    ("password", "the subscriber's secret (PAP or CHAP)"),
+    ("address", "a fixed address instead of one out of the pool"),
+];
+
 const DHCP_RELAY_FIELDS: &[Cand] = &[
     (
         "interface",
@@ -2231,6 +2263,14 @@ const BGP_FIELDS: &[Cand] = &[
         "BGP router-id (defaults to protocols router-id)",
     ),
     ("hold-time", "the OPEN Hold Time in seconds (default 180)"),
+    (
+        "flowspec-enforce",
+        "act on the FlowSpec rules peers advertise (true|false)",
+    ),
+    (
+        "flowspec-min-prefix",
+        "the broadest prefix an advertised rule may carry",
+    ),
     ("cluster-id", "route-reflector CLUSTER_ID (dotted quad)"),
     ("network", "a prefix to originate/advertise"),
     ("redistribute", "inject a route source (static / connected)"),
@@ -2687,6 +2727,14 @@ const IFACE_FIELDS: &[Cand] = &[
         "static IPv6 CIDR, `auto` (SLAAC) or `dhcp` (DHCPv6)",
     ),
     (
+        "ingress-limit",
+        "cap what this port may send into the box, in Mbit/s",
+    ),
+    (
+        "port-security",
+        "bind this port to one MAC and set of addresses (tenant ports)",
+    ),
+    (
         "pd-from",
         "request a delegated IPv6 prefix from this uplink (DHCPv6-PD)",
     ),
@@ -2809,6 +2857,13 @@ const IFACE_FIELDS: &[Cand] = &[
     ("pppoe", "PPPoE client credentials (on a type=pppoe uplink)"),
 ];
 /// `interface <name> wwan <Tab>` — what it takes to dial a bearer.
+/// The two halves of port security (roadmap B12), each independently useful:
+/// a tap gets both, a trunk port to a switch might reasonably get neither.
+const IFACE_PORT_SECURITY_FIELDS: &[Cand] = &[
+    ("mac", "the only source MAC this port may use"),
+    ("address", "an address this port may send from (repeatable)"),
+];
+
 const IFACE_WWAN_FIELDS: &[Cand] = &[
     ("apn", "the APN the operator gave you (required)"),
     ("username", "PAP/CHAP user, where the operator wants one"),
@@ -3508,8 +3563,10 @@ pub(crate) fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "vpn", "openconnect"] => OPENCONNECT_FIELDS,
         ["set" | "delete", "vpn", "openconnect", "user", _u] => OPENCONNECT_USER_FIELDS,
         ["set", "vpn", "openconnect", "default-route" | "disabled"] => BOOLS,
+        ["set", "protocols", "bgp", "flowspec-enforce"] => BOOLS,
         // `address6 auto` completes the SLAAC keyword.
         ["set", "interface", _name, "address6"] => ADDRESS6_HINT,
+        ["set" | "delete", "interface", _name, "port-security"] => IFACE_PORT_SECURITY_FIELDS,
         // Per-link kernel behaviour and DHCP-client identity: one level of
         // fields, then a boolean wherever the field is a switch.
         ["set" | "delete", "interface", _name, "wwan"] => IFACE_WWAN_FIELDS,
@@ -3663,6 +3720,8 @@ pub(crate) fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "services", "dyndns"] => DYNDNS_FIELDS,
         ["set", "services", "dyndns", "provider"] => DYNDNS_PROVIDERS,
         ["set" | "delete", "services", "dhcp-relay"] => DHCP_RELAY_FIELDS,
+        ["set" | "delete", "services", "pppoe-server"] => PPPOE_SERVER_FIELDS,
+        ["set" | "delete", "services", "pppoe-server", "user", _name] => PPPOE_USER_FIELDS,
         ["set" | "delete", "services", "reverse-proxy", _name] => REVERSE_PROXY_FIELDS,
         ["set", "services", "reverse-proxy", _name, "disabled"] => BOOLS,
         ["set" | "delete", "services", "broadcast-relay", _name] => BROADCAST_RELAY_FIELDS,
@@ -4303,7 +4362,7 @@ pub(crate) fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, 
         [
             "set",
             "services",
-            "lldp" | "mdns" | "dyndns" | "dhcp-relay",
+            "lldp" | "mdns" | "dyndns" | "dhcp-relay" | "pppoe-server",
             "interface",
         ] => nics("interface"),
         ["set", "services", "broadcast-relay", _name, "interface"] => {
@@ -4345,7 +4404,21 @@ pub(crate) fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, 
         ["set", "interface", _name, "vlan"] => own_cands(&[PH_VLAN]),
         ["set", "interface", _name, "pd-subnet" | "ttl"] => own_cands(&[PH_U8]),
         ["set", "interface", _name, "mtu"] => own_cands(&[PH_MTU]),
+        ["set", "interface", _name, "ingress-limit"] => {
+            own_cands(&[("<mbit>", "megabits per second this port may send")])
+        }
         ["set", "interface", _name, "mac"] => own_cands(&[PH_MAC]),
+        // Port security. The MAC hint is the placeholder rather than the link's
+        // current address on purpose: binding a tenant port to whatever it
+        // happens to be sending from today would defeat the point of binding it.
+        ["set" | "delete", "interface", _name, "port-security", "mac"] => own_cands(&[PH_MAC]),
+        [
+            "set" | "delete",
+            "interface",
+            _name,
+            "port-security",
+            "address",
+        ] => own_cands(&[PH_IPV4, PH_IPV6]),
         // Bridge/bond membership + per-port VLAN filtering.
         ["set" | "delete", "interface", _name, "member"] => nics("member NIC"),
         ["set", "interface", _name, "vlan-untagged"] => own_cands(&[PH_VLAN]),
@@ -4494,6 +4567,7 @@ pub(crate) fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, 
         ["set", "protocols", "bgp", "local-as"] => own_cands(&[PH_ASN]),
         ["set", "protocols", "bgp", "router-id"] => own_cands(&[PH_IPV4]),
         ["set", "protocols", "bgp", "hold-time"] => own_cands(&[PH_SECONDS]),
+        ["set", "protocols", "bgp", "flowspec-min-prefix"] => own_cands(&[PH_U8]),
         ["set", "protocols", "bgp", "network"] => own_cands(&[PH_IPV4_CIDR, PH_IPV6_CIDR]),
         ["set", "protocols", "bgp", "confederation", "id" | "member"] => own_cands(&[PH_ASN]),
         ["set", "protocols", "bgp", "rpki", "rtr"] => own_cands(&[PH_HOST_PORT]),
@@ -4550,6 +4624,18 @@ pub(crate) fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, 
         ["set", "system", "conntrack-sync", "listen" | "peer"] => own_cands(&[PH_IPV4]),
         ["set", "services", "snmp", "community"] => own_cands(&[PH_KEY]),
         ["set", "services", "snmp", "location" | "contact"] => own_cands(&[PH_TEXT]),
+        [
+            "set",
+            "services",
+            "pppoe-server",
+            "local-address" | "pool-start" | "dns",
+        ] => own_cands(&[PH_IPV4]),
+        ["set", "services", "pppoe-server", "max-sessions"] => {
+            own_cands(&[("<1-65535>", "how many sessions")])
+        }
+        ["set", "services", "pppoe-server", "mtu"] => own_cands(&[PH_MTU]),
+        ["set", "services", "pppoe-server", "user", _name, "address"] => own_cands(&[PH_IPV4]),
+        ["set", "services", "pppoe-server", "user", _name, "password"] => own_cands(&[PH_KEY]),
         ["set", "services", "dhcp-relay", "server"] => own_cands(&[PH_IPV4]),
         ["set", "services", "dhcp-relay", "server6"] => own_cands(&[PH_IPV6]),
         ["set", "services", "dyndns", "hostname"] => {
@@ -5099,6 +5185,8 @@ mod tests {
                 "zone",
                 "address",
                 "address6",
+                "ingress-limit",
+                "port-security",
                 "pd-from",
                 "pd-subnet",
                 "parent",
@@ -5390,6 +5478,7 @@ mod tests {
                 "mdns",
                 "dyndns",
                 "dhcp-relay",
+                "pppoe-server",
                 "reverse-proxy",
                 "broadcast-relay",
                 "portal",
@@ -5663,6 +5752,8 @@ mod tests {
                 "zone",
                 "address",
                 "address6",
+                "ingress-limit",
+                "port-security",
                 "pd-from",
                 "pd-subnet",
                 "parent",
