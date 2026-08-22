@@ -151,10 +151,14 @@ pub fn human_size(bytes: u64) -> String {
 ///
 /// It is deliberately NOT the real requirement: that is the source medium's own
 /// layout, which grows whenever the sealed store does, and is measured from the
-/// source by [`source_layout_bytes`] before a single byte is erased. A constant
-/// kept by hand falls behind the image it describes, and the way it fails is to
-/// admit a disk, wipe it, and only then discover the partitions do not fit.
-pub const MIN_TARGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// source by [`source_layout_bytes`] before a single byte is erased. That
+/// per-source check is the authority and it runs pre-erase, so a disk that
+/// clears this floor but is still too small is rejected before any wipe. The
+/// floor stays a coarse sanity gate, but no lower than it needs to be: the real
+/// layout is ~5.7 GiB today, so 5 GiB rejects the obviously-too-small disks
+/// without ever exceeding (and so wrongly rejecting) a disk the real check would
+/// have accepted.
+pub const MIN_TARGET_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 /// The number of bytes a target must have for the source layout to be written
 /// onto it: the end of the source's last partition, plus the 33 sectors the
@@ -233,8 +237,8 @@ pub fn plan_targets<'a>(
         }
         if disk.removable {
             bail!(
-                "disk {} is removable (the installer medium?) — refusing; \
-                 pass it explicitly only if you're sure",
+                "disk {} is removable (the installer medium?) — refusing to install \
+                 onto it. There is no override; install to a non-removable disk.",
                 disk.dev_path()
             );
         }
@@ -613,9 +617,12 @@ impl Drop for MountGuard {
 /// mounted under the live medium.
 pub fn seed_config(targets: &[&Disk], raid: Raid, toml: &str) -> Result<()> {
     let dev = match raid.mdadm_level() {
-        // The array is assembled at /dev/md/data by `prepare`; a single-disk
-        // install writes the partition directly.
-        Some(_) => "/dev/md/data".to_string(),
+        // `execute` creates the array as /dev/md/sentinel-data (mdadm --create),
+        // and it is still present at that node in this same installer session; a
+        // single-disk install writes the partition directly. This must match the
+        // name `execute` used — mounting /dev/md/data (which is never created)
+        // failed every RAID install at the seeding step.
+        Some(_) => "/dev/md/sentinel-data".to_string(),
         None => part_path(&targets[0].dev_path(), DATA_PART),
     };
     let mnt = std::path::Path::new("/run/sentinel-seed");
@@ -677,6 +684,39 @@ pub fn update(image: &std::path::Path, commit: bool) -> Result<()> {
         (dev.clone(), Some(LoopGuard(dev)))
     };
 
+    // The *identity* of the slot, not only its contents, and it is checked
+    // BEFORE any destructive write. systemd finds a verity pair by partition
+    // GUID -- the two halves of the image's root hash -- so a slot holding the
+    // new image while keeping the old slot's randomly assigned GUIDs is a slot
+    // the initrd cannot find. It then waits for a device that will never appear:
+    // the box hangs rather than failing, so it never resets, so the boot counter
+    // never decrements and the automatic rollback never fires. That is exactly
+    // how an updated appliance went dark on the bench.
+    //
+    // The same mechanism bites the *identical-image* case: if this image is
+    // byte-for-byte the one already running, its slot-A verity/store GUIDs ARE
+    // the active slot's GUIDs, and stamping them onto the inactive slot leaves
+    // two partitions sharing one PARTUUID — which the initrd cannot tell apart,
+    // so it hangs exactly as above. The GUIDs cannot be randomised away (verity
+    // derives them from the root hash the UKI expects), so the only safe answer
+    // is to refuse up front, before the inactive slot is touched.
+    let src_verity = partition_guid(&srcdev, SLOT_A.verity_part)?;
+    let src_store = partition_guid(&srcdev, SLOT_A.store_part)?;
+    let active_verity = partition_guid(&disk, active.verity_part)?;
+    let active_store = partition_guid(&disk, active.store_part)?;
+    if src_verity == active_verity || src_store == active_store {
+        bail!(
+            "this image is identical to the running slot {active} (its verity/store \
+             partitions carry the same GUIDs): writing it to slot {inactive} would \
+             leave two partitions with the same PARTUUID, which the initrd cannot \
+             tell apart — the box would hang at boot instead of auto-rolling-back. \
+             Nothing was changed. Update to a freshly built image, which carries its \
+             own verity GUIDs.",
+            active = active.name,
+            inactive = inactive.name,
+        );
+    }
+
     // Clone the source's slot-A store + verity hash into our inactive slot.
     eprintln!("writing slot {} from {srcdev} …", inactive.name);
     let clone = |from: u32, to: u32| -> Result<()> {
@@ -692,16 +732,6 @@ pub fn update(image: &std::path::Path, commit: bool) -> Result<()> {
     };
     clone(SLOT_A.verity_part, inactive.verity_part)?;
     clone(SLOT_A.store_part, inactive.store_part)?;
-
-    // The *identity* of the slot, not only its contents. systemd finds a verity
-    // pair by partition GUID -- the two halves of the image's root hash -- so a
-    // slot holding the new image while keeping the old slot's randomly assigned
-    // GUIDs is a slot the initrd cannot find. It then waits for a device that
-    // will never appear: the box hangs rather than failing, so it never resets,
-    // so the boot counter never decrements and the automatic rollback never
-    // fires. That is exactly how an updated appliance went dark on the bench.
-    let src_verity = partition_guid(&srcdev, SLOT_A.verity_part)?;
-    let src_store = partition_guid(&srcdev, SLOT_A.store_part)?;
     // Re-type the inactive (reserved-generic) partitions to the verity GUIDs so
     // the initrd's veritysetup considers them, and give them the source's
     // unique GUIDs so it can identify which image they hold.

@@ -1272,7 +1272,12 @@
           };
 
           systemd.tmpfiles.rules = [
-            "d /run/sentinel 0755 root root -"
+            # Must match nix/appliance.nix's rule for this same path: 0775
+            # root:wheel, so the admin who runs `configure` (not as root) can stage
+            # temp files here (system::stage_private) before the live apply
+            # escalates. A second, differing rule (0755 root:root) would win and
+            # break that staging with EACCES.
+            "d /run/sentinel 0775 root wheel -"
             "d /run/sentinel/chrony.d 0755 root root -"
             "d /run/sentinel/dnsmasq.d 0755 root root -"
             # The radio configs carry the pre-shared key, so the directory is
@@ -1820,7 +1825,7 @@
           assert token, "token file is empty"
 
           # /health needs no auth.
-          machine.succeed("curl -fsS http://127.0.0.1:8080/api/v1/health | grep -q ok")
+          machine.succeed("curl -fsSk https://127.0.0.1:8080/api/v1/health | grep -q ok")
 
           with subtest("a read-only account may read and may not write"):
               # Give the box a group and an account in it, through the same PUT
@@ -1832,9 +1837,9 @@
                   '"interface":[{"name":"eth0","zone":"wan","address":"dhcp"}]}'
               )
               machine.succeed(
-                  f"curl -fsS -X PUT -H 'Authorization: Bearer {token}' "
+                  f"curl -fsSk -X PUT -H 'Authorization: Bearer {token}' "
                   f"-H 'Content-Type: application/json' -d '{rbac}' "
-                  "http://127.0.0.1:8080/api/v1/config"
+                  "https://127.0.0.1:8080/api/v1/config"
               )
               # The account's token was minted beside the machine one, 0600.
               perms = machine.succeed(
@@ -1846,17 +1851,17 @@
 
               # Reads: allowed.
               machine.succeed(
-                  f"curl -fsS -H 'Authorization: Bearer {vera}' "
-                  "http://127.0.0.1:8080/api/v1/config >/dev/null"
+                  f"curl -fsSk -H 'Authorization: Bearer {vera}' "
+                  "https://127.0.0.1:8080/api/v1/config >/dev/null"
               )
               # Writes: refused, and with 403 rather than 401 — the caller is
               # known, they simply may not.
               code = machine.succeed(
-                  f"curl -s -o /dev/null -w '%{{http_code}}' -X PUT "
+                  f"curl -sk -o /dev/null -w '%{{http_code}}' -X PUT "
                   f"-H 'Authorization: Bearer {vera}' "
                   "-H 'Content-Type: application/json' "
                   "-d '{\"system\":{\"hostname\":\"taken-over\"}}' "
-                  "http://127.0.0.1:8080/api/v1/config"
+                  "https://127.0.0.1:8080/api/v1/config"
               ).strip()
               assert code == "403", f"read-only PUT returned {code} (want 403)"
               # …and nothing changed.
@@ -1871,14 +1876,14 @@
                   '"interface":[{"name":"eth0","zone":"wan","address":"dhcp"}]}'
               )
               machine.succeed(
-                  f"curl -fsS -X PUT -H 'Authorization: Bearer {token}' "
+                  f"curl -fsSk -X PUT -H 'Authorization: Bearer {token}' "
                   f"-H 'Content-Type: application/json' -d '{plain}' "
-                  "http://127.0.0.1:8080/api/v1/config"
+                  "https://127.0.0.1:8080/api/v1/config"
               )
               code = machine.succeed(
-                  f"curl -s -o /dev/null -w '%{{http_code}}' "
+                  f"curl -sk -o /dev/null -w '%{{http_code}}' "
                   f"-H 'Authorization: Bearer {vera}' "
-                  "http://127.0.0.1:8080/api/v1/config"
+                  "https://127.0.0.1:8080/api/v1/config"
               ).strip()
               assert code == "401", f"a withdrawn account got {code} (want 401)"
 
@@ -1890,7 +1895,7 @@
               # which looks exactly like a rejected token.  Nothing else here
               # would notice, because everything else reads the page as text.
               machine.succeed(
-                  "curl -fsS http://127.0.0.1:8080/ > /tmp/console.html"
+                  "curl -fsSk https://127.0.0.1:8080/ > /tmp/console.html"
               )
               # Cut the block out with node itself: the appliance image has no
               # python, and doing it with an index rather than a regex keeps
@@ -1907,15 +1912,15 @@
 
           # No token → 401.
           code = machine.succeed(
-              "curl -s -o /dev/null -w '%{http_code}' "
-              "http://127.0.0.1:8080/api/v1/config"
+              "curl -sk -o /dev/null -w '%{http_code}' "
+              "https://127.0.0.1:8080/api/v1/config"
           ).strip()
           assert code == "401", f"unauthenticated /config returned {code} (want 401)"
 
           # With the token → the running config as JSON (carries the hostname).
           cfg = machine.succeed(
-              f"curl -fsS -H 'Authorization: Bearer {token}' "
-              "http://127.0.0.1:8080/api/v1/config"
+              f"curl -fsSk -H 'Authorization: Bearer {token}' "
+              "https://127.0.0.1:8080/api/v1/config"
           )
           assert '"hostname"' in cfg, cfg
 
@@ -1928,9 +1933,9 @@
               '"rule":[{"name":"web","from":"wan","to":"wan","action":"accept"}]}'
           )
           out = machine.succeed(
-              f"curl -fsS -X PUT -H 'Authorization: Bearer {token}' "
+              f"curl -fsSk -X PUT -H 'Authorization: Bearer {token}' "
               f"-H 'Content-Type: application/json' -d '{body}' "
-              "http://127.0.0.1:8080/api/v1/config"
+              "https://127.0.0.1:8080/api/v1/config"
           )
           assert '"applied":true' in out, out
 
@@ -1945,9 +1950,9 @@
           # validation the CLI runs (a space + '!' in the hostname).
           bad = '{"system":{"hostname":"Bad Host!"}}'
           code = machine.succeed(
-              "curl -s -o /dev/null -w '%{http_code}' -X PUT "
+              "curl -sk -o /dev/null -w '%{http_code}' -X PUT "
               f"-H 'Authorization: Bearer {token}' -H 'Content-Type: application/json' "
-              f"-d '{bad}' http://127.0.0.1:8080/api/v1/config"
+              f"-d '{bad}' https://127.0.0.1:8080/api/v1/config"
           ).strip()
           assert code == "400", f"invalid PUT returned {code} (want 400)"
           # Still the previous good hostname (the bad config never applied).
@@ -1955,15 +1960,15 @@
 
           # An operational show proxied through the API returns live status.
           status = machine.succeed(
-              f"curl -fsS -H 'Authorization: Bearer {token}' "
-              "http://127.0.0.1:8080/api/v1/status"
+              f"curl -fsSk -H 'Authorization: Bearer {token}' "
+              "https://127.0.0.1:8080/api/v1/status"
           )
           assert "api-fw" in status, status
 
           # ---- the web console (roadmap C12) ------------------------------
           # The page is markup with no data in it, and a sign-in page nobody can
           # reach is not a sign-in page — so `/` answers without a token.
-          page = machine.succeed("curl -fsS http://127.0.0.1:8080/")
+          page = machine.succeed("curl -fsSk https://127.0.0.1:8080/")
           assert "<!doctype html>" in page.lower(), page[:200]
           assert "Sentinel" in page
 
@@ -1998,8 +2003,8 @@
           assert len(paths) >= 15, f"only found {paths}"
           for path in paths:
               code = machine.succeed(
-                  "curl -s -o /dev/null -w '%{http_code}' "
-                  f"-H 'Authorization: Bearer {token}' http://127.0.0.1:8080{path}"
+                  "curl -sk -o /dev/null -w '%{http_code}' "
+                  f"-H 'Authorization: Bearer {token}' https://127.0.0.1:8080{path}"
               ).strip()
               assert code == "200", f"the console calls {path}, which answered {code}"
 
@@ -2024,12 +2029,12 @@
               "commit save > /tmp/script"
           )
           rule = machine.succeed(
-              "curl -sS -X POST -H 'Authorization: Bearer " + token + "' "
-              "--data-binary @/tmp/script http://127.0.0.1:8080/api/v1/configure"
+              "curl -sSk -X POST -H 'Authorization: Bearer " + token + "' "
+              "--data-binary @/tmp/script https://127.0.0.1:8080/api/v1/configure"
           )
           shown = machine.succeed(
-              "curl -fsS -H 'Authorization: Bearer " + token + "' "
-              "http://127.0.0.1:8080/api/v1/show/configuration"
+              "curl -fsSk -H 'Authorization: Bearer " + token + "' "
+              "https://127.0.0.1:8080/api/v1/show/configuration"
           )
           assert "from-console" in shown, rule + shown
           # …and `save` really persisted it, rather than only applying it live.
@@ -2043,8 +2048,8 @@
               "printf '%s\n' 'set firewall rule nonsense action banana' commit save > /tmp/bad"
           )
           bad = machine.succeed(
-              "curl -sS -X POST -H 'Authorization: Bearer " + token + "' "
-              "--data-binary @/tmp/bad http://127.0.0.1:8080/api/v1/configure"
+              "curl -sSk -X POST -H 'Authorization: Bearer " + token + "' "
+              "--data-binary @/tmp/bad https://127.0.0.1:8080/api/v1/configure"
           )
           assert "banana" in bad, bad
           machine.fail("grep -q banana /var/lib/sentinel/appliance.toml")
@@ -2060,12 +2065,12 @@
               "commit save > /tmp/zones"
           )
           zones = machine.succeed(
-              "curl -sS -X POST -H 'Authorization: Bearer " + token + "' "
-              "--data-binary @/tmp/zones http://127.0.0.1:8080/api/v1/configure"
+              "curl -sSk -X POST -H 'Authorization: Bearer " + token + "' "
+              "--data-binary @/tmp/zones https://127.0.0.1:8080/api/v1/configure"
           )
           cfg = machine.succeed(
-              "curl -fsS -H 'Authorization: Bearer " + token + "' "
-              "http://127.0.0.1:8080/api/v1/show/configuration"
+              "curl -fsSk -H 'Authorization: Bearer " + token + "' "
+              "https://127.0.0.1:8080/api/v1/show/configuration"
           )
           assert "console-masq" in cfg, zones + cfg
           assert "default-action drop" in cfg, zones + cfg
@@ -2076,12 +2081,12 @@
               "printf '%s\n' 'delete nat source console-masq' commit save > /tmp/undo"
           )
           machine.succeed(
-              "curl -sS -X POST -H 'Authorization: Bearer " + token + "' "
-              "--data-binary @/tmp/undo http://127.0.0.1:8080/api/v1/configure"
+              "curl -sSk -X POST -H 'Authorization: Bearer " + token + "' "
+              "--data-binary @/tmp/undo https://127.0.0.1:8080/api/v1/configure"
           )
           cfg = machine.succeed(
-              "curl -fsS -H 'Authorization: Bearer " + token + "' "
-              "http://127.0.0.1:8080/api/v1/show/configuration"
+              "curl -fsSk -H 'Authorization: Bearer " + token + "' "
+              "https://127.0.0.1:8080/api/v1/show/configuration"
           )
           assert "console-masq" not in cfg, cfg
 
@@ -2091,8 +2096,8 @@
               "printf '%s\n' 'set firewall rule dry-run from wan' > /tmp/dry"
           )
           machine.succeed(
-              "curl -sS -X POST -H 'Authorization: Bearer " + token + "' "
-              "--data-binary @/tmp/dry http://127.0.0.1:8080/api/v1/configure"
+              "curl -sSk -X POST -H 'Authorization: Bearer " + token + "' "
+              "--data-binary @/tmp/dry https://127.0.0.1:8080/api/v1/configure"
           )
           machine.fail("grep -q dry-run /var/lib/sentinel/appliance.toml")
 
@@ -2121,12 +2126,12 @@
               "commit save > /tmp/masks"
           )
           masks = machine.succeed(
-              "curl -sS -X POST -H 'Authorization: Bearer " + token + "' "
-              "--data-binary @/tmp/masks http://127.0.0.1:8080/api/v1/configure"
+              "curl -sSk -X POST -H 'Authorization: Bearer " + token + "' "
+              "--data-binary @/tmp/masks https://127.0.0.1:8080/api/v1/configure"
           )
           cfg = machine.succeed(
-              "curl -fsS -H 'Authorization: Bearer " + token + "' "
-              "http://127.0.0.1:8080/api/v1/show/configuration"
+              "curl -fsSk -H 'Authorization: Bearer " + token + "' "
+              "https://127.0.0.1:8080/api/v1/show/configuration"
           )
           for want in ["65002", "site-a", "wg0", "dhcp-server"]:
               assert want in cfg, masks + cfg
@@ -2135,8 +2140,8 @@
           # what an operator copies. It has to name every setting with the path
           # that would set it — including a value that contains spaces.
           flat = machine.succeed(
-              "curl -fsS -H 'Authorization: Bearer " + token + "' "
-              "http://127.0.0.1:8080/api/v1/show/configuration/commands"
+              "curl -fsSk -H 'Authorization: Bearer " + token + "' "
+              "https://127.0.0.1:8080/api/v1/show/configuration/commands"
           )
           assert "set protocols bgp neighbor 192.0.2.1 remote-as 65002" in flat, flat
           assert "description upstream link" in flat, flat
@@ -2145,13 +2150,13 @@
           # the whole thing is the strongest form of that: it is how a config is
           # copied to a second appliance.
           machine.succeed(
-              "curl -fsS -H 'Authorization: Bearer " + token + "' "
-              "http://127.0.0.1:8080/api/v1/show/configuration/commands > /tmp/replay"
+              "curl -fsSk -H 'Authorization: Bearer " + token + "' "
+              "https://127.0.0.1:8080/api/v1/show/configuration/commands > /tmp/replay"
           )
           machine.succeed("printf '%s\n' commit >> /tmp/replay")
           replay = machine.succeed(
-              "curl -sS -X POST -H 'Authorization: Bearer " + token + "' "
-              "--data-binary @/tmp/replay http://127.0.0.1:8080/api/v1/configure"
+              "curl -sSk -X POST -H 'Authorization: Bearer " + token + "' "
+              "--data-binary @/tmp/replay https://127.0.0.1:8080/api/v1/configure"
           )
           assert "error" not in replay, replay
 
@@ -2186,44 +2191,44 @@
           # be there. Bounded, so the check cannot hang on a quiet interface.
           machine.succeed("ping -c 3 -i 0.2 127.0.0.1 >/dev/null &")
           cap = machine.succeed(
-              "curl -sS -X POST -H 'Authorization: Bearer " + token + "' "
+              "curl -sSk -X POST -H 'Authorization: Bearer " + token + "' "
               "-H 'Content-Type: application/json' "
               "--data '{\"interface\":\"lo\",\"filter\":\"icmp\",\"packets\":3,\"seconds\":8}' "
-              "http://127.0.0.1:8080/api/v1/capture"
+              "https://127.0.0.1:8080/api/v1/capture"
           )
           assert "ICMP echo" in cap or "packets captured" in cap, cap
 
           # A capture on a quiet interface answers rather than hanging: "that
           # traffic is not arriving" is a diagnosis too.
           quiet = machine.succeed(
-              "curl -sS -X POST -H 'Authorization: Bearer " + token + "' "
+              "curl -sSk -X POST -H 'Authorization: Bearer " + token + "' "
               "-H 'Content-Type: application/json' "
               "--data '{\"interface\":\"lo\",\"filter\":\"tcp port 9999\",\"packets\":1,\"seconds\":2}' "
-              "http://127.0.0.1:8080/api/v1/capture"
+              "https://127.0.0.1:8080/api/v1/capture"
           )
           assert "no packets matched" in quiet or "0 packets" in quiet, quiet
 
           # A filter that would become an option is refused, not quoted and
           # hoped for: tcpdump's -z runs a program and -w writes a file.
           code = machine.succeed(
-              "curl -s -o /dev/null -w '%{http_code}' -X POST "
+              "curl -sk -o /dev/null -w '%{http_code}' -X POST "
               "-H 'Authorization: Bearer " + token + "' "
               "-H 'Content-Type: application/json' "
               "--data '{\"interface\":\"lo\",\"filter\":\"-z /bin/sh\"}' "
-              "http://127.0.0.1:8080/api/v1/capture"
+              "https://127.0.0.1:8080/api/v1/capture"
           ).strip()
           assert code == "400", f"a filter that looks like an option answered {code}"
 
           # Operational commands are their own path: they change what the box is
           # doing, are nowhere in the saved config, and cannot be staged.
           machine.succeed(
-              "curl -fsS -X POST -H 'Authorization: Bearer " + token + "' "
-              "http://127.0.0.1:8080/api/v1/clear/ids/blocks"
+              "curl -fsSk -X POST -H 'Authorization: Bearer " + token + "' "
+              "https://127.0.0.1:8080/api/v1/clear/ids/blocks"
           )
           code = machine.succeed(
-              "curl -s -o /dev/null -w '%{http_code}' -X POST "
+              "curl -sk -o /dev/null -w '%{http_code}' -X POST "
               "-H 'Authorization: Bearer " + token + "' "
-              "http://127.0.0.1:8080/api/v1/clear/nonsense"
+              "https://127.0.0.1:8080/api/v1/clear/nonsense"
           ).strip()
           assert code == "400", f"an unknown clear path answered {code}"
 
@@ -2251,12 +2256,12 @@
               "commit save > /tmp/sections"
           )
           sections = machine.succeed(
-              "curl -sS -X POST -H 'Authorization: Bearer " + token + "' "
-              "--data-binary @/tmp/sections http://127.0.0.1:8080/api/v1/configure"
+              "curl -sSk -X POST -H 'Authorization: Bearer " + token + "' "
+              "--data-binary @/tmp/sections https://127.0.0.1:8080/api/v1/configure"
           )
           cfg = machine.succeed(
-              "curl -fsS -H 'Authorization: Bearer " + token + "' "
-              "http://127.0.0.1:8080/api/v1/show/configuration"
+              "curl -fsSk -H 'Authorization: Bearer " + token + "' "
+              "https://127.0.0.1:8080/api/v1/show/configuration"
           )
           for want in ["uplink", "10.0.0.254", "offices", "8443", "203.0.113.9",
                        "internal", "ops", "wan-vip", "track-interface"]:
@@ -2266,8 +2271,8 @@
           # view is never empty and an operator can tell "no peers" apart from
           # "the page failed to load".
           stack = machine.succeed(
-              "curl -fsS -H 'Authorization: Bearer " + token + "' "
-              "http://127.0.0.1:8080/api/v1/stack"
+              "curl -fsSk -H 'Authorization: Bearer " + token + "' "
+              "https://127.0.0.1:8080/api/v1/stack"
           )
           assert '"self"' in stack, stack
 
@@ -2275,16 +2280,16 @@
           # than proxied: the stack is exactly the config-sync peers, and
           # inventing a member would let the console reach anywhere the box can.
           code = machine.succeed(
-              "curl -s -o /dev/null -w '%{http_code}' "
+              "curl -sk -o /dev/null -w '%{http_code}' "
               "-H 'Authorization: Bearer " + token + "' "
-              "http://127.0.0.1:8080/api/v1/stack/10.9.9.9/show/version"
+              "https://127.0.0.1:8080/api/v1/stack/10.9.9.9/show/version"
           ).strip()
           assert code == "400", f"an unknown stack member answered {code}"
 
           # And those endpoints stay behind the token like every other one.
           code = machine.succeed(
-              "curl -s -o /dev/null -w '%{http_code}' "
-              f"http://127.0.0.1:8080{paths[0]}"
+              "curl -sk -o /dev/null -w '%{http_code}' "
+              f"https://127.0.0.1:8080{paths[0]}"
           ).strip()
           assert code == "401", f"{paths[0]} served data without a token ({code})"
         '';
@@ -4609,6 +4614,334 @@
               assert rate > 50, f"an uncapped port only managed {rate} Mbit/s"
         '';
       };
+
+      # B9 — the SRv6 data plane, end to end across two boxes and a real underlay.
+      #
+      # WHY THIS ONE DRIVES THE AGENT DIRECTLY, unlike every other data-path check
+      # here. The appliance's config surface renders an `[srv6]` *identity* and
+      # nothing else — no `[[srv6_route]]`, no `[[srv6_flood]]`, no
+      # `[[srv6_irb_route]]`. That is not an SRv6 gap: it renders no
+      # `[[mac_route]]` or `[[flood_vtep]]` either, because on an appliance those
+      # entries are learned from EVPN at run time and no bridge exists from wren's
+      # monitor stream into the appliance's config. So a check driven through
+      # `sentinel configure` could only prove the renderer emits an endpoint —
+      # which `checks.evpn` already does, and which is not what was broken.
+      #
+      # What was broken was the data plane, so this drives the data plane: two
+      # NixOS VMs on one L2, a real kernel, a real eBPF load, real frames, and the
+      # agent's own counters read back from its journal. The appliance's velstra
+      # unit is stopped first, because the agent here needs XDP on *two*
+      # interfaces (the tenant tap and the underlay) and the unit passes one.
+      #
+      # Each locator is its own /64 and the underlay routes it, which is what a
+      # real SRv6 fabric looks like. The service SIDs themselves are never routed:
+      # the outer destination MAC delivers the frame, exactly as a VTEP address
+      # would.
+      #
+      # Four behaviours, and three of them could not have passed before this work:
+      #   * End.DT2U round-trip — the baseline. Red here means the harness is
+      #     wrong and nothing below says anything.
+      #   * End.DT2M flood — `try_srv6_decap` refused every behaviour but
+      #     End.DT2U, so a flood copy was dropped on arrival; and the TC
+      #     classifier was attached only when a VXLAN `[overlay]` was configured,
+      #     so no copy was ever sent either. Both halves are asserted.
+      #   * Symmetric IRB, plus the gate that keeps bridged traffic bridged.
+      #   * Decap source authentication, which is the only thing standing between
+      #     the underlay and a tenant segment.
+      #
+      #   nix build .#checks.x86_64-linux.srv6 -L
+      srv6 =
+        let
+          # Written out in full rather than compressed, because the layout *is*
+          # the contract: `locator ++ discriminator(1) ++ vni(3)`. For a /64
+          # locator that puts `disc<<8 | vni>>16` in group 5 and the low 16 bits
+          # of the VNI in group 6. Compressing them hides the one field a reader
+          # needs to check.  vni 10000 = 0x2710, l3_vni 50100 = 0xc3b4.
+          dt2uSid = "fc00:0:2:0:0:2710:0:0"; # disc 0 — unicast bridge
+          dt2mSid = "fc00:0:2:0:100:2710:0:0"; # disc 1 — BUM flood
+          irbSid = "fc00:0:2:0:0:c3b4:0:0"; # disc 0, the tenant's L3 VNI
+          # The tenant peer's MAC: the inner destination the unicast entry keys
+          # on. Nothing answers to it — the counters are the proof, not a reply.
+          peerMac = "02:00:00:00:0b:02";
+          gatewayMac = "02:00:5e:00:00:01"; # the tenant's anycast gateway
+          routerMac = "02:00:5e:00:00:bb"; # the egress router, inner dst after IRB
+          # `VIA` is substituted with the far node's real MAC at run time: a
+          # nixosTest's MACs are not ours to predict, and hard-coding one is a
+          # check that passes until the harness renumbers.
+          configA = pkgs.writeText "srv6-a.toml" ''
+            default_action = "pass"
+
+            [srv6]
+            local_src = "fc00:0:1::1"
+            underlay_iface = "eth1"
+            underlay_mtu = 1500
+            peers = ["fc00:0:2::1"]
+
+            [[interface]]
+            name = "tap0"
+            policy = 0
+            vni = 10000
+
+            [[srv6_route]]
+            vni = 10000
+            mac = "${peerMac}"
+            remote_sid = "${dt2uSid}"
+            via_mac = "VIA"
+            out_iface = "eth1"
+
+            [[srv6_flood]]
+            vni = 10000
+            remote_sid = "${dt2mSid}"
+            via_mac = "VIA"
+            out_iface = "eth1"
+
+            [[srv6_irb_route]]
+            vni = 10000
+            inner_dst = "10.20.0.0/24"
+            l3_vni = 50100
+            remote_sid = "${irbSid}"
+            via_mac = "VIA"
+            out_iface = "eth1"
+            router_mac = "${routerMac}"
+            gateway_mac = "${gatewayMac}"
+          '';
+          # B instantiates all three SIDs. The End.DT2M one is the point of the
+          # exercise: the decap path refused it outright until the flood set
+          # existed, so an SRv6 segment could not carry a broadcast either way.
+          configB = pkgs.writeText "srv6-b.toml" ''
+            default_action = "pass"
+
+            [srv6]
+            local_src = "fc00:0:2::1"
+            underlay_iface = "eth1"
+            underlay_mtu = 1500
+            peers = ["fc00:0:1::1"]
+
+            [[srv6_local_sid]]
+            sid = "${dt2uSid}"
+            vni = 10000
+            behavior = "end.dt2u"
+
+            [[srv6_local_sid]]
+            sid = "${dt2mSid}"
+            vni = 10000
+            behavior = "end.dt2m"
+
+            [[srv6_local_sid]]
+            sid = "${irbSid}"
+            vni = 50100
+            behavior = "end.dt2u"
+          '';
+          node = n: { lib, ... }: {
+            imports = [ self.nixosModules.sentinel ];
+            networking.hostName = lib.mkForce "n${toString n}";
+            networking.firewall.enable = lib.mkForce false;
+            virtualisation.vlans = [ 1 ];
+            virtualisation.memorySize = 2048;
+            networking.interfaces.eth1.ipv6.addresses = [
+              {
+                address = "fc00:0:${toString n}::1";
+                prefixLength = 64;
+              }
+            ];
+            # Pointed at eth1 so the unit is well-formed; the test stops it before
+            # starting its own agent, which needs two interfaces.
+            services.velstra.interface = lib.mkForce "eth1";
+            environment.systemPackages = [ velstra ];
+          };
+        in
+        pkgs.testers.runNixOSTest {
+          name = "sentinel-srv6";
+          nodes.n1 = node 1;
+          nodes.n2 = node 2;
+          testScript = ''
+            start_all()
+            for m in (n1, n2):
+                m.wait_for_unit("multi-user.target")
+                # The appliance's own agent would hold eth1; this test needs it.
+                m.succeed("systemctl stop velstra.service")
+
+            # Each locator is a routed /64, so the two ends can actually reach each
+            # other. Asserted before anything is sent: a green run against a dead
+            # link would prove only that nothing was listening.
+            n1.wait_until_succeeds("ip -6 addr show eth1 | grep -q 'fc00:0:1::1'", timeout=30)
+            n2.wait_until_succeeds("ip -6 addr show eth1 | grep -q 'fc00:0:2::1'", timeout=30)
+            n1.succeed("ip -6 route replace fc00:0:2::/64 dev eth1")
+            n2.succeed("ip -6 route replace fc00:0:1::/64 dev eth1")
+            n1.wait_until_succeeds("ping -6 -c1 -W2 fc00:0:2::1", timeout=60)
+
+            b_mac = n2.succeed("cat /sys/class/net/eth1/address").strip()
+            n1.succeed(f"sed 's/VIA/{b_mac}/g' ${configA} > /run/srv6-n1.toml")
+            n2.succeed("cp ${configB} /run/srv6-n2.toml")
+
+            # The tenant: a veth pair with the far end in its own netns, which is
+            # what a tap looks like to the data plane.
+            n1.succeed(
+                "ip netns add tenant; "
+                "ip link add tap0 type veth peer name tap0c; "
+                "ip link set tap0c netns tenant; "
+                "ip link set tap0 up; "
+                "ip netns exec tenant ip link set lo up; "
+                "ip netns exec tenant ip link set tap0c up; "
+                "ip netns exec tenant ip addr add 192.168.100.1/24 dev tap0c"
+            )
+
+            # Both configs have to be *accepted* before the agent is judged on
+            # them: a typo would otherwise read as a data plane that does nothing.
+            print(n1.succeed("velstra validate /run/srv6-n1.toml"))
+            print(n2.succeed("velstra validate /run/srv6-n2.toml"))
+
+            # `--stats-interval 2` so the counter table lands often enough to poll.
+            n2.succeed(
+                "systemd-run --unit=agent-b --collect "
+                "velstra run --iface eth1 --config /run/srv6-n2.toml --stats-interval 2"
+            )
+            n1.succeed(
+                "systemd-run --unit=agent-a --collect velstra run "
+                "--iface tap0 --iface eth1 --config /run/srv6-n1.toml --stats-interval 2"
+            )
+            for m, unit in ((n1, "agent-a"), (n2, "agent-b")):
+                m.wait_until_succeeds(f"systemctl is-active {unit}", timeout=30)
+
+            def counters(m, unit):
+                """The agent's latest stats table, as a dict.
+
+                Read from the journal rather than a query socket: this agent was
+                started by the test, not by the appliance, so it owns no socket the
+                `sentinel` CLI knows about. Later dumps overwrite earlier ones,
+                which is what makes this the *current* value.
+                """
+                out = m.succeed(f"journalctl -u {unit} --no-pager -o cat")
+                got = {}
+                for line in out.splitlines():
+                    parts = line.split()
+                    if len(parts) == 2 and parts[1].isdigit():
+                        got[parts[0]] = int(parts[1])
+                return got
+
+            def wait_counter(m, unit, name, at_least):
+                """Block until a counter reaches `at_least`, then return the table.
+
+                The table is dumped on a timer, so a counter that has already moved
+                in the kernel is not yet in the journal. Polling is the honest way
+                to read it; a bare sleep is a flake waiting to happen.
+                """
+                m.wait_until_succeeds(
+                    f"journalctl -u {unit} --no-pager -o cat "
+                    f"| awk '/^ *{name} +[0-9]+$/ {{v=$NF}} END {{exit !(v>={at_least})}}'",
+                    timeout=90,
+                )
+                return counters(m, unit)
+
+            def settled(m, unit, name):
+                """The value of a counter once it has stopped moving.
+
+                `wait_counter` returns the moment a *threshold* is crossed, which
+                is not the same as the traffic having finished: the table is
+                dumped on a timer, so the journal can still be a dump behind the
+                kernel. Reading a "before" value at that moment and then asserting
+                it did not change afterwards compares two different instants and
+                fails on traffic that was already in flight -- which is exactly
+                what it did the first time this ran.
+
+                Two equal reads either side of a full dump period mean the last
+                dump reflected a quiet counter.
+                """
+                previous = counters(m, unit).get(name, 0)
+                for _ in range(30):
+                    m.sleep(3)
+                    current = counters(m, unit).get(name, 0)
+                    if current == previous:
+                        return current
+                    previous = current
+                raise Exception(f"{name} never settled on {unit}")
+
+            with subtest("the BUM classifier attached at all"):
+                # It is attached best-effort and its failure is only a log line, so
+                # a silent failure would look exactly like "no traffic" in the two
+                # flood assertions below. Ruled out first, by name.
+                # Not `log`: the test driver already owns that name (its logger),
+                # and shadowing it is the kind of thing mypy catches and a human
+                # does not.
+                attach_log = n1.succeed("journalctl -u agent-a --no-pager -o cat")
+                assert "BUM replication attach failed" not in attach_log, attach_log
+
+            with subtest("a known unicast crosses as End.DT2U"):
+                # Seed the neighbour so the tenant emits a frame addressed to
+                # peerMac at L2 without ARPing: the SRv6 FDB is then the only thing
+                # that can resolve the destination.
+                n1.succeed(
+                    "ip netns exec tenant ip neigh replace 192.168.100.2 "
+                    "lladdr ${peerMac} dev tap0c"
+                )
+                n1.execute("ip netns exec tenant ping -c3 -W1 192.168.100.2")
+                wait_counter(n1, "agent-a", "srv6_encap", 1)
+                wait_counter(n2, "agent-b", "srv6_decap", 1)
+
+            with subtest("a broadcast is head-end replicated and accepted"):
+                before = counters(n2, "agent-b").get("srv6_decap", 0)
+                # An address with no neighbour entry: the tenant ARPs for it, and a
+                # broadcast has no SRv6-FDB entry to consume it, so the TC
+                # classifier is the only thing left that can act.
+                n1.execute("ip netns exec tenant ping -c3 -W1 192.168.100.99")
+                wait_counter(n1, "agent-a", "srv6_bum_replicated", 1)
+                # ...and the far end took it. This is the assertion the old decap
+                # path could not pass: it refused every behaviour but End.DT2U, so
+                # the copy arrived and was dropped.
+                got = wait_counter(n2, "agent-b", "srv6_decap", before + 1)
+                assert got["srv6_decap"] > before, (before, got)
+
+            with subtest("inter-subnet traffic is routed, not bridged"):
+                routed_before = counters(n1, "agent-a").get("irb_routed", 0)
+                n1.succeed(
+                    "ip netns exec tenant ip route replace 10.20.0.0/24 "
+                    "via 192.168.100.254 dev tap0c; "
+                    "ip netns exec tenant ip neigh replace 192.168.100.254 "
+                    "lladdr ${gatewayMac} dev tap0c"
+                )
+                n1.execute("ip netns exec tenant ping -c3 -W1 10.20.0.5")
+                got = wait_counter(n1, "agent-a", "irb_routed", routed_before + 1)
+                # Both, and neither alone: `irb_routed` fires on the VXLAN path
+                # too, and `srv6_encap` fires on a bridged frame. Together they say
+                # this frame was routed AND left over SRv6.
+                assert got["irb_routed"] > routed_before, (routed_before, got)
+                assert got["srv6_encap"] >= 1, got
+
+            with subtest("a frame not addressed to the gateway stays bridged"):
+                # Same destination subnet, different L2 destination. Routing it
+                # would deliver it with a source MAC nobody expects, which is the
+                # whole reason the gateway-MAC gate exists.
+                # Settled, not merely current: the previous subtest's traffic is
+                # still landing in the journal when its `wait_counter` returns,
+                # and taking "before" then would compare two different instants.
+                before = settled(n1, "agent-a", "irb_routed")
+                n1.succeed(
+                    "ip netns exec tenant ip neigh replace 192.168.100.254 "
+                    "lladdr 02:00:00:00:0b:99 dev tap0c"
+                )
+                n1.execute("ip netns exec tenant ping -c3 -W1 10.20.0.5")
+                after = settled(n1, "agent-a", "irb_routed")
+                assert after == before, f"routed a frame not sent to the gateway: {before} -> {after}"
+
+            with subtest("an untrusted source is refused at decap"):
+                # Trust is the only thing between the underlay and a tenant
+                # segment: anything that can reach a SID could otherwise inject a
+                # frame past every zone the firewall has. Drop A from B's peer set
+                # and the very same traffic must stop being accepted.
+                n2.succeed("sed -i 's/^peers = .*/peers = []/' /run/srv6-n2.toml")
+                n2.succeed("systemctl stop agent-b")
+                n2.succeed(
+                    "systemd-run --unit=agent-b2 --collect "
+                    "velstra run --iface eth1 --config /run/srv6-n2.toml --stats-interval 2"
+                )
+                n2.wait_until_succeeds("systemctl is-active agent-b2", timeout=30)
+                n1.execute("ip netns exec tenant ping -c3 -W1 192.168.100.2")
+                got = wait_counter(n2, "agent-b2", "srv6_drop_untrusted", 1)
+                assert got.get("srv6_decap", 0) == 0, (
+                    "an untrusted peer was decapsulated anyway: " + repr(got)
+                )
+          '';
+        };
 
       portsec = pkgs.testers.runNixOSTest {
         name = "sentinel-portsec";
@@ -13816,6 +14149,22 @@
               backup.wait_until_succeeds(
                   "grep -q '12345' /run/sentinel/velstra.toml", timeout=20
               )
+
+              # H3: the push crossed the wire over HTTPS, not plaintext. The backup
+              # minted and persisted a self-signed management certificate, its API
+              # answers on TLS, and a plain-HTTP request to the TLS port is refused.
+              backup.succeed("test -f /var/lib/sentinel/web-tls/cert.pem")
+              backup.succeed("test -f /var/lib/sentinel/web-tls/key.pem")
+              backup.succeed(
+                  "curl -fsSk https://127.0.0.1:8080/api/v1/health | grep -q ok"
+              )
+              backup.fail(
+                  "curl -fsS --max-time 5 http://127.0.0.1:8080/api/v1/health"
+              )
+              # And the primary pinned the backup's TLS key on first use (no
+              # peer-fingerprint was configured), so the config was sent encrypted
+              # and authenticated to exactly that key rather than in the clear.
+              primary.succeed("ls /var/lib/sentinel/configsync/*.pin")
             '';
           };
       };

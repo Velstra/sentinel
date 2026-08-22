@@ -2166,6 +2166,23 @@ fn apply_api(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
 
     match listen {
         Some(addr) => {
+            // SECURITY (H3): the management server is HTTPS by default, so an
+            // off-box console is encrypted. Only warn when the operator has opted
+            // OUT of TLS (`[services.web] tls = false`) AND bound it off loopback —
+            // then passwords, TOTP and bearer tokens really do cross the wire in
+            // the clear, and the segment must be a trusted one.
+            let exposed = !(addr.starts_with("127.") || addr.starts_with("[::1]"));
+            if exposed && !appliance.services.web.tls {
+                eprintln!(
+                    "{}",
+                    crate::ui::yellow(&format!(
+                        "warning: the management console/API is reachable off-box on {addr} \
+                         over PLAINTEXT HTTP (tls is disabled) — passwords, TOTP and bearer \
+                         tokens cross the wire in the clear. Enable tls, or expose it only on \
+                         a trusted management network."
+                    ))
+                );
+            }
             let env = format!("SENTINEL_API_LISTEN={addr}\n");
             let changed = file_changed(Path::new(API_ENV), &env);
             system::install_file(Path::new(API_ENV), &env)?;
@@ -2226,6 +2243,54 @@ pub fn configsync_authority(peer: &str) -> String {
     }
 }
 
+/// Where a learned trust-on-first-use pin for `authority` is stored. Under the
+/// A/B-stable `/var/lib/sentinel` so the pin survives reboots and image updates;
+/// the filename is the authority with every non-alphanumeric byte flattened to
+/// `_` so a `host:port` or a `[v6]:port` is a safe single path component.
+fn configsync_pin_path(authority: &str) -> std::path::PathBuf {
+    let safe: String = authority
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    Path::new("/var/lib/sentinel/configsync").join(format!("{safe}.pin"))
+}
+
+/// The TLS public-key pin to verify `authority` with (H3). The configured
+/// `peer-fingerprint` wins when set — it pins every peer to that key, which fits
+/// the common single-peer HA pair. Otherwise it is trust-on-first-use: a pin
+/// learned from the peer and stored per-authority, so only the very first contact
+/// rests on the network and every later push is pinned. Returns the base64 pin
+/// (curl's `sha256//` value without the prefix).
+pub fn peer_pin(cs: &crate::config::ConfigSync, authority: &str) -> Result<String> {
+    if let Some(fp) = &cs.peer_fingerprint {
+        return Ok(fp.clone());
+    }
+    let pin_path = configsync_pin_path(authority);
+    if let Ok(stored) = std::fs::read_to_string(&pin_path) {
+        let stored = stored.trim();
+        if !stored.is_empty() {
+            return Ok(stored.to_string());
+        }
+    }
+    // First contact: learn the peer's key (over a connection that carries no
+    // secret), record it, and say so — pinning it explicitly with
+    // `peer-fingerprint` removes even this one network-trusted step.
+    let pin = system::learn_peer_pubkey_pin(authority)
+        .with_context(|| format!("learning {authority}'s TLS key (trust-on-first-use)"))?;
+    if let Some(parent) = pin_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&pin_path, &pin);
+    eprintln!(
+        "{}",
+        crate::ui::yellow(&format!(
+            "config-sync: trusting {authority}'s TLS key on first use (pin sha256//{pin}). \
+             Set `system config-sync peer-fingerprint` to pin it explicitly."
+        ))
+    );
+    Ok(pin)
+}
+
 /// The SENDING side of HA config sync (roadmap C21): push the just-committed config
 /// to every `[system.config-sync] peer` via its Sentinel API (`PUT /api/v1/config`,
 /// bearer = the shared secret), which applies + persists it. Called from the
@@ -2248,8 +2313,20 @@ pub fn push_config_to_peers(appliance: &Appliance) -> Result<()> {
     // wheel-writable, world-traversable /run/sentinel during the push.
     system::stage_private(tmp, &json)?;
     for peer in &cs.peers {
-        let url = format!("http://{}/api/v1/config", configsync_authority(peer));
-        match system::curl_put_config(&url, secret, tmp) {
+        let authority = configsync_authority(peer);
+        // H3: HTTPS, with the peer's TLS key pinned (from config, or learned on
+        // first use). This is what keeps the config — WireGuard private keys,
+        // IPsec PSKs, the shared secret — encrypted and authenticated to the peer
+        // instead of crossing the wire in the clear.
+        let pin = match peer_pin(cs, &authority) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("warning: config-sync to {peer} skipped — {e:#}");
+                continue;
+            }
+        };
+        let url = format!("https://{authority}/api/v1/config");
+        match system::curl_put_config(&url, secret, tmp, Some(&pin)) {
             Ok(()) => eprintln!("  config-sync → {peer}"),
             Err(e) => eprintln!("warning: config-sync to {peer} failed: {e}"),
         }
@@ -4260,6 +4337,27 @@ mod tests {
     }
     use super::*;
     use crate::config::{DhcpStaticLease, Pppoe, Qos, QosDiscipline, SyslogTarget};
+
+    #[test]
+    fn peer_pin_prefers_the_configured_fingerprint() {
+        // A configured fingerprint is used verbatim, with no filesystem or
+        // network access (so this is a pure unit test).
+        let cs = crate::config::ConfigSync {
+            peer_fingerprint: Some("PINNEDVALUE".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(peer_pin(&cs, "10.0.0.2:8080").unwrap(), "PINNEDVALUE");
+    }
+
+    #[test]
+    fn configsync_pin_path_is_a_safe_filename() {
+        // A `host:port` or a `[v6]:port` flattens to one safe path component.
+        let p = configsync_pin_path("[2001:db8::1]:8080");
+        let name = p.file_name().unwrap().to_string_lossy();
+        assert!(!name.contains(':') && !name.contains('[') && !name.contains(']'), "{name}");
+        assert!(name.ends_with(".pin"), "{name}");
+        assert!(p.starts_with("/var/lib/sentinel/configsync"), "{}", p.display());
+    }
 
     #[test]
     fn configsync_authority_brackets_bare_ipv6() {

@@ -14,10 +14,16 @@ whole box is described by one **declarative config** that the system reconciles
 to atomically (closer in spirit to Talos than to VyOS/pfSense). You change the
 appliance by changing its config and re-applying — never by editing live state.
 
-> **Status: skeleton.** First slice: the **programmable, declarative CLI** —
-> author/validate the appliance config, and talk to a Velstra controller over
-> [`velstra-proto`](https://crates.io/crates/velstra-proto). The immutable OS
-> image and the config→data-plane compiler build out from here.
+> **Status: working appliance, pre-1.0.** Implemented today: the declarative
+> config model and the interactive `configure` CLI (`commit` / `commit-confirm`
+> / `rollback` / `save`), the config→data-plane compiler driving the Velstra
+> XDP firewall + NAT, the immutable A/B disk image with dm-verity boot and an
+> installer (CLI + TUI), the REST API and read-only web console, dynamic
+> routing (BGP via the Wren control plane), VPN (WireGuard / IPsec / OpenConnect),
+> on-box PKI + ACME, intrusion detection (Suricata), AAA (RADIUS / LDAP / TOTP),
+> multi-WAN, and box services (DNS, NTP, SNMP, LLDP, …). It also talks to a
+> Velstra controller over [`velstra-proto`](https://crates.io/crates/velstra-proto).
+> Pre-1.0: config surface and defaults may still change.
 
 ## Try it
 
