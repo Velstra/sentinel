@@ -81,10 +81,49 @@ set firewall rule web-console action accept
 Then browse to `https://10.0.0.1:8443`. The same bearer token the REST API uses
 is minted into `/var/lib/sentinel/api-token` on first start.
 
+### TLS
+
+The management plane is **HTTPS by default** — passwords, TOTP codes and bearer
+tokens never cross the wire in the clear. With no certificate configured, the box
+mints its own self-signed certificate on first start and persists it at
+`/var/lib/sentinel/web-tls/` (the A/B-stable state partition, so it — and its
+fingerprint — survive reboots and image updates). A browser will warn once about
+the self-signed certificate; that is expected. The certificate's public-key pin
+is printed to the log when the API starts (`TLS pin sha256//…`), which is what a
+config-sync peer pins.
+
+Bring your own certificate instead — from your own CA, or an ACME cert — by
+pointing the server at a PEM cert chain and key:
+
+```
+set services web tls-cert /var/lib/sentinel/pki/web/fullchain.pem
+set services web tls-key  /var/lib/sentinel/pki/web/key.pem
+```
+
+Both are required together. To turn TLS off — only for a loopback/dev box, or one
+behind its own TLS terminator — `set services web tls false`; `commit` then warns
+whenever the plaintext server is bound off-box.
+
 HA config sync (`system config-sync`) uses this same server to receive pushes
 from a peer. When both are on, the console keeps the port you chose but is bound
 so peers can still reach it — a console pinned to localhost would otherwise stop
 config sync without saying so.
+
+> **Config sync is encrypted and the peer is verified.** A push sends the
+> **entire** running config — WireGuard private keys, IPsec PSKs and the shared
+> secret included — so it goes over **HTTPS**, and the peer's certificate is
+> pinned. With nothing configured this is trust-on-first-use: the peer's key is
+> learned and stored on the first push (logged as a one-time notice) and enforced
+> on every push after. To pin explicitly — the strongest option, and stateless —
+> copy the peer's `TLS pin` (from its startup log, or `openssl s_client`) into:
+>
+> ```
+> set system config-sync peer-fingerprint <base64-sha256-of-the-peer-key>
+> ```
+>
+> A single `peer-fingerprint` pins every peer to that key, which fits the common
+> single-peer HA pair; for several distinct peers, leave it unset and let
+> trust-on-first-use pin each one.
 
 ## Dynamic DNS
 

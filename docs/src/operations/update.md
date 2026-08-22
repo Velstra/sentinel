@@ -25,10 +25,19 @@ What happens:
 
 Without `--commit`, the plan is printed but nothing is written.
 
-## Signed updates (`update`)
+> **This local form is not signature-checked.** A path or block device is
+> written to the inactive slot exactly as given — it is the trusted-operator
+> escape hatch (a re-seal from the booted medium, an air-gapped install), so it
+> writes an image you already trust and prints a warning saying so. For an image
+> whose authenticity is verified before it is written, pin a channel and use
+> `sentinel update install` (below).
 
-The updater refuses any image whose release manifest isn't signed by a key you
-have pinned. Pin the channel in config (roadmap C13):
+## Signed updates (`update check` / `update install`)
+
+The **channel** updater refuses any image whose release manifest isn't signed by
+a key you have pinned. (The local `sentinel update <path>|<device>` form above is
+the trusted-operator path and does no such check.) Pin the channel in config
+(roadmap C13):
 
 ```shell
 configure

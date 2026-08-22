@@ -563,6 +563,81 @@ pub(crate) fn stage_private(tmp: &Path, contents: &str) -> Result<()> {
         .with_context(|| format!("staging {}", tmp.display()))
 }
 
+/// A held cross-process apply lock. Dropping it closes the file, which releases
+/// the advisory `flock`. `None` means the lock could not be taken (off-box, or a
+/// test with no `/run/sentinel`) and the caller proceeds unserialised — the lock
+/// is a best-effort guard against concurrent on-box writers, never a gate that
+/// fails a commit.
+#[must_use = "the lock is released as soon as this guard is dropped"]
+pub struct ApplyLock {
+    _file: Option<std::fs::File>,
+}
+
+/// The single lockfile that serialises the apply/persist critical section.
+const APPLY_LOCK_PATH: &str = "/run/sentinel/apply.lock";
+
+/// Serialise the config apply/persist critical section across processes.
+///
+/// Staging always uses fixed temp filenames under `/run/sentinel`
+/// (`.net-unit.tmp`, `.appliance.toml.tmp`, `.net-secret.tmp`, …), so a CLI
+/// `commit` racing an API `PUT` — or either racing the boot-late reconcile —
+/// could write the same temp out from under the other and install a spliced
+/// networkd unit or a half-written `velstra.toml` / `appliance.toml`. An
+/// exclusive advisory lock on one well-known lockfile makes those sections take
+/// turns. It is advisory (`flock`), which is enough because every writer goes
+/// through the same two chokepoints ([`crate::repl::apply_live`] and
+/// [`crate::session::persist_appliance`]) and so cooperates on the one lock. The
+/// call blocks until the lock is ours; the guard releases it on drop.
+///
+/// Best-effort: if the lockfile cannot be opened (no `/run/sentinel` off-box or
+/// in a test), the caller proceeds without the lock rather than failing — the
+/// races this guards against only exist on a running appliance, where the
+/// directory is always present and writable by the writers.
+///
+/// Never take this while already holding it (it would self-deadlock): the two
+/// chokepoints run their critical sections to completion and never nest.
+pub fn apply_lock() -> ApplyLock {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    if !Path::new("/run/sentinel").is_dir() {
+        return ApplyLock { _file: None };
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(APPLY_LOCK_PATH);
+    let Ok(file) = file else {
+        return ApplyLock { _file: None };
+    };
+    // SAFETY: a blocking `flock` on a valid fd we own for the lifetime of `file`;
+    // the lock is released when the fd is closed on drop. A failure here (rare —
+    // e.g. EINTR) degrades to proceeding unserialised rather than aborting.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        return ApplyLock { _file: None };
+    }
+    ApplyLock { _file: Some(file) }
+}
+
+/// The numeric gid of the `wheel` group, if this system has one. Used to set the
+/// saved config's group when writing it directly (as root), so it matches the
+/// `install -g wheel` the escalating path uses. Best-effort — a system without a
+/// `wheel` group simply leaves the file root-owned.
+fn wheel_gid() -> Option<u32> {
+    let name = std::ffi::CString::new("wheel").ok()?;
+    // SAFETY: `getgrnam` returns a pointer into storage that a later call could
+    // overwrite; we read `gr_gid` out immediately while the pointer is non-null
+    // and keep nothing that outlives this call.
+    let grp = unsafe { libc::getgrnam(name.as_ptr()) };
+    if grp.is_null() {
+        None
+    } else {
+        Some(unsafe { (*grp).gr_gid })
+    }
+}
+
 /// Install a strongSwan PSK secrets file at a root-owned `path`, mode **0600
 /// root:root**. `charon` runs as root, so the pre-shared key never needs to leave
 /// root — 0600 is the tightest mode that still works. Staged in `/run/sentinel`
@@ -677,10 +752,30 @@ pub fn install_file(path: &Path, contents: &str) -> Result<()> {
 /// secrets, and `wheel` is the group an operator account is in — the same
 /// membership that lets them escalate here in the first place.
 pub fn install_config_file(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let tmp = path.with_extension("toml.tmp");
-    if std::fs::write(&tmp, contents).is_ok() {
-        if std::fs::rename(&tmp, path).is_ok() {
-            return Ok(());
+    // Fast path (root, and the API service, which own the directory): stage the
+    // temp with the final mode 0640 from the outset — a plain `fs::write` honours
+    // the umask (0644) and `rename` preserves the temp's mode, so writing 0644
+    // here would silently widen a config that carries hashed passwords and VPN
+    // secrets. Group `wheel` (best-effort) matches the sudo path below, so an
+    // operator account can still read the saved config without escalating.
+    let direct = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o640)
+        .open(&tmp);
+    if let Ok(mut f) = direct {
+        if f.write_all(contents.as_bytes()).is_ok() {
+            drop(f);
+            if let Some(gid) = wheel_gid() {
+                let _ = std::os::unix::fs::chown(&tmp, None, Some(gid));
+            }
+            if std::fs::rename(&tmp, path).is_ok() {
+                return Ok(());
+            }
         }
         let _ = std::fs::remove_file(&tmp);
     }
@@ -888,7 +983,11 @@ pub fn set_login_password(user: &str, hash: &str) -> Result<()> {
 /// 0600 root:root (the API reads it as root; no other reader needs it).
 pub fn install_token(path: &Path, secret: &str) -> Result<()> {
     let tmp = Path::new("/run/sentinel").join(".api-token.tmp");
-    std::fs::write(&tmp, secret).with_context(|| format!("staging {}", tmp.display()))?;
+    // Stage 0600, not umask-default 0644: this token is the machine's full-access
+    // API secret, and `/run/sentinel` is wheel-writable and world-traversable, so
+    // a plain `fs::write` would leave it briefly world-readable there before the
+    // `install` below copies it to its 0600 home.
+    stage_private(&tmp, secret)?;
     let (Some(tmp_s), Some(dst_s)) = (tmp.to_str(), path.to_str()) else {
         bail!("non-UTF-8 path");
     };
@@ -906,11 +1005,21 @@ pub fn install_token(path: &Path, secret: &str) -> Result<()> {
 /// binary: one place to get TLS, timeouts and proxy behaviour wrong is enough.
 /// The timeout is short — a peer that is down must make the console say so
 /// quickly, not hang the page.
-pub fn curl_get(url: &str, token: &str, timeout_secs: u32) -> Result<String> {
+pub fn curl_get(url: &str, token: &str, timeout_secs: u32, pin: Option<&str>) -> Result<String> {
     let auth = format!("Authorization: Bearer {token}");
     let timeout = timeout_secs.to_string();
+    let mut args: Vec<String> = vec![
+        "-sS".into(),
+        "-f".into(),
+        "--max-time".into(),
+        timeout,
+        "-H".into(),
+        auth,
+    ];
+    add_pin_args(&mut args, pin);
+    args.push(url.into());
     let out = Command::new(bin("curl"))
-        .args(["-sS", "-f", "--max-time", &timeout, "-H", &auth, url])
+        .args(&args)
         .stderr(Stdio::null())
         .output()
         .with_context(|| format!("running curl to {url}"))?;
@@ -918,6 +1027,20 @@ pub fn curl_get(url: &str, token: &str, timeout_secs: u32) -> Result<String> {
         bail!("curl GET {url} failed");
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Add curl's public-key pinning for a self-signed peer (H3): `--insecure` drops
+/// CA and hostname verification (a self-signed peer certificate is vouched for by
+/// no CA), and `--pinnedpubkey sha256//<pin>` re-adds verification against exactly
+/// that public key — so the connection is both encrypted AND authenticated to the
+/// pinned peer, without a shared CA. `None` leaves curl's normal CA verification
+/// in place, for an operator-supplied certificate from a CA curl already trusts.
+fn add_pin_args(args: &mut Vec<String>, pin: Option<&str>) {
+    if let Some(pin) = pin {
+        args.push("--insecure".into());
+        args.push("--pinnedpubkey".into());
+        args.push(format!("sha256//{pin}"));
+    }
 }
 
 /// Ask the road-warrior VPN something, as JSON.
@@ -997,25 +1120,32 @@ pub fn curl_get_plain(url: &str, timeout_secs: u32) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-pub fn curl_put_config(url: &str, token: &str, body_file: &Path) -> Result<()> {
+pub fn curl_put_config(
+    url: &str,
+    token: &str,
+    body_file: &Path,
+    pin: Option<&str>,
+) -> Result<()> {
     let auth = format!("Authorization: Bearer {token}");
     let data = format!("@{}", body_file.display());
+    let mut args: Vec<String> = vec![
+        "-sS".into(),
+        "-f".into(),
+        "--max-time".into(),
+        "10".into(),
+        "-X".into(),
+        "PUT".into(),
+        "-H".into(),
+        "Content-Type: application/json".into(),
+        "-H".into(),
+        auth,
+        "--data-binary".into(),
+        data,
+    ];
+    add_pin_args(&mut args, pin);
+    args.push(url.into());
     let status = Command::new(bin("curl"))
-        .args([
-            "-sS",
-            "-f",
-            "--max-time",
-            "10",
-            "-X",
-            "PUT",
-            "-H",
-            "Content-Type: application/json",
-            "-H",
-            &auth,
-            "--data-binary",
-            &data,
-            url,
-        ])
+        .args(&args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -1093,6 +1223,181 @@ pub fn set_mode(path: &Path, mode: &str) -> Result<()> {
 /// / path arguments), so surfacing them on failure leaks nothing.
 pub fn openssl(args: &[&str]) -> Result<()> {
     run_priv("openssl", args)
+}
+
+/// Generate a self-signed TLS certificate + key (PEM) at `cert`/`key` if they are
+/// not already present (H3, the management-plane HTTPS server). Encrypts the
+/// console/API out of the box when the operator supplies no certificate. Runs
+/// `openssl` directly (no sudo — the caller owns the target directory, which is
+/// root-owned on the appliance and user-owned off-box) and never regenerates an
+/// existing pair: a self-signed cert that config sync may pin must keep a stable
+/// key across reboots. The private key is written 0600.
+pub fn ensure_self_signed_cert(cert: &Path, key: &Path, cn: &str, sans: &[String]) -> Result<()> {
+    if cert.exists() && key.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = cert.parent() {
+        ensure_dir(parent)?;
+    }
+    let san = build_san(cn, sans);
+    let (Some(cert_s), Some(key_s)) = (cert.to_str(), key.to_str()) else {
+        bail!("non-UTF-8 TLS certificate path");
+    };
+    let out = Command::new(bin("openssl"))
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-sha256",
+            "-days",
+            "3650",
+            "-nodes",
+            "-keyout",
+            key_s,
+            "-out",
+            cert_s,
+            "-subj",
+            &format!("/CN={cn}"),
+            "-addext",
+            &san,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .context("running openssl to mint the management TLS certificate")?;
+    if !out.status.success() {
+        bail!(
+            "openssl could not mint the management TLS certificate: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    // The key must never be group/world readable, whoever's umask minted it.
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(key, std::fs::Permissions::from_mode(0o600));
+    Ok(())
+}
+
+/// Build an OpenSSL `subjectAltName` extension covering the CN plus each supplied
+/// address/name, so a browser at the bound address is not warned about a name
+/// mismatch (pinning ignores the name, but a person does not). Numeric entries
+/// become `IP:`, everything else `DNS:`.
+fn build_san(cn: &str, sans: &[String]) -> String {
+    let mut parts: Vec<String> = vec![format!("DNS:{cn}"), "DNS:localhost".into()];
+    for s in sans {
+        if s.parse::<std::net::IpAddr>().is_ok() {
+            parts.push(format!("IP:{s}"));
+        } else {
+            parts.push(format!("DNS:{s}"));
+        }
+    }
+    format!("subjectAltName={}", parts.join(","))
+}
+
+/// The curl `--pinnedpubkey sha256//<base64>` pin of a PEM certificate at `cert`:
+/// the base64 of the SHA-256 of the certificate's DER SubjectPublicKeyInfo, i.e.
+/// exactly what curl compares against. Derived with the pinned `openssl` so a box
+/// can print its own management-cert pin for an operator to pin on a peer.
+pub fn cert_pubkey_pin(cert: &Path) -> Result<String> {
+    let pem = std::fs::read(cert).with_context(|| format!("reading {}", cert.display()))?;
+    pubkey_pin_from_cert_pem(&pem)
+}
+
+/// Learn a peer's TLS public-key pin (H3 trust-on-first-use): connect once with
+/// `openssl s_client` to read the peer's certificate — a public value, no secret
+/// crosses the wire — and derive the same pin curl's `--pinnedpubkey` compares.
+/// Used only when config sync has no pinned fingerprint in the config; the pin is
+/// then stored and enforced on every later exchange, so this is the one contact
+/// whose authenticity rests on the network rather than a pin.
+pub fn learn_peer_pubkey_pin(authority: &str) -> Result<String> {
+    let host = sni_host(authority);
+    let out = Command::new(bin("openssl"))
+        .args(["s_client", "-connect", authority, "-servername", &host])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .with_context(|| format!("openssl s_client to {authority}"))?;
+    if !out.status.success() {
+        bail!("could not reach {authority} to read its TLS certificate");
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let cert_pem =
+        first_pem_cert(&text).ok_or_else(|| bail_str(format!("{authority} presented no certificate")))?;
+    pubkey_pin_from_cert_pem(cert_pem.as_bytes())
+}
+
+/// A tiny helper so `ok_or_else` can carry a formatted message without a closure
+/// that captures a temporary `String` by move into `anyhow!`.
+fn bail_str(msg: String) -> anyhow::Error {
+    anyhow::Error::msg(msg)
+}
+
+/// The SNI/host part of a config-sync authority: `host:port`, a bracketed
+/// `[v6]:port`, or a bare host all reduce to the host for `-servername`.
+fn sni_host(authority: &str) -> String {
+    if let Some(rest) = authority.strip_prefix('[') {
+        // [v6] or [v6]:port
+        return rest.split(']').next().unwrap_or(rest).to_string();
+    }
+    // host or host:port (a bare IPv6 has >1 colon and no brackets — leave as is)
+    if authority.matches(':').count() == 1 {
+        authority.split(':').next().unwrap_or(authority).to_string()
+    } else {
+        authority.to_string()
+    }
+}
+
+/// Extract the first `-----BEGIN CERTIFICATE----- … END` block from text (the
+/// certificate `openssl s_client` prints among its diagnostics).
+fn first_pem_cert(text: &str) -> Option<String> {
+    const B: &str = "-----BEGIN CERTIFICATE-----";
+    const E: &str = "-----END CERTIFICATE-----";
+    let start = text.find(B)?;
+    let end = text[start..].find(E)? + start + E.len();
+    Some(text[start..end].to_string())
+}
+
+/// Derive curl's `sha256//<base64>` pin from a PEM certificate: cert → public key
+/// → DER SubjectPublicKeyInfo (both via the pinned `openssl`), then SHA-256 and
+/// base64. Kept in one place so the local-cert and peer-learn paths agree byte
+/// for byte with what curl checks.
+fn pubkey_pin_from_cert_pem(cert_pem: &[u8]) -> Result<String> {
+    use base64::Engine;
+    let pub_pem = openssl_filter(&["x509", "-pubkey", "-noout"], cert_pem)?;
+    let spki_der = openssl_filter(&["pkey", "-pubin", "-outform", "der"], &pub_pem)?;
+    let digest = openssl_filter(&["dgst", "-sha256", "-binary"], &spki_der)?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(digest))
+}
+
+/// Run `openssl <args>` as a filter: write `input` to its stdin and return its
+/// stdout. Used to chain cert → pubkey → DER → digest without a shell pipeline.
+fn openssl_filter(args: &[&str], input: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Write;
+    let mut child = Command::new(bin("openssl"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("spawning openssl {}", args.join(" ")))?;
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| bail_str("openssl stdin unavailable".into()))?;
+        stdin
+            .write_all(input)
+            .with_context(|| format!("feeding openssl {}", args.join(" ")))?;
+        // `stdin` drops here, closing the pipe so openssl sees EOF and exits.
+    }
+    let out = child
+        .wait_with_output()
+        .with_context(|| format!("running openssl {}", args.join(" ")))?;
+    if !out.status.success() {
+        bail!("openssl {} failed", args.join(" "));
+    }
+    Ok(out.stdout)
 }
 
 /// Tell systemd-networkd to re-read its unit files and re-apply them to the
@@ -1313,6 +1618,80 @@ pub(crate) fn sudo(cmd: &str, args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn openssl_available() -> bool {
+        std::process::Command::new(bin("openssl"))
+            .arg("version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn sni_host_extracts_the_host() {
+        assert_eq!(sni_host("10.0.0.2:8080"), "10.0.0.2");
+        assert_eq!(sni_host("fw.local:8080"), "fw.local");
+        assert_eq!(sni_host("10.0.0.2"), "10.0.0.2");
+        assert_eq!(sni_host("[2001:db8::1]:8080"), "2001:db8::1");
+        assert_eq!(sni_host("[2001:db8::1]"), "2001:db8::1");
+        // A bare IPv6 (no brackets, more than one colon) is left whole.
+        assert_eq!(sni_host("2001:db8::1"), "2001:db8::1");
+    }
+
+    #[test]
+    fn first_pem_cert_extracts_exactly_one_block() {
+        let text = "noise\n-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n\
+                    tail\n-----BEGIN CERTIFICATE-----\nBBB\n-----END CERTIFICATE-----\n";
+        let got = first_pem_cert(text).expect("a cert block");
+        assert!(got.starts_with("-----BEGIN CERTIFICATE-----"));
+        assert!(got.ends_with("-----END CERTIFICATE-----"));
+        assert!(got.contains("AAA") && !got.contains("BBB"), "only the first block");
+        assert!(first_pem_cert("no certificate here").is_none());
+    }
+
+    #[test]
+    fn build_san_marks_ips_and_names() {
+        let san = build_san("fw", &["127.0.0.1".to_string(), "mgmt.local".to_string()]);
+        assert!(san.starts_with("subjectAltName="));
+        assert!(san.contains("DNS:fw"));
+        assert!(san.contains("DNS:localhost"));
+        assert!(san.contains("IP:127.0.0.1"));
+        assert!(san.contains("DNS:mgmt.local"));
+    }
+
+    #[test]
+    fn self_signed_cert_pin_round_trips() {
+        if !openssl_available() {
+            eprintln!("skipping self_signed_cert_pin_round_trips: openssl not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("sentinel-tls-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        ensure_self_signed_cert(&cert, &key, "fw", &["127.0.0.1".to_string()]).expect("mint cert");
+        assert!(cert.exists() && key.exists());
+
+        // The private key is not group/world readable.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "key perms {mode:o}");
+
+        // The pin curl would check is a valid, stable 44-char base64 SHA-256.
+        let pin = cert_pubkey_pin(&cert).expect("pin");
+        assert!(crate::config::is_valid_pinned_sha256(&pin), "pin {pin:?}");
+        assert_eq!(cert_pubkey_pin(&cert).unwrap(), pin, "pin is stable");
+
+        // An existing pair is never regenerated (stable across reboots for pinning).
+        let key_before = std::fs::read(&key).unwrap();
+        ensure_self_signed_cert(&cert, &key, "fw", &[]).unwrap();
+        assert_eq!(
+            std::fs::read(&key).unwrap(),
+            key_before,
+            "an existing certificate must not be regenerated"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // A workstation with no agent socket once answered `show flows` with 1481
     // nested `sentinel agent-query` processes, and the API that spawned the

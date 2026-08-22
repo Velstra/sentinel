@@ -113,17 +113,99 @@ pub async fn serve(listen: &str, config: &Path, apply: Apply, token_file: &Path)
         eprintln!("warning: could not reconcile per-account API tokens: {e:#}");
     }
     let app = router(state);
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("binding {addr}"))?;
-    eprintln!(
-        "sentinel api listening on http://{addr} (bearer-token auth; token at {})",
-        token_file.display()
-    );
-    axum::serve(listener, app)
-        .await
-        .context("serving the REST API")?;
+
+    match resolve_web_tls(config, token_file, &addr)? {
+        // HTTPS (H3, the default): the console/API terminate TLS so passwords,
+        // TOTP codes and bearer tokens never cross the wire in the clear.
+        Some((cert, key)) => {
+            install_crypto_provider();
+            match system::cert_pubkey_pin(&cert) {
+                Ok(pin) => eprintln!(
+                    "sentinel api listening on https://{addr} (bearer-token auth; token at {}; \
+                     TLS pin sha256//{pin} — pin this on a config-sync peer)",
+                    token_file.display()
+                ),
+                Err(_) => eprintln!(
+                    "sentinel api listening on https://{addr} (bearer-token auth; token at {})",
+                    token_file.display()
+                ),
+            }
+            let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
+                .await
+                .with_context(|| {
+                    format!(
+                        "loading the management TLS certificate ({}) + key ({})",
+                        cert.display(),
+                        key.display()
+                    )
+                })?;
+            axum_server::bind_rustls(addr, tls)
+                .serve(app.into_make_service())
+                .await
+                .context("serving the management API over HTTPS")?;
+        }
+        // Opt-in plaintext (`[services.web] tls = false`): loopback/dev, or behind
+        // an external TLS terminator. Say plainly that it is unencrypted.
+        None => {
+            eprintln!(
+                "sentinel api listening on http://{addr} (bearer-token auth; token at {}) — \
+                 PLAINTEXT: tls is disabled, so use this only on a trusted or loopback network",
+                token_file.display()
+            );
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("binding {addr}"))?;
+            axum::serve(listener, app)
+                .await
+                .context("serving the REST API")?;
+        }
+    }
     Ok(())
+}
+
+/// Decide how the management server terminates TLS (H3). Returns the PEM
+/// certificate and key paths to serve HTTPS with, or `None` when `[services.web]
+/// tls = false` deliberately asked for plaintext. With no operator-supplied
+/// certificate, a self-signed one is minted once and persisted beside the API
+/// token — on the appliance that is the A/B-stable `/var/lib/sentinel`, so the
+/// certificate (and its pin) survives reboots and image updates.
+fn resolve_web_tls(
+    config: &Path,
+    token_file: &Path,
+    addr: &SocketAddr,
+) -> Result<Option<(PathBuf, PathBuf)>> {
+    // Lenient, like the boot path: a management server must still come up on a
+    // config a newer build wrote. A load failure falls back to the safe default
+    // (TLS on, self-signed), never to plaintext.
+    let web = Appliance::load_lenient(config)
+        .map(|a| a.services.web)
+        .unwrap_or_default();
+    if !web.tls {
+        return Ok(None);
+    }
+    if let (Some(cert), Some(key)) = (&web.tls_cert, &web.tls_key) {
+        return Ok(Some((PathBuf::from(cert), PathBuf::from(key))));
+    }
+    let dir = token_file
+        .parent()
+        .map(|p| p.join("web-tls"))
+        .unwrap_or_else(|| PathBuf::from("/var/lib/sentinel/web-tls"));
+    let cert = dir.join("cert.pem");
+    let key = dir.join("key.pem");
+    let cn = system::current_hostname();
+    let mut sans = vec!["127.0.0.1".to_string()];
+    if !addr.ip().is_unspecified() {
+        sans.push(addr.ip().to_string());
+    }
+    system::ensure_self_signed_cert(&cert, &key, &cn, &sans)?;
+    Ok(Some((cert, key)))
+}
+
+/// Install the ring crypto provider as the process default. rustls 0.23 requires
+/// a default provider before a server config can be built; ring is the one
+/// already in the dependency tree, and a repeat install is a harmless no-op.
+fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 /// Build the API router. `/api/v1/health` is unauthenticated; everything else sits
@@ -240,6 +322,13 @@ fn unauthorised() -> Response {
 /// visible where somebody would look.
 pub fn resolve_caller(state: &ApiState, presented: &str) -> Option<Caller> {
     use crate::config::Permission;
+    // An empty bearer never authenticates anything. `ct_eq(b"", b"")` is `true`,
+    // so an empty presented token would match an empty configured token or an
+    // empty token file — turning `Authorization: Bearer ` into full or account
+    // access. Refuse it before any comparison.
+    if presented.is_empty() {
+        return None;
+    }
     if ct_eq(presented.as_bytes(), state.token.as_bytes()) {
         return Some(Caller {
             user: None,
@@ -252,7 +341,13 @@ pub fn resolve_caller(state: &ApiState, presented: &str) -> Option<Caller> {
         let Ok(stored) = std::fs::read_to_string(entry.path()) else {
             continue;
         };
-        if !ct_eq(presented.as_bytes(), stored.trim().as_bytes()) {
+        let stored = stored.trim();
+        // An empty token file grants nothing: a half-written or truncated token
+        // must never authenticate an (also-empty) presented bearer.
+        if stored.is_empty() {
+            continue;
+        }
+        if !ct_eq(presented.as_bytes(), stored.as_bytes()) {
             continue;
         }
         let user = entry.file_name().to_string_lossy().into_owned();
@@ -434,6 +529,14 @@ async fn post_login(
             "a username and a password are needed"
         )));
     }
+    // Guessing costs time whether or not the account exists, so a wrong username
+    // and a wrong password look the same from outside. The delay is AWAITED, not
+    // slept on a thread: earlier it was a blocking sleep inside `spawn_blocking`,
+    // so a couple of hundred concurrent guesses pinned every blocking thread (up
+    // to 2 s each) and the API — and the console behind it — went dark.
+    let attempts = note_attempt(&username);
+    tokio::time::sleep(attempt_delay(attempts)).await;
+
     let state = state.clone();
     // Off the runtime: hashing is deliberately slow, and a login must not stall
     // the executor that is serving everybody else.
@@ -517,13 +620,9 @@ fn sign_in(
     password: &str,
     code: &str,
 ) -> Result<Value, ApiError> {
-    // Guessing costs time whether or not the account exists, so a wrong
-    // username and a wrong password are indistinguishable from the outside.
-    let attempts = note_attempt(username);
-    std::thread::sleep(std::time::Duration::from_millis(
-        250 * attempts.min(8) as u64,
-    ));
-
+    // The per-attempt slowdown and its counting happen in `post_login`, before
+    // this runs — and crucially off the blocking pool, awaited asynchronously —
+    // so a flood of guesses cannot pin blocking threads here.
     let appliance = Appliance::load(&state.config_path)
         .map_err(|e| ApiError::internal(anyhow!("reading the configuration: {e}")))?;
     let login = appliance
@@ -555,8 +654,11 @@ fn sign_in(
     };
     if !local_ok {
         let aaa = &appliance.system.aaa;
-        if aaa.radius.is_empty() {
-            // No directory to fall back to, so the local answer is the answer.
+        if aaa.radius.is_empty() && aaa.ldap.is_empty() {
+            // No directory of ANY kind to fall back to, so the local answer is
+            // the answer. Checking only RADIUS here refused every non-local login
+            // on an LDAP-only box, because `ask_the_directory` (which tries LDAP
+            // after RADIUS) was never reached.
             return Err(if login.is_some_and(|l| l.hashed_password.is_none()) {
                 ApiError::new(
                     StatusCode::UNAUTHORIZED,
@@ -616,6 +718,20 @@ fn sign_in(
         ));
     };
 
+    // The username becomes a filename (the account's per-account token file), so
+    // it must be a strict account name and nothing that could climb out of the
+    // tokens directory. A local login is already validated to this shape, but a
+    // directory-authenticated account (RADIUS/LDAP default-group) carries a name
+    // straight from the request — `../../etc/cron.d/x` would otherwise be written
+    // as a token file outside `tokens_dir`. Reject anything else before touching
+    // the filesystem.
+    if !valid_account_name(username) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            anyhow!("the account name is not a valid username"),
+        ));
+    }
+
     // The account's token, minted if this is the first time anybody asked.
     std::fs::create_dir_all(&state.tokens_dir)
         .map_err(|e| ApiError::internal(anyhow!("creating the token directory: {e}")))?;
@@ -643,14 +759,46 @@ fn attempts() -> &'static std::sync::Mutex<HashMap<String, (std::time::Instant, 
     ATTEMPTS.get_or_init(Default::default)
 }
 
+/// The most accounts whose failed attempts we track at once. A cap, not a tuning
+/// knob: the map is a throttle, and an attacker spraying distinct usernames must
+/// not be able to grow it without bound. When it is full and a new account
+/// appears, quiet entries are forgotten first and, if that is not enough, the
+/// least-recently-active entry is dropped.
+const MAX_TRACKED_ACCOUNTS: usize = 4096;
+
+/// How long the ten-minute forgiveness window lasts.
+const ATTEMPT_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// How long to slow a failed sign-in: 250 ms per attempt in the current window,
+/// capped at 2 s. Awaited asynchronously by [`post_login`], never slept on a
+/// thread, so it costs a guesser time without costing the server a worker.
+fn attempt_delay(attempts: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(250 * attempts.min(8) as u64)
+}
+
 fn note_attempt(username: &str) -> u32 {
     let mut map = attempts().lock().unwrap();
+    // Keep the map bounded before inserting a not-yet-seen account: forget the
+    // quiet entries, then, if still at the cap, evict the least-recently-active
+    // one. An account mid-attack has a recent entry and is never the victim.
+    if map.len() >= MAX_TRACKED_ACCOUNTS && !map.contains_key(username) {
+        map.retain(|_, (started, _)| started.elapsed() <= ATTEMPT_WINDOW);
+        if map.len() >= MAX_TRACKED_ACCOUNTS {
+            if let Some(oldest) = map
+                .iter()
+                .max_by_key(|(_, (started, _))| started.elapsed())
+                .map(|(k, _)| k.clone())
+            {
+                map.remove(&oldest);
+            }
+        }
+    }
     let entry = map
         .entry(username.to_string())
         .or_insert((std::time::Instant::now(), 0));
     // A quiet ten minutes forgives everything: the delay is meant to stop a
     // machine grinding through a wordlist, not to punish a person.
-    if entry.0.elapsed() > std::time::Duration::from_secs(600) {
+    if entry.0.elapsed() > ATTEMPT_WINDOW {
         *entry = (std::time::Instant::now(), 0);
     }
     entry.1 += 1;
@@ -666,11 +814,72 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
-/// `GET /api/v1/config` — the full running appliance config as JSON (the same
-/// [`Appliance`] the CLI edits).
-async fn get_config(State(state): State<Arc<ApiState>>) -> Result<Json<Appliance>, ApiError> {
+/// Serialised-config field names that carry secret material and must never be
+/// returned through the read API. Redaction is by name and by type, and it fails
+/// closed: any string value under one of these keys is replaced, so a future
+/// secret field that uses one of these conventional names is redacted the moment
+/// it exists, and a genuinely new secret name is a one-line addition here.
+///
+/// Type matters for `community`: the SNMP read community is a secret *string*,
+/// while a BGP `community` is a *list* of route tags that is not secret — so only
+/// string-valued occurrences are redacted, which leaves the BGP list alone. The
+/// GRE tunnel `key` is a `u32`, so it is likewise never touched (and not listed).
+const SECRET_FIELDS: &[&str] = &[
+    "secret",
+    "password",
+    "passphrase",
+    "psk",
+    "preshared-key",
+    "private-key",
+    "hashed-password",
+    "totp",
+    "community",
+    "ao-key",
+    "pin",
+];
+
+/// What a redacted secret reads as in the API's config output — a marker, not an
+/// empty string, so a reader can tell "a secret is set but hidden" apart from
+/// "unset". This is a read-only view; the real secrets stay on disk and in the
+/// config-sync push path, which serialise the [`Appliance`] directly.
+const REDACTED: &str = "__redacted__";
+
+/// Walk a serialised [`Appliance`] and replace every secret string in place, so
+/// the read API leaks no key material. Recurses through objects and arrays; only
+/// string values under a [`SECRET_FIELDS`] key are touched, which is what leaves
+/// the BGP `community` list and the numeric GRE `key` alone.
+fn redact_secrets(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                if v.is_string() && SECRET_FIELDS.contains(&k.as_str()) {
+                    *v = Value::String(REDACTED.to_string());
+                } else {
+                    redact_secrets(v);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for v in items.iter_mut() {
+                redact_secrets(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `GET /api/v1/config` — the running appliance config as JSON (the same
+/// [`Appliance`] the CLI edits), with every secret redacted. A read-only token
+/// can reach this endpoint, so the config-sync bearer secret (which is the
+/// machine's full-access API token), WireGuard private keys, IPsec PSKs, RADIUS
+/// secrets, the SNMP community and login password hashes / TOTP secrets are all
+/// replaced by [`REDACTED`] before the config leaves the box.
+async fn get_config(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, ApiError> {
     let appliance = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
-    Ok(Json(appliance))
+    let mut value = serde_json::to_value(&appliance)
+        .map_err(|e| ApiError::internal(anyhow!("serialising the configuration: {e}")))?;
+    redact_secrets(&mut value);
+    Ok(Json(value))
 }
 
 /// `PUT /api/v1/config` — replace the running config from a JSON body. This is
@@ -693,8 +902,48 @@ async fn put_config(
     if state.apply.enabled {
         repl::apply_live(&appliance, &state.apply).map_err(ApiError::internal)?;
     }
-    // Same persist path as a CLI `save` (atomic write + revision archive).
-    session::persist_appliance(&appliance, &state.config_path, true).map_err(ApiError::internal)?;
+    // Same persist path as a CLI `save` (atomic write + revision archive). If this
+    // fails AFTER a successful live apply, the running system already holds the new
+    // config while the boot config still holds the old one — a reboot would then
+    // silently revert the change (and any SSH-port move with it). Say that plainly
+    // rather than returning a bare 500.
+    if let Err(e) = session::persist_appliance(&appliance, &state.config_path, true) {
+        return Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            if state.apply.enabled {
+                anyhow!(
+                    "the new config is APPLIED to the running system but could NOT be saved \
+                     ({e:#}) — a reboot will revert to the previous config. Fix the cause and \
+                     PUT again to persist it."
+                )
+            } else {
+                anyhow!("saving the configuration failed: {e:#}")
+            },
+        ));
+    }
+
+    // A PUT saves as well as applies, so — like a CLI `save` — it makes the new
+    // config the baseline a pending commit-confirm would revert to. Left armed,
+    // that timer would "revert" to the config just saved: a no-op that silently
+    // defeats the safety net. Disarm it and report that, matching the CLI `save`.
+    let confirm_cancelled = if state.apply.enabled && crate::system::confirm_pending() {
+        crate::system::disarm_confirm();
+        true
+    } else {
+        false
+    };
+
+    // Record what is now running, the same running-snapshot a CLI `commit` writes,
+    // so a concurrent CLI session can tell the box has moved on under it. Only when
+    // it was actually applied live, and best-effort like the CLI path.
+    if state.apply.enabled {
+        if let Ok(toml) = appliance.to_toml() {
+            let _ = crate::system::install_config_file(
+                Path::new(crate::session::Session::RUNNING),
+                &toml,
+            );
+        }
+    }
 
     // An account that has just been given a group needs a token to exist, and
     // one whose group was taken away needs its token gone — both at the moment
@@ -705,6 +954,7 @@ async fn put_config(
     Ok(Json(json!({
         "applied": state.apply.enabled,
         "saved": true,
+        "confirm_auto_revert_cancelled": confirm_cancelled,
         "hostname": appliance.system.hostname,
         "interfaces": appliance.interfaces.len(),
         "rules": appliance.rules.len(),
@@ -998,7 +1248,7 @@ async fn get_stack(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, Ap
         // has is whether this console can drive that member, and only an
         // authenticated call answers it.
         let (hostname, reachable) = match cs.secret.as_deref() {
-            Some(secret) => match peer_get(peer, "status", secret) {
+            Some(secret) => match peer_get(cs, peer, "status", secret) {
                 Ok(body) => (
                     serde_json::from_str::<Value>(&body)
                         .ok()
@@ -1044,18 +1294,23 @@ async fn get_stack_show(
         .secret
         .as_deref()
         .ok_or_else(|| ApiError::bad_request(anyhow!("no config-sync secret is set")))?;
-    let body = peer_get(&member, &format!("show/{path}"), secret)
+    let body = peer_get(cs, &member, &format!("show/{path}"), secret)
         .map_err(|e| ApiError::bad_request(anyhow!("{member}: {e}")))?;
     Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response())
 }
 
-/// One authenticated `GET` against a peer's API.
-fn peer_get(peer: &str, path: &str, secret: &str) -> anyhow::Result<String> {
-    let url = format!(
-        "http://{}/api/v1/{path}",
-        crate::net::configsync_authority(peer)
-    );
-    system::curl_get(&url, secret, 5)
+/// One authenticated `GET` against a peer's API — HTTPS with the peer's TLS key
+/// pinned (H3), the same transport the config-sync push uses.
+fn peer_get(
+    cs: &crate::config::ConfigSync,
+    peer: &str,
+    path: &str,
+    secret: &str,
+) -> anyhow::Result<String> {
+    let authority = crate::net::configsync_authority(peer);
+    let pin = crate::net::peer_pin(cs, &authority)?;
+    let url = format!("https://{authority}/api/v1/{path}");
+    system::curl_get(&url, secret, 5, Some(&pin))
 }
 
 // ---- operational helpers -------------------------------------------------
@@ -1131,6 +1386,22 @@ fn generate_token() -> Result<String> {
     let mut bytes = [0u8; 32];
     getrandom::getrandom(&mut bytes).map_err(|e| anyhow!("generating a token: {e}"))?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+/// Whether `name` is a valid account name — the same POSIX-ish shape a
+/// configured `[[system.login]]` must have (letter or `_`, then letters / digits
+/// / `-` / `_`, at most 32). Used to gate any use of a request-supplied username
+/// as a filename: it admits no `/`, no `.`, and nothing empty, so it cannot name
+/// a path outside the tokens directory.
+fn valid_account_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 32 {
+        return false;
+    }
+    let mut chars = name.chars();
+    let ok_first = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    ok_first && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Constant-time byte comparison (length is allowed to leak; the content is
@@ -1543,6 +1814,56 @@ mod tests {
         // The body is the real Appliance JSON; parse it back and check the model.
         let a = Appliance::from_json(&body_string(resp).await).unwrap();
         assert_eq!(a.system.hostname, "round-trip-host");
+    }
+
+    /// A read-only caller can reach `GET /config`, so the config it returns must
+    /// carry no secret material: the config-sync bearer secret (which IS the
+    /// machine's full-access API token), RADIUS secrets, login password hashes
+    /// and TOTP secrets are all redacted before the config leaves the box.
+    #[tokio::test]
+    async fn get_config_redacts_every_secret() {
+        let path = temp_config();
+        let hash = crate::passwd::hash("a-good-password").expect("hashing works here");
+        let toml = format!(
+            "[system]\nhostname = \"fw\"\n\
+             [system.config-sync]\npeer = [\"10.0.0.2\"]\nsecret = \"machine-token-s3cret\"\n\
+             [[system.aaa.radius]]\nserver = \"10.0.0.9\"\nsecret = \"radius-shared-secret\"\n\
+             [[system.group]]\nname = \"ops\"\npermission = \"read-write\"\n\
+             [[system.login]]\nusername = \"vera\"\n\
+             hashed-password = \"{hash}\"\ntotp = \"GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ\"\ngroup = \"ops\"\n"
+        );
+        let a = Appliance::from_toml(&toml).expect("the configuration parses");
+        session::persist_appliance(&a, &path, false).unwrap();
+        let st = state(path);
+
+        let resp = router(st)
+            .oneshot(get("/api/v1/config", Some(TOKEN)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+
+        // Not one byte of any secret survives the read path…
+        for leaked in [
+            "machine-token-s3cret",
+            "radius-shared-secret",
+            "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
+            hash.as_str(),
+        ] {
+            assert!(
+                !body.contains(leaked),
+                "GET /config leaked a secret ({leaked:?}): {body}"
+            );
+        }
+        // …and the redaction marker is there in their place, so the reader can
+        // still tell that a secret is set.
+        assert!(
+            body.contains(REDACTED),
+            "secrets should be replaced by the redaction marker: {body}"
+        );
+        // Non-secret structure is untouched.
+        let parsed: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(parsed["system"]["hostname"], "fw");
     }
 
     #[tokio::test]

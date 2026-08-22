@@ -289,10 +289,22 @@ fn hide_password(password: &str, secret: &str, authenticator: &[u8; 16]) -> Vec<
     out
 }
 
-fn attr(code: u8, value: &[u8]) -> Vec<u8> {
+/// Encode one RADIUS attribute (RFC 2865 §5): `type`, then `length` (the whole
+/// TLV, i.e. value + 2), then the value. `length` is a single octet, so a value
+/// longer than 253 bytes cannot be represented — truncating it (`as u8`
+/// wrapping) would declare a short length and leave the tail to be parsed as a
+/// forged next attribute (attribute injection via, e.g., an over-long username).
+/// Reject it instead.
+fn attr(code: u8, value: &[u8]) -> Result<Vec<u8>> {
+    if value.len() > 253 {
+        bail!(
+            "RADIUS attribute {code} is {} bytes; the per-attribute maximum is 253",
+            value.len()
+        );
+    }
     let mut a = vec![code, (value.len() + 2) as u8];
     a.extend_from_slice(value);
-    a
+    Ok(a)
 }
 
 /// Ask a RADIUS server whether this username and password are good.
@@ -320,12 +332,12 @@ pub fn radius_authenticate(
     getrandom::getrandom(&mut identifier).context("entropy for the RADIUS identifier")?;
 
     let mut attrs = Vec::new();
-    attrs.extend_from_slice(&attr(RADIUS_ATTR_USER_NAME, username.as_bytes()));
+    attrs.extend_from_slice(&attr(RADIUS_ATTR_USER_NAME, username.as_bytes())?);
     attrs.extend_from_slice(&attr(
         RADIUS_ATTR_USER_PASSWORD,
         &hide_password(password, secret, &authenticator),
-    ));
-    attrs.extend_from_slice(&attr(RADIUS_ATTR_NAS_IDENTIFIER, nas_identifier.as_bytes()));
+    )?);
+    attrs.extend_from_slice(&attr(RADIUS_ATTR_NAS_IDENTIFIER, nas_identifier.as_bytes())?);
 
     let length = (20 + attrs.len()) as u16;
     let mut packet = vec![RADIUS_ACCESS_REQUEST, identifier[0]];

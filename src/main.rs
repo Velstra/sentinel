@@ -765,6 +765,10 @@ fn apply_boot(
     out: &std::path::Path,
     wren_out: &std::path::Path,
 ) -> Result<()> {
+    // Serialise against a `commit`/API `PUT` that lands mid-boot: this stage
+    // stages through the same fixed temp names, so an interleaved writer could
+    // corrupt a networkd unit or velstra.toml. Best-effort, held for the stage.
+    let _lock = system::apply_lock();
     // load_lenient, not load: this is the boot-time apply of the saved config,
     // and the one place an unknown key must not keep the box from coming up. A
     // rollback to an older image whose saved config carries a newer field would
@@ -818,6 +822,7 @@ fn apply_boot(
 fn apply_boot_late(config: &std::path::Path) -> Result<()> {
     // Lenient for the same reason as apply_boot: the second boot stage applies
     // the same saved config, and must survive an unknown key just the same.
+    let _lock = system::apply_lock();
     let appliance = Appliance::load_lenient(config)?;
     net::apply_link_runtime(&appliance)
 }
@@ -850,7 +855,19 @@ fn update_cmd(target: Option<&str>, commit: bool) -> Result<()> {
             install::update_from_channel(&chan, commit)
         }
         // Any other value is a local, operator-trusted image/block-device path.
-        Some(path) => install::update(std::path::Path::new(path), commit),
+        // This path does NOT verify a signature — a local image or a block
+        // device (a re-seal, an air-gapped install) is trusted as given, which
+        // is the whole point of the escape hatch. Say so plainly, so it is never
+        // mistaken for the signature-checked channel path (`update install`).
+        Some(path) => {
+            eprintln!(
+                "warning: writing {path} to the inactive slot WITHOUT signature \
+                 verification — a local image/device is trusted as given. For a \
+                 signature-checked update, pin an [update] channel and use \
+                 `sentinel update install`."
+            );
+            install::update(std::path::Path::new(path), commit)
+        }
     }
 }
 

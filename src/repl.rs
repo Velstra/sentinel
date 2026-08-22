@@ -228,12 +228,30 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
         "rollback" => return rollback_line(session, act, rest),
         "save" => {
             let to = rest.first().map(Path::new);
+            // A default `save` overwrites the very baseline a pending
+            // commit-confirm would revert to. Left armed, the timer would then
+            // "revert" to the just-saved config — a no-op that still reports
+            // success, silently defeating the safety net. So a save that
+            // overwrites the baseline cancels the pending auto-revert and says
+            // so; a `save <other-path>` leaves the baseline (and the timer) alone.
+            let overwrites_baseline = to.is_none() || to == Some(session.config_path());
             session.save(to).map(|p| {
                 eprintln!(
                     "{} saved {} (persists across reboot)",
                     ui::green("✔"),
                     p.display()
-                )
+                );
+                if overwrites_baseline && crate::system::confirm_pending() {
+                    crate::system::disarm_confirm();
+                    eprintln!(
+                        "{}",
+                        ui::yellow(
+                            "note: a commit-confirm auto-revert was pending; this save makes \
+                             the current config the new baseline, so the auto-revert has been \
+                             cancelled (there is no earlier config left to revert to)"
+                        )
+                    );
+                }
             })
         }
         "discard" => session.discard().map(|()| eprintln!("discarded edits")),
@@ -472,6 +490,12 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
     let saved_before = crate::config::Appliance::load(session.config_path()).ok();
     let running_before = Session::running_snapshot()
         .and_then(|toml| crate::config::Appliance::from_toml(&toml).ok());
+    // Whether the console note further down applies: a `commit` applies live but
+    // does not save, so the console (which reads the saved file) lags only when
+    // this commit actually changed something. `session.commit()` clears the dirty
+    // flag, so it must be read here, before the commit — reading it afterwards
+    // (as the note used to) always saw `false`, so the note never printed.
+    let had_uncommitted_edits = session.dirty();
     let appliance = match session.commit() {
         Ok(a) => a,
         Err(e) => {
@@ -513,7 +537,7 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
     // never reaches them: an account granted management access with `commit`
     // still cannot sign in, and the console keeps showing the configuration
     // before the change. Say so rather than let it be discovered.
-    if appliance.services.web.enable && session.dirty() {
+    if appliance.services.web.enable && had_uncommitted_edits {
         eprintln!(
             "{}",
             ui::yellow(
@@ -522,18 +546,21 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
             )
         );
     }
-    // Record what this commit applied, so the *next* session can tell the box
-    // has moved on. Only when it was really applied — an off-box `--no-apply`
-    // edit changed nothing about what is running.
-    if act.enabled {
-        if let Ok(toml) = appliance.to_toml() {
-            session.note_committed(&toml);
-        }
-    }
     if let Err(e) = apply_live(&appliance, act) {
         eprintln!("{} applying config: {e}", ui::red("error:"));
         note_refusal();
         return false;
+    }
+    // Record what this commit applied, so the *next* session can tell the box
+    // has moved on — but only AFTER apply succeeded. Writing it earlier meant a
+    // failed apply (which rolls back) left running.toml permanently claiming a
+    // config that was never run, and the next operator's `save` would then read
+    // as overwriting phantom work. Only when it was really applied — an off-box
+    // `--no-apply` edit changed nothing about what is running.
+    if act.enabled {
+        if let Ok(toml) = appliance.to_toml() {
+            session.note_committed(&toml);
+        }
     }
     if appliance.system.hostname != old_host {
         eprintln!("  hostname: {old_host} -> {}", appliance.system.hostname);
@@ -718,6 +745,8 @@ fn apply_service(
 }
 
 /// Combine the original stage error with the rollback outcome into one report.
+/// Only for stages the rollback stack actually covers (firewall, routing,
+/// hostname) — where "rolled back to the previous running config" is the truth.
 fn unwind_err(rb: Rollback, cause: anyhow::Error, stage: &str) -> anyhow::Error {
     let failures = rb.unwind();
     if failures.is_empty() {
@@ -730,12 +759,57 @@ fn unwind_err(rb: Rollback, cause: anyhow::Error, stage: &str) -> anyhow::Error 
     }
 }
 
-/// Apply a validated appliance config to the running system atomically: compile
+/// Report a failure of the final, broad `net::apply` stage honestly.
+///
+/// That stage reconciles roughly thirty sub-systems — DNS, NTP, PKI, sshd, the
+/// login passwords, IPsec, the VPNs, the reverse proxy, IDS and the box services
+/// — none of which the rollback stack above knows how to undo. When it fails
+/// partway there is no honest way to claim a clean rollback: the firewall,
+/// routing and hostname stages are undone, but whatever this stage managed to
+/// apply before it failed is still live, so the running system matches neither
+/// the old config nor the new one. Say exactly that, and point the operator at a
+/// way back to a known state rather than letting them trust a rollback that did
+/// not happen.
+fn unwind_err_mixed(rb: Rollback, cause: anyhow::Error) -> anyhow::Error {
+    let failures = rb.unwind();
+    let rolled = if failures.is_empty() {
+        "the firewall, routing and hostname changes were rolled back".to_string()
+    } else {
+        format!(
+            "the firewall/routing/hostname rollback itself did not fully complete ({})",
+            failures.join("; ")
+        )
+    };
+    anyhow!(
+        "applying system configuration failed: {cause}\n  \
+         MIXED STATE — {rolled}, but the rest of this commit (DNS, NTP, PKI, \
+         sshd, login passwords, IPsec, the VPNs and the box services) has no \
+         automatic undo and may be partly applied. The running system now \
+         matches neither the previous config nor the new one.\n  \
+         Recover by re-applying a known-good configuration: reboot to return to \
+         the saved config, or `rollback <N>` to a known-good archived revision \
+         (see `run show system commit`). Fix the cause first if it was a bad value."
+    )
+}
+
+/// Apply a validated appliance config to the running system: compile
 /// **everything** first (so a bad config is rejected before any live change),
-/// then apply firewall, routing, hostname and addressing in order — each stage
-/// recording how to undo itself. If a later stage fails, the completed stages
-/// are rolled back in reverse and a report of what changed is returned.
+/// then apply firewall, routing and hostname in order — each of those three
+/// stages recording how to undo itself — and finally the broad `net::apply`.
+///
+/// The atomic-rollback guarantee covers only the first three stages: if routing
+/// or hostname fails, the completed stages are rolled back in reverse and a
+/// clean-rollback report is returned. The final `net::apply` reconciles ~30
+/// sub-systems with no undo of their own; a failure there rolls back the three
+/// covered stages but reports an honest MIXED-STATE error (see
+/// [`unwind_err_mixed`]) rather than pretending the whole commit was undone.
 pub(crate) fn apply_live(appliance: &crate::config::Appliance, act: &Apply) -> Result<()> {
+    // Serialise the whole apply against a concurrent commit / API PUT / boot-late
+    // reconcile: staging uses fixed temp filenames under /run/sentinel, so two
+    // writers at once could splice a networkd unit or a half-written velstra.toml.
+    // Held until this function returns.
+    let _lock = system::apply_lock();
+
     // ---- Phase 1: prepare (fallible, NO live side effects) ----
     // Domain groups become address groups here: the compiler matches addresses and
     // knows nothing about names. Resolution never fails the commit — a name that
@@ -785,11 +859,14 @@ pub(crate) fn apply_live(appliance: &crate::config::Appliance, act: &Apply) -> R
     }
     rb.push("hostname", move || system::set_hostname(&old_host));
 
-    // Interface addressing: render + apply networkd units live. Last stage, so
-    // its own partial failure doesn't cascade; failure still rolls back the
-    // firewall/routing/hostname above.
+    // The broad system apply: networkd units plus ~30 co-services (DNS, NTP,
+    // PKI, sshd, login passwords, IPsec, the VPNs, the box services…). None of
+    // these is on the rollback stack, so a failure here cannot be honestly
+    // reported as a clean rollback — `unwind_err_mixed` undoes what it can
+    // (firewall/routing/hostname) and tells the operator the box is in a mixed
+    // state, rather than claiming a rollback that did not cover this stage.
     if let Err(e) = crate::net::apply(appliance) {
-        return Err(unwind_err(rb, e, "interface addressing"));
+        return Err(unwind_err_mixed(rb, e));
     }
     Ok(())
 }

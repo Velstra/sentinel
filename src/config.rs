@@ -1260,7 +1260,15 @@ impl Ssh {
 /// path is mirrored on. Off by default — a firewall does not open a management
 /// surface to the network unless it is asked to — and bound to localhost when
 /// enabled without an address, so turning it on is not the same as exposing it.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// TLS (H3): the server is HTTPS by default. With no `tls-cert`/`tls-key`, the
+/// box mints and persists its own self-signed certificate on first start
+/// ([`crate::api`]), so the management plane is encrypted out of the box without
+/// the operator standing up a PKI; an operator who has a real certificate points
+/// `tls-cert`/`tls-key` at it instead. `tls = false` opts back into plaintext
+/// HTTP — only sensible for a loopback/dev box or one fronted by its own TLS
+/// terminator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebConsole {
     /// Serve the console. Off by default.
     #[serde(default)]
@@ -1277,12 +1285,47 @@ pub struct WebConsole {
         skip_serializing_if = "Option::is_none"
     )]
     pub listen_address: Option<String>,
+    /// Serve over HTTPS. **On by default** — the management plane is not exposed
+    /// in the clear. `false` serves plaintext HTTP (loopback/dev, or behind an
+    /// external TLS terminator).
+    #[serde(default = "default_true")]
+    pub tls: bool,
+    /// Operator-supplied TLS certificate chain, a PEM file path. Unset ⇒ the box
+    /// generates and persists a self-signed certificate itself. Must be set
+    /// together with `tls-key`.
+    #[serde(rename = "tls-cert", default, skip_serializing_if = "Option::is_none")]
+    pub tls_cert: Option<String>,
+    /// Operator-supplied TLS private key, a PEM file path. Must accompany
+    /// `tls-cert`.
+    #[serde(rename = "tls-key", default, skip_serializing_if = "Option::is_none")]
+    pub tls_key: Option<String>,
+}
+
+impl Default for WebConsole {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            port: None,
+            listen_address: None,
+            // Mirrors the serde default: TLS is on unless explicitly disabled, so
+            // a `WebConsole` built in code is as safe as one parsed from config.
+            tls: true,
+            tls_cert: None,
+            tls_key: None,
+        }
+    }
 }
 
 impl WebConsole {
-    /// True when nothing was asked for, so `[services.web]` can be omitted.
+    /// True when nothing was asked for, so `[services.web]` can be omitted. `tls`
+    /// at its default (on) does not count as "asked for" — only an explicit
+    /// endpoint or certificate does.
     pub fn is_empty(&self) -> bool {
-        !self.enable && self.port.is_none() && self.listen_address.is_none()
+        !self.enable
+            && self.port.is_none()
+            && self.listen_address.is_none()
+            && self.tls_cert.is_none()
+            && self.tls_key.is_none()
     }
 
     /// The address the server binds, defaults applied.
@@ -4041,14 +4084,37 @@ pub struct ConfigSync {
     /// it is written to this box's API token file so a peer may push here too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
+    /// The peer's pinned TLS certificate public-key fingerprint (H3), in curl's
+    /// `--pinnedpubkey sha256//<base64>` form: base64 of the SHA-256 of the
+    /// peer's DER SubjectPublicKeyInfo. When set, the push verifies the peer's
+    /// certificate against it, which pins a self-signed peer without a shared CA.
+    /// Unset ⇒ trust-on-first-use: the peer's key is learned and pinned on the
+    /// first push, then enforced. Either way the push is HTTPS and the config
+    /// (WireGuard keys, PSKs, the shared secret) never crosses the wire in clear.
+    #[serde(
+        rename = "peer-fingerprint",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub peer_fingerprint: Option<String>,
 }
 
 impl ConfigSync {
     /// True when no config sync is configured — lets `[system.config-sync]` be
     /// omitted from a saved config.
     pub fn is_empty(&self) -> bool {
-        self.peers.is_empty() && self.secret.is_none()
+        self.peers.is_empty() && self.secret.is_none() && self.peer_fingerprint.is_none()
     }
+}
+
+/// Whether `s` is curl's `--pinnedpubkey sha256//<base64>` value: the standard
+/// base64 of a 32-byte SHA-256, which is 43 base64 characters plus one `=` pad.
+pub fn is_valid_pinned_sha256(s: &str) -> bool {
+    s.len() == 44
+        && s.ends_with('=')
+        && s.as_bytes()[..43]
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/')
 }
 
 /// HA conntrack-state sync (`[system.conntrack-sync]`, roadmap C9). The velstra
@@ -9265,6 +9331,17 @@ impl Appliance {
                 bail!("services web listen-address {addr:?}: not an IPv4/IPv6 address");
             }
         }
+        // TLS (H3): an operator-supplied certificate needs both halves — a cert
+        // without its key (or vice versa) cannot serve TLS — and neither half is
+        // meaningful once TLS is turned off.
+        match (&web.tls_cert, &web.tls_key) {
+            (Some(_), None) => bail!("services web tls-cert: also set tls-key (both or neither)"),
+            (None, Some(_)) => bail!("services web tls-key: also set tls-cert (both or neither)"),
+            _ => {}
+        }
+        if !web.tls && (web.tls_cert.is_some() || web.tls_key.is_some()) {
+            bail!("services web: tls-cert/tls-key set but tls is false — enable tls or drop them");
+        }
 
         // Local login accounts ([[system.login]]): a POSIX-ish username, single-line
         // OpenSSH keys (written verbatim into a per-user authorized_keys, so a
@@ -9331,6 +9408,19 @@ impl Appliance {
             match &cs.secret {
                 Some(s) if !s.is_empty() => {}
                 _ => bail!("system config-sync: a `secret` is required to push to peers"),
+            }
+        }
+        // A pinned peer fingerprint (H3) is curl's `sha256//<base64>` value: the
+        // base64 of a 32-byte SHA-256, i.e. 44 base64 characters ending in `=`.
+        // Reject anything else so a typo is caught at commit, not as a silent
+        // "peer refused" at push time.
+        if let Some(fp) = &cs.peer_fingerprint {
+            if !is_valid_pinned_sha256(fp) {
+                bail!(
+                    "system config-sync peer-fingerprint {fp:?}: expected the base64 SHA-256 of \
+                     the peer's public key (44 base64 chars, printed in the peer's log as \
+                     `TLS pin sha256//…` when its console starts)"
+                );
             }
         }
 
@@ -14337,6 +14427,84 @@ virtual-address = ["10.0.0.254"]
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn config_sync_peer_fingerprint_parses_and_validates() {
+        let base = "[system]\nhostname = \"fw\"\n";
+        let pin = format!("{}=", "A".repeat(43));
+
+        // A valid pinned fingerprint parses and round-trips.
+        let a = Appliance::from_toml(&format!(
+            "{base}[system.config-sync]\npeer = [\"10.0.0.2\"]\nsecret = \"s\"\n\
+             peer-fingerprint = \"{pin}\"\n"
+        ))
+        .expect("a valid peer-fingerprint parses");
+        assert_eq!(
+            a.system.config_sync.peer_fingerprint.as_deref(),
+            Some(pin.as_str())
+        );
+        let round = Appliance::from_toml(&a.to_toml().unwrap()).unwrap();
+        assert_eq!(
+            round.system.config_sync.peer_fingerprint,
+            a.system.config_sync.peer_fingerprint
+        );
+
+        // A malformed fingerprint is refused at validate.
+        assert!(
+            Appliance::from_toml(&format!(
+                "{base}[system.config-sync]\npeer = [\"10.0.0.2\"]\nsecret = \"s\"\n\
+                 peer-fingerprint = \"nope\"\n"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn web_tls_defaults_on_and_validates_cert_pairing() {
+        let base = "[system]\nhostname = \"fw\"\n";
+
+        // TLS is on by default — parsed from config and built in code.
+        let w = Appliance::from_toml(&format!("{base}[services.web]\nenable = true\n")).unwrap();
+        assert!(w.services.web.tls, "TLS must default on");
+        assert!(WebConsole::default().tls, "a code-built WebConsole is TLS-on too");
+
+        // An operator certificate needs both halves.
+        assert!(
+            Appliance::from_toml(&format!(
+                "{base}[services.web]\nenable = true\ntls-cert = \"/c.pem\"\n"
+            ))
+            .is_err(),
+            "cert without key is refused"
+        );
+        // A certificate with TLS turned off is contradictory.
+        assert!(
+            Appliance::from_toml(&format!(
+                "{base}[services.web]\nenable = true\ntls = false\n\
+                 tls-cert = \"/c.pem\"\ntls-key = \"/k.pem\"\n"
+            ))
+            .is_err()
+        );
+        // Both halves with TLS on is accepted and round-trips.
+        let ok = Appliance::from_toml(&format!(
+            "{base}[services.web]\nenable = true\ntls-cert = \"/c.pem\"\ntls-key = \"/k.pem\"\n"
+        ))
+        .expect("cert+key parses");
+        assert_eq!(ok.services.web.tls_cert.as_deref(), Some("/c.pem"));
+        let round = Appliance::from_toml(&ok.to_toml().unwrap()).unwrap();
+        assert_eq!(round.services.web.tls_key.as_deref(), Some("/k.pem"));
+    }
+
+    #[test]
+    fn pinned_sha256_shape_is_enforced() {
+        assert!(is_valid_pinned_sha256(&format!("{}=", "A".repeat(43))));
+        assert!(!is_valid_pinned_sha256("tooshort"));
+        // 44 chars but no `=` pad.
+        assert!(!is_valid_pinned_sha256(&"A".repeat(44)));
+        // 43 chars total (missing a byte of the digest).
+        assert!(!is_valid_pinned_sha256(&format!("{}=", "A".repeat(42))));
+        // Right length, but not the base64 alphabet.
+        assert!(!is_valid_pinned_sha256(&format!("{}=", "!".repeat(43))));
     }
 
     #[test]

@@ -37,7 +37,7 @@ These are pinned-nixpkgs-25.05 specifics worth keeping in mind if you touch
 
 - **Minimize'd partitions collapse to 4K.** The verity store + hash partitions
   are `Minimize`-marked; with auto image-sizing they shrink to 4K. Set explicit
-  `repartConfig.SizeMinBytes` floors (store ≈ 1300M, store-verity ≈ 96M).
+  `repartConfig.SizeMinBytes` floors (store ≈ 2560M, store-verity ≈ 192M).
 - **`image.repart.imageSize` doesn't exist** in 25.05 (added later) — size via
   `SizeMinBytes` on partitions instead.
 - **Sector size 512.** OVMF/UEFI needs 512-byte sectors, not repart's default
