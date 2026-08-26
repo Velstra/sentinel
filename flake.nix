@@ -216,7 +216,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-igiyfwbIWD1OPnEOtEr83BS5B9kmAAQhUl6/o0REqV4=";
+      ebpfHash = "sha256-6ZbLdCf0c6CnRTFr6jPqOFOE+rnwwpp3K/CHh1R+hI0=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -1371,6 +1371,63 @@
       # the data plane stays up.
       #   nix build .#checks.x86_64-linux.commit -L
       checks.${system} = {
+        # Every map the agent looks up by name exists in the object it loads.
+        #
+        # This exists because of one specific trap. `velstra-ebpf` is a
+        # fixed-output derivation — it needs network for `-Z build-std`, and the
+        # price of that is that Nix identifies it by its output hash **alone**.
+        # Its inputs are not part of its identity, so `nix flake update fabric`
+        # can move `src` to a revision carrying two new maps and Nix will
+        # happily reuse the object it already has. Nothing warns, nothing
+        # rebuilds, and the two halves of the data plane drift apart.
+        #
+        # What that produced was a new agent loaded against an old object: the
+        # userspace asked for SRV6_FLOOD_LIST, got None, and the failure
+        # surfaced ninety seconds into a two-VM SRv6 test as "map missing" —
+        # about as far from the cause as a failure can land.
+        #
+        # The invariant checked is the one that actually broke: a name the
+        # userspace passes to `map_mut` must resolve. Deliberately NOT "every
+        # #[map] static appears in the object" — several per-CPU scratch maps
+        # have never carried a symbol in any build, so that version fails
+        # for ever and gets switched off, which is worse than no check.
+        #
+        # Both sides are read out of fabric's own source, so there is no list
+        # here to fall behind: the map somebody forgets to add to a list is
+        # exactly the map that goes stale.
+        ebpf-maps =
+          pkgs.runCommand "sentinel-ebpf-maps" { nativeBuildInputs = [ pkgs.llvm ]; }
+            ''
+              wanted=$(grep -rhoE '\.(map_mut|map|take_map)\("[A-Z0-9_]+"\)' \
+                         ${fabric}/velstra-app/src/ \
+                       | grep -oE '"[A-Z0-9_]+"' | tr -d '"' | sort -u)
+
+              if [ -z "$wanted" ]; then
+                echo "no map lookups found in fabric's agent source; the shape of"
+                echo "that code changed and this check is now blind"
+                exit 1
+              fi
+
+              have=$(llvm-readelf --symbols ${velstra-ebpf} \
+                     | awk '$4 == "OBJECT" { print $NF }' | sort -u)
+
+              missing=$(comm -23 <(echo "$wanted") <(echo "$have"))
+
+              if [ -n "$missing" ]; then
+                echo "the agent looks up maps the eBPF object does not define:"
+                echo "$missing" | sed 's/^/  /'
+                echo ""
+                echo "the object is almost certainly stale. It is a fixed-output"
+                echo "derivation, so moving the fabric input does NOT rebuild it —"
+                echo "bump ebpfHash in flake.nix and build again; the first build"
+                echo "reports the real hash."
+                exit 1
+              fi
+
+              echo "$wanted" | wc -l | xargs printf '%s map lookups, all defined\n'
+              touch $out
+            '';
+
         # The web console, driven in a real browser.
         #
         # Everything else about the console is checked by reading its text —
