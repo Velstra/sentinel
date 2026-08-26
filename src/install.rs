@@ -247,6 +247,32 @@ pub fn plan_targets<'a>(
     Ok(chosen)
 }
 
+/// How the writable data partition is protected at rest.
+///
+/// The A/B root is dm-verity and read-only, so there is nothing on it worth
+/// encrypting — its integrity, not its secrecy, is what matters. The secrets live
+/// on the ONE writable partition: the TLS key and cert, config-sync pins and
+/// tokens, per-account password hashes, WireGuard/IPsec keys. That is what LUKS
+/// protects here, and nothing else needs to.
+#[derive(Debug, Clone)]
+pub enum Crypto {
+    /// Plaintext ext4 — the historical (and still default) behaviour.
+    None,
+    /// LUKS2 over the data partition, unlocked at boot with this passphrase.
+    Luks { passphrase: String },
+}
+
+/// The device-mapper name the unlocked data volume is opened as, both at install
+/// time and at boot (`sentinel unlock`). The ext4 filesystem — LABEL=data — lives
+/// *inside* it, so the appliance's existing `/dev/disk/by-label/data` mount finds
+/// it unchanged once the volume is open.
+pub const DATA_MAPPER: &str = "data";
+
+/// The `/dev/mapper` path of the unlocked data volume.
+pub fn data_mapper_path() -> String {
+    format!("/dev/mapper/{DATA_MAPPER}")
+}
+
 /// The A/B GPT layout: 1=ESP, 2=store-verity-A, 3=store-A, 4=store-verity-B,
 /// 5=store-B, 6=data. Data is last so it can grow to fill the disk.
 pub const DATA_PART: u32 = 6;
@@ -301,6 +327,87 @@ fn run(cmd: &str, args: &[&str]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Run an external tool feeding `input` on stdin — used to hand a LUKS passphrase
+/// to `cryptsetup` without ever putting it on the command line (where it would
+/// show in `ps` and the install log). stdout/stderr are inherited so the tool's
+/// own errors still reach the operator.
+fn run_stdin(cmd: &str, args: &[&str], input: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut child = Command::new(system::bin(cmd))
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("running {cmd}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("no stdin for {cmd}"))?
+        .write_all(input)
+        .with_context(|| format!("feeding the passphrase to {cmd}"))?;
+    let status = child
+        .wait()
+        .with_context(|| format!("waiting for {cmd}"))?;
+    if !status.success() {
+        bail!("`{cmd} {}` failed (exit {:?})", args.join(" "), status.code());
+    }
+    Ok(())
+}
+
+/// Format `dev` as a fresh LUKS2 container and open it as [`DATA_MAPPER`], with
+/// the passphrase fed on stdin (never on argv). LUKS2 is the modern default:
+/// Argon2id key derivation, a resilient on-disk header. The mapped device that
+/// comes back is where the data filesystem is then made.
+///
+/// TPM2-backed unattended unlock is a deliberate follow-up, not wired here: it
+/// needs `systemd-cryptenroll` against real hardware to test, and a half-wired
+/// TPM path is worse than an honest passphrase one. The on-disk format is
+/// standard LUKS2, so a later `sentinel` can enrol a TPM2 token onto the very
+/// same volume without reformatting.
+fn luks_format_open(dev: &str, passphrase: &str) -> Result<()> {
+    if passphrase.is_empty() {
+        bail!("refusing to create an encrypted volume with an empty passphrase");
+    }
+    // `--key-file -` reads the passphrase from stdin; `--batch-mode` skips the
+    // interactive "type uppercase YES" confirmation (we already confirmed the
+    // erase). luksFormat then luksOpen, both fed the same passphrase.
+    run_stdin(
+        "cryptsetup",
+        &[
+            "luksFormat",
+            "--type",
+            "luks2",
+            "--batch-mode",
+            "--key-file",
+            "-",
+            dev,
+        ],
+        passphrase.as_bytes(),
+    )
+    .with_context(|| format!("creating the LUKS2 volume on {dev}"))?;
+    luks_open(dev, passphrase)
+}
+
+/// Open an existing LUKS2 volume on `dev` as [`DATA_MAPPER`], passphrase on stdin.
+fn luks_open(dev: &str, passphrase: &str) -> Result<()> {
+    run_stdin(
+        "cryptsetup",
+        &["open", "--key-file", "-", dev, DATA_MAPPER],
+        passphrase.as_bytes(),
+    )
+    .with_context(|| format!("opening the LUKS2 volume on {dev}"))
+}
+
+/// Close the [`DATA_MAPPER`] device when dropped, so an encrypted install leaves
+/// nothing unlocked behind it however it returns.
+struct CryptGuard;
+impl Drop for CryptGuard {
+    fn drop(&mut self) {
+        let _ = Command::new(system::bin("cryptsetup"))
+            .args(["close", DATA_MAPPER])
+            .status();
+    }
 }
 
 /// The whole disk holding the running, sealed verity store — i.e. the install
@@ -367,6 +474,7 @@ pub fn execute(
     targets: &[&Disk],
     raid: Raid,
     source_image: Option<&std::path::Path>,
+    crypto: &Crypto,
 ) -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         bail!("install must run as root (try `sudo sentinel install …`)");
@@ -427,34 +535,29 @@ pub fn execute(
         .iter()
         .map(|t| part_path(&t.dev_path(), DATA_PART))
         .collect();
-    // Build the data filesystem (or RAID array). A failure here leaves every
-    // erased disk partitioned but without a bootable system — report which.
+    // Build the data filesystem (or RAID array, optionally LUKS-wrapped). A
+    // failure here leaves every erased disk partitioned but without a bootable
+    // system — report which.
     let fs_result: Result<()> = (|| {
-        match raid.mdadm_level() {
-            None => {
-                run("mkfs.ext4", &["-q", "-F", "-L", "data", &data_parts[0]])?;
+        // The block device the data filesystem sits on: the single data
+        // partition, or the assembled array across all of them.
+        let base = build_data_base(&data_parts, raid)?;
+        // Optionally wrap that device in LUKS2. The ext4 (LABEL=data) is then made
+        // *inside* the opened volume, so at rest the partition is a LUKS container
+        // and nothing readable. The volume is opened only for the mkfs and closed
+        // again here, so the install ends in a clean, LOCKED state — the box (or
+        // `seed_config`) unlocks it fresh with the passphrase.
+        match crypto {
+            Crypto::None => {
+                run("mkfs.ext4", &["-q", "-F", "-L", "data", &base])?;
             }
-            Some(level) => {
+            Crypto::Luks { passphrase } => {
+                eprintln!("encrypting the data partition (LUKS2) …");
+                luks_format_open(&base, passphrase)?;
+                let guard = CryptGuard;
                 run("udevadm", &["settle"]).ok();
-                let n = data_parts.len().to_string();
-                let mut args = vec![
-                    "--create",
-                    "/dev/md/sentinel-data",
-                    "--level",
-                    level,
-                    "--raid-devices",
-                    &n,
-                    "--metadata=1.2",
-                    "--run",
-                    "--force",
-                ];
-                args.extend(data_parts.iter().map(String::as_str));
-                eprintln!("creating RAID{level} across {} disk(s) …", data_parts.len());
-                run("mdadm", &args)?;
-                run(
-                    "mkfs.ext4",
-                    &["-q", "-F", "-L", "data", "/dev/md/sentinel-data"],
-                )?;
+                run("mkfs.ext4", &["-q", "-F", "-L", "data", &data_mapper_path()])?;
+                drop(guard); // close the volume now, not at end of scope
             }
         }
         Ok(())
@@ -464,6 +567,44 @@ pub fn execute(
     }
     eprintln!("install complete — remove the medium and reboot.");
     Ok(())
+}
+
+/// The block device the data filesystem sits on: the single data partition, or
+/// the freshly-assembled RAID array across all of them. For the RAID case this
+/// *creates* the array (as `/dev/md/sentinel-data`), so it is called exactly once
+/// per install.
+fn build_data_base(data_parts: &[String], raid: Raid) -> Result<String> {
+    match raid.mdadm_level() {
+        None => Ok(data_parts[0].clone()),
+        Some(level) => {
+            run("udevadm", &["settle"]).ok();
+            let n = data_parts.len().to_string();
+            let mut args = vec![
+                "--create",
+                "/dev/md/sentinel-data",
+                "--level",
+                level,
+                "--raid-devices",
+                &n,
+                "--metadata=1.2",
+                "--run",
+                "--force",
+            ];
+            args.extend(data_parts.iter().map(String::as_str));
+            eprintln!("creating RAID{level} across {} disk(s) …", data_parts.len());
+            run("mdadm", &args)?;
+            Ok("/dev/md/sentinel-data".to_string())
+        }
+    }
+}
+
+/// The already-assembled data base device to seed into, WITHOUT recreating a RAID
+/// array (which `execute` has already built in this same installer session).
+fn existing_data_base(targets: &[&Disk], raid: Raid) -> String {
+    match raid.mdadm_level() {
+        Some(_) => "/dev/md/sentinel-data".to_string(),
+        None => part_path(&targets[0].dev_path(), DATA_PART),
+    }
 }
 
 /// Wrap a destructive-phase failure with the list of disks already erased, so
@@ -615,15 +756,19 @@ impl Drop for MountGuard {
 /// The mount is a guard: it comes off however this returns, including on the
 /// error paths, so a failed seed does not leave the installed filesystem
 /// mounted under the live medium.
-pub fn seed_config(targets: &[&Disk], raid: Raid, toml: &str) -> Result<()> {
-    let dev = match raid.mdadm_level() {
-        // `execute` creates the array as /dev/md/sentinel-data (mdadm --create),
-        // and it is still present at that node in this same installer session; a
-        // single-disk install writes the partition directly. This must match the
-        // name `execute` used — mounting /dev/md/data (which is never created)
-        // failed every RAID install at the seeding step.
-        Some(_) => "/dev/md/sentinel-data".to_string(),
-        None => part_path(&targets[0].dev_path(), DATA_PART),
+pub fn seed_config(targets: &[&Disk], raid: Raid, toml: &str, crypto: &Crypto) -> Result<()> {
+    // On an encrypted install `execute` has left the data partition a closed LUKS
+    // volume, so re-open it with the passphrase to write the seed, and close it
+    // again afterwards so the freshly installed box unlocks it fresh on its first
+    // boot. Both guards run however this returns, error paths included; the mount
+    // guard is declared *after* the crypt guard so it drops first (unmount before
+    // close). A plaintext install writes the base device directly, unchanged.
+    let (dev, _crypt_guard) = match crypto {
+        Crypto::None => (existing_data_base(targets, raid), None),
+        Crypto::Luks { passphrase } => {
+            luks_open(&existing_data_base(targets, raid), passphrase)?;
+            (data_mapper_path(), Some(CryptGuard))
+        }
     };
     let mnt = std::path::Path::new("/run/sentinel-seed");
     std::fs::create_dir_all(mnt).context("creating the seed mountpoint")?;
@@ -891,6 +1036,36 @@ mod tests {
         assert_ne!(SLOT_A.name, SLOT_B.name);
         assert_eq!((SLOT_A.verity_part, SLOT_A.store_part), (2, 3));
         assert_eq!((SLOT_B.verity_part, SLOT_B.store_part), (4, 5));
+    }
+
+    #[test]
+    fn the_unlocked_data_volume_has_a_stable_name() {
+        assert_eq!(data_mapper_path(), "/dev/mapper/data");
+        assert_eq!(DATA_MAPPER, "data");
+    }
+
+    #[test]
+    fn the_seed_target_is_the_array_or_the_partition() {
+        let sda = disk("sda", 500, false);
+        let sdb = disk("sdb", 500, false);
+        // Single disk: the raw data partition.
+        assert_eq!(
+            existing_data_base(&[&sda], Raid::None),
+            "/dev/sda6"
+        );
+        // RAID: the assembled array node execute created.
+        assert_eq!(
+            existing_data_base(&[&sda, &sdb], Raid::Mirror),
+            "/dev/md/sentinel-data"
+        );
+    }
+
+    #[test]
+    fn an_empty_luks_passphrase_is_refused_before_touching_the_disk() {
+        // Fails on the empty-passphrase guard, before any cryptsetup spawn — so
+        // this runs without cryptsetup present.
+        let err = luks_format_open("/dev/does-not-matter", "").unwrap_err();
+        assert!(format!("{err}").contains("empty passphrase"), "{err}");
     }
 
     #[test]

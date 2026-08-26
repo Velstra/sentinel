@@ -57,6 +57,7 @@ fn seeded_names() -> DynNames {
         reverse_proxy: vec!["fe1".into()],
         broadcast_relay: vec!["br1".into()],
         prefix_lists: vec!["pl1".into()],
+        update_channels: vec![],
     }
 }
 
@@ -280,6 +281,16 @@ const CONTEXT: &[(&str, &[&str])] = &[
     ),
     ("services snmp", &["set services snmp community public"]),
     ("pki acme", &["set pki acme email ops@example.com"]),
+    // A named update channel needs its url + pinned key before it commits —
+    // the walk supplies both so each field is tested rather than its
+    // preconditions. (`t1` is what `<name>` descends with.)
+    (
+        "update channel",
+        &[
+            "set update channel t1 url https://updates.example.test/chan",
+            "set update channel t1 public-key file:/tmp/walker.pem",
+        ],
+    ),
     (
         "services dhcp-relay",
         &[

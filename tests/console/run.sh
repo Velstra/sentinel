@@ -68,6 +68,12 @@ set interface eth0 dhcp-server enable
 set interface eth0 router-advert enable
 set policy prefix-list customers rule 10 prefix 10.0.0.0/8
 set policy route-map to-transit rule 10 action permit
+# The management plane serves TLS by default, and the harness below drives the
+# console over plain http on loopback. `enable` is what keeps the section alive
+# through `save` — without it the whole `[services.web]` table is dropped and the
+# API comes back up on HTTPS, where every request in this suite fails at connect.
+set services web enable true
+set services web tls false
 commit
 save
 CLI

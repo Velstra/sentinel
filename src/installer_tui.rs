@@ -96,6 +96,17 @@ pub struct Answers {
     pub username: String,
     pub password: String,
     pub ssh_key: String,
+    /// Encrypt the writable data partition with LUKS2. When set, [`passphrase`]
+    /// carries the passphrase the box asks for at each boot (`sentinel unlock`).
+    ///
+    /// [`passphrase`]: Self::passphrase
+    pub encrypt: bool,
+    /// The LUKS2 passphrase, meaningful only when [`encrypt`] is set. Never
+    /// rendered back on the review screen or echoed while typed — it is the one
+    /// answer whose secrecy is the point.
+    ///
+    /// [`encrypt`]: Self::encrypt
+    pub passphrase: String,
     /// Interfaces to bring up. Configuring one is optional: an operator who
     /// only wants the box installed leaves them all off and sets the network up
     /// from the console afterwards.
@@ -367,15 +378,20 @@ impl Input {
 enum Page {
     Target,
     Locale,
+    Encryption,
     Account,
     Network,
     Review,
 }
 
 impl Page {
-    const ORDER: [Page; 5] = [
+    // Encryption sits after Locale on purpose: the passphrase is typed here, and
+    // the keyboard chosen on the previous page is already live on the console —
+    // a passphrase entered on the wrong layout is a box that cannot be unlocked.
+    const ORDER: [Page; 6] = [
         Page::Target,
         Page::Locale,
+        Page::Encryption,
         Page::Account,
         Page::Network,
         Page::Review,
@@ -389,6 +405,7 @@ impl Page {
         match self {
             Page::Target => "Installation target",
             Page::Locale => "Console and locale",
+            Page::Encryption => "Disk encryption",
             Page::Account => "First account",
             Page::Network => "Network (optional)",
             Page::Review => "Review",
@@ -415,6 +432,15 @@ struct App<'a> {
     sample: Input,
     locale: Input,
     timezone: Input,
+
+    // Encryption
+    /// Whether to lay the data filesystem inside a LUKS2 volume. Off by default:
+    /// the passphrase must be typed at every boot (there is no unattended unlock
+    /// yet), so it is a choice the operator makes, not one the installer makes
+    /// for them.
+    encrypt: bool,
+    passphrase: Input,
+    passphrase_confirm: Input,
 
     // Account
     hostname: Input,
@@ -467,6 +493,9 @@ impl<'a> App<'a> {
             sample: Input::new("Type hello-123 to check", "", ""),
             locale: Input::new("Locale", "", "en_US.UTF-8").choose_from(owned(LOCALES)),
             timezone: Input::new("Timezone", "", "UTC").choose_from(zone_suggestions()),
+            encrypt: false,
+            passphrase: Input::secret("Passphrase"),
+            passphrase_confirm: Input::secret("Repeat passphrase"),
             hostname: Input::new("Hostname", "", "sentinel"),
             username: Input::new("Username", "", "admin"),
             password: Input::secret("Password"),
@@ -505,6 +534,12 @@ impl<'a> App<'a> {
                 &mut self.locale,
                 &mut self.timezone,
             ],
+            // The passphrase fields exist only while encryption is on — the
+            // toggle at slot 0 is all there is when it is off.
+            Page::Encryption if self.encrypt => {
+                vec![&mut self.passphrase, &mut self.passphrase_confirm]
+            }
+            Page::Encryption => vec![],
             Page::Account => vec![
                 &mut self.hostname,
                 &mut self.username,
@@ -524,7 +559,10 @@ impl<'a> App<'a> {
     /// have one.
     fn list_slots(&self) -> usize {
         match self.page {
-            Page::Target | Page::Network => 1,
+            // Target/Network open on a selectable list; Encryption opens on the
+            // on/off toggle, which sits in that same first focus slot (Space
+            // flips it, like the list rows).
+            Page::Target | Page::Network | Page::Encryption => 1,
             _ => 0,
         }
     }
@@ -633,6 +671,22 @@ impl<'a> App<'a> {
                 }
                 None
             }
+            // Nothing to check when encryption is off. When it is on, the
+            // passphrase must be present and typed the same twice — the install
+            // path refuses an empty one, and a mistyped one is a volume nobody
+            // can open, so both are caught here before a disk is touched.
+            Page::Encryption => {
+                if !self.encrypt {
+                    return None;
+                }
+                if self.passphrase.value.is_empty() {
+                    return Some("an encrypted install needs a non-empty passphrase".into());
+                }
+                if self.passphrase.value != self.passphrase_confirm.value {
+                    return Some("the two passphrases do not match".into());
+                }
+                None
+            }
             Page::Account => {
                 if self.password.value.len() < 8 {
                     return Some("the password must be at least 8 characters".into());
@@ -664,6 +718,15 @@ impl<'a> App<'a> {
             username: self.username.effective(),
             password: self.password.value.clone(),
             ssh_key: self.ssh_key.value.clone(),
+            // The passphrase only means anything when encryption is on; an
+            // off-then-typed-then-off dance must not leak a stale one into the
+            // install path.
+            encrypt: self.encrypt,
+            passphrase: if self.encrypt {
+                self.passphrase.value.clone()
+            } else {
+                String::new()
+            },
             nics: self.nics.clone(),
             permit_ssh: self.permit_ssh,
         }
@@ -909,6 +972,7 @@ fn toggle(app: &mut App) {
                 nic.configure = !nic.configure;
             }
         }
+        Page::Encryption => app.encrypt = !app.encrypt,
         _ => {}
     }
 }
@@ -1009,6 +1073,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     match app.page {
         Page::Target => draw_target(f, inner, app),
         Page::Locale | Page::Account => draw_fields(f, inner, app),
+        Page::Encryption => draw_encryption(f, inner, app),
         Page::Network => draw_network(f, inner, app),
         Page::Review => draw_review(f, inner, app),
     }
@@ -1314,6 +1379,57 @@ fn draw_suggestions(f: &mut Frame, area: Rect, app: &mut App) {
     );
 }
 
+/// The encryption page: a single on/off toggle at focus slot 0, an honest note
+/// about what it does, and — only while it is on — the passphrase pair.
+fn draw_encryption(f: &mut Frame, area: Rect, app: &mut App) {
+    let inner = area.inner(Margin::new(2, 1));
+    let rows = Layout::vertical([
+        Constraint::Length(2), // the toggle
+        Constraint::Length(5), // the explanation
+        Constraint::Min(0),    // the passphrase pair, when on
+    ])
+    .split(inner);
+
+    let on_toggle = app.focus_on_list();
+    let mark = if app.encrypt { "[x]" } else { "[ ]" };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!(
+                    "{} {mark} Encrypt the data partition (LUKS2)",
+                    if on_toggle { ">" } else { " " }
+                ),
+                if on_toggle {
+                    Style::new().fg(ACCENT).bold()
+                } else {
+                    Style::new()
+                },
+            ),
+            Span::styled("   (Space toggles)", Style::new().fg(MUTED)),
+        ])),
+        rows[0],
+    );
+
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "Only the writable data partition is encrypted; the read-only system store \
+             is already integrity-sealed. The box asks for this passphrase at every boot \
+             (on the console, or through a waiting remote agent) - there is no unattended \
+             unlock yet, so keep it somewhere you can reach when the box restarts.",
+            Style::new().fg(MUTED),
+        ))
+        .wrap(Wrap { trim: true }),
+        rows[1],
+    );
+
+    if app.encrypt {
+        // The list occupies focus slot 0 on this page, so the fields start at 1.
+        let focus = app.focus;
+        let rendered = render_rows(app.fields(), focus, 1);
+        render_field_rows(f, rows[2], &rendered);
+    }
+}
+
 fn draw_network(f: &mut Frame, area: Rect, app: &mut App) {
     let inner = area.inner(Margin::new(2, 1));
     let rows = Layout::vertical([
@@ -1441,6 +1557,20 @@ fn draw_review(f: &mut Frame, area: Rect, app: &mut App) {
         app.locale.effective(),
         app.timezone.effective()
     )));
+    // The passphrase itself is deliberately absent — this is on screen at the
+    // end of an install, exactly where a secret must not be.
+    lines.push(Line::from(Span::styled(
+        if app.encrypt {
+            "    disk       LUKS2 encrypted - the box asks for the passphrase at each boot"
+        } else {
+            "    disk       not encrypted"
+        },
+        if app.encrypt {
+            Style::new().fg(ACCENT)
+        } else {
+            Style::new().fg(MUTED)
+        },
+    )));
     lines.push(Line::from(format!(
         "    account    {}  (password set, not shown)",
         app.username.effective()
@@ -1482,4 +1612,86 @@ fn draw_review(f: &mut Frame, area: Rect, app: &mut App) {
     lines.push(Line::from(Span::styled(firewall, Style::new().fg(MUTED))));
 
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn disk(name: &str, gib: u64) -> Disk {
+        Disk {
+            name: name.into(),
+            size: gib * 1024 * 1024 * 1024,
+            model: String::new(),
+            removable: false,
+        }
+    }
+
+    /// A wizard on the encryption page, with the toggle already flipped on.
+    fn app_on_encryption(encrypt: bool) -> App<'static> {
+        // Leak a tiny disk list so the App can borrow it for the test's lifetime.
+        let disks: &'static [Disk] = Box::leak(vec![disk("sda", 100)].into_boxed_slice());
+        let mut app = App::new(disks, &[]);
+        app.page = Page::Encryption;
+        app.encrypt = encrypt;
+        app
+    }
+
+    #[test]
+    fn encryption_off_needs_no_passphrase_and_carries_none() {
+        let mut app = app_on_encryption(false);
+        assert!(app.validate().is_none(), "an unencrypted install validates");
+        let answers = app.into_answers();
+        assert!(!answers.encrypt);
+        assert!(answers.passphrase.is_empty());
+    }
+
+    #[test]
+    fn an_empty_passphrase_is_refused_while_encrypting() {
+        let mut app = app_on_encryption(true);
+        let err = app.validate().expect("an empty passphrase must be refused");
+        assert!(err.contains("non-empty"), "{err}");
+    }
+
+    #[test]
+    fn a_mismatched_passphrase_is_refused() {
+        let mut app = app_on_encryption(true);
+        app.passphrase.value = "correcthorsebattery".into();
+        app.passphrase_confirm.value = "typo".into();
+        let err = app.validate().expect("a mismatch must be refused");
+        assert!(err.contains("do not match"), "{err}");
+    }
+
+    #[test]
+    fn a_matching_passphrase_validates_and_reaches_the_answers() {
+        let mut app = app_on_encryption(true);
+        app.passphrase.value = "correcthorsebattery".into();
+        app.passphrase_confirm.value = "correcthorsebattery".into();
+        assert!(app.validate().is_none(), "a matching pair validates");
+        let answers = app.into_answers();
+        assert!(answers.encrypt);
+        assert_eq!(answers.passphrase, "correcthorsebattery");
+    }
+
+    #[test]
+    fn the_passphrase_fields_appear_only_while_encryption_is_on() {
+        // Off: the toggle is all there is (one focus slot before the two buttons).
+        let mut off = app_on_encryption(false);
+        assert_eq!(off.fields().len(), 0);
+        assert_eq!(off.slots(), 3); // toggle + Back + Next
+        // On: the two passphrase fields join the page.
+        let mut on = app_on_encryption(true);
+        assert_eq!(on.fields().len(), 2);
+        assert_eq!(on.slots(), 5); // toggle + 2 fields + Back + Next
+    }
+
+    #[test]
+    fn a_passphrase_typed_then_turned_off_does_not_leak() {
+        let mut app = app_on_encryption(true);
+        app.passphrase.value = "secret-then-abandoned".into();
+        app.encrypt = false;
+        let answers = app.into_answers();
+        assert!(!answers.encrypt);
+        assert!(answers.passphrase.is_empty(), "a stale passphrase must not leak");
+    }
 }

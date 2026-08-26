@@ -161,22 +161,25 @@ pub fn page() -> String {
     let light = r#"
       color-scheme: light;
 
-      --bg-app: #f4f6fa; --surface: #ffffff;
-      --surface-raised: #ffffff; --surface-sunken: #f2f5fa;
-      --surface-hover: #e9eef7;
+      --bg-app: #f8fafc; --surface: #ffffff;
+      --surface-raised: #ffffff; --surface-sunken: #f1f5f9;
+      --surface-hover: #eef2f7;
       /* The rail stays a shade off the page in both appearances: a console
          reads as navigation-plus-content, and two identical whites collapse
          that into one sheet. */
-      --sidebar-bg: #edf1f8;
-      --text-strong: #0b0e14; --text-body: #1d2431;
-      --text-muted: #5b6779; --text-faint: #7a8699;
-      --border: #dde3ec; --border-strong: #c6cfdc;
-      --border-subtle: #e8edf4;
-      --brand: var(--signal-600); --brand-hover: var(--signal-500);
-      --brand-active: #2d5cc4; --focus-ring: var(--signal-600);
-      --link: var(--signal-600);
-      --green-500: #1a7f37; --amber-500: #9a6700; --red-500: #cf222e;
-      --cyan-500: #1b7f9e;
+      --sidebar-bg: #f1f5f9;
+      --text-strong: #0f172a; --text-body: #1e293b;
+      --text-muted: #64748b; --text-faint: #94a3b8;
+      --border: #e2e8f0; --border-strong: #cbd5e1;
+      --border-subtle: rgba(15,23,42,.07);
+      /* The accent darkens on white so a link and a focus ring still pass AA
+         at 4.5:1; the dark ramp's lighter cyan would not. */
+      --brand: #1f7fa8; --brand-hover: #186a8e;
+      --brand-active: #145b7a; --focus-ring: #1f7fa8;
+      --link: #1f7fa8;
+      --green-500: #047857; --amber-500: #b45309; --red-500: #b91c1c;
+      --green-300: #047857; --amber-300: #b45309; --red-300: #b91c1c;
+      --cyan-500: #1f7fa8; --meter: #94a3b8;
       --product: #b06a00; --product-strong: #8a5200; --product-subtle: #fff4e0;
       --on-brand: #ffffff;
 
@@ -218,17 +221,28 @@ pub fn page() -> String {
   :root {{
     color-scheme: dark;
 
-    --ink-950: #070a10; --ink-900: #0b0e14; --ink-850: #0e121a;
-    --ink-800: #11151f; --ink-700: #161c28; --ink-600: #1d2431;
-    --ink-500: #232b3a; --ink-400: #313b4d; --ink-300: #4a566b;
-    --slate-400: #9ba6b8; --slate-100: #e6eaf2; --white: #f6f8fc;
+    --ink-950: #080c11; --ink-900: #0b0f14; --ink-850: #10161d;
+    --ink-800: #141a22; --ink-700: #19212b; --ink-600: #1d2630;
+    --ink-500: #2a3441; --ink-400: #3a4658; --ink-300: #5c6b80;
+    --slate-400: #8b9bb0; --slate-100: #e8edf2; --white: #f4f8fb;
 
-    --signal-300: #85acff; --signal-400: #5f93ff; --signal-500: #4c8dff;
-    --signal-600: #3a72e6; --signal-900: #16264f;
-    --sentinel-500: #ffb020; --sentinel-600: #e6941a; --sentinel-900: #4a3208;
+    /* Signal is the interaction colour and nothing else — a cool blue-cyan
+       rather than the framework blue it used to be. It marks what answers the
+       operator: links, focus, selection, the active view, the one primary
+       action. It never means "healthy" and it never fills a utilisation bar. */
+    --signal-300: #7cc4e0; --signal-400: #4fb2dc; --signal-500: #2e96c4;
+    --signal-600: #2179a1; --signal-900: #0f2c3a;
+    --sentinel-500: #f59e0b; --sentinel-600: #d18509; --sentinel-900: #45260a;
 
-    --green-500: #3fb950; --amber-500: #ffb020; --red-500: #f85149;
-    --cyan-500: #39b4d6;
+    --green-500: #10b981; --amber-500: #f59e0b; --red-500: #ef4444;
+    /* The same three at text weight: a coloured word needs more lightness on a
+       dark surface than the dot beside it. */
+    --green-300: #34d399; --amber-300: #fbbf24; --red-300: #f87171;
+    --cyan-500: #2e96c4;
+
+    /* Utilisation is information, not interaction: its bar stays neutral and
+       only takes a status colour near or at a limit. */
+    --meter: #55647a;
 
     --bg-app: var(--ink-900); --surface: var(--ink-800);
     --surface-raised: var(--ink-700); --surface-sunken: var(--ink-850);
@@ -296,7 +310,12 @@ pub fn page() -> String {
        cards lg. (This supersedes the earlier all-square decision on purpose:
        squareness made the console read as a terminal, and a terminal is what
        the CLI is for.) */
-    --radius-xs: 4px; --radius-sm: 6px; --radius-md: 10px; --radius-lg: 14px;
+    /* Restrained: an appliance surface is a region of a structured page, not a
+       card you could pick up. 4px default, 6px the largest ordinary surface. */
+    --radius-xs: 3px; --radius-sm: 4px; --radius-md: 4px; --radius-lg: 6px;
+    /* The header bar's height, shared with everything that must stop under it
+       (the edit drawer, the add drawers). */
+    --bar-h: 60px;
     --radius-pill: 999px;
 
     /* Wider and lighter than before: a shadow is one light source doing its
@@ -401,8 +420,8 @@ pub fn page() -> String {
     background: var(--product); box-shadow: 0 0 18px -2px var(--product);
   }}
   aside .grp {{
-    font: var(--fw-semibold) var(--text-2xs)/1.2 var(--font-mono);
-    text-transform: uppercase; letter-spacing: var(--tracking-caps);
+    font: var(--fw-medium) var(--text-xs)/1.2 var(--font-sans);
+    letter-spacing: var(--tracking-body);
     color: var(--text-faint); margin: var(--space-5) var(--space-3) var(--space-2);
   }}
   aside button {{
@@ -432,10 +451,12 @@ pub fn page() -> String {
     position: sticky; top: 0; z-index: 20;
     display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap;
     margin: 0 calc(-1 * var(--space-7)) var(--space-5);
-    padding: var(--space-4) var(--space-7);
+    min-height: var(--bar-h); box-sizing: border-box;
+    padding: var(--space-2) var(--space-7);
     border-bottom: 1px solid var(--border-subtle);
-    background: color-mix(in srgb, var(--bg-app) 82%, transparent);
-    backdrop-filter: saturate(150%) blur(10px);
+    /* Opaque, like every non-floating surface: content scrolls up to an edge,
+       not into a blur. */
+    background: var(--bg-app);
   }}
   .bar h2 {{ font-size: var(--text-lg); }}
   .iconbtn {{
@@ -470,8 +491,8 @@ pub fn page() -> String {
   table th {{
     position: sticky; top: 0; z-index: 1;
     background: var(--surface); text-align: left;
-    font: var(--fw-semibold) var(--text-2xs)/1.2 var(--font-mono);
-    letter-spacing: var(--tracking-caps); text-transform: uppercase;
+    font: var(--fw-medium) var(--text-xs)/1.2 var(--font-sans);
+    letter-spacing: var(--tracking-body);
     color: var(--text-muted);
     padding: var(--space-2) var(--space-3);
     border-bottom: 1px solid var(--border);
@@ -516,40 +537,59 @@ pub fn page() -> String {
 
   .spacer {{ margin-left: auto; }}
 
+  /* A live state is a dot and a coloured word, not a framed tablet: a page of
+     bordered pills turns into a field of ornaments and the one DOWN that
+     matters stops standing out. The dot keeps colour from being the only
+     channel; the word carries the meaning. */
   .pill {{
-    font: var(--fw-medium) var(--text-2xs)/1.6 var(--font-mono);
-    text-transform: uppercase; letter-spacing: var(--tracking-caps);
-    padding: 0 var(--space-2); border-radius: var(--radius-pill);
-    border: 1px solid var(--border); color: var(--text-muted);
+    display: inline-flex; align-items: center; gap: var(--space-2);
+    font: var(--fw-medium) var(--text-xs)/1.6 var(--font-sans);
+    letter-spacing: var(--tracking-body);
+    color: var(--text-muted); white-space: nowrap;
   }}
-  /* "No pending changes" is the console's resting state, and the resting
-     state does not get a framed announcement in the header — it whispers.
-     The frame belongs to the amber pill that appears when there IS news. */
-  .pill.rest {{ border-color: transparent; color: var(--text-faint); }}
-  .pill.up {{ color: var(--status-up); border-color: color-mix(in oklab, var(--status-up) 45%, transparent); }}
-  .pill.down {{ color: var(--status-down); border-color: color-mix(in oklab, var(--status-down) 45%, transparent); }}
+  .pill::before {{
+    content: ""; width: 7px; height: 7px; border-radius: var(--radius-pill);
+    background: var(--text-faint); flex: none;
+  }}
+  /* The resting state whispers — no dot, no frame, just faint text. */
+  .pill.rest {{ color: var(--text-faint); }}
+  .pill.rest::before {{ display: none; }}
+  .pill.up, .pill.ok {{ color: var(--green-300); }}
+  .pill.up::before, .pill.ok::before {{ background: var(--status-up); }}
+  .pill.down {{ color: var(--red-300); }}
+  .pill.down::before {{ background: var(--status-down); }}
 
   /* --- surfaces --------------------------------------------------------- */
   .card {{
-    border: 1px solid var(--border-subtle); border-radius: var(--radius-lg);
-    background: var(--surface); box-shadow: var(--shadow-sm), var(--edge-top);
+    border: 1px solid var(--border); border-radius: var(--radius-lg);
+    background: var(--surface);
     padding: var(--space-5); margin: 0 0 var(--space-4);
   }}
   .card > h3 {{
-    font: var(--fw-semibold) var(--text-2xs)/1.2 var(--font-sans);
-    text-transform: uppercase; letter-spacing: var(--tracking-caps);
+    font: var(--fw-semibold) var(--text-xs)/1.2 var(--font-sans);
+    letter-spacing: var(--tracking-body);
     color: var(--text-muted); margin: 0 0 var(--space-3);
   }}
   /* auto-fill, not auto-fit: two service tiles beside four counters stretched
      to half the page each and stopped reading as the same kind of thing. An
      empty column is better than a tile the width of a paragraph. */
+  /* Like .stats: one bordered strip whose cells share dividers, not a grid of
+     floating tiles. The dashboard's daemon states and counters are readings on
+     one instrument, and the border belongs to the instrument. */
   .cards {{
-    display: grid; gap: var(--space-4);
-    grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr));
-    margin-bottom: var(--space-4);
+    display: flex; flex-wrap: wrap; margin-bottom: var(--space-4);
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius-lg); overflow: hidden;
   }}
+  .cards:empty {{ display: none; }}
+  .cards .kpi {{
+    border: 0; border-right: 1px solid var(--border-subtle); border-radius: 0;
+    flex: 1 1 11rem; padding: var(--space-3) var(--space-4);
+  }}
+  .cards .kpi:last-child {{ border-right: 0; }}
+  .cards .kpi:hover {{ border-color: var(--border-subtle); }}
   .metric {{
-    font: var(--fw-semibold) var(--text-xl)/var(--leading-tight) var(--font-display);
+    font: var(--fw-semibold) var(--text-lg)/var(--leading-tight) var(--font-sans);
     font-variant-numeric: tabular-nums; color: var(--text-strong);
   }}
   .metric small {{
@@ -590,8 +630,8 @@ pub fn page() -> String {
     border-bottom: 1px solid var(--border-subtle); vertical-align: middle;
   }}
   th {{
-    font: var(--fw-semibold) var(--text-2xs)/1.2 var(--font-sans);
-    text-transform: uppercase; letter-spacing: var(--tracking-caps);
+    font: var(--fw-semibold) var(--text-xs)/1.2 var(--font-sans);
+    letter-spacing: var(--tracking-body);
     color: var(--text-faint); border-bottom-color: var(--border-strong);
     white-space: nowrap;
   }}
@@ -817,8 +857,8 @@ pub fn page() -> String {
   .mtx {{ border-collapse: collapse; width: auto; }}
   .mtx th {{
     padding: var(--space-2) var(--space-3); text-align: left;
-    color: var(--text-muted); font: var(--fw-medium) var(--text-2xs)/1.4 var(--font-mono);
-    text-transform: uppercase; letter-spacing: var(--tracking-caps);
+    color: var(--text-muted); font: var(--fw-medium) var(--text-xs)/1.4 var(--font-sans);
+    letter-spacing: var(--tracking-body);
     border-bottom: 1px solid var(--border);
   }}
   .mtx td {{ padding: var(--space-2) var(--space-3); vertical-align: top; }}
@@ -833,8 +873,8 @@ pub fn page() -> String {
   .mtx td .sub {{ color: var(--text-faint); }}
   .req {{
     margin-left: var(--space-2); color: var(--product-strong);
-    font: var(--fw-medium) var(--text-2xs)/1.2 var(--font-mono);
-    text-transform: uppercase; letter-spacing: var(--tracking-caps);
+    font: var(--fw-medium) var(--text-xs)/1.2 var(--font-sans);
+    letter-spacing: var(--tracking-body);
   }}
   .formerr {{ grid-column: 1 / -1; margin: var(--space-2) 0 0; font-size: var(--text-sm); }}
   /* What the value means, under the value. Small and quiet: it is an aid, and
@@ -851,8 +891,8 @@ pub fn page() -> String {
      is what turned a protocol's settings into a questionnaire. */
   .fieldgroup {{
     display: block; margin: 0;
-    font: var(--fw-semibold) var(--text-2xs)/1.35 var(--font-mono);
-    text-transform: uppercase; letter-spacing: var(--tracking-caps);
+    font: var(--fw-semibold) var(--text-xs)/1.35 var(--font-sans);
+    letter-spacing: var(--tracking-body);
     color: var(--text-muted);
     padding-bottom: var(--space-2); border-bottom: 1px solid var(--border-strong);
   }}
@@ -870,7 +910,7 @@ pub fn page() -> String {
   .note {{
     color: var(--text-body); white-space: pre-wrap;
     background: var(--surface-sunken);
-    border-left: 3px solid var(--product);
+    border-left: 3px solid var(--border-strong);
   }}
   .ok {{ color: var(--status-up); }}
 
@@ -895,7 +935,32 @@ pub fn page() -> String {
      one of them and became a twenty-row questionnaire — the same object the add
      panel lays out four abreast. Wide enough for three, and no wider: a modal
      that fills the screen has stopped being a modal. */
-  dialog#editor {{ max-width: 66rem; }}
+  /* The editor is a drawer from the right edge, not a centred modal: the table
+     it edits stays visible behind a light scrim, so the row being changed and
+     the form changing it are on screen together. */
+  dialog#editor {{
+    position: fixed; inset: var(--bar-h) 0 0 auto; margin: 0;
+    height: calc(100dvh - var(--bar-h)); max-height: none;
+    width: min(46rem, 94vw); max-width: none;
+    border: 0; border-left: 1px solid var(--border-strong); border-radius: 0;
+    overflow-y: auto;
+  }}
+  /* The scrim stops where the drawer stops: the bar above stays readable and
+     usable, so the pending-changes answer is never behind a veil. */
+  dialog#editor::backdrop {{
+    background: linear-gradient(to bottom,
+      transparent 0, transparent var(--bar-h, 60px),
+      rgba(0,0,0,.25) var(--bar-h, 60px));
+  }}
+  /* Add-forms are the same gesture: a panel that slides in at the right and
+     leaves the list it extends readable. The inline edit rows inside tables
+     (`.editrow .addpanel`) are exempt — they are the row itself. */
+  .card.addpanel:not(.hidden) {{
+    position: fixed; top: var(--bar-h); right: 0; bottom: 0; z-index: 15;
+    width: min(44rem, 94vw); margin: 0; overflow-y: auto;
+    border-radius: 0; border: 0; border-left: 1px solid var(--border-strong);
+    box-shadow: var(--shadow-lg);
+  }}
   dialog[open] {{ opacity: 1; transform: scale(1); }}
   @starting-style {{ dialog[open] {{ opacity: 0; transform: scale(.97); }} }}
   dialog::backdrop {{
@@ -906,9 +971,54 @@ pub fn page() -> String {
   }}
   dialog[open]::backdrop {{ background: rgba(7,10,16,.7); }}
   @starting-style {{ dialog[open]::backdrop {{ background: rgba(7,10,16,0); }} }}
+
+  /* The jump palette rides high rather than centred — it is a place to type,
+     not a page to read, and a search box anchored near the top is where the
+     hand expects it. Padding is nil on the shell so the input can own the top
+     edge and the list can scroll under it. */
+  dialog#palette {{ max-width: 40rem; margin: 12vh auto auto; padding: 0; overflow: hidden; }}
+  #paletteq {{
+    width: 100%; box-sizing: border-box; border: 0;
+    border-bottom: 1px solid var(--border); background: transparent;
+    color: var(--text-body); font: inherit; font-size: 1rem; outline: none;
+    padding: var(--space-4) var(--space-5);
+  }}
+  #palettelist {{
+    max-height: 50vh; overflow-y: auto; padding: var(--space-2);
+    display: flex; flex-direction: column; gap: 2px;
+  }}
+  .palitem {{
+    display: flex; align-items: baseline; justify-content: space-between;
+    gap: var(--space-4); width: 100%; text-align: left; cursor: pointer;
+    padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm);
+    border: 1px solid transparent; background: transparent; color: var(--text-body);
+  }}
+  .palitem:hover {{ background: var(--surface-hover); }}
+  /* The keyboard's selection, and the one the pointer would land on, are the
+     same highlight — arrowing down and hovering are one idea to the operator. */
+  .palitem.on {{ background: var(--surface-hover); border-color: var(--border-strong); }}
+  .palt {{ font-weight: 500; }}
+  .palg {{ color: var(--text-muted); font-size: .82rem; white-space: nowrap; }}
+  .palempty {{ color: var(--text-muted); padding: var(--space-3); }}
+  /* The hint that the palette exists, sat under the rail's own search. Quiet by
+     default — an operator who needs it will find it, and one who does not is not
+     asked to read it every time. */
+  .palhint {{
+    display: flex; align-items: center; justify-content: space-between;
+    gap: var(--space-2); width: 100%; cursor: pointer;
+    margin-top: var(--space-2); padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);
+    background: transparent; color: var(--text-muted); font: inherit; font-size: .82rem;
+  }}
+  .palhint:hover {{ background: var(--surface-hover); color: var(--text-body); }}
+  .palhint kbd {{
+    font: inherit; font-size: .74rem; padding: 1px var(--space-2);
+    border: 1px solid var(--border); border-radius: var(--radius-xs);
+    background: var(--surface-sunken); color: var(--text-muted);
+  }}
   .script {{
     background: var(--surface-sunken); border: 1px solid var(--border);
-    border-left: 2px solid var(--product); border-radius: var(--radius-sm);
+    border-radius: var(--radius-sm);
     padding: var(--space-3); font: var(--fw-regular) var(--text-sm)/var(--leading-code) var(--font-mono);
     white-space: pre-wrap; color: var(--text-body);
   }}
@@ -960,14 +1070,13 @@ pub fn page() -> String {
     color: var(--text-faint);
   }}
 
-  /* A category carries its own colour, and only on its mark: the icon and the
-     edge that shows where you are. Tinting the label too would turn the rail
-     into a paint chart and stop the colour meaning anything -- it is here to
-     tell twelve areas apart at a glance, not to decorate. */
+  /* Category icons are quiet: colour in the rail belongs to the accent that
+     marks where you are, and to nothing else. Twelve tinted icons were a paint
+     chart, and the tints took meaning away from the status colours. */
   aside button.navitem.cat {{ padding-block: var(--space-2); }}
-  aside button.navitem.cat svg {{ color: var(--cat); width: 17px; height: 17px; }}
+  aside button.navitem.cat svg {{ color: var(--cat, var(--text-muted)); width: 17px; height: 17px; }}
   aside button.navitem.cat.on {{ color: var(--text-strong); background: var(--surface-raised); }}
-  aside button.navitem.cat.on::before {{ background: var(--cat); }}
+  aside button.navitem.cat.on::before {{ background: var(--cat, var(--brand)); }}
   aside button.navitem.cat:hover svg {{ filter: brightness(1.25); }}
 
   /* The pages inside the category, in the content rather than the rail. It sits
@@ -993,7 +1102,7 @@ pub fn page() -> String {
   }}
   .secstrip .secitem svg {{ width: 14px; height: 14px; flex: none; opacity: .8; }}
   .secstrip .secitem:hover {{ color: var(--text-strong); }}
-  .secstrip .secitem.on {{ color: var(--text-strong); border-bottom-color: var(--cat); }}
+  .secstrip .secitem.on {{ color: var(--text-strong); border-bottom-color: var(--cat, var(--brand)); }}
   /* Configured is not a status, and a mark that borrowed the colour of "up"
      would tell an operator something the appliance never said. */
   .secstrip .secitem .live {{
@@ -1006,24 +1115,26 @@ pub fn page() -> String {
      tile to the page that explains it. */
   /* The same tracks as .cards above it: two tile bands whose columns do not
      line up read as two unrelated pages sharing a scroll position. */
+  /* One structured strip, not a row of cards: the figures share one border and
+     are divided by vertical rules, so the page opens with a single quiet
+     instrument panel instead of five competing tiles. */
   .stats {{
-    display: grid; gap: var(--space-4); margin-bottom: var(--space-4);
-    grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr));
+    display: flex; flex-wrap: wrap; margin-bottom: var(--space-4);
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius-lg); overflow: hidden;
   }}
   .stat {{
-    position: relative; display: flex; flex-direction: column; gap: 2px;
-    padding: var(--space-4); background: var(--surface); border: 1px solid var(--border-subtle);
-    border-radius: var(--radius-sm); overflow: hidden;
+    display: flex; flex-direction: column; gap: 2px; flex: 1 1 11rem;
+    padding: var(--space-3) var(--space-4);
+    border-right: 1px solid var(--border-subtle);
   }}
-  .stat::before {{
-    content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--cat);
-  }}
+  .stat:last-child {{ border-right: 0; }}
   .stat .slabel {{
-    font: var(--fw-semibold) var(--text-2xs)/1.2 var(--font-sans);
-    letter-spacing: .08em; text-transform: uppercase; color: var(--text-muted);
+    font: var(--fw-medium) var(--text-xs)/1.2 var(--font-sans);
+    letter-spacing: var(--tracking-body); color: var(--text-muted);
   }}
   .stat .svalue {{
-    font: var(--fw-semibold) var(--text-2xl)/1.1 var(--font-sans);
+    font: var(--fw-semibold) var(--text-lg)/1.2 var(--font-mono);
     color: var(--text-strong); font-variant-numeric: tabular-nums;
   }}
   .stat .sfoot {{ font: var(--text-xs)/1.3 var(--font-sans); color: var(--text-faint); }}
@@ -1125,8 +1236,8 @@ pub fn page() -> String {
   .act {{
     display: inline-flex; align-items: center; flex: none;
     padding: 1px var(--space-2); border-radius: var(--radius-sm);
-    font: var(--fw-semibold) var(--text-2xs)/1.6 var(--font-mono);
-    text-transform: uppercase; letter-spacing: var(--tracking-caps);
+    font: var(--fw-medium) var(--text-xs)/1.6 var(--font-sans);
+    letter-spacing: var(--tracking-body);
     border: 1px solid currentColor; white-space: nowrap;
   }}
   /* Within the denied family the difference is carried by SHAPE, not by hue:
@@ -1147,7 +1258,31 @@ pub fn page() -> String {
   .act.reject {{ color: var(--status-down); background: none; border-style: dashed; }}
 
   /* --- pending changes --------------------------------------------------- */
-  .pill.warn {{ color: var(--status-warn); border-color: color-mix(in oklab, var(--status-warn) 45%, transparent); }}
+  .pill.warn {{ color: var(--amber-300); }}
+  .pill.warn::before {{ background: var(--status-warn); }}
+  /* The header's staged-changes indicator is the single global answer to "am I
+     editing live state?" — the one status on the page that earns a frame. It is
+     also the way back to the review, so it behaves like a control. */
+  #stagedbadge.warn {{
+    padding: 3px var(--space-3); border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--status-warn) 9%, transparent);
+    border: 1px solid color-mix(in srgb, var(--status-warn) 42%, transparent);
+    cursor: pointer;
+  }}
+  #stagedbadge.warn:hover {{
+    background: color-mix(in srgb, var(--status-warn) 14%, transparent);
+  }}
+  .userchip {{
+    display: inline-flex; align-items: center; gap: var(--space-2);
+    color: var(--text-muted); font-size: var(--text-sm); white-space: nowrap;
+  }}
+  .userchip .init {{
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 26px; height: 26px; border-radius: var(--radius-sm);
+    border: 1px solid var(--border); background: var(--surface-raised);
+    font: var(--fw-semibold) var(--text-2xs)/1 var(--font-sans);
+    color: var(--text-body); letter-spacing: .02em;
+  }}
   .dot.warn {{ background: var(--status-warn); box-shadow: 0 0 8px -1px var(--status-warn); }}
   .change {{
     display: flex; align-items: center; gap: var(--space-3);
@@ -1165,8 +1300,8 @@ pub fn page() -> String {
   nav .grouphead {{
     display: flex; align-items: center; gap: var(--space-2); width: 100%;
     background: none; cursor: pointer; color: var(--text-faint);
-    font: var(--fw-semibold) var(--text-2xs)/1.2 var(--font-sans);
-    text-transform: uppercase; letter-spacing: var(--tracking-caps);
+    font: var(--fw-semibold) var(--text-xs)/1.2 var(--font-sans);
+    letter-spacing: var(--tracking-body);
     padding: var(--space-3) var(--space-3) var(--space-2);
     margin: var(--space-4) 0 var(--space-1);
     border: 0; border-bottom: 1px solid var(--border-subtle);
@@ -1185,16 +1320,15 @@ pub fn page() -> String {
   /* --- dashboard tiles ---------------------------------------------------- */
   .kpi {{
     display: flex; flex-direction: column; gap: var(--space-1);
-    border: 1px solid var(--border-subtle); border-radius: var(--radius-lg);
-    background: var(--surface); box-shadow: var(--shadow-sm), var(--edge-top);
+    border: 1px solid var(--border); border-radius: var(--radius-lg);
+    background: var(--surface);
     padding: var(--space-4) var(--space-5);
-    transition: border-color var(--dur-fast) ease,
-                box-shadow var(--dur-fast) ease;
+    transition: border-color var(--dur-fast) ease;
   }}
-  .kpi:hover {{ border-color: var(--border-strong); box-shadow: var(--shadow-md); }}
+  .kpi:hover {{ border-color: var(--border-strong); }}
   .kpi .klabel {{
-    font: var(--fw-semibold) var(--text-2xs)/1.2 var(--font-sans);
-    text-transform: uppercase; letter-spacing: var(--tracking-caps);
+    font: var(--fw-semibold) var(--text-xs)/1.2 var(--font-sans);
+    letter-spacing: var(--tracking-body);
     color: var(--text-muted);
   }}
   .kpi .kfoot {{ font-size: var(--text-xs); color: var(--text-faint); }}
@@ -1257,8 +1391,8 @@ pub fn page() -> String {
   .margin {{ min-width: 0; padding-top: 2px; }}
   .margin > h3 {{
     display: block; margin: 0;
-    font: var(--fw-semibold) var(--text-2xs)/1.35 var(--font-sans);
-    text-transform: uppercase; letter-spacing: var(--tracking-caps);
+    font: var(--fw-semibold) var(--text-xs)/1.35 var(--font-sans);
+    letter-spacing: var(--tracking-body);
     color: var(--text-muted);
     padding-bottom: var(--space-2);
     border-bottom: 1px solid var(--border);
@@ -1505,6 +1639,10 @@ pub fn page() -> String {
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
       <input id="navsearch" placeholder="Search sections">
     </label>
+    <button id="palettehint" class="palhint" type="button"
+            aria-keyshortcuts="Meta+K Control+K">
+      <span>Jump to a page</span><kbd>⌘K</kbd>
+    </button>
 
     <nav id="nav"></nav>
     <div id="matches"></div>
@@ -1539,6 +1677,13 @@ pub fn page() -> String {
       <button class="iconbtn" id="theme" title="Appearance" aria-label="Appearance"></button>
       <button class="btn" id="discard">Discard</button>
       <button class="btn primary" id="applystaged">Apply</button>
+      <!-- Who is driving. The identity sits where every console in the family
+           puts it — top right — so the answer to "am I the right account for
+           this?" never needs a trip to the sidebar. -->
+      <span class="userchip" id="userchip">
+        <span class="init" id="whoinit">MT</span>
+        <span class="uname" id="whoname">management token</span>
+      </span>
     </header>
 
     <div class="card staged hidden" id="stagedcard">
@@ -1914,7 +2059,7 @@ pub fn page() -> String {
       <div id="radiuslist"></div>
 
       <div class="section">
-        <h3>Directories</h3>
+        <h3>Directories (LDAP)</h3>
         <span class="spacer"></span>
         <button class="btn" id="toggleldap">New directory</button>
       </div>
@@ -1925,6 +2070,14 @@ pub fn page() -> String {
       </p>
       <div class="card addpanel hidden" id="addldappanel"></div>
       <div id="ldaplist"></div>
+
+      <div class="section">
+        <h3>TACACS+ servers</h3>
+        <span class="spacer"></span>
+        <button class="btn" id="toggletacacs">New TACACS+ server</button>
+      </div>
+      <div class="card addpanel hidden" id="addtacacspanel"></div>
+      <div id="tacacslist"></div>
 
       <div class="card">
         <h3>Accounts as the appliance sees them</h3>
@@ -2186,10 +2339,25 @@ pub fn page() -> String {
         <p class="lede" style="margin:0 0 var(--space-4)">
           Where signed images come from, and the key their manifest must be
           signed with. Without the key nothing is installed — the channel is a
-          URL, the trust is the key.
+          URL, the trust is the key. Name a channel below to run several side
+          by side; the active one is chosen here.
         </p>
         <div class="grid" id="sys-update"></div>
       </div>
+      <div class="section">
+        <h3>Update channels</h3>
+        <span class="spacer"></span>
+        <button class="btn" id="toggleupchan">New channel</button>
+      </div>
+      <p class="lede inset" style="margin:0 0 var(--space-4)">
+        Each channel is signed by its own key, so trusting one channel pins one
+        key. A subscription key buys tested, delayed-stability images — never
+        features — and if it expires the appliance keeps running unchanged:
+        only new images from that channel become unavailable.
+      </p>
+      <div class="card addpanel hidden" id="addupchanpanel"></div>
+      <div id="upchanlist"></div>
+      <div class="card"><h3>Subscription</h3><pre class="out" id="subshow">…</pre></div>
       <div class="card"><h3>Version</h3><pre class="out" id="sysshow">…</pre></div>
     </div>
 
@@ -2338,6 +2506,7 @@ pub fn page() -> String {
 
       <div class="tabpane hidden" data-tab="management">
         <div class="card"><h3>SSH access</h3><div class="grid" id="svc-ssh"></div></div>
+        <div class="card"><h3>Web console</h3><div class="grid" id="svc-web"></div></div>
         <div class="card"><h3>SNMP (read-only)</h3><div class="grid" id="svc-snmp"></div></div>
         <div class="card"><h3>LLDP</h3><div class="grid" id="svc-lldp"></div></div>
       </div>
@@ -2477,6 +2646,10 @@ pub fn page() -> String {
   <div class="row" style="margin-top:.9rem">
     <button class="btn primary" id="applysave">Stage</button>
     <button class="btn" id="cancel">Cancel</button>
+    <!-- The same "More settings" control the add panel carries, placed by
+         `openEditor`. Emptied and refilled each open so a second edit does not
+         inherit the first rule's button. -->
+    <span id="editormore"></span>
   </div>
 </dialog>
 
@@ -2484,6 +2657,19 @@ pub fn page() -> String {
   <h3 style="margin:0 0 var(--space-4)" id="resulttitle">Applied</h3>
   <div id="resultout"></div>
   <div class="row" style="margin-top:.9rem"><button class="btn" id="resultclose">Close</button></div>
+</dialog>
+
+<!-- The jump palette. Sixty-nine pages behind a rail of categories is two
+     clicks to anywhere and a guess at which category holds what you want; this
+     is the way in for an operator who knows the page's name and not its box.
+     One flat, searchable list of every editable view and every live panel,
+     opened with Cmd/Ctrl-K, driven by the arrows and Enter, closed with Esc.
+     It reuses the rail's own activation — `goto` for a view, the panel swap for
+     a look — so there is one code path to a page however you reach it. -->
+<dialog id="palette" aria-label="Jump to a page">
+  <input id="paletteq" placeholder="Jump to a page…" autocomplete="off"
+         role="combobox" aria-controls="palettelist" aria-expanded="true">
+  <div id="palettelist" role="listbox" aria-label="Pages"></div>
 </dialog>
 
 <script>
@@ -2629,7 +2815,7 @@ function sparkline(canvas, values) {{
   const step = w / (values.length - 1);
   const y = (v) => h - 2 - (v / max) * (h - 6);
   const css = getComputedStyle(document.documentElement);
-  const accent = css.getPropertyValue("--brand").trim() || "#4c8dff";
+  const accent = css.getPropertyValue("--brand").trim() || "#2e96c4";
   g.beginPath();
   values.forEach((v, i) => (i ? g.lineTo(i * step, y(v)) : g.moveTo(0, y(v))));
   g.strokeStyle = accent; g.lineWidth = 1.6; g.stroke();
@@ -2859,7 +3045,11 @@ async function refreshDashboardExtras() {{
   sys.textContent = "";
   try {{
     const v = await text("/api/v1/show/version");
-    for (const line of v.split("\n").filter((l) => l.trim()).slice(0, 6)) {{
+    // Every line the appliance reports, not a fixed count of them: `show
+    // version` decides what identifies this box, and a console that keeps the
+    // first six silently drops the seventh the day somebody adds one. It cost
+    // exactly that — the data-at-rest line was invisible here for a release.
+    for (const line of v.split("\n").filter((l) => l.trim())) {{
       const [k, ...rest] = line.split(/:\s+/);
       sys.append(el("tr", {{}}, [el("td", {{ text: k }}), el("td", {{ class: "val", text: rest.join(": ") }})]));
     }}
@@ -3237,10 +3427,15 @@ const RULE_ONLY = {{
   }},
 }};
 
-// The editor is the whole rule, not a fold of it — it is opened deliberately,
-// for one rule, and there is nothing behind it to reveal. It still asks only
-// what the protocol has.
-const RULE_EDIT = {{ only: RULE_ONLY }};
+// The editor folds like the add panel does, from the same `FORMS.rule` — one
+// rule, one shape, whether it is being made or changed. It used to be the whole
+// rule flat, twenty-four boxes under five headings, on the reasoning that an
+// editor is opened deliberately and has nothing to reveal; but a rule that sets
+// seven of its fields still read as a rule that sets twenty-four, and the fold
+// is honest here for the same reason it is in the add panel — a field the rule
+// actually carries stays on screen (see `fieldGrid`'s honesty rule), only the
+// unset ones go behind "More settings". `openEditor` passes `FORMS.rule`
+// directly so the essential set is shared, not copied.
 
 // What the editor is currently editing: the fields it was built from, their
 // widgets, and the rule as it was — the last of these is what makes an emptied
@@ -3263,7 +3458,7 @@ function openEditor(rule, zones) {{
   $("r-name").value = rule ? rule.name : "";
   $("r-name").readOnly = !!rule;
   const fields = ruleFields(zones || []);
-  const {{ grid, widgets }} = fieldGrid(fields, rule, null, RULE_EDIT);
+  const {{ grid, widgets, more }} = fieldGrid(fields, rule, null, FORMS.rule);
   const box = $("editorfields");
   // Held before the box is emptied: after the second open the name field is a
   // child of the mask this is about to throw away, and emptying first would
@@ -3276,6 +3471,11 @@ function openEditor(rule, zones) {{
   // went is still two forms.
   grid.firstElementChild.prepend(named);
   box.append(grid);
+  // The reveal control the fold hands back, placed beside the modal's own
+  // buttons and cleared first so re-editing does not stack a second one.
+  const moreHost = $("editormore");
+  moreHost.textContent = "";
+  if (more) moreHost.append(more);
   editing = {{ fields, widgets, before: rule }};
   $("editorerr").textContent = "";
   $("editor").showModal();
@@ -3310,6 +3510,11 @@ function renderStaged() {{
   $("stagedbadge").textContent = n ? n + " pending change" + (n === 1 ? "" : "s")
                                    : "no pending changes";
   $("stagedbadge").className = "pill" + (n ? " warn" : " rest");
+  $("stagedbadge").title = n ? "Review the staged changes" : "";
+  // Apply and Discard only exist while there is something to apply or discard —
+  // a resting header must not offer actions that would do nothing.
+  $("discard").classList.toggle("hidden", n === 0);
+  $("applystaged").classList.toggle("hidden", n === 0);
   $("stagedcard").classList.toggle("hidden", n === 0);
   $("stagedtitle").textContent = n + " pending change" + (n === 1 ? "" : "s");
 
@@ -5348,7 +5553,7 @@ function firstGroup(fields) {{
 // to be edited; it is simply not on the board.
 const SECRETS = [
   "psk", "password", "hashed-password", "private-key", "preshared-key",
-  "auth-key", "secret", "passphrase", "macsec-key",
+  "auth-key", "secret", "passphrase", "macsec-key", "subscription-key",
 ];
 
 function shown(key, value) {{
@@ -6644,6 +6849,9 @@ const AAA_LDAP = [
 const AAA_RADIUS = [
   ["secret", "Shared secret"], ["port", "Port"], ["timeout", "Timeout (s)"],
 ];
+const AAA_TACACS = [
+  ["secret", "Shared secret"], ["port", "Port"], ["timeout", "Timeout (s)"],
+];
 const ADMIN_GROUP = [
   ["permission", "Permission", ["read-only", "read-write"]],
 ];
@@ -6675,6 +6883,17 @@ async function refreshUsers() {{
       ? {{ text: "no TLS", cls: "warn" }}
       : {{ text: r.tls || "ldaps" }},
     empty: "No directories configured.",
+  }});
+  renderObjects({{
+    listId: "tacacslist", required: "secret", toggleId: "toggletacacs",
+    toggleLabel: "New server", addId: "addtacacspanel", noun: "Server",
+    fields: AAA_TACACS, nameHint: "10.0.0.49",
+    path: (n) => `system aaa tacacs ${{n}}`,
+    rows: entriesUnder(aaals, ["system", "aaa", "tacacs"]),
+    // The secret is never a badge, exactly as with RADIUS.
+    badge: (r) => r.secret ? {{ text: "port " + (r.port || 49) }}
+                           : {{ text: "no secret", cls: "warn" }},
+    empty: "No TACACS+ servers configured.",
   }});
   renderObjects({{
     listId: "userlist", form: FORMS.user, toggleId: "toggleuser", toggleLabel: "New", addId: "adduserpanel", noun: "Administrator",
@@ -6873,6 +7092,17 @@ const SVC_SSH = [
   // was used, which turns "somebody logged in as admin" into "this key did".
   ["loglevel", "Log level",
    ["", "QUIET", "FATAL", "ERROR", "INFO", "VERBOSE", "DEBUG1", "DEBUG2", "DEBUG3"]],
+];
+// The console configuring the console. TLS is on by default and the box mints
+// its own certificate, so the reasons to touch this are: bring a certificate of
+// your own, move the port, widen the bind — or turn TLS off, which only makes
+// sense on loopback or behind a terminator that already speaks it.
+const SVC_WEB = [
+  ["enable", "Enabled", ["", "true", "false"]], ["port", "Port"],
+  ["listen-address", "Listen address"],
+  ["tls", "Serve HTTPS", ["", "true", "false"]],
+  ["tls-cert", "Certificate chain (PEM)"],
+  ["tls-key", "Private key (PEM)"],
 ];
 const SVC_SNMP = [
   ["community", "Community"], ["listen", "Listen"], ["location", "Location"],
@@ -7242,7 +7472,20 @@ const SYS_IDENT = [
   // here. It was not: the console could read the history and not start it.
   ["metrics enable", "Keep a history", ["", "true", "false"]],
 ];
-const SYS_UPDATE = [["url", "Channel URL"], ["public-key", "Signing key"]];
+const SYS_UPDATE = [
+  ["url", "Default channel URL"], ["public-key", "Signing key"],
+  // Typed rather than picked on purpose: the channel to use may be the one
+  // about to be defined in the list below, and a picker of what exists cannot
+  // say what is about to.
+  ["channel", "Active channel"],
+];
+// One named update channel. Each carries its OWN signing key — a channel is
+// only as trustworthy as the key that vouches for it — and, for a subscription
+// channel, the entitlement (a secret: listed as "set", never as its value).
+const UPDATE_CHANNEL = [
+  ["url", "Channel URL"], ["public-key", "Signing key"],
+  ["subscription-key", "Subscription key"],
+];
 
 
 // cake and fq_codel have different knobs, and the appliance refuses the other
@@ -7447,6 +7690,20 @@ async function refreshSystem() {{
     empty: "No kernel parameters set.",
   }});
   settingsPanel("sys-update", SYS_UPDATE, under("update"), "update", "Update channel");
+  renderObjects({{
+    listId: "upchanlist", required: "url", toggleId: "toggleupchan",
+    toggleLabel: "New channel", addId: "addupchanpanel", noun: "Channel",
+    fields: UPDATE_CHANNEL, nameHint: "enterprise",
+    path: (n) => `update channel ${{n}}`,
+    rows: entriesUnder(ls, ["update", "channel"]),
+    // What matters at a glance: whether this channel is the active one, and
+    // whether it can work at all. The subscription key is never a badge.
+    badge: (r) => !r.url ? {{ text: "no URL", cls: "warn" }}
+      : (fieldsOf(ls, "update").channel === r.name ? {{ text: "active" }}
+                                                   : {{ text: "available" }}),
+    empty: "No named channels — the default URL above is the channel.",
+  }});
+  await showInto("subshow", "/api/v1/show/subscription");
   await showInto("sysshow", "/api/v1/show/version");
 }}
 
@@ -7569,6 +7826,7 @@ async function refreshServices() {{
     ["svc-dns", SVC_DNS, "services dns", "DNS resolver"],
     ["svc-ntp", SVC_NTP, "services ntp", "NTP"],
     ["svc-ssh", SVC_SSH, "services ssh", "SSH access"],
+    ["svc-web", SVC_WEB, "services web", "Web console"],
     ["svc-snmp", SVC_SNMP, "services snmp", "SNMP"],
     ["svc-lldp", SVC_LLDP, "services lldp", "LLDP"],
     ["svc-mdns", SVC_MDNS, "services mdns", "mDNS reflector"],
@@ -7845,18 +8103,18 @@ function icon(name) {{
 
 // The editable views, in the order an operator meets them.
 const SECTIONS = [
-  {{ g: "Overview", i: "gauge", c: "#34d399", items: [
+  {{ g: "Overview", i: "gauge", items: [
     {{ v: "dashboard", t: "Dashboard", i: "gauge" }},
     {{ v: "history", t: "History", i: "chart" }},
   ]}},
-  {{ g: "Policy", i: "shield", c: "#f59e0b", items: [
+  {{ g: "Policy", i: "shield", items: [
     {{ v: "rules", t: "Firewall rules", i: "shield" }},
     {{ v: "zones", t: "Zones", i: "zones" }},
     {{ v: "groups", t: "Groups", i: "layers" }},
     {{ v: "nat", t: "NAT", i: "swap" }},
     {{ v: "synproxy", t: "SYN protection", i: "pulse" }},
   ]}},
-  {{ g: "Network", i: "address", c: "#38bdf8", items: [
+  {{ g: "Network", i: "address", items: [
     {{ v: "interfaces", t: "Interfaces", i: "address" }},
     // Not `address` again: two pages of a category wearing one glyph is a strip
     // read by position rather than by sight.
@@ -7870,7 +8128,7 @@ const SECTIONS = [
   // operator chasing a route should not have to know which of those answered.
   // Every protocol is named in the rail: a box that speaks seven of them and
   // shows one is a box an operator will assume cannot do the other six.
-  {{ g: "Routing", i: "globe", c: "#a78bfa", items: [
+  {{ g: "Routing", i: "globe", items: [
     {{ v: "routing", tab: "static", t: "Static routes", i: "pin" }},
     {{ v: "routing", tab: "bgp",    t: "BGP", i: "globe" }},
     {{ v: "routing", tab: "ospf",   t: "OSPFv2", i: "star" }},
@@ -7889,7 +8147,7 @@ const SECTIONS = [
     {{ v: "routepolicy", tab: "pbr", t: "Policy routing", i: "route" }},
     {{ v: "wan", t: "Multi-WAN", i: "swap" }},
   ]}},
-  {{ g: "Security", i: "lock", c: "#fb7185", items: [
+  {{ g: "Security", i: "lock", items: [
     {{ v: "ipsec", t: "IPsec", i: "lock" }},
     {{ v: "wireguard", t: "WireGuard", i: "key" }},
     {{ v: "openconnect", t: "Remote access", i: "lock" }},
@@ -7898,17 +8156,17 @@ const SECTIONS = [
     {{ v: "ids", t: "Intrusion detection", i: "bug" }},
     {{ v: "capture", t: "Packet capture", i: "search" }},
   ]}},
-  {{ g: "Overlay", i: "layers", c: "#2dd4bf", items: [
+  {{ g: "Overlay", i: "layers", items: [
     {{ v: "evpn", t: "EVPN", i: "layers" }},
   ]}},
-  {{ g: "Services", i: "swap", c: "#22d3ee", items: [
+  {{ g: "Services", i: "swap", items: [
     {{ v: "services", tab: "resolution", t: "DNS and time", i: "layers" }},
     {{ v: "services", tab: "management", t: "Management access", i: "key" }},
     {{ v: "services", tab: "addressing", t: "Addressing", i: "address" }},
     {{ v: "services", tab: "publishing", t: "Publishing", i: "swap" }},
     {{ v: "services", tab: "notification", t: "Logging and alerts", i: "bug" }},
   ]}},
-  {{ g: "System", i: "chip", c: "#c084fc", items: [
+  {{ g: "System", i: "chip", items: [
     {{ v: "system", t: "System", i: "gauge" }},
     {{ v: "ha", t: "High availability", i: "layers" }},
     {{ v: "users", t: "Administrators", i: "key" }},
@@ -7957,13 +8215,13 @@ const TABS = {{
 // Farbe und Symbol der Live-Gruppen. Die Rust-Tabelle, die sie aufzählt, soll
 // nichts über ihr Aussehen wissen -- deshalb hier, nach Namen nachgeschlagen.
 const NAVMETA = {{
-  Firewall:    ["shield", "#f59e0b"],
-  NAT:         ["swap", "#38bdf8"],
-  Network:     ["address", "#38bdf8"],
-  Routing:     ["globe", "#a78bfa"],
-  Security:    ["lock", "#fb7185"],
-  VPN:         ["key", "#fb7185"],
-  Diagnostics: ["bug", "#94a3b8"],
+  Firewall:    ["shield"],
+  NAT:         ["swap"],
+  Network:     ["address"],
+  Routing:     ["globe"],
+  Security:    ["lock"],
+  VPN:         ["key"],
+  Diagnostics: ["bug"],
 }};
 
 let tabs = {{}};        // view → the tab open in it
@@ -8084,6 +8342,81 @@ function goto(key) {{
   panel = null;
   buildNav();
   refresh();
+}}
+
+// Every place the palette can take you, flattened from the two registries the
+// rail is built from: the editable views in `SECTIONS`, and the live panels in
+// `NAV`. Each carries the same `run` the rail's own click does — `goto` for a
+// view, the panel swap for a look — so the palette is a second door onto one
+// activation, never a parallel one that could drift.
+function paletteItems() {{
+  const out = [];
+  for (const group of SECTIONS) {{
+    for (const item of group.items) {{
+      const key = item.tab ? item.v + ":" + item.tab : item.v;
+      out.push({{ t: item.t, g: group.g, run: () => goto(key) }});
+    }}
+  }}
+  for (const group of NAV) {{
+    for (const item of group.items) {{
+      out.push({{ t: item.t, g: group.g, run: () => {{ view = "panel"; panel = item; refresh(); }} }});
+    }}
+  }}
+  return out;
+}}
+
+let palItems = [];   // what the query currently matches
+let palSel = 0;      // the row the arrows and Enter act on
+
+function renderPalette() {{
+  const q = $("paletteq").value.trim().toLowerCase();
+  const all = paletteItems();
+  // Substring over the page's own name and its category — enough to find a page
+  // you can name, and nothing an operator has to learn the ranking of.
+  palItems = q ? all.filter((e) => (e.t + " " + e.g).toLowerCase().includes(q)) : all;
+  if (palSel >= palItems.length) palSel = Math.max(0, palItems.length - 1);
+  const list = $("palettelist");
+  list.textContent = "";
+  if (!palItems.length) {{
+    list.append(el("div", {{ class: "palempty", text: "No page matches" }}));
+    return;
+  }}
+  palItems.forEach((e, idx) => {{
+    const b = el("button", {{ class: "palitem" + (idx === palSel ? " on" : ""),
+                             onclick: () => runPalette(idx) }});
+    b.setAttribute("role", "option");
+    b.setAttribute("aria-selected", String(idx === palSel));
+    b.append(el("span", {{ class: "palt", text: e.t }}),
+             el("span", {{ class: "palg", text: e.g }}));
+    list.append(b);
+  }});
+}}
+
+function scrollPaletteSel() {{
+  const on = $("palettelist").querySelector(".palitem.on");
+  if (on) on.scrollIntoView({{ block: "nearest" }});
+}}
+
+function runPalette(idx) {{
+  const e = palItems[idx];
+  if (!e) return;
+  closePalette();
+  e.run();
+}}
+
+function openPalette() {{
+  const dlg = $("palette");
+  if (dlg.open) return;
+  $("paletteq").value = "";
+  palSel = 0;
+  renderPalette();
+  dlg.showModal();
+  $("paletteq").focus();
+}}
+
+function closePalette() {{
+  const dlg = $("palette");
+  if (dlg.open) dlg.close();
 }}
 
 function sectionFor(path) {{
@@ -8320,10 +8653,9 @@ function buildNav() {{
 
   const live = el("div", {{ class: "group" }}, [el("span", {{ class: "grp", text: "Look" }})]);
   for (const group of NAV) {{
-    const [ic, colour] = NAVMETA[group.g] || ["chart", "#94a3b8"];
+    const [ic] = NAVMETA[group.g] || ["chart"];
     const first = group.items[0];
     const b = navButton(group.g, ic, () => {{ view = "panel"; panel = first; refresh(); }}, "live:" + group.g);
-    b.style.setProperty("--cat", colour);
     b.classList.add("cat");
     if (panel && group.items.some((i) => i.p === panel.p)) b.classList.add("on");
     live.append(b);
@@ -8484,6 +8816,12 @@ function renderWho() {{
     label.textContent = who || "management token";
     label.title = who ? "signed in as " + who : "signed in with the machine token";
   }}
+  const name = who || "management token";
+  const parts = name.split(/[^a-zA-Z0-9]+/).filter(Boolean);
+  const init = ((parts[0] || "m")[0] + (parts[1] ? parts[1][0] : (parts[0] || "mt")[1] || "")).toUpperCase();
+  if ($("whoname")) $("whoname").textContent = name;
+  if ($("whoinit")) $("whoinit").textContent = init;
+  if ($("userchip")) $("userchip").title = who ? "signed in as " + who : "signed in with the machine token";
   const readOnly = permission === "read-only";
   const pill = $("permpill");
   if (pill) {{
@@ -8604,6 +8942,32 @@ $("tokenform").onsubmit = (e) => {{
 }};
 $("signout").onclick = () => signOut("");
 $("navsearch").oninput = () => {{ buildNav(); renderMatches(); }};
+
+// The palette: opened from the rail hint or by Cmd/Ctrl-K anywhere, filtered as
+// you type, walked with the arrows, taken with Enter, dismissed with Esc (the
+// dialog's own cancel closes it, so nothing here has to catch Escape).
+$("palettehint").onclick = openPalette;
+$("paletteq").oninput = () => {{ palSel = 0; renderPalette(); }};
+$("paletteq").onkeydown = (e) => {{
+  if (e.key === "ArrowDown") {{
+    e.preventDefault();
+    palSel = Math.min(palSel + 1, palItems.length - 1);
+    renderPalette(); scrollPaletteSel();
+  }} else if (e.key === "ArrowUp") {{
+    e.preventDefault();
+    palSel = Math.max(palSel - 1, 0);
+    renderPalette(); scrollPaletteSel();
+  }} else if (e.key === "Enter") {{
+    e.preventDefault();
+    runPalette(palSel);
+  }}
+}};
+document.addEventListener("keydown", (e) => {{
+  if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) {{
+    e.preventDefault();
+    $("palette").open ? closePalette() : openPalette();
+  }}
+}});
 $("togglerule").onclick = () => {{
   const panel = $("addrulepanel");
   panel.classList.toggle("hidden");
@@ -8616,6 +8980,12 @@ $("defaultpolicy").onchange = (e) => {{
   e.target.value = "";
 }};
 $("discard").onclick = () => {{ staged = []; renderStaged(); }};
+// The badge is the review's doorway: it brings the staged card into view, so
+// the exact commands are read before anything is applied.
+$("stagedbadge").onclick = () => {{
+  if (!staged.length) return;
+  $("stagedcard").scrollIntoView({{ behavior: "smooth", block: "start" }});
+}};
 $("applystaged").onclick = () => applyStaged(["commit", "save"]);
 $("applystaged2").onclick = () => applyStaged(["commit", "save"]);
 // Validating sends the staged commands with no commit: the appliance checks

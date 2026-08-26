@@ -8,29 +8,48 @@ rolls back automatically. The architecture is in
 ## Applying an update
 
 ```shell
-# from a new raw image (built with `nix build .#sentinel-image`)
+# from a new raw image (built with `nix build .#sentinel-image`) plus its
+# detached signature velstra-sentinel.raw.sig
 sentinel update /path/to/velstra-sentinel.raw --commit
 
-# or from a block device / mounted source
-sentinel update /dev/sdX --commit
+# or from a block device / mounted source (no signature — see --allow-unsigned)
+sentinel update /dev/sdX --commit --allow-unsigned
 ```
 
 What happens:
 
-1. the **active** slot is detected (via `/dev/mapper/usr`);
-2. the new image's store + verity are written to the **inactive** slot;
-3. that slot is re-typed to the verity GPT GUIDs;
-4. the new UKI is installed as `sentinel-<inactive>+3.efi` with **3 boot tries**;
-5. `loader.conf` `default` is pointed at the new slot.
+1. the image's signature is **verified** (see below) unless `--allow-unsigned`;
+2. the **active** slot is detected (via `/dev/mapper/usr`);
+3. the new image's store + verity are written to the **inactive** slot;
+4. that slot is re-typed to the verity GPT GUIDs;
+5. the new UKI is installed as `sentinel-<inactive>+3.efi` with **3 boot tries**;
+6. `loader.conf` `default` is pointed at the new slot.
 
 Without `--commit`, the plan is printed but nothing is written.
 
-> **This local form is not signature-checked.** A path or block device is
-> written to the inactive slot exactly as given — it is the trusted-operator
-> escape hatch (a re-seal from the booted medium, an air-gapped install), so it
-> writes an image you already trust and prints a warning saying so. For an image
-> whose authenticity is verified before it is written, pin a channel and use
-> `sentinel update install` (below).
+### Local images are signature-checked by default
+
+A local `sentinel update <image>` now **verifies the image before writing it** —
+the same authenticity gate the channel path applies, so a local install is no
+longer a way around it. It looks for a detached Ed25519 signature `<image>.sig`
+beside the image and verifies it against a pinned release key, tried in order:
+
+1. `--pubkey <pem|file:path>` on the command line;
+2. the saved `[update]` channel's `public-key`;
+3. a release key baked into the image at `/etc/sentinel/release.pem`.
+
+If no key is available, or the signature is missing or does not verify, the write
+is **refused** and nothing is touched. Sign an image with the release key:
+
+```shell
+openssl pkeyutl -sign -inkey release-priv.pem -rawin \
+  -in velstra-sentinel.raw -out velstra-sentinel.raw.sig
+```
+
+> **`--allow-unsigned` is the trusted-operator escape hatch.** A re-seal from the
+> booted medium or an air-gapped block device has no `.sig` to check; pass
+> `--allow-unsigned` to write it exactly as given. It is loud and logged — never
+> silent — so it can't be mistaken for a verified update.
 
 ## Signed updates (`update check` / `update install`)
 
@@ -66,6 +85,81 @@ sentinel update install --commit # re-verify, then write the inactive A/B slot
 `install` re-verifies the signature **and** the image's SHA-256 before writing
 anything — the authenticity gate in front of the verified-boot slot switch
 below. An unsigned or wrong-key manifest is refused; no slot is touched.
+
+## Named channels and subscriptions
+
+A box can know several channels at once — a community channel anyone can use,
+and a subscription channel carrying **tested, delayed-stability images**. That
+is the whole commercial model: the code is the same and open, what a
+subscription buys is verification work, never withheld features.
+
+```shell
+configure
+set update channel community url https://updates.velstra.example/community
+set update channel community public-key file:/etc/sentinel/community.pem
+set update channel enterprise url https://updates.velstra.example/enterprise
+set update channel enterprise public-key file:/etc/sentinel/enterprise.pem
+set update channel enterprise subscription-key <key>
+set update channel enterprise        # ← selects the active channel
+commit
+save
+```
+
+- **Each channel has its own `public-key`, on purpose.** A channel is only as
+  trustworthy as the key that vouches for it: the enterprise channel's releases
+  are signed by a different key than the community channel's, so trusting one
+  never means trusting the other. `url` and `public-key` are required per
+  channel; `https://` only (or `file://` for an air-gapped mirror).
+- **`set update channel <name>`** with nothing after the name selects which
+  channel `update check`/`install` use. A selection that names no defined
+  channel is refused at `commit`, not discovered during an incident.
+- The single-channel form above (`set update url …`) keeps working unchanged —
+  it is the unnamed *default* channel, and a box configured before named
+  channels existed loses nothing on upgrade.
+- **`subscription-key` is a secret.** It is sent to the channel server as a
+  bearer token, redacted by the read API, and masked everywhere it is shown —
+  `show subscription` prints only its last four characters. (One deliberate
+  exception: `show configuration` prints it in full, like every other secret in
+  the config document, because that document is what gets replayed onto a
+  second appliance and a masked value replayed is a corrupted config.)
+
+### What an expired subscription does — and does not — do
+
+**An expired or rejected subscription never disables the appliance.** The box
+keeps routing, keeps filtering, keeps its configuration, and keeps serving its
+console. The one and only consequence is that *new images from that channel*
+are unavailable: the channel server answers 401/403, and `update check` reports
+it plainly —
+
+```
+channel "enterprise": this subscription is not valid for this channel (HTTP 401).
+The appliance keeps running unchanged — only new images from this channel are
+unavailable. Renew the subscription with your vendor, or correct the key …
+```
+
+There is no phone-home timer, no nag screen, no degraded data plane. A firewall
+whose vendor relationship lapses is still a firewall.
+
+### `show subscription`
+
+The state, as facts this box holds:
+
+```
+channels:
+  community
+  enterprise (active)
+active channel: enterprise
+url:            https://updates.velstra.example/enterprise
+subscription:   key configured (ends …a1b2)
+last check:     2026-08-24 10:12:03 UTC — release 0.4.0 available
+expiry:         not reported by the channel server — nothing is assumed
+```
+
+`last check` is whatever the most recent `update check`/`install` actually
+said — never a fresh fetch (a `show` must not be the thing that talks to the
+internet). Expiry is shown **only if the server reports one**; today the
+channel protocol carries no expiry, so the honest answer is "not reported",
+not a locally computed countdown.
 
 ## The rollback guarantee
 

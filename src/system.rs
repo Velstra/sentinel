@@ -1477,6 +1477,9 @@ pub fn bin(name: &str) -> String {
         "mount" => "SENTINEL_MOUNT_BIN",
         "umount" => "SENTINEL_UMOUNT_BIN",
         "findmnt" => "SENTINEL_FINDMNT_BIN",
+        // data-partition encryption (LUKS2): format/open at install, unlock at boot
+        "cryptsetup" => "SENTINEL_CRYPTSETUP_BIN",
+        "systemd-ask-password" => "SENTINEL_ASK_PASSWORD_BIN",
         _ => "",
     };
     if !var.is_empty() {

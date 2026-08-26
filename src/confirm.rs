@@ -62,12 +62,20 @@ pub fn commit_confirm(session: &mut Session, act: &Apply, minutes: u32) -> Resul
     // apply_live rolls its own partial failure back, so on error nothing armed
     // and the previous running config stands.
     system::disarm_confirm();
-    apply_live(&appliance, act).context("applying the candidate")?;
+    // The saved baseline (guaranteed present above) is the last-good target a
+    // failed broad apply reconciles back to — the same config the timer reverts
+    // to. Loading it can fail for reasons applying it will not (a race on the
+    // file); a `None` target just means a partial failure reports mixed-state
+    // rather than rolling back, so fall back rather than refusing the commit.
+    let last_good = Appliance::load(&cfg_path).ok();
+    apply_live(&appliance, act, last_good.as_ref()).context("applying the candidate")?;
 
     // Arm the auto-rollback. If arming fails we must NOT leave the new config
     // live without protection — revert immediately and surface the failure.
     if let Err(e) = system::arm_confirm(minutes, &cfg_path) {
-        let revert = Appliance::load(&cfg_path).and_then(|prev| apply_live(&prev, act));
+        // A revert: no last-good to reconcile to (reconciling back to the
+        // un-confirmed candidate would defeat it), so `None`.
+        let revert = Appliance::load(&cfg_path).and_then(|prev| apply_live(&prev, act, None));
         return match revert {
             Ok(()) => {
                 Err(e).context("arming the rollback timer failed; reverted to the saved config")
@@ -117,7 +125,10 @@ pub fn rollback(act: &Apply, cfg_path: &Path) -> Result<()> {
     // Stop the timer first (it may be the very unit running us) so a revert
     // that itself races a second firing can't loop.
     system::disarm_confirm();
-    apply_live(&appliance, act).context("reverting to the saved config")?;
+    // A revert to saved: there is no last-good to reconcile a partial failure
+    // to (reconciling back to the un-confirmed config would defeat the revert),
+    // so `None` — a failure here reports mixed-state honestly.
+    apply_live(&appliance, act, None).context("reverting to the saved config")?;
     eprintln!("reverted the running system to the saved config.");
     Ok(())
 }

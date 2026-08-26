@@ -23,7 +23,7 @@ use crate::config::{
     PortMapping, PortSpec, Portal, Pppoe, PppoeServer, PrefixEntry, PrefixList, Proto, Protocols,
     Qos, QosDiscipline, ReverseProxy, Rip, RouterAdvert, Rule, Schedule, Services, Snmp,
     SourceValidation, Ssh, StaticRoute, Syslog, SyslogLevel, SyslogProto, SyslogTarget, System,
-    UpdateChannel, Vpn, VrfDef, Vrrp, WanMode, WanUplink, WebConsole, WgPeer, WireguardTunnel,
+    Vpn, VrfDef, Vrrp, WanMode, WanUplink, WebConsole, WgPeer, WireguardTunnel,
     Wireless, WirelessWpa, Wwan, ZoneCfg,
 };
 
@@ -1354,10 +1354,10 @@ struct Draft {
     /// `None` when unconfigured. A singleton (unlike the ipsec/wireguard lists)
     /// created on the first `set vpn openconnect …`.
     openconnect: Option<OpenConnectDraft>,
-    /// Signed update channel (roadmap C13): the pinned channel URL + release
-    /// signing key, or `None` when unconfigured. A singleton created on the first
-    /// `set update …`.
-    update: Option<UpdateChannelDraft>,
+    /// Signed update channel(s) (roadmap C13): the legacy pinned URL + release
+    /// signing key, the named channels, and which one is active. `None` when
+    /// unconfigured; a singleton created on the first `set update …`.
+    update: Option<UpdateDraft>,
     /// L7 reverse-proxy / load-balancer frontends (roadmap C22), keyed by name in
     /// sorted order (a `BTreeMap`, so materialise/show are name-ordered). Each
     /// terminates a listen port (optionally TLS via a PKI cert) and forwards to
@@ -1554,14 +1554,29 @@ struct OcUserDraft {
     password: Option<String>,
 }
 
-/// A partially-specified signed update channel (`[update]`, roadmap C13). A
-/// singleton behind an `Option` on the draft. Both `url` and `public-key` are
-/// required at commit — a half-specified channel materialises with an empty
-/// string for the missing side so `validate()` surfaces a clear "required".
+/// The partially-specified `[update]` section (roadmap C13). A singleton
+/// behind an `Option` on the draft. The legacy bare `url`/`public-key` pair is
+/// the unnamed default channel; `channels` are the named ones and `channel`
+/// selects the active one. Required fields left unset materialise as `None`
+/// so `validate()` surfaces a clear "required" rather than silently dropping a
+/// half-specified channel.
 #[derive(Debug, Clone, Default)]
-struct UpdateChannelDraft {
+struct UpdateDraft {
     url: Option<String>,
     public_key: Option<String>,
+    /// The active channel's name (`set update channel <name>`).
+    channel: Option<String>,
+    /// The named channels, in the order they were first mentioned.
+    channels: Vec<UpdateChannelEntryDraft>,
+}
+
+/// One named update channel in the draft (`set update channel <name> …`).
+#[derive(Debug, Clone, Default)]
+struct UpdateChannelEntryDraft {
+    name: String,
+    url: Option<String>,
+    public_key: Option<String>,
+    subscription_key: Option<String>,
 }
 
 /// A partially-specified local CA (`[[pki.ca]]`, roadmap C19), keyed by its name
@@ -1665,6 +1680,20 @@ impl Draft {
             .radius
             .iter_mut()
             .find(|r| r.server == server)
+            .expect("just inserted")
+    }
+
+    fn tacacs_mut(&mut self, server: &str) -> &mut crate::config::TacacsServer {
+        if !self.aaa.tacacs.iter().any(|t| t.server == server) {
+            self.aaa.tacacs.push(crate::config::TacacsServer {
+                server: server.to_string(),
+                ..Default::default()
+            });
+        }
+        self.aaa
+            .tacacs
+            .iter_mut()
+            .find(|t| t.server == server)
             .expect("just inserted")
     }
 
@@ -1879,10 +1908,24 @@ impl Draft {
         self.broadcast_relay.entry(name.to_string()).or_default()
     }
 
-    /// Mutable access to the signed update channel, creating an empty one on
+    /// Mutable access to the `[update]` section, creating an empty one on
     /// first touch (a singleton, so `set update …` materialises it).
-    fn update_mut(&mut self) -> &mut UpdateChannelDraft {
-        self.update.get_or_insert_with(UpdateChannelDraft::default)
+    fn update_mut(&mut self) -> &mut UpdateDraft {
+        self.update.get_or_insert_with(UpdateDraft::default)
+    }
+
+    /// Mutable access to the named update channel `name`, inserting it if new
+    /// (channels are kept in first-mention order, like the CAs).
+    fn update_channel_mut(&mut self, name: &str) -> &mut UpdateChannelEntryDraft {
+        let up = self.update.get_or_insert_with(UpdateDraft::default);
+        if let Some(i) = up.channels.iter().position(|c| c.name == name) {
+            return &mut up.channels[i];
+        }
+        up.channels.push(UpdateChannelEntryDraft {
+            name: name.to_string(),
+            ..UpdateChannelEntryDraft::default()
+        });
+        up.channels.last_mut().unwrap()
     }
 
     /// Mutable access to the local CA `name`, inserting it if new (CAs are keyed
@@ -2674,9 +2717,20 @@ impl Draft {
                     })
                     .collect(),
             }),
-            update: a.update.as_ref().map(|u| UpdateChannelDraft {
-                url: Some(u.url.clone()),
-                public_key: Some(u.public_key.clone()),
+            update: a.update.as_ref().map(|u| UpdateDraft {
+                url: u.url.clone(),
+                public_key: u.public_key.clone(),
+                channel: u.channel.clone(),
+                channels: u
+                    .channels
+                    .iter()
+                    .map(|c| UpdateChannelEntryDraft {
+                        name: c.name.clone(),
+                        url: c.url.clone(),
+                        public_key: c.public_key.clone(),
+                        subscription_key: c.subscription_key.clone(),
+                    })
+                    .collect(),
             }),
             reverse_proxy: a
                 .services
@@ -2948,6 +3002,16 @@ impl Session {
     /// `ca` value and `set/delete pki ca …`.
     pub fn pki_ca_names(&self) -> Vec<String> {
         self.draft.pki_cas.iter().map(|(n, _)| n.clone()).collect()
+    }
+
+    /// The declared update channel names — completion offers these for
+    /// `set/delete update channel …`.
+    pub fn update_channel_names(&self) -> Vec<String> {
+        self.draft
+            .update
+            .as_ref()
+            .map(|u| u.channels.iter().map(|c| c.name.clone()).collect())
+            .unwrap_or_default()
     }
 
     /// The declared PKI certificate names — completion offers these for
@@ -4354,6 +4418,21 @@ impl Session {
                 self.draft.web.enable = true;
                 self.draft.web.listen_address = Some((*v).to_string());
             }
+            // TLS is on by default and the box mints its own certificate, so the
+            // only reason to name it here is to turn it off (a loopback console,
+            // or one behind a terminator that already speaks TLS) or to bring a
+            // certificate of your own. Setting any of the three does not imply
+            // `enable`: an operator who configures the certificate first and
+            // switches the console on afterwards means exactly that.
+            ["services", "web", "tls", v] => {
+                self.draft.web.tls = parse_bool(v)?;
+            }
+            ["services", "web", "tls-cert", v] => {
+                self.draft.web.tls_cert = Some((*v).to_string());
+            }
+            ["services", "web", "tls-key", v] => {
+                self.draft.web.tls_key = Some((*v).to_string());
+            }
             ["services", "ssh", "loglevel", v] => {
                 const LEVELS: [&str; 8] = [
                     "QUIET", "FATAL", "ERROR", "INFO", "VERBOSE", "DEBUG1", "DEBUG2", "DEBUG3",
@@ -4475,6 +4554,26 @@ impl Session {
                         )
                     }
                     other => bail!("system aaa radius {server}: unknown field {other:?}"),
+                }
+            }
+            ["system", "aaa", "tacacs", server, field, v] => {
+                crate::config::validate_host(server)?;
+                let t = self.draft.tacacs_mut(server);
+                match *field {
+                    "secret" => t.secret = (*v).to_string(),
+                    "port" => {
+                        t.port = Some(
+                            v.parse()
+                                .with_context(|| format!("system aaa tacacs {server} port"))?,
+                        )
+                    }
+                    "timeout" => {
+                        t.timeout = Some(
+                            v.parse()
+                                .with_context(|| format!("system aaa tacacs {server} timeout"))?,
+                        )
+                    }
+                    other => bail!("system aaa tacacs {server}: unknown field {other:?}"),
                 }
             }
             ["system", "login", name, "hashed-password", v] => {
@@ -5939,15 +6038,56 @@ impl Session {
                 self.draft.acme_mut().agree_tos = Some(parse_bool(v)?);
             }
 
-            // update (roadmap C13): the single signed update channel. `url` is a
-            // single token; `public-key` may be a `file:<path>` ref or an inline
-            // PEM whose whitespace-split tokens are rejoined. Format/PEM checks
-            // live in config `validate()` and run at commit.
+            // update (roadmap C13): the signed update channels. The bare
+            // `url`/`public-key` pair stays the unnamed default channel (a box
+            // in the field must not lose its update path on upgrade); named
+            // channels carry per-channel keys and, for a subscription channel,
+            // the entitlement. `url` is a single token; `public-key` may be a
+            // `file:<path>` ref or an inline PEM whose whitespace-split tokens
+            // are rejoined. Format/PEM checks live in config `validate()` and
+            // run at commit.
             ["update", "url", v] => {
                 self.draft.update_mut().url = Some((*v).to_string());
             }
             ["update", "public-key", rest @ ..] if !rest.is_empty() => {
                 self.draft.update_mut().public_key = Some(rest.join(" "));
+            }
+            // Bare `set update channel <name>` SELECTS the active channel
+            // (creating an empty entry if it is new — the next lines fill it).
+            // A channel named like a field would make its own delete path
+            // unreachable (`delete update channel url` must mean the field),
+            // so those names are refused while they can still be renamed.
+            ["update", "channel", name] => {
+                if ["url", "public-key", "subscription-key"].contains(name) {
+                    bail!(
+                        "update channel: {name:?} is a field name — a channel called that \
+                         could never be addressed again; pick another name"
+                    );
+                }
+                self.draft.update_channel_mut(name);
+                self.draft.update_mut().channel = Some((*name).to_string());
+            }
+            ["update", "channel", name, "url", v] => {
+                self.draft.update_channel_mut(name).url = Some((*v).to_string());
+            }
+            ["update", "channel", name, "public-key", rest @ ..] if !rest.is_empty() => {
+                self.draft.update_channel_mut(name).public_key = Some(rest.join(" "));
+            }
+            ["update", "channel", name, "subscription-key", v] => {
+                // The marker `show configuration` prints in place of a key is
+                // not a key. Refused here so that replaying an operator's
+                // read-only view stops on this line with a sentence, instead
+                // of installing the marker as the entitlement and leaving the
+                // appliance to fail its next update check for no visible
+                // reason.
+                if *v == KEY_NOT_SHOWN {
+                    bail!(
+                        "{KEY_NOT_SHOWN} is what `show configuration` prints instead of the \
+                         key, not the key itself. Copy the real one from the vendor, or use \
+                         `show configuration commands`, which carries it."
+                    );
+                }
+                self.draft.update_channel_mut(name).subscription_key = Some((*v).to_string());
             }
 
             // A path the grammar knows but that stops before its value is not an
@@ -6014,7 +6154,9 @@ impl Session {
                  set pki ca <name> <common-name <cn> | organization <o> | key-type <ec|rsa> | validity-days <n>>\n  \
                  set pki certificate <name> <ca <ca-name|acme> | common-name <cn> | subject-alt-name <DNS:host|IP:addr> | key-type <ec|rsa> | usage <server|client> | validity-days <n>>\n  \
                  set pki acme <email <addr> | directory-url <https-url> | challenge <http-01|dns-01> | agree-tos <bool>>\n  \
-                 set update <url <https-url|file-url> | public-key <PEM|file:path>>"
+                 set update <url <https-url|file-url> | public-key <PEM|file:path>>\n  \
+                 set update channel <name>  (select the active channel)\n  \
+                 set update channel <name> <url <https-url|file-url> | public-key <PEM|file:path> | subscription-key <key>>"
                 )
             }
         }
@@ -7086,6 +7228,11 @@ impl Session {
                 "enable" => self.draft.web.enable = false,
                 "port" => self.draft.web.port = None,
                 "listen-address" => self.draft.web.listen_address = None,
+                // Deleting `tls` restores the secure default rather than clearing
+                // it: there is no third state, and the safe one is on.
+                "tls" => self.draft.web.tls = true,
+                "tls-cert" => self.draft.web.tls_cert = None,
+                "tls-key" => self.draft.web.tls_key = None,
                 other => anyhow::bail!("services web: no field {other:?}"),
             },
             ["services", "ssh"] => self.draft.ssh = Ssh::default(),
@@ -7125,6 +7272,78 @@ impl Session {
             }
             ["system", "group", name] => {
                 self.draft.admin_groups.retain(|g| g.name != *name);
+            }
+            // AAA: a whole server by host, one of its optional fields, or the
+            // default group. A required field (a RADIUS/TACACS+ secret, an
+            // LDAP base-dn) cannot be deleted on its own — a server without it
+            // is not a server, so the answer names the delete that works.
+            ["system", "aaa", "default-group"] => self.draft.aaa.default_group = None,
+            ["system", "aaa", "radius", server] => {
+                let before = self.draft.aaa.radius.len();
+                self.draft.aaa.radius.retain(|r| r.server != *server);
+                if self.draft.aaa.radius.len() == before {
+                    bail!("no radius server {server:?}");
+                }
+            }
+            ["system", "aaa", "radius", server, field] => {
+                let Some(r) = self.draft.aaa.radius.iter_mut().find(|r| r.server == *server)
+                else {
+                    bail!("no radius server {server:?}");
+                };
+                match *field {
+                    "secret" => bail!(
+                        "the shared secret is required; `delete system aaa radius {server}` \
+                         removes the server"
+                    ),
+                    "port" => r.port = None,
+                    "timeout" => r.timeout = None,
+                    other => bail!("system aaa radius has no field {other:?}"),
+                }
+            }
+            ["system", "aaa", "ldap", server] => {
+                let before = self.draft.aaa.ldap.len();
+                self.draft.aaa.ldap.retain(|d| d.server != *server);
+                if self.draft.aaa.ldap.len() == before {
+                    bail!("no ldap directory {server:?}");
+                }
+            }
+            ["system", "aaa", "ldap", server, field] => {
+                let Some(d) = self.draft.aaa.ldap.iter_mut().find(|d| d.server == *server) else {
+                    bail!("no ldap directory {server:?}");
+                };
+                match *field {
+                    "base-dn" => bail!(
+                        "the base-dn is required; `delete system aaa ldap {server}` removes \
+                         the directory"
+                    ),
+                    "user-attribute" => d.user_attribute = None,
+                    "tls" => d.tls = None,
+                    "port" => d.port = None,
+                    "timeout" => d.timeout = None,
+                    other => bail!("system aaa ldap has no field {other:?}"),
+                }
+            }
+            ["system", "aaa", "tacacs", server] => {
+                let before = self.draft.aaa.tacacs.len();
+                self.draft.aaa.tacacs.retain(|t| t.server != *server);
+                if self.draft.aaa.tacacs.len() == before {
+                    bail!("no tacacs server {server:?}");
+                }
+            }
+            ["system", "aaa", "tacacs", server, field] => {
+                let Some(t) = self.draft.aaa.tacacs.iter_mut().find(|t| t.server == *server)
+                else {
+                    bail!("no tacacs server {server:?}");
+                };
+                match *field {
+                    "secret" => bail!(
+                        "the shared secret is required; `delete system aaa tacacs {server}` \
+                         removes the server"
+                    ),
+                    "port" => t.port = None,
+                    "timeout" => t.timeout = None,
+                    other => bail!("system aaa tacacs has no field {other:?}"),
+                }
             }
             ["system", "commit-revisions"] => self.draft.commit_revisions = None,
             ["system", "console"] => self.draft.console = crate::config::Console::default(),
@@ -8220,10 +8439,47 @@ impl Session {
             }
 
             // update (roadmap C13). Bare `delete update` removes the whole
-            // channel; `... url` / `... public-key` clears one field (both are
-            // required, so a lone remaining field fails commit — clear the block
-            // to fully remove it).
+            // section; `... url` / `... public-key` clears one field of the
+            // unnamed default channel (both are required together, so a lone
+            // remaining field fails commit — clear the block to fully remove
+            // it). `delete update channel` clears the SELECTION; `delete update
+            // channel <name>` removes that channel — deliberately without
+            // touching the selection, so deleting the active channel is caught
+            // by commit ("selected but not defined") rather than silently
+            // re-pointing updates somewhere nobody chose.
             ["update"] => self.draft.update = None,
+            ["update", "channel"] => {
+                let Some(d) = self.draft.update.as_mut() else {
+                    bail!("no update channel configured");
+                };
+                if d.channel.take().is_none() {
+                    bail!("no update channel selected");
+                }
+            }
+            ["update", "channel", name] => {
+                let Some(d) = self.draft.update.as_mut() else {
+                    bail!("no update channel configured");
+                };
+                let before = d.channels.len();
+                d.channels.retain(|c| c.name != *name);
+                if d.channels.len() == before {
+                    bail!("no update channel {name:?}");
+                }
+            }
+            ["update", "channel", name, field] => {
+                let Some(d) = self.draft.update.as_mut() else {
+                    bail!("no update channel configured");
+                };
+                let Some(c) = d.channels.iter_mut().find(|c| c.name == *name) else {
+                    bail!("no update channel {name:?}");
+                };
+                match *field {
+                    "url" => c.url = None,
+                    "public-key" => c.public_key = None,
+                    "subscription-key" => c.subscription_key = None,
+                    other => bail!("update channel has no field {other:?}"),
+                }
+            }
             ["update", field] => {
                 let Some(d) = self.draft.update.as_mut() else {
                     bail!("no update channel configured");
@@ -9299,17 +9555,32 @@ impl Session {
             multiwan,
             vpn,
             pki,
-            // Signed update channel (roadmap C13). A required field left unset
-            // falls back to an empty string so `validate()` surfaces a clear "X
-            // is required" rather than silently dropping a half-specified
-            // channel; a block with neither field set materialises to None.
+            // Signed update channel(s) (roadmap C13). Required fields left
+            // unset stay `None` so `validate()` surfaces a clear "X is
+            // required" rather than silently dropping a half-specified channel;
+            // a section with nothing in it materialises to None.
             update: self.draft.update.as_ref().and_then(|u| {
-                if u.url.is_none() && u.public_key.is_none() {
+                if u.url.is_none()
+                    && u.public_key.is_none()
+                    && u.channel.is_none()
+                    && u.channels.is_empty()
+                {
                     None
                 } else {
-                    Some(UpdateChannel {
-                        url: u.url.clone().unwrap_or_default(),
-                        public_key: u.public_key.clone().unwrap_or_default(),
+                    Some(crate::config::Update {
+                        url: u.url.clone(),
+                        public_key: u.public_key.clone(),
+                        channel: u.channel.clone(),
+                        channels: u
+                            .channels
+                            .iter()
+                            .map(|c| crate::config::UpdateChannelCfg {
+                                name: c.name.clone(),
+                                url: c.url.clone(),
+                                public_key: c.public_key.clone(),
+                                subscription_key: c.subscription_key.clone(),
+                            })
+                            .collect(),
                     })
                 }
             }),
@@ -9434,10 +9705,58 @@ fn render_draft(draft: &Draft, skip_empty_ifaces: bool) -> String {
     render_draft_only(draft, skip_empty_ifaces, None)
 }
 
+/// What stands in for the subscription key in the view an operator reads.
+///
+/// Deliberately not a plausible value, and deliberately **refused by the
+/// setter** (see the `subscription-key` arm in `set`). The rule this obeys is
+/// the one the PPPoE password learned the hard way: a mask that the CLI would
+/// accept is not a redaction, it is a value — replaying a masked document once
+/// set every subscriber's password to four asterisks and nothing said so. This
+/// marker cannot be replayed at all; a replay carrying it stops on that line.
+pub const KEY_NOT_SHOWN: &str = "<not-shown>";
+
+/// Whether a rendering prints secrets or stands in for them.
+///
+/// An enum rather than a bool because the two call sites want opposite things
+/// and confusing them is silent: the operator's view must not carry the
+/// entitlement, and the replayable form must, or restoring a config quietly
+/// produces an appliance with no subscription.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Secrets {
+    /// In full. The form copied onto a second appliance.
+    Shown,
+    /// The subscription key is replaced by [`KEY_NOT_SHOWN`].
+    ///
+    /// Only that one. The IPsec PSK, the WireGuard private key and the PPPoE
+    /// passwords still print in full, and the asymmetry is deliberate: those
+    /// are device-local secrets that an operator restoring this appliance must
+    /// have, while the subscription key is a *vendor entitlement* that
+    /// identifies a paying customer and is re-issued rather than recovered.
+    Masked,
+}
+
 /// Render a saved appliance config in the hierarchical config syntax — the
 /// operational-mode `show configuration` view (VyOS-style).
+///
+/// Faithful: this is what [`flatten_config`] is given, and therefore what gets
+/// replayed onto a second appliance. For the view a person reads, use
+/// [`render_appliance_for_reading`].
 pub fn render_appliance(a: &Appliance) -> String {
     render_draft_only(&Draft::from_appliance(a), true, None)
+}
+
+/// The same document, with the subscription key withheld.
+///
+/// What `show configuration` prints. An install console is a serial line or an
+/// IPMI session that keeps its scrollback, and a `show configuration` pasted
+/// into a ticket is the ordinary way a support case starts — neither is a
+/// place to put a vendor entitlement.
+///
+/// The field is still *shown*, carrying [`KEY_NOT_SHOWN`], because "a key is
+/// configured" and "no key is configured" are different facts about an
+/// appliance and an operator needs to be able to tell them apart.
+pub fn render_appliance_for_reading(a: &Appliance) -> String {
+    render_draft_masked(&Draft::from_appliance(a), true, None, Secrets::Masked)
 }
 
 /// The running configuration as the flat `set` commands that would recreate it
@@ -9522,6 +9841,15 @@ pub fn flatten_pairs(rendered: &str) -> Vec<(String, String)> {
 /// (`system` / `interface` / `firewall` / `nat` / `protocols`) — the VyOS
 /// `show <path>` view. `None` renders everything.
 fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>) -> String {
+    render_draft_masked(draft, skip_empty_ifaces, only, Secrets::Shown)
+}
+
+fn render_draft_masked(
+    draft: &Draft,
+    skip_empty_ifaces: bool,
+    only: Option<&str>,
+    secrets: Secrets,
+) -> String {
     // Which top-level section a filter token selects ("interfaces" ≡ "interface").
     let want = |section: &str| match only {
         None => true,
@@ -9631,6 +9959,17 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
                 }
                 if let Some(t) = l.timeout {
                     sys.push_str(&format!("            timeout {t}\n"));
+                }
+                sys.push_str("        }\n");
+            }
+            for t in &draft.aaa.tacacs {
+                sys.push_str(&format!("        tacacs {} {{\n", t.server));
+                sys.push_str(&format!("            secret {}\n", t.secret));
+                if let Some(p) = t.port {
+                    sys.push_str(&format!("            port {p}\n"));
+                }
+                if let Some(x) = t.timeout {
+                    sys.push_str(&format!("            timeout {x}\n"));
                 }
                 sys.push_str("        }\n");
             }
@@ -11795,9 +12134,14 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
         out.push_str("}\n");
     }
 
-    // update { … } — the signed update channel (roadmap C13). The pinned key is
-    // shown verbatim, matching how wireguard private-key / ipsec psk render
-    // (in practice it is a short `file:<path>` ref).
+    // update { … } — the signed update channels (roadmap C13). The pinned key
+    // is shown verbatim, matching how wireguard private-key / ipsec psk render
+    // (in practice it is a short `file:<path>` ref). The subscription-key too:
+    // this document is the replayable configuration (`show configuration
+    // commands` is copied onto second appliances), and the `****`-lesson two
+    // screens up applies — a mask here is a value the CLI would accept, and a
+    // replay would silently install four asterisks as the entitlement. The
+    // masked view lives in `show subscription`; the API redacts the field.
     if want("update") {
         if let Some(u) = &draft.update {
             out.push_str("update {\n");
@@ -11806,6 +12150,29 @@ fn render_draft_only(draft: &Draft, skip_empty_ifaces: bool, only: Option<&str>)
             }
             if let Some(key) = &u.public_key {
                 out.push_str(&format!("    public-key {key}\n"));
+            }
+            // The selection first, then the channels it selects among: replayed
+            // top to bottom, the bare `channel <name>` line both creates and
+            // selects, and the blocks below fill the fields in.
+            if let Some(sel) = &u.channel {
+                out.push_str(&format!("    channel {sel}\n"));
+            }
+            for c in &u.channels {
+                out.push_str(&format!("    channel {} {{\n", c.name));
+                if let Some(url) = &c.url {
+                    out.push_str(&format!("        url {url}\n"));
+                }
+                if let Some(key) = &c.public_key {
+                    out.push_str(&format!("        public-key {key}\n"));
+                }
+                if let Some(k) = &c.subscription_key {
+                    let shown = match secrets {
+                        Secrets::Shown => k.as_str(),
+                        Secrets::Masked => KEY_NOT_SHOWN,
+                    };
+                    out.push_str(&format!("        subscription-key {shown}\n"));
+                }
+                out.push_str("    }\n");
             }
             out.push_str("}\n");
         }
@@ -12898,6 +13265,9 @@ secret = "radsecret"
 [[system.aaa.ldap]]
 server = "ldap.example.com"
 base-dn = "dc=example,dc=com"
+[[system.aaa.tacacs]]
+server = "10.0.0.7"
+secret = "tacsecret"
 
 [[interface]]
 name = "eth0"
@@ -13009,6 +13379,7 @@ common-name = "www.example.com"
         for expected in [
             "set system aaa radius 10.0.0.5 secret radsecret",
             "set system aaa ldap ldap.example.com base-dn dc=example,dc=com",
+            "set system aaa tacacs 10.0.0.7 secret tacsecret",
             "set system metrics enable true",
         ] {
             assert!(
@@ -16035,8 +16406,18 @@ backends = ["10.0.0.11:8443"]
 
         let a = s.commit().expect("valid update channel commits");
         let up = a.update.as_ref().expect("channel present");
-        assert_eq!(up.url, "https://updates.velstra.example/sentinel");
-        assert_eq!(up.public_key, "file:/etc/sentinel/release.pem");
+        assert_eq!(
+            up.url.as_deref(),
+            Some("https://updates.velstra.example/sentinel")
+        );
+        assert_eq!(up.public_key.as_deref(), Some("file:/etc/sentinel/release.pem"));
+        // The legacy bare pair resolves as the unnamed default channel — the
+        // back-compat promise a fielded box relies on.
+        let active = up.active().expect("the bare url is a channel");
+        assert_eq!(active.name, None);
+        assert_eq!(active.label(), "default");
+        assert_eq!(active.url, "https://updates.velstra.example/sentinel");
+        assert_eq!(active.subscription_key, None);
 
         // A fresh session seeded from the committed appliance shows the same.
         let reloaded = Session {
@@ -16109,5 +16490,242 @@ backends = ["10.0.0.11:8443"]
             a.update.as_ref().unwrap().public_key,
             b.update.as_ref().unwrap().public_key
         );
+    }
+
+    /// `show configuration` withholds the subscription key; the replayable
+    /// form still carries it.
+    ///
+    /// Both halves matter and they pull in opposite directions. An operator's
+    /// view lands in tickets and scrollback, so it must not carry a vendor
+    /// entitlement. A restore that produced an appliance with no subscription
+    /// would be a silent downgrade — so `show configuration commands`, the form
+    /// meant to be copied, keeps the real value.
+    #[test]
+    fn the_reading_view_withholds_the_subscription_key_and_the_replay_view_keeps_it() {
+        let mut s = Session::empty();
+        run(&mut s, "set system hostname box").unwrap();
+        run(&mut s, "set update channel ent url https://updates.example/ent").unwrap();
+        run(&mut s, "set update channel ent public-key file:/etc/e.pem").unwrap();
+        run(&mut s, "set update channel ent subscription-key velstra-ent-11aa22bb").unwrap();
+        let a = s.commit().expect("commits");
+
+        let reading = render_appliance_for_reading(&a);
+        assert!(
+            !reading.contains("velstra-ent-11aa22bb"),
+            "the key is in the view an operator reads:\n{reading}"
+        );
+        // Still shown as a field: "a key is configured" and "no key is
+        // configured" are different facts about an appliance.
+        assert!(
+            reading.contains(&format!("subscription-key {KEY_NOT_SHOWN}")),
+            "the reading view does not say a key is configured at all:\n{reading}"
+        );
+
+        let replayable = render_appliance(&a);
+        assert!(
+            replayable.contains("subscription-key velstra-ent-11aa22bb"),
+            "the replayable form lost the key, so a restore would silently \
+             produce an appliance with no subscription:\n{replayable}"
+        );
+        assert!(
+            flatten_config(&replayable)
+                .iter()
+                .any(|l| l == "set update channel ent subscription-key velstra-ent-11aa22bb"),
+            "the commands form lost the key"
+        );
+    }
+
+    /// Replaying the reading view stops on the key rather than installing the
+    /// marker as the entitlement.
+    ///
+    /// This is the PPPoE-password lesson applied: a mask the CLI accepts is not
+    /// a redaction but a value, and the last one set every subscriber's
+    /// password to four asterisks in silence. This marker cannot be set.
+    #[test]
+    fn the_marker_is_refused_rather_than_installed_as_a_key() {
+        let mut s = Session::empty();
+        run(&mut s, "set system hostname box").unwrap();
+        run(&mut s, "set update channel ent url https://updates.example/ent").unwrap();
+        run(&mut s, "set update channel ent public-key file:/etc/e.pem").unwrap();
+        let e = run(
+            &mut s,
+            &format!("set update channel ent subscription-key {KEY_NOT_SHOWN}"),
+        )
+        .expect_err("the marker was accepted as a key");
+        let said = e.to_string();
+        assert!(
+            said.contains("show configuration commands"),
+            "the refusal does not say where the real key can be found: {said}"
+        );
+
+        // And nothing was stored: a refused command leaves no half-set field.
+        let a = s.commit().expect("commits");
+        let key = a
+            .update
+            .as_ref()
+            .and_then(|u| u.channels.iter().find(|c| c.name == "ent"))
+            .and_then(|c| c.subscription_key.clone());
+        assert_eq!(key, None, "the refused marker was stored anyway");
+    }
+
+    /// Named channels: build two, select one, commit, and prove the selection
+    /// resolves to that channel's OWN url/key/entitlement — per-channel trust
+    /// is the design, and this is where it either holds or does not.
+    #[test]
+    fn named_update_channels_build_select_commit_and_round_trip() {
+        let mut s = Session::empty();
+        run(&mut s, "set system hostname box").unwrap();
+        run(
+            &mut s,
+            "set update channel community url https://updates.velstra.example/community",
+        )
+        .unwrap();
+        run(
+            &mut s,
+            "set update channel community public-key file:/etc/sentinel/community.pem",
+        )
+        .unwrap();
+        run(
+            &mut s,
+            "set update channel enterprise url https://updates.velstra.example/enterprise",
+        )
+        .unwrap();
+        run(
+            &mut s,
+            "set update channel enterprise public-key file:/etc/sentinel/enterprise.pem",
+        )
+        .unwrap();
+        run(
+            &mut s,
+            "set update channel enterprise subscription-key velstra-ent-11aa22bb",
+        )
+        .unwrap();
+        // Bare `set update channel <name>` selects the active channel.
+        run(&mut s, "set update channel enterprise").unwrap();
+
+        // Shown as blocks per channel + one selection line.
+        let shown = s.show_only("update");
+        assert!(shown.contains("channel enterprise {"), "got:\n{shown}");
+        assert!(shown.contains("channel community {"), "got:\n{shown}");
+        assert!(shown.contains("    channel enterprise\n"), "got:\n{shown}");
+
+        let a = s.commit().expect("two complete channels + a selection commit");
+        let up = a.update.as_ref().unwrap();
+        assert_eq!(up.channel.as_deref(), Some("enterprise"));
+        assert_eq!(up.channels.len(), 2);
+
+        let active = up.active().expect("the selection resolves");
+        assert_eq!(active.name.as_deref(), Some("enterprise"));
+        assert_eq!(active.url, "https://updates.velstra.example/enterprise");
+        assert_eq!(active.public_key, "file:/etc/sentinel/enterprise.pem");
+        assert_eq!(active.subscription_key.as_deref(), Some("velstra-ent-11aa22bb"));
+
+        // from_appliance ∘ materialize is the identity on the channels too.
+        let round = Session {
+            draft: Draft::from_appliance(&a),
+            path: PathBuf::from("/dev/null"),
+            dirty: false,
+            seen_running: None,
+        };
+        let b = round.materialize().expect("re-materialises");
+        let bu = b.update.as_ref().unwrap();
+        assert_eq!(bu.channel.as_deref(), Some("enterprise"));
+        assert_eq!(bu.channels.len(), 2);
+        assert_eq!(
+            bu.channels[1].subscription_key.as_deref(),
+            Some("velstra-ent-11aa22bb")
+        );
+    }
+
+    /// The validations that keep a channel honest at commit time: no URL, a
+    /// dangling selection, a plain-http URL, a duplicate name — each refused
+    /// with the fix in the sentence.
+    #[test]
+    fn named_update_channel_validation_refuses_the_broken_shapes() {
+        // A channel without a URL.
+        let mut s = Session::empty();
+        run(&mut s, "set system hostname box").unwrap();
+        run(
+            &mut s,
+            "set update channel ent public-key file:/etc/sentinel/e.pem",
+        )
+        .unwrap();
+        let err = s.commit().unwrap_err().to_string();
+        assert!(err.contains("url is required"), "got: {err}");
+
+        // A selection that names no defined channel. (Only the selection is
+        // set — the entry it auto-created is deleted again.)
+        let mut s = Session::empty();
+        run(&mut s, "set system hostname box").unwrap();
+        run(&mut s, "set update channel ghost").unwrap();
+        run(&mut s, "delete update channel ghost").unwrap();
+        let err = s.commit().unwrap_err().to_string();
+        assert!(
+            err.contains("selected but not defined"),
+            "got: {err}"
+        );
+
+        // A non-HTTPS channel URL (file:// stays allowed for air-gapped use).
+        let mut s = Session::empty();
+        run(&mut s, "set system hostname box").unwrap();
+        run(&mut s, "set update channel ent url http://updates.example/e").unwrap();
+        run(
+            &mut s,
+            "set update channel ent public-key file:/etc/sentinel/e.pem",
+        )
+        .unwrap();
+        let err = s.commit().unwrap_err().to_string();
+        assert!(err.contains("https:// or file://"), "got: {err}");
+
+        // A channel named like a field could never be addressed again.
+        let mut s = Session::empty();
+        let err = run(&mut s, "set update channel url").unwrap_err().to_string();
+        assert!(err.contains("field name"), "got: {err}");
+    }
+
+    /// Deleting: a field, a channel, the selection — each arm on its own, and
+    /// deleting the ACTIVE channel leaves the dangling selection for commit to
+    /// refuse rather than silently re-pointing updates.
+    #[test]
+    fn named_update_channel_delete_arms() {
+        let mut s = Session::empty();
+        run(&mut s, "set system hostname box").unwrap();
+        run(&mut s, "set update channel ent url https://u.example/e").unwrap();
+        run(&mut s, "set update channel ent public-key file:/etc/e.pem").unwrap();
+        run(&mut s, "set update channel ent subscription-key k-1234abcd").unwrap();
+        run(&mut s, "set update channel ent").unwrap();
+        s.commit().expect("a complete selected channel commits");
+
+        // Clearing the entitlement alone: the channel stays, now unauthenticated.
+        run(&mut s, "delete update channel ent subscription-key").unwrap();
+        let a = s.commit().expect("a channel without a key is fine");
+        assert_eq!(
+            a.update.as_ref().unwrap().channels[0].subscription_key,
+            None
+        );
+
+        // Clearing the selection: channels stay defined, none is active.
+        run(&mut s, "delete update channel").unwrap();
+        let a = s.commit().expect("defined-but-unselected is a valid config");
+        assert_eq!(a.update.as_ref().unwrap().channel, None);
+        let err = a.update.as_ref().unwrap().active().unwrap_err().to_string();
+        assert!(err.contains("no channel selected"), "got: {err}");
+
+        // Deleting the active channel leaves the selection dangling — commit
+        // says so instead of guessing a replacement.
+        run(&mut s, "set update channel ent").unwrap();
+        run(&mut s, "delete update channel ent").unwrap();
+        let err = s.commit().unwrap_err().to_string();
+        assert!(err.contains("selected but not defined"), "got: {err}");
+
+        // Clearing the dangling selection makes the config valid again…
+        run(&mut s, "delete update channel").unwrap();
+        s.commit().expect("no channels, no selection — valid");
+
+        // …and unknown names / an unset selection are refusals, not no-ops.
+        let err = run(&mut s, "delete update channel ghost").unwrap_err().to_string();
+        assert!(err.contains("no update channel"), "got: {err}");
+        let err = run(&mut s, "delete update channel").unwrap_err().to_string();
+        assert!(err.contains("no update channel selected"), "got: {err}");
     }
 }

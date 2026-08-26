@@ -44,6 +44,7 @@ mod repl;
 mod session;
 mod system;
 mod ui;
+mod unlock;
 mod update;
 mod velstra;
 mod webui;
@@ -256,6 +257,11 @@ enum Command {
         /// Actually perform the (destructive) install instead of a dry-run.
         #[arg(long)]
         commit: bool,
+        /// Encrypt the writable data partition with LUKS2. The passphrase is read
+        /// from $SENTINEL_LUKS_PASSPHRASE, or prompted for. The box asks for it at
+        /// each boot (`sentinel unlock`) before mounting /var/lib/sentinel.
+        #[arg(long)]
+        encrypt: bool,
         /// Ask the questions one at a time instead of drawing the full-screen
         /// installer. Chosen automatically on a console it cannot be drawn on.
         #[arg(long)]
@@ -278,7 +284,23 @@ enum Command {
         /// Actually perform the (destructive-to-the-inactive-slot) update.
         #[arg(long)]
         commit: bool,
+        /// Write a LOCAL image WITHOUT verifying its signature — the trusted-image
+        /// escape hatch (a re-seal from the booted medium, an air-gapped block
+        /// device). Loud and logged. Ignored by `check`/`install`, which always
+        /// verify the channel.
+        #[arg(long)]
+        allow_unsigned: bool,
+        /// The pinned Ed25519 release public key to verify a local image against
+        /// (a PEM file, or `file:<path>`). Defaults to the saved `[update]`
+        /// channel's `public-key`, then to a key baked into the image.
+        #[arg(long)]
+        pubkey: Option<String>,
     },
+    /// Unlock the encrypted data partition (LUKS2). Run by
+    /// `sentinel-unlock.service` before `/var/lib/sentinel` is mounted, not by
+    /// hand — it prompts for the passphrase, or does nothing on a box whose data
+    /// partition is not encrypted.
+    Unlock,
     /// Revert the running system to the saved config. Invoked by the
     /// `commit-confirm` auto-rollback timer when its window expires; can also be
     /// run manually to drop an un-confirmed change immediately.
@@ -439,9 +461,16 @@ async fn main() -> Result<()> {
             raid,
             source,
             commit,
+            encrypt,
             text,
-        } => install_cmd(&targets, raid.into(), source, commit, text),
-        Command::Update { target, commit } => update_cmd(target.as_deref(), commit),
+        } => install_cmd(&targets, raid.into(), source, commit, encrypt, text),
+        Command::Unlock => unlock::run(),
+        Command::Update {
+            target,
+            commit,
+            allow_unsigned,
+            pubkey,
+        } => update_cmd(target.as_deref(), commit, allow_unsigned, pubkey.as_deref()),
         Command::ApplyBoot {
             config,
             out,
@@ -660,6 +689,7 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
                     reverse_proxy: session.reverse_proxy_names(),
                     broadcast_relay: session.broadcast_relay_names(),
                     prefix_lists: session.prefix_list_names(),
+                    update_channels: session.update_channel_names(),
                 });
                 h.set_context(&ctx);
             }
@@ -835,50 +865,212 @@ fn apply_boot_late(config: &std::path::Path) -> Result<()> {
 /// image/block-device path (written directly by the existing slot-writer), or a
 /// signed-channel keyword driving roadmap C13's authenticity gate against the
 /// saved `[update]` channel.
-fn update_cmd(target: Option<&str>, commit: bool) -> Result<()> {
+fn update_cmd(
+    target: Option<&str>,
+    commit: bool,
+    allow_unsigned: bool,
+    pubkey: Option<&str>,
+) -> Result<()> {
     match target {
         None => anyhow::bail!(
-            "usage: sentinel update <image>|check|install [--commit]\n\
+            "usage: sentinel update <image>|check|install [--commit] [--allow-unsigned]\n\
              (`check`/`install` use the saved [update] channel; a path writes that image directly)"
         ),
         Some("check") => {
             let chan = load_update_channel()?;
-            let manifest = update::check(&chan)?;
-            println!(
-                "update available: {} (image {}, sha256 {})",
-                manifest.version, manifest.image, manifest.sha256
-            );
-            Ok(())
+            // Every outcome is remembered, success and refusal alike — `show
+            // subscription` reports the last contact as it happened, not as
+            // one would hope it went.
+            match update::check(&chan) {
+                Ok(manifest) => {
+                    update::record_status(
+                        &chan,
+                        &format!("release {} available", manifest.version),
+                    );
+                    println!(
+                        "channel {:?}: update available: {} (image {}, sha256 {})",
+                        chan.label(),
+                        manifest.version,
+                        manifest.image,
+                        manifest.sha256
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    update::record_status(&chan, &format!("refused: {e:#}"));
+                    Err(e)
+                }
+            }
         }
         Some("install") => {
             let chan = load_update_channel()?;
-            install::update_from_channel(&chan, commit)
+            match install::update_from_channel(&chan, commit) {
+                Ok(()) => {
+                    update::record_status(
+                        &chan,
+                        if commit {
+                            "image verified and written to the inactive slot"
+                        } else {
+                            "image verified (dry-run; nothing written)"
+                        },
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    update::record_status(&chan, &format!("refused: {e:#}"));
+                    Err(e)
+                }
+            }
         }
-        // Any other value is a local, operator-trusted image/block-device path.
-        // This path does NOT verify a signature — a local image or a block
-        // device (a re-seal, an air-gapped install) is trusted as given, which
-        // is the whole point of the escape hatch. Say so plainly, so it is never
-        // mistaken for the signature-checked channel path (`update install`).
-        Some(path) => {
-            eprintln!(
-                "warning: writing {path} to the inactive slot WITHOUT signature \
-                 verification — a local image/device is trusted as given. For a \
-                 signature-checked update, pin an [update] channel and use \
-                 `sentinel update install`."
-            );
-            install::update(std::path::Path::new(path), commit)
-        }
+        // Any other value is a local image/block-device path.
+        Some(path) => update_local(path, commit, allow_unsigned, pubkey),
     }
 }
 
-/// Load the saved appliance's `[update]` channel, or bail if none is configured.
+/// Write a LOCAL image to the inactive slot, verifying its signature FIRST unless
+/// the operator explicitly opts out.
+///
+/// Verification is now the default for a local image too — the local path used to
+/// write anything given to it, which was the supply-chain hole. A detached
+/// `<image>.sig` is checked against a pinned Ed25519 key (the `--pubkey` flag, the
+/// saved channel's `public-key`, or a key baked into the image) before a single
+/// byte reaches the slot-writer. `--allow-unsigned` keeps the old escape hatch for
+/// a re-seal or an air-gapped block device — loud and logged, never silent.
+fn update_local(path: &str, commit: bool, allow_unsigned: bool, pubkey: Option<&str>) -> Result<()> {
+    let image = std::path::Path::new(path);
+    if allow_unsigned {
+        eprintln!(
+            "warning: --allow-unsigned: writing {path} to the inactive slot WITHOUT signature \
+             verification. A local image/device is trusted exactly as given; make sure you \
+             trust its source."
+        );
+        return install::update(image, commit);
+    }
+    let key = local_update_pubkey(pubkey).ok_or_else(|| {
+        anyhow::anyhow!(
+            "refusing to write an unverified image: no release public key to verify against.\n\
+             Pin one with --pubkey <pem|file:path>, set an [update] channel public-key and save, \
+             or place the release key at {DEFAULT_RELEASE_KEY}. For a trusted local image/device, \
+             pass --allow-unsigned."
+        )
+    })?;
+    update::verify_local_image(image, &key)?;
+    eprintln!("signature verified against the pinned release key");
+    install::update(image, commit)
+}
+
+/// Where a local image's signing key is looked for, in order of precedence:
+/// the explicit `--pubkey`, then the saved `[update]` channel's pinned key, then
+/// a release key baked into the image at [`DEFAULT_RELEASE_KEY`].
+fn local_update_pubkey(flag: Option<&str>) -> Option<String> {
+    if let Some(k) = flag {
+        return Some(k.to_string());
+    }
+    if let Ok(appliance) = Appliance::load(saved_config_path().as_path()) {
+        // The ACTIVE channel's key, resolved the same way `update check` would
+        // — a box subscribed to a channel verifies local images against that
+        // channel's key, not against whichever entry happens to come first.
+        if let Some(key) = appliance
+            .update
+            .and_then(|u| u.active().ok())
+            .map(|c| c.public_key)
+            .filter(|k| !k.trim().is_empty())
+        {
+            return Some(key);
+        }
+    }
+    if std::path::Path::new(DEFAULT_RELEASE_KEY).exists() {
+        return Some(format!("file:{DEFAULT_RELEASE_KEY}"));
+    }
+    None
+}
+
+/// The default on-image location of the release-signing public key, used to
+/// verify a local image when no channel is pinned and no `--pubkey` is given.
+const DEFAULT_RELEASE_KEY: &str = "/etc/sentinel/release.pem";
+
+/// Load the saved appliance's ACTIVE `[update]` channel — the selected named
+/// channel, or the legacy bare `url` as the unnamed default — or bail with what
+/// exactly is missing.
 fn load_update_channel() -> Result<config::UpdateChannel> {
     let saved = saved_config_path();
     let path = saved.as_path();
     let appliance = Appliance::load(path)?;
-    appliance.update.ok_or_else(|| {
-        anyhow::anyhow!("no [update] channel configured (set update url + public-key, then save)")
-    })
+    appliance
+        .update
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no [update] channel configured (set update url + public-key, then save)"
+            )
+        })?
+        .active()
+}
+
+/// `show subscription` — the update channels and the entitlement state, as
+/// facts. The key is masked to its tail (`…a1b2`) so two keys can be told apart
+/// without either ever appearing; the last check is whatever `update
+/// check`/`install` recorded, verbatim; and expiry is reported as not reported,
+/// because the channel server has no contract for stating one yet — a date this
+/// box computed itself would be a guess, and this view does not guess.
+fn show_subscription() -> Result<()> {
+    let saved = saved_config_path();
+    let appliance = Appliance::load(saved.as_path())?;
+    let Some(up) = &appliance.update else {
+        println!(
+            "no update channel configured — set update url <https-url> + public-key, or \
+             define a named one: set update channel <name> url <https-url>"
+        );
+        return Ok(());
+    };
+
+    // Every channel this box knows, active one marked — the list is how an
+    // operator sees what `set update channel <name>` could switch to.
+    if !up.channels.is_empty() {
+        println!("channels:");
+        for c in &up.channels {
+            let active = if up.channel.as_deref() == Some(c.name.as_str()) {
+                " (active)"
+            } else {
+                ""
+            };
+            println!("  {}{active}", c.name);
+        }
+    }
+    if let Some(url) = &up.url {
+        let active = if up.channel.is_none() { " (active)" } else { "" };
+        println!("default channel:{active} {url}");
+    }
+
+    match up.active() {
+        Ok(chan) => {
+            println!("active channel: {}", chan.label());
+            println!("url:            {}", chan.url);
+            match &chan.subscription_key {
+                Some(key) => println!(
+                    "subscription:   key configured (ends {})",
+                    update::mask_key(key)
+                ),
+                None => println!("subscription:   no key configured"),
+            }
+            match update::read_status() {
+                // Only a record about THIS channel is this channel's history —
+                // a check against yesterday's channel says nothing about today's.
+                Some(st) if st.channel == chan.label() => println!(
+                    "last check:     {} — {}",
+                    crate::archive::fmt_utc(st.checked),
+                    st.outcome
+                ),
+                _ => println!("last check:     never (run `sentinel update check`)"),
+            }
+            if chan.subscription_key.is_some() {
+                println!(
+                    "expiry:         not reported by the channel server — nothing is assumed"
+                );
+            }
+        }
+        Err(e) => println!("active channel: none — {e:#}"),
+    }
+    Ok(())
 }
 
 fn install_cmd(
@@ -886,6 +1078,7 @@ fn install_cmd(
     raid: install::Raid,
     source: Option<PathBuf>,
     commit: bool,
+    encrypt: bool,
     force_text: bool,
 ) -> Result<()> {
     // A bundled source image may come from the flag or the environment (the ISO
@@ -904,11 +1097,51 @@ fn install_cmd(
 
     let chosen = install::plan_targets(&disks, targets, raid)?;
     print_plan(&chosen, raid);
+    if encrypt {
+        println!("data partition: LUKS2 encrypted (unlocked at each boot)");
+    }
     if !commit {
         println!("\n(dry-run — re-run with --commit to write. THIS ERASES THE TARGET DISK(S).)");
         return Ok(());
     }
-    install::execute(&chosen, raid, source.as_deref())
+    // Resolve the passphrase BEFORE erasing anything: a mistyped/absent one must
+    // fail while the target disk is still intact, not after it has been wiped.
+    let crypto = if encrypt {
+        install::Crypto::Luks {
+            passphrase: resolve_luks_passphrase()?,
+        }
+    } else {
+        install::Crypto::None
+    };
+    install::execute(&chosen, raid, source.as_deref(), &crypto)
+}
+
+/// The LUKS passphrase for an encrypted install: from $SENTINEL_LUKS_PASSPHRASE
+/// (scripted/automated installs), else prompted for twice on a terminal and
+/// checked to match. Never defaulted — an encrypted volume with a guessable or
+/// empty passphrase is worse than an honest plaintext one.
+fn resolve_luks_passphrase() -> Result<String> {
+    if let Some(p) = std::env::var_os("SENTINEL_LUKS_PASSPHRASE") {
+        let p = p.to_string_lossy().into_owned();
+        if p.is_empty() {
+            anyhow::bail!("$SENTINEL_LUKS_PASSPHRASE is set but empty");
+        }
+        return Ok(p);
+    }
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "--encrypt needs a passphrase: set $SENTINEL_LUKS_PASSPHRASE (no terminal to prompt on)"
+        );
+    }
+    let first = prompt_secret("Passphrase for the encrypted data partition: ")?;
+    if first.is_empty() {
+        anyhow::bail!("an encrypted install needs a non-empty passphrase");
+    }
+    let again = prompt_secret("Repeat the passphrase: ")?;
+    if first != again {
+        anyhow::bail!("the passphrases did not match");
+    }
+    Ok(first)
 }
 
 /// Print the candidate disks as a numbered table.
@@ -1138,6 +1371,29 @@ fn collect_text(
     let locale = ask("Locale", "en_US.UTF-8")?;
     let timezone = ask("Timezone", "UTC")?;
 
+    // Encryption comes after the keyboard check, deliberately: the passphrase is
+    // typed here, and a passphrase entered on a layout nobody verified is a box
+    // that cannot be unlocked.
+    println!("\n── Disk encryption ──");
+    println!("Only the writable data partition is encrypted; the read-only system store is");
+    println!("already integrity-sealed. The box asks for the passphrase at every boot —");
+    println!("there is no unattended unlock yet, so keep it somewhere you can reach.");
+    let (encrypt, passphrase) = if ask_yes("Encrypt the data partition (LUKS2)?", false)? {
+        let first = prompt_secret("Passphrase for the encrypted data partition: ")?;
+        let first = first.trim_end_matches(['\n', '\r']).to_string();
+        if first.is_empty() {
+            anyhow::bail!("an encrypted install needs a non-empty passphrase");
+        }
+        let again = prompt_secret("Repeat the passphrase: ")?;
+        let again = again.trim_end_matches(['\n', '\r']).to_string();
+        if first != again {
+            anyhow::bail!("the passphrases did not match");
+        }
+        (true, first)
+    } else {
+        (false, String::new())
+    };
+
     println!("\n── Identity ──");
     let hostname = ask("Hostname", "sentinel")?;
 
@@ -1200,6 +1456,8 @@ fn collect_text(
         username,
         password,
         ssh_key,
+        encrypt,
+        passphrase,
         nics: plans,
         permit_ssh,
     }))
@@ -1286,6 +1544,9 @@ fn interactive_install(
 
     println!();
     print_plan(&chosen, answers.raid);
+    if answers.encrypt {
+        println!("  data partition: LUKS2 encrypted (passphrase asked at each boot)");
+    }
     println!("\nThe installed system will come up as:");
     for line in &lines {
         // The password is the one answer that must not be echoed back at the
@@ -1306,10 +1567,20 @@ fn interactive_install(
             return Ok(());
         }
     }
-    install::execute(&chosen, answers.raid, source)?;
+    // The encryption step (a wizard toggle + passphrase) drives the exact same
+    // `install::Crypto::Luks` path `sentinel install --encrypt` uses — no second
+    // installer, no second crypto. Off leaves a plaintext ext4, unchanged.
+    let crypto = if answers.encrypt {
+        install::Crypto::Luks {
+            passphrase: answers.passphrase.clone(),
+        }
+    } else {
+        install::Crypto::None
+    };
+    install::execute(&chosen, answers.raid, source, &crypto)?;
     // Seeded after the image is written, because the data partition it lands on
     // is created by the install.
-    install::seed_config(&chosen, answers.raid, &toml)?;
+    install::seed_config(&chosen, answers.raid, &toml, &crypto)?;
     println!("\nInstalled. Remove the medium and reboot; the box comes up configured.");
     Ok(())
 }
@@ -1856,7 +2127,14 @@ fn show_op(args: &[String]) -> Result<()> {
             let saved = saved_config_path();
             let path = saved.as_path();
             if path.exists() {
-                print!("{}", session::render_appliance(&Appliance::load(path)?));
+                // The reading view: the subscription key is withheld. The
+                // faithful document is one command away, at
+                // `show configuration commands`, which is the form meant to
+                // be copied and therefore the one that must carry it.
+                print!(
+                    "{}",
+                    session::render_appliance_for_reading(&Appliance::load(path)?)
+                );
             } else {
                 println!(
                     "no saved config at {} (run `configure` + `save`)",
@@ -1923,6 +2201,12 @@ fn show_op(args: &[String]) -> Result<()> {
             &system::bin("journalctl"),
             &["-u", "wren.service", "-n", "50", "--no-pager"],
         ),
+        // The subscription/update-channel state, as facts this box actually
+        // holds: the active channel, whether a key is configured (masked — the
+        // value never appears in show output), and the last contact with the
+        // channel as it went. An unknown fact is printed as unknown; nothing
+        // here is fetched, guessed or counted down.
+        ["subscription"] => show_subscription(),
         ["version"] => {
             println!("sentinel:   {}", env!("CARGO_PKG_VERSION"));
             print!("wren:       ");
@@ -1939,6 +2223,7 @@ fn show_op(args: &[String]) -> Result<()> {
             println!("{:<12}{}", "image:", id.describe());
             println!("{:<12}{}", "binaries:", id.binaries_line());
             println!("{:<12}{}", "clock:", clock::current().describe());
+            println!("{:<12}{}", "data:", crate::unlock::data_at_rest());
             Ok(())
         }
 
@@ -1972,6 +2257,7 @@ fn show_op(args: &[String]) -> Result<()> {
              show pki                          local CAs + issued certificates (expiry)\n  \
              show configuration                the saved config (config syntax)\n  \
              show log [velstra|wren]           recent service log\n  \
+             show subscription                 update channels + entitlement state\n  \
              show version",
             other.join(" ")
         ),
@@ -2250,7 +2536,9 @@ fn show_revision(n: &str) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("revision must be a number (see `show system commit`)"))?;
     let toml = archive::read_revision(&saved_config_path(), n)?;
     let appliance = Appliance::from_toml(&toml)?;
-    print!("{}", session::render_appliance(&appliance));
+    // A past revision is read, not replayed, so it is shown the same way the
+    // running one is.
+    print!("{}", session::render_appliance_for_reading(&appliance));
     Ok(())
 }
 

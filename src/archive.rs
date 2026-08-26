@@ -177,7 +177,10 @@ pub fn rollback(session: &mut Session, act: &Apply, n: usize) -> Result<()> {
     let appliance = Appliance::from_toml(&content).context("the archived revision is invalid")?;
 
     if act.enabled {
-        crate::repl::apply_live(&appliance, act).context("applying the revision")?;
+        // A revert to an archived revision: `None`, so a partial broad-apply
+        // failure reports mixed-state rather than reconciling back to the
+        // config the operator explicitly asked to leave.
+        crate::repl::apply_live(&appliance, act, None).context("applying the revision")?;
     }
 
     // Persist it as the current saved config and archive the rollback as a new

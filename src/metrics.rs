@@ -303,7 +303,7 @@ pub fn sample_once(root: &Path, at: u64) -> Result<usize> {
 }
 
 /// How many flows the data plane is tracking, if it will say.
-fn session_count() -> Option<u64> {
+pub fn session_count() -> Option<u64> {
     let reply = crate::velstra::query("stats").ok()?;
     // The agent prints `key: value` lines; the flow count is the one that
     // matters here and anything else it says is ignored on purpose — this is a
@@ -337,6 +337,142 @@ pub fn series(root: &Path) -> Vec<String> {
         }
     }
     names.into_iter().collect()
+}
+
+// ---- Prometheus exposition ------------------------------------------------
+//
+// The rings above answer "what did this box look like over time" for the
+// appliance's own console. A site that already runs Prometheus wants the same
+// numbers pulled its way, in the text exposition format a scraper reads — so
+// this is a *format adapter* over the exact counters the JSON endpoints serve,
+// not a second source of truth. Live counters are exposed raw (a scraper does
+// its own rate maths from the running totals), which is also why this reads the
+// kernel's current counters rather than the sampled rings.
+
+/// Escape a string for a Prometheus label VALUE: backslash, double-quote and
+/// newline are the three characters the text format gives meaning to.
+fn escape_label(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// One metric family in the exposition: a name, its HELP line, its type, and the
+/// samples (each a single `label=value` pair plus the reading).
+struct Family<'a> {
+    name: &'a str,
+    help: &'a str,
+    kind: &'a str,
+    label: &'a str,
+    samples: &'a [(String, u64)],
+}
+
+impl Family<'_> {
+    /// Render this family, HELP/TYPE header once then a line per sample. Nothing
+    /// is emitted for a family with no samples — an empty `# TYPE` block is noise
+    /// a scraper has to skip, and says nothing a missing family doesn't.
+    fn write_to(&self, out: &mut String) {
+        if self.samples.is_empty() {
+            return;
+        }
+        out.push_str(&format!("# HELP {} {}\n", self.name, escape_help(self.help)));
+        out.push_str(&format!("# TYPE {} {}\n", self.name, self.kind));
+        for (key, value) in self.samples {
+            out.push_str(&format!(
+                "{}{{{}=\"{}\"}} {}\n",
+                self.name,
+                self.label,
+                escape_label(key),
+                value
+            ));
+        }
+    }
+}
+
+/// Escape a string for a HELP line: only backslash and newline carry meaning
+/// there (a quote is literal in HELP text).
+fn escape_help(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('\n', "\\n")
+}
+
+/// Render the appliance's live counters as a Prometheus text exposition.
+///
+/// Pure, so the whole format is tested without a data plane or a `/proc`: the
+/// caller gathers the same numbers the JSON endpoints do — per-interface byte
+/// counters, per-rule hit counters, and the session gauge — and hands them here.
+/// The `sentinel_` prefix keeps these out of the way of a `node_exporter` on the
+/// same box.
+pub fn prometheus_exposition(
+    interfaces: &[(String, u64, u64)],
+    rule_hits: &[(String, u64, u64)],
+    sessions: Option<u64>,
+) -> String {
+    let rx: Vec<(String, u64)> = interfaces
+        .iter()
+        .map(|(n, rx, _)| (n.clone(), *rx))
+        .collect();
+    let tx: Vec<(String, u64)> = interfaces
+        .iter()
+        .map(|(n, _, tx)| (n.clone(), *tx))
+        .collect();
+    let hit_flows: Vec<(String, u64)> = rule_hits
+        .iter()
+        .map(|(n, flows, _)| (n.clone(), *flows))
+        .collect();
+    let hit_packets: Vec<(String, u64)> = rule_hits
+        .iter()
+        .map(|(n, _, packets)| (n.clone(), *packets))
+        .collect();
+
+    let mut out = String::new();
+    Family {
+        name: "sentinel_interface_receive_bytes_total",
+        help: "Bytes received on the interface (kernel counter).",
+        kind: "counter",
+        label: "interface",
+        samples: &rx,
+    }
+    .write_to(&mut out);
+    Family {
+        name: "sentinel_interface_transmit_bytes_total",
+        help: "Bytes transmitted on the interface (kernel counter).",
+        kind: "counter",
+        label: "interface",
+        samples: &tx,
+    }
+    .write_to(&mut out);
+    Family {
+        name: "sentinel_rule_hit_flows_total",
+        help: "Flows attributed to the firewall rule.",
+        kind: "counter",
+        label: "rule",
+        samples: &hit_flows,
+    }
+    .write_to(&mut out);
+    Family {
+        name: "sentinel_rule_hit_packets_total",
+        help: "Packets attributed to the firewall rule.",
+        kind: "counter",
+        label: "rule",
+        samples: &hit_packets,
+    }
+    .write_to(&mut out);
+
+    // The session gauge has no label — it is one number for the whole box — so
+    // it is written directly rather than through the labelled `Family`.
+    if let Some(n) = sessions {
+        out.push_str("# HELP sentinel_sessions Flows currently tracked by the data plane.\n");
+        out.push_str("# TYPE sentinel_sessions gauge\n");
+        out.push_str(&format!("sentinel_sessions {n}\n"));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -462,5 +598,56 @@ mod tests {
         assert_eq!(safe("../../etc/passwd"), ".._.._etc_passwd");
         assert_eq!(safe("iface.eth0.rx"), "iface.eth0.rx");
         assert_eq!(safe("iface.br-lan.tx"), "iface.br-lan.tx");
+    }
+
+    /// The exposition is a real Prometheus text document: HELP and TYPE once per
+    /// family, then a labelled sample per series, and a single unlabelled gauge.
+    #[test]
+    fn the_exposition_is_valid_prometheus_text() {
+        let ifaces = vec![
+            ("eth0".to_string(), 1000u64, 2000u64),
+            ("br-lan".to_string(), 30u64, 40u64),
+        ];
+        let hits = vec![("ssh-in".to_string(), 3u64, 99u64)];
+        let text = prometheus_exposition(&ifaces, &hits, Some(42));
+
+        // Each family carries exactly one HELP and one TYPE line.
+        assert_eq!(
+            text.matches("# TYPE sentinel_interface_receive_bytes_total").count(),
+            1
+        );
+        assert!(text.contains("# TYPE sentinel_interface_receive_bytes_total counter\n"));
+        assert!(
+            text.contains("sentinel_interface_receive_bytes_total{interface=\"eth0\"} 1000\n"),
+            "{text}"
+        );
+        assert!(text.contains("sentinel_interface_transmit_bytes_total{interface=\"eth0\"} 2000\n"));
+        assert!(text.contains("sentinel_interface_receive_bytes_total{interface=\"br-lan\"} 30\n"));
+        // Rule hits, both families.
+        assert!(text.contains("sentinel_rule_hit_flows_total{rule=\"ssh-in\"} 3\n"));
+        assert!(text.contains("sentinel_rule_hit_packets_total{rule=\"ssh-in\"} 99\n"));
+        // The session gauge is a single unlabelled line.
+        assert!(text.contains("# TYPE sentinel_sessions gauge\n"));
+        assert!(text.contains("sentinel_sessions 42\n"));
+    }
+
+    /// No data means no family: an empty `# TYPE` block with no samples is noise
+    /// a scraper has to skip and tells it nothing a missing family doesn't.
+    #[test]
+    fn an_empty_family_emits_nothing() {
+        let text = prometheus_exposition(&[], &[], None);
+        assert_eq!(text, "", "nothing to report is the empty document, {text:?}");
+    }
+
+    /// A label value with a quote or backslash in it must be escaped, or the
+    /// document a scraper reads is malformed the day an interface is named oddly.
+    #[test]
+    fn label_values_are_escaped() {
+        let ifaces = vec![("a\"b\\c".to_string(), 1u64, 2u64)];
+        let text = prometheus_exposition(&ifaces, &[], None);
+        assert!(
+            text.contains("{interface=\"a\\\"b\\\\c\"}"),
+            "quote and backslash must be escaped: {text}"
+        );
     }
 }

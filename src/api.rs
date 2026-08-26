@@ -32,7 +32,7 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
-    extract::{Path as UrlPath, Request, State},
+    extract::{ConnectInfo, Path as UrlPath, Request, State},
     http::{StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -139,8 +139,11 @@ pub async fn serve(listen: &str, config: &Path, apply: Apply, token_file: &Path)
                         key.display()
                     )
                 })?;
+            // `into_make_service_with_connect_info::<SocketAddr>` so the login
+            // handler can see the peer address and apply a per-IP lockout —
+            // without it every request would look like it came from nowhere.
             axum_server::bind_rustls(addr, tls)
-                .serve(app.into_make_service())
+                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
                 .await
                 .context("serving the management API over HTTPS")?;
         }
@@ -155,9 +158,12 @@ pub async fn serve(listen: &str, config: &Path, apply: Apply, token_file: &Path)
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
                 .with_context(|| format!("binding {addr}"))?;
-            axum::serve(listener, app)
-                .await
-                .context("serving the REST API")?;
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .context("serving the REST API")?;
         }
     }
     Ok(())
@@ -218,6 +224,10 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/api/v1/rule-hits", get(get_rule_hits))
         .route("/api/v1/metrics", get(get_metrics_list))
         .route("/api/v1/metrics/:resolution/:series", get(get_metrics))
+        // The Prometheus scrape target, at the conventional `/metrics`. Same
+        // data as the JSON endpoints above, in text exposition format, behind the
+        // same bearer auth (it is part of this protected sub-router).
+        .route("/metrics", get(get_metrics_prometheus))
         .route("/api/v1/configure", post(post_configure))
         .route("/api/v1/clear/*path", post(post_clear))
         .route("/api/v1/capture", post(post_capture))
@@ -436,6 +446,47 @@ async fn get_rule_hits(State(state): State<Arc<ApiState>>) -> Result<Json<Value>
     })))
 }
 
+/// Per-rule hit counters as `(name, flows, packets)`, the same attribution the
+/// JSON `/api/v1/rule-hits` reports — factored out so the Prometheus adapter and
+/// the JSON endpoint can never disagree about the numbers.
+fn rule_hit_counts(config_path: &Path) -> Vec<(String, u64, u64)> {
+    let Ok(appliance) = Appliance::load(config_path) else {
+        return Vec::new();
+    };
+    let cfg = crate::compile::compile(&appliance);
+    let table = crate::velstra::query("flows --limit 0")
+        .or_else(|_| crate::velstra::query("flows"))
+        .unwrap_or_default();
+    let flows = crate::compile::parse_flows(&table);
+    crate::compile::attribute(&cfg, &flows)
+        .into_iter()
+        .map(|(name, h)| (name, h.flows, h.packets))
+        .collect()
+}
+
+/// `GET /metrics` — the live counters in Prometheus text exposition format.
+///
+/// Behind the same bearer-token auth as every other endpoint (it sits in the
+/// protected router), so a scraper presents the account/machine token like any
+/// other client. This is a **format adapter**: it exposes the exact numbers the
+/// JSON endpoints do — per-interface byte counters, per-rule hit counters and the
+/// session gauge — as raw running totals, letting the scraper do its own rate
+/// maths. See [`crate::metrics::prometheus_exposition`].
+async fn get_metrics_prometheus(State(state): State<Arc<ApiState>>) -> Response {
+    let ifaces = crate::metrics::interface_counters().unwrap_or_default();
+    let hits = rule_hit_counts(&state.config_path);
+    let sessions = crate::metrics::session_count();
+    let body = crate::metrics::prometheus_exposition(&ifaces, &hits, sessions);
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response()
+}
+
 /// `GET /api/v1/metrics` — which series are being kept.
 async fn get_metrics_list() -> Result<Json<Value>, ApiError> {
     let root = crate::metrics::dir();
@@ -501,13 +552,37 @@ async fn get_metrics(
 /// log in to the box and gets nothing here, and it is told exactly that: a
 /// refusal an operator cannot act on is a support ticket.
 ///
-/// Failures are slowed and counted. Not a lockout — locking an administrator
-/// out of their own firewall is a denial of service anyone can trigger — but
-/// enough that guessing over the network is not a practical way in.
+/// Failures are slowed and counted two ways. **Per account** the delay grows but
+/// there is no lockout — locking an administrator out of their own account is a
+/// denial of service anyone can trigger by guessing their name. **Per source IP**
+/// there IS a lockout: a single address grinding through passwords is stopped
+/// cold after enough failures, and while locked its guesses are refused *before*
+/// the expensive password hash runs — which is the point, since the hash is the
+/// work an attacker was trying to make the box do. A locked address is one
+/// address; the operator reaching the box from anywhere else is unaffected.
+///
+/// The peer address comes from `ConnectInfo`, which the server wires in via
+/// `into_make_service_with_connect_info`. When it is absent (an in-process test,
+/// or a transport with no peer address) the per-IP limiter is simply skipped and
+/// the per-account throttle still applies.
 async fn post_login(
     State(state): State<Arc<ApiState>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
+    let peer_ip = connect_info.map(|ci| ci.0.ip());
+    // A locked address is refused up front — cheaply, before the password hash
+    // that a guesser is really trying to spend the box's CPU on.
+    if let Some(ip) = peer_ip {
+        if let Some(remaining) = ip_lockout_remaining(ip) {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                anyhow!(
+                    "too many failed sign-ins from your address; locked for another {remaining}s"
+                ),
+            ));
+        }
+    }
     let username = body
         .get("username")
         .and_then(|v| v.as_str())
@@ -544,14 +619,38 @@ async fn post_login(
         .await
         .map_err(|e| ApiError::internal(anyhow!("login task: {e}")))?;
     match outcome {
-        Ok(session) => Ok(Json(session)),
-        Err(refusal) => Err(refusal),
+        Ok(session) => {
+            // A good sign-in clears the address: an operator who mistyped twice
+            // and then got it right is not one attempt away from a lockout.
+            if let Some(ip) = peer_ip {
+                forget_ip(ip);
+            }
+            Ok(Json(session))
+        }
+        Err(refusal) => {
+            if let Some(ip) = peer_ip {
+                note_ip_failure(ip);
+            }
+            Err(refusal)
+        }
     }
+}
+
+/// What consulting the configured servers concluded, when one of them answered.
+///
+/// A rejection carries which protocol's server said no, so the refusal can name
+/// it — with three kinds of server configurable, "not accepted" alone sends an
+/// operator diffing three configs to find the one that decided.
+enum Consulted {
+    Accepted,
+    RejectedBy(&'static str),
 }
 
 /// Ask each configured server in turn, and say whether one of them accepted.
 ///
-/// The distinction that matters: a server that **rejects** has answered, and no
+/// The order is RADIUS, then LDAP, then TACACS+ — fixed, like local-first, so
+/// nobody has to reverse-engineer a precedence from a config file. The
+/// distinction that matters: a server that **rejects** has answered, and no
 /// other server is asked — a directory saying no is a decision. A server that
 /// cannot be reached has not answered, so the next one is tried, and if none
 /// answers at all that is an error rather than a refusal. Treating an
@@ -562,7 +661,7 @@ fn ask_the_directory(
     hostname: &str,
     username: &str,
     password: &str,
-) -> Result<bool, ApiError> {
+) -> Result<Consulted, ApiError> {
     let mut last: Option<String> = None;
     for server in &aaa.radius {
         let timeout = std::time::Duration::from_secs(server.timeout.unwrap_or(3) as u64);
@@ -575,7 +674,8 @@ fn ask_the_directory(
             timeout,
             hostname,
         ) {
-            Ok(accepted) => return Ok(accepted),
+            Ok(true) => return Ok(Consulted::Accepted),
+            Ok(false) => return Ok(Consulted::RejectedBy("RADIUS")),
             Err(e) => {
                 eprintln!(
                     "warning: RADIUS server {} did not answer: {e}",
@@ -596,10 +696,28 @@ fn ask_the_directory(
             password,
             d.timeout.unwrap_or(5),
         ) {
-            Ok(crate::aaa::Directory::Accepted) => return Ok(true),
-            Ok(crate::aaa::Directory::Rejected) => return Ok(false),
+            Ok(crate::aaa::Directory::Accepted) => return Ok(Consulted::Accepted),
+            Ok(crate::aaa::Directory::Rejected) => return Ok(Consulted::RejectedBy("LDAP")),
             Err(e) => {
                 eprintln!("warning: LDAP directory {} did not answer: {e}", d.server);
+                last = Some(e.to_string());
+            }
+        }
+    }
+    for t in &aaa.tacacs {
+        let timeout = std::time::Duration::from_secs(t.timeout.unwrap_or(3) as u64);
+        match crate::aaa::tacacs_authenticate(
+            &t.server,
+            t.port.unwrap_or(crate::aaa::TACACS_DEFAULT_PORT),
+            &t.secret,
+            username,
+            password,
+            timeout,
+        ) {
+            Ok(crate::aaa::Directory::Accepted) => return Ok(Consulted::Accepted),
+            Ok(crate::aaa::Directory::Rejected) => return Ok(Consulted::RejectedBy("TACACS+")),
+            Err(e) => {
+                eprintln!("warning: TACACS+ server {} did not answer: {e}", t.server);
                 last = Some(e.to_string());
             }
         }
@@ -654,7 +772,7 @@ fn sign_in(
     };
     if !local_ok {
         let aaa = &appliance.system.aaa;
-        if aaa.radius.is_empty() && aaa.ldap.is_empty() {
+        if !aaa.has_servers() {
             // No directory of ANY kind to fall back to, so the local answer is
             // the answer. Checking only RADIUS here refused every non-local login
             // on an LDAP-only box, because `ask_the_directory` (which tries LDAP
@@ -668,8 +786,18 @@ fn sign_in(
                 refused()
             });
         }
-        if !ask_the_directory(aaa, &appliance.system.hostname, username, password)? {
-            return Err(refused());
+        match ask_the_directory(aaa, &appliance.system.hostname, username, password)? {
+            Consulted::Accepted => {}
+            // The refusal names the protocol that decided — not the username,
+            // not which part was wrong — so a caller probing accounts learns
+            // nothing while an operator with three kinds of server configured
+            // knows which one to look at.
+            Consulted::RejectedBy(method) => {
+                return Err(ApiError::new(
+                    StatusCode::UNAUTHORIZED,
+                    anyhow!("that username and password were not accepted ({method} refused)"),
+                ));
+            }
         }
     }
 
@@ -721,7 +849,7 @@ fn sign_in(
     // The username becomes a filename (the account's per-account token file), so
     // it must be a strict account name and nothing that could climb out of the
     // tokens directory. A local login is already validated to this shape, but a
-    // directory-authenticated account (RADIUS/LDAP default-group) carries a name
+    // directory-authenticated account (RADIUS/LDAP/TACACS+ default-group) carries a name
     // straight from the request — `../../etc/cron.d/x` would otherwise be written
     // as a token file outside `tokens_dir`. Reject anything else before touching
     // the filesystem.
@@ -809,6 +937,111 @@ fn forget_attempts(username: &str) {
     attempts().lock().unwrap().remove(username);
 }
 
+// ---- per-IP lockout -------------------------------------------------------
+//
+// The per-account throttle above only slows a guesser; the per-IP lockout stops
+// one. It is keyed by the peer address, so a single machine spraying passwords
+// trips it while an operator arriving from any other address is untouched — and
+// a locked address is refused before the password hash runs, which is the DoS
+// the hash would otherwise let one address inflict.
+
+/// One address's recent failures: when the current window opened, how many
+/// failures have landed in it, and, once tripped, until when the address is
+/// locked out.
+#[derive(Clone, Copy)]
+struct IpRecord {
+    window_started: std::time::Instant,
+    failures: u32,
+    locked_until: Option<std::time::Instant>,
+}
+
+/// Failed sign-ins per source address, in memory (a restart clears it, like the
+/// per-account map). Bounded by [`MAX_TRACKED_IPS`].
+fn ip_attempts() -> &'static std::sync::Mutex<HashMap<std::net::IpAddr, IpRecord>> {
+    static IPS: OnceLock<std::sync::Mutex<HashMap<std::net::IpAddr, IpRecord>>> = OnceLock::new();
+    IPS.get_or_init(Default::default)
+}
+
+/// The most source addresses whose failures we track at once. A cap, not a
+/// tuning knob: a spray from many spoofable-looking addresses must not grow the
+/// map without bound. Evicted the same way the account map is — quiet entries
+/// first, then the least-recently-active.
+const MAX_TRACKED_IPS: usize = 4096;
+
+/// Failures within one window before an address is locked out.
+const IP_MAX_FAILURES: u32 = 10;
+
+/// How long an address stays locked once it trips the threshold.
+const IP_LOCKOUT: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// How long a quiet address is forgiven — the counting window. A stray failure an
+/// hour ago is not evidence of an attack now.
+const IP_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The seconds an address remains locked, or `None` if it is free to try. Clears
+/// a lock that has expired so the address gets a clean slate on its next attempt.
+fn ip_lockout_remaining(ip: std::net::IpAddr) -> Option<u64> {
+    let mut map = ip_attempts().lock().unwrap();
+    let rec = map.get_mut(&ip)?;
+    match rec.locked_until {
+        Some(until) => {
+            let now = std::time::Instant::now();
+            if until > now {
+                Some((until - now).as_secs().max(1))
+            } else {
+                // The lock has run out: forgive and let this attempt through.
+                map.remove(&ip);
+                None
+            }
+        }
+        None => None,
+    }
+}
+
+/// Record a failed sign-in from `ip`, opening a new window when the last one has
+/// lapsed and tripping the lockout when failures reach the threshold.
+fn note_ip_failure(ip: std::net::IpAddr) {
+    let mut map = ip_attempts().lock().unwrap();
+    // Bound the map before inserting a not-yet-seen address: forget entries whose
+    // window has lapsed and which are not locked, then, if still full, evict the
+    // least-recently-active. An address mid-attack has a fresh entry and is never
+    // the one dropped.
+    if map.len() >= MAX_TRACKED_IPS && !map.contains_key(&ip) {
+        map.retain(|_, r| {
+            r.locked_until.is_some() || r.window_started.elapsed() <= IP_WINDOW
+        });
+        if map.len() >= MAX_TRACKED_IPS {
+            if let Some(oldest) = map
+                .iter()
+                .max_by_key(|(_, r)| r.window_started.elapsed())
+                .map(|(k, _)| *k)
+            {
+                map.remove(&oldest);
+            }
+        }
+    }
+    let now = std::time::Instant::now();
+    let rec = map.entry(ip).or_insert(IpRecord {
+        window_started: now,
+        failures: 0,
+        locked_until: None,
+    });
+    // A quiet window forgives: reopen it rather than carrying an old count.
+    if rec.window_started.elapsed() > IP_WINDOW && rec.locked_until.is_none() {
+        rec.window_started = now;
+        rec.failures = 0;
+    }
+    rec.failures += 1;
+    if rec.failures >= IP_MAX_FAILURES {
+        rec.locked_until = Some(now + IP_LOCKOUT);
+    }
+}
+
+/// Clear an address after a good sign-in from it.
+fn forget_ip(ip: std::net::IpAddr) {
+    ip_attempts().lock().unwrap().remove(&ip);
+}
+
 /// `GET /api/v1/health` — liveness, no auth.
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
@@ -836,6 +1069,10 @@ const SECRET_FIELDS: &[&str] = &[
     "community",
     "ao-key",
     "pin",
+    // The update channel's entitlement (`[[update.channels]] subscription-key`):
+    // a bearer token that buys tested images — anyone holding it can consume
+    // the subscription, so it never leaves through the read API.
+    "subscription-key",
 ];
 
 /// What a redacted secret reads as in the API's config output — a marker, not an
@@ -872,8 +1109,8 @@ fn redact_secrets(value: &mut Value) {
 /// [`Appliance`] the CLI edits), with every secret redacted. A read-only token
 /// can reach this endpoint, so the config-sync bearer secret (which is the
 /// machine's full-access API token), WireGuard private keys, IPsec PSKs, RADIUS
-/// secrets, the SNMP community and login password hashes / TOTP secrets are all
-/// replaced by [`REDACTED`] before the config leaves the box.
+/// and TACACS+ secrets, the SNMP community and login password hashes / TOTP
+/// secrets are all replaced by [`REDACTED`] before the config leaves the box.
 async fn get_config(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, ApiError> {
     let appliance = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
     let mut value = serde_json::to_value(&appliance)
@@ -900,7 +1137,13 @@ async fn put_config(
     // Same live-apply as a CLI `commit` (skipped off-box, mirroring `commit`'s
     // own `act.enabled` gate).
     if state.apply.enabled {
-        repl::apply_live(&appliance, &state.apply).map_err(ApiError::internal)?;
+        // The reconcile target for a failed broad apply: the saved config on
+        // disk, which still holds the previous config here (this handler applies
+        // live first, persists below). `net::apply` is level-triggered, so
+        // re-applying it rolls a partial failure back to last-good.
+        let last_good = Appliance::load(&state.config_path).ok();
+        repl::apply_live(&appliance, &state.apply, last_good.as_ref())
+            .map_err(ApiError::internal)?;
     }
     // Same persist path as a CLI `save` (atomic write + revision archive). If this
     // fails AFTER a successful live apply, the running system already holds the new
@@ -1572,6 +1815,134 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The Prometheus scrape target lives behind the same bearer auth as the rest
+    /// and answers in the text exposition format. Interface counters come from the
+    /// host's own `/proc/net/dev`, so this asserts the transport (auth, status,
+    /// content type, well-formedness) rather than a fixed series.
+    #[tokio::test]
+    async fn the_prometheus_endpoint_is_authed_and_well_formed() {
+        let st = state(seed("fw"));
+
+        // No token: refused, exactly like every other protected endpoint.
+        let unauth = router(st.clone())
+            .oneshot(get("/metrics", None))
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+        // With a token: 200, Prometheus content type, and — since the test host
+        // has interfaces in /proc/net/dev — at least one counter family, each
+        // sample line naming its metric with a labelled value.
+        let resp = router(st)
+            .oneshot(get("/metrics", Some(TOKEN)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(ct.starts_with("text/plain"), "content type was {ct:?}");
+        let body = body_string(resp).await;
+        // Every HELP line is matched by a TYPE line for the same family, and no
+        // sample line is orphaned without its header.
+        for line in body.lines() {
+            if let Some(rest) = line.strip_prefix("# TYPE ") {
+                assert!(
+                    rest.ends_with(" counter") || rest.ends_with(" gauge"),
+                    "unexpected metric type line {line:?}"
+                );
+            }
+        }
+        if body.contains("sentinel_interface_receive_bytes_total") {
+            assert!(
+                body.contains("# TYPE sentinel_interface_receive_bytes_total counter"),
+                "a sample without its TYPE header: {body}"
+            );
+        }
+    }
+
+    /// The per-IP limiter counts within a window, trips a lockout at the
+    /// threshold, and forgets an address on demand. A distinctive TEST-NET-3
+    /// address keeps it clear of any other test sharing the process-global map.
+    #[test]
+    fn the_per_ip_lockout_trips_at_the_threshold() {
+        let ip: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        forget_ip(ip);
+        // One below the threshold: still free to try.
+        for _ in 0..IP_MAX_FAILURES - 1 {
+            note_ip_failure(ip);
+        }
+        assert!(
+            ip_lockout_remaining(ip).is_none(),
+            "{} failures must not lock yet",
+            IP_MAX_FAILURES - 1
+        );
+        // The failure that reaches the threshold locks the address.
+        note_ip_failure(ip);
+        let remaining = ip_lockout_remaining(ip).expect("the threshold must lock the address");
+        assert!(
+            remaining > 0 && remaining <= IP_LOCKOUT.as_secs(),
+            "a fresh lock counts down from the full window, got {remaining}"
+        );
+        // A neighbouring address is untouched — the lockout is per address.
+        let other: std::net::IpAddr = "203.0.113.99".parse().unwrap();
+        assert!(ip_lockout_remaining(other).is_none());
+        // Forgetting clears it.
+        forget_ip(ip);
+        assert!(ip_lockout_remaining(ip).is_none());
+    }
+
+    /// The handler reads `ConnectInfo` and refuses a locked address up front — the
+    /// point being that the refusal comes *before* the password hash, so a locked
+    /// guesser cannot make the box spend that work. Proven by pre-loading the
+    /// limiter for an address, then driving one login from it and seeing 429.
+    #[tokio::test]
+    async fn a_locked_address_is_refused_with_429() {
+        let ip: std::net::IpAddr = "203.0.113.8".parse().unwrap();
+        forget_ip(ip);
+        for _ in 0..IP_MAX_FAILURES {
+            note_ip_failure(ip);
+        }
+        assert!(ip_lockout_remaining(ip).is_some(), "precondition: locked");
+
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/login")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"username":"admin","password":"whatever"}"#))
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([203, 0, 113, 8], 5555))));
+
+        let resp = router(state(seed("fw"))).oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a locked address must be refused before anything else"
+        );
+        forget_ip(ip);
+    }
+
+    /// With no `ConnectInfo` at all — an in-process oneshot, a peer-less transport
+    /// — the per-IP limiter is simply skipped and the login proceeds on the
+    /// per-account throttle alone. It must not error for want of an address.
+    #[tokio::test]
+    async fn a_login_without_connect_info_still_works() {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/login")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"username":"","password":""}"#))
+            .unwrap();
+        let resp = router(state(seed("fw"))).oneshot(req).await.unwrap();
+        // An empty username/password is a bad request, NOT a 500 and NOT a 429:
+        // the missing ConnectInfo was tolerated and the handler ran normally.
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
     /// A second factor is checked *after* the password and never instead of it,
     /// so an account with a code is not a way to get in without one — and a
     /// wrong code is the same refusal as a wrong password, which is what stops
@@ -1828,6 +2199,7 @@ mod tests {
             "[system]\nhostname = \"fw\"\n\
              [system.config-sync]\npeer = [\"10.0.0.2\"]\nsecret = \"machine-token-s3cret\"\n\
              [[system.aaa.radius]]\nserver = \"10.0.0.9\"\nsecret = \"radius-shared-secret\"\n\
+             [[system.aaa.tacacs]]\nserver = \"10.0.0.10\"\nsecret = \"tacacs-shared-secret\"\n\
              [[system.group]]\nname = \"ops\"\npermission = \"read-write\"\n\
              [[system.login]]\nusername = \"vera\"\n\
              hashed-password = \"{hash}\"\ntotp = \"GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ\"\ngroup = \"ops\"\n"
@@ -1847,6 +2219,7 @@ mod tests {
         for leaked in [
             "machine-token-s3cret",
             "radius-shared-secret",
+            "tacacs-shared-secret",
             "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
             hash.as_str(),
         ] {
@@ -1864,6 +2237,49 @@ mod tests {
         // Non-secret structure is untouched.
         let parsed: Value = serde_json::from_str(&body).expect("json");
         assert_eq!(parsed["system"]["hostname"], "fw");
+    }
+
+    /// The subscription key is an entitlement — whoever holds it can consume
+    /// the subscription — so it must never leave over the API, in any channel,
+    /// however the config was written. The redaction marker takes its place so
+    /// a reader can still see that a key IS configured.
+    #[tokio::test]
+    async fn a_subscription_key_never_leaves_over_the_api() {
+        let path = temp_config();
+        let toml = "[system]\nhostname = \"fw\"\n\
+             [update]\nchannel = \"enterprise\"\n\
+             [[update.channels]]\nname = \"community\"\n\
+             url = \"https://updates.example.test/community\"\n\
+             public-key = \"file:/etc/sentinel/community.pem\"\n\
+             [[update.channels]]\nname = \"enterprise\"\n\
+             url = \"https://updates.example.test/enterprise\"\n\
+             public-key = \"file:/etc/sentinel/enterprise.pem\"\n\
+             subscription-key = \"velstra-ent-9f2c-SECRET\"\n";
+        let a = Appliance::from_toml(toml).expect("the configuration parses");
+        session::persist_appliance(&a, &path, false).unwrap();
+        let st = state(path);
+
+        let resp = router(st)
+            .oneshot(get("/api/v1/config", Some(TOKEN)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(
+            !body.contains("velstra-ent-9f2c-SECRET"),
+            "GET /config leaked the subscription key: {body}"
+        );
+        let parsed: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(
+            parsed["update"]["channels"][1]["subscription-key"], REDACTED,
+            "the key reads as redacted, not as absent: {body}"
+        );
+        // The rest of the channel is readable — only the entitlement is hidden.
+        assert_eq!(parsed["update"]["channel"], "enterprise");
+        assert_eq!(
+            parsed["update"]["channels"][1]["url"],
+            "https://updates.example.test/enterprise"
+        );
     }
 
     #[tokio::test]

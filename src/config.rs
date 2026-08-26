@@ -411,6 +411,21 @@ port = 443
 # [update]
 # url = "https://updates.example.com/sentinel/stable"
 # public-key = "file:/etc/sentinel/update-key.pem"
+#
+# Named channels: several sources side by side (a community channel and a
+# subscription channel carrying tested, delayed-stability images), each signed
+# by its OWN key — the per-channel key is the point, since a channel is only as
+# trustworthy as the key that vouches for it. `channel` selects the active one;
+# a bare `url`/`public-key` (above) stays valid as the unnamed default channel.
+# `subscription-key` is the entitlement sent as a bearer token; an expired or
+# rejected key only makes NEW images from that channel unavailable — it never
+# disables or degrades the appliance.
+# channel = "enterprise"
+# [[update.channels]]
+# name = "enterprise"
+# url = "https://updates.example.com/sentinel/enterprise"
+# public-key = "file:/etc/sentinel/enterprise-key.pem"
+# subscription-key = "…"
 "#;
 
 /// The whole declarative appliance config.
@@ -500,34 +515,138 @@ pub struct Appliance {
     /// `[protocols]`. Omitted from saved configs when empty.
     #[serde(default, skip_serializing_if = "Policy::is_empty")]
     pub policy: Policy,
-    /// Signed update channel (roadmap C13): where to fetch A/B image updates from
-    /// and the pinned public key that must have signed them. The slot-write +
-    /// boot-switch already exist (`sentinel update`); this adds the authenticity
-    /// gate in front of it, so only a release signed by the pinned key is ever
-    /// written to a slot. Omitted from saved configs when not configured.
+    /// Signed update channel(s) (roadmap C13): where to fetch A/B image updates
+    /// from and the pinned public key that must have signed them. The
+    /// slot-write and boot-switch already exist (`sentinel update`); this adds
+    /// the authenticity gate in front of it, so only a release signed by the
+    /// pinned key is ever written to a slot. Omitted from saved configs when
+    /// not configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub update: Option<UpdateChannel>,
+    pub update: Option<Update>,
 }
 
-/// The signed update channel (`[update]`, roadmap C13). `sentinel update check`
-/// fetches a signed manifest from `url`, verifies its detached signature against
-/// the pinned `public-key` (an Ed25519 key), and only then trusts the version +
-/// image digest it names; `sentinel update install` re-verifies before writing
-/// the image to the inactive A/B slot. The pinned key is the trust anchor for
-/// the whole distribution path — in production it is baked into the immutable
-/// image; carrying it in config here lets an operator pin their own channel.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The `[update]` section (roadmap C13): the signed update channel(s).
+///
+/// Two shapes live here on purpose. The original single-channel form — a bare
+/// `url` + `public-key` — keeps working exactly as before, because a box in the
+/// field must not lose its update path on upgrade; it is treated as the unnamed
+/// **default** channel. The named form (`[[update.channels]]` + `channel`
+/// selecting the active one) is what carries the community/subscription split:
+/// each channel is signed by its **own** key, so trusting a channel means
+/// pinning that channel's key and nothing wider.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Update {
+    /// Base URL of the unnamed default channel — the directory holding
+    /// `manifest.json` (+ its `.sig`) and the images it names. Must be
+    /// `https://` (or `file://` for a local/offline mirror). The original
+    /// single-channel form; optional once named channels exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// The pinned Ed25519 public key for the unnamed default channel, PEM
+    /// (`-----BEGIN PUBLIC KEY-----`) or a `file:<path>` reference (so the key
+    /// can live in the image, not the config). Required beside `url`.
+    #[serde(default, rename = "public-key", skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+    /// Which named channel updates come from. Must name an entry in
+    /// `channels`; when unset, the bare `url` above is the channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    /// The named channels. Each carries its own URL and its own signing key —
+    /// per-channel trust is the design: the subscription channel's releases are
+    /// signed by a different key than the community channel's.
+    #[serde(default, rename = "channels", skip_serializing_if = "Vec::is_empty")]
+    pub channels: Vec<UpdateChannelCfg>,
+}
+
+/// One named update channel (`[[update.channels]]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateChannelCfg {
+    /// The channel's name — how `channel` selects it and how refusals name it.
+    pub name: String,
+    /// Base URL of this channel (holds `manifest.json` + `.sig` + images).
+    /// `https://` or `file://`. Required at commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// The pinned Ed25519 key THIS channel's manifests must be signed with —
+    /// PEM or `file:<path>`. Required at commit; deliberately per-channel.
+    #[serde(default, rename = "public-key", skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+    /// The subscription entitlement, sent to the channel server as an
+    /// `Authorization: Bearer` header. A SECRET: redacted by the read API,
+    /// masked in operational `show` output, never logged. A rejected or expired
+    /// key only makes new images from this channel unavailable — the appliance
+    /// itself keeps running, unchanged (see `update::fetch`).
+    #[serde(
+        default,
+        rename = "subscription-key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub subscription_key: Option<String>,
+}
+
+/// The **resolved** update channel `sentinel update check`/`install` runs
+/// against: one URL, one pinned key, at most one entitlement. Built by
+/// [`Update::active`] from whichever config shape is in use — the code that
+/// fetches and verifies never has to know whether the operator wrote the
+/// legacy single-channel form or a named channel.
+#[derive(Debug, Clone)]
 pub struct UpdateChannel {
-    /// Base URL of the update channel — the directory holding `manifest.json`
-    /// (+ its `.sig`) and the images it names. Must be `https://` (or `file://`
-    /// for a local/offline mirror). Required.
+    /// The channel's configured name; `None` for the unnamed default channel.
+    pub name: Option<String>,
+    /// Base URL of the channel directory.
     pub url: String,
-    /// The pinned Ed25519 public key that release manifests must be signed with,
-    /// PEM (`-----BEGIN PUBLIC KEY-----`). Required — an unsigned or
-    /// wrong-key manifest is refused. A `file:`-prefixed value reads the PEM
-    /// from that path instead (so the key can live in the image, not the config).
-    #[serde(rename = "public-key")]
+    /// The pinned Ed25519 release-signing key (PEM or `file:<path>`).
     pub public_key: String,
+    /// The subscription key sent as a bearer token, if this channel has one.
+    pub subscription_key: Option<String>,
+}
+
+impl UpdateChannel {
+    /// How refusals and status lines name this channel.
+    pub fn label(&self) -> &str {
+        self.name.as_deref().unwrap_or("default")
+    }
+}
+
+impl Update {
+    /// Resolve the channel updates currently come from, or say exactly what is
+    /// missing. Selection order is deliberate and small: an explicit `channel`
+    /// wins; otherwise the legacy bare `url` is the channel. Named channels
+    /// that exist but were never selected are NOT guessed at — updating from a
+    /// channel nobody chose would be the guess that matters most.
+    pub fn active(&self) -> anyhow::Result<UpdateChannel> {
+        if let Some(name) = &self.channel {
+            let Some(c) = self.channels.iter().find(|c| &c.name == name) else {
+                bail!(
+                    "update: the selected channel {name:?} is not defined — define it \
+                     (set update channel {name} url …) or select an existing one"
+                );
+            };
+            return Ok(UpdateChannel {
+                name: Some(c.name.clone()),
+                url: c.url.clone().unwrap_or_default(),
+                public_key: c.public_key.clone().unwrap_or_default(),
+                subscription_key: c.subscription_key.clone(),
+            });
+        }
+        if let Some(url) = &self.url {
+            return Ok(UpdateChannel {
+                name: None,
+                url: url.clone(),
+                public_key: self.public_key.clone().unwrap_or_default(),
+                subscription_key: None,
+            });
+        }
+        if !self.channels.is_empty() {
+            let names: Vec<&str> = self.channels.iter().map(|c| c.name.as_str()).collect();
+            bail!(
+                "update: no channel selected — pick one with `set update channel <name>` \
+                 (defined: {})",
+                names.join(", ")
+            );
+        }
+        bail!("no [update] channel configured (set update url + public-key, then save)")
+    }
 }
 
 /// IPFIX flow export (roadmap C12). The data plane already counts every
@@ -3970,6 +4089,10 @@ pub struct Aaa {
     /// decides.
     #[serde(default, rename = "ldap", skip_serializing_if = "Vec::is_empty")]
     pub ldap: Vec<LdapServer>,
+    /// TACACS+ servers, tried after the LDAP directories. The first that
+    /// answers decides.
+    #[serde(default, rename = "tacacs", skip_serializing_if = "Vec::is_empty")]
+    pub tacacs: Vec<TacacsServer>,
     /// The permission group an account authenticated by a server gets when this
     /// box has no local entry for it. Unset ⇒ a directory account still needs a
     /// local `[[system.login]]` naming its group, which is the safe default:
@@ -3985,7 +4108,16 @@ pub struct Aaa {
 
 impl Aaa {
     pub fn is_empty(&self) -> bool {
-        self.radius.is_empty() && self.ldap.is_empty() && self.default_group.is_none()
+        self.radius.is_empty()
+            && self.ldap.is_empty()
+            && self.tacacs.is_empty()
+            && self.default_group.is_none()
+    }
+
+    /// Whether any server of any kind is configured — the gate the login path
+    /// uses to decide whether there is a directory to consult at all.
+    pub fn has_servers(&self) -> bool {
+        !self.radius.is_empty() || !self.ldap.is_empty() || !self.tacacs.is_empty()
     }
 }
 
@@ -4041,6 +4173,25 @@ pub struct RadiusServer {
     /// which is not encryption in any modern sense — a RADIUS server belongs on
     /// a segment you already trust, and this is worth saying out loud rather
     /// than leaving for somebody to discover.
+    pub secret: String,
+    /// How long to wait for an answer, in seconds. Unset ⇒ 3. A login is a
+    /// person waiting, so this is short on purpose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u32>,
+}
+
+/// One TACACS+ server (`[[system.aaa.tacacs]]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TacacsServer {
+    /// Its address or hostname.
+    pub server: String,
+    /// Its port. Unset ⇒ 49, TACACS+'s registered TCP port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// The shared secret. RFC 8907 XORs the packet body against an MD5 chain
+    /// over this, which the RFC itself calls obfuscation rather than
+    /// encryption — a TACACS+ server belongs on a segment you already trust,
+    /// exactly like a RADIUS server.
     pub secret: String,
     /// How long to wait for an answer, in seconds. Unset ⇒ 3. A login is a
     /// person waiting, so this is short on purpose.
@@ -8456,6 +8607,23 @@ impl Appliance {
                 );
             }
         }
+        for t in &self.system.aaa.tacacs {
+            validate_host(&t.server).context("system aaa tacacs")?;
+            if t.secret.is_empty() {
+                bail!(
+                    "system aaa tacacs {:?}: needs a shared secret — without one the packet \
+                     body cannot be de-obfuscated and the server will drop the session",
+                    t.server
+                );
+            }
+            if t.port == Some(0) {
+                bail!(
+                    "system aaa tacacs {:?}: port 0 is not a port — delete the port to use \
+                     TACACS+'s default of 49",
+                    t.server
+                );
+            }
+        }
         if let Some(g) = &self.system.aaa.default_group {
             if !self.system.groups.iter().any(|x| &x.name == g) {
                 bail!("system aaa default-group {g:?}: no such permission group");
@@ -8647,6 +8815,23 @@ impl Appliance {
                 bail!(
                     "system aaa ldap {:?}: needs a base-dn — without it there is no DN to bind as",
                     d.server
+                );
+            }
+        }
+        for t in &self.system.aaa.tacacs {
+            validate_host(&t.server).context("system aaa tacacs")?;
+            if t.secret.is_empty() {
+                bail!(
+                    "system aaa tacacs {:?}: needs a shared secret — without one the packet \
+                     body cannot be de-obfuscated and the server will drop the session",
+                    t.server
+                );
+            }
+            if t.port == Some(0) {
+                bail!(
+                    "system aaa tacacs {:?}: port 0 is not a port — delete the port to use \
+                     TACACS+'s default of 49",
+                    t.server
                 );
             }
         }
@@ -10421,28 +10606,75 @@ impl Appliance {
         // watching (roadmap C19).
         crate::acme::validate(&self.pki)?;
 
-        // Signed update channel (roadmap C13): the URL must be a fetchable
-        // channel and the pinned key must be present (its cryptographic validity
-        // is checked by openssl at update time — here we reject the obvious
-        // mistakes so a `commit` fails fast rather than an update later).
+        // Signed update channel(s) (roadmap C13): every URL must be a fetchable
+        // channel and every pinned key must be present (a key's cryptographic
+        // validity is checked by openssl at update time — here we reject the
+        // obvious mistakes so a `commit` fails fast rather than an update
+        // later). One shared checker, because the legacy bare channel and each
+        // named channel must be held to exactly the same bar.
         if let Some(up) = &self.update {
-            if !(up.url.starts_with("https://") || up.url.starts_with("file://")) {
-                bail!(
-                    "update: url {:?} must be an https:// or file:// URL",
-                    up.url
-                );
+            let check_url = |what: &str, url: &str| -> Result<()> {
+                // https (or file:// for an air-gapped mirror) only: a plain-http
+                // channel would hand the manifest fetch to whoever is on path,
+                // and the signature check should be the second line, not the
+                // first.
+                if !(url.starts_with("https://") || url.starts_with("file://")) {
+                    bail!("{what}: url {url:?} must be an https:// or file:// URL");
+                }
+                Ok(())
+            };
+            let check_key = |what: &str, key: &str| -> Result<()> {
+                let key = key.trim();
+                if key.is_empty() {
+                    bail!("{what}: public-key is required (the pinned release signing key)");
+                }
+                if !key.contains("BEGIN PUBLIC KEY") && !key.starts_with("file:") {
+                    bail!(
+                        "{what}: public-key must be a PEM public key \
+                         (-----BEGIN PUBLIC KEY-----) or a `file:<path>` reference"
+                    );
+                }
+                Ok(())
+            };
+            // The legacy unnamed channel: `url` and `public-key` come together.
+            match (&up.url, &up.public_key) {
+                (Some(url), key) => {
+                    check_url("update", url)?;
+                    check_key("update", key.as_deref().unwrap_or(""))?;
+                }
+                (None, Some(_)) => bail!(
+                    "update: public-key without a url — add `set update url <https-url>` \
+                     or move both onto a named channel (set update channel <name> …)"
+                ),
+                (None, None) => {}
             }
-            if up.public_key.trim().is_empty() {
-                bail!("update: public-key is required (the pinned release signing key)");
+            // Named channels: each is a complete channel on its own.
+            let mut seen: Vec<&str> = Vec::new();
+            for c in &up.channels {
+                let what = format!("update channel {}", c.name);
+                if seen.contains(&c.name.as_str()) {
+                    bail!("update: channel {:?} is defined twice", c.name);
+                }
+                seen.push(&c.name);
+                match &c.url {
+                    Some(url) => check_url(&what, url)?,
+                    None => bail!(
+                        "{what}: url is required — set update channel {} url <https-url>",
+                        c.name
+                    ),
+                }
+                check_key(&what, c.public_key.as_deref().unwrap_or(""))?;
             }
-            let key = up.public_key.trim();
-            let looks_like_pem = key.contains("BEGIN PUBLIC KEY");
-            let is_file_ref = key.starts_with("file:");
-            if !looks_like_pem && !is_file_ref {
-                bail!(
-                    "update: public-key must be a PEM public key (-----BEGIN PUBLIC KEY-----) \
-                     or a `file:<path>` reference"
-                );
+            // The selection must point at something that exists — an update
+            // path that dangles is found at 03:00 during an incident otherwise.
+            if let Some(sel) = &up.channel {
+                if !up.channels.iter().any(|c| &c.name == sel) {
+                    bail!(
+                        "update: channel {sel:?} is selected but not defined — define it \
+                         (set update channel {sel} url …) or delete the selection \
+                         (delete update channel)"
+                    );
+                }
             }
         }
         // EVPN: one identity feeding two lower halves, so the checks are about
@@ -12129,6 +12361,71 @@ fn proto_str(p: Proto) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    /// The back-compat promise: a config written before named channels — a
+    /// bare `[update] url` + `public-key` — parses, validates and resolves as
+    /// the unnamed default channel. A box in the field must not lose its
+    /// update path on upgrade.
+    #[test]
+    fn a_bare_update_url_is_the_unnamed_default_channel() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[update]
+url = "https://updates.velstra.example/sentinel"
+public-key = "file:/etc/sentinel/release.pem"
+"#;
+        let a = super::Appliance::from_toml(toml).expect("the old shape parses");
+        a.validate().expect("…and still validates");
+        let chan = a.update.as_ref().unwrap().active().expect("…and resolves");
+        assert_eq!(chan.name, None);
+        assert_eq!(chan.label(), "default");
+        assert_eq!(chan.url, "https://updates.velstra.example/sentinel");
+        assert_eq!(chan.public_key, "file:/etc/sentinel/release.pem");
+        assert_eq!(chan.subscription_key, None);
+    }
+
+    /// The named shape: the selection resolves to that channel's own url, key
+    /// and entitlement; channels defined but unselected are not guessed at.
+    #[test]
+    fn named_channels_resolve_by_selection_and_never_by_guess() {
+        let toml = r#"
+[system]
+hostname = "fw"
+[update]
+channel = "enterprise"
+[[update.channels]]
+name = "community"
+url = "https://updates.velstra.example/community"
+public-key = "file:/etc/sentinel/community.pem"
+[[update.channels]]
+name = "enterprise"
+url = "https://updates.velstra.example/enterprise"
+public-key = "file:/etc/sentinel/enterprise.pem"
+subscription-key = "velstra-ent-11aa22bb"
+"#;
+        let a = super::Appliance::from_toml(toml).expect("parses");
+        a.validate().expect("validates");
+        let chan = a.update.as_ref().unwrap().active().expect("resolves");
+        assert_eq!(chan.name.as_deref(), Some("enterprise"));
+        assert_eq!(chan.public_key, "file:/etc/sentinel/enterprise.pem");
+        assert_eq!(chan.subscription_key.as_deref(), Some("velstra-ent-11aa22bb"));
+
+        // Drop the selection: two channels, no choice — an error naming them,
+        // never a silent pick.
+        let mut up = a.update.clone().unwrap();
+        up.channel = None;
+        let err = up.active().unwrap_err().to_string();
+        assert!(err.contains("no channel selected"), "got: {err}");
+        assert!(err.contains("community"), "got: {err}");
+
+        // Duplicate names are refused at validate time.
+        let mut b = a.clone();
+        let dup = b.update.as_ref().unwrap().channels[0].clone();
+        b.update.as_mut().unwrap().channels.push(dup);
+        let err = b.validate().unwrap_err().to_string();
+        assert!(err.contains("defined twice"), "got: {err}");
+    }
 
     /// A local zone has no interfaces of its own — it *is* the box — so a check
     /// for "an addressed interface in that zone" can never pass for one. The

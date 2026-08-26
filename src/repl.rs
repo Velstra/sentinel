@@ -546,7 +546,12 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
             )
         );
     }
-    if let Err(e) = apply_live(&appliance, act) {
+    // The reconcile target for a failed broad apply: the config the box was
+    // running before this commit (the live snapshot, or the saved file if there
+    // is no snapshot yet). `net::apply` is level-triggered, so re-applying it
+    // rolls a partial failure back to last-good instead of leaving a mix.
+    let last_good = running_before.as_ref().or(saved_before.as_ref());
+    if let Err(e) = apply_live(&appliance, act, last_good) {
         eprintln!("{} applying config: {e}", ui::red("error:"));
         note_refusal();
         return false;
@@ -792,18 +797,114 @@ fn unwind_err_mixed(rb: Rollback, cause: anyhow::Error) -> anyhow::Error {
     )
 }
 
+/// Reconcile the broad `net::apply` back to the last-good config after it
+/// failed partway, then unwind the firewall/routing/hostname stages, and report
+/// honestly which of the two happened.
+///
+/// `net::apply` is a declarative, level-triggered reconcile — "apply = bring the
+/// box to this config": each of its ~30 sub-systems writes its drop-in (removing
+/// what the config no longer names) and (re)starts its daemon only when the
+/// rendered config changed, and the kernel-state ones (policy routes, Multi-WAN,
+/// QoS, the swanctl load) tear their whole owned scope down before rebuilding it.
+/// So re-running `net::apply` against the config the box was running *before*
+/// this commit overwrites whatever the failed apply left half-done — the same
+/// safe revert [`crate::confirm::rollback`] already performs. When that reconcile
+/// succeeds this is a TRUE rollback, not the mixed state the un-reconciled path
+/// (see [`unwind_err_mixed`]) has to report.
+///
+/// It stays honest about the two ways it can still fall short — the reconcile
+/// itself failing (a genuine mixed state), or the firewall/routing/hostname
+/// restore not completing — and about what a *successful* reconcile still does
+/// not undo: transient disruption. An IPsec SA that was torn and re-established,
+/// a daemon that was already restarted, a login password briefly set to the new
+/// value and back — the box's *configuration* is at last-good and nothing is
+/// left half-configured, but those events happened, so the message names them.
+fn unwind_to_last_good(
+    rb: Rollback,
+    cause: anyhow::Error,
+    prev: &crate::config::Appliance,
+) -> anyhow::Error {
+    // The level-triggered rollback: reconcile the ~30 sub-systems to last-good.
+    let reconcile = crate::net::apply(prev);
+    // Then the three stages the undo stack does cover, in reverse.
+    let failures = rb.unwind();
+    mixed_or_rolled_message(&cause, &reconcile, failures)
+}
+
+/// Compose the honest report for a failed broad apply from the two outcomes of
+/// the attempted rollback: whether the `net::apply(last_good)` reconcile
+/// succeeded, and which (if any) of the firewall/routing/hostname undos failed.
+///
+/// Split out from [`unwind_to_last_good`] with no live side effects of its own so
+/// the three cases — true rollback, rollback-with-incomplete-stage-restore, and
+/// genuine mixed state — can be asserted directly.
+fn mixed_or_rolled_message(
+    cause: &anyhow::Error,
+    reconcile: &Result<()>,
+    unwind_failures: Vec<String>,
+) -> anyhow::Error {
+    match reconcile {
+        Ok(()) if unwind_failures.is_empty() => anyhow!(
+            "applying system configuration failed: {cause}\n  \
+             ROLLED BACK to the last-good running configuration — the box was \
+             reconciled back to the config it ran before this commit. Services \
+             that had to be bounced to get there (IPsec tunnels, and any daemon \
+             already restarted before the failure) will have blipped, but their \
+             configuration matches last-good again. Fix the cause first if it was \
+             a bad value."
+        ),
+        Ok(()) => anyhow!(
+            "applying system configuration failed: {cause}\n  \
+             the broad system apply was rolled back to the last-good config, but \
+             restoring the firewall/routing/hostname did not fully complete ({}). \
+             Re-check those, or reboot to return to the saved config.",
+            unwind_failures.join("; ")
+        ),
+        Err(re) => {
+            let rolled = if unwind_failures.is_empty() {
+                "the firewall, routing and hostname changes were rolled back".to_string()
+            } else {
+                format!(
+                    "the firewall/routing/hostname rollback itself did not fully complete ({})",
+                    unwind_failures.join("; ")
+                )
+            };
+            anyhow!(
+                "applying system configuration failed: {cause}\n  \
+                 MIXED STATE — reconciling back to the last-good config ALSO \
+                 failed ({re}); {rolled}. The broad system apply (DNS, NTP, PKI, \
+                 sshd, login passwords, IPsec, the VPNs and the box services) may \
+                 be partly on the new config and partly on the old, so the running \
+                 system matches neither cleanly.\n  \
+                 Recover by re-applying a known-good configuration: reboot to \
+                 return to the saved config, or `rollback <N>` to a known-good \
+                 archived revision (see `run show system commit`). Fix the cause \
+                 first if it was a bad value."
+            )
+        }
+    }
+}
+
 /// Apply a validated appliance config to the running system: compile
 /// **everything** first (so a bad config is rejected before any live change),
 /// then apply firewall, routing and hostname in order — each of those three
 /// stages recording how to undo itself — and finally the broad `net::apply`.
 ///
-/// The atomic-rollback guarantee covers only the first three stages: if routing
-/// or hostname fails, the completed stages are rolled back in reverse and a
-/// clean-rollback report is returned. The final `net::apply` reconciles ~30
-/// sub-systems with no undo of their own; a failure there rolls back the three
-/// covered stages but reports an honest MIXED-STATE error (see
-/// [`unwind_err_mixed`]) rather than pretending the whole commit was undone.
-pub(crate) fn apply_live(appliance: &crate::config::Appliance, act: &Apply) -> Result<()> {
+/// The atomic-rollback guarantee covers the first three stages directly (their
+/// undo stack), and — when `rollback_to` names the config the box was running
+/// before this commit — the broad `net::apply` too, by reconciling it back to
+/// that last-good config on failure (a level-triggered rollback, see
+/// [`unwind_to_last_good`]): most partial failures then become a TRUE rollback
+/// rather than a mixed state. `rollback_to` is `None` only where there is no
+/// meaningful "before" to reconcile to — a `net::apply` failure there falls back
+/// to the honest MIXED-STATE report (see [`unwind_err_mixed`]). This is the case
+/// for the revert paths themselves (`confirm`/archive rollback): reconciling a
+/// failed revert back to the config it is trying to leave would defeat it.
+pub(crate) fn apply_live(
+    appliance: &crate::config::Appliance,
+    act: &Apply,
+    rollback_to: Option<&crate::config::Appliance>,
+) -> Result<()> {
     // Serialise the whole apply against a concurrent commit / API PUT / boot-late
     // reconcile: staging uses fixed temp filenames under /run/sentinel, so two
     // writers at once could splice a networkd unit or a half-written velstra.toml.
@@ -861,12 +962,17 @@ pub(crate) fn apply_live(appliance: &crate::config::Appliance, act: &Apply) -> R
 
     // The broad system apply: networkd units plus ~30 co-services (DNS, NTP,
     // PKI, sshd, login passwords, IPsec, the VPNs, the box services…). None of
-    // these is on the rollback stack, so a failure here cannot be honestly
-    // reported as a clean rollback — `unwind_err_mixed` undoes what it can
-    // (firewall/routing/hostname) and tells the operator the box is in a mixed
-    // state, rather than claiming a rollback that did not cover this stage.
+    // these is on the rollback stack. Because `net::apply` is a level-triggered
+    // reconcile, a failure here is rolled back by re-running it against the
+    // last-good config (`rollback_to`) — turning most partial failures into a
+    // TRUE rollback. Only where there is no last-good to reconcile to
+    // (`None` — the revert paths, and a first-ever commit) does it fall back to
+    // the honest MIXED-STATE report that undoes just firewall/routing/hostname.
     if let Err(e) = crate::net::apply(appliance) {
-        return Err(unwind_err_mixed(rb, e));
+        return Err(match rollback_to {
+            Some(prev) => unwind_to_last_good(rb, e, prev),
+            None => unwind_err_mixed(rb, e),
+        });
     }
     Ok(())
 }
@@ -1244,6 +1350,10 @@ const OP_SHOW_TOP: &[Cand] = &[
     ),
     ("pki", "local CAs + issued certificates (expiry)"),
     ("configuration", "the saved configuration (config syntax)"),
+    (
+        "subscription",
+        "update channels + entitlement state (key masked, last check)",
+    ),
     ("arp", "the ARP / neighbour table"),
     ("system", "hostname, services, interfaces"),
     ("log", "recent service log (velstra | wren)"),
@@ -1401,10 +1511,26 @@ const PERMIT_DENY: &[Cand] = &[
 ];
 // `update <Tab>` reveals the signed-update-channel fields (roadmap C13).
 const UPDATE_FIELDS: &[Cand] = &[
-    ("url", "channel base URL (holds manifest.json + images)"),
+    ("url", "default channel base URL (holds manifest.json + images)"),
     (
         "public-key",
         "pinned Ed25519 signing key (PEM or file:<path>)",
+    ),
+    (
+        "channel",
+        "a named channel (per-channel key + subscription); bare = select the active one",
+    ),
+];
+// `update channel <name> <Tab>` — one named channel's fields.
+const UPDATE_CHANNEL_FIELDS: &[Cand] = &[
+    ("url", "this channel's base URL (manifest.json + images)"),
+    (
+        "public-key",
+        "THIS channel's pinned Ed25519 signing key (PEM or file:<path>)",
+    ),
+    (
+        "subscription-key",
+        "entitlement sent as a bearer token; a rejected key only pauses updates",
     ),
 ];
 // `multiwan <Tab>` reveals the mode + the uplinks (each keyed by interface).
@@ -1871,6 +1997,15 @@ const WEB_FIELDS: &[Cand] = &[
         "listen-address",
         "local address to bind (default 127.0.0.1 - the box itself only)",
     ),
+    (
+        "tls",
+        "serve HTTPS (true|false; default true - a self-signed certificate is minted if none is given)",
+    ),
+    (
+        "tls-cert",
+        "PEM certificate chain to serve instead of the self-signed one",
+    ),
+    ("tls-key", "PEM private key belonging to tls-cert"),
 ];
 
 const SSH_FIELDS: &[Cand] = &[
@@ -1916,6 +2051,14 @@ const AAA_FIELDS: &[Cand] = &[
         "a RADIUS server (by host): secret / port / timeout",
     ),
     (
+        "ldap",
+        "an LDAP directory (by host): base-dn / user-attribute / tls / port / timeout",
+    ),
+    (
+        "tacacs",
+        "a TACACS+ server (by host): secret / port / timeout",
+    ),
+    (
         "default-group",
         "the group a directory account gets with no local entry",
     ),
@@ -1938,6 +2081,11 @@ const AAA_LDAP_TLS: &[Cand] = &[
 const AAA_RADIUS_FIELDS: &[Cand] = &[
     ("secret", "the shared secret (required)"),
     ("port", "server port (default 1812)"),
+    ("timeout", "seconds to wait for an answer (default 3)"),
+];
+const AAA_TACACS_FIELDS: &[Cand] = &[
+    ("secret", "the shared secret (required)"),
+    ("port", "server port (default 49, TCP)"),
     ("timeout", "seconds to wait for an answer (default 3)"),
 ];
 const LOGIN_FIELDS: &[Cand] = &[
@@ -3777,6 +3925,7 @@ pub(crate) fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "services", "ntp"] => NTP_FIELDS,
         ["set" | "delete", "services", "lldp"] => LLDP_FIELDS,
         ["set", "services", "web", "enable"] => BOOLS,
+        ["set", "services", "web", "tls"] => BOOLS,
         ["set", "services", "web", "port"] => PORT_VALUE,
         ["set", "services", "lldp", "enable"] => BOOLS,
         ["set" | "delete", "services", "snmp"] => SNMP_FIELDS,
@@ -3820,6 +3969,7 @@ pub(crate) fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set", "system", "metrics", "enable"] => BOOLS,
         ["set" | "delete", "system", "aaa", "radius", _host] => AAA_RADIUS_FIELDS,
         ["set" | "delete", "system", "aaa", "ldap", _host] => AAA_LDAP_FIELDS,
+        ["set" | "delete", "system", "aaa", "tacacs", _host] => AAA_TACACS_FIELDS,
         ["set", "system", "aaa", "ldap", _host, "tls"] => AAA_LDAP_TLS,
         ["set" | "delete", "system", "console"] => CONSOLE_FIELDS,
         ["set" | "delete", "interface", _name, "offload"] => OFFLOAD_FIELDS,
@@ -4069,6 +4219,7 @@ pub(crate) fn candidates(tokens: &[&str]) -> &'static [Cand] {
         // The pki (certificate authority + ACME) sub-tree.
         ["set" | "delete", "pki"] => PKI_NODES,
         ["set" | "delete", "update"] => UPDATE_FIELDS,
+        ["set" | "delete", "update", "channel", _name] => UPDATE_CHANNEL_FIELDS,
         ["set" | "delete", "pki", "ca", _name] => PKI_CA_FIELDS,
         ["set", "pki", "ca", _name, "key-type"] => PKI_KEY_TYPES,
         ["set" | "delete", "pki", "certificate", _name] => PKI_CERT_FIELDS,
@@ -4269,6 +4420,8 @@ pub struct DynNames {
     pub reverse_proxy: Vec<String>,
     pub broadcast_relay: Vec<String>,
     pub prefix_lists: Vec<String>,
+    /// Declared update channel names (`set update channel <name> …`).
+    pub update_channels: Vec<String>,
 }
 
 /// Own a static `Cand` slice into `(keyword, description)` pairs — the bridge
@@ -4831,6 +4984,18 @@ pub(crate) fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, 
         ["set", "update", "public-key"] => {
             own_cands(&[("<pem|file:path>", "PEM key or file:<path>")])
         }
+        // A named channel: the ones that exist, plus a `<name>` inviting a new
+        // one (naming it alone selects it as the active channel).
+        ["set" | "delete", "update", "channel"] => named(
+            &names.update_channels,
+            "update channel",
+            "a new channel name (selects it as active)",
+        ),
+        ["set", "update", "channel", _name, "url"] => own_cands(&[PH_URL]),
+        ["set", "update", "channel", _name, "public-key"] => {
+            own_cands(&[("<pem|file:path>", "PEM key or file:<path>")])
+        }
+        ["set", "update", "channel", _name, "subscription-key"] => own_cands(&[PH_KEY]),
         ["set", "pki", "acme", "directory-url"] => own_cands(&[PH_URL]),
         ["set", "pki", "acme", "email"] => own_cands(&[("<email>", "a contact email address")]),
 
@@ -5093,6 +5258,94 @@ mod tests {
     /// The keywords offered for a context (drops the descriptions).
     fn kw(tokens: &[&str]) -> Vec<&'static str> {
         candidates(tokens).iter().map(|(k, _)| *k).collect()
+    }
+
+    /// A successful reconcile with every covered stage restored is a TRUE
+    /// rollback — the box is back at last-good — and the report must say so
+    /// rather than the old mixed-state hedge. It still names the cause (so a bad
+    /// value can be found) and is honest that services blipped on the way back.
+    #[test]
+    fn a_clean_reconcile_reports_a_true_rollback() {
+        let msg = format!(
+            "{:#}",
+            mixed_or_rolled_message(&anyhow!("sshd refused the new port"), &Ok(()), Vec::new())
+        );
+        assert!(msg.contains("ROLLED BACK to the last-good"), "{msg}");
+        assert!(msg.contains("sshd refused the new port"), "{msg}");
+        // Not the mixed-state language — this is the case that used to lie.
+        assert!(!msg.contains("MIXED STATE"), "{msg}");
+        // Honest about the one thing a reconcile does not undo: the blip.
+        assert!(msg.contains("blipped"), "{msg}");
+    }
+
+    /// The reconcile succeeded but a firewall/routing/hostname undo did not:
+    /// still a rollback of the broad apply, but the operator is told exactly
+    /// which stage is left to re-check — not a bare success.
+    #[test]
+    fn a_reconcile_with_a_stuck_stage_names_the_stage() {
+        let msg = format!(
+            "{:#}",
+            mixed_or_rolled_message(
+                &anyhow!("ipsec load failed"),
+                &Ok(()),
+                vec!["routing (wren reload failed)".to_string()],
+            )
+        );
+        assert!(msg.contains("rolled back to the last-good"), "{msg}");
+        assert!(msg.contains("did not fully complete"), "{msg}");
+        assert!(msg.contains("routing (wren reload failed)"), "{msg}");
+        assert!(!msg.contains("ROLLED BACK"), "{msg}");
+    }
+
+    /// When the reconcile ITSELF fails there is no honest rollback to claim: the
+    /// box may be part-new, part-old. The report must say MIXED STATE, name both
+    /// the original cause and the reconcile failure, and point at recovery.
+    #[test]
+    fn a_failed_reconcile_reports_an_honest_mixed_state() {
+        let msg = format!(
+            "{:#}",
+            mixed_or_rolled_message(
+                &anyhow!("ipsec load failed"),
+                &Err(anyhow!("networkd would not restart")),
+                Vec::new(),
+            )
+        );
+        assert!(msg.contains("MIXED STATE"), "{msg}");
+        assert!(msg.contains("ipsec load failed"), "{msg}");
+        assert!(msg.contains("networkd would not restart"), "{msg}");
+        assert!(msg.contains("firewall, routing and hostname changes were rolled back"), "{msg}");
+        assert!(msg.contains("rollback"), "{msg}");
+    }
+
+    /// The rollback stack unwinds in reverse and reports exactly the steps whose
+    /// own undo failed — the failure list `mixed_or_rolled_message` reads to
+    /// decide whether the covered stages are truly restored.
+    #[test]
+    fn the_rollback_stack_unwinds_in_reverse_and_reports_failures() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let order = Rc::new(RefCell::new(Vec::<&'static str>::new()));
+        let mut rb = Rollback::new();
+        let (o1, o2, o3) = (order.clone(), order.clone(), order.clone());
+        rb.push("firewall", move || {
+            o1.borrow_mut().push("firewall");
+            Ok(())
+        });
+        rb.push("routing", move || {
+            o2.borrow_mut().push("routing");
+            anyhow::bail!("wren would not reload")
+        });
+        rb.push("hostname", move || {
+            o3.borrow_mut().push("hostname");
+            Ok(())
+        });
+        let failures = rb.unwind();
+        // Reverse of push order.
+        assert_eq!(*order.borrow(), ["hostname", "routing", "firewall"]);
+        // Only the failing step is reported, with its cause.
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("routing"), "{:?}", failures);
+        assert!(failures[0].contains("wren would not reload"), "{:?}", failures);
     }
 
     /// Being offered at a level is half of it; the other half is that the branch
@@ -5755,6 +6008,7 @@ mod tests {
             reverse_proxy: vec!["web".into()],
             broadcast_relay: vec!["wol".into()],
             prefix_lists: vec!["LAN".into()],
+            update_channels: vec!["enterprise".into()],
         };
         let kws = |toks: &[&str]| -> Vec<String> {
             dyn_candidates(toks, &names)
@@ -5769,6 +6023,10 @@ mod tests {
         assert_eq!(kws(&["set", "nat", "source"]), ["wan-masq", "<name>"]);
         assert_eq!(kws(&["set", "nat", "destination"]), ["web-fwd", "<name>"]);
         assert_eq!(kws(&["set", "firewall", "zone"]), ["lan", "wan", "<name>"]);
+        assert_eq!(
+            kws(&["set", "update", "channel"]),
+            ["enterprise", "<name>"]
+        );
         // Zone-value positions splice in the known zone names.
         assert_eq!(kws(&["set", "interface", "eth0", "zone"]), ["lan", "wan"]);
         assert_eq!(
@@ -5944,6 +6202,21 @@ mod tests {
         // Signed update channel value positions (roadmap C13).
         assert_eq!(kws(&["set", "update", "url"]), ["<url>"]);
         assert_eq!(kws(&["set", "update", "public-key"]), ["<pem|file:path>"]);
+        // Named channels: the name position invites a new channel, and each
+        // channel carries url / its own key / the subscription entitlement.
+        assert_eq!(kws(&["set", "update", "channel"]), ["<name>"]);
+        assert_eq!(
+            kws(&["set", "update", "channel", "enterprise"]),
+            ["url", "public-key", "subscription-key"]
+        );
+        assert_eq!(
+            kws(&["set", "update", "channel", "enterprise", "url"]),
+            ["<url>"]
+        );
+        assert_eq!(
+            kws(&["set", "update", "channel", "enterprise", "subscription-key"]),
+            ["<key>"]
+        );
         // OpenConnect value positions get their vtysh-style hints, and the
         // certificate position offers the literal `acme` fallback.
         assert_eq!(kws(&["set", "vpn", "openconnect", "pool"]), ["<A.B.C.D/M>"]);
