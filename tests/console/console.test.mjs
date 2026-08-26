@@ -1271,6 +1271,81 @@ await test("a rule is the same form whether it is being made or changed", async 
   check(r.columns > 1, `the editor lays the mask out in ${r.columns} column`);
 });
 
+// The editor folds the unset rest away just as the add panel does, and is
+// honest about it: a field the rule actually carries stays on screen, only the
+// ones it never set go behind "More settings".
+await test("the editor folds the unset rest and keeps what the rule sets", async () => {
+  const r = await page.evaluate(`(async () => {
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms || 400));
+    await configure(["set firewall rule fold-probe from wan",
+                     "set firewall rule fold-probe to lan",
+                     "set firewall rule fold-probe action accept",
+                     "set firewall rule fold-probe proto tcp",
+                     "set firewall rule fold-probe port 443",
+                     // Set, and not in the essential few: this must stay visible.
+                     "set firewall rule fold-probe description 'kept in view'",
+                     "commit", "save"]);
+    view = "rules"; panel = null; await refresh(); await wait(700);
+    const rule = parseRules(lastLeaves).find((x) => x.name === "fold-probe");
+    if (!rule) return { error: "the fold-probe rule did not come back" };
+    openEditor(rule, zoneNames(lastLeaves));
+    await wait(400);
+    const box = document.getElementById("editorfields");
+    const field = (label) => [...box.querySelectorAll(".field")]
+      .find((f) => f.querySelector("span").firstChild.textContent.trim() === label);
+    const hidden = (label) => field(label).classList.contains("hidden");
+    // "Burst" is unset and not essential, so it folds; "Description" is set but
+    // not essential, so the honesty rule keeps it. (A field the appliance emits
+    // a value for — "Log matches" comes back as "false" — is genuinely set, and
+    // rightly stays too; "Burst" is the one this rule never touched.)
+    const foldedBefore = hidden("Burst");
+    const keptSet = !hidden("Description");
+    const keptEssential = !hidden("From zone") && !hidden("Port");
+    const moreBtn = [...document.querySelectorAll("#editormore button")]
+      .find((b) => /more settings/i.test(b.textContent));
+    const hadMore = !!moreBtn;
+    if (moreBtn) { moreBtn.click(); await wait(200); }
+    const revealed = !hidden("Burst");
+    document.getElementById("editor").close();
+    await configure(["delete firewall rule fold-probe", "commit", "save"]);
+    return { foldedBefore, keptSet, keptEssential, hadMore, revealed };
+  })()`);
+  check(!r.error, r.error || "");
+  check(r.hadMore, "the editor offers no \"More settings\" control");
+  check(r.foldedBefore, "an unset, non-essential field is not folded away");
+  check(r.keptSet, "a field the rule actually sets was hidden — the fold is lying");
+  check(r.keptEssential, "an essential field was folded away");
+  check(r.revealed, "\"More settings\" does not reveal the folded field");
+});
+
+// The jump palette: a flat search over every page, so a page an operator can
+// name is one keystroke away rather than a guess at which category holds it.
+await test("the jump palette reaches a page by name", async () => {
+  const r = await page.evaluate(`(async () => {
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms || 200));
+    view = "dashboard"; panel = null; await refresh(); await wait(300);
+    // Ctrl/Cmd-K from anywhere opens it.
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "k", ctrlKey: true, bubbles: true }));
+    await wait(150);
+    const opened = document.getElementById("palette").open;
+    const q = document.getElementById("paletteq");
+    q.value = "zones";
+    q.dispatchEvent(new Event("input"));
+    await wait(120);
+    const rows = [...document.querySelectorAll("#palettelist .palitem")]
+      .map((b) => b.querySelector(".palt").textContent.trim());
+    // Enter takes the selected (first) row.
+    q.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await wait(250);
+    const closed = !document.getElementById("palette").open;
+    return { opened, rows, closed, view, panel };
+  })()`);
+  check(r.opened, "Ctrl/Cmd-K did not open the palette");
+  check(r.rows.some((t) => /zones/i.test(t)), `the palette did not find Zones: ${JSON.stringify(r.rows)}`);
+  check(r.closed, "the palette stayed open after Enter");
+  equal(r.view, "zones", `Enter did not navigate to the named page (view=${r.view})`);
+});
+
 await test("validating leaves the change staged and applyable", async () => {
   // Validate used to clear the panel: the check said "fine" and then the change
   // could no longer be applied.

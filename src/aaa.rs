@@ -3,7 +3,8 @@
 //!
 //! Two things live here because they share the same need — legacy hash
 //! primitives that no dependency in this tree provides. MD5 is what RADIUS
-//! hides a password with (RFC 2865) and SHA-1 is what TOTP is defined over
+//! hides a password with (RFC 2865) and what TACACS+ builds its body pad from
+//! (RFC 8907); SHA-1 is what TOTP is defined over
 //! (RFC 6238). Both are implemented here rather than pulled in, because each is
 //! sixty lines of fully specified arithmetic, both are testable against the
 //! published vectors in the RFCs, and neither is used to *store* anything: the
@@ -496,6 +497,300 @@ pub fn ldap_authenticate(
     directory_from_exit(out?)
 }
 
+// ---- TACACS+ (RFC 8907) ---------------------------------------------------
+//
+// The third of the trio a network operator expects beside RADIUS and LDAP.
+// Only the authentication part of the protocol is spoken here — an appliance
+// login needs a yes or a no, not command authorization or accounting — and
+// only the ASCII flow, which every TACACS+ server supports: the client STARTs
+// a session naming the user, the server asks for the password (GETPASS), the
+// client CONTINUEs with it, and the server answers PASS or FAIL.
+
+/// TACACS+ runs over TCP, on 49 unless the configuration says otherwise.
+pub const TACACS_DEFAULT_PORT: u16 = 49;
+
+/// `major_version` 0xc, `minor_version` 0 — the version the ASCII flow speaks
+/// (RFC 8907 §4.1; minor 1 is for PAP/CHAP, which this client does not use).
+const TACACS_VERSION: u8 = 0xc0;
+/// Packet type: authentication (§4.1). Authorization (2) and accounting (3)
+/// are deliberately not implemented.
+const TACACS_TYPE_AUTHEN: u8 = 0x01;
+/// Header flag: the body is NOT obfuscated. This client never sets it, and a
+/// server answering with it has no shared secret configured for us — a
+/// misconfiguration to report, not an answer to trust.
+const TACACS_FLAG_UNENCRYPTED: u8 = 0x01;
+
+/// START: action LOGIN, at the user privilege level, ASCII, login service
+/// (§5.1). One combination, spelled out, because it is the only one sent.
+const TACACS_AUTHEN_LOGIN: u8 = 0x01;
+const TACACS_PRIV_LVL_USER: u8 = 0x01;
+const TACACS_AUTHEN_TYPE_ASCII: u8 = 0x01;
+const TACACS_AUTHEN_SVC_LOGIN: u8 = 0x01;
+
+/// REPLY statuses (§5.2). GETDATA/RESTART/FOLLOW exist in the RFC; a server
+/// answering one of those wants a conversation this client does not have
+/// (a password change, a redirect), and saying so beats pretending.
+const TACACS_STATUS_PASS: u8 = 0x01;
+const TACACS_STATUS_FAIL: u8 = 0x02;
+const TACACS_STATUS_GETUSER: u8 = 0x04;
+const TACACS_STATUS_GETPASS: u8 = 0x05;
+const TACACS_STATUS_ERROR: u8 = 0x07;
+
+/// The body cap accepted from a server. A REPLY is a status and a prompt; a
+/// length claiming megabytes is not a reply, it is an attempt to make this
+/// client allocate one.
+const TACACS_MAX_REPLY: u32 = 65536;
+
+/// The pseudo-pad of RFC 8907 §4.5: MD5 blocks chained over the header fields
+/// and the shared secret, truncated to the body length.
+///
+///   pad_1 = MD5(session_id ‖ secret ‖ version ‖ seq_no)
+///   pad_n = MD5(session_id ‖ secret ‖ version ‖ seq_no ‖ pad_{n-1})
+///
+/// The body is XORed with this pad. That is **obfuscation, not encryption** —
+/// the RFC itself says so (§10.3): anyone holding the shared secret, or able
+/// to guess it offline, reads every packet. A TACACS+ server belongs on a
+/// segment you already trust, exactly like a RADIUS server.
+fn tacacs_pad(session_id: &[u8; 4], secret: &str, seq_no: u8, len: usize) -> Vec<u8> {
+    let mut pad = Vec::with_capacity(len.next_multiple_of(16));
+    let mut prev: Option<[u8; 16]> = None;
+    while pad.len() < len {
+        let mut seed = session_id.to_vec();
+        seed.extend_from_slice(secret.as_bytes());
+        seed.push(TACACS_VERSION);
+        seed.push(seq_no);
+        if let Some(p) = prev {
+            seed.extend_from_slice(&p);
+        }
+        let digest = md5(&seed);
+        pad.extend_from_slice(&digest);
+        prev = Some(digest);
+    }
+    pad.truncate(len);
+    pad
+}
+
+/// A complete packet: the 12-byte header (§4.1) followed by the body XORed
+/// with the pseudo-pad. `seq_no` is odd for the client (1, 3, …), even for
+/// the server.
+fn tacacs_packet(session_id: &[u8; 4], secret: &str, seq_no: u8, body: &[u8]) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(12 + body.len());
+    packet.push(TACACS_VERSION);
+    packet.push(TACACS_TYPE_AUTHEN);
+    packet.push(seq_no);
+    packet.push(0); // flags: obfuscated body, single session
+    packet.extend_from_slice(session_id);
+    packet.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    let pad = tacacs_pad(session_id, secret, seq_no, body.len());
+    packet.extend(body.iter().zip(&pad).map(|(b, p)| b ^ p));
+    packet
+}
+
+/// The START body (§5.1) that opens an ASCII login for `username`. The `port`
+/// and `rem_addr` fields describe the line the user is on; this client reports
+/// where the login arrived so the server's accounting names something real.
+fn tacacs_start_body(username: &str, port: &str, rem_addr: &str) -> Result<Vec<u8>> {
+    // Each length is one octet, and like the RADIUS attribute cap, truncating
+    // (`as u8` wrapping) would declare a short length and let the tail be
+    // parsed as some other field. Refuse instead.
+    for (what, v) in [("username", username), ("port", port), ("rem_addr", rem_addr)] {
+        if v.len() > 255 {
+            bail!("TACACS+ {what} is {} bytes; the field maximum is 255", v.len());
+        }
+    }
+    let mut body = vec![
+        TACACS_AUTHEN_LOGIN,
+        TACACS_PRIV_LVL_USER,
+        TACACS_AUTHEN_TYPE_ASCII,
+        TACACS_AUTHEN_SVC_LOGIN,
+        username.len() as u8,
+        port.len() as u8,
+        rem_addr.len() as u8,
+        0, // data_len: the ASCII flow sends nothing in START's data field
+    ];
+    body.extend_from_slice(username.as_bytes());
+    body.extend_from_slice(port.as_bytes());
+    body.extend_from_slice(rem_addr.as_bytes());
+    Ok(body)
+}
+
+/// The CONTINUE body (§5.3) answering a server prompt — for this client,
+/// always the password after a GETPASS (or the username after a GETUSER from
+/// a server that ignored the one in START).
+fn tacacs_continue_body(user_msg: &str) -> Result<Vec<u8>> {
+    if user_msg.len() > u16::MAX as usize {
+        bail!(
+            "a TACACS+ answer of {} bytes does not fit its 16-bit length field",
+            user_msg.len()
+        );
+    }
+    let mut body = Vec::with_capacity(5 + user_msg.len());
+    body.extend_from_slice(&(user_msg.len() as u16).to_be_bytes());
+    body.extend_from_slice(&0u16.to_be_bytes()); // data_len
+    body.push(0); // flags
+    body.extend_from_slice(user_msg.as_bytes());
+    Ok(body)
+}
+
+/// A REPLY body (§5.2), decoded: the status octet and the server's message
+/// (which a FAIL or ERROR often uses to say why).
+fn tacacs_parse_reply(clear: &[u8]) -> Result<(u8, String)> {
+    if clear.len() < 6 {
+        bail!("the TACACS+ reply body is {} bytes; the fixed part alone is 6", clear.len());
+    }
+    let status = clear[0];
+    let server_msg_len = u16::from_be_bytes([clear[2], clear[3]]) as usize;
+    let data_len = u16::from_be_bytes([clear[4], clear[5]]) as usize;
+    // A reply whose declared lengths overrun the body it arrived in is not a
+    // reply that got shortened; it is a length field lying about the bytes
+    // that follow, and reading past them would read the pad.
+    if 6 + server_msg_len + data_len > clear.len() {
+        bail!(
+            "the TACACS+ reply declares {server_msg_len}+{data_len} bytes of text in a \
+             {}-byte body",
+            clear.len()
+        );
+    }
+    let server_msg = String::from_utf8_lossy(&clear[6..6 + server_msg_len]).into_owned();
+    Ok((status, server_msg))
+}
+
+/// Read one server packet for `session_id`, expecting `seq_no`, and return the
+/// de-obfuscated body.
+fn tacacs_read_reply(
+    stream: &mut std::net::TcpStream,
+    session_id: &[u8; 4],
+    secret: &str,
+    seq_no: u8,
+) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut header = [0u8; 12];
+    stream
+        .read_exact(&mut header)
+        .context("no answer from the TACACS+ server")?;
+    if header[0] != TACACS_VERSION {
+        bail!(
+            "the TACACS+ server answered with version {:#04x}, not the {TACACS_VERSION:#04x} \
+             this client speaks",
+            header[0]
+        );
+    }
+    if header[1] != TACACS_TYPE_AUTHEN {
+        bail!("the TACACS+ server answered with packet type {}, not authentication", header[1]);
+    }
+    if header[2] != seq_no {
+        bail!("the TACACS+ server answered out of sequence ({} where {seq_no} was next)", header[2]);
+    }
+    if header[3] & TACACS_FLAG_UNENCRYPTED != 0 {
+        // The server is answering in the clear, which means it has no shared
+        // secret configured for this client. Its answer may even be readable —
+        // but trusting an unobfuscated PASS would let anything on the path
+        // mint one.
+        bail!(
+            "the TACACS+ server answered unobfuscated — it has no shared secret configured \
+             for this box; configure the same secret on both ends"
+        );
+    }
+    if header[4..8] != session_id[..] {
+        bail!("the TACACS+ answer belongs to a different session than the one opened");
+    }
+    let len = u32::from_be_bytes([header[8], header[9], header[10], header[11]]);
+    if len > TACACS_MAX_REPLY {
+        bail!("the TACACS+ server declared a {len}-byte reply, which is not a plausible reply");
+    }
+    let mut body = vec![0u8; len as usize];
+    stream
+        .read_exact(&mut body)
+        .context("the TACACS+ reply ended before its declared length")?;
+    let pad = tacacs_pad(session_id, secret, seq_no, body.len());
+    for (b, p) in body.iter_mut().zip(&pad) {
+        *b ^= p;
+    }
+    Ok(body)
+}
+
+/// Ask a TACACS+ server whether this username and password are good, over the
+/// ASCII authentication flow of RFC 8907.
+///
+/// Returns [`Directory::Accepted`] on PASS, [`Directory::Rejected`] on FAIL,
+/// and an error when the server could not be reached or the conversation went
+/// somewhere this client does not follow. The caller must keep those apart for
+/// the same reason as with RADIUS and LDAP: a server that is down is not a
+/// wrong password, and treating it as one locks everybody out at the worst
+/// moment.
+pub fn tacacs_authenticate(
+    server: &str,
+    port: u16,
+    secret: &str,
+    username: &str,
+    password: &str,
+    timeout: Duration,
+) -> Result<Directory> {
+    use std::io::Write;
+    let target = (server, port)
+        .to_socket_addrs()
+        .with_context(|| format!("resolving the TACACS+ server {server}"))?
+        .next()
+        .ok_or_else(|| anyhow!("the TACACS+ server {server} resolved to nothing"))?;
+    let mut stream = std::net::TcpStream::connect_timeout(&target, timeout)
+        .with_context(|| format!("connecting to the TACACS+ server {server}"))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+
+    let mut session_id = [0u8; 4];
+    getrandom::getrandom(&mut session_id).context("entropy for the TACACS+ session id")?;
+
+    // Where this login arrived, for the server's own log line.
+    let start = tacacs_start_body(username, "api", "")?;
+    stream
+        .write_all(&tacacs_packet(&session_id, secret, 1, &start))
+        .with_context(|| format!("sending to the TACACS+ server {server}"))?;
+
+    // START is seq 1; the server's replies are even, ours odd. The password
+    // goes over the wire once: a server that asks again after receiving it is
+    // off-script, and the loop ends rather than repeating a credential.
+    let mut seq = 2u8;
+    let mut sent_password = false;
+    loop {
+        let body = tacacs_read_reply(&mut stream, &session_id, secret, seq)?;
+        let (status, server_msg) = tacacs_parse_reply(&body)?;
+        let answer = match status {
+            TACACS_STATUS_PASS => return Ok(Directory::Accepted),
+            TACACS_STATUS_FAIL => return Ok(Directory::Rejected),
+            // A server may ask for the username even though START carried it.
+            TACACS_STATUS_GETUSER => username,
+            TACACS_STATUS_GETPASS if !sent_password => {
+                sent_password = true;
+                password
+            }
+            TACACS_STATUS_GETPASS => {
+                bail!("the TACACS+ server asked for the password twice; not repeating it")
+            }
+            TACACS_STATUS_ERROR => bail!(
+                "the TACACS+ server reported an error{}",
+                if server_msg.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {server_msg}")
+                }
+            ),
+            other => bail!(
+                "the TACACS+ server answered status {other}, which the ASCII login flow \
+                 does not use"
+            ),
+        };
+        seq = seq
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("the TACACS+ conversation ran past 255 packets"))?;
+        stream
+            .write_all(&tacacs_packet(&session_id, secret, seq, &tacacs_continue_body(answer)?))
+            .with_context(|| format!("sending to the TACACS+ server {server}"))?;
+        seq = seq
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("the TACACS+ conversation ran past 255 packets"))?;
+    }
+}
+
 /// Now, as a Unix time. Split out so the TOTP check can be driven from a test.
 pub fn unix_now() -> u64 {
     SystemTime::now()
@@ -722,5 +1017,140 @@ mod tests {
         // An empty password still occupies a block — a zero-length attribute is
         // malformed, and some servers drop the whole packet for it.
         assert_eq!(hide_password("", "shared", &auth).len(), 16);
+    }
+
+    /// The START body, pinned octet by octet against RFC 8907 §5.1 — written
+    /// out by hand from the RFC's field layout, not produced by the encoder
+    /// under test. A codec that only agrees with itself has been wrong here
+    /// before (the OSPF flag byte), and a TACACS+ server would answer such a
+    /// packet with silence.
+    #[test]
+    fn tacacs_start_is_the_rfc_wire_layout() {
+        let body = tacacs_start_body("alice", "api", "").unwrap();
+        let expected: &[u8] = &[
+            0x01, // action: LOGIN
+            0x01, // priv_lvl: user
+            0x01, // authen_type: ASCII
+            0x01, // authen_service: login
+            0x05, // user_len:      "alice"
+            0x03, // port_len:      "api"
+            0x00, // rem_addr_len
+            0x00, // data_len
+            b'a', b'l', b'i', b'c', b'e', b'a', b'p', b'i',
+        ];
+        assert_eq!(body, expected);
+
+        // A name that does not fit its one-octet length field is refused, not
+        // truncated — a wrapped length would declare a short field and leave
+        // the tail to be misparsed as the ones after it.
+        assert!(tacacs_start_body(&"x".repeat(256), "api", "").is_err());
+    }
+
+    /// The CONTINUE body (§5.3), likewise pinned by hand: two 16-bit
+    /// big-endian lengths, a flag octet, then the text.
+    #[test]
+    fn tacacs_continue_is_the_rfc_wire_layout() {
+        let body = tacacs_continue_body("hunter2").unwrap();
+        let expected: &[u8] = &[
+            0x00, 0x07, // user_msg_len
+            0x00, 0x00, // data_len
+            0x00, // flags
+            b'h', b'u', b'n', b't', b'e', b'r', b'2',
+        ];
+        assert_eq!(body, expected);
+    }
+
+    /// The 12-byte header (§4.1), pinned by hand around a body of known
+    /// length: version 0xc0, type authentication, the sequence number, a zero
+    /// flag octet (obfuscated), the session id, and a 32-bit big-endian body
+    /// length.
+    #[test]
+    fn tacacs_header_is_the_rfc_wire_layout() {
+        let session = [0x01u8, 0x02, 0x03, 0x04];
+        let packet = tacacs_packet(&session, "s3cret", 1, &[0u8; 20]);
+        assert_eq!(
+            &packet[..12],
+            &[0xc0, 0x01, 0x01, 0x00, 0x01, 0x02, 0x03, 0x04, 0x00, 0x00, 0x00, 0x14],
+        );
+        assert_eq!(packet.len(), 12 + 20);
+    }
+
+    /// The §4.5 pseudo-pad, checked against the RFC's formula computed
+    /// longhand: MD5(session_id ‖ secret ‖ version ‖ seq), then each further
+    /// block re-including the previous digest. The chaining is the part an
+    /// implementation gets wrong — a pad that repeats its first block XORs the
+    /// second body block against the wrong bytes, and every login fails with
+    /// no hint why. (MD5 itself is pinned against RFC 1321 above.)
+    #[test]
+    fn tacacs_pad_chains_the_way_the_rfc_says() {
+        let session = [0xde, 0xad, 0xbe, 0xef];
+        let pad = tacacs_pad(&session, "shared", 3, 20);
+
+        let mut seed = session.to_vec();
+        seed.extend_from_slice(b"shared");
+        seed.push(0xc0); // version
+        seed.push(3); // seq_no
+        let first = md5(&seed);
+        assert_eq!(&pad[..16], &first);
+
+        let mut seed2 = seed.clone();
+        seed2.extend_from_slice(&first);
+        assert_eq!(&pad[16..20], &md5(&seed2)[..4]);
+
+        // A pad for a different sequence number is a different pad — reusing
+        // one across packets would make the XOR trivially strippable.
+        assert_ne!(tacacs_pad(&session, "shared", 1, 16), pad[..16].to_vec());
+    }
+
+    /// Obfuscation is XOR against the pad and nothing else, so applying it
+    /// twice returns the body — which is also how a reply is read.
+    #[test]
+    fn tacacs_obfuscation_is_an_involution() {
+        let session = [7u8, 7, 7, 7];
+        let body = tacacs_start_body("bob", "api", "").unwrap();
+        let packet = tacacs_packet(&session, "key", 1, &body);
+        let pad = tacacs_pad(&session, "key", 1, body.len());
+        let clear: Vec<u8> = packet[12..].iter().zip(&pad).map(|(b, p)| b ^ p).collect();
+        assert_eq!(clear, body);
+        // …and without the pad, the password-carrying bytes are not on the
+        // wire in the clear.
+        assert_ne!(&packet[12..], &body[..]);
+    }
+
+    /// A REPLY body parsed from hand-written bytes (§5.2): status, flags, two
+    /// big-endian lengths, then the server's message.
+    #[test]
+    fn tacacs_reply_parses_from_raw_bytes() {
+        // A GETPASS with the classic prompt.
+        let mut reply = vec![0x05, 0x00, 0x00, 0x0a, 0x00, 0x00];
+        reply.extend_from_slice(b"Password: ");
+        assert_eq!(tacacs_parse_reply(&reply).unwrap(), (5, "Password: ".to_string()));
+
+        // A bare PASS and a bare FAIL.
+        assert_eq!(tacacs_parse_reply(&[0x01, 0, 0, 0, 0, 0]).unwrap().0, 1);
+        assert_eq!(tacacs_parse_reply(&[0x02, 0, 0, 0, 0, 0]).unwrap().0, 2);
+
+        // A reply whose declared lengths overrun the bytes that actually
+        // arrived is refused — reading on would read the pseudo-pad as text.
+        assert!(tacacs_parse_reply(&[0x01, 0x00, 0xff, 0xff, 0x00, 0x00]).is_err());
+        // And a runt shorter than the fixed part is not a reply at all.
+        assert!(tacacs_parse_reply(&[0x01, 0x00]).is_err());
+    }
+
+    /// Nobody is listening on a closed port, and that must come back as an
+    /// error — the "could not ask" that keeps the login moving to the local
+    /// account — never as a rejection.
+    #[test]
+    fn an_unreachable_tacacs_server_is_an_error_not_a_rejection() {
+        // A TEST-NET-1 address with a tiny timeout: nothing routable answers.
+        let out = tacacs_authenticate(
+            "192.0.2.1",
+            49,
+            "secret",
+            "alice",
+            "pw",
+            Duration::from_millis(50),
+        );
+        assert!(out.is_err(), "an unreachable server must be an error");
     }
 }

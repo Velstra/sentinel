@@ -116,6 +116,8 @@
             --set SENTINEL_MOUNT_BIN      ${pkgs.util-linux}/bin/mount \
             --set SENTINEL_UMOUNT_BIN     ${pkgs.util-linux}/bin/umount \
             --set SENTINEL_FINDMNT_BIN    ${pkgs.util-linux}/bin/findmnt \
+            --set SENTINEL_CRYPTSETUP_BIN ${pkgs.cryptsetup}/bin/cryptsetup \
+            --set SENTINEL_ASK_PASSWORD_BIN ${pkgs.systemd}/bin/systemd-ask-password \
             --prefix PATH : /run/wrappers/bin
         '';
       };
@@ -337,6 +339,14 @@
       # velstra agent runs the build-time-compiled firewall config as a systemd
       # service — so the box filters as part of the immutable, rollback-able
       # generation.
+      # The appliance factory, shared with sibling products (the Velstra Cloud
+      # compute node builds with it). Product identity, sizing and branding are
+      # `velstra.appliance.*` / `velstra.iso.*` options whose defaults are
+      # Sentinel's values; Sentinel itself consumes them via the thin wrappers
+      # nix/image.nix and nix/iso.nix, so its image is unchanged by the sharing.
+      nixosModules.applianceImage = ./nix/appliance-image.nix;
+      nixosModules.applianceIso = ./nix/appliance-iso.nix;
+
       nixosModules.sentinel =
         { pkgs, lib, ... }:
         {
@@ -2292,6 +2302,107 @@
               f"https://127.0.0.1:8080{paths[0]}"
           ).strip()
           assert code == "401", f"{paths[0]} served data without a token ({code})"
+        '';
+      };
+
+      # Admin AAA against a real directory (roadmap C12): a genuine TACACS+
+      # server — Shrubbery's tac_plus, from nixpkgs — on the VM, the appliance
+      # pointed at it, and sign-ins through the same API endpoint the console
+      # uses. This exercises the RFC 8907 ASCII flow end to end (START, GETPASS,
+      # CONTINUE, PASS/FAIL) against an implementation this repo did not write,
+      # so a green run means the wire format is right rather than merely
+      # self-consistent. It also pins the two answers that must never blur:
+      # a wrong password is a 401 naming TACACS+, an unreachable server is a
+      # 503 — and the local account still gets in while the directory is down,
+      # which is the local-first rule doing its job.
+      #   nix build .#checks.x86_64-linux.aaa -L
+      aaa = pkgs.testers.runNixOSTest {
+        name = "sentinel-aaa";
+        nodes.machine = {
+          imports = [ self.nixosModules.sentinel ];
+          virtualisation.memorySize = 2048;
+          environment.systemPackages = [ pkgs.curl ];
+          systemd.services.tac-plus = {
+            wantedBy = [ "multi-user.target" ];
+            after = [ "network.target" ];
+            serviceConfig = {
+              Type = "exec";
+              ExecStart = "${pkgs.tacacsplus}/bin/tac_plus -G -C ${
+                pkgs.writeText "tac_plus.conf" ''
+                  key = "vm-shared-secret"
+                  user = tacuser {
+                      login = cleartext "tacpass123"
+                  }
+                ''
+              }";
+            };
+          };
+        };
+        testScript = ''
+          machine.wait_for_unit("multi-user.target")
+          machine.wait_for_unit("sentinel-boot.service")
+          machine.wait_for_unit("tac-plus.service")
+          machine.wait_for_open_port(49)
+
+          machine.succeed("systemctl start sentinel-api.service")
+          machine.wait_for_unit("sentinel-api.service")
+          machine.wait_for_open_port(8080)
+
+          # Point the appliance at the server. `tacuser` exists only in the
+          # directory — no local entry — so its rights come from default-group,
+          # and `vera` is the local account the outage half of the test needs.
+          machine.succeed(
+              "su admin -c \"printf '%s\\n' "
+              "'set system group operators permission read-only' "
+              "'set system aaa tacacs 127.0.0.1 secret vm-shared-secret' "
+              "'set system aaa default-group operators' "
+              "'set system login vera password local-pass-9' "
+              "'set system login vera group operators' "
+              "commit save exit "
+              "| sentinel configure\""
+          )
+
+          # A directory account signs in through the same endpoint the console
+          # uses, and gets the default group's permission.
+          out = machine.wait_until_succeeds(
+              "curl -fsSk -X POST -H 'Content-Type: application/json' "
+              "-d '{\"username\":\"tacuser\",\"password\":\"tacpass123\"}' "
+              "https://127.0.0.1:8080/api/v1/login",
+              timeout=60,
+          )
+          assert '"token"' in out and "read-only" in out, out
+
+          # A wrong password is a 401 — an answer, from the server that gave
+          # it, and the refusal says which protocol refused.
+          code = machine.succeed(
+              "curl -sk -o /tmp/refusal -w '%{http_code}' -X POST "
+              "-H 'Content-Type: application/json' "
+              "-d '{\"username\":\"tacuser\",\"password\":\"wrong\"}' "
+              "https://127.0.0.1:8080/api/v1/login"
+          ).strip()
+          assert code == "401", f"a rejected password returned {code} (want 401)"
+          refusal = machine.succeed("cat /tmp/refusal")
+          assert "TACACS+" in refusal, refusal
+
+          # Stop the directory. The right directory password now gets a 503 —
+          # "could not ask" — never a 401 pretending the password was wrong…
+          machine.succeed("systemctl stop tac-plus.service")
+          code = machine.succeed(
+              "curl -sk -o /dev/null -w '%{http_code}' -X POST "
+              "-H 'Content-Type: application/json' "
+              "-d '{\"username\":\"tacuser\",\"password\":\"tacpass123\"}' "
+              "https://127.0.0.1:8080/api/v1/login"
+          ).strip()
+          assert code == "503", f"an unreachable server returned {code} (want 503)"
+
+          # …and the local account written on the box still gets in, which is
+          # the local-first rule at exactly the moment it exists for.
+          out = machine.succeed(
+              "curl -fsSk -X POST -H 'Content-Type: application/json' "
+              "-d '{\"username\":\"vera\",\"password\":\"local-pass-9\"}' "
+              "https://127.0.0.1:8080/api/v1/login"
+          )
+          assert '"token"' in out, out
         '';
       };
 
@@ -5961,6 +6072,110 @@
             '';
         };
 
+        # Encrypted install (LUKS2). Boots the appliance image, installs onto a
+        # blank target with `--encrypt`, and proves the writable data partition is
+        # a LUKS2 container (not plaintext ext4), that the passphrase opens it, and
+        # that the ext4 (LABEL=data) — where every at-rest secret lives — is INSIDE
+        # the encrypted volume.
+        #
+        # It exercises the on-disk half here (install + cryptsetup open). The
+        # boot-time `sentinel-unlock.service` ordering is asserted by the unit
+        # tests' device chooser plus this volume being a real, openable LUKS2; a
+        # full reboot-into-encrypted is the same OVMF limit checks.update documents.
+        #   nix build .#checks.x86_64-linux.luks -L
+        luks = pkgs.testers.runNixOSTest {
+          name = "sentinel-luks";
+          nodes.machine = {
+            imports = [
+              self.nixosModules.sentinel
+              ./nix/image.nix
+            ];
+            virtualisation = {
+              directBoot.enable = false;
+              mountHostNixStore = false;
+              useEFIBoot = true;
+              memorySize = 2048;
+              # One blank target, big enough for the cloned layout (see the
+              # install test for the sizing rationale).
+              emptyDiskImages = [ 8000 ];
+              fileSystems = lib.mkVMOverride { };
+            };
+            # `cryptsetup` for the test's OWN open/close (the appliance reaches its
+            # pinned SENTINEL_CRYPTSETUP_BIN); `blkid` comes with util-linux.
+            environment.systemPackages = [ pkgs.cryptsetup ];
+          };
+          testScript =
+            { nodes, ... }:
+            ''
+              import os
+              import subprocess
+              import tempfile
+
+              tmp = tempfile.NamedTemporaryFile()
+              subprocess.run([
+                "${nodes.machine.virtualisation.qemu.package}/bin/qemu-img",
+                "create", "-f", "qcow2",
+                "-b", "${nodes.machine.system.build.finalImage}/${nodes.machine.image.filePath}",
+                "-F", "raw", tmp.name,
+              ], check=True)
+              os.environ["NIX_DISK_IMAGE"] = tmp.name
+
+              machine.wait_for_unit("multi-user.target")
+
+              secret = "correct-horse-battery-staple"
+
+              with subtest("`sentinel unlock` is a no-op while no volume is encrypted"):
+                  # The booted appliance's own data partition is not encrypted and
+                  # nothing else is a LUKS device yet, so the boot-time unlock
+                  # command finds nothing to do and exits 0 (checked BEFORE the
+                  # encrypted install below adds a crypto_LUKS device).
+                  # unlock logs to stderr (a boot-service convention), so fold it in.
+                  out = machine.succeed("sentinel unlock 2>&1")
+                  assert "nothing to unlock" in out.lower(), out
+
+              with subtest("an encrypted install lays down a LUKS2 data partition"):
+                  machine.succeed(
+                      f"SENTINEL_LUKS_PASSPHRASE={secret} "
+                      "sentinel install /dev/vdb --encrypt --commit"
+                  )
+                  machine.succeed("udevadm settle")
+                  # Partition 6 is a LUKS2 container, not a bare ext4.
+                  fstype = machine.succeed("blkid -s TYPE -o value /dev/vdb6").strip()
+                  assert fstype == "crypto_LUKS", f"data partition should be LUKS, got {fstype!r}"
+                  # The install closed the volume: nothing is left unlocked.
+                  machine.fail("test -e /dev/mapper/data")
+
+              with subtest("the passphrase opens it and the ext4 (LABEL=data) is inside"):
+                  machine.succeed(
+                      f"printf '%s' {secret} | cryptsetup open --key-file - /dev/vdb6 data"
+                  )
+                  blk = machine.succeed("blkid /dev/mapper/data")
+                  assert 'TYPE="ext4"' in blk, blk
+                  assert 'LABEL="data"' in blk, blk
+
+              with subtest("the at-rest secrets are on the encrypted volume, not the raw partition"):
+                  # The raw partition carries no plaintext ext4 signature — only the
+                  # LUKS header. The filesystem (and everything on it) is inside.
+                  raw = machine.succeed("blkid /dev/vdb6")
+                  assert 'TYPE="ext4"' not in raw, f"the raw partition must be opaque: {raw}"
+                  machine.succeed("mkdir -p /mnt/data && mount /dev/mapper/data /mnt/data")
+                  # A fresh data filesystem (the non-interactive install does not
+                  # seed a config); the point is that it is real, writable, and only
+                  # reachable through the open volume.
+                  machine.succeed("echo tls-private-key > /mnt/data/secret && sync")
+                  machine.succeed("umount /mnt/data")
+                  machine.succeed("cryptsetup close data")
+                  # With the volume closed the secret is not findable in the clear.
+                  machine.fail("test -e /dev/mapper/data")
+
+              with subtest("a wrong passphrase is refused"):
+                  rc, out = machine.execute(
+                      "printf '%s' WRONG-PASSPHRASE | cryptsetup open --key-file - /dev/vdb6 data 2>&1"
+                  )
+                  assert rc != 0, f"a wrong passphrase must be refused: {out}"
+            '';
+        };
+
         # Boots the live installer environment (the ISO config) and installs onto
         # a blank disk from the BUNDLED image via the `--source` path (no booted
         # verity store to clone) — the real live-boot flow. Verifies the target
@@ -6094,6 +6309,106 @@
           '';
         };
 
+        # The guided installer's ENCRYPTION step, driven end to end. Same live
+        # environment as `wizard`, but the wizard's disk-encryption toggle is
+        # taken and a passphrase entered — proving the wizard drives the very
+        # same `install::Crypto::Luks` path `sentinel install --encrypt` uses.
+        #
+        # What it asserts: the target's data partition comes out a LUKS2
+        # container (not plaintext ext4), the passphrase opens it, and the
+        # config the wizard seeded is INSIDE that encrypted volume and is one the
+        # appliance accepts. The reboot-into-encrypted-and-SSH half is the same
+        # OVMF limit `checks.wizard`/`checks.update` document, so it waits for a
+        # harness that can boot the installed image; the on-disk crypto is proved
+        # here, exactly as `checks.luks` proves it for `--encrypt`.
+        #
+        #   nix build .#checks.x86_64-linux.wizard-encrypted -L
+        wizard-encrypted = pkgs.testers.runNixOSTest {
+          name = "sentinel-wizard-encrypted";
+          nodes.machine =
+            { pkgs, ... }:
+            {
+              imports = [ ./nix/iso.nix ];
+              _module.args = {
+                sentinelPkg = sentinel;
+                inherit sentinelImageRaw;
+              };
+              virtualisation = {
+                memorySize = 4096; # argon2id keyslot headroom under the expect-driven wizard
+                mountHostNixStore = true;
+                # Must exceed the raw appliance image (two 2560M store slots +
+                # their verity trees + ESP ≈ 5.6G) — the install clones it whole.
+                emptyDiskImages = [ 8000 ]; # vdb — the install target
+              };
+              # expect drives the pty; cryptsetup is for the test's OWN open of
+              # the resulting volume (the appliance resolves its own by absolute
+              # path and does not rely on PATH).
+              environment.systemPackages = [
+                pkgs.expect
+                pkgs.cryptsetup
+              ];
+            };
+          testScript = ''
+            machine.wait_for_unit("multi-user.target")
+
+            secret = "correcthorsebattery-luks"
+
+            # Read the target's disk number off the wizard's own candidate
+            # listing, the way an operator reads it off the screen.
+            listing = machine.succeed("sentinel install < /dev/null")
+            picks = [
+                line.split("]")[0].strip().lstrip("[")
+                for line in listing.splitlines()
+                if "/dev/vdb" in line
+            ]
+            assert len(picks) == 1, listing
+
+            with subtest("the wizard installs with encryption turned on"):
+                rc, _ = machine.execute(
+                    f"SENTINEL_INSTALL_SOURCE=${sentinelImageRaw} PICK={picks[0]} "
+                    f"PASSPHRASE={secret} "
+                    "timeout 1200 expect -f ${./nix/drive-wizard-encrypted.exp} "
+                    "> /tmp/wizard.log 2>&1",
+                    timeout=1500,
+                )
+                transcript = machine.succeed("tr '\\r' '\\n' < /tmp/wizard.log")
+                assert rc == 0, f"the wizard exited {rc}; transcript:\n{transcript}"
+                machine.succeed("udevadm settle")
+                # The passphrase is never echoed while typed nor printed back —
+                # an install is done over whatever console is at hand.
+                assert secret not in transcript, transcript
+
+            with subtest("the target's data partition is a LUKS2 container"):
+                fstype = machine.succeed("blkid -s TYPE -o value /dev/vdb6").strip()
+                assert fstype == "crypto_LUKS", f"data partition should be LUKS, got {fstype!r}"
+                # The install closed the volume behind it — nothing left unlocked.
+                assert "/dev/mapper/data" not in machine.succeed("ls /dev/mapper")
+
+            with subtest("the passphrase opens it and the seeded config is inside"):
+                machine.succeed(
+                    f"printf '%s' {secret} | cryptsetup open --key-file - /dev/vdb6 data"
+                )
+                machine.succeed("mkdir -p /mnt/data && mount /dev/mapper/data /mnt/data")
+                cfg = machine.succeed("cat /mnt/data/appliance.toml")
+                assert 'hostname = "fw-crypt"' in cfg, cfg
+                assert 'keyboard = "de"' in cfg, cfg
+                # The passphrase is an install-time secret, never written to the
+                # config, and the login password is stored hashed, never plain.
+                assert secret not in cfg, cfg
+                assert "correcthorsebattery" not in cfg, cfg
+
+            with subtest("the seeded configuration is one the appliance accepts"):
+                machine.succeed("sentinel config check /mnt/data/appliance.toml")
+                machine.succeed("umount /mnt/data && cryptsetup close data")
+
+            with subtest("a wrong passphrase is refused"):
+                rc, out = machine.execute(
+                    "printf '%s' WRONG | cryptsetup open --key-file - /dev/vdb6 data 2>&1"
+                )
+                assert rc != 0, f"a wrong passphrase must be refused: {out}"
+          '';
+        };
+
         install-iso = pkgs.testers.runNixOSTest {
           name = "sentinel-install-iso";
           nodes.machine = {
@@ -6186,7 +6501,11 @@
                   assert f"{src}3" in machine.succeed("lsblk -nsro NAME /dev/mapper/usr")
 
               with subtest("update writes + verity-types the inactive slot B"):
-                  machine.succeed(f"sentinel update --commit {disk}")
+                  # A re-seal from the booted medium is a block device with no
+                  # detached signature — the trusted-operator escape hatch, so it
+                  # takes --allow-unsigned. (The default-secure refusal and the
+                  # signed-image path are proven by checks.updatelocal.)
+                  machine.succeed(f"sentinel update --commit --allow-unsigned {disk}")
                   machine.succeed("udevadm settle")
                   usr = "8484680c-9521-48c6-9c11-b0720656f69e"
                   usrv = "77ff5f63-e7b6-4633-acf4-1565b864c0e6"
@@ -6338,6 +6657,283 @@
                 )
           '';
         };
+
+        # LOCAL image signature enforcement (the supply-chain hole this closes):
+        # `sentinel update <image>` now verifies a detached signature by default,
+        # exactly like the channel path — a local install is no longer a way
+        # around it. Like updatechannel this proves the CRYPTO GATE only (it needs
+        # no A/B disk: verification runs before the slot-writer, which then fails
+        # at find_source_disk — reaching THAT is the proof the gate passed).
+        #   nix build .#checks.x86_64-linux.updatelocal -L
+        updatelocal = pkgs.testers.runNixOSTest {
+          name = "sentinel-updatelocal";
+          nodes.machine = {
+            imports = [ self.nixosModules.sentinel ];
+            virtualisation.memorySize = 1024;
+            environment.systemPackages = [ pkgs.openssl ];
+          };
+          testScript = ''
+            machine.wait_for_unit("multi-user.target")
+
+            with subtest("a pinned Ed25519 key, a fixture image, and a WRONG key"):
+                machine.succeed("openssl genpkey -algorithm ed25519 -out /tmp/priv.pem")
+                machine.succeed("openssl pkey -in /tmp/priv.pem -pubout -out /tmp/pub.pem")
+                machine.succeed("openssl genpkey -algorithm ed25519 -out /tmp/wrong-priv.pem")
+                machine.succeed("openssl pkey -in /tmp/wrong-priv.pem -pubout -out /tmp/wrong-pub.pem")
+                machine.succeed("head -c 4096 /dev/urandom > /tmp/img.raw")
+
+            with subtest("DEFAULT-SECURE: no key and no signature refuses the write"):
+                # No channel pinned, no /etc/sentinel/release.pem, no --pubkey:
+                # nothing to verify against, so the write is refused up front.
+                status, out = machine.execute("sentinel update /tmp/img.raw 2>&1")
+                assert status != 0, f"an unverifiable local image must be refused: {out}"
+                assert "public key" in out.lower(), (
+                    f"expected 'no release public key' refusal: {out}"
+                )
+
+            with subtest("a key but NO signature is still refused"):
+                status, out = machine.execute(
+                    "sentinel update /tmp/img.raw --pubkey file:/tmp/pub.pem 2>&1"
+                )
+                assert status != 0, f"a missing .sig must be refused: {out}"
+                assert "no detached signature" in out.lower(), (
+                    f"expected a missing-signature refusal: {out}"
+                )
+
+            with subtest("GOOD: a correctly signed image passes the gate and reaches the writer"):
+                machine.succeed(
+                    "openssl pkeyutl -sign -inkey /tmp/priv.pem -rawin "
+                    "-in /tmp/img.raw -out /tmp/img.raw.sig"
+                )
+                # No A/B disk here, so the writer fails at find_source_disk — but
+                # ONLY a signature-verified image gets that far, which is the proof.
+                status, out = machine.execute(
+                    "sentinel update /tmp/img.raw --pubkey file:/tmp/pub.pem 2>&1"
+                )
+                assert status != 0, f"expected the writer to fail without a disk: {out}"
+                assert "signature verified" in out.lower(), (
+                    f"verification should report success: {out}"
+                )
+                assert "could not resolve the source disk" in out, (
+                    f"a verified image must reach the slot-writer: {out}"
+                )
+
+            with subtest("WRONG key: verification fails closed (image never written)"):
+                status, out = machine.execute(
+                    "sentinel update /tmp/img.raw --pubkey file:/tmp/wrong-pub.pem 2>&1"
+                )
+                assert status != 0, f"a wrong-key signature must be refused: {out}"
+                assert "signature verification failed" in out.lower(), (
+                    f"expected a signature verification failure: {out}"
+                )
+
+            with subtest("--allow-unsigned honours the escape hatch, loudly"):
+                # Remove the signature so ONLY --allow-unsigned could let it through.
+                machine.succeed("rm -f /tmp/img.raw.sig")
+                status, out = machine.execute(
+                    "sentinel update /tmp/img.raw --allow-unsigned 2>&1"
+                )
+                # Warns loudly, skips verification, and reaches the writer (which
+                # fails for want of a disk — the proof it got past the gate).
+                assert "allow-unsigned" in out.lower(), f"the bypass must warn: {out}"
+                assert "could not resolve the source disk" in out, (
+                    f"--allow-unsigned must reach the slot-writer: {out}"
+                )
+
+            with subtest("a channel public-key is used to verify a local image too"):
+                # Re-sign, pin the SAME key as an [update] channel public-key, then
+                # update WITHOUT --pubkey: the channel key is the fallback.
+                machine.succeed("mkdir -p /tmp/chan")
+                machine.succeed(
+                    "openssl pkeyutl -sign -inkey /tmp/priv.pem -rawin "
+                    "-in /tmp/img.raw -out /tmp/img.raw.sig"
+                )
+                machine.succeed(
+                    "su admin -c \"printf '%s\\n' "
+                    "'set update url file:///tmp/chan' "
+                    "'set update public-key file:/tmp/pub.pem' "
+                    "commit save exit "
+                    "| sentinel configure --no-apply\""
+                )
+                status, out = machine.execute("sentinel update /tmp/img.raw 2>&1")
+                assert status != 0, out
+                assert "signature verified" in out.lower(), (
+                    f"the channel public-key should verify the local image: {out}"
+                )
+          '';
+        };
+
+        # The subscription/enterprise channel's ENTITLEMENT GATE (the channel
+        # side of the Proxmox-style model in LICENSING.md): a channel that
+        # requires a bearer token serves the image when the subscription key is
+        # right, and refuses with the honest message when it is wrong — and a
+        # refusal changes NOTHING about the appliance (the product commitment:
+        # an expired subscription never bricks or degrades the box, it only
+        # makes new images from that channel unavailable). Like updatechannel
+        # this proves the gate only, no A/B disk. The channel server is a small
+        # scripted HTTPS responder inside the VM; its certificate is minted at
+        # build time and handed to the fetch via CURL_CA_BUNDLE, since a test
+        # CA in the real trust store would prove less about a real deployment,
+        # not more.
+        #   nix build .#checks.x86_64-linux.updatesub -L
+        updatesub =
+          let
+            tls = pkgs.runCommand "updatesub-tls" {
+              nativeBuildInputs = [ pkgs.openssl ];
+            } ''
+              mkdir -p $out
+              openssl req -x509 -newkey ed25519 -nodes -days 36500 \
+                -keyout $out/key.pem -out $out/cert.pem \
+                -subj "/CN=localhost" \
+                -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+            '';
+            # The channel server: serves /tmp/chan/* over TLS, but only to a
+            # caller presenting the right bearer token — anything else is a 401
+            # with no body worth having. Content-Length is sent so curl -f
+            # completes the transfer before the connection closes.
+            responder = pkgs.writeText "subchan.py" ''
+              import http.server, os, ssl
+
+              KEY = "velstra-ent-a1b2c3d4"
+              CHAN = "/tmp/chan"
+
+              class H(http.server.BaseHTTPRequestHandler):
+                  def do_GET(self):
+                      if self.headers.get("Authorization", "") != f"Bearer {KEY}":
+                          body = b"subscription required"
+                          self.send_response(401)
+                      else:
+                          name = os.path.basename(self.path)
+                          try:
+                              with open(os.path.join(CHAN, name), "rb") as f:
+                                  body = f.read()
+                              self.send_response(200)
+                          except OSError:
+                              body = b"no such release file"
+                              self.send_response(404)
+                      self.send_header("Content-Length", str(len(body)))
+                      self.end_headers()
+                      self.wfile.write(body)
+
+                  def log_message(self, *a):
+                      pass
+
+              srv = http.server.HTTPServer(("127.0.0.1", 8443), H)
+              ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+              ctx.load_cert_chain("${tls}/cert.pem", "${tls}/key.pem")
+              srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+              srv.serve_forever()
+            '';
+          in
+          pkgs.testers.runNixOSTest {
+            name = "sentinel-updatesub";
+            nodes.machine = {
+              imports = [ self.nixosModules.sentinel ];
+              virtualisation.memorySize = 1024;
+              environment.systemPackages = [
+                pkgs.openssl
+                pkgs.python3
+              ];
+            };
+            testScript = ''
+              # The fetch path is the pinned curl; the test CA rides an env var
+              # rather than the system trust store (see the comment above).
+              CA = "CURL_CA_BUNDLE=${tls}/cert.pem"
+
+              machine.wait_for_unit("multi-user.target")
+              machine.wait_for_unit("sentinel-boot.service")
+              machine.succeed("test -f /var/lib/sentinel/appliance.toml")
+
+              with subtest("a signed channel directory + the bearer-gated server"):
+                  machine.succeed("mkdir -p /tmp/chan")
+                  machine.succeed("openssl genpkey -algorithm ed25519 -out /tmp/priv.pem")
+                  machine.succeed("openssl pkey -in /tmp/priv.pem -pubout -out /tmp/pub.pem")
+                  machine.succeed("head -c 4096 /dev/urandom > /tmp/chan/sentinel-0.3.0.img")
+                  sha = machine.succeed(
+                      "openssl dgst -sha256 /tmp/chan/sentinel-0.3.0.img | awk '{print $NF}'"
+                  ).strip()
+                  machine.succeed(
+                      "printf '%s' "
+                      "'{\"version\":\"0.3.0\",\"image\":\"sentinel-0.3.0.img\",\"sha256\":\"'"
+                      + sha + "'\"}' > /tmp/chan/manifest.json"
+                  )
+                  machine.succeed(
+                      "openssl pkeyutl -sign -inkey /tmp/priv.pem -rawin "
+                      "-in /tmp/chan/manifest.json -out /tmp/chan/manifest.json.sig"
+                  )
+                  machine.succeed(
+                      "python3 ${responder} >/dev/null 2>&1 &"
+                  )
+                  machine.wait_for_open_port(8443)
+
+              with subtest("pin the channel with a WRONG subscription key"):
+                  machine.succeed(
+                      "su admin -c \"printf '%s\\n' "
+                      "'set update channel enterprise url https://localhost:8443' "
+                      "'set update channel enterprise public-key file:/tmp/pub.pem' "
+                      "'set update channel enterprise subscription-key wrong-key-0000' "
+                      "'set update channel enterprise' "
+                      "commit save exit "
+                      "| sentinel configure --no-apply\""
+                  )
+                  machine.succeed(
+                      "grep -q 'https://localhost:8443' /var/lib/sentinel/appliance.toml"
+                  )
+
+              with subtest("a rejected subscription refuses honestly and changes NOTHING"):
+                  before = machine.succeed(
+                      "sha256sum /var/lib/sentinel/appliance.toml"
+                  ).strip()
+                  status, out = machine.execute(f"{CA} sentinel update check 2>&1")
+                  assert status != 0, f"a 401 must fail the check: {out}"
+                  assert "not valid for this channel" in out, (
+                      f"expected the honest entitlement refusal: {out}"
+                  )
+                  assert "keeps running unchanged" in out, (
+                      f"the refusal must state the no-brick promise: {out}"
+                  )
+                  assert "wrong-key-0000" not in out, (
+                      f"the refusal must not echo the key: {out}"
+                  )
+                  after = machine.succeed(
+                      "sha256sum /var/lib/sentinel/appliance.toml"
+                  ).strip()
+                  assert before == after, "the refusal must not touch the configuration"
+                  # …and the appliance still answers as itself.
+                  machine.succeed("sentinel show version")
+
+              with subtest("`show subscription` reports the state, key masked"):
+                  out = machine.succeed("sentinel show subscription")
+                  assert "enterprise" in out, out
+                  assert "key configured" in out, out
+                  assert "wrong-key-0000" not in out, (
+                      f"the subscription key must never appear in show output: {out}"
+                  )
+                  assert "not valid for this channel" in out, (
+                      f"the last check's outcome should be on record: {out}"
+                  )
+
+              with subtest("the RIGHT key is served the signed release"):
+                  machine.succeed(
+                      "su admin -c \"printf '%s\\n' "
+                      "'set update channel enterprise subscription-key velstra-ent-a1b2c3d4' "
+                      "commit save exit "
+                      "| sentinel configure --no-apply\""
+                  )
+                  out = machine.succeed(f"{CA} sentinel update check")
+                  assert "0.3.0" in out, f"check should report the signed version: {out}"
+
+              with subtest("…and a verified image reaches the slot-writer"):
+                  # No A/B disk here, so the writer fails at find_source_disk —
+                  # but ONLY a crypto-verified, entitlement-served image gets
+                  # that far, which is the proof.
+                  status, out = machine.execute(f"{CA} sentinel update install 2>&1")
+                  assert status != 0, f"expected the writer to fail without a disk: {out}"
+                  assert "could not resolve the source disk" in out, (
+                      f"verification should pass and control reach the slot-writer: {out}"
+                  )
+            '';
+          };
 
         # Boots the SIGNED image in a Secure-Boot OVMF with our PK/KEK/db enrolled
         # (built with virt-fw-vars). If the firmware verifies the signed

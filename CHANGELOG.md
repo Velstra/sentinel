@@ -4,6 +4,60 @@
 
 ### Added
 
+- **Named update channels + subscriptions — the enterprise update channel.**
+  The single `[update] url` grows into named channels
+  (`set update channel <name> url|public-key|subscription-key …`, with the
+  bare `set update channel <name>` selecting the active one), each signed by
+  its **own** pinned Ed25519 key — the community/subscription split from
+  LICENSING.md is a trust split, and trusting one channel must never mean
+  trusting another. The old bare `url`/`public-key` pair keeps working
+  unchanged as the unnamed default channel, so a fielded box loses nothing on
+  upgrade. A channel's `subscription-key` is the entitlement, sent to the
+  channel server as a bearer token; it is a secret — redacted by the read API,
+  masked to its last four characters in `show subscription`, carried to curl
+  via a 0600 header file rather than argv, and never logged. **An expired or
+  rejected subscription never disables the appliance**: an HTTP 401/403 from
+  the channel is answered with a refusal that names the channel and the fix,
+  and the one and only consequence is that new images from that channel are
+  unavailable — no nag, no phone-home, no degraded data plane; the promise is
+  written where the refusal is built (`update::fetch`) and proven by the new
+  `checks.updatesub` VM test, which drives a bearer-gated HTTPS channel server
+  through the wrong-key refusal (configuration untouched) and the right-key
+  install. `show subscription` (CLI and console) reports the channels, the
+  active one, whether a key is set (masked), and the last check's outcome as
+  recorded — expiry is reported as "not reported by the channel server",
+  because no server contract for expiry exists yet and this box does not
+  guess. The console's System page gains the channel list with an add panel
+  beside the existing update mask.
+
+- **TACACS+ authentication (RFC 8907), completing the admin-AAA trio.**
+  `set system aaa tacacs <host> secret <s>` points the login path at a TACACS+
+  server the way `radius` and `ldap` already could; the appliance speaks the
+  ASCII authentication flow (START, GETPASS, CONTINUE, PASS/FAIL) over TCP 49
+  with its own small codec, wire-pinned in tests the way the RADIUS one is.
+  The rules that hold for the other two hold here: local accounts are tried
+  first, so a box whose directory is unreachable stays enterable; a server
+  that rejects has answered and a server that cannot be reached has not; the
+  shared secret is redacted from the read API like every other secret; and the
+  body obfuscation is called what the RFC calls it — obfuscation, not
+  encryption — so the server belongs on a trusted segment. A refusal from a
+  directory now names the protocol that refused (RADIUS, LDAP or TACACS+),
+  because with three kinds of server configurable, "not accepted" alone sends
+  an operator diffing three configs. Authorization and accounting are
+  deliberately not implemented: an appliance login needs a yes or a no, and
+  what an account may do is decided by its group. The web console gains a
+  TACACS+ server list beside the RADIUS and LDAP ones, and a new
+  `checks.aaa` VM test drives the flow against a real tac_plus server —
+  including the wrong-password 401 and the directory-outage 503 staying
+  distinct, and the local account still entering while the directory is down.
+
+- **`delete system aaa …` now works.** The completion tables offered `delete`
+  for the RADIUS and LDAP entries, but the delete grammar had no arms for
+  them: every attempt ended in "unknown delete path". A server can now be
+  removed by host, an optional field cleared, and a required field (a shared
+  secret, an LDAP base-dn) answers with the delete that works instead —
+  a server without its secret is not a server.
+
 - **`show version` says which image is running, not just which version number
   somebody typed.** An A/B update that demonstrably replaced the running system
   — new slot, new dm-verity root hash, new store path for every binary —

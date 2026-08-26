@@ -47,13 +47,52 @@ For each target the installer:
 Because `/var/lib/sentinel` is mounted by `LABEL=data`, the same image boots
 correctly whether `data` is a partition or a RAID array.
 
+## Disk encryption (LUKS2)
+
+The A/B root is dm-verity and read-only — it has integrity, and nothing on it is
+secret. Every secret the box holds lives on the ONE writable partition: the TLS
+key and certificate, config-sync pins and tokens, per-account password hashes,
+WireGuard/IPsec keys. `--encrypt` protects that partition at rest with LUKS2:
+
+```shell
+# passphrase prompted (twice, to confirm)
+sentinel install /dev/sda --encrypt --commit
+
+# or supply it non-interactively (scripted installs)
+SENTINEL_LUKS_PASSPHRASE='…' sentinel install /dev/sda --encrypt --commit
+```
+
+The `data` partition becomes a LUKS2 container; the ext4 (`LABEL=data`) is created
+**inside** it. RAID composes as expected — the array is assembled first, then
+encrypted. The passphrase is resolved and checked **before** any disk is erased,
+so a mistyped or missing one fails while the target is still intact.
+
+### Unlocking at boot
+
+An encrypted box asks for its passphrase at each boot, before mounting
+`/var/lib/sentinel`. `sentinel-unlock.service` runs `sentinel unlock`, which
+prompts via `systemd-ask-password` (answerable at the console or by a remote
+`systemd-tty-ask-password-agent`) and opens the volume as `/dev/mapper/data`.
+
+The service is **conditional and shipped in every image**: on a plaintext box it
+finds no LUKS volume and does nothing, so the ordinary `LABEL=data` mount takes
+over. The `/var/lib/sentinel` mount takes an
+`x-systemd.requires=sentinel-unlock.service` dependency, so on an encrypted box it
+waits for the unlock and on a plaintext box the no-op just succeeds.
+
+> **TPM2 unattended unlock is a documented follow-up, not yet wired.** The on-disk
+> format is standard LUKS2, so a TPM2 token (`systemd-cryptenroll`) can be enrolled
+> onto the same volume later without reformatting — an unattended box would then
+> reboot without a console passphrase. Today, encrypted means a passphrase at boot.
+
 ## Verifying it
 
-Two tests cover this:
+Three tests cover this:
 
 ```shell
 nix build .#checks.x86_64-linux.install -L       # single + RAID1 on blank disks
 nix build .#checks.x86_64-linux.install-iso -L   # live-boot install from the ISO's bundled image
+nix build .#checks.x86_64-linux.luks -L          # encrypted install: LUKS2 container, passphrase unlock, secrets inside
 ```
 
 ## Gotchas (for hacking on `src/install.rs`)

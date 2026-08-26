@@ -204,6 +204,34 @@ The username is escaped into the DN (RFC 4514). It lands inside
 `uid=<here>,ou=…`, so a name containing a comma would not be a name any more —
 it would be a different DN, chosen by whoever typed it.
 
+### TACACS+
+
+The third of the trio, for shops whose AAA lives on a TACACS+ server
+(RFC 8907). The appliance speaks the ASCII authentication flow — it asks
+whether this username and password are good, over TCP. Authorization and
+accounting are not implemented: an appliance login needs a yes or a no, and
+what an account may do here is decided by its group, not by the server.
+
+| Field | Meaning |
+|---|---|
+| `secret` | The shared secret (required). |
+| `port` | Server port (default 49, TCP). |
+| `timeout` | Seconds to wait (default 3). A login is a person waiting. |
+
+```text
+set system aaa tacacs 10.0.0.49 secret a-shared-secret
+set system aaa tacacs 10.0.0.49 timeout 2
+```
+
+RFC 8907 XORs the packet body against an MD5 chain over the shared secret —
+the RFC itself calls that **obfuscation, not encryption** — so a TACACS+
+server belongs on a segment you already trust, exactly like a RADIUS server.
+
+When more than one kind of server is configured, they are consulted in a fixed
+order — RADIUS, then LDAP, then TACACS+ — after the local account list, and
+the first server that answers decides. A refusal names the protocol that
+refused, so with three kinds configured you know which one to look at.
+
 ### Who gets in, and what they may do
 
 A directory account still needs a local `system login` entry naming its group —

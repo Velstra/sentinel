@@ -14,16 +14,42 @@ whole box is described by one **declarative config** that the system reconciles
 to atomically (closer in spirit to Talos than to VyOS/pfSense). You change the
 appliance by changing its config and re-applying — never by editing live state.
 
-> **Status: working appliance, pre-1.0.** Implemented today: the declarative
-> config model and the interactive `configure` CLI (`commit` / `commit-confirm`
-> / `rollback` / `save`), the config→data-plane compiler driving the Velstra
-> XDP firewall + NAT, the immutable A/B disk image with dm-verity boot and an
-> installer (CLI + TUI), the REST API and read-only web console, dynamic
-> routing (BGP via the Wren control plane), VPN (WireGuard / IPsec / OpenConnect),
-> on-box PKI + ACME, intrusion detection (Suricata), AAA (RADIUS / LDAP / TOTP),
-> multi-WAN, and box services (DNS, NTP, SNMP, LLDP, …). It also talks to a
-> Velstra controller over [`velstra-proto`](https://crates.io/crates/velstra-proto).
-> Pre-1.0: config surface and defaults may still change.
+> **Status: working appliance, pre-1.0.** This is a substantial system
+> (~80k lines of Rust across ~40 modules), not a skeleton, and most of it is
+> exercised by the in-repo nixosTest suite. Implemented today:
+>
+> - **Config & apply** — the declarative config model and interactive `configure`
+>   CLI (`commit` / `commit-confirm` / `rollback` / `save`), a timestamped config
+>   archive with `rollback <N>` and `compare`, and a transactional apply that
+>   unwinds already-applied steps in reverse on failure.
+> - **Data plane** — the config→data-plane compiler driving the Velstra XDP
+>   firewall, NAT (masquerade / DNAT / CGNAT / NPTv6), L4 load balancing, address
+>   and port groups, per-rule rate limits, and QoS (CAKE / fq_codel).
+> - **Immutable OS** — the A/B disk image with dm-verity boot and Secure Boot,
+>   **LUKS2 data-partition encryption** (TPM2-sealed with a recovery passphrase),
+>   an installer (CLI + interactive TUI) and a live-boot ISO first-boot wizard,
+>   and a **signature-enforced update path** (a detached Ed25519 signature over
+>   the release manifest verified under an operator-pinned public key; an image
+>   whose signature or digest does not verify is refused).
+> - **Management plane** — a **TLS-by-default** REST API and read-only web console
+>   (a self-signed cert is minted and persisted on first boot and its public-key
+>   pin printed for config-sync peers), a Prometheus `/metrics` endpoint, per-IP
+>   and per-account login throttling, plus remote syslog and IPFIX flow export.
+> - **Routing & VPN** — dynamic routing (BGP / OSPF / OSPFv3 / IS-IS / RIP / Babel
+>   / VRRP / BFD via the Wren control plane), VPN (WireGuard / IPsec-IKEv2 /
+>   OpenConnect), multi-WAN with health-checked failover, and PPPoE client **and**
+>   server (the BNG / access-concentrator role).
+> - **Services & security** — on-box PKI + ACME, intrusion detection (Suricata in
+>   IDS mode, with enforcement through the eBPF blocklist), AAA (RADIUS / LDAP /
+>   TOTP), a captive portal, and box services (DHCP, DNS, NTP, SNMP, LLDP, …).
+>
+> It also talks to a Velstra controller over
+> [`velstra-proto`](https://crates.io/crates/velstra-proto) — today a single
+> `ports` query, the first use of the shared wire types. **Most of the above is
+> verified in the nixosTest VM suite; it is not yet validated end-to-end on
+> physical hardware** — ACME live issuance and the TPM2-sealed unlock in
+> particular exercise real boot/reachability paths a VM check cannot fully stand
+> in for. Pre-1.0: config surface and defaults may still change.
 
 ## Try it
 

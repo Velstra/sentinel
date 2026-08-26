@@ -40,6 +40,12 @@ answer "to check the layout"     "hello-123"
 answer "Locale"                  "de_DE.UTF-8"
 answer "Timezone"                "Europe/Berlin"
 
+# Disk encryption. This path declines it (the plaintext install); the encrypted
+# path is driven end to end by drive-wizard-encrypted.exp. The question comes
+# after the keyboard check on purpose — a passphrase typed on an unchecked
+# layout is a box that cannot be unlocked.
+answer "Encrypt the data partition" "n"
+
 # Identity and the first account.
 answer "Hostname"        "fw-wizard"
 answer "Username"        "operator"

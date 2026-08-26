@@ -79,6 +79,39 @@ in
       '';
     };
 
+    # Unlock the encrypted data partition before /var/lib/sentinel is mounted.
+    #
+    # Conditional by design: the SAME image serves plaintext and encrypted
+    # installs, so `sentinel unlock` inspects the disk and does nothing on a
+    # plaintext box (a no-op exit 0 — see src/unlock.rs). On an encrypted box it
+    # opens the LUKS volume as /dev/mapper/data, whose LABEL=data ext4 the
+    # `/var/lib/sentinel` mount then finds. The mount takes an
+    # `x-systemd.requires=sentinel-unlock.service` dependency (see nix/image.nix),
+    # so it is ordered after this and only runs once the volume is open.
+    #
+    # Passphrase-based: `sentinel unlock` prompts via systemd-ask-password, which
+    # the boot-time console password agent answers. TPM2 unattended unlock is a
+    # documented follow-up (the on-disk format is standard LUKS2).
+    systemd.services.sentinel-unlock = {
+      description = "Unlock the encrypted Sentinel data volume";
+      wantedBy = [ "local-fs.target" ];
+      before = [
+        "local-fs.target"
+        "var-lib-sentinel.mount"
+      ];
+      # The block devices (and any assembled RAID array) must exist first.
+      after = [
+        "local-fs-pre.target"
+        "mdmonitor.service"
+      ];
+      unitConfig.DefaultDependencies = false;
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = "${cfg.sentinel}/bin/sentinel unlock";
+      };
+    };
+
     # The console keymap, put back after systemd has had its say.
     #
     # systemd owns the virtual console: it runs systemd-vconsole-setup at boot

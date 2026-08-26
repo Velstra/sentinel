@@ -440,6 +440,9 @@ services service-name
 services session-timeout
 services sni-block
 services starttls
+services tls
+services tls-cert
+services tls-key
 services to
 services txt-record
 services upstream
@@ -466,6 +469,7 @@ system timezone
 system totp
 system value
 update public-key
+update subscription-key
 update url
 vpn allowed-ips
 vpn certificate

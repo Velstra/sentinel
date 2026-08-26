@@ -1,0 +1,62 @@
+# Drive the guided installer through the ENCRYPTED path: same questions as
+# drive-wizard.exp, but the disk-encryption step is taken — the toggle is turned
+# on and a passphrase is entered twice. What this exercises that the plaintext
+# run cannot is the wizard driving `install::Crypto::Luks`: the same on-disk LUKS2
+# path `sentinel install --encrypt` uses, reached from the wizard's own toggle.
+#
+# `--text` on purpose, like its sibling: the full-screen front end is covered by
+# its own probe, and the line-by-line one ends in the exact same answers.
+#
+# The disk number is not hardcoded: it comes from $PICK, which the test reads off
+# the wizard's own candidate listing. The passphrase comes from $PASSPHRASE so
+# the test and the script cannot drift on what to type.
+
+set timeout 120
+log_user 1
+
+proc answer {what reply} {
+    expect {
+        $what   { send -- "$reply\r" }
+        timeout { puts "\nSTALLED — no prompt matching: $what"; exit 3 }
+        eof     { puts "\nEXITED — while waiting for: $what"; exit 4 }
+    }
+}
+
+spawn sentinel install --text
+
+# Where to install.
+answer "Mode "                "1"
+answer "Select disk number"   "$env(PICK)"
+
+# Console and locale — the keyboard is confirmed before the passphrase is typed.
+answer "Console keyboard layout" "de"
+answer "to check the layout"     "hello-123"
+answer "Locale"                  "de_DE.UTF-8"
+answer "Timezone"                "Europe/Berlin"
+
+# Disk encryption: take it, and enter the passphrase twice.
+answer "Encrypt the data partition"                 "y"
+answer "Passphrase for the encrypted data partition" "$env(PASSPHRASE)"
+answer "Repeat the passphrase"                        "$env(PASSPHRASE)"
+
+# Identity and the first account.
+answer "Hostname"        "fw-crypt"
+answer "Username"        "operator"
+answer "Password:"       "correcthorsebattery"
+answer "SSH public key"  ""
+
+# The network step is optional; decline it here — this run is about the crypto
+# path, and the plaintext run already covers the network answers reaching config.
+answer "Configure an interface now" "n"
+
+answer "Type YES to proceed" "YES"
+
+# From here it is cloning ~2.9G onto the target, then the LUKS format + mkfs;
+# wait on the process, not a prompt.
+set timeout 900
+expect {
+    eof     {}
+    timeout { puts "\nSTALLED — the encrypted install itself never finished"; exit 5 }
+}
+catch wait result
+exit [lindex $result 3]
