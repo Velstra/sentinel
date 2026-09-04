@@ -2,6 +2,45 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **`checks.update` updates from a different image, as a real update does.**
+  It re-sealed the booted medium into the other slot, which `sentinel update`
+  has refused since the identical-image guard (two partitions with one
+  PARTUUID, an initrd that hangs instead of rolling back) — so the check had
+  been red since then. It now builds a donor image (the same appliance plus one
+  marker file, hence a different root hash and different GUIDs), attaches it as
+  a second disk, asserts the refusal of the identical image, updates from the
+  donor, and after the reboot proves by the marker that slot B is what booted.
+- **The medium an update was read from must be unplugged before the reboot.**
+  The check above found it: slot B is given the source's partition GUIDs (that
+  is how the initrd finds it), and a medium still attached at boot answers to
+  the same GUIDs — systemd took the *donor's* store partition for `/usr`.
+  `sentinel update` from a block device now says so when it finishes, and the
+  check blanks the donor before rebooting.
+- **`checks.ospfinterop` explains a missed route.** On a timeout it now prints
+  both link-state databases, Wren's neighbours and routes and FRR's routing
+  table, so a route that never crossed is told apart from an LSA that never
+  arrived.
+- **A read-only account can no longer stage a change it could never apply.**
+  New/Edit/Delete were gated once per view, but every list redraws itself
+  after each fetch, and a row's Edit and Delete drawn after the gate ran were
+  live — so a read-only operator could stage "delete firewall rule web-in" and
+  then sit with a pending change whose Apply *and* Discard were disabled. The
+  gate now re-runs whenever the page redraws, and `stage()` itself refuses a
+  read-only account with the sentence the buttons carry. Covered by the
+  console suite's read-only test.
+- **The console has a tab icon.** Browsers ask for `/favicon.ico` on every
+  load whether the page names one or not, and every load answered 404 into
+  the API log and the browser console. Served as a 96-byte PNG from the API;
+  the page itself stays self-contained.
+- **`ebgp-require-policy = false` reaches Wren.** The compiled `wren.toml` only
+  carried the key when it was `true`. Wren now defaults a missing key to `true`
+  (RFC 8212 default-deny), so an appliance that never touched the setting — the
+  documented permit-all default — handed the decision to Wren and exchanged no
+  eBGP routes at all. The key is written both ways now; `checks.bgp` is the
+  proof, run against the current Wren.
+
 ### Added
 
 - **Named update channels + subscriptions — the enterprise update channel.**
@@ -96,8 +135,6 @@
 
 ## [0.4.2] — 2026-08-02
 
-## [0.4.2] — 2026-08-02
-
 A test fix; the appliance is unchanged.
 
 ### Fixed
@@ -112,8 +149,6 @@ A test fix; the appliance is unchanged.
 
 
 ## [0.4.1] — 2026-08-02
-
-## [0.4.1] — 2026-08-01
 
 A build fix: 0.4.0 shipped with an `ebpfHash` that no longer described the data
 plane it pins, so every `nixosTest` refused to build.

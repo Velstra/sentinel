@@ -101,10 +101,11 @@ struct WrenBgp {
         skip_serializing_if = "std::ops::Not::not"
     )]
     rpki_reject_invalid: bool,
-    #[serde(
-        rename = "ebgp-require-policy",
-        skip_serializing_if = "std::ops::Not::not"
-    )]
+    // Always written, both ways. Wren's own default for a missing key is `true`
+    // (RFC 8212 default-deny), Sentinel's is `false` (permit-all unless the operator
+    // says otherwise), so leaving the key out when it is false would silently hand
+    // the decision to Wren and no eBGP route would be exchanged.
+    #[serde(rename = "ebgp-require-policy")]
     ebgp_require_policy: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     vrf: Option<String>,
@@ -1745,6 +1746,17 @@ origin-as = 65001
         assert!(out.contains("multipath = 4"), "{out}");
         assert!(out.contains("rpki-reject-invalid = true"), "{out}");
         assert!(out.contains("ebgp-require-policy = true"), "{out}");
+        // And the permit-all default is spelled out too, never left to Wren's own
+        // (opposite) default for a missing key.
+        let plain = Appliance::from_toml(
+            "[system]\nhostname = \"r1\"\n[protocols]\nrouter-id = \"10.0.0.1\"\n[protocols.bgp]\nlocal-as = 65001\n",
+        )
+        .unwrap();
+        let plain_out = compile_wren(&plain).to_toml().unwrap();
+        assert!(
+            plain_out.contains("ebgp-require-policy = false"),
+            "{plain_out}"
+        );
         assert!(out.contains("[bgp.rtr]"), "{out}");
         assert!(out.contains("server = \"10.0.0.9:3323\""), "{out}");
         assert!(out.contains("[[bgp.aggregate]]"), "{out}");

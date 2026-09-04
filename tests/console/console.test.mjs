@@ -876,6 +876,32 @@ await test("that account can then sign in with its username and password", async
   equal(outcome.who, "vera", "the console does not say who is signed in");
   check(outcome.readOnly, "a read-only account is not marked as one");
   check(outcome.applyDisabled, "a read-only account is offered Apply");
+
+  // And nothing on a list offers a change either — not after the list has
+  // redrawn itself, which it does after every fetch. A read-only account used
+  // to be able to stage "delete firewall rule web-in" from a row whose Delete
+  // was drawn after the gate ran, and then sit with a pending change it could
+  // neither apply nor discard.
+  const rows = await page.evaluate(`(async () => {
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms || 800));
+    view = "rules"; panel = null;
+    await refresh();
+    await wait(1200);
+    const buttons = [...document.querySelectorAll("#view-rules button")]
+      .filter((b) => /^(edit|delete|new rule)$/i.test(b.textContent.trim()));
+    const before = staged.length;
+    stage("a change a read-only account made", ["set firewall rule nope action accept"]);
+    return {
+      buttons: buttons.length,
+      enabled: buttons.filter((b) => !b.disabled).map((b) => b.textContent.trim()),
+      staged: staged.length - before,
+      banner: document.getElementById("banner").textContent,
+    };
+  })()`);
+  check(rows.buttons > 0, "the rules view drew no Edit, Delete or New rule at all");
+  equal(rows.enabled, [], "a read-only account is offered a change on the rules list");
+  equal(rows.staged, 0, "a read-only account staged a change");
+  check(/read the configuration/.test(rows.banner), "refusing to stage said nothing");
 });
 
 await test("a wrong password is refused, and says so once", async () => {

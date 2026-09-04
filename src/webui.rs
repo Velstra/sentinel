@@ -63,6 +63,15 @@
 //! is gone when the tab closes: an appliance token has no business outliving the
 //! session on a shared machine.
 
+/// The tab icon, served at `/favicon.ico` — a 16×16 PNG, a few dozen bytes.
+///
+/// Browsers ask for it on every load whether the page names one or not, and
+/// a console with none answered every load with a 404 that landed in the API
+/// log and the browser console. Served as bytes rather than named by a
+/// `<link>`: the page stays self-contained, and a `<link>` is exactly what
+/// [`tests::the_page_is_self_contained`] refuses.
+pub const FAVICON_PNG: &[u8] = &[137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 16, 0, 0, 0, 16, 8, 6, 0, 0, 0, 31, 243, 255, 97, 0, 0, 0, 39, 73, 68, 65, 84, 120, 218, 99, 96, 160, 22, 144, 207, 239, 254, 79, 10, 30, 53, 96, 212, 0, 218, 24, 64, 138, 33, 20, 37, 105, 138, 242, 5, 69, 153, 139, 129, 86, 0, 0, 75, 73, 53, 240, 89, 14, 85, 95, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130];
+
 /// A read-only view: a title and the `show` path behind it.
 ///
 /// Grouped, because a flat list of thirty panels is a list nobody reads. The
@@ -2687,6 +2696,10 @@ let token = sessionStorage.getItem(KEY) || "";
 // the operator would learn their permission by being told no.
 let who = "";
 let permission = "read-write";
+// Re-runs the write gate whenever the page redraws a list: the lists rebuild
+// themselves constantly, and a gate that ran once per view left every row's
+// Edit and Delete enabled for a read-only account.
+let gateObserver = null;
 let view = "dashboard";
 let panel = null;
 let target = "";           // "" = this appliance, otherwise a stack member
@@ -3495,6 +3508,17 @@ function openEditor(rule, zones) {{
 let staged = [];
 
 function stage(label, lines) {{
+  // A read-only account cannot apply, so it must not stage either: a change
+  // it builds is a change it can only look at, and one it could not even
+  // discard (Discard is gated with Apply). Refused here, once, where the
+  // change was attempted — the buttons are gated too, but the lists rebuild
+  // themselves after every fetch and a button can be drawn before the gate
+  // runs over it, which is how a read-only account came to hold a pending
+  // "delete firewall rule".
+  if (permission === "read-only") {{
+    banner("This account may read the configuration, not change it");
+    return;
+  }}
   const cmds = lines.filter(Boolean);
   if (!cmds.length) return;
   staged.push({{ label, cmds }});
@@ -8836,6 +8860,12 @@ function renderWho() {{
     b.disabled = readOnly;
     b.title = readOnly ? "This account may read the configuration, not change it" : "";
   }}
+  if (readOnly && !gateObserver) {{
+    gateObserver = new MutationObserver(() => gateWrites());
+    gateObserver.observe(document.querySelector("main") || document.body,
+      {{ childList: true, subtree: true }});
+  }}
+  gateWrites();
 }}
 
 function signOut(message) {{
@@ -9719,6 +9749,7 @@ mod tests {
             "RegExp",
             "Intl",
             "fetch",
+            "MutationObserver",
             "encodeURIComponent",
             "decodeURIComponent",
             "setInterval",

@@ -6017,12 +6017,17 @@
               # enough for the whole cloned layout (two 2560M store slots +
               # their verity trees + ESP ≈ 5.6G) — `sgdisk --replicate` writes
               # the source table verbatim, so anything smaller cannot take it.
-              # Plus vde, deliberately too small, to prove that is refused.
+              # Plus vde, deliberately too small, to prove that is refused —
+              # and too small in the way that matters: over the installer's
+              # coarse 5 GiB floor (`MIN_TARGET_BYTES`, which refuses without
+              # reading anything) and under the real layout, so the refusal
+              # has to come from the per-source measurement. 5450 MB is
+              # 5.08 GiB.
               emptyDiskImages = [
                 8000
                 8000
                 8000
-                5000
+                5450
               ];
               fileSystems = lib.mkVMOverride { };
             };
@@ -6061,7 +6066,7 @@
                   assert "/dev/vdb" in listing, listing
 
               with subtest("a disk too small for the layout is refused, not erased"):
-                  # vde clears the hand-kept 4 GiB floor and still cannot hold
+                  # vde clears the hand-kept 5 GiB floor and still cannot hold
                   # the source's partition table. The failure that matters is
                   # not the refusal but *when* it happens: `sgdisk --replicate`
                   # discovers the mismatch after `wipefs`, which is how this
@@ -6505,27 +6510,72 @@
           '';
         };
 
-        # Boots slot A of the verity image and runs an A/B update (re-sealing
-        # from the booted medium into slot B), verifying the inactive slot is
-        # written + verity-typed and the bootloader is switched to it with boot
-        # counting. The actual cross-reboot slot switch + rollback can't be driven
-        # in this harness (OVMF reboot hangs); it's verified structurally here and
-        # the boot-counting/bless mechanism itself is proven by checks.verified-boot.
+        # Boots slot A of the verity image and runs an A/B update into slot B
+        # from a DONOR image: the same appliance built once more with one extra
+        # file under /etc, so its store differs, its verity root hash differs,
+        # and the partition GUIDs derived from that hash differ. That is what a
+        # real update carries — and it is the only thing `sentinel update`
+        # accepts. Re-sealing the booted medium into the other slot, which is
+        # what this check used to do, is refused before a byte is written: an
+        # image whose slot-A GUIDs ARE the running slot's would leave two
+        # partitions with one PARTUUID, and the initrd hangs on that instead of
+        # rolling back (the refusal is asserted below, the reason is written at
+        # the refusal in install.rs). The donor rides along as a read-only
+        # second virtio disk (vdb); its node is never started.
+        #
+        # The cross-reboot slot switch is then driven for real: the machine
+        # comes back on slot B, and the donor's marker file is the proof of
+        # which slot it booted. The boot-counting/bless mechanism itself is
+        # proven by checks.verified-boot.
         #   nix build .#checks.x86_64-linux.update -L
         update = pkgs.testers.runNixOSTest {
           name = "sentinel-update";
-          nodes.machine = {
-            imports = [
-              self.nixosModules.sentinel
-              ./nix/image.nix
-            ];
-            virtualisation = {
-              directBoot.enable = false;
-              mountHostNixStore = false;
-              useEFIBoot = true;
-              memorySize = 2048;
-              fileSystems = lib.mkVMOverride { };
+          nodes = {
+            # Never started: only its image is used.
+            donor = {
+              imports = [
+                self.nixosModules.sentinel
+                ./nix/image.nix
+              ];
+              # The driver names a machine after `system.name`, and the
+              # appliance module forces one hostname on every node; two nodes
+              # need two names.
+              system.name = "donor";
+              # The one difference from `machine` — enough to change the store,
+              # hence the root hash, hence the GUIDs; and visible after the
+              # reboot as the proof of which slot came up.
+              environment.etc."sentinel-update-donor".text = "slot B came from the donor image\n";
+              virtualisation = {
+                directBoot.enable = false;
+                mountHostNixStore = false;
+                useEFIBoot = true;
+                memorySize = 2048;
+                fileSystems = lib.mkVMOverride { };
+              };
             };
+            machine =
+              { nodes, ... }:
+              {
+                imports = [
+                  self.nixosModules.sentinel
+                  ./nix/image.nix
+                ];
+                system.name = "machine";
+                virtualisation = {
+                  directBoot.enable = false;
+                  mountHostNixStore = false;
+                  useEFIBoot = true;
+                  memorySize = 2048;
+                  fileSystems = lib.mkVMOverride { };
+                  # The donor image as the second virtio disk (vdb), behind a
+                  # throwaway qcow2 overlay the test script creates — the
+                  # update only reads it, but the test blanks it before the
+                  # reboot (see there), and the store copy is read-only.
+                  qemu.options = [
+                    "-drive if=virtio,format=qcow2,file=$DONOR_DISK_IMAGE"
+                  ];
+                };
+              };
           };
           testScript =
             { nodes, ... }:
@@ -6542,6 +6592,14 @@
                 "-F", "raw", tmp.name,
               ], check=True)
               os.environ["NIX_DISK_IMAGE"] = tmp.name
+              tmp_donor = tempfile.NamedTemporaryFile()
+              subprocess.run([
+                "${nodes.machine.virtualisation.qemu.package}/bin/qemu-img",
+                "create", "-f", "qcow2",
+                "-b", "${nodes.donor.system.build.finalImage}/${nodes.donor.image.filePath}",
+                "-F", "raw", tmp_donor.name,
+              ], check=True)
+              os.environ["DONOR_DISK_IMAGE"] = tmp_donor.name
 
               machine.wait_for_unit("multi-user.target")
 
@@ -6553,23 +6611,44 @@
                       break
               assert src, "no source disk"
               disk = "/dev/" + src
+              donor_disk = "/dev/vdb"
+
+              # lsblk rather than sgdisk: the appliance reaches sgdisk by an
+              # absolute store path, the test shell has no such PATH entry.
+              guid = lambda dev, n: machine.succeed(f"lsblk -nro PARTUUID {dev}{n}").strip().lower()
 
               with subtest("active slot A backs /dev/mapper/usr (store partition #3)"):
                   assert f"{src}3" in machine.succeed("lsblk -nsro NAME /dev/mapper/usr")
 
-              with subtest("update writes + verity-types the inactive slot B"):
-                  # A re-seal from the booted medium is a block device with no
-                  # detached signature — the trusted-operator escape hatch, so it
-                  # takes --allow-unsigned. (The default-secure refusal and the
-                  # signed-image path are proven by checks.updatelocal.)
-                  machine.succeed(f"sentinel update --commit --allow-unsigned {disk}")
+              with subtest("the donor is a different image: other bytes, other GUIDs"):
+                  machine.succeed(f"test -b {donor_disk}3")
+                  machine.fail(f"cmp {donor_disk}3 {disk}3")
+                  assert guid(donor_disk, 2) != guid(disk, 2), "donor verity GUID equals the running slot's"
+                  assert guid(donor_disk, 3) != guid(disk, 3), "donor store GUID equals the running slot's"
+
+              with subtest("re-sealing the booted medium is refused before anything is written"):
+                  # The image already running carries the active slot's own
+                  # GUIDs; stamping them onto slot B is the two-PARTUUID hang.
+                  status, out = machine.execute(f"sentinel update --commit --allow-unsigned {disk} 2>&1")
+                  assert status != 0, f"an identical image must be refused: {out}"
+                  assert "identical to the running slot" in out, out
+                  # Nothing was touched: slot B does not wear the image's identity.
+                  assert guid(disk, 4) != guid(disk, 2), "the refused update stamped slot B's verity GUID"
+                  assert guid(disk, 5) != guid(disk, 3), "the refused update stamped slot B's store GUID"
+
+              with subtest("update writes + verity-types the inactive slot B from the donor"):
+                  # A block device with no detached signature — the
+                  # trusted-operator escape hatch, so it takes --allow-unsigned.
+                  # (The default-secure refusal and the signed-image path are
+                  # proven by checks.updatelocal.)
+                  machine.succeed(f"sentinel update --commit --allow-unsigned {donor_disk}")
                   machine.succeed("udevadm settle")
                   usr = "8484680c-9521-48c6-9c11-b0720656f69e"
                   usrv = "77ff5f63-e7b6-4633-acf4-1565b864c0e6"
                   assert usrv in machine.succeed(f"lsblk -nro PARTTYPE {disk}4").lower()
                   assert usr in machine.succeed(f"lsblk -nro PARTTYPE {disk}5").lower()
-                  # slot B store == slot A store (this re-seal copies the running image)
-                  machine.succeed(f"cmp {disk}3 {disk}5")
+                  # slot B store == the donor's slot A store, byte for byte.
+                  machine.succeed(f"cmp {disk}5 {donor_disk}3")
 
               with subtest("the bootloader is switched to slot B with boot counting"):
                   machine.succeed(f"mkdir -p /mnt/esp && mount {disk}1 /mnt/esp")
@@ -6587,13 +6666,23 @@
               # so the boot counter never decremented and the rollback this test
               # checks for never fired. Everything above still passed.
               with subtest("slot B carries the identity of the image it holds"):
-                  # lsblk rather than sgdisk: the appliance reaches sgdisk by an
-                  # absolute store path, the test shell has no such PATH entry.
-                  guid = lambda n: machine.succeed(f"lsblk -nro PARTUUID {disk}{n}").strip().lower()
-                  assert guid(4) == guid(2), (
-                      f"slot B verity GUID {guid(4)} does not match the image's {guid(2)}")
-                  assert guid(5) == guid(3), (
-                      f"slot B store GUID {guid(5)} does not match the image's {guid(3)}")
+                  assert guid(disk, 4) == guid(donor_disk, 2), (
+                      f"slot B verity GUID {guid(disk, 4)} does not match the donor's {guid(donor_disk, 2)}")
+                  assert guid(disk, 5) == guid(donor_disk, 3), (
+                      f"slot B store GUID {guid(disk, 5)} does not match the donor's {guid(donor_disk, 3)}")
+
+              # Slot B now answers to the donor's GUIDs — by design, that is how
+              # the initrd finds it. A medium still attached at boot answers to
+              # the same GUIDs, and systemd takes whichever it meets first: with
+              # the donor left in, the machine came back with /usr backed by the
+              # DONOR's store partition, not by slot B (this check found that).
+              # So the medium goes blank here, standing in for the stick an
+              # operator pulls; `sentinel update` says as much when its source
+              # is a device.
+              with subtest("the donor medium is blanked before the reboot"):
+                  machine.succeed(f"wipefs -a {donor_disk}")
+                  machine.succeed("udevadm settle")
+                  machine.fail(f"test -b {donor_disk}3")
 
               # And the proof that costs a reboot: come up on the slot the update
               # just made default. Every assertion above holds for an update that
@@ -6602,22 +6691,17 @@
                   machine.shutdown()
                   machine.start()
                   machine.wait_for_unit("multi-user.target")
-                  # What is asserted is that it came up and works, not which of
-                  # the two store partitions the kernel attached. This test
-                  # re-seals the *running* image, so both pairs hold the same
-                  # bytes and — now that slot B carries the image's identity —
-                  # the same GUIDs; which one systemd picks is then not a
-                  # meaningful question. A real update carries a different image,
-                  # whose hash gives it different GUIDs, and the subtest above is
-                  # what covers that.
+                  # The donor's marker: only its store has it, so its presence
+                  # says slot B is what booted, not merely that something did.
+                  machine.succeed("test -f /etc/sentinel-update-donor")
                   machine.succeed("sentinel show version")
                   machine.wait_for_unit("velstra.service")
-                  # The attached store really is one of the two slots, verity
-                  # intact — a mismatched pair would have failed to open at all.
+                  # And the attached store is slot B, verity intact — a
+                  # mismatched pair would have failed to open at all.
                   backing = machine.succeed("lsblk -nsro NAME /dev/mapper/usr")
-                  assert f"{src}3" in backing or f"{src}5" in backing, (
-                      f"/usr is backed by neither slot: {backing.strip()!r}")
-          '';
+                  assert f"{src}5" in backing, (
+                      f"/usr is not backed by slot B: {backing.strip()!r}")
+            '';
         };
 
         # The signed update channel's CRYPTO GATE (roadmap C13). Proves the
@@ -8920,8 +9004,18 @@
         #     with it: the box lost the route to its own subnet, stopped hearing
         #     the neighbour, and declared it dead — a minute after coming up.
         #
+        # A fourth came later, and only the restart leg found it: the Hello
+        # from the peer's second subnet was let in and took part in the DR
+        # election under the peer's Router ID, so one restart in two our
+        # Router-LSA named the DR by its address on the OTHER subnet — no
+        # Network-LSA matched, the SPF tree ended at this router, and not one
+        # route was computed with every database in perfect agreement. Such a
+        # Hello is now dropped at the door (RFC 2328 §8.2), so the second
+        # neighbour entry it used to show is gone too.
+        #
         # Hence the shape of this check: reaching Full is not enough, it has to
-        # still be Full a minute later, and a route has to cross it.
+        # still be Full a minute later, a route has to cross it, and it has to
+        # do all that again after the appliance restarts.
         #   nix build .#checks.x86_64-linux.ospfinterop -L
         ospfinterop = pkgs.testers.runNixOSTest {
           name = "sentinel-ospfinterop";
@@ -9025,9 +9119,38 @@
                 fw.succeed("wren show ospf neighbors | grep -q Full")
                 peer.succeed("vtysh -c 'show ip ospf neighbor' | grep -q Full")
 
+            # What each side holds. A route that does not cross is either an
+            # LSA that never arrived or one that did and was not turned into a
+            # route, and those are fixed in different places; a bare timeout
+            # cannot tell them apart.
+            def dump(tag):
+                for what, cmd in [
+                    ("fw: wren show ospf database", "wren show ospf database"),
+                    ("fw: wren show ospf neighbors", "wren show ospf neighbors"),
+                    ("fw: ip route", "ip route"),
+                    ("fw: wren journal", "journalctl -u wren --no-pager | tail -n 40"),
+                ]:
+                    print(f"--- [{tag}] {what}\n" + fw.execute(cmd)[1])
+                for what, cmd in [
+                    ("peer: show ip ospf neighbor", "vtysh -c 'show ip ospf neighbor'"),
+                    ("peer: show ip ospf database", "vtysh -c 'show ip ospf database'"),
+                    ("peer: show ip ospf database router", "vtysh -c 'show ip ospf database router'"),
+                    ("peer: show ip ospf database network", "vtysh -c 'show ip ospf database network'"),
+                    ("peer: show ip ospf database external", "vtysh -c 'show ip ospf database external'"),
+                    ("peer: show ip route", "vtysh -c 'show ip route'"),
+                ]:
+                    print(f"--- [{tag}] {what}\n" + peer.execute(cmd)[1])
+
+            def route_crosses(tag):
+                try:
+                    fw.wait_until_succeeds(
+                        "ip route show proto ospf | grep -q 203.0.113.0/24", timeout=90)
+                except Exception:
+                    dump(tag)
+                    raise
+
             with subtest("and a route actually crosses it"):
-                fw.wait_until_succeeds(
-                    "ip route show proto ospf | grep -q 203.0.113.0/24", timeout=90)
+                route_crosses("first adjacency")
 
             with subtest("and it comes back after the appliance restarts"):
                 # The peer keeps running, so it still holds the LSAs this
@@ -9040,8 +9163,11 @@
                 fw.succeed("systemctl restart wren")
                 fw.wait_until_succeeds(
                     "wren show ospf neighbors | grep -q Full", timeout=120)
-                fw.wait_until_succeeds(
-                    "ip route show proto ospf | grep -q 203.0.113.0/24", timeout=90)
+                # A snapshot shortly after Full, before the verdict: what the
+                # database looked like while the route was (not) being computed.
+                fw.succeed("sleep 15")
+                dump("15 s after Full, post-restart")
+                route_crosses("after restart")
           '';
         };
 
