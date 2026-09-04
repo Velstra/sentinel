@@ -81,11 +81,11 @@
     "wren": {
       "flake": false,
       "locked": {
-        "lastModified": 1786816762,
-        "narHash": "sha256-JZy/6pqHiUaCPGzWHR/TNbk8ar3EwzUsOYMUJyu8UhU=",
+        "lastModified": 1788538001,
+        "narHash": "sha256-YjblmCQjlGT1LinZe32MvWz2mQMspDDV8IGUyjeJ1u4=",
         "owner": "Velstra",
         "repo": "wren",
-        "rev": "5d84755ccbb31bb29e8651e5e886a06df0d51889",
+        "rev": "3afee7a911d2e8a59a7ca987354e001bb97c6ec3",
         "type": "github"
       },
       "original": {
