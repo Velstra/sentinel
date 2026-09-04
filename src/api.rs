@@ -254,8 +254,20 @@ pub fn router(state: Arc<ApiState>) -> Router {
         // fetches goes through the middleware above like any other client.
         .route("/", get(console))
         .route("/ui", get(console))
+        .route("/favicon.ico", get(favicon))
         .merge(protected)
         .with_state(state)
+}
+
+/// `GET /favicon.ico` — the tab icon (see [`crate::webui::FAVICON_PNG`]).
+async fn favicon() -> impl axum::response::IntoResponse {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "image/png"),
+            (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        crate::webui::FAVICON_PNG,
+    )
 }
 
 /// `GET /` — the web console (roadmap C12).

@@ -898,6 +898,19 @@ pub fn update(image: &std::path::Path, commit: bool) -> Result<()> {
         "update complete — reboot to boot slot {} (auto-rolls back to {} if it fails 3×)",
         inactive.name, active.name
     );
+    // The slot was just given the source's partition GUIDs — that is how the
+    // initrd finds it. A medium that stays attached across the reboot answers
+    // to the same GUIDs, and systemd mounts whichever it meets first: /usr then
+    // comes up from the stick, and pulling the stick later takes /usr with it.
+    // (checks.update reproduced exactly that with the medium left in.)
+    if is_block {
+        eprintln!(
+            "note: {srcdev} carries the same verity/store partition GUIDs as slot {} now. \
+             Unplug it before rebooting — while it is attached, the initrd may mount /usr \
+             from the medium instead of the slot.",
+            inactive.name
+        );
+    }
     Ok(())
 }
 
