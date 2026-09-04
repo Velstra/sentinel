@@ -561,6 +561,23 @@ pub fn page() -> String {
     background: var(--text-faint); flex: none;
   }}
   /* The resting state whispers — no dot, no frame, just faint text. */
+  .pill.busy {{ color: var(--amber-300, #d9a441); }}
+  .pill.busy::before {{ background: currentColor; animation: pulse 1.2s var(--ease-out) infinite; }}
+  /* Work in progress: a spinner beside the verb. The verb is what says it;
+     the spinner is what keeps saying it while nothing else on screen moves. */
+  .btn.busy {{ position: relative; padding-right: 2.2em; }}
+  .btn.busy::after {{
+    content: ""; position: absolute; right: .7em; top: 50%; width: .9em; height: .9em;
+    margin-top: -.45em; border-radius: 50%;
+    border: 2px solid currentColor; border-right-color: transparent;
+    animation: spin .8s linear infinite;
+  }}
+  @keyframes pulse {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: .35; }} }}
+  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+  @media (prefers-reduced-motion: reduce) {{
+    .pill.busy::before {{ animation: none; }}
+    .btn.busy::after {{ animation-duration: 2s; }}
+  }}
   .pill.rest {{ color: var(--text-faint); }}
   .pill.rest::before {{ display: none; }}
   .pill.up, .pill.ok {{ color: var(--green-300); }}
@@ -3529,11 +3546,20 @@ function stagedCommands() {{
   return staged.flatMap((s) => s.cmds);
 }}
 
+// While an apply is out, the badge says so and nothing redraws it away —
+// the apply path itself redraws the staged list halfway through.
+let applying = false;
+
 function renderStaged() {{
   const n = staged.length;
-  $("stagedbadge").textContent = n ? n + " pending change" + (n === 1 ? "" : "s")
-                                   : "no pending changes";
-  $("stagedbadge").className = "pill" + (n ? " warn" : " rest");
+  if (applying) {{
+    $("stagedbadge").textContent = "applying";
+    $("stagedbadge").className = "pill busy";
+  }} else {{
+    $("stagedbadge").textContent = n ? n + " pending change" + (n === 1 ? "" : "s")
+                                     : "no pending changes";
+    $("stagedbadge").className = "pill" + (n ? " warn" : " rest");
+  }}
   $("stagedbadge").title = n ? "Review the staged changes" : "";
   // Apply and Discard only exist while there is something to apply or discard —
   // a resting header must not offer actions that would do nothing.
@@ -3579,6 +3605,44 @@ async function applyStaged(tail) {{
     return;
   }}
   banner("");
+  // Say that it is happening. An apply takes a second or two on the box and
+  // longer on a slow link, and a button that goes quiet for that long reads
+  // as a button that did nothing — which is when somebody presses it again.
+  const working = busy(["applystaged", "applystaged2", "validate"], "Applying…");
+  try {{
+    await applyStagedNow(tail);
+  }} finally {{
+    working();
+  }}
+}}
+
+/// Mark buttons as working until the returned function is called: disabled,
+/// a spinner, and the verb in the present tense. Restored exactly, including
+/// a disabled state the write gate had set.
+function busy(ids, label) {{
+  const was = [];
+  for (const id of ids) {{
+    const b = $(id);
+    if (!b) continue;
+    was.push([b, b.textContent, b.disabled]);
+    b.disabled = true;
+    b.classList.add("busy");
+    if (label && id !== "validate") b.textContent = label;
+  }}
+  applying = true;
+  renderStaged();
+  return () => {{
+    for (const [b, text, disabled] of was) {{
+      b.classList.remove("busy");
+      b.textContent = text;
+      b.disabled = disabled;
+    }}
+    applying = false;
+    renderStaged();
+  }};
+}}
+
+async function applyStagedNow(tail) {{
   // The batch runs once, and the appliance's own report is the answer.
   //
   // Applying used to run every command twice: once with no `commit` to see

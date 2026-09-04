@@ -22,6 +22,11 @@
   both link-state databases, Wren's neighbours and routes and FRR's routing
   table, so a route that never crossed is told apart from an LSA that never
   arrived.
+- **Apply says that it is applying.** The button and the pending-changes
+  badge show the work while the batch runs — the verb in the present tense, a
+  spinner, a pulsing badge — and go back to themselves when the appliance has
+  answered. A button that went quiet for the second an apply takes read as a
+  button that did nothing, which is when somebody presses it again.
 - **A read-only account can no longer stage a change it could never apply.**
   New/Edit/Delete were gated once per view, but every list redraws itself
   after each fetch, and a row's Edit and Delete drawn after the gate ran were
