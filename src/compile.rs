@@ -15,11 +15,14 @@
 //!   trie is keyed on, `interface-group` scopes a rule to a link, `family` and
 //!   `direction` narrow it, and a MAC-group rule becomes one verdict per member;
 //! * a **destination zone** (`to = <zone>`) as a match on that zone's own
-//!   subnets — or, for the `local` zone, on this box's own addresses as host
+//!   subnets — or, for a zone marked `local` (whatever it is called: the flag
+//!   is per zone, not a reserved name), on this box's own addresses as host
 //!   routes. The data plane has no notion of an egress zone; it ranks one
 //!   address end per rule by longest prefix, so "to lan" is enforced as "to the
-//!   networks lan is made of". A `to` on a zone with no static subnet matches
-//!   nothing and is reported at commit rather than silently widened;
+//!   networks lan is made of". A zone with no static subnet yields nothing to
+//!   match on, and the rule then **widens to any destination** rather than
+//!   matching none — `warnings()` says so at every commit, and that warning is
+//!   the only thing between a rule that reads narrow and one that is not;
 //! * port-forwards, hairpin reflections, load-balanced services (each with the
 //!   `pass` that opens its port), masquerade and CGNAT layout per interface,
 //!   NPTv6, SYN proxy, flow export, conntrack sync, the EVPN overlay and SRv6.
