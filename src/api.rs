@@ -88,6 +88,10 @@ pub struct Caller {
 /// Serve the REST API until the process is stopped. Loads (or generates) the
 /// bearer token, then binds `listen` and serves the router.
 pub async fn serve(listen: &str, config: &Path, apply: Apply, token_file: &Path) -> Result<()> {
+    // A client that hangs up while this is writing must not end the service.
+    // See [`crate::system::ignore_sigpipe`] — without it the server dies on the
+    // first `curl … | grep -q`, and systemd calls that a clean exit.
+    crate::system::ignore_sigpipe();
     let token = load_or_create_token(token_file)?;
     let addr: SocketAddr = listen
         .parse()
