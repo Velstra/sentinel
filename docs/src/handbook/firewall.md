@@ -772,6 +772,52 @@ It also only sees **now**: what the connection table holds, not what went throug
 yesterday.
 
 
+## Asking before you send (packet trace)
+
+The question a rule set of any size eventually raises is "why can this host not
+reach that one", and the honest answer is scattered across the zone the link is
+in, a port-forward that rewrites the destination first, the routing table, a
+dozen rules naming the zone, and whether the leaving link masquerades. `trace`
+walks those in the order the data plane takes them and says what it found at
+each:
+
+```text
+sentinel trace --in lan0 tcp 10.0.0.200 10.9.0.10 22
+```
+
+```text
+ingress:   lan0 is in zone lan (policy 2, default pass, stateful: replies to admitted flows pass by conntrack)
+route:     10.9.0.10 leaves on dmz0 (connected, 10.9.0.1/24), zone dmz
+rules:     rule no-ssh-from-guests matches (source 10.0.0.128/25, tcp/22) → drop
+
+rules looked at and passed over:
+  ssh-to-dmz               matches too, but no-ssh-from-guests is more specific
+
+verdict:   drop (no-ssh-from-guests)
+```
+
+The console has the same under **Policy → Packet trace**, and the API answers
+`GET /api/v1/trace?in=lan0&proto=tcp&src=…&dst=…&port=22` with the walk as
+JSON (`--json` prints the same on the command line). `--src-mac` consults
+MAC-group rules, `--icmp-type` the typed ICMP ones, and `--config` walks a
+file other than the saved configuration — a candidate you are about to commit,
+for instance.
+
+It is a **simulation against the compiled configuration**, not a capture: the
+rules are matched the way the data plane ranks them (a MAC verdict first, then a
+rule scoped to the arriving link, then a typed ICMP rule, then the longest
+prefix, and on an equal prefix the stricter action), a matching port-forward
+admits the flow on its own, and the blocklist is consulted before anything
+else — all in the same order the eBPF program decides. Anything the box only
+knows at runtime is **not** in the answer, and the trace says so where it would
+matter: an established connection (which conntrack would admit regardless), a
+route learned from a routing protocol (a more specific one would win over the
+static route named), and which uplink multi-WAN currently prefers (the highest
+priority is assumed healthy). Rules the walk looked at and passed over are
+listed with the reason, because "why did my rule not fire" is the question the
+verdict alone does not answer.
+
+
 ## A packet the filter cannot parse
 
 ```text

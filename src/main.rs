@@ -33,6 +33,7 @@ mod lockout;
 mod lookup;
 mod metrics;
 mod net;
+mod openapi;
 mod openconnect;
 mod passwd;
 mod pki;
@@ -43,6 +44,7 @@ mod relay;
 mod repl;
 mod session;
 mod system;
+mod trace;
 mod ui;
 mod unlock;
 mod update;
@@ -138,6 +140,36 @@ enum Command {
         /// The show path words (empty shows the system status).
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
+    },
+    /// Where would this packet go, and which rule decides it — answered from
+    /// the configuration, without sending anything.
+    ///
+    ///   sentinel trace --in lan0 tcp 10.0.0.5 93.184.216.34 443
+    Trace {
+        /// The link the packet arrives on.
+        #[arg(long = "in")]
+        in_interface: String,
+        /// tcp, udp, icmp, icmpv6, …
+        proto: String,
+        /// Source address.
+        src: std::net::IpAddr,
+        /// Destination address, as the packet carries it (before any NAT).
+        dst: std::net::IpAddr,
+        /// Destination port; omit for a protocol without ports.
+        #[arg(default_value_t = 0)]
+        port: u16,
+        /// The sender's hardware address, to consult MAC-group rules.
+        #[arg(long = "src-mac")]
+        src_mac: Option<String>,
+        /// The ICMP/ICMPv6 type, to consult typed rules.
+        #[arg(long = "icmp-type")]
+        icmp_type: Option<u8>,
+        /// The configuration to walk (default: the saved one).
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+        /// Print the answer as JSON rather than as text.
+        #[arg(long)]
+        json: bool,
     },
     /// Take one round of history samples. Run by the `sentinel-metrics` timer
     /// once a minute; not something to type, but not hidden either — a timer
@@ -373,6 +405,10 @@ enum Command {
         /// `$SENTINEL_API_TOKEN`).
         #[arg(long, default_value = api::DEFAULT_TOKEN_PATH)]
         token_file: PathBuf,
+        /// Print the API as OpenAPI 3.1 and exit, serving nothing — the same
+        /// document a running box answers at `/api/v1/openapi.json`.
+        #[arg(long)]
+        openapi: bool,
     },
     /// Wake a host on the LAN: send a Wake-on-LAN magic packet to a MAC address
     /// (an operational action, not persistent config). Broadcasts on the given
@@ -424,6 +460,37 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Configure { config, no_apply } => configure(&config, no_apply),
         Command::Show { args } => show_op(&args),
+        Command::Trace {
+            in_interface,
+            proto,
+            src,
+            dst,
+            port,
+            src_mac,
+            icmp_type,
+            config,
+            json,
+        } => {
+            let appliance = Appliance::load(&config)?;
+            let answer = trace::trace(
+                &appliance,
+                &trace::Query {
+                    in_interface,
+                    proto,
+                    src,
+                    dst,
+                    port,
+                    src_mac,
+                    icmp_type,
+                },
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&answer)?);
+            } else {
+                print!("{}", answer.render());
+            }
+            Ok(())
+        }
         Command::RecordMetrics => {
             let root = crate::metrics::dir();
             let root = root.as_path();
@@ -497,7 +564,14 @@ async fn main() -> Result<()> {
             config,
             no_apply,
             token_file,
-        } => api::serve(&listen, &config, live_apply(!no_apply), &token_file).await,
+            openapi,
+        } => {
+            if openapi {
+                print!("{}", openapi::pretty());
+                return Ok(());
+            }
+            api::serve(&listen, &config, live_apply(!no_apply), &token_file).await
+        }
         Command::Wol { mac, interface } => wol(&mac, interface.as_deref()),
     }
 }

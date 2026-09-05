@@ -113,6 +113,7 @@ Outside of edits, `sentinel show …` (or `run show …` inside a session, or ju
 | `show configuration` | The saved configuration, in config syntax. |
 | `show log [velstra\|wren]` | Recent service log. |
 | `show version` | Software versions, which image is running (verity root hash + slot), and whether the clock is synchronised. |
+| `trace --in <if> <proto> <src> <dst> [port]` | Where a packet would go and which rule decides it, walked from the configuration without sending anything — see [Firewall & NAT](firewall.md#asking-before-you-send-packet-trace). |
 
 The rest of this handbook is a tour of the config tree, section by section,
 each with the commands it exposes and a worked example. The final chapter,
