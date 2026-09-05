@@ -127,3 +127,118 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+// ---- reporting up ----------------------------------------------------------
+
+/// The counters this box would tell a Velstra controller about.
+///
+/// One flat `(name, value)` list, because that is what `StatsReport` carries and
+/// what a controller can aggregate without knowing anything about appliances.
+/// Three sources, named so a reader of the controller's side can tell them
+/// apart: the links (`iface.<name>.rx|tx`), the firewall's own totals
+/// (`fw.<counter>`), and the rules that are carrying traffic
+/// (`rule.<name>.flows|packets`).
+///
+/// Pure over what it is handed, so the shape can be tested without a data plane
+/// or a controller — the gathering is [`report_counters`] below.
+pub fn counters_from(
+    interfaces: &[(String, u64, u64)],
+    firewall: &[(String, u64)],
+    rules: &[(String, u64, u64)],
+    sessions: Option<u64>,
+) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    for (name, rx, tx) in interfaces {
+        out.push((format!("iface.{name}.rx"), *rx));
+        out.push((format!("iface.{name}.tx"), *tx));
+    }
+    for (name, value) in firewall {
+        out.push((format!("fw.{name}"), *value));
+    }
+    for (name, flows, packets) in rules {
+        // A rule the operator did not name is one the compiler opened itself
+        // (a load-balanced service); it has no name a controller could match
+        // against a configuration, so it is left out rather than sent as noise.
+        if name.starts_with('(') {
+            continue;
+        }
+        out.push((format!("rule.{name}.flows"), *flows));
+        out.push((format!("rule.{name}.packets"), *packets));
+    }
+    if let Some(n) = sessions {
+        out.push(("sessions".to_string(), n));
+    }
+    out
+}
+
+/// Parse the agent's `stats` table into `(counter, value)`.
+///
+/// The agent prints a fixed-width table rather than JSON, so this reads it back
+/// and skips anything that does not parse — a report that vanishes because one
+/// row was odd is worse than one that is short by it.
+pub fn parse_stats(text: &str) -> Vec<(String, u64)> {
+    text.lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() != 2 {
+                return None;
+            }
+            let value: u64 = f[1].parse().ok()?;
+            let name = f[0];
+            if !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+            {
+                return None;
+            }
+            Some((name.to_string(), value))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::*;
+
+    #[test]
+    fn the_three_sources_are_named_apart_and_a_compiler_rule_is_left_out() {
+        let counters = counters_from(
+            &[("eth0".into(), 10, 20)],
+            &[("passed_rule".into(), 7)],
+            &[
+                ("web-in".into(), 3, 400),
+                ("(load-balancer vip)".into(), 9, 900),
+            ],
+            Some(42),
+        );
+        assert_eq!(
+            counters,
+            vec![
+                ("iface.eth0.rx".into(), 10),
+                ("iface.eth0.tx".into(), 20),
+                ("fw.passed_rule".into(), 7),
+                ("rule.web-in.flows".into(), 3),
+                ("rule.web-in.packets".into(), 400),
+                ("sessions".into(), 42),
+            ]
+        );
+    }
+
+    #[test]
+    fn nothing_to_report_is_an_empty_list_rather_than_a_row_of_zeroes() {
+        assert!(counters_from(&[], &[], &[], None).is_empty());
+    }
+
+    #[test]
+    fn the_agents_table_is_read_back_and_odd_rows_are_skipped() {
+        let text = "  counter                       value\n\
+                    \x20 -------------------- --------------\n\
+                    \x20 rx_packets                        4\n\
+                    \x20 dropped_rule                     11\n\
+                    \x20 not a number                      x\n";
+        assert_eq!(
+            parse_stats(text),
+            vec![("rx_packets".into(), 4), ("dropped_rule".into(), 11)]
+        );
+    }
+}
