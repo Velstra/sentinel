@@ -111,6 +111,15 @@ jobs:
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          # `udevadm trigger` returns before udev has applied the rule, so the
+          # mode arrives a moment after the command that asked for it. Asked
+          # once, this reported "/dev/kvm is not writable" and then printed
+          # crw-rw-rw- on the very next line: the device was fine, the question
+          # was put too early. Wait for it instead.
+          for _ in $(seq 20); do
+            [ -w /dev/kvm ] && break
+            sleep 0.5
+          done
           if [ ! -w /dev/kvm ]; then
             echo "::error::/dev/kvm is not writable — the VM tests cannot boot."
             ls -l /dev/kvm || true
@@ -205,6 +214,15 @@ jobs:
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          # `udevadm trigger` returns before udev has applied the rule, so the
+          # mode arrives a moment after the command that asked for it. Asked
+          # once, this reported "/dev/kvm is not writable" and then printed
+          # crw-rw-rw- on the very next line: the device was fine, the question
+          # was put too early. Wait for it instead.
+          for _ in $(seq 20); do
+            [ -w /dev/kvm ] && break
+            sleep 0.5
+          done
           if [ ! -w /dev/kvm ]; then
             echo "::error::/dev/kvm is not writable — the VM tests cannot boot."
             ls -l /dev/kvm || true
@@ -275,6 +293,15 @@ jobs:
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          # `udevadm trigger` returns before udev has applied the rule, so the
+          # mode arrives a moment after the command that asked for it. Asked
+          # once, this reported "/dev/kvm is not writable" and then printed
+          # crw-rw-rw- on the very next line: the device was fine, the question
+          # was put too early. Wait for it instead.
+          for _ in $(seq 20); do
+            [ -w /dev/kvm ] && break
+            sleep 0.5
+          done
           if [ ! -w /dev/kvm ]; then
             echo "::error::/dev/kvm is not writable — the image build will crawl or fail."
             ls -l /dev/kvm || true
