@@ -1609,7 +1609,7 @@ pub fn page() -> String {
 
 <section id="login" class="card">
   <div class="brand" style="margin-bottom:var(--space-5)">
-    <span class="mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg></span>
+    <span class="mark"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg></span>
     <span class="wordmark">
       <span class="name">Velstra Sentinel</span>
       <span class="sub">Appliance console</span>
@@ -1660,7 +1660,7 @@ pub fn page() -> String {
   <div id="banner" class="err hidden" style="grid-column:1/-1;padding:var(--space-3) var(--space-5);border-bottom:1px solid var(--border)"></div>
   <aside>
     <div class="brand">
-      <span class="mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg></span>
+      <span class="mark"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg></span>
       <span class="wordmark">
         <span class="name">Velstra Sentinel</span>
         <span class="sub" id="navhost">appliance console</span>
@@ -1668,7 +1668,7 @@ pub fn page() -> String {
     </div>
 
     <label class="search">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
       <input id="navsearch" placeholder="Search sections">
     </label>
     <button id="palettehint" class="palhint" type="button"
@@ -1704,7 +1704,7 @@ pub fn page() -> String {
       <span class="spacer"></span>
       <span class="pill" id="stagedbadge">no staged changes</span>
       <button class="iconbtn" id="refresh" title="Reload this page" aria-label="Reload this page">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.3-5.7"/><path d="M20 4v5h-5"/></svg>
+        <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.3-5.7"/><path d="M20 4v5h-5"/></svg>
       </button>
       <button class="iconbtn" id="theme" title="Appearance" aria-label="Appearance"></button>
       <button class="btn" id="discard">Discard</button>
@@ -1719,7 +1719,7 @@ pub fn page() -> String {
     </header>
 
     <div class="card staged hidden" id="stagedcard">
-      <span class="tile"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 2 9 5-9 5-9-5 9-5z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/></svg></span>
+      <span class="tile"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 2 9 5-9 5-9-5 9-5z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/></svg></span>
       <span class="stagedtext">
         <span class="t" id="stagedtitle">Staged changes</span>
         <span class="b">Nothing is applied until you say so. These are the exact
@@ -8239,7 +8239,7 @@ const ICONS = {{
 // not have to.
 function icon(name) {{
   const box = document.createElement("span");
-  box.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+  box.innerHTML = '<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
     'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
     (ICONS[name] || ICONS.file) + "</svg>";
   return box.firstChild;
