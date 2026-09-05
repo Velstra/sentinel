@@ -2,19 +2,37 @@
 //!
 //! Velstra's data plane decides a packet's fate at its **ingress interface**:
 //! each interface is bound to a policy, and the policy carries a default action
-//! plus (later) rules. So we map each Sentinel interface to a per-**zone** policy
-//! and give that policy an ingress posture derived from the zone's rules:
+//! plus its rules. So each Sentinel interface maps to a per-**zone** policy, and
+//! everything the operator wrote about that zone becomes that policy:
 //!
-//! * a zone whose rules let it *initiate* (any `from = <zone>, action = accept`)
-//!   gets `default_action = pass`,
-//! * every other zone gets `default_action = drop` (e.g. WAN: block inbound),
-//! * all policies are `stateful`, so return traffic for allowed flows comes back.
+//! * the **posture** — an explicit `default-action`, else `pass` when a broad
+//!   `from = <zone>, action = accept` rule lets the zone initiate, else the
+//!   global default; `stateful`, `block-icmp`, `log`, source validation, the
+//!   blocklist (including GeoIP) and the captive-portal gate;
+//! * every **port rule** as one data-plane rule per `(proto, port, one address
+//!   end[, interface])`: ranges and `port-group`s fan out, `tcp_udp` becomes
+//!   two rules, `source`/`destination` and their groups become the CIDR the
+//!   trie is keyed on, `interface-group` scopes a rule to a link, `family` and
+//!   `direction` narrow it, and a MAC-group rule becomes one verdict per member;
+//! * a **destination zone** (`to = <zone>`) as a match on that zone's own
+//!   subnets — or, for the `local` zone, on this box's own addresses as host
+//!   routes. The data plane has no notion of an egress zone; it ranks one
+//!   address end per rule by longest prefix, so "to lan" is enforced as "to the
+//!   networks lan is made of". A `to` on a zone with no static subnet matches
+//!   nothing and is reported at commit rather than silently widened;
+//! * port-forwards, hairpin reflections, load-balanced services (each with the
+//!   `pass` that opens its port), masquerade and CGNAT layout per interface,
+//!   NPTv6, SYN proxy, flow export, conntrack sync, the EVPN overlay and SRv6.
 //!
-//! This is the **zone ingress posture** — a real, working firewall from the
-//! declared zones. The precise per-destination-zone matrix (and port rules) is
-//! the next slice; this module emits a subset of Velstra's `FileConfig`, and
-//! Velstra fills the rest with defaults (its schema is `deny_unknown_fields` +
-//! `default`, so the subset must use only known field names — it does).
+//! Matching is exactly what the data plane loads: `attribute` (which rule is
+//! carrying a flow) and `crate::trace` (which rule would decide a packet) both
+//! run over this output rather than over the operator's rules, so neither can
+//! disagree with the firewall. `checks.rulescope` in the flake proves the
+//! verdicts on a live data plane — including that a `to <zone>` deny drops.
+//!
+//! The output is a subset of Velstra's `FileConfig`; Velstra fills the rest with
+//! defaults (its schema is `deny_unknown_fields` + `default`, so the subset must
+//! use only known field names — it does).
 
 use std::collections::BTreeMap;
 

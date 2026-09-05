@@ -9770,6 +9770,18 @@
                 "'set firewall rule plain port 9084' "
                 "'set firewall rule plain action drop' "
                 "'set firewall rule plain log true' "
+                # A zone pair. `to firewall` is the box's own addresses, which
+                # is the one destination zone this two-node topology has; the
+                # compiler turns it into a destination match, and the point of
+                # the check is that the data plane then *drops* on it rather
+                # than the rule being flattened into the zone's posture.
+                "'set firewall zone firewall local true' "
+                "'set firewall rule pair-deny from wan' "
+                "'set firewall rule pair-deny to firewall' "
+                "'set firewall rule pair-deny proto tcp' "
+                "'set firewall rule pair-deny port 9085' "
+                "'set firewall rule pair-deny action drop' "
+                "'set firewall rule pair-deny log true' "
                 "commit save exit "
                 "| sentinel configure\""
             )
@@ -9815,11 +9827,18 @@
                 knock(9081, v6)
             knock(9083)
             knock(9084)
+            knock(9085)
 
             # A rule that names an address and one that does not, both IPv4,
             # both arriving: whichever of these fails says where to look.
             assert dropped(9083), "a rule naming a source address did not match" + why()
             assert dropped(9084), "a rule naming no address at all did not match" + why()
+
+            # A zone pair: `from wan to firewall` compiled to a destination match
+            # on the box's own address, and the data plane dropped on it. The
+            # zone's posture is `accept`, so nothing but the pair rule can have
+            # done this.
+            assert dropped(9085), "a deny on a zone pair did not drop" + why()
 
             # Family: each rule stops its own family and leaves the other alone.
             assert dropped(9080), "an ipv4-scoped rule did not stop an IPv4 connection" + why()
