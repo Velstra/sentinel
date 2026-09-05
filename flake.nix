@@ -38,7 +38,33 @@
     { self, nixpkgs, fenix, fabric, wren }:
     let
       system = "x86_64-linux";
-      pkgs = nixpkgs.legacyPackages.${system};
+
+      # crates.io answers nix's fetcher with 403. It refuses curl's default
+      # User-Agent, and `fetchurl` *is* curl — so every `cargoLock` build here
+      # stopped downloading its crates, which is nine VM checks failing on a
+      # download rather than on anything this repository did. The identical
+      # tarball is on static.crates.io, which does not care who asks, and that
+      # is where nixpkgs itself fetches crates from since 25.11; this rewrites
+      # the URL rather than crossing a nixpkgs release to fix a fetch. Nothing
+      # downstream moves: a crate tarball is a fixed-output derivation, so its
+      # store path is decided by the hash and the name in `Cargo.lock`, never by
+      # where the bytes came from. Delete this when the pin reaches 25.11.
+      crateSource = _: prev: {
+        fetchurl =
+          args:
+          let
+            gone = "https://crates.io/api/v1/crates/";
+            parts = lib.splitString "/" (lib.removePrefix gone args.url);
+            name = builtins.elemAt parts 0;
+            version = builtins.elemAt parts 1;
+          in
+          if (args ? url) && lib.hasPrefix gone args.url && builtins.length parts == 3 then
+            prev.fetchurl (args // { url = "https://static.crates.io/crates/${name}/${name}-${version}.crate"; })
+          else
+            prev.fetchurl args;
+      };
+
+      pkgs = nixpkgs.legacyPackages.${system}.extend crateSource;
       lib = nixpkgs.lib;
 
       # --- the sentinel CLI (stable rustc is fine) ---------------------------
