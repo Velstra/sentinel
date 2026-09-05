@@ -48,6 +48,18 @@
 
 ### Added
 
+- **The appliance reports up.** `sentinel report --controller <url>` hands a
+  Velstra controller what this box is carrying — per-link rx/tx, the data
+  plane's own counters, the rules that are carrying traffic, and the session
+  count — as one `ReportStats` call over the wire types the `ports` query
+  already used. `--dry-run` prints the list instead of sending it, and
+  `--node` names the box to the controller (its hostname otherwise).
+
+  Only observations go: what the links carried, what the firewall did. Nothing
+  about the configuration, and nothing comes back — an appliance that took
+  configuration from a controller would have two writers for the one document
+  it reconciles to. A box whose configuration cannot be read still reports its
+  links and its data plane, which is when a controller most wants them.
 - **The API describes itself.** `GET /api/v1/openapi.json` (and `sentinel api
   --openapi`) is the management API as OpenAPI 3.1 — every route, its
   parameters, bodies and answers — for a client generator, a Terraform

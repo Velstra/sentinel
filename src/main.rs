@@ -77,7 +77,10 @@ fn saved_config_path() -> std::path::PathBuf {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_CONFIG))
 }
-use velstra_proto::{ListPortsRequest, velstra_orchestrator_client::VelstraOrchestratorClient};
+use velstra_proto::{
+    Counter, ListPortsRequest, StatsReport, velstra_control_client::VelstraControlClient,
+    velstra_orchestrator_client::VelstraOrchestratorClient,
+};
 
 use crate::config::Appliance;
 
@@ -170,6 +173,29 @@ enum Command {
         /// Print the answer as JSON rather than as text.
         #[arg(long)]
         json: bool,
+    },
+    /// Tell a Velstra controller what this box is carrying.
+    ///
+    ///   sentinel report --controller http://10.0.0.1:50052
+    ///
+    /// The first thing the appliance *sends* rather than asks: link counters,
+    /// the firewall's own totals, the rules that are carrying traffic, and the
+    /// session count, as one `ReportStats` call. Nothing about the box's
+    /// configuration goes with it — a controller learns what is happening, not
+    /// what was declared.
+    Report {
+        /// The controller's gRPC endpoint.
+        #[arg(long)]
+        controller: String,
+        /// How this box is named to the controller (default: its hostname).
+        #[arg(long)]
+        node: Option<String>,
+        /// The configuration the rule names come from (default: the saved one).
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+        /// Print what would be sent and send nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Take one round of history samples. Run by the `sentinel-metrics` timer
     /// once a minute; not something to type, but not hidden either — a timer
@@ -576,6 +602,12 @@ async fn main() -> Result<()> {
         }
         Command::PortMap { state } => serve_portmap(&state),
         Command::AcmeRenew => acme::run(),
+        Command::Report {
+            controller,
+            node,
+            config,
+            dry_run,
+        } => report(&controller, node, &config, dry_run).await,
         Command::Ports { controller } => ports(&controller).await,
         Command::Api {
             listen,
@@ -3087,6 +3119,70 @@ fn config_cmd(action: ConfigAction) -> Result<()> {
 
 /// Connect to a Velstra controller and print its ports — a working first use of
 /// the shared `velstra-proto` wire types.
+/// Gather this box's counters and hand them to a controller.
+///
+/// Everything it sends is an observation: what the links carried, what the
+/// firewall did, which rules are carrying traffic. A controller that wanted to
+/// know what this appliance is *configured* to do would read its configuration,
+/// which is a different question and a different surface.
+async fn report(
+    endpoint: &str,
+    node: Option<String>,
+    config: &std::path::Path,
+    dry_run: bool,
+) -> Result<()> {
+    let node_id = node.unwrap_or_else(system::current_hostname);
+    let interfaces = metrics::interface_counters().unwrap_or_default();
+    let firewall = velstra::parse_stats(&velstra::query("stats").unwrap_or_default());
+    let rules = match Appliance::load(config) {
+        Ok(appliance) => {
+            let compiled = compile::compile(&appliance);
+            let flows = compile::parse_flows(
+                &velstra::query("flows --limit 0")
+                    .or_else(|_| velstra::query("flows"))
+                    .unwrap_or_default(),
+            );
+            compile::attribute(&compiled, &flows)
+                .into_iter()
+                .map(|(name, hits)| (name, hits.flows, hits.packets))
+                .collect()
+        }
+        // A box whose configuration cannot be read still has links and a data
+        // plane, and those numbers are the ones a controller most wants when
+        // something is wrong. Report what there is.
+        Err(e) => {
+            eprintln!("warning: reading {} for rule names: {e}", config.display());
+            Vec::new()
+        }
+    };
+    let counters = velstra::counters_from(&interfaces, &firewall, &rules, metrics::session_count());
+
+    if dry_run {
+        println!("would report {} counters as {node_id}:", counters.len());
+        for (name, value) in &counters {
+            println!("  {name:<40} {value:>12}");
+        }
+        return Ok(());
+    }
+
+    let mut client = VelstraControlClient::connect(endpoint.to_string())
+        .await
+        .with_context(|| format!("connecting to controller {endpoint}"))?;
+    let sent = counters.len();
+    client
+        .report_stats(StatsReport {
+            node_id: node_id.clone(),
+            counters: counters
+                .into_iter()
+                .map(|(name, value)| Counter { name, value })
+                .collect(),
+        })
+        .await
+        .context("ReportStats RPC")?;
+    println!("reported {sent} counters to {endpoint} as {node_id}");
+    Ok(())
+}
+
 async fn ports(endpoint: &str) -> Result<()> {
     let mut client = VelstraOrchestratorClient::connect(endpoint.to_string())
         .await
