@@ -44,8 +44,12 @@ appliance by changing its config and re-applying — never by editing live state
 >   TOTP), a captive portal, and box services (DHCP, DNS, NTP, SNMP, LLDP, …).
 >
 > It also talks to a Velstra controller over
-> [`velstra-proto`](https://crates.io/crates/velstra-proto) — today a single
-> `ports` query, the first use of the shared wire types. **Most of the above is
+> [`velstra-proto`](https://crates.io/crates/velstra-proto): a `ports` query,
+> and `report`, which hands the controller this box's counters — the links, the
+> firewall's own totals, the rules that are carrying traffic. Reporting up is
+> deliberately the first thing it *sends*: taking configuration down would put
+> a second writer next to the declarative document this appliance reconciles
+> to. **Most of the above is
 > verified in the nixosTest VM suite; it is not yet validated end-to-end on
 > physical hardware** — ACME live issuance and the TPM2-sealed unlock in
 > particular exercise real boot/reachability paths a VM check cannot fully stand
