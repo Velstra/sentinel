@@ -901,6 +901,23 @@ pub fn install_service_secret(path: &Path, contents: &str) -> Result<()> {
 /// it wasn't running. Only invoked (by [`crate::net`]) when the rendered config
 /// changed, or to (re)assert the service at boot-late (after networkd). Mirrors
 /// [`multiwan_restart`], generalised over the unit name.
+/// Go back to ignoring SIGPIPE, for a command that serves rather than prints.
+///
+/// `main` sets the default action so a `show` piped into `head` ends quietly.
+/// A server must not carry that: the default action is to terminate, so one
+/// client hanging up mid-write ends the whole service — and because systemd
+/// counts SIGPIPE as a clean exit, it does so silently and without a restart.
+/// Rust's own startup ignores SIGPIPE for exactly this reason; this puts it
+/// back for the processes that need it.
+pub fn ignore_sigpipe() {
+    #[cfg(unix)]
+    // SAFETY: setting a signal disposition to SIG_IGN is async-signal-safe and
+    // is what the Rust runtime itself does before `main`.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+}
+
 pub fn service_restart(unit: &str) -> Result<()> {
     run_priv("systemctl", &["restart", unit])
 }

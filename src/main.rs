@@ -452,6 +452,15 @@ async fn main() -> Result<()> {
     // exits quietly when the reader closes the pipe, instead of panicking on
     // EPIPE (Rust ignores SIGPIPE by default, turning a closed pipe into a
     // "failed printing to stdout" panic).
+    //
+    // **For the commands that print and exit only.** A server that carries this
+    // setting dies the first time a client hangs up while it is writing: the
+    // default action for SIGPIPE is to terminate, and systemd counts SIGPIPE as
+    // a *clean* exit — so the unit reads "Deactivated successfully", nothing is
+    // logged, and `Restart=on-failure` does not fire. That is how the
+    // management API disappeared mid-request after a `curl … | grep -q`, which
+    // closes the pipe on the first match and drops the connection under the
+    // server's feet. The long-running commands below put it back.
     #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
@@ -553,9 +562,18 @@ async fn main() -> Result<()> {
         Command::Apply { file, out, reload } => apply(&file, &out, reload.as_deref()),
         Command::ConfirmRollback { config } => confirm_rollback(&config),
         Command::Alert { unit, config } => alert_unit(&unit, &config),
-        Command::IdsWatch => ids::watch(),
-        Command::BroadcastRelay => relay::run(),
-        Command::Portal { state } => serve_portal(&state).await,
+        Command::IdsWatch => {
+            system::ignore_sigpipe();
+            ids::watch()
+        }
+        Command::BroadcastRelay => {
+            system::ignore_sigpipe();
+            relay::run()
+        }
+        Command::Portal { state } => {
+            system::ignore_sigpipe();
+            serve_portal(&state).await
+        }
         Command::PortMap { state } => serve_portmap(&state),
         Command::AcmeRenew => acme::run(),
         Command::Ports { controller } => ports(&controller).await,
