@@ -2603,6 +2603,29 @@ pub fn page() -> String {
       </div>
     </div>
 
+    <div id="view-trace" class="hidden">
+      <div class="card addpanel">
+        <label class="field"><span>Arrives on</span><select id="tr-iface"></select></label>
+        <label class="field w-s"><span>Protocol</span>
+          <select id="tr-proto">
+            <option value="tcp">tcp</option>
+            <option value="udp">udp</option>
+            <option value="icmp">icmp</option>
+            <option value="icmpv6">icmpv6</option>
+            <option value="gre">gre</option>
+            <option value="esp">esp</option>
+          </select>
+        </label>
+        <label class="field"><span>Source</span><input id="tr-src" placeholder="10.0.0.5"></label>
+        <label class="field"><span>Destination</span><input id="tr-dst" placeholder="10.9.0.10"></label>
+        <label class="field w-s"><span>Port</span>
+          <input id="tr-port" type="number" inputmode="numeric" min="0" max="65535" placeholder="443">
+        </label>
+        <button class="btn primary" id="runtrace">Trace</button>
+      </div>
+      <div class="card"><h3>Answer</h3><pre class="out" id="traceout">Not asked yet.</pre></div>
+    </div>
+
     <div id="view-capture" class="hidden">
       <div class="card addpanel">
         <label class="field"><span>Interface</span><select id="cap-iface"></select></label>
@@ -8062,6 +8085,33 @@ async function refreshHa() {{
 
 // The interface list comes from the config, so the picker offers the interfaces
 // this appliance knows rather than whatever the kernel happens to have.
+// The interface picker is the capture's, for the same reason: a link that is
+// not in the configuration is not one the data plane has an answer about.
+async function refreshTrace() {{
+  const ls = await leaves();
+  const names = [...new Set(ls.filter((l) => l.path[0] === "interface").map((l) => l.path[1]))];
+  const sel = $("tr-iface");
+  const chosen = sel.value;
+  sel.textContent = "";
+  for (const n of names.sort()) {{
+    const o = el("option", {{ value: n, text: n }});
+    if (n === chosen) o.setAttribute("selected", "selected");
+    sel.append(o);
+  }}
+}}
+
+// The answer is drawn as the walk went — one line per stage, then the rules
+// that were looked at and passed over, then the verdict and what decided it.
+function renderTrace(t) {{
+  const lines = t.steps.map((s) => (s.stage + ":").padEnd(10) + " " + s.text);
+  if (t.considered.length) {{
+    lines.push("", "rules looked at and passed over:");
+    for (const c of t.considered) lines.push("  " + c.rule.padEnd(24) + " " + c.outcome);
+  }}
+  lines.push("", "verdict:   " + t.verdict + " (" + t.decided_by + ")");
+  return lines.join("\n");
+}}
+
 async function refreshCapture() {{
   const ls = await leaves();
   const names = [...new Set(ls.filter((l) => l.path[0] === "interface").map((l) => l.path[1]))];
@@ -8197,6 +8247,7 @@ const SECTIONS = [
   ]}},
   {{ g: "Policy", i: "shield", items: [
     {{ v: "rules", t: "Firewall rules", i: "shield" }},
+    {{ v: "trace", t: "Packet trace", i: "search" }},
     {{ v: "zones", t: "Zones", i: "zones" }},
     {{ v: "groups", t: "Groups", i: "layers" }},
     {{ v: "nat", t: "NAT", i: "swap" }},
@@ -8605,6 +8656,7 @@ const ABOUT = {{
   pki: "Local certificate authorities.",
   certs: "Issued certificates and what they are used for.",
   ids: "Detection, and what an alert is allowed to do about it.",
+  trace: "Ask before you send: which zone a packet arrives in, what a port-forward makes of it, where the routing table sends it, which rule wins and why the others did not. Answered from the saved configuration, so nothing is touched — and nothing the box only learns at runtime is known.",
   capture: "See the wire itself: never more than 500 packets or 60 seconds, headers only, and nothing written to disk. A capture that finds nothing is an answer too.",
   services: "The box services: resolution, time, management access, notification.",
   system: "Identity, and where signed images come from.",
@@ -8872,6 +8924,7 @@ async function refresh() {{
   if (view === "certs") return refreshCerts();
   if (view === "ids") return refreshIds();
   if (view === "capture") return refreshCapture();
+  if (view === "trace") return refreshTrace();
   if (view === "evpn") return refreshEvpn();
   if (view === "ha") return refreshHa();
   if (view === "users") return refreshUsers();
@@ -9099,6 +9152,29 @@ wireToggle("togglesyn", "addsynpanel", "New");
 wireToggle("togglevrrp", "addvrrppanel", "New");
 $("groupkind").onchange = () => refreshGroups();
 $("liftall").onclick = () => clearOp("ids/blocks");
+$("runtrace").onclick = async () => {{
+  const btn = $("runtrace");
+  btn.disabled = true;
+  btn.textContent = "Tracing…";
+  const q = new URLSearchParams({{
+    in: $("tr-iface").value,
+    proto: $("tr-proto").value,
+    src: $("tr-src").value.trim(),
+    dst: $("tr-dst").value.trim(),
+    port: String(Number($("tr-port").value) || 0),
+  }});
+  try {{
+    const r = await api("/api/v1/trace?" + q.toString());
+    const body = await r.json();
+    // A malformed question comes back as an error with a sentence in it, and
+    // the sentence is the answer.
+    $("traceout").textContent = r.ok ? renderTrace(body) : (body.error || JSON.stringify(body));
+  }} catch (e) {{
+    $("traceout").textContent = String(e.message || e);
+  }}
+  btn.disabled = false;
+  btn.textContent = "Trace";
+}};
 $("runcapture").onclick = async () => {{
   const btn = $("runcapture");
   // A capture takes as long as it takes; saying so beats a page that looks
@@ -9525,6 +9601,17 @@ mod tests {
         }
     }
 
+    /// The trace touches nothing, so it is a GET with the question in the
+    /// query — and the page says it is working, like the capture does.
+    #[test]
+    fn a_trace_is_a_get_that_says_it_is_working() {
+        let html = page();
+        assert!(html.contains(r#""/api/v1/trace?""#));
+        assert!(html.contains("Tracing…"), "the page looks frozen while it asks");
+        assert!(html.contains(r#"id="view-trace""#));
+        assert!(html.contains("rules looked at and passed over"));
+    }
+
     /// A capture holds a process open for as long as it runs, so it must be a
     /// POST — a GET that does that is one a browser or a proxy will repeat —
     /// and the page must say it is running rather than look frozen.
@@ -9814,6 +9901,7 @@ mod tests {
             "Intl",
             "fetch",
             "MutationObserver",
+            "URLSearchParams",
             "encodeURIComponent",
             "decodeURIComponent",
             "setInterval",

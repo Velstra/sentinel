@@ -44,14 +44,14 @@ fn mss_ceiling(i: &crate::config::Interface) -> Option<u16> {
 /// `policy`/`interface` array renames match Velstra's TOML schema exactly.
 #[derive(Debug, Serialize)]
 pub struct VelstraConfig {
-    default_action: &'static str,
-    stateful: bool,
-    drop_icmp: bool,
-    log: bool,
+    pub(crate) default_action: &'static str,
+    pub(crate) stateful: bool,
+    pub(crate) drop_icmp: bool,
+    pub(crate) log: bool,
     /// Source-address validation (uRPF) for the default policy. Omitted when
     /// disabled, which is velstra's own default.
     #[serde(skip_serializing_if = "is_disabled")]
-    source_validation: &'static str,
+    pub(crate) source_validation: &'static str,
     /// Host-wide: drop a packet the data plane cannot parse rather than pass it.
     /// Not a per-policy field — the parse fails before any policy is known — so
     /// it is emitted once, at the top level.
@@ -61,17 +61,17 @@ pub struct VelstraConfig {
     /// meant two defaults had to agree, in two repositories, for a
     /// security-relevant decision. Stating it every time leaves one place the
     /// answer comes from.
-    fail_closed: bool,
+    pub(crate) fail_closed: bool,
     // Inline array of strings — still a scalar for TOML ordering, so it must
     // precede the `[[policy]]`/`[[interface]]` tables below.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    blocklist: Vec<String>,
+    pub(crate) blocklist: Vec<String>,
     #[serde(rename = "policy")]
-    policies: Vec<Policy>,
+    pub(crate) policies: Vec<Policy>,
     #[serde(rename = "interface")]
-    interfaces: Vec<Interface>,
+    pub(crate) interfaces: Vec<Interface>,
     #[serde(rename = "port_forward", skip_serializing_if = "Vec::is_empty")]
-    port_forwards: Vec<PortForwardOut>,
+    pub(crate) port_forwards: Vec<PortForwardOut>,
     #[serde(rename = "npt66", skip_serializing_if = "Vec::is_empty")]
     npt66: Vec<Npt66Out>,
     /// C15 SYN proxy (`[[synproxy]]`) — the TCP ports whose handshake the data
@@ -211,24 +211,24 @@ struct SynProxyOut {
 const DEFAULT_SYNPROXY_MSS: u16 = 1460;
 
 #[derive(Debug, Serialize)]
-struct Policy {
-    id: u32,
-    name: String,
-    default_action: &'static str,
-    stateful: bool,
-    drop_icmp: bool,
-    log: bool,
+pub(crate) struct Policy {
+    pub(crate) id: u32,
+    pub(crate) name: String,
+    pub(crate) default_action: &'static str,
+    pub(crate) stateful: bool,
+    pub(crate) drop_icmp: bool,
+    pub(crate) log: bool,
     #[serde(skip_serializing_if = "is_disabled")]
-    source_validation: &'static str,
+    pub(crate) source_validation: &'static str,
     // Scalars above, the array-of-tables below (TOML requires this order).
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    blocklist: Vec<String>,
+    pub(crate) blocklist: Vec<String>,
     /// C20: the captive-portal gate for this zone. A sub-table, so it comes
     /// after the scalars and before the `[[policy.port_rule]]` array.
     #[serde(skip_serializing_if = "Option::is_none")]
-    portal: Option<PortalOut>,
+    pub(crate) portal: Option<PortalOut>,
     #[serde(rename = "port_rule", skip_serializing_if = "Vec::is_empty")]
-    port_rules: Vec<PortRule>,
+    pub(crate) port_rules: Vec<PortRule>,
 }
 
 /// Which policy id each zone in use compiles to.
@@ -288,65 +288,65 @@ fn portal_gate(appliance: &Appliance, zone: &str) -> Option<PortalOut> {
 /// The appliance's own addresses in a gated zone — what a device that has not
 /// been admitted is still allowed to reach (roadmap C20).
 #[derive(Debug, Serialize)]
-struct PortalOut {
+pub(crate) struct PortalOut {
     #[serde(skip_serializing_if = "Option::is_none")]
-    address: Option<String>,
+    pub(crate) address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    address6: Option<String>,
+    pub(crate) address6: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
-struct PortRule {
+pub(crate) struct PortRule {
     /// Which configured rule this came from. Carried in memory so the appliance
     /// can say what a live flow was admitted by, and never serialised — the data
     /// plane keys on `(policy, proto, port, address)` and has no use for a name.
     #[serde(skip)]
-    name: String,
-    proto: &'static str,
-    port: u16,
-    action: &'static str,
+    pub(crate) name: String,
+    pub(crate) proto: &'static str,
+    pub(crate) port: u16,
+    pub(crate) action: &'static str,
     /// Log packets matching this rule. Omitted when false (the common case).
     #[serde(skip_serializing_if = "is_false")]
-    log: bool,
+    pub(crate) log: bool,
     /// Optional source CIDR ("10.0.0.0/24"). Omitted when the rule is `from any`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    src: Option<String>,
+    pub(crate) src: Option<String>,
     /// The sender's hardware address this rule is a verdict on. Never set
     /// together with a port or an address: the data plane consults MACs once
     /// from the Ethernet header, not as a dimension of its rule tries.
     #[serde(rename = "src-mac", skip_serializing_if = "Option::is_none")]
-    src_mac: Option<String>,
+    pub(crate) src_mac: Option<String>,
     /// The interface this rule applies on. Omitted when it applies everywhere
     /// the policy does.
     #[serde(rename = "in-interface", skip_serializing_if = "Option::is_none")]
-    in_interface: Option<String>,
+    pub(crate) in_interface: Option<String>,
     /// Optional destination CIDR. Omitted when the rule is `to any`. Never set
     /// together with `src` — the data plane ranks one end per rule.
     #[serde(skip_serializing_if = "Option::is_none")]
-    dst: Option<String>,
+    pub(crate) dst: Option<String>,
     /// New-flow rate limit in packets/s. Omitted when the rule is unlimited.
     #[serde(skip_serializing_if = "Option::is_none")]
-    limit: Option<u32>,
+    pub(crate) limit: Option<u32>,
     /// Burst capacity in packets. Omitted to let the data plane default it to one
     /// second's worth of `limit`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    burst: Option<u32>,
+    pub(crate) burst: Option<u32>,
     /// The ICMP/ICMPv6 type, already resolved from whatever name the operator
     /// wrote. Omitted when the rule matches every type.
     #[serde(rename = "icmp-type", skip_serializing_if = "Option::is_none")]
-    icmp_type: Option<u8>,
+    pub(crate) icmp_type: Option<u8>,
     /// Which address family this rule is for. Omitted when it is for both.
     #[serde(skip_serializing_if = "Option::is_none")]
-    family: Option<String>,
+    pub(crate) family: Option<String>,
     /// Which direction this rule is for. Omitted when it is for both.
     #[serde(skip_serializing_if = "Option::is_none")]
-    direction: Option<String>,
+    pub(crate) direction: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
-struct Interface {
-    name: String,
-    policy: u32,
+pub(crate) struct Interface {
+    pub(crate) name: String,
+    pub(crate) policy: u32,
     /// The overlay segment this port is on, when an EVPN instance names it.
     ///
     /// Deliberately separate from `policy`: the ruleset a port is filtered by
@@ -354,32 +354,32 @@ struct Interface {
     /// ports on one segment may want different rules. Omitted ⇒ the data plane
     /// defaults it to `policy`, the single-tenant convenience.
     #[serde(skip_serializing_if = "Option::is_none")]
-    vni: Option<u32>,
+    pub(crate) vni: Option<u32>,
     /// Clamp the MSS a departing SYN advertises to this. Omitted when the link
     /// does not need one.
     #[serde(skip_serializing_if = "Option::is_none")]
-    mss: Option<u16>,
+    pub(crate) mss: Option<u16>,
     /// Source-NAT (masquerade) traffic leaving this interface — set when the
     /// interface's zone has a `[[nat.source]]` rule. Omitted when false.
     #[serde(skip_serializing_if = "is_false")]
-    masquerade: bool,
+    pub(crate) masquerade: bool,
     /// Deterministic CGNAT (roadmap C16): the first WAN port and the ports each
     /// internal address gets. Both omitted unless the zone's masquerade rule asks
     /// for blocks — the data plane's own default is the plain hash-spread NAPT.
     #[serde(skip_serializing_if = "is_zero_u16")]
-    cgnat_base_port: u16,
+    pub(crate) cgnat_base_port: u16,
     #[serde(skip_serializing_if = "is_zero_u16")]
-    cgnat_block_size: u16,
+    pub(crate) cgnat_block_size: u16,
     /// B13: what this port may send, in megabits per second. Omitted on a port
     /// nobody capped.
     #[serde(rename = "rate-limit-mbit", skip_serializing_if = "Option::is_none")]
-    ingress_limit: Option<u32>,
+    pub(crate) ingress_limit: Option<u32>,
     /// Port security (roadmap B12): the identity this port is bound to. Both
     /// omitted on a port nobody bound, which is every uplink.
     #[serde(skip_serializing_if = "Option::is_none")]
-    bind_mac: Option<String>,
+    pub(crate) bind_mac: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    bind_addresses: Vec<String>,
+    pub(crate) bind_addresses: Vec<String>,
 }
 
 fn is_zero_u16(v: &u16) -> bool {
@@ -419,20 +419,20 @@ fn geo_blocklist(posture: &crate::config::ResolvedZone) -> Vec<String> {
 }
 
 #[derive(Debug, Serialize)]
-struct PortForwardOut {
-    policy: u32,
-    proto: &'static str,
-    port: u16,
-    dst_ip: String,
-    dst_port: u16,
+pub(crate) struct PortForwardOut {
+    pub(crate) policy: u32,
+    pub(crate) proto: &'static str,
+    pub(crate) port: u16,
+    pub(crate) dst_ip: String,
+    pub(crate) dst_port: u16,
     /// Hairpin (NAT reflection) match guard — only DNAT when the packet's
     /// destination equals this (the box's public IP). Absent ⇒ match any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    match_dst: Option<String>,
+    pub(crate) match_dst: Option<String>,
     /// Hairpin source-NAT address (the box's IP on the client's segment). Absent
     /// ⇒ no source rewrite.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    snat_ip: Option<String>,
+    pub(crate) snat_ip: Option<String>,
 }
 
 impl VelstraConfig {

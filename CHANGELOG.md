@@ -48,6 +48,26 @@
 
 ### Added
 
+- **The API describes itself.** `GET /api/v1/openapi.json` (and `sentinel api
+  --openapi`) is the management API as OpenAPI 3.1 — every route, its
+  parameters, bodies and answers — for a client generator, a Terraform
+  provider or an IDE. Open like `health`, because a client has to read it
+  before it can know how to sign in. A unit test reads the routes out of the
+  router and fails when one is served and not documented, or documented and
+  not served. Velstra Cloud serves the same document at the same path.
+- **A packet trace: ask before you send.** `sentinel trace --in lan0 tcp
+  10.0.0.200 10.9.0.10 22` walks a packet through the configuration in the
+  order the data plane takes it — the arriving link's zone, the blocklist,
+  source validation, a port-forward's rewrite, the routing decision, the rule
+  that wins and the ones that were looked at and passed over (with the
+  reason), and the masquerade on the way out — and says what decided the
+  verdict. Matching runs over the *compiled* rules, so the ranking is the one
+  the eBPF program applies (a MAC verdict, then a link-scoped rule, then a
+  typed ICMP rule, then the longest prefix, then the stricter action) and
+  cannot drift from it. What the box only knows at runtime — an established
+  flow, a learned route, which uplink is up — is named in the answer rather
+  than guessed. The console has it under Policy → Packet trace, the API as
+  `GET /api/v1/trace`, and `--json` prints the same walk as data.
 - **Named update channels + subscriptions — the enterprise update channel.**
   The single `[update] url` grows into named channels
   (`set update channel <name> url|public-key|subscription-key …`, with the

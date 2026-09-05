@@ -222,6 +222,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/api/v1/status", get(get_status))
         .route("/api/v1/show/*path", get(get_show))
         .route("/api/v1/rule-hits", get(get_rule_hits))
+        .route("/api/v1/trace", get(get_trace))
         .route("/api/v1/metrics", get(get_metrics_list))
         .route("/api/v1/metrics/:resolution/:series", get(get_metrics))
         // The Prometheus scrape target, at the conventional `/metrics`. Same
@@ -244,6 +245,9 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
     Router::new()
         .route("/api/v1/health", get(health))
+        // The surface as a document. Open like `health`: a client has to read
+        // it before it can know how to sign in, and it names no secret.
+        .route("/api/v1/openapi.json", get(get_openapi))
         // Signing in cannot require being signed in. The account's password is
         // checked here and the account's own token is handed back — the same
         // token an operator could read off the box, so nothing new is granted
@@ -456,6 +460,23 @@ async fn get_rule_hits(State(state): State<Arc<ApiState>>) -> Result<Json<Value>
             .map(|(name, h)| json!({ "name": name, "flows": h.flows, "packets": h.packets }))
             .collect::<Vec<_>>(),
     })))
+}
+
+/// `GET /api/v1/trace?in=lan0&proto=tcp&src=10.0.0.5&dst=10.9.0.10&port=22` —
+/// where would this packet go, and which rule decides it.
+///
+/// A walk over the saved configuration, not a capture: nothing is sent and
+/// nothing on the box is touched, which is why it is a GET. The same answer
+/// `sentinel trace` prints, as JSON — see [`crate::trace`] for what it can and
+/// cannot know.
+async fn get_trace(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Query(query): axum::extract::Query<crate::trace::Query>,
+) -> Result<Json<crate::trace::Trace>, ApiError> {
+    let appliance = Appliance::load(&state.config_path)
+        .map_err(|e| ApiError::internal(anyhow!("reading the configuration: {e}")))?;
+    let answer = crate::trace::trace(&appliance, &query).map_err(ApiError::bad_request)?;
+    Ok(Json(answer))
 }
 
 /// Per-rule hit counters as `(name, flows, packets)`, the same attribution the
@@ -1055,6 +1076,16 @@ fn forget_ip(ip: std::net::IpAddr) {
 }
 
 /// `GET /api/v1/health` — liveness, no auth.
+/// `GET /api/v1/openapi.json` — the API as OpenAPI 3.1. See [`crate::openapi`].
+async fn get_openapi() -> Response {
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        crate::openapi::pretty(),
+    )
+        .into_response()
+}
+
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
@@ -2135,6 +2166,23 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(body_string(resp).await.contains("ok"));
+    }
+
+    /// The document a client reads before it has a token, so it is open like
+    /// `health` — and it is the router's own routes, or the check in
+    /// `openapi.rs` would have failed first.
+    #[tokio::test]
+    async fn the_openapi_document_needs_no_auth_and_names_the_trace() {
+        let st = state(seed("seed-host"));
+        let resp = router(st)
+            .oneshot(get("/api/v1/openapi.json", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let doc: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(doc["openapi"], "3.1.0");
+        assert!(doc["paths"]["/api/v1/trace"]["get"].is_object());
     }
 
     /// The closed sets the console's pickers are filled from. Behind the token
