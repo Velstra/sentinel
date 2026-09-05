@@ -346,11 +346,13 @@ fn run_stdin(cmd: &str, args: &[&str], input: &[u8]) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("no stdin for {cmd}"))?
         .write_all(input)
         .with_context(|| format!("feeding the passphrase to {cmd}"))?;
-    let status = child
-        .wait()
-        .with_context(|| format!("waiting for {cmd}"))?;
+    let status = child.wait().with_context(|| format!("waiting for {cmd}"))?;
     if !status.success() {
-        bail!("`{cmd} {}` failed (exit {:?})", args.join(" "), status.code());
+        bail!(
+            "`{cmd} {}` failed (exit {:?})",
+            args.join(" "),
+            status.code()
+        );
     }
     Ok(())
 }
@@ -556,7 +558,10 @@ pub fn execute(
                 luks_format_open(&base, passphrase)?;
                 let guard = CryptGuard;
                 run("udevadm", &["settle"]).ok();
-                run("mkfs.ext4", &["-q", "-F", "-L", "data", &data_mapper_path()])?;
+                run(
+                    "mkfs.ext4",
+                    &["-q", "-F", "-L", "data", &data_mapper_path()],
+                )?;
                 drop(guard); // close the volume now, not at end of scope
             }
         }
@@ -1062,10 +1067,7 @@ mod tests {
         let sda = disk("sda", 500, false);
         let sdb = disk("sdb", 500, false);
         // Single disk: the raw data partition.
-        assert_eq!(
-            existing_data_base(&[&sda], Raid::None),
-            "/dev/sda6"
-        );
+        assert_eq!(existing_data_base(&[&sda], Raid::None), "/dev/sda6");
         // RAID: the assembled array node execute created.
         assert_eq!(
             existing_data_base(&[&sda, &sdb], Raid::Mirror),

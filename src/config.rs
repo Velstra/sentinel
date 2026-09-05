@@ -545,7 +545,11 @@ pub struct Update {
     /// The pinned Ed25519 public key for the unnamed default channel, PEM
     /// (`-----BEGIN PUBLIC KEY-----`) or a `file:<path>` reference (so the key
     /// can live in the image, not the config). Required beside `url`.
-    #[serde(default, rename = "public-key", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "public-key",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub public_key: Option<String>,
     /// Which named channel updates come from. Must name an entry in
     /// `channels`; when unset, the bare `url` above is the channel.
@@ -569,7 +573,11 @@ pub struct UpdateChannelCfg {
     pub url: Option<String>,
     /// The pinned Ed25519 key THIS channel's manifests must be signed with —
     /// PEM or `file:<path>`. Required at commit; deliberately per-channel.
-    #[serde(default, rename = "public-key", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "public-key",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub public_key: Option<String>,
     /// The subscription entitlement, sent to the channel server as an
     /// `Authorization: Bearer` header. A SECRET: redacted by the read API,
@@ -12409,7 +12417,10 @@ subscription-key = "velstra-ent-11aa22bb"
         let chan = a.update.as_ref().unwrap().active().expect("resolves");
         assert_eq!(chan.name.as_deref(), Some("enterprise"));
         assert_eq!(chan.public_key, "file:/etc/sentinel/enterprise.pem");
-        assert_eq!(chan.subscription_key.as_deref(), Some("velstra-ent-11aa22bb"));
+        assert_eq!(
+            chan.subscription_key.as_deref(),
+            Some("velstra-ent-11aa22bb")
+        );
 
         // Drop the selection: two channels, no choice — an error naming them,
         // never a silent pick.
@@ -14764,7 +14775,10 @@ virtual-address = ["10.0.0.254"]
         // TLS is on by default — parsed from config and built in code.
         let w = Appliance::from_toml(&format!("{base}[services.web]\nenable = true\n")).unwrap();
         assert!(w.services.web.tls, "TLS must default on");
-        assert!(WebConsole::default().tls, "a code-built WebConsole is TLS-on too");
+        assert!(
+            WebConsole::default().tls,
+            "a code-built WebConsole is TLS-on too"
+        );
 
         // An operator certificate needs both halves.
         assert!(

@@ -23,8 +23,8 @@ use crate::config::{
     PortMapping, PortSpec, Portal, Pppoe, PppoeServer, PrefixEntry, PrefixList, Proto, Protocols,
     Qos, QosDiscipline, ReverseProxy, Rip, RouterAdvert, Rule, Schedule, Services, Snmp,
     SourceValidation, Ssh, StaticRoute, Syslog, SyslogLevel, SyslogProto, SyslogTarget, System,
-    Vpn, VrfDef, Vrrp, WanMode, WanUplink, WebConsole, WgPeer, WireguardTunnel,
-    Wireless, WirelessWpa, Wwan, ZoneCfg,
+    Vpn, VrfDef, Vrrp, WanMode, WanUplink, WebConsole, WgPeer, WireguardTunnel, Wireless,
+    WirelessWpa, Wwan, ZoneCfg,
 };
 
 /// Default on-disk location of the active appliance config. Writable and
@@ -7286,7 +7286,12 @@ impl Session {
                 }
             }
             ["system", "aaa", "radius", server, field] => {
-                let Some(r) = self.draft.aaa.radius.iter_mut().find(|r| r.server == *server)
+                let Some(r) = self
+                    .draft
+                    .aaa
+                    .radius
+                    .iter_mut()
+                    .find(|r| r.server == *server)
                 else {
                     bail!("no radius server {server:?}");
                 };
@@ -7331,7 +7336,12 @@ impl Session {
                 }
             }
             ["system", "aaa", "tacacs", server, field] => {
-                let Some(t) = self.draft.aaa.tacacs.iter_mut().find(|t| t.server == *server)
+                let Some(t) = self
+                    .draft
+                    .aaa
+                    .tacacs
+                    .iter_mut()
+                    .find(|t| t.server == *server)
                 else {
                     bail!("no tacacs server {server:?}");
                 };
@@ -16410,7 +16420,10 @@ backends = ["10.0.0.11:8443"]
             up.url.as_deref(),
             Some("https://updates.velstra.example/sentinel")
         );
-        assert_eq!(up.public_key.as_deref(), Some("file:/etc/sentinel/release.pem"));
+        assert_eq!(
+            up.public_key.as_deref(),
+            Some("file:/etc/sentinel/release.pem")
+        );
         // The legacy bare pair resolves as the unnamed default channel — the
         // back-compat promise a fielded box relies on.
         let active = up.active().expect("the bare url is a channel");
@@ -16504,9 +16517,17 @@ backends = ["10.0.0.11:8443"]
     fn the_reading_view_withholds_the_subscription_key_and_the_replay_view_keeps_it() {
         let mut s = Session::empty();
         run(&mut s, "set system hostname box").unwrap();
-        run(&mut s, "set update channel ent url https://updates.example/ent").unwrap();
+        run(
+            &mut s,
+            "set update channel ent url https://updates.example/ent",
+        )
+        .unwrap();
         run(&mut s, "set update channel ent public-key file:/etc/e.pem").unwrap();
-        run(&mut s, "set update channel ent subscription-key velstra-ent-11aa22bb").unwrap();
+        run(
+            &mut s,
+            "set update channel ent subscription-key velstra-ent-11aa22bb",
+        )
+        .unwrap();
         let a = s.commit().expect("commits");
 
         let reading = render_appliance_for_reading(&a);
@@ -16545,7 +16566,11 @@ backends = ["10.0.0.11:8443"]
     fn the_marker_is_refused_rather_than_installed_as_a_key() {
         let mut s = Session::empty();
         run(&mut s, "set system hostname box").unwrap();
-        run(&mut s, "set update channel ent url https://updates.example/ent").unwrap();
+        run(
+            &mut s,
+            "set update channel ent url https://updates.example/ent",
+        )
+        .unwrap();
         run(&mut s, "set update channel ent public-key file:/etc/e.pem").unwrap();
         let e = run(
             &mut s,
@@ -16609,7 +16634,9 @@ backends = ["10.0.0.11:8443"]
         assert!(shown.contains("channel community {"), "got:\n{shown}");
         assert!(shown.contains("    channel enterprise\n"), "got:\n{shown}");
 
-        let a = s.commit().expect("two complete channels + a selection commit");
+        let a = s
+            .commit()
+            .expect("two complete channels + a selection commit");
         let up = a.update.as_ref().unwrap();
         assert_eq!(up.channel.as_deref(), Some("enterprise"));
         assert_eq!(up.channels.len(), 2);
@@ -16618,7 +16645,10 @@ backends = ["10.0.0.11:8443"]
         assert_eq!(active.name.as_deref(), Some("enterprise"));
         assert_eq!(active.url, "https://updates.velstra.example/enterprise");
         assert_eq!(active.public_key, "file:/etc/sentinel/enterprise.pem");
-        assert_eq!(active.subscription_key.as_deref(), Some("velstra-ent-11aa22bb"));
+        assert_eq!(
+            active.subscription_key.as_deref(),
+            Some("velstra-ent-11aa22bb")
+        );
 
         // from_appliance ∘ materialize is the identity on the channels too.
         let round = Session {
@@ -16660,15 +16690,16 @@ backends = ["10.0.0.11:8443"]
         run(&mut s, "set update channel ghost").unwrap();
         run(&mut s, "delete update channel ghost").unwrap();
         let err = s.commit().unwrap_err().to_string();
-        assert!(
-            err.contains("selected but not defined"),
-            "got: {err}"
-        );
+        assert!(err.contains("selected but not defined"), "got: {err}");
 
         // A non-HTTPS channel URL (file:// stays allowed for air-gapped use).
         let mut s = Session::empty();
         run(&mut s, "set system hostname box").unwrap();
-        run(&mut s, "set update channel ent url http://updates.example/e").unwrap();
+        run(
+            &mut s,
+            "set update channel ent url http://updates.example/e",
+        )
+        .unwrap();
         run(
             &mut s,
             "set update channel ent public-key file:/etc/sentinel/e.pem",
@@ -16679,7 +16710,9 @@ backends = ["10.0.0.11:8443"]
 
         // A channel named like a field could never be addressed again.
         let mut s = Session::empty();
-        let err = run(&mut s, "set update channel url").unwrap_err().to_string();
+        let err = run(&mut s, "set update channel url")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("field name"), "got: {err}");
     }
 
@@ -16706,7 +16739,9 @@ backends = ["10.0.0.11:8443"]
 
         // Clearing the selection: channels stay defined, none is active.
         run(&mut s, "delete update channel").unwrap();
-        let a = s.commit().expect("defined-but-unselected is a valid config");
+        let a = s
+            .commit()
+            .expect("defined-but-unselected is a valid config");
         assert_eq!(a.update.as_ref().unwrap().channel, None);
         let err = a.update.as_ref().unwrap().active().unwrap_err().to_string();
         assert!(err.contains("no channel selected"), "got: {err}");
@@ -16723,9 +16758,13 @@ backends = ["10.0.0.11:8443"]
         s.commit().expect("no channels, no selection — valid");
 
         // …and unknown names / an unset selection are refusals, not no-ops.
-        let err = run(&mut s, "delete update channel ghost").unwrap_err().to_string();
+        let err = run(&mut s, "delete update channel ghost")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("no update channel"), "got: {err}");
-        let err = run(&mut s, "delete update channel").unwrap_err().to_string();
+        let err = run(&mut s, "delete update channel")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("no update channel selected"), "got: {err}");
     }
 }

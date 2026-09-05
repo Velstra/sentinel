@@ -1120,12 +1120,7 @@ pub fn curl_get_plain(url: &str, timeout_secs: u32) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-pub fn curl_put_config(
-    url: &str,
-    token: &str,
-    body_file: &Path,
-    pin: Option<&str>,
-) -> Result<()> {
+pub fn curl_put_config(url: &str, token: &str, body_file: &Path, pin: Option<&str>) -> Result<()> {
     let auth = format!("Authorization: Bearer {token}");
     let data = format!("@{}", body_file.display());
     let mut args: Vec<String> = vec![
@@ -1322,8 +1317,8 @@ pub fn learn_peer_pubkey_pin(authority: &str) -> Result<String> {
         bail!("could not reach {authority} to read its TLS certificate");
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    let cert_pem =
-        first_pem_cert(&text).ok_or_else(|| bail_str(format!("{authority} presented no certificate")))?;
+    let cert_pem = first_pem_cert(&text)
+        .ok_or_else(|| bail_str(format!("{authority} presented no certificate")))?;
     pubkey_pin_from_cert_pem(cert_pem.as_bytes())
 }
 
@@ -1648,7 +1643,10 @@ mod tests {
         let got = first_pem_cert(text).expect("a cert block");
         assert!(got.starts_with("-----BEGIN CERTIFICATE-----"));
         assert!(got.ends_with("-----END CERTIFICATE-----"));
-        assert!(got.contains("AAA") && !got.contains("BBB"), "only the first block");
+        assert!(
+            got.contains("AAA") && !got.contains("BBB"),
+            "only the first block"
+        );
         assert!(first_pem_cert("no certificate here").is_none());
     }
 

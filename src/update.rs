@@ -208,9 +208,7 @@ fn fetch(chan: &UpdateChannel, url: &str, dest: &Path) -> Result<()> {
         // move onto a named channel, and saying `set update channel default …`
         // would name a command that does not exist.
         let fix = match &chan.name {
-            Some(n) => format!(
-                "Add the key with `set update channel {n} subscription-key <key>`"
-            ),
+            Some(n) => format!("Add the key with `set update channel {n} subscription-key <key>`"),
             None => "Define a named channel carrying the key (set update channel <name> \
                      url/public-key/subscription-key …) and select it"
                 .to_string(),
@@ -679,10 +677,7 @@ mod tests {
             signature_path(Path::new("/tmp/sentinel-0.4.raw")),
             Path::new("/tmp/sentinel-0.4.raw.sig")
         );
-        assert_eq!(
-            signature_path(Path::new("image")),
-            Path::new("image.sig")
-        );
+        assert_eq!(signature_path(Path::new("image")), Path::new("image.sig"));
     }
 
     /// A missing signature is refused without needing any crypto at all — the
@@ -694,10 +689,7 @@ mod tests {
         std::fs::write(&img, b"pretend image").unwrap();
         // No image.raw.sig beside it.
         let err = verify_local_image(&img, "does-not-matter").unwrap_err();
-        assert!(
-            format!("{err}").contains("no detached signature"),
-            "{err}"
-        );
+        assert!(format!("{err}").contains("no detached signature"), "{err}");
     }
 
     /// The local path reuses the channel's Ed25519 infra: a detached signature
@@ -718,7 +710,13 @@ mod tests {
         let ob = openssl_bin();
         assert!(
             Command::new(&ob)
-                .args(["genpkey", "-algorithm", "ed25519", "-out", priv_pem.to_str().unwrap()])
+                .args([
+                    "genpkey",
+                    "-algorithm",
+                    "ed25519",
+                    "-out",
+                    priv_pem.to_str().unwrap()
+                ])
                 .status()
                 .unwrap()
                 .success()

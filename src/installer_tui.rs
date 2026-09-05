@@ -1692,6 +1692,9 @@ mod tests {
         app.encrypt = false;
         let answers = app.into_answers();
         assert!(!answers.encrypt);
-        assert!(answers.passphrase.is_empty(), "a stale passphrase must not leak");
+        assert!(
+            answers.passphrase.is_empty(),
+            "a stale passphrase must not leak"
+        );
     }
 }

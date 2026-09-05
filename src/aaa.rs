@@ -338,7 +338,10 @@ pub fn radius_authenticate(
         RADIUS_ATTR_USER_PASSWORD,
         &hide_password(password, secret, &authenticator),
     )?);
-    attrs.extend_from_slice(&attr(RADIUS_ATTR_NAS_IDENTIFIER, nas_identifier.as_bytes())?);
+    attrs.extend_from_slice(&attr(
+        RADIUS_ATTR_NAS_IDENTIFIER,
+        nas_identifier.as_bytes(),
+    )?);
 
     let length = (20 + attrs.len()) as u16;
     let mut packet = vec![RADIUS_ACCESS_REQUEST, identifier[0]];
@@ -593,9 +596,16 @@ fn tacacs_start_body(username: &str, port: &str, rem_addr: &str) -> Result<Vec<u
     // Each length is one octet, and like the RADIUS attribute cap, truncating
     // (`as u8` wrapping) would declare a short length and let the tail be
     // parsed as some other field. Refuse instead.
-    for (what, v) in [("username", username), ("port", port), ("rem_addr", rem_addr)] {
+    for (what, v) in [
+        ("username", username),
+        ("port", port),
+        ("rem_addr", rem_addr),
+    ] {
         if v.len() > 255 {
-            bail!("TACACS+ {what} is {} bytes; the field maximum is 255", v.len());
+            bail!(
+                "TACACS+ {what} is {} bytes; the field maximum is 255",
+                v.len()
+            );
         }
     }
     let mut body = vec![
@@ -636,7 +646,10 @@ fn tacacs_continue_body(user_msg: &str) -> Result<Vec<u8>> {
 /// (which a FAIL or ERROR often uses to say why).
 fn tacacs_parse_reply(clear: &[u8]) -> Result<(u8, String)> {
     if clear.len() < 6 {
-        bail!("the TACACS+ reply body is {} bytes; the fixed part alone is 6", clear.len());
+        bail!(
+            "the TACACS+ reply body is {} bytes; the fixed part alone is 6",
+            clear.len()
+        );
     }
     let status = clear[0];
     let server_msg_len = u16::from_be_bytes([clear[2], clear[3]]) as usize;
@@ -676,10 +689,16 @@ fn tacacs_read_reply(
         );
     }
     if header[1] != TACACS_TYPE_AUTHEN {
-        bail!("the TACACS+ server answered with packet type {}, not authentication", header[1]);
+        bail!(
+            "the TACACS+ server answered with packet type {}, not authentication",
+            header[1]
+        );
     }
     if header[2] != seq_no {
-        bail!("the TACACS+ server answered out of sequence ({} where {seq_no} was next)", header[2]);
+        bail!(
+            "the TACACS+ server answered out of sequence ({} where {seq_no} was next)",
+            header[2]
+        );
     }
     if header[3] & TACACS_FLAG_UNENCRYPTED != 0 {
         // The server is answering in the clear, which means it has no shared
@@ -783,7 +802,12 @@ pub fn tacacs_authenticate(
             .checked_add(1)
             .ok_or_else(|| anyhow!("the TACACS+ conversation ran past 255 packets"))?;
         stream
-            .write_all(&tacacs_packet(&session_id, secret, seq, &tacacs_continue_body(answer)?))
+            .write_all(&tacacs_packet(
+                &session_id,
+                secret,
+                seq,
+                &tacacs_continue_body(answer)?,
+            ))
             .with_context(|| format!("sending to the TACACS+ server {server}"))?;
         seq = seq
             .checked_add(1)
@@ -1070,7 +1094,9 @@ mod tests {
         let packet = tacacs_packet(&session, "s3cret", 1, &[0u8; 20]);
         assert_eq!(
             &packet[..12],
-            &[0xc0, 0x01, 0x01, 0x00, 0x01, 0x02, 0x03, 0x04, 0x00, 0x00, 0x00, 0x14],
+            &[
+                0xc0, 0x01, 0x01, 0x00, 0x01, 0x02, 0x03, 0x04, 0x00, 0x00, 0x00, 0x14
+            ],
         );
         assert_eq!(packet.len(), 12 + 20);
     }
@@ -1124,7 +1150,10 @@ mod tests {
         // A GETPASS with the classic prompt.
         let mut reply = vec![0x05, 0x00, 0x00, 0x0a, 0x00, 0x00];
         reply.extend_from_slice(b"Password: ");
-        assert_eq!(tacacs_parse_reply(&reply).unwrap(), (5, "Password: ".to_string()));
+        assert_eq!(
+            tacacs_parse_reply(&reply).unwrap(),
+            (5, "Password: ".to_string())
+        );
 
         // A bare PASS and a bare FAIL.
         assert_eq!(tacacs_parse_reply(&[0x01, 0, 0, 0, 0, 0]).unwrap().0, 1);

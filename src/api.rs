@@ -1040,9 +1040,7 @@ fn note_ip_failure(ip: std::net::IpAddr) {
     // least-recently-active. An address mid-attack has a fresh entry and is never
     // the one dropped.
     if map.len() >= MAX_TRACKED_IPS && !map.contains_key(&ip) {
-        map.retain(|_, r| {
-            r.locked_until.is_some() || r.window_started.elapsed() <= IP_WINDOW
-        });
+        map.retain(|_, r| r.locked_until.is_some() || r.window_started.elapsed() <= IP_WINDOW);
         if map.len() >= MAX_TRACKED_IPS {
             if let Some(oldest) = map
                 .iter()

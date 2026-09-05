@@ -4354,9 +4354,16 @@ mod tests {
         // A `host:port` or a `[v6]:port` flattens to one safe path component.
         let p = configsync_pin_path("[2001:db8::1]:8080");
         let name = p.file_name().unwrap().to_string_lossy();
-        assert!(!name.contains(':') && !name.contains('[') && !name.contains(']'), "{name}");
+        assert!(
+            !name.contains(':') && !name.contains('[') && !name.contains(']'),
+            "{name}"
+        );
         assert!(name.ends_with(".pin"), "{name}");
-        assert!(p.starts_with("/var/lib/sentinel/configsync"), "{}", p.display());
+        assert!(
+            p.starts_with("/var/lib/sentinel/configsync"),
+            "{}",
+            p.display()
+        );
     }
 
     #[test]

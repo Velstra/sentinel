@@ -70,7 +70,13 @@
 /// log and the browser console. Served as bytes rather than named by a
 /// `<link>`: the page stays self-contained, and a `<link>` is exactly what
 /// [`tests::the_page_is_self_contained`] refuses.
-pub const FAVICON_PNG: &[u8] = &[137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 16, 0, 0, 0, 16, 8, 6, 0, 0, 0, 31, 243, 255, 97, 0, 0, 0, 39, 73, 68, 65, 84, 120, 218, 99, 96, 160, 22, 144, 207, 239, 254, 79, 10, 30, 53, 96, 212, 0, 218, 24, 64, 138, 33, 20, 37, 105, 138, 242, 5, 69, 153, 139, 129, 86, 0, 0, 75, 73, 53, 240, 89, 14, 85, 95, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130];
+pub const FAVICON_PNG: &[u8] = &[
+    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 16, 0, 0, 0, 16, 8, 6,
+    0, 0, 0, 31, 243, 255, 97, 0, 0, 0, 39, 73, 68, 65, 84, 120, 218, 99, 96, 160, 22, 144, 207,
+    239, 254, 79, 10, 30, 53, 96, 212, 0, 218, 24, 64, 138, 33, 20, 37, 105, 138, 242, 5, 69, 153,
+    139, 129, 86, 0, 0, 75, 73, 53, 240, 89, 14, 85, 95, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96,
+    130,
+];
 
 /// A read-only view: a title and the `show` path behind it.
 ///
@@ -9607,7 +9613,10 @@ mod tests {
     fn a_trace_is_a_get_that_says_it_is_working() {
         let html = page();
         assert!(html.contains(r#""/api/v1/trace?""#));
-        assert!(html.contains("Tracing…"), "the page looks frozen while it asks");
+        assert!(
+            html.contains("Tracing…"),
+            "the page looks frozen while it asks"
+        );
         assert!(html.contains(r#"id="view-trace""#));
         assert!(html.contains("rules looked at and passed over"));
     }
