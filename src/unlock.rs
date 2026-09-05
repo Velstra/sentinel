@@ -128,7 +128,10 @@ fn pick_luks_data(lsblk: &str) -> Option<String> {
             Some((name.to_string(), label))
         })
         .collect();
-    if let Some((name, _)) = luks.iter().find(|(_, label)| label.as_deref() == Some("data")) {
+    if let Some((name, _)) = luks
+        .iter()
+        .find(|(_, label)| label.as_deref() == Some("data"))
+    {
         return Some(name.clone());
     }
     match luks.as_slice() {
@@ -147,10 +150,7 @@ fn ask_passphrase() -> Result<String> {
         .output()
         .context("prompting for the LUKS passphrase")?;
     if !out.status.success() {
-        bail!(
-            "systemd-ask-password failed (exit {:?})",
-            out.status.code()
-        );
+        bail!("systemd-ask-password failed (exit {:?})", out.status.code());
     }
     // Only the trailing newline is stripped: a passphrase may legitimately begin
     // or end with a space, so nothing else is trimmed.
@@ -180,7 +180,10 @@ fn open(dev: &str, passphrase: &str) -> Result<()> {
         .context("feeding the passphrase to cryptsetup")?;
     let status = child.wait().context("waiting for cryptsetup")?;
     if !status.success() {
-        bail!("cryptsetup open refused the passphrase (exit {:?})", status.code());
+        bail!(
+            "cryptsetup open refused the passphrase (exit {:?})",
+            status.code()
+        );
     }
     Ok(())
 }

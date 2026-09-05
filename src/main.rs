@@ -1010,7 +1010,12 @@ fn update_cmd(
 /// saved channel's `public-key`, or a key baked into the image) before a single
 /// byte reaches the slot-writer. `--allow-unsigned` keeps the old escape hatch for
 /// a re-seal or an air-gapped block device — loud and logged, never silent.
-fn update_local(path: &str, commit: bool, allow_unsigned: bool, pubkey: Option<&str>) -> Result<()> {
+fn update_local(
+    path: &str,
+    commit: bool,
+    allow_unsigned: bool,
+    pubkey: Option<&str>,
+) -> Result<()> {
     let image = std::path::Path::new(path);
     if allow_unsigned {
         eprintln!(
@@ -1111,7 +1116,11 @@ fn show_subscription() -> Result<()> {
         }
     }
     if let Some(url) = &up.url {
-        let active = if up.channel.is_none() { " (active)" } else { "" };
+        let active = if up.channel.is_none() {
+            " (active)"
+        } else {
+            ""
+        };
         println!("default channel:{active} {url}");
     }
 
@@ -1137,9 +1146,7 @@ fn show_subscription() -> Result<()> {
                 _ => println!("last check:     never (run `sentinel update check`)"),
             }
             if chan.subscription_key.is_some() {
-                println!(
-                    "expiry:         not reported by the channel server — nothing is assumed"
-                );
+                println!("expiry:         not reported by the channel server — nothing is assumed");
             }
         }
         Err(e) => println!("active channel: none — {e:#}"),
