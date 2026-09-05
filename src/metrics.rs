@@ -382,7 +382,11 @@ impl Family<'_> {
         if self.samples.is_empty() {
             return;
         }
-        out.push_str(&format!("# HELP {} {}\n", self.name, escape_help(self.help)));
+        out.push_str(&format!(
+            "# HELP {} {}\n",
+            self.name,
+            escape_help(self.help)
+        ));
         out.push_str(&format!("# TYPE {} {}\n", self.name, self.kind));
         for (key, value) in self.samples {
             out.push_str(&format!(
@@ -613,7 +617,8 @@ mod tests {
 
         // Each family carries exactly one HELP and one TYPE line.
         assert_eq!(
-            text.matches("# TYPE sentinel_interface_receive_bytes_total").count(),
+            text.matches("# TYPE sentinel_interface_receive_bytes_total")
+                .count(),
             1
         );
         assert!(text.contains("# TYPE sentinel_interface_receive_bytes_total counter\n"));
@@ -621,7 +626,9 @@ mod tests {
             text.contains("sentinel_interface_receive_bytes_total{interface=\"eth0\"} 1000\n"),
             "{text}"
         );
-        assert!(text.contains("sentinel_interface_transmit_bytes_total{interface=\"eth0\"} 2000\n"));
+        assert!(
+            text.contains("sentinel_interface_transmit_bytes_total{interface=\"eth0\"} 2000\n")
+        );
         assert!(text.contains("sentinel_interface_receive_bytes_total{interface=\"br-lan\"} 30\n"));
         // Rule hits, both families.
         assert!(text.contains("sentinel_rule_hit_flows_total{rule=\"ssh-in\"} 3\n"));
@@ -636,7 +643,10 @@ mod tests {
     #[test]
     fn an_empty_family_emits_nothing() {
         let text = prometheus_exposition(&[], &[], None);
-        assert_eq!(text, "", "nothing to report is the empty document, {text:?}");
+        assert_eq!(
+            text, "",
+            "nothing to report is the empty document, {text:?}"
+        );
     }
 
     /// A label value with a quote or backslash in it must be escaped, or the

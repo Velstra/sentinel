@@ -1511,7 +1511,10 @@ const PERMIT_DENY: &[Cand] = &[
 ];
 // `update <Tab>` reveals the signed-update-channel fields (roadmap C13).
 const UPDATE_FIELDS: &[Cand] = &[
-    ("url", "default channel base URL (holds manifest.json + images)"),
+    (
+        "url",
+        "default channel base URL (holds manifest.json + images)",
+    ),
     (
         "public-key",
         "pinned Ed25519 signing key (PEM or file:<path>)",
@@ -5313,7 +5316,10 @@ mod tests {
         assert!(msg.contains("MIXED STATE"), "{msg}");
         assert!(msg.contains("ipsec load failed"), "{msg}");
         assert!(msg.contains("networkd would not restart"), "{msg}");
-        assert!(msg.contains("firewall, routing and hostname changes were rolled back"), "{msg}");
+        assert!(
+            msg.contains("firewall, routing and hostname changes were rolled back"),
+            "{msg}"
+        );
         assert!(msg.contains("rollback"), "{msg}");
     }
 
@@ -5345,7 +5351,11 @@ mod tests {
         // Only the failing step is reported, with its cause.
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("routing"), "{:?}", failures);
-        assert!(failures[0].contains("wren would not reload"), "{:?}", failures);
+        assert!(
+            failures[0].contains("wren would not reload"),
+            "{:?}",
+            failures
+        );
     }
 
     /// Being offered at a level is half of it; the other half is that the branch
@@ -6023,10 +6033,7 @@ mod tests {
         assert_eq!(kws(&["set", "nat", "source"]), ["wan-masq", "<name>"]);
         assert_eq!(kws(&["set", "nat", "destination"]), ["web-fwd", "<name>"]);
         assert_eq!(kws(&["set", "firewall", "zone"]), ["lan", "wan", "<name>"]);
-        assert_eq!(
-            kws(&["set", "update", "channel"]),
-            ["enterprise", "<name>"]
-        );
+        assert_eq!(kws(&["set", "update", "channel"]), ["enterprise", "<name>"]);
         // Zone-value positions splice in the known zone names.
         assert_eq!(kws(&["set", "interface", "eth0", "zone"]), ["lan", "wan"]);
         assert_eq!(
