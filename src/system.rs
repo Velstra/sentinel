@@ -1479,6 +1479,7 @@ pub fn bin(name: &str) -> String {
         "sysctl" => "SENTINEL_SYSCTL_BIN",
         "swanctl" => "SENTINEL_SWANCTL_BIN",
         "openssl" => "SENTINEL_OPENSSL_BIN",
+        "curl" => "SENTINEL_CURL_BIN",
         "ethtool" => "SENTINEL_ETHTOOL_BIN",
         "lego" => "SENTINEL_LEGO_BIN",
         "lsblk" => "SENTINEL_LSBLK_BIN",
