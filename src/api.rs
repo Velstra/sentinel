@@ -1271,7 +1271,7 @@ fn replace_config(state: &ApiState, appliance: Appliance) -> Result<Json<Value>,
     // An account that has just been given a group needs a token to exist, and
     // one whose group was taken away needs its token gone — both at the moment
     // the change is saved, not at the next restart.
-    if let Err(e) = sync_user_tokens(&state) {
+    if let Err(e) = sync_user_tokens(state) {
         eprintln!("warning: could not reconcile per-account API tokens: {e:#}");
     }
     Ok(Json(json!({
