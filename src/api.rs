@@ -1569,17 +1569,34 @@ async fn get_stack(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, Ap
     for peer in &cs.peers {
         // Reachability is a real request, not a ping: the question the operator
         // has is whether this console can drive that member, and only an
-        // authenticated call answers it.
+        // authenticated call answers it. curl is blocking; keep it off the
+        // async worker or two single-vCPU peers polling each other's stack view
+        // can occupy their only workers and mutually time out.
         let (hostname, reachable) = match cs.secret.as_deref() {
-            Some(secret) => match peer_get(cs, peer, "status", secret) {
-                Ok(body) => (
-                    serde_json::from_str::<Value>(&body)
-                        .ok()
-                        .and_then(|v| v.get("hostname")?.as_str().map(str::to_string)),
-                    true,
-                ),
-                Err(_) => (None, false),
-            },
+            Some(secret) => {
+                let cs = cs.clone();
+                let peer = peer.clone();
+                let peer_label = peer.clone();
+                let secret = secret.to_string();
+                match tokio::task::spawn_blocking(move || peer_get(&cs, &peer, "status", &secret))
+                    .await
+                {
+                    Ok(Ok(body)) => (
+                        serde_json::from_str::<Value>(&body)
+                            .ok()
+                            .and_then(|v| v.get("hostname")?.as_str().map(str::to_string)),
+                        true,
+                    ),
+                    Ok(Err(e)) => {
+                        eprintln!("warning: config-sync peer {peer_label} status failed: {e:#}");
+                        (None, false)
+                    }
+                    Err(e) => {
+                        eprintln!("warning: config-sync peer {peer_label} status task failed: {e}");
+                        (None, false)
+                    }
+                }
+            }
             None => (None, false),
         };
         members.push(json!({
@@ -1617,7 +1634,13 @@ async fn get_stack_show(
         .secret
         .as_deref()
         .ok_or_else(|| ApiError::bad_request(anyhow!("no config-sync secret is set")))?;
-    let body = peer_get(cs, &member, &format!("show/{path}"), secret)
+    let cs = cs.clone();
+    let peer = member.clone();
+    let endpoint = format!("show/{path}");
+    let secret = secret.to_string();
+    let body = tokio::task::spawn_blocking(move || peer_get(&cs, &peer, &endpoint, &secret))
+        .await
+        .map_err(|e| ApiError::internal(anyhow!("peer request task failed: {e}")))?
         .map_err(|e| ApiError::bad_request(anyhow!("{member}: {e}")))?;
     Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response())
 }
