@@ -4227,7 +4227,7 @@ impl Console {
 }
 
 /// HA config sync (`[system.config-sync]`). On every `commit`, the running config
-/// is pushed to each `peer`'s Sentinel API (`PUT /api/v1/config`, bearer = the
+/// is pushed to each `peer`'s Sentinel API (`PUT /api/v1/config-sync`, bearer = the
 /// shared `secret`), which applies + persists it — pfSense-XMLRPC-analog, but
 /// declarative. A received sync does NOT re-push (only the interactive commit does),
 /// so a pair does not loop. Configuring a `secret` also arms the receiving side:

@@ -13,7 +13,9 @@
 //!   parse+validate the CLI runs), applies it with [`repl::apply_live`] — the
 //!   exact live-apply path a CLI `commit` takes — and persists it with
 //!   [`session::persist_appliance`], the same save path the CLI `save` uses.
-//! - `GET /api/v1/config` returns the running [`Appliance`] as JSON.
+//! - `GET /api/v1/config` returns the running [`Appliance`] as JSON, while
+//!   `PUT /api/v1/config-sync` accepts a peer's shared configuration and keeps
+//!   receiver-local identity intact.
 //! - `GET /api/v1/status` and `GET /api/v1/show/*` surface the operational state
 //!   the `show` commands report.
 //! - `GET /` serves the **web console** ([`crate::webui`]) — a read-only view over
@@ -223,6 +225,10 @@ fn install_crypto_provider() {
 pub fn router(state: Arc<ApiState>) -> Router {
     let protected = Router::new()
         .route("/api/v1/config", get(get_config).put(put_config))
+        // A config-sync peer is not a second administrator. Its document is
+        // shared policy, merged with the receiver's local identity before it
+        // can reach the normal apply path.
+        .route("/api/v1/config-sync", axum::routing::put(put_config_sync))
         .route("/api/v1/status", get(get_status))
         .route("/api/v1/show/*path", get(get_show))
         .route("/api/v1/rule-hits", get(get_rule_hits))
@@ -1175,10 +1181,39 @@ async fn put_config(
     State(state): State<Arc<ApiState>>,
     body: String,
 ) -> Result<Json<Value>, ApiError> {
-    // Same parse + validate the CLI runs — a semantically invalid config fails
-    // here, before any live change or write.
     let appliance = Appliance::from_json(&body).map_err(ApiError::bad_request)?;
+    replace_config(&state, appliance)
+}
 
+/// Receive the shared half of another firewall's configuration.
+///
+/// The transport is deliberately distinct from the administrator's full
+/// `PUT /config`: a peer must never rename this box, take its management
+/// addresses, turn its config-sync peers into itself, or overwrite the
+/// endpoint used for conntrack state. The remaining document is still applied
+/// atomically through the ordinary configuration path, so firewall policy,
+/// services and routing policy converge exactly as a local commit would.
+async fn put_config_sync(
+    State(state): State<Arc<ApiState>>,
+    body: String,
+) -> Result<Json<Value>, ApiError> {
+    let incoming = Appliance::from_json(&body).map_err(ApiError::bad_request)?;
+    let local = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
+    replace_config(&state, merge_synced_config(incoming, &local))
+}
+
+/// Keep facts that identify one member of an HA pair on that member.
+fn merge_synced_config(mut incoming: Appliance, local: &Appliance) -> Appliance {
+    incoming.system.hostname = local.system.hostname.clone();
+    incoming.system.config_sync = local.system.config_sync.clone();
+    incoming.system.conntrack_sync = local.system.conntrack_sync.clone();
+    incoming.interfaces = local.interfaces.clone();
+    incoming.protocols.router_id = local.protocols.router_id.clone();
+    incoming
+}
+
+/// Validate, apply and persist a complete, receiver-safe appliance document.
+fn replace_config(state: &ApiState, appliance: Appliance) -> Result<Json<Value>, ApiError> {
     // Same live-apply as a CLI `commit` (skipped off-box, mirroring `commit`'s
     // own `act.enabled` gate).
     if state.apply.enabled {
@@ -1785,6 +1820,69 @@ mod tests {
             apply: Apply::off(),
             tokens_dir: std::env::temp_dir().join("sentinel-test-tokens"),
         })
+    }
+
+    #[test]
+    fn config_sync_keeps_member_identity_and_converges_policy() {
+        let source = Appliance::from_toml(
+            r#"
+[system]
+hostname = "sentinel-a"
+
+[system.config-sync]
+peer = ["10.43.0.41"]
+secret = "shared-secret"
+
+[[interface]]
+name = "wan"
+address = "10.43.0.40/24"
+zone = "wan"
+
+[protocols]
+router-id = "10.43.0.40"
+
+[firewall]
+stateful = false
+"#,
+        )
+        .unwrap();
+        let local = Appliance::from_toml(
+            r#"
+[system]
+hostname = "sentinel-b"
+
+[system.config-sync]
+peer = ["10.43.0.40"]
+secret = "shared-secret"
+
+[system.conntrack-sync]
+listen = "10.43.0.41:5429"
+peer = ["10.43.0.40:5429"]
+
+[[interface]]
+name = "wan"
+address = "10.43.0.41/24"
+zone = "wan"
+
+[protocols]
+router-id = "10.43.0.41"
+"#,
+        )
+        .unwrap();
+
+        let merged = merge_synced_config(source, &local);
+        assert_eq!(merged.system.hostname, "sentinel-b");
+        assert_eq!(
+            merged.interfaces[0].address.as_deref(),
+            Some("10.43.0.41/24")
+        );
+        assert_eq!(merged.protocols.router_id.as_deref(), Some("10.43.0.41"));
+        assert_eq!(merged.system.config_sync.peers, vec!["10.43.0.40"]);
+        assert_eq!(
+            merged.system.conntrack_sync.listen.as_deref(),
+            Some("10.43.0.41:5429")
+        );
+        assert!(!merged.firewall.stateful);
     }
 
     /// The history endpoints answer the same question `show history` does, and
