@@ -55,7 +55,7 @@ set services ssh listen-address 10.0.0.1
 ## HA config sync
 
 `system config-sync` keeps a high-availability pair in step: on every `commit`,
-the running config is pushed to each configured peer, which applies and
+the shared configuration is pushed to each configured peer, which applies and
 persists it. It rides the box's own management API (bearer-token authenticated),
 so it needs no extra daemon — a declarative analog of pfSense's XMLRPC sync.
 
@@ -76,8 +76,10 @@ set system config-sync secret <shared-token>
 set system config-sync peer 10.0.0.2
 ```
 
-> Config sync copies the **whole** config, including interface addresses and the
-> peer list — appropriate when the pair is symmetric. Pair it with
+> Config sync keeps each receiver's hostname, interfaces, config-sync peers,
+> conntrack-sync endpoint and routing router ID local. This prevents a primary
+> commit from renaming a standby or moving its management address. Firewall,
+> service and routing policy still converge. Pair it with
 > [VRRP](routing.md#vrrp) for the virtual IP and you have a full
 > active/standby firewall. See the [HA pair example](examples.md#ha-pair).
 
