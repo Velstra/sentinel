@@ -2292,7 +2292,7 @@ pub fn peer_pin(cs: &crate::config::ConfigSync, authority: &str) -> Result<Strin
 }
 
 /// The SENDING side of HA config sync (roadmap C21): push the just-committed config
-/// to every `[system.config-sync] peer` via its Sentinel API (`PUT /api/v1/config`,
+/// to every `[system.config-sync] peer` via its Sentinel API (`PUT /api/v1/config-sync`,
 /// bearer = the shared secret), which applies + persists it. Called from the
 /// interactive `commit` ONLY — never from the API's own PUT handler — so a received
 /// sync does not re-push and a pair never loops. Best-effort per peer: a down backup
@@ -2325,7 +2325,7 @@ pub fn push_config_to_peers(appliance: &Appliance) -> Result<()> {
                 continue;
             }
         };
-        let url = format!("https://{authority}/api/v1/config");
+        let url = format!("https://{authority}/api/v1/config-sync");
         match system::curl_put_config(&url, secret, tmp, Some(&pin)) {
             Ok(()) => eprintln!("  config-sync → {peer}"),
             Err(e) => eprintln!("warning: config-sync to {peer} failed: {e}"),
