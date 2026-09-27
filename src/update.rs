@@ -26,7 +26,7 @@
 //! manifest field is ever interpolated into a URL path beyond a validated image
 //! basename.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -396,11 +396,40 @@ pub fn signature_path(image: &Path) -> std::path::PathBuf {
 /// an unreadable/…invalid key, or a signature that does not verify all return
 /// `Err`, and the caller never reaches the slot-writer.
 ///
-/// The image is signed directly rather than through a manifest because a local
-/// file needs no fetch step: there is no version/name/digest to fetch and trust,
-/// only the bytes in front of the operator, so signing those bytes is the whole
-/// proof.
+/// Large images may instead carry `<image>.sha256` (one hex digest) and its
+/// Ed25519 signature `<image>.sha256.sig`. The signature authenticates the
+/// digest, then a streaming hash authenticates the complete image. When supplied,
+/// this proof takes precedence; a bad proof never falls back to a raw signature.
 pub fn verify_local_image(image: &Path, public_key: &str) -> Result<()> {
+    // Ed25519/OpenSSL buffers its input in one shot; signing a multi-GiB
+    // appliance directly can fail. Prefer a small signed digest when supplied,
+    // and never fall back to another proof after a failed digest verification.
+    let mut digest_name = image.as_os_str().to_os_string();
+    digest_name.push(".sha256");
+    let digest_path = PathBuf::from(digest_name);
+    if digest_path.exists() {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::fs::File::open(&digest_path)?
+            .take(129)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > 128 {
+            bail!("signed image digest is too large");
+        }
+        let digest = std::str::from_utf8(&bytes)?.trim();
+        if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!("signed image digest must contain one SHA-256 hex value");
+        }
+        let scratch = Scratch::new()?;
+        let pubkey = resolve_pubkey_pem(public_key, &scratch)?;
+        let signed_bytes = scratch.join("image.sha256");
+        std::fs::write(&signed_bytes, &bytes)?;
+        verify_signature(&pubkey, &signed_bytes, &signature_path(&digest_path))?;
+        if !sha256_hex(image)?.eq_ignore_ascii_case(digest) {
+            bail!("image does not match its signed SHA-256 digest");
+        }
+        return Ok(());
+    }
     let sig = signature_path(image);
     if !sig.exists() {
         bail!(
@@ -690,6 +719,85 @@ mod tests {
         // No image.raw.sig beside it.
         let err = verify_local_image(&img, "does-not-matter").unwrap_err();
         assert!(format!("{err}").contains("no detached signature"), "{err}");
+    }
+
+    #[test]
+    fn a_large_local_image_uses_a_signed_digest_and_rejects_tampering() {
+        if !openssl_available() {
+            return;
+        }
+        let dir = Scratch::new().unwrap();
+        let private = dir.join("private.pem");
+        let public = dir.join("public.pem");
+        let image = dir.join("large.raw");
+        let digest = dir.join("large.raw.sha256");
+        let signature = signature_path(&digest);
+        // Sparse, larger than OpenSSL's direct-signing limit; no large RAM buffer.
+        let file = std::fs::File::create(&image).unwrap();
+        file.set_len((1_u64 << 31) + 1).unwrap();
+        let ob = openssl_bin();
+        for args in [
+            vec![
+                "genpkey",
+                "-algorithm",
+                "ed25519",
+                "-out",
+                private.to_str().unwrap(),
+            ],
+            vec![
+                "pkey",
+                "-in",
+                private.to_str().unwrap(),
+                "-pubout",
+                "-out",
+                public.to_str().unwrap(),
+            ],
+        ] {
+            assert!(Command::new(&ob).args(args).status().unwrap().success());
+        }
+        std::fs::write(&digest, format!("{}\n", sha256_hex(&image).unwrap())).unwrap();
+        assert!(
+            Command::new(&ob)
+                .args([
+                    "pkeyutl",
+                    "-sign",
+                    "-rawin",
+                    "-inkey",
+                    private.to_str().unwrap(),
+                    "-in",
+                    digest.to_str().unwrap(),
+                    "-out",
+                    signature.to_str().unwrap()
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let key = format!("file:{}", public.display());
+        verify_local_image(&image, &key).unwrap();
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&image)
+            .unwrap();
+        file.seek(SeekFrom::End(-1)).unwrap();
+        file.write_all(b"x").unwrap();
+        assert!(
+            verify_local_image(&image, &key)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
+        // A malformed supplied digest never falls back to another signature.
+        std::fs::write(&digest, b"not a digest").unwrap();
+        assert!(verify_local_image(&image, &key).is_err());
+        std::fs::write(&digest, [b'a'; 129]).unwrap();
+        assert!(
+            verify_local_image(&image, &key)
+                .unwrap_err()
+                .to_string()
+                .contains("too large")
+        );
     }
 
     /// The local path reuses the channel's Ed25519 infra: a detached signature
