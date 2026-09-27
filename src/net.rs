@@ -626,7 +626,9 @@ fn network_unit_body(
             body.push_str(&format!("UserClass={u}\n"));
         }
         if d.no_default_route {
-            body.push_str("UseGateway=no\n");
+            // DHCP option 121 can carry a default route independently of the
+            // Router option. UseGateway alone does not suppress that route.
+            body.push_str("UseGateway=no\nUseRoutes=no\n");
         }
         if let Some(m) = d.default_route_distance {
             body.push_str(&format!("RouteMetric={m}\n"));
@@ -6517,6 +6519,7 @@ mod tests {
             "VendorClassIdentifier=sentinel",
             "UserClass=residential",
             "UseGateway=no",
+            "UseRoutes=no",
             "RouteMetric=210",
             "DenyList=192.0.2.9 198.51.100.0/24",
             "WithoutRA=information-request",
