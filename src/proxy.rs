@@ -53,14 +53,12 @@ fn cert_bundle_path(name: &str) -> PathBuf {
 /// Render a bootable `haproxy.cfg` for `proxies`. Every value has already passed
 /// validation (safe name, `host:port` backends, valid port), so nothing needs
 /// escaping. A frontend whose `certificate` is set binds `ssl crt <bundle>`
-/// (TLS-terminated); one without binds plain HTTP. A `disabled` frontend is
+/// (TLS-terminated); one without forwards HTTP or a TCP stream. A `disabled` frontend is
 /// omitted entirely. Each backend load-balances `roundrobin` with one checked
 /// `server` line per upstream.
 ///
-/// The caller ([`apply`]) has already cleared `certificate` on any frontend whose
-/// PKI leaf is not yet on disk, so a `crt` line here always names a bundle that
-/// exists — a not-yet-issued cert degrades to plain HTTP rather than a config
-/// HAProxy would reject.
+/// The caller ([`apply`]) refuses a configured TLS frontend whose certificate
+/// is unavailable, so a `crt` line always names a complete bundle.
 fn haproxy_cfg_body(proxies: &[ReverseProxy]) -> String {
     let mut s = String::from("# rendered by sentinel — L7 reverse proxy (HAProxy), roadmap C22\n");
     // Master-worker mode (`-W`) keeps the master in the foreground for systemd, so
@@ -82,6 +80,9 @@ fn haproxy_cfg_body(proxies: &[ReverseProxy]) -> String {
     for p in proxies.iter().filter(|p| !p.disabled) {
         let port = p.port();
         s.push_str(&format!("\nfrontend {}\n", p.name));
+        if p.mode == crate::config::ProxyMode::Tcp {
+            s.push_str("    mode tcp\n    option tcplog\n    no option forwardfor\n    timeout client 1h\n");
+        }
         match &p.certificate {
             Some(_) => s.push_str(&format!(
                 "    bind *:{port} ssl crt {}\n",
@@ -92,6 +93,9 @@ fn haproxy_cfg_body(proxies: &[ReverseProxy]) -> String {
         s.push_str(&format!("    default_backend {}\n", p.name));
 
         s.push_str(&format!("\nbackend {}\n", p.name));
+        if p.mode == crate::config::ProxyMode::Tcp {
+            s.push_str("    mode tcp\n    no option forwardfor\n    timeout server 1h\n");
+        }
         s.push_str("    balance roundrobin\n");
         for (i, backend) in p.backends.iter().enumerate() {
             s.push_str(&format!("    server s{i} {backend} check\n"));
@@ -103,28 +107,23 @@ fn haproxy_cfg_body(proxies: &[ReverseProxy]) -> String {
 /// Assemble the combined cert+key PEM bundle HAProxy's `crt` wants for the TLS
 /// frontend `name`: read the PKI leaf's `cert.crt` and `cert.key`, concatenate
 /// (cert then key), and install it 0600 (it holds the private key) via the same
-/// installer the IPsec/OpenConnect secrets use. Returns `Ok(None)` when the
-/// leaf's files are not on disk yet (a not-yet-issued cert) — the caller then
-/// degrades that frontend to plain HTTP rather than failing the whole apply.
-/// `Ok(Some(changed))` reports whether the bundle differed from what was there.
-fn write_cert_bundle(name: &str, cert_ref: &str) -> Result<Option<bool>> {
+/// installer the IPsec/OpenConnect secrets use. Missing certificate material
+/// is an error: an encrypted listener must never degrade to plaintext. The
+/// result reports whether the installed bundle changed.
+fn write_cert_bundle(name: &str, cert_ref: &str) -> Result<bool> {
     let (crt, key) = crate::pki::leaf_paths(cert_ref);
     let (Ok(crt_pem), Ok(key_pem)) = (std::fs::read_to_string(&crt), std::fs::read_to_string(&key))
     else {
-        eprintln!(
-            "warning: reverse-proxy frontend {name:?}: certificate {cert_ref:?} is not issued \
-             yet ({} / {} missing) — serving plain HTTP until it is",
-            crt.display(),
-            key.display()
+        anyhow::bail!(
+            "reverse-proxy frontend {name:?}: TLS certificate {cert_ref:?} is not available; refusing plaintext fallback"
         );
-        return Ok(None);
     };
     // HAProxy reads one PEM with the cert (chain) first, then the private key.
     let bundle = format!("{crt_pem}{key_pem}");
     let path = cert_bundle_path(name);
     let changed = file_changed(&path, &bundle);
     system::install_ipsec_secret(&path, &bundle)?;
-    Ok(Some(changed))
+    Ok(changed)
 }
 
 /// Remove any stale `certs/<name>.pem` bundle no longer in `keep` (a frontend was
@@ -189,34 +188,21 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
 
     system::ensure_dir(Path::new(HAPROXY_CERTS_DIR))?;
 
-    // Render each TLS frontend's bundle first. A frontend whose leaf is not yet
-    // issued has its `certificate` cleared on the working copy, so the config
-    // renderer emits a plain `bind` for it (degrade, don't fail). `bundles_changed`
-    // rolls into the change-detect so a rotated cert triggers a reload.
-    let mut effective: Vec<ReverseProxy> = Vec::with_capacity(proxies.len());
+    // Render TLS bundles before touching the listener configuration. A missing
+    // certificate aborts the update; rotation participates in change detection.
     let mut keep: HashSet<String> = HashSet::new();
     let mut bundles_changed = false;
-    for p in proxies {
-        let mut p = p.clone();
-        if !p.disabled {
-            if let Some(cert_ref) = p.certificate.clone() {
-                match write_cert_bundle(&p.name, &cert_ref)? {
-                    Some(changed) => {
-                        keep.insert(p.name.clone());
-                        bundles_changed |= changed;
-                    }
-                    // Not issued yet: serve plain until it is.
-                    None => p.certificate = None,
-                }
-            }
+    for p in proxies.iter().filter(|p| !p.disabled) {
+        if let Some(cert_ref) = &p.certificate {
+            bundles_changed |= write_cert_bundle(&p.name, cert_ref)?;
+            keep.insert(p.name.clone());
         }
-        effective.push(p);
     }
     // Drop bundles for frontends that no longer terminate TLS (removed/disabled).
     prune_cert_bundles(&keep)?;
 
     system::ensure_dir(Path::new(HAPROXY_RUNTIME_DIR))?;
-    let cfg = haproxy_cfg_body(&effective);
+    let cfg = haproxy_cfg_body(proxies);
     let changed = file_changed(cfg_path, &cfg) || bundles_changed;
     system::install_file(cfg_path, &cfg)?;
 
@@ -244,12 +230,31 @@ mod tests {
 
     fn proxy(name: &str) -> ReverseProxy {
         ReverseProxy {
+            mode: crate::config::ProxyMode::Http,
             name: name.into(),
             disabled: false,
             port: None,
             certificate: None,
             backends: vec!["10.0.0.10:8080".into()],
         }
+    }
+
+    #[test]
+    fn tcp_passthrough_keeps_streams_and_backend_checks() {
+        let mut p = proxy("cloud");
+        p.mode = crate::config::ProxyMode::Tcp;
+        let body = haproxy_cfg_body(&[proxy("web"), p]);
+        assert_eq!(body.matches("mode tcp").count(), 2, "{body}");
+        assert!(body.contains("option tcplog"));
+        assert!(body.contains("timeout client 1h"));
+        assert!(body.contains("server s0 10.0.0.10:8080 check"));
+        assert!(!body.contains("bind *:443 ssl"));
+    }
+
+    #[test]
+    fn missing_tls_material_never_falls_back_to_plaintext() {
+        let why = write_cert_bundle("test-unissued-safety", "test-unissued-safety").unwrap_err();
+        assert!(why.to_string().contains("refusing plaintext fallback"));
     }
 
     #[test]
