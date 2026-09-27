@@ -452,7 +452,6 @@ services wan-zone
 services webhook
 services zone
 system commit-revisions
-system config-sync
 system device
 system group
 system hashed-password
@@ -463,6 +462,7 @@ system listen
 system locale
 system password
 system peer
+system peer-fingerprint
 system permission
 system secret
 system speed

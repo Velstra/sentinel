@@ -5614,7 +5614,8 @@ pub struct DhcpClient {
         skip_serializing_if = "Option::is_none"
     )]
     pub user_class: Option<String>,
-    /// Take the address and DNS from the lease, but not the default route. For a
+    /// Take the address and DNS from the lease, but not DHCP-provided routes
+    /// (including classless default routes). For a
     /// second uplink whose route is chosen by policy rather than by whichever
     /// server answered first.
     #[serde(
