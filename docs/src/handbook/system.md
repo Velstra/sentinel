@@ -77,7 +77,7 @@ set system config-sync peer 10.0.0.2
 ```
 
 > Config sync keeps each receiver's hostname, interfaces, config-sync peers,
-> conntrack-sync endpoint and routing router ID local. This prevents a primary
+> conntrack-sync endpoint, routing router ID and existing VRRP priorities local. This prevents a primary
 > commit from renaming a standby or moving its management address. Firewall,
 > service and routing policy still converge. Pair it with
 > [VRRP](routing.md#vrrp) for the virtual IP and you have a full
