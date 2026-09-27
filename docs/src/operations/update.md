@@ -39,7 +39,20 @@ beside the image and verifies it against a pinned release key, tried in order:
 3. a release key baked into the image at `/etc/sentinel/release.pem`.
 
 If no key is available, or the signature is missing or does not verify, the write
-is **refused** and nothing is touched. Sign an image with the release key:
+is **refused** and nothing is touched. For multi-GiB appliance images, sign a
+small digest file instead: OpenSSL's direct Ed25519 operation buffers its input
+and can fail for large files. The digest file contains only the 64 hex digits
+(optionally followed by a newline), not a filename.
+
+```shell
+sha256sum velstra-sentinel.raw | cut -d ' ' -f 1 > velstra-sentinel.raw.sha256
+openssl pkeyutl -sign -inkey release-priv.pem -rawin \
+  -in velstra-sentinel.raw.sha256 -out velstra-sentinel.raw.sha256.sig
+```
+
+The updater verifies the signed digest and then hashes the entire image. A
+supplied digest takes precedence; invalid or missing signatures fail closed,
+even if a raw signature also exists. Older images still accept direct signatures:
 
 ```shell
 openssl pkeyutl -sign -inkey release-priv.pem -rawin \
