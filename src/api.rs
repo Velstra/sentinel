@@ -1209,6 +1209,13 @@ fn merge_synced_config(mut incoming: Appliance, local: &Appliance) -> Appliance 
     incoming.system.conntrack_sync = local.system.conntrack_sync.clone();
     incoming.interfaces = local.interfaces.clone();
     incoming.protocols.router_id = local.protocols.router_id.clone();
+    // Election preference belongs to the member, not the shared policy. Copying
+    // the primary's priority onto its backup destroys the intended HA ordering.
+    for router in &mut incoming.protocols.vrrp {
+        if let Some(member) = local.protocols.vrrp.iter().find(|v| v.name == router.name) {
+            router.priority = member.priority;
+        }
+    }
     incoming
 }
 
@@ -1864,6 +1871,13 @@ zone = "wan"
 [protocols]
 router-id = "10.43.0.40"
 
+[[protocols.vrrp]]
+name = "cloud"
+interface = "wan"
+vrid = 42
+priority = 200
+virtual-address = ["10.43.0.254"]
+
 [firewall]
 stateful = false
 "#,
@@ -1889,6 +1903,13 @@ zone = "wan"
 
 [protocols]
 router-id = "10.43.0.41"
+
+[[protocols.vrrp]]
+name = "cloud"
+interface = "wan"
+vrid = 42
+priority = 100
+virtual-address = ["10.43.0.253"]
 "#,
         )
         .unwrap();
@@ -1900,6 +1921,11 @@ router-id = "10.43.0.41"
             Some("10.43.0.41/24")
         );
         assert_eq!(merged.protocols.router_id.as_deref(), Some("10.43.0.41"));
+        assert_eq!(merged.protocols.vrrp[0].priority, Some(100));
+        assert_eq!(
+            merged.protocols.vrrp[0].virtual_address,
+            vec!["10.43.0.254"]
+        );
         assert_eq!(merged.system.config_sync.peers, vec!["10.43.0.40"]);
         assert_eq!(
             merged.system.conntrack_sync.listen.as_deref(),
