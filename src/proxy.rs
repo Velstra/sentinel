@@ -72,16 +72,15 @@ fn haproxy_cfg_body(proxies: &[ReverseProxy]) -> String {
     s.push_str("    log global\n");
     s.push_str("    option httplog\n");
     s.push_str("    option dontlognull\n");
-    s.push_str("    option forwardfor\n");
     s.push_str("    timeout connect 5s\n");
     s.push_str("    timeout client 30s\n");
     s.push_str("    timeout server 30s\n");
 
     for p in proxies.iter().filter(|p| !p.disabled) {
         let port = p.port();
-        s.push_str(&format!("\nfrontend {}\n", p.name));
+        s.push_str(&format!("\nfrontend fe_{}\n", p.name));
         if p.mode == crate::config::ProxyMode::Tcp {
-            s.push_str("    mode tcp\n    option tcplog\n    no option forwardfor\n    timeout client 1h\n");
+            s.push_str("    mode tcp\n    option tcplog\n    timeout client 1h\n");
         }
         match &p.certificate {
             Some(_) => s.push_str(&format!(
@@ -90,11 +89,13 @@ fn haproxy_cfg_body(proxies: &[ReverseProxy]) -> String {
             )),
             None => s.push_str(&format!("    bind *:{port}\n")),
         }
-        s.push_str(&format!("    default_backend {}\n", p.name));
+        s.push_str(&format!("    default_backend be_{}\n", p.name));
 
-        s.push_str(&format!("\nbackend {}\n", p.name));
+        s.push_str(&format!("\nbackend be_{}\n", p.name));
         if p.mode == crate::config::ProxyMode::Tcp {
-            s.push_str("    mode tcp\n    no option forwardfor\n    timeout server 1h\n");
+            s.push_str("    mode tcp\n    timeout server 1h\n");
+        } else {
+            s.push_str("    option forwardfor\n");
         }
         s.push_str("    balance roundrobin\n");
         for (i, backend) in p.backends.iter().enumerate() {
@@ -165,9 +166,8 @@ fn config_is_valid(cfg: &Path) -> Option<bool> {
 /// `haproxy` unit when the rendered config changed (a fresh boot always counts as
 /// changed, since the tmpfs files are gone, so the daemon is re-asserted then
 /// too). When nothing is configured — or every frontend is `disabled` — stop the
-/// unit and drop the runtime artifacts. The restart is best-effort: at early boot
-/// the unit's dependencies may not be ready, in which case the config applies on
-/// the next commit/boot.
+/// unit and drop the runtime artifacts. Invalid configurations and failed
+/// restarts fail the apply so callers never report an inactive proxy as ready.
 pub fn apply(appliance: &Appliance) -> Result<()> {
     let proxies = &appliance.services.reverse_proxy;
     let cfg_path = Path::new(HAPROXY_CFG);
@@ -204,22 +204,23 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
     system::ensure_dir(Path::new(HAPROXY_RUNTIME_DIR))?;
     let cfg = haproxy_cfg_body(proxies);
     let changed = file_changed(cfg_path, &cfg) || bundles_changed;
-    system::install_file(cfg_path, &cfg)?;
+    let staged_path = Path::new("/run/sentinel/haproxy/.candidate.cfg");
+    system::install_file(staged_path, &cfg)?;
 
     // Gate the reload on HAProxy's own check: never replace a running proxy with a
     // config it would reject. An un-runnable check (off-box) is treated as "go".
-    if config_is_valid(cfg_path) == Some(false) {
-        eprintln!(
-            "warning: rendered haproxy.cfg failed `haproxy -c` — leaving the running proxy \
+    if config_is_valid(staged_path) == Some(false) {
+        let _ = system::remove_file(staged_path);
+        anyhow::bail!(
+            "rendered haproxy.cfg failed `haproxy -c` — leaving the running proxy \
              untouched; fix the config and re-commit"
         );
-        return Ok(());
     }
+    system::install_file(cfg_path, &cfg)?;
+    system::remove_file(staged_path)?;
 
     if changed {
-        if let Err(e) = system::service_restart(HAPROXY_UNIT) {
-            eprintln!("warning: (re)starting haproxy failed (applies on next commit/boot): {e}");
-        }
+        system::service_restart(HAPROXY_UNIT)?;
     }
     Ok(())
 }
@@ -246,6 +247,8 @@ mod tests {
         let body = haproxy_cfg_body(&[proxy("web"), p]);
         assert_eq!(body.matches("mode tcp").count(), 2, "{body}");
         assert!(body.contains("option tcplog"));
+        assert!(!body.contains("no option forwardfor"));
+        assert_eq!(body.matches("option forwardfor").count(), 1);
         assert!(body.contains("timeout client 1h"));
         assert!(body.contains("server s0 10.0.0.10:8080 check"));
         assert!(!body.contains("bind *:443 ssl"));
@@ -272,11 +275,11 @@ mod tests {
         let body = haproxy_cfg_body(&[proxy("web")]);
         // A frontend + its backend, bound plain on the default 443, one checked
         // server per backend.
-        assert!(body.contains("frontend web\n"), "{body}");
+        assert!(body.contains("frontend fe_web\n"), "{body}");
         assert!(body.contains("    bind *:443\n"), "{body}");
         assert!(!body.contains("ssl crt"), "no TLS without a cert: {body}");
-        assert!(body.contains("    default_backend web\n"), "{body}");
-        assert!(body.contains("backend web\n"), "{body}");
+        assert!(body.contains("    default_backend be_web\n"), "{body}");
+        assert!(body.contains("backend be_web\n"), "{body}");
         assert!(
             body.contains("    server s0 10.0.0.10:8080 check\n"),
             "{body}"
@@ -315,8 +318,8 @@ mod tests {
             ..proxy("web")
         };
         let body = haproxy_cfg_body(&[p]);
-        assert!(!body.contains("frontend web"), "{body}");
-        assert!(!body.contains("backend web"), "{body}");
+        assert!(!body.contains("frontend fe_web"), "{body}");
+        assert!(!body.contains("backend be_web"), "{body}");
         // The skeleton still renders (so a torn-down proxy is a valid empty cfg).
         assert!(body.contains("mode http"), "{body}");
     }
@@ -329,10 +332,10 @@ mod tests {
             ..proxy("api")
         };
         let body = haproxy_cfg_body(&[a, b]);
-        assert!(body.contains("frontend web\n"), "{body}");
-        assert!(body.contains("frontend api\n"), "{body}");
-        assert!(body.contains("backend web\n"), "{body}");
-        assert!(body.contains("backend api\n"), "{body}");
+        assert!(body.contains("frontend fe_web\n"), "{body}");
+        assert!(body.contains("frontend fe_api\n"), "{body}");
+        assert!(body.contains("backend be_web\n"), "{body}");
+        assert!(body.contains("backend be_api\n"), "{body}");
     }
 
     #[test]
