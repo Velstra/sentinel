@@ -196,6 +196,15 @@ in
     boot.loader.systemd-boot.enable = lib.mkForce false;
     boot.loader.efi.canTouchEfiVariables = lib.mkForce false;
     boot.initrd.systemd.enable = true;
+    # Image builds cannot detect the eventual hypervisor's disk transport.
+    # Carry virtio drivers so cloud boot volumes are visible before mounting
+    # the verified store and persistent data partition.
+    boot.initrd.availableKernelModules = [
+      "virtio_pci"
+      "virtio_blk"
+      "virtio_scsi"
+      "virtio_net"
+    ];
 
     # The slot-A UKI is `<prefix>-a+3.efi` (3 boot tries before it's deemed bad).
     # The name in the installed system's boot menu. systemd-boot shows a UKI's
