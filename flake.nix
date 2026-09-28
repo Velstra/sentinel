@@ -3604,6 +3604,11 @@
               "port = 443\n"
               "certificate = \"web-cert\"\n"
               "backends = [\"10.0.0.3:8080\", \"10.0.0.3:8081\"]\n"
+              "[[services.reverse-proxy]]\n"
+              "name = \"stream\"\n"
+              "mode = \"tcp\"\n"
+              "port = 8443\n"
+              "backends = [\"10.0.0.3:8080\"]\n"
               "EOF"
           )
           fw.succeed("sentinel apply-boot-late --config /var/lib/sentinel/appliance.toml")
@@ -3612,14 +3617,20 @@
           # one checked server per backend) and the 0600 cert+key bundle, and the
           # haproxy unit is up.
           cfg = fw.succeed("cat /run/sentinel/haproxy/haproxy.cfg")
-          assert "frontend web" in cfg, cfg
-          assert "backend web" in cfg, cfg
+          assert "frontend fe_web" in cfg, cfg
+          assert "backend be_web" in cfg, cfg
           assert "ssl crt /run/sentinel/haproxy/certs/web.pem" in cfg, cfg
           assert "server s0 10.0.0.3:8080 check" in cfg, cfg
           assert "server s1 10.0.0.3:8081 check" in cfg, cfg
           mode = fw.succeed("stat -c %a /run/sentinel/haproxy/certs/web.pem").strip()
           assert mode == "600", mode
+          assert "frontend fe_stream" in cfg, cfg
+          assert "no option forwardfor" not in cfg, cfg
+          fw.succeed("haproxy -c -f /run/sentinel/haproxy/haproxy.cfg")
           fw.wait_for_unit("haproxy.service")
+          client.wait_until_succeeds(
+              "curl -fsS http://10.0.0.1:8443/ | grep -q BACKEND-A", timeout=60
+          )
 
           # (2) TLS terminated at the fw and forwarded: the client gets a backend
           # body back over HTTPS (-k: the cert is self-issued by the on-box CA).

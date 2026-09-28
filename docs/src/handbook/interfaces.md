@@ -584,8 +584,10 @@ reinstall of the appliance; the default `duid` is derived from the machine-id, s
 a rebuilt router asks for a different lease. `set interface wan0 dhcp duid <hex>`
 pins the DUID instead, and needs `client-id duid` to carry it.
 
-`no-default-route` takes the address and the DNS from the lease but not the
-route — for a second uplink whose route is chosen by policy rather than by
+`no-default-route` takes the address and DNS from the lease but ignores
+DHCP-provided routes, including a default carried in classless static routes.
+Use explicit static routes for any required non-default destinations on that
+link. This suits a second uplink whose route is chosen by policy rather than by
 whichever server answered first. Two DHCP uplinks with the same
 `default-route-distance` are a coin toss; distinct metrics are a primary and a
 backup. `reject` refuses offers from a server address or CIDR, which is the
