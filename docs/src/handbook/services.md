@@ -170,6 +170,7 @@ from the [on-box PKI](vpn.md#pki)) and forwards to one or more backends
 
 | Field | Meaning |
 |---|---|
+| `mode` | `http` (default) or `tcp` for stream/TLS passthrough. |
 | `port` | Listen port (default 443). |
 | `certificate` | TLS termination cert — a `pki certificate` name (omit ⇒ plain HTTP). |
 | `backends` | Upstream `host:port` targets (round-robin; repeatable). |
@@ -180,6 +181,19 @@ set services reverse-proxy web port 443
 set services reverse-proxy web certificate site-cert
 set services reverse-proxy web backends 10.0.0.10:8080,10.0.0.11:8080
 ```
+
+For encrypted APIs, gRPC, and long-lived consoles, forward TLS unchanged:
+
+```text
+set services reverse-proxy cloud-api mode tcp
+set services reverse-proxy cloud-api port 8443
+set services reverse-proxy cloud-api backends 10.42.0.10:8443,10.42.0.11:8443,10.42.0.12:8443
+```
+
+TCP frontends preserve streams, check backend reachability, and use one-hour
+idle timeouts. Without `certificate`, TLS terminates at the backend. If a
+termination certificate *is* configured but unavailable, Sentinel refuses the
+update; it never substitutes an unencrypted listener.
 
 ## Remote syslog
 

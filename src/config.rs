@@ -1236,8 +1236,26 @@ pub const DEFAULT_REVERSE_PROXY_PORT: u16 = 443;
 /// else plain HTTP) and forwards requests to `backends` round-robin. The XDP L4
 /// load-balancer (fabric) is the separate high-throughput path; this is the L7
 /// tier that does TLS termination + HTTP-aware routing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyMode {
+    #[default]
+    Http,
+    Tcp,
+}
+
+impl ProxyMode {
+    pub fn is_http(&self) -> bool {
+        *self == Self::Http
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReverseProxy {
+    /// HTTP processing by default; TCP forwards the stream unchanged (TLS
+    /// passthrough when no termination certificate is selected).
+    #[serde(default, skip_serializing_if = "ProxyMode::is_http")]
+    pub mode: ProxyMode,
     /// Frontend name — the HAProxy `frontend`/`backend` id + the log tag.
     /// Required; `[A-Za-z0-9_-]` (rendered as a config section name).
     pub name: String,
@@ -5596,7 +5614,8 @@ pub struct DhcpClient {
         skip_serializing_if = "Option::is_none"
     )]
     pub user_class: Option<String>,
-    /// Take the address and DNS from the lease, but not the default route. For a
+    /// Take the address and DNS from the lease, but not DHCP-provided routes
+    /// (including classless default routes). For a
     /// second uplink whose route is chosen by policy rather than by whichever
     /// server answered first.
     #[serde(
