@@ -6547,7 +6547,7 @@ const FORMS = {{
   cert: {{ essential: ["ca", "common-name", "usage"] }},
   ca: {{ essential: ["common-name", "organization"] }},
   user: {{ essential: ["password", "group"] }},
-  reverseProxy: {{ essential: ["port", "backends", "certificate"] }},
+  reverseProxy: {{ essential: ["port", "mode", "backends", "certificate"] }},
   relay: {{ essential: ["port", "interface"] }},
   collector: {{ essential: ["port", "proto"] }},
   ocUser: {{ essential: ["password"] }},
@@ -7164,6 +7164,7 @@ const VRRP = [
 // configuration nor the connections.
 const CONFIG_SYNC = [
   ["peer", "Peers", null, "list"], ["secret", "Shared secret"],
+  ["peer-fingerprint", "Peer TLS fingerprint"],
 ];
 const CONNTRACK_SYNC = [
   ["peer", "Peers", null, "list"], ["listen", "Listen on"], ["interval", "Interval (s)"],
@@ -7294,6 +7295,7 @@ const SVC_ALERTMAIL = [
   ["user", "User"], ["password", "Password"],
 ];
 const RPROXY = [
+  ["mode", "Protocol", ["", "http", "tcp"]],
   ["port", "Listen port"], ["certificate", "Certificate"],
   ["backends", "Backends", null, "list"], ["disabled", "Disabled", ["", "true", "false"]],
 ];
@@ -7974,7 +7976,7 @@ async function refreshServices() {{
     fields: RPROXY, nameHint: "web",
     path: (n) => `services reverse-proxy ${{n}}`,
     rows: entriesUnder(ls, ["services", "reverse-proxy"]),
-    badge: (r) => r.certificate ? {{ text: "TLS" }} : {{ text: "plain", cls: "warn" }},
+    badge: (r) => r.certificate ? {{ text: "TLS" }} : r.mode === "tcp" ? {{ text: "TCP" }} : {{ text: "HTTP", cls: "warn" }},
     empty: "No reverse-proxy frontends configured.",
   }});
   renderObjects({{
