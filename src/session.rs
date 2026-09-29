@@ -1628,6 +1628,7 @@ struct BroadcastRelayDraft {
 
 #[derive(Debug, Clone, Default)]
 struct ReverseProxyDraft {
+    mode: Option<crate::config::ProxyMode>,
     disabled: Option<bool>,
     port: Option<u16>,
     certificate: Option<String>,
@@ -2740,6 +2741,7 @@ impl Draft {
                     (
                         rp.name.clone(),
                         ReverseProxyDraft {
+                            mode: Some(rp.mode),
                             disabled: rp.disabled.then_some(true),
                             port: rp.port,
                             certificate: rp.certificate.clone(),
@@ -4605,6 +4607,9 @@ impl Session {
             ["system", "config-sync", "peer", v] => {
                 append_csv(&mut self.draft.config_sync.peers, v);
             }
+            ["system", "config-sync", "peer-fingerprint", v] => {
+                self.draft.config_sync.peer_fingerprint = Some((*v).to_string());
+            }
             ["system", "config-sync", "secret", v] => {
                 self.draft.config_sync.secret = Some((*v).to_string());
             }
@@ -4936,6 +4941,13 @@ impl Session {
             // load balancer (HAProxy). `backends` append+dedup (CSV) like the
             // other list fields; validation (port≠0/unique across frontends, cert
             // declared in pki, ≥1 `host:port` backend) runs at commit.
+            ["services", "reverse-proxy", name, "mode", v] => {
+                self.draft.reverse_proxy_mut(name).mode = Some(match *v {
+                    "http" => crate::config::ProxyMode::Http,
+                    "tcp" => crate::config::ProxyMode::Tcp,
+                    _ => bail!("reverse-proxy mode must be http or tcp"),
+                });
+            }
             ["services", "reverse-proxy", name, "port", v] => {
                 let port: u16 = v.parse().with_context(|| format!("invalid port {v:?}"))?;
                 if port == 0 {
@@ -7373,6 +7385,7 @@ impl Session {
                 let c = &mut self.draft.config_sync;
                 match *field {
                     "peer" => c.peers.clear(),
+                    "peer-fingerprint" => c.peer_fingerprint = None,
                     "secret" => c.secret = None,
                     other => bail!("system config-sync has no field {other:?}"),
                 }
@@ -7609,6 +7622,7 @@ impl Session {
             ["services", "reverse-proxy", name, field] => {
                 let rp = self.reverse_proxy(name)?;
                 match *field {
+                    "mode" => rp.mode = None,
                     "port" => rp.port = None,
                     "certificate" => rp.certificate = None,
                     "backends" => rp.backends.clear(),
@@ -9538,6 +9552,7 @@ impl Session {
                     .reverse_proxy
                     .iter()
                     .map(|(name, d)| ReverseProxy {
+                        mode: d.mode.unwrap_or_default(),
                         name: name.clone(),
                         disabled: d.disabled.unwrap_or(false),
                         port: d.port,
@@ -9868,7 +9883,7 @@ fn render_draft_masked(
     };
     let mut out = String::new();
     let cs = &draft.config_sync;
-    let cs_set = !cs.peers.is_empty() || cs.secret.is_some();
+    let cs_set = !cs.is_empty();
     let cts = &draft.conntrack_sync;
     let cts_set = !cts.is_empty();
     // Body first, wrapper afterwards. The gate that used to stand here listed
@@ -10007,6 +10022,9 @@ fn render_draft_masked(
             sys.push_str("    config-sync {\n");
             if !cs.peers.is_empty() {
                 sys.push_str(&format!("        peer {}\n", cs.peers.join(",")));
+            }
+            if let Some(pin) = &cs.peer_fingerprint {
+                sys.push_str(&format!("        peer-fingerprint {pin}\n"));
             }
             if let Some(s) = &cs.secret {
                 sys.push_str(&format!("        secret {s}\n"));
@@ -11792,6 +11810,13 @@ fn render_draft_masked(
         // reverse-proxy <name> { … } — L7 frontends, name-ordered (BTreeMap).
         for (name, rp) in rproxy {
             svc.push_str(&format!("    reverse-proxy {name} {{\n"));
+            if let Some(mode) = rp.mode {
+                let mode = match mode {
+                    crate::config::ProxyMode::Http => "http",
+                    crate::config::ProxyMode::Tcp => "tcp",
+                };
+                svc.push_str(&format!("        mode {mode}\n"));
+            }
             if let Some(port) = rp.port {
                 svc.push_str(&format!("        port {port}\n"));
             }
@@ -14671,6 +14696,7 @@ backends = ["10.0.0.11:8443"]
             "set services reverse-proxy web backends 10.0.0.10:8080,10.0.0.11:8080",
             // A second frontend on a different port exercises the keyed list.
             "set services reverse-proxy api port 8443",
+            "set services reverse-proxy api mode tcp",
             "set services reverse-proxy api backends 10.0.0.20:9000",
         ] {
             run(&mut s, line).unwrap();
@@ -14691,6 +14717,10 @@ backends = ["10.0.0.11:8443"]
         assert_eq!(a.services.reverse_proxy.len(), 2);
         assert_eq!(a.services.reverse_proxy[0].name, "api");
         assert_eq!(a.services.reverse_proxy[0].port(), 8443);
+        assert_eq!(
+            a.services.reverse_proxy[0].mode,
+            crate::config::ProxyMode::Tcp
+        );
         assert_eq!(a.services.reverse_proxy[1].name, "web");
         assert_eq!(a.services.reverse_proxy[1].port(), 443);
         assert_eq!(

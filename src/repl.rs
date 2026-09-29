@@ -1955,6 +1955,7 @@ const BROADCAST_RELAY_FIELDS: &[Cand] = &[
     ),
 ];
 const REVERSE_PROXY_FIELDS: &[Cand] = &[
+    ("mode", "http (default) or tcp passthrough"),
     ("port", "listen port (default 443)"),
     (
         "certificate",
@@ -2769,6 +2770,10 @@ const CONFIGSYNC_FIELDS: &[Cand] = &[
         "a peer firewall to push to — host or host:port (repeatable)",
     ),
     ("secret", "the shared bearer token both peers present"),
+    (
+        "peer-fingerprint",
+        "the peer's base64 SHA-256 TLS public-key pin",
+    ),
 ];
 // `system conntrack-sync <Tab>` reveals the HA conntrack-sync fields (C9).
 const CONNTRACKSYNC_FIELDS: &[Cand] = &[
@@ -3953,6 +3958,10 @@ pub(crate) fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "services", "pppoe-server", "user", _name] => PPPOE_USER_FIELDS,
         ["set" | "delete", "services", "reverse-proxy", _name] => REVERSE_PROXY_FIELDS,
         ["set", "services", "reverse-proxy", _name, "disabled"] => BOOLS,
+        ["set", "services", "reverse-proxy", _name, "mode"] => &[
+            ("http", "HTTP reverse proxy"),
+            ("tcp", "TCP stream passthrough"),
+        ],
         ["set" | "delete", "services", "broadcast-relay", _name] => BROADCAST_RELAY_FIELDS,
         ["set", "services", "broadcast-relay", _name, "disabled"] => BOOLS,
         ["set" | "delete", "services", "alerts"] => ALERTS_NODES,
@@ -4854,6 +4863,7 @@ pub(crate) fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, 
         ["set", "services", "ssh", "listen-address"] => own_cands(&[PH_IPV4]),
         ["set", "system", "login", _name, "ssh-key"] => own_cands(&[PH_KEY]),
         ["set", "system", "config-sync", "peer"] => own_cands(&[PH_IPV4]),
+        ["set", "system", "config-sync", "peer-fingerprint"] => own_cands(&[PH_PUBKEY]),
         ["set", "system", "conntrack-sync", "listen" | "peer"] => own_cands(&[PH_IPV4]),
         ["set", "services", "snmp", "community"] => own_cands(&[PH_KEY]),
         ["set", "services", "snmp", "location" | "contact"] => own_cands(&[PH_TEXT]),
@@ -5512,7 +5522,10 @@ mod tests {
                 "conntrack-sync"
             ]
         );
-        assert_eq!(kw(&["set", "system", "config-sync"]), ["peer", "secret"]);
+        assert_eq!(
+            kw(&["set", "system", "config-sync"]),
+            ["peer", "secret", "peer-fingerprint"]
+        );
         assert_eq!(
             kw(&["set", "system", "conntrack-sync"]),
             ["listen", "peer", "interval"]
