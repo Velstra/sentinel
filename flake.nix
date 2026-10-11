@@ -10285,6 +10285,15 @@
             # The metric came from the lease, not from a default.
             fw.succeed("ip -4 route show default dev eth2 | grep -q 'metric 210'")
 
+            # An unrelated commit must preserve the live lease, rather than
+            # reconfiguring every link and temporarily disconnecting the edge.
+            unit_stamp = fw.succeed("stat -c %y /run/systemd/network/10-sentinel-eth2.network")
+            lost_before = fw.succeed("journalctl -u systemd-networkd --no-pager -o cat | grep -c 'DHCP lease lost' || true")
+            configure("set system hostname fw-updated")
+            assert fw.succeed("stat -c %y /run/systemd/network/10-sentinel-eth2.network") == unit_stamp
+            assert fw.succeed("journalctl -u systemd-networkd --no-pager -o cat | grep -c 'DHCP lease lost' || true") == lost_before
+            fw.succeed("ip addr show eth2 | grep -q 10.8.0.50")
+
             # Phase 6 — port mirroring. A copy of eth1's traffic is queued for
             # transmission on dum0, a link that carries none of it otherwise, so
             # its counter moving is the mirror and nothing else.
