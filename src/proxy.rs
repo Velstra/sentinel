@@ -98,6 +98,12 @@ fn haproxy_cfg_body(proxies: &[ReverseProxy]) -> String {
             s.push_str("    option forwardfor\n");
         }
         s.push_str("    balance roundrobin\n");
+        // A backend can fail between two health probes. Retry connecting to a
+        // different server before any application bytes have been forwarded;
+        // never replay an HTTP request or an established TCP stream.
+        s.push_str("    retries 3\n");
+        s.push_str("    option redispatch 1\n");
+        s.push_str("    default-server inter 1s fastinter 250ms downinter 1s fall 2 rise 2\n");
         for (i, backend) in p.backends.iter().enumerate() {
             s.push_str(&format!("    server s{i} {backend} check\n"));
         }
@@ -354,6 +360,29 @@ mod tests {
             body.contains("    server s1 10.0.0.11:8080 check\n"),
             "{body}"
         );
+    }
+
+    #[test]
+    fn retries_failed_connections_without_replaying_requests() {
+        for mode in [
+            crate::config::ProxyMode::Http,
+            crate::config::ProxyMode::Tcp,
+        ] {
+            let body = haproxy_cfg_body(&[ReverseProxy {
+                mode,
+                ..proxy("api")
+            }]);
+            assert!(body.contains("    retries 3\n"), "{body}");
+            assert!(body.contains("    option redispatch 1\n"), "{body}");
+            assert!(
+                body.contains("fastinter 250ms downinter 1s fall 2 rise 2"),
+                "{body}"
+            );
+            assert!(
+                !body.contains("retry-on"),
+                "must not enable application replay: {body}"
+            );
+        }
     }
 
     #[test]
