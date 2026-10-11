@@ -1428,21 +1428,18 @@ fn openssl_filter(args: &[&str], input: &[u8]) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
-/// Tell systemd-networkd to re-read its unit files and re-apply them to the
-/// given links — so a freshly written `.network` takes effect immediately.
+/// Tell systemd-networkd to re-read its unit files. Reload automatically
+/// reconfigures links whose network files changed; forcing another reconfigure
+/// would discard DHCP leases again, including on unchanged links.
 /// Best-effort: at early boot networkd may not be up yet (it reads the files on
 /// start anyway), so failures are reported by the caller, not fatal here.
-pub fn networkctl_reload(ifaces: &[String]) -> Result<()> {
+pub fn networkctl_reload() -> Result<()> {
     // NOTE: this talks to networkd over D-Bus, which on-demand *activates* it if
     // down — fatal at early boot where sentinel-boot is ordered Before networkd
     // (the out-of-order activation deadlocks the boot). Callers therefore invoke
     // this only in `ApplyMode::Live` (networkd already up); at boot networkd
     // reads the freshly written `.network` units on its own start.
-    run_priv("networkctl", &["reload"])?;
-    for iface in ifaces {
-        run_priv("networkctl", &["reconfigure", iface])?;
-    }
-    Ok(())
+    run_priv("networkctl", &["reload"])
 }
 
 /// Resolve a logical tool name to an absolute path. The Nix wrapper injects
