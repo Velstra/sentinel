@@ -3691,7 +3691,7 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     // a WireGuard link (which needs a `.network` to be brought up even when it
     // carries only AllowedIPs routes and no local address), a bridge/bond device,
     // or a member enslaved to one.
-    let reloaded: Vec<String> = ifaces
+    ifaces
         .iter()
         .filter(|i| {
             // A PPPoE client (ppp0) is owned by pppd, not networkd — never render
@@ -3727,7 +3727,7 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
                     || children.contains_key(i.name.as_str())
                     || pppoe_parents.contains(i.name.as_str()))
         })
-        .map(|i| {
+        .for_each(|i| {
             let kids = children
                 .get(i.name.as_str())
                 .map(Vec::as_slice)
@@ -3787,10 +3787,11 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
             body.push_str(&bridge_vlan_body(&i.vlan_tagged, i.vlan_untagged));
             writes.push((name.clone(), body));
             keep.insert(name);
-            i.name.clone()
-        })
-        .collect();
+        });
 
+    // Unrelated commits must not reconfigure DHCP links and discard leases.
+    // Only reload networkd when its actual unit content changes.
+    let mut network_changed = false;
     // Remove sentinel units (either kind) no longer wanted.
     if let Ok(entries) = std::fs::read_dir(NETWORKD_RUNTIME_DIR) {
         for entry in entries.flatten() {
@@ -3799,6 +3800,7 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
                 && (name.ends_with(".network") || name.ends_with(".netdev"));
             if ours && !keep.contains(&name) {
                 system::remove_file(&entry.path())?;
+                network_changed = true;
             }
         }
     }
@@ -3808,6 +3810,13 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     // ordinary users); everything else stays the default 0644.
     for (name, body) in &writes {
         let path = Path::new(NETWORKD_RUNTIME_DIR).join(name);
+        if !file_changed(&path, body) {
+            if secrets.contains(name) {
+                system::set_mode(&path, "0640")?;
+            }
+            continue;
+        }
+        network_changed = true;
         if secrets.contains(name) {
             system::install_secret_file(&path, body)?;
         } else {
@@ -3819,8 +3828,8 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     // reads them on its own start, and a `networkctl reload` here would D-Bus-
     // activate networkd out of order (sentinel-boot is Before networkd) and
     // deadlock the boot.
-    if mode == ApplyMode::Live {
-        if let Err(e) = system::networkctl_reload(&reloaded) {
+    if mode == ApplyMode::Live && network_changed {
+        if let Err(e) = system::networkctl_reload() {
             eprintln!("warning: networkctl reload failed (networkd applies units on start): {e}");
         }
     }
