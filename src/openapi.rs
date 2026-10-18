@@ -33,7 +33,7 @@ pub fn document() -> Value {
             "responses": {
                 "200": { "description": op.answer },
                 "default": {
-                    "description": "Refused: `{\"error\": \"<a sentence>\"}` with the status saying why (400 malformed, 401 no or wrong token, 429 locked out, 500 the box could not answer).",
+                    "description": "Refused: `{\"error\": \"<a sentence>\"}` with the status saying why (400 malformed, 401 no or wrong token, 403 insufficient permission, 429 locked out, 500 the box could not answer).",
                     "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
                 },
             },
@@ -288,7 +288,7 @@ const OPERATIONS: &[Operation] = &[
         path: "/api/v1/show/{path}",
         id: "show",
         summary: "An operational `show`, by path.",
-        description: "`/api/v1/show/ip/route` is `show ip route`; the words of the path are the words of the command. The text the CLI prints, as the CLI prints it.",
+        description: "`/api/v1/show/ip/route` is `show ip route`. Configuration and archived reads redact credentials for read-only accounts. Administrators retain the CLI's replayable configuration export.",
         parameters: &[(
             "path",
             "path",
@@ -474,7 +474,7 @@ const OPERATIONS: &[Operation] = &[
         path: "/api/v1/stack/{member}/show/{path}",
         id: "stack-show",
         summary: "An operational `show` on a peer, forwarded over the sync link.",
-        description: "A peer's management port is usually not reachable from wherever the operator is, and this box already trusts the link; the request is forwarded already authenticated.",
+        description: "A peer's management port is usually not reachable from wherever the operator is. Read-only configuration views use structured redacted peer reads, so the proxy's credential never elevates the caller. Historical views require the peer's structured revision endpoint; unsupported reads fail closed.",
         parameters: &[
             ("member", "path", "The peer, as `/api/v1/stack` names it."),
             ("path", "path", "The show path."),

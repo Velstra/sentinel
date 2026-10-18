@@ -1709,6 +1709,31 @@
           machine.wait_for_unit("velstra.service")
           machine.succeed("test -f /var/lib/sentinel/appliance.toml")
           machine.succeed("test -f /run/sentinel/velstra.toml")
+          with subtest("root and operator commits share the same apply lock"):
+              machine.succeed("test $(stat -c %a /run/sentinel/apply.lock) = 660")
+              machine.succeed("test $(stat -c %G /run/sentinel/apply.lock) = wheel")
+              machine.succeed("su admin -c 'test -w /run/sentinel/apply.lock'")
+              machine.succeed(
+                  "nohup flock /run/sentinel/apply.lock sh -c "
+                  "'touch /tmp/apply-lock-held; sleep 3' >/tmp/lock-holder.log 2>&1 &"
+              )
+              machine.wait_until_succeeds("test -f /tmp/apply-lock-held")
+              import time
+              started = time.monotonic()
+              machine.succeed("su admin -c \"printf '%s\\n' save exit | sentinel configure --no-apply\"")
+              assert time.monotonic() - started >= 1, "operator bypassed the root-held lock"
+
+          with subtest("an unavailable on-box lock refuses the commit"):
+              before = machine.succeed("hostname").strip()
+              machine.succeed("chmod 600 /run/sentinel/apply.lock")
+              status, output = machine.execute(
+                  "su admin -c \"printf '%s\\n' 'set system hostname lock-bypass' "
+                  "commit exit | sentinel configure 2>&1\""
+              )
+              assert status != 0, "an unlocked configuration session was accepted"
+              assert "apply lock" in output.lower(), output
+              assert machine.succeed("hostname").strip() == before, "unlocked commit changed the host"
+              machine.succeed("chmod 660 /run/sentinel/apply.lock")
           # The system's real NIC (eth0) is discovered and shows up in the config,
           # ready to assign — VyOS-style. (The minimal factory config has no
           # interfaces of its own.)

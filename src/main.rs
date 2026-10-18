@@ -921,8 +921,8 @@ fn apply_boot(
 ) -> Result<()> {
     // Serialise against a `commit`/API `PUT` that lands mid-boot: this stage
     // stages through the same fixed temp names, so an interleaved writer could
-    // corrupt a networkd unit or velstra.toml. Best-effort, held for the stage.
-    let _lock = system::apply_lock();
+    // corrupt a networkd unit or velstra.toml. Held for the whole stage.
+    let _lock = system::apply_lock()?;
     // load_lenient, not load: this is the boot-time apply of the saved config,
     // and the one place an unknown key must not keep the box from coming up. A
     // rollback to an older image whose saved config carries a newer field would
@@ -976,7 +976,7 @@ fn apply_boot(
 fn apply_boot_late(config: &std::path::Path) -> Result<()> {
     // Lenient for the same reason as apply_boot: the second boot stage applies
     // the same saved config, and must survive an unknown key just the same.
-    let _lock = system::apply_lock();
+    let _lock = system::apply_lock()?;
     let appliance = Appliance::load_lenient(config)?;
     net::apply_link_runtime(&appliance)
 }

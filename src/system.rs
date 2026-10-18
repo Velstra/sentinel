@@ -563,62 +563,62 @@ pub(crate) fn stage_private(tmp: &Path, contents: &str) -> Result<()> {
         .with_context(|| format!("staging {}", tmp.display()))
 }
 
-/// A held cross-process apply lock. Dropping it closes the file, which releases
-/// the advisory `flock`. `None` means the lock could not be taken (off-box, or a
-/// test with no `/run/sentinel`) and the caller proceeds unserialised — the lock
-/// is a best-effort guard against concurrent on-box writers, never a gate that
-/// fails a commit.
+/// A held cross-process apply lock. Off-box validation without the appliance
+/// runtime directory needs no runtime lock. On-box failures refuse the write.
 #[must_use = "the lock is released as soon as this guard is dropped"]
 pub struct ApplyLock {
     _file: Option<std::fs::File>,
 }
 
-/// The single lockfile that serialises the apply/persist critical section.
 const APPLY_LOCK_PATH: &str = "/run/sentinel/apply.lock";
 
-/// Serialise the config apply/persist critical section across processes.
-///
-/// Staging always uses fixed temp filenames under `/run/sentinel`
-/// (`.net-unit.tmp`, `.appliance.toml.tmp`, `.net-secret.tmp`, …), so a CLI
-/// `commit` racing an API `PUT` — or either racing the boot-late reconcile —
-/// could write the same temp out from under the other and install a spliced
-/// networkd unit or a half-written `velstra.toml` / `appliance.toml`. An
-/// exclusive advisory lock on one well-known lockfile makes those sections take
-/// turns. It is advisory (`flock`), which is enough because every writer goes
-/// through the same two chokepoints ([`crate::repl::apply_live`] and
-/// [`crate::session::persist_appliance`]) and so cooperates on the one lock. The
-/// call blocks until the lock is ours; the guard releases it on drop.
-///
-/// Best-effort: if the lockfile cannot be opened (no `/run/sentinel` off-box or
-/// in a test), the caller proceeds without the lock rather than failing — the
-/// races this guards against only exist on a running appliance, where the
-/// directory is always present and writable by the writers.
-///
-/// Never take this while already holding it (it would self-deadlock): the two
-/// chokepoints run their critical sections to completion and never nest.
-pub fn apply_lock() -> ApplyLock {
-    use std::os::unix::fs::OpenOptionsExt;
+/// Serialize runtime apply and persistence across boot, API and operator
+/// processes. Both root and wheel operators must open the same inode; failing
+/// open on a root-only lock would silently bypass this boundary.
+/// Never nest this lock: separately opened descriptors would self-deadlock.
+pub fn apply_lock() -> Result<ApplyLock> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::os::unix::io::AsRawFd;
-    if !Path::new("/run/sentinel").is_dir() {
-        return ApplyLock { _file: None };
+    match std::fs::metadata("/run/sentinel") {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ApplyLock { _file: None });
+        }
+        Err(error) => return Err(error).context("accessing appliance apply lock directory"),
+        Ok(metadata) if !metadata.is_dir() => {
+            bail!("appliance apply lock directory is not a directory")
+        }
+        Ok(_) => {}
     }
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
-        .mode(0o600)
-        .open(APPLY_LOCK_PATH);
-    let Ok(file) = file else {
-        return ApplyLock { _file: None };
-    };
-    // SAFETY: a blocking `flock` on a valid fd we own for the lifetime of `file`;
-    // the lock is released when the fd is closed on drop. A failure here (rare —
-    // e.g. EINTR) degrades to proceeding unserialised rather than aborting.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    if rc != 0 {
-        return ApplyLock { _file: None };
+        .mode(0o660)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(APPLY_LOCK_PATH)
+        .context("opening appliance apply lock")?;
+    let metadata = file.metadata().context("reading appliance apply lock")?;
+    let gid = wheel_gid().context("wheel group missing for appliance apply lock")?;
+    if metadata.gid() != gid {
+        // SAFETY: fd belongs to file; uid -1 preserves its existing owner.
+        if unsafe { libc::fchown(file.as_raw_fd(), u32::MAX, gid) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("setting apply lock group");
+        }
     }
-    ApplyLock { _file: Some(file) }
+    if metadata.permissions().mode() & 0o777 != 0o660 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o660))
+            .context("setting appliance apply lock permissions")?;
+    }
+    loop {
+        // SAFETY: the descriptor remains valid for the lifetime of the guard.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(ApplyLock { _file: Some(file) });
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error).context("acquiring appliance apply lock");
+        }
+    }
 }
 
 /// The numeric gid of the `wheel` group, if this system has one. Used to set the

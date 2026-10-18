@@ -9687,10 +9687,10 @@ impl Session {
 /// revision. Archiving is best-effort — a failed archive must never fail the
 /// save that already landed.
 pub fn persist_appliance(appliance: &Appliance, path: &Path, archive: bool) -> Result<PathBuf> {
-    // Serialise against a concurrent apply / another persist: `install_config_file`
-    // stages through a fixed temp name, so two writers at once could corrupt the
-    // saved config. Held only for this write; never nested inside an `apply_live`.
-    let _lock = crate::system::apply_lock();
+    // Serialize against concurrent runtime writes and revision archival.
+    // Installation is atomic off-box too, where there is no runtime lock.
+    // Never nest this inside an `apply_live` lock.
+    let _lock = crate::system::apply_lock()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;

@@ -1208,7 +1208,14 @@ async fn get_config_revision(
 
 fn read_config_revision(path: &Path, revision: usize) -> Result<Appliance, ApiError> {
     let source = crate::archive::read_revision(path, revision).map_err(ApiError::bad_request)?;
-    Appliance::from_toml(&source).map_err(ApiError::internal)
+    // TOML diagnostics include the original source line, which may be a
+    // password or shared key. A damaged archive must not turn a read-only
+    // error response into a credential export.
+    Appliance::from_toml(&source).map_err(|_| {
+        ApiError::bad_request(anyhow!(
+            "configuration revision is invalid or incompatible with this appliance version"
+        ))
+    })
 }
 
 /// Configuration-bearing show paths, including the CLI's permissive aliases.

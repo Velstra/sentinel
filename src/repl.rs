@@ -909,7 +909,7 @@ pub(crate) fn apply_live(
     // reconcile: staging uses fixed temp filenames under /run/sentinel, so two
     // writers at once could splice a networkd unit or a half-written velstra.toml.
     // Held until this function returns.
-    let _lock = system::apply_lock();
+    let _lock = system::apply_lock()?;
 
     // ---- Phase 1: prepare (fallible, NO live side effects) ----
     // Domain groups become address groups here: the compiler matches addresses and

@@ -255,6 +255,19 @@ bfd-auth-key-id = 9
         self.assertEqual(status, 401)
         self.assertNotIn(SECRET, body)
 
+    def test_corrupt_revision_errors_do_not_disclose_credential_source_lines(self):
+        revision = self.config.parent / "archive/config-00000000000000000001.toml"
+        original = revision.read_bytes()
+        try:
+            revision.write_text('[system.config-sync]\nsecret = "' + SECRET)
+            for path in ["config/revisions/0", "show/system/commit/0"]:
+                with self.subTest(path=path):
+                    status, body = request(self.base, path, self.viewer)
+                    self.assertNotIn(SECRET, body)
+                    self.assertEqual(status, 400, body)
+        finally:
+            revision.write_bytes(original)
+
 
 if __name__ == "__main__":
     unittest.main()
