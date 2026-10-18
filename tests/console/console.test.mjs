@@ -27,6 +27,31 @@ await test("the page loads without the script throwing", () => {
   noThrows("the console threw while loading");
 });
 
+await test("secret settings are masked until explicitly revealed", async () => {
+  const result = await page.evaluate(`(() => {
+    const keys = ["secret", "psk", "private-key", "preshared-key", "hashed-password", "pppoe password", "wwan password", "auth-key", "ao-key", "bfd-auth-key", "macsec-key", "pin", "totp", "subscription-key"];
+    const masked = keys.every(key => fieldWidget([key, key], "fixture-only").type === "password");
+    const snmpMasked = fieldWidget(["community", "Community", null, null, "secret"], "fixture-only").type === "password";
+    const bgp = fieldWidget(["community", "Communities", null, "list"], "65001:1");
+    const bgpPublic = bgp.type !== "password" && !bgp.querySelector('input[type="password"]');
+    const group = fieldGrid([["secret", "Sync secret"]], {secret:"fixture-only"});
+    document.body.append(group.grid);
+    const input = group.widgets[0];
+    const button = group.grid.querySelector('button[data-secret-toggle]');
+    if (!button) {group.grid.remove();return {masked, toggle:false};}
+    const label = group.grid.querySelector('label[for="'+input.id+'"]');
+    const named = !!label && label.textContent === "Sync secret";
+    button.click(); const revealed = input.type === "text" && button.getAttribute("aria-pressed") === "true";
+    button.click(); const hidden = input.type === "password" && button.getAttribute("aria-pressed") === "false";
+    const unchanged = fieldLines([["secret", "Sync secret"]], group.widgets, "system config-sync", {secret:"fixture-only"}).length === 0;
+    const valueKept = input.value === "fixture-only";
+    group.grid.remove();
+    return {masked,snmpMasked,bgpPublic,toggle:true,named,revealed,hidden,unchanged,valueKept,plain:fieldWidget(["description","Description"],"public").type === "text"};
+  })()`);
+  check(result.masked, "a secret field was readable by default");
+  for (const key of ["snmpMasked","bgpPublic","toggle","named","revealed","hidden","unchanged","valueKept","plain"]) check(result[key], "secret control contract: " + key);
+});
+
 // --- navigation -------------------------------------------------------------
 
 // One rail entry per call, not sixty in one.

@@ -999,16 +999,28 @@ pub fn set_login_password(user: &str, hash: &str) -> Result<()> {
 /// admin (`configure`) and as root (boot) — mirrors [`install_secret_file`] but
 /// 0600 root:root (the API reads it as root; no other reader needs it).
 pub fn install_token(path: &Path, secret: &str) -> Result<()> {
-    let tmp = Path::new("/run/sentinel").join(".api-token.tmp");
-    // Stage 0600, not umask-default 0644: this token is the machine's full-access
-    // API secret, and `/run/sentinel` is wheel-writable and world-traversable, so
-    // a plain `fs::write` would leave it briefly world-readable there before the
-    // `install` below copies it to its 0600 home.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    let suffix = format!("{}.{}", std::process::id(), id);
+    let tmp = Path::new("/run/sentinel").join(format!(".api-token.{suffix}.tmp"));
+    let destination = path.with_extension(format!("token.{suffix}.tmp"));
+    // Each writer owns its staging paths. Copy to the destination filesystem
+    // with final permissions before renaming, so readers see a complete old or
+    // new credential and never an empty or partially copied prefix.
     stage_private(&tmp, secret)?;
-    let (Some(tmp_s), Some(dst_s)) = (tmp.to_str(), path.to_str()) else {
+    let (Some(src), Some(staged), Some(dst)) = (tmp.to_str(), destination.to_str(), path.to_str())
+    else {
+        let _ = std::fs::remove_file(&tmp);
         bail!("non-UTF-8 path");
     };
-    sudo("install", &["-m", "0600", tmp_s, dst_s])
+    let result = sudo("install", &["-m", "0600", "--", src, staged])
+        .and_then(|_| sudo("mv", &["-fT", "--", staged, dst]));
+    let _ = std::fs::remove_file(&tmp);
+    if result.is_err() {
+        let _ = sudo("rm", &["-f", "--", staged]);
+    }
+    result
 }
 
 /// PUT a config body (a file of JSON) to a peer's Sentinel API for HA config sync

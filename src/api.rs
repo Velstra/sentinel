@@ -60,6 +60,10 @@ pub const DEFAULT_TOKEN_PATH: &str = "/var/lib/sentinel/api-token";
 pub struct ApiState {
     /// The bearer token every request (except `/api/v1/health`) must present.
     pub token: String,
+    /// File-backed credentials are re-read for each request so rotation revokes
+    /// the previous key without restarting the management server. None keeps an
+    /// explicitly supplied environment token fixed for this process.
+    pub token_path: Option<PathBuf>,
     /// The running/boot config a `GET` reads and a `PUT` writes.
     pub config_path: PathBuf,
     /// Whether/where a `PUT` applies the config to the running system.
@@ -100,6 +104,11 @@ pub async fn serve(listen: &str, config: &Path, apply: Apply, token_file: &Path)
         .with_context(|| format!("parsing --listen {listen:?} (want host:port)"))?;
     let state = Arc::new(ApiState {
         token,
+        token_path: std::env::var("SENTINEL_API_TOKEN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .is_none()
+            .then(|| token_file.to_path_buf()),
         config_path: config.to_path_buf(),
         apply,
         // Beside the machine token, wherever that was put. Deriving it rather
@@ -365,7 +374,15 @@ pub fn resolve_caller(state: &ApiState, presented: &str) -> Option<Caller> {
     if presented.is_empty() {
         return None;
     }
-    if ct_eq(presented.as_bytes(), state.token.as_bytes()) {
+    let machine_token = match &state.token_path {
+        Some(path) => std::fs::read_to_string(path)
+            .ok()
+            .map(|value| value.trim().to_string()),
+        None => Some(state.token.clone()),
+    };
+    if machine_token.as_deref().is_some_and(|configured| {
+        !configured.is_empty() && ct_eq(presented.as_bytes(), configured.as_bytes())
+    }) {
         return Some(Caller {
             user: None,
             permission: Permission::ReadWrite,
@@ -1119,6 +1136,9 @@ const SECRET_FIELDS: &[&str] = &[
     "totp",
     "community",
     "ao-key",
+    "auth-key",
+    "bfd-auth-key",
+    "macsec-key",
     "pin",
     // The update channel's entitlement (`[[update.channels]] subscription-key`):
     // a bearer token that buys tested images — anyone holding it can consume
@@ -1846,6 +1866,7 @@ mod tests {
     fn state(config_path: PathBuf) -> Arc<ApiState> {
         Arc::new(ApiState {
             token: TOKEN.to_string(),
+            token_path: None,
             config_path,
             apply: Apply::off(),
             tokens_dir: std::env::temp_dir().join("sentinel-test-tokens"),
@@ -2207,6 +2228,7 @@ virtual-address = ["10.43.0.253"]
 
         let st = ApiState {
             token: TOKEN.to_string(),
+            token_path: None,
             config_path: cfg.clone(),
             apply: Apply::off(),
             tokens_dir: tokens,
@@ -2245,6 +2267,7 @@ virtual-address = ["10.43.0.253"]
         let tokens = dir.join("tokens");
         let st = ApiState {
             token: TOKEN.to_string(),
+            token_path: None,
             config_path: cfg.clone(),
             apply: Apply::off(),
             tokens_dir: tokens.clone(),
@@ -2446,6 +2469,151 @@ virtual-address = ["10.43.0.253"]
         // Non-secret structure is untouched.
         let parsed: Value = serde_json::from_str(&body).expect("json");
         assert_eq!(parsed["system"]["hostname"], "fw");
+    }
+
+    #[tokio::test]
+    async fn readonly_config_hides_routing_and_macsec_keys() {
+        let root = tempdir();
+        let path = root.join("appliance.toml");
+        let tokens = root.join("tokens");
+        std::fs::create_dir_all(&tokens).unwrap();
+        std::fs::write(tokens.join("viewer"), "viewer-token").unwrap();
+        let source = r#"
+[system]
+hostname = "fw"
+[[system.group]]
+name = "viewers"
+permission = "read-only"
+[[system.login]]
+username = "viewer"
+group = "viewers"
+[[interface]]
+name = "eth0"
+mac = "02:00:00:00:00:01"
+[[interface]]
+name = "sec0"
+type = "macsec"
+parent = "eth0"
+macsec-key = "112233445566778899aabbccddeeff00"
+macsec-peer = "02:00:00:00:00:02"
+[protocols.ospf]
+auth-type = "md5"
+auth-key = "routing-secret"
+auth-key-id = 7
+[protocols.bgp]
+local-as = 65001
+[[protocols.bgp.neighbor]]
+address = "192.0.2.2"
+remote-as = 65002
+bfd = true
+bfd-auth-type = "meticulous-sha1"
+bfd-auth-key = "bfd-secret"
+bfd-auth-key-id = 9
+"#;
+        let appliance = Appliance::from_toml(source).expect("valid authenticated routing config");
+        session::persist_appliance(&appliance, &path, false).unwrap();
+        let st = Arc::new(ApiState {
+            token: TOKEN.to_string(),
+            token_path: None,
+            config_path: path,
+            apply: Apply::off(),
+            tokens_dir: tokens,
+        });
+        let response = router(st)
+            .oneshot(get("/api/v1/config", Some("viewer-token")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_string(response).await;
+        for secret in [
+            "routing-secret",
+            "bfd-secret",
+            "112233445566778899aabbccddeeff00",
+        ] {
+            assert!(
+                !body.contains(secret),
+                "read-only configuration disclosed a network authentication key"
+            );
+        }
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["protocols"]["ospf"]["auth-key"], REDACTED);
+        assert_eq!(parsed["protocols"]["ospf"]["auth-key-id"], 7);
+        assert_eq!(
+            parsed["protocols"]["bgp"]["neighbor"][0]["bfd-auth-key"],
+            REDACTED
+        );
+        assert_eq!(
+            parsed["protocols"]["bgp"]["neighbor"][0]["bfd-auth-key-id"],
+            9
+        );
+    }
+
+    #[tokio::test]
+    async fn rotating_the_machine_token_revokes_the_old_key_without_restart() {
+        let root = tempdir();
+        let path = root.join("appliance.toml");
+        std::fs::write(&path, "[system]\nhostname = \"fw\"\n").unwrap();
+        let token_path = root.join("api-token");
+        std::fs::write(&token_path, "original-token").unwrap();
+        let app = router(Arc::new(ApiState {
+            token: "original-token".to_string(),
+            token_path: Some(token_path.clone()),
+            config_path: path,
+            apply: Apply::off(),
+            tokens_dir: root.join("tokens"),
+        }));
+        assert_eq!(
+            app.clone()
+                .oneshot(get("/api/v1/config", Some("original-token")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let next = root.join("next-token");
+        std::fs::write(&next, "rotated-token\n").unwrap();
+        std::fs::rename(&next, &token_path).unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(get("/api/v1/config", Some("original-token")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(get("/api/v1/config", Some("rotated-token")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        std::fs::write(&token_path, "").unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(get("/api/v1/config", Some("original-token")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(get("/api/v1/config", Some("rotated-token")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        std::fs::remove_file(&token_path).unwrap();
+        assert_eq!(
+            app.oneshot(get("/api/v1/config", Some("rotated-token")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     /// The subscription key is an entitlement — whoever holds it can consume

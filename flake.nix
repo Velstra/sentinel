@@ -124,6 +124,7 @@
             --set SENTINEL_WREN_BIN       ${wrenPkg}/bin/wren \
             --set SENTINEL_LSBLK_BIN      ${pkgs.util-linux}/bin/lsblk \
             --set SENTINEL_INSTALL_BIN    ${pkgs.coreutils}/bin/install \
+            --set SENTINEL_MV_BIN         ${pkgs.coreutils}/bin/mv \
             --set SENTINEL_MKDIR_BIN      ${pkgs.coreutils}/bin/mkdir \
             --set SENTINEL_USERADD_BIN    ${pkgs.shadow}/bin/useradd \
             --set SENTINEL_USERMOD_BIN    ${pkgs.shadow}/bin/usermod \
@@ -2385,6 +2386,34 @@
               f"https://127.0.0.1:8080{paths[0]}"
           ).strip()
           assert code == "401", f"{paths[0]} served data without a token ({code})"
+
+          with subtest("rotating a sync key reloads API authentication without restarting"):
+              machine.succeed(
+                  "printf '%s\n' 'set system config-sync secret rotation-initial-secret' "
+                  "commit save | sentinel configure"
+              )
+              machine.wait_until_succeeds(
+                  "curl -fsSk -H 'Authorization: Bearer rotation-initial-secret' "
+                  "https://127.0.0.1:8080/api/v1/config >/dev/null"
+              )
+              pid = machine.succeed("systemctl show -p MainPID --value sentinel-api.service").strip()
+              machine.succeed(
+                  "printf '%s\n' 'set system config-sync secret rotation-replaced-secret' "
+                  "commit save | sentinel configure"
+              )
+              code = machine.succeed(
+                  "curl -sk -o /dev/null -w '%{http_code}' "
+                  "-H 'Authorization: Bearer rotation-initial-secret' "
+                  "https://127.0.0.1:8080/api/v1/config"
+              ).strip()
+              assert code == "401", f"previous credential survived rotation: {code}"
+              machine.succeed(
+                  "curl -fsSk -H 'Authorization: Bearer rotation-replaced-secret' "
+                  "https://127.0.0.1:8080/api/v1/config >/dev/null"
+              )
+              assert pid == machine.succeed("systemctl show -p MainPID --value sentinel-api.service").strip()
+              assert machine.succeed("stat -c %a /var/lib/sentinel/api-token").strip() == "600"
+              machine.fail("find /var/lib/sentinel -maxdepth 1 -name 'api-token.token.*.tmp' -print | grep .")
         '';
       };
 
