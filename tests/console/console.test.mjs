@@ -1462,12 +1462,27 @@ await test("every control stages a command the appliance accepts", async () => {
         // Hidden pages remain mounted. Operate this page's controls once,
         // rather than editing every hidden page again on each navigation.
         const onScreen = (node) => node.offsetParent !== null || node.getClientRects().length > 0;
+        for (const button of [...document.querySelectorAll("button")].filter(onScreen)) {
+          if (button.textContent.trim() === "More settings") button.click();
+        }
+        // Generic fields deliberately wait for Stage. Changing the field and
+        // draining immediately tested nothing except auto-staging widgets.
+        const stageControl = (control) => {
+          for (let host = control.parentElement; host; host = host.parentElement) {
+            const foot = [...host.children].find(node => node.classList.contains("maskfoot"));
+            if (!foot) continue;
+            const button = foot.querySelector("button.btn.primary");
+            if (button && onScreen(button)) button.click();
+            break;
+          }
+        };
         for (const sel of [...document.querySelectorAll("select")].filter(onScreen)) {
           for (const opt of [...sel.options]) {
             if (!opt.value) continue;
             sel.value = opt.value;
             sel.dispatchEvent(new Event("change", { bubbles: true }));
             await wait(25);
+            stageControl(sel);
             drain();
           }
         }
@@ -1475,11 +1490,13 @@ await test("every control stages a command the appliance accepts", async () => {
           box.checked = !box.checked;
           box.dispatchEvent(new Event("change", { bubbles: true }));
           await wait(25);
+          stageControl(box);
           drain();
         }
         return out;
       })()`);
       staged.push(...out);
+      if (process.env.CONSOLE_PROGRESS) console.log(`       → controls ${c + 1}/${cats}, page ${p + 1}/${pages}: ${out.length} commands`);
     }
   }
 
@@ -1495,12 +1512,15 @@ await test("every control stages a command the appliance accepts", async () => {
       headers: { "Content-Type": "text/plain", Authorization: "Bearer " + token },
       body: ${JSON.stringify(body)},
     });
-    return await r.text();
+    return { status: r.status, body: await r.json() };
   })()`);
+  equal(verdict.status, 200, `the configure endpoint refused the control walk: ${JSON.stringify(verdict.body)}`);
+  check(verdict.body.ok === true && typeof verdict.body.output === "string",
+    `the control walk did not execute: ${JSON.stringify(verdict.body)}`);
   // A line that needs company — a rule's port wants a proto — is the model
   // doing its job, not a broken control: this operates each control on its own,
   // which no operator does.
-  const refused = (verdict.match(/error: [^\n"]+/g) || []).filter(
+  const refused = (verdict.body.output.match(/error: [^\n]+/g) || []).filter(
     (e) => !/together|require|need|must be|is required|not a declared|no such|not supported/i.test(e));
   check(refused.length === 0,
     `${refused.length} staged commands were refused:\n  ` + refused.slice(0, 8).join("\n  "));
