@@ -435,10 +435,14 @@ const OPERATIONS: &[Operation] = &[
         path: "/api/v1/lookup/{kind}/{value}",
         id: "lookup",
         summary: "What the appliance can tell you about a value you are typing.",
-        description: "The console never reaches outside itself; it asks here, and this asks the world — a hostname's addresses, an address's name, a country's code.",
+        description: "Look up the holder of an autonomous system number (`asn`) or the reverse DNS name of an IP address (`ptr`). An unavailable answer returns `known: false`; an unknown kind or malformed value is rejected.",
         parameters: &[
-            ("kind", "path", "`host`, `address`, `country`, …"),
-            ("value", "path", "The value."),
+            ("kind", "path", "`asn` or `ptr`."),
+            (
+                "value",
+                "path",
+                "An AS number for `asn`, or an IPv4/IPv6 address for `ptr`.",
+            ),
         ],
         body: None,
         answer: "`{known, answer}`.",
