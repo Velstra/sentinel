@@ -422,7 +422,11 @@ const OPERATIONS: &[Operation] = &[
         description: "Look up the holder of an autonomous system number (`asn`) or the reverse DNS name of an IP address (`ptr`). An unavailable answer returns `known: false`; an unknown kind or malformed value is rejected.",
         parameters: &[
             ("kind", "path", "`asn` or `ptr`."),
-            ("value", "path", "An AS number for `asn`, or an IPv4/IPv6 address for `ptr`."),
+            (
+                "value",
+                "path",
+                "An AS number for `asn`, or an IPv4/IPv6 address for `ptr`.",
+            ),
         ],
         body: None,
         answer: "`{known, answer}`.",
