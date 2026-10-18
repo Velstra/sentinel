@@ -53,13 +53,13 @@ export const instrument = (page, { swallow = true, live = false } = {}) =>
   };
   const ro = renderObjects;
   renderObjects = (o) => {
-    try { note(o.path ? o.path("<n>") : null, o.fields); } catch (e) {}
+    note(o.path ? o.path("<n>") : null, o.fields);
     return ro(o);
   };
   const rap = typeof renderAddPanel === "function" ? renderAddPanel : null;
   if (rap) {
     renderAddPanel = (o) => {
-      try { note(o.path ? o.path("<n>") : null, o.fields); } catch (e) {}
+      note(o.path ? o.path("<n>") : null, o.fields);
       return rap(o);
     };
   }
@@ -183,7 +183,7 @@ export const walkAll = async (page, log = () => {}, panels = false) => {
   // non-default tab then read as a mask the console does not have.
   const strips = await page.evaluate(`Object.keys(TABS)`);
   for (const v of strips) {
-    const n = await page.evaluate(`(TABS[${JSON.stringify(v)}] || []).length`).catch(() => 0);
+    const n = await page.evaluate(`(TABS[${JSON.stringify(v)}] || []).length`);
     for (let i = 0; i < n; i++) {
       await page.evaluate(`(async () => {
         view = ${JSON.stringify(v)}; panel = null;
@@ -192,7 +192,7 @@ export const walkAll = async (page, log = () => {}, panels = false) => {
         await refresh();
         await new Promise((r) => setTimeout(r, 400));
         return true;
-      })()`).catch((e) => log(`  ! ${v} ${i} ${e.message}`));
+      })()`);
       log(`  ${v} tab ${i + 1}/${n}: ${await exercise(page, panels)} controls`);
     }
   }

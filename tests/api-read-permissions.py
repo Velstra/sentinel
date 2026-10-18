@@ -72,7 +72,7 @@ class ReadPermissions(unittest.TestCase):
         cls.config = root / "appliance.toml"
 
     @classmethod
-    def start(cls, name, tls=False, peer=None, fingerprint=None):
+    def start(cls, name, tls=False, peer=None, fingerprint=None, environment=None, config_mode=0o600):
         root = cls.root / name
         root.mkdir(mode=0o700)
         config = (
@@ -119,7 +119,7 @@ bfd-auth-key-id = 9
 '''
         path = root / "appliance.toml"
         path.write_text(config)
-        path.chmod(0o600)
+        path.chmod(config_mode)
         valid = subprocess.run(
             [BINARY, "config", "check", str(path)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -141,6 +141,7 @@ bfd-auth-key-id = 9
         cls.addClassCleanup(log.close)
         env = dict(os.environ)
         env.pop("SENTINEL_API_TOKEN", None)
+        env.update(environment or {})
         proc = subprocess.Popen(
             [BINARY, "api", "--listen", f"127.0.0.1:{port}",
              "--config", str(path), "--token-file", str(token), "--no-apply"],
@@ -254,6 +255,91 @@ bfd-auth-key-id = 9
         status, body = request(self.base, "show/configuration")
         self.assertEqual(status, 401)
         self.assertNotIn(SECRET, body)
+
+    def test_saved_revisions_are_not_world_readable(self):
+        base, root = self.start("private-archive")
+        document = {"system": {"hostname": "private-archive",
+                               "config-sync": {"secret": SECRET}}}
+        req = urllib.request.Request(
+            base + "/api/v1/config", method="PUT", data=json.dumps(document).encode(),
+            headers={"Authorization": "Bearer " + SECRET,
+                     "Content-Type": "application/json"},
+        )
+        with OPENER.open(req, timeout=10) as response:
+            self.assertEqual(response.status, 200)
+        revisions = list((root / "archive").glob("config-*.toml"))
+        self.assertGreaterEqual(len(revisions), 2)
+        for revision in revisions:
+            self.assertEqual(revision.stat().st_mode & 0o007, 0,
+                             f"credentials are readable by everyone: {revision.name}")
+        self.assertTrue(any(SECRET in revision.read_text() for revision in revisions))
+
+    def test_large_configuration_scripts_do_not_deadlock_the_child_pipes(self):
+        before = self.config.read_bytes()
+        req = urllib.request.Request(
+            self.base + "/api/v1/configure", method="POST",
+            data=b"unknown-configuration-verb\n" * 7000,
+            headers={"Authorization": "Bearer " + SECRET, "Content-Type": "text/plain"},
+        )
+        with OPENER.open(req, timeout=10) as response:
+            result = json.load(response)
+            self.assertEqual(response.status, 200)
+        self.assertFalse(result["ok"], "invalid commands were reported as successful")
+        self.assertIn("unknown-configuration-verb", result["output"])
+        self.assertEqual(before, self.config.read_bytes())
+
+    def test_peer_adjustment_is_validated_before_persistence(self):
+        base, root = self.start("peer-validation")
+        before = (root / "appliance.toml").read_bytes()
+        document = {
+            "system": {"hostname": "source"},
+            "interface": [{"name": "source0", "address": "192.0.2.1/24"}],
+            "services": {"dns": {"serve-on": ["source0"]}},
+        }
+        req = urllib.request.Request(
+            base + "/api/v1/config-sync", method="PUT", data=json.dumps(document).encode(),
+            headers={"Authorization": "Bearer " + SECRET,
+                     "Content-Type": "application/json"},
+        )
+        try:
+            with OPENER.open(req, timeout=10) as response:
+                status, body = response.status, response.read().decode()
+        except urllib.error.HTTPError as error:
+            with error:
+                status, body = error.code, error.read().decode()
+        self.assertEqual(status, 400, body)
+        self.assertIn("source0", body)
+        self.assertEqual(before, (root / "appliance.toml").read_bytes())
+
+    def test_operational_vpn_queries_never_prompt_for_privilege(self):
+        tools = self.root / "noninteractive-tools"
+        tools.mkdir(mode=0o700)
+        arguments = tools / "arguments"
+        swanctl = tools / "swanctl"
+        swanctl.write_text("#!/bin/sh\nexit 1\n")
+        swanctl.chmod(0o700)
+        sudo = tools / "sudo"
+        sudo.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$PROBE_ARGUMENTS"\nexit 1\n')
+        sudo.chmod(0o700)
+        base, _ = self.start("noninteractive-vpn", environment={
+            "PATH": str(tools) + os.pathsep + os.environ.get("PATH", ""),
+            "SENTINEL_SWANCTL_BIN": str(swanctl),
+            "PROBE_ARGUMENTS": str(arguments),
+        })
+        status, body = request(base, "show/vpn", SECRET)
+        self.assertEqual(status, 200, body)
+        # The native-root VM run needs no sudo. Workstation diagnostics must
+        # refuse an unavailable escalation immediately rather than prompt.
+        if os.geteuid() != 0:
+            self.assertEqual(arguments.read_text().splitlines()[0], "-n")
+        else:
+            self.assertFalse(arguments.exists(), "root diagnostics unexpectedly escalated")
+
+    def test_legacy_active_configuration_is_protected_at_startup(self):
+        _, root = self.start("legacy-config", config_mode=0o644)
+        path = root / "appliance.toml"
+        self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+        self.assertIn(SECRET, path.read_text())
 
     def test_corrupt_revision_errors_do_not_disclose_credential_source_lines(self):
         revision = self.config.parent / "archive/config-00000000000000000001.toml"

@@ -527,19 +527,10 @@ pub fn swanctl_load(path: &Path) -> Result<()> {
 /// Run a read-only `swanctl` query and return its stdout (for `show vpn` — the
 /// SA / connection state). charon's vici control socket is root-only, so this
 /// must run privileged: directly when already root, else via `sudo` (the admin
-/// is passwordless-wheel on the appliance). The exit code is ignored, like the
+/// is passwordless-wheel on the appliance), without ever prompting. The exit code is ignored, like the
 /// other `show` paths, so an empty/inactive daemon still prints cleanly.
 pub fn swanctl_show(args: &[&str]) -> Result<String> {
-    let is_root = unsafe { libc::geteuid() } == 0;
-    let swanctl = bin("swanctl");
-    let output = if is_root {
-        Command::new(&swanctl).args(args).output()
-    } else {
-        let mut all = vec![swanctl.as_str()];
-        all.extend_from_slice(args);
-        Command::new("sudo").args(&all).output()
-    };
-    let out = output.with_context(|| "running swanctl")?;
+    let out = escalated_output("swanctl", args).context("running swanctl")?;
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
@@ -767,9 +758,10 @@ pub fn install_file(path: &Path, contents: &str) -> Result<()> {
 /// Installed 0640 root:wheel: the file carries hashed passwords and VPN
 /// secrets, and `wheel` is the group an operator account is in — the same
 /// membership that lets them escalate here in the first place.
-pub fn install_config_file(path: &Path, contents: &str) -> Result<()> {
+pub fn install_config_file(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let contents = contents.as_ref();
     let mut random = [0u8; 16];
     getrandom::getrandom(&mut random)
         .map_err(|e| anyhow::anyhow!("config staging entropy: {e}"))?;
@@ -777,16 +769,23 @@ pub fn install_config_file(path: &Path, contents: &str) -> Result<()> {
     let tmp = path.with_extension(format!("toml.{suffix}.tmp"));
     // Writers own distinct same-filesystem temporary files. Exclusive creation
     // refuses pre-existing files and symlinks instead of truncating them.
-    let direct = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o640)
-        .open(&tmp);
+    // Appliance daemons run as root with a deliberately narrow capability
+    // bounding set. An operator-owned 0640 file is unreadable to them without
+    // DAC override, so on-box operator writes must use the root installer even
+    // when wheel can create files in the destination directory.
+    let direct = if !is_root() && Path::new("/run/sentinel").is_dir() {
+        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    } else {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o640)
+            .open(&tmp)
+    };
     match direct {
         Ok(mut file) => {
             let result = (|| -> Result<()> {
-                file.write_all(contents.as_bytes())
-                    .context("writing configuration")?;
+                file.write_all(contents).context("writing configuration")?;
                 file.set_permissions(std::fs::Permissions::from_mode(0o640))?;
                 file.sync_all().context("syncing configuration")?;
                 // Best-effort off-box, where the operator need not own wheel.
@@ -812,7 +811,7 @@ pub fn install_config_file(path: &Path, contents: &str) -> Result<()> {
             .open(&staged)
             .context("creating private configuration staging file")?;
         source_owned = true;
-        source.write_all(contents.as_bytes())?;
+        source.write_all(contents)?;
         source.sync_all()?;
         let (Some(src), Some(dst), Some(destination)) =
             (staged.to_str(), path.to_str(), tmp.to_str())
@@ -841,6 +840,26 @@ pub fn install_config_file(path: &Path, contents: &str) -> Result<()> {
             path.display()
         )
     })
+}
+
+/// Protect configuration documents left with public permissions by an older
+/// version. Use the same atomic installer as writes so ownership and access
+/// remain consistent for root services and wheel operators.
+pub fn secure_config_file(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("reading configuration file permissions"),
+    };
+    anyhow::ensure!(metadata.is_file(), "configuration is not a regular file");
+    if metadata.permissions().mode() & 0o777 == 0o640 {
+        return Ok(());
+    }
+    let contents = std::fs::read(path)
+        .with_context(|| format!("reading private configuration {}", path.display()))?;
+    install_config_file(path, &contents)
+        .with_context(|| format!("protecting configuration {}", path.display()))
 }
 
 /// Install a secret file `contents` at a (root-owned) `path` readable by

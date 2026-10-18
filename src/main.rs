@@ -923,6 +923,8 @@ fn apply_boot(
     // stages through the same fixed temp names, so an interleaved writer could
     // corrupt a networkd unit or velstra.toml. Held for the whole stage.
     let _lock = system::apply_lock()?;
+    system::secure_config_file(config)?;
+    archive::secure_revisions(config)?;
     // load_lenient, not load: this is the boot-time apply of the saved config,
     // and the one place an unknown key must not keep the box from coming up. A
     // rollback to an older image whose saved config carries a newer field would
@@ -946,14 +948,15 @@ fn apply_boot(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    std::fs::write(out, &rendered).with_context(|| format!("writing {}", out.display()))?;
+    system::install_config_file(out, &rendered)
+        .with_context(|| format!("writing {}", out.display()))?;
 
     // Routing: seed the Wren config too (the daemon starts after, so no reload).
     if let Some(parent) = wren_out.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    std::fs::write(wren_out, &wren_rendered)
+    system::install_config_file(wren_out, &wren_rendered)
         .with_context(|| format!("writing {}", wren_out.display()))?;
 
     system::set_hostname(&appliance.system.hostname)?;

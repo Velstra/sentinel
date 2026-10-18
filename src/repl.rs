@@ -704,10 +704,8 @@ fn atomic_install(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    // Routing output and rollback snapshots carry authentication keys too.
+    system::install_config_file(path, bytes)
 }
 
 /// Restore a config file to a snapshot taken before the apply: rewrite the old
@@ -6881,6 +6879,12 @@ mod tests {
         std::fs::write(&path, b"new").unwrap();
         restore_file(&path, Some(b"old")).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640,
+            "compiled routing configuration can contain authentication keys"
+        );
 
         // Snapshot None (no file existed) removes the file we wrote.
         restore_file(&path, None).unwrap();

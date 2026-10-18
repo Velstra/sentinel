@@ -98,6 +98,11 @@ pub async fn serve(listen: &str, config: &Path, apply: Apply, token_file: &Path)
     // See [`crate::system::ignore_sigpipe`] — without it the server dies on the
     // first `curl … | grep -q`, and systemd calls that a clean exit.
     crate::system::ignore_sigpipe();
+    {
+        let _lock = crate::system::apply_lock()?;
+        crate::system::secure_config_file(config)?;
+        crate::archive::secure_revisions(config)?;
+    }
     let token = load_or_create_token(token_file)?;
     let addr: SocketAddr = listen
         .parse()
@@ -1297,6 +1302,9 @@ fn merge_synced_config(mut incoming: Appliance, local: &Appliance) -> Appliance 
 
 /// Validate, apply and persist a complete, receiver-safe appliance document.
 fn replace_config(state: &ApiState, appliance: Appliance) -> Result<Json<Value>, ApiError> {
+    // Peer adjustment replaces member-local interfaces and identity. Validate
+    // the resulting document too, before either runtime or saved state changes.
+    appliance.validate().map_err(ApiError::bad_request)?;
     // Same live-apply as a CLI `commit` (skipped off-box, mirroring `commit`'s
     // own `act.enabled` gate).
     if state.apply.enabled {
@@ -1479,9 +1487,8 @@ async fn get_show(
 /// persist" are genuinely different intentions and the endpoint must not decide
 /// which one was meant.
 ///
-/// **A refused commit is reported in the output, not in the exit status** — so
-/// the whole output is always returned, and a caller that only checks `ok` will
-/// believe a rejected change succeeded.
+/// `ok` reflects the configuration session's exit status. Detailed command and
+/// commit refusals are returned in `output` for the operator to inspect.
 async fn post_configure(
     State(state): State<Arc<ApiState>>,
     body: String,
@@ -1511,15 +1518,25 @@ async fn post_configure(
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()?;
-        {
-            use std::io::Write as _;
-            let mut stdin = child
-                .stdin
-                .take()
-                .ok_or_else(|| std::io::Error::other("configure has no stdin"))?;
-            stdin.write_all(body.as_bytes())?;
-        }
-        child.wait_with_output()
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("configure has no stdin"))?;
+        // Drain both output pipes while feeding stdin. Writing the whole script
+        // first deadlocks when diagnostics fill stderr before stdin is consumed.
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                use std::io::Write as _;
+                stdin.write_all(body.as_bytes())
+            });
+            let output = child.wait_with_output();
+            let written = writer
+                .join()
+                .map_err(|_| std::io::Error::other("configure input writer panicked"))?;
+            let output = output?;
+            written?;
+            Ok(output)
+        })
     })
     .await
     .map_err(|e| ApiError::internal(anyhow!("running configure: {e}")))?

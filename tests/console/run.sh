@@ -12,6 +12,7 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 bin=${1:-}
+node --test "$here/coverage.test.mjs"
 
 # Built, not merely found. Preferring an existing binary made this suite report
 # on whatever was compiled last: two runs in a row said the console could not set

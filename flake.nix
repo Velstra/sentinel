@@ -1508,7 +1508,7 @@
             };
           }
           ''
-            set -eu
+            set -euo pipefail
             export CHROMIUM=${pkgs.chromium}/bin/chromium
             export CONSOLE_PORT=18099
             # A build sandbox is slower than a workstation, and every `show` the
@@ -1709,6 +1709,10 @@
           machine.wait_for_unit("velstra.service")
           machine.succeed("test -f /var/lib/sentinel/appliance.toml")
           machine.succeed("test -f /run/sentinel/velstra.toml")
+          for path in ("/run/sentinel/velstra.toml", "/run/sentinel/wren.toml"):
+              machine.succeed(f"test $(stat -c %a {path}) = 640")
+              machine.succeed(f"test $(stat -c %U:%G {path}) = root:wheel")
+              machine.fail(f"su -s /bin/sh nobody -c 'cat {path}'")
           with subtest("root and operator commits share the same apply lock"):
               machine.succeed("test $(stat -c %a /run/sentinel/apply.lock) = 660")
               machine.succeed("test $(stat -c %G /run/sentinel/apply.lock) = wheel")
@@ -1919,6 +1923,14 @@
           # still-writing producer under pipefail)
           machine.succeed("sentinel show version | grep wren")
           machine.succeed("sentinel show firewall")
+          machine.wait_until_succeeds("wren show routes", timeout=30)
+          machine.wait_until_succeeds("sentinel agent-query stats", timeout=30)
+          # Operator commits retain private runtime configs and usable services.
+          for path in ("/run/sentinel/velstra.toml", "/run/sentinel/wren.toml"):
+              machine.succeed(f"test $(stat -c %a {path}) = 640")
+              machine.succeed(f"test $(stat -c %U:%G {path}) = root:wheel")
+              machine.succeed(f"su admin -c 'test -r {path}'")
+              machine.fail(f"su -s /bin/sh nobody -c 'cat {path}'")
         '';
       };
 
@@ -14387,6 +14399,24 @@
             )
             assert "no revision 999" in out, out
             machine.succeed("hostname | grep -x rev-b")
+            with subtest("private revisions and legacy permission recovery"):
+                revisions = machine.succeed("find /var/lib/sentinel/archive -name 'config-*.toml'").splitlines()
+                assert len(revisions) >= 3, revisions
+                for path in revisions:
+                    machine.succeed(f"test $(stat -c %a {path}) = 640")
+                machine.fail("su -s /bin/sh nobody -c 'cat /var/lib/sentinel/archive/config-*.toml'")
+                machine.succeed(
+                    "cp /var/lib/sentinel/appliance.toml "
+                    "/var/lib/sentinel/archive/config-00000000000000000001.toml"
+                )
+                machine.succeed("chmod 644 /var/lib/sentinel/archive/config-00000000000000000001.toml")
+                machine.succeed("chmod 644 /var/lib/sentinel/appliance.toml")
+                machine.succeed("sentinel apply-boot --config /var/lib/sentinel/appliance.toml")
+                machine.succeed("test $(stat -c %a /var/lib/sentinel/appliance.toml) = 640")
+                machine.succeed(
+                    "test $(stat -c %a /var/lib/sentinel/archive/config-00000000000000000001.toml) = 640"
+                )
+                machine.succeed("su admin -c 'sentinel show system commit 0'")
           '';
         };
 
