@@ -173,13 +173,10 @@
       # fenix's `complete` nightly bundles rust-src, which the BPF target's
       # build-std needs. The agent's build.rs (aya-build) compiles the eBPF crate
       # for the bpf target during this build.
-      # Pin a nightly whose LLVM matches nixpkgs' bpf-linker (LLVM 20). The latest
-      # nightly emits LLVM 22 bitcode, which nixpkgs' LLVM-20 bpf-linker can't
-      # read ("Unknown attribute kind"). nixpkgs 25.05 ships at most LLVM 20, so
-      # the toolchain must be from the LLVM-20 era. Replace fakeHash with the
-      # value the first build reports.
-      nightlyDate = "2025-06-15";
-      nightlySha = "sha256-hMlbNn0xAaLK+EDwdxW/8ZlC8/GHLpFhqB2fhCoj/iU=";
+      # Match Fabric's verified LLVM-22 toolchain. Older LLVM cannot lower the
+      # current datapath; rolling LLVM-23 builds have emitted invalid r11 uses.
+      nightlyDate = "2026-08-01";
+      nightlySha = "sha256-9LY9sgDes2oSCyeuCFFAY37gSvElSJEwh5kiXlr76L8=";
       nightlyProfile = fenix.packages.${system}.toolchainOf {
         channel = "nightly";
         date = nightlyDate;
@@ -206,6 +203,28 @@
       rustPlatformNightly = pkgs.makeRustPlatform {
         cargo = nightly;
         rustc = nightly;
+      };
+
+      # Upstream's static LLVM-22 release avoids mixing the pinned compiler
+      # with nixpkgs 25.05's LLVM-20 linker. This is a build tool only; its
+      # immutable, hash-verified archive is not part of the appliance runtime.
+      bpfLinker = pkgs.stdenvNoCC.mkDerivation {
+        pname = "bpf-linker";
+        version = "0.10.3";
+        src = pkgs.fetchurl {
+          url = "https://github.com/aya-rs/bpf-linker/releases/download/v0.10.3/bpf-linker-x86_64-unknown-linux-musl.tar.gz";
+          hash = "sha256-D6RkXS37tcr+YjGwqp+tTxQwvQhx471zGegtgnv2Jiw=";
+        };
+        sourceRoot = ".";
+        dontConfigure = true;
+        dontBuild = true;
+        installPhase = ''
+          install -Dm755 bpf-linker "$out/bin/bpf-linker"
+        '';
+        doInstallCheck = true;
+        installCheckPhase = ''
+          "$out/bin/bpf-linker" --version | grep -Fx 'bpf-linker 0.10.3'
+        '';
       };
 
       # All aya-* crates come from one git checkout, so they share one hash.
@@ -243,16 +262,25 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-RA4DaBqHiWvPi6YIxl2/9cHpG0px96WNQamLdAwyde0=";
+      ebpfHash = "sha256-elS16ZUNcNUYYmWWM8anbIRG4s1DpZk3+XkjTIcwMho=";
+      fabricBuildId = builtins.substring 0 12 (
+        fabric.rev or (builtins.hashString "sha256" fabric.outPath)
+      );
       velstra-ebpf = pkgs.stdenv.mkDerivation {
-        pname = "velstra-ebpf";
+        # A fixed-output path is identified by hash AND name. Include its
+        # source/toolchain identity so advancing the Fabric pin cannot silently
+        # reuse an object built from a different program with the old hash.
+        pname = "velstra-ebpf-${fabricBuildId}-${nightlyDate}-${bpfLinker.version}";
         version = "0.1.0";
         src = fabric;
-        nativeBuildInputs = [ nightly pkgs.bpf-linker ];
+        nativeBuildInputs = [ nightly bpfLinker ];
 
         outputHashMode = "flat";
         outputHashAlgo = "sha256";
         outputHash = ebpfHash;
+        # This is a BPF relocatable object, not a host ELF executable. Generic
+        # patchelf/strip fixups are inapplicable and must preserve its BTF.
+        dontFixup = true;
         # The eBPF object embeds build-path strings (debuginfo/BTF) that look like
         # store-path references; a raw object file can't actually "use" them, so
         # discard them. Needs structured attrs.
@@ -265,13 +293,8 @@
           # Same flags aya-build uses for the BPF target, plus the explicit
           # bpf-linker selection.
           export RUSTFLAGS='--cfg=bpf_target_arch="x86_64" -Cdebuginfo=2 -Clinker=bpf-linker -Clink-arg=--btf'
-          # The lockfile was generated with a newer rustc, so some build-deps of
-          # *other* workspace members (aya-build -> cargo-platform) declare a
-          # rustc newer than this pinned nightly. They aren't compiled when
-          # building velstra-ebpf, so ignore the version gate.
-          cargo build -p velstra-ebpf --bins --release \
-            --target bpfel-unknown-none -Z build-std=core \
-            --ignore-rust-version
+          cargo build -p velstra-ebpf --bins --release --locked \
+            --target bpfel-unknown-none -Z build-std=core
         '';
         installPhase = ''
           cp target/bpfel-unknown-none/release/velstra "$out"
@@ -291,7 +314,7 @@
         # must be on PATH even though our shim already supplied the object.
         nativeBuildInputs = [
           pkgs.protobuf
-          pkgs.bpf-linker
+          bpfLinker
           pkgs.removeReferencesTo
         ];
         PROTOC = "${pkgs.protobuf}/bin/protoc";
@@ -310,10 +333,7 @@
           remove-references-to -t ${nightly} "$out/bin/velstra"
         '';
         VELSTRA_EBPF_OBJ = velstra-ebpf;
-        # Build just the agent binary. --ignore-rust-version: the lockfile (made
-        # with a newer rustc) has build-deps declaring a newer rustc than this
-        # pinned LLVM-20 nightly; skip the version gate.
-        cargoBuildFlags = [ "-p" "velstra" "--ignore-rust-version" ];
+        cargoBuildFlags = [ "-p" "velstra" "--locked" ];
         # The workspace's tests need root (they load eBPF) — skip in the sandbox.
         doCheck = false;
       };
@@ -1906,6 +1926,12 @@
           machine.wait_for_unit("sentinel-boot.service")
           machine.wait_for_unit("velstra.service")
           machine.succeed("test -f /var/lib/sentinel/appliance.toml")
+
+          with subtest("local and pinned-TLS peer reads preserve account permissions"):
+              machine.succeed(
+                  "${pkgs.python3}/bin/python3 ${./tests/api-read-permissions.py} "
+                  "${sentinel}/bin/sentinel"
+              )
 
           # The API service is off by default (a box service); start it explicitly.
           machine.succeed("systemctl start sentinel-api.service")
@@ -6190,6 +6216,13 @@
                   detail = machine.succeed("mdadm --detail /dev/md/sentinel-data")
                   assert "raid1" in detail, detail
                   assert "active sync" in detail, detail
+                  # The monitor must have a working notification destination,
+                  # including on isolated appliances without a mail service.
+                  machine.succeed("mdadm --monitor --oneshot --test /dev/md/sentinel-data")
+                  machine.wait_until_succeeds(
+                      "journalctl -t sentinel-raid --no-pager | grep -F TestMessage",
+                      timeout=20,
+                  )
                   # The array carries the data filesystem, labelled `data`.
                   assert 'LABEL="data"' in machine.succeed("blkid /dev/md/sentinel-data")
                   # Both members are typed Linux RAID (GPT type GUID), checked via
@@ -7261,6 +7294,7 @@
                 };
                 systemd.services.web = {
                   wantedBy = [ "multi-user.target" ];
+                  wants = [ "network-online.target" ];
                   after = [ "network-online.target" ];
                   script = ''
                     mkdir -p /srv/web && echo hello-from-server > /srv/web/index.html
@@ -7609,6 +7643,7 @@
                 };
                 systemd.services.web = {
                   wantedBy = [ "multi-user.target" ];
+                  wants = [ "network-online.target" ];
                   after = [ "network-online.target" ];
                   script = ''
                     mkdir -p /srv/web && echo hello-from-server > /srv/web/index.html
@@ -7766,6 +7801,7 @@
                 };
                 systemd.services.web = {
                   wantedBy = [ "multi-user.target" ];
+                  wants = [ "network-online.target" ];
                   after = [ "network-online.target" ];
                   script = ''
                     mkdir -p /srv/web && echo hello-from-protected > /srv/web/index.html
@@ -8005,6 +8041,7 @@
                 };
                 systemd.services.web = {
                   wantedBy = [ "multi-user.target" ];
+                  wants = [ "network-online.target" ];
                   after = [ "network-online.target" ];
                   script = ''
                     mkdir -p /srv/web && echo hello-from-server > /srv/web/index.html
@@ -8304,6 +8341,7 @@
                 services.velstra.interface = lib.mkForce "eth1";
                 systemd.services.web = {
                   wantedBy = [ "multi-user.target" ];
+                  wants = [ "network-online.target" ];
                   after = [ "network-online.target" ];
                   script = ''
                     mkdir -p /srv/web && echo hello-from-server > /srv/web/index.html
@@ -8447,6 +8485,7 @@
                 };
                 systemd.services.web = {
                   wantedBy = [ "multi-user.target" ];
+                  wants = [ "network-online.target" ];
                   after = [ "network-online.target" ];
                   script = ''
                     mkdir -p /srv/web && echo hello-from-server > /srv/web/index.html

@@ -234,6 +234,10 @@ fn install_crypto_provider() {
 pub fn router(state: Arc<ApiState>) -> Router {
     let protected = Router::new()
         .route("/api/v1/config", get(get_config).put(put_config))
+        .route(
+            "/api/v1/config/revisions/:revision",
+            get(get_config_revision),
+        )
         // A config-sync peer is not a second administrator. Its document is
         // shared policy, merged with the receiver's local identity before it
         // can reach the normal apply path.
@@ -1184,10 +1188,55 @@ fn redact_secrets(value: &mut Value) {
 /// secrets are all replaced by [`REDACTED`] before the config leaves the box.
 async fn get_config(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, ApiError> {
     let appliance = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
-    let mut value = serde_json::to_value(&appliance)
+    Ok(Json(redacted_config(&appliance)?))
+}
+
+fn redacted_config(appliance: &Appliance) -> Result<Value, ApiError> {
+    let mut value = serde_json::to_value(appliance)
         .map_err(|e| ApiError::internal(anyhow!("serialising the configuration: {e}")))?;
     redact_secrets(&mut value);
-    Ok(Json(value))
+    Ok(value)
+}
+
+async fn get_config_revision(
+    State(state): State<Arc<ApiState>>,
+    UrlPath(revision): UrlPath<usize>,
+) -> Result<Json<Value>, ApiError> {
+    let appliance = read_config_revision(&state.config_path, revision)?;
+    Ok(Json(redacted_config(&appliance)?))
+}
+
+fn read_config_revision(path: &Path, revision: usize) -> Result<Appliance, ApiError> {
+    let source = crate::archive::read_revision(path, revision).map_err(ApiError::bad_request)?;
+    Appliance::from_toml(&source).map_err(ApiError::internal)
+}
+
+/// Configuration-bearing show paths, including the CLI's permissive aliases.
+fn configuration_read(path: &str) -> Option<Option<&str>> {
+    let words: Vec<_> = path.split('/').filter(|word| !word.is_empty()).collect();
+    match words.as_slice() {
+        ["configuration", ..] => Some(None),
+        ["system", "commit", revision] => Some(Some(revision)),
+        _ => None,
+    }
+}
+
+fn render_redacted_config(mut value: Value, path: &str) -> Result<Response, ApiError> {
+    // Recheck peer responses locally: proxying with the machine token must not
+    // turn a viewer into an administrator, even against an older peer.
+    redact_secrets(&mut value);
+    // Presentation only. The redaction markers intentionally do not pass the
+    // runtime key validators; this copy must never reach apply or persistence.
+    let appliance: Appliance = serde_json::from_value(value)
+        .map_err(|_| ApiError::internal(anyhow!("invalid configuration read response")))?;
+    let rendered = session::render_appliance(&appliance);
+    let words: Vec<_> = path.split('/').filter(|word| !word.is_empty()).collect();
+    let body = if words.as_slice() == ["configuration", "commands"] {
+        session::flatten_config(&rendered).join("\n") + "\n"
+    } else {
+        rendered
+    };
+    Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response())
 }
 
 /// `PUT /api/v1/config` — replace the running config from a JSON body. This is
@@ -1353,7 +1402,20 @@ async fn get_status(
 async fn get_show(
     State(state): State<Arc<ApiState>>,
     UrlPath(path): UrlPath<String>,
+    axum::Extension(caller): axum::Extension<Caller>,
 ) -> Result<Response, ApiError> {
+    if let Some(revision) = configuration_read(&path).filter(|_| !caller.permission.may_write()) {
+        let appliance = match revision {
+            Some(index) => read_config_revision(
+                &state.config_path,
+                index
+                    .parse()
+                    .map_err(|_| ApiError::bad_request(anyhow!("revision must be a number")))?,
+            )?,
+            None => Appliance::load(&state.config_path).map_err(ApiError::internal)?,
+        };
+        return render_redacted_config(redacted_config(&appliance)?, &path);
+    }
     let words: Vec<String> = path
         .split('/')
         .filter(|s| !s.is_empty())
@@ -1649,6 +1711,7 @@ async fn get_stack(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, Ap
 async fn get_stack_show(
     State(state): State<Arc<ApiState>>,
     UrlPath((member, path)): UrlPath<(String, String)>,
+    axum::Extension(caller): axum::Extension<Caller>,
 ) -> Result<Response, ApiError> {
     let appliance = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
     let cs = &appliance.system.config_sync;
@@ -1663,12 +1726,29 @@ async fn get_stack_show(
         .ok_or_else(|| ApiError::bad_request(anyhow!("no config-sync secret is set")))?;
     let cs = cs.clone();
     let peer = member.clone();
-    let endpoint = format!("show/{path}");
+    let protected_read = (!caller.permission.may_write())
+        .then(|| configuration_read(&path))
+        .flatten();
+    let endpoint = match protected_read {
+        Some(Some(revision)) => {
+            let revision: usize = revision
+                .parse()
+                .map_err(|_| ApiError::bad_request(anyhow!("revision must be a number")))?;
+            format!("config/revisions/{revision}")
+        }
+        Some(None) => "config".to_string(),
+        None => format!("show/{path}"),
+    };
     let secret = secret.to_string();
     let body = tokio::task::spawn_blocking(move || peer_get(&cs, &peer, &endpoint, &secret))
         .await
         .map_err(|e| ApiError::internal(anyhow!("peer request task failed: {e}")))?
         .map_err(|e| ApiError::bad_request(anyhow!("{member}: {e}")))?;
+    if protected_read.is_some() {
+        let value = serde_json::from_str(&body)
+            .map_err(|_| ApiError::internal(anyhow!("peer returned invalid configuration")))?;
+        return render_redacted_config(value, &path);
+    }
     Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response())
 }
 

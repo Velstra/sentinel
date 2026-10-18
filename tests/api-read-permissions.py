@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""Exercise read permissions against two real, isolated management processes.
+
+Usage: python3 tests/api-read-permissions.py /path/to/sentinel
+No live apply, root privileges, network namespaces or external services required.
+"""
+
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+import urllib.error
+import urllib.request
+
+
+BINARY = str(Path(sys.argv.pop(1)).resolve())
+SECRET = "integration-machine-secret"
+WIREGUARD_KEY = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+SECRETS = [SECRET, WIREGUARD_KEY, "112233445566778899aabbccddeeff00",
+           "ospf-test-key", "bfd-test-secret", "snmp-test-secret"]
+OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}),
+    urllib.request.HTTPSHandler(context=ssl._create_unverified_context()),
+)
+
+
+def request(base, path, token=None):
+    headers = {"Authorization": "Bearer " + token} if token else {}
+    req = urllib.request.Request(base + "/api/v1/" + path, headers=headers)
+    try:
+        with OPENER.open(req, timeout=10) as response:
+            return response.status, response.read().decode()
+    except urllib.error.HTTPError as error:
+        with error:
+            return error.code, error.read().decode()
+
+
+class ReadPermissions(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary = tempfile.TemporaryDirectory(prefix="sentinel-read-permissions-")
+        cls.addClassCleanup(cls.temporary.cleanup)
+        cls.root = Path(cls.temporary.name)
+        cls.processes = []
+        cls.addClassCleanup(cls.stop)
+        cls.peer, peer_root = cls.start("peer", tls=True)
+        openssl = os.environ.get("SENTINEL_OPENSSL_BIN", "openssl")
+        public = subprocess.check_output(
+            [openssl, "x509", "-in", str(peer_root / "web-tls/cert.pem"),
+             "-pubkey", "-noout"]
+        )
+        der = subprocess.run(
+            [openssl, "pkey", "-pubin", "-outform", "DER"],
+            input=public, stdout=subprocess.PIPE, check=True,
+        ).stdout
+        pin = base64.b64encode(hashlib.sha256(der).digest()).decode()
+        authority = cls.peer.removeprefix("https://")
+        cls.base, root = cls.start("primary", peer=authority, fingerprint=pin)
+        cls.viewer = (root / "api-tokens/viewer").read_text().strip()
+        cls.authority = authority
+        cls.config = root / "appliance.toml"
+
+    @classmethod
+    def start(cls, name, tls=False, peer=None, fingerprint=None):
+        root = cls.root / name
+        root.mkdir(mode=0o700)
+        config = (
+            '[system]\nhostname = "' + name + '"\n'
+            '[[system.group]]\nname = "viewers"\npermission = "read-only"\n'
+            '[[system.login]]\nusername = "viewer"\ngroup = "viewers"\n'
+            '[system.config-sync]\nsecret = "' + SECRET + '"\n'
+        )
+        if peer:
+            config += 'peer = [' + json.dumps(peer) + ']\n'
+            config += 'peer-fingerprint = ' + json.dumps(fingerprint) + '\n'
+        config += '[services.web]\nenable = true\ntls = ' + str(tls).lower() + '\n'
+        config += '''
+[services.snmp]
+community = "snmp-test-secret"
+[[interface]]
+name = "eth0"
+mac = "02:00:00:00:00:01"
+[[interface]]
+name = "sec0"
+type = "macsec"
+parent = "eth0"
+macsec-key = "112233445566778899aabbccddeeff00"
+macsec-peer = "02:00:00:00:00:02"
+[[interface]]
+name = "wg0"
+type = "wireguard"
+[[vpn.wireguard]]
+name = "wg0"
+private-key = "''' + WIREGUARD_KEY + '''"
+[protocols.ospf]
+auth-type = "md5"
+auth-key = "ospf-test-key"
+auth-key-id = 7
+[protocols.bgp]
+local-as = 65001
+[[protocols.bgp.neighbor]]
+address = "192.0.2.2"
+remote-as = 65002
+bfd = true
+bfd-auth-type = "meticulous-sha1"
+bfd-auth-key = "bfd-test-secret"
+bfd-auth-key-id = 9
+'''
+        path = root / "appliance.toml"
+        path.write_text(config)
+        path.chmod(0o600)
+        valid = subprocess.run(
+            [BINARY, "config", "check", str(path)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        if valid.returncode:
+            raise RuntimeError("test configuration was refused: " + valid.stderr)
+        archive = root / "archive"
+        archive.mkdir(mode=0o700)
+        revision = archive / "config-00000000000000000001.toml"
+        revision.write_text(config)
+        revision.chmod(0o600)
+        token = root / "api-token"
+        token.write_text(SECRET)
+        token.chmod(0o600)
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        log = (root / "api.log").open("w+")
+        cls.addClassCleanup(log.close)
+        env = dict(os.environ)
+        env.pop("SENTINEL_API_TOKEN", None)
+        proc = subprocess.Popen(
+            [BINARY, "api", "--listen", f"127.0.0.1:{port}",
+             "--config", str(path), "--token-file", str(token), "--no-apply"],
+            stdout=log, stderr=subprocess.STDOUT, env=env,
+        )
+        cls.processes.append(proc)
+        base = f"{'https' if tls else 'http'}://127.0.0.1:{port}"
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            try:
+                if request(base, "health")[0] == 200:
+                    return base, root
+            except (OSError, urllib.error.URLError):
+                pass
+            if proc.poll() is not None:
+                break
+            time.sleep(0.05)
+        log.seek(0)
+        raise RuntimeError("management API did not start: " + log.read())
+
+    @classmethod
+    def stop(cls):
+        for proc in reversed(cls.processes):
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+    def test_readonly_configuration_paths_and_archive_hide_credentials(self):
+        before = self.config.read_bytes()
+        for path in ["config", "show/configuration", "show/configuration/commands",
+                     "show/configuration/extra", "show/system/commit/0",
+                     "config/revisions/0"]:
+            with self.subTest(path=path):
+                status, body = request(self.base, path, self.viewer)
+                self.assertEqual(status, 200, body)
+                self.assertIn("primary", body)
+                for secret in SECRETS:
+                    self.assertNotIn(secret, body)
+        self.assertEqual(before, self.config.read_bytes())
+
+    def test_invalid_revisions_are_refused_without_disclosing_configuration(self):
+        for path in ["config/revisions/-1", "config/revisions/not-a-number",
+                     "config/revisions/9999", "show/system/commit/not-a-number",
+                     "stack/" + self.authority + "/show/system/commit/not-a-number"]:
+            with self.subTest(path=path):
+                status, body = request(self.base, path, self.viewer)
+                self.assertEqual(status, 400, body)
+                for secret in SECRETS:
+                    self.assertNotIn(secret, body)
+
+    def test_peer_proxy_does_not_elevate_the_viewer(self):
+        for path in ["configuration", "configuration/commands", "system/commit/0"]:
+            with self.subTest(path=path):
+                status, body = request(
+                    self.base, "stack/" + self.authority + "/show/" + path, self.viewer
+                )
+                self.assertEqual(status, 200, body)
+                self.assertIn("peer", body)
+                for secret in SECRETS:
+                    self.assertNotIn(secret, body)
+
+    def test_administrator_can_still_export_replayable_configuration(self):
+        for prefix in ["show/", "stack/" + self.authority + "/show/"]:
+            status, body = request(self.base, prefix + "configuration/commands", SECRET)
+            self.assertEqual(status, 200, body)
+            for secret in SECRETS:
+                self.assertIn(secret, body)
+
+    def test_anonymous_requests_are_refused(self):
+        status, body = request(self.base, "show/configuration")
+        self.assertEqual(status, 401)
+        self.assertNotIn(SECRET, body)
+
+
+if __name__ == "__main__":
+    unittest.main()

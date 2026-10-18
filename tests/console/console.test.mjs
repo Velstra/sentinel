@@ -1459,7 +1459,10 @@ await test("every control stages a command the appliance accepts", async () => {
         };
         const strip = document.querySelectorAll("#sectionstrip .secitem");
         if (strip[${p}]) { strip[${p}].click(); await wait(200); }
-        for (const sel of [...document.querySelectorAll("select")]) {
+        // Hidden pages remain mounted. Operate this page's controls once,
+        // rather than editing every hidden page again on each navigation.
+        const onScreen = (node) => node.offsetParent !== null || node.getClientRects().length > 0;
+        for (const sel of [...document.querySelectorAll("select")].filter(onScreen)) {
           for (const opt of [...sel.options]) {
             if (!opt.value) continue;
             sel.value = opt.value;
@@ -1468,14 +1471,14 @@ await test("every control stages a command the appliance accepts", async () => {
             drain();
           }
         }
-        for (const box of [...document.querySelectorAll("input[type=checkbox]")]) {
+        for (const box of [...document.querySelectorAll("input[type=checkbox]")].filter(onScreen)) {
           box.checked = !box.checked;
           box.dispatchEvent(new Event("change", { bubbles: true }));
           await wait(25);
           drain();
         }
         return out;
-      })()`).catch(() => []);
+      })()`);
       staged.push(...out);
     }
   }

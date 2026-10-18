@@ -232,6 +232,22 @@ const OPERATIONS: &[Operation] = &[
         open: false,
     },
     Operation {
+        method: "get",
+        path: "/api/v1/config/revisions/{revision}",
+        id: "get-config-revision",
+        summary: "An archived configuration, with every secret redacted.",
+        description: "Revision zero is the newest saved revision. Missing or invalid revisions are refused. This structured read also lets a stack proxy render a historical configuration without forwarding the peer's privileged command output to a read-only account.",
+        parameters: &[(
+            "revision",
+            "path",
+            "Nonnegative revision index; zero is newest.",
+        )],
+        body: None,
+        answer: "The archived configuration.",
+        answer_shape: Some(("application/json", any_object)),
+        open: false,
+    },
+    Operation {
         method: "put",
         path: "/api/v1/config",
         id: "put-config",
@@ -476,10 +492,15 @@ pub(crate) mod tests {
 
     /// The router's paths, spelled the way OpenAPI spells them.
     fn served() -> Vec<(String, String)> {
-        let src = include_str!("api.rs");
+        routes_in(include_str!("api.rs"))
+    }
+
+    fn routes_in(src: &str) -> Vec<(String, String)> {
         let mut out = Vec::new();
-        for (at, needle) in src.match_indices(".route(\"") {
-            let rest = &src[at + needle.len()..];
+        for (at, needle) in src.match_indices(".route(") {
+            let Some(rest) = src[at + needle.len()..].trim_start().strip_prefix('"') else {
+                continue;
+            };
             let Some(end) = rest.find('"') else { continue };
             let path = rest[..end]
                 .replace("/*path", "/{path}")
@@ -490,16 +511,60 @@ pub(crate) mod tests {
                 })
                 .collect::<Vec<_>>()
                 .join("/");
-            // The verbs on the same line: `get(x).put(y)`.
-            let line_end = rest.find('\n').unwrap_or(rest.len());
-            let line = &rest[end..line_end];
+            // rustfmt wraps longer paths and handlers over several lines.
+            // Stop at this route's closing parenthesis, not at a newline or
+            // the next route, so unrelated handlers cannot add phantom verbs.
+            let tail = &rest[end + 1..];
+            let mut depth = 1;
+            let mut quoted = false;
+            let mut escaped = false;
+            let mut close = tail.len();
+            for (index, ch) in tail.char_indices() {
+                if quoted {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '"' {
+                        quoted = false;
+                    }
+                    continue;
+                }
+                match ch {
+                    '"' => quoted = true,
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = index;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let handlers = &tail[..close];
             for verb in ["get", "put", "post", "patch", "delete"] {
-                if line.contains(&format!("{verb}(")) {
+                if handlers.contains(&format!("{verb}(")) {
                     out.push((verb.to_string(), path.clone()));
                 }
             }
         }
         out
+    }
+
+    #[test]
+    fn route_inventory_survives_multiline_formatting() {
+        assert_eq!(
+            routes_in(
+                "router.route(\n\"/api/v1/config/:revision\",\nget(read).put(write),\n).route(\"/next\", post(next))"
+            ),
+            vec![
+                ("get".to_string(), "/api/v1/config/{revision}".to_string()),
+                ("put".to_string(), "/api/v1/config/{revision}".to_string()),
+                ("post".to_string(), "/next".to_string()),
+            ],
+        );
     }
 
     /// The console and the favicon are pages, not API; everything else the

@@ -146,7 +146,7 @@ const exercise = (page, panels = false) =>
       await wait();
     }
     return touched;
-  })()`).catch((e) => (console.error("  ! exercise", e.message), 0));
+  })()`);
 
 /// Open every category, every page inside it, and every tab strip, exercising
 /// each. One call per step: a build sandbox is slow enough that a single
@@ -161,14 +161,14 @@ export const walkAll = async (page, log = () => {}, panels = false) => {
       [...document.querySelectorAll("aside button.navitem")][${i}].click();
       await new Promise((r) => setTimeout(r, 350));
       return document.querySelectorAll("#sectionstrip .secitem").length || 1;
-    })()`).catch((e) => (log(`  ! ${cats[i]} ${e.message}`), 1));
+    })()`);
     for (let p = 0; p < pages; p++) {
       await page.evaluate(`(async () => {
         const strip = document.querySelectorAll("#sectionstrip .secitem");
         if (strip[${p}]) strip[${p}].click();
         await new Promise((r) => setTimeout(r, 300));
         return true;
-      })()`).catch((e) => log(`  ! ${cats[i]}/${p} ${e.message}`));
+      })()`);
       const spent = await exercise(page, panels);
       log(`  ${cats[i]} ${p + 1}/${pages}: ${spent} controls`);
     }
