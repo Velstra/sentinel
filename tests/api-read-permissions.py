@@ -6,6 +6,7 @@ No live apply, root privileges, network namespaces or external services required
 """
 
 import base64
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -15,7 +16,9 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import tomllib
 import unittest
 import urllib.error
 import urllib.request
@@ -208,6 +211,44 @@ bfd-auth-key-id = 9
             self.assertEqual(status, 200, body)
             for secret in SECRETS:
                 self.assertIn(secret, body)
+
+    def test_concurrent_configuration_writes_publish_complete_documents(self):
+        base, root = self.start("concurrent")
+        barrier = threading.Barrier(12, timeout=15)
+
+        def write(index):
+            document = {
+                "system": {"hostname": f"writer-{index}"},
+                "interface": [
+                    {"name": f"dummy{n}", "description": str(index % 10) * 240}
+                    for n in range(1000)
+                ],
+            }
+            req = urllib.request.Request(
+                base + "/api/v1/config", method="PUT",
+                data=json.dumps(document).encode(),
+                headers={"Authorization": "Bearer " + SECRET,
+                         "Content-Type": "application/json"},
+            )
+            barrier.wait()
+            try:
+                with OPENER.open(req, timeout=30) as response:
+                    return response.status, response.read().decode()
+            except urllib.error.HTTPError as error:
+                with error:
+                    return error.code, error.read().decode()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+            responses = list(pool.map(write, range(12)))
+        self.assertEqual([status for status, _ in responses], [200] * 12, responses)
+        saved = root / "appliance.toml"
+        result = tomllib.loads(saved.read_text())
+        index = int(result["system"]["hostname"].removeprefix("writer-"))
+        self.assertEqual(len(result["interface"]), 1000)
+        self.assertTrue(all(row["description"] == str(index % 10) * 240
+                            for row in result["interface"]))
+        self.assertEqual(saved.stat().st_mode & 0o777, 0o640)
+        self.assertFalse(list(root.glob("*.tmp")), "a writer left configuration staging files")
 
     def test_anonymous_requests_are_refused(self):
         status, body = request(self.base, "show/configuration")

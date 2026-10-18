@@ -627,14 +627,30 @@ pub fn apply_lock() -> ApplyLock {
 /// `wheel` group simply leaves the file root-owned.
 fn wheel_gid() -> Option<u32> {
     let name = std::ffi::CString::new("wheel").ok()?;
-    // SAFETY: `getgrnam` returns a pointer into storage that a later call could
-    // overwrite; we read `gr_gid` out immediately while the pointer is non-null
-    // and keep nothing that outlives this call.
-    let grp = unsafe { libc::getgrnam(name.as_ptr()) };
-    if grp.is_null() {
-        None
-    } else {
-        Some(unsafe { (*grp).gr_gid })
+    let mut buffer = vec![0u8; 1024];
+    loop {
+        let mut group = std::mem::MaybeUninit::<libc::group>::uninit();
+        let mut found = std::ptr::null_mut();
+        // SAFETY: storage belongs to this call and lives through the gid read.
+        // getgrnam_r shares no static buffer with concurrent API writers.
+        let result = unsafe {
+            libc::getgrnam_r(
+                name.as_ptr(),
+                group.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut found,
+            )
+        };
+        if result == libc::ERANGE && buffer.len() < 65536 {
+            buffer.resize(buffer.len() * 2, 0);
+            continue;
+        }
+        if result != 0 || found.is_null() {
+            return None;
+        }
+        // SAFETY: a successful lookup initialized group and returned its address.
+        return Some(unsafe { group.assume_init().gr_gid });
     }
 }
 
@@ -753,38 +769,73 @@ pub fn install_file(path: &Path, contents: &str) -> Result<()> {
 /// membership that lets them escalate here in the first place.
 pub fn install_config_file(path: &Path, contents: &str) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let tmp = path.with_extension("toml.tmp");
-    // Fast path (root, and the API service, which own the directory): stage the
-    // temp with the final mode 0640 from the outset — a plain `fs::write` honours
-    // the umask (0644) and `rename` preserves the temp's mode, so writing 0644
-    // here would silently widen a config that carries hashed passwords and VPN
-    // secrets. Group `wheel` (best-effort) matches the sudo path below, so an
-    // operator account can still read the saved config without escalating.
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut random = [0u8; 16];
+    getrandom::getrandom(&mut random)
+        .map_err(|e| anyhow::anyhow!("config staging entropy: {e}"))?;
+    let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+    let tmp = path.with_extension(format!("toml.{suffix}.tmp"));
+    // Writers own distinct same-filesystem temporary files. Exclusive creation
+    // refuses pre-existing files and symlinks instead of truncating them.
     let direct = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o640)
         .open(&tmp);
-    if let Ok(mut f) = direct {
-        if f.write_all(contents.as_bytes()).is_ok() {
-            drop(f);
-            if let Some(gid) = wheel_gid() {
-                let _ = std::os::unix::fs::chown(&tmp, None, Some(gid));
-            }
-            if std::fs::rename(&tmp, path).is_ok() {
-                return Ok(());
-            }
+    match direct {
+        Ok(mut file) => {
+            let result = (|| -> Result<()> {
+                file.write_all(contents.as_bytes())
+                    .context("writing configuration")?;
+                file.set_permissions(std::fs::Permissions::from_mode(0o640))?;
+                file.sync_all().context("syncing configuration")?;
+                // Best-effort off-box, where the operator need not own wheel.
+                if let Some(gid) = wheel_gid() {
+                    let _ = std::os::unix::fs::chown(&tmp, None, Some(gid));
+                }
+                std::fs::rename(&tmp, path).context("publishing configuration")?;
+                Ok(())
+            })();
+            let _ = std::fs::remove_file(&tmp);
+            return result;
         }
-        let _ = std::fs::remove_file(&tmp);
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Err(error) => return Err(error).context("creating configuration staging file"),
     }
-    let staged = Path::new("/run/sentinel").join(".appliance.toml.tmp");
-    stage_private(&staged, contents)?;
-    let (Some(src), Some(dst)) = (staged.to_str(), path.to_str()) else {
-        bail!("non-UTF-8 path");
-    };
-    sudo("install", &["-m", "0640", "-g", "wheel", src, dst]).with_context(|| {
+    let staged = Path::new("/run/sentinel").join(format!(".appliance.{suffix}.tmp"));
+    let mut source_owned = false;
+    let result = (|| -> Result<()> {
+        let mut source = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&staged)
+            .context("creating private configuration staging file")?;
+        source_owned = true;
+        source.write_all(contents.as_bytes())?;
+        source.sync_all()?;
+        let (Some(src), Some(dst), Some(destination)) =
+            (staged.to_str(), path.to_str(), tmp.to_str())
+        else {
+            bail!("non-UTF-8 path");
+        };
+        // Copy with final ownership to the destination filesystem, then rename:
+        // privileged saves must never expose a partially copied document.
+        sudo(
+            "install",
+            &["-m", "0640", "-g", "wheel", "--", src, destination],
+        )?;
+        sudo("mv", &["-fT", "--", destination, dst])
+    })();
+    if source_owned {
+        let _ = std::fs::remove_file(&staged);
+    }
+    if result.is_err() {
+        if let Some(tmp) = tmp.to_str() {
+            let _ = sudo("rm", &["-f", "--", tmp]);
+        }
+    }
+    result.with_context(|| {
         format!(
             "installing {} (needs root, or an account in the wheel group)",
             path.display()
