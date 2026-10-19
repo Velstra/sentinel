@@ -10859,6 +10859,7 @@ impl Appliance {
         // cannot start with. Better to refuse the setting than to accept it and
         // discover the problem on the next boot.
         crate::wren::compile_wren(self).to_toml()?;
+        crate::compile::compile(self).validate_capacity()?;
         Ok(())
     }
 

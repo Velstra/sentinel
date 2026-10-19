@@ -272,9 +272,9 @@
       # The eBPF object, compiled as a FIXED-OUTPUT derivation. `-Z build-std`
       # needs std's own build-deps, which a sealed offline sandbox can't fetch —
       # so this derivation is allowed network (that's what a FOD grants) and is
-      # pinned by its output hash, keeping the result reproducible. First build
-      # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-elS16ZUNcNUYYmWWM8anbIRG4s1DpZk3+XkjTIcwMho=";
+      # pinned by its observed output hash. Updating the datapath requires a
+      # fresh build and verification of the resulting object before repinning.
+      ebpfHash = "sha256-skXnUxs5uu1CmA+YnRgIMeKuMWXORpa+5xu5OmPL+bo=";
       fabricBuildId = builtins.substring 0 12 (
         fabric.rev or (builtins.hashString "sha256" fabric.outPath)
       );
@@ -300,7 +300,6 @@
         unsafeDiscardReferences.out = true;
 
         buildPhase = ''
-          export HOME=$TMPDIR
           export CARGO_HOME=$TMPDIR/cargo
           # Same flags aya-build uses for the BPF target, plus the explicit
           # bpf-linker selection.
@@ -349,6 +348,13 @@
         # The workspace's tests need root (they load eBPF) — skip in the sandbox.
         doCheck = false;
       };
+
+      # Controller used by real-stream reconciliation/fault tests.
+      testController = velstra.overrideAttrs (old: {
+        cargoBuildFlags = [ "-p" "velstra-controller" "--locked" ];
+        postInstall = builtins.replaceStrings
+          [ "/bin/velstra\"" ] [ "/bin/velstra-controller\"" ] old.postInstall;
+      });
 
       # The factory-default appliance config, baked into the image. At runtime the
       # operator edits /var/lib/sentinel/appliance.toml; the sentinel-boot service
@@ -1429,7 +1435,11 @@
       # network). Edits the hostname and asserts it changed via hostnamectl while
       # the data plane stays up.
       #   nix build .#checks.x86_64-linux.commit -L
-      checks.${system} = {
+      checks.${system} =
+        let
+          # Each invocation creates an independent lazy set. CI keeps only
+          # strictly evaluated build identities, not whole NixOS module graphs.
+          makeChecks = _: {
         # Every map the agent looks up by name exists in the object it loads.
         #
         # This exists because of one specific trap. `velstra-ebpf` is a
@@ -1486,6 +1496,38 @@
               echo "$wanted" | wc -l | xargs printf '%s map lookups, all defined\n'
               touch $out
             '';
+
+        # Load every embedded program with the real agent and inspect actual
+        # kernel attachments, including the overlay-only BUM classifier.
+        ebpf-verifier = import ./tests/ebpf-kernel.nix {
+          inherit pkgs sentinel velstra fabric;
+          sentinelModule = self.nixosModules.sentinel;
+        };
+
+        # Real controller streams, rejected updates and late route devices.
+        reconcile = import ./tests/reconcile.nix {
+          inherit pkgs velstra;
+          sentinelModule = self.nixosModules.sentinel;
+          controller = testController;
+        };
+
+        # Actual Wren FIB events recover from apply and observation failures.
+        wren-reconcile = import ./tests/wren-reconcile.nix {
+          inherit pkgs velstra;
+          sentinelModule = self.nixosModules.sentinel;
+        };
+
+        # Capacity/permission failures exercise real map writes and packets.
+        config-transaction = import ./tests/config-transaction.nix {
+          inherit pkgs sentinel velstra;
+          sentinelModule = self.nixosModules.sentinel;
+          controller = testController;
+        };
+        egress-transaction = import ./tests/egress-transaction.nix {
+          inherit pkgs sentinel velstra;
+          sentinelModule = self.nixosModules.sentinel;
+          controller = testController;
+        };
 
         # The web console, driven in a real browser.
         #
@@ -1556,10 +1598,18 @@
         #   nix build .#checks.x86_64-linux.contract -L
         contract = pkgs.runCommand "sentinel-contract"
           {
-            nativeBuildInputs = [ sentinel velstra pkgs.bash ];
+            nativeBuildInputs = [ sentinel velstra pkgs.bash pkgs.python3 ];
           }
           ''
             set -eu
+            python3 - <<'PY'
+            import re
+            from pathlib import Path
+            agent = re.search(r"pub const MAX_RULE_LIMITS: u32 = ([0-9_]+);", Path("${fabric}/velstra-common/src/policy.rs").read_text())
+            appliance = re.search(r"pub const MAX_RATE_LIMITED_RULES: usize = ([0-9_]+);", Path("${self}/src/compile.rs").read_text())
+            assert agent and appliance, "rate-limit capacity constants are missing"
+            assert int(agent[1].replace("_", "")) == int(appliance[1].replace("_", "")), "appliance/agent rate-limit capacity mismatch"
+            PY
             printf '[system]\nhostname = "contract"\n' > appliance.toml
             sentinel configure --config appliance.toml --no-apply <<'CLI'
             set interface eth0 zone lan
@@ -15205,6 +15255,18 @@
               primary.succeed("ls /var/lib/sentinel/configsync/*.pin")
             '';
           };
-      };
+          };
+          # Recreate diagnostic/override attributes only when explicitly used.
+          # This helper's environment contains names, never the evaluated test.
+          deferredAttributes = name: keys:
+            lib.genAttrs keys (key: (makeChecks null).${name}.${key});
+        in
+        # Capture only each name, never a shared set of evaluated VM tests.
+        lib.genAttrs (builtins.attrNames (makeChecks null)) (name:
+          let job = lib.hydraJob (makeChecks null).${name};
+          in job // deferredAttributes name
+            (builtins.filter (key: !(builtins.hasAttr key job))
+              (builtins.attrNames (makeChecks null).${name}))
+        );
     };
 }

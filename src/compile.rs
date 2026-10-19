@@ -456,10 +456,32 @@ pub(crate) struct PortForwardOut {
     pub(crate) snat_ip: Option<String>,
 }
 
+/// The agent's packed rule value has seven bits for the shared bucket index.
+/// The Nix contract check verifies this against Fabric's ABI constant.
+pub const MAX_RATE_LIMITED_RULES: usize = 127;
+
 impl VelstraConfig {
+    /// Count emitted rules, including protocol, group and zone expansion.
+    /// Reject overflow before a commit can install an unlimited fallback.
+    pub fn validate_capacity(&self) -> anyhow::Result<()> {
+        let limited = self
+            .policies
+            .iter()
+            .flat_map(|policy| &policy.port_rules)
+            .filter(|rule| rule.limit.is_some_and(|limit| limit > 0))
+            .count();
+        if limited > MAX_RATE_LIMITED_RULES {
+            anyhow::bail!(
+                "firewall: {limited} rate-limited rules after expansion exceeds the data plane's {MAX_RATE_LIMITED_RULES}; reduce the number of rate-limited rules or their expansion"
+            );
+        }
+        Ok(())
+    }
+
     /// Render as the TOML the Velstra agent loads with `--config`.
     pub fn to_toml(&self) -> anyhow::Result<String> {
         use anyhow::Context;
+        self.validate_capacity()?;
         toml::to_string_pretty(self).context("serializing the velstra config")
     }
 }
@@ -2098,6 +2120,42 @@ action = "accept"
             .find(|r| r.port == 443)
             .unwrap();
         assert!(rule.dst.is_none());
+    }
+
+    fn expanded_rate_limit_config(dual_rules: usize, one_single_rule: bool) -> String {
+        let mut source = String::from(
+            "[system]\nhostname = \"capacity\"\n[[interface]]\nname = \"wan0\"\nzone = \"wan\"\n",
+        );
+        for index in 0..dual_rules {
+            source.push_str(&format!("[[rule]]\nname = \"r{index}\"\nfrom = \"wan\"\nproto = \"tcp_udp\"\nport = {}\naction = \"accept\"\nlimit = 100\n",10000+index));
+        }
+        if one_single_rule {
+            source.push_str("[[rule]]\nname = \"last\"\nfrom = \"wan\"\nproto = \"tcp\"\nport = 20000\naction = \"accept\"\nlimit = 100\n");
+        }
+        source
+    }
+
+    #[test]
+    fn expanded_rate_limit_capacity_accepts_the_exact_kernel_boundary() {
+        let appliance = Appliance::from_toml(&expanded_rate_limit_config(63, true)).unwrap();
+        let emitted = compile(&appliance);
+        let count = emitted
+            .policies
+            .iter()
+            .flat_map(|policy| &policy.port_rules)
+            .filter(|rule| rule.limit.is_some())
+            .count();
+        assert_eq!(count, 127);
+        emitted.to_toml().unwrap();
+    }
+
+    #[test]
+    fn expanded_rate_limit_capacity_refuses_silent_unlimited_rules() {
+        let error = Appliance::from_toml(&expanded_rate_limit_config(64, false)).unwrap_err();
+        assert!(
+            error.to_string().contains("128 rate-limited rules"),
+            "{error:#}"
+        );
     }
 
     /// A rate limit reaches the data plane on the rule it belongs to, and the burst

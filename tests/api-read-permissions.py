@@ -403,6 +403,73 @@ bfd-auth-key-id = 9
         self.assertEqual(request(base, "config", persisted)[0], 200)
         self.assertEqual(sorted(p.name for p in account_token.parent.iterdir()), ["viewer"])
 
+    def test_unauthenticated_login_never_exposes_invalid_configuration(self):
+        base, root = self.start("invalid-login-config")
+        path = root / "appliance.toml"
+        damaged = path.read_text().replace('secret = "' + SECRET + '"', 'secret = ["' + SECRET + '"]')
+        path.write_text(damaged)
+        login = urllib.request.Request(
+            base + "/api/v1/login", method="POST",
+            data=b'{"username":"unknown","password":"fixture-password"}',
+            headers={"Content-Type": "application/json"},
+        )
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            OPENER.open(login, timeout=10)
+        with raised.exception as error:
+            status, body = error.code, error.read().decode()
+        self.assertNotIn(SECRET, body, "public login leaked a configured secret through a parse error")
+        self.assertEqual(status, 500)
+        self.assertIn("configuration", json.loads(body)["error"])
+        self.assertEqual(path.read_text(), damaged)
+
+    def test_every_documented_route_enforces_its_authentication_boundary(self):
+        status, body = request(self.base, "openapi.json")
+        self.assertEqual(status, 200)
+        schema = json.loads(body)
+        before = self.config.read_bytes()
+        public = {("GET", "/api/v1/health"), ("GET", "/api/v1/openapi.json"),
+                  ("POST", "/api/v1/login")}
+        substitutions = {"kind": "interfaces", "path": "flows", "revision": "0",
+                         "member": "primary", "resolution": "hour", "series": "cpu",
+                         "value": "192.0.2.1"}
+        tested = set()
+        for template, operations in schema["paths"].items():
+            path = template
+            for name, value in substitutions.items():
+                path = path.replace("{" + name + "}", value)
+            self.assertNotIn("{", path, "route needs a concrete test parameter")
+            for method, operation in operations.items():
+                method = method.upper()
+                if method not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
+                    continue
+                tested.add((method, template))
+                is_public = (method, template) in public
+                self.assertEqual(operation.get("security") == [], is_public,
+                                 "documented authentication policy differs from the expected boundary")
+                anonymous_status = (400 if method == "POST" else 200) if is_public else 401
+                cases = [(None, anonymous_status), ("invalid-fixture-token", anonymous_status)]
+                if not is_public and method != "GET":
+                    cases.append((self.viewer, 403))
+                for credential, expected in cases:
+                    with self.subTest(method=method, route=template, expected=expected):
+                        headers = {"Content-Type": "application/json"}
+                        if credential:
+                            headers["Authorization"] = "Bearer " + credential
+                        req = urllib.request.Request(self.base + path, method=method,
+                                                     data=None if method == "GET" else b"{}",
+                                                     headers=headers)
+                        try:
+                            with OPENER.open(req, timeout=10) as response:
+                                code, content = response.status, response.read().decode()
+                        except urllib.error.HTTPError as error:
+                            with error:
+                                code, content = error.code, error.read().decode()
+                        self.assertEqual(code, expected)
+                        self.assertNotIn(SECRET, content)
+        self.assertTrue(public.issubset(tested))
+        self.assertGreaterEqual(len(tested), 22)
+        self.assertEqual(self.config.read_bytes(), before)
+
     def test_candidate_validation_is_complete_authorized_and_side_effect_free(self):
         before = self.config.read_bytes()
         archive = sorted((self.config.parent / "archive").iterdir())
@@ -437,6 +504,28 @@ bfd-auth-key-id = 9
                     self.assertTrue(result["error"])
                 self.assertEqual(before, self.config.read_bytes())
                 self.assertEqual(archive, sorted((self.config.parent / "archive").iterdir()))
+
+    def test_candidate_rejects_expanded_rate_limit_overflow_without_saving(self):
+        before = self.config.read_bytes()
+        source = "set interface capacity0 zone capacity\n"
+        for index in range(64):
+            prefix = f"set firewall rule capacity-{index} "
+            source += "".join(prefix + setting + "\n" for setting in [
+                "from capacity", "action accept", "proto tcp_udp",
+                f"port {10000 + index}", "limit 100",
+            ])
+        req = urllib.request.Request(self.base + "/api/v1/configure/validate",
+                                     data=source.encode(), method="POST", headers={
+                                         "Authorization": "Bearer " + SECRET,
+                                         "Content-Type": "text/plain",
+                                     })
+        with self.assertRaises(urllib.error.HTTPError) as failure:
+            OPENER.open(req, timeout=10)
+        with failure.exception as response:
+            result = json.load(response)
+            self.assertEqual(response.code, 400, result)
+        self.assertIn("128 rate-limited rules", result["error"])
+        self.assertEqual(before, self.config.read_bytes())
 
     def test_corrupt_revision_errors_do_not_disclose_credential_source_lines(self):
         revision = self.config.parent / "archive/config-00000000000000000001.toml"

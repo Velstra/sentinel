@@ -87,6 +87,11 @@ jobs:
           - lldp
           - bgp
           - nat
+          - ebpf-verifier
+          - reconcile
+          - wren-reconcile
+          - config-transaction
+          - egress-transaction
     steps:
       - uses: actions/checkout@v7
       # nixosTests build a full NixOS VM (kernel + qemu + system closure), which

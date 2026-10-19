@@ -42,6 +42,7 @@ mod portmap;
 mod proxy;
 mod relay;
 mod repl;
+mod secret_input;
 mod session;
 mod system;
 mod trace;
@@ -1348,33 +1349,7 @@ fn ask(msg: &str, default: &str) -> Result<String> {
 /// behaviour, done by hand so it costs no dependency: drop `ECHO` for the read
 /// and put the terminal back exactly as it was, including when the read fails.
 fn prompt_secret(msg: &str) -> Result<String> {
-    use std::io::Write;
-    print!("{msg}");
-    std::io::stdout().flush().ok();
-
-    let fd = libc::STDIN_FILENO;
-    let mut saved: libc::termios = unsafe { std::mem::zeroed() };
-    // Not a terminal (a piped answer file) — there is no echo to turn off.
-    let is_term = unsafe { libc::tcgetattr(fd, &mut saved) } == 0;
-    if is_term {
-        let mut quiet = saved;
-        quiet.c_lflag &= !libc::ECHO;
-        // TCSANOW, not TCSAFLUSH: flushing would discard input that arrived
-        // between the prompt and this call, which is precisely the answer.
-        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) };
-    }
-
-    let mut line = String::new();
-    let read = std::io::stdin().read_line(&mut line);
-
-    if is_term {
-        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &saved) };
-        // The newline the user typed was swallowed with the echo; put it back so
-        // the next prompt starts on its own line.
-        println!();
-    }
-    read.context("reading input")?;
-    Ok(line)
+    secret_input::prompt(msg)
 }
 
 /// Ask a yes/no question.

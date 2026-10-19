@@ -8,6 +8,7 @@ segments — so they need `/dev/kvm`.
 ```shell
 nix flake check --no-build                        # evaluate every check
 nix flake check                                   # evaluate and run every check
+./tests/evaluate-flake.sh                        # bounded evaluation plus VM diagnostic/override interfaces
 nix build .#checks.x86_64-linux.<name> -L         # run one
 ```
 
@@ -64,6 +65,8 @@ write, which is how ten sections that could be typed and not clicked were found.
 |---|---|
 | `console` | the web console in a **real browser**: every section opens, a create panel stages a command the CLI accepts, applying writes the file, a wrong password is refused and says so |
 | `contract` | the compiled agent config keeps the shape the data plane reads |
+| `reconcile` | failed VXLAN/SRv6 controller updates preserve active filtering and retry the same revision; a late egress device installs its deferred route and carries real traffic without restarting |
+| `wren-reconcile` | real Wren/XDP traffic: failed installs and withdrawals retry without duplicate advertisements; unavailable ARP observations preserve forwarding; recovery applies cached routes; empty withdrawals need no ARP lookup; gateway MAC changes converge without a route event |
 | `shipped` | what the image actually carries |
 | `wizard` | the installer's click-through, answered end to end |
 
@@ -71,6 +74,9 @@ write, which is how ten sections that could be typed and not clicked were found.
 
 | Check | Proves |
 |---|---|
+| `ebpf-verifier` | real-kernel verification and JIT of every embedded XDP/TC program; tenant hooks recover after interface replacement without descriptor leaks; broken statistics output and exhausted descriptors preserve packet filtering, and query/portal/mapping sockets recover without a restart |
+| `config-transaction` | a full kernel map rejects the candidate without admitting forbidden packets; the same revision recovers after capacity returns; temporary NAT grants survive rollback and successful updates; standalone configured forwards cannot be replaced or removed by temporary grants; failed rollback blocks traffic |
+| `egress-transaction` | packet capture at the receiving namespace proves a failed update never detaches the previous egress filter; an unresponsive controller cannot prevent bounded agent shutdown |
 | `reject` | a rejected TCP port answers with a **RST**, not a silent drop |
 | `rejectudp` | a rejected UDP port answers with **ICMP port-unreachable** |
 | `log` | per-rule logging fires for a logged drop and a logged pass, and stays quiet otherwise |
