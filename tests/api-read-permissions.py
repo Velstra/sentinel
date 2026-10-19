@@ -341,6 +341,41 @@ bfd-auth-key-id = 9
         self.assertEqual(path.stat().st_mode & 0o777, 0o640)
         self.assertIn(SECRET, path.read_text())
 
+    def test_candidate_validation_is_complete_authorized_and_side_effect_free(self):
+        before = self.config.read_bytes()
+        archive = sorted((self.config.parent / "archive").iterdir())
+        cases = [
+            ("set system hostname preview\n", SECRET, 200),
+            ("set protocols static not-a-network via 192.0.2.1\n", SECRET, 400),
+            ("set services dns serve-on missing0\n", SECRET, 400),
+            ("set system hostname preview\nsave\n", SECRET, 400),
+            ("commit\n", SECRET, 400),
+            ("run clear ids blocks\n", SECRET, 400),
+            ("rollback 0\n", SECRET, 400),
+            ("set system hostname preview\n", self.viewer, 403),
+            ("set system hostname preview\n", None, 401),
+        ]
+        for source, token, expected in cases:
+            with self.subTest(source=source, role="viewer" if token == self.viewer else "other"):
+                headers = {"Content-Type": "text/plain"}
+                if token:
+                    headers["Authorization"] = "Bearer " + token
+                req = urllib.request.Request(self.base + "/api/v1/configure/validate",
+                                             data=source.encode(), method="POST", headers=headers)
+                try:
+                    with OPENER.open(req, timeout=10) as response:
+                        status, result = response.status, json.load(response)
+                except urllib.error.HTTPError as error:
+                    with error:
+                        status, result = error.code, json.load(error)
+                self.assertEqual(status, expected, result)
+                if expected == 200:
+                    self.assertTrue(result["ok"])
+                else:
+                    self.assertTrue(result["error"])
+                self.assertEqual(before, self.config.read_bytes())
+                self.assertEqual(archive, sorted((self.config.parent / "archive").iterdir()))
+
     def test_corrupt_revision_errors_do_not_disclose_credential_source_lines(self):
         revision = self.config.parent / "archive/config-00000000000000000001.toml"
         original = revision.read_bytes()

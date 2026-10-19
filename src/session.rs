@@ -2811,8 +2811,21 @@ impl Session {
     /// Record what we have just applied, so our own commit does not read as
     /// somebody else's.
     pub fn note_committed(&mut self, toml: &str) {
-        let _ = crate::system::install_config_file(Path::new(Self::RUNNING), toml);
         self.seen_running = Some(toml.to_string());
+    }
+
+    /// Publish the last successfully applied candidate while its runtime lock
+    /// is still held. Deferred boot work must not replay an older saved file
+    /// over a live (possibly not yet saved) commit.
+    pub(crate) fn publish_running(
+        appliance: &Appliance,
+        _lock: &crate::system::ApplyLock,
+    ) -> Result<()> {
+        let path = Path::new(Self::RUNNING);
+        if path.parent().is_some_and(Path::is_dir) {
+            crate::system::install_config_file(path, appliance.to_toml()?)?;
+        }
+        Ok(())
     }
 
     /// Open a session, loading `path` as the candidate if it exists.

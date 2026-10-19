@@ -260,7 +260,7 @@ enum Command {
     /// state a reboot wipes — tc qdiscs (QoS), Multi-WAN routes, IPsec SAs. Used
     /// by the sentinel-boot-late service.
     ApplyBootLate {
-        /// The active appliance config to apply.
+        /// Fallback config when no applied runtime snapshot exists.
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
@@ -930,9 +930,8 @@ fn apply_boot(
     // rollback to an older image whose saved config carries a newer field would
     // otherwise boot unconfigured. `config check` and every interactive path
     // stay strict — see Appliance::load_lenient.
-    let appliance = identity::with_resolved(&feed::with_fetched(&domain::with_resolved(
-        &Appliance::load_lenient(config)?,
-    )));
+    let desired = Appliance::load_lenient(config)?;
+    let appliance = identity::with_resolved(&feed::with_fetched(&domain::with_resolved(&desired)));
 
     // Compile BOTH configs before writing either, so a compile error can't leave
     // a half-seeded system (velstra written, wren missing). Rendering is pure and
@@ -969,6 +968,7 @@ fn apply_boot(
     // SAs) — which a file can't express — is deferred to `apply-boot-late`, run
     // after networkd has brought the links up.
     net::apply_persistent(&appliance, net::ApplyMode::Boot)?;
+    session::Session::publish_running(&desired, &_lock)?;
     Ok(())
 }
 
@@ -977,10 +977,17 @@ fn apply_boot(
 /// before the links existed — tc egress qdiscs (QoS), the Multi-WAN policy
 /// routes, and the IPsec SAs. Run by the `sentinel-boot-late` service.
 fn apply_boot_late(config: &std::path::Path) -> Result<()> {
-    // Lenient for the same reason as apply_boot: the second boot stage applies
-    // the same saved config, and must survive an unknown key just the same.
+    // Follow the latest applied state under the same lock as live commits. A
+    // delayed boot stage must not replay an older saved file over that state.
+    // Keep boot's lenient parsing for snapshots from a newer software version.
     let _lock = system::apply_lock()?;
-    let appliance = Appliance::load_lenient(config)?;
+    let running = std::path::Path::new(session::Session::RUNNING);
+    let source = if running.try_exists()? {
+        running
+    } else {
+        config
+    };
+    let appliance = Appliance::load_lenient(source)?;
     net::apply_link_runtime(&appliance)
 }
 

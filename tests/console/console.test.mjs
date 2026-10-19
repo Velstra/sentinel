@@ -1420,6 +1420,33 @@ await test("validating leaves the change staged and applyable", async () => {
   check(/would|accept/i.test(after.title), `the dialog claims it applied: ${after.title}`);
 });
 
+await test("validation refuses a semantically invalid candidate without changing the appliance", async () => {
+  const before = readFileSync(CONFIG, "utf8");
+  const r = await page.evaluate(`(async () => {
+    staged = []; dirty.clear(); renderStaged();
+    stage("Invalid route", ["set protocols static not-a-network via 192.0.2.1"]);
+    const before = stagedCommands();
+    document.getElementById("validate").click();
+    for (let i = 0; i < 100 && !document.getElementById("result").open; i++) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    const result = {
+      opened: document.getElementById("result").open,
+      title: document.getElementById("resulttitle").textContent,
+      message: document.getElementById("resultout").textContent,
+      before, after: stagedCommands(),
+    };
+    document.getElementById("result").close();
+    staged = []; dirty.clear(); renderStaged();
+    return result;
+  })()`);
+  check(r.opened, "validation returned no result");
+  equal(r.after, r.before, "validation discarded the candidate");
+  equal(readFileSync(CONFIG, "utf8"), before, "validation changed the saved configuration");
+  check(/refused/i.test(r.title), `invalid route was reported as accepted: ${r.title}`);
+  check(/prefix|network|cidr/i.test(r.message), `validation gave no useful reason: ${r.message}`);
+});
+
 // Every control, in every section, actually operated.
 //
 // The section walk proves each page *renders*. This proves the things on it

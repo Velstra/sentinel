@@ -2821,13 +2821,15 @@ async function text(path) {{
   return body;
 }}
 
-async function configure(lines) {{
-  const r = await api("/api/v1/configure", {{
+async function configure(lines, validateOnly = false) {{
+  const r = await api(validateOnly ? "/api/v1/configure/validate" : "/api/v1/configure", {{
     method: "POST",
     headers: {{ Authorization: "Bearer " + token, "Content-Type": "text/plain" }},
     body: lines.join("\n") + "\n",
   }}, 120);
-  return r.json();
+  const result = await r.json();
+  if (!r.ok) throw new Error(result.error || "The configuration request was refused (HTTP " + r.status + ").");
+  return result;
 }}
 
 function el(tag, attrs, kids) {{
@@ -3694,15 +3696,16 @@ async function applyStagedNow(tail) {{
   // hidden second run that every apply paid for and that could refuse a change
   // the appliance was willing to take.
   //
-  // Validating runs the same commands with no `commit`, so nothing is applied
-  // — and the staged list must survive it. Clearing on a *validate* was the
+  // Validate materializes and checks the complete candidate through a pure
+  // endpoint. No commit or operational command can run there. The staged list
+  // must survive it. Clearing on a *validate* was the
   // worst possible bug in this panel: the check said "fine", the panel emptied
   // itself, and the change an operator had just been told was good could no
   // longer be applied.
   const committed = tail.includes("commit");
   let r;
   try {{
-    r = await configure(stagedCommands().concat(tail));
+    r = await configure(stagedCommands().concat(tail), !committed);
   }} catch (e) {{
     // An apply that never reached the appliance has to say so. Left to throw,
     // the page swallowed it: no dialog, no banner, the changes still staged —
@@ -3797,7 +3800,7 @@ function summarise(output) {{
 
 function showResult(r, committed, blamed) {{
   const notes = summarise(r.output);
-  const failed = notes.some((n) => n.kind === "bad");
+  const failed = !r.ok || notes.some((n) => n.kind === "bad");
   // The appliance runs the commands it can and reports what it could not: a
   // batch that is refused *and* committed leaves the box changed, and calling
   // that "Not applied" sends an operator to re-run commands that already ran.

@@ -73,7 +73,17 @@
         # From Cargo.toml, so the boot menu and `show version` cannot disagree —
         # the medium said 0.1.0 while the CLI on it said 0.4.2.
         version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
-        src = ./.;
+        src = lib.fileset.toSource {
+          root = ./.;
+          fileset = lib.fileset.unions [
+            ./Cargo.toml
+            ./Cargo.lock
+            ./src
+            ./example-appliance.toml
+            ./tests/console/cli-fields.txt
+            ./LICENSE
+          ];
+        };
         cargoLock.lockFile = ./Cargo.lock;
         nativeBuildInputs = [
           pkgs.protobuf
@@ -2247,16 +2257,28 @@
           )
           assert "console-masq" not in cfg, cfg
 
-          # A script with no commit validates and changes nothing — what the
-          # console's "validate only" button sends.
-          machine.succeed(
-              "printf '%s\n' 'set firewall rule dry-run from wan' > /tmp/dry"
-          )
-          machine.succeed(
-              "curl -sSk -X POST -H 'Authorization: Bearer " + token + "' "
-              "--data-binary @/tmp/dry https://127.0.0.1:8080/api/v1/configure"
-          )
-          machine.fail("grep -q dry-run /var/lib/sentinel/appliance.toml")
+          with subtest("candidate validation cannot apply or save on a live appliance"):
+              paths = (
+                  "/var/lib/sentinel/appliance.toml /run/sentinel/running.toml "
+                  "/run/sentinel/velstra.toml /run/sentinel/wren.toml"
+              )
+              before = machine.succeed("sha256sum " + paths)
+              hostname = machine.succeed("hostname")
+              for command, expected in [
+                  ("set system hostname preview-only", "200"),
+                  ("set protocols static not-a-network via 192.0.2.1", "400"),
+                  ("commit", "400"),
+                  ("save", "400"),
+              ]:
+                  code = machine.succeed(
+                      f"curl -sk -o /tmp/validation-result -w '%{{http_code}}' -X POST "
+                      f"-H 'Authorization: Bearer {token}' -H 'Content-Type: text/plain' "
+                      f"--data-binary '{command}' "
+                      "https://127.0.0.1:8080/api/v1/configure/validate"
+                  ).strip()
+                  assert code == expected, machine.succeed("cat /tmp/validation-result")
+                  assert machine.succeed("sha256sum " + paths) == before
+                  assert machine.succeed("hostname") == hostname
 
           # The four service masks, each through the same command path: a BGP
           # neighbour, an IPsec tunnel, a WireGuard interface with a peer, and a
@@ -3685,25 +3707,19 @@
           crt = "/var/lib/sentinel/pki/certs/web-cert/cert.crt"
           fw.wait_until_succeeds(f"test -f {crt}", timeout=30)
 
-          # Append the reverse-proxy frontend to the saved config and apply it via
-          # the boot-late path — which loads the real Appliance (reverse_proxy
-          # intact, unlike the draft round-trip) and runs proxy::apply. TLS via the
-          # web-cert leaf on :443, two round-robin backends.
+          # Configure both frontends through the operator's live commit path.
+          # Boot-late follows the applied snapshot; editing a saved file alone
+          # must not override an unsaved, already running configuration.
           fw.succeed(
-              "cat >> /var/lib/sentinel/appliance.toml <<'EOF'\n"
-              "[[services.reverse-proxy]]\n"
-              "name = \"web\"\n"
-              "port = 443\n"
-              "certificate = \"web-cert\"\n"
-              "backends = [\"10.0.0.3:8080\", \"10.0.0.3:8081\"]\n"
-              "[[services.reverse-proxy]]\n"
-              "name = \"stream\"\n"
-              "mode = \"tcp\"\n"
-              "port = 8443\n"
-              "backends = [\"10.0.0.3:8080\"]\n"
-              "EOF"
+              "su admin -c \"printf '%s\\n' "
+              "'set services reverse-proxy web port 443' "
+              "'set services reverse-proxy web certificate web-cert' "
+              "'set services reverse-proxy web backends 10.0.0.3:8080,10.0.0.3:8081' "
+              "'set services reverse-proxy stream mode tcp' "
+              "'set services reverse-proxy stream port 8443' "
+              "'set services reverse-proxy stream backends 10.0.0.3:8080' "
+              "commit save exit | sentinel configure\""
           )
-          fw.succeed("sentinel apply-boot-late --config /var/lib/sentinel/appliance.toml")
 
           # (1) proxy::apply rendered haproxy.cfg (frontend + backend + `ssl crt` +
           # one checked server per backend) and the 0600 cert+key bundle, and the
@@ -8661,12 +8677,19 @@
                       f"'set interface sec0 macsec-key ${key}' 'set interface sec0 macsec-peer {peermac}' "
                       f"'set interface sec0 zone lan' 'set interface sec0 address {addr}' "
                       "'set firewall zone lan default-action accept' "
-                      "commit save exit "
+                      "commit exit "
                       "| sentinel configure\""
                   )
 
               configure(a, "${macA}", "${macB}", "10.9.0.1/24")
               configure(b, "${macB}", "${macA}", "10.9.0.2/24")
+
+              # Reproduce a delayed boot stage after a live, unsaved commit.
+              # It must follow the applied snapshot, not stop MACsec using the
+              # older saved baseline. No boot-timing assumption is required.
+              for node in (a, b):
+                  node.fail("grep -q sec0 /var/lib/sentinel/appliance.toml")
+                  node.succeed("sentinel apply-boot-late --config /var/lib/sentinel/appliance.toml")
 
               # networkd created the encrypted device and the sentinel-macsec unit
               # installed its secure associations (the keys).

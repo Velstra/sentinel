@@ -91,10 +91,14 @@ be set once the links networkd brought up actually exist:
    the runtime-only state a file cannot express — tc qdiscs, multi-WAN policy
    routes, IPsec SAs — once the interfaces are up.
 
-Both stages load the saved config **leniently** (an unknown key from a newer
-build must not keep the box from coming up) and take the same apply lock as an
-interactive commit. So a `commit save` writes the durable file, and the boot
-services re-assert it every boot — no generation, no rebuild.
+The early stage loads the saved config **leniently** (an unknown key from a
+newer build must not keep the box from coming up) and publishes a private
+runtime snapshot. Successful live commits update that snapshot while still
+holding the apply lock. The late stage takes the same lock and reads the latest
+applied snapshot, falling back to the saved config only when no snapshot exists.
+This prevents a delayed boot stage from undoing a live commit using an older
+saved file. A `commit save` writes the durable file; boot reasserts it on the
+next restart without a rebuild.
 
 ## Privilege path
 

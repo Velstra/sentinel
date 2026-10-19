@@ -258,6 +258,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         // same bearer auth (it is part of this protected sub-router).
         .route("/metrics", get(get_metrics_prometheus))
         .route("/api/v1/configure", post(post_configure))
+        .route("/api/v1/configure/validate", post(post_validate_configure))
         .route("/api/v1/clear/*path", post(post_clear))
         .route("/api/v1/capture", post(post_capture))
         // What the appliance can tell you about a value you are typing. The
@@ -1347,17 +1348,9 @@ fn replace_config(state: &ApiState, appliance: Appliance) -> Result<Json<Value>,
         false
     };
 
-    // Record what is now running, the same running-snapshot a CLI `commit` writes,
-    // so a concurrent CLI session can tell the box has moved on under it. Only when
-    // it was actually applied live, and best-effort like the CLI path.
-    if state.apply.enabled {
-        if let Ok(toml) = appliance.to_toml() {
-            let _ = crate::system::install_config_file(
-                Path::new(crate::session::Session::RUNNING),
-                &toml,
-            );
-        }
-    }
+    // apply_live already published the running snapshot under its runtime lock.
+    // Publishing again here could overwrite a newer commit that won that lock
+    // between this request's apply and persistence steps.
 
     // An account that has just been given a group needs a token to exist, and
     // one whose group was taken away needs its token gone — both at the moment
@@ -1472,6 +1465,28 @@ async fn get_show(
     }
     let body = String::from_utf8_lossy(&out.stdout).into_owned();
     Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response())
+}
+
+/// Validate a complete candidate using CLI editing commands, without running
+/// operational commands or changing runtime, saved state or revision history.
+async fn post_validate_configure(
+    State(state): State<Arc<ApiState>>,
+    body: String,
+) -> Result<Json<Value>, ApiError> {
+    if body.len() > 256 * 1024 {
+        return Err(ApiError::bad_request(anyhow!(
+            "configuration script too large"
+        )));
+    }
+    let path = state.config_path.clone();
+    tokio::task::spawn_blocking(move || repl::validate_script(&path, &body))
+        .await
+        .map_err(|e| ApiError::internal(anyhow!("configuration validation task: {e}")))?
+        .map_err(ApiError::bad_request)?;
+    Ok(Json(json!({
+        "ok": true,
+        "output": "✔ configuration is valid; nothing was applied or saved\n",
+    })))
 }
 
 /// `POST /api/v1/configure` — run configuration commands.
