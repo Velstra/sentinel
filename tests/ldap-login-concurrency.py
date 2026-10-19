@@ -151,12 +151,15 @@ finally:
 
         wait_for(healthy, "actual management API")
 
+        authenticated = {}
+
         def login(password):
             request = urllib.request.Request(base + "login", method="POST",
                                              data=json.dumps({"username": "ldapuser", "password": password}).encode(),
                                              headers={"Content-Type": "application/json"})
             try:
                 with opener.open(request, timeout=25) as response:
+                    authenticated["token"] = json.load(response)["token"]
                     return response.status
             except urllib.error.HTTPError as error:
                 with error:
@@ -172,6 +175,34 @@ finally:
         print(json.dumps(result), flush=True)
         assert result == {"valid": 200, "invalid": 401}, "concurrent LDAP requests shared credentials"
         assert not list(Path("/run/sentinel").glob(f"ldap-bind.{api.pid}*")), "bind secrets were left behind"
+
+        def api_request(method, resource, credential, document=None):
+            headers = {"Authorization": "Bearer " + credential}
+            data = None
+            if document is not None:
+                data = json.dumps(document).encode()
+                headers["Content-Type"] = "application/json"
+            request = urllib.request.Request(base + resource, method=method, data=data, headers=headers)
+            try:
+                with opener.open(request, timeout=10) as response:
+                    return response.status, json.load(response)
+            except urllib.error.HTTPError as error:
+                with error:
+                    return error.code, json.load(error)
+
+        credential = authenticated["token"]
+        assert api_request("GET", "config", credential)[0] == 200, "directory login returned an unusable token"
+        assert api_request("PUT", "config", credential, {"system": {"hostname": "forbidden"}})[0] == 403
+        status, document = api_request("GET", "config", "ldap-fixture-machine-token")
+        assert status == 200
+        document["system"]["hostname"] = "directory-session-retained"
+        update = api_request("PUT", "config", "ldap-fixture-machine-token", document)
+        assert update[0] == 200, update
+        assert api_request("GET", "config", credential)[0] == 200, "unrelated commit revoked a directory session"
+        del document["system"]["aaa"]["default-group"]
+        update = api_request("PUT", "config", "ldap-fixture-machine-token", document)
+        assert update[0] == 200, update
+        assert api_request("GET", "config", credential)[0] == 401, "withdrawn directory access still authenticated"
 
 
 if __name__ == "__main__":

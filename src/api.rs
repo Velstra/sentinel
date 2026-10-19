@@ -399,41 +399,57 @@ pub fn resolve_caller(state: &ApiState, presented: &str) -> Option<Caller> {
         });
     }
     let appliance = Appliance::load(&state.config_path).ok()?;
-    let entries = std::fs::read_dir(&state.tokens_dir).ok()?;
-    for entry in entries.flatten() {
-        let Ok(stored) = std::fs::read_to_string(entry.path()) else {
+    // Keep directory-authenticated principals distinct from local accounts.
+    // Otherwise removing a local account could accidentally grant its stale
+    // token the directory default group's rights.
+    for (directory, root) in [
+        (false, state.tokens_dir.clone()),
+        (true, state.tokens_dir.join(".directory")),
+    ] {
+        let Ok(entries) = std::fs::read_dir(root) else {
             continue;
         };
-        let stored = stored.trim();
-        // An empty token file grants nothing: a half-written or truncated token
-        // must never authenticate an (also-empty) presented bearer.
-        if stored.is_empty() {
-            continue;
+        for entry in entries.flatten() {
+            let user = entry.file_name().to_string_lossy().into_owned();
+            if !valid_account_name(&user) {
+                continue;
+            }
+            let Ok(stored) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let stored = stored.trim();
+            if stored.is_empty() || !ct_eq(presented.as_bytes(), stored.as_bytes()) {
+                continue;
+            }
+            let group = management_group(&appliance, &user, directory)?;
+            let permission = appliance
+                .system
+                .groups
+                .iter()
+                .find(|g| g.name == group)?
+                .permission;
+            return Some(Caller {
+                user: Some(user),
+                permission,
+            });
         }
-        if !ct_eq(presented.as_bytes(), stored.as_bytes()) {
-            continue;
-        }
-        let user = entry.file_name().to_string_lossy().into_owned();
-        // A token file whose account or group has since gone grants nothing:
-        // the config is the authority, and the file is only the secret.
-        let login = appliance
-            .system
-            .logins
-            .iter()
-            .find(|l| l.username == user)?;
-        let group = login.group.as_deref()?;
-        let permission = appliance
-            .system
-            .groups
-            .iter()
-            .find(|g| g.name == group)?
-            .permission;
-        return Some(Caller {
-            user: Some(user),
-            permission,
-        });
     }
     None
+}
+
+/// The configuration remains the authority on every request. A locally defined
+/// principal needs an explicit group; the directory default applies only to
+/// authenticated directory principals with no local entry and enabled servers.
+fn management_group<'a>(appliance: &'a Appliance, user: &str, directory: bool) -> Option<&'a str> {
+    let login = appliance.system.logins.iter().find(|l| l.username == user);
+    if directory {
+        if login.is_some() || !appliance.system.aaa.has_servers() {
+            return None;
+        }
+        appliance.system.aaa.default_group.as_deref()
+    } else {
+        login?.group.as_deref()
+    }
 }
 
 /// Mint a token for every account with a group, and remove the files of accounts
@@ -442,6 +458,9 @@ pub fn resolve_caller(state: &ApiState, presented: &str) -> Option<Caller> {
 /// A token is generated once and then left alone: rotating it on every apply
 /// would log every client out whenever anything at all was committed.
 pub fn sync_user_tokens(state: &ApiState) -> Result<()> {
+    // Load authority after acquiring the same lock as sign-in, so a delayed
+    // cleanup cannot act on a configuration read before another token update.
+    let _tokens_lock = lock_token_directory(&state.tokens_dir)?;
     let appliance = Appliance::load(&state.config_path)?;
     let wanted: Vec<&str> = appliance
         .system
@@ -450,22 +469,28 @@ pub fn sync_user_tokens(state: &ApiState) -> Result<()> {
         .filter(|l| l.group.is_some())
         .map(|l| l.username.as_str())
         .collect();
-    if wanted.is_empty() && !state.tokens_dir.exists() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(&state.tokens_dir)
-        .with_context(|| format!("creating {}", state.tokens_dir.display()))?;
     // Share the minting lock with sign-in so cleanup cannot remove an atomic
     // staging file while another request is creating its account credential.
-    let _tokens_lock = lock_token_directory(&state.tokens_dir)?;
     for user in &wanted {
         load_or_create_file_token_locked(&state.tokens_dir.join(user))?;
     }
     // Withdraw what is no longer granted.
-    for entry in std::fs::read_dir(&state.tokens_dir)?.flatten() {
+    for entry in std::fs::read_dir(&state.tokens_dir)? {
+        let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !wanted.iter().any(|u| *u == name) {
-            let _ = std::fs::remove_file(entry.path());
+        if name != ".directory" && !wanted.iter().any(|u| *u == name) {
+            std::fs::remove_file(entry.path()).context("withdrawing an account token")?;
+        }
+    }
+    let directory = state.tokens_dir.join(".directory");
+    if directory.exists() {
+        let _directory_lock = lock_token_directory(&directory)?;
+        for entry in std::fs::read_dir(&directory)? {
+            let entry = entry?;
+            let user = entry.file_name().to_string_lossy().into_owned();
+            if !valid_account_name(&user) || management_group(&appliance, &user, true).is_none() {
+                std::fs::remove_file(entry.path()).context("withdrawing a directory token")?;
+            }
         }
     }
     Ok(())
@@ -891,10 +916,8 @@ fn sign_in(
     // back to the configured default group; without one it gets nothing, which
     // is what stops a configured server from handing management access to
     // everybody in the directory.
-    let group =
-        login
-            .and_then(|l| l.group.as_deref())
-            .or(appliance.system.aaa.default_group.as_deref());
+    let directory_principal = login.is_none();
+    let group = management_group(&appliance, username, directory_principal);
     let Some(group) = group else {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
@@ -931,9 +954,12 @@ fn sign_in(
     }
 
     // The account's token, minted if this is the first time anybody asked.
-    std::fs::create_dir_all(&state.tokens_dir)
-        .map_err(|e| ApiError::internal(anyhow!("creating the token directory: {e}")))?;
-    let token = load_or_create_file_token(&state.tokens_dir.join(username))
+    let tokens = if directory_principal {
+        state.tokens_dir.join(".directory")
+    } else {
+        state.tokens_dir.clone()
+    };
+    let token = load_or_create_file_token(&tokens.join(username))
         .map_err(|e| ApiError::internal(anyhow!("minting the account's token: {e}")))?;
     forget_attempts(username);
     Ok(json!({
@@ -2468,6 +2494,75 @@ virtual-address = ["10.43.0.253"]
         )
         .unwrap();
         assert!(resolve_caller(&st, "alice-secret").is_none());
+    }
+
+    #[test]
+    fn directory_tokens_follow_current_grants_without_reviving_local_accounts() {
+        let root = tempdir();
+        let config = root.join("appliance.toml");
+        let tokens = root.join("tokens");
+        let directory = tokens.join(".directory");
+        std::fs::create_dir_all(&directory).unwrap();
+        let st = ApiState {
+            token: TOKEN.to_owned(),
+            token_path: None,
+            config_path: config.clone(),
+            apply: Apply::off(),
+            tokens_dir: tokens.clone(),
+        };
+        let document = "[system]\nhostname = \"fw\"\n\
+            [[system.group]]\nname = \"viewers\"\npermission = \"read-only\"\n\
+            [system.aaa]\ndefault-group = \"viewers\"\n\
+            [[system.aaa.ldap]]\nserver = \"127.0.0.1\"\ntls = \"none\"\nbase-dn = \"dc=example,dc=test\"\n";
+        Appliance::from_toml(document).unwrap();
+        std::fs::write(&config, document).unwrap();
+        std::fs::write(tokens.join("deleted-local"), "old-local-token").unwrap();
+        std::fs::write(directory.join("directory-user"), "directory-token").unwrap();
+        assert!(resolve_caller(&st, "old-local-token").is_none());
+        let caller = resolve_caller(&st, "directory-token").unwrap();
+        assert_eq!(caller.user.as_deref(), Some("directory-user"));
+        assert!(!caller.permission.may_write());
+        sync_user_tokens(&st).unwrap();
+        assert!(!tokens.join("deleted-local").exists());
+        assert_eq!(
+            std::fs::read_to_string(directory.join("directory-user")).unwrap(),
+            "directory-token"
+        );
+
+        // Defining a local principal replaces directory-default authority. No
+        // explicit local grant means no access, including at password sign-in.
+        let hash = crate::passwd::hash("local-fixture-password").unwrap();
+        let local = format!(
+            "{document}\n[[system.login]]\nusername = \"directory-user\"\nhashed-password = \"{hash}\"\n"
+        );
+        std::fs::write(&config, &local).unwrap();
+        assert!(resolve_caller(&st, "directory-token").is_none());
+        assert_eq!(
+            sign_in(&st, "directory-user", "local-fixture-password", "")
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+        sync_user_tokens(&st).unwrap();
+        assert!(!directory.join("directory-user").exists());
+
+        // Disabling the directory or withdrawing its group revokes tokens even
+        // before cleanup runs; the token itself never stores permission.
+        for revoked in [
+            document.replace("default-group = \"viewers\"\n", ""),
+            document
+                .split("[[system.aaa.ldap]]")
+                .next()
+                .unwrap()
+                .to_owned(),
+        ] {
+            std::fs::write(&config, revoked).unwrap();
+            std::fs::write(directory.join("directory-user"), "directory-token").unwrap();
+            assert!(resolve_caller(&st, "directory-token").is_none());
+            sync_user_tokens(&st).unwrap();
+            assert!(!directory.join("directory-user").exists());
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// Minting adds what has been granted and removes what has not — the second

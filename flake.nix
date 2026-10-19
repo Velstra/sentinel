@@ -2571,6 +2571,30 @@
           )
           assert '"token"' in out and "read-only" in out, out
 
+          # A successful directory bind must produce a usable, restricted API
+          # session, including after an unrelated configuration commit.
+          import json
+          directory_token = json.loads(out)["token"]
+          machine.succeed(
+              f"curl -fsSk -H 'Authorization: Bearer {directory_token}' "
+              "https://127.0.0.1:8080/api/v1/config > /dev/null"
+          )
+          forbidden = machine.succeed(
+              f"curl -sk -o /dev/null -w '%{{http_code}}' "
+              f"-H 'Authorization: Bearer {directory_token}' -X PUT "
+              "-H 'Content-Type: application/json' -d '{}' "
+              "https://127.0.0.1:8080/api/v1/config"
+          ).strip()
+          assert forbidden == "403", forbidden
+          machine.succeed(
+              "su admin -c \"printf '%s\\n' 'set system hostname directory-session' "
+              "commit save exit | sentinel configure\""
+          )
+          machine.succeed(
+              f"curl -fsSk -H 'Authorization: Bearer {directory_token}' "
+              "https://127.0.0.1:8080/api/v1/config > /dev/null"
+          )
+
           # A wrong password is a 401 — an answer, from the server that gave
           # it, and the refusal says which protocol refused.
           code = machine.succeed(
