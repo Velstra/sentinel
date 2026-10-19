@@ -862,6 +862,27 @@ pub fn secure_config_file(path: &Path) -> Result<()> {
         .with_context(|| format!("protecting configuration {}", path.display()))
 }
 
+/// Read private appliance material as an authorized operator without widening
+/// its file permissions. Privileged output stays in memory, never the terminal.
+pub fn read_private_file(path: &Path) -> Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => Ok(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            let path_arg = path.to_str().context("non-UTF-8 private file path")?;
+            let output = escalated_output("cat", &["--", path_arg])?;
+            anyhow::ensure!(
+                output.status.success(),
+                "could not read private file {}",
+                path.display()
+            );
+            String::from_utf8(output.stdout).context("private file is not UTF-8")
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("reading private file {}", path.display()))
+        }
+    }
+}
+
 /// Install a secret file `contents` at a (root-owned) `path` readable by
 /// systemd-networkd but no one else — mode **0640, group `systemd-network`**.
 /// A WireGuard `.netdev` carries an inline `PrivateKey=`, so it must not be
@@ -1539,6 +1560,8 @@ pub fn bin(name: &str) -> String {
         }
     }
     let var = match name {
+        "cat" => "SENTINEL_CAT_BIN",
+        "haproxy" => "SENTINEL_HAPROXY_BIN",
         "hostname" => "SENTINEL_HOSTNAME_BIN",
         "ldapwhoami" => "SENTINEL_LDAPWHOAMI_BIN",
         "occtl" => "SENTINEL_OCCTL_BIN",

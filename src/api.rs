@@ -455,11 +455,11 @@ pub fn sync_user_tokens(state: &ApiState) -> Result<()> {
     }
     std::fs::create_dir_all(&state.tokens_dir)
         .with_context(|| format!("creating {}", state.tokens_dir.display()))?;
+    // Share the minting lock with sign-in so cleanup cannot remove an atomic
+    // staging file while another request is creating its account credential.
+    let _tokens_lock = lock_token_directory(&state.tokens_dir)?;
     for user in &wanted {
-        let path = state.tokens_dir.join(user);
-        if !path.exists() {
-            load_or_create_token(&path)?;
-        }
+        load_or_create_file_token_locked(&state.tokens_dir.join(user))?;
     }
     // Withdraw what is no longer granted.
     for entry in std::fs::read_dir(&state.tokens_dir)?.flatten() {
@@ -933,7 +933,7 @@ fn sign_in(
     // The account's token, minted if this is the first time anybody asked.
     std::fs::create_dir_all(&state.tokens_dir)
         .map_err(|e| ApiError::internal(anyhow!("creating the token directory: {e}")))?;
-    let token = load_or_create_token(&state.tokens_dir.join(username))
+    let token = load_or_create_file_token(&state.tokens_dir.join(username))
         .map_err(|e| ApiError::internal(anyhow!("minting the account's token: {e}")))?;
     forget_attempts(username);
     Ok(json!({
@@ -1844,31 +1844,82 @@ pub fn load_or_create_token(path: &Path) -> Result<String> {
             return Ok(env.to_string());
         }
     }
-    if path.exists() {
-        let existing = std::fs::read_to_string(path)
-            .with_context(|| format!("reading the API token {}", path.display()))?;
-        let existing = existing.trim();
-        if !existing.is_empty() {
-            return Ok(existing.to_string());
+    load_or_create_file_token(path)
+}
+
+/// Account credentials never inherit the machine's environment override: that
+/// credential has full administration rights independently of account RBAC.
+fn load_or_create_file_token(path: &Path) -> Result<String> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let _lock = lock_token_directory(parent)?;
+    load_or_create_file_token_locked(path)
+}
+
+/// Lock the directory inode, not a removable lock file that token cleanup could
+/// unlink. Each independently opened descriptor serializes threads and API
+/// processes; closing it releases the lock, including on every error path.
+fn lock_token_directory(parent: &Path) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let directory = std::fs::File::open(parent)
+        .with_context(|| format!("opening token directory {}", parent.display()))?;
+    loop {
+        // SAFETY: the descriptor stays open for the entire lock lifetime.
+        if unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(directory);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error).context("locking the token directory");
+        }
+    }
+}
+
+/// Caller holds the parent-directory lock, covering both the initial read and
+/// publication. Readers see either the complete previous token or the complete
+/// new one, and simultaneous first sign-ins all receive the same credential.
+fn load_or_create_file_token_locked(path: &Path) -> Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(existing) if !existing.trim().is_empty() => return Ok(existing.trim().to_owned()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading the API token {}", path.display()));
         }
     }
     let token = generate_token()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    // Create with 0600 from the outset (no world-readable window between
-    // create and chmod).
-    let mut f = std::fs::OpenOptions::new()
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let staging = parent.join(format!(
+        ".api-token-{}-{}.tmp",
+        std::process::id(),
+        generate_token()?
+    ));
+    // Create with 0600 from the outset; never expose an empty destination or a
+    // partially written credential. The random staging name contains no secret.
+    let mut file = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
-        .open(path)
-        .with_context(|| format!("creating the API token {}", path.display()))?;
-    use std::io::Write;
-    f.write_all(token.as_bytes())
-        .with_context(|| format!("writing the API token {}", path.display()))?;
+        .open(&staging)
+        .with_context(|| format!("staging the API token {}", path.display()))?;
+    let result = (|| -> Result<()> {
+        use std::io::Write;
+        file.write_all(token.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&staging, path)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staging);
+    }
+    result.with_context(|| format!("writing the API token {}", path.display()))?;
     Ok(token)
 }
 
@@ -1970,6 +2021,49 @@ mod tests {
             std::env::temp_dir().join(format!("sentinel-api-test-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("appliance.toml")
+    }
+
+    #[test]
+    fn concurrent_token_creation_returns_one_complete_private_credential() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Barrier;
+
+        let directory = temp_config().parent().unwrap().to_owned();
+        for round in 0..16 {
+            let path = directory.join(format!("token-{round}"));
+            let barrier = Barrier::new(16);
+            let results = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..16)
+                    .map(|_| {
+                        let path = &path;
+                        let barrier = &barrier;
+                        scope.spawn(move || {
+                            barrier.wait();
+                            load_or_create_file_token(path)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let persisted = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(persisted.len(), 43);
+            for result in results {
+                assert_eq!(
+                    result.unwrap(),
+                    persisted,
+                    "concurrent login revoked a token"
+                );
+            }
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 16);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     /// Seed a config file with `hostname` and return its path in a fresh dir.

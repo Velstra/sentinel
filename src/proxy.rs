@@ -17,9 +17,8 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::config::{Appliance, ReverseProxy};
 use crate::system;
@@ -119,16 +118,19 @@ fn haproxy_cfg_body(proxies: &[ReverseProxy]) -> String {
 /// result reports whether the installed bundle changed.
 fn write_cert_bundle(name: &str, cert_ref: &str) -> Result<bool> {
     let (crt, key) = crate::pki::leaf_paths(cert_ref);
-    let (Ok(crt_pem), Ok(key_pem)) = (std::fs::read_to_string(&crt), std::fs::read_to_string(&key))
-    else {
-        anyhow::bail!(
+    let unavailable = || {
+        format!(
             "reverse-proxy frontend {name:?}: TLS certificate {cert_ref:?} is not available; refusing plaintext fallback"
-        );
+        )
     };
+    let crt_pem = system::read_private_file(&crt).with_context(unavailable)?;
+    let key_pem = system::read_private_file(&key).with_context(unavailable)?;
     // HAProxy reads one PEM with the cert (chain) first, then the private key.
     let bundle = format!("{crt_pem}{key_pem}");
     let path = cert_bundle_path(name);
-    let changed = file_changed(&path, &bundle);
+    let changed = system::read_private_file(&path)
+        .map(|previous| previous != bundle)
+        .unwrap_or(true);
     system::install_ipsec_secret(&path, &bundle)?;
     Ok(changed)
 }
@@ -152,19 +154,14 @@ fn prune_cert_bundles(keep: &HashSet<String>) -> Result<()> {
 }
 
 /// Run HAProxy's own config check (`haproxy -c -f <cfg>`) before a reload, so a
-/// config it would reject never replaces a working one. `Some(true)` = valid,
-/// `Some(false)` = HAProxy rejected it, `None` = the check could not run (e.g.
-/// `haproxy` not on PATH off-box) — the caller treats `None` as "proceed", since
-/// the render is trusted and the unit's own start would surface a real problem.
-fn config_is_valid(cfg: &Path) -> Option<bool> {
-    let Some(cfg_s) = cfg.to_str() else {
-        return Some(false);
-    };
-    Command::new(system::bin("haproxy"))
-        .args(["-c", "-f", cfg_s])
-        .output()
-        .ok()
-        .map(|o| o.status.success())
+/// config it would reject never replaces a working one. Check with the same
+/// privileges the service uses, so root-only TLS bundles stay private. An
+/// unavailable checker is an error, never permission to activate unchecked state.
+fn config_is_valid(cfg: &Path) -> Result<bool> {
+    let cfg_s = cfg.to_str().context("non-UTF-8 proxy configuration path")?;
+    let output = system::escalated_output("haproxy", &["-c", "-f", cfg_s])
+        .context("checking reverse-proxy configuration")?;
+    Ok(output.status.success())
 }
 
 /// Reconcile the reverse proxy to `appliance.services.reverse_proxy`: render
@@ -213,9 +210,11 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
     let staged_path = Path::new("/run/sentinel/haproxy/.candidate.cfg");
     system::install_file(staged_path, &cfg)?;
 
-    // Gate the reload on HAProxy's own check: never replace a running proxy with a
-    // config it would reject. An un-runnable check (off-box) is treated as "go".
-    if config_is_valid(staged_path) == Some(false) {
+    // A missing checker or unreadable TLS bundle must fail closed too.
+    let valid = config_is_valid(staged_path).inspect_err(|_| {
+        let _ = system::remove_file(staged_path);
+    })?;
+    if !valid {
         let _ = system::remove_file(staged_path);
         anyhow::bail!(
             "rendered haproxy.cfg failed `haproxy -c` — leaving the running proxy \

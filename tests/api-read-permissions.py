@@ -72,13 +72,15 @@ class ReadPermissions(unittest.TestCase):
         cls.config = root / "appliance.toml"
 
     @classmethod
-    def start(cls, name, tls=False, peer=None, fingerprint=None, environment=None, config_mode=0o600):
+    def start(cls, name, tls=False, peer=None, fingerprint=None, environment=None, config_mode=0o600,
+              password_hash=None):
         root = cls.root / name
         root.mkdir(mode=0o700)
         config = (
             '[system]\nhostname = "' + name + '"\n'
             '[[system.group]]\nname = "viewers"\npermission = "read-only"\n'
             '[[system.login]]\nusername = "viewer"\ngroup = "viewers"\n'
+            + ('hashed-password = ' + json.dumps(password_hash) + '\n' if password_hash else '') +
             '[system.config-sync]\nsecret = "' + SECRET + '"\n'
         )
         if peer:
@@ -340,6 +342,66 @@ bfd-auth-key-id = 9
         path = root / "appliance.toml"
         self.assertEqual(path.stat().st_mode & 0o777, 0o640)
         self.assertIn(SECRET, path.read_text())
+
+    def test_environment_machine_token_never_escalates_account_permissions(self):
+        machine = "isolated-environment-machine-token"
+        openssl = os.environ.get("SENTINEL_OPENSSL_BIN", "openssl")
+        password_hash = subprocess.run(
+            [openssl, "passwd", "-6", "-stdin"], input="fixture-login-password",
+            text=True, stdout=subprocess.PIPE, check=True,
+        ).stdout.strip()
+        base, root = self.start("environment-account", password_hash=password_hash,
+                                environment={"SENTINEL_API_TOKEN": machine})
+        account_token = root / "api-tokens/viewer"
+        startup_token = account_token.read_text().strip()
+        self.assertNotEqual(startup_token, machine)
+        login = urllib.request.Request(
+            base + "/api/v1/login", method="POST",
+            data=json.dumps({"username": "viewer", "password": "fixture-login-password"}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with OPENER.open(login, timeout=10) as response:
+            session = json.load(response)
+        self.assertEqual(session["permission"], "read-only")
+        self.assertEqual(session["token"], startup_token)
+        before = (root / "appliance.toml").read_bytes()
+        mutation = urllib.request.Request(
+            base + "/api/v1/config", method="PUT",
+            data=b'{"system":{"hostname":"unauthorized-write"}}',
+            headers={"Content-Type": "application/json", "Authorization": "Bearer " + session["token"]},
+        )
+        try:
+            with OPENER.open(mutation, timeout=10) as response:
+                status = response.status
+        except urllib.error.HTTPError as error:
+            with error:
+                status = error.code
+        self.assertEqual(status, 403, "a read-only sign-in returned a globally privileged credential")
+        self.assertNotEqual(session["token"], machine)
+        self.assertEqual((root / "appliance.toml").read_bytes(), before)
+        self.assertEqual(account_token.read_text().strip(), session["token"])
+        self.assertEqual(request(base, "config", machine)[0], 200)
+
+        # Directory-authenticated accounts are minted on first login. Exercise
+        # that same boundary with real concurrent HTTP handlers, not only the
+        # in-process file helper, after withdrawing the pre-minted fixture token.
+        account_token.unlink()
+        barrier = threading.Barrier(8)
+
+        def first_login(_):
+            barrier.wait(timeout=10)
+            with OPENER.open(login, timeout=20) as response:
+                return json.load(response)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            sessions = list(pool.map(first_login, range(8)))
+        persisted = account_token.read_text().strip()
+        self.assertEqual(len(persisted), 43)
+        self.assertEqual({s["token"] for s in sessions}, {persisted})
+        self.assertTrue(all(s["permission"] == "read-only" for s in sessions))
+        self.assertEqual(account_token.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(request(base, "config", persisted)[0], 200)
+        self.assertEqual(sorted(p.name for p in account_token.parent.iterdir()), ["viewer"])
 
     def test_candidate_validation_is_complete_authorized_and_side_effect_free(self):
         before = self.config.read_bytes()

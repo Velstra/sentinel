@@ -121,6 +121,8 @@
             --set SENTINEL_TIMEOUT_BIN    ${pkgs.coreutils}/bin/timeout \
             --set SENTINEL_SWANCTL_BIN    ${pkgs.strongswan}/bin/swanctl \
             --set SENTINEL_OPENSSL_BIN    ${pkgs.openssl.bin}/bin/openssl \
+            --set SENTINEL_CAT_BIN        ${pkgs.coreutils}/bin/cat \
+            --set SENTINEL_HAPROXY_BIN    ${pkgs.haproxy}/bin/haproxy \
             --set SENTINEL_LEGO_BIN       ${pkgs.lego}/bin/lego \
             `# --set-default, not --set: this names DATA rather than a binary,
              # and a newer database (or a test) has a legitimate reason to point
@@ -1365,8 +1367,8 @@
             "d /run/sentinel/ocserv 0750 root root -"
             # Reverse proxy (roadmap C22): haproxy.cfg (world-readable) + the certs/
             # subdir holding the 0600 cert+key bundles (private keys, root only).
-            "d /run/sentinel/haproxy 0750 root root -"
-            "d /run/sentinel/haproxy/certs 0700 root root -"
+            "d /run/sentinel/haproxy 0750 root wheel -"
+            "d /run/sentinel/haproxy/certs 0750 root wheel -"
             # Box-service (roadmap C18) runtime dirs: LLDP confdir, avahi + DHCP-
             # relay configs (world-readable), and the ddclient dir (0640 secret).
             "d /run/sentinel/lldpd.d 0755 root root -"
@@ -2600,6 +2602,15 @@
               "https://127.0.0.1:8080/api/v1/login"
           )
           assert '"token"' in out, out
+
+          with subtest("concurrent LDAP logins cannot share bind credentials"):
+              # Invoke the actual ELF directly so its test launcher can freeze
+              # the credential boundary; the production wrapper deliberately
+              # pins ldapwhoami and must not accept executable overrides.
+              machine.succeed(
+                  "${pkgs.python3}/bin/python3 -W error ${./tests/ldap-login-concurrency.py} "
+                  "--isolated-runtime ${sentinel}/bin/.sentinel-wrapped ${pkgs.openldap}"
+              )
         '';
       };
 
@@ -3732,6 +3743,9 @@
           assert "server s1 10.0.0.3:8081 check" in cfg, cfg
           mode = fw.succeed("stat -c %a /run/sentinel/haproxy/certs/web.pem").strip()
           assert mode == "600", mode
+          fw.fail("su admin -c 'cat /var/lib/sentinel/pki/certs/web-cert/cert.key'")
+          fw.fail("su admin -c 'cat /run/sentinel/haproxy/certs/web.pem'")
+          fw.fail("su -s /bin/sh nobody -c 'cat /run/sentinel/haproxy/certs/web.pem'")
           assert "frontend fe_stream" in cfg, cfg
           assert "no option forwardfor" not in cfg, cfg
           fw.succeed("haproxy -c -f /run/sentinel/haproxy/haproxy.cfg")
@@ -3752,6 +3766,16 @@
               "echo \"$OUT\" | grep -q BACKEND-A && echo \"$OUT\" | grep -q BACKEND-B",
               timeout=60,
           )
+
+          # Reading private bundles for change detection must not restart an
+          # unchanged proxy on every unrelated operator commit.
+          proxy_pid = fw.succeed("systemctl show -p MainPID --value haproxy.service").strip()
+          fw.succeed(
+              "su admin -c \"printf '%s\\n' 'set system hostname proxy-stable' "
+              "commit save exit | sentinel configure\""
+          )
+          assert fw.succeed("systemctl show -p MainPID --value haproxy.service").strip() == proxy_pid
+          client.succeed("curl -fsSk https://10.0.0.1:443/ | grep -qE 'BACKEND-[AB]'")
         '';
       };
 
