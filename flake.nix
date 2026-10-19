@@ -2258,11 +2258,11 @@
           assert "console-masq" not in cfg, cfg
 
           with subtest("candidate validation cannot apply or save on a live appliance"):
-              paths = (
+              validation_files = (
                   "/var/lib/sentinel/appliance.toml /run/sentinel/running.toml "
                   "/run/sentinel/velstra.toml /run/sentinel/wren.toml"
               )
-              before = machine.succeed("sha256sum " + paths)
+              before = machine.succeed("sha256sum " + validation_files)
               hostname = machine.succeed("hostname")
               for command, expected in [
                   ("set system hostname preview-only", "200"),
@@ -2277,7 +2277,7 @@
                       "https://127.0.0.1:8080/api/v1/configure/validate"
                   ).strip()
                   assert code == expected, machine.succeed("cat /tmp/validation-result")
-                  assert machine.succeed("sha256sum " + paths) == before
+                  assert machine.succeed("sha256sum " + validation_files) == before
                   assert machine.succeed("hostname") == hostname
 
           # The four service masks, each through the same command path: a BGP
