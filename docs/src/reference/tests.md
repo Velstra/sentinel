@@ -1,12 +1,13 @@
 # Test suite (nixosTests)
 
-Sentinel is verified by **93 nixosTests**, **478 Rust unit tests** and a
-**browser suite** that drives the web console against a running appliance. The nixosTests
+Sentinel has Rust unit tests, compiler and map-contract checks, and a
+browser suite that drives the web console against a running appliance. The nixosTests
 boot real QEMU/OVMF VMs — several of them two or three at a time on shared virtual
 segments — so they need `/dev/kvm`.
 
 ```shell
-nix flake check                                   # evaluate every check
+nix flake check --no-build                        # evaluate every check
+nix flake check                                   # evaluate and run every check
 nix build .#checks.x86_64-linux.<name> -L         # run one
 ```
 
@@ -16,7 +17,7 @@ authoritative list.
 The unit tests need nothing but a checkout:
 
 ```shell
-cargo test                                        # 460 of them
+cargo test --workspace
 tests/console/run.sh                              # the browser suite
 ```
 
@@ -55,7 +56,7 @@ write, which is how ten sections that could be typed and not clicked were found.
 | `commitconfirm` | a timed commit auto-reverts unless `confirm`ed — the safety net for editing a firewall over its own link |
 | `confighistory` | every `save` archives a revision, `show system commit` lists them, `rollback <N>` restores one |
 | `configsync` | a commit on the primary pushes the running config to the backup's API, which applies **and** persists it |
-| `api` | the REST management API drives one config model end to end; `/health` is unauthenticated, the rest is not; and the web console — that it fetches nothing external, that every `/api/v1/…` path the page calls really answers, that a rule clicked into being is applied *and* persisted through the same commands the CLI runs, that a zone posture, a NAT entry, a BGP neighbour, an IPsec tunnel, a WireGuard interface and a DHCP server are all written through that one path, that `show configuration commands` replays into the same configuration it came from, that a script with no `commit` changes nothing, that a packet capture sees real ICMP on the loopback and refuses a filter that would become a tcpdump option, that a refused command comes back as output rather than as a silent success, and that the stack refuses a member the appliance has no relationship with |
+| `api` | the REST management API drives one config model end to end; health, login and OpenAPI documentation are public, management operations require authentication; the console fetches nothing external; its API paths answer; zone, NAT, routing, VPN and DHCP changes use the CLI commit path; command exports replay faithfully; complete-candidate validation cannot apply or save; packet capture sees real ICMP and refuses filters that become options; command refusals are reported; unrelated stack members are refused |
 
 ### Also here
 
