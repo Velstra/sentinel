@@ -31,6 +31,16 @@ use std::io::Write;
 use crate::repl::{DynNames, dyn_candidates};
 use crate::session::Session;
 
+/// Diagnostic reports follow Cargo's output directory, including when the
+/// source tree is immutable and build artifacts live elsewhere.
+fn report_path(name: &str) -> std::path::PathBuf {
+    let directory = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("target"));
+    std::fs::create_dir_all(&directory).expect("creating grammar report directory");
+    directory.join(name)
+}
+
 /// The names the completion knows about while walking. Seeded to match
 /// [`BASE`], so a position that references an existing object (a zone, a
 /// prefix-list) offers a name that really is there — a walk against an empty
@@ -778,7 +788,7 @@ fn every_settable_path_is_accepted_shown_persisted_and_deletable() {
         }
     }
 
-    let report = std::path::PathBuf::from("target/grammar-walk.txt");
+    let report = report_path("grammar-walk.txt");
     let mut f = std::fs::File::create(&report).unwrap();
     writeln!(
         f,
@@ -1104,7 +1114,7 @@ fn every_settable_path_survives_show_configuration_commands() {
         ));
     }
 
-    let report = std::path::PathBuf::from("target/grammar-walk-flatten.txt");
+    let report = report_path("grammar-walk-flatten.txt");
     let mut f = std::fs::File::create(&report).unwrap();
     writeln!(
         f,
