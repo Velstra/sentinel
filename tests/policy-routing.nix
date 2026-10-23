@@ -9,6 +9,7 @@ pkgs.testers.runNixOSTest {
   testScript = ''
     import json
     import shlex
+    import re
     machine.wait_for_unit("multi-user.target")
     machine.wait_for_unit("sentinel-boot-late.service")
     def apply(*commands):
@@ -41,7 +42,23 @@ pkgs.testers.runNixOSTest {
         apply("set policy route only-v6 source 2001:db8:510::2/128", "set policy route only-v6 destination 2001:db8:520::2/128", "set policy route only-v6 proto tcp", "set policy route only-v6 destination-port 8080", "set policy route only-v6 table 202")
         machine.fail(web4)
         machine.fail(web6)
+        machine.succeed("systemd-run --unit=pbr-watch sh -c 'exec ${pkgs.coreutils}/bin/stdbuf -oL ${pkgs.iproute2}/bin/ip -ts monitor rule >> /run/pbr-rule-events'")
+        machine.wait_for_unit("pbr-watch.service")
+        machine.succeed("ip -4 rule add priority 9001 table 203; ip -4 rule del priority 9001")
+        machine.wait_until_succeeds("grep -q 9001 /run/pbr-rule-events", timeout=10)
+        machine.succeed("echo BEGIN_STABLE_RECONCILE >> /run/pbr-rule-events")
         apply("set firewall global log true")
+        print("ACTUAL_RULE_JSON4 " + machine.succeed("ip -4 -j -N rule show"), flush=True)
+        print("ACTUAL_RULE_JSON6 " + machine.succeed("ip -6 -j -N rule show"), flush=True)
+        observed = machine.succeed("cat /run/pbr-rule-events").split("BEGIN_STABLE_RECONCILE", 1)[1]
+        print("ACTUAL_RULE_MONITOR " + observed, flush=True)
+        owned_events = [line for line in observed.splitlines() if (m := re.search(r"(?:Deleted )?(\d+):\s+from", line)) and 10000 <= int(m[1]) <= 19999]
+        assert not owned_events, "unchanged policy routes were removed during an unrelated commit: " + observed
+        # Confirm that the observer stays live; an empty interval is not a
+        # successful test if the monitor died before the commit.
+        machine.succeed("ip -6 rule add priority 9002 table 203; ip -6 rule del priority 9002")
+        machine.wait_until_succeeds("grep -q 9002 /run/pbr-rule-events", timeout=10)
+        machine.succeed("systemctl stop pbr-watch.service")
         assert len(rules("-4")) == 1 and len(rules("-6")) == 1
         apply("delete policy route only-v4")
         assert not rules("-4") and len(rules("-6")) == 1
@@ -61,6 +78,32 @@ pkgs.testers.runNixOSTest {
         allowed(web4)
         allowed(web6)
         machine.succeed("ip -4 rule show | grep '^9000:.*203.0.113.0/24.*lookup 203'")
+    with subtest("CIDR, ranges and interface selectors remain unchanged"):
+        apply("delete policy route both", "set policy route ranged source 192.0.2.123/24", "set policy route ranged destination 198.51.100.77/24", "set policy route ranged interface rp-front", "set policy route ranged proto tcp", "set policy route ranged source-port 1024-65534", "set policy route ranged destination-port 8080", "set policy route ranged table 201")
+        machine.fail(web4)
+        allowed(web6)
+        machine.succeed("systemd-run --unit=pbr-range-watch sh -c 'exec ${pkgs.coreutils}/bin/stdbuf -oL ${pkgs.iproute2}/bin/ip -ts monitor rule >> /run/pbr-range-events'")
+        machine.wait_for_unit("pbr-range-watch.service")
+        machine.succeed("ip -4 rule add priority 9003 table 203; ip -4 rule del priority 9003")
+        machine.wait_until_succeeds("grep -q 9003 /run/pbr-range-events", timeout=10)
+        machine.succeed("echo BEGIN_STABLE_RECONCILE >> /run/pbr-range-events")
+        apply("set firewall global log false")
+        observed=machine.succeed("cat /run/pbr-range-events").split("BEGIN_STABLE_RECONCILE",1)[1]
+        owned_events=[line for line in observed.splitlines() if (m:=re.search(r"(?:Deleted )?(\d+):\s+from",line)) and 10000 <= int(m[1]) <= 19999]
+        assert not owned_events, observed
+        machine.succeed("ip -6 rule add priority 9004 table 203; ip -6 rule del priority 9004")
+        machine.wait_until_succeeds("grep -q 9004 /run/pbr-range-events", timeout=10)
+        machine.succeed("systemctl stop pbr-range-watch.service")
+        before4, before6 = rules("-4"), rules("-6")
+        before_pid = machine.succeed("systemctl show -p MainPID --value velstra.service").strip()
+        status, refused = machine.execute("printf '%s\\n' 'set policy route ranged source-port 1024-65535' commit | sentinel configure 2>&1")
+        assert status != 0 and "source-port" in refused and "1-65534" in refused, refused
+        assert rules("-4") == before4 and rules("-6") == before6
+        assert machine.succeed("systemctl show -p MainPID --value velstra.service").strip() == before_pid
+        machine.fail(web4)
+        apply("delete policy route ranged")
+        allowed(web4)
+        allowed(web6)
     print("ACTUAL_POLICY_ROUTING_DUAL_STACK_LIFECYCLE PASS", flush=True)
   '';
 }

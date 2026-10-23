@@ -455,14 +455,14 @@ pub fn ip_route_flush_table(table: u32) -> Result<()> {
     run_priv("ip", &["route", "flush", "table", &table.to_string()])
 }
 
-/// The routing-policy rules the appliance owns, as `ip rule` prints them. Only
+/// The routing-policy rules in numeric JSON form for semantic reconciliation. Only
 /// the priority band in [`crate::net::PBR_PRIORITY_BASE`] is ours; anything else
 /// in the table belongs to the kernel or to somebody else and is left alone.
 pub fn ip_rule_list(family: &str) -> Result<String> {
     anyhow::ensure!(matches!(family, "-4" | "-6"), "invalid IP rule family");
     let is_root = unsafe { libc::geteuid() } == 0;
     let ip = bin("ip");
-    let args = [family, "-o", "rule", "show"];
+    let args = [family, "-j", "-N", "rule", "show"];
     let output = if is_root {
         Command::new(&ip).args(args).output()
     } else {
