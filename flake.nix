@@ -1440,6 +1440,11 @@
           # Each invocation creates an independent lazy set. CI keeps only
           # strictly evaluated build identities, not whole NixOS module graphs.
           makeChecks = _: {
+        management-tls-powerloss = import ./tests/management-tls-powerloss.nix {
+          inherit pkgs;
+          sentinelModule = self.nixosModules.sentinel;
+        };
+
         # Every map the agent looks up by name exists in the object it loads.
         #
         # This exists because of one specific trap. `velstra-ebpf` is a

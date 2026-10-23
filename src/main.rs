@@ -31,6 +31,7 @@ mod installer_tui;
 mod ipsec;
 mod lockout;
 mod lookup;
+mod management_tls;
 mod metrics;
 mod net;
 mod openapi;

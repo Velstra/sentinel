@@ -1364,49 +1364,13 @@ pub fn openssl(args: &[&str]) -> Result<()> {
 /// existing pair: a self-signed cert that config sync may pin must keep a stable
 /// key across reboots. The private key is written 0600.
 pub fn ensure_self_signed_cert(cert: &Path, key: &Path, cn: &str, sans: &[String]) -> Result<()> {
-    if cert.exists() && key.exists() {
-        return Ok(());
-    }
-    if let Some(parent) = cert.parent() {
-        ensure_dir(parent)?;
-    }
-    let san = build_san(cn, sans);
-    let (Some(cert_s), Some(key_s)) = (cert.to_str(), key.to_str()) else {
-        bail!("non-UTF-8 TLS certificate path");
-    };
-    let out = Command::new(bin("openssl"))
-        .args([
-            "req",
-            "-x509",
-            "-newkey",
-            "rsa:2048",
-            "-sha256",
-            "-days",
-            "3650",
-            "-nodes",
-            "-keyout",
-            key_s,
-            "-out",
-            cert_s,
-            "-subj",
-            &format!("/CN={cn}"),
-            "-addext",
-            &san,
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .context("running openssl to mint the management TLS certificate")?;
-    if !out.status.success() {
-        bail!(
-            "openssl could not mint the management TLS certificate: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    // The key must never be group/world readable, whoever's umask minted it.
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(key, std::fs::Permissions::from_mode(0o600));
-    Ok(())
+    crate::management_tls::ensure_pair(
+        cert,
+        key,
+        cn,
+        &build_san(cn, sans),
+        Path::new(&bin("openssl")),
+    )
 }
 
 /// Build an OpenSSL `subjectAltName` extension covering the CN plus each supplied
