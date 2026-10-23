@@ -1440,6 +1440,10 @@
           # Each invocation creates an independent lazy set. CI keeps only
           # strictly evaluated build identities, not whole NixOS module graphs.
           makeChecks = _: {
+        policy-routing = import ./tests/policy-routing.nix {
+          inherit pkgs self velstra;
+        };
+
         management-tls-powerloss = import ./tests/management-tls-powerloss.nix {
           inherit pkgs;
           sentinelModule = self.nixosModules.sentinel;
