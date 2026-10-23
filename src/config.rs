@@ -8739,6 +8739,20 @@ impl Appliance {
                     r.name
                 );
             }
+            if let Some(proto) = &r.proto {
+                if !matches!(proto.as_str(), "tcp" | "udp") {
+                    bail!("policy route {:?} proto {proto:?}: tcp or udp", r.name);
+                }
+            }
+            for (field, spec) in [
+                ("source-port", &r.source_port),
+                ("destination-port", &r.destination_port),
+            ] {
+                if let Some(spec) = spec {
+                    validate_policy_route_port(spec)
+                        .with_context(|| format!("policy route {:?} {field}", r.name))?;
+                }
+            }
             for (what, v) in [("source", &r.source), ("destination", &r.destination)] {
                 if let Some(a) = v {
                     validate_cidr_or_ip(a)
@@ -8920,51 +8934,6 @@ impl Appliance {
                      threshold to be strict about",
                     p.name
                 );
-            }
-        }
-        // Policy routing: a rule that redirects nowhere, or matches a port
-        // without saying which protocol's port, is a rule the kernel will
-        // refuse — better to say so here, with the name in hand.
-        let mut seen_pbr = std::collections::BTreeSet::new();
-        for r in &self.policy.routes {
-            if !seen_pbr.insert(r.name.as_str()) {
-                bail!("policy route {:?}: declared twice", r.name);
-            }
-            if r.table == 0 {
-                bail!(
-                    "policy route {:?}: needs a table — a rule that redirects nowhere is not a policy route",
-                    r.name
-                );
-            }
-            // 0 and 253-255 are the kernel's own (unspec/default/main/local).
-            if (253..=255).contains(&r.table) {
-                bail!(
-                    "policy route {:?}: table {} is the kernel's own (253-255)",
-                    r.name,
-                    r.table
-                );
-            }
-            if (r.source_port.is_some() || r.destination_port.is_some()) && r.proto.is_none() {
-                bail!(
-                    "policy route {:?}: a port needs a `proto` to key it (tcp or udp)",
-                    r.name
-                );
-            }
-            for (what, v) in [("source", &r.source), ("destination", &r.destination)] {
-                if let Some(a) = v {
-                    validate_cidr_or_ip(a)
-                        .with_context(|| format!("policy route {:?} {what}", r.name))?;
-                }
-            }
-            // Both ends in one rule is fine; both *families* in one rule is not,
-            // because a kernel rule belongs to one.
-            if let (Some(s), Some(d)) = (&r.source, &r.destination) {
-                if s.contains(':') != d.contains(':') {
-                    bail!(
-                        "policy route {:?}: source and destination are different address families",
-                        r.name
-                    );
-                }
             }
         }
         for r in &self.protocols.statics {
@@ -10859,6 +10828,7 @@ impl Appliance {
         // cannot start with. Better to refuse the setting than to accept it and
         // discover the problem on the next boot.
         crate::wren::compile_wren(self).to_toml()?;
+        crate::compile::compile(self).validate_capacity()?;
         Ok(())
     }
 
@@ -12168,6 +12138,26 @@ pub(crate) fn validate_description(s: &str) -> Result<()> {
     Ok(())
 }
 
+/// The appliance kernel's FIB rule ABI rejects zero and the 65535 endpoint.
+/// This restriction applies only to routing-policy selectors, not firewall
+/// ports. Validate before a commit changes any live interfaces or services.
+fn validate_policy_route_port(spec: &str) -> Result<()> {
+    let (low, high) = spec.split_once('-').unwrap_or((spec, spec));
+    let parse = |text: &str| -> Option<u16> {
+        if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        text.parse().ok()
+    };
+    let valid = parse(low)
+        .zip(parse(high))
+        .is_some_and(|(a, b)| a > 0 && a <= b && b < u16::MAX);
+    if !valid {
+        bail!("expected a port or ascending port range within 1-65534 for the appliance kernel");
+    }
+    Ok(())
+}
+
 /// Validate a firewall blocklist entry: a bare IPv4 (`192.0.2.5`) or an IPv4
 /// CIDR (`10.6.6.0/24`).
 pub(crate) fn validate_cidr_or_ip(s: &str) -> Result<()> {
@@ -12388,6 +12378,53 @@ fn proto_str(p: Proto) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn policy_route_ports_are_validated_before_live_apply() {
+        for field in ["source-port", "destination-port"] {
+            for spec in [
+                "", "0", "65535", "1-65535", "65534-1", "1-2-3", "1x", "65536", "-1", "+80", " 80",
+                "80 ", "80-", "0-10",
+            ] {
+                let text = format!(
+                    "[system]\nhostname='fw'\n[[policy.route]]\nname='customer'\nproto='tcp'\ntable=201\n{field}={spec:?}\n"
+                );
+                let error = format!("{:#}", super::Appliance::from_toml(&text).unwrap_err());
+                assert!(
+                    error.contains("customer")
+                        && error.contains(field)
+                        && error.contains("1-65534"),
+                    "{error}"
+                );
+            }
+            for proto in ["tcp", "udp"] {
+                for spec in ["1", "65534", "1-65534", "1024-65534", "8080-8080", "00080"] {
+                    let text = format!(
+                        "[system]\nhostname='fw'\n[[policy.route]]\nname='customer'\nproto='{proto}'\ntable=201\n{field}='{spec}'\n"
+                    );
+                    super::Appliance::from_toml(&text)
+                        .unwrap()
+                        .validate()
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn policy_route_protocol_is_validated_for_direct_config_input() {
+        for proto in ["icmp", "sctp", "6", "tcp "] {
+            let text = format!(
+                "[system]\nhostname='fw'\n[[policy.route]]\nname='customer'\nproto='{proto}'\ntable=201\n"
+            );
+            let error = super::Appliance::from_toml(&text).unwrap_err().to_string();
+            assert!(
+                error.contains("customer")
+                    && error.contains("proto")
+                    && error.contains("tcp or udp"),
+                "{error}"
+            );
+        }
+    }
 
     /// The back-compat promise: a config written before named channels — a
     /// bare `[update] url` + `public-key` — parses, validates and resolves as

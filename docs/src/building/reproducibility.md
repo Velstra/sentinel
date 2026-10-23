@@ -8,19 +8,28 @@ which hash is which.
 
 | Pin | Variable | What it covers |
 |---|---|---|
-| nixpkgs | `inputs.nixpkgs` | `nixos-25.05` — ships `rustc ≥ 1.85` and an LLVM-20 `bpf-linker` |
+| nixpkgs | `inputs.nixpkgs` (`flake.lock`) | appliance packages and stable Rust |
 | nightly toolchain | `nightlyDate` + `nightlySha` | the fenix nightly used to compile the eBPF |
+| BPF linker | `bpfLinker` | hash-verified upstream `bpf-linker` 0.10.3, built with LLVM 22 |
 | nightly manifest | `rustNightlyManifest` (fetchurl, same `nightlySha`) | re-fetched so **offline eval** works |
 | aya crates | `ayaHash` / `ayaOutputHashes` | all `aya-*` git crates share one checkout hash |
-| eBPF object | `ebpfHash` | the `velstra-ebpf` fixed-output derivation |
+| eBPF object | `ebpfHash` | the `velstra-ebpf` fixed-output derivation, named with its Fabric/compiler/linker identity |
 | Fabric source | `inputs.fabric` (`flake.lock`) | the data-plane agent source commit |
+| Wren source | `inputs.wren` (`flake.lock`) | routing daemon source commit |
 
-## Why nightly must match LLVM 20
+## Why the compiler and linker must agree
 
-`bpf-linker` in nixpkgs 25.05 is **LLVM 20**. A newer nightly emits LLVM 22
-bitcode, which that linker can't read (`Unknown attribute kind`). So the pinned
-nightly (`2025-06-15`) is deliberately from the LLVM-20 era. If you bump nixpkgs
-to a release with a newer LLVM, bump the nightly to match — not independently.
+The appliance pins nightly **2026-08-01** and the LLVM-22 build of
+[`bpf-linker` 0.10.3](https://github.com/aya-rs/bpf-linker/releases/tag/v0.10.3).
+The older LLVM-20 pipeline cannot compile the current datapath. A newer nightly
+must also be verified against its linker and the appliance kernel; changing the
+date alone is insufficient.
+
+The fixed-output object's name includes the Fabric source revision, compiler
+date and linker version. This prevents a source update from silently reusing an
+older object with the same recorded output hash. `checks.ebpf-maps` checks the
+agent's map lookups against the actual object; packet VM tests verify loading
+and forwarding. Preserve BTF and avoid host ELF stripping on the BPF object.
 
 ## Updating a hash (the fakeHash dance)
 
@@ -36,16 +45,21 @@ nix build .#velstra-ebpf 2>&1 | grep -A2 'specified:'
 
 ## Airgapped builds
 
-Two FODs need network (`velstra-ebpf` and IFD of the nightly manifest). The flake
-already **re-fetches the nightly manifest into the store** with the same hash
+The eBPF fixed-output build fetches its pinned source and dependencies. The
+nightly manifest is also needed during evaluation. The flake
+**re-fetches the nightly manifest into the store** with the same hash
 (`rustNightlyManifest`), so a content-addressed copy exists locally and even
-*evaluation* succeeds offline. For a fully sealed build, pre-populate the store
-with:
+evaluation can run offline once its inputs are available. For a sealed rebuild,
+pre-populate the complete build-input closure, including:
 
-- the `velstra-ebpf` output (build it once online, it's then cached by hash), and
-- the nightly toolchain + manifest.
+- the `velstra-ebpf` output (build it once online, it's then cached by hash);
+- the nightly toolchain and manifest;
+- the pinned linker archive and tool outputs;
+- flake sources, vendored Rust dependencies and the other appliance build inputs.
 
-After that, `nix build .#sentinel-image` runs with no network.
+Caching only the eBPF object and compiler does not supply missing appliance
+dependencies. Verify the offline rebuild before moving a cache into an isolated
+environment.
 
 ## What is *not* committed
 

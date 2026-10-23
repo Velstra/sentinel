@@ -736,6 +736,9 @@ pub fn page() -> String {
 
   .row {{ display: flex; gap: var(--space-2); flex-wrap: wrap; align-items: center; }}
   .field {{ display: flex; flex-direction: column; gap: var(--space-1); }}
+  .secretinput {{ display: flex; gap: var(--space-1); }}
+  .secretinput input {{ min-width: 0; flex: 1; width: 0; }}
+  .secretinput button {{ flex: none; }}
   .grid2 {{ display: grid; gap: var(--space-3); grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); }}
   /* The settings masks. Without this every panel was one column of full-width
      inputs — a form the length of the protocol rather than a page of it. */
@@ -1618,7 +1621,7 @@ pub fn page() -> String {
   <!-- Signing in as somebody. The console used to ask only for the machine
        token, so in practice one secret was passed around and the accounts and
        permission groups on the box were configuration nobody could use. -->
-  <form id="loginform">
+  <form id="loginform" novalidate>
     <div class="grid2" style="margin-bottom:var(--space-4)">
       <label class="field">
         <span>Username</span>
@@ -1645,7 +1648,7 @@ pub fn page() -> String {
       The management token — the same bearer token the API takes, and the way in
       before any account exists. Kept for this tab only and never written to disk.
     </p>
-    <form class="row" id="tokenform">
+    <form class="row" id="tokenform" novalidate>
       <input id="token" type="password" placeholder="management token" autocomplete="off"
              style="flex:1 1 14rem">
       <button class="btn" type="submit">Use token</button>
@@ -2818,13 +2821,15 @@ async function text(path) {{
   return body;
 }}
 
-async function configure(lines) {{
-  const r = await api("/api/v1/configure", {{
+async function configure(lines, validateOnly = false) {{
+  const r = await api(validateOnly ? "/api/v1/configure/validate" : "/api/v1/configure", {{
     method: "POST",
     headers: {{ Authorization: "Bearer " + token, "Content-Type": "text/plain" }},
     body: lines.join("\n") + "\n",
   }}, 120);
-  return r.json();
+  const result = await r.json();
+  if (!r.ok) throw new Error(result.error || "The configuration request was refused (HTTP " + r.status + ").");
+  return result;
 }}
 
 function el(tag, attrs, kids) {{
@@ -3691,15 +3696,16 @@ async function applyStagedNow(tail) {{
   // hidden second run that every apply paid for and that could refuse a change
   // the appliance was willing to take.
   //
-  // Validating runs the same commands with no `commit`, so nothing is applied
-  // — and the staged list must survive it. Clearing on a *validate* was the
+  // Validate materializes and checks the complete candidate through a pure
+  // endpoint. No commit or operational command can run there. The staged list
+  // must survive it. Clearing on a *validate* was the
   // worst possible bug in this panel: the check said "fine", the panel emptied
   // itself, and the change an operator had just been told was good could no
   // longer be applied.
   const committed = tail.includes("commit");
   let r;
   try {{
-    r = await configure(stagedCommands().concat(tail));
+    r = await configure(stagedCommands().concat(tail), !committed);
   }} catch (e) {{
     // An apply that never reached the appliance has to say so. Left to throw,
     // the page swallowed it: no dialog, no banner, the changes still staged —
@@ -3794,7 +3800,7 @@ function summarise(output) {{
 
 function showResult(r, committed, blamed) {{
   const notes = summarise(r.output);
-  const failed = notes.some((n) => n.kind === "bad");
+  const failed = !r.ok || notes.some((n) => n.kind === "bad");
   // The appliance runs the commands it can and reports what it could not: a
   // batch that is refused *and* committed leaves the box changed, and calling
   // that "Not applied" sends an operator to re-run commands that already ran.
@@ -5144,11 +5150,20 @@ function chipsWidget(input, options) {{
   return box;
 }}
 
+let secretControlId = 0;
+
+function secretSetting(key) {{
+  return SECRETS.includes(String(key).split(" ").pop());
+}}
+
 function fieldWidget(field, value) {{
   // A heading, not a setting: eighteen inputs in one flat grid is a form nobody
   // reads top to bottom, and the groups are how an operator already thinks
   // about the protocol — where it speaks, how fast, who it trusts.
   if (field[0] === "#") return null;
+  if (secretSetting(field[0]) || field[4] === "secret") {{
+    return el("input", {{ type: "password", value: value || "", autocomplete: "new-password", spellcheck: "false", "data-secret": "true" }});
+  }}
   // A field that points at something the appliance already has is a choice,
   // not a spelling test. A key that carries its path — `import bgp`, `export
   // ospf` — is answered by the first word: what may go there is decided by the
@@ -5399,13 +5414,32 @@ function fieldGrid(fields, row, required, form) {{
     // the other way round: the only labelable thing inside it is the hidden
     // value, so a click on the row would open a dropdown nobody can see.
     const kind = (widgets[i].classList && widgets[i].className) || "";
-    const owns = kind.includes("pick") || kind.includes("switch");
+    const secret = widgets[i].dataset && widgets[i].dataset.secret === "true";
+    const owns = kind.includes("pick") || kind.includes("switch") || secret;
     // A set of tick boxes needs the run; a single figure does not, and neither
     // does a switch — two states take less room than a sentence, not more.
     const size = kind.includes("pick") || kind.includes("chips") ? " w-l"
       : kind.includes("switch") ? " w-auto"
       : (WIDTH[f[0]] ? " " + WIDTH[f[0]] : " w-m");
-    const box = el(owns ? "div" : "label", {{ class: "field" + size }}, [label, widgets[i], hint]);
+    let control = widgets[i];
+    let fieldLabel = label;
+    if (secret) {{
+      widgets[i].id = "secret-field-" + (++secretControlId);
+      fieldLabel = el("label", {{ for: widgets[i].id }}, [label]);
+      const toggle = el("button", {{
+        type: "button", class: "btn", text: "Show", "data-secret-toggle": "true",
+        "aria-label": "Show " + f[1], "aria-pressed": "false",
+        onclick: () => {{
+          const reveal = widgets[i].type === "password";
+          widgets[i].type = reveal ? "text" : "password";
+          toggle.textContent = reveal ? "Hide" : "Show";
+          toggle.setAttribute("aria-label", (reveal ? "Hide " : "Show ") + f[1]);
+          toggle.setAttribute("aria-pressed", String(reveal));
+        }},
+      }});
+      control = el("span", {{ class: "secretinput" }}, [widgets[i], toggle]);
+    }}
+    const box = el(owns ? "div" : "label", {{ class: "field" + size }}, [fieldLabel, control, hint]);
     // A value the console can produce, offered rather than demanded.
     if (SUGGEST[f[0]]) {{
       label.append(el("button", {{
@@ -5671,10 +5705,11 @@ function firstGroup(fields) {{
 const SECRETS = [
   "psk", "password", "hashed-password", "private-key", "preshared-key",
   "auth-key", "secret", "passphrase", "macsec-key", "subscription-key",
+  "ao-key", "bfd-auth-key", "totp", "pin",
 ];
 
 function shown(key, value) {{
-  if (!SECRETS.includes(key)) return value;
+  if (!secretSetting(key)) return value;
   return value ? "set" : "";
 }}
 
@@ -7223,7 +7258,7 @@ const SVC_WEB = [
   ["tls-key", "Private key (PEM)"],
 ];
 const SVC_SNMP = [
-  ["community", "Community"], ["listen", "Listen"], ["location", "Location"],
+  ["community", "Community", null, null, "secret"], ["listen", "Listen"], ["location", "Location"],
   ["contact", "Contact"], ["allow", "Allow from", null, "list"],
 ];
 const SVC_LLDP = [["enable", "Enabled", ["", "true", "false"]], ["interface", "Interfaces", null, "list"]];

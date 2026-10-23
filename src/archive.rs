@@ -66,37 +66,24 @@ pub fn archive_config(config_path: &Path, contents: &str, keep: usize) -> Result
     let name = format!("{ARCHIVE_PREFIX}{nanos:020}{ARCHIVE_SUFFIX}");
     let path = dir.join(&name);
 
-    // Write it as ourselves if we can, and escalate if we cannot — the same
-    // shape as the config file's own install, and for the same reason. The
-    // comment above used to assert that this directory is wheel-writable; on a
-    // real appliance it is the mount point of the data partition, whose root the
-    // installer made root:root, and the tmpfiles rule that would have widened it
-    // never applies to an already-mounted filesystem. So every commit an
-    // operator made printed "could not archive this config revision" and left
-    // the revision history empty — `rollback` had nothing to roll back to, and
-    // the only sign was a warning nobody has to read.
-    if std::fs::create_dir_all(&dir).is_ok() {
-        // Atomic: temp + rename, so a reader never sees a half-written revision.
-        let tmp = dir.join(format!(".{name}.tmp"));
-        if std::fs::write(&tmp, contents).is_ok() {
-            if std::fs::rename(&tmp, &path).is_ok() {
-                prune(&dir, keep);
-                return Ok(());
-            }
-            let _ = std::fs::remove_file(&tmp);
-        }
-    }
-    let staged = Path::new("/run/sentinel").join(".archive.toml.tmp");
-    crate::system::stage_private(&staged, contents)?;
-    let (Some(d), Some(src), Some(dst)) = (dir.to_str(), staged.to_str(), path.to_str()) else {
-        anyhow::bail!("non-UTF-8 path");
-    };
-    crate::system::sudo("install", &["-d", "-m", "0755", d])
-        .with_context(|| format!("creating {d}"))?;
-    crate::system::sudo("install", &["-m", "0644", src, dst])
-        .with_context(|| format!("installing {dst}"))?;
-    let _ = std::fs::remove_file(&staged);
+    crate::system::ensure_dir(&dir)?;
+    secure_revisions(config_path)?;
+    // Revisions carry exactly the same credentials as appliance.toml. Reuse
+    // its private, atomic installer for root and privileged operator saves.
+    crate::system::install_config_file(&path, contents)?;
     prune(&dir, keep);
+    Ok(())
+}
+
+/// Repair revisions written world-readable by older appliance versions.
+/// Called before boot applies services and before publishing a new revision.
+/// Atomic replacement also fixes ownership for root-owned historical archives
+/// when an operator saves through the privileged installer.
+pub fn secure_revisions(config_path: &Path) -> Result<()> {
+    for (path, _) in revision_files(&archive_dir(config_path)) {
+        crate::system::secure_config_file(&path)
+            .with_context(|| format!("protecting revision {}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -307,5 +294,28 @@ mod tests {
         assert_eq!(read_revision(&cfg, 0).unwrap(), "newest");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_revision_permissions_are_repaired_idempotently() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("sentinel-archive-private-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("archive")).unwrap();
+        let path = dir.join("archive/config-00000000000000000001.toml");
+        let contents = b"archived credentials must remain private";
+        std::fs::write(&path, contents).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        for _ in 0..2 {
+            secure_revisions(&dir.join("appliance.toml")).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), contents);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+            assert_eq!(std::fs::read_dir(dir.join("archive")).unwrap().count(), 1);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -89,6 +89,7 @@ export async function browser({ port = 0, width = 1600, height = 1000 } = {}) {
   });
 
   let id = 0;
+  let terminalError = null;
   const pending = new Map();
   const thrown = [];
   ws.onmessage = (ev) => {
@@ -122,6 +123,7 @@ export async function browser({ port = 0, width = 1600, height = 1000 } = {}) {
   const giveUp = (why) => {
     const tail = said.join("").trim().split("\n").slice(-8).join("\n");
     const e = new Error(why + (tail ? `\n  the browser said:\n  ${tail.split("\n").join("\n  ")}` : ""));
+    terminalError ??= e;
     for (const [, settle] of pending) settle({ __dead: e });
     pending.clear();
   };
@@ -131,6 +133,10 @@ export async function browser({ port = 0, width = 1600, height = 1000 } = {}) {
 
   const send = (method, params = {}) =>
     new Promise((res, rej) => {
+      if (terminalError || ws.readyState !== WebSocket.OPEN) {
+        rej(terminalError || new Error("the browser debugging socket is closed"));
+        return;
+      }
       const callId = ++id;
       const timer = setTimeout(() => {
         pending.delete(callId);

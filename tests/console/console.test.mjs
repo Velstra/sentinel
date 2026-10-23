@@ -27,6 +27,31 @@ await test("the page loads without the script throwing", () => {
   noThrows("the console threw while loading");
 });
 
+await test("secret settings are masked until explicitly revealed", async () => {
+  const result = await page.evaluate(`(() => {
+    const keys = ["secret", "psk", "private-key", "preshared-key", "hashed-password", "pppoe password", "wwan password", "auth-key", "ao-key", "bfd-auth-key", "macsec-key", "pin", "totp", "subscription-key"];
+    const masked = keys.every(key => fieldWidget([key, key], "fixture-only").type === "password");
+    const snmpMasked = fieldWidget(["community", "Community", null, null, "secret"], "fixture-only").type === "password";
+    const bgp = fieldWidget(["community", "Communities", null, "list"], "65001:1");
+    const bgpPublic = bgp.type !== "password" && !bgp.querySelector('input[type="password"]');
+    const group = fieldGrid([["secret", "Sync secret"]], {secret:"fixture-only"});
+    document.body.append(group.grid);
+    const input = group.widgets[0];
+    const button = group.grid.querySelector('button[data-secret-toggle]');
+    if (!button) {group.grid.remove();return {masked, toggle:false};}
+    const label = group.grid.querySelector('label[for="'+input.id+'"]');
+    const named = !!label && label.textContent === "Sync secret";
+    button.click(); const revealed = input.type === "text" && button.getAttribute("aria-pressed") === "true";
+    button.click(); const hidden = input.type === "password" && button.getAttribute("aria-pressed") === "false";
+    const unchanged = fieldLines([["secret", "Sync secret"]], group.widgets, "system config-sync", {secret:"fixture-only"}).length === 0;
+    const valueKept = input.value === "fixture-only";
+    group.grid.remove();
+    return {masked,snmpMasked,bgpPublic,toggle:true,named,revealed,hidden,unchanged,valueKept,plain:fieldWidget(["description","Description"],"public").type === "text"};
+  })()`);
+  check(result.masked, "a secret field was readable by default");
+  for (const key of ["snmpMasked","bgpPublic","toggle","named","revealed","hidden","unchanged","valueKept","plain"]) check(result[key], "secret control contract: " + key);
+});
+
 // --- navigation -------------------------------------------------------------
 
 // One rail entry per call, not sixty in one.
@@ -1395,6 +1420,33 @@ await test("validating leaves the change staged and applyable", async () => {
   check(/would|accept/i.test(after.title), `the dialog claims it applied: ${after.title}`);
 });
 
+await test("validation refuses a semantically invalid candidate without changing the appliance", async () => {
+  const before = readFileSync(CONFIG, "utf8");
+  const r = await page.evaluate(`(async () => {
+    staged = []; dirty.clear(); renderStaged();
+    stage("Invalid route", ["set protocols static not-a-network via 192.0.2.1"]);
+    const before = stagedCommands();
+    document.getElementById("validate").click();
+    for (let i = 0; i < 100 && !document.getElementById("result").open; i++) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    const result = {
+      opened: document.getElementById("result").open,
+      title: document.getElementById("resulttitle").textContent,
+      message: document.getElementById("resultout").textContent,
+      before, after: stagedCommands(),
+    };
+    document.getElementById("result").close();
+    staged = []; dirty.clear(); renderStaged();
+    return result;
+  })()`);
+  check(r.opened, "validation returned no result");
+  equal(r.after, r.before, "validation discarded the candidate");
+  equal(readFileSync(CONFIG, "utf8"), before, "validation changed the saved configuration");
+  check(/refused/i.test(r.title), `invalid route was reported as accepted: ${r.title}`);
+  check(/prefix|network|cidr/i.test(r.message), `validation gave no useful reason: ${r.message}`);
+});
+
 // Every control, in every section, actually operated.
 //
 // The section walk proves each page *renders*. This proves the things on it
@@ -1434,24 +1486,44 @@ await test("every control stages a command the appliance accepts", async () => {
         };
         const strip = document.querySelectorAll("#sectionstrip .secitem");
         if (strip[${p}]) { strip[${p}].click(); await wait(200); }
-        for (const sel of [...document.querySelectorAll("select")]) {
+        // Hidden pages remain mounted. Operate this page's controls once,
+        // rather than editing every hidden page again on each navigation.
+        const onScreen = (node) => node.offsetParent !== null || node.getClientRects().length > 0;
+        for (const button of [...document.querySelectorAll("button")].filter(onScreen)) {
+          if (button.textContent.trim() === "More settings") button.click();
+        }
+        // Generic fields deliberately wait for Stage. Changing the field and
+        // draining immediately tested nothing except auto-staging widgets.
+        const stageControl = (control) => {
+          for (let host = control.parentElement; host; host = host.parentElement) {
+            const foot = [...host.children].find(node => node.classList.contains("maskfoot"));
+            if (!foot) continue;
+            const button = foot.querySelector("button.btn.primary");
+            if (button && onScreen(button)) button.click();
+            break;
+          }
+        };
+        for (const sel of [...document.querySelectorAll("select")].filter(onScreen)) {
           for (const opt of [...sel.options]) {
             if (!opt.value) continue;
             sel.value = opt.value;
             sel.dispatchEvent(new Event("change", { bubbles: true }));
             await wait(25);
+            stageControl(sel);
             drain();
           }
         }
-        for (const box of [...document.querySelectorAll("input[type=checkbox]")]) {
+        for (const box of [...document.querySelectorAll("input[type=checkbox]")].filter(onScreen)) {
           box.checked = !box.checked;
           box.dispatchEvent(new Event("change", { bubbles: true }));
           await wait(25);
+          stageControl(box);
           drain();
         }
         return out;
-      })()`).catch(() => []);
+      })()`);
       staged.push(...out);
+      if (process.env.CONSOLE_PROGRESS) console.log(`       → controls ${c + 1}/${cats}, page ${p + 1}/${pages}: ${out.length} commands`);
     }
   }
 
@@ -1467,12 +1539,15 @@ await test("every control stages a command the appliance accepts", async () => {
       headers: { "Content-Type": "text/plain", Authorization: "Bearer " + token },
       body: ${JSON.stringify(body)},
     });
-    return await r.text();
+    return { status: r.status, body: await r.json() };
   })()`);
+  equal(verdict.status, 200, `the configure endpoint refused the control walk: ${JSON.stringify(verdict.body)}`);
+  check(verdict.body.ok === true && typeof verdict.body.output === "string",
+    `the control walk did not execute: ${JSON.stringify(verdict.body)}`);
   // A line that needs company — a rule's port wants a proto — is the model
   // doing its job, not a broken control: this operates each control on its own,
   // which no operator does.
-  const refused = (verdict.match(/error: [^\n"]+/g) || []).filter(
+  const refused = (verdict.body.output.match(/error: [^\n]+/g) || []).filter(
     (e) => !/together|require|need|must be|is required|not a declared|no such|not supported/i.test(e));
   check(refused.length === 0,
     `${refused.length} staged commands were refused:\n  ` + refused.slice(0, 8).join("\n  "));

@@ -73,7 +73,17 @@
         # From Cargo.toml, so the boot menu and `show version` cannot disagree —
         # the medium said 0.1.0 while the CLI on it said 0.4.2.
         version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
-        src = ./.;
+        src = lib.fileset.toSource {
+          root = ./.;
+          fileset = lib.fileset.unions [
+            ./Cargo.toml
+            ./Cargo.lock
+            ./src
+            ./example-appliance.toml
+            ./tests/console/cli-fields.txt
+            ./LICENSE
+          ];
+        };
         cargoLock.lockFile = ./Cargo.lock;
         nativeBuildInputs = [
           pkgs.protobuf
@@ -111,6 +121,8 @@
             --set SENTINEL_TIMEOUT_BIN    ${pkgs.coreutils}/bin/timeout \
             --set SENTINEL_SWANCTL_BIN    ${pkgs.strongswan}/bin/swanctl \
             --set SENTINEL_OPENSSL_BIN    ${pkgs.openssl.bin}/bin/openssl \
+            --set SENTINEL_CAT_BIN        ${pkgs.coreutils}/bin/cat \
+            --set SENTINEL_HAPROXY_BIN    ${pkgs.haproxy}/bin/haproxy \
             --set SENTINEL_LEGO_BIN       ${pkgs.lego}/bin/lego \
             `# --set-default, not --set: this names DATA rather than a binary,
              # and a newer database (or a test) has a legitimate reason to point
@@ -124,6 +136,7 @@
             --set SENTINEL_WREN_BIN       ${wrenPkg}/bin/wren \
             --set SENTINEL_LSBLK_BIN      ${pkgs.util-linux}/bin/lsblk \
             --set SENTINEL_INSTALL_BIN    ${pkgs.coreutils}/bin/install \
+            --set SENTINEL_MV_BIN         ${pkgs.coreutils}/bin/mv \
             --set SENTINEL_MKDIR_BIN      ${pkgs.coreutils}/bin/mkdir \
             --set SENTINEL_USERADD_BIN    ${pkgs.shadow}/bin/useradd \
             --set SENTINEL_USERMOD_BIN    ${pkgs.shadow}/bin/usermod \
@@ -172,13 +185,10 @@
       # fenix's `complete` nightly bundles rust-src, which the BPF target's
       # build-std needs. The agent's build.rs (aya-build) compiles the eBPF crate
       # for the bpf target during this build.
-      # Pin a nightly whose LLVM matches nixpkgs' bpf-linker (LLVM 20). The latest
-      # nightly emits LLVM 22 bitcode, which nixpkgs' LLVM-20 bpf-linker can't
-      # read ("Unknown attribute kind"). nixpkgs 25.05 ships at most LLVM 20, so
-      # the toolchain must be from the LLVM-20 era. Replace fakeHash with the
-      # value the first build reports.
-      nightlyDate = "2025-06-15";
-      nightlySha = "sha256-hMlbNn0xAaLK+EDwdxW/8ZlC8/GHLpFhqB2fhCoj/iU=";
+      # Match Fabric's verified LLVM-22 toolchain. Older LLVM cannot lower the
+      # current datapath; rolling LLVM-23 builds have emitted invalid r11 uses.
+      nightlyDate = "2026-08-01";
+      nightlySha = "sha256-9LY9sgDes2oSCyeuCFFAY37gSvElSJEwh5kiXlr76L8=";
       nightlyProfile = fenix.packages.${system}.toolchainOf {
         channel = "nightly";
         date = nightlyDate;
@@ -205,6 +215,28 @@
       rustPlatformNightly = pkgs.makeRustPlatform {
         cargo = nightly;
         rustc = nightly;
+      };
+
+      # Upstream's static LLVM-22 release avoids mixing the pinned compiler
+      # with nixpkgs 25.05's LLVM-20 linker. This is a build tool only; its
+      # immutable, hash-verified archive is not part of the appliance runtime.
+      bpfLinker = pkgs.stdenvNoCC.mkDerivation {
+        pname = "bpf-linker";
+        version = "0.10.3";
+        src = pkgs.fetchurl {
+          url = "https://github.com/aya-rs/bpf-linker/releases/download/v0.10.3/bpf-linker-x86_64-unknown-linux-musl.tar.gz";
+          hash = "sha256-D6RkXS37tcr+YjGwqp+tTxQwvQhx471zGegtgnv2Jiw=";
+        };
+        sourceRoot = ".";
+        dontConfigure = true;
+        dontBuild = true;
+        installPhase = ''
+          install -Dm755 bpf-linker "$out/bin/bpf-linker"
+        '';
+        doInstallCheck = true;
+        installCheckPhase = ''
+          "$out/bin/bpf-linker" --version | grep -Fx 'bpf-linker 0.10.3'
+        '';
       };
 
       # All aya-* crates come from one git checkout, so they share one hash.
@@ -240,18 +272,27 @@
       # The eBPF object, compiled as a FIXED-OUTPUT derivation. `-Z build-std`
       # needs std's own build-deps, which a sealed offline sandbox can't fetch —
       # so this derivation is allowed network (that's what a FOD grants) and is
-      # pinned by its output hash, keeping the result reproducible. First build
-      # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-RA4DaBqHiWvPi6YIxl2/9cHpG0px96WNQamLdAwyde0=";
+      # pinned by its observed output hash. Updating the datapath requires a
+      # fresh build and verification of the resulting object before repinning.
+      ebpfHash = "sha256-skXnUxs5uu1CmA+YnRgIMeKuMWXORpa+5xu5OmPL+bo=";
+      fabricBuildId = builtins.substring 0 12 (
+        fabric.rev or (builtins.hashString "sha256" fabric.outPath)
+      );
       velstra-ebpf = pkgs.stdenv.mkDerivation {
-        pname = "velstra-ebpf";
+        # A fixed-output path is identified by hash AND name. Include its
+        # source/toolchain identity so advancing the Fabric pin cannot silently
+        # reuse an object built from a different program with the old hash.
+        pname = "velstra-ebpf-${fabricBuildId}-${nightlyDate}-${bpfLinker.version}";
         version = "0.1.0";
         src = fabric;
-        nativeBuildInputs = [ nightly pkgs.bpf-linker ];
+        nativeBuildInputs = [ nightly bpfLinker ];
 
         outputHashMode = "flat";
         outputHashAlgo = "sha256";
         outputHash = ebpfHash;
+        # This is a BPF relocatable object, not a host ELF executable. Generic
+        # patchelf/strip fixups are inapplicable and must preserve its BTF.
+        dontFixup = true;
         # The eBPF object embeds build-path strings (debuginfo/BTF) that look like
         # store-path references; a raw object file can't actually "use" them, so
         # discard them. Needs structured attrs.
@@ -259,18 +300,12 @@
         unsafeDiscardReferences.out = true;
 
         buildPhase = ''
-          export HOME=$TMPDIR
           export CARGO_HOME=$TMPDIR/cargo
           # Same flags aya-build uses for the BPF target, plus the explicit
           # bpf-linker selection.
           export RUSTFLAGS='--cfg=bpf_target_arch="x86_64" -Cdebuginfo=2 -Clinker=bpf-linker -Clink-arg=--btf'
-          # The lockfile was generated with a newer rustc, so some build-deps of
-          # *other* workspace members (aya-build -> cargo-platform) declare a
-          # rustc newer than this pinned nightly. They aren't compiled when
-          # building velstra-ebpf, so ignore the version gate.
-          cargo build -p velstra-ebpf --bins --release \
-            --target bpfel-unknown-none -Z build-std=core \
-            --ignore-rust-version
+          cargo build -p velstra-ebpf --bins --release --locked \
+            --target bpfel-unknown-none -Z build-std=core
         '';
         installPhase = ''
           cp target/bpfel-unknown-none/release/velstra "$out"
@@ -290,7 +325,7 @@
         # must be on PATH even though our shim already supplied the object.
         nativeBuildInputs = [
           pkgs.protobuf
-          pkgs.bpf-linker
+          bpfLinker
           pkgs.removeReferencesTo
         ];
         PROTOC = "${pkgs.protobuf}/bin/protoc";
@@ -309,13 +344,17 @@
           remove-references-to -t ${nightly} "$out/bin/velstra"
         '';
         VELSTRA_EBPF_OBJ = velstra-ebpf;
-        # Build just the agent binary. --ignore-rust-version: the lockfile (made
-        # with a newer rustc) has build-deps declaring a newer rustc than this
-        # pinned LLVM-20 nightly; skip the version gate.
-        cargoBuildFlags = [ "-p" "velstra" "--ignore-rust-version" ];
+        cargoBuildFlags = [ "-p" "velstra" "--locked" ];
         # The workspace's tests need root (they load eBPF) — skip in the sandbox.
         doCheck = false;
       };
+
+      # Controller used by real-stream reconciliation/fault tests.
+      testController = velstra.overrideAttrs (old: {
+        cargoBuildFlags = [ "-p" "velstra-controller" "--locked" ];
+        postInstall = builtins.replaceStrings
+          [ "/bin/velstra\"" ] [ "/bin/velstra-controller\"" ] old.postInstall;
+      });
 
       # The factory-default appliance config, baked into the image. At runtime the
       # operator edits /var/lib/sentinel/appliance.toml; the sentinel-boot service
@@ -1334,8 +1373,8 @@
             "d /run/sentinel/ocserv 0750 root root -"
             # Reverse proxy (roadmap C22): haproxy.cfg (world-readable) + the certs/
             # subdir holding the 0600 cert+key bundles (private keys, root only).
-            "d /run/sentinel/haproxy 0750 root root -"
-            "d /run/sentinel/haproxy/certs 0700 root root -"
+            "d /run/sentinel/haproxy 0750 root wheel -"
+            "d /run/sentinel/haproxy/certs 0750 root wheel -"
             # Box-service (roadmap C18) runtime dirs: LLDP confdir, avahi + DHCP-
             # relay configs (world-readable), and the ddclient dir (0640 secret).
             "d /run/sentinel/lldpd.d 0755 root root -"
@@ -1396,7 +1435,20 @@
       # network). Edits the hostname and asserts it changed via hostnamectl while
       # the data plane stays up.
       #   nix build .#checks.x86_64-linux.commit -L
-      checks.${system} = {
+      checks.${system} =
+        let
+          # Each invocation creates an independent lazy set. CI keeps only
+          # strictly evaluated build identities, not whole NixOS module graphs.
+          makeChecks = _: {
+        policy-routing = import ./tests/policy-routing.nix {
+          inherit pkgs self velstra;
+        };
+
+        management-tls-powerloss = import ./tests/management-tls-powerloss.nix {
+          inherit pkgs;
+          sentinelModule = self.nixosModules.sentinel;
+        };
+
         # Every map the agent looks up by name exists in the object it loads.
         #
         # This exists because of one specific trap. `velstra-ebpf` is a
@@ -1454,6 +1506,38 @@
               touch $out
             '';
 
+        # Load every embedded program with the real agent and inspect actual
+        # kernel attachments, including the overlay-only BUM classifier.
+        ebpf-verifier = import ./tests/ebpf-kernel.nix {
+          inherit pkgs sentinel velstra fabric;
+          sentinelModule = self.nixosModules.sentinel;
+        };
+
+        # Real controller streams, rejected updates and late route devices.
+        reconcile = import ./tests/reconcile.nix {
+          inherit pkgs velstra;
+          sentinelModule = self.nixosModules.sentinel;
+          controller = testController;
+        };
+
+        # Actual Wren FIB events recover from apply and observation failures.
+        wren-reconcile = import ./tests/wren-reconcile.nix {
+          inherit pkgs velstra;
+          sentinelModule = self.nixosModules.sentinel;
+        };
+
+        # Capacity/permission failures exercise real map writes and packets.
+        config-transaction = import ./tests/config-transaction.nix {
+          inherit pkgs sentinel velstra;
+          sentinelModule = self.nixosModules.sentinel;
+          controller = testController;
+        };
+        egress-transaction = import ./tests/egress-transaction.nix {
+          inherit pkgs sentinel velstra;
+          sentinelModule = self.nixosModules.sentinel;
+          controller = testController;
+        };
+
         # The web console, driven in a real browser.
         #
         # Everything else about the console is checked by reading its text —
@@ -1487,7 +1571,7 @@
             };
           }
           ''
-            set -eu
+            set -euo pipefail
             export CHROMIUM=${pkgs.chromium}/bin/chromium
             export CONSOLE_PORT=18099
             # A build sandbox is slower than a workstation, and every `show` the
@@ -1523,10 +1607,18 @@
         #   nix build .#checks.x86_64-linux.contract -L
         contract = pkgs.runCommand "sentinel-contract"
           {
-            nativeBuildInputs = [ sentinel velstra pkgs.bash ];
+            nativeBuildInputs = [ sentinel velstra pkgs.bash pkgs.python3 ];
           }
           ''
             set -eu
+            python3 - <<'PY'
+            import re
+            from pathlib import Path
+            agent = re.search(r"pub const MAX_RULE_LIMITS: u32 = ([0-9_]+);", Path("${fabric}/velstra-common/src/policy.rs").read_text())
+            appliance = re.search(r"pub const MAX_RATE_LIMITED_RULES: usize = ([0-9_]+);", Path("${self}/src/compile.rs").read_text())
+            assert agent and appliance, "rate-limit capacity constants are missing"
+            assert int(agent[1].replace("_", "")) == int(appliance[1].replace("_", "")), "appliance/agent rate-limit capacity mismatch"
+            PY
             printf '[system]\nhostname = "contract"\n' > appliance.toml
             sentinel configure --config appliance.toml --no-apply <<'CLI'
             set interface eth0 zone lan
@@ -1688,6 +1780,35 @@
           machine.wait_for_unit("velstra.service")
           machine.succeed("test -f /var/lib/sentinel/appliance.toml")
           machine.succeed("test -f /run/sentinel/velstra.toml")
+          for path in ("/run/sentinel/velstra.toml", "/run/sentinel/wren.toml"):
+              machine.succeed(f"test $(stat -c %a {path}) = 640")
+              machine.succeed(f"test $(stat -c %U:%G {path}) = root:wheel")
+              machine.fail(f"su -s /bin/sh nobody -c 'cat {path}'")
+          with subtest("root and operator commits share the same apply lock"):
+              machine.succeed("test $(stat -c %a /run/sentinel/apply.lock) = 660")
+              machine.succeed("test $(stat -c %G /run/sentinel/apply.lock) = wheel")
+              machine.succeed("su admin -c 'test -w /run/sentinel/apply.lock'")
+              machine.succeed(
+                  "nohup flock /run/sentinel/apply.lock sh -c "
+                  "'touch /tmp/apply-lock-held; sleep 3' >/tmp/lock-holder.log 2>&1 &"
+              )
+              machine.wait_until_succeeds("test -f /tmp/apply-lock-held")
+              import time
+              started = time.monotonic()
+              machine.succeed("su admin -c \"printf '%s\\n' save exit | sentinel configure --no-apply\"")
+              assert time.monotonic() - started >= 1, "operator bypassed the root-held lock"
+
+          with subtest("an unavailable on-box lock refuses the commit"):
+              before = machine.succeed("hostname").strip()
+              machine.succeed("chmod 600 /run/sentinel/apply.lock")
+              status, output = machine.execute(
+                  "su admin -c \"printf '%s\\n' 'set system hostname lock-bypass' "
+                  "commit exit | sentinel configure 2>&1\""
+              )
+              assert status != 0, "an unlocked configuration session was accepted"
+              assert "apply lock" in output.lower(), output
+              assert machine.succeed("hostname").strip() == before, "unlocked commit changed the host"
+              machine.succeed("chmod 660 /run/sentinel/apply.lock")
           # The system's real NIC (eth0) is discovered and shows up in the config,
           # ready to assign — VyOS-style. (The minimal factory config has no
           # interfaces of its own.)
@@ -1873,6 +1994,14 @@
           # still-writing producer under pipefail)
           machine.succeed("sentinel show version | grep wren")
           machine.succeed("sentinel show firewall")
+          machine.wait_until_succeeds("wren show routes", timeout=30)
+          machine.wait_until_succeeds("sentinel agent-query stats", timeout=30)
+          # Operator commits retain private runtime configs and usable services.
+          for path in ("/run/sentinel/velstra.toml", "/run/sentinel/wren.toml"):
+              machine.succeed(f"test $(stat -c %a {path}) = 640")
+              machine.succeed(f"test $(stat -c %U:%G {path}) = root:wheel")
+              machine.succeed(f"su admin -c 'test -r {path}'")
+              machine.fail(f"su -s /bin/sh nobody -c 'cat {path}'")
         '';
       };
 
@@ -1905,6 +2034,12 @@
           machine.wait_for_unit("sentinel-boot.service")
           machine.wait_for_unit("velstra.service")
           machine.succeed("test -f /var/lib/sentinel/appliance.toml")
+
+          with subtest("local and pinned-TLS peer reads preserve account permissions"):
+              machine.succeed(
+                  "${pkgs.python3}/bin/python3 ${./tests/api-read-permissions.py} "
+                  "${sentinel}/bin/sentinel"
+              )
 
           # The API service is off by default (a box service); start it explicitly.
           machine.succeed("systemctl start sentinel-api.service")
@@ -2183,16 +2318,28 @@
           )
           assert "console-masq" not in cfg, cfg
 
-          # A script with no commit validates and changes nothing — what the
-          # console's "validate only" button sends.
-          machine.succeed(
-              "printf '%s\n' 'set firewall rule dry-run from wan' > /tmp/dry"
-          )
-          machine.succeed(
-              "curl -sSk -X POST -H 'Authorization: Bearer " + token + "' "
-              "--data-binary @/tmp/dry https://127.0.0.1:8080/api/v1/configure"
-          )
-          machine.fail("grep -q dry-run /var/lib/sentinel/appliance.toml")
+          with subtest("candidate validation cannot apply or save on a live appliance"):
+              validation_files = (
+                  "/var/lib/sentinel/appliance.toml /run/sentinel/running.toml "
+                  "/run/sentinel/velstra.toml /run/sentinel/wren.toml"
+              )
+              before = machine.succeed("sha256sum " + validation_files)
+              hostname = machine.succeed("hostname")
+              for command, expected in [
+                  ("set system hostname preview-only", "200"),
+                  ("set protocols static not-a-network via 192.0.2.1", "400"),
+                  ("commit", "400"),
+                  ("save", "400"),
+              ]:
+                  code = machine.succeed(
+                      f"curl -sk -o /tmp/validation-result -w '%{{http_code}}' -X POST "
+                      f"-H 'Authorization: Bearer {token}' -H 'Content-Type: text/plain' "
+                      f"--data-binary '{command}' "
+                      "https://127.0.0.1:8080/api/v1/configure/validate"
+                  ).strip()
+                  assert code == expected, machine.succeed("cat /tmp/validation-result")
+                  assert machine.succeed("sha256sum " + validation_files) == before
+                  assert machine.succeed("hostname") == hostname
 
           # The four service masks, each through the same command path: a BGP
           # neighbour, an IPsec tunnel, a WireGuard interface with a peer, and a
@@ -2385,6 +2532,34 @@
               f"https://127.0.0.1:8080{paths[0]}"
           ).strip()
           assert code == "401", f"{paths[0]} served data without a token ({code})"
+
+          with subtest("rotating a sync key reloads API authentication without restarting"):
+              machine.succeed(
+                  "printf '%s\n' 'set system config-sync secret rotation-initial-secret' "
+                  "commit save | sentinel configure"
+              )
+              machine.wait_until_succeeds(
+                  "curl -fsSk -H 'Authorization: Bearer rotation-initial-secret' "
+                  "https://127.0.0.1:8080/api/v1/config >/dev/null"
+              )
+              pid = machine.succeed("systemctl show -p MainPID --value sentinel-api.service").strip()
+              machine.succeed(
+                  "printf '%s\n' 'set system config-sync secret rotation-replaced-secret' "
+                  "commit save | sentinel configure"
+              )
+              code = machine.succeed(
+                  "curl -sk -o /dev/null -w '%{http_code}' "
+                  "-H 'Authorization: Bearer rotation-initial-secret' "
+                  "https://127.0.0.1:8080/api/v1/config"
+              ).strip()
+              assert code == "401", f"previous credential survived rotation: {code}"
+              machine.succeed(
+                  "curl -fsSk -H 'Authorization: Bearer rotation-replaced-secret' "
+                  "https://127.0.0.1:8080/api/v1/config >/dev/null"
+              )
+              assert pid == machine.succeed("systemctl show -p MainPID --value sentinel-api.service").strip()
+              assert machine.succeed("stat -c %a /var/lib/sentinel/api-token").strip() == "600"
+              machine.fail("find /var/lib/sentinel -maxdepth 1 -name 'api-token.token.*.tmp' -print | grep .")
         '';
       };
 
@@ -2455,6 +2630,30 @@
           )
           assert '"token"' in out and "read-only" in out, out
 
+          # A successful directory bind must produce a usable, restricted API
+          # session, including after an unrelated configuration commit.
+          import json
+          directory_token = json.loads(out)["token"]
+          machine.succeed(
+              f"curl -fsSk -H 'Authorization: Bearer {directory_token}' "
+              "https://127.0.0.1:8080/api/v1/config > /dev/null"
+          )
+          forbidden = machine.succeed(
+              f"curl -sk -o /dev/null -w '%{{http_code}}' "
+              f"-H 'Authorization: Bearer {directory_token}' -X PUT "
+              "-H 'Content-Type: application/json' -d '{}' "
+              "https://127.0.0.1:8080/api/v1/config"
+          ).strip()
+          assert forbidden == "403", forbidden
+          machine.succeed(
+              "su admin -c \"printf '%s\\n' 'set system hostname directory-session' "
+              "commit save exit | sentinel configure\""
+          )
+          machine.succeed(
+              f"curl -fsSk -H 'Authorization: Bearer {directory_token}' "
+              "https://127.0.0.1:8080/api/v1/config > /dev/null"
+          )
+
           # A wrong password is a 401 — an answer, from the server that gave
           # it, and the refusal says which protocol refused.
           code = machine.succeed(
@@ -2486,6 +2685,15 @@
               "https://127.0.0.1:8080/api/v1/login"
           )
           assert '"token"' in out, out
+
+          with subtest("concurrent LDAP logins cannot share bind credentials"):
+              # Invoke the actual ELF directly so its test launcher can freeze
+              # the credential boundary; the production wrapper deliberately
+              # pins ldapwhoami and must not accept executable overrides.
+              machine.succeed(
+                  "${pkgs.python3}/bin/python3 -W error ${./tests/ldap-login-concurrency.py} "
+                  "--isolated-runtime ${sentinel}/bin/.sentinel-wrapped ${pkgs.openldap}"
+              )
         '';
       };
 
@@ -3593,25 +3801,19 @@
           crt = "/var/lib/sentinel/pki/certs/web-cert/cert.crt"
           fw.wait_until_succeeds(f"test -f {crt}", timeout=30)
 
-          # Append the reverse-proxy frontend to the saved config and apply it via
-          # the boot-late path — which loads the real Appliance (reverse_proxy
-          # intact, unlike the draft round-trip) and runs proxy::apply. TLS via the
-          # web-cert leaf on :443, two round-robin backends.
+          # Configure both frontends through the operator's live commit path.
+          # Boot-late follows the applied snapshot; editing a saved file alone
+          # must not override an unsaved, already running configuration.
           fw.succeed(
-              "cat >> /var/lib/sentinel/appliance.toml <<'EOF'\n"
-              "[[services.reverse-proxy]]\n"
-              "name = \"web\"\n"
-              "port = 443\n"
-              "certificate = \"web-cert\"\n"
-              "backends = [\"10.0.0.3:8080\", \"10.0.0.3:8081\"]\n"
-              "[[services.reverse-proxy]]\n"
-              "name = \"stream\"\n"
-              "mode = \"tcp\"\n"
-              "port = 8443\n"
-              "backends = [\"10.0.0.3:8080\"]\n"
-              "EOF"
+              "su admin -c \"printf '%s\\n' "
+              "'set services reverse-proxy web port 443' "
+              "'set services reverse-proxy web certificate web-cert' "
+              "'set services reverse-proxy web backends 10.0.0.3:8080,10.0.0.3:8081' "
+              "'set services reverse-proxy stream mode tcp' "
+              "'set services reverse-proxy stream port 8443' "
+              "'set services reverse-proxy stream backends 10.0.0.3:8080' "
+              "commit save exit | sentinel configure\""
           )
-          fw.succeed("sentinel apply-boot-late --config /var/lib/sentinel/appliance.toml")
 
           # (1) proxy::apply rendered haproxy.cfg (frontend + backend + `ssl crt` +
           # one checked server per backend) and the 0600 cert+key bundle, and the
@@ -3624,6 +3826,9 @@
           assert "server s1 10.0.0.3:8081 check" in cfg, cfg
           mode = fw.succeed("stat -c %a /run/sentinel/haproxy/certs/web.pem").strip()
           assert mode == "600", mode
+          fw.fail("su admin -c 'cat /var/lib/sentinel/pki/certs/web-cert/cert.key'")
+          fw.fail("su admin -c 'cat /run/sentinel/haproxy/certs/web.pem'")
+          fw.fail("su -s /bin/sh nobody -c 'cat /run/sentinel/haproxy/certs/web.pem'")
           assert "frontend fe_stream" in cfg, cfg
           assert "no option forwardfor" not in cfg, cfg
           fw.succeed("haproxy -c -f /run/sentinel/haproxy/haproxy.cfg")
@@ -3644,6 +3849,16 @@
               "echo \"$OUT\" | grep -q BACKEND-A && echo \"$OUT\" | grep -q BACKEND-B",
               timeout=60,
           )
+
+          # Reading private bundles for change detection must not restart an
+          # unchanged proxy on every unrelated operator commit.
+          proxy_pid = fw.succeed("systemctl show -p MainPID --value haproxy.service").strip()
+          fw.succeed(
+              "su admin -c \"printf '%s\\n' 'set system hostname proxy-stable' "
+              "commit save exit | sentinel configure\""
+          )
+          assert fw.succeed("systemctl show -p MainPID --value haproxy.service").strip() == proxy_pid
+          client.succeed("curl -fsSk https://10.0.0.1:443/ | grep -qE 'BACKEND-[AB]'")
         '';
       };
 
@@ -6161,6 +6376,13 @@
                   detail = machine.succeed("mdadm --detail /dev/md/sentinel-data")
                   assert "raid1" in detail, detail
                   assert "active sync" in detail, detail
+                  # The monitor must have a working notification destination,
+                  # including on isolated appliances without a mail service.
+                  machine.succeed("mdadm --monitor --oneshot --test /dev/md/sentinel-data")
+                  machine.wait_until_succeeds(
+                      "journalctl -t sentinel-raid --no-pager | grep -F TestMessage",
+                      timeout=20,
+                  )
                   # The array carries the data filesystem, labelled `data`.
                   assert 'LABEL="data"' in machine.succeed("blkid /dev/md/sentinel-data")
                   # Both members are typed Linux RAID (GPT type GUID), checked via
@@ -7232,6 +7454,7 @@
                 };
                 systemd.services.web = {
                   wantedBy = [ "multi-user.target" ];
+                  wants = [ "network-online.target" ];
                   after = [ "network-online.target" ];
                   script = ''
                     mkdir -p /srv/web && echo hello-from-server > /srv/web/index.html
@@ -7580,6 +7803,7 @@
                 };
                 systemd.services.web = {
                   wantedBy = [ "multi-user.target" ];
+                  wants = [ "network-online.target" ];
                   after = [ "network-online.target" ];
                   script = ''
                     mkdir -p /srv/web && echo hello-from-server > /srv/web/index.html
@@ -7737,6 +7961,7 @@
                 };
                 systemd.services.web = {
                   wantedBy = [ "multi-user.target" ];
+                  wants = [ "network-online.target" ];
                   after = [ "network-online.target" ];
                   script = ''
                     mkdir -p /srv/web && echo hello-from-protected > /srv/web/index.html
@@ -7976,6 +8201,7 @@
                 };
                 systemd.services.web = {
                   wantedBy = [ "multi-user.target" ];
+                  wants = [ "network-online.target" ];
                   after = [ "network-online.target" ];
                   script = ''
                     mkdir -p /srv/web && echo hello-from-server > /srv/web/index.html
@@ -8275,6 +8501,7 @@
                 services.velstra.interface = lib.mkForce "eth1";
                 systemd.services.web = {
                   wantedBy = [ "multi-user.target" ];
+                  wants = [ "network-online.target" ];
                   after = [ "network-online.target" ];
                   script = ''
                     mkdir -p /srv/web && echo hello-from-server > /srv/web/index.html
@@ -8418,6 +8645,7 @@
                 };
                 systemd.services.web = {
                   wantedBy = [ "multi-user.target" ];
+                  wants = [ "network-online.target" ];
                   after = [ "network-online.target" ];
                   script = ''
                     mkdir -p /srv/web && echo hello-from-server > /srv/web/index.html
@@ -8556,12 +8784,19 @@
                       f"'set interface sec0 macsec-key ${key}' 'set interface sec0 macsec-peer {peermac}' "
                       f"'set interface sec0 zone lan' 'set interface sec0 address {addr}' "
                       "'set firewall zone lan default-action accept' "
-                      "commit save exit "
+                      "commit exit "
                       "| sentinel configure\""
                   )
 
               configure(a, "${macA}", "${macB}", "10.9.0.1/24")
               configure(b, "${macB}", "${macA}", "10.9.0.2/24")
+
+              # Reproduce a delayed boot stage after a live, unsaved commit.
+              # It must follow the applied snapshot, not stop MACsec using the
+              # older saved baseline. No boot-timing assumption is required.
+              for node in (a, b):
+                  node.fail("grep -q sec0 /var/lib/sentinel/appliance.toml")
+                  node.succeed("sentinel apply-boot-late --config /var/lib/sentinel/appliance.toml")
 
               # networkd created the encrypted device and the sentinel-macsec unit
               # installed its secure associations (the keys).
@@ -14294,6 +14529,24 @@
             )
             assert "no revision 999" in out, out
             machine.succeed("hostname | grep -x rev-b")
+            with subtest("private revisions and legacy permission recovery"):
+                revisions = machine.succeed("find /var/lib/sentinel/archive -name 'config-*.toml'").splitlines()
+                assert len(revisions) >= 3, revisions
+                for path in revisions:
+                    machine.succeed(f"test $(stat -c %a {path}) = 640")
+                machine.fail("su -s /bin/sh nobody -c 'cat /var/lib/sentinel/archive/config-*.toml'")
+                machine.succeed(
+                    "cp /var/lib/sentinel/appliance.toml "
+                    "/var/lib/sentinel/archive/config-00000000000000000001.toml"
+                )
+                machine.succeed("chmod 644 /var/lib/sentinel/archive/config-00000000000000000001.toml")
+                machine.succeed("chmod 644 /var/lib/sentinel/appliance.toml")
+                machine.succeed("sentinel apply-boot --config /var/lib/sentinel/appliance.toml")
+                machine.succeed("test $(stat -c %a /var/lib/sentinel/appliance.toml) = 640")
+                machine.succeed(
+                    "test $(stat -c %a /var/lib/sentinel/archive/config-00000000000000000001.toml) = 640"
+                )
+                machine.succeed("su admin -c 'sentinel show system commit 0'")
           '';
         };
 
@@ -15011,6 +15264,18 @@
               primary.succeed("ls /var/lib/sentinel/configsync/*.pin")
             '';
           };
-      };
+          };
+          # Recreate diagnostic/override attributes only when explicitly used.
+          # This helper's environment contains names, never the evaluated test.
+          deferredAttributes = name: keys:
+            lib.genAttrs keys (key: (makeChecks null).${name}.${key});
+        in
+        # Capture only each name, never a shared set of evaluated VM tests.
+        lib.genAttrs (builtins.attrNames (makeChecks null)) (name:
+          let job = lib.hydraJob (makeChecks null).${name};
+          in job // deferredAttributes name
+            (builtins.filter (key: !(builtins.hasAttr key job))
+              (builtins.attrNames (makeChecks null).${name}))
+        );
     };
 }

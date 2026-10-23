@@ -33,7 +33,7 @@ pub fn document() -> Value {
             "responses": {
                 "200": { "description": op.answer },
                 "default": {
-                    "description": "Refused: `{\"error\": \"<a sentence>\"}` with the status saying why (400 malformed, 401 no or wrong token, 429 locked out, 500 the box could not answer).",
+                    "description": "Refused: `{\"error\": \"<a sentence>\"}` with the status saying why (400 malformed, 401 no or wrong token, 403 insufficient permission, 429 locked out, 500 the box could not answer).",
                     "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
                 },
             },
@@ -232,6 +232,22 @@ const OPERATIONS: &[Operation] = &[
         open: false,
     },
     Operation {
+        method: "get",
+        path: "/api/v1/config/revisions/{revision}",
+        id: "get-config-revision",
+        summary: "An archived configuration, with every secret redacted.",
+        description: "Revision zero is the newest saved revision. Missing or invalid revisions are refused. This structured read also lets a stack proxy render a historical configuration without forwarding the peer's privileged command output to a read-only account.",
+        parameters: &[(
+            "revision",
+            "path",
+            "Nonnegative revision index; zero is newest.",
+        )],
+        body: None,
+        answer: "The archived configuration.",
+        answer_shape: Some(("application/json", any_object)),
+        open: false,
+    },
+    Operation {
         method: "put",
         path: "/api/v1/config",
         id: "put-config",
@@ -272,7 +288,7 @@ const OPERATIONS: &[Operation] = &[
         path: "/api/v1/show/{path}",
         id: "show",
         summary: "An operational `show`, by path.",
-        description: "`/api/v1/show/ip/route` is `show ip route`; the words of the path are the words of the command. The text the CLI prints, as the CLI prints it.",
+        description: "`/api/v1/show/ip/route` is `show ip route`. Configuration and archived reads redact credentials for read-only accounts. Administrators retain the CLI's replayable configuration export.",
         parameters: &[(
             "path",
             "path",
@@ -383,10 +399,22 @@ const OPERATIONS: &[Operation] = &[
         path: "/api/v1/configure",
         id: "configure",
         summary: "Run a configuration script: `set` / `delete` / `commit` lines, as the CLI would.",
-        description: "The body is the script, one command per line, and the answer is everything the CLI would have printed. A refused commit is reported in that output, not in the status code, so read the output rather than trusting `ok`. At most 256 KiB.",
+        description: "The body is the script, one command per line, and the answer is everything the CLI would have printed. `ok` reflects the session exit status; refusals are detailed in `output`. Use `/configure/validate` for a complete candidate check without applying or saving. At most 256 KiB.",
         parameters: &[],
         body: Some(("text/plain", text)),
         answer: "`{ok, output}` — the CLI's text.",
+        answer_shape: Some(("application/json", any_object)),
+        open: false,
+    },
+    Operation {
+        method: "post",
+        path: "/api/v1/configure/validate",
+        id: "configure-validate",
+        summary: "Validate an editing script without changing the appliance.",
+        description: "Apply set/delete/edit/up/top commands to an in-memory candidate and validate the complete document. Operational, commit, save and rollback commands are refused. No runtime or saved state changes. At most 256 KiB. Requires write permission like the configuration editor.",
+        parameters: &[],
+        body: Some(("text/plain", text)),
+        answer: "`{ok: true, output}` when valid; HTTP 400 with an error otherwise.",
         answer_shape: Some(("application/json", any_object)),
         open: false,
     },
@@ -419,10 +447,14 @@ const OPERATIONS: &[Operation] = &[
         path: "/api/v1/lookup/{kind}/{value}",
         id: "lookup",
         summary: "What the appliance can tell you about a value you are typing.",
-        description: "The console never reaches outside itself; it asks here, and this asks the world — a hostname's addresses, an address's name, a country's code.",
+        description: "Look up the holder of an autonomous system number (`asn`) or the reverse DNS name of an IP address (`ptr`). An unavailable answer returns `known: false`; an unknown kind or malformed value is rejected.",
         parameters: &[
-            ("kind", "path", "`host`, `address`, `country`, …"),
-            ("value", "path", "The value."),
+            ("kind", "path", "`asn` or `ptr`."),
+            (
+                "value",
+                "path",
+                "An AS number for `asn`, or an IPv4/IPv6 address for `ptr`.",
+            ),
         ],
         body: None,
         answer: "`{known, answer}`.",
@@ -458,7 +490,7 @@ const OPERATIONS: &[Operation] = &[
         path: "/api/v1/stack/{member}/show/{path}",
         id: "stack-show",
         summary: "An operational `show` on a peer, forwarded over the sync link.",
-        description: "A peer's management port is usually not reachable from wherever the operator is, and this box already trusts the link; the request is forwarded already authenticated.",
+        description: "A peer's management port is usually not reachable from wherever the operator is. Read-only configuration views use structured redacted peer reads, so the proxy's credential never elevates the caller. Historical views require the peer's structured revision endpoint; unsupported reads fail closed.",
         parameters: &[
             ("member", "path", "The peer, as `/api/v1/stack` names it."),
             ("path", "path", "The show path."),
@@ -476,10 +508,15 @@ pub(crate) mod tests {
 
     /// The router's paths, spelled the way OpenAPI spells them.
     fn served() -> Vec<(String, String)> {
-        let src = include_str!("api.rs");
+        routes_in(include_str!("api.rs"))
+    }
+
+    fn routes_in(src: &str) -> Vec<(String, String)> {
         let mut out = Vec::new();
-        for (at, needle) in src.match_indices(".route(\"") {
-            let rest = &src[at + needle.len()..];
+        for (at, needle) in src.match_indices(".route(") {
+            let Some(rest) = src[at + needle.len()..].trim_start().strip_prefix('"') else {
+                continue;
+            };
             let Some(end) = rest.find('"') else { continue };
             let path = rest[..end]
                 .replace("/*path", "/{path}")
@@ -490,16 +527,60 @@ pub(crate) mod tests {
                 })
                 .collect::<Vec<_>>()
                 .join("/");
-            // The verbs on the same line: `get(x).put(y)`.
-            let line_end = rest.find('\n').unwrap_or(rest.len());
-            let line = &rest[end..line_end];
+            // rustfmt wraps longer paths and handlers over several lines.
+            // Stop at this route's closing parenthesis, not at a newline or
+            // the next route, so unrelated handlers cannot add phantom verbs.
+            let tail = &rest[end + 1..];
+            let mut depth = 1;
+            let mut quoted = false;
+            let mut escaped = false;
+            let mut close = tail.len();
+            for (index, ch) in tail.char_indices() {
+                if quoted {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '"' {
+                        quoted = false;
+                    }
+                    continue;
+                }
+                match ch {
+                    '"' => quoted = true,
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = index;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let handlers = &tail[..close];
             for verb in ["get", "put", "post", "patch", "delete"] {
-                if line.contains(&format!("{verb}(")) {
+                if handlers.contains(&format!("{verb}(")) {
                     out.push((verb.to_string(), path.clone()));
                 }
             }
         }
         out
+    }
+
+    #[test]
+    fn route_inventory_survives_multiline_formatting() {
+        assert_eq!(
+            routes_in(
+                "router.route(\n\"/api/v1/config/:revision\",\nget(read).put(write),\n).route(\"/next\", post(next))"
+            ),
+            vec![
+                ("get".to_string(), "/api/v1/config/{revision}".to_string()),
+                ("put".to_string(), "/api/v1/config/{revision}".to_string()),
+                ("post".to_string(), "/next".to_string()),
+            ],
+        );
     }
 
     /// The console and the favicon are pages, not API; everything else the

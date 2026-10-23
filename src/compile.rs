@@ -456,10 +456,32 @@ pub(crate) struct PortForwardOut {
     pub(crate) snat_ip: Option<String>,
 }
 
+/// The agent's packed rule value has seven bits for the shared bucket index.
+/// The Nix contract check verifies this against Fabric's ABI constant.
+pub const MAX_RATE_LIMITED_RULES: usize = 127;
+
 impl VelstraConfig {
+    /// Count emitted rules, including protocol, group and zone expansion.
+    /// Reject overflow before a commit can install an unlimited fallback.
+    pub fn validate_capacity(&self) -> anyhow::Result<()> {
+        let limited = self
+            .policies
+            .iter()
+            .flat_map(|policy| &policy.port_rules)
+            .filter(|rule| rule.limit.is_some_and(|limit| limit > 0))
+            .count();
+        if limited > MAX_RATE_LIMITED_RULES {
+            anyhow::bail!(
+                "firewall: {limited} rate-limited rules after expansion exceeds the data plane's {MAX_RATE_LIMITED_RULES}; reduce the number of rate-limited rules or their expansion"
+            );
+        }
+        Ok(())
+    }
+
     /// Render as the TOML the Velstra agent loads with `--config`.
     pub fn to_toml(&self) -> anyhow::Result<String> {
         use anyhow::Context;
+        self.validate_capacity()?;
         toml::to_string_pretty(self).context("serializing the velstra config")
     }
 }
@@ -1058,6 +1080,153 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                 peers: e.srv6_peers.clone(),
             }
         }),
+    }
+}
+
+// ---- attribution ----------------------------------------------------------
+
+/// One live flow, as the data plane reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Flow {
+    pub policy: u32,
+    pub proto: String,
+    pub src: std::net::IpAddr,
+    pub dst: std::net::IpAddr,
+    pub dst_port: u16,
+    pub packets: u64,
+}
+
+/// What a rule is currently carrying.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Hits {
+    pub flows: u64,
+    pub packets: u64,
+}
+
+/// Attribute live flows to the rules that admitted them.
+///
+/// Not a hardware counter — the data plane counts globally, not per rule — but
+/// the answer to the question people actually have: which rules are carrying
+/// traffic, and which are carrying none. The matching is done against the
+/// **compiled** rules rather than the configured ones, so it applies the same
+/// ranking the data plane does (longest prefix wins; on an equal prefix the
+/// stricter action) and cannot drift from what is loaded.
+///
+/// Only `accept` rules are counted, and the caller must say so. A rule that
+/// drops leaves no flow behind — the packet is gone — so a zero against a drop
+/// rule would mean "nothing got through here", which is what it is *for*, and
+/// reporting that as "never matched" would invite somebody to delete the rule
+/// that is doing its job.
+pub fn attribute(cfg: &VelstraConfig, flows: &[Flow]) -> BTreeMap<String, Hits> {
+    let mut out: BTreeMap<String, Hits> = BTreeMap::new();
+    // Every accept rule starts at zero, so a rule carrying nothing is present in
+    // the answer rather than missing from it.
+    for policy in &cfg.policies {
+        for r in &policy.port_rules {
+            if r.action == "pass" && !r.name.is_empty() {
+                out.entry(r.name.clone()).or_default();
+            }
+        }
+    }
+    for flow in flows {
+        let Some(policy) = cfg.policies.iter().find(|p| p.id == flow.policy) else {
+            continue;
+        };
+        let mut best: Option<(&PortRule, u8)> = None;
+        for r in &policy.port_rules {
+            if r.proto != flow.proto || (r.port != 0 && r.port != flow.dst_port) {
+                continue;
+            }
+            // One end per rule — the data plane ranks a source-scoped and a
+            // destination-scoped rule against each other by prefix length, and
+            // this has to agree with it.
+            let bits = match (&r.src, &r.dst) {
+                (Some(cidr), _) => match cidr_contains(cidr, flow.src) {
+                    Some(b) => b,
+                    None => continue,
+                },
+                (_, Some(cidr)) => match cidr_contains(cidr, flow.dst) {
+                    Some(b) => b,
+                    None => continue,
+                },
+                (None, None) => 0,
+            };
+            if best.is_none_or(|(_, b)| bits > b) {
+                best = Some((r, bits));
+            }
+        }
+        if let Some((r, _)) = best {
+            if r.action == "pass" && !r.name.is_empty() {
+                let e = out.entry(r.name.clone()).or_default();
+                e.flows += 1;
+                e.packets += flow.packets;
+            }
+        }
+    }
+    out
+}
+
+/// Parse the agent's flow table.
+///
+/// The agent renders a fixed-width table rather than JSON, so this reads it back
+/// — which means it has to be forgiving: a header line, a "… n more" footer and
+/// a NAT column that is only meaningful for some rows. Anything that does not
+/// parse is skipped rather than failing the whole report, because a report that
+/// vanishes on one odd line is worse than one that is short by it.
+pub fn parse_flows(text: &str) -> Vec<Flow> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 7 {
+            continue;
+        }
+        let Ok(policy) = f[0].parse::<u32>() else {
+            continue; // the header, or the footer
+        };
+        let split = |s: &str| -> Option<(std::net::IpAddr, u16)> {
+            let (ip, port) = s.rsplit_once(':')?;
+            Some((ip.parse().ok()?, port.parse().ok()?))
+        };
+        let (Some((src, _)), Some((dst, dst_port))) = (split(f[2]), split(f[3])) else {
+            continue;
+        };
+        out.push(Flow {
+            policy,
+            proto: f[1].to_string(),
+            src,
+            dst,
+            dst_port,
+            packets: f[5].parse().unwrap_or(0),
+        });
+    }
+    out
+}
+
+/// Whether `addr` is inside `cidr`, and how specific that was. `None` when it is
+/// not, or when the two are different address families.
+fn cidr_contains(cidr: &str, addr: std::net::IpAddr) -> Option<u8> {
+    let (net, len) = cidr.split_once('/')?;
+    let len: u8 = len.parse().ok()?;
+    match (net.parse().ok()?, addr) {
+        (std::net::IpAddr::V4(n), std::net::IpAddr::V4(a)) => {
+            if len > 32 {
+                return None;
+            }
+            let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+            (u32::from(n) & mask == u32::from(a) & mask).then_some(len)
+        }
+        (std::net::IpAddr::V6(n), std::net::IpAddr::V6(a)) => {
+            if len > 128 {
+                return None;
+            }
+            let mask = if len == 0 {
+                0
+            } else {
+                u128::MAX << (128 - len)
+            };
+            (u128::from(n) & mask == u128::from(a) & mask).then_some(len)
+        }
+        _ => None,
     }
 }
 
@@ -1953,6 +2122,42 @@ action = "accept"
         assert!(rule.dst.is_none());
     }
 
+    fn expanded_rate_limit_config(dual_rules: usize, one_single_rule: bool) -> String {
+        let mut source = String::from(
+            "[system]\nhostname = \"capacity\"\n[[interface]]\nname = \"wan0\"\nzone = \"wan\"\n",
+        );
+        for index in 0..dual_rules {
+            source.push_str(&format!("[[rule]]\nname = \"r{index}\"\nfrom = \"wan\"\nproto = \"tcp_udp\"\nport = {}\naction = \"accept\"\nlimit = 100\n",10000+index));
+        }
+        if one_single_rule {
+            source.push_str("[[rule]]\nname = \"last\"\nfrom = \"wan\"\nproto = \"tcp\"\nport = 20000\naction = \"accept\"\nlimit = 100\n");
+        }
+        source
+    }
+
+    #[test]
+    fn expanded_rate_limit_capacity_accepts_the_exact_kernel_boundary() {
+        let appliance = Appliance::from_toml(&expanded_rate_limit_config(63, true)).unwrap();
+        let emitted = compile(&appliance);
+        let count = emitted
+            .policies
+            .iter()
+            .flat_map(|policy| &policy.port_rules)
+            .filter(|rule| rule.limit.is_some())
+            .count();
+        assert_eq!(count, 127);
+        emitted.to_toml().unwrap();
+    }
+
+    #[test]
+    fn expanded_rate_limit_capacity_refuses_silent_unlimited_rules() {
+        let error = Appliance::from_toml(&expanded_rate_limit_config(64, false)).unwrap_err();
+        assert!(
+            error.to_string().contains("128 rate-limited rules"),
+            "{error:#}"
+        );
+    }
+
     /// A rate limit reaches the data plane on the rule it belongs to, and the burst
     /// stays absent when unset so the agent applies its own default rather than the
     /// compiler inventing one.
@@ -2770,152 +2975,5 @@ underlay-interface = "eth0"
             "the peer trust list is missing: {out}"
         );
         assert!(!out.contains("[overlay]"), "{out}");
-    }
-}
-
-// ---- attribution ----------------------------------------------------------
-
-/// One live flow, as the data plane reports it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Flow {
-    pub policy: u32,
-    pub proto: String,
-    pub src: std::net::IpAddr,
-    pub dst: std::net::IpAddr,
-    pub dst_port: u16,
-    pub packets: u64,
-}
-
-/// What a rule is currently carrying.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Hits {
-    pub flows: u64,
-    pub packets: u64,
-}
-
-/// Attribute live flows to the rules that admitted them.
-///
-/// Not a hardware counter — the data plane counts globally, not per rule — but
-/// the answer to the question people actually have: which rules are carrying
-/// traffic, and which are carrying none. The matching is done against the
-/// **compiled** rules rather than the configured ones, so it applies the same
-/// ranking the data plane does (longest prefix wins; on an equal prefix the
-/// stricter action) and cannot drift from what is loaded.
-///
-/// Only `accept` rules are counted, and the caller must say so. A rule that
-/// drops leaves no flow behind — the packet is gone — so a zero against a drop
-/// rule would mean "nothing got through here", which is what it is *for*, and
-/// reporting that as "never matched" would invite somebody to delete the rule
-/// that is doing its job.
-pub fn attribute(cfg: &VelstraConfig, flows: &[Flow]) -> BTreeMap<String, Hits> {
-    let mut out: BTreeMap<String, Hits> = BTreeMap::new();
-    // Every accept rule starts at zero, so a rule carrying nothing is present in
-    // the answer rather than missing from it.
-    for policy in &cfg.policies {
-        for r in &policy.port_rules {
-            if r.action == "pass" && !r.name.is_empty() {
-                out.entry(r.name.clone()).or_default();
-            }
-        }
-    }
-    for flow in flows {
-        let Some(policy) = cfg.policies.iter().find(|p| p.id == flow.policy) else {
-            continue;
-        };
-        let mut best: Option<(&PortRule, u8)> = None;
-        for r in &policy.port_rules {
-            if r.proto != flow.proto || (r.port != 0 && r.port != flow.dst_port) {
-                continue;
-            }
-            // One end per rule — the data plane ranks a source-scoped and a
-            // destination-scoped rule against each other by prefix length, and
-            // this has to agree with it.
-            let bits = match (&r.src, &r.dst) {
-                (Some(cidr), _) => match cidr_contains(cidr, flow.src) {
-                    Some(b) => b,
-                    None => continue,
-                },
-                (_, Some(cidr)) => match cidr_contains(cidr, flow.dst) {
-                    Some(b) => b,
-                    None => continue,
-                },
-                (None, None) => 0,
-            };
-            if best.is_none_or(|(_, b)| bits > b) {
-                best = Some((r, bits));
-            }
-        }
-        if let Some((r, _)) = best {
-            if r.action == "pass" && !r.name.is_empty() {
-                let e = out.entry(r.name.clone()).or_default();
-                e.flows += 1;
-                e.packets += flow.packets;
-            }
-        }
-    }
-    out
-}
-
-/// Parse the agent's flow table.
-///
-/// The agent renders a fixed-width table rather than JSON, so this reads it back
-/// — which means it has to be forgiving: a header line, a "… n more" footer and
-/// a NAT column that is only meaningful for some rows. Anything that does not
-/// parse is skipped rather than failing the whole report, because a report that
-/// vanishes on one odd line is worse than one that is short by it.
-pub fn parse_flows(text: &str) -> Vec<Flow> {
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let f: Vec<&str> = line.split_whitespace().collect();
-        if f.len() < 7 {
-            continue;
-        }
-        let Ok(policy) = f[0].parse::<u32>() else {
-            continue; // the header, or the footer
-        };
-        let split = |s: &str| -> Option<(std::net::IpAddr, u16)> {
-            let (ip, port) = s.rsplit_once(':')?;
-            Some((ip.parse().ok()?, port.parse().ok()?))
-        };
-        let (Some((src, _)), Some((dst, dst_port))) = (split(f[2]), split(f[3])) else {
-            continue;
-        };
-        out.push(Flow {
-            policy,
-            proto: f[1].to_string(),
-            src,
-            dst,
-            dst_port,
-            packets: f[5].parse().unwrap_or(0),
-        });
-    }
-    out
-}
-
-/// Whether `addr` is inside `cidr`, and how specific that was. `None` when it is
-/// not, or when the two are different address families.
-fn cidr_contains(cidr: &str, addr: std::net::IpAddr) -> Option<u8> {
-    let (net, len) = cidr.split_once('/')?;
-    let len: u8 = len.parse().ok()?;
-    match (net.parse().ok()?, addr) {
-        (std::net::IpAddr::V4(n), std::net::IpAddr::V4(a)) => {
-            if len > 32 {
-                return None;
-            }
-            let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
-            (u32::from(n) & mask == u32::from(a) & mask).then_some(len)
-        }
-        (std::net::IpAddr::V6(n), std::net::IpAddr::V6(a)) => {
-            if len > 128 {
-                return None;
-            }
-            let mask = if len == 0 {
-                0
-            } else {
-                u128::MAX << (128 - len)
-            };
-            (u128::from(n) & mask == u128::from(a) & mask).then_some(len)
-        }
-        _ => None,
     }
 }

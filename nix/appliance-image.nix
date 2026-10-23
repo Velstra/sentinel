@@ -321,6 +321,11 @@ in
 
     # mdadm RAID support, so a RAID install assembles its data array at boot.
     boot.swraid.enable = true;
+    boot.swraid.mdadmConf = ''
+      PROGRAM ${pkgs.writeShellScript "sentinel-raid-event" ''
+        exec ${pkgs.util-linux}/bin/logger --priority daemon.warning --tag sentinel-raid -- "$@"
+      ''}
+    '';
 
     # The updater mounts the ESP (vfat) to install the new slot's UKI.
     boot.supportedFilesystems.vfat = true;

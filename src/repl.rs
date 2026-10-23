@@ -12,7 +12,7 @@ use rustyline::{
     validate::Validator,
 };
 
-use crate::{compile, session::Session, system, ui};
+use crate::{compile, config::Appliance, session::Session, system, ui};
 
 /// Where the velstra agent reads its compiled config from (writable runtime
 /// path, not the read-only image).
@@ -114,6 +114,46 @@ fn split_line(line: &str) -> Vec<String> {
         out.push(word);
     }
     out
+}
+
+/// Validate an editing script against the complete candidate without executing
+/// operational, apply or persistence commands. Parsing and domain validation
+/// use the same lexer, setters and materialization as an interactive commit.
+pub(crate) fn validate_script(path: &Path, source: &str) -> Result<Appliance> {
+    let mut session = Session::load(path)?;
+    let mut context = Vec::<String>::new();
+    for (index, line) in source.lines().enumerate() {
+        let words = split_line(line);
+        let Some((command, rest)) = words.split_first() else {
+            continue;
+        };
+        let full: Vec<String> = context.iter().chain(rest).cloned().collect();
+        let args: Vec<&str> = full.iter().map(String::as_str).collect();
+        let result = match command.as_str() {
+            "set" => session.set(&args),
+            "delete" | "del" => session.delete(&args),
+            "edit" if is_interior_node(&full) => {
+                context = full;
+                Ok(())
+            }
+            "edit" => Err(edit_error(&full)),
+            "up" => {
+                pop_level(&mut context);
+                Ok(())
+            }
+            "top" => {
+                context.clear();
+                Ok(())
+            }
+            _ => Err(anyhow!(
+                "validation accepts only set, delete, edit, up and top commands"
+            )),
+        };
+        result.with_context(|| format!("line {}", index + 1))?;
+    }
+    session
+        .commit()
+        .context("validating the complete candidate")
 }
 
 pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line: &str) -> bool {
@@ -704,10 +744,8 @@ fn atomic_install(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    // Routing output and rollback snapshots carry authentication keys too.
+    system::install_config_file(path, bytes)
 }
 
 /// Restore a config file to a snapshot taken before the apply: rewrite the old
@@ -909,7 +947,14 @@ pub(crate) fn apply_live(
     // reconcile: staging uses fixed temp filenames under /run/sentinel, so two
     // writers at once could splice a networkd unit or a half-written velstra.toml.
     // Held until this function returns.
-    let _lock = system::apply_lock();
+    let _lock = system::apply_lock()?;
+
+    let desired = appliance;
+    let previous_running = Appliance::load(Path::new(Session::RUNNING)).ok();
+    // A caller asking for rollback needs the state found under this lock, not
+    // a saved snapshot loaded before a concurrent commit. Revert callers that
+    // deliberately pass None keep their existing mixed-state error behavior.
+    let rollback_to = rollback_to.and(previous_running.as_ref().or(rollback_to));
 
     // ---- Phase 1: prepare (fallible, NO live side effects) ----
     // Domain groups become address groups here: the compiler matches addresses and
@@ -969,6 +1014,12 @@ pub(crate) fn apply_live(
     // (`None` — the revert paths, and a first-ever commit) does it fall back to
     // the honest MIXED-STATE report that undoes just firewall/routing/hostname.
     if let Err(e) = crate::net::apply(appliance) {
+        return Err(match rollback_to {
+            Some(prev) => unwind_to_last_good(rb, e, prev),
+            None => unwind_err_mixed(rb, e),
+        });
+    }
+    if let Err(e) = Session::publish_running(desired, &_lock) {
         return Err(match rollback_to {
             Some(prev) => unwind_to_last_good(rb, e, prev),
             None => unwind_err_mixed(rb, e),
@@ -5268,6 +5319,71 @@ impl Completer for ConfigCompleter {
 mod tests {
     use super::*;
 
+    fn validation_fixture(tag: &str) -> (PathBuf, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("sentinel-validate-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("appliance.toml");
+        std::fs::write(&path, "[system]\nhostname = \"before\"\n[[interface]]\nname = \"eth0\"\naddress = \"192.0.2.1/24\"\n").unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn validation_materializes_the_whole_candidate_without_saving() {
+        let (dir, path) = validation_fixture("valid");
+        let before = std::fs::read(&path).unwrap();
+        let candidate = validate_script(&path, "edit interface eth0\nset description \"local # note\"\nup\ntop\nset system hostname preview\n").unwrap();
+        assert_eq!(candidate.system.hostname, "preview");
+        assert_eq!(
+            candidate.interfaces[0].description.as_deref(),
+            Some("local # note")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn validation_refuses_a_route_that_only_fails_when_materialized() {
+        let (dir, path) = validation_fixture("invalid");
+        let before = std::fs::read(&path).unwrap();
+        let error = validate_script(&path, "set protocols static not-a-network via 192.0.2.2\n")
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("complete candidate"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn validation_refuses_operational_and_persistence_commands() {
+        let (dir, path) = validation_fixture("verbs");
+        let before = std::fs::read(&path).unwrap();
+        for command in [
+            "commit",
+            "save",
+            "run clear ids blocks",
+            "rollback 0",
+            "confirm",
+            "discard",
+        ] {
+            let error =
+                validate_script(&path, &format!("set system hostname preview\n{command}\n"))
+                    .unwrap_err();
+            let error = format!("{error:#}");
+            assert!(
+                error.contains("line 2") && error.contains("only"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// The keywords offered for a context (drops the descriptions).
     fn kw(tokens: &[&str]) -> Vec<&'static str> {
         candidates(tokens).iter().map(|(k, _)| *k).collect()
@@ -6881,6 +6997,12 @@ mod tests {
         std::fs::write(&path, b"new").unwrap();
         restore_file(&path, Some(b"old")).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640,
+            "compiled routing configuration can contain authentication keys"
+        );
 
         // Snapshot None (no file existed) removes the file we wrote.
         restore_file(&path, None).unwrap();

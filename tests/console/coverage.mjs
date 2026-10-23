@@ -53,13 +53,13 @@ export const instrument = (page, { swallow = true, live = false } = {}) =>
   };
   const ro = renderObjects;
   renderObjects = (o) => {
-    try { note(o.path ? o.path("<n>") : null, o.fields); } catch (e) {}
+    note(o.path ? o.path("<n>") : null, o.fields);
     return ro(o);
   };
   const rap = typeof renderAddPanel === "function" ? renderAddPanel : null;
   if (rap) {
     renderAddPanel = (o) => {
-      try { note(o.path ? o.path("<n>") : null, o.fields); } catch (e) {}
+      note(o.path ? o.path("<n>") : null, o.fields);
       return rap(o);
     };
   }
@@ -146,7 +146,7 @@ const exercise = (page, panels = false) =>
       await wait();
     }
     return touched;
-  })()`).catch((e) => (console.error("  ! exercise", e.message), 0));
+  })()`);
 
 /// Open every category, every page inside it, and every tab strip, exercising
 /// each. One call per step: a build sandbox is slow enough that a single
@@ -161,14 +161,14 @@ export const walkAll = async (page, log = () => {}, panels = false) => {
       [...document.querySelectorAll("aside button.navitem")][${i}].click();
       await new Promise((r) => setTimeout(r, 350));
       return document.querySelectorAll("#sectionstrip .secitem").length || 1;
-    })()`).catch((e) => (log(`  ! ${cats[i]} ${e.message}`), 1));
+    })()`);
     for (let p = 0; p < pages; p++) {
       await page.evaluate(`(async () => {
         const strip = document.querySelectorAll("#sectionstrip .secitem");
         if (strip[${p}]) strip[${p}].click();
         await new Promise((r) => setTimeout(r, 300));
         return true;
-      })()`).catch((e) => log(`  ! ${cats[i]}/${p} ${e.message}`));
+      })()`);
       const spent = await exercise(page, panels);
       log(`  ${cats[i]} ${p + 1}/${pages}: ${spent} controls`);
     }
@@ -183,7 +183,7 @@ export const walkAll = async (page, log = () => {}, panels = false) => {
   // non-default tab then read as a mask the console does not have.
   const strips = await page.evaluate(`Object.keys(TABS)`);
   for (const v of strips) {
-    const n = await page.evaluate(`(TABS[${JSON.stringify(v)}] || []).length`).catch(() => 0);
+    const n = await page.evaluate(`(TABS[${JSON.stringify(v)}] || []).length`);
     for (let i = 0; i < n; i++) {
       await page.evaluate(`(async () => {
         view = ${JSON.stringify(v)}; panel = null;
@@ -192,7 +192,7 @@ export const walkAll = async (page, log = () => {}, panels = false) => {
         await refresh();
         await new Promise((r) => setTimeout(r, 400));
         return true;
-      })()`).catch((e) => log(`  ! ${v} ${i} ${e.message}`));
+      })()`);
       log(`  ${v} tab ${i + 1}/${n}: ${await exercise(page, panels)} controls`);
     }
   }

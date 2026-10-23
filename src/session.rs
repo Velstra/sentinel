@@ -2811,8 +2811,21 @@ impl Session {
     /// Record what we have just applied, so our own commit does not read as
     /// somebody else's.
     pub fn note_committed(&mut self, toml: &str) {
-        let _ = crate::system::install_config_file(Path::new(Self::RUNNING), toml);
         self.seen_running = Some(toml.to_string());
+    }
+
+    /// Publish the last successfully applied candidate while its runtime lock
+    /// is still held. Deferred boot work must not replay an older saved file
+    /// over a live (possibly not yet saved) commit.
+    pub(crate) fn publish_running(
+        appliance: &Appliance,
+        _lock: &crate::system::ApplyLock,
+    ) -> Result<()> {
+        let path = Path::new(Self::RUNNING);
+        if path.parent().is_some_and(Path::is_dir) {
+            crate::system::install_config_file(path, appliance.to_toml()?)?;
+        }
+        Ok(())
     }
 
     /// Open a session, loading `path` as the candidate if it exists.
@@ -9687,10 +9700,10 @@ impl Session {
 /// revision. Archiving is best-effort — a failed archive must never fail the
 /// save that already landed.
 pub fn persist_appliance(appliance: &Appliance, path: &Path, archive: bool) -> Result<PathBuf> {
-    // Serialise against a concurrent apply / another persist: `install_config_file`
-    // stages through a fixed temp name, so two writers at once could corrupt the
-    // saved config. Held only for this write; never nested inside an `apply_live`.
-    let _lock = crate::system::apply_lock();
+    // Serialize against concurrent runtime writes and revision archival.
+    // Installation is atomic off-box too, where there is no runtime lock.
+    // Never nest this inside an `apply_live` lock.
+    let _lock = crate::system::apply_lock()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;

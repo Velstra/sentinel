@@ -246,6 +246,12 @@ set system aaa default-group operators
 Without that rule, configuring one server would hand management access to
 everybody in the directory.
 
+Local accounts always need an explicit permission group. The directory default
+applies only to accounts without a local entry. Their API sessions survive
+unrelated commits, but removing the default group or disabling all directory
+servers withdraws access. Creating a local entry replaces the directory grant
+with that account's explicit permissions.
+
 Three answers are told apart, and the difference matters. A server that
 **rejects** has answered, and no other server is asked. A server that cannot be
 **reached** has not answered, so the next is tried; if none answers at all, the

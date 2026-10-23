@@ -31,6 +31,7 @@ mod installer_tui;
 mod ipsec;
 mod lockout;
 mod lookup;
+mod management_tls;
 mod metrics;
 mod net;
 mod openapi;
@@ -42,6 +43,7 @@ mod portmap;
 mod proxy;
 mod relay;
 mod repl;
+mod secret_input;
 mod session;
 mod system;
 mod trace;
@@ -260,7 +262,7 @@ enum Command {
     /// state a reboot wipes — tc qdiscs (QoS), Multi-WAN routes, IPsec SAs. Used
     /// by the sentinel-boot-late service.
     ApplyBootLate {
-        /// The active appliance config to apply.
+        /// Fallback config when no applied runtime snapshot exists.
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
@@ -921,16 +923,17 @@ fn apply_boot(
 ) -> Result<()> {
     // Serialise against a `commit`/API `PUT` that lands mid-boot: this stage
     // stages through the same fixed temp names, so an interleaved writer could
-    // corrupt a networkd unit or velstra.toml. Best-effort, held for the stage.
-    let _lock = system::apply_lock();
+    // corrupt a networkd unit or velstra.toml. Held for the whole stage.
+    let _lock = system::apply_lock()?;
+    system::secure_config_file(config)?;
+    archive::secure_revisions(config)?;
     // load_lenient, not load: this is the boot-time apply of the saved config,
     // and the one place an unknown key must not keep the box from coming up. A
     // rollback to an older image whose saved config carries a newer field would
     // otherwise boot unconfigured. `config check` and every interactive path
     // stay strict — see Appliance::load_lenient.
-    let appliance = identity::with_resolved(&feed::with_fetched(&domain::with_resolved(
-        &Appliance::load_lenient(config)?,
-    )));
+    let desired = Appliance::load_lenient(config)?;
+    let appliance = identity::with_resolved(&feed::with_fetched(&domain::with_resolved(&desired)));
 
     // Compile BOTH configs before writing either, so a compile error can't leave
     // a half-seeded system (velstra written, wren missing). Rendering is pure and
@@ -946,14 +949,15 @@ fn apply_boot(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    std::fs::write(out, &rendered).with_context(|| format!("writing {}", out.display()))?;
+    system::install_config_file(out, &rendered)
+        .with_context(|| format!("writing {}", out.display()))?;
 
     // Routing: seed the Wren config too (the daemon starts after, so no reload).
     if let Some(parent) = wren_out.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    std::fs::write(wren_out, &wren_rendered)
+    system::install_config_file(wren_out, &wren_rendered)
         .with_context(|| format!("writing {}", wren_out.display()))?;
 
     system::set_hostname(&appliance.system.hostname)?;
@@ -966,6 +970,7 @@ fn apply_boot(
     // SAs) — which a file can't express — is deferred to `apply-boot-late`, run
     // after networkd has brought the links up.
     net::apply_persistent(&appliance, net::ApplyMode::Boot)?;
+    session::Session::publish_running(&desired, &_lock)?;
     Ok(())
 }
 
@@ -974,10 +979,17 @@ fn apply_boot(
 /// before the links existed — tc egress qdiscs (QoS), the Multi-WAN policy
 /// routes, and the IPsec SAs. Run by the `sentinel-boot-late` service.
 fn apply_boot_late(config: &std::path::Path) -> Result<()> {
-    // Lenient for the same reason as apply_boot: the second boot stage applies
-    // the same saved config, and must survive an unknown key just the same.
-    let _lock = system::apply_lock();
-    let appliance = Appliance::load_lenient(config)?;
+    // Follow the latest applied state under the same lock as live commits. A
+    // delayed boot stage must not replay an older saved file over that state.
+    // Keep boot's lenient parsing for snapshots from a newer software version.
+    let _lock = system::apply_lock()?;
+    let running = std::path::Path::new(session::Session::RUNNING);
+    let source = if running.try_exists()? {
+        running
+    } else {
+        config
+    };
+    let appliance = Appliance::load_lenient(source)?;
     net::apply_link_runtime(&appliance)
 }
 
@@ -1338,33 +1350,7 @@ fn ask(msg: &str, default: &str) -> Result<String> {
 /// behaviour, done by hand so it costs no dependency: drop `ECHO` for the read
 /// and put the terminal back exactly as it was, including when the read fails.
 fn prompt_secret(msg: &str) -> Result<String> {
-    use std::io::Write;
-    print!("{msg}");
-    std::io::stdout().flush().ok();
-
-    let fd = libc::STDIN_FILENO;
-    let mut saved: libc::termios = unsafe { std::mem::zeroed() };
-    // Not a terminal (a piped answer file) — there is no echo to turn off.
-    let is_term = unsafe { libc::tcgetattr(fd, &mut saved) } == 0;
-    if is_term {
-        let mut quiet = saved;
-        quiet.c_lflag &= !libc::ECHO;
-        // TCSANOW, not TCSAFLUSH: flushing would discard input that arrived
-        // between the prompt and this call, which is precisely the answer.
-        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) };
-    }
-
-    let mut line = String::new();
-    let read = std::io::stdin().read_line(&mut line);
-
-    if is_term {
-        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &saved) };
-        // The newline the user typed was swallowed with the echo; put it back so
-        // the next prompt starts on its own line.
-        println!();
-    }
-    read.context("reading input")?;
-    Ok(line)
+    secret_input::prompt(msg)
 }
 
 /// Ask a yes/no question.

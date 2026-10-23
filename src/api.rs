@@ -60,6 +60,10 @@ pub const DEFAULT_TOKEN_PATH: &str = "/var/lib/sentinel/api-token";
 pub struct ApiState {
     /// The bearer token every request (except `/api/v1/health`) must present.
     pub token: String,
+    /// File-backed credentials are re-read for each request so rotation revokes
+    /// the previous key without restarting the management server. None keeps an
+    /// explicitly supplied environment token fixed for this process.
+    pub token_path: Option<PathBuf>,
     /// The running/boot config a `GET` reads and a `PUT` writes.
     pub config_path: PathBuf,
     /// Whether/where a `PUT` applies the config to the running system.
@@ -94,12 +98,22 @@ pub async fn serve(listen: &str, config: &Path, apply: Apply, token_file: &Path)
     // See [`crate::system::ignore_sigpipe`] — without it the server dies on the
     // first `curl … | grep -q`, and systemd calls that a clean exit.
     crate::system::ignore_sigpipe();
+    {
+        let _lock = crate::system::apply_lock()?;
+        crate::system::secure_config_file(config)?;
+        crate::archive::secure_revisions(config)?;
+    }
     let token = load_or_create_token(token_file)?;
     let addr: SocketAddr = listen
         .parse()
         .with_context(|| format!("parsing --listen {listen:?} (want host:port)"))?;
     let state = Arc::new(ApiState {
         token,
+        token_path: std::env::var("SENTINEL_API_TOKEN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .is_none()
+            .then(|| token_file.to_path_buf()),
         config_path: config.to_path_buf(),
         apply,
         // Beside the machine token, wherever that was put. Deriving it rather
@@ -225,6 +239,10 @@ fn install_crypto_provider() {
 pub fn router(state: Arc<ApiState>) -> Router {
     let protected = Router::new()
         .route("/api/v1/config", get(get_config).put(put_config))
+        .route(
+            "/api/v1/config/revisions/:revision",
+            get(get_config_revision),
+        )
         // A config-sync peer is not a second administrator. Its document is
         // shared policy, merged with the receiver's local identity before it
         // can reach the normal apply path.
@@ -240,6 +258,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         // same bearer auth (it is part of this protected sub-router).
         .route("/metrics", get(get_metrics_prometheus))
         .route("/api/v1/configure", post(post_configure))
+        .route("/api/v1/configure/validate", post(post_validate_configure))
         .route("/api/v1/clear/*path", post(post_clear))
         .route("/api/v1/capture", post(post_capture))
         // What the appliance can tell you about a value you are typing. The
@@ -365,48 +384,72 @@ pub fn resolve_caller(state: &ApiState, presented: &str) -> Option<Caller> {
     if presented.is_empty() {
         return None;
     }
-    if ct_eq(presented.as_bytes(), state.token.as_bytes()) {
+    let machine_token = match &state.token_path {
+        Some(path) => std::fs::read_to_string(path)
+            .ok()
+            .map(|value| value.trim().to_string()),
+        None => Some(state.token.clone()),
+    };
+    if machine_token.as_deref().is_some_and(|configured| {
+        !configured.is_empty() && ct_eq(presented.as_bytes(), configured.as_bytes())
+    }) {
         return Some(Caller {
             user: None,
             permission: Permission::ReadWrite,
         });
     }
     let appliance = Appliance::load(&state.config_path).ok()?;
-    let entries = std::fs::read_dir(&state.tokens_dir).ok()?;
-    for entry in entries.flatten() {
-        let Ok(stored) = std::fs::read_to_string(entry.path()) else {
+    // Keep directory-authenticated principals distinct from local accounts.
+    // Otherwise removing a local account could accidentally grant its stale
+    // token the directory default group's rights.
+    for (directory, root) in [
+        (false, state.tokens_dir.clone()),
+        (true, state.tokens_dir.join(".directory")),
+    ] {
+        let Ok(entries) = std::fs::read_dir(root) else {
             continue;
         };
-        let stored = stored.trim();
-        // An empty token file grants nothing: a half-written or truncated token
-        // must never authenticate an (also-empty) presented bearer.
-        if stored.is_empty() {
-            continue;
+        for entry in entries.flatten() {
+            let user = entry.file_name().to_string_lossy().into_owned();
+            if !valid_account_name(&user) {
+                continue;
+            }
+            let Ok(stored) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let stored = stored.trim();
+            if stored.is_empty() || !ct_eq(presented.as_bytes(), stored.as_bytes()) {
+                continue;
+            }
+            let group = management_group(&appliance, &user, directory)?;
+            let permission = appliance
+                .system
+                .groups
+                .iter()
+                .find(|g| g.name == group)?
+                .permission;
+            return Some(Caller {
+                user: Some(user),
+                permission,
+            });
         }
-        if !ct_eq(presented.as_bytes(), stored.as_bytes()) {
-            continue;
-        }
-        let user = entry.file_name().to_string_lossy().into_owned();
-        // A token file whose account or group has since gone grants nothing:
-        // the config is the authority, and the file is only the secret.
-        let login = appliance
-            .system
-            .logins
-            .iter()
-            .find(|l| l.username == user)?;
-        let group = login.group.as_deref()?;
-        let permission = appliance
-            .system
-            .groups
-            .iter()
-            .find(|g| g.name == group)?
-            .permission;
-        return Some(Caller {
-            user: Some(user),
-            permission,
-        });
     }
     None
+}
+
+/// The configuration remains the authority on every request. A locally defined
+/// principal needs an explicit group; the directory default applies only to
+/// authenticated directory principals with no local entry and enabled servers.
+fn management_group<'a>(appliance: &'a Appliance, user: &str, directory: bool) -> Option<&'a str> {
+    let login = appliance.system.logins.iter().find(|l| l.username == user);
+    if directory {
+        if login.is_some() || !appliance.system.aaa.has_servers() {
+            return None;
+        }
+        appliance.system.aaa.default_group.as_deref()
+    } else {
+        login?.group.as_deref()
+    }
 }
 
 /// Mint a token for every account with a group, and remove the files of accounts
@@ -415,6 +458,9 @@ pub fn resolve_caller(state: &ApiState, presented: &str) -> Option<Caller> {
 /// A token is generated once and then left alone: rotating it on every apply
 /// would log every client out whenever anything at all was committed.
 pub fn sync_user_tokens(state: &ApiState) -> Result<()> {
+    // Load authority after acquiring the same lock as sign-in, so a delayed
+    // cleanup cannot act on a configuration read before another token update.
+    let _tokens_lock = lock_token_directory(&state.tokens_dir)?;
     let appliance = Appliance::load(&state.config_path)?;
     let wanted: Vec<&str> = appliance
         .system
@@ -423,22 +469,28 @@ pub fn sync_user_tokens(state: &ApiState) -> Result<()> {
         .filter(|l| l.group.is_some())
         .map(|l| l.username.as_str())
         .collect();
-    if wanted.is_empty() && !state.tokens_dir.exists() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(&state.tokens_dir)
-        .with_context(|| format!("creating {}", state.tokens_dir.display()))?;
+    // Share the minting lock with sign-in so cleanup cannot remove an atomic
+    // staging file while another request is creating its account credential.
     for user in &wanted {
-        let path = state.tokens_dir.join(user);
-        if !path.exists() {
-            load_or_create_token(&path)?;
-        }
+        load_or_create_file_token_locked(&state.tokens_dir.join(user))?;
     }
     // Withdraw what is no longer granted.
-    for entry in std::fs::read_dir(&state.tokens_dir)?.flatten() {
+    for entry in std::fs::read_dir(&state.tokens_dir)? {
+        let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !wanted.iter().any(|u| *u == name) {
-            let _ = std::fs::remove_file(entry.path());
+        if name != ".directory" && !wanted.iter().any(|u| *u == name) {
+            std::fs::remove_file(entry.path()).context("withdrawing an account token")?;
+        }
+    }
+    let directory = state.tokens_dir.join(".directory");
+    if directory.exists() {
+        let _directory_lock = lock_token_directory(&directory)?;
+        for entry in std::fs::read_dir(&directory)? {
+            let entry = entry?;
+            let user = entry.file_name().to_string_lossy().into_owned();
+            if !valid_account_name(&user) || management_group(&appliance, &user, true).is_none() {
+                std::fs::remove_file(entry.path()).context("withdrawing a directory token")?;
+            }
         }
     }
     Ok(())
@@ -864,10 +916,8 @@ fn sign_in(
     // back to the configured default group; without one it gets nothing, which
     // is what stops a configured server from handing management access to
     // everybody in the directory.
-    let group =
-        login
-            .and_then(|l| l.group.as_deref())
-            .or(appliance.system.aaa.default_group.as_deref());
+    let directory_principal = login.is_none();
+    let group = management_group(&appliance, username, directory_principal);
     let Some(group) = group else {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
@@ -904,9 +954,12 @@ fn sign_in(
     }
 
     // The account's token, minted if this is the first time anybody asked.
-    std::fs::create_dir_all(&state.tokens_dir)
-        .map_err(|e| ApiError::internal(anyhow!("creating the token directory: {e}")))?;
-    let token = load_or_create_token(&state.tokens_dir.join(username))
+    let tokens = if directory_principal {
+        state.tokens_dir.join(".directory")
+    } else {
+        state.tokens_dir.clone()
+    };
+    let token = load_or_create_file_token(&tokens.join(username))
         .map_err(|e| ApiError::internal(anyhow!("minting the account's token: {e}")))?;
     forget_attempts(username);
     Ok(json!({
@@ -1119,6 +1172,9 @@ const SECRET_FIELDS: &[&str] = &[
     "totp",
     "community",
     "ao-key",
+    "auth-key",
+    "bfd-auth-key",
+    "macsec-key",
     "pin",
     // The update channel's entitlement (`[[update.channels]] subscription-key`):
     // a bearer token that buys tested images — anyone holding it can consume
@@ -1164,10 +1220,62 @@ fn redact_secrets(value: &mut Value) {
 /// secrets are all replaced by [`REDACTED`] before the config leaves the box.
 async fn get_config(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, ApiError> {
     let appliance = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
-    let mut value = serde_json::to_value(&appliance)
+    Ok(Json(redacted_config(&appliance)?))
+}
+
+fn redacted_config(appliance: &Appliance) -> Result<Value, ApiError> {
+    let mut value = serde_json::to_value(appliance)
         .map_err(|e| ApiError::internal(anyhow!("serialising the configuration: {e}")))?;
     redact_secrets(&mut value);
-    Ok(Json(value))
+    Ok(value)
+}
+
+async fn get_config_revision(
+    State(state): State<Arc<ApiState>>,
+    UrlPath(revision): UrlPath<usize>,
+) -> Result<Json<Value>, ApiError> {
+    let appliance = read_config_revision(&state.config_path, revision)?;
+    Ok(Json(redacted_config(&appliance)?))
+}
+
+fn read_config_revision(path: &Path, revision: usize) -> Result<Appliance, ApiError> {
+    let source = crate::archive::read_revision(path, revision).map_err(ApiError::bad_request)?;
+    // TOML diagnostics include the original source line, which may be a
+    // password or shared key. A damaged archive must not turn a read-only
+    // error response into a credential export.
+    Appliance::from_toml(&source).map_err(|_| {
+        ApiError::bad_request(anyhow!(
+            "configuration revision is invalid or incompatible with this appliance version"
+        ))
+    })
+}
+
+/// Configuration-bearing show paths, including the CLI's permissive aliases.
+fn configuration_read(path: &str) -> Option<Option<&str>> {
+    let words: Vec<_> = path.split('/').filter(|word| !word.is_empty()).collect();
+    match words.as_slice() {
+        ["configuration", ..] => Some(None),
+        ["system", "commit", revision] => Some(Some(revision)),
+        _ => None,
+    }
+}
+
+fn render_redacted_config(mut value: Value, path: &str) -> Result<Response, ApiError> {
+    // Recheck peer responses locally: proxying with the machine token must not
+    // turn a viewer into an administrator, even against an older peer.
+    redact_secrets(&mut value);
+    // Presentation only. The redaction markers intentionally do not pass the
+    // runtime key validators; this copy must never reach apply or persistence.
+    let appliance: Appliance = serde_json::from_value(value)
+        .map_err(|_| ApiError::internal(anyhow!("invalid configuration read response")))?;
+    let rendered = session::render_appliance(&appliance);
+    let words: Vec<_> = path.split('/').filter(|word| !word.is_empty()).collect();
+    let body = if words.as_slice() == ["configuration", "commands"] {
+        session::flatten_config(&rendered).join("\n") + "\n"
+    } else {
+        rendered
+    };
+    Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response())
 }
 
 /// `PUT /api/v1/config` — replace the running config from a JSON body. This is
@@ -1221,6 +1329,9 @@ fn merge_synced_config(mut incoming: Appliance, local: &Appliance) -> Appliance 
 
 /// Validate, apply and persist a complete, receiver-safe appliance document.
 fn replace_config(state: &ApiState, appliance: Appliance) -> Result<Json<Value>, ApiError> {
+    // Peer adjustment replaces member-local interfaces and identity. Validate
+    // the resulting document too, before either runtime or saved state changes.
+    appliance.validate().map_err(ApiError::bad_request)?;
     // Same live-apply as a CLI `commit` (skipped off-box, mirroring `commit`'s
     // own `act.enabled` gate).
     if state.apply.enabled {
@@ -1263,17 +1374,9 @@ fn replace_config(state: &ApiState, appliance: Appliance) -> Result<Json<Value>,
         false
     };
 
-    // Record what is now running, the same running-snapshot a CLI `commit` writes,
-    // so a concurrent CLI session can tell the box has moved on under it. Only when
-    // it was actually applied live, and best-effort like the CLI path.
-    if state.apply.enabled {
-        if let Ok(toml) = appliance.to_toml() {
-            let _ = crate::system::install_config_file(
-                Path::new(crate::session::Session::RUNNING),
-                &toml,
-            );
-        }
-    }
+    // apply_live already published the running snapshot under its runtime lock.
+    // Publishing again here could overwrite a newer commit that won that lock
+    // between this request's apply and persistence steps.
 
     // An account that has just been given a group needs a token to exist, and
     // one whose group was taken away needs its token gone — both at the moment
@@ -1333,7 +1436,20 @@ async fn get_status(
 async fn get_show(
     State(state): State<Arc<ApiState>>,
     UrlPath(path): UrlPath<String>,
+    axum::Extension(caller): axum::Extension<Caller>,
 ) -> Result<Response, ApiError> {
+    if let Some(revision) = configuration_read(&path).filter(|_| !caller.permission.may_write()) {
+        let appliance = match revision {
+            Some(index) => read_config_revision(
+                &state.config_path,
+                index
+                    .parse()
+                    .map_err(|_| ApiError::bad_request(anyhow!("revision must be a number")))?,
+            )?,
+            None => Appliance::load(&state.config_path).map_err(ApiError::internal)?,
+        };
+        return render_redacted_config(redacted_config(&appliance)?, &path);
+    }
     let words: Vec<String> = path
         .split('/')
         .filter(|s| !s.is_empty())
@@ -1377,6 +1493,28 @@ async fn get_show(
     Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response())
 }
 
+/// Validate a complete candidate using CLI editing commands, without running
+/// operational commands or changing runtime, saved state or revision history.
+async fn post_validate_configure(
+    State(state): State<Arc<ApiState>>,
+    body: String,
+) -> Result<Json<Value>, ApiError> {
+    if body.len() > 256 * 1024 {
+        return Err(ApiError::bad_request(anyhow!(
+            "configuration script too large"
+        )));
+    }
+    let path = state.config_path.clone();
+    tokio::task::spawn_blocking(move || repl::validate_script(&path, &body))
+        .await
+        .map_err(|e| ApiError::internal(anyhow!("configuration validation task: {e}")))?
+        .map_err(ApiError::bad_request)?;
+    Ok(Json(json!({
+        "ok": true,
+        "output": "✔ configuration is valid; nothing was applied or saved\n",
+    })))
+}
+
 /// `POST /api/v1/configure` — run configuration commands.
 ///
 /// The body is the same **CLI** the operator types, one command per line, and it
@@ -1390,9 +1528,8 @@ async fn get_show(
 /// persist" are genuinely different intentions and the endpoint must not decide
 /// which one was meant.
 ///
-/// **A refused commit is reported in the output, not in the exit status** — so
-/// the whole output is always returned, and a caller that only checks `ok` will
-/// believe a rejected change succeeded.
+/// `ok` reflects the configuration session's exit status. Detailed command and
+/// commit refusals are returned in `output` for the operator to inspect.
 async fn post_configure(
     State(state): State<Arc<ApiState>>,
     body: String,
@@ -1422,15 +1559,25 @@ async fn post_configure(
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()?;
-        {
-            use std::io::Write as _;
-            let mut stdin = child
-                .stdin
-                .take()
-                .ok_or_else(|| std::io::Error::other("configure has no stdin"))?;
-            stdin.write_all(body.as_bytes())?;
-        }
-        child.wait_with_output()
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("configure has no stdin"))?;
+        // Drain both output pipes while feeding stdin. Writing the whole script
+        // first deadlocks when diagnostics fill stderr before stdin is consumed.
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                use std::io::Write as _;
+                stdin.write_all(body.as_bytes())
+            });
+            let output = child.wait_with_output();
+            let written = writer
+                .join()
+                .map_err(|_| std::io::Error::other("configure input writer panicked"))?;
+            let output = output?;
+            written?;
+            Ok(output)
+        })
     })
     .await
     .map_err(|e| ApiError::internal(anyhow!("running configure: {e}")))?
@@ -1629,6 +1776,7 @@ async fn get_stack(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, Ap
 async fn get_stack_show(
     State(state): State<Arc<ApiState>>,
     UrlPath((member, path)): UrlPath<(String, String)>,
+    axum::Extension(caller): axum::Extension<Caller>,
 ) -> Result<Response, ApiError> {
     let appliance = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
     let cs = &appliance.system.config_sync;
@@ -1643,12 +1791,29 @@ async fn get_stack_show(
         .ok_or_else(|| ApiError::bad_request(anyhow!("no config-sync secret is set")))?;
     let cs = cs.clone();
     let peer = member.clone();
-    let endpoint = format!("show/{path}");
+    let protected_read = (!caller.permission.may_write())
+        .then(|| configuration_read(&path))
+        .flatten();
+    let endpoint = match protected_read {
+        Some(Some(revision)) => {
+            let revision: usize = revision
+                .parse()
+                .map_err(|_| ApiError::bad_request(anyhow!("revision must be a number")))?;
+            format!("config/revisions/{revision}")
+        }
+        Some(None) => "config".to_string(),
+        None => format!("show/{path}"),
+    };
     let secret = secret.to_string();
     let body = tokio::task::spawn_blocking(move || peer_get(&cs, &peer, &endpoint, &secret))
         .await
         .map_err(|e| ApiError::internal(anyhow!("peer request task failed: {e}")))?
         .map_err(|e| ApiError::bad_request(anyhow!("{member}: {e}")))?;
+    if protected_read.is_some() {
+        let value = serde_json::from_str(&body)
+            .map_err(|_| ApiError::internal(anyhow!("peer returned invalid configuration")))?;
+        return render_redacted_config(value, &path);
+    }
     Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response())
 }
 
@@ -1705,31 +1870,82 @@ pub fn load_or_create_token(path: &Path) -> Result<String> {
             return Ok(env.to_string());
         }
     }
-    if path.exists() {
-        let existing = std::fs::read_to_string(path)
-            .with_context(|| format!("reading the API token {}", path.display()))?;
-        let existing = existing.trim();
-        if !existing.is_empty() {
-            return Ok(existing.to_string());
+    load_or_create_file_token(path)
+}
+
+/// Account credentials never inherit the machine's environment override: that
+/// credential has full administration rights independently of account RBAC.
+fn load_or_create_file_token(path: &Path) -> Result<String> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let _lock = lock_token_directory(parent)?;
+    load_or_create_file_token_locked(path)
+}
+
+/// Lock the directory inode, not a removable lock file that token cleanup could
+/// unlink. Each independently opened descriptor serializes threads and API
+/// processes; closing it releases the lock, including on every error path.
+fn lock_token_directory(parent: &Path) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let directory = std::fs::File::open(parent)
+        .with_context(|| format!("opening token directory {}", parent.display()))?;
+    loop {
+        // SAFETY: the descriptor stays open for the entire lock lifetime.
+        if unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(directory);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error).context("locking the token directory");
+        }
+    }
+}
+
+/// Caller holds the parent-directory lock, covering both the initial read and
+/// publication. Readers see either the complete previous token or the complete
+/// new one, and simultaneous first sign-ins all receive the same credential.
+fn load_or_create_file_token_locked(path: &Path) -> Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(existing) if !existing.trim().is_empty() => return Ok(existing.trim().to_owned()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading the API token {}", path.display()));
         }
     }
     let token = generate_token()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    // Create with 0600 from the outset (no world-readable window between
-    // create and chmod).
-    let mut f = std::fs::OpenOptions::new()
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let staging = parent.join(format!(
+        ".api-token-{}-{}.tmp",
+        std::process::id(),
+        generate_token()?
+    ));
+    // Create with 0600 from the outset; never expose an empty destination or a
+    // partially written credential. The random staging name contains no secret.
+    let mut file = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
-        .open(path)
-        .with_context(|| format!("creating the API token {}", path.display()))?;
-    use std::io::Write;
-    f.write_all(token.as_bytes())
-        .with_context(|| format!("writing the API token {}", path.display()))?;
+        .open(&staging)
+        .with_context(|| format!("staging the API token {}", path.display()))?;
+    let result = (|| -> Result<()> {
+        use std::io::Write;
+        file.write_all(token.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&staging, path)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staging);
+    }
+    result.with_context(|| format!("writing the API token {}", path.display()))?;
     Ok(token)
 }
 
@@ -1833,6 +2049,49 @@ mod tests {
         dir.join("appliance.toml")
     }
 
+    #[test]
+    fn concurrent_token_creation_returns_one_complete_private_credential() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Barrier;
+
+        let directory = temp_config().parent().unwrap().to_owned();
+        for round in 0..16 {
+            let path = directory.join(format!("token-{round}"));
+            let barrier = Barrier::new(16);
+            let results = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..16)
+                    .map(|_| {
+                        let path = &path;
+                        let barrier = &barrier;
+                        scope.spawn(move || {
+                            barrier.wait();
+                            load_or_create_file_token(path)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let persisted = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(persisted.len(), 43);
+            for result in results {
+                assert_eq!(
+                    result.unwrap(),
+                    persisted,
+                    "concurrent login revoked a token"
+                );
+            }
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 16);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     /// Seed a config file with `hostname` and return its path in a fresh dir.
     fn seed(hostname: &str) -> PathBuf {
         let path = temp_config();
@@ -1846,6 +2105,7 @@ mod tests {
     fn state(config_path: PathBuf) -> Arc<ApiState> {
         Arc::new(ApiState {
             token: TOKEN.to_string(),
+            token_path: None,
             config_path,
             apply: Apply::off(),
             tokens_dir: std::env::temp_dir().join("sentinel-test-tokens"),
@@ -2207,6 +2467,7 @@ virtual-address = ["10.43.0.253"]
 
         let st = ApiState {
             token: TOKEN.to_string(),
+            token_path: None,
             config_path: cfg.clone(),
             apply: Apply::off(),
             tokens_dir: tokens,
@@ -2235,6 +2496,75 @@ virtual-address = ["10.43.0.253"]
         assert!(resolve_caller(&st, "alice-secret").is_none());
     }
 
+    #[test]
+    fn directory_tokens_follow_current_grants_without_reviving_local_accounts() {
+        let root = tempdir();
+        let config = root.join("appliance.toml");
+        let tokens = root.join("tokens");
+        let directory = tokens.join(".directory");
+        std::fs::create_dir_all(&directory).unwrap();
+        let st = ApiState {
+            token: TOKEN.to_owned(),
+            token_path: None,
+            config_path: config.clone(),
+            apply: Apply::off(),
+            tokens_dir: tokens.clone(),
+        };
+        let document = "[system]\nhostname = \"fw\"\n\
+            [[system.group]]\nname = \"viewers\"\npermission = \"read-only\"\n\
+            [system.aaa]\ndefault-group = \"viewers\"\n\
+            [[system.aaa.ldap]]\nserver = \"127.0.0.1\"\ntls = \"none\"\nbase-dn = \"dc=example,dc=test\"\n";
+        Appliance::from_toml(document).unwrap();
+        std::fs::write(&config, document).unwrap();
+        std::fs::write(tokens.join("deleted-local"), "old-local-token").unwrap();
+        std::fs::write(directory.join("directory-user"), "directory-token").unwrap();
+        assert!(resolve_caller(&st, "old-local-token").is_none());
+        let caller = resolve_caller(&st, "directory-token").unwrap();
+        assert_eq!(caller.user.as_deref(), Some("directory-user"));
+        assert!(!caller.permission.may_write());
+        sync_user_tokens(&st).unwrap();
+        assert!(!tokens.join("deleted-local").exists());
+        assert_eq!(
+            std::fs::read_to_string(directory.join("directory-user")).unwrap(),
+            "directory-token"
+        );
+
+        // Defining a local principal replaces directory-default authority. No
+        // explicit local grant means no access, including at password sign-in.
+        let hash = crate::passwd::hash("local-fixture-password").unwrap();
+        let local = format!(
+            "{document}\n[[system.login]]\nusername = \"directory-user\"\nhashed-password = \"{hash}\"\n"
+        );
+        std::fs::write(&config, &local).unwrap();
+        assert!(resolve_caller(&st, "directory-token").is_none());
+        assert_eq!(
+            sign_in(&st, "directory-user", "local-fixture-password", "")
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+        sync_user_tokens(&st).unwrap();
+        assert!(!directory.join("directory-user").exists());
+
+        // Disabling the directory or withdrawing its group revokes tokens even
+        // before cleanup runs; the token itself never stores permission.
+        for revoked in [
+            document.replace("default-group = \"viewers\"\n", ""),
+            document
+                .split("[[system.aaa.ldap]]")
+                .next()
+                .unwrap()
+                .to_owned(),
+        ] {
+            std::fs::write(&config, revoked).unwrap();
+            std::fs::write(directory.join("directory-user"), "directory-token").unwrap();
+            assert!(resolve_caller(&st, "directory-token").is_none());
+            sync_user_tokens(&st).unwrap();
+            assert!(!directory.join("directory-user").exists());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// Minting adds what has been granted and removes what has not — the second
     /// half matters more: a token file left behind after the group was taken
     /// away would be an access nobody can see in the configuration.
@@ -2245,6 +2575,7 @@ virtual-address = ["10.43.0.253"]
         let tokens = dir.join("tokens");
         let st = ApiState {
             token: TOKEN.to_string(),
+            token_path: None,
             config_path: cfg.clone(),
             apply: Apply::off(),
             tokens_dir: tokens.clone(),
@@ -2446,6 +2777,151 @@ virtual-address = ["10.43.0.253"]
         // Non-secret structure is untouched.
         let parsed: Value = serde_json::from_str(&body).expect("json");
         assert_eq!(parsed["system"]["hostname"], "fw");
+    }
+
+    #[tokio::test]
+    async fn readonly_config_hides_routing_and_macsec_keys() {
+        let root = tempdir();
+        let path = root.join("appliance.toml");
+        let tokens = root.join("tokens");
+        std::fs::create_dir_all(&tokens).unwrap();
+        std::fs::write(tokens.join("viewer"), "viewer-token").unwrap();
+        let source = r#"
+[system]
+hostname = "fw"
+[[system.group]]
+name = "viewers"
+permission = "read-only"
+[[system.login]]
+username = "viewer"
+group = "viewers"
+[[interface]]
+name = "eth0"
+mac = "02:00:00:00:00:01"
+[[interface]]
+name = "sec0"
+type = "macsec"
+parent = "eth0"
+macsec-key = "112233445566778899aabbccddeeff00"
+macsec-peer = "02:00:00:00:00:02"
+[protocols.ospf]
+auth-type = "md5"
+auth-key = "routing-secret"
+auth-key-id = 7
+[protocols.bgp]
+local-as = 65001
+[[protocols.bgp.neighbor]]
+address = "192.0.2.2"
+remote-as = 65002
+bfd = true
+bfd-auth-type = "meticulous-sha1"
+bfd-auth-key = "bfd-secret"
+bfd-auth-key-id = 9
+"#;
+        let appliance = Appliance::from_toml(source).expect("valid authenticated routing config");
+        session::persist_appliance(&appliance, &path, false).unwrap();
+        let st = Arc::new(ApiState {
+            token: TOKEN.to_string(),
+            token_path: None,
+            config_path: path,
+            apply: Apply::off(),
+            tokens_dir: tokens,
+        });
+        let response = router(st)
+            .oneshot(get("/api/v1/config", Some("viewer-token")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_string(response).await;
+        for secret in [
+            "routing-secret",
+            "bfd-secret",
+            "112233445566778899aabbccddeeff00",
+        ] {
+            assert!(
+                !body.contains(secret),
+                "read-only configuration disclosed a network authentication key"
+            );
+        }
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["protocols"]["ospf"]["auth-key"], REDACTED);
+        assert_eq!(parsed["protocols"]["ospf"]["auth-key-id"], 7);
+        assert_eq!(
+            parsed["protocols"]["bgp"]["neighbor"][0]["bfd-auth-key"],
+            REDACTED
+        );
+        assert_eq!(
+            parsed["protocols"]["bgp"]["neighbor"][0]["bfd-auth-key-id"],
+            9
+        );
+    }
+
+    #[tokio::test]
+    async fn rotating_the_machine_token_revokes_the_old_key_without_restart() {
+        let root = tempdir();
+        let path = root.join("appliance.toml");
+        std::fs::write(&path, "[system]\nhostname = \"fw\"\n").unwrap();
+        let token_path = root.join("api-token");
+        std::fs::write(&token_path, "original-token").unwrap();
+        let app = router(Arc::new(ApiState {
+            token: "original-token".to_string(),
+            token_path: Some(token_path.clone()),
+            config_path: path,
+            apply: Apply::off(),
+            tokens_dir: root.join("tokens"),
+        }));
+        assert_eq!(
+            app.clone()
+                .oneshot(get("/api/v1/config", Some("original-token")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let next = root.join("next-token");
+        std::fs::write(&next, "rotated-token\n").unwrap();
+        std::fs::rename(&next, &token_path).unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(get("/api/v1/config", Some("original-token")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(get("/api/v1/config", Some("rotated-token")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        std::fs::write(&token_path, "").unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(get("/api/v1/config", Some("original-token")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(get("/api/v1/config", Some("rotated-token")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        std::fs::remove_file(&token_path).unwrap();
+        assert_eq!(
+            app.oneshot(get("/api/v1/config", Some("rotated-token")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     /// The subscription key is an entitlement — whoever holds it can consume

@@ -52,13 +52,11 @@ jobs:
       # There is no rustfmt.toml here, so stable rustfmt is the whole story and
       # `--check` is a real gate (unlike the wren repository, where it is not).
       #
-      # Do not set CARGO_TARGET_DIR in this job: `grammar_walk` writes its report
-      # to a relative `target/`, and moving the target directory turns that test
-      # into a "No such file or directory" panic that has nothing to do with the
-      # grammar.
+      # Grammar reports also follow CARGO_TARGET_DIR for external build trees.
       - run: cargo fmt --all -- --check
+      - run: cargo check --locked
       - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --locked
+      - run: cargo test --workspace --locked
       - run: cargo build --release --locked
 
   # Integration proof: the nixosTests boot real VMs and exercise the appliance
@@ -80,13 +78,20 @@ jobs:
         check:
           - commit
           - reboot
+          - management-tls-powerloss
           - api
           - console
           - pki
           - dns
           - lldp
           - bgp
+          - policy-routing
           - nat
+          - ebpf-verifier
+          - reconcile
+          - wren-reconcile
+          - config-transaction
+          - egress-transaction
     steps:
       - uses: actions/checkout@v7
       # nixosTests build a full NixOS VM (kernel + qemu + system closure), which

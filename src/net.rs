@@ -4179,6 +4179,171 @@ fn pbr_families(r: &crate::config::PolicyRoute) -> Vec<&'static str> {
     }
 }
 
+/// Reject malformed observations before changing either family. Unknown rule
+/// selectors within our band are drift, never evidence of an unchanged rule.
+fn pbr_observed(text: &str) -> Result<Vec<(u32, serde_json::Value)>> {
+    let rows: Vec<serde_json::Value> = serde_json::from_str(text)?;
+    let mut owned = Vec::new();
+    for row in rows {
+        let priority = row
+            .get("priority")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .context("kernel policy rule has no valid priority")?;
+        if (PBR_PRIORITY_BASE..=PBR_PRIORITY_END).contains(&priority) {
+            owned.push((priority, row));
+        }
+    }
+    Ok(owned)
+}
+
+fn pbr_prefix(text: Option<&str>, family: &str) -> Option<(std::net::IpAddr, u8)> {
+    let text = text.unwrap_or("all");
+    if text == "all" {
+        return Some((
+            if family == "-4" { "0.0.0.0" } else { "::" }.parse().ok()?,
+            0,
+        ));
+    }
+    let (address, prefix) = text
+        .split_once('/')
+        .map_or((text, None), |(a, p)| (a, Some(p)));
+    match address.parse::<std::net::IpAddr>().ok()? {
+        std::net::IpAddr::V4(address) if family == "-4" => {
+            let n = prefix.map_or(Some(32), |p| p.parse::<u8>().ok())?;
+            if n > 32 {
+                return None;
+            }
+            let mask = u32::MAX.checked_shl(u32::from(32 - n)).unwrap_or(0);
+            Some((
+                std::net::Ipv4Addr::from(u32::from(address) & mask).into(),
+                n,
+            ))
+        }
+        std::net::IpAddr::V6(address) if family == "-6" => {
+            let n = prefix.map_or(Some(128), |p| p.parse::<u8>().ok())?;
+            if n > 128 {
+                return None;
+            }
+            let mask = u128::MAX.checked_shl(u32::from(128 - n)).unwrap_or(0);
+            Some((
+                std::net::Ipv6Addr::from(u128::from(address) & mask).into(),
+                n,
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn pbr_number(value: &serde_json::Value) -> Option<u32> {
+    value
+        .as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .or_else(|| value.as_str()?.parse().ok())
+}
+
+fn pbr_ports(value: &serde_json::Value, name: &str, desired: Option<&str>) -> bool {
+    let start = value.get(format!("{name}_start"));
+    let end = value.get(format!("{name}_end"));
+    let actual = if let Some(port) = value.get(name) {
+        if start.is_some() || end.is_some() {
+            return false;
+        }
+        pbr_number(port)
+            .and_then(|p| u16::try_from(p).ok())
+            .map(|p| (p, p))
+    } else {
+        match (start, end) {
+            (None, None) => return desired.is_none(),
+            (Some(a), Some(b)) => pbr_number(a)
+                .and_then(|n| u16::try_from(n).ok())
+                .zip(pbr_number(b).and_then(|n| u16::try_from(n).ok())),
+            _ => None,
+        }
+    };
+    let wanted = desired.and_then(|text| {
+        let (a, b) = text.split_once('-').unwrap_or((text, text));
+        a.parse::<u16>().ok().zip(b.parse::<u16>().ok())
+    });
+    actual.is_some() && actual == wanted
+}
+
+fn pbr_matches(value: &serde_json::Value, rule: &crate::config::PolicyRoute, family: &str) -> bool {
+    let Some(row) = value.as_object() else {
+        return false;
+    };
+    // `protocol` identifies the rule's creator, not an IP packet selector.
+    const FIELDS: &[&str] = &[
+        "priority",
+        "src",
+        "srclen",
+        "dstlen",
+        "dst",
+        "iif",
+        "table",
+        "ipproto",
+        "sport",
+        "sport_start",
+        "sport_end",
+        "dport",
+        "dport_start",
+        "dport_end",
+        "protocol",
+    ];
+    if row.keys().any(|k| !FIELDS.contains(&k.as_str())) {
+        return false;
+    }
+    let prefix_matches = |name: &str, expected: Option<&str>| {
+        let text = match value.get(name) {
+            None => None,
+            Some(v) => match v.as_str() {
+                Some(s) => Some(s),
+                None => return false,
+            },
+        };
+        let with_length = match value.get(format!("{name}len")) {
+            None => None,
+            Some(length) => match pbr_number(length) {
+                Some(n) => Some(format!(
+                    "{}/{n}",
+                    text.filter(|s| *s != "all").unwrap_or(if family == "-4" {
+                        "0.0.0.0"
+                    } else {
+                        "::"
+                    })
+                )),
+                None => return false,
+            },
+        };
+        let actual = pbr_prefix(with_length.as_deref().or(text), family);
+        actual.is_some() && actual == pbr_prefix(expected, family)
+    };
+    let protocol = |v: &str| match v {
+        "tcp" | "6" | "ipproto-6" => Some(6),
+        "udp" | "17" | "ipproto-17" => Some(17),
+        _ => None,
+    };
+    let proto_matches = match (value.get("ipproto"), rule.proto.as_deref()) {
+        (None, None) => true,
+        (Some(v), Some(w)) => {
+            let p = v.as_str().and_then(protocol).or_else(|| pbr_number(v));
+            p.is_some() && p == protocol(w)
+        }
+        _ => false,
+    };
+    value.get("table").and_then(pbr_number) == Some(rule.table)
+        && prefix_matches("src", rule.source.as_deref())
+        && prefix_matches("dst", rule.destination.as_deref())
+        && match (value.get("iif"), rule.interface.as_deref()) {
+            (None, None) => true,
+            (Some(v), Some(w)) => v.as_str() == Some(w),
+            _ => false,
+        }
+        && proto_matches
+        && pbr_ports(value, "sport", rule.source_port.as_deref())
+        && pbr_ports(value, "dport", rule.destination_port.as_deref())
+}
+
 /// Reconcile the kernel's routing-policy rules to the configuration.
 ///
 /// Ordinary routing asks where a packet is going. These rules ask the other
@@ -4186,49 +4351,70 @@ fn pbr_families(r: &crate::config::PolicyRoute) -> Vec<&'static str> {
 /// answer to a different table. Only the appliance's own priority band is
 /// touched: a rule somebody else put in the table stays.
 fn apply_policy_routes(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
+    apply_policy_routes_with(appliance, mode, system::ip_rule_list, system::ip_rule)
+}
+
+fn apply_policy_routes_with(
+    appliance: &Appliance,
+    mode: ApplyMode,
+    mut list: impl FnMut(&str) -> Result<String>,
+    mut change: impl FnMut(&str, &[&str]) -> Result<()>,
+) -> Result<()> {
     if mode != ApplyMode::Live {
         return Ok(());
     }
-    // Tear our band down first. Deleting by priority is exact and does not
-    // depend on reconstructing the selectors of a rule that has since changed.
-    if let Ok(listing) = system::ip_rule_list() {
-        for line in listing.lines() {
-            let Some((prio, _)) = line.split_once(':') else {
-                continue;
-            };
-            let Ok(p) = prio.trim().parse::<u32>() else {
-                continue;
-            };
-            if !(PBR_PRIORITY_BASE..=PBR_PRIORITY_END).contains(&p) {
-                continue;
-            }
-            let family = if line.contains("from all") && !line.contains('.') {
-                "-6"
-            } else {
-                "-4"
-            };
-            let _ = system::ip_rule(&[family, "del", "priority", &p.to_string()]);
-            // The same priority can hold one rule per family.
-            let other = if family == "-4" { "-6" } else { "-4" };
-            let _ = system::ip_rule(&[other, "del", "priority", &p.to_string()]);
-        }
-    }
-    for (i, r) in appliance.policy.routes.iter().enumerate() {
-        let priority = r
-            .priority
-            .unwrap_or(PBR_PRIORITY_BASE + i as u32)
-            .clamp(PBR_PRIORITY_BASE, PBR_PRIORITY_END);
-        let Some(args) = pbr_args(r, priority) else {
-            continue;
-        };
-        for family in pbr_families(r) {
-            let mut all: Vec<&str> = vec![family, "add"];
-            all.extend(args.iter().map(String::as_str));
-            if let Err(e) = system::ip_rule(&all) {
-                eprintln!("warning: installing policy route {:?} failed: {e}", r.name);
+    // Snapshot and validate BOTH families before any mutation. Numeric JSON
+    // avoids formatting, host-prefix and rt_tables alias differences.
+    let v4 = pbr_observed(&list("-4").context("listing -4 policy routes")?)
+        .context("decoding -4 policy routes")?;
+    let v6 = pbr_observed(&list("-6").context("listing -6 policy routes")?)
+        .context("decoding -6 policy routes")?;
+    for (family, observed) in [("-4", v4), ("-6", v6)] {
+        let mut desired = std::collections::BTreeMap::<u32, Vec<_>>::new();
+        for (i, rule) in appliance.policy.routes.iter().enumerate() {
+            if !rule.disabled && pbr_families(rule).contains(&family) {
+                let priority = rule
+                    .priority
+                    .unwrap_or(PBR_PRIORITY_BASE + i as u32)
+                    .clamp(PBR_PRIORITY_BASE, PBR_PRIORITY_END);
+                desired.entry(priority).or_default().push(rule);
             }
         }
+        // Retain unchanged groups and their kernel tie order. An unrelated
+        // commit must never briefly send their traffic to the main table.
+        let mut retained = std::collections::BTreeSet::new();
+        for (priority, wanted) in &desired {
+            let actual: Vec<_> = observed.iter().filter(|(p, _)| p == priority).collect();
+            if wanted.len() == actual.len()
+                && wanted
+                    .iter()
+                    .zip(&actual)
+                    .all(|(rule, (_, value))| pbr_matches(value, rule, family))
+            {
+                retained.insert(*priority);
+            }
+        }
+        for (priority, _) in &observed {
+            if !retained.contains(priority) {
+                change(family, &["del", "priority", &priority.to_string()]).with_context(|| {
+                    format!("removing {family} policy route priority {priority}")
+                })?;
+            }
+        }
+        for (priority, rules) in desired {
+            if retained.contains(&priority) {
+                continue;
+            }
+            for rule in rules {
+                let args = pbr_args(rule, priority).expect("enabled policy route");
+                let mut all: Vec<&str> = vec!["add"];
+                all.extend(args.iter().map(String::as_str));
+                change(family, &all)
+                    .with_context(|| format!("installing {family} policy route {:?}", rule.name))?;
+            }
+        }
     }
+
     Ok(())
 }
 
@@ -5831,6 +6017,293 @@ mod tests {
             ..r
         };
         assert!(pbr_args(&off, 10_000).is_none());
+    }
+
+    #[test]
+    fn policy_route_observation_matches_kernel_normalization_and_all_selectors() {
+        let mut rule = crate::config::PolicyRoute {
+            name: "test".into(),
+            source: Some("192.0.2.123/24".into()),
+            destination: Some("198.51.100.2/32".into()),
+            interface: Some("lan0".into()),
+            proto: Some("tcp".into()),
+            source_port: Some("1000-2000".into()),
+            destination_port: Some("8080-8080".into()),
+            table: 201,
+            ..Default::default()
+        };
+        let row = serde_json::json!({"priority":10000,"src":"192.0.2.0","srclen":24,"dst":"198.51.100.2",
+            "iif":"lan0","ipproto":"ipproto-6","sport_start":1000,"sport_end":2000,"dport":8080,"table":"201"});
+        assert!(pbr_matches(&row, &rule, "-4"));
+        for (field, value) in [
+            ("table", serde_json::json!(202)),
+            ("dst", serde_json::json!("198.51.100.3")),
+            ("iif", serde_json::json!("lan1")),
+            ("ipproto", serde_json::json!("17")),
+            ("sport_end", serde_json::json!(2001)),
+            ("dport", serde_json::json!(8081)),
+            ("not", serde_json::json!(true)),
+            ("fwmark", serde_json::json!(1)),
+            ("action", serde_json::json!("blackhole")),
+        ] {
+            let mut drift = row.clone();
+            drift[field] = value;
+            assert!(
+                !pbr_matches(&drift, &rule, "-4"),
+                "unrecognized drift in {field}"
+            );
+        }
+        rule.source = Some("2001:db8:1::cafe/64".into());
+        rule.destination = Some("2001:db8:2::2/128".into());
+        let mut v6 = row;
+        v6["src"] = serde_json::json!("2001:db8:1::");
+        v6["srclen"] = serde_json::json!(64);
+        v6["dst"] = serde_json::json!("2001:0db8:0002::2");
+        assert!(pbr_matches(&v6, &rule, "-6"));
+        assert!(!pbr_matches(&v6, &rule, "-4"));
+        assert_eq!(
+            pbr_prefix(Some("192.0.2.2/0"), "-4"),
+            pbr_prefix(None, "-4")
+        );
+        assert_eq!(
+            pbr_prefix(Some("2001:db8::1/0"), "-6"),
+            pbr_prefix(None, "-6")
+        );
+    }
+
+    #[test]
+    fn unchanged_policy_routes_are_not_removed_or_reordered() {
+        let mut appliance = Appliance::from_toml("[system]\nhostname='fw'\n").unwrap();
+        for table in [201, 202] {
+            appliance.policy.routes.push(crate::config::PolicyRoute {
+                name: format!("route-{table}"),
+                priority: Some(10000),
+                table,
+                ..Default::default()
+            });
+        }
+        apply_policy_routes_with(
+            &appliance,
+            ApplyMode::Live,
+            |_| {
+                Ok(r#"[{"priority":9000,"src":"all","table":"203"},
+                {"priority":10000,"src":"all","table":"201"},
+                {"priority":10000,"src":"all","table":"202"}]"#
+                    .into())
+            },
+            |_, args| panic!("unchanged rules must not mutate: {args:?}"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn changing_equal_priority_rule_order_is_not_ignored() {
+        let mut appliance = Appliance::from_toml("[system]\nhostname='fw'\n").unwrap();
+        for table in [202, 201] {
+            appliance.policy.routes.push(crate::config::PolicyRoute {
+                name: format!("route-{table}"),
+                priority: Some(10000),
+                table,
+                source: Some("192.0.2.0/24".into()),
+                ..Default::default()
+            });
+        }
+        let mut changes = Vec::new();
+        apply_policy_routes_with(
+            &appliance,
+            ApplyMode::Live,
+            |family| {
+                Ok(if family == "-4" {
+                    r#"[
+                {"priority":10000,"src":"192.0.2.0","srclen":24,"table":"201"},
+                {"priority":10000,"src":"192.0.2.0","srclen":24,"table":"202"}]"#
+                } else {
+                    "[]"
+                }
+                .into())
+            },
+            |family, args| {
+                changes.push((family.to_owned(), args.join(" ")));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            changes,
+            [
+                ("-4".into(), "del priority 10000".into()),
+                ("-4".into(), "del priority 10000".into()),
+                (
+                    "-4".into(),
+                    "add priority 10000 from 192.0.2.0/24 lookup 202".into()
+                ),
+                (
+                    "-4".into(),
+                    "add priority 10000 from 192.0.2.0/24 lookup 201".into()
+                )
+            ]
+        );
+    }
+
+    #[test]
+    fn policy_route_drift_changes_only_its_family_and_priority() {
+        let mut appliance = Appliance::from_toml("[system]\nhostname='fw'\n").unwrap();
+        appliance.policy.routes.push(crate::config::PolicyRoute {
+            name: "both".into(),
+            table: 201,
+            ..Default::default()
+        });
+        let mut changes = Vec::new();
+        apply_policy_routes_with(
+            &appliance,
+            ApplyMode::Live,
+            |family| {
+                Ok(if family == "-4" {
+                    r#"[{"priority":10000,"src":"all","table":"202"},
+                    {"priority":9000,"src":"all","table":"203"}]"#
+                } else {
+                    r#"[{"priority":10000,"src":"all","table":"201"}]"#
+                }
+                .into())
+            },
+            |family, args| {
+                changes.push((family.to_owned(), args.join(" ")));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            changes,
+            [
+                ("-4".into(), "del priority 10000".into()),
+                ("-4".into(), "add priority 10000 lookup 201".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn duplicate_policy_routes_are_removed_without_accumulating_on_retry() {
+        let mut appliance = Appliance::from_toml("[system]\nhostname='fw'\n").unwrap();
+        appliance.policy.routes.push(crate::config::PolicyRoute {
+            name: "only-v4".into(),
+            source: Some("192.0.2.2/32".into()),
+            table: 201,
+            ..Default::default()
+        });
+        let mut changes = Vec::new();
+        apply_policy_routes_with(
+            &appliance,
+            ApplyMode::Live,
+            |family| {
+                Ok(if family == "-4" {
+                    r#"[
+                {"priority":10000,"src":"192.0.2.2","table":"201"},
+                {"priority":10000,"src":"192.0.2.2","table":"201"}]"#
+                } else {
+                    "[]"
+                }
+                .into())
+            },
+            |family, args| {
+                changes.push((family.to_owned(), args.join(" ")));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            changes,
+            [
+                ("-4".into(), "del priority 10000".into()),
+                ("-4".into(), "del priority 10000".into()),
+                (
+                    "-4".into(),
+                    "add priority 10000 from 192.0.2.2/32 lookup 201".into()
+                )
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_second_family_never_removes_valid_first_family_rules() {
+        for invalid in ["not json", "{}", "[{}]", r#"[{"priority":"10000"}]"#] {
+            let error = apply_policy_routes_with(
+                &Appliance::from_toml("[system]\nhostname='fw'\n").unwrap(),
+                ApplyMode::Live,
+                |family| {
+                    Ok(if family == "-4" {
+                        r#"[{"priority":10000,"table":"201"}]"#
+                    } else {
+                        invalid
+                    }
+                    .into())
+                },
+                |_, _| panic!("a malformed dump must never cause mutation"),
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("decoding -6 policy routes"));
+        }
+        apply_policy_routes_with(
+            &Appliance::from_toml("[system]\nhostname='fw'\n").unwrap(),
+            ApplyMode::Boot,
+            |_| panic!("early boot cannot query rules"),
+            |_, _| panic!("early boot cannot modify rules"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn policy_route_listing_failure_cannot_mutate_either_family() {
+        let error = apply_policy_routes_with(
+            &Appliance::from_toml("[system]\nhostname='fw'\n").unwrap(),
+            ApplyMode::Live,
+            |family| {
+                if family == "-4" {
+                    Ok(r#"[{"priority":10000,"src":"all","table":"201"}]"#.into())
+                } else {
+                    anyhow::bail!("kernel rule dump failed")
+                }
+            },
+            |_, _| panic!("no mutation before both family dumps succeeded"),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("listing -6 policy routes"));
+    }
+
+    #[test]
+    fn policy_route_removal_failure_stops_before_installing_new_rules() {
+        let mut calls = Vec::new();
+        let error = apply_policy_routes_with(
+            &Appliance::from_toml("[system]\nhostname='fw'\n").unwrap(),
+            ApplyMode::Live,
+            |_| Ok(r#"[{"priority":10000,"src":"all","table":"201"}]"#.into()),
+            |family, args| {
+                calls.push((family.to_owned(), args.join(" ")));
+                anyhow::bail!("kernel rejected deletion")
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("removing -4 policy route priority 10000"));
+        assert_eq!(calls, [("-4".into(), "del priority 10000".into())]);
+    }
+
+    #[test]
+    fn policy_route_add_failure_is_a_failed_apply_with_the_rule_name() {
+        let mut appliance = Appliance::from_toml("[system]\nhostname='fw'\n").unwrap();
+        appliance.policy.routes.push(crate::config::PolicyRoute {
+            name: "isolated-client".into(),
+            source: Some("192.0.2.2/32".into()),
+            table: 201,
+            ..Default::default()
+        });
+        let error = apply_policy_routes_with(
+            &appliance,
+            ApplyMode::Live,
+            |_| Ok("[]".into()),
+            |_, _| anyhow::bail!("kernel denied rule"),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("isolated-client") && message.contains("kernel denied rule"));
     }
 
     /// The point of the whole feature: when an encrypted upstream is set, the

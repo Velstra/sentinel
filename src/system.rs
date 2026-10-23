@@ -455,13 +455,14 @@ pub fn ip_route_flush_table(table: u32) -> Result<()> {
     run_priv("ip", &["route", "flush", "table", &table.to_string()])
 }
 
-/// The routing-policy rules the appliance owns, as `ip rule` prints them. Only
+/// The routing-policy rules in numeric JSON form for semantic reconciliation. Only
 /// the priority band in [`crate::net::PBR_PRIORITY_BASE`] is ours; anything else
 /// in the table belongs to the kernel or to somebody else and is left alone.
-pub fn ip_rule_list() -> Result<String> {
+pub fn ip_rule_list(family: &str) -> Result<String> {
+    anyhow::ensure!(matches!(family, "-4" | "-6"), "invalid IP rule family");
     let is_root = unsafe { libc::geteuid() } == 0;
     let ip = bin("ip");
-    let args = ["-o", "rule", "show"];
+    let args = [family, "-j", "-N", "rule", "show"];
     let output = if is_root {
         Command::new(&ip).args(args).output()
     } else {
@@ -470,13 +471,19 @@ pub fn ip_rule_list() -> Result<String> {
         Command::new("sudo").args(&all).output()
     };
     let out = output.context("running ip rule show")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "listing {family} policy rules failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Add or delete one routing-policy rule. The arguments are built by the caller
 /// from the configuration; nothing here interprets them.
-pub fn ip_rule(args: &[&str]) -> Result<()> {
-    let mut all = vec!["rule"];
+pub fn ip_rule(family: &str, args: &[&str]) -> Result<()> {
+    anyhow::ensure!(matches!(family, "-4" | "-6"), "invalid IP rule family");
+    let mut all = vec![family, "rule"];
     all.extend_from_slice(args);
     run_priv("ip", &all)
 }
@@ -527,19 +534,10 @@ pub fn swanctl_load(path: &Path) -> Result<()> {
 /// Run a read-only `swanctl` query and return its stdout (for `show vpn` — the
 /// SA / connection state). charon's vici control socket is root-only, so this
 /// must run privileged: directly when already root, else via `sudo` (the admin
-/// is passwordless-wheel on the appliance). The exit code is ignored, like the
+/// is passwordless-wheel on the appliance), without ever prompting. The exit code is ignored, like the
 /// other `show` paths, so an empty/inactive daemon still prints cleanly.
 pub fn swanctl_show(args: &[&str]) -> Result<String> {
-    let is_root = unsafe { libc::geteuid() } == 0;
-    let swanctl = bin("swanctl");
-    let output = if is_root {
-        Command::new(&swanctl).args(args).output()
-    } else {
-        let mut all = vec![swanctl.as_str()];
-        all.extend_from_slice(args);
-        Command::new("sudo").args(&all).output()
-    };
-    let out = output.with_context(|| "running swanctl")?;
+    let out = escalated_output("swanctl", args).context("running swanctl")?;
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
@@ -563,62 +561,62 @@ pub(crate) fn stage_private(tmp: &Path, contents: &str) -> Result<()> {
         .with_context(|| format!("staging {}", tmp.display()))
 }
 
-/// A held cross-process apply lock. Dropping it closes the file, which releases
-/// the advisory `flock`. `None` means the lock could not be taken (off-box, or a
-/// test with no `/run/sentinel`) and the caller proceeds unserialised — the lock
-/// is a best-effort guard against concurrent on-box writers, never a gate that
-/// fails a commit.
+/// A held cross-process apply lock. Off-box validation without the appliance
+/// runtime directory needs no runtime lock. On-box failures refuse the write.
 #[must_use = "the lock is released as soon as this guard is dropped"]
 pub struct ApplyLock {
     _file: Option<std::fs::File>,
 }
 
-/// The single lockfile that serialises the apply/persist critical section.
 const APPLY_LOCK_PATH: &str = "/run/sentinel/apply.lock";
 
-/// Serialise the config apply/persist critical section across processes.
-///
-/// Staging always uses fixed temp filenames under `/run/sentinel`
-/// (`.net-unit.tmp`, `.appliance.toml.tmp`, `.net-secret.tmp`, …), so a CLI
-/// `commit` racing an API `PUT` — or either racing the boot-late reconcile —
-/// could write the same temp out from under the other and install a spliced
-/// networkd unit or a half-written `velstra.toml` / `appliance.toml`. An
-/// exclusive advisory lock on one well-known lockfile makes those sections take
-/// turns. It is advisory (`flock`), which is enough because every writer goes
-/// through the same two chokepoints ([`crate::repl::apply_live`] and
-/// [`crate::session::persist_appliance`]) and so cooperates on the one lock. The
-/// call blocks until the lock is ours; the guard releases it on drop.
-///
-/// Best-effort: if the lockfile cannot be opened (no `/run/sentinel` off-box or
-/// in a test), the caller proceeds without the lock rather than failing — the
-/// races this guards against only exist on a running appliance, where the
-/// directory is always present and writable by the writers.
-///
-/// Never take this while already holding it (it would self-deadlock): the two
-/// chokepoints run their critical sections to completion and never nest.
-pub fn apply_lock() -> ApplyLock {
-    use std::os::unix::fs::OpenOptionsExt;
+/// Serialize runtime apply and persistence across boot, API and operator
+/// processes. Both root and wheel operators must open the same inode; failing
+/// open on a root-only lock would silently bypass this boundary.
+/// Never nest this lock: separately opened descriptors would self-deadlock.
+pub fn apply_lock() -> Result<ApplyLock> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::os::unix::io::AsRawFd;
-    if !Path::new("/run/sentinel").is_dir() {
-        return ApplyLock { _file: None };
+    match std::fs::metadata("/run/sentinel") {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ApplyLock { _file: None });
+        }
+        Err(error) => return Err(error).context("accessing appliance apply lock directory"),
+        Ok(metadata) if !metadata.is_dir() => {
+            bail!("appliance apply lock directory is not a directory")
+        }
+        Ok(_) => {}
     }
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
-        .mode(0o600)
-        .open(APPLY_LOCK_PATH);
-    let Ok(file) = file else {
-        return ApplyLock { _file: None };
-    };
-    // SAFETY: a blocking `flock` on a valid fd we own for the lifetime of `file`;
-    // the lock is released when the fd is closed on drop. A failure here (rare —
-    // e.g. EINTR) degrades to proceeding unserialised rather than aborting.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    if rc != 0 {
-        return ApplyLock { _file: None };
+        .mode(0o660)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(APPLY_LOCK_PATH)
+        .context("opening appliance apply lock")?;
+    let metadata = file.metadata().context("reading appliance apply lock")?;
+    let gid = wheel_gid().context("wheel group missing for appliance apply lock")?;
+    if metadata.gid() != gid {
+        // SAFETY: fd belongs to file; uid -1 preserves its existing owner.
+        if unsafe { libc::fchown(file.as_raw_fd(), u32::MAX, gid) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("setting apply lock group");
+        }
     }
-    ApplyLock { _file: Some(file) }
+    if metadata.permissions().mode() & 0o777 != 0o660 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o660))
+            .context("setting appliance apply lock permissions")?;
+    }
+    loop {
+        // SAFETY: the descriptor remains valid for the lifetime of the guard.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(ApplyLock { _file: Some(file) });
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error).context("acquiring appliance apply lock");
+        }
+    }
 }
 
 /// The numeric gid of the `wheel` group, if this system has one. Used to set the
@@ -627,14 +625,30 @@ pub fn apply_lock() -> ApplyLock {
 /// `wheel` group simply leaves the file root-owned.
 fn wheel_gid() -> Option<u32> {
     let name = std::ffi::CString::new("wheel").ok()?;
-    // SAFETY: `getgrnam` returns a pointer into storage that a later call could
-    // overwrite; we read `gr_gid` out immediately while the pointer is non-null
-    // and keep nothing that outlives this call.
-    let grp = unsafe { libc::getgrnam(name.as_ptr()) };
-    if grp.is_null() {
-        None
-    } else {
-        Some(unsafe { (*grp).gr_gid })
+    let mut buffer = vec![0u8; 1024];
+    loop {
+        let mut group = std::mem::MaybeUninit::<libc::group>::uninit();
+        let mut found = std::ptr::null_mut();
+        // SAFETY: storage belongs to this call and lives through the gid read.
+        // getgrnam_r shares no static buffer with concurrent API writers.
+        let result = unsafe {
+            libc::getgrnam_r(
+                name.as_ptr(),
+                group.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut found,
+            )
+        };
+        if result == libc::ERANGE && buffer.len() < 65536 {
+            buffer.resize(buffer.len() * 2, 0);
+            continue;
+        }
+        if result != 0 || found.is_null() {
+            return None;
+        }
+        // SAFETY: a successful lookup initialized group and returned its address.
+        return Some(unsafe { group.assume_init().gr_gid });
     }
 }
 
@@ -751,45 +765,129 @@ pub fn install_file(path: &Path, contents: &str) -> Result<()> {
 /// Installed 0640 root:wheel: the file carries hashed passwords and VPN
 /// secrets, and `wheel` is the group an operator account is in — the same
 /// membership that lets them escalate here in the first place.
-pub fn install_config_file(path: &Path, contents: &str) -> Result<()> {
+pub fn install_config_file(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let tmp = path.with_extension("toml.tmp");
-    // Fast path (root, and the API service, which own the directory): stage the
-    // temp with the final mode 0640 from the outset — a plain `fs::write` honours
-    // the umask (0644) and `rename` preserves the temp's mode, so writing 0644
-    // here would silently widen a config that carries hashed passwords and VPN
-    // secrets. Group `wheel` (best-effort) matches the sudo path below, so an
-    // operator account can still read the saved config without escalating.
-    let direct = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o640)
-        .open(&tmp);
-    if let Ok(mut f) = direct {
-        if f.write_all(contents.as_bytes()).is_ok() {
-            drop(f);
-            if let Some(gid) = wheel_gid() {
-                let _ = std::os::unix::fs::chown(&tmp, None, Some(gid));
-            }
-            if std::fs::rename(&tmp, path).is_ok() {
-                return Ok(());
-            }
-        }
-        let _ = std::fs::remove_file(&tmp);
-    }
-    let staged = Path::new("/run/sentinel").join(".appliance.toml.tmp");
-    stage_private(&staged, contents)?;
-    let (Some(src), Some(dst)) = (staged.to_str(), path.to_str()) else {
-        bail!("non-UTF-8 path");
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let contents = contents.as_ref();
+    let mut random = [0u8; 16];
+    getrandom::getrandom(&mut random)
+        .map_err(|e| anyhow::anyhow!("config staging entropy: {e}"))?;
+    let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+    let tmp = path.with_extension(format!("toml.{suffix}.tmp"));
+    // Writers own distinct same-filesystem temporary files. Exclusive creation
+    // refuses pre-existing files and symlinks instead of truncating them.
+    // Appliance daemons run as root with a deliberately narrow capability
+    // bounding set. An operator-owned 0640 file is unreadable to them without
+    // DAC override, so on-box operator writes must use the root installer even
+    // when wheel can create files in the destination directory.
+    let direct = if !is_root() && Path::new("/run/sentinel").is_dir() {
+        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    } else {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o640)
+            .open(&tmp)
     };
-    sudo("install", &["-m", "0640", "-g", "wheel", src, dst]).with_context(|| {
+    match direct {
+        Ok(mut file) => {
+            let result = (|| -> Result<()> {
+                file.write_all(contents).context("writing configuration")?;
+                file.set_permissions(std::fs::Permissions::from_mode(0o640))?;
+                file.sync_all().context("syncing configuration")?;
+                // Best-effort off-box, where the operator need not own wheel.
+                if let Some(gid) = wheel_gid() {
+                    let _ = std::os::unix::fs::chown(&tmp, None, Some(gid));
+                }
+                std::fs::rename(&tmp, path).context("publishing configuration")?;
+                Ok(())
+            })();
+            let _ = std::fs::remove_file(&tmp);
+            return result;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Err(error) => return Err(error).context("creating configuration staging file"),
+    }
+    let staged = Path::new("/run/sentinel").join(format!(".appliance.{suffix}.tmp"));
+    let mut source_owned = false;
+    let result = (|| -> Result<()> {
+        let mut source = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&staged)
+            .context("creating private configuration staging file")?;
+        source_owned = true;
+        source.write_all(contents)?;
+        source.sync_all()?;
+        let (Some(src), Some(dst), Some(destination)) =
+            (staged.to_str(), path.to_str(), tmp.to_str())
+        else {
+            bail!("non-UTF-8 path");
+        };
+        // Copy with final ownership to the destination filesystem, then rename:
+        // privileged saves must never expose a partially copied document.
+        sudo(
+            "install",
+            &["-m", "0640", "-g", "wheel", "--", src, destination],
+        )?;
+        sudo("mv", &["-fT", "--", destination, dst])
+    })();
+    if source_owned {
+        let _ = std::fs::remove_file(&staged);
+    }
+    if result.is_err() {
+        if let Some(tmp) = tmp.to_str() {
+            let _ = sudo("rm", &["-f", "--", tmp]);
+        }
+    }
+    result.with_context(|| {
         format!(
             "installing {} (needs root, or an account in the wheel group)",
             path.display()
         )
     })
+}
+
+/// Protect configuration documents left with public permissions by an older
+/// version. Use the same atomic installer as writes so ownership and access
+/// remain consistent for root services and wheel operators.
+pub fn secure_config_file(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("reading configuration file permissions"),
+    };
+    anyhow::ensure!(metadata.is_file(), "configuration is not a regular file");
+    if metadata.permissions().mode() & 0o777 == 0o640 {
+        return Ok(());
+    }
+    let contents = std::fs::read(path)
+        .with_context(|| format!("reading private configuration {}", path.display()))?;
+    install_config_file(path, &contents)
+        .with_context(|| format!("protecting configuration {}", path.display()))
+}
+
+/// Read private appliance material as an authorized operator without widening
+/// its file permissions. Privileged output stays in memory, never the terminal.
+pub fn read_private_file(path: &Path) -> Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => Ok(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            let path_arg = path.to_str().context("non-UTF-8 private file path")?;
+            let output = escalated_output("cat", &["--", path_arg])?;
+            anyhow::ensure!(
+                output.status.success(),
+                "could not read private file {}",
+                path.display()
+            );
+            String::from_utf8(output.stdout).context("private file is not UTF-8")
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("reading private file {}", path.display()))
+        }
+    }
 }
 
 /// Install a secret file `contents` at a (root-owned) `path` readable by
@@ -999,16 +1097,28 @@ pub fn set_login_password(user: &str, hash: &str) -> Result<()> {
 /// admin (`configure`) and as root (boot) — mirrors [`install_secret_file`] but
 /// 0600 root:root (the API reads it as root; no other reader needs it).
 pub fn install_token(path: &Path, secret: &str) -> Result<()> {
-    let tmp = Path::new("/run/sentinel").join(".api-token.tmp");
-    // Stage 0600, not umask-default 0644: this token is the machine's full-access
-    // API secret, and `/run/sentinel` is wheel-writable and world-traversable, so
-    // a plain `fs::write` would leave it briefly world-readable there before the
-    // `install` below copies it to its 0600 home.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    let suffix = format!("{}.{}", std::process::id(), id);
+    let tmp = Path::new("/run/sentinel").join(format!(".api-token.{suffix}.tmp"));
+    let destination = path.with_extension(format!("token.{suffix}.tmp"));
+    // Each writer owns its staging paths. Copy to the destination filesystem
+    // with final permissions before renaming, so readers see a complete old or
+    // new credential and never an empty or partially copied prefix.
     stage_private(&tmp, secret)?;
-    let (Some(tmp_s), Some(dst_s)) = (tmp.to_str(), path.to_str()) else {
+    let (Some(src), Some(staged), Some(dst)) = (tmp.to_str(), destination.to_str(), path.to_str())
+    else {
+        let _ = std::fs::remove_file(&tmp);
         bail!("non-UTF-8 path");
     };
-    sudo("install", &["-m", "0600", tmp_s, dst_s])
+    let result = sudo("install", &["-m", "0600", "--", src, staged])
+        .and_then(|_| sudo("mv", &["-fT", "--", staged, dst]));
+    let _ = std::fs::remove_file(&tmp);
+    if result.is_err() {
+        let _ = sudo("rm", &["-f", "--", staged]);
+    }
+    result
 }
 
 /// PUT a config body (a file of JSON) to a peer's Sentinel API for HA config sync
@@ -1261,49 +1371,13 @@ pub fn openssl(args: &[&str]) -> Result<()> {
 /// existing pair: a self-signed cert that config sync may pin must keep a stable
 /// key across reboots. The private key is written 0600.
 pub fn ensure_self_signed_cert(cert: &Path, key: &Path, cn: &str, sans: &[String]) -> Result<()> {
-    if cert.exists() && key.exists() {
-        return Ok(());
-    }
-    if let Some(parent) = cert.parent() {
-        ensure_dir(parent)?;
-    }
-    let san = build_san(cn, sans);
-    let (Some(cert_s), Some(key_s)) = (cert.to_str(), key.to_str()) else {
-        bail!("non-UTF-8 TLS certificate path");
-    };
-    let out = Command::new(bin("openssl"))
-        .args([
-            "req",
-            "-x509",
-            "-newkey",
-            "rsa:2048",
-            "-sha256",
-            "-days",
-            "3650",
-            "-nodes",
-            "-keyout",
-            key_s,
-            "-out",
-            cert_s,
-            "-subj",
-            &format!("/CN={cn}"),
-            "-addext",
-            &san,
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .context("running openssl to mint the management TLS certificate")?;
-    if !out.status.success() {
-        bail!(
-            "openssl could not mint the management TLS certificate: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    // The key must never be group/world readable, whoever's umask minted it.
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(key, std::fs::Permissions::from_mode(0o600));
-    Ok(())
+    crate::management_tls::ensure_pair(
+        cert,
+        key,
+        cn,
+        &build_san(cn, sans),
+        Path::new(&bin("openssl")),
+    )
 }
 
 /// Build an OpenSSL `subjectAltName` extension covering the CN plus each supplied
@@ -1457,6 +1531,8 @@ pub fn bin(name: &str) -> String {
         }
     }
     let var = match name {
+        "cat" => "SENTINEL_CAT_BIN",
+        "haproxy" => "SENTINEL_HAPROXY_BIN",
         "hostname" => "SENTINEL_HOSTNAME_BIN",
         "ldapwhoami" => "SENTINEL_LDAPWHOAMI_BIN",
         "occtl" => "SENTINEL_OCCTL_BIN",

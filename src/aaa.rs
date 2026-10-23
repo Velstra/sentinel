@@ -492,12 +492,44 @@ pub fn ldap_authenticate(
 ) -> Result<Directory> {
     let (uri, dn) = ldap_target(server, port, tls, base_dn, user_attribute, username);
     let dir = std::path::Path::new("/run/sentinel");
-    std::fs::create_dir_all(dir).ok();
-    let secret = dir.join(format!("ldap-bind.{}", std::process::id()));
-    crate::system::stage_private(&secret, password).context("staging the bind password")?;
-    let out = crate::system::ldapwhoami(&uri, &dn, &secret, tls == "starttls", timeout);
-    let _ = std::fs::remove_file(&secret);
+    let secret = LdapBindSecret::create(dir, password)?;
+    let out = crate::system::ldapwhoami(&uri, &dn, &secret.0, tls == "starttls", timeout);
     directory_from_exit(out?)
+}
+
+/// Each blocking login task owns its credential file until its LDAP client
+/// exits. A process ID alone is not unique across concurrent API requests.
+struct LdapBindSecret(std::path::PathBuf);
+
+impl LdapBindSecret {
+    fn create(dir: &std::path::Path, password: &str) -> Result<Self> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::create_dir_all(dir).context("creating LDAP credential directory")?;
+        let mut random = [0u8; 16];
+        getrandom::getrandom(&mut random)
+            .map_err(|e| anyhow!("LDAP credential staging entropy: {e}"))?;
+        let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let path = dir.join(format!("ldap-bind.{}.{suffix}", std::process::id()));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .context("creating private LDAP credential file")?;
+        // Own cleanup before the first fallible write, including error/unwind
+        // paths. Exclusive creation refuses existing files and symbolic links.
+        let secret = Self(path);
+        file.write_all(password.as_bytes())
+            .context("staging LDAP bind password")?;
+        Ok(secret)
+    }
+}
+
+impl Drop for LdapBindSecret {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 // ---- TACACS+ (RFC 8907) ---------------------------------------------------
@@ -826,6 +858,56 @@ pub fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_ldap_bind_credentials_are_private_isolated_and_cleaned() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "sentinel-ldap-secrets-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let barrier = std::sync::Barrier::new(8);
+        let paths = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|n| {
+                    let dir = &dir;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        let password = format!("request-{n}");
+                        let secret = LdapBindSecret::create(dir, &password);
+                        barrier.wait();
+                        let secret = secret.unwrap();
+                        assert_eq!(std::fs::read_to_string(&secret.0).unwrap(), password);
+                        assert_eq!(
+                            std::fs::metadata(&secret.0).unwrap().permissions().mode() & 0o777,
+                            0o600
+                        );
+                        secret.0.clone()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            paths.iter().collect::<std::collections::HashSet<_>>().len(),
+            8
+        );
+        assert!(paths.iter().all(|path| !path.exists()));
+        let failed = (|| -> Result<()> {
+            let _secret = LdapBindSecret::create(&dir, "failed-request")?;
+            bail!("client could not start")
+        })();
+        assert!(failed.is_err());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir(dir).unwrap();
+    }
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()

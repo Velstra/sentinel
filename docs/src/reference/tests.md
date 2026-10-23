@@ -1,12 +1,14 @@
 # Test suite (nixosTests)
 
-Sentinel is verified by **93 nixosTests**, **478 Rust unit tests** and a
-**browser suite** that drives the web console against a running appliance. The nixosTests
+Sentinel has Rust unit tests, compiler and map-contract checks, and a
+browser suite that drives the web console against a running appliance. The nixosTests
 boot real QEMU/OVMF VMs — several of them two or three at a time on shared virtual
 segments — so they need `/dev/kvm`.
 
 ```shell
-nix flake check                                   # evaluate every check
+nix flake check --no-build                        # evaluate every check
+nix flake check                                   # evaluate and run every check
+./tests/evaluate-flake.sh                        # bounded evaluation plus VM diagnostic/override interfaces
 nix build .#checks.x86_64-linux.<name> -L         # run one
 ```
 
@@ -16,7 +18,7 @@ authoritative list.
 The unit tests need nothing but a checkout:
 
 ```shell
-cargo test                                        # 460 of them
+cargo test --workspace
 tests/console/run.sh                              # the browser suite
 ```
 
@@ -55,7 +57,7 @@ write, which is how ten sections that could be typed and not clicked were found.
 | `commitconfirm` | a timed commit auto-reverts unless `confirm`ed — the safety net for editing a firewall over its own link |
 | `confighistory` | every `save` archives a revision, `show system commit` lists them, `rollback <N>` restores one |
 | `configsync` | a commit on the primary pushes the running config to the backup's API, which applies **and** persists it |
-| `api` | the REST management API drives one config model end to end; `/health` is unauthenticated, the rest is not; and the web console — that it fetches nothing external, that every `/api/v1/…` path the page calls really answers, that a rule clicked into being is applied *and* persisted through the same commands the CLI runs, that a zone posture, a NAT entry, a BGP neighbour, an IPsec tunnel, a WireGuard interface and a DHCP server are all written through that one path, that `show configuration commands` replays into the same configuration it came from, that a script with no `commit` changes nothing, that a packet capture sees real ICMP on the loopback and refuses a filter that would become a tcpdump option, that a refused command comes back as output rather than as a silent success, and that the stack refuses a member the appliance has no relationship with |
+| `api` | the REST management API drives one config model end to end; health, login and OpenAPI documentation are public, management operations require authentication; the console fetches nothing external; its API paths answer; zone, NAT, routing, VPN and DHCP changes use the CLI commit path; command exports replay faithfully; complete-candidate validation cannot apply or save; packet capture sees real ICMP and refuses filters that become options; command refusals are reported; unrelated stack members are refused |
 
 ### Also here
 
@@ -63,6 +65,8 @@ write, which is how ten sections that could be typed and not clicked were found.
 |---|---|
 | `console` | the web console in a **real browser**: every section opens, a create panel stages a command the CLI accepts, applying writes the file, a wrong password is refused and says so |
 | `contract` | the compiled agent config keeps the shape the data plane reads |
+| `reconcile` | failed VXLAN/SRv6 controller updates preserve active filtering and retry the same revision; a late egress device installs its deferred route and carries real traffic without restarting |
+| `wren-reconcile` | real Wren/XDP traffic: failed installs and withdrawals retry without duplicate advertisements; unavailable ARP observations preserve forwarding; recovery applies cached routes; empty withdrawals need no ARP lookup; gateway MAC changes converge without a route event |
 | `shipped` | what the image actually carries |
 | `wizard` | the installer's click-through, answered end to end |
 
@@ -70,6 +74,9 @@ write, which is how ten sections that could be typed and not clicked were found.
 
 | Check | Proves |
 |---|---|
+| `ebpf-verifier` | real-kernel verification and JIT of every embedded XDP/TC program; tenant hooks recover after interface replacement without descriptor leaks; broken statistics output and exhausted descriptors preserve packet filtering, and query/portal/mapping sockets recover without a restart |
+| `config-transaction` | a full kernel map rejects the candidate without admitting forbidden packets; the same revision recovers after capacity returns; temporary NAT grants survive rollback and successful updates; standalone configured forwards cannot be replaced or removed by temporary grants; failed rollback blocks traffic |
+| `egress-transaction` | packet capture at the receiving namespace proves a failed update never detaches the previous egress filter; an unresponsive controller cannot prevent bounded agent shutdown |
 | `reject` | a rejected TCP port answers with a **RST**, not a silent drop |
 | `rejectudp` | a rejected UDP port answers with **ICMP port-unreachable** |
 | `log` | per-rule logging fires for a logged drop and a logged pass, and stays quiet otherwise |
