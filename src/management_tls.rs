@@ -4,7 +4,7 @@ use std::{
     fs::{self, File, OpenOptions},
     os::unix::{
         fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
-        io::AsRawFd,
+        io::{AsRawFd, FromRawFd},
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -58,6 +58,39 @@ fn directory(path: &Path) -> Result<File> {
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(path)
         .with_context(|| format!("opening TLS directory {}", path.display()))
+}
+
+/// Anchor every directory entry on the storage filesystem, even when a
+/// concurrent creator made it. Stop at its mount boundary, so an immutable
+/// parent filesystem does not have to be synchronized for a persistent mount.
+fn sync_directory_ancestry(directory: &File) -> Result<()> {
+    let mut current = directory.try_clone()?;
+    loop {
+        current
+            .sync_all()
+            .context("syncing the management TLS directory ancestry")?;
+        let metadata = current.metadata()?;
+        // SAFETY: the descriptor is live and the relative name is NUL-terminated.
+        // Walking descriptors also avoids re-resolving mutable path prefixes.
+        let raw = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                c"..".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("opening the management TLS ancestor directory");
+        }
+        // SAFETY: openat returned a new, exclusively owned descriptor above.
+        let parent = unsafe { File::from_raw_fd(raw) };
+        let ancestor = parent.metadata()?;
+        if ancestor.dev() != metadata.dev() || ancestor.ino() == metadata.ino() {
+            return Ok(());
+        }
+        current = parent;
+    }
 }
 
 fn public_key(openssl: &Path, path: &Path, certificate: bool) -> Result<Vec<u8>> {
@@ -118,23 +151,8 @@ pub fn ensure_pair(cert: &Path, key: &Path, cn: &str, san: &str, openssl: &Path)
         parent == key_parent && cert != key,
         "management TLS files must have distinct names in one directory"
     );
-    // Remember every new directory entry: syncing a file or the new directory
-    // alone does not make its entry in its own parent survive a power loss.
-    let mut created = Vec::new();
-    let mut cursor = parent;
-    loop {
-        match fs::symlink_metadata(cursor) {
-            Ok(_) => break,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                created.push(cursor.to_path_buf());
-                cursor = cursor
-                    .parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .unwrap_or(Path::new("."));
-            }
-            Err(error) => return Err(error).context("inspecting management TLS directory"),
-        }
-    }
+    // Another startup can create the directory before this one takes the
+    // generation lock. Existing entries are not evidence of durable ancestry.
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o755)
@@ -247,18 +265,7 @@ pub fn ensure_pair(cert: &Path, key: &Path, cn: &str, san: &str, openssl: &Path)
             .context("management certificate missing")?
             .sync_all()?;
     }
-    parent_fd
-        .sync_all()
-        .context("syncing the management TLS directory")?;
-    for path in created {
-        directory(
-            path.parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or(Path::new(".")),
-        )?
-        .sync_all()
-        .context("syncing the management TLS directory ancestry")?;
-    }
+    sync_directory_ancestry(&parent_fd)?;
     Ok(())
 }
 
