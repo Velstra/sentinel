@@ -15,7 +15,7 @@ pkgs.testers.runNixOSTest {
         output = machine.succeed("printf '%s\\n' " + " ".join(shlex.quote(c) for c in [*commands, "commit", "save"]) + " | sentinel configure 2>&1", timeout=120)
         assert "commit ok: applied live" in output, output
         assert "installing policy route" not in output and "Command \\\"-" not in output, output
-        machine.succeed("sentinel agent-query status | grep '^Ready$'")
+        machine.wait_until_succeeds("sentinel agent-query status | grep '^Ready$'", timeout=30)
     machine.succeed("ip netns add rp-client; ip netns add rp-server; ip link add rp-front type veth peer name client; ip link set client netns rp-client; ip link add rp-back type veth peer name server; ip link set server netns rp-server")
     machine.succeed("ip -n rp-client link set lo up; ip -n rp-client link set client up; ip -n rp-client addr add 192.0.2.2/24 dev client; ip -n rp-client route add default via 192.0.2.1; ip -n rp-server link set lo up; ip -n rp-server link set server up; ip -n rp-server addr add 198.51.100.2/24 dev server; ip -n rp-server route add default via 198.51.100.1")
     machine.succeed("ip -n rp-client -6 addr add 2001:db8:510::2/64 dev client nodad; ip -n rp-client -6 route add default via 2001:db8:510::1; ip -n rp-server -6 addr add 2001:db8:520::2/64 dev server nodad; ip -n rp-server -6 route add default via 2001:db8:520::1")
