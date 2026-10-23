@@ -458,10 +458,11 @@ pub fn ip_route_flush_table(table: u32) -> Result<()> {
 /// The routing-policy rules the appliance owns, as `ip rule` prints them. Only
 /// the priority band in [`crate::net::PBR_PRIORITY_BASE`] is ours; anything else
 /// in the table belongs to the kernel or to somebody else and is left alone.
-pub fn ip_rule_list() -> Result<String> {
+pub fn ip_rule_list(family: &str) -> Result<String> {
+    anyhow::ensure!(matches!(family, "-4" | "-6"), "invalid IP rule family");
     let is_root = unsafe { libc::geteuid() } == 0;
     let ip = bin("ip");
-    let args = ["-o", "rule", "show"];
+    let args = [family, "-o", "rule", "show"];
     let output = if is_root {
         Command::new(&ip).args(args).output()
     } else {
@@ -470,13 +471,19 @@ pub fn ip_rule_list() -> Result<String> {
         Command::new("sudo").args(&all).output()
     };
     let out = output.context("running ip rule show")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "listing {family} policy rules failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Add or delete one routing-policy rule. The arguments are built by the caller
 /// from the configuration; nothing here interprets them.
-pub fn ip_rule(args: &[&str]) -> Result<()> {
-    let mut all = vec!["rule"];
+pub fn ip_rule(family: &str, args: &[&str]) -> Result<()> {
+    anyhow::ensure!(matches!(family, "-4" | "-6"), "invalid IP rule family");
+    let mut all = vec![family, "rule"];
     all.extend_from_slice(args);
     run_priv("ip", &all)
 }

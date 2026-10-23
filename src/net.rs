@@ -4186,12 +4186,25 @@ fn pbr_families(r: &crate::config::PolicyRoute) -> Vec<&'static str> {
 /// answer to a different table. Only the appliance's own priority band is
 /// touched: a rule somebody else put in the table stays.
 fn apply_policy_routes(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
+    apply_policy_routes_with(appliance, mode, system::ip_rule_list, system::ip_rule)
+}
+
+fn apply_policy_routes_with(
+    appliance: &Appliance,
+    mode: ApplyMode,
+    mut list: impl FnMut(&str) -> Result<String>,
+    mut change: impl FnMut(&str, &[&str]) -> Result<()>,
+) -> Result<()> {
     if mode != ApplyMode::Live {
         return Ok(());
     }
     // Tear our band down first. Deleting by priority is exact and does not
     // depend on reconstructing the selectors of a rule that has since changed.
-    if let Ok(listing) = system::ip_rule_list() {
+    // Read both namespaces before making any changes. A failed IPv6 read must
+    // not leave IPv4 rules removed while reporting a failed reconcile.
+    let v4 = list("-4").context("listing -4 policy routes")?;
+    let v6 = list("-6").context("listing -6 policy routes")?;
+    for (family, listing) in [("-4", v4), ("-6", v6)] {
         for line in listing.lines() {
             let Some((prio, _)) = line.split_once(':') else {
                 continue;
@@ -4202,15 +4215,8 @@ fn apply_policy_routes(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
             if !(PBR_PRIORITY_BASE..=PBR_PRIORITY_END).contains(&p) {
                 continue;
             }
-            let family = if line.contains("from all") && !line.contains('.') {
-                "-6"
-            } else {
-                "-4"
-            };
-            let _ = system::ip_rule(&[family, "del", "priority", &p.to_string()]);
-            // The same priority can hold one rule per family.
-            let other = if family == "-4" { "-6" } else { "-4" };
-            let _ = system::ip_rule(&[other, "del", "priority", &p.to_string()]);
+            change(family, &["del", "priority", &p.to_string()])
+                .with_context(|| format!("removing {family} policy route priority {p}"))?;
         }
     }
     for (i, r) in appliance.policy.routes.iter().enumerate() {
@@ -4222,11 +4228,10 @@ fn apply_policy_routes(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
             continue;
         };
         for family in pbr_families(r) {
-            let mut all: Vec<&str> = vec![family, "add"];
+            let mut all: Vec<&str> = vec!["add"];
             all.extend(args.iter().map(String::as_str));
-            if let Err(e) = system::ip_rule(&all) {
-                eprintln!("warning: installing policy route {:?} failed: {e}", r.name);
-            }
+            change(family, &all)
+                .with_context(|| format!("installing {family} policy route {:?}", r.name))?;
         }
     }
     Ok(())
@@ -5831,6 +5836,61 @@ mod tests {
             ..r
         };
         assert!(pbr_args(&off, 10_000).is_none());
+    }
+
+    #[test]
+    fn policy_route_listing_failure_cannot_mutate_either_family() {
+        let error = apply_policy_routes_with(
+            &Appliance::from_toml("[system]\nhostname='fw'\n").unwrap(),
+            ApplyMode::Live,
+            |family| {
+                if family == "-4" {
+                    Ok("10000: from all lookup 201\n".into())
+                } else {
+                    anyhow::bail!("kernel rule dump failed")
+                }
+            },
+            |_, _| panic!("no mutation before both family dumps succeeded"),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("listing -6 policy routes"));
+    }
+
+    #[test]
+    fn policy_route_removal_failure_stops_before_installing_new_rules() {
+        let mut calls = Vec::new();
+        let error = apply_policy_routes_with(
+            &Appliance::from_toml("[system]\nhostname='fw'\n").unwrap(),
+            ApplyMode::Live,
+            |_| Ok("10000: from all lookup 201\n".into()),
+            |family, args| {
+                calls.push((family.to_owned(), args.join(" ")));
+                anyhow::bail!("kernel rejected deletion")
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("removing -4 policy route priority 10000"));
+        assert_eq!(calls, [("-4".into(), "del priority 10000".into())]);
+    }
+
+    #[test]
+    fn policy_route_add_failure_is_a_failed_apply_with_the_rule_name() {
+        let mut appliance = Appliance::from_toml("[system]\nhostname='fw'\n").unwrap();
+        appliance.policy.routes.push(crate::config::PolicyRoute {
+            name: "isolated-client".into(),
+            source: Some("192.0.2.2/32".into()),
+            table: 201,
+            ..Default::default()
+        });
+        let error = apply_policy_routes_with(
+            &appliance,
+            ApplyMode::Live,
+            |_| Ok(String::new()),
+            |_, _| anyhow::bail!("kernel denied rule"),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("isolated-client") && message.contains("kernel denied rule"));
     }
 
     /// The point of the whole feature: when an encrypted upstream is set, the

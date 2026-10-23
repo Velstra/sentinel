@@ -85,6 +85,7 @@ jobs:
           - dns
           - lldp
           - bgp
+          - policy-routing
           - nat
           - ebpf-verifier
           - reconcile
