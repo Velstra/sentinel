@@ -1819,6 +1819,15 @@ pub fn page() -> String {
         <div class="addpanel" id="globalform"></div>
       </div>
 
+      <div class="card">
+        <h3>Connection timeouts</h3>
+        <p class="lede" style="margin:0 0 var(--space-3)">
+          Idle time before a connection expires, in seconds (1–604800).
+          Clear a value to restore its default.
+        </p>
+        <div class="addpanel" id="conntrackform"></div>
+      </div>
+
       <div class="section">
         <h3>Zones</h3>
         <span class="spacer"></span>
@@ -4440,6 +4449,10 @@ const PATH_DEFAULTS = {{
     "default-action": "drop", stateful: "on", "block-icmp": "off",
     log: "off", "fail-closed": "on", "source-validation": "disable",
   }},
+  "firewall global conntrack": {{
+    "tcp-syn": "30", "tcp-established": "86400", "tcp-closing": "30",
+    udp: "30", "udp-stream": "180", icmp: "10",
+  }},
   "firewall zone": {{
     "default-action": "the global posture", stateful: "the global posture",
     "block-icmp": "the global posture", log: "the global posture",
@@ -6201,10 +6214,21 @@ const GLOBAL_POSTURE = POSTURE.filter((f) => !ZONE_ONLY.includes(f[0])).concat([
   ["fail-closed", "Drop unparseable packets", ["", "true", "false"]],
 ]);
 
+const CONNTRACK_TIMEOUTS = [
+  ["tcp-syn", "TCP handshake (s)"],
+  ["tcp-established", "TCP established (s)"],
+  ["tcp-closing", "TCP closing (s)"],
+  ["udp", "UDP request (s)"],
+  ["udp-stream", "UDP stream (s)"],
+  ["icmp", "ICMP echo (s)"],
+];
+
 async function refreshZones() {{
   const ls = await leaves();
   const globals = fieldsOf(ls, "firewall global");
   settingsPanel("globalform", GLOBAL_POSTURE, globals, "firewall global", "Global firewall posture");
+  settingsPanel("conntrackform", CONNTRACK_TIMEOUTS, fieldsOf(ls, "firewall global conntrack"),
+    "firewall global conntrack", "Connection timeouts");
 
   // A zone exists because an interface names it, so the list is the zones in
   // use — not only the ones that happen to carry an override.
