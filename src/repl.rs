@@ -469,6 +469,14 @@ fn unknown_command(cmd: &str, rest: &[&str], ctx: &[String]) -> anyhow::Error {
 /// plane, and set the hostname live. No rebuild, no reboot. Never exits the
 /// shell. Returns `false`.
 fn commit(session: &mut Session, act: &Apply) -> bool {
+    let _transaction = match system::apply_lock() {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            note_refusal();
+            return false;
+        }
+    };
     // Somebody else got here first. Not refused — an operator may well mean to
     // replace what the other session did — but never silent: this commit
     // replaces the running configuration wholesale, including the parts they
@@ -570,11 +578,9 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
     if appliance.system.hostname != old_host {
         eprintln!("  hostname: {old_host} -> {}", appliance.system.hostname);
     }
-    // HA config sync (roadmap C21): push the just-applied running config to any
-    // configured peers. Best-effort — a down peer warns but never fails the commit.
-    // Only the interactive commit pushes (never the API's own PUT handler), so a
-    // received sync does not re-push and a pair never loops.
-    if let Err(e) = crate::net::push_config_to_peers(&appliance) {
+    // Queue the applied intent durably; a down peer is retried by the worker.
+    // Local API updates queue too; received revisions never do.
+    if let Err(e) = crate::configsync::enqueue(&appliance) {
         eprintln!("{} config-sync: {e}", ui::yellow("warning:"));
     }
     eprintln!(
@@ -913,7 +919,7 @@ pub(crate) fn apply_live(
     // reconcile: staging uses fixed temp filenames under /run/sentinel, so two
     // writers at once could splice a networkd unit or a half-written velstra.toml.
     // Held until this function returns.
-    let _lock = system::apply_lock();
+    let _lock = system::apply_lock()?;
 
     // ---- Phase 1: prepare (fallible, NO live side effects) ----
     // Domain groups become address groups here: the compiler matches addresses and

@@ -140,6 +140,8 @@
             --set SENTINEL_ID_BIN         ${pkgs.coreutils}/bin/id \
             --set SENTINEL_CHMOD_BIN      ${pkgs.coreutils}/bin/chmod \
             --set SENTINEL_RM_BIN         ${pkgs.coreutils}/bin/rm \
+            --set SENTINEL_MV_BIN         ${pkgs.coreutils}/bin/mv \
+            --set SENTINEL_SYNC_BIN       ${pkgs.coreutils}/bin/sync \
             --set SENTINEL_UNAME_BIN      ${pkgs.coreutils}/bin/uname \
             --set SENTINEL_SGDISK_BIN     ${pkgs.gptfdisk}/bin/sgdisk \
             --set SENTINEL_WIPEFS_BIN     ${pkgs.util-linux}/bin/wipefs \
@@ -329,6 +331,28 @@
         # The workspace's tests need root (they load eBPF) — skip in the sandbox.
         doCheck = false;
       };
+
+      # Run the state-replication acceptance test with real kernel LRU maps in
+      # an isolated VM. The sandbox builds the harness but never needs CAP_BPF.
+      velstra-ha-tests = velstra.overrideAttrs (old: {
+        pname = "velstra-ha-tests";
+        nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.jq ];
+        buildPhase = ''
+          runHook preBuild
+          cargo test --release --locked --offline --bin velstra --no-run \
+            --ignore-rust-version --message-format=json-render-diagnostics > test-artifacts.jsonl
+          runHook postBuild
+        '';
+        installPhase = ''
+          mkdir -p "$out/bin"
+          harness=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "velstra") | .executable' test-artifacts.jsonl)
+          test -n "$harness"
+          cp "$harness" "$out/bin/velstra-ha-tests"
+        '';
+        postInstall = ''
+          remove-references-to -t ${nightly} "$out/bin/velstra-ha-tests"
+        '';
+      });
 
       # The factory-default appliance config, baked into the image. At runtime the
       # operator edits /var/lib/sentinel/appliance.toml; the sentinel-boot service
@@ -700,6 +724,22 @@
               Restart = "on-failure";
               RestartSec = "5s";
             };
+          };
+
+          systemd.services.sentinel-configsync = {
+            description = "Retry the durable Sentinel HA configuration outbox";
+            after = [ "network-online.target" "sentinel-boot.service" ];
+            wants = [ "network-online.target" ];
+            unitConfig.ConditionPathExists = "/var/lib/sentinel/configsync/pending.json";
+            serviceConfig = {
+              Type = "oneshot";
+              ExecStart = "${sentinel}/bin/sentinel sync-config";
+              UMask = "0077";
+            };
+          };
+          systemd.timers.sentinel-configsync = {
+            wantedBy = [ "timers.target" ];
+            timerConfig = { OnBootSec = "5s"; OnUnitInactiveSec = "1s"; Unit = "sentinel-configsync.service"; };
           };
 
           # Persistence guard for the editable config itself: order the
@@ -8230,6 +8270,9 @@
         # listen-only. Verified by each node's velstra journal (push on `fw`, apply on
         # both backups) — the sync datapath runs inside the sandboxed VMs.
         #   nix build .#checks.x86_64-linux.conntracksync -L
+        ha-kernel = import ./nix/ha-kernel-test.nix { inherit pkgs velstra-ha-tests; };
+        ha-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; };
+
         conntracksync = pkgs.testers.runNixOSTest {
           name = "sentinel-conntracksync";
           nodes = {
@@ -15124,6 +15167,24 @@
               # peer-fingerprint was configured), so the config was sent encrypted
               # and authenticated to exactly that key rather than in the clear.
               primary.succeed("ls /var/lib/sentinel/configsync/*.pin")
+
+              # API-originated changes queue while the backup is unavailable,
+              # then apply without a second administrator commit. Shared link
+              # settings converge, while the receiver keeps its own address.
+              import json, shlex
+              backup.succeed("systemctl stop sentinel-api.service")
+              desired=json.loads(primary.succeed("sentinel config convert /var/lib/sentinel/appliance.toml --to json"))
+              desired["rule"].append(dict(desired["rule"][0],name="api-synced-rule",port=12346))
+              for interface in desired["interface"]:
+                  if interface["name"]=="eth1": interface["mtu"]=1450
+              primary.succeed("printf %s "+shlex.quote(json.dumps(desired))+" >/tmp/ha-api.json")
+              primary.succeed("curl -fsSk -X PUT -H 'Authorization: Bearer shared-token-123' -H 'Content-Type: application/json' --data-binary @/tmp/ha-api.json https://127.0.0.1:8080/api/v1/config")
+              primary.succeed("grep -q api-synced-rule /var/lib/sentinel/configsync/pending.json; test $(stat -c %a /var/lib/sentinel/configsync/pending.json) = 640")
+              backup.fail("grep -q api-synced-rule /var/lib/sentinel/appliance.toml")
+              backup.succeed("systemctl start sentinel-api.service")
+              backup.wait_until_succeeds("grep -q api-synced-rule /var/lib/sentinel/appliance.toml",timeout=45)
+              primary.wait_until_succeeds("test ! -f /var/lib/sentinel/configsync/pending.json",timeout=20)
+              backup.succeed("ip -o link show eth1 | grep -q 'mtu 1450'; ip -o address show eth1 | grep -q 10.9.0.2; ! ip -o address show eth1 | grep -q 10.9.0.1")
             '';
           };
       };

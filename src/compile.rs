@@ -203,6 +203,10 @@ struct ConntrackSyncOut {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     peer: Vec<String>,
     interval_secs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secret: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    interval_ms: Option<u64>,
 }
 
 /// One `[[npt66]]` entry in the emitted velstra config — a NPTv6 (RFC 6296)
@@ -1009,10 +1013,28 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
     // C9 conntrack sync — emit `[conntrack_sync]` only when configured, with the
     // endpoints already normalized to `ip:port` by the appliance layer.
     let cts = &appliance.system.conntrack_sync;
+    // Reuse the pair's credential with a distinct protocol key. Config-sync
+    // bearer tokens never appear in conntrack frames or in another protocol's
+    // authentication context. Existing trusted-link UDP configurations remain
+    // compatible until a pair credential is configured.
+    let state_secret = appliance.system.config_sync.secret.as_ref().map(|secret| {
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+        ring::hmac::sign(&key, b"Velstra Sentinel VCS2 state replication key")
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    });
     let conntrack_sync = cts.listen_endpoint().map(|listen| ConntrackSyncOut {
         listen,
         peer: cts.peer_endpoints(),
         interval_secs: cts.interval.unwrap_or(1),
+        interval_ms: state_secret.as_ref().map(|_| {
+            cts.interval
+                .map(|seconds| seconds.saturating_mul(1000))
+                .unwrap_or(50)
+        }),
+        secret: state_secret,
     });
 
     VelstraConfig {
@@ -2861,6 +2883,29 @@ zone = "lan"
         let cfg = compile(&appliance);
         assert!(cfg.conntrack_sync.is_none());
         assert!(!cfg.to_toml().unwrap().contains("conntrack_sync"));
+    }
+
+    #[test]
+    fn paired_conntrack_sync_uses_separate_authenticated_key_and_fast_default() {
+        let mut appliance = Appliance::from_toml(crate::config::EXAMPLE).unwrap();
+        appliance.system.config_sync.secret = Some("pair credential used for this test".into());
+        appliance.system.conntrack_sync.peers = vec!["10.9.0.2".into()];
+        let output = compile(&appliance);
+        let sync = output.conntrack_sync.unwrap();
+        assert_eq!(sync.interval_ms, Some(50));
+        let key = sync.secret.unwrap();
+        assert_eq!(key.len(), 64);
+        assert_ne!(key, appliance.system.config_sync.secret.clone().unwrap());
+        appliance.system.conntrack_sync.interval = Some(3);
+        assert_eq!(
+            compile(&appliance).conntrack_sync.unwrap().interval_ms,
+            Some(3000)
+        );
+        appliance.system.config_sync.secret = Some("a different pair credential".into());
+        assert_ne!(
+            compile(&appliance).conntrack_sync.unwrap().secret.unwrap(),
+            key
+        );
     }
 
     /// The MSS ceiling reaches the data plane as a *number*. It used to be an

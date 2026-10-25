@@ -4248,11 +4248,12 @@ impl Console {
     }
 }
 
-/// HA config sync (`[system.config-sync]`). On every `commit`, the running config
-/// is pushed to each `peer`'s Sentinel API (`PUT /api/v1/config-sync`, bearer = the
-/// shared `secret`), which applies + persists it — pfSense-XMLRPC-analog, but
-/// declarative. A received sync does NOT re-push (only the interactive commit does),
-/// so a pair does not loop. Configuring a `secret` also arms the receiving side:
+/// HA config sync (`[system.config-sync]`). Local CLI commits and API updates
+/// enter a durable outbox delivered to each peer's `PUT /api/v1/config-sync`.
+/// Failed peers are retried; receiving a revision does not queue another push.
+/// The receiver preserves its member addresses and validates the merged shared
+/// policy before applying and atomically persisting it. Configuring a `secret`
+/// also arms the receiving side:
 /// this box runs its own API (on `:8080`, token = the secret) so a peer can push to
 /// it. Firewall rules gate who may reach that port.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -4305,8 +4306,10 @@ pub fn is_valid_pinned_sha256(s: &str) -> bool {
 /// `[system.config-sync]` (running config) it completes the HA triad: a failover
 /// keeps established, NAT'd connections alive instead of dropping every flow.
 ///
-/// The sync stream is **unauthenticated** (like pfsync), so it must run over a
-/// trusted/dedicated sync link; firewall rules gate who may reach the port.
+/// With `system.config-sync.secret`, state uses mutually authenticated TCP,
+/// polling changes every 50ms by default. Without a pair credential this retains
+/// the legacy trusted-link UDP protocol. Authentication does not encrypt flow
+/// metadata: use WireGuard when the HA network is not private.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ConntrackSync {
     /// Address the data plane binds to receive peer state — `host` or `host:port`
@@ -4318,7 +4321,7 @@ pub struct ConntrackSync {
     /// port `5429`). Repeatable.
     #[serde(rename = "peer", default, skip_serializing_if = "Vec::is_empty")]
     pub peers: Vec<String>,
-    /// Seconds between pushes. Defaults to 1.
+    /// Seconds between pushes. Unset: 50ms with a pair credential, otherwise 1s.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interval: Option<u64>,
 }
@@ -9714,6 +9717,9 @@ impl Appliance {
         // `listen` and every `peer` must be a host or host:port; the interval must
         // be a sane, non-zero cadence.
         let cts = &self.system.conntrack_sync;
+        if !cts.is_empty() && cs.secret.is_some() && cts.peers.is_empty() {
+            bail!("system conntrack-sync: authenticated state replication requires explicit peers");
+        }
         if let Some(listen) = &cts.listen {
             validate_sync_peer(listen)
                 .map_err(|e| anyhow::anyhow!("system conntrack-sync listen {e}"))?;

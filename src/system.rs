@@ -601,14 +601,15 @@ pub(crate) fn stage_private(tmp: &Path, contents: &str) -> Result<()> {
         .with_context(|| format!("staging {}", tmp.display()))
 }
 
-/// A held cross-process apply lock. Dropping it closes the file, which releases
-/// the advisory `flock`. `None` means the lock could not be taken (off-box, or a
-/// test with no `/run/sentinel`) and the caller proceeds unserialised — the lock
-/// is a best-effort guard against concurrent on-box writers, never a gate that
-/// fails a commit.
+/// A reentrant, thread-bound cross-process configuration lock. Nested apply and
+/// persist calls share the descriptor; the last guard releases the flock.
 #[must_use = "the lock is released as soon as this guard is dropped"]
 pub struct ApplyLock {
-    _file: Option<std::fs::File>,
+    _file: Option<std::rc::Rc<std::fs::File>>,
+}
+
+thread_local! {
+    static APPLY_OWNERS: std::cell::RefCell<std::collections::BTreeMap<std::path::PathBuf,std::rc::Weak<std::fs::File>>> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
 }
 
 /// The single lockfile that serialises the apply/persist critical section.
@@ -627,36 +628,64 @@ const APPLY_LOCK_PATH: &str = "/run/sentinel/apply.lock";
 /// [`crate::session::persist_appliance`]) and so cooperates on the one lock. The
 /// call blocks until the lock is ours; the guard releases it on drop.
 ///
-/// Best-effort: if the lockfile cannot be opened (no `/run/sentinel` off-box or
-/// in a test), the caller proceeds without the lock rather than failing — the
-/// races this guards against only exist on a running appliance, where the
-/// directory is always present and writable by the writers.
-///
-/// Never take this while already holding it (it would self-deadlock): the two
-/// chokepoints run their critical sections to completion and never nest.
-pub fn apply_lock() -> ApplyLock {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::AsRawFd;
+/// Off-box editing has no runtime directory. On an appliance, failure to lock
+/// is an error before mutation, rather than permission to race another writer.
+pub fn apply_lock() -> Result<ApplyLock> {
     if !Path::new("/run/sentinel").is_dir() {
-        return ApplyLock { _file: None };
+        return Ok(ApplyLock { _file: None });
+    }
+    lock_config_at(Path::new(APPLY_LOCK_PATH))
+}
+
+pub(crate) fn lock_config_at(path: &Path) -> Result<ApplyLock> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::io::AsRawFd;
+    if let Some(file) =
+        APPLY_OWNERS.with(|owners| owners.borrow().get(path).and_then(std::rc::Weak::upgrade))
+    {
+        return Ok(ApplyLock { _file: Some(file) });
     }
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
-        .mode(0o600)
-        .open(APPLY_LOCK_PATH);
-    let Ok(file) = file else {
-        return ApplyLock { _file: None };
-    };
-    // SAFETY: a blocking `flock` on a valid fd we own for the lifetime of `file`;
-    // the lock is released when the fd is closed on drop. A failure here (rare —
-    // e.g. EINTR) degrades to proceeding unserialised rather than aborting.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    if rc != 0 {
-        return ApplyLock { _file: None };
+        .mode(0o660)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("opening configuration lock {}", path.display()))?;
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "configuration lock is not a regular file"
+    );
+    // The boot service creates the lock as root; interactive wheel sessions
+    // must lock the same inode rather than silently skipping serialization.
+    if unsafe { libc::geteuid() } == 0 {
+        if let Some(gid) = wheel_gid() {
+            anyhow::ensure!(
+                unsafe { libc::fchown(file.as_raw_fd(), 0, gid) } == 0,
+                "setting configuration lock group: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        file.set_permissions(std::fs::Permissions::from_mode(0o660))?;
     }
-    ApplyLock { _file: Some(file) }
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error).context("locking configuration transaction");
+        }
+    }
+    let file = std::rc::Rc::new(file);
+    APPLY_OWNERS.with(|owners| {
+        let mut owners = owners.borrow_mut();
+        owners.retain(|_, owner| owner.strong_count() > 0);
+        owners.insert(path.to_path_buf(), std::rc::Rc::downgrade(&file));
+    });
+    Ok(ApplyLock { _file: Some(file) })
 }
 
 /// The numeric gid of the `wheel` group, if this system has one. Used to set the
@@ -828,43 +857,79 @@ pub fn install_file(path: &Path, contents: &str) -> Result<()> {
 /// membership that lets them escalate here in the first place.
 pub fn install_config_file(path: &Path, contents: &str) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let tmp = path.with_extension("toml.tmp");
-    // Fast path (root, and the API service, which own the directory): stage the
-    // temp with the final mode 0640 from the outset — a plain `fs::write` honours
-    // the umask (0644) and `rename` preserves the temp's mode, so writing 0644
-    // here would silently widen a config that carries hashed passwords and VPN
-    // secrets. Group `wheel` (best-effort) matches the sudo path below, so an
-    // operator account can still read the saved config without escalating.
-    let direct = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o640)
-        .open(&tmp);
-    if let Ok(mut f) = direct {
-        if f.write_all(contents.as_bytes()).is_ok() {
-            drop(f);
+    let _transaction = apply_lock()?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    match PrivateStage::create(parent, 0o640) {
+        Ok(mut stage) => {
+            stage.file.write_all(contents.as_bytes())?;
             if let Some(gid) = wheel_gid() {
-                let _ = std::os::unix::fs::chown(&tmp, None, Some(gid));
+                std::os::unix::fs::chown(&stage.path, None, Some(gid))?;
             }
-            if std::fs::rename(&tmp, path).is_ok() {
-                return Ok(());
-            }
+            stage.file.sync_all()?;
+            std::fs::rename(&stage.path, path)
+                .with_context(|| format!("atomically replacing {}", path.display()))?;
+            std::fs::File::open(parent)?.sync_all()?;
+            return Ok(());
         }
-        let _ = std::fs::remove_file(&tmp);
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied) => {}
+        Err(error) => return Err(error),
     }
-    let staged = Path::new("/run/sentinel").join(".appliance.toml.tmp");
-    stage_private(&staged, contents)?;
-    let (Some(src), Some(dst)) = (staged.to_str(), path.to_str()) else {
-        bail!("non-UTF-8 path");
-    };
-    sudo("install", &["-m", "0640", "-g", "wheel", src, dst]).with_context(|| {
-        format!(
-            "installing {} (needs root, or an account in the wheel group)",
-            path.display()
-        )
-    })
+    // Escalation must preserve atomic replacement too: install into a sibling,
+    // flush it, then rename. Installing over the live path exposes a truncated
+    // document to the peer/API and leaves it truncated if install is interrupted.
+    let mut staged = PrivateStage::create(Path::new("/run/sentinel"), 0o600)?;
+    staged.file.write_all(contents.as_bytes())?;
+    staged.file.sync_all()?;
+    let target = parent.join(staged.path.file_name().context("staging filename")?);
+    let source = staged.path.to_str().context("non-UTF-8 staging path")?;
+    let temporary = target.to_str().context("non-UTF-8 config directory")?;
+    let destination = path.to_str().context("non-UTF-8 config path")?;
+    let directory = parent.to_str().context("non-UTF-8 config directory")?;
+    let result = (|| {
+        sudo("install", &["-m", "0640", "-g", "wheel", source, temporary])?;
+        sudo("sync", &["-f", temporary])?;
+        sudo("mv", &["-fT", "--", temporary, destination])?;
+        sudo("sync", &["-f", directory])
+    })();
+    if result.is_err() {
+        let _ = sudo("rm", &["-f", "--", temporary]);
+    }
+    result.with_context(|| format!("atomically installing {}", path.display()))
+}
+
+/// Exclusively created, private staging file. Unpredictable names and O_EXCL
+/// prevent following a pre-existing symlink or reusing another writer's file.
+pub(crate) struct PrivateStage {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) file: std::fs::File,
+}
+impl PrivateStage {
+    pub(crate) fn create(directory: &Path, mode: u32) -> Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut random = [0u8; 16];
+        getrandom::getrandom(&mut random)
+            .map_err(|error| anyhow::anyhow!("configuration staging entropy: {error}"))?;
+        let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let path = directory.join(format!(".sentinel-config-{suffix}.tmp"));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)?;
+        Ok(Self { path, file })
+    }
+}
+impl Drop for PrivateStage {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// Install a secret file `contents` at a (root-owned) `path` readable by
@@ -1591,6 +1656,8 @@ pub fn bin(name: &str) -> String {
         "mkdir" => "SENTINEL_MKDIR_BIN",
         "chmod" => "SENTINEL_CHMOD_BIN",
         "rm" => "SENTINEL_RM_BIN",
+        "mv" => "SENTINEL_MV_BIN",
+        "sync" => "SENTINEL_SYNC_BIN",
         // local login accounts ([[system.login]], roadmap C21)
         "useradd" => "SENTINEL_USERADD_BIN",
         "usermod" => "SENTINEL_USERMOD_BIN",
@@ -1752,6 +1819,76 @@ pub(crate) fn sudo(cmd: &str, args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atomic_config_replacement_does_not_follow_the_old_predictable_temp_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory =
+            std::env::temp_dir().join(format!("sentinel-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("appliance.toml");
+        let victim = directory.join("unrelated");
+        std::fs::write(&target, "previous").unwrap();
+        std::fs::write(&victim, "preserved").unwrap();
+        std::os::unix::fs::symlink(&victim, target.with_extension("toml.tmp")).unwrap();
+        install_config_file(&target, "replacement").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "replacement");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "preserved");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert!(!std::fs::read_dir(&directory).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".sentinel-config-")
+        }));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn configuration_transaction_is_reentrant_and_serializes_other_writers() {
+        let directory = std::env::temp_dir().join(format!(
+            "sentinel-lock-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("apply.lock");
+        let outer = lock_config_at(&path).unwrap();
+        let nested = lock_config_at(&path).unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let other_path = path.clone();
+        let other = std::thread::spawn(move || {
+            let _guard = lock_config_at(&other_path).unwrap();
+            sent.send(()).unwrap();
+        });
+        assert!(
+            received
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
+        drop(outer);
+        assert!(
+            received
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
+        drop(nested);
+        received
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        other.join().unwrap();
+        let target = directory.join("unrelated");
+        std::fs::write(&target, "preserved").unwrap();
+        let link = directory.join("symlink");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(lock_config_at(&link).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "preserved");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn policy_id_reuse_or_removal_invalidates_sessions_but_rule_edits_do_not() {
