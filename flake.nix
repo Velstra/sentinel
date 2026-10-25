@@ -738,7 +738,7 @@
           };
           systemd.timers.sentinel-configsync = {
             wantedBy = [ "timers.target" ];
-            timerConfig = { OnBootSec = "5s"; OnUnitInactiveSec = "1s"; Unit = "sentinel-configsync.service"; };
+            timerConfig = { OnBootSec = "5s"; OnUnitInactiveSec = "1s"; AccuracySec = "100ms"; Unit = "sentinel-configsync.service"; };
           };
 
           # Persistence guard for the editable config itself: order the
