@@ -425,6 +425,7 @@ services loglevel
 services max-lifetime
 services max-sessions
 services message
+services mode
 services mtu
 services negative-ttl
 services never-block
@@ -467,6 +468,7 @@ system listen
 system locale
 system password
 system peer
+system peer-fingerprint
 system permission
 system secret
 system speed

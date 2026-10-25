@@ -1112,11 +1112,19 @@ pub fn curl_get(url: &str, token: &str, timeout_secs: u32, pin: Option<&str>) ->
     args.push(url.into());
     let out = Command::new(bin("curl"))
         .args(&args)
-        .stderr(Stdio::null())
         .output()
         .with_context(|| format!("running curl to {url}"))?;
     if !out.status.success() {
-        bail!("curl GET {url} failed");
+        let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        bail!(
+            "curl GET {url} failed ({}): {}",
+            out.status,
+            if detail.is_empty() {
+                "no diagnostic"
+            } else {
+                &detail
+            }
+        );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -1231,14 +1239,22 @@ pub fn curl_put_config(url: &str, token: &str, body_file: &Path, pin: Option<&st
     ];
     add_pin_args(&mut args, pin);
     args.push(url.into());
-    let status = Command::new(bin("curl"))
+    let out = Command::new(bin("curl"))
         .args(&args)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .output()
         .with_context(|| format!("running curl to {url}"))?;
-    if !status.success() {
-        bail!("curl PUT {url} failed");
+    if !out.status.success() {
+        let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        bail!(
+            "curl PUT {url} failed ({}): {}",
+            out.status,
+            if detail.is_empty() {
+                "no diagnostic"
+            } else {
+                &detail
+            }
+        );
     }
     Ok(())
 }
@@ -1487,8 +1503,9 @@ fn openssl_filter(args: &[&str], input: &[u8]) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
-/// Tell systemd-networkd to re-read its unit files and re-apply them to the
-/// given links — so a freshly written `.network` takes effect immediately.
+/// Tell systemd-networkd to re-read its unit files. Reload automatically
+/// reconfigures links whose network files changed; forcing another reconfigure
+/// would discard DHCP leases again, including on unchanged links.
 /// Best-effort: at early boot networkd may not be up yet (it reads the files on
 /// start anyway), so failures are reported by the caller, not fatal here.
 pub fn networkctl_reload(ifaces: &[String]) -> Result<()> {
@@ -1564,6 +1581,7 @@ pub fn bin(name: &str) -> String {
         "sysctl" => "SENTINEL_SYSCTL_BIN",
         "swanctl" => "SENTINEL_SWANCTL_BIN",
         "openssl" => "SENTINEL_OPENSSL_BIN",
+        "curl" => "SENTINEL_CURL_BIN",
         "ethtool" => "SENTINEL_ETHTOOL_BIN",
         "lego" => "SENTINEL_LEGO_BIN",
         "lsblk" => "SENTINEL_LSBLK_BIN",

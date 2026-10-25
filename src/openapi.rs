@@ -244,6 +244,18 @@ const OPERATIONS: &[Operation] = &[
         open: false,
     },
     Operation {
+        method: "put",
+        path: "/api/v1/config-sync",
+        id: "put-config-sync",
+        summary: "Apply configuration received from an HA peer.",
+        description: "The peer's shared policy is validated, applied and saved through the normal commit path. The receiving firewall keeps its hostname, interface addresses, config-sync peers, conntrack-sync endpoint and router ID, so a sync cannot turn the standby into a copy of the sender.",
+        parameters: &[],
+        body: Some(("application/json", any_object)),
+        answer: "What was applied and saved.",
+        answer_shape: Some(("application/json", any_object)),
+        open: false,
+    },
+    Operation {
         method: "get",
         path: "/api/v1/status",
         id: "status",

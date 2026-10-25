@@ -51,6 +51,18 @@ pub(crate) fn effective_mtu(
     resolve(iface, all, 0)
 }
 
+/// A firewall-only commit must not discard an unchanged DHCP lease.
+pub(crate) fn network_changed(
+    name: &str,
+    previous: &BTreeMap<String, String>,
+    desired: &BTreeMap<String, String>,
+) -> bool {
+    ["network", "netdev", "link"].iter().any(|kind| {
+        let file = format!("10-sentinel-{name}.{kind}");
+        previous.get(&file) != desired.get(&file)
+    })
+}
+
 fn device_name(file: &str) -> Option<&str> {
     let name = file.strip_prefix("10-sentinel-")?.strip_suffix(".netdev")?;
     (!name.is_empty()
@@ -201,5 +213,36 @@ mod tests {
             retire(&old, &desired),
             BTreeSet::from(["svlan".into(), "cvlan".into()])
         );
+    }
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+    #[test]
+    fn only_changed_link_units_require_reconfiguration() {
+        let previous = BTreeMap::from([
+            (
+                "10-sentinel-wan0.network".into(),
+                "[Network]\nDHCP=ipv4\n".into(),
+            ),
+            (
+                "10-sentinel-lan0.network".into(),
+                "[Network]\nAddress=192.0.2.1/24\n".into(),
+            ),
+        ]);
+        assert!(!network_changed("wan0", &previous, &previous));
+        let mut desired = previous.clone();
+        desired.insert(
+            "10-sentinel-lan0.network".into(),
+            "[Network]\nAddress=192.0.2.2/24\n".into(),
+        );
+        assert!(!network_changed("wan0", &previous, &desired));
+        assert!(network_changed("lan0", &previous, &desired));
+        desired.insert(
+            "10-sentinel-wan0.link".into(),
+            "[Link]\nMTUBytes=1400\n".into(),
+        );
+        assert!(network_changed("wan0", &previous, &desired));
     }
 }

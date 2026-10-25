@@ -133,8 +133,8 @@
   # prompt. (Tighten to a specific command rule for production.)
 
   # Test-VM convenience: a console login (SSH is key-only, so the QEMU console
-  # would otherwise be a dead end). INSECURE — for `build-vm` only; a real
-  # appliance image should drop these.
+  # would otherwise be a dead end). The flashable appliance image overrides
+  # both settings in image.nix; do not rely on these defaults in production.
   users.users.admin.initialPassword = lib.mkDefault "sentinel";
   services.getty.autologinUser = lib.mkDefault "admin";
 
