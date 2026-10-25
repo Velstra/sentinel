@@ -978,102 +978,55 @@ pub enum ApplyMode {
 /// order (chronyd reads the drop-in on its own start).
 fn apply_chrony(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     let path = Path::new(CHRONY_CONFDIR).join(CHRONY_CONF);
-    match chrony_conf_body(&appliance.services.ntp, &appliance.interfaces) {
-        Some(body) => {
-            let changed = std::fs::read_to_string(&path)
-                .map(|c| c != body)
-                .unwrap_or(true);
-            system::ensure_dir(Path::new(CHRONY_CONFDIR))?;
-            system::install_file(&path, &body)?;
-            if changed && mode == ApplyMode::Live {
-                restart_chrony();
+    crate::reconcile::service_file(
+        &path,
+        chrony_conf_body(&appliance.services.ntp, &appliance.interfaces).as_deref(),
+        mode,
+        system::install_file,
+        |changed| {
+            if changed {
+                system::reload_chrony()
+            } else {
+                system::service_start("chronyd.service")
             }
-        }
-        None => {
-            if path.exists() {
-                system::remove_file(&path)?;
-                if mode == ApplyMode::Live {
-                    restart_chrony();
-                }
-            }
-        }
-    }
-    Ok(())
+        },
+    )
 }
 
-/// Restart chrony best-effort (mirrors the resolved reconcile): the confdir file
-/// is written regardless, so a boot-time chrony start still picks it up.
-fn restart_chrony() {
-    if let Err(e) = system::reload_chrony() {
-        eprintln!("warning: restarting chrony failed (applies on next start): {e}");
-    }
-}
-
-/// Reconcile the systemd-resolved drop-in to `appliance.dns`: write it when a
-/// forwarder is configured, remove it otherwise, then restart resolved so the
-/// stub listener (re)binds. Best-effort restart (mirrors networkd): the drop-in
-/// is written regardless, so a boot-time resolved start still picks it up.
+/// Reconcile the box's resolver, retaining failed activations for retry.
 fn apply_resolved(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     let path = Path::new(RESOLVED_DROPIN_DIR).join(RESOLVED_DROPIN);
-    let changed = match resolved_dropin_body(&appliance.services.dns) {
-        Some(body) => {
-            let changed = std::fs::read_to_string(&path)
-                .map(|c| c != body)
-                .unwrap_or(true);
-            system::ensure_dir(Path::new(RESOLVED_DROPIN_DIR))?;
-            system::install_file(&path, &body)?;
-            changed
-        }
-        None => {
-            let existed = path.exists();
-            if existed {
-                system::remove_file(&path)?;
+    crate::reconcile::service_file(
+        &path,
+        resolved_dropin_body(&appliance.services.dns).as_deref(),
+        mode,
+        system::install_file,
+        |changed| {
+            if changed {
+                system::reload_resolved()
+            } else {
+                system::service_start("systemd-resolved.service")
             }
-            existed
-        }
-    };
-    // Boot never restarts (resolved reads the drop-in on its own start, and a
-    // restart from the pre-networkd sentinel-boot would deadlock).
-    if changed && mode == ApplyMode::Live {
-        if let Err(e) = system::reload_resolved() {
-            eprintln!("warning: restarting systemd-resolved failed (applies on next start): {e}");
-        }
-    }
-    Ok(())
+        },
+    )
 }
 
-/// Reconcile the dnsmasq drop-in to the LAN DNS config: write it when an
-/// interface serves DNS, remove it otherwise, and restart dnsmasq — but only
-/// when the desired config changed, so a non-DNS commit never disturbs the LAN
-/// resolver. Best-effort restart (the drop-in is written regardless, so a
-/// boot-time dnsmasq start still picks it up).
+/// Reconcile LAN DNS without restarting an unchanged, successfully applied config.
 fn apply_dnsmasq(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     let path = Path::new(DNSMASQ_CONFDIR).join(DNSMASQ_CONF);
-    let changed = match dnsmasq_conf_body(&appliance.services.dns)? {
-        Some(body) => {
-            let changed = std::fs::read_to_string(&path)
-                .map(|c| c != body)
-                .unwrap_or(true);
-            system::ensure_dir(Path::new(DNSMASQ_CONFDIR))?;
-            system::install_file(&path, &body)?;
-            changed
-        }
-        None => {
-            let existed = path.exists();
-            if existed {
-                system::remove_file(&path)?;
+    crate::reconcile::service_file(
+        &path,
+        dnsmasq_conf_body(&appliance.services.dns)?.as_deref(),
+        mode,
+        system::install_file,
+        |changed| {
+            if changed {
+                system::reload_dnsmasq()
+            } else {
+                system::service_start("dnsmasq.service")
             }
-            existed
-        }
-    };
-    // Boot never restarts (dnsmasq reads its conf-dir on its own start, and a
-    // restart from the pre-networkd sentinel-boot would deadlock).
-    if changed && mode == ApplyMode::Live {
-        if let Err(e) = system::reload_dnsmasq() {
-            eprintln!("warning: restarting dnsmasq failed (applies on next start): {e}");
-        }
-    }
-    Ok(())
+        },
+    )
 }
 
 // --- Box services (roadmap C18) --------------------------------------------
@@ -1200,28 +1153,24 @@ fn dnsproxy_args_body(dns: &Dns) -> Option<String> {
 
 /// Reconcile the encrypted-DNS proxy to the configuration.
 fn apply_dnsproxy(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
-    let path = Path::new(DNSPROXY_ARGS);
-    match dnsproxy_args_body(&appliance.services.dns) {
-        Some(body) => {
-            let changed = file_changed(path, &body);
-            system::ensure_dir(Path::new("/run/sentinel"))?;
-            system::install_file(path, &body)?;
-            if mode == ApplyMode::Live && changed {
-                if let Err(e) = system::service_restart(DNSPROXY_UNIT) {
-                    eprintln!("warning: (re)starting {DNSPROXY_UNIT} failed: {e}");
+    let body = dnsproxy_args_body(&appliance.services.dns);
+    crate::reconcile::service_file(
+        Path::new(DNSPROXY_ARGS),
+        body.as_deref(),
+        mode,
+        system::install_file,
+        |changed| {
+            if body.is_some() {
+                if changed {
+                    system::service_restart(DNSPROXY_UNIT)
+                } else {
+                    system::service_start(DNSPROXY_UNIT)
                 }
+            } else {
+                system::service_stop(DNSPROXY_UNIT)
             }
-        }
-        None => {
-            if path.exists() {
-                if mode == ApplyMode::Live {
-                    let _ = system::service_stop(DNSPROXY_UNIT);
-                }
-                system::remove_file(path)?;
-            }
-        }
-    }
-    Ok(())
+        },
+    )
 }
 
 /// The history sampler (roadmap: history) — a timer and the one-shot it fires.
@@ -1614,30 +1563,29 @@ fn dhcp6_conf_body(ifaces: &[Interface]) -> Option<String> {
 /// The generic core behind [`apply_lldp`]/[`apply_snmp`]/… — mirrors
 /// [`apply_multiwan`]'s model, parameterised over unit + path + body.
 fn apply_box_service(unit: &str, path: &Path, body: Option<String>, secret: bool) -> Result<()> {
-    match body {
-        Some(body) => {
-            let changed = file_changed(path, &body);
+    crate::reconcile::service_file(
+        path,
+        body.as_deref(),
+        ApplyMode::Live,
+        |path, body| {
             if secret {
-                system::install_service_secret(path, &body)?;
+                system::install_service_secret(path, body)
             } else {
-                system::install_file(path, &body)?;
+                system::install_file(path, body)
             }
-            if changed {
-                if let Err(e) = system::service_restart(unit) {
-                    eprintln!("warning: (re)starting {unit} failed (applies on next start): {e}");
+        },
+        |changed| {
+            if body.is_some() {
+                if changed {
+                    system::service_restart(unit)
+                } else {
+                    system::service_start(unit)
                 }
+            } else {
+                system::service_stop(unit)
             }
-        }
-        None => {
-            if path.exists() {
-                if let Err(e) = system::service_stop(unit) {
-                    eprintln!("warning: stopping {unit}: {e}");
-                }
-                system::remove_file(path)?;
-            }
-        }
-    }
-    Ok(())
+        },
+    )
 }
 
 /// The units an `OnFailure=` alert drop-in is installed on (roadmap C23).
@@ -3488,26 +3436,17 @@ fn apply_agent_iface(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     };
     let env = format!("VELSTRA_IFACE={iface}\n{flowspec}");
     let changed = file_changed(Path::new(AGENT_ENV), &env);
-    system::install_file(Path::new(AGENT_ENV), &env)?;
+    if changed {
+        system::install_file(Path::new(AGENT_ENV), &env)?;
+    }
     if changed && mode == ApplyMode::Live {
-        if let Err(e) = system::service_restart(AGENT_UNIT) {
-            eprintln!("warning: restarting {AGENT_UNIT} failed: {e}");
-        }
+        system::service_restart(AGENT_UNIT).context("applying data-plane launch settings")?;
     }
     Ok(())
 }
 
 pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     let ifaces = &appliance.interfaces;
-
-    // A PPPoE client's raw uplink NIC (`parent`) must be link-up for pppd's
-    // discovery to run, but carries no address itself — so it still needs a bare
-    // networkd `.network` to be managed/brought up.
-    let pppoe_parents: HashSet<&str> = ifaces
-        .iter()
-        .filter(|i| i.is_pppoe())
-        .filter_map(|i| i.parent.as_deref())
-        .collect();
 
     // The members named as a bond's `primary`. Collected from the bonds, applied
     // to the members — the relationship is configured on one end and written on
@@ -3689,42 +3628,12 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     // a WireGuard link (which needs a `.network` to be brought up even when it
     // carries only AllowedIPs routes and no local address), a bridge/bond device,
     // or a member enslaved to one.
-    let reloaded: Vec<String> = ifaces
+    let mut reloaded: Vec<String> = ifaces
         .iter()
-        .filter(|i| {
-            // A PPPoE client (ppp0) is owned by pppd, not networkd — never render
-            // a unit for it (even if it carries an `mtu`).
-            !i.is_pppoe()
-                && (i.address.is_some()
-                    || i.address6.is_some()
-                    || (i.parent.is_some() && i.vlan.is_some())
-                    || i.is_wireguard()
-                    || i.router_advert.is_some()
-                    || i.is_virtual_l2()
-                    || i.is_tunnel()
-                    || i.is_macvlan()
-                    || i.is_macsec()
-                    || i.is_vti()
-                    || macsec_children.contains_key(i.name.as_str())
-                    || macvlan_children.contains_key(i.name.as_str())
-                    || master_of.contains_key(i.name.as_str())
-                    || !i.vlan_tagged.is_empty()
-                    || i.vlan_untagged.is_some()
-                    || i.pd_from.is_some()
-                    || i.mtu.is_some()
-                    || i.mac.is_some()
-                    || i.qos.is_some()
-                    // Without these an interface configured *only* with per-link
-                    // behaviour would get no `.network` unit, and the half of
-                    // that behaviour networkd owns would silently not happen.
-                    || !i.ip.is_empty()
-                    || !i.ipv6.is_empty()
-                    || !i.dhcp.is_empty()
-                    || !i.dhcpv6.is_empty()
-                    || i.disabled
-                    || children.contains_key(i.name.as_str())
-                    || pppoe_parents.contains(i.name.as_str()))
-        })
+        // Every declared link needs an explicit unit, including one from which
+        // the last address/MTU/member setting was removed. Otherwise an image
+        // default can take over instead of clearing the old desired state.
+        .filter(|i| !i.is_pppoe())
         .map(|i| {
             let kids = children
                 .get(i.name.as_str())
@@ -3763,7 +3672,7 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
                 i.router_advert.as_ref(),
                 master.as_deref(),
                 pd,
-                i.mtu,
+                crate::network_reconcile::effective_mtu(i, ifaces),
                 i.mac.as_deref(),
                 i.description.as_deref(),
                 i.disabled,
@@ -3789,15 +3698,36 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
         })
         .collect();
 
-    // Remove sentinel units (either kind) no longer wanted.
-    if let Ok(entries) = std::fs::read_dir(NETWORKD_RUNTIME_DIR) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let ours = name.starts_with(PREFIX)
-                && (name.ends_with(".network") || name.ends_with(".netdev"));
-            if ours && !keep.contains(&name) {
-                system::remove_file(&entry.path())?;
+    let mut previous = BTreeMap::new();
+    for entry in std::fs::read_dir(NETWORKD_RUNTIME_DIR)?.collect::<std::io::Result<Vec<_>>>()? {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(PREFIX)
+            && (name.ends_with(".network") || name.ends_with(".netdev") || name.ends_with(".link"))
+        {
+            if let Some(body) = system::read_owned_file(&entry.path())? {
+                previous.insert(name, body);
             }
+        }
+    }
+    let desired: BTreeMap<String, String> = writes.iter().cloned().collect();
+    let journal = Path::new("/run/sentinel/network-retire.json");
+    let mut retire = crate::network_reconcile::retire(&previous, &desired);
+    if mode == ApplyMode::Live {
+        if let Some(pending) = system::read_owned_file(journal)? {
+            retire.extend(
+                serde_json::from_str::<std::collections::BTreeSet<String>>(&pending)
+                    .context("reading pending network reconciliation")?,
+            );
+        }
+        if previous != desired || !retire.is_empty() {
+            // Persist before changing files, so an interrupted/failed apply can
+            // still retire the old kernel devices on an unchanged retry.
+            system::install_file(journal, &serde_json::to_string(&retire)?)?;
+        }
+    }
+    for name in previous.keys() {
+        if !keep.contains(name) {
+            system::remove_file(&Path::new(NETWORKD_RUNTIME_DIR).join(name))?;
         }
     }
 
@@ -3805,6 +3735,9 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     // it is installed 0640 root:systemd-network (readable by networkd, not by
     // ordinary users); everything else stays the default 0644.
     for (name, body) in &writes {
+        if previous.get(name) == Some(body) {
+            continue;
+        }
         let path = Path::new(NETWORKD_RUNTIME_DIR).join(name);
         if secrets.contains(name) {
             system::install_secret_file(&path, body)?;
@@ -3818,9 +3751,35 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     // activate networkd out of order (sentinel-boot is Before networkd) and
     // deadlock the boot.
     if mode == ApplyMode::Live {
-        if let Err(e) = system::networkctl_reload(&reloaded) {
-            eprintln!("warning: networkctl reload failed (networkd applies units on start): {e}");
+        if !retire.is_empty() {
+            // Forget removed definitions before deleting their devices, so
+            // networkd cannot recreate a removed link using an old definition.
+            system::networkctl_reload(&[])?;
+            for name in &retire {
+                system::delete_virtual_link(name)?;
+            }
         }
+        // Reconfigure parents before their child links (including QinQ).
+        reloaded.sort_by_key(|name| {
+            let mut depth = 0;
+            let mut parent = ifaces
+                .iter()
+                .find(|i| &i.name == name)
+                .and_then(|i| i.parent.as_deref());
+            while let Some(p) = parent {
+                depth += 1;
+                if depth > ifaces.len() {
+                    break;
+                }
+                parent = ifaces
+                    .iter()
+                    .find(|i| i.name == p)
+                    .and_then(|i| i.parent.as_deref());
+            }
+            depth
+        });
+        system::networkctl_reload(&reloaded).context("applying live network configuration")?;
+        system::remove_file(journal)?;
     }
 
     // DNS: resolved is the box's own forwarder (`[services.dns] upstream`),
@@ -3853,17 +3812,6 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     // the API when a secret is set. The sending side (push) is driven from commit.
     apply_agent_iface(appliance, mode)?;
     apply_configsync(appliance, mode)?;
-    // A commit that reports success while the firewall is not running is a false
-    // statement on this of all products.
-    if mode == ApplyMode::Live
-        && appliance.interfaces.iter().any(|i| i.zone.is_some())
-        && !system::unit_active(AGENT_UNIT)
-    {
-        eprintln!(
-            "warning: {AGENT_UNIT} is not running, so these rules are not being \
-             enforced. `systemctl status {AGENT_UNIT}` says why."
-        );
-    }
     Ok(())
 }
 
@@ -3945,6 +3893,16 @@ pub fn apply_link_runtime(appliance: &Appliance) -> Result<()> {
 pub fn apply(appliance: &Appliance) -> Result<()> {
     apply_persistent(appliance, ApplyMode::Live)?;
     apply_link_runtime(appliance)?;
+    if appliance.interfaces.iter().any(|i| i.zone.is_some()) {
+        system::service_start(AGENT_UNIT).context("starting the data plane")?;
+        let reply = crate::velstra::query("reconcile-links")
+            .context("verifying packet hooks after network reconciliation")?;
+        anyhow::ensure!(
+            reply.trim() == "ok",
+            "data-plane interface reconciliation: {}",
+            reply.trim()
+        );
+    }
     Ok(())
 }
 
@@ -4031,17 +3989,11 @@ const CONSOLE_DROPIN_DIR: &str = "/run/systemd/system";
 /// not have must not take the whole configuration down with it, and the file
 /// stays so a kernel that does have it picks it up next boot.
 fn apply_sysctl(appliance: &Appliance) -> Result<()> {
-    let params = &appliance.system.sysctl;
+    let params = routing_sysctls(appliance);
     let per_link = link_sysctls(appliance);
-    if params.is_empty() && per_link.is_empty() {
-        // Nothing configured: remove ours rather than leaving a stale file
-        // asserting settings the configuration no longer names.
-        let _ = std::fs::remove_file(SYSCTL_DROPIN);
-        return Ok(());
-    }
     let mut body =
         String::from("# Written by sentinel from [system.sysctl] and per-interface settings.\n");
-    for (key, value) in params {
+    for (key, value) in &params {
         body.push_str(&format!("{key} = {value}\n"));
     }
     for (dir, iface, knob, value) in &per_link {
@@ -4052,7 +4004,15 @@ fn apply_sysctl(appliance: &Appliance) -> Result<()> {
     }
     system::ensure_dir(Path::new("/run/sysctl.d"))?;
     system::install_file(Path::new(SYSCTL_DROPIN), &body)?;
-    for (key, value) in params {
+    for (key, value) in &params {
+        if matches!(
+            key.as_str(),
+            "net.ipv4.ip_forward" | "net.ipv6.conf.all.forwarding"
+        ) {
+            system::sysctl_write(key, value)
+                .with_context(|| format!("applying routing parameter {key}"))?;
+            continue;
+        }
         if let Err(e) = system::sysctl_write(key, value) {
             eprintln!("warning: setting {key} failed (applies on next boot): {e}");
         }
@@ -4067,6 +4027,18 @@ fn apply_sysctl(appliance: &Appliance) -> Result<()> {
     Ok(())
 }
 
+/// Per-link IPv6Forwarding alone does not enable Linux's ip6_forward path.
+/// Keep both global routing gates in the desired state too. Explicit system
+/// parameters may disable routing; removing that override restores the defaults.
+fn routing_sysctls(appliance: &Appliance) -> BTreeMap<String, String> {
+    let mut params = BTreeMap::from([
+        ("net.ipv4.ip_forward".into(), "1".into()),
+        ("net.ipv6.conf.all.forwarding".into(), "1".into()),
+    ]);
+    params.extend(appliance.system.sysctl.clone());
+    params
+}
+
 /// The per-interface kernel parameters implied by `[interface.ip]` and
 /// `[interface.ipv6]`, as `(directory, interface, knob, value)`.
 ///
@@ -4077,9 +4049,44 @@ fn apply_sysctl(appliance: &Appliance) -> Result<()> {
 /// instead of having networkd and a sysctl file quietly disagree.
 fn link_sysctls(appliance: &Appliance) -> Vec<(&'static str, String, &'static str, String)> {
     let mut out = Vec::new();
+    let disabled = |key: &str| {
+        appliance
+            .system
+            .sysctl
+            .get(key)
+            .and_then(|s| s.parse::<u32>().ok())
+            == Some(0)
+    };
+    let ipv4_off = disabled("net.ipv4.ip_forward");
+    let ipv6_off = disabled("net.ipv6.conf.all.forwarding");
     for i in &appliance.interfaces {
         let p = &i.ip;
         let name = &i.name;
+        // Changing either global routing gate can reset per-link settings.
+        // Reassert the same desired values networkd renders after that change,
+        // including on an otherwise unchanged commit that heals kernel drift.
+        out.push((
+            "net.ipv4.conf",
+            name.clone(),
+            "forwarding",
+            if ipv4_off || i.disabled || p.disable_forwarding {
+                "0"
+            } else {
+                "1"
+            }
+            .into(),
+        ));
+        out.push((
+            "net.ipv6.conf",
+            name.clone(),
+            "forwarding",
+            if ipv6_off || i.disabled || i.ipv6.disable_forwarding {
+                "0"
+            } else {
+                "1"
+            }
+            .into(),
+        ));
         for (on, knob) in [
             (p.arp_filter, "arp_filter"),
             (p.arp_accept, "arp_accept"),
@@ -6550,6 +6557,8 @@ mod tests {
         assert_eq!(
             sys,
             [
+                "net.ipv4.conf.wan0.forwarding=0",
+                "net.ipv6.conf.wan0.forwarding=0",
                 "net.ipv4.conf.wan0.arp_filter=1",
                 "net.ipv4.conf.wan0.arp_accept=1",
                 "net.ipv4.conf.wan0.bc_forwarding=1",
@@ -6559,6 +6568,19 @@ mod tests {
                 "net.ipv6.conf.wan0.accept_dad=2",
             ]
         );
+    }
+
+    #[test]
+    fn routing_gates_have_defaults_and_explicit_overrides_are_reversible() {
+        let mut a = Appliance::from_toml("[system]\nhostname = \"fw\"\n").unwrap();
+        assert_eq!(routing_sysctls(&a)["net.ipv6.conf.all.forwarding"], "1");
+        assert_eq!(routing_sysctls(&a)["net.ipv4.ip_forward"], "1");
+        a.system
+            .sysctl
+            .insert("net.ipv6.conf.all.forwarding".into(), "0".into());
+        assert_eq!(routing_sysctls(&a)["net.ipv6.conf.all.forwarding"], "0");
+        a.system.sysctl.clear();
+        assert_eq!(routing_sysctls(&a)["net.ipv6.conf.all.forwarding"], "1");
     }
 
     /// The bridge's own settings reach its `.netdev`, under one `[Bridge]`

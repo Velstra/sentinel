@@ -733,8 +733,11 @@ fn apply_service(
     new: &[u8],
     prev: Option<&[u8]>,
 ) -> Result<Box<dyn FnOnce() -> Result<()>>> {
+    if prev == Some(new) && system::unit_active(unit) {
+        return Ok(Box::new(|| Ok(())));
+    }
     atomic_install(out, new).with_context(|| format!("installing {}", out.display()))?;
-    if let Err(e) = system::reload_velstra(unit) {
+    if let Err(e) = system::reload_compiled(unit, prev, new) {
         // Reload failed: put the previous file back so we don't leave a new
         // config staged under a daemon still running the old one.
         let _ = restore_file(out, prev);
@@ -743,9 +746,10 @@ fn apply_service(
     let out = out.to_path_buf();
     let unit = unit.to_string();
     let prev = prev.map(<[u8]>::to_vec);
+    let installed = new.to_vec();
     Ok(Box::new(move || {
         restore_file(&out, prev.as_deref())?;
-        system::reload_velstra(&unit)
+        system::reload_compiled(&unit, Some(&installed), prev.as_deref().unwrap_or_default())
     }))
 }
 
@@ -845,7 +849,7 @@ fn mixed_or_rolled_message(
 ) -> anyhow::Error {
     match reconcile {
         Ok(()) if unwind_failures.is_empty() => anyhow!(
-            "applying system configuration failed: {cause}\n  \
+            "applying system configuration failed: {cause:#}\n  \
              ROLLED BACK to the last-good running configuration — the box was \
              reconciled back to the config it ran before this commit. Services \
              that had to be bounced to get there (IPsec tunnels, and any daemon \
@@ -1336,7 +1340,10 @@ const OP_SHOW_TOP: &[Cand] = &[
         "multicast",
         "the multicast forwarding cache / joined groups",
     ),
-    ("firewall", "firewall summary / statistics / hits / log"),
+    (
+        "firewall",
+        "firewall summary / statistics / counters / events / states / hits / log",
+    ),
     ("nat", "NAT configuration summary"),
     ("ids", "intrusion detection: what is watched, what fired"),
     (
@@ -2782,7 +2789,16 @@ const CONNTRACKSYNC_FIELDS: &[Cand] = &[
     ),
     ("interval", "seconds between pushes (default 1)"),
 ];
+const CONNTRACK_FIELDS: &[Cand] = &[
+    ("tcp-syn", "idle timeout in seconds"),
+    ("tcp-established", "idle timeout in seconds"),
+    ("tcp-closing", "idle timeout in seconds"),
+    ("udp", "idle timeout in seconds"),
+    ("udp-stream", "idle timeout in seconds"),
+    ("icmp", "idle timeout in seconds"),
+];
 const GLOBAL_FIELDS: &[Cand] = &[
+    ("conntrack", "connection tracking idle timeouts (seconds)"),
     (
         "stateful",
         "track flows so return traffic is allowed (true|false)",
@@ -2831,6 +2847,7 @@ const ZONE_FIELDS: &[Cand] = &[
     ("block", "drop a source IP/CIDR on this zone"),
 ];
 const NAT_SOURCE_FIELDS: &[Cand] = &[
+    ("to", "static SNAT IPv4 address (absent: masquerade)"),
     ("zone", "egress (WAN) zone to masquerade"),
     (
         "cgnat-block-size",
@@ -4004,6 +4021,7 @@ pub(crate) fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "firewall", "group", "feed-group", _name] => FEED_GROUP_FIELDS,
         ["set" | "delete", "firewall", "group", "user-group", _name] => USER_GROUP_FIELDS,
         ["set" | "delete", "firewall", "global"] => GLOBAL_FIELDS,
+        ["set" | "delete", "firewall", "global", "conntrack"] => CONNTRACK_FIELDS,
         [
             "set",
             "firewall",
@@ -4606,6 +4624,7 @@ pub(crate) fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, 
         ["set", "interface", _name, "zone"] => zones("zone"),
         ["set", "firewall", "rule", _name, "from" | "to"] => zones("zone"),
         ["set", "load-balancer", _name, "zone"] => zones("zone"),
+        ["set", "nat", "source", _name, "to"] => own_cands(&[PH_IPV4]),
         ["set", "nat", "source", _name, "zone"] => zones("zone"),
         ["set", "nat", "destination", _name, "zone"] => zones("zone"),
         // Group-REFERENCE positions (an existing alias, no `<name>` invite).
@@ -4799,6 +4818,7 @@ pub(crate) fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, 
         ["set", "protocols", "babel", "router-id"] => own_cands(&[PH_IPV4]),
         ["set", "protocols", "bgp", "local-as"] => own_cands(&[PH_ASN]),
         ["set", "protocols", "bgp", "router-id"] => own_cands(&[PH_IPV4]),
+        ["set", "firewall", "global", "conntrack", _] => own_cands(&[PH_SECONDS]),
         ["set", "protocols", "bgp", "hold-time"] => own_cands(&[PH_SECONDS]),
         ["set", "protocols", "bgp", "flowspec-min-prefix"] => own_cands(&[PH_U8]),
         ["set", "protocols", "bgp", "network"] => own_cands(&[PH_IPV4_CIDR, PH_IPV6_CIDR]),
@@ -5679,6 +5699,7 @@ mod tests {
         assert_eq!(
             kw(&["set", "firewall", "global"]),
             [
+                "conntrack",
                 "stateful",
                 "block-icmp",
                 "default-action",
@@ -5781,6 +5802,7 @@ mod tests {
         assert_eq!(
             kw(&["set", "nat", "source", "wan-masq"]),
             [
+                "to",
                 "zone",
                 "cgnat-block-size",
                 "cgnat-base-port",

@@ -87,6 +87,10 @@ jobs:
           - lldp
           - bgp
           - nat
+          - reconciliation
+          - phase2-dataplane
+          - wireguard-dataplane
+          - ebpf-verifier
     steps:
       - uses: actions/checkout@v7
       # nixosTests build a full NixOS VM (kernel + qemu + system closure), which

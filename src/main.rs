@@ -33,6 +33,7 @@ mod lockout;
 mod lookup;
 mod metrics;
 mod net;
+mod network_reconcile;
 mod openapi;
 mod openconnect;
 mod passwd;
@@ -40,6 +41,7 @@ mod pki;
 mod portal;
 mod portmap;
 mod proxy;
+mod reconcile;
 mod relay;
 mod repl;
 mod session;
@@ -872,6 +874,7 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
 /// Compile the appliance config, atomically install the Velstra agent config at
 /// `out`, and (if given) reload the systemd `unit` running the data plane.
 fn apply(file: &std::path::Path, out: &std::path::Path, reload: Option<&str>) -> Result<()> {
+    let _lock = system::apply_lock();
     // Resolve domain groups before compiling: the compiler only knows addresses,
     // and this is also the periodic refresh — the timer re-runs exactly this.
     let appliance = identity::with_resolved(&feed::with_fetched(&domain::with_resolved(
@@ -885,6 +888,7 @@ fn apply(file: &std::path::Path, out: &std::path::Path, reload: Option<&str>) ->
         eprintln!("warning: {w}");
     }
     let rendered = compile::compile(&appliance).to_toml()?;
+    let previous = std::fs::read(out).ok();
 
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)
@@ -897,15 +901,7 @@ fn apply(file: &std::path::Path, out: &std::path::Path, reload: Option<&str>) ->
     println!("installed {}", out.display());
 
     if let Some(unit) = reload {
-        // Use the pinned absolute path like the rest of the binary, so neither
-        // the admin's $PATH nor sudo's secure_path can shadow or miss systemctl.
-        let status = std::process::Command::new(system::bin("systemctl"))
-            .args(["reload-or-restart", unit])
-            .status()
-            .with_context(|| format!("running systemctl reload-or-restart {unit}"))?;
-        if !status.success() {
-            anyhow::bail!("systemctl reload-or-restart {unit} failed");
-        }
+        system::reload_compiled(unit, previous.as_deref(), rendered.as_bytes())?;
         println!("reloaded {unit}");
     }
     Ok(())
@@ -1470,8 +1466,14 @@ fn collect_text(
     disks: &[install::Disk],
     nics: &[String],
 ) -> Result<Option<installer_tui::Answers>> {
-    list_disks(disks);
-
+    // The mode first, then the disks — and the disks are listed *after* the
+    // mode is known, so the list is read with its question already in mind.
+    //
+    // It ran the other way round: a table of disks, then a mode, then "select
+    // disk number(s)" about a table that had scrolled past. Somebody reading
+    // top to bottom met a list before there was anything to do with it, and a
+    // plural prompt whether or not the mode they had just picked takes more
+    // than one disk.
     println!("\nInstall mode:");
     println!("  [1] single disk");
     println!("  [2] RAID0  (stripe — capacity, no redundancy, 2+ disks)");
@@ -1484,7 +1486,19 @@ fn collect_text(
         "4" => install::Raid::Mirror10,
         other => anyhow::bail!("invalid mode {other:?}"),
     };
-    let pick = prompt("Select disk number(s), space-separated: ")?;
+
+    println!();
+    list_disks(disks);
+
+    let disk_prompt = match raid {
+        install::Raid::None => "Disk number: ".to_string(),
+        _ => format!(
+            "Disk numbers for {:?}, space-separated (at least {}): ",
+            raid,
+            raid.min_disks()
+        ),
+    };
+    let pick = prompt(&disk_prompt)?;
     let picks = resolve_picks(disks, pick.trim())?;
 
     println!("\n── Console and locale ──");
@@ -2165,6 +2179,9 @@ fn show_op(args: &[String]) -> Result<()> {
         // block), and nothing brought them together, so a box could be filtering
         // exactly as configured and look misconfigured.
         ["firewall", "zones"] | ["zones"] => show_zones(),
+        ["firewall", "states"] => show_agent_query("firewall-states", "firewall connection states"),
+        ["firewall", "counters"] => show_agent_query("rule-stats", "rule packet counters"),
+        ["firewall", "events"] => show_agent_query("packet-events 100", "packet events"),
         ["firewall", "statistics" | "stats"] => show_firewall_stats(),
         // Which rules are carrying traffic, and which are carrying none.
         ["firewall", "hits"] | ["firewall", "rules"] => show_rule_hits(),
@@ -2387,7 +2404,7 @@ fn show_op(args: &[String]) -> Result<()> {
              show isis [neighbors|interfaces|database]\n  \
              show babel [neighbors|routes]\n  \
              show vrrp | show bfd [sessions]\n  \
-             show firewall [statistics|log]    firewall summary / counters / log\n  \
+             show firewall [statistics|counters|events|states|log]\n  \
              show flows [| top-talkers]        live state table / hosts by volume\n  \
              show nat                          NAT configuration\n  \
              show vpn [ipsec]                  IPsec security associations / connections\n  \
