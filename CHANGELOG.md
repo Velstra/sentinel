@@ -2,8 +2,30 @@
 
 ## [Unreleased]
 
+### Added
+
+- **The firewall log is searchable, and reaches back further than fifty lines.**
+  `show firewall log` took no arguments and printed the last fifty lines, which
+  is not enough to answer "what happened at nine this morning". It now takes a
+  depth (up to 5000 lines) or a period — `since 15m|1h|6h|24h|7d` — both bounded
+  here rather than passed through, because those words reach `journalctl`. The
+  console gets the same under **Policy → Firewall log**: one row per refusal,
+  marked by verdict, with the time, the source and what it was carrying, and the
+  reason; a search box that narrows what is already on screen; and **Every line**
+  for the journal unparsed. A row's **Explain** opens the packet trace with that line's numbers
+  filled in — the log records the counter that was bumped, not the rule that
+  decided, so the tracer is the honest way from a line to a rule. The old
+  read-only *Firewall → Recent log* panel is gone; this replaces it.
+
 ### Fixed
 
+- **The packet trace and the packet capture no longer cover their own answer.**
+  Both put their query form in a `.card.addpanel`, which the console styles as a
+  drawer fixed to the right edge — the right 44rem of the page, on top of
+  whatever is under it. For an add-form that is opened and closed again that is
+  the point; for a form that is always open it meant the trace walk and the
+  capture output were read through a panel sitting on them. Both are now cards
+  in the page, with their fields on the same mask grid every other form uses.
 - **`checks.update` updates from a different image, as a real update does.**
   It re-sealed the booted medium into the other slot, which `sentinel update`
   has refused since the identical-image guard (two partitions with one

@@ -2178,10 +2178,16 @@ fn show_op(args: &[String]) -> Result<()> {
         ["firewall", "top-talkers" | "top"] | ["top-talkers"] => {
             show_agent_query("top", "top talkers")
         }
-        ["firewall", "log"] => run_show(
-            &system::bin("journalctl"),
-            &["-u", "velstra.service", "-n", "50", "--no-pager"],
-        ),
+        // The firewall's own log, and how much of it.
+        //
+        // Bare, it is the last fifty lines, as it always was. `<n>` asks for a
+        // different depth and `since <window>` for a period rather than a
+        // count — both bounded here rather than passed through, because these
+        // words reach `journalctl` and an appliance does not hand a management
+        // request an argument list.
+        ["firewall", "log"] => show_firewall_log("50", None),
+        ["firewall", "log", depth] => show_firewall_log(depth, None),
+        ["firewall", "log", "since", window] => show_firewall_log("5000", Some(window)),
         ["nat"] => show_nat(),
         ["nat", "cgnat", addr] => show_cgnat(addr),
 
@@ -3079,6 +3085,56 @@ fn cert_status(crt_path: &str) -> String {
     }
 }
 
+/// `show firewall log [<lines> | since <window>]`.
+///
+/// The depth is a number this appliance will actually read — capped, because a
+/// console asking for the whole journal is a console that hangs on a box with a
+/// busy data plane. The window is one of a fixed set rather than whatever the
+/// caller typed: `journalctl --since` takes a small language, and forwarding a
+/// management request into it is how a `show` command becomes an argument
+/// injection.
+fn show_firewall_log(depth: &str, window: Option<&str>) -> Result<()> {
+    let args = firewall_log_args(depth, window)?;
+    run_show(
+        &system::bin("journalctl"),
+        &args.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+}
+
+/// The argument list, worked out and bounded, without running anything.
+///
+/// Separate from the call so the bounds are testable: this is the only place
+/// where a word from a management request becomes an argument to another
+/// program, and a test that has to spawn `journalctl` to check it is a test
+/// nobody runs.
+fn firewall_log_args(depth: &str, window: Option<&str>) -> Result<Vec<String>> {
+    const MAX_LINES: u32 = 5000;
+    const WINDOWS: [&str; 5] = ["15m", "1h", "6h", "24h", "7d"];
+
+    let lines = depth.parse::<u32>().unwrap_or(0);
+    if lines == 0 || lines > MAX_LINES {
+        anyhow::bail!(
+            "show firewall log takes a number of lines from 1 to {MAX_LINES}, or `since <{}>`",
+            WINDOWS.join("|")
+        );
+    }
+    let mut args = vec![
+        "-u".to_string(),
+        "velstra.service".to_string(),
+        "-n".to_string(),
+        lines.to_string(),
+        "--no-pager".to_string(),
+    ];
+    if let Some(w) = window {
+        if !WINDOWS.contains(&w) {
+            anyhow::bail!("show firewall log since <{}>", WINDOWS.join("|"));
+        }
+        args.push("--since".into());
+        args.push(format!("-{w}"));
+    }
+    Ok(args)
+}
+
 /// Run a command and print its stdout, ignoring the exit code (for read-only
 /// `show` output — e.g. `systemctl is-active` exits non-zero when inactive).
 fn run_show(cmd: &str, args: &[&str]) -> Result<()> {
@@ -3198,4 +3254,40 @@ async fn ports(endpoint: &str) -> Result<()> {
         println!("{:<22} {:>6}  {:<15} {}", p.id, p.vni, p.ip, p.host);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::firewall_log_args;
+
+    #[test]
+    fn the_log_reads_fifty_lines_unless_asked_otherwise() {
+        let args = firewall_log_args("50", None).unwrap();
+        assert_eq!(args, ["-u", "velstra.service", "-n", "50", "--no-pager"]);
+    }
+
+    #[test]
+    fn a_period_is_asked_of_the_journal_as_a_relative_time() {
+        let args = firewall_log_args("5000", Some("6h")).unwrap();
+        assert!(args.windows(2).any(|w| w == ["--since", "-6h"]), "{args:?}");
+    }
+
+    // The two ways a management request could reach into `journalctl`: a period
+    // it did not offer, and a depth that would read the whole journal.
+    #[test]
+    fn a_period_the_console_does_not_offer_is_refused() {
+        for bad in ["; rm -rf /", "yesterday", "2026-01-01", "6 h", ""] {
+            assert!(
+                firewall_log_args("50", Some(bad)).is_err(),
+                "accepted {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_depth_that_is_not_a_small_number_is_refused() {
+        for bad in ["0", "5001", "-1", "1e6", "all", "50; id"] {
+            assert!(firewall_log_args(bad, None).is_err(), "accepted {bad:?}");
+        }
+    }
 }
