@@ -730,7 +730,6 @@
             description = "Retry the durable Sentinel HA configuration outbox";
             after = [ "network-online.target" "sentinel-boot.service" ];
             wants = [ "network-online.target" ];
-            unitConfig.ConditionPathExists = "/var/lib/sentinel/configsync/pending.json";
             serviceConfig = {
               Type = "oneshot";
               ExecStart = "${sentinel}/bin/sentinel sync-config";
@@ -15180,10 +15179,13 @@
               primary.succeed("printf %s "+shlex.quote(json.dumps(desired))+" >/tmp/ha-api.json")
               primary.succeed("curl -fsSk -X PUT -H 'Authorization: Bearer shared-token-123' -H 'Content-Type: application/json' --data-binary @/tmp/ha-api.json https://127.0.0.1:8080/api/v1/config")
               primary.succeed("grep -q api-synced-rule /var/lib/sentinel/configsync/pending.json; test $(stat -c %a /var/lib/sentinel/configsync/pending.json) = 640")
+              primary.succeed("systemctl is-active --quiet sentinel-configsync.timer")
               backup.fail("grep -q api-synced-rule /var/lib/sentinel/appliance.toml")
               backup.succeed("systemctl start sentinel-api.service")
               backup.wait_until_succeeds("grep -q api-synced-rule /var/lib/sentinel/appliance.toml",timeout=45)
               primary.wait_until_succeeds("test ! -f /var/lib/sentinel/configsync/pending.json",timeout=20)
+              primary.wait_until_succeeds("! systemctl is-active --quiet sentinel-configsync.timer",timeout=20)
+              backup.succeed("! systemctl is-active --quiet sentinel-configsync.timer")
               backup.succeed("ip -o link show eth1 | grep -q 'mtu 1450'; ip -o address show eth1 | grep -q 10.9.0.2; ! ip -o address show eth1 | grep -q 10.9.0.1")
             '';
           };
