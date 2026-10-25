@@ -85,9 +85,10 @@ smoke script and Nix checks automatically.
   while the kernel continues forwarding. Hardware/hypervisor fencing is an
   alternative. Fail-closed behavior without an independent decision sacrifices
   availability and needs an explicit operating policy.
-* Gate cold-start promotion/preemption on synchronized state and test recovery,
-  link partitions, process pauses and failback. The current crash test qualifies
-  a warm, already synchronized standby.
+* Gate cold-start promotion/preemption on synchronized state and implement
+  authority handover for entries owned locally by a previous master. Test
+  recovery, link partitions, process pauses and failback. The current crash
+  test qualifies a warm, already synchronized standby.
 * Implement `sentinel ha pair <peer-endpoint> --secret <token>` with authenticated
   TLS bootstrap, member identity profiles, idempotent recovery and the selected
   fencing policy; verify pairing in under 30 seconds.

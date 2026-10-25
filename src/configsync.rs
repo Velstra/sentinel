@@ -18,12 +18,15 @@ struct Pending {
 }
 
 pub fn enqueue(appliance: &Appliance) -> Result<()> {
+    let _transaction = system::apply_lock()?;
     if appliance.system.config_sync.peers.is_empty() {
-        return system::remove_file(Path::new(PENDING));
+        system::remove_file(Path::new(PENDING))?;
+        return stop_when_empty();
     }
     system::ensure_dir_mode(Path::new(DIRECTORY), "0750")?;
     enqueue_at(Path::new(PENDING), appliance)?;
     // The timer also retries after reboot or a temporarily unavailable peer.
+    system::service_start_nowait("sentinel-configsync.timer")?;
     system::service_start_nowait("sentinel-configsync.service")
 }
 
@@ -40,7 +43,7 @@ fn enqueue_at(path: &Path, appliance: &Appliance) -> Result<()> {
 pub fn flush() -> Result<()> {
     let path = Path::new(PENDING);
     if !system::owned_file_exists(path)? {
-        return Ok(());
+        return stop_when_empty();
     }
     // After a reboot, an unsaved CLI commit is no longer desired state. Never
     // send its persisted outbox over the configuration this boot actually uses.
@@ -48,7 +51,18 @@ pub fn flush() -> Result<()> {
         PathBuf::from(crate::session::DEFAULT_CONFIG),
         PathBuf::from(crate::session::Session::RUNNING),
     ];
-    flush_at(path, Some(&current), crate::net::push_config_peer).map(|_| ())
+    flush_at(path, Some(&current), crate::net::push_config_peer)?;
+    stop_when_empty()
+}
+
+fn stop_when_empty() -> Result<()> {
+    // Serialize the check and stop with enqueue's write and timer start. A
+    // successful older worker must not disable retries for a newer commit.
+    let _transaction = system::apply_lock()?;
+    if !system::owned_file_exists(Path::new(PENDING))? {
+        system::service_stop("sentinel-configsync.timer")?;
+    }
+    Ok(())
 }
 
 fn flush_at(
