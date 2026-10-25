@@ -772,6 +772,41 @@ It also only sees **now**: what the connection table holds, not what went throug
 yesterday.
 
 
+## What was already refused (firewall log)
+
+A drop leaves no flow behind, so the counters above cannot tell you about it
+after the fact. The data plane writes a line instead, and `show firewall log`
+reads those lines back:
+
+```text
+show firewall log            # the last fifty lines
+show firewall log 500        # a deeper read, up to 5000
+show firewall log since 6h   # a period instead of a count
+```
+
+```text
+Sep 06 12:00:01 gate velstra[9]: DROP 10.0.0.5 proto=6 dport=22 reason=blocklist
+Sep 06 12:00:02 gate velstra[9]: DROP portal 10.0.0.9 proto=17 dport=53
+Sep 06 12:00:04 gate velstra[9]: REJECT 192.0.2.7 proto=6 dport=3389
+```
+
+The period is one of `15m`, `1h`, `6h`, `24h` or `7d` and the depth is a number
+up to 5000. Both are **bounded on purpose**: these words reach `journalctl`, and
+an appliance does not hand a management request an argument list.
+
+The console has the same under **Policy → Firewall log**, as a table rather than
+as text — one row per refusal, marked by its verdict, with the time, the source
+and what it was carrying, and the reason it was turned away. Typing in the box narrows what is already
+on screen without asking the appliance again; the period is the only control
+that goes back for more. **Every line** shows the journal unparsed, which is
+what you want when the interesting line is not a verdict at all.
+
+**A reason is a counter, not a rule.** `reason=blocklist` names the counter the
+data plane bumped, and several rules can bump the same one — so the console does
+not claim to know which rule decided. The **Explain** button on a row opens the
+packet trace with that line's source, protocol and port already filled in:
+choose the link the packet arrived on and the walk below names the rule.
+
 ## Asking before you send (packet trace)
 
 The question a rule set of any size eventually raises is "why can this host not

@@ -1346,6 +1346,74 @@ await test("the editor folds the unset rest and keeps what the rule sets", async
 
 // The jump palette: a flat search over every page, so a page an operator can
 // name is one keystroke away rather than a guess at which category holds it.
+// The firewall log, driven with lines the data plane actually writes.
+//
+// The appliance under test has an empty journal, so what is checked here is the
+// reading, not the fetch. Every line below is one `velstra-ebpf` emits: a rule
+// drop, a captive-portal refusal, a v6 drop and a reject, each wrapped in the
+// prefix the journal puts in front of it — plus one line that is not a refusal
+// at all, because a service says plenty that is not a verdict.
+await test("the firewall log reads the data plane's own lines", async () => {
+  const out = await page.evaluate(`(async () => {
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms || 300));
+    logRead = true;                       // so opening the view reads nothing
+    goto("log"); await wait(400);
+    logLines = [
+      "Sep 06 12:00:01 gate velstra[9]: DROP 10.0.0.5 proto=6 dport=22 reason=blocklist",
+      "Sep 06 12:00:02 gate velstra[9]: DROP portal 10.0.0.9 proto=17 dport=53",
+      "Sep 06 12:00:03 gate velstra[9]: DROP6 proto=58 dport=0 reason=zone",
+      "Sep 06 12:00:04 gate velstra[9]: REJECT 192.0.2.7 proto=6 dport=3389",
+      "Sep 06 12:00:05 gate velstra[9]: applied revision 12",
+    ];
+    logRows = []; logSkipped = 0;
+    for (const l of logLines) {
+      const r = parseLogLine(l);
+      if (r) logRows.push(r); else logSkipped++;
+    }
+    const q = document.getElementById("lg-q");
+    const verdict = document.getElementById("lg-verdict");
+    q.value = ""; verdict.value = "";
+    document.getElementById("lg-show").value = "table";
+    renderLog();
+    const rows = () => [...document.querySelectorAll("#loglist tbody tr")]
+      .map((tr) => [...tr.children].map((td) => td.textContent.trim()));
+    const all = rows();
+    q.value = "3389"; renderLog();
+    const searched = rows();
+    q.value = ""; verdict.value = "reject"; renderLog();
+    const rejected = rows();
+    verdict.value = ""; q.value = "no line says this"; renderLog();
+    const none = document.querySelector("#loglist .empty").textContent;
+    q.value = ""; renderLog();
+    [...document.querySelectorAll("#loglist tbody tr")]
+      .find((tr) => tr.textContent.includes("192.0.2.7"))
+      .querySelector("button").click();
+    await wait(400);
+    return {
+      all, searched, rejected, none, skipped: logSkipped, view,
+      src: document.getElementById("tr-src").value,
+      port: document.getElementById("tr-port").value,
+      proto: document.getElementById("tr-proto").value,
+    };
+  })()`);
+  equal(out.all.length, 4, "the four refusals did not all become rows");
+  equal(out.skipped, 1, "a line that is not a verdict was counted as one");
+  const said = out.all.map((r) => r.join(" "));
+  check(said[0].includes("rejected"),
+    `the newest refusal is not the first row: ${said[0]}`);
+  check(said.some((r) => r.includes("tcp")), "a protocol number was not named");
+  check(said.some((r) => r.includes("portal")),
+    "the portal refusal lost the reason it was refused for");
+  check(said.some((r) => r.includes("IPv6")), "the v6 drop was not marked as one");
+  equal(out.searched.length, 1, "searching did not narrow the table");
+  equal(out.rejected.length, 1, "the verdict filter did not narrow the table");
+  check(/No refusal matches/.test(out.none), `a search that finds nothing says: ${out.none}`);
+  equal(out.view, "trace", "explaining a line did not open the tracer");
+  equal(out.src, "192.0.2.7", "the tracer was not given the line's source");
+  equal(out.port, "3389", "the tracer was not given the line's port");
+  equal(out.proto, "tcp", "the tracer was not given the line's protocol");
+});
+
 await test("the jump palette reaches a page by name", async () => {
   const r = await page.evaluate(`(async () => {
     const wait = (ms) => new Promise((r) => setTimeout(r, ms || 200));
