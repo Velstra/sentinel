@@ -626,7 +626,9 @@ fn network_unit_body(
             body.push_str(&format!("UserClass={u}\n"));
         }
         if d.no_default_route {
-            body.push_str("UseGateway=no\n");
+            // DHCP option 121 can carry a default route independently of the
+            // Router option. UseGateway alone does not suppress that route.
+            body.push_str("UseGateway=no\nUseRoutes=no\n");
         }
         if let Some(m) = d.default_route_distance {
             body.push_str(&format!("RouteMetric={m}\n"));
@@ -2240,7 +2242,7 @@ pub fn peer_pin(cs: &crate::config::ConfigSync, authority: &str) -> Result<Strin
 }
 
 /// The SENDING side of HA config sync (roadmap C21): push the just-committed config
-/// to every `[system.config-sync] peer` via its Sentinel API (`PUT /api/v1/config`,
+/// to every `[system.config-sync] peer` via its Sentinel API (`PUT /api/v1/config-sync`,
 /// bearer = the shared secret), which applies + persists it. Called from the
 /// interactive `commit` ONLY — never from the API's own PUT handler — so a received
 /// sync does not re-push and a pair never loops. Best-effort per peer: a down backup
@@ -2273,7 +2275,7 @@ pub fn push_config_to_peers(appliance: &Appliance) -> Result<()> {
                 continue;
             }
         };
-        let url = format!("https://{authority}/api/v1/config");
+        let url = format!("https://{authority}/api/v1/config-sync");
         match system::curl_put_config(&url, secret, tmp, Some(&pin)) {
             Ok(()) => eprintln!("  config-sync → {peer}"),
             Err(e) => eprintln!("warning: config-sync to {peer} failed: {e}"),
@@ -3712,8 +3714,10 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     let desired: BTreeMap<String, String> = writes.iter().cloned().collect();
     let journal = Path::new("/run/sentinel/network-retire.json");
     let mut retire = crate::network_reconcile::retire(&previous, &desired);
+    let mut retry_network = false;
     if mode == ApplyMode::Live {
         if let Some(pending) = system::read_owned_file(journal)? {
+            retry_network = true;
             retire.extend(
                 serde_json::from_str::<std::collections::BTreeSet<String>>(&pending)
                     .context("reading pending network reconciliation")?,
@@ -3731,6 +3735,13 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
         }
     }
 
+    reloaded.retain(|name| {
+        retry_network
+            || retire.contains(name)
+            || !Path::new("/sys/class/net").join(name).exists()
+            || crate::network_reconcile::network_changed(name, &previous, &desired)
+    });
+
     // Write the wanted units. A WireGuard `.netdev` embeds the private key, so
     // it is installed 0640 root:systemd-network (readable by networkd, not by
     // ordinary users); everything else stays the default 0644.
@@ -3739,6 +3750,12 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
             continue;
         }
         let path = Path::new(NETWORKD_RUNTIME_DIR).join(name);
+        if !file_changed(&path, body) {
+            if secrets.contains(name) {
+                system::set_mode(&path, "0640")?;
+            }
+            continue;
+        }
         if secrets.contains(name) {
             system::install_secret_file(&path, body)?;
         } else {
@@ -3778,7 +3795,9 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
             }
             depth
         });
-        system::networkctl_reload(&reloaded).context("applying live network configuration")?;
+        if retry_network || previous != desired || !reloaded.is_empty() || !retire.is_empty() {
+            system::networkctl_reload(&reloaded).context("applying live network configuration")?;
+        }
         system::remove_file(journal)?;
     }
 
@@ -6524,6 +6543,7 @@ mod tests {
             "VendorClassIdentifier=sentinel",
             "UserClass=residential",
             "UseGateway=no",
+            "UseRoutes=no",
             "RouteMetric=210",
             "DenyList=192.0.2.9 198.51.100.0/24",
             "WithoutRA=information-request",

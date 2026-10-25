@@ -252,7 +252,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-PyFARaVS2gmuMl7cVf9vfpEkzTGQp7S0EV+c4Mqh+yA=";
+      ebpfHash = "sha256-yPIoUxKRF1BJy32VB0MKlOJbuMmEWQnNJBGhvxuv7Gk=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -1444,7 +1444,7 @@
             machine.start()
             machine.wait_for_unit("multi-user.target")
             result = machine.succeed("velstra verify-ebpf ${velstra-ebpf} 2>&1")
-            for program in ["velstra", "velstra_main", "velstra_forward", "velstra_v6", "velstra_local", "velstra_v6_state", "velstra_egress", "velstra_egress_v4", "velstra_egress_v6", "velstra_bum", "velstra_icmp_nat", "velstra_egress_icmp"]:
+            for program in ["velstra", "velstra_main", "velstra_guest_delivery", "velstra_forward", "velstra_v6", "velstra_local", "velstra_v6_state", "velstra_egress", "velstra_egress_v4", "velstra_egress_v6", "velstra_bum", "velstra_icmp_nat", "velstra_egress_icmp"]:
                 assert "verified " + program in result, result
             assert "BTF couldn't be loaded" not in result, result
           '';
@@ -3636,6 +3636,11 @@
               "port = 443\n"
               "certificate = \"web-cert\"\n"
               "backends = [\"10.0.0.3:8080\", \"10.0.0.3:8081\"]\n"
+              "[[services.reverse-proxy]]\n"
+              "name = \"stream\"\n"
+              "mode = \"tcp\"\n"
+              "port = 8443\n"
+              "backends = [\"10.0.0.3:8080\"]\n"
               "EOF"
           )
           fw.succeed("sentinel apply-boot-late --config /var/lib/sentinel/appliance.toml")
@@ -3644,14 +3649,20 @@
           # one checked server per backend) and the 0600 cert+key bundle, and the
           # haproxy unit is up.
           cfg = fw.succeed("cat /run/sentinel/haproxy/haproxy.cfg")
-          assert "frontend web" in cfg, cfg
-          assert "backend web" in cfg, cfg
+          assert "frontend fe_web" in cfg, cfg
+          assert "backend be_web" in cfg, cfg
           assert "ssl crt /run/sentinel/haproxy/certs/web.pem" in cfg, cfg
           assert "server s0 10.0.0.3:8080 check" in cfg, cfg
           assert "server s1 10.0.0.3:8081 check" in cfg, cfg
           mode = fw.succeed("stat -c %a /run/sentinel/haproxy/certs/web.pem").strip()
           assert mode == "600", mode
+          assert "frontend fe_stream" in cfg, cfg
+          assert "no option forwardfor" not in cfg, cfg
+          fw.succeed("haproxy -c -f /run/sentinel/haproxy/haproxy.cfg")
           fw.wait_for_unit("haproxy.service")
+          client.wait_until_succeeds(
+              "curl -fsS http://10.0.0.1:8443/ | grep -q BACKEND-A", timeout=60
+          )
 
           # (2) TLS terminated at the fw and forwarded: the client gets a backend
           # body back over HTTPS (-k: the cert is self-issued by the on-box CA).
@@ -10308,6 +10319,15 @@
             assert "10.8.0.50" in leases and "fw" in leases, leases
             # The metric came from the lease, not from a default.
             fw.succeed("ip -4 route show default dev eth2 | grep -q 'metric 210'")
+
+            # An unrelated commit must preserve the live lease, rather than
+            # reconfiguring every link and temporarily disconnecting the edge.
+            unit_stamp = fw.succeed("stat -c %y /run/systemd/network/10-sentinel-eth2.network")
+            lost_before = fw.succeed("journalctl -u systemd-networkd --no-pager -o cat | grep -c 'DHCP lease lost' || true")
+            configure("set system hostname fw-updated")
+            assert fw.succeed("stat -c %y /run/systemd/network/10-sentinel-eth2.network") == unit_stamp
+            assert fw.succeed("journalctl -u systemd-networkd --no-pager -o cat | grep -c 'DHCP lease lost' || true") == lost_before
+            fw.succeed("ip addr show eth2 | grep -q 10.8.0.50")
 
             # Phase 6 — port mirroring. A copy of eth1's traffic is queued for
             # transmission on dum0, a link that carries none of it otherwise, so
