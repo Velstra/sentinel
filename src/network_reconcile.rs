@@ -63,6 +63,18 @@ pub(crate) fn network_changed(
     })
 }
 
+/// Recreating a VLAN/macvlan/tunnel also requires its unchanged parent to
+/// create the replacement link. An unrelated DHCP link is still left alone.
+pub(crate) fn recreates_child(
+    name: &str,
+    desired: &BTreeMap<String, String>,
+    retired: &BTreeSet<String>,
+) -> bool {
+    attachments(desired)
+        .iter()
+        .any(|(child, parent)| parent == name && retired.contains(child))
+}
+
 fn device_name(file: &str) -> Option<&str> {
     let name = file.strip_prefix("10-sentinel-")?.strip_suffix(".netdev")?;
     (!name.is_empty()
@@ -244,5 +256,43 @@ mod lease_tests {
             "[Link]\nMTUBytes=1400\n".into(),
         );
         assert!(network_changed("wan0", &previous, &desired));
+    }
+}
+
+#[cfg(test)]
+mod recreation_tests {
+    use super::*;
+    #[test]
+    fn recreating_a_vlan_reconfigures_its_unchanged_parent_only() {
+        let desired = BTreeMap::from([
+            (
+                "10-sentinel-eth1.network".into(),
+                "[Network]\nVLAN=tenant0\n".into(),
+            ),
+            (
+                "10-sentinel-tenant0.network".into(),
+                "[Network]\nAddress=192.0.2.2/24\n".into(),
+            ),
+            (
+                "10-sentinel-tenant0.netdev".into(),
+                "[NetDev]\nName=tenant0\nKind=vlan\n[VLAN]\nId=20\n".into(),
+            ),
+            (
+                "10-sentinel-wan0.network".into(),
+                "[Network]\nDHCP=ipv4\n".into(),
+            ),
+        ]);
+        let mut previous = desired.clone();
+        previous.insert(
+            "10-sentinel-tenant0.netdev".into(),
+            "[NetDev]\nName=tenant0\nKind=vlan\n[VLAN]\nId=10\n".into(),
+        );
+        let retired = retire(&previous, &desired);
+        assert!(retired.contains("tenant0"));
+        assert!(!network_changed("eth1", &previous, &desired));
+        assert!(recreates_child("eth1", &desired, &retired));
+        assert!(!recreates_child("wan0", &desired, &retired));
+        assert!(!network_changed("wan0", &previous, &desired));
+        assert!(!recreates_child("eth1", &desired, &BTreeSet::new()));
     }
 }

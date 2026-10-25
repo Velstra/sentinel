@@ -3740,6 +3740,7 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
             || retire.contains(name)
             || !Path::new("/sys/class/net").join(name).exists()
             || crate::network_reconcile::network_changed(name, &previous, &desired)
+            || crate::network_reconcile::recreates_child(name, &desired, &retire)
     });
 
     // Write the wanted units. A WireGuard `.netdev` embeds the private key, so
