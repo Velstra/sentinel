@@ -113,7 +113,7 @@ in pkgs.testers.runNixOSTest {
     backup.succeed("! ip -o address show eth2 | grep -q 10.2.0.100")
     server.wait_for_unit("ha-echo.service")
     for node in (client, server):
-        node.succeed("systemd-run --unit=ha-packets ${pkgs.tcpdump}/bin/tcpdump -n -l -e -i eth1 tcp port 8443")
+        node.succeed("systemd-run --unit=ha-packets ${pkgs.tcpdump}/bin/tcpdump -p -U -w /tmp/ha-packets.pcap -i eth1 tcp port 8443")
     client.succeed("systemd-run --unit=ha-stream ${pkgs.python3}/bin/python3 ${stream}")
     client.wait_until_succeeds("test -f /tmp/stream-ready",timeout=20)
     # Prove the flow crossed the intended datapath before the crash. Splicing
@@ -141,7 +141,9 @@ in pkgs.testers.runNixOSTest {
         print(f"TCP progress before crash={before}, after={after}")
         print(backup.succeed("sentinel show firewall flows; sentinel show firewall statistics; ip -s neighbour; journalctl -u velstra --no-pager -n 100"))
         for node in (client, server):
-            print(node.succeed("ip route; ip -s neighbour; journalctl -u ha-packets -u ha-stream --no-pager -n 100"))
+            node.succeed("systemctl stop ha-packets")
+            print(node.succeed("ip route; ip -s neighbour; journalctl -u ha-stream --no-pager -n 30"))
+            print(node.succeed("${pkgs.tcpdump}/bin/tcpdump -n -e -r /tmp/ha-packets.pcap 2>&1 | tail -n 80"))
         print(server.succeed("cat /tmp/accepted"))
     assert after["count"] > before+20, "established TCP connection did not continue"
     assert after["maximum_gap"] < 1.0, after
