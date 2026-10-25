@@ -39,6 +39,7 @@ let
     networking.firewall.enable = lib.mkForce false;
     services.velstra.interface = lib.mkForce "eth1";
     services.velstra.appliance = lib.mkForce (appliance number priority);
+    systemd.services.velstra.environment.RUST_LOG = "velstra::conntrack_sync=debug";
   };
   echo = pkgs.writeText "ha-echo.py" ''
     import socket, threading
@@ -84,9 +85,10 @@ in pkgs.testers.runNixOSTest {
       networking.firewall.enable = false;
       networking.interfaces.eth1.ipv4.addresses = [{ address = "10.2.0.10"; prefixLength = 24; }];
       networking.interfaces.eth1.ipv4.routes = [{ address = "10.1.0.0"; prefixLength = 24; via = "10.2.0.100"; }];
-      environment.systemPackages = [ pkgs.python3 ];
+      environment.systemPackages = [ pkgs.python3 pkgs.tcpdump ];
     };
     server = {
+      environment.systemPackages = [ pkgs.tcpdump ];
       virtualisation.vlans = [ 1 ];
       networking.firewall.enable = false;
       networking.interfaces.eth1.ipv4.addresses = [{ address = "10.1.0.10"; prefixLength = 24; }];
@@ -110,6 +112,8 @@ in pkgs.testers.runNixOSTest {
     master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=30)
     backup.succeed("! ip -o address show eth2 | grep -q 10.2.0.100")
     server.wait_for_unit("ha-echo.service")
+    for node in (client, server):
+        node.succeed("systemd-run --unit=ha-packets ${pkgs.tcpdump}/bin/tcpdump -n -l -e -i eth1 tcp port 8443")
     client.succeed("systemd-run --unit=ha-stream ${pkgs.python3}/bin/python3 ${stream}")
     client.wait_until_succeeds("test -f /tmp/stream-ready",timeout=20)
     # Prove the flow crossed the intended datapath before the crash. Splicing
@@ -133,6 +137,12 @@ in pkgs.testers.runNixOSTest {
     backup.succeed("ip -o address show eth1 | grep -q 10.1.0.100")
     time.sleep(2)
     after=json.loads(client.succeed("cat /tmp/stream-status"))
+    if after["count"] <= before+20 or after["maximum_gap"] >= 1.0:
+        print(f"TCP progress before crash={before}, after={after}")
+        print(backup.succeed("sentinel show firewall flows; sentinel show firewall statistics; ip -s neighbour; journalctl -u velstra --no-pager -n 100"))
+        for node in (client, server):
+            print(node.succeed("ip route; ip -s neighbour; journalctl -u ha-packets -u ha-stream --no-pager -n 100"))
+        print(server.succeed("cat /tmp/accepted"))
     assert after["count"] > before+20, "established TCP connection did not continue"
     assert after["maximum_gap"] < 1.0, after
     client.succeed("touch /tmp/stream-stop")
