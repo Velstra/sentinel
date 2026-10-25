@@ -158,13 +158,10 @@ in
         # answer what the data plane is doing. RuntimeDirectory creates (and
         # cleans up) /run/velstra for it.
         #
-        # The portal socket (C20) and the mapping socket (C18) are separate from
-        # it and from each other, and deliberately: the query socket can only add
-        # a drop, the portal one admits a device to a zone's ordinary rules, and
-        # the mapping one opens an inbound port. Three different amounts of
-        # trust, so three files — a service that needs one is not handed the
-        # others. All live in the same root-owned 0700 directory, which is what
-        # governs who may ask.
+        # The query socket also applies validated local configuration reloads.
+        # It is a privileged control interface, like the separate portal (C20)
+        # and mapping (C18) sockets. The root-owned 0700 directory restricts all
+        # three to the appliance's privileged management processes.
         # The uplink comes from the appliance config at runtime (sentinel writes
         # it here on every apply), not from a build-time constant: an image
         # baked with `eth0` never attached on a box whose NIC is called

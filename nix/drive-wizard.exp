@@ -31,7 +31,7 @@ spawn sentinel install --text
 # Where to install. Asked first on purpose: an operator who changes their mind
 # during the questions below has erased nothing yet.
 answer "Mode "                "1"
-answer "Select disk number"   "$env(PICK)"
+answer "Disk number"          "$env(PICK)"
 
 # Console and locale. The keyboard comes before the password, and the sample
 # string is what stops a password being set on a layout nobody checked.

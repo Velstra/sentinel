@@ -3233,6 +3233,10 @@ pub const NAT64_WELL_KNOWN_PREFIX: &str = "64:ff9b::/96";
 /// zone's egress address. The classic WAN masquerade.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NatSource {
+    /// Static SNAT address; absent uses the egress interface address. Return
+    /// traffic to this address must be routed to the appliance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
     pub name: String,
     /// A free-text label, shown in `show`. Purely documentary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4470,6 +4474,8 @@ impl SourceValidation {
 /// — capabilities the data plane already enforces.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Firewall {
+    #[serde(default, skip_serializing_if = "ConntrackTimeouts::is_default")]
+    pub conntrack: ConntrackTimeouts,
     /// Stateful inspection: track allowed flows so return traffic comes back
     /// without an explicit rule. On by default (a real firewall default).
     #[serde(default = "default_true")]
@@ -4533,6 +4539,67 @@ pub struct Firewall {
     pub syn_protect: Vec<SynProtect>,
 }
 
+/// Stateful-firewall idle timeouts in seconds, applied live to the data plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct ConntrackTimeouts {
+    pub tcp_syn: u32,
+    pub tcp_established: u32,
+    pub tcp_closing: u32,
+    pub udp: u32,
+    pub udp_stream: u32,
+    pub icmp: u32,
+}
+impl Default for ConntrackTimeouts {
+    fn default() -> Self {
+        Self {
+            tcp_syn: 30,
+            tcp_established: 86400,
+            tcp_closing: 30,
+            udp: 30,
+            udp_stream: 180,
+            icmp: 10,
+        }
+    }
+}
+impl ConntrackTimeouts {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+    pub fn entries(&self) -> [(&'static str, u32); 6] {
+        [
+            ("tcp-syn", self.tcp_syn),
+            ("tcp-established", self.tcp_established),
+            ("tcp-closing", self.tcp_closing),
+            ("udp", self.udp),
+            ("udp-stream", self.udp_stream),
+            ("icmp", self.icmp),
+        ]
+    }
+    pub fn set(&mut self, name: &str, value: Option<u32>) -> Result<()> {
+        let defaults = Self::default();
+        match name {
+            "tcp-syn" => self.tcp_syn = value.unwrap_or(defaults.tcp_syn),
+            "tcp-established" => self.tcp_established = value.unwrap_or(defaults.tcp_established),
+            "tcp-closing" => self.tcp_closing = value.unwrap_or(defaults.tcp_closing),
+            "udp" => self.udp = value.unwrap_or(defaults.udp),
+            "udp-stream" => self.udp_stream = value.unwrap_or(defaults.udp_stream),
+            "icmp" => self.icmp = value.unwrap_or(defaults.icmp),
+            _ => bail!("unknown conntrack timeout {name:?}"),
+        }
+        self.validate()
+    }
+    pub fn validate(&self) -> Result<()> {
+        for (name, value) in self.entries() {
+            anyhow::ensure!(
+                (1..=604800).contains(&value),
+                "firewall conntrack {name}: must be 1..=604800 seconds"
+            );
+        }
+        Ok(())
+    }
+}
+
 /// A TCP port protected by the SYN proxy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SynProtect {
@@ -4562,6 +4629,7 @@ fn default_drop() -> Action {
 impl Default for Firewall {
     fn default() -> Self {
         Firewall {
+            conntrack: ConntrackTimeouts::default(),
             stateful: true,
             block_icmp: false,
             blocklist: Vec::new(),
@@ -4580,7 +4648,8 @@ impl Firewall {
     /// True when this is exactly the default posture — used to omit `[firewall]`
     /// from saved configs that never touched it.
     pub fn is_default(&self) -> bool {
-        self.stateful
+        self.conntrack.is_default()
+            && self.stateful
             && !self.block_icmp
             && self.blocklist.is_empty()
             && self.default_action == Action::Drop
@@ -6527,8 +6596,8 @@ pub struct Rule {
     ///
     /// `out` is the only way to describe traffic **this box originates**: the
     /// egress hook is where a locally-generated packet is seen, and rules that
-    /// only ever run on arrival cannot say anything about it. IPv4 only, because
-    /// the egress hook is.
+    /// only ever run on arrival cannot say anything about it. Both IPv4 and IPv6
+    /// are enforced by the egress hooks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direction: Option<String>,
     /// Log packets matching this (port) rule, independent of the zone's `log`.
@@ -6929,6 +6998,7 @@ impl Appliance {
     /// Reject configs that parse but are not coherent.
     pub fn validate(&self) -> Result<()> {
         validate_hostname(&self.system.hostname)?;
+        self.firewall.conntrack.validate()?;
 
         // Every blocklist entry must be a valid IPv4 address or CIDR.
         for entry in &self.firewall.blocklist {
@@ -8154,16 +8224,6 @@ impl Appliance {
                 if !matches!(d.as_str(), "in" | "out") {
                     bail!("rule {:?}: direction {d:?} is not in or out", rule.name);
                 }
-                // The egress hook is IPv4 only. A v6 rule scoped to `out` would
-                // be written and never consulted, so it is refused rather than
-                // enforcing nothing quietly.
-                if d == "out" && rule.family.as_deref() == Some("ipv6") {
-                    bail!(
-                        "rule {:?}: direction out is IPv4 only — an ipv6 rule on the way \
-                         out would never be consulted",
-                        rule.name
-                    );
-                }
             }
             if rule.source.is_some() && rule.source_group.is_some() {
                 bail!(
@@ -8360,8 +8420,12 @@ impl Appliance {
             }
         }
 
-        // Source NAT (masquerade) targets a zone that must have an interface.
+        // Each egress zone has one unambiguous source-NAT policy.
+        let mut snat_zones = HashSet::new();
         for src in &self.nat.source {
+            if !src.disabled && !snat_zones.insert(src.zone.as_str()) {
+                bail!("nat source: multiple enabled rules for zone {:?}", src.zone);
+            }
             if let Some(d) = &src.description {
                 validate_description(d)
                     .with_context(|| format!("nat source {:?} description", src.name))?;
@@ -8371,6 +8435,15 @@ impl Appliance {
                     "nat source {:?}: zone {:?} has no interface",
                     src.name,
                     src.zone
+                );
+            }
+            if let Some(address) = &src.to {
+                let ip: std::net::Ipv4Addr = address
+                    .parse()
+                    .context("nat source to must be an IPv4 address")?;
+                anyhow::ensure!(
+                    !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast(),
+                    "nat source to must be a unicast IPv4 address"
                 );
             }
             // A base port without a block size configures nothing; a block size
@@ -12370,10 +12443,70 @@ fn proto_str(p: Proto) -> &'static str {
 #[cfg(test)]
 mod tests {
 
+    #[test]
+    fn ipv6_egress_rules_validate_and_round_trip() {
+        let text = r#"
+            [system]
+            hostname = "fw"
+            [[interface]]
+            name = "eth0"
+            zone = "wan"
+            [[rule]]
+            name = "reply6"
+            from = "wan"
+            proto = "icmpv6"
+            icmp-type = "echo-reply"
+            family = "ipv6"
+            direction = "out"
+            action = "drop"
+        "#;
+        let config = super::Appliance::from_toml(text).unwrap();
+        let encoded = config.to_toml().unwrap();
+        let decoded = super::Appliance::from_toml(&encoded).unwrap();
+        assert_eq!(decoded.rules[0].direction.as_deref(), Some("out"));
+        assert_eq!(decoded.rules[0].family.as_deref(), Some("ipv6"));
+        assert!(
+            super::Appliance::from_toml(
+                &text.replace("direction = \"out\"", "direction = \"sideways\"")
+            )
+            .is_err()
+        );
+    }
+
     /// The back-compat promise: a config written before named channels — a
     /// bare `[update] url` + `public-key` — parses, validates and resolves as
     /// the unnamed default channel. A box in the field must not lose its
     /// update path on upgrade.
+    #[test]
+    fn source_nat_rejects_conflicting_egress_translations() {
+        let text = r#"
+            [system]
+            hostname = "fw"
+            [[interface]]
+            name = "eth0"
+            zone = "wan"
+            [[nat.source]]
+            name = "a"
+            zone = "wan"
+            to = "203.0.113.10"
+            [[nat.source]]
+            name = "b"
+            zone = "wan"
+        "#;
+        assert!(
+            super::Appliance::from_toml(text)
+                .unwrap_err()
+                .to_string()
+                .contains("multiple enabled")
+        );
+        assert!(
+            super::Appliance::from_toml(
+                &text.replace("name = \"b\"", "name = \"b\"\ndisabled = true")
+            )
+            .is_ok()
+        );
+    }
+
     #[test]
     fn a_bare_update_url_is_the_unnamed_default_channel() {
         let toml = r#"

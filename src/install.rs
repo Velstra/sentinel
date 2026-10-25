@@ -626,10 +626,197 @@ fn partial_install_error(cause: anyhow::Error, erased: &[String]) -> anyhow::Err
     )
 }
 
+/// Take down whatever is holding `target` open, so it can be erased.
+///
+/// Scoped to this disk on purpose. A volume group that also has a physical
+/// volume on another disk is left alone and named instead: deactivating it
+/// would take down storage the operator did not offer to this installer, and
+/// "it erased the disk I did not pick" is not a failure anybody recovers from.
+///
+/// Every step is best-effort and in the order the holders stack — swap and
+/// mounts sit on top of dm and md, which sit on the partitions. What is left
+/// after this is reported by [`holders_of`], which is what makes the refusal
+/// name a cause instead of an errno.
+fn release_holders(target: &str) -> Result<()> {
+    let kernel = target.trim_start_matches("/dev/");
+
+    // Swap first: a swap partition is an open holder and `swapoff` is the only
+    // thing that closes it.
+    if let Ok(swaps) = std::fs::read_to_string("/proc/swaps") {
+        for line in swaps.lines().skip(1) {
+            let Some(dev) = line.split_whitespace().next() else {
+                continue;
+            };
+            if dev.starts_with(target) {
+                eprintln!("  swapoff {dev}");
+                let _ = run("swapoff", &[dev]);
+            }
+        }
+    }
+
+    // Then mounts, deepest first: /var before /, or the shallower umount
+    // fails on a busy subtree.
+    let mut mounts: Vec<(String, String)> = Vec::new();
+    if let Ok(mi) = std::fs::read_to_string("/proc/self/mountinfo") {
+        for line in mi.lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let Some(sep) = f.iter().position(|x| *x == "-") else {
+                continue;
+            };
+            let (Some(point), Some(dev)) = (f.get(4), f.get(sep + 2)) else {
+                continue;
+            };
+            if dev.starts_with(target) {
+                mounts.push(((*point).to_string(), (*dev).to_string()));
+            }
+        }
+    }
+    mounts.sort_by_key(|(point, _)| std::cmp::Reverse(point.matches('/').count()));
+    for (point, dev) in mounts {
+        eprintln!("  umount {point} ({dev})");
+        let _ = run("umount", &[&point]);
+    }
+
+    // Device-mapper and md, from `/sys/class/block/<part>/holders`. That
+    // directory is the kernel's own answer to "who has this open", so it needs
+    // no guessing about naming and covers LUKS, LVM and md alike.
+    for part in partitions_of(kernel) {
+        for holder in holders_named(&part) {
+            if holder.starts_with("dm-") {
+                let name = std::fs::read_to_string(format!("/sys/class/block/{holder}/dm/name"))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                // An LVM volume group may span disks this installer was not
+                // given. Named rather than deactivated; `wipefs` then refuses
+                // and says so, which is the safe half of the two.
+                if is_shared_volume_group(&name, target) {
+                    eprintln!(
+                        "  leaving {name} alone: its volume group also lives on another disk"
+                    );
+                    continue;
+                }
+                eprintln!("  dmsetup remove {name}");
+                let _ = run("dmsetup", &["remove", "--retry", &name]);
+            } else if holder.starts_with("md") {
+                eprintln!("  mdadm --stop /dev/{holder}");
+                let _ = run("mdadm", &["--stop", &format!("/dev/{holder}")]);
+            }
+        }
+    }
+
+    // The kernel needs a moment to notice; `wipefs` right after a `dmsetup
+    // remove` can still see the old holder.
+    let _ = run("udevadm", &["settle"]);
+
+    let left = holders_of(kernel);
+    if !left.is_empty() {
+        bail!(
+            "{target} is still held by {} — nothing has been written. \
+             Take it down and run the installer again, or pick another disk. \
+             `lsblk {target}` shows what is on it",
+            left.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// The partition kernel names of a whole disk, `nvme0n1p1`, `sda1`.
+fn partitions_of(kernel: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(format!("/sys/class/block/{kernel}")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with(kernel) && n != kernel)
+        .collect()
+}
+
+/// What the kernel says currently holds a block device open.
+fn holders_named(kernel: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(format!("/sys/class/block/{kernel}/holders")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect()
+}
+
+/// Everything still holding the disk or any of its partitions, for a refusal
+/// that names a cause. Device-mapper devices are reported by their real name
+/// (`vg0-root`) rather than `dm-3`, because that is what an operator can act on.
+fn holders_of(kernel: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut parts = vec![kernel.to_string()];
+    parts.extend(partitions_of(kernel));
+    for part in parts {
+        for holder in holders_named(&part) {
+            let named = std::fs::read_to_string(format!("/sys/class/block/{holder}/dm/name"))
+                .ok()
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty())
+                .unwrap_or(holder);
+            if !out.contains(&named) {
+                out.push(named);
+            }
+        }
+    }
+    out
+}
+
+/// Whether a device-mapper name belongs to an LVM volume group with a physical
+/// volume outside `target`.
+///
+/// `pvs` is asked rather than inferred: an LVM name is `<vg>-<lv>` with dashes
+/// doubled inside each half, and reconstructing the volume group from the
+/// mapper name is a parser nobody should write. No LVM on the machine means no
+/// `pvs`, which means nothing shared — the `false` is right either way.
+fn is_shared_volume_group(mapper_name: &str, target: &str) -> bool {
+    let Ok(out) = Command::new("pvs")
+        .args(["--noheadings", "-o", "pv_name,vg_name"])
+        .output()
+    else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    // The volume groups that have a PV on this disk …
+    let mine: Vec<&str> = text
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            let (pv, vg) = (f.next()?, f.next()?);
+            pv.starts_with(target).then_some(vg)
+        })
+        .collect();
+    // … and whether any of them also has one somewhere else.
+    text.lines().any(|l| {
+        let mut f = l.split_whitespace();
+        let (Some(pv), Some(vg)) = (f.next(), f.next()) else {
+            return false;
+        };
+        mine.contains(&vg) && !pv.starts_with(target) && mapper_name.starts_with(vg)
+    })
+}
+
 /// Lay the image's A/B partition layout onto `target` and clone the sealed
 /// partitions block-for-block from `source`. The data partition (the last one)
 /// is recreated to fill the target, typed for a filesystem or a RAID member.
 fn prepare_disk(source: &str, target: &str, raid: Raid) -> Result<()> {
+    // Everything the kernel is still holding this disk open with, taken down
+    // first. Without it `wipefs` fails with `probing initialization failed:
+    // Device or resource busy` and the install stops before it has written
+    // anything — on any machine that already carries an installation, which is
+    // every machine being *re*-installed.
+    //
+    // A live medium assembles what it finds: an existing LUKS volume becomes a
+    // `/dev/mapper/…`, an LVM volume group is activated, an md array is
+    // started, a swap partition may be switched on. Each of those is an open
+    // holder of the whole-disk device, and none of them is visible in the
+    // candidate listing — so the operator sees a disk offered, picks it, says
+    // YES, and is told the device is busy with no indication of what by.
+    release_holders(target)?;
     run("wipefs", &["-a", target])?;
     // Replicate the source GPT onto the target (`--replicate=<dest>` takes the
     // DESTINATION; the source is the positional device), then move the backup

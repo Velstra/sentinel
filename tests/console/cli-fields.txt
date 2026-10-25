@@ -32,6 +32,7 @@ firewall fail-closed
 firewall family
 firewall from
 firewall geoip-block
+firewall icmp
 firewall icmp-type
 firewall interface
 firewall interface-group
@@ -49,7 +50,12 @@ firewall source-mac-group
 firewall source-validation
 firewall start
 firewall stateful
+firewall tcp-closing
+firewall tcp-established
+firewall tcp-syn
 firewall to
+firewall udp
+firewall udp-stream
 firewall url
 firewall user
 interface ac-name
