@@ -217,7 +217,61 @@ fn locale_names() -> Vec<String> {
 }
 
 /// Reload the velstra data plane so it picks up a freshly written config.
-pub fn reload_velstra(unit: &str) -> Result<()> {
+pub fn reload_compiled(unit: &str, previous: Option<&[u8]>, next: &[u8]) -> Result<()> {
+    let command = if unit == "velstra.service" && policy_identity_changed(previous, next) {
+        // Conntrack keys contain the numeric policy ID. Reusing an ID for a
+        // different zone must never inherit that zone's established sessions,
+        // NAT mappings, counters or other policy-scoped runtime state.
+        "reload-reset"
+    } else {
+        "reload"
+    };
+    reload_agent(unit, command)
+}
+
+fn policy_identity_changed(previous: Option<&[u8]>, next: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Identities {
+        #[serde(default)]
+        policy: Vec<Identity>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Identity {
+        id: u32,
+        name: Option<String>,
+    }
+    let identities = |bytes: &[u8]| {
+        let text = std::str::from_utf8(bytes).ok()?;
+        let parsed: Identities = toml::from_str(text).ok()?;
+        Some(
+            parsed
+                .policy
+                .into_iter()
+                .map(|p| (p.id, p.name))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+        )
+    };
+    match (previous.and_then(identities), identities(next)) {
+        (Some(old), Some(new)) => old.iter().any(|(id, name)| new.get(id) != Some(name)),
+        _ => true,
+    }
+}
+
+fn reload_agent(unit: &str, command: &str) -> Result<()> {
+    if unit == "velstra.service" && unit_active(unit) {
+        let reply = crate::velstra::query(command);
+        if let Ok(reply) = reply {
+            match reply.trim() {
+                "ok" => return Ok(()),
+                "restart-required" => return service_restart(unit),
+                message if message.starts_with("error:") => bail!("{message}"),
+                // Older agents have no reload verb. Restart once to upgrade.
+                _ => {}
+            }
+        } else if Path::new(crate::velstra::SOCKET).exists() {
+            return Err(reply.unwrap_err()).context("live data-plane reload failed");
+        }
+    }
     run_priv("systemctl", &["reload-or-restart", unit])
 }
 
@@ -230,22 +284,6 @@ pub fn unit_active(unit: &str) -> bool {
     matches!(out, Ok(o) if String::from_utf8_lossy(&o.stdout).trim() == "active")
 }
 
-/// Restart `unit` to pick up a freshly written drop-in — but ONLY when it is
-/// already running. These are always-enabled co-services (resolved/chrony/
-/// dnsmasq): at boot the sentinel-boot service writes their drop-in and they
-/// read it on their own (later) start, so no restart is needed there. And a
-/// synchronous `systemctl restart` issued from the early sentinel-boot (which is
-/// ordered Before systemd-networkd) would DEADLOCK — the restart job waits for
-/// the network the service orders after, which waits for networkd, which waits
-/// for sentinel-boot to finish. `commit` runs with the service up, so it
-/// restarts live exactly as before.
-fn restart_if_active(unit: &str) -> Result<()> {
-    if !unit_active(unit) {
-        return Ok(());
-    }
-    run_priv("systemctl", &["restart", unit])
-}
-
 /// Restart systemd-resolved so a freshly written drop-in takes effect. A plain
 /// `restart` (not reload) is used deliberately: adding/removing a
 /// `DNSStubListenerExtra=` listener requires resolved to re-bind its sockets,
@@ -253,7 +291,7 @@ fn restart_if_active(unit: &str) -> Result<()> {
 /// only — at boot the drop-in is written and resolved reads it on its own start
 /// (a restart from the pre-networkd sentinel-boot would deadlock).
 pub fn reload_resolved() -> Result<()> {
-    restart_if_active("systemd-resolved.service")
+    service_restart("systemd-resolved.service")
 }
 
 /// Restart chrony so a freshly written confdir drop-in takes effect. A restart
@@ -261,7 +299,7 @@ pub fn reload_resolved() -> Result<()> {
 /// `allow` directives in a confdir file are applied on start. Live-mode only
 /// (see [`reload_resolved`]).
 pub fn reload_chrony() -> Result<()> {
-    restart_if_active("chronyd.service")
+    service_restart("chronyd.service")
 }
 
 /// Restart dnsmasq so a freshly written conf-dir drop-in takes effect (new
@@ -269,7 +307,7 @@ pub fn reload_chrony() -> Result<()> {
 /// SIGHUP does not fully do for interface bindings). Live-mode only (see
 /// [`reload_resolved`]).
 pub fn reload_dnsmasq() -> Result<()> {
-    restart_if_active("dnsmasq.service")
+    service_restart("dnsmasq.service")
 }
 
 /// (Re)start the `sentinel-pppoe@<name>` templated unit that runs `pppd` for one
@@ -719,6 +757,43 @@ pub fn confirm_pending() -> bool {
 /// per-interface `.network` units here so addressing is applied live and is gone
 /// on reboot unless re-asserted from the saved config by the boot service.
 pub const NETWORKD_RUNTIME_DIR: &str = "/run/systemd/network";
+
+pub fn owned_file_exists(path: &Path) -> Result<bool> {
+    match path.try_exists() {
+        Ok(exists) => Ok(exists),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            let p = path.to_str().context("non-UTF-8 config path")?;
+            let out = escalated_output("test", &["-e", p])?;
+            match out.status.code() {
+                Some(0) => Ok(true),
+                Some(1) => Ok(false),
+                _ => bail!("checking {} failed", path.display()),
+            }
+        }
+        Err(e) => Err(e).with_context(|| format!("stat {}", path.display())),
+    }
+}
+
+/// Read a Sentinel-owned file, including a root/networkd-readable key file.
+/// Never include its contents in an error or a command argument.
+pub fn read_owned_file(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(body) => Ok(Some(body)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            if !owned_file_exists(path)? {
+                return Ok(None);
+            }
+            let p = path.to_str().context("non-UTF-8 config path")?;
+            let out = escalated_output("cat", &["--", p])?;
+            anyhow::ensure!(out.status.success(), "reading {} failed", path.display());
+            Ok(Some(
+                String::from_utf8(out.stdout).context("non-UTF-8 config")?,
+            ))
+        }
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
 
 /// Install file `contents` at a (root-owned) `path`. Tries a direct write first
 /// (works as root, e.g. the boot service) and falls back to staging in a
@@ -1193,7 +1268,7 @@ pub fn daemon_reload() -> Result<()> {
 
 /// Remove a (possibly root-owned) file, tolerating an already-absent path.
 pub fn remove_file(path: &Path) -> Result<()> {
-    if !path.exists() {
+    if !owned_file_exists(path)? {
         return Ok(());
     }
     if std::fs::remove_file(path).is_ok() {
@@ -1433,13 +1508,41 @@ fn openssl_filter(args: &[&str], input: &[u8]) -> Result<Vec<u8>> {
 /// would discard DHCP leases again, including on unchanged links.
 /// Best-effort: at early boot networkd may not be up yet (it reads the files on
 /// start anyway), so failures are reported by the caller, not fatal here.
-pub fn networkctl_reload() -> Result<()> {
+pub fn networkctl_reload(ifaces: &[String]) -> Result<()> {
     // NOTE: this talks to networkd over D-Bus, which on-demand *activates* it if
     // down — fatal at early boot where sentinel-boot is ordered Before networkd
     // (the out-of-order activation deadlocks the boot). Callers therefore invoke
     // this only in `ApplyMode::Live` (networkd already up); at boot networkd
     // reads the freshly written `.network` units on its own start.
-    run_priv("networkctl", &["reload"])
+    run_priv("networkctl", &["reload"])?;
+    for iface in ifaces {
+        // Netdev creation is asynchronous. In particular a new VLAN is not
+        // necessarily present when `reload` returns. Never turn that race into
+        // a successful commit with no configured interface.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let link = Path::new("/sys/class/net").join(iface);
+        while !link.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        anyhow::ensure!(link.exists(), "network interface {iface} was not created");
+        run_priv("networkctl", &["reconfigure", iface])?;
+    }
+    Ok(())
+}
+
+/// Retire a device created by a Sentinel netdev. Physical NICs are never deleted.
+pub fn delete_virtual_link(name: &str) -> Result<()> {
+    if !Path::new("/sys/class/net").join(name).exists() {
+        return Ok(());
+    }
+    let out = escalated_output("ip", &["-details", "-json", "link", "show", "dev", name])?;
+    anyhow::ensure!(out.status.success(), "inspecting interface {name} failed");
+    let links: serde_json::Value = serde_json::from_slice(&out.stdout)?;
+    anyhow::ensure!(
+        links[0]["linkinfo"]["info_kind"].is_string(),
+        "refusing to delete non-virtual interface {name}"
+    );
+    run_priv("ip", &["link", "delete", "dev", name])
 }
 
 /// Resolve a logical tool name to an absolute path. The Nix wrapper injects
@@ -1462,6 +1565,8 @@ pub fn bin(name: &str) -> String {
         "occtl" => "SENTINEL_OCCTL_BIN",
         "ip" => "SENTINEL_IP_BIN",
         "networkctl" => "SENTINEL_NETWORKCTL_BIN",
+        "cat" => "SENTINEL_CAT_BIN",
+        "test" => "SENTINEL_TEST_BIN",
         "systemctl" => "SENTINEL_SYSTEMCTL_BIN",
         "systemd-run" => "SENTINEL_SYSTEMD_RUN_BIN",
         "journalctl" => "SENTINEL_JOURNALCTL_BIN",
@@ -1647,6 +1752,28 @@ pub(crate) fn sudo(cmd: &str, args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn policy_id_reuse_or_removal_invalidates_sessions_but_rule_edits_do_not() {
+        let old = b"[[policy]]\nid=1\nname='lan'\n[[policy]]\nid=2\nname='wan'\n";
+        assert!(!policy_identity_changed(Some(old), old));
+        let rules = [old.as_slice(), b"default_action='pass'\n"].concat();
+        assert!(!policy_identity_changed(Some(old), &rules));
+        let appended = [old.as_slice(), b"[[policy]]\nid=3\nname='vpn'\n"].concat();
+        assert!(!policy_identity_changed(Some(old), &appended));
+        let shifted = b"[[policy]]\nid=1\nname='aaa'\n[[policy]]\nid=2\nname='lan'\n[[policy]]\nid=3\nname='wan'\n";
+        assert!(policy_identity_changed(Some(old), shifted));
+        assert!(policy_identity_changed(
+            Some(old),
+            b"[[policy]]\nid=1\nname='lan'\n"
+        ));
+        assert!(policy_identity_changed(
+            Some(old),
+            b"[[policy]]\nid=1\nname='vpn'\n"
+        ));
+        assert!(policy_identity_changed(None, old));
+        assert!(policy_identity_changed(Some(b"invalid TOML"), old));
+    }
 
     fn openssl_available() -> bool {
         std::process::Command::new(bin("openssl"))

@@ -58,7 +58,11 @@ pub fn query_at(path: &Path, command: &str) -> Result<String> {
             );
             match out {
                 Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).into_owned()),
-                _ => Err(e),
+                Ok(o) => bail!(
+                    "{e:#}; privileged agent query {command}: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+                Err(escalation) => Err(escalation).context(e),
             }
         }
     }
@@ -66,12 +70,38 @@ pub fn query_at(path: &Path, command: &str) -> Result<String> {
 
 /// The socket conversation itself, without escalation.
 fn query_direct(path: &Path, command: &str) -> Result<String> {
-    if !path.exists() {
-        bail!("{} does not exist", path.display());
-    }
-    let mut stream = UnixStream::connect(path)
-        .with_context(|| format!("connecting to the agent at {}", path.display()))?;
-    stream.set_read_timeout(Some(TIMEOUT)).ok();
+    // Type=simple becomes active before the agent has loaded and attached its
+    // programs. An interface change can restart it during this same commit.
+    // Wait for its control socket, rather than rolling a valid commit back
+    // because systemd acknowledged the process before it was ready. Retry only
+    // connecting: never resend a request whose application might have begun.
+    let control = matches!(command, "reload" | "reconcile-links");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut stream = loop {
+        match UnixStream::connect(path) {
+            Ok(stream) => break stream,
+            Err(e)
+                if control
+                    && matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    )
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("connecting to the agent at {}", path.display()));
+            }
+        }
+    };
+    let timeout = if matches!(command, "reload" | "reconcile-links") {
+        std::time::Duration::from_secs(120)
+    } else {
+        TIMEOUT
+    };
+    stream.set_read_timeout(Some(timeout)).ok();
     stream.set_write_timeout(Some(TIMEOUT)).ok();
     stream
         .write_all(format!("{command}\n").as_bytes())
@@ -98,7 +128,7 @@ mod tests {
         let missing = std::env::temp_dir().join("sentinel-no-such-agent.sock");
         let _ = std::fs::remove_file(&missing);
         let err = query_at(&missing, "stats").unwrap_err().to_string();
-        assert!(err.contains("does not exist"), "{err}");
+        assert!(err.contains("sentinel-no-such-agent.sock"), "{err}");
     }
 
     /// The round trip: the command reaches the agent with a trailing newline (its
@@ -125,6 +155,28 @@ mod tests {
         server.join().expect("server thread");
         assert_eq!(reply, "got flows 5\n");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reconciliation_waits_for_the_restarting_agents_socket() {
+        use std::io::{BufRead, BufReader};
+        let path =
+            std::env::temp_dir().join(format!("sentinel-starting-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let server_path = path.clone();
+        let server = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let listener = std::os::unix::net::UnixListener::bind(&server_path).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut command = String::new();
+            reader.read_line(&mut command).unwrap();
+            assert_eq!(command, "reconcile-links\n");
+            reader.into_inner().write_all(b"ok\n").unwrap();
+        });
+        assert_eq!(query_at(&path, "reconcile-links").unwrap(), "ok\n");
+        server.join().unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 }
 

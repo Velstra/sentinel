@@ -26,7 +26,7 @@ spawn sentinel install --text
 
 # Where to install.
 answer "Mode "                "1"
-answer "Select disk number"   "$env(PICK)"
+answer "Disk number"          "$env(PICK)"
 
 # Console and locale — the keyboard is confirmed before the passphrase is typed.
 answer "Console keyboard layout" "de"
