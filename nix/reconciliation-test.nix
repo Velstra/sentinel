@@ -43,8 +43,64 @@ pkgs.testers.runNixOSTest {
         first = fw.succeed("cat /sys/class/net/tenant0/ifindex").strip()
 
     with subtest("an unchanged commit preserves the existing device"):
+        invocation = fw.succeed("systemctl show -p InvocationID --value systemd-networkd.service").strip()
         configure([])
         assert fw.succeed("cat /sys/class/net/tenant0/ifindex").strip() == first
+        assert fw.succeed("systemctl show -p InvocationID --value systemd-networkd.service").strip() == invocation
+
+    with subtest("an unchanged commit recovers the network supervisor"):
+        fw.succeed("systemctl stop systemd-networkd.service")
+        fw.fail("systemctl is-active systemd-networkd.service")
+        configure([])
+        fw.succeed("systemctl is-active systemd-networkd.service")
+        fw.wait_until_succeeds("ip -4 addr show tenant0 | grep -q 192.0.2.1")
+
+    with subtest("an unchanged commit repairs mutable kernel drift"):
+        fw.succeed("ip link set eth1 mtu 1300")
+        fw.succeed("ip addr del 192.0.2.1/24 dev tenant0")
+        fw.succeed("ip -6 addr del 2001:db8:10::1/64 dev tenant0")
+        fw.succeed("ip link set d0 nomaster")
+        configure([])
+        fw.wait_until_succeeds("ip link show eth1 | grep -q 'mtu 1400'")
+        fw.wait_until_succeeds("ip -4 addr show tenant0 | grep -q 192.0.2.1")
+        fw.wait_until_succeeds("ip -6 addr show tenant0 | grep -q 2001:db8:10::1")
+        fw.wait_until_succeeds("ip link show d0 | grep -q 'master br0'")
+        assert fw.succeed("cat /sys/class/net/tenant0/ifindex").strip() == first
+
+    with subtest("an unchanged commit recreates a deleted owned VLAN"):
+        fw.succeed("ip link delete tenant0")
+        configure([])
+        fw.wait_until_succeeds("ip -d link show tenant0 | grep -q 'id 10 '")
+        fw.wait_until_succeeds("ip -4 addr show tenant0 | grep -q 192.0.2.1")
+        fw.wait_until_succeeds("ip -6 addr show tenant0 | grep -q 2001:db8:10::1")
+        first = fw.succeed("cat /sys/class/net/tenant0/ifindex").strip()
+        fw.succeed("ip -d link show tenant0 | grep -q 'prog/xdp'")
+
+    with subtest("an unchanged commit replaces an owned VLAN with the wrong tag"):
+        fw.succeed("ip link delete tenant0")
+        fw.succeed("ip link add link eth1 name tenant0 type vlan id 99")
+        configure([])
+        fw.wait_until_succeeds("ip -d link show tenant0 | grep -q 'id 10 '")
+        fw.wait_until_succeeds("ip -4 addr show tenant0 | grep -q 192.0.2.1")
+        fw.wait_until_succeeds("ip -6 addr show tenant0 | grep -q 2001:db8:10::1")
+        first = fw.succeed("cat /sys/class/net/tenant0/ifindex").strip()
+        configure([])
+        assert fw.succeed("cat /sys/class/net/tenant0/ifindex").strip() == first
+
+    with subtest("recreating a bridge reattaches its unchanged members"):
+        before = fw.succeed("cat /sys/class/net/br0/ifindex").strip()
+        configure(["set interface br0 bridge stp true"])
+        fw.wait_until_succeeds("test $(cat /sys/class/net/br0/bridge/stp_state) = 1")
+        fw.wait_until_succeeds("ip link show d0 | grep -q 'master br0'")
+        assert fw.succeed("cat /sys/class/net/br0/ifindex").strip() != before
+
+    with subtest("an unchanged commit replaces an owned bridge with the wrong device kind"):
+        fw.succeed("ip link delete br0")
+        fw.succeed("ip link add br0 type dummy")
+        configure([])
+        fw.wait_until_succeeds("test -d /sys/class/net/br0/bridge")
+        fw.wait_until_succeeds("ip link show d0 | grep -q 'master br0'")
+        fw.wait_until_succeeds("ip -4 addr show br0 | grep -q 198.51.100.1")
 
     with subtest("removing the MTU override restores the Ethernet and VLAN defaults"):
         configure(["delete interface eth1 mtu"])
