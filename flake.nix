@@ -8270,6 +8270,7 @@
         # both backups) — the sync datapath runs inside the sandboxed VMs.
         #   nix build .#checks.x86_64-linux.conntracksync -L
         ha-kernel = import ./nix/ha-kernel-test.nix { inherit pkgs velstra-ha-tests; };
+        ha-synproxy-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; synproxy = true; };
         ha-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; };
 
         conntracksync = pkgs.testers.runNixOSTest {
