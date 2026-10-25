@@ -12,7 +12,8 @@ not by themselves provide a release-ready HA pair.
   must advertise the same VIP set.
 * With a configured `system.config-sync.secret`, conntrack sync uses mutually
   authenticated TCP with a separately derived protocol key. Initial snapshots,
-  updates and deletions synchronize NAT and IPv4/IPv6 firewall LRU state.
+  updates and deletions synchronize NAT, IPv4/IPv6 firewall and SYN-proxy LRU
+  state, including the TCP sequence-number splice.
   Batched kernel reads avoid per-entry lookup syscalls. Local packet updates
   take precedence; imported entries are not echoed. Policy fingerprints and
   the live-reconcile lock reject obsolete state.
@@ -61,6 +62,7 @@ integrated with the pairing/member-profile workflow.
 ```sh
 nix build .#checks.x86_64-linux.ha-kernel -L
 nix build .#checks.x86_64-linux.ha-failover -L
+nix build .#checks.x86_64-linux.ha-synproxy-failover -L
 nix build .#checks.x86_64-linux.configsync -L
 ```
 
@@ -69,7 +71,11 @@ updates/deletions, local ownership and policy-generation rejection. The
 four-node `ha-failover` test streams through a stateful default-deny firewall
 using a shared WAN SNAT VIP, terminates the master VM without shutdown, and
 requires sub-second promotion and continuity of the same TCP socket. The
-config-sync VM test covers both CLI and API changes, a stopped peer, retries,
+`ha-synproxy-failover` variant requires the same continuity through a real
+SYN-proxy splice. An unacknowledged SYN cookie can require a fresh handshake
+because cookie-minting secrets stay local. Both members must use the version 3
+policy fingerprint introduced with splice replication. The config-sync VM test covers both CLI and API changes, a stopped peer,
+retries,
 shared MTU convergence, and preservation of the receiver's IP address.
 
 The Wren `scripts/vrrp-ha-smoke.sh` test uses isolated user/network namespaces
@@ -93,7 +99,7 @@ smoke script and Nix checks automatically.
   TLS bootstrap, member identity profiles, idempotent recovery and the selected
   fencing policy; verify pairing in under 30 seconds.
 * Qualify additional flow-bearing subsystems. This transport replicates
-  `CONNTRACK` and `FW_FLOWS`; SYN-proxy sequence-adjustment state and WireGuard
-  session state are not replicated by it.
+  `CONNTRACK`, `FW_FLOWS` and `SYN_FLOWS`; WireGuard kernel handshake/session
+  state is not replicated by it. WireGuard recovery still needs qualification.
 
 These gates must pass before Phase 3 is declared complete or Phase 4 begins.

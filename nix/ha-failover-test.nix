@@ -1,5 +1,6 @@
-{ pkgs, self }:
+{ pkgs, self, synproxy ? false }:
 let
+  name = if synproxy then "sentinel-ha-synproxy-failover" else "sentinel-ha-failover";
   secret = "ha-vm-test-credential-at-least-32-bytes";
   appliance = number: priority: (pkgs.formats.toml {}).generate "ha-appliance.toml" {
     system = {
@@ -15,10 +16,11 @@ let
       { name = "eth2"; zone = "lan"; address = "10.2.0.${number}/24"; }
       { name = "eth3"; zone = "sync"; address = "10.3.0.${number}/24"; }
     ];
-    firewall = { default_action = "drop"; stateful = true; fail_closed = true; };
+    firewall = { default_action = "drop"; stateful = true; fail_closed = true; } //
+      pkgs.lib.optionalAttrs synproxy { syn-protect = [{ port = 8443; }]; };
     zone = { wan.default_action = "drop"; lan.default_action = "drop"; sync.default_action = "accept"; };
     rule = [{ name = "echo"; from = "lan"; proto = "tcp"; port = 8443; action = "accept"; }];
-    nat.source = [{ name = "shared-snat"; zone = "wan"; to = "10.1.0.100"; }];
+    nat.source = pkgs.lib.optionals (!synproxy) [{ name = "shared-snat"; zone = "wan"; to = "10.1.0.100"; }];
     protocols.vrrp = map (link: {
       name = link.name; interface = "eth3"; address-interface = link.interface;
       vrid = link.vrid; inherit priority; advert-interval = 100; preempt = true;
@@ -73,7 +75,7 @@ let
     connection.close()
   '';
 in pkgs.testers.runNixOSTest {
-  name = "sentinel-ha-failover";
+  inherit name;
   nodes = {
     master = firewall "1" 200;
     backup = firewall "2" 100;
@@ -88,6 +90,7 @@ in pkgs.testers.runNixOSTest {
       virtualisation.vlans = [ 1 ];
       networking.firewall.enable = false;
       networking.interfaces.eth1.ipv4.addresses = [{ address = "10.1.0.10"; prefixLength = 24; }];
+      networking.interfaces.eth1.ipv4.routes = [{ address = "10.2.0.0"; prefixLength = 24; via = "10.1.0.100"; }];
       systemd.services.ha-echo = {
         wantedBy = [ "multi-user.target" ];
         after = [ "network.target" ];
@@ -109,8 +112,13 @@ in pkgs.testers.runNixOSTest {
     server.wait_for_unit("ha-echo.service")
     client.succeed("systemd-run --unit=ha-stream ${pkgs.python3}/bin/python3 ${stream}")
     client.wait_until_succeeds("test -f /tmp/stream-ready",timeout=20)
-    # Real replicated NAT state, not just a listening socket or journal message.
+    # Prove the flow crossed the intended datapath before the crash. Splicing
+    # on a real socket checks TCP sequence translation and checksum correction.
+    ${if synproxy then ''
+    master.wait_until_succeeds("sentinel show firewall statistics | awk 'BEGIN {ok=0} /^[[:space:]]*synproxy_spliced[[:space:]]/ {ok=($2 >= 1)} END {exit !ok}'",timeout=30)
+    '' else ''
     backup.wait_until_succeeds("sentinel show firewall flows | grep -q 10.2.0.10",timeout=20)
+    ''}
     time.sleep(2)
     before=json.loads(client.succeed("cat /tmp/stream-status"))["count"]
     # No priority-zero advert, service shutdown or graceful address removal.
@@ -129,7 +137,7 @@ in pkgs.testers.runNixOSTest {
     assert after["maximum_gap"] < 1.0, after
     client.succeed("touch /tmp/stream-stop")
     client.wait_until_succeeds("test $(systemctl show ha-stream -p ExecMainStatus --value) = 0 && ! systemctl is-active --quiet ha-stream",timeout=10)
-    server.succeed("test $(wc -l </tmp/accepted) = 1; grep -q '^10.1.0.100:' /tmp/accepted")
-    print(f"ungraceful failover {elapsed:.3f}s; one TCP socket, preserved SNAT, {after}")
+    server.succeed("test $(wc -l </tmp/accepted) = 1; grep -q '^${if synproxy then "10.2.0.10" else "10.1.0.100"}:' /tmp/accepted")
+    print(f"ungraceful failover {elapsed:.3f}s; one TCP socket, ${if synproxy then "preserved SYN-proxy splice" else "preserved SNAT"}, {after}")
   '';
 }
