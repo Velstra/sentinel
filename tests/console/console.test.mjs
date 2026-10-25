@@ -465,6 +465,52 @@ await test("emptying a field removes the setting", async () => {
 // from being applied too. The global firewall block had two — `local` and
 // `description`, which say something about a *zone* and nothing about the
 // appliance-wide posture — because it was built from the zone's own table.
+await test("connection timeouts apply, reject invalid values, and reset to defaults", async () => {
+  const values = { "tcp-syn": "45", "tcp-established": "3600", "tcp-closing": "15", udp: "20", "udp-stream": "90", icmp: "5" };
+  const initial = await page.evaluate(`(async () => {
+    staged = []; dirty.clear(); renderStaged();
+    view = "zones"; panel = null; await refresh();
+    const box = document.getElementById("conntrackform");
+    const inputs = [...box.querySelectorAll("input")];
+    const values = ${JSON.stringify(Object.values(values))};
+    if (inputs.length !== values.length) throw Error("missing timeout fields: " + inputs.length);
+    inputs.forEach((input, i) => { input.value = values[i]; input.dispatchEvent(new Event("input", { bubbles: true })); });
+    [...box.querySelectorAll("button")].find((b) => b.textContent.startsWith("Stage")).click();
+    const commands = stagedCommands();
+    await applyStaged(["commit", "save"]);
+    return { commands, pending: stagedCommands() };
+  })()`);
+  equal(initial.commands, Object.entries(values).map(([key, value]) => `set firewall global conntrack ${key} ${value}`), "timeout commands differ from the CLI contract");
+  equal(initial.pending, [], "valid timeouts remained staged");
+  if (CONFIG) {
+    const saved = readFileSync(CONFIG, "utf8");
+    check(saved.includes("[firewall.conntrack]"), "the timeouts were not persisted");
+    for (const [key, value] of Object.entries(values)) check(saved.includes(`${key} = ${value}`), `missing persisted ${key}`);
+  }
+  const invalid = await page.evaluate(`(async () => {
+    await refresh();
+    const box = document.getElementById("conntrackform");
+    box.querySelector("input").value = "0";
+    [...box.querySelectorAll("button")].find((b) => b.textContent.startsWith("Stage")).click();
+    const reply = await configure(stagedCommands());
+    staged = []; dirty.clear(); renderStaged();
+    await refresh();
+    return { output: reply.output, value: document.getElementById("conntrackform").querySelector("input").value };
+  })()`);
+  check(/1.*604800/.test(invalid.output), "the server accepted an invalid timeout: " + invalid.output);
+  equal(invalid.value, "45", "an invalid timeout replaced the saved value");
+  const reset = await page.evaluate(`(async () => {
+    const box = document.getElementById("conntrackform");
+    for (const input of box.querySelectorAll("input")) input.value = "";
+    [...box.querySelectorAll("button")].find((b) => b.textContent.startsWith("Stage")).click();
+    const commands = stagedCommands();
+    await applyStaged(["commit", "save"]);
+    return { commands, pending: stagedCommands() };
+  })()`);
+  equal(reset.commands, Object.keys(values).map((key) => `delete firewall global conntrack ${key}`), "clearing did not restore each default");
+  equal(reset.pending, [], "restoring defaults was refused");
+});
+
 await test("every setting the global firewall posture offers is one the appliance has", async () => {
   const r = await page.evaluate(`(async () => {
     const wait = (ms) => new Promise((r) => setTimeout(r, ms || 400));
