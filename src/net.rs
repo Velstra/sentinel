@@ -3714,6 +3714,13 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     let desired: BTreeMap<String, String> = writes.iter().cloned().collect();
     let journal = Path::new("/run/sentinel/network-retire.json");
     let mut retire = crate::network_reconcile::retire(&previous, &desired);
+    let observed = if mode == ApplyMode::Live {
+        let observed = crate::network_reconcile::inventory()?;
+        crate::network_reconcile::retire_drifted(&previous, ifaces, &observed, &mut retire);
+        observed
+    } else {
+        BTreeMap::new()
+    };
     let mut retry_network = false;
     if mode == ApplyMode::Live {
         if let Some(pending) = system::read_owned_file(journal)? {
@@ -3741,6 +3748,22 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
             || !Path::new("/sys/class/net").join(name).exists()
             || crate::network_reconcile::network_changed(name, &previous, &desired)
             || crate::network_reconcile::recreates_child(name, &desired, &retire)
+            // Retiring a bridge/bond releases its unchanged members too.
+            || master_of
+                .get(name.as_str())
+                .is_some_and(|(master, _)| retire.contains(*master))
+            || (mode == ApplyMode::Live
+                && ifaces
+                    .iter()
+                    .find(|iface| &iface.name == name)
+                    .is_some_and(|iface| {
+                        crate::network_reconcile::drifted(
+                            iface,
+                            ifaces,
+                            master_of.get(name.as_str()).map(|(master, _)| *master),
+                            &observed,
+                        )
+                    }))
     });
 
     // Write the wanted units. A WireGuard `.netdev` embeds the private key, so
@@ -3769,6 +3792,10 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     // activate networkd out of order (sentinel-boot is Before networkd) and
     // deadlock the boot.
     if mode == ApplyMode::Live {
+        // An unchanged rendered configuration is not proof the supervising
+        // daemon is still running. start is idempotent and preserves leases.
+        system::service_start("systemd-networkd.service")
+            .context("ensuring network supervision is running")?;
         if !retire.is_empty() {
             // Forget removed definitions before deleting their devices, so
             // networkd cannot recreate a removed link using an old definition.
