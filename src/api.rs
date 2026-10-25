@@ -1182,7 +1182,16 @@ async fn put_config(
     body: String,
 ) -> Result<Json<Value>, ApiError> {
     let appliance = Appliance::from_json(&body).map_err(ApiError::bad_request)?;
-    replace_config(&state, appliance)
+    let _transaction = system::apply_lock().map_err(ApiError::internal)?;
+    let response = replace_config(&state, appliance.clone())?;
+    if state.apply.enabled {
+        crate::configsync::enqueue(&appliance).map_err(|error| {
+            ApiError::internal(anyhow!(
+                "configuration applied and saved, but HA outbox could not be queued: {error:#}"
+            ))
+        })?;
+    }
+    Ok(response)
 }
 
 /// Receive the shared half of another firewall's configuration.
@@ -1198,16 +1207,37 @@ async fn put_config_sync(
     body: String,
 ) -> Result<Json<Value>, ApiError> {
     let incoming = Appliance::from_json(&body).map_err(ApiError::bad_request)?;
+    let _transaction = system::apply_lock().map_err(ApiError::internal)?;
     let local = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
-    replace_config(&state, merge_synced_config(incoming, &local))
+    let merged = merge_synced_config(incoming, &local).map_err(ApiError::bad_request)?;
+    replace_config(&state, merged)
 }
 
 /// Keep facts that identify one member of an HA pair on that member.
-fn merge_synced_config(mut incoming: Appliance, local: &Appliance) -> Appliance {
+fn merge_synced_config(mut incoming: Appliance, local: &Appliance) -> Result<Appliance> {
     incoming.system.hostname = local.system.hostname.clone();
     incoming.system.config_sync = local.system.config_sync.clone();
     incoming.system.conntrack_sync = local.system.conntrack_sync.clone();
-    incoming.interfaces = local.interfaces.clone();
+    // Shared link intent (MTU, VLAN tags/parents, bridges, services, zones) must
+    // converge too. Preserve only the member's addressing/tunnel endpoint facts.
+    for interface in &mut incoming.interfaces {
+        if let Some(member) = local.interfaces.iter().find(|i| i.name == interface.name) {
+            interface.address = member.address.clone();
+            interface.address6 = member.address6.clone();
+            interface.local = member.local.clone();
+        } else {
+            anyhow::ensure!(
+                interface.address.as_deref().is_none_or(|a| a == "dhcp")
+                    && interface
+                        .address6
+                        .as_deref()
+                        .is_none_or(|a| matches!(a, "auto" | "dhcp"))
+                    && interface.local.is_none(),
+                "interface {} needs its receiver-specific addresses declared on this member before synchronization",
+                interface.name
+            );
+        }
+    }
     incoming.protocols.router_id = local.protocols.router_id.clone();
     // Election preference belongs to the member, not the shared policy. Copying
     // the primary's priority onto its backup destroys the intended HA ordering.
@@ -1216,11 +1246,13 @@ fn merge_synced_config(mut incoming: Appliance, local: &Appliance) -> Appliance 
             router.priority = member.priority;
         }
     }
-    incoming
+    incoming.validate()?;
+    Ok(incoming)
 }
 
 /// Validate, apply and persist a complete, receiver-safe appliance document.
 fn replace_config(state: &ApiState, appliance: Appliance) -> Result<Json<Value>, ApiError> {
+    let _transaction = system::apply_lock().map_err(ApiError::internal)?;
     // Same live-apply as a CLI `commit` (skipped off-box, mirroring `commit`'s
     // own `act.enabled` gate).
     if state.apply.enabled {
@@ -1914,7 +1946,7 @@ virtual-address = ["10.43.0.253"]
         )
         .unwrap();
 
-        let merged = merge_synced_config(source, &local);
+        let merged = merge_synced_config(source, &local).unwrap();
         assert_eq!(merged.system.hostname, "sentinel-b");
         assert_eq!(
             merged.interfaces[0].address.as_deref(),

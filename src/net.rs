@@ -2241,47 +2241,23 @@ pub fn peer_pin(cs: &crate::config::ConfigSync, authority: &str) -> Result<Strin
     Ok(pin)
 }
 
-/// The SENDING side of HA config sync (roadmap C21): push the just-committed config
-/// to every `[system.config-sync] peer` via its Sentinel API (`PUT /api/v1/config-sync`,
-/// bearer = the shared secret), which applies + persists it. Called from the
-/// interactive `commit` ONLY — never from the API's own PUT handler — so a received
-/// sync does not re-push and a pair never loops. Best-effort per peer: a down backup
-/// warns but does not fail the local commit.
-pub fn push_config_to_peers(appliance: &Appliance) -> Result<()> {
+/// Deliver one durable-outbox revision over pinned HTTPS. Transport errors must
+/// reach the worker so it retains this peer for retry.
+pub(crate) fn push_config_peer(appliance: &Appliance, peer: &str) -> Result<()> {
+    use std::io::Write;
     let cs = &appliance.system.config_sync;
-    if cs.peers.is_empty() {
-        return Ok(());
-    }
-    let Some(secret) = &cs.secret else {
-        return Ok(());
-    };
+    let secret = cs
+        .secret
+        .as_ref()
+        .context("config-sync credential missing")?;
     let json = serde_json::to_string(appliance).context("serializing config for sync")?;
-    let tmp = Path::new("/run/sentinel/.configsync.json");
-    // The staged copy is the WHOLE running config — WireGuard keys, IPsec PSKs,
-    // the PPPoE password, the SNMP community and the shared bearer secret. Stage it
-    // 0600 (not the umask-default 0644) so it is never world-readable in the
-    // wheel-writable, world-traversable /run/sentinel during the push.
-    system::stage_private(tmp, &json)?;
-    for peer in &cs.peers {
-        let authority = configsync_authority(peer);
-        // H3: HTTPS, with the peer's TLS key pinned (from config, or learned on
-        // first use). This is what keeps the config — WireGuard private keys,
-        // IPsec PSKs, the shared secret — encrypted and authenticated to the peer
-        // instead of crossing the wire in the clear.
-        let pin = match peer_pin(cs, &authority) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("warning: config-sync to {peer} skipped — {e:#}");
-                continue;
-            }
-        };
-        let url = format!("https://{authority}/api/v1/config-sync");
-        match system::curl_put_config(&url, secret, tmp, Some(&pin)) {
-            Ok(()) => eprintln!("  config-sync → {peer}"),
-            Err(e) => eprintln!("warning: config-sync to {peer} failed: {e}"),
-        }
-    }
-    let _ = std::fs::remove_file(tmp);
+    let mut staged = system::PrivateStage::create(Path::new("/run/sentinel"), 0o600)?;
+    staged.file.write_all(json.as_bytes())?;
+    let authority = configsync_authority(peer);
+    let pin = peer_pin(cs, &authority)?;
+    let url = format!("https://{authority}/api/v1/config-sync");
+    system::curl_put_config(&url, secret, &staged.path, Some(&pin))?;
+    eprintln!("config-sync → {peer}");
     Ok(())
 }
 
