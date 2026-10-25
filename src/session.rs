@@ -313,6 +313,7 @@ impl RuleDraft {
 /// A partially-specified source-NAT (masquerade) rule.
 #[derive(Debug, Clone, Default)]
 struct NatSrcDraft {
+    to: Option<String>,
     description: Option<String>,
     disabled: Option<bool>,
     zone: Option<String>,
@@ -376,6 +377,7 @@ struct ZoneDraft {
 /// entries.
 #[derive(Debug, Clone, Default)]
 struct FirewallDraft {
+    conntrack: crate::config::ConntrackTimeouts,
     stateful: Option<bool>,
     block_icmp: Option<bool>,
     blocklist: Vec<String>,
@@ -2034,6 +2036,7 @@ impl Draft {
             locale: a.system.locale.clone(),
             timezone: a.system.timezone.clone(),
             firewall: FirewallDraft {
+                conntrack: a.firewall.conntrack,
                 stateful: Some(a.firewall.stateful),
                 block_icmp: Some(a.firewall.block_icmp),
                 blocklist: a.firewall.blocklist.clone(),
@@ -2245,6 +2248,7 @@ impl Draft {
                     (
                         s.name.clone(),
                         NatSrcDraft {
+                            to: s.to.clone(),
                             description: s.description.clone(),
                             disabled: s.disabled.then_some(true),
                             zone: Some(s.zone.clone()),
@@ -3857,7 +3861,14 @@ impl Session {
             }
 
             // --- firewall { … } — everything firewall lives under this node ---
-
+            ["firewall", "global", "conntrack", name, value] => {
+                let mut candidate = self.draft.firewall.conntrack;
+                candidate.set(
+                    name,
+                    Some(value.parse().context("expected timeout in seconds")?),
+                )?;
+                self.draft.firewall.conntrack = candidate;
+            }
             // firewall global: the defaults every zone inherits.
             ["firewall", "global", "stateful", v] => {
                 self.draft.firewall.stateful = Some(parse_bool(v)?)
@@ -4172,6 +4183,15 @@ impl Session {
             ["nat", "source", name, "cgnat-base-port", v] => {
                 self.draft.nat_source_mut(name).cgnat_base_port =
                     Some(parse_u16(v, "cgnat-base-port")?)
+            }
+            ["nat", "source", name, "to", v] => {
+                let ip: std::net::Ipv4Addr =
+                    v.parse().context("expected static SNAT IPv4 address")?;
+                anyhow::ensure!(
+                    !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast(),
+                    "expected unicast SNAT address"
+                );
+                self.draft.nat_source_mut(name).to = Some((*v).to_string());
             }
             ["nat", "source", name, "zone", v] => {
                 self.draft.nat_source_mut(name).zone = Some((*v).to_string())
@@ -6856,6 +6876,12 @@ impl Session {
                     bail!("tcp/{port} is not syn-protected");
                 }
             }
+            ["firewall", "global", "conntrack", name] => {
+                self.draft.firewall.conntrack.set(name, None)?
+            }
+            ["firewall", "global", "conntrack"] => {
+                self.draft.firewall.conntrack = Default::default()
+            }
             ["firewall", "global", field] => match *field {
                 "stateful" => self.draft.firewall.stateful = None,
                 "block-icmp" => self.draft.firewall.block_icmp = None,
@@ -7092,6 +7118,7 @@ impl Session {
             ["nat", "source", name, field] => {
                 let s = self.nat_source(name)?;
                 match *field {
+                    "to" => s.to = None,
                     "zone" => s.zone = None,
                     "description" => s.description = None,
                     "disabled" => s.disabled = None,
@@ -8916,6 +8943,7 @@ impl Session {
             .collect::<Result<Vec<_>>>()?;
 
         let firewall = Firewall {
+            conntrack: self.draft.firewall.conntrack,
             stateful: self.draft.firewall.stateful.unwrap_or(true),
             block_icmp: self.draft.firewall.block_icmp.unwrap_or(false),
             blocklist: self.draft.firewall.blocklist.clone(),
@@ -8954,6 +8982,7 @@ impl Session {
             .iter()
             .map(|(name, d)| {
                 Ok(NatSource {
+                    to: d.to.clone(),
                     name: name.clone(),
                     description: d.description.clone(),
                     disabled: d.disabled.unwrap_or(false),
@@ -10608,7 +10637,8 @@ fn render_draft_masked(
     // NAT (translation) is rendered separately, below.
     let mut fwi = String::new(); // inner body, indented one level
     let fw = &draft.firewall;
-    if fw.stateful.is_some()
+    if !fw.conntrack.is_default()
+        || fw.stateful.is_some()
         || fw.block_icmp.is_some()
         || fw.default_action.is_some()
         || fw.log.is_some()
@@ -10641,6 +10671,13 @@ fn render_draft_masked(
         }
         for e in &fw.blocklist {
             fwi.push_str(&format!("        block {e}\n"));
+        }
+        if !fw.conntrack.is_default() {
+            fwi.push_str("        conntrack {\n");
+            for (field, value) in fw.conntrack.entries() {
+                fwi.push_str(&format!("            {field} {value}\n"));
+            }
+            fwi.push_str("        }\n");
         }
         fwi.push_str("    }\n");
     }
@@ -10870,6 +10907,9 @@ fn render_draft_masked(
     let mut nati = String::new();
     for (name, s) in &draft.nat_source {
         nati.push_str(&format!("    source {name} {{\n"));
+        if let Some(address) = &s.to {
+            nati.push_str(&format!("        to {address}\n"));
+        }
         if let Some(desc) = &s.description {
             nati.push_str(&format!("        description {desc}\n"));
         }

@@ -82,6 +82,12 @@ everywhere an operator would look it up.
 A WireGuard tunnel is an [`interface type wireguard`](interfaces.md#virtual-interface-types)
 plus its keys and peers under `vpn wireguard <ifname>`.
 
+The tunnel's zone filters decrypted IPv4 and IPv6 traffic, including connection
+state and rule counters. The physical WAN zone separately controls the encrypted
+UDP transport. Configure both: allowing the handshake does not admit every
+connection inside the tunnel. Changes to peers and addresses apply on `commit`;
+an unchanged commit preserves the existing tunnel.
+
 | Field | Meaning |
 |---|---|
 | `private-key` | The tunnel private key, or `generate` for a fresh keypair. |

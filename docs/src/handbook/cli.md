@@ -106,6 +106,7 @@ Outside of edits, `sentinel show …` (or `run show …` inside a session, or ju
 | `show isis …`, `show babel …`, `show ip rip`, `show ipv6 ripng` | Other IGPs. |
 | `show vrrp`, `show bfd` | First-hop redundancy / liveness sessions. |
 | `show firewall [statistics\|log]` | Firewall summary, per-rule counters, the eBPF log. |
+| `show firewall log [<lines>\|since <period>]` | Deeper than the default fifty lines, or a period: `15m`, `1h`, `6h`, `24h`, `7d` — see [Firewall & NAT](firewall.md#what-was-already-refused-firewall-log). |
 | `show nat` | NAT configuration summary. |
 | `show vpn ipsec [sas\|connections]` | IPsec security associations / loaded connections. |
 | `show pki` | Local CAs + issued certificates (with expiry). |

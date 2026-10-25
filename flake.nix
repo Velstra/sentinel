@@ -73,7 +73,15 @@
         # From Cargo.toml, so the boot menu and `show version` cannot disagree —
         # the medium said 0.1.0 while the CLI on it said 0.4.2.
         version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
-        src = ./.;
+        # Nix tests and handbook prose do not enter the Rust binary. Keeping them out
+        # also lets kernel/VM tests iterate without rebuilding identical code.
+        src = lib.cleanSourceWith {
+          src = ./.;
+          filter = path: type:
+            lib.cleanSourceFilter path type
+            && !(lib.hasSuffix ".nix" path)
+            && !(builtins.elem (baseNameOf path) [ "flake.lock" "docs" ".github" "README.md" "CHANGELOG.md" ]);
+        };
         cargoLock.lockFile = ./Cargo.lock;
         nativeBuildInputs = [
           pkgs.protobuf
@@ -96,6 +104,8 @@
           wrapProgram $out/bin/sentinel \
             --set SENTINEL_HOSTNAME_BIN   ${pkgs.nettools}/bin/hostname \
             --set SENTINEL_IP_BIN         ${pkgs.iproute2}/bin/ip \
+            --set SENTINEL_CAT_BIN        ${pkgs.coreutils}/bin/cat \
+            --set SENTINEL_TEST_BIN       ${pkgs.coreutils}/bin/test \
             --set SENTINEL_TC_BIN         ${pkgs.iproute2}/bin/tc \
             --set SENTINEL_LOADKEYS_BIN   ${pkgs.kbd}/bin/loadkeys \
             --set SENTINEL_LOGINCTL_BIN   ${pkgs.systemd}/bin/loginctl \
@@ -242,12 +252,12 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-RA4DaBqHiWvPi6YIxl2/9cHpG0px96WNQamLdAwyde0=";
+      ebpfHash = "sha256-yPIoUxKRF1BJy32VB0MKlOJbuMmEWQnNJBGhvxuv7Gk=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
         src = fabric;
-        nativeBuildInputs = [ nightly pkgs.bpf-linker ];
+        nativeBuildInputs = [ nightly pkgs.bpf-linker pkgs.python3 pkgs.llvm ];
 
         outputHashMode = "flat";
         outputHashAlgo = "sha256";
@@ -271,6 +281,9 @@
           cargo build -p velstra-ebpf --bins --release \
             --target bpfel-unknown-none -Z build-std=core \
             --ignore-rust-version
+          llvm-objcopy --dump-section .BTF=btf.bin target/bpfel-unknown-none/release/velstra
+          python3 ${./scripts/sanitize-btf.py} btf.bin
+          llvm-objcopy --update-section .BTF=btf.bin target/bpfel-unknown-none/release/velstra
         '';
         installPhase = ''
           cp target/bpfel-unknown-none/release/velstra "$out"
@@ -1421,9 +1434,26 @@
         # Both sides are read out of fabric's own source, so there is no list
         # here to fall behind: the map somebody forgets to add to a list is
         # exactly the map that goes stale.
+        ebpf-verifier = pkgs.testers.runNixOSTest {
+          name = "sentinel-ebpf-verifier";
+          nodes.machine = { ... }: {
+            virtualisation.memorySize = 2048;
+            environment.systemPackages = [ velstra ];
+          };
+          testScript = ''
+            machine.start()
+            machine.wait_for_unit("multi-user.target")
+            result = machine.succeed("velstra verify-ebpf ${velstra-ebpf} 2>&1")
+            for program in ["velstra", "velstra_main", "velstra_guest_delivery", "velstra_forward", "velstra_v6", "velstra_local", "velstra_v6_state", "velstra_egress", "velstra_egress_v4", "velstra_egress_v6", "velstra_bum", "velstra_icmp_nat", "velstra_egress_icmp"]:
+                assert "verified " + program in result, result
+            assert "BTF couldn't be loaded" not in result, result
+          '';
+        };
+
         ebpf-maps =
-          pkgs.runCommand "sentinel-ebpf-maps" { nativeBuildInputs = [ pkgs.llvm ]; }
+          pkgs.runCommand "sentinel-ebpf-maps" { nativeBuildInputs = [ pkgs.llvm pkgs.python3 ]; }
             ''
+              python3 ${./scripts/sanitize-btf.py} --self-test
               wanted=$(grep -rhoE '\.(map_mut|map|take_map)\("[A-Z0-9_]+"\)' \
                          ${fabric}/velstra-app/src/ \
                        | grep -oE '"[A-Z0-9_]+"' | tr -d '"' | sort -u)
@@ -1598,7 +1628,7 @@
         shipped = pkgs.testers.runNixOSTest {
           name = "sentinel-shipped";
           nodes.machine = {
-            imports = [ self.nixosModules.sentinel ];
+            imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
             virtualisation.memorySize = 2048;
             # To try the password the way an operator does, over the wire.
             environment.systemPackages = [ pkgs.sshpass ];
@@ -1677,7 +1707,7 @@
         commit = pkgs.testers.runNixOSTest {
         name = "sentinel-commit";
         nodes.machine = {
-          imports = [ self.nixosModules.sentinel ];
+          imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
           virtualisation.memorySize = 2048;
         };
         testScript = ''
@@ -1888,7 +1918,7 @@
       api = pkgs.testers.runNixOSTest {
         name = "sentinel-api";
         nodes.machine = {
-          imports = [ self.nixosModules.sentinel ];
+          imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
           virtualisation.memorySize = 2048;
           # `nodejs` is here for one reason: to hand the console's script to a
           # real JavaScript parser. Everything else this check asserts about the
@@ -2402,7 +2432,7 @@
       aaa = pkgs.testers.runNixOSTest {
         name = "sentinel-aaa";
         nodes.machine = {
-          imports = [ self.nixosModules.sentinel ];
+          imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
           virtualisation.memorySize = 2048;
           environment.systemPackages = [ pkgs.curl ];
           systemd.services.tac-plus = {
@@ -2503,7 +2533,7 @@
         nodes.machine =
           { lib, pkgs, ... }:
           {
-            imports = [ self.nixosModules.sentinel ];
+            imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
             virtualisation.memorySize = 2048;
             # A dedicated, persistent block device for the editable config —
             # exactly like the appliance image's LABEL=data partition. This
@@ -2626,10 +2656,12 @@
       # wg0 private ICOioMTTlfQE/2NndOoEntortz+0tZ5Hll0AEM7tdmE=
       #   → derived public 6gUqcU72dUQr2VqzOWxiON1qzkzIOQD7SkZjPjPFWXs=
       # peer public ukF+iwo+aai/wm9k1nIlxCBFRnZ+bLPb2xIu4+4PvmQ= (a second genkey).
+      wireguard-dataplane = import ./nix/wireguard-dataplane-test.nix { inherit pkgs self; };
+
       wireguard = pkgs.testers.runNixOSTest {
         name = "sentinel-wireguard";
         nodes.machine = {
-          imports = [ self.nixosModules.sentinel ];
+          imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
           virtualisation.memorySize = 2048;
           # `wg show` needs the userspace tool; the kernel module ships with the
           # test kernel. `ip -d link show` comes from iproute2 (already present).
@@ -2710,7 +2742,7 @@
               { wanAddr, transit, protoNet }:
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce (
                   if wanAddr == "10.0.0.1" then "left" else "right"
                 );
@@ -2891,7 +2923,7 @@
         nodes.fw =
           { lib, pkgs, ... }:
           {
-            imports = [ self.nixosModules.sentinel ];
+            imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
             networking.hostName = lib.mkForce "fw";
             networking.firewall.enable = lib.mkForce false;
             virtualisation.vlans = [ 1 ];
@@ -3059,7 +3091,7 @@
             '';
           in
           {
-            imports = [ self.nixosModules.sentinel ];
+            imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
             networking.hostName = lib.mkForce "fw";
             networking.firewall.enable = lib.mkForce false;
             virtualisation.vlans = [ 1 ];
@@ -3163,7 +3195,7 @@
               { wanAddr, protoAddr }:
               { lib, pkgs, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 # Pin the runtime hostname to the node name so the test driver's
                 # per-machine python variable resolves (sentinel forces the factory
                 # hostname otherwise; sentinel-boot re-applies it regardless).
@@ -3344,7 +3376,7 @@
           fw =
             { lib, pkgs, ... }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               # Pin the runtime hostname to the node name so the driver's per-machine
               # python variable resolves (sentinel forces the factory hostname
               # otherwise; sentinel-boot re-applies it regardless).
@@ -3502,7 +3534,7 @@
           fw =
             { lib, pkgs, ... }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               # Pin the runtime hostname to the node name (sentinel forces the
               # factory hostname otherwise; sentinel-boot re-applies it regardless).
               networking.hostName = lib.mkForce "fw";
@@ -3660,7 +3692,7 @@
               hostname:
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce hostname;
                 networking.firewall.enable = lib.mkForce false;
                 virtualisation.vlans = [ 1 ];
@@ -3724,7 +3756,7 @@
       snmp = pkgs.testers.runNixOSTest {
         name = "sentinel-snmp";
         nodes.machine = {
-          imports = [ self.nixosModules.sentinel ];
+          imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
           virtualisation.memorySize = 2048;
         };
         testScript = ''
@@ -3773,7 +3805,7 @@
           fw =
             { lib, ... }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               networking.hostName = lib.mkForce "fw";
               networking.firewall.enable = lib.mkForce false;
               virtualisation.memorySize = 2048;
@@ -3992,7 +4024,7 @@
           fw =
             { pkgs, lib, ... }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               networking.hostName = lib.mkForce "fw";
               networking.firewall.enable = lib.mkForce false;
               virtualisation.vlans = [ 1 ];
@@ -4136,7 +4168,7 @@
           fw =
             { pkgs, lib, ... }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               networking.hostName = lib.mkForce "fw";
               networking.firewall.enable = lib.mkForce false;
               virtualisation.memorySize = 2048;
@@ -4345,7 +4377,7 @@
           fw =
             { pkgs, lib, ... }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               networking.hostName = lib.mkForce "fw";
               networking.firewall.enable = lib.mkForce false;
               networking.interfaces.eth1.ipv4.addresses = [
@@ -4552,7 +4584,7 @@
           fw =
             { lib, ... }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               networking.hostName = lib.mkForce "fw";
               networking.firewall.enable = lib.mkForce false;
               virtualisation.vlans = [ 1 ];
@@ -4717,7 +4749,7 @@
           fw =
             { lib, pkgs, ... }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               networking.hostName = lib.mkForce "fw";
               networking.firewall.enable = lib.mkForce false;
               virtualisation.vlans = [ 1 ];
@@ -4938,7 +4970,7 @@
             behavior = "end.dt2u"
           '';
           node = n: { lib, ... }: {
-            imports = [ self.nixosModules.sentinel ];
+            imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
             networking.hostName = lib.mkForce "n${toString n}";
             networking.firewall.enable = lib.mkForce false;
             virtualisation.vlans = [ 1 ];
@@ -5178,7 +5210,7 @@
           fw =
             { lib, ... }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               networking.hostName = lib.mkForce "fw";
               networking.firewall.enable = lib.mkForce false;
               virtualisation.vlans = [ 1 ];
@@ -5356,7 +5388,7 @@
           fw =
             { lib, ... }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               networking.hostName = lib.mkForce "fw";
               networking.firewall.enable = lib.mkForce false;
               networking.interfaces.eth1.ipv4.addresses = [
@@ -5526,7 +5558,7 @@
           fw =
             { lib, ... }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               networking.hostName = lib.mkForce "fw";
               networking.firewall.enable = lib.mkForce false;
               # Suricata loads its rule set into memory before it processes a
@@ -5781,7 +5813,7 @@
           fw =
             { lib, ... }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               networking.hostName = lib.mkForce "fw";
               networking.firewall.enable = lib.mkForce false;
               virtualisation.memorySize = 2048;
@@ -5878,7 +5910,7 @@
         name = "sentinel-verified-boot";
         nodes.machine = {
           imports = [
-            self.nixosModules.sentinel
+            self.nixosModules.sentinel ./nix/test-network-seed.nix
             ./nix/image.nix
           ];
           # (The test framework already sets nixpkgs.hostPlatform for nodes.)
@@ -6042,7 +6074,7 @@
           name = "sentinel-install";
           nodes.machine = {
             imports = [
-              self.nixosModules.sentinel
+              self.nixosModules.sentinel ./nix/test-network-seed.nix
               ./nix/image.nix
             ];
             virtualisation = {
@@ -6186,7 +6218,7 @@
           name = "sentinel-luks";
           nodes.machine = {
             imports = [
-              self.nixosModules.sentinel
+              self.nixosModules.sentinel ./nix/test-network-seed.nix
               ./nix/image.nix
             ];
             virtualisation = {
@@ -6571,7 +6603,7 @@
             # Never started: only its image is used.
             donor = {
               imports = [
-                self.nixosModules.sentinel
+                self.nixosModules.sentinel ./nix/test-network-seed.nix
                 ./nix/image.nix
               ];
               # The driver names a machine after `system.name`, and the
@@ -6594,7 +6626,7 @@
               { nodes, ... }:
               {
                 imports = [
-                  self.nixosModules.sentinel
+                  self.nixosModules.sentinel ./nix/test-network-seed.nix
                   ./nix/image.nix
                 ];
                 system.name = "machine";
@@ -6751,7 +6783,7 @@
         updatechannel = pkgs.testers.runNixOSTest {
           name = "sentinel-updatechannel";
           nodes.machine = {
-            imports = [ self.nixosModules.sentinel ];
+            imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
             virtualisation.memorySize = 1024;
             # `openssl` for the test's own keygen/sign/hash (the sentinel CLI uses
             # its pinned SENTINEL_OPENSSL_BIN/SENTINEL_CURL_BIN); `curl` is already
@@ -6846,7 +6878,7 @@
         updatelocal = pkgs.testers.runNixOSTest {
           name = "sentinel-updatelocal";
           nodes.machine = {
-            imports = [ self.nixosModules.sentinel ];
+            imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
             virtualisation.memorySize = 1024;
             environment.systemPackages = [ pkgs.openssl ];
           };
@@ -7006,7 +7038,7 @@
           pkgs.testers.runNixOSTest {
             name = "sentinel-updatesub";
             nodes.machine = {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               virtualisation.memorySize = 1024;
               environment.systemPackages = [
                 pkgs.openssl
@@ -7140,7 +7172,7 @@
             name = "sentinel-secureboot";
             nodes.machine = {
               imports = [
-                self.nixosModules.sentinel
+                self.nixosModules.sentinel ./nix/test-network-seed.nix
                 ./nix/image.nix
               ];
               virtualisation = {
@@ -7243,7 +7275,7 @@
             fw =
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 # The sentinel module forces the hostname to the factory value;
                 # in a multi-node test the driver derives each machine's python
                 # variable from its hostname, so pin it back to the node name `fw`
@@ -7367,7 +7399,7 @@
             fw.fail("grep -q 'name = \"clash\"' /var/lib/sentinel/appliance.toml")
             # The firewall is opened for the VIP, since the data plane special-cases
             # a port-forward but knows nothing about a service.
-            fw.succeed("grep -A2 '\\[\\[policy.port_rule\\]\\]' /run/sentinel/velstra.toml | grep -q 'port = 9090'")
+            fw.succeed("${pkgs.python3}/bin/python3 -c 'import tomllib; c=tomllib.load(open(\"/run/sentinel/velstra.toml\",\"rb\")); assert any(r[\"port\"] == 9090 for p in c[\"policy\"] for r in p.get(\"port_rule\", []))'")
             # The headline for C22: a client actually reaches the VIP. This is the
             # cross-zone case — the request enters on the wan policy and the
             # backend's reply comes back on the lan policy — which is exactly what
@@ -7614,7 +7646,7 @@
             fw =
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "fw";
                 networking.firewall.enable = lib.mkForce false;
                 virtualisation.vlans = [
@@ -7750,7 +7782,7 @@
             fw =
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "fw";
                 networking.firewall.enable = lib.mkForce false;
                 networking.interfaces.eth1.ipv4.addresses = [
@@ -7989,7 +8021,7 @@
             fw =
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "fw";
                 networking.firewall.enable = lib.mkForce false;
                 networking.interfaces.eth1.ipv4.addresses = [
@@ -8228,7 +8260,7 @@
             fw =
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "fw";
                 networking.firewall.enable = lib.mkForce false;
                 networking.interfaces.eth1.ipv4.addresses = [
@@ -8261,7 +8293,7 @@
             bk1 =
               { pkgs, lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "bk1";
                 networking.firewall.enable = lib.mkForce false;
                 networking.interfaces.eth1.ipv4.addresses = [
@@ -8287,7 +8319,7 @@
             bk2 =
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "bk2";
                 networking.firewall.enable = lib.mkForce false;
                 networking.interfaces.eth1.ipv4.addresses = [
@@ -8452,7 +8484,7 @@
             fw =
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "fw";
                 networking.firewall.enable = lib.mkForce false;
                 virtualisation.vlans = [
@@ -8527,7 +8559,7 @@
               hostName:
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce hostName;
                 networking.firewall.enable = lib.mkForce false;
                 virtualisation.vlans = [ 1 ];
@@ -8605,7 +8637,7 @@
               hostName:
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce hostName;
                 networking.firewall.enable = lib.mkForce false;
                 virtualisation.vlans = [ 1 ];
@@ -8681,7 +8713,7 @@
             fw =
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "fw";
                 networking.firewall.enable = lib.mkForce false;
                 networking.interfaces.eth1.ipv4.addresses = [
@@ -8762,7 +8794,7 @@
         fwdomain = pkgs.testers.runNixOSTest {
           name = "sentinel-fwdomain";
           nodes.machine = {
-            imports = [ self.nixosModules.sentinel ];
+            imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
             virtualisation.memorySize = 2048;
             # A name the resolver answers without a network. /etc/hosts is what
             # `getaddrinfo` consults first, which is the path `sentinel` takes.
@@ -8831,7 +8863,7 @@
         fwschedule = pkgs.testers.runNixOSTest {
           name = "sentinel-fwschedule";
           nodes.machine = {
-            imports = [ self.nixosModules.sentinel ];
+            imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
             virtualisation.memorySize = 2048;
             # A deterministic wall clock: fix the zone to UTC and disable NTP so a
             # `date -s` sticks for the length of the test (the sandbox has no
@@ -8937,7 +8969,7 @@
             fw =
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "fw";
                 networking.firewall.enable = lib.mkForce false;
                 networking.interfaces.eth1.ipv4.addresses = [
@@ -9090,7 +9122,7 @@
             fw =
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "fw";
                 networking.firewall.enable = lib.mkForce false;
                 networking.interfaces.eth1.ipv4.addresses = [
@@ -9253,7 +9285,7 @@
             fw =
               { lib, pkgs, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "fw";
                 networking.firewall.enable = lib.mkForce false;
                 networking.interfaces.eth1.ipv4.addresses = [
@@ -9301,6 +9333,9 @@
             # egress program and by nothing else, so a non-zero count is proof;
             # a `clsact` qdisc, which is what this used to look for, sits there
             # empty on a box whose hook was never attached.
+            # Generate IP traffic: an otherwise idle static-addressed box may
+            # only have sent ARP, which is outside the IP classifier counters.
+            fw.succeed("ping -c1 -W2 10.1.0.2")
             fw.wait_until_succeeds(
                 "sentinel show firewall statistics | awk '/tx_packets/{exit $2==0}'",
                 timeout=30)
@@ -9385,7 +9420,7 @@
             fw =
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "fw";
                 networking.firewall.enable = lib.mkForce false;
                 networking.interfaces.eth1.ipv4.addresses = [
@@ -9469,7 +9504,7 @@
             fw =
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "fw";
                 networking.firewall.enable = lib.mkForce false;
                 networking.interfaces.eth1.ipv4.addresses = [
@@ -9572,7 +9607,7 @@
             fw =
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "fw";
                 networking.firewall.enable = lib.mkForce false;
                 networking.interfaces.eth1.ipv6.addresses = [
@@ -9709,7 +9744,7 @@
             fw =
               { lib, pkgs, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "fw";
                 networking.firewall.enable = lib.mkForce false;
                 networking.interfaces.eth1.ipv4.addresses = [
@@ -9884,7 +9919,7 @@
           nodes =
             let
               leaf = n: { lib, ... }: {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "leaf${toString n}";
                 networking.firewall.enable = lib.mkForce false;
                 networking.interfaces.eth1.ipv4.addresses = [
@@ -9996,7 +10031,7 @@
             fw =
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "fw";
                 networking.firewall.enable = lib.mkForce false;
                 networking.interfaces.eth1.ipv4.addresses = [
@@ -10130,7 +10165,7 @@
             fw =
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "fw";
                 networking.firewall.enable = lib.mkForce false;
                 # eth1's address is set through Sentinel below, not here. Once
@@ -10352,7 +10387,7 @@
             fw =
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "fw";
                 networking.firewall.enable = lib.mkForce false;
                 networking.interfaces.eth1.ipv4.addresses = [
@@ -10408,6 +10443,7 @@
             configure(
                 "set firewall rule no-ping from wan",
                 "set firewall rule no-ping proto icmp",
+                "set firewall rule no-ping direction in",
                 "set firewall rule no-ping icmp-type echo-request",
                 "set firewall rule no-ping action drop",
             )
@@ -10452,11 +10488,31 @@
             configure(
                 "set firewall rule no-ping6 from wan",
                 "set firewall rule no-ping6 proto icmpv6",
+                "set firewall rule no-ping6 direction in",
                 "set firewall rule no-ping6 icmp-type echo-request",
                 "set firewall rule no-ping6 action drop",
             )
             assert not pings6(), "an icmpv6 echo-request rule did not stop a v6 ping"
             assert pings(), "the v6 rule stopped the v4 ping as well"
+
+            # The ingress type-0/129 cases must not accidentally block the
+            # outgoing echo reply. An explicitly outgoing rule must block it.
+            configure(
+                "set firewall rule no-ping6 icmp-type echo-reply",
+            )
+            assert pings6(), "an ingress echo-reply rule matched an echo-request"
+            configure(
+                "set firewall rule no-replies6 from wan",
+                "set firewall rule no-replies6 proto icmpv6",
+                "set firewall rule no-replies6 family ipv6",
+                "set firewall rule no-replies6 direction out",
+                "set firewall rule no-replies6 icmp-type echo-reply",
+                "set firewall rule no-replies6 action drop",
+            )
+            assert not pings6(), "the IPv6 egress rule did not block replies"
+            assert pings(), "the IPv6 egress rule affected IPv4"
+            configure("delete firewall rule no-replies6")
+            assert pings6(), "removing the IPv6 egress rule did not restore replies"
           '';
         };
 
@@ -10516,7 +10572,7 @@
               fw =
                 { lib, ... }:
                 {
-                  imports = [ self.nixosModules.sentinel ];
+                  imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                   networking.hostName = lib.mkForce "fw";
                   networking.firewall.enable = lib.mkForce false;
                   networking.interfaces.eth1.ipv6.addresses = [
@@ -10620,7 +10676,7 @@
             fw =
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "fw";
                 networking.firewall.enable = lib.mkForce false;
                 networking.interfaces.eth1.ipv4.addresses = [
@@ -10718,7 +10774,7 @@
             fw =
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "fw";
                 networking.firewall.enable = lib.mkForce false;
                 # eth1's address + DHCP server are configured via sentinel, so the
@@ -10835,7 +10891,7 @@
             fw =
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "fw";
                 networking.firewall.enable = lib.mkForce false;
                 virtualisation.vlans = [
@@ -10950,7 +11006,7 @@
             fw =
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "fw";
                 networking.firewall.enable = lib.mkForce false;
                 virtualisation.vlans = [
@@ -11127,7 +11183,7 @@
             relay =
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "relay";
                 networking.firewall.enable = lib.mkForce false;
                 virtualisation.vlans = [
@@ -11273,7 +11329,7 @@
             relay =
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "relay";
                 networking.firewall.enable = lib.mkForce false;
                 virtualisation.vlans = [
@@ -11396,7 +11452,7 @@
             relay =
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "relay";
                 networking.firewall.enable = lib.mkForce false;
                 virtualisation.vlans = [
@@ -11529,7 +11585,7 @@
               fw =
                 { lib, ... }:
                 {
-                  imports = [ self.nixosModules.sentinel ];
+                  imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                   networking.hostName = lib.mkForce "fw";
                   networking.firewall.enable = lib.mkForce false;
                   virtualisation.vlans = [
@@ -11621,7 +11677,7 @@
           nodes =
             let
               appliance = host: { lib, ... }: {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce host;
                 networking.firewall.enable = lib.mkForce false;
                 virtualisation.vlans = [ 1 ];
@@ -11775,7 +11831,7 @@
             fw =
               { lib, pkgs, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "fw";
                 networking.firewall.enable = lib.mkForce false;
                 virtualisation.vlans = [
@@ -11888,7 +11944,7 @@
             fw =
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "fw";
                 networking.firewall.enable = lib.mkForce false;
                 # eth1's addressing + RA are configured via sentinel (it owns the
@@ -11981,7 +12037,7 @@
             fw =
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "fw";
                 networking.firewall.enable = lib.mkForce false;
                 virtualisation.vlans = [ 1 ];
@@ -12079,7 +12135,7 @@
             fw =
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "fw";
                 networking.firewall.enable = lib.mkForce false;
                 virtualisation.vlans = [ 1 ];
@@ -12260,7 +12316,7 @@
             fw =
               { lib, pkgs, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "fw";
                 networking.firewall.enable = lib.mkForce false;
                 # `dig` for the test's own DNS64 synthesis assertions.
@@ -12391,12 +12447,15 @@
         # kernel path: the bridge/bond devices exist with the right kind/mode and
         # their members are enslaved.
         #   nix build .#checks.x86_64-linux.l2 -L
+        reconciliation = import ./nix/reconciliation-test.nix { inherit pkgs self; };
+        phase2-dataplane = import ./nix/phase2-dataplane-test.nix { inherit pkgs self; };
+
         l2 = pkgs.testers.runNixOSTest {
           name = "sentinel-l2";
           nodes.fw =
             { lib, ... }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               networking.hostName = lib.mkForce "fw";
               networking.firewall.enable = lib.mkForce false;
               virtualisation.vlans = [ 1 2 3 ];
@@ -12541,7 +12600,7 @@
           nodes.fw =
             { lib, ... }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               networking.hostName = lib.mkForce "fw";
               networking.firewall.enable = lib.mkForce false;
               virtualisation.vlans = [ 1 2 3 ];
@@ -12635,7 +12694,7 @@
                 { wanAddr }:
                 { lib, ... }:
                 {
-                  imports = [ self.nixosModules.sentinel ];
+                  imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                   networking.hostName = lib.mkForce (
                     if wanAddr == "10.0.0.1" then "left" else "right"
                   );
@@ -12760,7 +12819,7 @@
             fw =
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "fw";
                 networking.firewall.enable = lib.mkForce false;
                 virtualisation.vlans = [ 1 ];
@@ -12882,7 +12941,7 @@
           nodes.fw =
             { lib, ... }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               networking.hostName = lib.mkForce "fw";
               networking.firewall.enable = lib.mkForce false;
               virtualisation.vlans = [ 1 ];
@@ -12976,7 +13035,7 @@
             fw =
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "fw";
                 networking.firewall.enable = lib.mkForce false;
                 virtualisation.vlans = [
@@ -13038,7 +13097,7 @@
           nodes.fw =
             { lib, ... }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               networking.hostName = lib.mkForce "fw";
               networking.firewall.enable = lib.mkForce false;
               virtualisation.vlans = [ 1 ];
@@ -13083,7 +13142,7 @@
           nodes.fw =
             { lib, ... }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               networking.hostName = lib.mkForce "fw";
               networking.firewall.enable = lib.mkForce false;
               virtualisation.vlans = [ 1 ];
@@ -13131,7 +13190,7 @@
           nodes.fw =
             { lib, pkgs, ... }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               networking.hostName = lib.mkForce "fw";
               networking.firewall.enable = lib.mkForce false;
               virtualisation.vlans = [ 1 ];
@@ -13203,7 +13262,7 @@
           nodes.machine =
             { lib, pkgs, ... }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               virtualisation.memorySize = 2048;
               # velstra needs an underlay interface to attach to (a required
               # option); the PKI test does no dataplane, so any NIC will do.
@@ -13306,7 +13365,7 @@
               ...
             }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               networking.hostName = lib.mkForce hostname;
               networking.firewall.enable = lib.mkForce false;
               networking.interfaces.eth1.ipv4.addresses = [
@@ -13372,6 +13431,22 @@
               # And the operational `wren show` command works on the box, reporting
               # the established session.
               bgp1.succeed("wren show bgp neighbors | grep -qi established")
+
+              with subtest("BGP desired-state changes withdraw and restore kernel routes live"):
+                  def commit_bgp(command=""):
+                      result = bgp1.succeed(
+                          "su admin -c \"printf '%s\\n' "
+                          f"'{command}' commit save exit | sentinel configure\""
+                      )
+                      assert "error:" not in result.lower() and "commit failed" not in result.lower(), result
+                  invocation = bgp1.succeed("systemctl show -p InvocationID --value wren.service")
+                  commit_bgp()
+                  assert bgp1.succeed("systemctl show -p InvocationID --value wren.service") == invocation
+                  bgp1.succeed("wren show bgp neighbors | grep -qi established")
+                  commit_bgp("delete protocols bgp network")
+                  bgp2.wait_until_succeeds("! ip -4 route show proto bgp | grep -q '10.11.0.0/24'", timeout=90)
+                  commit_bgp("set protocols bgp network 10.11.0.0/24")
+                  bgp2.wait_until_succeeds("ip -4 route show proto bgp | grep -q '10.11.0.0/24'", timeout=90)
             '';
           };
 
@@ -13390,7 +13465,7 @@
               ...
             }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               networking.hostName = lib.mkForce hostname;
               networking.firewall.enable = lib.mkForce false;
               networking.interfaces.eth1.ipv4.addresses = [
@@ -13508,7 +13583,7 @@
               ...
             }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               networking.hostName = lib.mkForce hostname;
               networking.firewall.enable = lib.mkForce false;
               networking.interfaces.eth1.ipv4.addresses = [
@@ -13649,7 +13724,7 @@
               ...
             }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               networking.hostName = lib.mkForce hostname;
               networking.firewall.enable = lib.mkForce false;
               networking.interfaces.eth1.ipv4.addresses = [
@@ -13715,6 +13790,31 @@
 
               # And the adjacency is Full.
               ospf1.succeed("wren show ospf neighbors | grep -qi full")
+
+              with subtest("OSPF desired-state changes withdraw and restore kernel routes live"):
+                  def commit_ospf(command=""):
+                      result = ospf1.succeed(
+                          "su admin -c \"printf '%s\\n' "
+                          f"'{command}' commit save exit | sentinel configure\""
+                      )
+                      assert "error:" not in result.lower() and "commit failed" not in result.lower(), result
+                  invocation = ospf1.succeed("systemctl show -p InvocationID --value wren.service")
+                  commit_ospf()
+                  assert ospf1.succeed("systemctl show -p InvocationID --value wren.service") == invocation
+                  ospf1.succeed("wren show ospf neighbors | grep -qi full")
+                  commit_ospf("delete protocols static 10.11.0.0/24")
+                  ospf2.wait_until_succeeds("! ip -4 route show proto ospf | grep -q '10.11.0.0/24'", timeout=120)
+                  commit_ospf("set protocols static 10.11.0.0/24 dev lo")
+                  ospf2.wait_until_succeeds("ip -4 route show proto ospf | grep -q '10.11.0.0/24'", timeout=120)
+
+              with subtest("graceful restart does not preserve a withdrawn external route"):
+                  commit_ospf("set protocols ospf graceful-restart true")
+                  ospf1.wait_until_succeeds("wren show ospf neighbors | grep -qi full", timeout=120)
+                  ospf2.wait_until_succeeds("ip -4 route show proto ospf | grep -q '10.11.0.0/24'", timeout=120)
+                  commit_ospf("delete protocols static 10.11.0.0/24")
+                  ospf2.wait_until_succeeds("! ip -4 route show proto ospf | grep -q '10.11.0.0/24'", timeout=120)
+                  commit_ospf("set protocols static 10.11.0.0/24 dev lo")
+                  ospf2.wait_until_succeeds("ip -4 route show proto ospf | grep -q '10.11.0.0/24'", timeout=120)
             '';
           };
 
@@ -13729,7 +13829,7 @@
               ...
             }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               networking.hostName = lib.mkForce hostname;
               networking.firewall.enable = lib.mkForce false;
               networking.interfaces.eth1.ipv4.addresses = [
@@ -13801,7 +13901,7 @@
               ...
             }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               networking.hostName = lib.mkForce hostname;
               networking.firewall.enable = lib.mkForce false;
               networking.interfaces.eth1.ipv6.addresses = [
@@ -13874,7 +13974,7 @@
               ...
             }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               networking.hostName = lib.mkForce hostname;
               networking.firewall.enable = lib.mkForce false;
               networking.interfaces.eth1.ipv6.addresses = [
@@ -13958,7 +14058,7 @@
               ...
             }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               networking.hostName = lib.mkForce hostname;
               networking.firewall.enable = lib.mkForce false;
               networking.interfaces.eth1.ipv6.addresses = [
@@ -14044,7 +14144,7 @@
               ...
             }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               networking.hostName = lib.mkForce hostname;
               networking.firewall.enable = lib.mkForce false;
               networking.interfaces.eth1.ipv6.addresses = [
@@ -14142,7 +14242,7 @@
         commitconfirm = pkgs.testers.runNixOSTest {
           name = "sentinel-commitconfirm";
           nodes.machine = {
-            imports = [ self.nixosModules.sentinel ];
+            imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
             virtualisation.memorySize = 2048;
           };
           testScript = ''
@@ -14221,7 +14321,7 @@
         confighistory = pkgs.testers.runNixOSTest {
           name = "sentinel-confighistory";
           nodes.machine = {
-            imports = [ self.nixosModules.sentinel ];
+            imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
             virtualisation.memorySize = 2048;
           };
           testScript = ''
@@ -14305,7 +14405,7 @@
         fwgroups = pkgs.testers.runNixOSTest {
           name = "sentinel-fwgroups";
           nodes.machine = {
-            imports = [ self.nixosModules.sentinel ];
+            imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
             virtualisation.memorySize = 2048;
           };
           testScript = ''
@@ -14420,7 +14520,7 @@
             fw =
               { lib, pkgs, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "fw";
                 networking.firewall.enable = lib.mkForce false;
                 networking.interfaces.eth1.ipv4.addresses = [
@@ -14546,7 +14646,7 @@
               ...
             }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               networking.hostName = lib.mkForce hostname;
               networking.firewall.enable = lib.mkForce false;
               networking.interfaces.eth1.ipv4.addresses = [
@@ -14645,7 +14745,7 @@
               ...
             }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               networking.hostName = lib.mkForce hostname;
               networking.firewall.enable = lib.mkForce false;
               networking.interfaces.eth1.ipv4.addresses = [
@@ -14747,7 +14847,7 @@
               ...
             }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               networking.hostName = lib.mkForce hostname;
               networking.firewall.enable = lib.mkForce false;
               virtualisation.vlans = [ 1 ];
@@ -14805,6 +14905,21 @@
 
               # And the OSPFv3 adjacency is Full.
               ospf31.succeed("wren show ospf3 neighbors | grep -qi full")
+
+              with subtest("OSPFv3 removes and restores redistributed IPv6 routes live"):
+                  def commit_ospf3(command=""):
+                      result = ospf31.succeed(
+                          "su admin -c \"printf '%s\\n' "
+                          f"'{command}' commit save exit | sentinel configure\""
+                      )
+                      assert "error:" not in result.lower() and "commit failed" not in result.lower(), result
+                  invocation = ospf31.succeed("systemctl show -p InvocationID --value wren.service")
+                  commit_ospf3()
+                  assert ospf31.succeed("systemctl show -p InvocationID --value wren.service") == invocation
+                  commit_ospf3("delete protocols static 2001:db8:11::/64")
+                  ospf32.wait_until_succeeds("! ip -6 route show proto ospf | grep -q '2001:db8:11::/64'", timeout=120)
+                  commit_ospf3("set protocols static 2001:db8:11::/64 dev lo")
+                  ospf32.wait_until_succeeds("ip -6 route show proto ospf | grep -q '2001:db8:11::/64'", timeout=120)
             '';
           };
 
@@ -14821,7 +14936,7 @@
             fw =
               { lib, ... }:
               {
-                imports = [ self.nixosModules.sentinel ];
+                imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
                 networking.hostName = lib.mkForce "fw";
                 networking.firewall.enable = lib.mkForce false;
                 networking.interfaces.eth1.ipv4.addresses = [
@@ -14921,7 +15036,7 @@
               ...
             }:
             {
-              imports = [ self.nixosModules.sentinel ];
+              imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               networking.hostName = lib.mkForce hostname;
               networking.firewall.enable = lib.mkForce false;
               networking.interfaces.eth1.ipv4.addresses = [

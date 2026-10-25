@@ -626,10 +626,229 @@ fn partial_install_error(cause: anyhow::Error, erased: &[String]) -> anyhow::Err
     )
 }
 
+/// Take down whatever is holding `target` open, so it can be erased.
+///
+/// Scoped to this disk on purpose. A volume group that also has a physical
+/// volume on another disk is left alone and named instead: deactivating it
+/// would take down storage the operator did not offer to this installer, and
+/// "it erased the disk I did not pick" is not a failure anybody recovers from.
+///
+/// Every step is best-effort and in the order the holders stack — swap and
+/// mounts sit on top of dm and md, which sit on the partitions. What is left
+/// after this is reported by [`holders_of`], which is what makes the refusal
+/// name a cause instead of an errno.
+fn release_holders(target: &str) -> Result<()> {
+    let kernel = target.trim_start_matches("/dev/");
+
+    // Swap first: a swap partition is an open holder and `swapoff` is the only
+    // thing that closes it.
+    if let Ok(swaps) = std::fs::read_to_string("/proc/swaps") {
+        for line in swaps.lines().skip(1) {
+            let Some(dev) = line.split_whitespace().next() else {
+                continue;
+            };
+            if disk_path_matches(dev, target) {
+                eprintln!("  swapoff {dev}");
+                let _ = run("swapoff", &[dev]);
+            }
+        }
+    }
+
+    // Then mounts, deepest first: /var before /, or the shallower umount
+    // fails on a busy subtree.
+    let mut mounts: Vec<(String, String)> = Vec::new();
+    if let Ok(mi) = std::fs::read_to_string("/proc/self/mountinfo") {
+        for line in mi.lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let Some(sep) = f.iter().position(|x| *x == "-") else {
+                continue;
+            };
+            let (Some(point), Some(dev)) = (f.get(4), f.get(sep + 2)) else {
+                continue;
+            };
+            if disk_path_matches(dev, target) {
+                mounts.push(((*point).to_string(), (*dev).to_string()));
+            }
+        }
+    }
+    mounts.sort_by_key(|(point, _)| std::cmp::Reverse(point.matches('/').count()));
+    for (point, dev) in mounts {
+        eprintln!("  umount {point} ({dev})");
+        let _ = run("umount", &[&point]);
+    }
+
+    // Device-mapper and md, from `/sys/class/block/<part>/holders`. That
+    // directory is the kernel's own answer to "who has this open", so it needs
+    // no guessing about naming and covers LUKS, LVM and md alike.
+    for part in std::iter::once(kernel.to_string()).chain(partitions_of(kernel)) {
+        for holder in holders_named(&part) {
+            if !holder_is_confined(&holder, kernel, &|name| {
+                let entries = std::fs::read_dir(format!("/sys/class/block/{name}/slaves")).ok()?;
+                entries
+                    .map(|entry| entry.ok()?.file_name().into_string().ok())
+                    .collect()
+            }) {
+                eprintln!(
+                    "  leaving {holder} alone: its dependencies are shared with another disk or could not be verified"
+                );
+                continue;
+            }
+            if holder.starts_with("dm-") {
+                let name = std::fs::read_to_string(format!("/sys/class/block/{holder}/dm/name"))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                eprintln!("  dmsetup remove {name}");
+                let _ = run("dmsetup", &["remove", "--retry", &name]);
+            } else if holder.starts_with("md") {
+                eprintln!("  mdadm --stop /dev/{holder}");
+                let _ = run("mdadm", &["--stop", &format!("/dev/{holder}")]);
+            }
+        }
+    }
+
+    // The kernel needs a moment to notice; `wipefs` right after a `dmsetup
+    // remove` can still see the old holder.
+    let _ = run("udevadm", &["settle"]);
+
+    let left = holders_of(kernel);
+    if !left.is_empty() {
+        bail!(
+            "{target} is still held by {} — nothing has been written. \
+             Take it down and run the installer again, or pick another disk. \
+             `lsblk {target}` shows what is on it",
+            left.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// The partition kernel names of a whole disk, `nvme0n1p1`, `sda1`.
+fn partitions_of(kernel: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(format!("/sys/class/block/{kernel}")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| disk_node_matches(n, kernel) && n != kernel)
+        .collect()
+}
+
+/// What the kernel says currently holds a block device open.
+fn holders_named(kernel: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(format!("/sys/class/block/{kernel}/holders")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect()
+}
+
+/// Everything still holding the disk or any of its partitions, for a refusal
+/// that names a cause. Device-mapper devices are reported by their real name
+/// (`vg0-root`) rather than `dm-3`, because that is what an operator can act on.
+fn holders_of(kernel: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut parts = vec![kernel.to_string()];
+    parts.extend(partitions_of(kernel));
+    for part in parts {
+        for holder in holders_named(&part) {
+            let named = std::fs::read_to_string(format!("/sys/class/block/{holder}/dm/name"))
+                .ok()
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty())
+                .unwrap_or(holder);
+            if !out.contains(&named) {
+                out.push(named);
+            }
+        }
+    }
+    out
+}
+
+/// Match a disk and its partitions without confusing sda with sdaa, or
+/// nvme0n1 with nvme0n10. The kernel separates digit-ending disk names with p.
+fn disk_node_matches(node: &str, disk: &str) -> bool {
+    if node == disk {
+        return true;
+    }
+    let Some(suffix) = node.strip_prefix(disk) else {
+        return false;
+    };
+    let suffix = if disk.ends_with(|c: char| c.is_ascii_digit()) {
+        let Some(part) = suffix.strip_prefix('p') else {
+            return false;
+        };
+        part
+    } else {
+        suffix
+    };
+    !suffix.is_empty() && suffix.bytes().all(|c| c.is_ascii_digit())
+}
+
+fn disk_path_matches(device: &str, target: &str) -> bool {
+    let device = std::fs::canonicalize(device).unwrap_or_else(|_| device.into());
+    let target = std::fs::canonicalize(target).unwrap_or_else(|_| target.into());
+    device.parent() == target.parent()
+        && device
+            .file_name()
+            .zip(target.file_name())
+            .is_some_and(|(node, disk)| {
+                disk_node_matches(&node.to_string_lossy(), &disk.to_string_lossy())
+            })
+}
+
+/// Follow the kernel dependency graph, including md and stacked dm devices.
+/// Unknown dependencies fail closed; a shared volume must never be stopped.
+fn holder_is_confined(
+    holder: &str,
+    disk: &str,
+    slaves: &impl Fn(&str) -> Option<Vec<String>>,
+) -> bool {
+    fn visit(
+        node: &str,
+        disk: &str,
+        slaves: &impl Fn(&str) -> Option<Vec<String>>,
+        seen: &mut std::collections::BTreeSet<String>,
+    ) -> bool {
+        if seen.len() >= 64 || !seen.insert(node.into()) {
+            return false;
+        }
+        let Some(children) = slaves(node) else {
+            return false;
+        };
+        let safe = if children.is_empty() {
+            disk_node_matches(node, disk)
+        } else {
+            children
+                .iter()
+                .all(|child| visit(child, disk, slaves, seen))
+        };
+        seen.remove(node);
+        safe
+    }
+    visit(holder, disk, slaves, &mut std::collections::BTreeSet::new())
+}
+
 /// Lay the image's A/B partition layout onto `target` and clone the sealed
 /// partitions block-for-block from `source`. The data partition (the last one)
 /// is recreated to fill the target, typed for a filesystem or a RAID member.
 fn prepare_disk(source: &str, target: &str, raid: Raid) -> Result<()> {
+    // Everything the kernel is still holding this disk open with, taken down
+    // first. Without it `wipefs` fails with `probing initialization failed:
+    // Device or resource busy` and the install stops before it has written
+    // anything — on any machine that already carries an installation, which is
+    // every machine being *re*-installed.
+    //
+    // A live medium assembles what it finds: an existing LUKS volume becomes a
+    // `/dev/mapper/…`, an LVM volume group is activated, an md array is
+    // started, a swap partition may be switched on. Each of those is an open
+    // holder of the whole-disk device, and none of them is visible in the
+    // candidate listing — so the operator sees a disk offered, picks it, says
+    // YES, and is told the device is busy with no indication of what by.
+    release_holders(target)?;
     run("wipefs", &["-a", target])?;
     // Replicate the source GPT onto the target (`--replicate=<dest>` takes the
     // DESTINATION; the source is the positional device), then move the backup
@@ -1216,5 +1435,51 @@ Number  Start (sector)    End (sector)  Size       Code  Name
         assert!(plan_targets(&avail, &["nope".into()], Raid::None).is_err());
         // Non-RAID rejects multiple targets.
         assert!(plan_targets(&avail, &["sda".into(), "sdb".into()], Raid::None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod holder_scope_tests {
+    use super::*;
+    #[test]
+    fn disk_partition_matching_excludes_similarly_named_disks() {
+        for (disk, yes, no) in [
+            ("sda", "sda12", "sdaa1"),
+            ("nvme0n1", "nvme0n1p2", "nvme0n10p2"),
+            ("mmcblk0", "mmcblk0p1", "mmcblk01p1"),
+        ] {
+            assert!(disk_node_matches(disk, disk));
+            assert!(disk_node_matches(yes, disk));
+            assert!(!disk_node_matches(no, disk));
+        }
+        assert!(!disk_node_matches("sda", ""));
+        assert!(!disk_path_matches("/dev/sdaa1", "/dev/sda"));
+        assert!(!disk_path_matches("/different/sda1", "/dev/sda"));
+    }
+    #[test]
+    fn shared_unknown_and_cyclic_holders_are_never_released() {
+        let mut graph = std::collections::BTreeMap::from([
+            ("sda1", vec![]),
+            ("sdb1", vec![]),
+            ("dm-local", vec!["sda1"]),
+            ("md-shared", vec!["sda1", "sdb1"]),
+            ("dm-stack", vec!["dm-local"]),
+            ("dm-shared", vec!["md-shared"]),
+            ("dm-cycle", vec!["dm-cycle"]),
+        ]);
+        let query = |name: &str| {
+            graph
+                .get(name)
+                .map(|nodes| nodes.iter().map(|s| (*s).into()).collect())
+        };
+        assert!(holder_is_confined("dm-local", "sda", &query));
+        assert!(holder_is_confined("dm-stack", "sda", &query));
+        for name in ["md-shared", "dm-shared", "dm-cycle", "missing"] {
+            assert!(!holder_is_confined(name, "sda", &query));
+        }
+        graph.remove("sda1");
+        assert!(!holder_is_confined("dm-local", "sda", &|name| graph
+            .get(name)
+            .map(|nodes| nodes.iter().map(|s| (*s).into()).collect())));
     }
 }

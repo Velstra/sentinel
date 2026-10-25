@@ -25,6 +25,13 @@ set interface eth1 address 10.0.0.1/24
 set interface eth1 address6 2001:db8:0:1::1/64
 ```
 
+Commits reconcile these settings without a reboot. Removing an address clears
+it; removing an MTU restores 1500 for Ethernet, the parent's MTU for a VLAN,
+the smallest member MTU for a bridge/bond, or 1420 for WireGuard. Changing a
+VLAN's tag, parent or virtual device definition recreates that owned device and
+reattaches its packet hooks. Removing a virtual interface deletes its owned
+kernel device. Unchanged commits retain device identities.
+
 ## VLANs (802.1Q / QinQ)
 
 Name a subinterface `<parent>.<id>` to infer it, or set `parent`/`vlan`
@@ -529,6 +536,12 @@ only when it is switched off. A router that says nothing about forwarding is at
 the mercy of whatever the network manager's own default happens to be, and the
 symptom when that default is "off" is a link that carries traffic *to* the box
 and none *through* it — with a global `ip_forward` of 1 the whole time.
+
+Commits also reconcile the global IPv4 and IPv6 forwarding gates. Per-link
+IPv6 forwarding alone does not enable transit traffic. Explicit overrides in
+`system.sysctl` remain authoritative; deleting one restores the appliance's
+routing default. An unchanged commit repairs a changed global gate and
+reasserts each interface's forwarding setting.
 
 ### The ARP block
 

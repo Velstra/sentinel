@@ -33,6 +33,7 @@ mod lockout;
 mod lookup;
 mod metrics;
 mod net;
+mod network_reconcile;
 mod openapi;
 mod openconnect;
 mod passwd;
@@ -40,6 +41,7 @@ mod pki;
 mod portal;
 mod portmap;
 mod proxy;
+mod reconcile;
 mod relay;
 mod repl;
 mod session;
@@ -872,6 +874,7 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
 /// Compile the appliance config, atomically install the Velstra agent config at
 /// `out`, and (if given) reload the systemd `unit` running the data plane.
 fn apply(file: &std::path::Path, out: &std::path::Path, reload: Option<&str>) -> Result<()> {
+    let _lock = system::apply_lock();
     // Resolve domain groups before compiling: the compiler only knows addresses,
     // and this is also the periodic refresh — the timer re-runs exactly this.
     let appliance = identity::with_resolved(&feed::with_fetched(&domain::with_resolved(
@@ -885,6 +888,7 @@ fn apply(file: &std::path::Path, out: &std::path::Path, reload: Option<&str>) ->
         eprintln!("warning: {w}");
     }
     let rendered = compile::compile(&appliance).to_toml()?;
+    let previous = std::fs::read(out).ok();
 
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)
@@ -897,15 +901,7 @@ fn apply(file: &std::path::Path, out: &std::path::Path, reload: Option<&str>) ->
     println!("installed {}", out.display());
 
     if let Some(unit) = reload {
-        // Use the pinned absolute path like the rest of the binary, so neither
-        // the admin's $PATH nor sudo's secure_path can shadow or miss systemctl.
-        let status = std::process::Command::new(system::bin("systemctl"))
-            .args(["reload-or-restart", unit])
-            .status()
-            .with_context(|| format!("running systemctl reload-or-restart {unit}"))?;
-        if !status.success() {
-            anyhow::bail!("systemctl reload-or-restart {unit} failed");
-        }
+        system::reload_compiled(unit, previous.as_deref(), rendered.as_bytes())?;
         println!("reloaded {unit}");
     }
     Ok(())
@@ -1470,8 +1466,14 @@ fn collect_text(
     disks: &[install::Disk],
     nics: &[String],
 ) -> Result<Option<installer_tui::Answers>> {
-    list_disks(disks);
-
+    // The mode first, then the disks — and the disks are listed *after* the
+    // mode is known, so the list is read with its question already in mind.
+    //
+    // It ran the other way round: a table of disks, then a mode, then "select
+    // disk number(s)" about a table that had scrolled past. Somebody reading
+    // top to bottom met a list before there was anything to do with it, and a
+    // plural prompt whether or not the mode they had just picked takes more
+    // than one disk.
     println!("\nInstall mode:");
     println!("  [1] single disk");
     println!("  [2] RAID0  (stripe — capacity, no redundancy, 2+ disks)");
@@ -1484,7 +1486,19 @@ fn collect_text(
         "4" => install::Raid::Mirror10,
         other => anyhow::bail!("invalid mode {other:?}"),
     };
-    let pick = prompt("Select disk number(s), space-separated: ")?;
+
+    println!();
+    list_disks(disks);
+
+    let disk_prompt = match raid {
+        install::Raid::None => "Disk number: ".to_string(),
+        _ => format!(
+            "Disk numbers for {:?}, space-separated (at least {}): ",
+            raid,
+            raid.min_disks()
+        ),
+    };
+    let pick = prompt(&disk_prompt)?;
     let picks = resolve_picks(disks, pick.trim())?;
 
     println!("\n── Console and locale ──");
@@ -2165,6 +2179,9 @@ fn show_op(args: &[String]) -> Result<()> {
         // block), and nothing brought them together, so a box could be filtering
         // exactly as configured and look misconfigured.
         ["firewall", "zones"] | ["zones"] => show_zones(),
+        ["firewall", "states"] => show_agent_query("firewall-states", "firewall connection states"),
+        ["firewall", "counters"] => show_agent_query("rule-stats", "rule packet counters"),
+        ["firewall", "events"] => show_agent_query("packet-events 100", "packet events"),
         ["firewall", "statistics" | "stats"] => show_firewall_stats(),
         // Which rules are carrying traffic, and which are carrying none.
         ["firewall", "hits"] | ["firewall", "rules"] => show_rule_hits(),
@@ -2178,10 +2195,16 @@ fn show_op(args: &[String]) -> Result<()> {
         ["firewall", "top-talkers" | "top"] | ["top-talkers"] => {
             show_agent_query("top", "top talkers")
         }
-        ["firewall", "log"] => run_show(
-            &system::bin("journalctl"),
-            &["-u", "velstra.service", "-n", "50", "--no-pager"],
-        ),
+        // The firewall's own log, and how much of it.
+        //
+        // Bare, it is the last fifty lines, as it always was. `<n>` asks for a
+        // different depth and `since <window>` for a period rather than a
+        // count — both bounded here rather than passed through, because these
+        // words reach `journalctl` and an appliance does not hand a management
+        // request an argument list.
+        ["firewall", "log"] => show_firewall_log("50", None),
+        ["firewall", "log", depth] => show_firewall_log(depth, None),
+        ["firewall", "log", "since", window] => show_firewall_log("5000", Some(window)),
         ["nat"] => show_nat(),
         ["nat", "cgnat", addr] => show_cgnat(addr),
 
@@ -2381,7 +2404,7 @@ fn show_op(args: &[String]) -> Result<()> {
              show isis [neighbors|interfaces|database]\n  \
              show babel [neighbors|routes]\n  \
              show vrrp | show bfd [sessions]\n  \
-             show firewall [statistics|log]    firewall summary / counters / log\n  \
+             show firewall [statistics|counters|events|states|log]\n  \
              show flows [| top-talkers]        live state table / hosts by volume\n  \
              show nat                          NAT configuration\n  \
              show vpn [ipsec]                  IPsec security associations / connections\n  \
@@ -3079,6 +3102,56 @@ fn cert_status(crt_path: &str) -> String {
     }
 }
 
+/// `show firewall log [<lines> | since <window>]`.
+///
+/// The depth is a number this appliance will actually read — capped, because a
+/// console asking for the whole journal is a console that hangs on a box with a
+/// busy data plane. The window is one of a fixed set rather than whatever the
+/// caller typed: `journalctl --since` takes a small language, and forwarding a
+/// management request into it is how a `show` command becomes an argument
+/// injection.
+fn show_firewall_log(depth: &str, window: Option<&str>) -> Result<()> {
+    let args = firewall_log_args(depth, window)?;
+    run_show(
+        &system::bin("journalctl"),
+        &args.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+}
+
+/// The argument list, worked out and bounded, without running anything.
+///
+/// Separate from the call so the bounds are testable: this is the only place
+/// where a word from a management request becomes an argument to another
+/// program, and a test that has to spawn `journalctl` to check it is a test
+/// nobody runs.
+fn firewall_log_args(depth: &str, window: Option<&str>) -> Result<Vec<String>> {
+    const MAX_LINES: u32 = 5000;
+    const WINDOWS: [&str; 5] = ["15m", "1h", "6h", "24h", "7d"];
+
+    let lines = depth.parse::<u32>().unwrap_or(0);
+    if lines == 0 || lines > MAX_LINES {
+        anyhow::bail!(
+            "show firewall log takes a number of lines from 1 to {MAX_LINES}, or `since <{}>`",
+            WINDOWS.join("|")
+        );
+    }
+    let mut args = vec![
+        "-u".to_string(),
+        "velstra.service".to_string(),
+        "-n".to_string(),
+        lines.to_string(),
+        "--no-pager".to_string(),
+    ];
+    if let Some(w) = window {
+        if !WINDOWS.contains(&w) {
+            anyhow::bail!("show firewall log since <{}>", WINDOWS.join("|"));
+        }
+        args.push("--since".into());
+        args.push(format!("-{w}"));
+    }
+    Ok(args)
+}
+
 /// Run a command and print its stdout, ignoring the exit code (for read-only
 /// `show` output — e.g. `systemctl is-active` exits non-zero when inactive).
 fn run_show(cmd: &str, args: &[&str]) -> Result<()> {
@@ -3198,4 +3271,40 @@ async fn ports(endpoint: &str) -> Result<()> {
         println!("{:<22} {:>6}  {:<15} {}", p.id, p.vni, p.ip, p.host);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::firewall_log_args;
+
+    #[test]
+    fn the_log_reads_fifty_lines_unless_asked_otherwise() {
+        let args = firewall_log_args("50", None).unwrap();
+        assert_eq!(args, ["-u", "velstra.service", "-n", "50", "--no-pager"]);
+    }
+
+    #[test]
+    fn a_period_is_asked_of_the_journal_as_a_relative_time() {
+        let args = firewall_log_args("5000", Some("6h")).unwrap();
+        assert!(args.windows(2).any(|w| w == ["--since", "-6h"]), "{args:?}");
+    }
+
+    // The two ways a management request could reach into `journalctl`: a period
+    // it did not offer, and a depth that would read the whole journal.
+    #[test]
+    fn a_period_the_console_does_not_offer_is_refused() {
+        for bad in ["; rm -rf /", "yesterday", "2026-01-01", "6 h", ""] {
+            assert!(
+                firewall_log_args("50", Some(bad)).is_err(),
+                "accepted {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_depth_that_is_not_a_small_number_is_refused() {
+        for bad in ["0", "5001", "-1", "1e6", "all", "50; id"] {
+            assert!(firewall_log_args(bad, None).is_err(), "accepted {bad:?}");
+        }
+    }
 }

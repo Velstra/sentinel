@@ -6,7 +6,6 @@ rust-version = "1.85"
 license = "AGPL-3.0-or-later"
 description = "Velstra Sentinel — a standalone firewall/router appliance built on the Velstra eBPF/XDP data plane."
 repository = "https://github.com/Velstra/sentinel"
-homepage = "https://github.com/Velstra/sentinel"
 publish = false # an appliance, not a library — not published to crates.io
 
 [[bin]]

@@ -465,6 +465,52 @@ await test("emptying a field removes the setting", async () => {
 // from being applied too. The global firewall block had two — `local` and
 // `description`, which say something about a *zone* and nothing about the
 // appliance-wide posture — because it was built from the zone's own table.
+await test("connection timeouts apply, reject invalid values, and reset to defaults", async () => {
+  const values = { "tcp-syn": "45", "tcp-established": "3600", "tcp-closing": "15", udp: "20", "udp-stream": "90", icmp: "5" };
+  const initial = await page.evaluate(`(async () => {
+    staged = []; dirty.clear(); renderStaged();
+    view = "zones"; panel = null; await refresh();
+    const box = document.getElementById("conntrackform");
+    const inputs = [...box.querySelectorAll("input")];
+    const values = ${JSON.stringify(Object.values(values))};
+    if (inputs.length !== values.length) throw Error("missing timeout fields: " + inputs.length);
+    inputs.forEach((input, i) => { input.value = values[i]; input.dispatchEvent(new Event("input", { bubbles: true })); });
+    [...box.querySelectorAll("button")].find((b) => b.textContent.startsWith("Stage")).click();
+    const commands = stagedCommands();
+    await applyStaged(["commit", "save"]);
+    return { commands, pending: stagedCommands() };
+  })()`);
+  equal(initial.commands, Object.entries(values).map(([key, value]) => `set firewall global conntrack ${key} ${value}`), "timeout commands differ from the CLI contract");
+  equal(initial.pending, [], "valid timeouts remained staged");
+  if (CONFIG) {
+    const saved = readFileSync(CONFIG, "utf8");
+    check(saved.includes("[firewall.conntrack]"), "the timeouts were not persisted");
+    for (const [key, value] of Object.entries(values)) check(saved.includes(`${key} = ${value}`), `missing persisted ${key}`);
+  }
+  const invalid = await page.evaluate(`(async () => {
+    await refresh();
+    const box = document.getElementById("conntrackform");
+    box.querySelector("input").value = "0";
+    [...box.querySelectorAll("button")].find((b) => b.textContent.startsWith("Stage")).click();
+    const reply = await configure(stagedCommands());
+    staged = []; dirty.clear(); renderStaged();
+    await refresh();
+    return { output: reply.output, value: document.getElementById("conntrackform").querySelector("input").value };
+  })()`);
+  check(/1.*604800/.test(invalid.output), "the server accepted an invalid timeout: " + invalid.output);
+  equal(invalid.value, "45", "an invalid timeout replaced the saved value");
+  const reset = await page.evaluate(`(async () => {
+    const box = document.getElementById("conntrackform");
+    for (const input of box.querySelectorAll("input")) input.value = "";
+    [...box.querySelectorAll("button")].find((b) => b.textContent.startsWith("Stage")).click();
+    const commands = stagedCommands();
+    await applyStaged(["commit", "save"]);
+    return { commands, pending: stagedCommands() };
+  })()`);
+  equal(reset.commands, Object.keys(values).map((key) => `delete firewall global conntrack ${key}`), "clearing did not restore each default");
+  equal(reset.pending, [], "restoring defaults was refused");
+});
+
 await test("every setting the global firewall posture offers is one the appliance has", async () => {
   const r = await page.evaluate(`(async () => {
     const wait = (ms) => new Promise((r) => setTimeout(r, ms || 400));
@@ -1346,6 +1392,74 @@ await test("the editor folds the unset rest and keeps what the rule sets", async
 
 // The jump palette: a flat search over every page, so a page an operator can
 // name is one keystroke away rather than a guess at which category holds it.
+// The firewall log, driven with lines the data plane actually writes.
+//
+// The appliance under test has an empty journal, so what is checked here is the
+// reading, not the fetch. Every line below is one `velstra-ebpf` emits: a rule
+// drop, a captive-portal refusal, a v6 drop and a reject, each wrapped in the
+// prefix the journal puts in front of it — plus one line that is not a refusal
+// at all, because a service says plenty that is not a verdict.
+await test("the firewall log reads the data plane's own lines", async () => {
+  const out = await page.evaluate(`(async () => {
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms || 300));
+    logRead = true;                       // so opening the view reads nothing
+    goto("log"); await wait(400);
+    logLines = [
+      "Sep 06 12:00:01 gate velstra[9]: DROP 10.0.0.5 proto=6 dport=22 reason=blocklist",
+      "Sep 06 12:00:02 gate velstra[9]: DROP portal 10.0.0.9 proto=17 dport=53",
+      "Sep 06 12:00:03 gate velstra[9]: DROP6 proto=58 dport=0 reason=zone",
+      "Sep 06 12:00:04 gate velstra[9]: REJECT 192.0.2.7 proto=6 dport=3389",
+      "Sep 06 12:00:05 gate velstra[9]: applied revision 12",
+    ];
+    logRows = []; logSkipped = 0;
+    for (const l of logLines) {
+      const r = parseLogLine(l);
+      if (r) logRows.push(r); else logSkipped++;
+    }
+    const q = document.getElementById("lg-q");
+    const verdict = document.getElementById("lg-verdict");
+    q.value = ""; verdict.value = "";
+    document.getElementById("lg-show").value = "table";
+    renderLog();
+    const rows = () => [...document.querySelectorAll("#loglist tbody tr")]
+      .map((tr) => [...tr.children].map((td) => td.textContent.trim()));
+    const all = rows();
+    q.value = "3389"; renderLog();
+    const searched = rows();
+    q.value = ""; verdict.value = "reject"; renderLog();
+    const rejected = rows();
+    verdict.value = ""; q.value = "no line says this"; renderLog();
+    const none = document.querySelector("#loglist .empty").textContent;
+    q.value = ""; renderLog();
+    [...document.querySelectorAll("#loglist tbody tr")]
+      .find((tr) => tr.textContent.includes("192.0.2.7"))
+      .querySelector("button").click();
+    await wait(400);
+    return {
+      all, searched, rejected, none, skipped: logSkipped, view,
+      src: document.getElementById("tr-src").value,
+      port: document.getElementById("tr-port").value,
+      proto: document.getElementById("tr-proto").value,
+    };
+  })()`);
+  equal(out.all.length, 4, "the four refusals did not all become rows");
+  equal(out.skipped, 1, "a line that is not a verdict was counted as one");
+  const said = out.all.map((r) => r.join(" "));
+  check(said[0].includes("rejected"),
+    `the newest refusal is not the first row: ${said[0]}`);
+  check(said.some((r) => r.includes("tcp")), "a protocol number was not named");
+  check(said.some((r) => r.includes("portal")),
+    "the portal refusal lost the reason it was refused for");
+  check(said.some((r) => r.includes("IPv6")), "the v6 drop was not marked as one");
+  equal(out.searched.length, 1, "searching did not narrow the table");
+  equal(out.rejected.length, 1, "the verdict filter did not narrow the table");
+  check(/No refusal matches/.test(out.none), `a search that finds nothing says: ${out.none}`);
+  equal(out.view, "trace", "explaining a line did not open the tracer");
+  equal(out.src, "192.0.2.7", "the tracer was not given the line's source");
+  equal(out.port, "3389", "the tracer was not given the line's port");
+  equal(out.proto, "tcp", "the tracer was not given the line's protocol");
+});
+
 await test("the jump palette reaches a page by name", async () => {
   const r = await page.evaluate(`(async () => {
     const wait = (ms) => new Promise((r) => setTimeout(r, ms || 200));

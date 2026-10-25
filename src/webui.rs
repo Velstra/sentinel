@@ -91,7 +91,6 @@ pub const PANELS: &[(&str, &[(&str, &str)])] = &[
             ("Counters", "/api/v1/show/firewall/statistics"),
             ("Connections", "/api/v1/show/firewall/flows"),
             ("Top talkers", "/api/v1/show/firewall/top"),
-            ("Recent log", "/api/v1/show/firewall/log"),
         ],
     ),
     (
@@ -1242,7 +1241,7 @@ pub fn page() -> String {
   }}
   .inline {{ display: flex; align-items: center; gap: var(--space-2); }}
   .inline > span {{ font-size: var(--text-sm); color: var(--text-muted); white-space: nowrap; }}
-  .inline select {{ width: auto; }}
+  .inline select, .inline input {{ width: auto; }}
 
   /* The one surface that is about to change something, marked by an amber edge.
      It lays out nothing itself — the mask inside it brings its own groups and
@@ -1510,6 +1509,13 @@ pub fn page() -> String {
     font-variant-numeric: tabular-nums; overflow-wrap: anywhere;
   }}
   table.otbl .val.dim {{ color: var(--text-muted); }}
+  /* A log's values are a clock and an address, and both are read as one word.
+     Breaking them where they happen to run out of room turns 12:00:04 into two
+     lines that say nothing — so here they stay whole and the wrapper scrolls,
+     which is what it is for. */
+  #loglist table.otbl .val, #loglist table.otbl .sub {{
+    overflow-wrap: normal; white-space: nowrap;
+  }}
   table.otbl .sub {{
     display: block; margin-top: 2px;
     font: var(--fw-regular) var(--text-2xs)/1.4 var(--font-mono); color: var(--text-faint);
@@ -1811,6 +1817,15 @@ pub fn page() -> String {
           from here — the same thing as leaving it out of the config.
         </p>
         <div class="addpanel" id="globalform"></div>
+      </div>
+
+      <div class="card">
+        <h3>Connection timeouts</h3>
+        <p class="lede" style="margin:0 0 var(--space-3)">
+          Idle time before a connection expires, in seconds (1–604800).
+          Clear a value to restore its default.
+        </p>
+        <div class="addpanel" id="conntrackform"></div>
       </div>
 
       <div class="section">
@@ -2610,7 +2625,11 @@ pub fn page() -> String {
     </div>
 
     <div id="view-trace" class="hidden">
-      <div class="card addpanel">
+      <!-- A form that stays open is a card in the page, not the drawer: the
+           drawer is fixed to the right edge and would sit on top of the answer
+           below it. -->
+      <div class="card">
+        <div class="grid">
         <label class="field"><span>Arrives on</span><select id="tr-iface"></select></label>
         <label class="field w-s"><span>Protocol</span>
           <select id="tr-proto">
@@ -2627,13 +2646,63 @@ pub fn page() -> String {
         <label class="field w-s"><span>Port</span>
           <input id="tr-port" type="number" inputmode="numeric" min="0" max="65535" placeholder="443">
         </label>
-        <button class="btn primary" id="runtrace">Trace</button>
+        </div>
+        <button class="btn primary" id="runtrace" style="margin-top:var(--space-4)">Trace</button>
       </div>
       <div class="card"><h3>Answer</h3><pre class="out" id="traceout">Not asked yet.</pre></div>
     </div>
 
+    <div id="view-log" class="hidden">
+      <!-- A line of controls above the thing they narrow, not a drawer: the
+           panel that slides in from the right is for a form that is normally
+           closed, and one left open would cover the log it is filtering. -->
+      <div class="toolbar">
+        <label class="inline"><span>Contains</span>
+          <input id="lg-q" size="24" placeholder="address, reason or port">
+        </label>
+        <label class="inline"><span>Verdict</span>
+          <select id="lg-verdict">
+            <option value="">any</option>
+            <option value="drop">dropped</option>
+            <option value="reject">rejected</option>
+          </select>
+        </label>
+        <label class="inline"><span>Period</span>
+          <select id="lg-window">
+            <option value="">last 200 lines</option>
+            <option value="15m">last 15 minutes</option>
+            <option value="1h">last hour</option>
+            <option value="6h">last 6 hours</option>
+            <option value="24h">last day</option>
+            <option value="7d">last week</option>
+          </select>
+        </label>
+        <label class="inline"><span>Show</span>
+          <select id="lg-show">
+            <option value="table">refusals</option>
+            <option value="raw">every line</option>
+          </select>
+        </label>
+        <span class="spacer"></span>
+        <button class="btn" id="runlog">Read</button>
+      </div>
+      <div class="card">
+        <h3 id="logheading">Refused packets</h3>
+        <p class="lede" style="margin:0 0 var(--space-3)">
+          The data plane writes a line for every packet it turns away. This reads
+          them back out of the journal, so traffic that is disappearing can be
+          found without a shell on the appliance.
+        </p>
+        <div id="loglist"><p class="empty">Not read yet.</p></div>
+      </div>
+    </div>
+
     <div id="view-capture" class="hidden">
-      <div class="card addpanel">
+      <!-- A form that stays open is a card in the page, not the drawer: the
+           drawer is fixed to the right edge and would sit on top of the answer
+           below it. -->
+      <div class="card">
+        <div class="grid">
         <label class="field"><span>Interface</span><select id="cap-iface"></select></label>
         <label class="field"><span>Filter</span><input id="cap-filter" placeholder="tcp port 443"></label>
         <!-- Both are bounded by the appliance, so the boxes are bounded too:
@@ -2648,7 +2717,8 @@ pub fn page() -> String {
             <span class="unit">s</span>
           </span>
         </label>
-        <button class="btn primary" id="runcapture">Capture</button>
+        </div>
+        <button class="btn primary" id="runcapture" style="margin-top:var(--space-4)">Capture</button>
       </div>
       <div class="card"><h3>Output</h3><pre class="out" id="capout">Not run yet.</pre></div>
     </div>
@@ -4378,6 +4448,10 @@ const PATH_DEFAULTS = {{
   "firewall global": {{
     "default-action": "drop", stateful: "on", "block-icmp": "off",
     log: "off", "fail-closed": "on", "source-validation": "disable",
+  }},
+  "firewall global conntrack": {{
+    "tcp-syn": "30", "tcp-established": "86400", "tcp-closing": "30",
+    udp: "30", "udp-stream": "180", icmp: "10",
   }},
   "firewall zone": {{
     "default-action": "the global posture", stateful: "the global posture",
@@ -6140,10 +6214,21 @@ const GLOBAL_POSTURE = POSTURE.filter((f) => !ZONE_ONLY.includes(f[0])).concat([
   ["fail-closed", "Drop unparseable packets", ["", "true", "false"]],
 ]);
 
+const CONNTRACK_TIMEOUTS = [
+  ["tcp-syn", "TCP handshake (s)"],
+  ["tcp-established", "TCP established (s)"],
+  ["tcp-closing", "TCP closing (s)"],
+  ["udp", "UDP request (s)"],
+  ["udp-stream", "UDP stream (s)"],
+  ["icmp", "ICMP echo (s)"],
+];
+
 async function refreshZones() {{
   const ls = await leaves();
   const globals = fieldsOf(ls, "firewall global");
   settingsPanel("globalform", GLOBAL_POSTURE, globals, "firewall global", "Global firewall posture");
+  settingsPanel("conntrackform", CONNTRACK_TIMEOUTS, fieldsOf(ls, "firewall global conntrack"),
+    "firewall global conntrack", "Connection timeouts");
 
   // A zone exists because an interface names it, so the list is the zones in
   // use — not only the ones that happen to carry an override.
@@ -8120,6 +8205,224 @@ function renderTrace(t) {{
   return lines.join("\n");
 }}
 
+// ---- firewall log --------------------------------------------------------
+
+// The prefix the journal puts in front of every line: `Sep 06 12:00:01 host
+// velstra[9]: `. Split off rather than shown, because a column repeating this
+// appliance's own name on every row is a column that earns nothing.
+const LOGSTAMP = /^(\w\w\w\s+\d+\s+\d\d:\d\d:\d\d)\s+\S+\s+[^:]+:\s*(.*)$/;
+// What the data plane writes when it refuses a packet: a verdict carrying the
+// family, then an optional reason word, then an address when the line has one,
+// then `key=value` pairs.
+const LOGVERDICT = /^(DROP6|DROP|REJECT)\b\s*(.*)$/;
+const LOGQUALIFIERS = ["spoofed source", "portal"];
+const PROTONAMES = new Map([
+  ["1", "icmp"], ["6", "tcp"], ["17", "udp"],
+  ["47", "gre"], ["50", "esp"], ["58", "icmpv6"],
+]);
+// How many rows this page will draw. A week of a busy edge is more lines than a
+// browser can lay out, and a table that takes ten seconds to appear is a table
+// an operator kills. The rest are not hidden quietly — the count says so, and
+// narrowing the period or the search is how you reach them.
+const LOGMAX = 500;
+
+let logLines = [];
+let logRows = [];
+let logSkipped = 0;
+let logRead = false;
+// Which read the page is waiting for. Changing the period starts a new one, and
+// two answers can come back in the other order — a slow week landing after the
+// quick quarter-hour that replaced it would leave the table showing what nobody
+// asked for.
+let logAsked = 0;
+
+function protoName(n) {{
+  return PROTONAMES.get(String(n)) || (n ? "proto " + n : "");
+}}
+
+// One journal line, split into the parts an operator filters on. A line that
+// is not a refusal returns null: `velstra.service` says plenty that is not a
+// verdict, and mixing it into a table of verdicts makes both harder to read.
+// Nothing is thrown away — `every line` shows the journal as it stands.
+function parseLogLine(line) {{
+  const stamped = LOGSTAMP.exec(line);
+  const at = stamped ? stamped[1] : "";
+  const msg = (stamped ? stamped[2] : line).trim();
+  const found = LOGVERDICT.exec(msg);
+  if (!found) return null;
+  let rest = found[2];
+  let why = "";
+  for (const q of LOGQUALIFIERS) {{
+    if (rest.startsWith(q)) {{ why = q; rest = rest.slice(q.length).trim(); }}
+  }}
+  let source = "";
+  const fields = new Map();
+  for (const word of rest.split(/\s+/)) {{
+    if (!word) continue;
+    const eq = word.indexOf("=");
+    if (eq > 0) fields.set(word.slice(0, eq), word.slice(eq + 1));
+    else if (!source) source = word;
+  }}
+  return {{
+    at,
+    text: msg,
+    verdict: found[1] === "REJECT" ? "reject" : "drop",
+    family: found[1] === "DROP6" ? "IPv6" : "IPv4",
+    source,
+    proto: fields.get("proto") || "",
+    port: fields.get("dport") || "",
+    reason: fields.get("reason") || why || "rule",
+  }};
+}}
+
+// The search matches the whole message rather than a chosen column: an operator
+// hunting a host types the address and does not care whether it turned up as
+// the source or inside the reason.
+function filterLog(rows, needle, verdict) {{
+  const q = needle.trim().toLowerCase();
+  return rows.filter((r) =>
+    (!verdict || r.verdict === verdict) &&
+    (!q || (r.at + " " + r.text).toLowerCase().includes(q)));
+}}
+
+// From a line to the question it raises. The log records what the data plane
+// refused, not which rule refused it — `reason` is a counter's name, and a
+// counter is not a rule. So the honest hand-off is the tracer with this line's
+// own numbers already in it: pick the link the packet arrived on and the walk
+// ends at the same verdict, naming the rule this time.
+function explainLine(r) {{
+  goto("trace");
+  const p = protoName(r.proto);
+  const proto = $("tr-proto");
+  if ([...proto.options].some((o) => o.value === p)) proto.value = p;
+  $("tr-src").value = r.source;
+  $("tr-port").value = r.port;
+  $("traceout").textContent =
+    "Choose the interface this arrived on, then trace.";
+}}
+
+// A row in the width the content column actually has. The console lays a view's
+// first panel out as a rail, which leaves about six hundred pixels — so what
+// belongs together is stacked rather than given a column of its own: the clock
+// over the date, the address over what it was carrying. A column an operator
+// has to scroll sideways to reach is a column they do not read.
+function logRow(r) {{
+  const space = r.at.lastIndexOf(" ");
+  const carried = [protoName(r.proto), r.port && r.port !== "0" ? r.port : ""]
+    .filter(Boolean).join(" ");
+  // The family is said only when it is the exception. Writing IPv4 on every one
+  // of five hundred rows tells an operator nothing they did not already read
+  // off the address.
+  const under = [carried, r.family === "IPv6" ? "IPv6" : ""].filter(Boolean).join(" · ");
+  const cells = [
+    el("td", {{ class: "mark" }}),
+    el("td", {{}}, [
+      el("span", {{ class: "val", text: space > 0 ? r.at.slice(space + 1) : (r.at || "—") }}),
+      el("span", {{ class: "sub", text: space > 0 ? r.at.slice(0, space) : "" }}),
+    ]),
+    el("td", {{ text: r.verdict === "reject" ? "rejected" : "dropped" }}),
+    el("td", {{}}, [
+      el("span", {{ class: "val", text: r.source || "any source" }}),
+      el("span", {{ class: "sub", text: under || "—" }}),
+    ]),
+    el("td", {{ text: r.reason }}),
+  ];
+  const end = el("td", {{ class: "end" }}, [
+    el("button", {{
+      class: "btn",
+      text: "Explain",
+      title: "Trace a packet like this one",
+      onclick: () => explainLine(r),
+    }}),
+  ]);
+  return el("tr", {{ class: r.verdict }}, [...cells, end]);
+}}
+
+function renderLog() {{
+  const list = $("loglist");
+  const raw = $("lg-show").value === "raw";
+  // The heading says what is under it. In `every line` that is the journal,
+  // refusals and everything else, and a heading still saying refusals would be
+  // the page telling an operator something it can see is not true.
+  $("logheading").textContent = raw ? "The journal" : "Refused packets";
+  list.textContent = "";
+  const needle = $("lg-q").value;
+  const shown = filterLog(logRows, needle, $("lg-verdict").value);
+
+  if (raw) {{
+    const q = needle.trim().toLowerCase();
+    const lines = logLines.filter((l) => !q || l.toLowerCase().includes(q));
+    const nothing = logLines.length
+      ? "No line matches this search."
+      : "Nothing in the journal for this period.";
+    list.append(el("pre", {{ class: "out",
+      text: lines.length ? lines.slice(-LOGMAX).join("\n") : nothing }}));
+    return;
+  }}
+
+  if (!shown.length) {{
+    list.append(el("p", {{ class: "empty", text: !logRows.length
+      ? "Nothing was refused in this period."
+      : "No refusal matches this search." }}));
+    return;
+  }}
+
+  const head = el("tr", {{}}, [
+    el("th", {{}}),
+    ...["Time", "Verdict", "Source", "Reason"]
+      .map((h) => el("th", {{ text: h }})),
+    el("th", {{}}),
+  ]);
+  const tbody = el("tbody", {{}});
+  // Newest first: an operator opens a log because something is wrong now.
+  for (const r of shown.slice(-LOGMAX).reverse()) tbody.append(logRow(r));
+  list.append(el("div", {{ class: "tblwrap" }}, [
+    el("table", {{ class: "otbl" }}, [el("thead", {{}}, [head]), tbody]),
+  ]));
+
+  const notes = [];
+  if (shown.length > LOGMAX) notes.push(
+    "Showing the newest " + LOGMAX + " of " + shown.length + " refusals.");
+  if (logSkipped) notes.push(logSkipped === 1
+    ? "One other line in this period was not a refusal."
+    : logSkipped + " other lines in this period were not refusals.");
+  if (notes.length) list.append(el("p", {{ class: "lede", text: notes.join(" ") }}));
+}}
+
+async function readLog() {{
+  const mine = ++logAsked;
+  const win = $("lg-window").value;
+  const path = win
+    ? "/api/v1/show/firewall/log/since/" + encodeURIComponent(win)
+    : "/api/v1/show/firewall/log/200";
+  $("loglist").textContent = "";
+  $("loglist").append(el("p", {{ class: "empty", text: "Reading the journal…" }}));
+  try {{
+    const body = await text(path);
+    if (mine !== logAsked) return;
+    logLines = body.split("\n").filter((l) => l.trim() && l !== "-- No entries --");
+    logRows = [];
+    logSkipped = 0;
+    for (const line of logLines) {{
+      const r = parseLogLine(line);
+      if (r) logRows.push(r); else logSkipped++;
+    }}
+    logRead = true;
+    renderLog();
+  }} catch (e) {{
+    if (mine !== logAsked) return;
+    logRead = false;
+    $("loglist").textContent = "";
+    $("loglist").append(el("p", {{ class: "empty", text: String(e.message || e) }}));
+  }}
+}}
+
+// Opening the view reads once. Re-reading is the operator's call — a log that
+// reloads under the cursor is a log you cannot read a line of.
+async function refreshLog() {{
+  if (!logRead) await readLog();
+}}
+
 async function refreshCapture() {{
   const ls = await leaves();
   const names = [...new Set(ls.filter((l) => l.path[0] === "interface").map((l) => l.path[1]))];
@@ -8256,6 +8559,7 @@ const SECTIONS = [
   {{ g: "Policy", i: "shield", items: [
     {{ v: "rules", t: "Firewall rules", i: "shield" }},
     {{ v: "trace", t: "Packet trace", i: "search" }},
+    {{ v: "log", t: "Firewall log", i: "file" }},
     {{ v: "zones", t: "Zones", i: "zones" }},
     {{ v: "groups", t: "Groups", i: "layers" }},
     {{ v: "nat", t: "NAT", i: "swap" }},
@@ -8665,6 +8969,7 @@ const ABOUT = {{
   certs: "Issued certificates and what they are used for.",
   ids: "Detection, and what an alert is allowed to do about it.",
   trace: "Ask before you send: which zone a packet arrives in, what a port-forward makes of it, where the routing table sends it, which rule wins and why the others did not. Answered from the saved configuration, so nothing is touched — and nothing the box only learns at runtime is known.",
+  log: "What the data plane already refused, read back out of the journal. Search it, narrow it to a period, and hand any line to the tracer to find out which rule would decide it.",
   capture: "See the wire itself: never more than 500 packets or 60 seconds, headers only, and nothing written to disk. A capture that finds nothing is an answer too.",
   services: "The box services: resolution, time, management access, notification.",
   system: "Identity, and where signed images come from.",
@@ -8933,6 +9238,7 @@ async function refresh() {{
   if (view === "ids") return refreshIds();
   if (view === "capture") return refreshCapture();
   if (view === "trace") return refreshTrace();
+  if (view === "log") return refreshLog();
   if (view === "evpn") return refreshEvpn();
   if (view === "ha") return refreshHa();
   if (view === "users") return refreshUsers();
@@ -9183,6 +9489,20 @@ $("runtrace").onclick = async () => {{
   btn.disabled = false;
   btn.textContent = "Trace";
 }};
+$("runlog").onclick = async () => {{
+  const btn = $("runlog");
+  btn.disabled = true;
+  btn.textContent = "Reading…";
+  await readLog();
+  btn.disabled = false;
+  btn.textContent = "Read";
+}};
+// Filtering is done on what was already read, so typing narrows the table
+// without going back to the appliance. Only the period is a new question.
+$("lg-q").oninput = () => {{ if (logRead) renderLog(); }};
+$("lg-verdict").onchange = () => {{ if (logRead) renderLog(); }};
+$("lg-show").onchange = () => {{ if (logRead) renderLog(); }};
+$("lg-window").onchange = () => readLog();
 $("runcapture").onclick = async () => {{
   const btn = $("runcapture");
   // A capture takes as long as it takes; saying so beats a page that looks
@@ -9621,6 +9941,33 @@ mod tests {
         );
         assert!(html.contains(r#"id="view-trace""#));
         assert!(html.contains("rules looked at and passed over"));
+    }
+
+    /// The log is read out of the journal by the same `show` the terminal
+    /// uses, and the period is one of a fixed set — a console that could ask
+    /// for an arbitrary period would be handing `journalctl` a management
+    /// request's own words.
+    #[test]
+    fn the_log_asks_for_a_period_the_appliance_already_bounds() {
+        let html = page();
+        assert!(html.contains(r#"id="view-log""#));
+        assert!(html.contains("/api/v1/show/firewall/log/200"));
+        assert!(html.contains(r#""/api/v1/show/firewall/log/since/""#));
+        for window in ["15m", "1h", "6h", "24h", "7d"] {
+            assert!(
+                html.contains(&format!(r#"value="{window}""#)),
+                "the period {window} cannot be chosen"
+            );
+        }
+        // A line is handed to the tracer rather than to a rule name the log
+        // does not carry.
+        assert!(html.contains("function explainLine"));
+        assert!(html.contains(r#"goto("trace")"#));
+        // Reading, empty and too-much-to-draw are all said out loud.
+        assert!(html.contains("Reading the journal…"));
+        assert!(html.contains("Nothing was refused in this period."));
+        assert!(html.contains("No refusal matches this search."));
+        assert!(html.contains("const LOGMAX"));
     }
 
     /// A capture holds a process open for as long as it runs, so it must be a
