@@ -24,10 +24,10 @@ On a Linux build host with Nix flakes enabled:
 nix build .#sentinel-iso --out-link result-iso
 nix build .#qemu-firmware --out-link result-firmware
 qemu-img create -f qcow2 sentinel.qcow2 32G
-cp result-firmware/FV/OVMF_VARS.fd sentinel-vars.fd
+cp result-firmware-fd/FV/OVMF_VARS.fd sentinel-vars.fd
 chmod u+w sentinel-vars.fd
 qemu-system-x86_64 -enable-kvm -machine q35 -cpu host -smp 2 -m 4096 \
-  -drive if=pflash,format=raw,readonly=on,file=result-firmware/FV/OVMF_CODE.fd \
+  -drive if=pflash,format=raw,readonly=on,file=result-firmware-fd/FV/OVMF_CODE.fd \
   -drive if=pflash,format=raw,file=sentinel-vars.fd \
   -drive file=sentinel.qcow2,if=virtio,format=qcow2 \
   -cdrom result-iso/iso/velstra-sentinel-installer.iso -boot order=d \
