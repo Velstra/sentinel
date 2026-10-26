@@ -18,11 +18,13 @@ mod capture;
 mod clock;
 mod compile;
 mod config;
+mod configsync;
 mod confirm;
 mod diff;
 mod domain;
 mod feed;
 mod grammar_walk;
+mod ha;
 mod identity;
 mod ids;
 mod image;
@@ -125,7 +127,39 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum HaCommand {
+    /// Pair this primary with a secondary using its bootstrap machine token.
+    Pair {
+        peer: String,
+        #[arg(
+            long,
+            required_unless_present = "secret_stdin",
+            conflicts_with = "secret_stdin"
+        )]
+        secret: Option<String>,
+        #[arg(long, hide = true)]
+        secret_stdin: bool,
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+        /// Independent witness IP:port; otherwise use system.ha.witness.
+        #[arg(long)]
+        witness: Option<String>,
+        /// Explicit peer facts for newly declared interfaces (JSON HaIdentity).
+        #[arg(long)]
+        peer_identity: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum Command {
+    /// Manage active/passive high availability.
+    Ha {
+        #[command(subcommand)]
+        command: HaCommand,
+    },
+    /// Retry the durable HA configuration outbox (systemd worker).
+    #[command(hide = true)]
+    SyncConfig,
     /// Enter an interactive configuration session (set/show/delete/commit/save).
     Configure {
         /// The appliance config to edit (loaded if it exists). `commit` writes
@@ -495,7 +529,35 @@ async fn main() -> Result<()> {
     }
 
     match Cli::parse().command {
+        Command::Ha {
+            command:
+                HaCommand::Pair {
+                    peer,
+                    secret,
+                    secret_stdin,
+                    config,
+                    witness,
+                    peer_identity,
+                },
+        } => {
+            use std::io::Read;
+            let secret = if secret_stdin {
+                let mut value = String::new();
+                std::io::stdin().take(1025).read_to_string(&mut value)?;
+                value
+            } else {
+                secret.context("--secret required")?
+            };
+            ha::pair(
+                &peer,
+                &secret,
+                &config,
+                witness.as_deref(),
+                peer_identity.as_deref(),
+            )
+        }
         Command::Configure { config, no_apply } => configure(&config, no_apply),
+        Command::SyncConfig => configsync::flush(),
         Command::Show { args } => show_op(&args),
         Command::Trace {
             in_interface,
@@ -874,7 +936,7 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
 /// Compile the appliance config, atomically install the Velstra agent config at
 /// `out`, and (if given) reload the systemd `unit` running the data plane.
 fn apply(file: &std::path::Path, out: &std::path::Path, reload: Option<&str>) -> Result<()> {
-    let _lock = system::apply_lock();
+    let _lock = system::apply_lock()?;
     // Resolve domain groups before compiling: the compiler only knows addresses,
     // and this is also the periodic refresh — the timer re-runs exactly this.
     let appliance = identity::with_resolved(&feed::with_fetched(&domain::with_resolved(
@@ -918,7 +980,7 @@ fn apply_boot(
     // Serialise against a `commit`/API `PUT` that lands mid-boot: this stage
     // stages through the same fixed temp names, so an interleaved writer could
     // corrupt a networkd unit or velstra.toml. Best-effort, held for the stage.
-    let _lock = system::apply_lock();
+    let _lock = system::apply_lock()?;
     // load_lenient, not load: this is the boot-time apply of the saved config,
     // and the one place an unknown key must not keep the box from coming up. A
     // rollback to an older image whose saved config carries a newer field would
@@ -972,7 +1034,7 @@ fn apply_boot(
 fn apply_boot_late(config: &std::path::Path) -> Result<()> {
     // Lenient for the same reason as apply_boot: the second boot stage applies
     // the same saved config, and must survive an unknown key just the same.
-    let _lock = system::apply_lock();
+    let _lock = system::apply_lock()?;
     let appliance = Appliance::load_lenient(config)?;
     net::apply_link_runtime(&appliance)
 }

@@ -60,6 +60,8 @@ pub const DEFAULT_TOKEN_PATH: &str = "/var/lib/sentinel/api-token";
 pub struct ApiState {
     /// The bearer token every request (except `/api/v1/health`) must present.
     pub token: String,
+    pub token_path: Option<PathBuf>,
+    pub tls_pin: Option<String>,
     /// The running/boot config a `GET` reads and a `PUT` writes.
     pub config_path: PathBuf,
     /// Whether/where a `PUT` applies the config to the running system.
@@ -98,8 +100,19 @@ pub async fn serve(listen: &str, config: &Path, apply: Apply, token_file: &Path)
     let addr: SocketAddr = listen
         .parse()
         .with_context(|| format!("parsing --listen {listen:?} (want host:port)"))?;
+    let tls_files = resolve_web_tls(config, token_file, &addr)?;
+    let tls_pin = tls_files
+        .as_ref()
+        .map(|(cert, _)| system::cert_pubkey_pin(cert))
+        .transpose()?;
     let state = Arc::new(ApiState {
         token,
+        token_path: std::env::var("SENTINEL_API_TOKEN")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .is_none()
+            .then(|| token_file.to_path_buf()),
+        tls_pin,
         config_path: config.to_path_buf(),
         apply,
         // Beside the machine token, wherever that was put. Deriving it rather
@@ -120,7 +133,7 @@ pub async fn serve(listen: &str, config: &Path, apply: Apply, token_file: &Path)
     }
     let app = router(state);
 
-    match resolve_web_tls(config, token_file, &addr)? {
+    match tls_files {
         // HTTPS (H3, the default): the console/API terminate TLS so passwords,
         // TOTP codes and bearer tokens never cross the wire in the clear.
         Some((cert, key)) => {
@@ -181,7 +194,7 @@ pub async fn serve(listen: &str, config: &Path, apply: Apply, token_file: &Path)
 /// certificate, a self-signed one is minted once and persisted beside the API
 /// token — on the appliance that is the A/B-stable `/var/lib/sentinel`, so the
 /// certificate (and its pin) survives reboots and image updates.
-fn resolve_web_tls(
+pub(crate) fn resolve_web_tls(
     config: &Path,
     token_file: &Path,
     addr: &SocketAddr,
@@ -225,6 +238,8 @@ fn install_crypto_provider() {
 pub fn router(state: Arc<ApiState>) -> Router {
     let protected = Router::new()
         .route("/api/v1/config", get(get_config).put(put_config))
+        .route("/api/v1/ha/enrollment", get(ha_enrollment))
+        .route("/api/v1/ha/pair", post(ha_pair))
         // A config-sync peer is not a second administrator. Its document is
         // shared policy, merged with the receiver's local identity before it
         // can reach the normal apply path.
@@ -255,6 +270,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
     Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/ha/proof/:nonce", get(ha_proof))
         // The surface as a document. Open like `health`: a client has to read
         // it before it can know how to sign in, and it names no secret.
         .route("/api/v1/openapi.json", get(get_openapi))
@@ -365,7 +381,7 @@ pub fn resolve_caller(state: &ApiState, presented: &str) -> Option<Caller> {
     if presented.is_empty() {
         return None;
     }
-    if ct_eq(presented.as_bytes(), state.token.as_bytes()) {
+    if machine_token(state).is_ok_and(|token| ct_eq(presented.as_bytes(), token.as_bytes())) {
         return Some(Caller {
             user: None,
             permission: Permission::ReadWrite,
@@ -1162,6 +1178,129 @@ fn redact_secrets(value: &mut Value) {
 /// machine's full-access API token), WireGuard private keys, IPsec PSKs, RADIUS
 /// and TACACS+ secrets, the SNMP community and login password hashes / TOTP
 /// secrets are all replaced by [`REDACTED`] before the config leaves the box.
+/// Reload rotated machine credentials without restarting management. Never use
+/// a cached credential after its persistent source becomes unreadable.
+fn machine_token(state: &ApiState) -> Result<String> {
+    use std::{io::Read, os::unix::fs::MetadataExt};
+    let Some(path) = &state.token_path else {
+        anyhow::ensure!(!state.token.is_empty(), "empty machine credential");
+        return Ok(state.token.clone());
+    };
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let meta = file.metadata()?;
+    anyhow::ensure!(
+        meta.is_file()
+            && meta.uid() == unsafe { libc::geteuid() }
+            && meta.mode() & 0o077 == 0
+            && meta.len() <= 4096,
+        "unsafe machine credential file"
+    );
+    let mut token = String::new();
+    file.take(4097).read_to_string(&mut token)?;
+    let token = token.trim();
+    anyhow::ensure!(
+        !token.is_empty() && token.len() <= 4096,
+        "invalid machine credential"
+    );
+    Ok(token.into())
+}
+
+fn require_ha_machine(state: &ApiState, caller: &Caller) -> Result<(), ApiError> {
+    if state.tls_pin.is_none() || caller.user.is_some() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            anyhow!("HA enrollment requires TLS and the machine credential"),
+        ));
+    }
+    Ok(())
+}
+
+async fn ha_proof(
+    State(state): State<Arc<ApiState>>,
+    UrlPath(nonce): UrlPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let pin = state
+        .tls_pin
+        .as_deref()
+        .ok_or_else(|| ApiError::new(StatusCode::FORBIDDEN, anyhow!("HA proof requires TLS")))?;
+    let proof = crate::ha::enrollment_proof(
+        &machine_token(&state).map_err(ApiError::internal)?,
+        &nonce,
+        pin,
+    )
+    .map_err(ApiError::bad_request)?;
+    Ok(Json(json!({"proof": proof})))
+}
+
+async fn ha_enrollment(
+    State(state): State<Arc<ApiState>>,
+    axum::Extension(caller): axum::Extension<Caller>,
+) -> Result<Response, ApiError> {
+    require_ha_machine(&state, &caller)?;
+    let _transaction = system::apply_lock().map_err(ApiError::internal)?;
+    let appliance = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
+    let revision = crate::ha::revision(&appliance).map_err(ApiError::internal)?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({"appliance": appliance, "revision": revision})),
+    )
+        .into_response())
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PairRequest {
+    pub expected_revision: String,
+    pub appliance: Appliance,
+}
+
+async fn ha_pair(
+    State(state): State<Arc<ApiState>>,
+    axum::Extension(caller): axum::Extension<Caller>,
+    Json(request): Json<PairRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_ha_machine(&state, &caller)?;
+    let _transaction = system::apply_lock().map_err(ApiError::internal)?;
+    let local = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
+    request
+        .appliance
+        .validate()
+        .map_err(ApiError::bad_request)?;
+    let desired = crate::ha::revision(&request.appliance).map_err(ApiError::internal)?;
+    let current = crate::ha::revision(&local).map_err(ApiError::internal)?;
+    if desired == current {
+        return Ok(Json(json!({"saved": true, "revision": desired})));
+    }
+    if current != request.expected_revision {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            anyhow!("configuration changed during enrollment; reload and retry"),
+        ));
+    }
+    let next = request
+        .appliance
+        .system
+        .ha
+        .as_ref()
+        .filter(|h| h.enabled && h.peer_identity.is_some())
+        .ok_or_else(|| {
+            ApiError::bad_request(anyhow!("complete paired HA configuration required"))
+        })?;
+    if let Some(existing) = local.system.ha.as_ref().filter(|h| h.enabled) {
+        if existing.cluster != next.cluster || existing.node() != next.node() {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                anyhow!("member already belongs to another active HA identity"),
+            ));
+        }
+    }
+    // Received enrollment must not enqueue a reverse configuration push.
+    replace_config(&state, request.appliance)
+}
+
 async fn get_config(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, ApiError> {
     let appliance = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
     let mut value = serde_json::to_value(&appliance)
@@ -1182,7 +1321,17 @@ async fn put_config(
     body: String,
 ) -> Result<Json<Value>, ApiError> {
     let appliance = Appliance::from_json(&body).map_err(ApiError::bad_request)?;
-    replace_config(&state, appliance)
+    let _transaction = system::apply_lock().map_err(ApiError::internal)?;
+    let previous = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
+    let response = replace_config(&state, appliance.clone())?;
+    if state.apply.enabled {
+        crate::configsync::enqueue(&appliance, Some(&previous)).map_err(|error| {
+            ApiError::internal(anyhow!(
+                "configuration applied and saved, but HA outbox could not be queued: {error:#}"
+            ))
+        })?;
+    }
+    Ok(response)
 }
 
 /// Receive the shared half of another firewall's configuration.
@@ -1198,16 +1347,61 @@ async fn put_config_sync(
     body: String,
 ) -> Result<Json<Value>, ApiError> {
     let incoming = Appliance::from_json(&body).map_err(ApiError::bad_request)?;
+    let _transaction = system::apply_lock().map_err(ApiError::internal)?;
     let local = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
-    replace_config(&state, merge_synced_config(incoming, &local))
+    let merged = merge_synced_config(incoming, &local).map_err(ApiError::bad_request)?;
+    replace_config(&state, merged)
 }
 
 /// Keep facts that identify one member of an HA pair on that member.
-fn merge_synced_config(mut incoming: Appliance, local: &Appliance) -> Appliance {
+fn merge_synced_config(mut incoming: Appliance, local: &Appliance) -> Result<Appliance> {
+    if let Some(source) = &incoming.system.ha {
+        anyhow::ensure!(
+            source.peer_identity.is_some(),
+            "paired config-sync requires explicit member identities"
+        );
+        let target = local
+            .system
+            .ha
+            .as_ref()
+            .context("receiver has not been paired")?;
+        anyhow::ensure!(
+            target.peer_identity.is_some()
+                && target.cluster == source.cluster
+                && target.node() != source.node(),
+            "config-sync HA cluster/member mismatch"
+        );
+        let adjusted = crate::ha::materialize_peer(incoming)?;
+        adjusted.validate()?;
+        return Ok(adjusted);
+    }
+    anyhow::ensure!(
+        local.system.ha.as_ref().is_none_or(|h| !h.enabled),
+        "cannot remove paired HA through legacy config-sync"
+    );
     incoming.system.hostname = local.system.hostname.clone();
     incoming.system.config_sync = local.system.config_sync.clone();
     incoming.system.conntrack_sync = local.system.conntrack_sync.clone();
-    incoming.interfaces = local.interfaces.clone();
+    // Shared link intent (MTU, VLAN tags/parents, bridges, services, zones) must
+    // converge too. Preserve only the member's addressing/tunnel endpoint facts.
+    for interface in &mut incoming.interfaces {
+        if let Some(member) = local.interfaces.iter().find(|i| i.name == interface.name) {
+            interface.address = member.address.clone();
+            interface.address6 = member.address6.clone();
+            interface.local = member.local.clone();
+        } else {
+            anyhow::ensure!(
+                interface.address.as_deref().is_none_or(|a| a == "dhcp")
+                    && interface
+                        .address6
+                        .as_deref()
+                        .is_none_or(|a| matches!(a, "auto" | "dhcp"))
+                    && interface.local.is_none(),
+                "interface {} needs its receiver-specific addresses declared on this member before synchronization",
+                interface.name
+            );
+        }
+    }
     incoming.protocols.router_id = local.protocols.router_id.clone();
     // Election preference belongs to the member, not the shared policy. Copying
     // the primary's priority onto its backup destroys the intended HA ordering.
@@ -1216,11 +1410,13 @@ fn merge_synced_config(mut incoming: Appliance, local: &Appliance) -> Appliance 
             router.priority = member.priority;
         }
     }
-    incoming
+    incoming.validate()?;
+    Ok(incoming)
 }
 
 /// Validate, apply and persist a complete, receiver-safe appliance document.
 fn replace_config(state: &ApiState, appliance: Appliance) -> Result<Json<Value>, ApiError> {
+    let _transaction = system::apply_lock().map_err(ApiError::internal)?;
     // Same live-apply as a CLI `commit` (skipped off-box, mirroring `commit`'s
     // own `act.enabled` gate).
     if state.apply.enabled {
@@ -1759,7 +1955,7 @@ fn valid_account_name(name: &str) -> bool {
 
 /// Constant-time byte comparison (length is allowed to leak; the content is
 /// not). Prevents a timing side-channel on the token check.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -1846,10 +2042,141 @@ mod tests {
     fn state(config_path: PathBuf) -> Arc<ApiState> {
         Arc::new(ApiState {
             token: TOKEN.to_string(),
+            token_path: None,
+            tls_pin: None,
             config_path,
             apply: Apply::off(),
             tokens_dir: std::env::temp_dir().join("sentinel-test-tokens"),
         })
+    }
+
+    #[tokio::test]
+    async fn enrollment_requires_tls_machine_credential_and_revision_match() {
+        let path = seed("unpaired");
+        let app = router(state(path.clone()));
+        assert_eq!(
+            app.oneshot(get("/api/v1/ha/enrollment", Some(TOKEN)))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let mut configured = Arc::try_unwrap(state(path.clone())).ok().unwrap();
+        configured.tls_pin = Some("test-pin".into());
+        let state = Arc::new(configured);
+        let app = router(state.clone());
+        let response = app
+            .clone()
+            .oneshot(get("/api/v1/ha/enrollment", Some(TOKEN)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let current = Appliance::load(&path).unwrap();
+        let desired = crate::ha::paired_fixture();
+        let request = |expected: String, a: &Appliance| {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/ha/pair")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&PairRequest {
+                        expected_revision: expected,
+                        appliance: a.clone(),
+                    })
+                    .unwrap(),
+                ))
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone()
+                .oneshot(request("stale".into(), &desired))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(Appliance::load(&path).unwrap().system.hostname, "unpaired");
+        let expected = crate::ha::revision(&current).unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(request(expected.clone(), &desired))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(expected, &desired))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK,
+            "lost-ack retry must be idempotent"
+        );
+        let proof = app
+            .oneshot(get(&format!("/api/v1/ha/proof/{}", "a".repeat(64)), None))
+            .await
+            .unwrap();
+        assert_eq!(proof.status(), StatusCode::OK);
+        let proof: Value =
+            serde_json::from_slice(&to_bytes(proof.into_body(), 8192).await.unwrap()).unwrap();
+        assert_eq!(
+            proof["proof"],
+            crate::ha::enrollment_proof(TOKEN, &"a".repeat(64), "test-pin").unwrap()
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn machine_credential_rotation_is_immediate_and_fails_closed() {
+        let path = seed("rotation");
+        let token_path = path.with_file_name("machine-token");
+        let mut configured = Arc::try_unwrap(state(path)).ok().unwrap();
+        configured.token_path = Some(token_path.clone());
+        assert!(resolve_caller(&configured, TOKEN).is_none());
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&token_path)
+                .unwrap();
+            file.write_all(TOKEN.as_bytes()).unwrap();
+        }
+        assert!(resolve_caller(&configured, TOKEN).is_some());
+        system::install_token(&token_path, "rotated-token").unwrap();
+        assert!(resolve_caller(&configured, TOKEN).is_none());
+        assert!(resolve_caller(&configured, "rotated-token").is_some());
+        std::fs::remove_file(&token_path).unwrap();
+        assert!(resolve_caller(&configured, "rotated-token").is_none());
+        std::fs::remove_dir_all(token_path.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn paired_config_sync_swaps_profiles_and_rejects_wrong_cluster() {
+        let mut primary = crate::ha::paired_fixture();
+        let secondary = crate::ha::materialize_peer(primary.clone()).unwrap();
+        primary.interfaces[0].mtu = Some(1400);
+        let merged = merge_synced_config(primary.clone(), &secondary).unwrap();
+        assert_eq!(merged.system.ha.unwrap().node(), 2);
+        assert_eq!(
+            merged.interfaces[0].address.as_deref(),
+            Some("10.10.0.2/24")
+        );
+        assert_eq!(merged.interfaces[0].mtu, Some(1400));
+        primary.system.ha.as_mut().unwrap().enabled = false;
+        assert!(
+            !merge_synced_config(primary.clone(), &secondary)
+                .unwrap()
+                .system
+                .ha
+                .unwrap()
+                .enabled
+        );
+        primary.system.ha.as_mut().unwrap().cluster = "different-cluster-12345".into();
+        assert!(merge_synced_config(primary, &secondary).is_err());
     }
 
     #[test]
@@ -1914,7 +2241,7 @@ virtual-address = ["10.43.0.253"]
         )
         .unwrap();
 
-        let merged = merge_synced_config(source, &local);
+        let merged = merge_synced_config(source, &local).unwrap();
         assert_eq!(merged.system.hostname, "sentinel-b");
         assert_eq!(
             merged.interfaces[0].address.as_deref(),
@@ -2207,6 +2534,8 @@ virtual-address = ["10.43.0.253"]
 
         let st = ApiState {
             token: TOKEN.to_string(),
+            token_path: None,
+            tls_pin: None,
             config_path: cfg.clone(),
             apply: Apply::off(),
             tokens_dir: tokens,
@@ -2245,6 +2574,8 @@ virtual-address = ["10.43.0.253"]
         let tokens = dir.join("tokens");
         let st = ApiState {
             token: TOKEN.to_string(),
+            token_path: None,
+            tls_pin: None,
             config_path: cfg.clone(),
             apply: Apply::off(),
             tokens_dir: tokens.clone(),

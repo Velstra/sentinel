@@ -1315,6 +1315,8 @@ struct Draft {
     /// thing entirely.
     admin_groups: Vec<Group>,
     /// HA config sync (`[system.config-sync]`). A plain owned struct.
+    ha: Option<crate::config::Ha>,
+    ha_witness: Option<crate::config::HaWitness>,
     config_sync: ConfigSync,
     /// HA conntrack sync (`[system.conntrack-sync]`, C9). A plain owned struct.
     conntrack_sync: ConntrackSync,
@@ -2528,6 +2530,8 @@ impl Draft {
             web: a.services.web.clone(),
             logins: a.system.logins.clone(),
             admin_groups: a.system.groups.clone(),
+            ha: a.system.ha.clone(),
+            ha_witness: a.system.ha_witness.clone(),
             config_sync: a.system.config_sync.clone(),
             conntrack_sync: a.system.conntrack_sync.clone(),
             mdns: MdnsDraft {
@@ -2814,9 +2818,14 @@ impl Session {
 
     /// Record what we have just applied, so our own commit does not read as
     /// somebody else's.
-    pub fn note_committed(&mut self, toml: &str) {
-        let _ = crate::system::install_config_file(Path::new(Self::RUNNING), toml);
+    pub fn note_committed(&mut self, toml: &str) -> Result<()> {
+        self.note_committed_at(Path::new(Self::RUNNING), toml)
+    }
+
+    fn note_committed_at(&mut self, path: &Path, toml: &str) -> Result<()> {
+        crate::system::install_config_file(path, toml)?;
         self.seen_running = Some(toml.to_string());
+        Ok(())
     }
 
     /// Open a session, loading `path` as the candidate if it exists.
@@ -4624,6 +4633,30 @@ impl Session {
             // system config-sync: push the running config to peer firewalls on
             // every commit (HA). `peer` is a host or host:port; `secret` the shared
             // bearer token (also arms this box's receiving API).
+            ["system", "ha", field, value] => {
+                let ha = self.draft.ha.get_or_insert_with(Default::default);
+                match *field {
+                    "enabled" => ha.enabled = parse_bool(value)?,
+                    "cluster" => ha.cluster = (*value).into(),
+                    "node" => ha.node = Some(value.parse()?),
+                    "witness" => ha.witness = (*value).into(),
+                    "sync-interface" => ha.sync_interface = (*value).into(),
+                    "priority" => ha.priority = Some(value.parse()?),
+                    "preempt" => ha.preempt = parse_bool(value)?,
+                    "management-fingerprint" => ha.management_fingerprint = Some((*value).into()),
+                    "peer-identity" => ha.peer_identity = Some(serde_json::from_str(value)?),
+                    _ => bail!("unknown HA field: {field}"),
+                }
+            }
+            ["system", "ha-witness", field, value] => {
+                let witness = self.draft.ha_witness.get_or_insert_with(Default::default);
+                match *field {
+                    "listen" => witness.listen = (*value).into(),
+                    "secret" => witness.secret = (*value).into(),
+                    "cluster" => witness.cluster = (*value).into(),
+                    _ => bail!("unknown witness field: {field}"),
+                }
+            }
             ["system", "config-sync", "peer", v] => {
                 append_csv(&mut self.draft.config_sync.peers, v);
             }
@@ -7407,6 +7440,34 @@ impl Session {
             ["system", "group", name, "permission"] => {
                 bail!("a group is its permission; `delete system group {name}` removes it")
             }
+            ["system", "ha"] => self.draft.ha = None,
+            ["system", "ha-witness"] => self.draft.ha_witness = None,
+            ["system", "ha", field] => {
+                if let Some(h) = &mut self.draft.ha {
+                    match *field {
+                        "enabled" => h.enabled = false,
+                        "cluster" => h.cluster.clear(),
+                        "node" => h.node = None,
+                        "witness" => h.witness.clear(),
+                        "sync-interface" => h.sync_interface.clear(),
+                        "priority" => h.priority = None,
+                        "preempt" => h.preempt = false,
+                        "management-fingerprint" => h.management_fingerprint = None,
+                        "peer-identity" => h.peer_identity = None,
+                        _ => bail!("unknown HA field: {field}"),
+                    }
+                }
+            }
+            ["system", "ha-witness", field] => {
+                if let Some(h) = &mut self.draft.ha_witness {
+                    match *field {
+                        "listen" => h.listen.clear(),
+                        "secret" => h.secret.clear(),
+                        "cluster" => h.cluster.clear(),
+                        _ => bail!("unknown witness field: {field}"),
+                    }
+                }
+            }
             ["system", "config-sync"] => self.draft.config_sync = ConfigSync::default(),
             ["system", "config-sync", field] => {
                 let c = &mut self.draft.config_sync;
@@ -9466,6 +9527,8 @@ impl Session {
                 timezone: self.draft.timezone.clone(),
                 logins: self.draft.logins.clone(),
                 groups: self.draft.admin_groups.clone(),
+                ha: self.draft.ha.clone(),
+                ha_witness: self.draft.ha_witness.clone(),
                 config_sync: self.draft.config_sync.clone(),
                 conntrack_sync: self.draft.conntrack_sync.clone(),
                 sysctl: self.draft.sysctl.clone(),
@@ -9719,7 +9782,7 @@ pub fn persist_appliance(appliance: &Appliance, path: &Path, archive: bool) -> R
     // Serialise against a concurrent apply / another persist: `install_config_file`
     // stages through a fixed temp name, so two writers at once could corrupt the
     // saved config. Held only for this write; never nested inside an `apply_live`.
-    let _lock = crate::system::apply_lock();
+    let _lock = crate::system::apply_lock()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -9831,6 +9894,12 @@ pub fn flatten_config(rendered: &str) -> Vec<String> {
         .into_iter()
         .map(|(path, value)| match value.is_empty() {
             true => format!("set {path}"),
+            false
+                if path == "system ha peer-identity" && value.chars().any(char::is_whitespace) =>
+            {
+                let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("set {path} \"{escaped}\"")
+            }
             false => format!("set {path} {value}"),
         })
         .collect()
@@ -9921,6 +9990,54 @@ fn render_draft_masked(
     // commit-revision count printed no system section at all.
     if want("system") {
         let mut sys = String::new();
+        if let Some(ha) = &draft.ha {
+            sys.push_str(&format!(
+                "    ha {{\n        enabled {}\n        preempt {}\n",
+                ha.enabled, ha.preempt
+            ));
+            if let Some(node) = ha.node {
+                sys.push_str(&format!("        node {node}\n"));
+            }
+            if let Some(priority) = ha.priority {
+                sys.push_str(&format!("        priority {priority}\n"));
+            }
+            for (key, value) in [
+                ("cluster", &ha.cluster),
+                ("witness", &ha.witness),
+                ("sync-interface", &ha.sync_interface),
+            ] {
+                if !value.is_empty() {
+                    sys.push_str(&format!("        {key} {value}\n"));
+                }
+            }
+            if let Some(pin) = &ha.management_fingerprint {
+                sys.push_str(&format!("        management-fingerprint {pin}\n"));
+            }
+            if let Some(identity) = &ha.peer_identity {
+                sys.push_str(&format!(
+                    "        peer-identity {}\n",
+                    serde_json::to_string(identity).expect("serializable identity")
+                ));
+            }
+            sys.push_str("    }\n");
+        }
+        if let Some(w) = &draft.ha_witness {
+            let secret = match secrets {
+                Secrets::Shown => w.secret.as_str(),
+                _ => "********",
+            };
+            sys.push_str("    ha-witness {\n");
+            for (key, value) in [
+                ("listen", w.listen.as_str()),
+                ("cluster", w.cluster.as_str()),
+                ("secret", secret),
+            ] {
+                if !value.is_empty() {
+                    sys.push_str(&format!("        {key} {value}\n"));
+                }
+            }
+            sys.push_str("    }\n");
+        }
         if let Some(h) = &draft.hostname {
             sys.push_str(&format!("    hostname {h}\n"));
         }
@@ -12879,6 +12996,30 @@ fn validate_bind_address(v: &str) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_failed_running_publication_does_not_advance_the_sessions_revision() {
+        let directory = std::env::temp_dir().join(format!(
+            "sentinel-commit-publication-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut session = super::Session::load(&directory.join("saved.toml")).unwrap();
+        let previous = session.seen_running.clone();
+        let blocked = directory.join("not-a-directory");
+        std::fs::write(&blocked, "preserved").unwrap();
+        assert!(
+            session
+                .note_committed_at(&blocked.join("running.toml"), "new revision")
+                .is_err()
+        );
+        assert_eq!(session.seen_running, previous);
+        assert_eq!(std::fs::read_to_string(&blocked).unwrap(), "preserved");
+        let running = directory.join("running.toml");
+        session.note_committed_at(&running, "new revision").unwrap();
+        assert_eq!(session.seen_running.as_deref(), Some("new revision"));
+        assert_eq!(std::fs::read_to_string(running).unwrap(), "new revision");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     /// The whole specification of `flatten_config`, as a round trip: render a
     /// config, flatten it to commands, feed those commands back through the

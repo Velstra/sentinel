@@ -46,6 +46,7 @@ libc = "0.2"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 base64 = "0.22"
 getrandom = "0.2"
+ring = "0.17.14"
 ratatui = "0.29.0"
 crossterm = "0.29.0"
 

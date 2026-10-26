@@ -735,6 +735,8 @@ pub fn page() -> String {
 
   .row {{ display: flex; gap: var(--space-2); flex-wrap: wrap; align-items: center; }}
   .field {{ display: flex; flex-direction: column; gap: var(--space-1); }}
+  .secretfield {{ display: flex; align-items: center; gap: var(--space-2); }}
+  .secretfield > input {{ flex: 1; min-width: 0; }}
   .grid2 {{ display: grid; gap: var(--space-3); grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); }}
   /* The settings masks. Without this every panel was one column of full-width
      inputs — a form the length of the protocol rather than a page of it. */
@@ -1251,7 +1253,7 @@ pub fn page() -> String {
     display: block; border-radius: var(--radius-sm);
     border-color: var(--sentinel-600);
   }}
-  .field > span:first-child {{
+  .field > span:first-child, .field > label:first-child {{
     font: var(--fw-medium) var(--text-xs)/1.2 var(--font-sans); color: var(--text-muted);
     text-transform: none; letter-spacing: 0;
   }}
@@ -2219,6 +2221,25 @@ pub fn page() -> String {
     </div>
 
     <div id="view-ha" class="hidden">
+      <div class="card">
+        <h3>Leased active/passive pair</h3>
+        <p class="lede" style="margin:0 0 var(--space-4)">
+          An independent witness grants forwarding authority to one member.
+          Prepare the witness address, then run <code>sentinel ha pair</code>
+          to enroll both members and record their identities. The control link
+          must remain separate from the guarded data links. Disabling a
+          prepared pair closes its data links; it does not restore standalone mode.
+        </p>
+        <div class="grid" id="haform"></div>
+      </div>
+      <div class="card">
+        <h3>Independent witness</h3>
+        <p class="lede" style="margin:0 0 var(--space-4)">
+          Configure this only on the independent witness appliance. Its
+          enrollment credential must match the pair's configuration sync secret.
+        </p>
+        <div class="grid" id="hawitnessform"></div>
+      </div>
       <div class="section">
         <h3>Virtual router groups</h3>
         <span class="spacer"></span>
@@ -4432,6 +4453,7 @@ const PATH_DEFAULTS = {{
   "services ssh": {{ port: "22" }},
   "services flow-export": {{ interval: "30", domain: "1" }},
   "system conntrack-sync": {{ port: "5429", interval: "1" }},
+  "system ha": {{ enabled: "off", preempt: "off", node: "1", priority: "200 for member 1, 100 for member 2" }},
   "system aaa radius": {{ port: "1812", timeout: "3" }},
   "system aaa ldap": {{
     timeout: "5", tls: "ldaps", port: "636 with ldaps, 389 otherwise",
@@ -5218,11 +5240,40 @@ function chipsWidget(input, options) {{
   return box;
 }}
 
+let secretFieldSerial = 0;
+function secretWidget(name, value) {{
+  const input = el("input", {{
+    id: "secret-field-" + (++secretFieldSerial), type: "password",
+    value: value || "", autocomplete: "off", spellcheck: "false",
+  }});
+  const button = el("button", {{
+    class: "btn", type: "button", text: "Show", "aria-label": "Show " + name,
+    "aria-pressed": "false",
+    onclick: () => {{
+      const visible = input.type === "password";
+      input.type = visible ? "text" : "password";
+      button.textContent = visible ? "Hide" : "Show";
+      button.setAttribute("aria-label", (visible ? "Hide " : "Show ") + name);
+      button.setAttribute("aria-pressed", String(visible));
+    }},
+  }});
+  const box = el("span", {{ class: "secretfield" }}, [input, button]);
+  Object.defineProperty(box, "value", {{
+    get: () => input.value,
+    set: (v) => {{ input.value = String(v || ""); }},
+  }});
+  for (const kind of ["input", "change"]) {{
+    input.addEventListener(kind, () => box.dispatchEvent(new Event(kind)));
+  }}
+  return box;
+}}
+
 function fieldWidget(field, value) {{
   // A heading, not a setting: eighteen inputs in one flat grid is a form nobody
   // reads top to bottom, and the groups are how an operator already thinks
   // about the protocol — where it speaks, how fast, who it trusts.
   if (field[0] === "#") return null;
+  if (field[4] === "secret") return secretWidget(field[1], value);
   // A field that points at something the appliance already has is a choice,
   // not a spelling test. A key that carries its path — `import bgp`, `export
   // ospf` — is answered by the first word: what may go there is decided by the
@@ -5461,10 +5512,12 @@ function fieldGrid(fields, row, required, form) {{
     // the same word twice.
     const unit = widgets[i].classList && widgets[i].classList.contains("num")
       ? (boundsOf(f[0]) || [])[2] : null;
-    const label = el("span", {{
+    const secret = widgets[i].classList && widgets[i].classList.contains("secretfield");
+    const label = el(secret ? "label" : "span", {{
       text: unit && f[1].endsWith(" (" + unit + ")")
         ? f[1].slice(0, -(unit.length + 3)) : f[1],
     }});
+    if (secret) label.setAttribute("for", widgets[i].querySelector("input").id);
     if (required && f[0] === required) label.append(el("span", {{ class: "req", text: "required" }}));
     const hint = el("span", {{ class: "hint" }});
     // A `<label>` around a set of `<label>`s makes every click in the dead
@@ -5473,7 +5526,7 @@ function fieldGrid(fields, row, required, form) {{
     // the other way round: the only labelable thing inside it is the hidden
     // value, so a click on the row would open a dropdown nobody can see.
     const kind = (widgets[i].classList && widgets[i].className) || "";
-    const owns = kind.includes("pick") || kind.includes("switch");
+    const owns = kind.includes("pick") || kind.includes("switch") || secret;
     // A set of tick boxes needs the run; a single figure does not, and neither
     // does a switch — two states take less room than a sentence, not more.
     const size = kind.includes("pick") || kind.includes("chips") ? " w-l"
@@ -5617,7 +5670,10 @@ function fieldLines(fields, widgets, path, before) {{
         push(`set ${{path}} ${{f[0]}} ${{one}}`);
       }}
     }} else {{
-      push(`set ${{path}} ${{f[0]}} ${{v}}`);
+      // Peer identity is one JSON token, including spaces and escaped keys.
+      // Quote protected values as well so a credential is never a CLI fragment.
+      const argument = f[0] === "peer-identity" || f[4] === "secret" ? JSON.stringify(v) : v;
+      push(`set ${{path}} ${{f[0]}} ${{argument}}`);
     }}
   }});
   return lines;
@@ -7247,8 +7303,24 @@ const VRRP = [
 // box holds the address, and these decide what the other box knows when it
 // does — a pair with VRRP alone fails over to a firewall that has neither the
 // configuration nor the connections.
+const HA = [
+  ["enabled", "Activate leased HA", ["", "true", "false"]],
+  ["witness", "Witness IP:port"],
+  ["sync-interface", "Dedicated control interface"],
+  ["node", "Member", ["", "1", "2"]],
+  ["priority", "Election priority"],
+  ["preempt", "Preempt after state sync", ["", "true", "false"]],
+  ["cluster", "Cluster identifier"],
+  ["management-fingerprint", "Local management TLS fingerprint"],
+  ["peer-identity", "Peer identity JSON", null, null, "secret"],
+];
+const HA_WITNESS = [
+  ["listen", "Witness listen IP:port"],
+  ["secret", "Witness enrollment credential", null, null, "secret"],
+  ["cluster", "Witness cluster identifier"],
+];
 const CONFIG_SYNC = [
-  ["peer", "Peers", null, "list"], ["secret", "Shared secret"],
+  ["peer", "Peers", null, "list"], ["secret", "Shared secret", null, null, "secret"],
   ["peer-fingerprint", "Peer TLS fingerprint"],
 ];
 const CONNTRACK_SYNC = [
@@ -8166,6 +8238,9 @@ async function refreshHa() {{
   // the same way BGP's router settings are rather than as objects with names.
   const ls = await leaves();
   const under = (node) => fieldsOf(ls, node);
+  settingsPanel("haform", HA, under("system ha"), "system ha", "Leased HA");
+  settingsPanel("hawitnessform", HA_WITNESS, under("system ha-witness"),
+                "system ha-witness", "Independent witness");
   settingsPanel(
     "configsyncform", CONFIG_SYNC, under("system config-sync"),
     "system config-sync", "Configuration sync",
@@ -8779,6 +8854,8 @@ const OWNERS = [
   [["system", "login"], "users"],
   [["system", "group"], "users"],
   [["system", "config-sync"], "ha"],
+  [["system", "ha"], "ha"],
+  [["system", "ha-witness"], "ha"],
   [["system", "conntrack-sync"], "ha"],
   [["system"], "system"],
   [["update"], "system"],
@@ -9799,7 +9876,7 @@ mod tests {
         let html = page();
         assert!(html.contains("/api/v1/configure"));
         // Every edit becomes `set <path> <field> <value>` — the CLI's own verb.
-        assert!(html.contains("push(`set ${path} ${f[0]} ${v}`)"));
+        assert!(html.contains("push(`set ${path} ${f[0]} ${argument}`)"));
         assert!(html.contains("firewall rule "));
         assert!(
             !html.contains("PUT"),

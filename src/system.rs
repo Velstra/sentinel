@@ -601,14 +601,15 @@ pub(crate) fn stage_private(tmp: &Path, contents: &str) -> Result<()> {
         .with_context(|| format!("staging {}", tmp.display()))
 }
 
-/// A held cross-process apply lock. Dropping it closes the file, which releases
-/// the advisory `flock`. `None` means the lock could not be taken (off-box, or a
-/// test with no `/run/sentinel`) and the caller proceeds unserialised — the lock
-/// is a best-effort guard against concurrent on-box writers, never a gate that
-/// fails a commit.
+/// A reentrant, thread-bound cross-process configuration lock. Nested apply and
+/// persist calls share the descriptor; the last guard releases the flock.
 #[must_use = "the lock is released as soon as this guard is dropped"]
 pub struct ApplyLock {
-    _file: Option<std::fs::File>,
+    _file: Option<std::rc::Rc<std::fs::File>>,
+}
+
+thread_local! {
+    static APPLY_OWNERS: std::cell::RefCell<std::collections::BTreeMap<std::path::PathBuf,std::rc::Weak<std::fs::File>>> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
 }
 
 /// The single lockfile that serialises the apply/persist critical section.
@@ -627,36 +628,64 @@ const APPLY_LOCK_PATH: &str = "/run/sentinel/apply.lock";
 /// [`crate::session::persist_appliance`]) and so cooperates on the one lock. The
 /// call blocks until the lock is ours; the guard releases it on drop.
 ///
-/// Best-effort: if the lockfile cannot be opened (no `/run/sentinel` off-box or
-/// in a test), the caller proceeds without the lock rather than failing — the
-/// races this guards against only exist on a running appliance, where the
-/// directory is always present and writable by the writers.
-///
-/// Never take this while already holding it (it would self-deadlock): the two
-/// chokepoints run their critical sections to completion and never nest.
-pub fn apply_lock() -> ApplyLock {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::AsRawFd;
+/// Off-box editing has no runtime directory. On an appliance, failure to lock
+/// is an error before mutation, rather than permission to race another writer.
+pub fn apply_lock() -> Result<ApplyLock> {
     if !Path::new("/run/sentinel").is_dir() {
-        return ApplyLock { _file: None };
+        return Ok(ApplyLock { _file: None });
+    }
+    lock_config_at(Path::new(APPLY_LOCK_PATH))
+}
+
+pub(crate) fn lock_config_at(path: &Path) -> Result<ApplyLock> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::io::AsRawFd;
+    if let Some(file) =
+        APPLY_OWNERS.with(|owners| owners.borrow().get(path).and_then(std::rc::Weak::upgrade))
+    {
+        return Ok(ApplyLock { _file: Some(file) });
     }
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
-        .mode(0o600)
-        .open(APPLY_LOCK_PATH);
-    let Ok(file) = file else {
-        return ApplyLock { _file: None };
-    };
-    // SAFETY: a blocking `flock` on a valid fd we own for the lifetime of `file`;
-    // the lock is released when the fd is closed on drop. A failure here (rare —
-    // e.g. EINTR) degrades to proceeding unserialised rather than aborting.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    if rc != 0 {
-        return ApplyLock { _file: None };
+        .mode(0o660)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("opening configuration lock {}", path.display()))?;
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "configuration lock is not a regular file"
+    );
+    // The boot service creates the lock as root; interactive wheel sessions
+    // must lock the same inode rather than silently skipping serialization.
+    if unsafe { libc::geteuid() } == 0 {
+        if let Some(gid) = wheel_gid() {
+            anyhow::ensure!(
+                unsafe { libc::fchown(file.as_raw_fd(), 0, gid) } == 0,
+                "setting configuration lock group: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        file.set_permissions(std::fs::Permissions::from_mode(0o660))?;
     }
-    ApplyLock { _file: Some(file) }
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error).context("locking configuration transaction");
+        }
+    }
+    let file = std::rc::Rc::new(file);
+    APPLY_OWNERS.with(|owners| {
+        let mut owners = owners.borrow_mut();
+        owners.retain(|_, owner| owner.strong_count() > 0);
+        owners.insert(path.to_path_buf(), std::rc::Rc::downgrade(&file));
+    });
+    Ok(ApplyLock { _file: Some(file) })
 }
 
 /// The numeric gid of the `wheel` group, if this system has one. Used to set the
@@ -827,44 +856,106 @@ pub fn install_file(path: &Path, contents: &str) -> Result<()> {
 /// secrets, and `wheel` is the group an operator account is in — the same
 /// membership that lets them escalate here in the first place.
 pub fn install_config_file(path: &Path, contents: &str) -> Result<()> {
+    install_owned_atomic(path, contents, false)
+}
+/// Root-private atomic state for credentials and interrupted HA transactions.
+pub fn install_ha_secret(path: &Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    install_owned_atomic(path, contents, true)
+}
+fn install_owned_atomic(path: &Path, contents: &str, private: bool) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let tmp = path.with_extension("toml.tmp");
-    // Fast path (root, and the API service, which own the directory): stage the
-    // temp with the final mode 0640 from the outset — a plain `fs::write` honours
-    // the umask (0644) and `rename` preserves the temp's mode, so writing 0644
-    // here would silently widen a config that carries hashed passwords and VPN
-    // secrets. Group `wheel` (best-effort) matches the sudo path below, so an
-    // operator account can still read the saved config without escalating.
-    let direct = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o640)
-        .open(&tmp);
-    if let Ok(mut f) = direct {
-        if f.write_all(contents.as_bytes()).is_ok() {
-            drop(f);
-            if let Some(gid) = wheel_gid() {
-                let _ = std::os::unix::fs::chown(&tmp, None, Some(gid));
-            }
-            if std::fs::rename(&tmp, path).is_ok() {
+    let _transaction = apply_lock()?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    // A wheel-writable parent is still root-owned on the appliance. Creating
+    // a sibling as the operator and renaming it would silently change file
+    // ownership, and the API must reject such a machine credential. Only the
+    // parent's owner may use the direct path; other callers install via sudo.
+    use std::os::unix::fs::MetadataExt;
+    if std::fs::metadata(parent)?.uid() == unsafe { libc::geteuid() } {
+        match PrivateStage::create(parent, if private { 0o600 } else { 0o640 }) {
+            Ok(mut stage) => {
+                stage.file.write_all(contents.as_bytes())?;
+                if let Some(gid) = (!private).then(wheel_gid).flatten() {
+                    std::os::unix::fs::chown(&stage.path, None, Some(gid))?;
+                }
+                stage.file.sync_all()?;
+                std::fs::rename(&stage.path, path)
+                    .with_context(|| format!("atomically replacing {}", path.display()))?;
+                std::fs::File::open(parent)?.sync_all()?;
                 return Ok(());
             }
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied) => {}
+            Err(error) => return Err(error),
         }
-        let _ = std::fs::remove_file(&tmp);
     }
-    let staged = Path::new("/run/sentinel").join(".appliance.toml.tmp");
-    stage_private(&staged, contents)?;
-    let (Some(src), Some(dst)) = (staged.to_str(), path.to_str()) else {
-        bail!("non-UTF-8 path");
-    };
-    sudo("install", &["-m", "0640", "-g", "wheel", src, dst]).with_context(|| {
-        format!(
-            "installing {} (needs root, or an account in the wheel group)",
-            path.display()
-        )
-    })
+    // Escalation must preserve atomic replacement too: install into a sibling,
+    // flush it, then rename. Installing over the live path exposes a truncated
+    // document to the peer/API and leaves it truncated if install is interrupted.
+    let mut staged = PrivateStage::create(Path::new("/run/sentinel"), 0o600)?;
+    staged.file.write_all(contents.as_bytes())?;
+    staged.file.sync_all()?;
+    // The destination can itself be /run/sentinel (running.toml). A basename
+    // copied from the source would ask install to copy a file onto itself,
+    // preventing publication of the running snapshot before the outbox starts.
+    let target = parent
+        .join(staged.path.file_name().context("staging filename")?)
+        .with_extension("install");
+    let source = staged.path.to_str().context("non-UTF-8 staging path")?;
+    let temporary = target.to_str().context("non-UTF-8 config directory")?;
+    let destination = path.to_str().context("non-UTF-8 config path")?;
+    let directory = parent.to_str().context("non-UTF-8 config directory")?;
+    let result = (|| {
+        if private {
+            sudo("install", &["-m", "0600", source, temporary])?;
+        } else {
+            sudo("install", &["-m", "0640", "-g", "wheel", source, temporary])?;
+        }
+        sudo("sync", &["-f", temporary])?;
+        sudo("mv", &["-fT", "--", temporary, destination])?;
+        sudo("sync", &["-f", directory])
+    })();
+    if result.is_err() {
+        let _ = sudo("rm", &["-f", "--", temporary]);
+    }
+    result.with_context(|| format!("atomically installing {}", path.display()))
+}
+
+/// Exclusively created, private staging file. Unpredictable names and O_EXCL
+/// prevent following a pre-existing symlink or reusing another writer's file.
+pub(crate) struct PrivateStage {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) file: std::fs::File,
+}
+impl PrivateStage {
+    pub(crate) fn create(directory: &Path, mode: u32) -> Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut random = [0u8; 16];
+        getrandom::getrandom(&mut random)
+            .map_err(|error| anyhow::anyhow!("configuration staging entropy: {error}"))?;
+        let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let path = directory.join(format!(".sentinel-config-{suffix}.tmp"));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)?;
+        Ok(Self { path, file })
+    }
+}
+impl Drop for PrivateStage {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// Install a secret file `contents` at a (root-owned) `path` readable by
@@ -1074,22 +1165,12 @@ pub fn set_login_password(user: &str, hash: &str) -> Result<()> {
 /// admin (`configure`) and as root (boot) — mirrors [`install_secret_file`] but
 /// 0600 root:root (the API reads it as root; no other reader needs it).
 pub fn install_token(path: &Path, secret: &str) -> Result<()> {
-    let tmp = Path::new("/run/sentinel").join(".api-token.tmp");
-    // Stage 0600, not umask-default 0644: this token is the machine's full-access
-    // API secret, and `/run/sentinel` is wheel-writable and world-traversable, so
-    // a plain `fs::write` would leave it briefly world-readable there before the
-    // `install` below copies it to its 0600 home.
-    stage_private(&tmp, secret)?;
-    let (Some(tmp_s), Some(dst_s)) = (tmp.to_str(), path.to_str()) else {
-        bail!("non-UTF-8 path");
-    };
-    sudo("install", &["-m", "0600", tmp_s, dst_s])
+    install_ha_secret(path, secret)
 }
 
 /// PUT a config body (a file of JSON) to a peer's Sentinel API for HA config sync
 /// (roadmap C21). Best-effort at the call site — a down peer must not fail the local
-/// commit. The bearer token is an argv element (no shell), so it is never expanded
-/// or logged; a short timeout keeps a commit from hanging on an unreachable peer.
+/// commit. Bearer material travels through stdin; a short timeout bounds an unreachable peer.
 /// `GET url` with a bearer token, returning the body.
 ///
 /// The stack view's one way of reaching a peer. Deliberately the same tool the
@@ -1097,36 +1178,77 @@ pub fn install_token(path: &Path, secret: &str) -> Result<()> {
 /// binary: one place to get TLS, timeouts and proxy behaviour wrong is enough.
 /// The timeout is short — a peer that is down must make the console say so
 /// quickly, not hang the page.
-pub fn curl_get(url: &str, token: &str, timeout_secs: u32, pin: Option<&str>) -> Result<String> {
-    let auth = format!("Authorization: Bearer {token}");
-    let timeout = timeout_secs.to_string();
-    let mut args: Vec<String> = vec![
-        "-sS".into(),
+/// Bearer material is passed through a private stdin pipe, never process argv.
+pub fn curl_request(
+    url: &str,
+    token: Option<&str>,
+    method: &str,
+    body: Option<&Path>,
+    timeout_secs: u32,
+    pin: Option<&str>,
+) -> Result<String> {
+    use std::io::Write;
+    let mut args = vec![
+        "-sS".to_string(),
         "-f".into(),
         "--max-time".into(),
-        timeout,
-        "-H".into(),
-        auth,
+        timeout_secs.to_string(),
+        "--max-filesize".into(),
+        "8388608".into(),
+        "-X".into(),
+        method.into(),
+        "--config".into(),
+        "-".into(),
     ];
+    if let Some(body) = body {
+        args.extend([
+            "-H".into(),
+            "Content-Type: application/json".into(),
+            "--data-binary".into(),
+            format!("@{}", body.display()),
+        ]);
+    }
     add_pin_args(&mut args, pin);
     args.push(url.into());
-    let out = Command::new(bin("curl"))
+    let config = curl_auth_config(token)?;
+    let mut child = Command::new(bin("curl"))
         .args(&args)
-        .output()
-        .with_context(|| format!("running curl to {url}"))?;
-    if !out.status.success() {
-        let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        bail!(
-            "curl GET {url} failed ({}): {}",
-            out.status,
-            if detail.is_empty() {
-                "no diagnostic"
-            } else {
-                &detail
-            }
-        );
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("starting management request")?;
+    if let Err(error) = child
+        .stdin
+        .take()
+        .context("curl stdin")?
+        .write_all(config.as_bytes())
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error.into());
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    let out = child.wait_with_output()?;
+    anyhow::ensure!(
+        out.status.success(),
+        "management request {method} {url} failed ({})",
+        out.status
+    );
+    String::from_utf8(out.stdout).context("non-UTF8 management response")
+}
+fn curl_auth_config(token: Option<&str>) -> Result<String> {
+    let Some(token) = token else {
+        return Ok(String::new());
+    };
+    anyhow::ensure!(
+        !token.is_empty() && !token.chars().any(|c| c.is_control()),
+        "invalid bearer credential"
+    );
+    let escaped = token.replace('\\', "\\\\").replace('"', "\\\"");
+    Ok(format!("header = \"Authorization: Bearer {escaped}\"\n"))
+}
+pub fn curl_get(url: &str, token: &str, timeout_secs: u32, pin: Option<&str>) -> Result<String> {
+    curl_request(url, Some(token), "GET", None, timeout_secs, pin)
 }
 
 /// Add curl's public-key pinning for a self-signed peer (H3): `--insecure` drops
@@ -1221,42 +1343,7 @@ pub fn curl_get_plain(url: &str, timeout_secs: u32) -> Result<String> {
 }
 
 pub fn curl_put_config(url: &str, token: &str, body_file: &Path, pin: Option<&str>) -> Result<()> {
-    let auth = format!("Authorization: Bearer {token}");
-    let data = format!("@{}", body_file.display());
-    let mut args: Vec<String> = vec![
-        "-sS".into(),
-        "-f".into(),
-        "--max-time".into(),
-        "10".into(),
-        "-X".into(),
-        "PUT".into(),
-        "-H".into(),
-        "Content-Type: application/json".into(),
-        "-H".into(),
-        auth,
-        "--data-binary".into(),
-        data,
-    ];
-    add_pin_args(&mut args, pin);
-    args.push(url.into());
-    let out = Command::new(bin("curl"))
-        .args(&args)
-        .stdout(Stdio::null())
-        .output()
-        .with_context(|| format!("running curl to {url}"))?;
-    if !out.status.success() {
-        let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        bail!(
-            "curl PUT {url} failed ({}): {}",
-            out.status,
-            if detail.is_empty() {
-                "no diagnostic"
-            } else {
-                &detail
-            }
-        );
-    }
-    Ok(())
+    curl_request(url, Some(token), "PUT", Some(body_file), 10, pin).map(|_| ())
 }
 
 /// Make systemd re-read unit files after Sentinel wrote/removed one under
@@ -1324,6 +1411,13 @@ pub fn set_mode(path: &Path, mode: &str) -> Result<()> {
 /// consistently root-owned in both the boot-service (root) and `configure`
 /// (admin, via `sudo`) paths. openssl reads no secret from `args` (only subject
 /// / path arguments), so surfacing them on failure leaks nothing.
+pub fn ha_guard(config: &Path) -> Result<()> {
+    run_priv(
+        "velstra",
+        &["ha-guard", config.to_str().context("HA config path")?],
+    )
+}
+
 pub fn openssl(args: &[&str]) -> Result<()> {
     run_priv("openssl", args)
 }
@@ -1414,7 +1508,9 @@ pub fn cert_pubkey_pin(cert: &Path) -> Result<String> {
 /// whose authenticity rests on the network rather than a pin.
 pub fn learn_peer_pubkey_pin(authority: &str) -> Result<String> {
     let host = sni_host(authority);
-    let out = Command::new(bin("openssl"))
+    let out = Command::new(bin("timeout"))
+        .arg("5s")
+        .arg(bin("openssl"))
         .args(["s_client", "-connect", authority, "-servername", &host])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1574,6 +1670,7 @@ pub fn bin(name: &str) -> String {
         // whatever `sentinel` a $PATH lookup under sudo might find.
         "sentinel-self" => "SENTINEL_SELF_BIN",
         "wren" => "SENTINEL_WREN_BIN",
+        "velstra" => "SENTINEL_VELSTRA_BIN",
         "tc" => "SENTINEL_TC_BIN",
         "loadkeys" => "SENTINEL_LOADKEYS_BIN",
         "loginctl" => "SENTINEL_LOGINCTL_BIN",
@@ -1591,6 +1688,8 @@ pub fn bin(name: &str) -> String {
         "mkdir" => "SENTINEL_MKDIR_BIN",
         "chmod" => "SENTINEL_CHMOD_BIN",
         "rm" => "SENTINEL_RM_BIN",
+        "mv" => "SENTINEL_MV_BIN",
+        "sync" => "SENTINEL_SYNC_BIN",
         // local login accounts ([[system.login]], roadmap C21)
         "useradd" => "SENTINEL_USERADD_BIN",
         "usermod" => "SENTINEL_USERMOD_BIN",
@@ -1752,6 +1851,93 @@ pub(crate) fn sudo(cmd: &str, args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atomic_config_replacement_does_not_follow_the_old_predictable_temp_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory =
+            std::env::temp_dir().join(format!("sentinel-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("appliance.toml");
+        let victim = directory.join("unrelated");
+        std::fs::write(&target, "previous").unwrap();
+        std::fs::write(&victim, "preserved").unwrap();
+        std::os::unix::fs::symlink(&victim, target.with_extension("toml.tmp")).unwrap();
+        install_config_file(&target, "replacement").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "replacement");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "preserved");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert!(!std::fs::read_dir(&directory).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".sentinel-config-")
+        }));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn private_token_replacement_retains_the_parent_owner_and_private_mode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let directory =
+            std::env::temp_dir().join(format!("sentinel-token-owner-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let token = directory.join("api-token");
+        std::fs::write(&token, "previous").unwrap();
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o644)).unwrap();
+        install_token(&token, "replacement").unwrap();
+        let metadata = std::fs::metadata(&token).unwrap();
+        assert_eq!(metadata.uid(), std::fs::metadata(&directory).unwrap().uid());
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read_to_string(&token).unwrap(), "replacement");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn configuration_transaction_is_reentrant_and_serializes_other_writers() {
+        let directory = std::env::temp_dir().join(format!(
+            "sentinel-lock-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("apply.lock");
+        let outer = lock_config_at(&path).unwrap();
+        let nested = lock_config_at(&path).unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let other_path = path.clone();
+        let other = std::thread::spawn(move || {
+            let _guard = lock_config_at(&other_path).unwrap();
+            sent.send(()).unwrap();
+        });
+        assert!(
+            received
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
+        drop(outer);
+        assert!(
+            received
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
+        drop(nested);
+        received
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        other.join().unwrap();
+        let target = directory.join("unrelated");
+        std::fs::write(&target, "preserved").unwrap();
+        let link = directory.join("symlink");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(lock_config_at(&link).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "preserved");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn policy_id_reuse_or_removal_invalidates_sessions_but_rule_edits_do_not() {
@@ -1948,6 +2134,22 @@ mod tests {
         // And the caller still gets Ok: an empty answer is an answer.
         for kind in ["timezone", "keyboard", "locale"] {
             assert!(choices(kind).is_ok(), "{kind}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod ha_curl_tests {
+    use super::*;
+    #[test]
+    fn bearer_config_escapes_and_rejects_injection() {
+        assert_eq!(
+            curl_auth_config(Some("a\\b\"c")).unwrap(),
+            "header = \"Authorization: Bearer a\\\\b\\\"c\"\n"
+        );
+        assert_eq!(curl_auth_config(None).unwrap(), "");
+        for bad in ["", "secret\nurl = https://attacker", "secret\r\n", "nul\0"] {
+            assert!(curl_auth_config(Some(bad)).is_err());
         }
     }
 }

@@ -137,6 +137,9 @@ in
     };
 
     systemd.services.velstra = {
+      environment.VELSTRA_TC_BIN = "${pkgs.iproute2}/bin/tc";
+      environment.VELSTRA_IP_BIN = "${pkgs.iproute2}/bin/ip";
+      environment.VELSTRA_WG_BIN = "${pkgs.wireguard-tools}/bin/wg";
       description = "Velstra eBPF/XDP data plane";
       wantedBy = [ "multi-user.target" ];
       after = [
@@ -175,6 +178,7 @@ in
         ExecStart = "${cfg.package}/bin/velstra run --iface \${VELSTRA_IFACE} --config /run/sentinel/velstra.toml --query-socket /run/velstra/query.sock --portal-socket /run/velstra/portal.sock --mapping-socket /run/velstra/mapping.sock $VELSTRA_FLOWSPEC_ARGS";
         RuntimeDirectory = "velstra";
         RuntimeDirectoryMode = "0700";
+        RuntimeDirectoryPreserve = "yes";
         Restart = "on-failure";
         RestartSec = 2;
         # Loading + attaching XDP/eBPF needs these capabilities. CAP_SYS_ADMIN is

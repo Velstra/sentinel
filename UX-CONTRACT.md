@@ -31,3 +31,23 @@ The form introduces no new permission, authentication or runtime-apply policy.
 The fields inherit shared labels, focus treatment, keyboard behavior, themes
 and responsive layout. Tests must cover applying every timeout, invalid input,
 reading persisted values, restoring defaults and complete CLI-field coverage.
+
+Leased HA and the independent witness use the same settingsPanel/fieldGrid,
+Stage, Validate, Apply and delete semantics on the existing HA page. Their
+configuration and security rules remain owned by src/ha.rs, src/config.rs and
+docs/ha-phase3.md. They do not introduce another apply or enrollment path;
+initial pairing remains the authenticated `sentinel ha pair` operation.
+
+HA identity JSON, witness credentials and the configuration-sync credential use
+the shared secretWidget: a masked input with an associated label and a keyboard
+accessible Show/Hide button. Values stay in the current form/staged batch and
+are never included in the staged summary or browser storage. The CLI argument
+encoder preserves identity JSON as one token. Unchanged fields, including a
+server-redacted witness credential, are never replayed during another edit.
+Server validation keeps rejected edits staged and leaves persisted state intact.
+
+The member selector uses the established native select; its two choices accept
+platform-owned popup geometry and keyboard behavior. Activation and preemption
+reuse the existing switch primitive. All fields inherit existing tokens, themes,
+responsive flow and focus styles. Browser tests cover all HA fields, identity
+round trips, reveal controls, invalid election settings and credential retention.

@@ -357,6 +357,9 @@ fn from_hint(ph: &str) -> &'static str {
         "<name>" => "t1",
         "<xx:xx:xx:xx:xx:xx>" => "02:00:00:00:00:01",
         "<pubkey>" => "d0JCPLcS8bXlwuA6xdaHrqLdEeQz9M+xUsHhVJnEbn0=",
+        "<json>" => {
+            r#"{"node":2,"hostname":"peer","management-endpoint":"10.0.0.2:8080","management-fingerprint":"d0JCPLcS8bXlwuA6xdaHrqLdEeQz9M+xUsHhVJnEbn0=","state-listen":"10.0.0.2:5429","priority":100}"#
+        }
         "<pem|file:path>" => "file:/tmp/walker.pem",
         _ => "sample",
     }
@@ -903,6 +906,11 @@ fn value_enumerations(leaves: &[Leaf]) -> BTreeSet<Vec<String>> {
         let parent = leaf.path[..leaf.path.len() - 1].to_vec();
         if leaf.hint.is_none() {
             *terminal.entry(parent).or_default() += 1;
+        } else {
+            // A hinted child needs a value: its parent is an object, not a
+            // vocabulary. A value hint on the parent itself still permits
+            // keyword alternatives such as `address dhcp | <IPv4/CIDR>`.
+            has_other.insert(parent);
         }
         // Anything further above has a child that leads deeper than one word.
         for n in 1..leaf.path.len().saturating_sub(1) {
@@ -914,6 +922,36 @@ fn value_enumerations(leaves: &[Leaf]) -> BTreeSet<Vec<String>> {
         .filter(|(path, n)| *n >= 1 && !has_other.contains(path))
         .map(|(path, _)| path)
         .collect()
+}
+
+#[test]
+fn typed_object_fields_are_not_mistaken_for_keyword_values() {
+    let path = |s: &str| s.split_whitespace().map(str::to_string).collect();
+    let leaves = [
+        Leaf {
+            path: path("set system ha-witness listen"),
+            hint: Some("<host:port>".into()),
+        },
+        Leaf {
+            path: path("set system ha-witness secret"),
+            hint: None,
+        },
+        Leaf {
+            path: path("set system ha-witness cluster"),
+            hint: None,
+        },
+        Leaf {
+            path: path("set interface eth0 address dhcp"),
+            hint: None,
+        },
+        Leaf {
+            path: path("set interface eth0 address"),
+            hint: Some("<IPv4/CIDR>".into()),
+        },
+    ];
+    let vocabularies = value_enumerations(&leaves);
+    assert!(!vocabularies.contains(&path("set system ha-witness")));
+    assert!(vocabularies.contains(&path("set interface eth0 address")));
 }
 
 /// The inventory the web console is measured against, as a committed file.
