@@ -1,85 +1,251 @@
 //! One bounded collector fans out to all authenticated SSE clients. A browser
 //! never drains the kernel ring itself; slow clients retain only one snapshot.
+//! The collector runs only while somebody is watching: each sample costs a
+//! dozen agent queries and child processes, which an appliance nobody has open
+//! in a browser should not be paying every second.
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, VecDeque},
     io::Read,
-    sync::{
-        Arc, Weak,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
+
+type Sampler = dyn Fn(&mut Collector) -> Value + Send + Sync;
 
 pub struct Hub {
     sender: watch::Sender<Value>,
-    started: AtomicBool,
+    /// Whether a collector task is running. A mutex, not a flag: subscribing
+    /// and the collector's "nobody left, stop" decision must not interleave, or
+    /// a client arriving at that moment would wait on a collector that just
+    /// quit.
+    running: Mutex<bool>,
+    sample: Arc<Sampler>,
+    interval: Duration,
 }
 impl Default for Hub {
     fn default() -> Self {
-        let (sender, _) = watch::channel(json!({"collecting":true}));
-        Self {
-            sender,
-            started: AtomicBool::new(false),
-        }
+        Self::with_sampler(Duration::from_secs(1), |c| c.collect(true))
     }
 }
 impl Hub {
+    fn with_sampler(
+        interval: Duration,
+        sample: impl Fn(&mut Collector) -> Value + Send + Sync + 'static,
+    ) -> Self {
+        let (sender, _) = watch::channel(json!({"collecting":true}));
+        Self {
+            sender,
+            running: Mutex::new(false),
+            sample: Arc::new(sample),
+            interval,
+        }
+    }
+    /// A receiver of telemetry frames, starting the collector if this is the
+    /// first one. Dropping the last receiver stops it again.
     pub fn subscribe(self: &Arc<Self>) -> watch::Receiver<Value> {
+        let mut running = self.running.lock().unwrap_or_else(|p| p.into_inner());
         let receiver = self.sender.subscribe();
-        if !self.started.swap(true, Ordering::AcqRel) {
-            let weak = Arc::downgrade(self);
-            tokio::spawn(run(weak));
+        if !*running {
+            *running = true;
+            tokio::spawn(run(Arc::downgrade(self)));
         }
         receiver
+    }
+    /// Stop when nobody is subscribed. Checked under the same lock a subscriber
+    /// takes, so a subscriber either is counted here or starts a new collector.
+    fn stop_if_unwatched(&self) -> bool {
+        let mut running = self.running.lock().unwrap_or_else(|p| p.into_inner());
+        if self.sender.receiver_count() > 0 {
+            return false;
+        }
+        *running = false;
+        // The next viewer must not be shown a frame from whenever the last one
+        // left; it waits for a fresh sample like the very first viewer did.
+        self.sender.send_replace(json!({"collecting":true}));
+        true
     }
 }
 async fn run(hub: Weak<Hub>) {
     let mut collector = Collector::default();
     loop {
-        if hub.strong_count() == 0 {
+        let Some((sample, interval)) = hub.upgrade().map(|h| (h.sample.clone(), h.interval)) else {
             break;
-        }
+        };
         let result = tokio::task::spawn_blocking(move || {
-            let value = collector.collect(true);
+            let value = sample(&mut collector);
             (collector, value)
         })
         .await;
-        let Ok((state, value)) = result else {
-            if let Some(hub) = hub.upgrade() {
-                hub.started.store(false, Ordering::Release);
-            }
-            break;
-        };
-        collector = state;
         let Some(hub) = hub.upgrade() else {
             break;
         };
+        let Ok((state, value)) = result else {
+            *hub.running.lock().unwrap_or_else(|p| p.into_inner()) = false;
+            break;
+        };
+        collector = state;
         hub.sender.send_replace(value);
+        if hub.stop_if_unwatched() {
+            break;
+        }
         drop(hub);
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(interval).await;
     }
 }
 
-/// Fleet telemetry is a non-draining snapshot. The local API remains the sole
-/// packet-ring consumer; cumulative interface counters let controllers derive rates.
-pub fn fleet_snapshot() -> Value {
-    Collector::default().collect(false)
+/// How often a live stream re-checks the credential that opened it. Checking
+/// on every frame meant a token-file read and parse per client per second;
+/// every few seconds still ends a revoked session promptly.
+const REVALIDATE: Duration = Duration::from_secs(5);
+
+/// One client's stream of frames. The credential is re-checked through
+/// `still_authorized` at most every `REVALIDATE`, and the stream ends with an
+/// error the first time it fails. Each client also gets the route table only
+/// when it changed since the last frame it was sent.
+pub fn client_stream<F, Fut>(
+    receiver: watch::Receiver<Value>,
+    still_authorized: F,
+) -> tokio_stream::wrappers::ReceiverStream<std::io::Result<Value>>
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = bool> + Send,
+{
+    client_stream_every(receiver, REVALIDATE, still_authorized)
+}
+
+fn client_stream_every<F, Fut>(
+    mut receiver: watch::Receiver<Value>,
+    every: Duration,
+    mut still_authorized: F,
+) -> tokio_stream::wrappers::ReceiverStream<std::io::Result<Value>>
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = bool> + Send,
+{
+    // Capacity one: a slow client holds at most one frame here besides the
+    // latest in the watch channel, never a backlog.
+    let (frames, stream) = mpsc::channel(1);
+    tokio::spawn(async move {
+        // The middleware authenticated this request a moment ago.
+        let mut checked = tokio::time::Instant::now();
+        let mut routes = None;
+        loop {
+            let value = receiver.borrow_and_update().clone();
+            if checked.elapsed() >= every {
+                if !still_authorized().await {
+                    let _ = frames
+                        .send(Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "telemetry credential revoked",
+                        )))
+                        .await;
+                    return;
+                }
+                checked = tokio::time::Instant::now();
+            }
+            if frames
+                .send(Ok(elide_unchanged_routes(value, &mut routes)))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            // A client that went away releases its receiver at once, so the
+            // collector can see that nobody is watching any more.
+            tokio::select! {
+                changed = receiver.changed() => if changed.is_err() { return },
+                () = frames.closed() => return,
+            }
+        }
+    });
+    tokio_stream::wrappers::ReceiverStream::new(stream)
+}
+
+/// The route table is the largest text in a frame and rarely changes. Send it
+/// to a client once per change; otherwise mark it unchanged so the console
+/// keeps the copy it has. Per client, because each joined at a different time.
+fn elide_unchanged_routes(mut value: Value, last: &mut Option<u64>) -> Value {
+    use std::hash::{Hash, Hasher};
+    let Some(text) = value["routing"]["routes"].as_str() else {
+        *last = None;
+        return value;
+    };
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    let hash = hasher.finish();
+    if *last == Some(hash) {
+        if let Some(routing) = value["routing"].as_object_mut() {
+            routing.remove("routes");
+            routing.insert("routes_unchanged".into(), json!(true));
+        }
+    } else {
+        *last = Some(hash);
+    }
+    value
+}
+
+/// Fleet telemetry is a snapshot without packet events; cumulative interface
+/// counters let controllers derive rates.
+///
+/// Counters only unless `[fleet] flow-telemetry` says otherwise: the console
+/// on the box itself may show who talks to whom, but a controller elsewhere
+/// receives that only where this box's operator opted in.
+pub fn fleet_snapshot(flow_detail: bool) -> Value {
+    let snapshot = Collector::default().collect(false);
+    if flow_detail {
+        snapshot
+    } else {
+        without_flow_detail(snapshot)
+    }
+}
+
+/// The snapshot minus everything that names an endpoint: the conntrack state
+/// sample, the NAT flow table and the top talkers (and any collector error
+/// text about them). The totals and every counter stay.
+fn without_flow_detail(mut snapshot: Value) -> Value {
+    if let Some(conntrack) = snapshot["conntrack"].as_object_mut() {
+        conntrack.remove("states");
+        conntrack.remove("sample_limit");
+        conntrack.remove("nat_flows");
+    }
+    if let Some(errors) = snapshot["errors"].as_object_mut() {
+        errors.remove("nat_flows");
+        errors.remove("top_talkers");
+    }
+    if let Some(root) = snapshot.as_object_mut() {
+        root.remove("top_talkers");
+        root.remove("top_talkers_scope");
+        root.insert("flow_detail".into(), json!(false));
+    }
+    snapshot
 }
 
 #[derive(Default)]
 struct Collector {
     previous: Option<(Instant, BTreeMap<String, [u64; 4]>)>,
     events: VecDeque<Value>,
-    event_id: u64,
+    /// This reader's place in the agent's event log. The agent hands out the
+    /// ids and keeps the events; reading them takes nothing from any other
+    /// reader (`show firewall events`, a second console).
+    cursor: u64,
+    /// The agent run the cursor belongs to; ids restart with every run.
+    epoch: Option<u64>,
+    /// Events this view will never show: evicted from the agent's window before
+    /// it read them, or dropped by a full kernel ring.
+    lost: u64,
+    /// The kernel's cumulative ring overflow count when this view started,
+    /// so only overflows during it are counted as its loss.
+    ring_lost_base: Option<u64>,
     sequence: u64,
 }
 impl Collector {
     fn collect(&mut self, include_events: bool) -> Value {
+        let events_query = format!("packet-events-since {} 512", self.cursor);
         let queries = [
-            ("events", "packet-events 256"),
+            ("events", events_query.as_str()),
             ("conntrack", "firewall-state-summary 200"),
             ("nat_flows", "flows 100"),
             ("top_talkers", "top 20"),
@@ -124,14 +290,22 @@ impl Collector {
         } else {
             None
         };
-        if let Some(text) = events {
-            self.append_events(&text);
-        }
+        let events_error =
+            events.and_then(|text| match serde_json::from_str::<Value>(text.trim()) {
+                Ok(page) => {
+                    self.append_page(&page);
+                    None
+                }
+                Err(error) => Some(format!("packet events: {error}")),
+            });
         let conntrack = answer("conntrack").and_then(|v| serde_json::from_str::<Value>(&v).ok());
         let nat = answer("nat_flows");
         let top = answer("top_talkers");
         let rules = answer("rule_counters").and_then(|v| serde_json::from_str::<Value>(&v).ok());
         let ha = answer("ha").and_then(|v| serde_json::from_str::<Value>(&v).ok());
+        if let Some(error) = events_error {
+            errors.insert("events".into(), json!(error));
+        }
         let mut routing = serde_json::Map::new();
         // The commands are fixed, bounded and contain no user input. A stalled
         // routing daemon cannot hold the collector or its children indefinitely.
@@ -171,30 +345,54 @@ impl Collector {
         });
         self.sequence += 1;
         json!({"sequence":self.sequence,"sampled_at":crate::aaa::unix_now(),"interfaces":interfaces,
-            "events":self.events,"oldest_event_id":self.events.front().and_then(|v|v["id"].as_u64()),"next_event_id":self.event_id+1,
+            "events":self.events,"oldest_event_id":self.events.front().and_then(|v|v["id"].as_u64()),"next_event_id":self.cursor+1,
+            "events_lost":self.lost,
             "conntrack":{"total":total,"states":states,"sample_limit":200,"nat_flows":nat},"top_talkers":top,"top_talkers_scope":"NAT flows; node-local counters",
             "rule_counters":rules,"ha":ha,"routing":routing,"wireguard":vpn,"errors":errors})
     }
-    fn append_events(&mut self, text: &str) {
-        for line in text.lines() {
-            if let Ok(mut event) = serde_json::from_str::<Value>(line) {
-                if !event.is_object() {
-                    continue;
+    /// Take one `packet-events-since` page: advance the cursor and count what
+    /// this view lost. A new agent run restarts the cursor rather than waiting
+    /// for the new ids to reach the old one.
+    fn append_page(&mut self, page: &Value) {
+        let epoch = page["epoch"].as_u64();
+        let first = self.epoch.is_none() || page["restarted"] == true;
+        if self.epoch.is_some() && epoch != self.epoch {
+            // Ask again from the start of the new run on the next sample;
+            // nothing in this page belongs to the old cursor.
+            self.epoch = epoch;
+            self.cursor = 0;
+            self.ring_lost_base = None;
+            // Their ids belong to the old run and would collide with the new.
+            self.events.clear();
+            return;
+        }
+        self.epoch = epoch;
+        // What the agent evicted before this view first asked was never this
+        // view's to lose; afterwards, every eviction it is told of is.
+        if !first {
+            self.lost += page["missed"].as_u64().unwrap_or(0);
+        }
+        if let Some(ring) = page["ring_lost"].as_u64() {
+            let base = *self.ring_lost_base.get_or_insert(ring);
+            self.lost += ring.saturating_sub(base);
+            self.ring_lost_base = Some(ring);
+        }
+        self.cursor = page["cursor"].as_u64().unwrap_or(self.cursor);
+        for event in page["events"].as_array().into_iter().flatten() {
+            if !event.is_object() || event["id"].as_u64().is_none() {
+                continue;
+            }
+            let mut event = event.clone();
+            if let Some(index) = event["interface"].as_u64() {
+                let mut name = [0i8; libc::IF_NAMESIZE];
+                if !unsafe { libc::if_indextoname(index as u32, name.as_mut_ptr()) }.is_null() {
+                    event["interface_name"] =
+                        json!(unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }.to_string_lossy());
                 }
-                self.event_id += 1;
-                event["id"] = json!(self.event_id);
-                if let Some(index) = event["interface"].as_u64() {
-                    let mut name = [0i8; libc::IF_NAMESIZE];
-                    if !unsafe { libc::if_indextoname(index as u32, name.as_mut_ptr()) }.is_null() {
-                        event["interface_name"] = json!(
-                            unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }.to_string_lossy()
-                        );
-                    }
-                }
-                self.events.push_back(event);
-                while self.events.len() > 512 {
-                    self.events.pop_front();
-                }
+            }
+            self.events.push_back(event);
+            while self.events.len() > 512 {
+                self.events.pop_front();
             }
         }
     }
@@ -311,16 +509,124 @@ mod tests {
         assert_eq!(parsed["eth0"], [100, 200, 10, 20]);
         assert_eq!(parsed.len(), 1);
     }
+    fn page(epoch: u64, ids: std::ops::RangeInclusive<u64>, missed: u64, ring: u64) -> Value {
+        let events: Vec<Value> = ids
+            .clone()
+            .map(|id| json!({"id":id,"src":"2001:db8::1","action":"drop","interface":0}))
+            .chain([json!(null), json!({"no":"id"})])
+            .collect();
+        json!({"epoch":epoch,"events":events,"cursor":ids.end(),"missed":missed,
+            "ring_lost":ring,"restarted":false})
+    }
     #[test]
-    fn retained_event_window_is_bounded_and_ids_expose_slow_client_gaps() {
+    fn retained_event_window_is_bounded_and_follows_the_agents_ids() {
         let mut c = Collector::default();
-        c.append_events("broken\nnull\n[]\n");
-        for _ in 0..600 {
-            c.append_events(r#"{"src":"2001:db8::1","dst":"2001:db8::2","rule":"web","action":"drop","interface":0}"#);
-        }
+        c.append_page(&page(1, 1..=300, 0, 0));
+        c.append_page(&page(1, 301..=600, 0, 0));
         assert_eq!(c.events.len(), 512);
         assert_eq!(c.events.front().unwrap()["id"], 89);
         assert_eq!(c.events.back().unwrap()["id"], 600);
+        assert_eq!(c.cursor, 600);
+    }
+    #[test]
+    fn lost_events_count_only_what_this_view_missed() {
+        let mut c = Collector::default();
+        // Evicted and overflowed before this view started: not its loss.
+        c.append_page(&page(1, 40..=50, 39, 1000));
+        assert_eq!(c.lost, 0);
+        c.append_page(&page(1, 60..=61, 9, 1003));
+        assert_eq!(c.lost, 9 + 3);
+        // A new agent run: start over from its first event, not from 61.
+        c.append_page(&page(2, 1..=2, 0, 0));
+        assert_eq!((c.cursor, c.events.len()), (0, 0));
+        c.append_page(&page(2, 1..=2, 0, 0));
+        assert_eq!(c.cursor, 2);
+        assert_eq!(c.lost, 12);
+    }
+    #[test]
+    fn the_route_table_is_sent_to_a_client_once_per_change() {
+        let mut last = None;
+        let frame = |routes: &str| json!({"routing":{"routes":routes,"bgp":"up"}});
+        assert_eq!(
+            elide_unchanged_routes(frame("a"), &mut last)["routing"]["routes"],
+            "a"
+        );
+        let again = elide_unchanged_routes(frame("a"), &mut last);
+        assert_eq!(again["routing"]["routes"], Value::Null);
+        assert_eq!(again["routing"]["routes_unchanged"], true);
+        assert_eq!(again["routing"]["bgp"], "up");
+        assert_eq!(
+            elide_unchanged_routes(frame("b"), &mut last)["routing"]["routes"],
+            "b"
+        );
+        // An unavailable table is not "unchanged": the next one is sent in full.
+        elide_unchanged_routes(json!({"routing":{}}), &mut last);
+        assert_eq!(
+            elide_unchanged_routes(frame("b"), &mut last)["routing"]["routes"],
+            "b"
+        );
+    }
+    #[tokio::test]
+    async fn the_collector_runs_only_while_somebody_is_subscribed() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let samples = Arc::new(AtomicU64::new(0));
+        let counter = samples.clone();
+        let hub = Arc::new(Hub::with_sampler(
+            Duration::from_millis(10),
+            move |_| json!({"sample":counter.fetch_add(1, Ordering::SeqCst)}),
+        ));
+        let mut viewer = hub.subscribe();
+        viewer.changed().await.unwrap();
+        viewer.changed().await.unwrap();
+        drop(viewer);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let idle = samples.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            samples.load(Ordering::SeqCst),
+            idle,
+            "the collector kept sampling with nobody subscribed"
+        );
+        assert!(!*hub.running.lock().unwrap());
+        // The next viewer starts it again, and is not handed the stale frame.
+        let mut viewer = hub.subscribe();
+        assert_eq!(viewer.borrow_and_update()["collecting"], true);
+        viewer.changed().await.unwrap();
+        assert!(viewer.borrow()["sample"].as_u64().unwrap() >= idle);
+    }
+    #[tokio::test]
+    async fn a_stream_rechecks_its_credential_periodically_and_ends_on_revocation() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use tokio_stream::StreamExt;
+        let (sender, receiver) = watch::channel(json!({"n":0}));
+        let checks = Arc::new(AtomicU64::new(0));
+        let counted = checks.clone();
+        let mut stream = client_stream_every(receiver, Duration::from_millis(100), move || {
+            let n = counted.fetch_add(1, Ordering::SeqCst);
+            async move { n < 1 }
+        });
+        let producer = tokio::spawn(async move {
+            for n in 1..200 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                if sender.send(json!({"n":n})).is_err() {
+                    return;
+                }
+            }
+        });
+        let mut frames = 0;
+        let ended = loop {
+            match tokio::time::timeout(Duration::from_secs(2), stream.next()).await {
+                Ok(Some(Ok(_))) => frames += 1,
+                Ok(Some(Err(error))) => break error,
+                other => panic!("the stream outlived its revocation: {other:?}"),
+            }
+        };
+        assert_eq!(ended.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(stream.next().await.is_none());
+        // Two checks (one passed, one revoked) across many more frames.
+        assert_eq!(checks.load(Ordering::SeqCst), 2);
+        assert!(frames > 10, "only {frames} frames");
+        producer.abort();
     }
     #[tokio::test]
     async fn slow_subscribers_hold_only_the_latest_snapshot() {
@@ -333,5 +639,26 @@ mod tests {
         a.changed().await.unwrap();
         assert_eq!(a.borrow_and_update()["sequence"], 999);
         assert_eq!(b.borrow()["sequence"], 999);
+    }
+    /// The default fleet payload carries counters and no endpoint: no state
+    /// sample, NAT flow or top talker survives, while the totals do.
+    #[test]
+    fn fleet_telemetry_without_opt_in_names_no_endpoint() {
+        let full = json!({"sequence":1,"interfaces":[{"name":"eth0","rx_bytes":5}],
+            "conntrack":{"total":2,"states":[{"src":"192.0.2.7","dst":"198.51.100.9"}],
+                "sample_limit":200,"nat_flows":"192.0.2.7:5000 -> 198.51.100.9:443"},
+            "top_talkers":"192.0.2.7 9000 bytes","top_talkers_scope":"NAT flows; node-local counters",
+            "rule_counters":{"web":3},"errors":{"top_talkers":"192.0.2.7 timed out","routes":"down"}});
+        let counters = without_flow_detail(full);
+        let text = counters.to_string();
+        assert!(
+            !text.contains("192.0.2.7") && !text.contains("198.51.100.9"),
+            "{text}"
+        );
+        assert_eq!(counters["conntrack"]["total"], 2);
+        assert_eq!(counters["rule_counters"]["web"], 3);
+        assert_eq!(counters["interfaces"][0]["rx_bytes"], 5);
+        assert_eq!(counters["errors"]["routes"], "down");
+        assert_eq!(counters["flow_detail"], false);
     }
 }

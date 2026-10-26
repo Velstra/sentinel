@@ -16,8 +16,13 @@ check-ins never renew the confirmation deadline or confirm implicitly.
 
 Provision a client certificate and private key for this node, the controller's
 CA certificate, and a private enrollment-token file under
-`/var/lib/sentinel/fleet/`. Keep the client key and token owned by root with mode
-0600. The controller must map the client certificate identity to the enrolled
+`/var/lib/sentinel/fleet/`. Keep the directory owned by root and writable by
+nobody else (0700), and the client key and token owned by root with mode 0600.
+A `file:` enrollment token must name a file directly in that directory; any other
+path is refused at commit, and the file is opened without following a symlink at
+the directory or the file. (The token is sent to `controller-url`, so a reference
+that could name any root-owned private file would let whoever sets those two
+fields post that file to a server of their choosing.) The controller must map the client certificate identity to the enrolled
 node ID and validate the bearer credential. Client certificates are issued by
 your controller/PKI; the hook does not mint a controller-trusted identity itself.
 
@@ -42,6 +47,7 @@ client-certificate = "/var/lib/sentinel/fleet/client.pem"
 client-key = "/var/lib/sentinel/fleet/client.key"
 # Set signing-key to the base64 public value obtained above before applying.
 poll-interval = 5
+# flow-telemetry = true   # opt in to per-flow detail; see "Telemetry" below
 ```
 
 `signing-key` is required; a partial identity is rejected. The interval accepts
@@ -50,7 +56,9 @@ read API and human-readable configuration view redact it. Client private PEM
 bytes never belong in `appliance.toml`. CA and certificate paths are absolute;
 normal TLS chain, host-name/IP and validity checks are mandatory. HTTP, URL
 credentials, query strings, fragments, redirects and ambient curl configuration
-are not accepted. A request has a ten-second bound and responses are capped at
+are not accepted: curl runs with `--disable` and an empty environment, so
+`~/.curlrc`, `HTTPS_PROXY`/`ALL_PROXY`, `SSLKEYLOGFILE` and
+`CURL_CA_BUNDLE`/`SSL_CERT_FILE` have no effect. Proxies are not supported. A request has a ten-second bound and responses are capped at
 2 MiB. An unavailable controller cannot hold the configuration lock during its
 request or block boot/forwarding.
 
@@ -105,8 +113,25 @@ reports an interrupted `processing` outcome, use those actual transaction
 facts and issue a new sequence; do not assume an operation was applied.
 
 `apply` uses the normal complete `Appliance` schema and CAS against
-`expected_revision`. It cannot change/remove `[fleet]`: enrollment/trust rotation
-requires a local management change. The independent commit-confirm worker and
+`expected_revision`. It cannot change the **local-only trust settings**; a
+revision that differs from the running configuration in any of them is refused
+with a message naming each section, and nothing is applied:
+
+- `[fleet]` — enrollment, controller URL, signing key, telemetry opt-in;
+- `[[system.login]]`, `[[system.group]]`, `[system.aaa]` — accounts, SSH keys,
+  password hashes, TOTP secrets, permissions, RADIUS/LDAP/TACACS servers and
+  secrets;
+- `[update]` — channel URLs, pinned public keys, subscription keys (the channel
+  key also verifies local images);
+- `[system.ha]`, `[system.ha-witness]`, `[system.config-sync]`,
+  `[system.conntrack-sync]` — pairing identity, witness secret, sync peers,
+  secret and pinned fingerprint;
+- `[services.ssh]`, `[services.web]`, `[system.console]` — how the local
+  operator reaches the box.
+
+A controller must send these sections exactly as the node has them. Changing
+them is a local management act. Policy — rules, zones, NAT, interfaces,
+routing, VPN tunnels, DNS/DHCP and other services — remains fleet-managed. The independent commit-confirm worker and
 watchdog protect address, port, TLS, VLAN, routing and firewall changes. Wait for
 `transaction.pending.ready`, verify reachability, then sign a separate `confirm`
 for that identity and revision. Without it, the previous saved and working state
@@ -120,17 +145,24 @@ included in shared configuration deliveries.
 
 ## Telemetry and verification
 
-A signed `telemetry` command requests the following check-in's snapshot. It
-includes bounded firewall/conntrack/rule counters, HA authority, Wren routes and
-neighbors, VPN handshakes and cumulative interface counters. Source failures are
+A signed `telemetry` command requests the following check-in's snapshot. By
+default it carries **counters only**: the conntrack total, rule counters, HA
+authority, Wren routes and neighbors, VPN handshakes and cumulative interface
+counters, with `"flow_detail": false`. Nothing in it names a client. Per-flow
+detail — the sampled connection states, the NAT flow table and the top talkers,
+all lists of endpoint addresses — is sent only when the node's operator sets
+`set fleet flow-telemetry true`; being part of `[fleet]`, a controller cannot
+turn it on for itself. Source failures are
 explicit; interface rates may be unknown on this one-shot sample, so the
 controller derives rates from successive cumulative counters. Fleet never drains
 the packet-event ring: the local API remains its sole streaming consumer.
 
 `nix build .#checks.x86_64-linux.fleet -L` boots an appliance and a real TLS
 controller fixture. It checks client-certificate authentication, wrong CA/token,
-private key permissions, signed telemetry without stolen ring events, bad
-signatures/challenges/targets, replay across reboot, live apply, explicit confirm,
-controller-outage rollback, local edits and return to standalone operation.
+private key permissions, signed telemetry without stolen ring events and
+without flow detail until opted in, bad signatures/challenges/targets, a signed
+revision adding a login refused, replay across reboot, live apply, explicit
+confirm, controller-outage rollback, local edits and return to standalone
+operation.
 `tests/fleet/controller.py` is solely that disposable test peer; it is not a
 production fleet controller. The existing API PR-CI check includes this VM.

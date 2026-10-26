@@ -32,6 +32,8 @@ export interface Telemetry {
   events: PacketEvent[];
   oldest_event_id?: number;
   next_event_id?: number;
+  /** Events this view will never show: evicted or dropped before it read them. */
+  events_lost?: number;
   conntrack?: { total: number | null; states?: unknown[] };
   top_talkers?: string | null;
   rule_counters?: unknown;
@@ -41,8 +43,16 @@ export interface Telemetry {
     node?: string;
     term?: number;
     sync_age_ms?: number | null;
+    ready?: boolean;
+    not_ready?: string | null;
   } | null;
-  routing?: { bgp?: string; ospf?: string; routes?: string };
+  routing?: {
+    bgp?: string;
+    ospf?: string;
+    routes?: string;
+    /** The table is sent once per change; keep the copy already received. */
+    routes_unchanged?: boolean;
+  };
   wireguard?: string | null;
   errors: Record<string, string>;
 }
@@ -51,6 +61,9 @@ export interface Pending {
   remaining_seconds: number;
   ready: boolean;
   reverting?: boolean;
+  recovery_attempts?: number;
+  /** Recovery gave up; only an explicit accept (or a reboot) ends it. */
+  recovery_failed?: boolean;
 }
 export interface StagedChange {
   label: string;
@@ -232,4 +245,14 @@ export function isTelemetry(value: unknown): value is Telemetry {
     Array.isArray(f.events) &&
     !!f.errors
   );
+}
+
+/** The member's role, and for a member that is not forwarding, why the
+ * witness would refuse it authority. A bare "Backup" reads as "covered". */
+export function haRole(ha: Telemetry["ha"]): string {
+  if (!ha) return "—";
+  if (ha.role === "standalone") return "Standalone";
+  return ha.role !== "Master" && ha.not_ready
+    ? `${ha.role} (not ready: ${ha.not_ready})`
+    : ha.role;
 }

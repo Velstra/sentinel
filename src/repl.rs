@@ -224,7 +224,7 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
         "compare" => do_compare(session, rest),
         "commit" => return commit(session, act),
         "commit-confirm" => return commit_confirm_line(session, act, rest),
-        "confirm" => crate::confirm::confirm(act),
+        "confirm" => crate::confirm::confirm(act, rest.first().copied()),
         "rollback" => return rollback_line(session, act, rest),
         "save" => {
             let to = rest.first().map(Path::new);
@@ -1144,10 +1144,11 @@ const CMD_HELP: &[CmdHelp] = &[
     },
     CmdHelp {
         name: "confirm",
-        usage: "confirm",
+        usage: "confirm [<transaction-id>]",
         summary: "keep a commit-confirm change (cancel the revert)",
-        detail: "",
-        examples: &[],
+        detail: "A bare `confirm` keeps only this shell's `commit-confirm`. A change \
+                 applied from the API or console is kept by naming its transaction id.",
+        examples: &["confirm"],
     },
     CmdHelp {
         name: "save",
@@ -1360,6 +1361,7 @@ const OP_SHOW_TOP: &[Cand] = &[
     ("isis", "IS-IS adjacencies / interfaces / database"),
     ("babel", "Babel neighbours / routes"),
     ("vrrp", "VRRP virtual-router state"),
+    ("ha", "leased HA authority and standby readiness"),
     ("bfd", "BFD sessions"),
     ("vrf", "the VRFs that are running, and their devices"),
     (
@@ -1565,6 +1567,10 @@ const FLEET_FIELDS: &[Cand] = &[
     (
         "poll-interval",
         "check-in interval in seconds (1–300, default 5)",
+    ),
+    (
+        "flow-telemetry",
+        "send per-flow detail (addresses) in telemetry; default counters only",
     ),
 ];
 const UPDATE_FIELDS: &[Cand] = &[
@@ -2842,11 +2848,26 @@ const HA_FIELDS: &[Cand] = &[
         "this member's management TLS SPKI",
     ),
     ("peer-identity", "peer-specific facts as a JSON object"),
+    (
+        "lease-ms",
+        "witness lease in ms (default 250; same on the witness)",
+    ),
+    (
+        "io-timeout-ms",
+        "bound on one witness exchange in ms (default 80; about 3 round trips)",
+    ),
 ];
 const HA_WITNESS_FIELDS: &[Cand] = &[
     ("listen", "listen IP:port"),
-    ("secret", "shared enrollment credential"),
-    ("cluster", "cluster identifier (derived when omitted)"),
+    ("key", "derived witness key (sentinel ha witness-key)"),
+    ("member", "the two member source addresses"),
+    ("cluster", "cluster identifier (required with key)"),
+    ("lease-ms", "lease granted in ms (default 250)"),
+    (
+        "peer-silence-ms",
+        "silence before a lone cold member may take over (default 10000)",
+    ),
+    ("secret", "deprecated: the members' credential; use key"),
 ];
 // `system config-sync <Tab>` reveals the HA config-sync fields.
 const CONFIGSYNC_FIELDS: &[Cand] = &[
@@ -5119,6 +5140,13 @@ pub(crate) fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, 
             "ca-certificate" | "client-certificate" | "client-key",
         ] => own_cands(&[("<absolute-path>", "absolute file path")]),
         ["set", "fleet", "poll-interval"] => own_cands(&[("<seconds>", "1–300 seconds")]),
+        ["set", "fleet", "flow-telemetry"] => own_cands(&[
+            (
+                "true",
+                "include connection states, NAT flows and top talkers",
+            ),
+            ("false", "counters only (the default)"),
+        ]),
         ["set", "update", "url"] => own_cands(&[PH_URL]),
         ["set", "update", "public-key"] => {
             own_cands(&[("<pem|file:path>", "PEM key or file:<path>")])

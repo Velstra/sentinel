@@ -542,6 +542,15 @@ pub struct Fleet {
     pub signing_key: String,
     /// Omitted means five seconds; zero and values above 300 are refused.
     pub poll_interval: Option<u32>,
+    /// Include flow-level detail in fleet telemetry: the sampled connection
+    /// states, the NAT flow table and the top talkers — every one of them a
+    /// list of client and server addresses. Off by default, so a controller
+    /// receives counters (totals, rule hits, interfaces, HA, routing, VPN
+    /// handshakes) and learns who talked to whom only where the operator of
+    /// this box has said so. Part of `[fleet]`, so a controller cannot turn it
+    /// on for itself.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub flow_telemetry: bool,
 }
 impl std::fmt::Debug for Fleet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -4314,6 +4323,14 @@ pub struct Ha {
     pub management_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_identity: Option<HaIdentity>,
+    /// The witness lease in milliseconds (default 250). Set the witness's
+    /// `lease-ms` to the same value: a member honours the shorter of the two.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_ms: Option<u64>,
+    /// Bound on one complete witness exchange (default 80), about three round
+    /// trips. `2 x io-timeout-ms + 45` must not exceed `lease-ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io_timeout_ms: Option<u64>,
 }
 impl Ha {
     pub fn node(&self) -> u8 {
@@ -4354,9 +4371,31 @@ pub struct HaInterfaceIdentity {
 #[serde(deny_unknown_fields)]
 pub struct HaWitness {
     pub listen: String,
+    /// Deprecated: the members' enrollment credential, which is also their
+    /// API machine token. Still honoured so an upgraded witness keeps serving
+    /// its pair, but `key` gives the witness only what it needs.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub secret: String,
+    /// The derived witness key (`sentinel ha witness-key`). It authenticates
+    /// lease sessions and nothing else; it cannot sign in to either member.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub key: String,
     #[serde(default)]
     pub cluster: String,
+    /// The two members' source addresses; every other source is refused
+    /// before it can hold a session.
+    #[serde(rename = "member", default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<String>,
+    #[serde(rename = "lease-ms", default, skip_serializing_if = "Option::is_none")]
+    pub lease_ms: Option<u64>,
+    /// How long one member must be silent before the other may start a new,
+    /// empty epoch alone (default 10000).
+    #[serde(
+        rename = "peer-silence-ms",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub peer_silence_ms: Option<u64>,
 }
 
 /// HA config sync (`[system.config-sync]`). Local CLI commits and API updates
@@ -6171,7 +6210,7 @@ pub struct Dhcp6Pool {
 /// A built-in (systemd-networkd) DHCP server on an interface that carries a
 /// static address. All fields are optional refinements of networkd's defaults;
 /// the presence of the block is what turns the server on.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DhcpServer {
     /// Offset of the first pool address within the interface's subnet.
     #[serde(
@@ -7118,6 +7157,66 @@ impl Appliance {
         }
     }
 
+    /// The virtual IPv4 address a segment's clients should use as their gateway:
+    /// a VRRP address held on `iface` that lies inside its static subnet.
+    ///
+    /// A first-hop redundancy group exists so the gateway outlives any one
+    /// router. Handing clients a member's own address instead — which is what
+    /// networkd's DHCP server does when told nothing — undoes that for every
+    /// DHCP client on the segment.
+    pub(crate) fn segment_virtual_ipv4(&self, iface: &Interface) -> Option<String> {
+        let subnet = iface.address.as_deref().filter(|a| *a != "dhcp")?;
+        self.protocols
+            .vrrp
+            .iter()
+            .filter(|v| v.address_interface.as_deref().unwrap_or(&v.interface) == iface.name)
+            .flat_map(|v| v.virtual_address.iter())
+            .find(|vip| ipv4_in_cidr(vip, subnet).unwrap_or(false))
+            .cloned()
+    }
+
+    /// DHCP on a leased HA pair. Leases are not replicated between members, so
+    /// the design is that only the lease owner serves: the standby's data links
+    /// are fenced by the HA guard, which drops a DISCOVER before the standby's
+    /// server can hear it, and networkd derives each client's address from a
+    /// hash of its identifier, so the new owner tends to hand a returning client
+    /// the address it already had.
+    ///
+    /// Two configurations break that, and both are refused rather than warned
+    /// about, because each fails exactly when the pair is needed:
+    /// - a server on a link outside the fence (the control link) runs on both
+    ///   members at once, from one pool, onto one segment — duplicate leases by
+    ///   construction;
+    /// - a server with no gateway to hand out but the member's own address
+    ///   leaves every client pointing at a dead router after failover.
+    fn validate_ha_dhcp(&self) -> Result<()> {
+        if self.system.ha.as_ref().is_none_or(|ha| !ha.enabled) {
+            return Ok(());
+        }
+        let fenced = crate::ha::guarded_interfaces(self);
+        for iface in self.interfaces.iter().filter(|i| !i.disabled) {
+            let Some(dhcp) = &iface.dhcp_server else {
+                continue;
+            };
+            if !fenced.contains(&iface.name) {
+                bail!(
+                    "interface {:?} dhcp-server: this link is not fenced by HA, so both members \
+                     would serve the same pool to it at once; serve DHCP on a data link",
+                    iface.name
+                );
+            }
+            if dhcp.default_router.is_none() && self.segment_virtual_ipv4(iface).is_none() {
+                bail!(
+                    "interface {:?} dhcp-server: clients would be handed this member's own \
+                     address as their gateway, which is gone after a failover; declare a VRRP \
+                     virtual-address inside the subnet or set default-router",
+                    iface.name
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Serialize to canonical TOML.
     pub fn to_toml(&self) -> Result<String> {
         toml::to_string_pretty(self).context("serializing to TOML")
@@ -7131,6 +7230,7 @@ impl Appliance {
     /// Reject configs that parse but are not coherent.
     pub fn validate(&self) -> Result<()> {
         crate::ha::validate(self)?;
+        self.validate_ha_dhcp()?;
         validate_hostname(&self.system.hostname)?;
         self.firewall.conntrack.validate()?;
 
@@ -7528,6 +7628,13 @@ impl Appliance {
                 for dns in &dhcp.dns {
                     validate_ipv4(dns)
                         .with_context(|| format!("interface {:?} dhcp-server dns", iface.name))?;
+                }
+                // Rendered as networkd's `SendOption=15:string:<domain>` — a line
+                // of the unit, so a newline in it would be the next directive.
+                if let Some(domain) = &dhcp.domain {
+                    validate_host(domain).with_context(|| {
+                        format!("interface {:?} dhcp-server domain", iface.name)
+                    })?;
                 }
                 // `address` is a static CIDR here (checked just above).
                 let subnet = iface.address.as_deref().unwrap_or("");
@@ -8228,6 +8335,17 @@ impl Appliance {
                 );
             }
         }
+        // The serial console's tty names a directory and a unit instance
+        // (`serial-getty@<device>.service.d`), so it must be a bare device name:
+        // a `/` or `..` would put the drop-in somewhere else entirely.
+        if let Some(device) = &self.system.console.device {
+            if device.is_empty()
+                || device.len() > 32
+                || !device.bytes().all(|b| b.is_ascii_alphanumeric())
+            {
+                bail!("system console device {device:?}: a tty name like `ttyS0`, without /dev/");
+            }
+        }
         if let Some(k) = &self.system.keyboard {
             if k.is_empty()
                 || !k
@@ -8239,13 +8357,20 @@ impl Appliance {
         }
         if let Some(l) = &self.system.locale {
             // `xx_YY.CHARSET`, or one of the two that name no territory.
+            // The charset (and an `@modifier`) used to be taken on trust, and
+            // the whole value is written as `LANG=<locale>` into locale.conf —
+            // so a newline after the dot was a second assignment in that file.
             let ok = l == "C" || l == "POSIX" || {
-                let (lang, _) = l.split_once('.').unwrap_or((l.as_str(), ""));
+                let (lang, charset) = l.split_once('.').unwrap_or((l.as_str(), "x"));
                 let (a, b) = lang.split_once('_').unwrap_or(("", ""));
                 a.len() == 2
                     && b.len() >= 2
                     && a.bytes().all(|c| c.is_ascii_lowercase())
                     && b.bytes().all(|c| c.is_ascii_uppercase())
+                    && !charset.is_empty()
+                    && charset
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'@'))
             };
             if !ok {
                 bail!("system locale {l:?}: expected e.g. `de_DE.UTF-8`, `C` or `POSIX`");
@@ -9631,6 +9756,14 @@ impl Appliance {
         if let Some(dom) = &dns.local_domain {
             validate_host(dom).with_context(|| "services dns local-domain")?;
         }
+        // Encrypted upstreams become words of the proxy's command line, which
+        // systemd splits out of `ARGS=` on whitespace. Checked here rather than
+        // only in the CLI's `set`, because the API document, config-sync and a
+        // fleet push never pass through that parser.
+        for up in &dns.secure_upstream {
+            validate_secure_upstream(up)
+                .with_context(|| format!("services dns secure-upstream {up:?}"))?;
+        }
 
         // NTP server: upstreams are IPs or hostnames; every serving interface
         // must be declared and carry a static address (its subnet is `allow`ed).
@@ -9897,6 +10030,44 @@ impl Appliance {
         // any other field (`… user alice address 10.0.0.5`) made the account,
         // and the empty secret went straight into `chap-secrets` as a row that
         // authenticates on an empty password.
+        // Everything else the concentrator is told arrives as words of one
+        // `$PPPOE_SERVER_ARGS` line, so each value must be exactly one word of
+        // the shape it claims to be — a space in an interface name is an extra
+        // `pppoe-server` option, a newline another environment assignment.
+        let bng = &self.services.pppoe_server;
+        if let Some(iface) = &bng.interface {
+            if !self.interfaces.iter().any(|i| &i.name == iface) {
+                bail!("services pppoe-server interface {iface:?}: not a declared interface");
+            }
+        }
+        for (field, value) in [
+            ("local-address", &bng.local_address),
+            ("pool-start", &bng.pool_start),
+        ] {
+            if let Some(v) = value {
+                validate_ipv4(v).with_context(|| format!("services pppoe-server {field}"))?;
+            }
+        }
+        for d in &bng.dns {
+            validate_ipv4(d).with_context(|| "services pppoe-server dns")?;
+        }
+        for (field, value) in [
+            ("service-name", &bng.service_name),
+            ("ac-name", &bng.ac_name),
+        ] {
+            if let Some(v) = value {
+                if v.is_empty()
+                    || v.bytes().any(|b| {
+                        b.is_ascii_control() || matches!(b, b' ' | b'"' | b'\\' | b'\'' | b'#')
+                    })
+                {
+                    bail!(
+                        "services pppoe-server {field}: must be one word, without whitespace, a \
+                         control character, quote, backslash or '#'"
+                    );
+                }
+            }
+        }
         for u in &self.services.pppoe_server.users {
             if u.name.trim().is_empty() {
                 bail!("services pppoe-server: a subscriber name must not be empty");
@@ -11111,6 +11282,7 @@ impl Appliance {
     #[allow(dead_code)]
     pub fn warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
+        out.extend(crate::ha::witness_warnings(self));
         // An encrypted upstream named by hostname cannot be reached until
         // something resolves that hostname, and that something has to be
         // plaintext. Without one the box looks like "DNS is broken" rather than
@@ -11132,6 +11304,7 @@ impl Appliance {
             let by_name = dns.secure_upstream.iter().any(|u| {
                 u.trim_start_matches("tls://")
                     .trim_start_matches("https://")
+                    .trim_start_matches("quic://")
                     .split(['/', ':'])
                     .next()
                     .is_some_and(|h| h.parse::<std::net::IpAddr>().is_err())
@@ -12409,15 +12582,83 @@ pub(crate) fn validate_cidr_or_ip(s: &str) -> Result<()> {
 
 /// Validate a WireGuard key (private, peer public, or preshared): the standard
 /// base64 encoding of exactly 32 raw bytes — the `wg` tool's format.
+///
+/// The error names what is wrong and never the value: this checks private and
+/// preshared keys too, and an error is printed to a terminal, returned by the
+/// API and kept in the commit log — none of them a place for key material.
 pub(crate) fn validate_wg_key(s: &str) -> Result<()> {
-    let raw = STANDARD
-        .decode(s)
-        .with_context(|| format!("wireguard key {s:?} is not valid base64"))?;
+    let raw = STANDARD.decode(s).map_err(|_| {
+        anyhow::anyhow!(
+            "wireguard key ({} characters) is not valid base64 — expected the 44-character \
+             form `wg genkey` prints",
+            s.len()
+        )
+    })?;
     if raw.len() != 32 {
-        bail!(
-            "wireguard key {s:?} decodes to {} bytes, expected 32",
-            raw.len()
-        );
+        bail!("wireguard key decodes to {} bytes, expected 32", raw.len());
+    }
+    Ok(())
+}
+
+/// Validate an encrypted DNS upstream (`services dns secure-upstream`): DNS over
+/// TLS (`tls://`), HTTPS (`https://`) or QUIC (`quic://`), then a host — an IPv4
+/// literal, a bracketed IPv6 literal or a DNS name — an optional port, and, for
+/// HTTPS only, a path.
+///
+/// Strict on purpose: the value becomes one word of the proxy's command line
+/// (`--upstream=<value>` in an `ARGS=` environment file that systemd splits on
+/// whitespace). Anything outside this grammar — a space, a quote, a newline — is
+/// a second argument or a second assignment, not an unusual upstream.
+pub(crate) fn validate_secure_upstream(s: &str) -> Result<()> {
+    let (scheme, rest) = ["tls://", "https://", "quic://"]
+        .iter()
+        .find_map(|scheme| s.strip_prefix(scheme).map(|rest| (*scheme, rest)))
+        .context("expected tls://<host>, https://<host>/dns-query or quic://<host>")?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    if !path.is_empty() {
+        if scheme != "https://" {
+            bail!("only an https:// upstream has a path");
+        }
+        if !path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'.' | b'_' | b'~'))
+        {
+            bail!("the path may hold only letters, digits and / - . _ ~");
+        }
+    }
+    let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
+        let (addr, after) = v6.split_once(']').context("unterminated [IPv6] literal")?;
+        validate_ipv6(addr)?;
+        let port = match after {
+            "" => None,
+            _ => Some(
+                after
+                    .strip_prefix(':')
+                    .context("expected :port after the [IPv6] literal")?,
+            ),
+        };
+        (None, port)
+    } else {
+        match authority.split_once(':') {
+            Some((host, port)) => (Some(host), Some(port)),
+            None => (Some(authority), None),
+        }
+    };
+    if let Some(host) = host {
+        // validate_host would also take a bare IPv6 literal, whose colons are
+        // indistinguishable from a port separator here — brackets are required.
+        if host.contains(':') || validate_host(host).is_err() {
+            bail!("{host:?} is not an IPv4 address or host name (bracket an IPv6 literal)");
+        }
+    }
+    if let Some(port) = port {
+        match port.parse::<u16>() {
+            Ok(p) if p > 0 => {}
+            _ => bail!("{port:?} is not a port (1-65535)"),
+        }
     }
     Ok(())
 }
@@ -15157,6 +15398,250 @@ virtual-address = ["10.0.0.254"]
                 "{base}[system.conntrack-sync]\nlisten = \"0.0.0.0\"\ninterval = 0\n"
             ))
             .is_err()
+        );
+    }
+}
+
+/// Values that end up inside a rendered daemon argument line, environment file,
+/// unit name or networkd directive. Each one was checked by the CLI's `set`
+/// parser (or by nothing at all), never by `validate` — so the API document
+/// path, config-sync and a fleet push delivered them to the renderer unchecked,
+/// where a space starts another argument and a newline another directive.
+#[cfg(test)]
+mod rendered_value_validation_tests {
+    use super::*;
+
+    const BASE: &str = "[system]\nhostname = \"fw\"\n\
+        [[interface]]\nname = \"eth0\"\nzone = \"lan\"\naddress = \"10.0.0.1/24\"\n\
+        [zone.lan]\n";
+
+    fn with(extra: &str) -> Result<Appliance> {
+        Appliance::from_toml(&format!("{BASE}{extra}\n"))
+    }
+
+    fn secure(upstream: &str) -> Result<Appliance> {
+        with(&format!(
+            "[services.dns]\nupstream = [\"9.9.9.9\"]\nsecure-upstream = [{}]",
+            toml::Value::String(upstream.into())
+        ))
+    }
+
+    #[test]
+    fn secure_upstream_accepts_the_three_encrypted_transports() {
+        for ok in [
+            "tls://dns.quad9.net",
+            "tls://9.9.9.9:853",
+            "tls://[2620:fe::fe]:853",
+            "https://dns.quad9.net/dns-query",
+            "https://cloudflare-dns.com:443/dns-query",
+            "quic://dns.adguard-dns.com",
+        ] {
+            assert!(secure(ok).is_ok(), "{ok}: {:?}", secure(ok).err());
+        }
+    }
+
+    #[test]
+    fn secure_upstream_refuses_anything_that_could_become_another_argument() {
+        for bad in [
+            // Another dnsproxy flag, spliced in with a space.
+            "tls://dns.quad9.net --listen=0.0.0.0",
+            // A second environment assignment, spliced in with a newline.
+            "tls://dns.quad9.net\nLD_PRELOAD=/tmp/x.so",
+            "tls://dns.quad9.net\t--port=53",
+            // systemd's EnvironmentFile parser strips quotes and backslashes.
+            "tls://\"dns.quad9.net\"",
+            "tls://dns.quad9.net\\",
+            // Not one of the encrypted transports, or none at all.
+            "udp://9.9.9.9",
+            "9.9.9.9",
+            "--upstream=9.9.9.9",
+            "tls://",
+            // A path only means something to DNS over HTTPS.
+            "tls://dns.quad9.net/dns-query",
+            // Malformed authorities.
+            "tls://dns.quad9.net:0",
+            "tls://dns.quad9.net:99999",
+            "tls://-dns.quad9.net",
+            "tls://[2620:fe::fe",
+            "tls://2620:fe::fe",
+            "https://dns.quad9.net/dns query",
+            "https://dns.quad9.net/dns-query?x=$(id)",
+        ] {
+            let err = secure(bad).expect_err(bad);
+            assert!(
+                format!("{err:#}").contains("secure-upstream"),
+                "{bad:?}: the refusal must name the setting: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn pppoe_server_values_spliced_into_its_argument_line_are_validated() {
+        let ok = "[services.pppoe-server]\ninterface = \"eth0\"\nlocal-address = \"10.90.0.1\"\n\
+                  pool-start = \"10.90.0.100\"\ndns = [\"10.90.0.1\"]\nservice-name = \"internet\"\n\
+                  ac-name = \"bng-1\"";
+        assert!(with(ok).is_ok(), "{:?}", with(ok).err());
+        for (field, bad) in [
+            ("interface", "eth0 -O /tmp/evil"),
+            ("interface", "nope0"),
+            ("local-address", "10.90.0.1 -O /tmp/evil"),
+            ("pool-start", "10.90.0.100\nX=1"),
+            ("service-name", "internet -O /tmp/evil"),
+            ("service-name", "inter\"net"),
+            ("ac-name", "bng\n-O /tmp/evil"),
+        ] {
+            let doc = ok
+                .lines()
+                .map(|l| {
+                    if l.starts_with(&format!("{field} =")) {
+                        format!("{field} = {}", toml::Value::String(bad.into()))
+                    } else {
+                        l.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let err = with(&doc).expect_err(bad);
+            assert!(
+                format!("{err:#}").contains("pppoe-server"),
+                "{field}={bad:?}: {err:#}"
+            );
+        }
+        let bad_dns = ok.replace("dns = [\"10.90.0.1\"]", "dns = [\"10.90.0.1 x\"]");
+        assert!(with(&bad_dns).is_err());
+    }
+
+    #[test]
+    fn dhcp_domain_cannot_splice_a_networkd_directive() {
+        let doc = |domain: &str| {
+            format!(
+                "[system]\nhostname = \"fw\"\n[[interface]]\nname = \"eth0\"\nzone = \"lan\"\n\
+                 address = \"10.0.0.1/24\"\n[interface.dhcp-server]\ndomain = {}\n[zone.lan]\n",
+                toml::Value::String(domain.into())
+            )
+        };
+        assert!(Appliance::from_toml(&doc("lan.example")).is_ok());
+        for bad in [
+            "lan.example\n[Network]\nIPv4Forwarding=yes",
+            "lan example",
+            "",
+        ] {
+            assert!(Appliance::from_toml(&doc(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn locale_charset_cannot_carry_a_second_assignment() {
+        let locale = |l: &str| {
+            Appliance::from_toml(&BASE.replace(
+                "hostname = \"fw\"\n",
+                &format!(
+                    "hostname = \"fw\"\nlocale = {}\n",
+                    toml::Value::String(l.into())
+                ),
+            ))
+        };
+        for ok in [
+            "de_DE.UTF-8",
+            "en_US.utf8",
+            "C",
+            "POSIX",
+            "de_DE.UTF-8@euro",
+            "de_DE",
+        ] {
+            assert!(locale(ok).is_ok(), "{ok}: {:?}", locale(ok).err());
+        }
+        for bad in [
+            "de_DE.UTF-8\nLD_PRELOAD=/tmp/x.so",
+            "de_DE.UTF 8",
+            "de_DE./x",
+        ] {
+            assert!(locale(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn serial_console_device_is_a_tty_name_not_a_path() {
+        let console = |d: &str| {
+            with(&format!(
+                "[system.console]\ndevice = {}\nspeed = 115200",
+                toml::Value::String(d.into())
+            ))
+        };
+        for ok in ["ttyS0", "ttyUSB0", "ttyAMA0", "hvc0"] {
+            assert!(console(ok).is_ok(), "{ok}: {:?}", console(ok).err());
+        }
+        for bad in [
+            "../../etc/systemd/system/x",
+            "ttyS0/..",
+            "ttyS0\n",
+            "",
+            "tty S0",
+        ] {
+            assert!(console(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_wireguard_key_error_never_prints_the_key() {
+        // A private key one character short: still a secret, still not valid.
+        let secret = "kHwGDRm2nVmlXQ5hT1F2hb1D/VY2vGb3qpqsGG9Hxl";
+        let err = format!("{:#}", validate_wg_key(secret).unwrap_err());
+        assert!(!err.contains(secret), "the key leaked into: {err}");
+        assert!(
+            !err.contains(&secret[..16]),
+            "part of the key leaked into: {err}"
+        );
+        assert!(err.contains("base64"), "say what is wrong: {err}");
+        // Valid base64 of the wrong length.
+        let short = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let err = format!("{:#}", validate_wg_key(short).unwrap_err());
+        assert!(!err.contains(short), "the key leaked into: {err}");
+        assert!(err.contains("30 bytes") && err.contains("32"), "{err}");
+    }
+}
+
+/// A DHCP server on a leased-HA pair. Leases are not replicated, so the design
+/// is that only the lease owner serves: the standby's data links are fenced by
+/// the HA guard, which drops the DISCOVERs before its server ever sees them. A
+/// server on an unfenced link would run on both members at once, from the same
+/// pool, and a gateway that is one member's own address is gone after failover.
+#[cfg(test)]
+mod ha_dhcp_validation_tests {
+    use super::*;
+
+    #[test]
+    fn a_ha_dhcp_server_needs_a_gateway_that_survives_failover() {
+        let mut a = crate::ha::paired_fixture();
+        a.interfaces[0].dhcp_server = Some(DhcpServer::default());
+        // wan0 carries the VIP 10.10.0.254 inside 10.10.0.0/24: fine.
+        a.validate().unwrap();
+        // Move the VIP out of the served subnet: the node address would be the
+        // gateway, so the server is refused rather than rendered.
+        a.protocols.vrrp[0].virtual_address = vec!["10.99.0.254".into()];
+        let err = format!("{:#}", a.validate().unwrap_err());
+        assert!(
+            err.contains("dhcp-server") && err.contains("failover"),
+            "{err}"
+        );
+        // An explicit default-router is the operator's answer to that question.
+        a.interfaces[0].dhcp_server.as_mut().unwrap().default_router = Some("10.10.0.250".into());
+        a.validate().unwrap();
+    }
+
+    #[test]
+    fn a_ha_dhcp_server_on_the_unfenced_control_link_is_refused() {
+        let mut a = crate::ha::paired_fixture();
+        // sync0 is the control link: never fenced, so both members would serve
+        // the same pool to the same segment at the same time.
+        a.interfaces[1].dhcp_server = Some(DhcpServer {
+            default_router: Some("10.20.0.1".into()),
+            ..Default::default()
+        });
+        let err = format!("{:#}", a.validate().unwrap_err());
+        assert!(
+            err.contains("sync0") && err.contains("both members"),
+            "{err}"
         );
     }
 }
