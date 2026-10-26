@@ -200,7 +200,9 @@ in pkgs.testers.runNixOSTest {
     master.succeed("systemctl kill --kill-who=main --signal=SIGSTOP wren.service")
     '' else "master.crash()"}
     while True:
-        code,_=backup.execute("ip -o address show eth2 | grep -q 10.2.0.100")
+        # Legacy VRRP groups have independent timers. Promotion is complete
+        # only when both WAN and LAN VIPs are present within the same deadline.
+        code,_=backup.execute("ip -o address show eth2 | grep -q 10.2.0.100 && ip -o address show eth1 | grep -q 10.1.0.100")
         if code == 0: break
         assert time.monotonic()-started < 1.0, "VIP promotion exceeded one second"
         time.sleep(0.01)
