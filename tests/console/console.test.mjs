@@ -519,6 +519,7 @@ await test("leased HA settings save, validate and protect peer identity", async 
     "console-ha-cluster-1", "A".repeat(43) + "=", JSON.stringify(identity, null, 2)];
   try {
     const result = await page.evaluate(`(async () => {
+      if (document.getElementById("result").open) document.getElementById("resultclose").click();
       staged = []; dirty.clear(); renderStaged(); view = "ha"; panel = null; await refresh();
       const box = document.getElementById("haform");
       const widgets = [...box.querySelectorAll(".field")].map((f) =>
@@ -536,7 +537,7 @@ await test("leased HA settings save, validate and protect peer identity", async 
       const revealed = secret.type === "text" && toggle.getAttribute("aria-pressed") === "true";
       toggle.click();
       const hiddenAgain = secret.type === "password";
-      [...box.querySelectorAll("button")].find((b) => b.textContent === "Stage").click();
+      [...box.querySelectorAll("button")].find((b) => b.textContent.startsWith("Stage")).click();
       const commands = stagedCommands();
       const safeSummary = !document.getElementById("stagedlist").textContent.includes("peer-two");
       await applyStaged(["commit", "save"]);
@@ -545,7 +546,7 @@ await test("leased HA settings save, validate and protect peer identity", async 
         pending: stagedCommands(), current };
     })()`);
     check(result.focused && result.masked && result.revealed && result.hiddenAgain,
-      "peer identity must have an associated label and an accessible masked/reveal control");
+      "peer identity focus/masking/reveal failed: " + JSON.stringify({ focused: result.focused, masked: result.masked, revealed: result.revealed, hiddenAgain: result.hiddenAgain }));
     check(result.safeSummary, "peer identity leaked into the staged summary");
     equal(result.pending, [], "valid HA settings remained staged");
     equal(JSON.parse(result.current["peer-identity"]), identity, "JSON identity did not survive CLI quoting");
@@ -553,10 +554,11 @@ await test("leased HA settings save, validate and protect peer identity", async 
     check(result.commands.length === 9, "not every HA setting was staged");
     const before = CONFIG && readFileSync(CONFIG, "utf8");
     const refused = await page.evaluate(`(async () => {
+      document.getElementById("resultclose").click();
       await refresh(); const box = document.getElementById("haform");
       const field = [...box.querySelectorAll(".field")].find((f) => f.textContent.includes("Election priority"));
       field.querySelector("input").value = "0";
-      [...box.querySelectorAll("button")].find((b) => b.textContent === "Stage").click();
+      [...box.querySelectorAll("button")].find((b) => b.textContent.startsWith("Stage")).click();
       await applyStaged(["commit", "save"]);
       return { pending: stagedCommands(), output: document.getElementById("resultout").textContent };
     })()`);
@@ -566,7 +568,9 @@ await test("leased HA settings save, validate and protect peer identity", async 
   } finally {
     await page.evaluate(`(async () => {
       staged = []; dirty.clear(); renderStaged();
-      await configure(["delete system ha", "commit", "save"]); await refresh();
+      await configure(["delete system ha", "commit", "save"]);
+      if (document.getElementById("result").open) document.getElementById("resultclose").click();
+      await refresh();
     })()`);
   }
 });
@@ -575,17 +579,19 @@ await test("the independent witness edits preserve its enrollment credential", a
   const credential = "console-witness-enrollment-credential-123456";
   try {
     const result = await page.evaluate(`(async () => {
+      if (document.getElementById("result").open) document.getElementById("resultclose").click();
       staged = []; dirty.clear(); renderStaged(); view = "ha"; panel = null; await refresh();
       const box = document.getElementById("hawitnessform");
       const widgets = [...box.querySelectorAll(".field")].map((f) => f.querySelector(".secretfield, input"));
       ["127.0.0.9:5440", ${JSON.stringify(credential)}, "console-ha-cluster-1"].forEach((v, i) => {
         widgets[i].value = v; widgets[i].dispatchEvent(new Event("input"));
       });
-      [...box.querySelectorAll("button")].find((b) => b.textContent === "Stage").click();
+      [...box.querySelectorAll("button")].find((b) => b.textContent.startsWith("Stage")).click();
       await applyStaged(["commit", "save"]); await refresh();
+      document.getElementById("resultclose").click();
       const edit = document.getElementById("hawitnessform");
       edit.querySelector("input").value = "127.0.0.9:5441";
-      [...edit.querySelectorAll("button")].find((b) => b.textContent === "Stage").click();
+      [...edit.querySelectorAll("button")].find((b) => b.textContent.startsWith("Stage")).click();
       const commands = stagedCommands();
       await applyStaged(["commit", "save"]);
       return { commands, pending: stagedCommands() };
@@ -601,7 +607,9 @@ await test("the independent witness edits preserve its enrollment credential", a
   } finally {
     await page.evaluate(`(async () => {
       staged = []; dirty.clear(); renderStaged();
-      await configure(["delete system ha-witness", "commit", "save"]); await refresh();
+      await configure(["delete system ha-witness", "commit", "save"]);
+      if (document.getElementById("result").open) document.getElementById("resultclose").click();
+      await refresh();
     })()`);
   }
 });
