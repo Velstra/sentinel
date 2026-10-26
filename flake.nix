@@ -67,6 +67,33 @@
       pkgs = nixpkgs.legacyPackages.${system}.extend crateSource;
       lib = nixpkgs.lib;
 
+      # Compile and test React in the sandbox. Cargo embeds these exact assets;
+      # neither the appliance nor an isolated browser needs Node or a CDN.
+      sentinelFrontend = pkgs.buildNpmPackage {
+        pname = "sentinel-ui";
+        version = "1.0.0";
+        src = lib.cleanSourceWith {
+          src = ./ui;
+          filter = path: type: lib.cleanSourceFilter path type
+            && baseNameOf path != "node_modules";
+        };
+        npmDepsHash = "sha256-lSrSTn/hhuhnNRdLgQ5zv43Xs/r/ugWWWWzwo+rPvls=";
+        doCheck = true;
+        preBuild = "cp -r dist expected-dist";
+        checkPhase = ''
+          runHook preCheck
+          npm run format:check
+          npm test
+          cmp expected-dist/management.js dist/management.js
+          cmp expected-dist/management.css dist/management.css
+          runHook postCheck
+        '';
+        installPhase = ''
+          mkdir -p "$out"
+          cp dist/management.js dist/management.css "$out/"
+        '';
+      };
+
       # --- the sentinel CLI (stable rustc is fine) ---------------------------
       sentinelCore = pkgs.rustPlatform.buildRustPackage {
         pname = "sentinel";
@@ -83,6 +110,10 @@
             && !(builtins.elem (baseNameOf path) [ "flake.lock" "docs" ".github" "README.md" "CHANGELOG.md" ]);
         };
         cargoLock.lockFile = ./Cargo.lock;
+        preBuild = ''
+          cp ${sentinelFrontend}/management.js ui/dist/management.js
+          cp ${sentinelFrontend}/management.css ui/dist/management.css
+        '';
         nativeBuildInputs = [ pkgs.protobuf ];
         PROTOC = "${pkgs.protobuf}/bin/protoc";
         # The password tests hash with the same `openssl passwd` the appliance
@@ -387,6 +418,7 @@
       packages.${system} = {
         default = sentinel;
         inherit sentinel velstra velstra-ebpf;
+        sentinel-ui = sentinelFrontend;
         wren = wrenPkg;
         # The flashable verified-boot disk image (dm-verity store + UKI). Note:
         # `finalImage` is the two-stage verity build with the roothash-bearing
@@ -1504,6 +1536,7 @@
       # the data plane stays up.
       #   nix build .#checks.x86_64-linux.commit -L
       checks.${system} = {
+        react-ui = sentinelFrontend;
         # Every map the agent looks up by name exists in the object it loads.
         #
         # This exists because of one specific trap. `velstra-ebpf` is a
@@ -2139,7 +2172,9 @@
                   "const h=f.readFileSync('/tmp/console.html','utf8');"
                   "const a=h.indexOf('>',h.indexOf('<script'))+1;"
                   "const b=h.indexOf('</'+'script>');"
-                  "f.writeFileSync('/tmp/console.js',h.slice(a,b));\""
+                  "const c=h.lastIndexOf('<script>')+8;"
+                  "const d=h.lastIndexOf('</'+'script>');"
+                  "f.writeFileSync('/tmp/console.js',h.slice(a,b)+';'+h.slice(c,d));\""
               )
               machine.succeed("node --check /tmp/console.js")
 
@@ -2209,8 +2244,9 @@
           # It reaches outside for nothing. An appliance is expected to work on
           # an isolated network, and a console that half-renders without the
           # internet is worse than no console.
+          authored_page = page.split("<script data-sentinel-react>")[0] + page.split("<script data-sentinel-react>")[1].split("</script>", 1)[1]
           for external in ["http://", "https://", "<link", "<script src", "@import"]:
-              assert external not in page, f"the console fetches {external!r}"
+              assert external not in authored_page, f"the console fetches {external!r}"
 
           # The design system's tokens have to be *in* the page. The system's own
           # font file imports them from a CDN, which an appliance cannot reach —

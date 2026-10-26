@@ -20,3 +20,7 @@ target/
 # Nix build result symlinks (point at machine-local /nix/store paths)
 /result
 /result-*
+
+# Frontend dependencies; production bundles are committed for plain cargo builds.
+/ui/node_modules/
+/ui/coverage/

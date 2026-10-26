@@ -91,11 +91,16 @@ export async function browser({ port = 0, width = 1600, height = 1000 } = {}) {
   let id = 0;
   const pending = new Map();
   const thrown = [];
+  const requests = [];
   ws.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
     if (m.id && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); return; }
     // An uncaught exception is the failure mode this harness exists for: the
     // page keeps rendering and every button wired after it is dead.
+    if (m.method === "Network.requestWillBeSent") {
+      requests.push(m.params.request.url);
+      if (requests.length > 16384) requests.shift();
+    }
     if (m.method === "Runtime.exceptionThrown") {
       const d = m.params.exceptionDetails;
       thrown.push(`${d.exception?.description || d.text} (line ${d.lineNumber})`);
@@ -155,9 +160,12 @@ export async function browser({ port = 0, width = 1600, height = 1000 } = {}) {
 
   await send("Runtime.enable");
   await send("Page.enable");
+  await send("Network.enable");
 
   return {
     evaluate,
+    send,
+    requests,
     thrown,
     async goto(url) { await send("Page.navigate", { url }); await sleep(1200); },
     async screenshot() {

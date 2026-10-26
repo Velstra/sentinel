@@ -137,7 +137,8 @@ nix build .#sentinel-image .#sentinel-iso -L
 ```
 
 The web assets are compiled into the Rust binary and Nix appliance; there is no
-separate npm build or runtime asset server. The test suite boots Linux VMs for
+runtime asset server. The React/TypeScript management views are built and tested
+with npm, then embedded in the Rust binary (see below). The test suite boots Linux VMs for
 real packet forwarding/NAT, kernel verifier loading, service reconciliation,
 HA/replication, management rollback and mTLS fleet commands. Hardware-specific
 TPM/Secure Boot provisioning and physical NIC compatibility still require
@@ -153,3 +154,44 @@ published vendor update channel or signing authority.
 
 **AGPL-3.0-or-later**. A commercial license is available; contributions are under
 the project CLA.
+
+### React management UI
+
+The live dashboard, flow/rule inspector, TOML editor and global Commit-Confirm
+banner are React/TypeScript components in `ui/`. They use the same authenticated
+API, telemetry collector and durable safe-apply worker as the CLI-backed console.
+The navigation, login and remaining configuration forms retain their existing
+implementation during this incremental migration. The shared shell uses the same
+light/dark tokens as the React views. On narrow screens, open **Menu** to find
+a destination; Escape closes it. Dashboard cards and quick access buttons open
+the corresponding management page. **Policy → Firewall rules** opens the rule
+editor, while **Policy → Live packets** opens the live inspector. Its **Blocked**
+preset includes both dropped and rejected packets. Technical source errors and
+additional dashboard diagnostics can be expanded when needed.
+
+```sh
+cd ui
+npm ci
+npm test
+npm run build
+npm run check:assets
+cd ..
+cargo build --locked
+CONSOLE_TEST_FILE=react.test.mjs bash tests/console/run.sh target/debug/sentinel
+nix build .#sentinel-ui .#sentinel
+```
+
+Commit `ui/dist/management.js` and `ui/dist/management.css` with source changes so
+plain Cargo builds work without Node. CI rejects stale bundles. Nix rebuilds and
+tests the assets from the pinned npm lockfile in its sandbox, compares them with
+the committed output, and embeds that result into Sentinel and its appliance
+images. There are no runtime package downloads or CDN requests.
+
+The dashboard displays measured interface throughput/PPS, HA authority and replica
+age, BGP/OSPF neighbors and WireGuard handshake age. Source failures remain unknown.
+The flow inspector filters the bounded live event window by action, rule, endpoint
+or interface and supports pagination and a paused display. The configuration editor
+reveals secrets only on request, retains rejected drafts, provides a side-by-side
+visual diff, and validates through the same parser/schema as `sentinel validate`.
+Applying starts the server's confirmation window (60 seconds by default). Only
+**Keep change** confirms it; polling and navigation never extend the deadline.
