@@ -23,6 +23,7 @@ mod confirm;
 mod diff;
 mod domain;
 mod feed;
+mod fleet;
 mod grammar_walk;
 mod ha;
 mod identity;
@@ -43,6 +44,8 @@ mod pki;
 mod portal;
 mod portmap;
 mod proxy;
+#[cfg(test)]
+mod quickstart;
 mod reconcile;
 mod relay;
 mod repl;
@@ -239,6 +242,13 @@ enum Command {
     /// once a minute; not something to type, but not hidden either — a timer
     /// whose command cannot be run by hand is a timer nobody can debug.
     RecordMetrics,
+    /// Perform one authenticated fleet check-in, or exit without networking in standalone mode.
+    FleetPoll {
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+        #[arg(long)]
+        no_apply: bool,
+    },
     /// Capture packets on an interface (bounded: never more than 500 packets
     /// or 60 seconds, and nothing is written to disk).
     Capture {
@@ -601,6 +611,11 @@ async fn main() -> Result<()> {
                 print!("{}", answer.render());
             }
             Ok(())
+        }
+        Command::FleetPoll { config, no_apply } => {
+            let mut act = repl::Apply::off();
+            act.enabled = !no_apply;
+            fleet::poll(&std::path::absolute(config)?, &act)
         }
         Command::RecordMetrics => {
             let root = crate::metrics::dir();

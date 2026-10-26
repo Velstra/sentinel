@@ -523,6 +523,33 @@ pub struct Appliance {
     /// not configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update: Option<Update>,
+    /// Optional outbound fleet management. No controller is contacted when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet: Option<Fleet>,
+}
+
+/// Provisioned fleet identity. Private key material stays in private files.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Fleet {
+    pub controller_url: String,
+    pub node_id: String,
+    pub enrollment_token: String,
+    pub ca_certificate: String,
+    pub client_certificate: String,
+    pub client_key: String,
+    /// Base64-encoded raw Ed25519 public key, independent of the TLS CA.
+    pub signing_key: String,
+    /// Omitted means five seconds; zero and values above 300 are refused.
+    pub poll_interval: Option<u32>,
+}
+impl std::fmt::Debug for Fleet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Fleet")
+            .field("controller_url", &self.controller_url)
+            .field("node_id", &self.node_id)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The `[update]` section (roadmap C13): the signed update channel(s).
@@ -10802,6 +10829,10 @@ impl Appliance {
         // that would otherwise fail hours later inside a timer, with nobody
         // watching (roadmap C19).
         crate::acme::validate(&self.pki)?;
+
+        if let Some(fleet) = &self.fleet {
+            crate::fleet::validate(fleet)?;
+        }
 
         // Signed update channel(s) (roadmap C13): every URL must be a fetchable
         // channel and every pinned key must be present (a key's cryptographic

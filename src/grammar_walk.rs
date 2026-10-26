@@ -98,6 +98,18 @@ const BASE: &[&str] = &[
 /// on top of [`BASE`].
 const CONTEXT: &[(&str, &[&str])] = &[
     (
+        "fleet",
+        &[
+            "set fleet controller-url https://fleet.example",
+            "set fleet node-id sentinel-test",
+            "set fleet enrollment-token test-enrollment-credential",
+            "set fleet ca-certificate /etc/fleet/ca.pem",
+            "set fleet client-certificate /etc/fleet/client.pem",
+            "set fleet client-key /etc/fleet/client.key",
+            "set fleet signing-key AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        ],
+    ),
+    (
         "protocols bgp",
         &[
             "set protocols bgp local-as 65001",
@@ -351,6 +363,9 @@ fn from_hint(ph: &str) -> &'static str {
         "<email>" => "ops@example.com",
         "<fqdn>" => "host.example.com",
         "<url>" => "https://example.com/hook",
+        "<enrollment-token>" => "test-enrollment-credential",
+        "<ed25519-base64>" => "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        "<absolute-path>" => "/etc/fleet/client.pem",
         "<host:port>" => "10.20.30.40:514",
         "<key>" => "sample-secret",
         "<text>" => "sample",

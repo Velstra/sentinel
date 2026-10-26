@@ -1362,6 +1362,7 @@ struct Draft {
     /// signing key, the named channels, and which one is active. `None` when
     /// unconfigured; a singleton created on the first `set update …`.
     update: Option<UpdateDraft>,
+    fleet: Option<crate::config::Fleet>,
     /// L7 reverse-proxy / load-balancer frontends (roadmap C22), keyed by name in
     /// sorted order (a `BTreeMap`, so materialise/show are name-ordered). Each
     /// terminates a listen port (optionally TLS via a PKI cert) and forwards to
@@ -2726,6 +2727,7 @@ impl Draft {
                     })
                     .collect(),
             }),
+            fleet: a.fleet.clone(),
             update: a.update.as_ref().map(|u| UpdateDraft {
                 url: u.url.clone(),
                 public_key: u.public_key.clone(),
@@ -6117,6 +6119,30 @@ impl Session {
             // `file:<path>` ref or an inline PEM whose whitespace-split tokens
             // are rejoined. Format/PEM checks live in config `validate()` and
             // run at commit.
+            ["fleet", field, v] => {
+                let fleet = self.draft.fleet.get_or_insert_with(Default::default);
+                match *field {
+                    "controller-url" => fleet.controller_url = (*v).into(),
+                    "node-id" => fleet.node_id = (*v).into(),
+                    "enrollment-token" => {
+                        if *v == KEY_NOT_SHOWN {
+                            bail!(
+                                "use show configuration commands to obtain the real fleet credential"
+                            );
+                        }
+                        fleet.enrollment_token = (*v).into();
+                    }
+                    "ca-certificate" => fleet.ca_certificate = (*v).into(),
+                    "client-certificate" => fleet.client_certificate = (*v).into(),
+                    "client-key" => fleet.client_key = (*v).into(),
+                    "signing-key" => fleet.signing_key = (*v).into(),
+                    "poll-interval" => {
+                        fleet.poll_interval =
+                            Some(v.parse().context("fleet poll interval must be seconds")?)
+                    }
+                    _ => bail!("unknown fleet field {field}"),
+                }
+            }
             ["update", "url", v] => {
                 self.draft.update_mut().url = Some((*v).to_string());
             }
@@ -8566,6 +8592,22 @@ impl Session {
             // touching the selection, so deleting the active channel is caught
             // by commit ("selected but not defined") rather than silently
             // re-pointing updates somewhere nobody chose.
+            ["fleet"] => self.draft.fleet = None,
+            ["fleet", field] => {
+                if let Some(fleet) = &mut self.draft.fleet {
+                    match *field {
+                        "controller-url" => fleet.controller_url.clear(),
+                        "node-id" => fleet.node_id.clear(),
+                        "enrollment-token" => fleet.enrollment_token.clear(),
+                        "ca-certificate" => fleet.ca_certificate.clear(),
+                        "client-certificate" => fleet.client_certificate.clear(),
+                        "client-key" => fleet.client_key.clear(),
+                        "signing-key" => fleet.signing_key.clear(),
+                        "poll-interval" => fleet.poll_interval = None,
+                        _ => bail!("unknown fleet field {field}"),
+                    }
+                }
+            }
             ["update"] => self.draft.update = None,
             ["update", "channel"] => {
                 let Some(d) = self.draft.update.as_mut() else {
@@ -8749,7 +8791,8 @@ impl Session {
             // renderable — `show load-balancer` answered "unknown section",
             // which reads like the feature does not exist.
             "system" | "interface" | "interfaces" | "firewall" | "nat" | "protocols" | "policy"
-            | "services" | "multiwan" | "vpn" | "pki" | "update" | "load-balancer" | "evpn" => {
+            | "services" | "multiwan" | "vpn" | "pki" | "update" | "load-balancer" | "evpn"
+            | "fleet" => {
                 let out = render_draft_only(&self.draft, false, Some(section));
                 if out.is_empty() {
                     format!("(no {section} configuration)\n")
@@ -8760,7 +8803,7 @@ impl Session {
             other => format!(
                 "error: unknown section {other:?} (system | interfaces | firewall | nat | \
                  load-balancer | protocols | policy | services | multiwan | vpn | pki | evpn | \
-                 update)\n"
+                 update | fleet)\n"
             ),
         }
     }
@@ -9683,6 +9726,7 @@ impl Session {
             // unset stay `None` so `validate()` surfaces a clear "X is
             // required" rather than silently dropping a half-specified channel;
             // a section with nothing in it materialises to None.
+            fleet: self.draft.fleet.clone(),
             update: self.draft.update.as_ref().and_then(|u| {
                 if u.url.is_none()
                     && u.public_key.is_none()
@@ -12341,6 +12385,37 @@ fn render_draft_masked(
             out.push_str("    }\n");
         }
         out.push_str("}\n");
+    }
+
+    if want("fleet") {
+        if let Some(fleet) = &draft.fleet {
+            out.push_str("fleet {\n");
+            for (key, value) in [
+                ("controller-url", &fleet.controller_url),
+                ("node-id", &fleet.node_id),
+                ("enrollment-token", &fleet.enrollment_token),
+                ("ca-certificate", &fleet.ca_certificate),
+                ("client-certificate", &fleet.client_certificate),
+                ("client-key", &fleet.client_key),
+                ("signing-key", &fleet.signing_key),
+            ] {
+                if !value.is_empty() {
+                    if key == "enrollment-token" && secrets == Secrets::Masked {
+                        out.push_str(&format!("    {key} {KEY_NOT_SHOWN}\n"));
+                    } else {
+                        if value.chars().any(char::is_whitespace) || value.starts_with('"') {
+                            out.push_str(&format!("    {key} {value:?}\n"));
+                        } else {
+                            out.push_str(&format!("    {key} {value}\n"));
+                        }
+                    }
+                }
+            }
+            if let Some(seconds) = fleet.poll_interval {
+                out.push_str(&format!("    poll-interval {seconds}\n"));
+            }
+            out.push_str("}\n");
+        }
     }
 
     // update { … } — the signed update channels (roadmap C13). The pinned key

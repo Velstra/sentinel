@@ -398,6 +398,7 @@
         # The live-boot installer ISO (carries the image above; runs `sentinel
         # install`).  nix build .#sentinel-iso
         sentinel-iso = self.nixosConfigurations.sentinel-iso.config.system.build.isoImage;
+        qemu-firmware = pkgs.OVMF.fd;
       };
 
       # `nix run .#vm` — boot the appliance in a throwaway QEMU VM. The easy
@@ -750,6 +751,29 @@
               ExecStart = "${sentinel}/bin/sentinel api --listen $SENTINEL_API_LISTEN --config /var/lib/sentinel/appliance.toml --token-file /var/lib/sentinel/api-token";
               Restart = "on-failure";
               RestartSec = "5s";
+            };
+          };
+
+          # Optional fleet hook: no wantedBy and no listening socket. Declarative
+          # reconciliation starts/stops only this timer; controller outages never
+          # become a boot or forwarding dependency.
+          systemd.services.sentinel-fleet = {
+            description = "Authenticated Sentinel fleet check-in";
+            after = [ "network.target" "sentinel-boot-late.service" ];
+            unitConfig.StartLimitIntervalSec = 0;
+            serviceConfig = {
+              Type = "oneshot";
+              ExecStart = "${sentinel}/bin/sentinel fleet-poll --config /var/lib/sentinel/appliance.toml";
+              UMask = "0077";
+              TimeoutStartSec = "45s";
+              KillMode = "control-group";
+            };
+          };
+          systemd.timers.sentinel-fleet = {
+            timerConfig = {
+              OnBootSec = "5s";
+              OnUnitInactiveSec = "5s";
+              AccuracySec = "100ms";
             };
           };
 
@@ -2515,6 +2539,8 @@
         # Existing per-PR API builds include the independent-worker, lockout,
         # reboot and concurrent real-kernel stream proof automatically.
         { name = "management"; path = self.checks.${system}.management; }
+        { name = "fleet"; path = self.checks.${system}.fleet; }
+        { name = "quickstart"; path = self.checks.${system}.quickstart; }
       ]) // { driver = apiVm.driver; };
 
       # Admin AAA against a real directory (roadmap C12): a genuine TACACS+
@@ -12556,6 +12582,8 @@
         # their members are enslaved.
         #   nix build .#checks.x86_64-linux.l2 -L
         management = import ./nix/management-test.nix { inherit pkgs self; };
+        fleet = import ./nix/fleet-test.nix { inherit pkgs self; };
+        quickstart = import ./nix/quickstart-test.nix { inherit pkgs self; };
         reconciliation = import ./nix/reconciliation-test.nix { inherit pkgs self; };
         phase2-dataplane = import ./nix/phase2-dataplane-test.nix { inherit pkgs self; };
 

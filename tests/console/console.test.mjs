@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { browser, signIn, sleep, test, check, equal, summary } from "./harness.mjs";
 import { instrument, walkAll, collect, sectionFields } from "./coverage.mjs";
 import { managementTests } from "./management.test.mjs";
+import { fleetTests } from "./fleet.test.mjs";
 
 // Note: this shadows the global `URL` for the whole file — resolve paths next
 // to this file with `fileURLToPath(import.meta.url)`, never with `new URL()`.
@@ -29,6 +30,7 @@ await test("the page loads without the script throwing", () => {
 });
 
 await managementTests(page);
+await fleetTests(page);
 
 // --- navigation -------------------------------------------------------------
 
