@@ -6714,8 +6714,8 @@
         # image whose slot-A GUIDs ARE the running slot's would leave two
         # partitions with one PARTUUID, and the initrd hangs on that instead of
         # rolling back (the refusal is asserted below, the reason is written at
-        # the refusal in install.rs). The donor rides along as a read-only
-        # second virtio disk (vdb); its node is never started.
+        # the refusal in install.rs). The donor is hot-plugged as a USB update
+        # medium after boot; its separate NixOS node is never started.
         #
         # The cross-reboot slot switch is then driven for real: the machine
         # comes back on slot B, and the donor's marker file is the proof of
@@ -6761,13 +6761,10 @@
                   useEFIBoot = true;
                   memorySize = 2048;
                   fileSystems = lib.mkVMOverride { };
-                  # The donor image as the second virtio disk (vdb), behind a
-                  # throwaway qcow2 overlay the test script creates — the
-                  # update only reads it, but the test blanks it before the
-                  # reboot (see there), and the store copy is read-only.
-                  qemu.options = [
-                    "-drive if=virtio,format=qcow2,file=$DONOR_DISK_IMAGE"
-                  ];
+                  # Attach the update stick AFTER boot, just as an operator
+                  # would. Booting with two appliance images races their equal
+                  # LABEL=data mounts and can put live state on the donor.
+                  qemu.options = [ "-device qemu-xhci,id=update-usb" ];
                 };
               };
           };
@@ -6793,8 +6790,6 @@
                 "-b", "${nodes.donor.system.build.finalImage}/${nodes.donor.image.filePath}",
                 "-F", "raw", tmp_donor.name,
               ], check=True)
-              os.environ["DONOR_DISK_IMAGE"] = tmp_donor.name
-
               machine.wait_for_unit("multi-user.target")
 
               src = ""
@@ -6805,7 +6800,19 @@
                       break
               assert src, "no source disk"
               disk = "/dev/" + src
-              donor_disk = "/dev/vdb"
+              donor_disk = "/dev/sda"
+              with subtest("the appliance owns its data before the USB update medium arrives"):
+                  assert machine.succeed("findmnt -n -o SOURCE /var/lib/sentinel").strip() == disk + "6"
+                  machine.succeed("printf persistent-target-data > /var/lib/sentinel/update-data-proof")
+                  machine.fail(f"test -e {donor_disk}")
+                  drive = machine.send_monitor_command(
+                      f"drive_add 0 if=none,id=update-source,format=qcow2,file={tmp_donor.name}")
+                  assert "Error" not in drive, drive
+                  attached = machine.send_monitor_command(
+                      "device_add usb-storage,bus=update-usb.0,drive=update-source,id=update-stick")
+                  assert "Error" not in attached, attached
+                  machine.wait_until_succeeds(f"test -b {donor_disk}3", timeout=30)
+                  assert machine.succeed("findmnt -n -o SOURCE /var/lib/sentinel").strip() == disk + "6"
 
               # lsblk rather than sgdisk: the appliance reaches sgdisk by an
               # absolute store path, the test shell has no such PATH entry.
@@ -6865,26 +6872,19 @@
                   assert guid(disk, 5) == guid(donor_disk, 3), (
                       f"slot B store GUID {guid(disk, 5)} does not match the donor's {guid(donor_disk, 3)}")
 
-              # Slot B now answers to the donor's GUIDs — by design, that is how
-              # the initrd finds it. A medium still attached at boot answers to
-              # the same GUIDs, and systemd takes whichever it meets first: with
-              # the donor left in, the machine came back with /usr backed by the
-              # DONOR's store partition, not by slot B (this check found that).
-              # So the medium goes blank here, standing in for the stick an
-              # operator pulls; `sentinel update` says as much when its source
-              # is a device.
-              with subtest("the donor medium is blanked before the reboot"):
-                  machine.succeed(f"wipefs -a {donor_disk}")
-                  machine.succeed("udevadm settle")
-                  machine.fail(f"test -b {donor_disk}3")
-
-              # And the proof that costs a reboot: come up on the slot the update
-              # just made default. Every assertion above holds for an update that
-              # writes a slot nothing can boot -- which is why they all held.
-              with subtest("the appliance actually boots the slot it switched to"):
+              # Slot B now has the donor's GUIDs. The hot-plugged USB medium
+              # must be absent at the next boot, or the initrd could select its
+              # store instead. QEMU hot-plug state is deliberately not part of
+              # the VM's startup arguments: shutdown/start models unplugging it.
+              with subtest("the USB update medium is removed before cold boot"):
                   machine.shutdown()
+
+              with subtest("the appliance actually boots the slot it switched to"):
                   machine.start()
                   machine.wait_for_unit("multi-user.target")
+                  machine.fail(f"test -b {donor_disk}3")
+                  assert machine.succeed("findmnt -n -o SOURCE /var/lib/sentinel").strip() == disk + "6"
+                  assert machine.succeed("cat /var/lib/sentinel/update-data-proof") == "persistent-target-data"
                   # The donor's marker: only its store has it, so its presence
                   # says slot B is what booted, not merely that something did.
                   machine.succeed("test -f /etc/sentinel-update-donor")
