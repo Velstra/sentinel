@@ -462,7 +462,6 @@ system commit-revisions
 system device
 system enabled
 system group
-system ha-witness
 system hashed-password
 system hostname
 system interval
