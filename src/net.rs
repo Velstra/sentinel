@@ -2074,6 +2074,7 @@ const AGENT_UNIT: &str = "velstra.service";
 /// comes from. One socket, one daemon.
 const WREN_SOCKET: &str = "/run/wren/wren.sock";
 const API_UNIT: &str = "sentinel-api.service";
+const API_LISTENER: &str = "/run/sentinel/api-listener.json";
 
 /// Reconcile the receiving side of HA config sync to `[system.config-sync]`: a
 /// configured `secret` becomes the API's bearer token and the API is widened +
@@ -2133,7 +2134,18 @@ fn apply_api(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
                     ))
                 );
             }
-            let env = format!("SENTINEL_API_LISTEN={addr}\n");
+            // A TLS-only edit also needs a fresh listener. No certificate/key
+            // contents or paths enter unit metadata; only this configuration hash.
+            let tls = serde_json::to_vec(&(web.tls, &web.tls_cert, &web.tls_key))?;
+            let revision: String = ring::digest::digest(&ring::digest::SHA256, &tls)
+                .as_ref()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            system::install_config_file(Path::new(API_LISTENER), &serde_json::to_string(web)?)?;
+            let env = format!(
+                "SENTINEL_API_LISTEN={addr}\nSENTINEL_API_TLS_REVISION={revision}\nSENTINEL_API_LISTENER_CONFIG={API_LISTENER}\n"
+            );
             let changed = file_changed(Path::new(API_ENV), &env);
             system::install_file(Path::new(API_ENV), &env)?;
             // Started at boot as well, not only on a commit: the unit carries no
@@ -2163,6 +2175,7 @@ fn apply_api(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
             // config, which is what `PUT /config` did.
             if Path::new(API_ENV).exists() {
                 system::remove_file(Path::new(API_ENV))?;
+                system::remove_file(Path::new(API_LISTENER))?;
                 if mode == ApplyMode::Live {
                     let _ = system::service_stop(API_UNIT);
                 }

@@ -189,6 +189,78 @@ fn trace_answer() -> Value {
 const OPERATIONS: &[Operation] = &[
     Operation {
         method: "get",
+        path: "/api/v1/telemetry",
+        id: "telemetry",
+        summary: "Live dataplane and routing telemetry.",
+        description: "Authenticated SSE telemetry events. One collector fans out a bounded 512-packet history with monotonically increasing event IDs, conntrack summary, rule counters, throughput/PPS, HA, routing and WireGuard state. Slow consumers receive the newest snapshot; oldest_event_id exposes gaps. Missing sources appear in errors, never as healthy zeros.",
+        parameters: &[],
+        body: None,
+        answer: "SSE telemetry events, one JSON snapshot per event.",
+        answer_shape: Some(("text/event-stream", text)),
+        open: false,
+    },
+    Operation {
+        method: "get",
+        path: "/api/v1/config/document",
+        id: "config-document",
+        summary: "Read the complete TOML document.",
+        description: "Write access required. Contains secrets; never cache. Returns toml and CAS revision.",
+        parameters: &[],
+        body: None,
+        answer: "The operation result.",
+        answer_shape: Some(("application/json", any_object)),
+        open: false,
+    },
+    Operation {
+        method: "post",
+        path: "/api/v1/config/document",
+        id: "apply-document",
+        summary: "Validate or provisionally apply TOML.",
+        description: "toml, expected_revision and optional validate_only. The default confirmation window is 60 seconds; stale revisions return 409.",
+        parameters: &[],
+        body: Some(("application/json", any_object)),
+        answer: "The operation result.",
+        answer_shape: Some(("application/json", any_object)),
+        open: false,
+    },
+    Operation {
+        method: "get",
+        path: "/api/v1/config/transaction",
+        id: "transaction",
+        summary: "Read pending configuration confirmation.",
+        description: "Returns pending identity, readiness and remaining_seconds, or null. No rollback secrets.",
+        parameters: &[],
+        body: None,
+        answer: "The operation result.",
+        answer_shape: Some(("application/json", any_object)),
+        open: false,
+    },
+    Operation {
+        method: "post",
+        path: "/api/v1/config/confirm",
+        id: "confirm-config",
+        summary: "Confirm a provisional revision.",
+        description: "Body id must match the pending transaction before its monotonic deadline. Expired and stale confirmations return 409.",
+        parameters: &[],
+        body: Some(("application/json", any_object)),
+        answer: "The operation result.",
+        answer_shape: Some(("application/json", any_object)),
+        open: false,
+    },
+    Operation {
+        method: "post",
+        path: "/api/v1/config/revert",
+        id: "revert-config",
+        summary: "Revert a provisional revision immediately.",
+        description: "Body id must match the pending transaction. Restores saved bytes and reconciles the prior working network.",
+        parameters: &[],
+        body: Some(("application/json", any_object)),
+        answer: "The operation result.",
+        answer_shape: Some(("application/json", any_object)),
+        open: false,
+    },
+    Operation {
+        method: "get",
         path: "/api/v1/ha/proof/{nonce}",
         id: "haProof",
         summary: "Authenticate a peer before sending enrollment credentials.",
@@ -280,10 +352,10 @@ const OPERATIONS: &[Operation] = &[
         path: "/api/v1/config",
         id: "put-config",
         summary: "Replace the whole configuration.",
-        description: "The same parse and validation the CLI runs; a config that does not validate is refused before anything is applied or saved. What validates is applied live — the same path a `commit` takes — and then persisted, so a reboot comes back to it.",
+        description: "Validate the complete document, then accept a provisional management transaction. An independent worker applies and saves it. Poll config/transaction until ready and POST its id to config/confirm within 60 seconds by default; otherwise the working baseline is restored. Off-box --no-apply emulation saves without changing the network.",
         parameters: &[],
         body: Some(("application/json", any_object)),
-        answer: "Applied and saved.",
+        answer: "Accepted provisional transaction; explicit confirmation required on a live appliance.",
         answer_shape: Some(("application/json", any_object)),
         open: false,
     },
@@ -427,7 +499,7 @@ const OPERATIONS: &[Operation] = &[
         path: "/api/v1/configure",
         id: "configure",
         summary: "Run a configuration script: `set` / `delete` / `commit` lines, as the CLI would.",
-        description: "The body is the script, one command per line, and the answer is everything the CLI would have printed. A refused commit is reported in that output, not in the status code, so read the output rather than trusting `ok`. At most 256 KiB.",
+        description: "Atomic configuration batch: set, delete, rollback, commit and save only. The whole candidate is validated before mutation; a refused batch returns ok:false and output with no partial application. A live commit returns an accepted provisional transaction requiring explicit confirmation after pending.ready becomes true. At most 256 KiB.",
         parameters: &[],
         body: Some(("text/plain", text)),
         answer: "`{ok, output}` — the CLI's text.",
@@ -526,8 +598,11 @@ pub(crate) mod tests {
     fn served() -> Vec<(String, String)> {
         let src = include_str!("api.rs");
         let mut out = Vec::new();
-        for (at, needle) in src.match_indices(".route(\"") {
-            let rest = &src[at + needle.len()..];
+        for (at, needle) in src.match_indices(".route(") {
+            let rest = src[at + needle.len()..].trim_start();
+            let Some(rest) = rest.strip_prefix('"') else {
+                continue;
+            };
             let Some(end) = rest.find('"') else { continue };
             let path = rest[..end]
                 .replace("/*path", "/{path}")
@@ -538,8 +613,20 @@ pub(crate) mod tests {
                 })
                 .collect::<Vec<_>>()
                 .join("/");
-            // The verbs on the same line: `get(x).put(y)`.
-            let line_end = rest.find('\n').unwrap_or(rest.len());
+            // Formatting may spread a route over several lines. Bound the
+            // method expression by its balanced outer route call, not a line.
+            let mut depth = 1;
+            let line_end = rest[end + 1..]
+                .char_indices()
+                .find_map(|(index, ch)| {
+                    match ch {
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        _ => {}
+                    }
+                    (depth == 0).then_some(end + 1 + index)
+                })
+                .unwrap_or(rest.len());
             let line = &rest[end..line_end];
             for verb in ["get", "put", "post", "patch", "delete"] {
                 if line.contains(&format!("{verb}(")) {
