@@ -926,6 +926,7 @@ pub(crate) fn apply_live(
     // writers at once could splice a networkd unit or a half-written velstra.toml.
     // Held until this function returns.
     let _lock = system::apply_lock()?;
+    crate::safe_apply::ensure_writable(Path::new(crate::session::DEFAULT_CONFIG))?;
 
     // ---- Phase 1: prepare (fallible, NO live side effects) ----
     // Domain groups become address groups here: the compiler matches addresses and
@@ -2028,6 +2029,10 @@ const SNMP_FIELDS: &[Cand] = &[
 // `services ssh <Tab>` reveals the SSH DAEMON fields (per-user keys live under
 // `system login`).
 const WEB_FIELDS: &[Cand] = &[
+    (
+        "confirm-timeout",
+        "management confirmation window in seconds (default 60)",
+    ),
     (
         "enable",
         "serve the web console (true|false; default false)",
@@ -4004,6 +4009,7 @@ pub(crate) fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "services", "lldp"] => LLDP_FIELDS,
         ["set", "services", "web", "enable"] => BOOLS,
         ["set", "services", "web", "tls"] => BOOLS,
+        ["set", "services", "web", "confirm-timeout"] => &[("<seconds>", "1–3600; default 60")],
         ["set", "services", "web", "port"] => PORT_VALUE,
         ["set", "services", "lldp", "enable"] => BOOLS,
         ["set" | "delete", "services", "snmp"] => SNMP_FIELDS,

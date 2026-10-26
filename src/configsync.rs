@@ -123,6 +123,11 @@ fn flush_at(
     let _delivery = system::lock_config_at(&parent.join("delivery.lock"))?;
     let original = {
         let _transaction = system::apply_lock()?;
+        if let Some(current) = current {
+            for config in current {
+                crate::safe_apply::ensure_writable(config)?;
+            }
+        }
         system::read_owned_file(path)?
     };
     let Some(original) = original else {

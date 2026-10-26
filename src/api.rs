@@ -18,8 +18,8 @@
 //!   receiver-local identity intact.
 //! - `GET /api/v1/status` and `GET /api/v1/show/*` surface the operational state
 //!   the `show` commands report.
-//! - `GET /` serves the **web console** ([`crate::webui`]) — a read-only view over
-//!   those same endpoints, so it cannot report anything the CLI would not.
+//! - `GET /` serves the staged web console ([`crate::webui`]); confirmed management
+//!   transactions and live SSE telemetry share the same model and runtime sources.
 //!
 //! Auth is a bearer token (0600 file or `$SENTINEL_API_TOKEN`), required on every
 //! endpoint except `/api/v1/health`. The server binds localhost by default; widen it
@@ -58,6 +58,7 @@ pub const DEFAULT_TOKEN_PATH: &str = "/var/lib/sentinel/api-token";
 /// Shared handler state: the bearer token, the running-config path, and how a
 /// `PUT` applies the config live (the same [`Apply`] a CLI `commit` uses).
 pub struct ApiState {
+    pub telemetry: Arc<crate::telemetry::Hub>,
     /// The bearer token every request (except `/api/v1/health`) must present.
     pub token: String,
     pub token_path: Option<PathBuf>,
@@ -96,6 +97,11 @@ pub async fn serve(listen: &str, config: &Path, apply: Apply, token_file: &Path)
     // See [`crate::system::ignore_sigpipe`] — without it the server dies on the
     // first `curl … | grep -q`, and systemd calls that a clean exit.
     crate::system::ignore_sigpipe();
+    // Independent systemd workers have a different working directory. Carry
+    // the selected document's absolute identity across every process boundary.
+    let config_path = std::path::absolute(config).context("resolving the configuration path")?;
+    let token_path = std::path::absolute(token_file).context("resolving the token path")?;
+    let (config, token_file) = (config_path.as_path(), token_path.as_path());
     let token = load_or_create_token(token_file)?;
     let addr: SocketAddr = listen
         .parse()
@@ -106,6 +112,7 @@ pub async fn serve(listen: &str, config: &Path, apply: Apply, token_file: &Path)
         .map(|(cert, _)| system::cert_pubkey_pin(cert))
         .transpose()?;
     let state = Arc::new(ApiState {
+        telemetry: Arc::default(),
         token,
         token_path: std::env::var("SENTINEL_API_TOKEN")
             .ok()
@@ -130,6 +137,19 @@ pub async fn serve(listen: &str, config: &Path, apply: Apply, token_file: &Path)
     // `PUT` (which restarts nothing) by the same call below.
     if let Err(e) = sync_user_tokens(&state) {
         eprintln!("warning: could not reconcile per-account API tokens: {e:#}");
+    }
+    if !state.apply.enabled {
+        let path = state.config_path.clone();
+        tokio::spawn(async move {
+            loop {
+                let path = path.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::safe_apply::recover(&path, &Apply::off(), false, false)
+                })
+                .await;
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
     }
     let app = router(state);
 
@@ -199,12 +219,8 @@ pub(crate) fn resolve_web_tls(
     token_file: &Path,
     addr: &SocketAddr,
 ) -> Result<Option<(PathBuf, PathBuf)>> {
-    // Lenient, like the boot path: a management server must still come up on a
-    // config a newer build wrote. A load failure falls back to the safe default
-    // (TLS on, self-signed), never to plaintext.
-    let web = Appliance::load_lenient(config)
-        .map(|a| a.services.web)
-        .unwrap_or_default();
+    let listener = std::env::var_os("SENTINEL_API_LISTENER_CONFIG").map(PathBuf::from);
+    let web = web_settings(config, listener.as_deref())?;
     if !web.tls {
         return Ok(None);
     }
@@ -226,6 +242,21 @@ pub(crate) fn resolve_web_tls(
     Ok(Some((cert, key)))
 }
 
+/// A running-only CLI commit must not start its new listener using the old
+/// saved TLS settings. Reconciliation publishes this exact descriptor before
+/// starting the API. Standalone/off-box servers still read their config path.
+fn web_settings(config: &Path, listener: Option<&Path>) -> Result<crate::config::WebConsole> {
+    if let Some(path) = listener {
+        let text =
+            system::read_owned_file(path)?.context("runtime API listener settings missing")?;
+        return serde_json::from_str(&text).context("invalid runtime API listener settings");
+    }
+    // Lenient boot/off-box fallback remains encrypted by default.
+    Ok(Appliance::load_lenient(config)
+        .map(|a| a.services.web)
+        .unwrap_or_default())
+}
+
 /// Install the ring crypto provider as the process default. rustls 0.23 requires
 /// a default provider before a server config can be built; ring is the one
 /// already in the dependency tree, and a repeat install is a harmless no-op.
@@ -238,6 +269,13 @@ fn install_crypto_provider() {
 pub fn router(state: Arc<ApiState>) -> Router {
     let protected = Router::new()
         .route("/api/v1/config", get(get_config).put(put_config))
+        .route(
+            "/api/v1/config/document",
+            get(get_config_document).post(post_config_document),
+        )
+        .route("/api/v1/config/transaction", get(get_transaction))
+        .route("/api/v1/config/confirm", post(post_confirm))
+        .route("/api/v1/config/revert", post(post_revert))
         .route("/api/v1/ha/enrollment", get(ha_enrollment))
         .route("/api/v1/ha/pair", post(ha_pair))
         // A config-sync peer is not a second administrator. Its document is
@@ -245,6 +283,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         // can reach the normal apply path.
         .route("/api/v1/config-sync", axum::routing::put(put_config_sync))
         .route("/api/v1/status", get(get_status))
+        .route("/api/v1/telemetry", get(get_telemetry))
         .route("/api/v1/show/*path", get(get_show))
         .route("/api/v1/rule-hits", get(get_rule_hits))
         .route("/api/v1/trace", get(get_trace))
@@ -1321,17 +1360,178 @@ async fn put_config(
     body: String,
 ) -> Result<Json<Value>, ApiError> {
     let appliance = Appliance::from_json(&body).map_err(ApiError::bad_request)?;
+    tokio::task::spawn_blocking(move || management_replace(&state, appliance))
+        .await
+        .map_err(|error| ApiError::internal(anyhow!("configuration task: {error}")))?
+}
+
+/// All administrator writes use the same transaction; HA enrollment and
+/// config-sync retain their authenticated machine protocol and refuse a pending
+/// local transaction. Off-box CLI emulation has no live network to lock out.
+fn management_replace(state: &ApiState, appliance: Appliance) -> Result<Json<Value>, ApiError> {
     let _transaction = system::apply_lock().map_err(ApiError::internal)?;
-    let previous = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
-    let response = replace_config(&state, appliance.clone())?;
+    let _file = system::lock_config_at(&state.config_path.with_extension("transaction.lock"))
+        .map_err(ApiError::internal)?;
+    crate::safe_apply::ensure_writable(&state.config_path)
+        .map_err(|error| ApiError::new(StatusCode::CONFLICT, error))?;
     if state.apply.enabled {
-        crate::configsync::enqueue(&appliance, Some(&previous)).map_err(|error| {
-            ApiError::internal(anyhow!(
-                "configuration applied and saved, but HA outbox could not be queued: {error:#}"
-            ))
-        })?;
+        let seconds = Appliance::load(&state.config_path)
+            .map_err(ApiError::internal)?
+            .services
+            .web
+            .confirm_timeout
+            .unwrap_or(60);
+        crate::safe_apply::begin(&state.config_path, &appliance, &state.apply, seconds)
+            .map(Json)
+            .map_err(ApiError::internal)
+    } else {
+        replace_config(state, appliance)
     }
-    Ok(response)
+}
+
+async fn get_telemetry(
+    State(state): State<Arc<ApiState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    use tokio_stream::StreamExt;
+    let credential = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or_default()
+        .to_string();
+    let stream =
+        tokio_stream::wrappers::WatchStream::new(state.telemetry.subscribe()).map(move |value| {
+            if resolve_caller(&state, &credential).is_none() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "telemetry credential revoked",
+                ));
+            }
+            Ok::<_, std::io::Error>(
+                axum::response::sse::Event::default()
+                    .event("telemetry")
+                    .json_data(value)
+                    .expect("JSON telemetry value"),
+            )
+        });
+    let mut response = axum::response::Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
+        .headers_mut()
+        .insert("x-accel-buffering", header::HeaderValue::from_static("no"));
+    response
+}
+
+async fn get_transaction(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, ApiError> {
+    crate::safe_apply::status(&state.config_path)
+        .map(Json)
+        .map_err(ApiError::internal)
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Confirmation {
+    id: String,
+}
+async fn post_confirm(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<Confirmation>,
+) -> Result<Json<Value>, ApiError> {
+    tokio::task::spawn_blocking(move || {
+        let result = crate::safe_apply::confirm(&state.config_path, &request.id, &state.apply)
+            .map_err(|e| ApiError::new(StatusCode::CONFLICT, e))?;
+        sync_user_tokens(&state).map_err(ApiError::internal)?;
+        Ok(Json(result))
+    })
+    .await
+    .map_err(|error| ApiError::internal(anyhow!("confirmation task: {error}")))?
+}
+async fn post_revert(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<Confirmation>,
+) -> Result<Json<Value>, ApiError> {
+    tokio::task::spawn_blocking(move || {
+        let reverted = crate::safe_apply::revert(&state.config_path, &request.id, &state.apply)
+            .map_err(|e| ApiError::new(StatusCode::CONFLICT, e))?;
+        if reverted {
+            sync_user_tokens(&state).map_err(ApiError::internal)?;
+        }
+        Ok(Json(json!({"reverted":reverted,"reverting":!reverted})))
+    })
+    .await
+    .map_err(|error| ApiError::internal(anyhow!("recovery request: {error}")))?
+}
+
+async fn get_config_document(
+    State(state): State<Arc<ApiState>>,
+    axum::Extension(caller): axum::Extension<Caller>,
+) -> Result<Response, ApiError> {
+    if !caller.permission.may_write() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            anyhow!("full configuration documents require write access"),
+        ));
+    }
+    tokio::task::spawn_blocking(move || read_config_document(&state))
+        .await
+        .map_err(|error| ApiError::internal(anyhow!("reading configuration document: {error}")))?
+}
+fn read_config_document(state: &ApiState) -> Result<Response, ApiError> {
+    let _lock = system::apply_lock().map_err(ApiError::internal)?;
+    let appliance = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({
+            "toml":appliance.to_toml().map_err(ApiError::internal)?,
+            "revision":crate::ha::revision(&appliance).map_err(ApiError::internal)?
+        })),
+    )
+        .into_response())
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocumentRequest {
+    toml: String,
+    expected_revision: String,
+    #[serde(default)]
+    validate_only: bool,
+}
+async fn post_config_document(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<DocumentRequest>,
+) -> Result<Json<Value>, ApiError> {
+    tokio::task::spawn_blocking(move || apply_document(&state, request))
+        .await
+        .map_err(|error| ApiError::internal(anyhow!("document task: {error}")))?
+}
+fn apply_document(state: &ApiState, request: DocumentRequest) -> Result<Json<Value>, ApiError> {
+    let candidate = Appliance::from_toml(&request.toml).map_err(ApiError::bad_request)?;
+    let _lock = system::apply_lock().map_err(ApiError::internal)?;
+    let _file = system::lock_config_at(&state.config_path.with_extension("transaction.lock"))
+        .map_err(ApiError::internal)?;
+    let previous = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
+    if crate::ha::revision(&previous).map_err(ApiError::internal)? != request.expected_revision {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            anyhow!("configuration changed; reload and review the new baseline"),
+        ));
+    }
+    if request.validate_only {
+        return Ok(Json(
+            json!({"valid":true,"diff":crate::diff::unified(&previous.to_toml().map_err(ApiError::internal)?, &candidate.to_toml().map_err(ApiError::internal)?)}),
+        ));
+    }
+    crate::safe_apply::ensure_writable(&state.config_path)
+        .map_err(|error| ApiError::new(StatusCode::CONFLICT, error))?;
+    let seconds = previous.services.web.confirm_timeout.unwrap_or(60);
+    crate::safe_apply::begin(&state.config_path, &candidate, &state.apply, seconds)
+        .map(Json)
+        .map_err(ApiError::internal)
 }
 
 /// Receive the shared half of another firewall's configuration.
@@ -1417,6 +1617,10 @@ fn merge_synced_config(mut incoming: Appliance, local: &Appliance) -> Result<App
 /// Validate, apply and persist a complete, receiver-safe appliance document.
 fn replace_config(state: &ApiState, appliance: Appliance) -> Result<Json<Value>, ApiError> {
     let _transaction = system::apply_lock().map_err(ApiError::internal)?;
+    let _file = system::lock_config_at(&state.config_path.with_extension("transaction.lock"))
+        .map_err(ApiError::internal)?;
+    crate::safe_apply::ensure_writable(&state.config_path)
+        .map_err(|e| ApiError::new(StatusCode::CONFLICT, e))?;
     // Same live-apply as a CLI `commit` (skipped off-box, mirroring `commit`'s
     // own `act.enabled` gate).
     if state.apply.enabled {
@@ -1582,13 +1786,12 @@ async fn get_show(
 /// guards a typed command guards a clicked one, and there is no second grammar
 /// to drift.
 ///
-/// The caller sends its own `commit` / `save`, because "apply now" and "apply and
-/// persist" are genuinely different intentions and the endpoint must not decide
-/// which one was meant.
-///
-/// **A refused commit is reported in the output, not in the exit status** — so
-/// the whole output is always returned, and a caller that only checks `ok` will
-/// believe a rejected change succeeded.
+/// The complete batch is validated before any write. `commit` begins the
+/// common provisional management transaction; a trailing `save` is accepted
+/// for CLI-style clients. Only configuration verbs are accepted: operational
+/// commands and arbitrary export paths cannot escape the transaction boundary.
+/// Refusals preserve the whole batch and are returned as `ok: false` plus the
+/// validation output, with no partial application.
 async fn post_configure(
     State(state): State<Arc<ApiState>>,
     body: String,
@@ -1598,47 +1801,41 @@ async fn post_configure(
             "configuration script too large"
         )));
     }
-    let exe = std::env::current_exe()
-        .map_err(|e| ApiError::internal(anyhow!("locating the sentinel binary: {e}")))?;
-    let config_path = state.config_path.clone();
-    let no_apply = !state.apply.enabled;
-    // Off the runtime, for the reason spelled out at `get_show`: a commit is the
-    // longest child process this API runs.
-    let out = tokio::task::spawn_blocking(move || -> std::io::Result<std::process::Output> {
-        let mut cmd = std::process::Command::new(exe);
-        cmd.arg("configure").arg("--config").arg(&config_path);
-        // The API's own `--no-apply` has to reach the commands it runs, or an
-        // off-box instance edits the right file and then tries to reconfigure
-        // the machine it is running on. Same gate the PUT handler honours.
-        if no_apply {
-            cmd.arg("--no-apply");
+    tokio::task::spawn_blocking(move || -> Result<Json<Value>, ApiError> {
+        let _transaction = system::apply_lock().map_err(ApiError::internal)?;
+        let _file = system::lock_config_at(&state.config_path.with_extension("configure.lock")).map_err(ApiError::internal)?;
+        let mut candidate = session::Session::load(&state.config_path).map_err(ApiError::internal)?;
+        let mut commit = false;
+        for (index, line) in body.lines().enumerate() {
+            let words = repl::split_line(line);
+            let args: Vec<&str> = words.iter().map(String::as_str).collect();
+            let result = match args.as_slice() {
+                [] => Ok(()),
+                ["set", rest @ ..] => candidate.set(rest),
+                ["delete", rest @ ..] => candidate.delete(rest),
+                ["rollback", revision] => (|| {
+                    let revision = revision.parse::<usize>()?;
+                    let content = crate::archive::read_revision(&state.config_path, revision)?;
+                    candidate.replace_candidate(Appliance::from_toml(&content)?);
+                    Ok(())
+                })(),
+                ["commit"] => { commit = true; Ok(()) },
+                ["save"] => Ok(()),
+                _ => Err(anyhow!("only set, delete, rollback, commit and save are accepted by the management configuration endpoint")),
+            };
+            if let Err(error) = result {
+                return Ok(Json(json!({"ok":false,"output":format!("error: line {} refused: {error:#}",index+1)})));
+            }
         }
-        let mut child = cmd
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()?;
-        {
-            use std::io::Write as _;
-            let mut stdin = child
-                .stdin
-                .take()
-                .ok_or_else(|| std::io::Error::other("configure has no stdin"))?;
-            stdin.write_all(body.as_bytes())?;
-        }
-        child.wait_with_output()
-    })
-    .await
-    .map_err(|e| ApiError::internal(anyhow!("running configure: {e}")))?
-    .map_err(|e| ApiError::internal(anyhow!("running configure: {e}")))?;
-    // Both streams: `set` errors and commit refusals go to stderr, the commit's
-    // own report to stdout, and an operator needs to read them in one place.
-    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&out.stderr));
-    Ok(Json(json!({
-        "ok": out.status.success(),
-        "output": text,
-    })))
+        let appliance = match candidate.commit() {
+            Ok(value) => value,
+            Err(error) => return Ok(Json(json!({"ok":false,"output":format!("error: {error:#}")}))),
+        };
+        let mut response = if commit { management_replace(&state, appliance)?.0 } else { json!({}) };
+        response["ok"] = json!(true);
+        response["output"] = json!(if response.get("pending").is_some() { "commit ok; provisional application started; confirmation required" } else if commit { "commit ok; configuration applied and saved" } else { "validation ok; nothing applied" });
+        Ok(Json(response))
+    }).await.map_err(|e|ApiError::internal(anyhow!("configuration task: {e}")))?
 }
 
 /// `POST /api/v1/clear/*path` — run an operational `clear` command.
@@ -2041,6 +2238,7 @@ mod tests {
     /// live system (no systemctl/networkd in a unit test).
     fn state(config_path: PathBuf) -> Arc<ApiState> {
         Arc::new(ApiState {
+            telemetry: Arc::default(),
             token: TOKEN.to_string(),
             token_path: None,
             tls_pin: None,
@@ -2533,6 +2731,7 @@ virtual-address = ["10.43.0.253"]
         std::fs::write(tokens.join("alice"), "alice-secret\n").unwrap();
 
         let st = ApiState {
+            telemetry: Arc::default(),
             token: TOKEN.to_string(),
             token_path: None,
             tls_pin: None,
@@ -2573,6 +2772,7 @@ virtual-address = ["10.43.0.253"]
         let cfg = dir.join("appliance.toml");
         let tokens = dir.join("tokens");
         let st = ApiState {
+            telemetry: Arc::default(),
             token: TOKEN.to_string(),
             token_path: None,
             tls_pin: None,
@@ -2635,6 +2835,230 @@ virtual-address = ["10.43.0.253"]
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(json.to_string()))
             .unwrap()
+    }
+
+    fn post_json(uri: &str, value: Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(value.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn document_validation_cas_confirmation_and_revert_share_one_transaction() {
+        let path = seed("working");
+        let app = router(state(path.clone()));
+        let response = app
+            .clone()
+            .oneshot(get("/api/v1/config/document", Some(TOKEN)))
+            .await
+            .unwrap();
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let document: Value = serde_json::from_str(&body_string(response).await).unwrap();
+        let mut request = json!({"toml":"[system]\nhostname=\"provisional\"\n","expected_revision":document["revision"],"validate_only":true});
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/v1/config/document", request.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(body_string(response).await.contains("provisional"));
+        assert_eq!(Appliance::load(&path).unwrap().system.hostname, "working");
+        request["validate_only"] = json!(false);
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/v1/config/document", request.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let result: Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert!(result["pending"]["remaining_seconds"].as_u64().unwrap() <= 60);
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/v1/config/confirm", json!({"id":"wrong"})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/v1/config/document", request))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let response = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/config/revert",
+                json!({"id":result["pending"]["id"]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(Appliance::load(&path).unwrap().system.hostname, "working");
+        let mut request = document.clone();
+        request["toml"] = json!("[system]\nhostname=\"confirmed\"\n");
+        request.as_object_mut().unwrap().remove("revision");
+        request["expected_revision"] = document["revision"].clone();
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/v1/config/document", request))
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_str(&body_string(response).await).unwrap();
+        let response = app
+            .oneshot(post_json(
+                "/api/v1/config/confirm",
+                json!({"id":result["pending"]["id"]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!crate::safe_apply::recover(&path, &Apply::off(), true, false).unwrap());
+        assert_eq!(Appliance::load(&path).unwrap().system.hostname, "confirmed");
+    }
+
+    #[tokio::test]
+    async fn concurrent_documents_cannot_overwrite_the_same_baseline() {
+        let path = seed("working");
+        let app = router(state(path.clone()));
+        let revision = crate::ha::revision(&Appliance::load(&path).unwrap()).unwrap();
+        let request = |hostname: &str| {
+            post_json(
+                "/api/v1/config/document",
+                json!({
+                    "toml":format!("[system]\nhostname=\"{hostname}\"\n"),
+                    "expected_revision":revision
+                }),
+            )
+        };
+        let (a, b) = tokio::join!(
+            app.clone().oneshot(request("first")),
+            app.oneshot(request("second"))
+        );
+        let mut statuses = [a.unwrap().status().as_u16(), b.unwrap().status().as_u16()];
+        statuses.sort();
+        assert_eq!(statuses, [200, 409]);
+        assert!(crate::safe_apply::status(&path).unwrap()["pending"].is_object());
+        crate::safe_apply::recover(&path, &Apply::off(), true, false).unwrap();
+        assert_eq!(Appliance::load(&path).unwrap().system.hostname, "working");
+    }
+
+    #[tokio::test]
+    async fn configure_is_atomic_and_does_not_execute_operational_commands() {
+        let path = seed("working");
+        let app = router(state(path.clone()));
+        for script in [
+            "set system hostname partial\nset nonsense nope\ncommit\nsave\n",
+            "run confirm-rollback\n",
+            "save /tmp/escape.toml\n",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/configure")
+                        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                        .body(Body::from(script))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(body_string(response).await.contains("\"ok\":false"));
+            assert_eq!(Appliance::load(&path).unwrap().system.hostname, "working");
+        }
+    }
+
+    #[tokio::test]
+    async fn telemetry_is_authenticated_and_not_buffered_or_cached() {
+        let app = router(state(seed("working")));
+        assert_eq!(
+            app.clone()
+                .oneshot(get("/api/v1/telemetry", None))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let response = app
+            .oneshot(get("/api/v1/telemetry", Some(TOKEN)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/event-stream"
+        );
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(response.headers()["x-accel-buffering"], "no");
+    }
+
+    #[tokio::test]
+    async fn read_only_accounts_cannot_read_full_toml_or_confirm_revisions() {
+        let path = seed("working");
+        let appliance = Appliance::from_toml("[system]\nhostname=\"working\"\n[[system.group]]\nname=\"viewers\"\npermission=\"read-only\"\n[[system.login]]\nusername=\"viewer\"\ngroup=\"viewers\"\n").unwrap();
+        session::persist_appliance(&appliance, &path, false).unwrap();
+        let mut configured = Arc::try_unwrap(state(path.clone())).ok().unwrap();
+        configured.tokens_dir = path.parent().unwrap().join("tokens");
+        sync_user_tokens(&configured).unwrap();
+        let credential = std::fs::read_to_string(configured.tokens_dir.join("viewer")).unwrap();
+        let app = router(Arc::new(configured));
+        assert_eq!(
+            app.clone()
+                .oneshot(get("/api/v1/config", Some(credential.trim())))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(get("/api/v1/config/document", Some(credential.trim())))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        for endpoint in ["confirm", "revert", "document"] {
+            let request = Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/config/{endpoint}"))
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", credential.trim()),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+    }
+
+    #[test]
+    fn a_running_only_listener_uses_the_new_tls_settings_and_invalid_runtime_state_fails_closed() {
+        let config = seed("working");
+        let listener = config.with_extension("listener.json");
+        assert!(web_settings(&config, None).unwrap().tls);
+        let web = crate::config::WebConsole {
+            tls: false,
+            ..Default::default()
+        };
+        system::install_config_file(&listener, &serde_json::to_string(&web).unwrap()).unwrap();
+        assert!(!web_settings(&config, Some(&listener)).unwrap().tls);
+        assert!(
+            Appliance::load(&config).unwrap().services.web.tls,
+            "the saved baseline was changed to configure the listener"
+        );
+        std::fs::write(&listener, "broken").unwrap();
+        assert!(web_settings(&config, Some(&listener)).is_err());
+        std::fs::remove_file(&listener).unwrap();
+        assert!(web_settings(&config, Some(&listener)).is_err());
     }
 
     #[tokio::test]

@@ -1415,6 +1415,13 @@ impl Ssh {
 /// terminator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebConsole {
+    /// Management confirmation window in seconds. Default 60.
+    #[serde(
+        rename = "confirm-timeout",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub confirm_timeout: Option<u32>,
     /// Serve the console. Off by default.
     #[serde(default)]
     pub enable: bool,
@@ -1449,6 +1456,7 @@ pub struct WebConsole {
 impl Default for WebConsole {
     fn default() -> Self {
         Self {
+            confirm_timeout: None,
             enable: false,
             port: None,
             listen_address: None,
@@ -1467,6 +1475,7 @@ impl WebConsole {
     /// endpoint or certificate does.
     pub fn is_empty(&self) -> bool {
         !self.enable
+            && self.confirm_timeout.is_none()
             && self.port.is_none()
             && self.listen_address.is_none()
             && self.tls_cert.is_none()
@@ -9685,6 +9694,12 @@ impl Appliance {
         // bind address to localhost, so an enabled console is not an exposed one
         // until an address is named.
         let web = &self.services.web;
+        if web
+            .confirm_timeout
+            .is_some_and(|seconds| !(1..=3600).contains(&seconds))
+        {
+            bail!("services web confirm-timeout: must be 1–3600 seconds");
+        }
         if let Some(p) = web.port {
             if p == 0 {
                 bail!("services web port: must be 1-65535");

@@ -97,7 +97,15 @@ pub fn commit_confirm(session: &mut Session, act: &Apply, minutes: u32) -> Resul
 
 /// Cancel a pending auto-rollback: the live config stays as committed. The
 /// operator still needs `save` to persist it across a reboot (VyOS semantics).
-pub fn confirm(_act: &Apply) -> Result<()> {
+pub fn confirm(act: &Apply) -> Result<()> {
+    if act.enabled {
+        let path = Path::new(crate::session::DEFAULT_CONFIG);
+        if let Some(id) = crate::safe_apply::status(path)?["pending"]["id"].as_str() {
+            crate::safe_apply::confirm(path, id, act)?;
+            eprintln!("confirmed management revision — applied and saved.");
+            return Ok(());
+        }
+    }
     if !system::confirm_pending() {
         eprintln!("no pending commit-confirm (nothing to confirm).");
         return Ok(());
@@ -113,6 +121,11 @@ pub fn confirm(_act: &Apply) -> Result<()> {
 /// un-confirmed change immediately. Idempotent: re-applying the saved config
 /// live is always safe.
 pub fn rollback(act: &Apply, cfg_path: &Path) -> Result<()> {
+    if crate::safe_apply::status(cfg_path)?["pending"].is_object() {
+        crate::safe_apply::recover(cfg_path, act, true, false)?;
+        eprintln!("reverted the provisional management revision.");
+        return Ok(());
+    }
     if !cfg_path.exists() {
         eprintln!(
             "no saved config at {} — nothing to revert to.",

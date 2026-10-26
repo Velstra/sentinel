@@ -204,6 +204,8 @@ pub fn page() -> String {
       --glow-focus: 0 0 0 3px rgba(58,114,230,.22);
       --wash: radial-gradient(1100px 460px at 78% -12%, rgba(58,114,230,.10), transparent 62%);
 "#;
+    let management_js = include_str!("management.js");
+    let management_css = include_str!("management.css");
     format!(
         r##"<!doctype html>
 <html lang="en">
@@ -1611,6 +1613,7 @@ pub fn page() -> String {
     dialog[open] {{ transform: none; }}
     @starting-style {{ dialog[open] {{ transform: none; }} }}
   }}
+{management_css}
 </style>
 </head>
 <body>
@@ -1740,6 +1743,13 @@ pub fn page() -> String {
       <div class="script" id="stagedlist" style="flex:1 1 100%"></div>
     </div>
 
+    <div id="confirmation" class="card staged hidden" role="status">
+      <span class="stagedtext"><span class="t">Confirm network configuration</span>
+        <span id="confirmation-message">Verify connectivity before keeping this change.</span>
+        <span id="confirmation-countdown" aria-hidden="true"></span></span>
+      <button class="btn primary" id="confirm-change">Keep change</button>
+      <button class="btn" id="revert-change">Revert now</button>
+    </div>
     <div class="secstrip" id="sectionstrip"></div>
     <div class="page" id="pagehead"></div>
 
@@ -1750,6 +1760,16 @@ pub fn page() -> String {
            that opens with a time series answers a question they have not asked
            yet. -->
       <div class="stats" id="stats"></div>
+      <div class="card"><h3>Live interface throughput</h3><p id="telemetry-status" role="status">Connecting to telemetry…</p><p id="telemetry-freshness" class="lede"></p>
+        <div class="tblwrap"><table id="live-interfaces"></table></div></div>
+      <div class="dashgrid">
+        <div class="card"><h3>HA authority and replication</h3><p id="live-ha">Awaiting the agent.</p></div>
+        <div class="card"><h3>Connection tracking</h3><p id="live-connections">Awaiting the agent.</p><pre id="live-talkers" class="out"></pre></div>
+      </div>
+      <div class="dashgrid">
+        <div class="card"><h3>BGP and OSPF neighbors</h3><pre id="live-routing" class="out"></pre></div>
+        <div class="card"><h3>WireGuard handshakes</h3><pre id="live-vpn" class="out"></pre></div>
+      </div>
       <div class="cards" id="services"></div>
       <div class="dashgrid">
         <div class="card">
@@ -1787,6 +1807,20 @@ pub fn page() -> String {
     </div>
 
     <div id="view-rules" class="hidden">
+      <div class="card">
+        <h3>Live flow and rule inspector</h3>
+        <p class="lede">Live packets for rules with Log enabled. Events include active rule names and identifiers.</p>
+        <div class="toolbar">
+          <label class="field"><span>Filter events</span><input id="flow-search" type="search" autocomplete="off"></label>
+          <button class="btn hidden" id="flow-clear" aria-label="Clear event filter">Clear</button>
+          <label class="field"><span>Action</span><select id="flow-action"><option value="">All actions</option><option value="accept">Accept</option><option value="drop">Drop</option><option value="reject">Reject</option></select></label>
+          <label class="check"><input id="flow-pause" type="checkbox"><span>Pause display</span></label>
+        </div>
+        <p id="flow-state" role="status">Connecting to telemetry…</p>
+        <div class="tblwrap"><table id="live-flows"></table></div>
+        <div class="row"><button class="btn" id="flow-prev">Previous</button><span id="flow-range"></span><button class="btn" id="flow-next">Next</button></div>
+        <details><summary>Exact per-rule packet counters</summary><pre class="out" id="live-rule-counters"></pre></details>
+      </div>
       <div class="toolbar">
         <label class="inline">
           <span>Default policy</span>
@@ -2746,6 +2780,20 @@ pub fn page() -> String {
 
     <div id="view-config" class="hidden">
       <div class="card">
+        <h3>Declarative configuration</h3>
+        <p class="lede">Edit appliance.toml using the same schema validation as sentinel validate. Loading the document reveals configuration secrets to this tab. Drafts stay in memory.</p>
+        <div class="toolbar"><button class="btn" id="toml-load">Show configuration</button><button class="btn hidden" id="toml-hide">Hide configuration</button></div>
+        <div id="toml-editor" class="hidden">
+          <div class="config-columns">
+            <div><h4>Current appliance.toml</h4><pre class="out config-source" id="toml-baseline"></pre></div>
+            <label class="field"><span>Proposed appliance.toml</span><textarea id="toml-candidate" rows="20" spellcheck="false" autocomplete="off" aria-describedby="toml-feedback"></textarea></label>
+          </div>
+          <p id="toml-feedback" role="status">No changes.</p>
+          <details><summary>Validated configuration diff</summary><pre id="toml-diff" class="out"></pre></details>
+          <div class="row"><button class="btn" id="toml-reload">Reload current baseline</button><button class="btn" id="toml-validate">Validate</button><button class="btn primary" id="toml-apply">Apply with confirmation</button></div>
+        </div>
+      </div>
+      <div class="card">
         <h3>Revisions</h3>
         <p class="lede" style="margin:0 0 var(--space-3)">
           Every save archives a revision. Rolling back stages the change like any
@@ -2843,6 +2891,7 @@ let target = "";           // "" = this appliance, otherwise a stack member
 let timer = null;
 const history = new Map(); // counter -> recent values, for the sparklines
 let lastCounters = null;
+let lastCountersAt = 0;
 
 // ---- plumbing ------------------------------------------------------------
 
@@ -2875,7 +2924,9 @@ async function api(path, opts, patience) {{
   if (r.status === 401) {{ signOut("That token was not accepted."); throw new Error("unauthorised"); }}
   if (!r.ok) {{
     const body = await r.text();
-    throw new Error(unwrapError(body) || body.trim() || ("HTTP " + r.status));
+    const failure = new Error(unwrapError(body) || body.trim() || ("HTTP " + r.status));
+    failure.status = r.status;
+    throw failure;
   }}
   return r;
 }}
@@ -2915,7 +2966,9 @@ async function configure(lines) {{
     headers: {{ Authorization: "Bearer " + token, "Content-Type": "text/plain" }},
     body: lines.join("\n") + "\n",
   }}, 120);
-  return r.json();
+  const reply = await r.json();
+  if (reply.pending) setTransaction(reply.pending);
+  return reply;
 }}
 
 function el(tag, attrs, kids) {{
@@ -3261,21 +3314,27 @@ async function refreshDashboard() {{
     $("graphs").append(el("div", {{ class: "card", text:
       "The data plane's counters could not be read: " + (e.message || e) }}));
     lastCounters = null;
+    lastCountersAt = 0;
     return;
   }}
 
-  // The graphs plot the *rate*: a monotonic total tells you nothing about now.
+  // Polls can be delayed or triggered early by an apply. A delta is a rate
+  // only after dividing by the measured interval; resets start a new series.
+  const observedAt = performance.now();
+  const elapsed = lastCountersAt ? (observedAt - lastCountersAt) / 1000 : 0;
   for (const g of GRAPHS) {{
     const now = counters.get(g.c) || 0;
     const prev = lastCounters ? (lastCounters.get(g.c) || 0) : null;
-    if (prev !== null) {{
+    if (prev !== null && now < prev) history.delete(g.c);
+    else if (prev !== null && elapsed > 0) {{
       const series = history.get(g.c) || [];
-      series.push(Math.max(0, now - prev));
+      series.push((now - prev) / elapsed);
       while (series.length > 60) series.shift();
       history.set(g.c, series);
     }}
   }}
   lastCounters = counters;
+  lastCountersAt = observedAt;
 
   const box = $("graphs");
   box.textContent = "";
@@ -3795,7 +3854,10 @@ async function applyStagedNow(tail) {{
     // An apply that never reached the appliance has to say so. Left to throw,
     // the page swallowed it: no dialog, no banner, the changes still staged —
     // an operator pressing Apply and being answered with nothing at all.
-    showResult({{ ok: false, output: "error: " + (e.message || e) }}, committed);
+    if (committed) await refreshTransaction();
+    showResult({{ ok: false, uncertain: committed && !e.status,
+      output: "error: " + (e.message || e) + (committed && !e.status
+        ? " The request may have started. Check the pending revision after reconnecting; recovery runs independently." : "") }}, committed);
     return;
   }}
   const refused = !r.ok || summarise(r.output).some((n) => n.kind === "bad");
@@ -3804,6 +3866,7 @@ async function applyStagedNow(tail) {{
   // commands staged, so the operator can fix one and try again rather than
   // reconstructing what they had clicked.
   if (committed && !refused) {{
+    rememberPendingBatch(r.pending, staged);
     staged = [];
     renderStaged();
   }}
@@ -3884,6 +3947,7 @@ function summarise(output) {{
 }}
 
 function showResult(r, committed, blamed) {{
+  $("result").dataset.transaction = r.pending?.id || "";
   const notes = summarise(r.output);
   const failed = notes.some((n) => n.kind === "bad");
   // The appliance runs the commands it can and reports what it could not: a
@@ -3892,9 +3956,9 @@ function showResult(r, committed, blamed) {{
   const partly = failed && /commit ok/i.test(r.output || "");
   // Validating and applying are different answers to different questions, and
   // a dialog that says "Applied" after a validate is a lie an operator acts on.
-  $("resulttitle").textContent = failed
+  $("resulttitle").textContent = r.uncertain ? "Connection interrupted" : failed
     ? (committed ? (partly ? "Partly applied" : "Not applied") : "This would be refused")
-    : (committed ? "Applied" : "This would be accepted");
+    : (committed ? (r.pending ? (r.pending.ready ? "Awaiting confirmation" : "Applying configuration") : "Applied") : "This would be accepted");
   const box = $("resultout");
   box.textContent = "";
   if (!notes.length) {{
@@ -5999,6 +6063,9 @@ function renderObjects(o) {{
 // New, Edit, Delete and Stage to an account whose changes can never run is a
 // console inviting work it will throw away.
 function gateWrites() {{
+  for (const id of ["toml-load", "toml-reload", "toml-apply", "toml-validate", "confirm-change", "revert-change"]) {{
+    $(id).disabled = permission === "read-only" || !!target || $(id).classList.contains("busy") || (id === "toml-apply" && !!pendingTransaction);
+  }}
   if (permission !== "read-only") return;
   for (const b of document.querySelectorAll("main button")) {{
     if (/^(edit|delete|new|add|stage|apply|validate|generate|lift|capture|roll)/i
@@ -7373,6 +7440,7 @@ const SVC_SSH = [
 // your own, move the port, widen the bind — or turn TLS off, which only makes
 // sense on loopback or behind a terminator that already speaks it.
 const SVC_WEB = [
+  ["confirm-timeout", "Confirmation window (seconds)"],
   ["enable", "Enabled", ["", "true", "false"]], ["port", "Port"],
   ["listen-address", "Listen address"],
   ["tls", "Serve HTTPS", ["", "true", "false"]],
@@ -8696,7 +8764,7 @@ const SECTIONS = [
     {{ v: "system", t: "System", i: "gauge" }},
     {{ v: "ha", t: "High availability", i: "layers" }},
     {{ v: "users", t: "Administrators", i: "key" }},
-    {{ v: "config", t: "Revisions", i: "file" }},
+    {{ v: "config", t: "Configuration", i: "file" }},
     {{ v: "stack", t: "Stack", i: "layers" }},
   ]}},
 ];
@@ -9301,6 +9369,7 @@ async function refresh() {{
   }}
   document.title = (panel ? panel.t : (place ? place.item.t : "Dashboard")) + " — Sentinel";
   gateWrites();
+  renderLive();
 
   if (view === "dashboard") return refreshDashboard();
   if (view === "rules") return refreshRules();
@@ -9377,6 +9446,7 @@ function renderWho() {{
 }}
 
 function signOut(message) {{
+  stopManagement();
   token = "";
   who = "";
   permission = "read-write";
@@ -9392,6 +9462,7 @@ function signOut(message) {{
   searchIndex = [];
   history.clear();
   lastCounters = null;
+  lastCountersAt = 0;
   renderStaged();
   banner("");
   sessionStorage.removeItem(KEY);
@@ -9407,6 +9478,7 @@ function signedIn() {{
   $("app").classList.remove("hidden");
   buildNav();
   renderStaged();
+  startManagement();
   refreshCluster();
   buildSearchIndex();
   refresh();
@@ -9689,6 +9761,7 @@ window.addEventListener("beforeunload", (e) => {{
   e.returnValue = "";
 }});
 
+{management_js}
 spreadify();
 if (token) signedIn();
 </script>
@@ -10300,6 +10373,20 @@ mod tests {
                 }
             }
         }
+        // Arrow callback parameters are declarations too (e.g. a Promise
+        // resolver). Checking only const/let/function gives false positives.
+        for (at, _) in script.match_indices("=>") {
+            let before = script[..at].trim_end();
+            if let Some(before) = before.strip_suffix(')') {
+                if let Some(start) = before.rfind('(') {
+                    for parameter in before[start + 1..].split(',').map(str::trim) {
+                        if ident(parameter) == Some(parameter) {
+                            defined.insert(parameter);
+                        }
+                    }
+                }
+            }
+        }
         // The names the browser brings. Anything else has to come from the page.
         const BUILTIN: &[&str] = &[
             "if",
@@ -10352,6 +10439,7 @@ mod tests {
             "Event",
             "URL",
             "AbortController",
+            "TextDecoder",
             // Typed arrays and the crypto interface: a page that generates a
             // secret in the browser needs both, and both are as much a builtin
             // as `Array` is.

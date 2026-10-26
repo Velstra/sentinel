@@ -36,7 +36,7 @@ let
   };
   firewall = number: priority: { lib, ... }: {
     imports = [ self.nixosModules.sentinel ];
-    environment.systemPackages=[pkgs.python3 pkgs.wireguard-tools pkgs.bpftools];
+    environment.systemPackages=[pkgs.python3 pkgs.wireguard-tools pkgs.bpftools pkgs.curl];
     virtualisation.vlans = [ 1 2 3 ];
     virtualisation.memorySize = 2048;
     virtualisation.cores = 2;
@@ -165,6 +165,13 @@ in pkgs.testers.runNixOSTest {
     master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=30)
     backup.succeed("! ip -o address show eth2 | grep -q 10.2.0.100")
     ${pkgs.lib.optionalString leased ''
+    # Keep live management telemetry active throughout the HA fault matrix.
+    # Querying state must not interfere with lease refresh or TCP continuity.
+    for node in (master,backup):
+        node.wait_for_unit("sentinel-api.service")
+        node.succeed("curl -skN --max-time 180 -H 'Authorization: Bearer ${secret}' https://127.0.0.1:8080/api/v1/telemetry > /tmp/live-management 2>/tmp/live-management-errors &")
+    master.wait_until_succeeds(python_command('import json,subprocess; state=json.loads(subprocess.check_output(["sentinel","agent-query","ha-status"])); assert state["role"]=="Master" and state["sync_age_ms"] is None'),timeout=20)
+    backup.wait_until_succeeds(python_command('import json,subprocess; state=json.loads(subprocess.check_output(["sentinel","agent-query","ha-status"])); assert state["role"]=="Backup" and state["sync_age_ms"] is not None and state["sync_age_ms"]<1500'),timeout=20)
     for node in (master,backup):
         print(node.succeed(python_command('import json,time; r=json.load(open("/run/velstra/ha/role.json")); a=json.load(open("/run/velstra/ha/agent.json")); print(json.dumps({"role":r,"agent":a,"remaining_ms":(r["deadline_ns"]-time.clock_gettime_ns(time.CLOCK_BOOTTIME))/1000000,"policy_match":a["policy"]==r["authority"]["policy"],"agent_match":a["agent_boot"]==r["claimed_agent_boot"]}))')))
         print(node.execute("bpftool -j map dump pinned /sys/fs/bpf/velstra-ha/deadline")[1])
@@ -208,6 +215,9 @@ in pkgs.testers.runNixOSTest {
         time.sleep(0.01)
     elapsed=time.monotonic()-started
     backup.succeed("ip -o address show eth1 | grep -q 10.1.0.100")
+    ${pkgs.lib.optionalString leased ''
+    backup.wait_until_succeeds(python_command('import json; frames=[json.loads(line[5:]) for line in open("/tmp/live-management") if line.startswith("data:")]; assert any(frame.get("ha",{}).get("role")=="Master" for frame in frames if frame.get("ha"))'),timeout=15)
+    ''}
     ${pkgs.lib.optionalString leased ''
     backup.succeed("ip -6 -o address show eth2 | grep fd42:2::100 | grep -v tentative")
     client.succeed("ping -6 -c1 -W2 fd42:2::100")
