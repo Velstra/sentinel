@@ -148,7 +148,7 @@ fn login_body() -> Value {
         "properties": {
             "username": { "type": "string" },
             "password": { "type": "string", "format": "password" },
-            "code": { "type": "string", "description": "The second factor, when the account has one." },
+            "code": { "type": "string", "description": "The one-time code, when the account has one; ignored otherwise." },
         },
     })
 }
@@ -157,7 +157,7 @@ fn token_answer() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "token": { "type": "string", "description": "The account's own token; present it as the bearer from now on." },
+            "token": { "type": "string", "description": "The session's token; present it as the bearer until it expires or is signed out." },
             "user": { "type": "string" },
             "permission": { "type": "string", "enum": ["read-only", "read-write"] },
         },
@@ -260,6 +260,18 @@ const OPERATIONS: &[Operation] = &[
         open: false,
     },
     Operation {
+        method: "post",
+        path: "/api/v1/config/recovery/accept",
+        id: "accept-current-config",
+        summary: "End a transaction whose automatic recovery failed.",
+        description: "Body id must match the pending transaction, and its recovery must have given up (recovery_failed in config/transaction); 409 while it is still retrying. Keeps the restored saved document and accepts the live network as it is.",
+        parameters: &[],
+        body: Some(("application/json", any_object)),
+        answer: "The operation result.",
+        answer_shape: Some(("application/json", any_object)),
+        open: false,
+    },
+    Operation {
         method: "get",
         path: "/api/v1/ha/proof/{nonce}",
         id: "haProof",
@@ -327,13 +339,25 @@ const OPERATIONS: &[Operation] = &[
         method: "post",
         path: "/api/v1/login",
         id: "login",
-        summary: "Sign in as an account and receive its token.",
-        description: "Checks the account's password (and second factor, when it has one) and hands back the token the account holds — the same one an operator could read off the box, so knowing the password grants nothing new, only a way to ask. Throttled per address and per account; a lock-out answers 429 with the seconds remaining.",
+        summary: "Sign in as an account and open a session.",
+        description: "Checks the account's password and, when it has one, its one-time code — both in this one request — and opens a session: a new token, valid for 30 minutes without use and 12 hours in all, and ended early by signing out or by any change to the account's password, second factor or group. Every refused credential answers the same 401. Throttled per address and per account; a lock-out answers 429 with the seconds remaining.",
         parameters: &[],
         body: Some(("application/json", login_body)),
-        answer: "The token and what it may do.",
+        answer: "The session's token and what it may do.",
         answer_shape: Some(("application/json", token_answer)),
         open: true,
+    },
+    Operation {
+        method: "post",
+        path: "/api/v1/sign-out",
+        id: "sign-out",
+        summary: "End the session the bearer names.",
+        description: "Ends a signed-in session, read-only ones included: 200 when it was open, the usual 401 when the bearer is no session, and 400 for the machine token, which is rotated rather than signed out.",
+        parameters: &[],
+        body: None,
+        answer: "`{\"signed_out\": true}`; the session is over.",
+        answer_shape: Some(("application/json", any_object)),
+        open: false,
     },
     Operation {
         method: "get",
