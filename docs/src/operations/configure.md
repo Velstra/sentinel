@@ -563,7 +563,12 @@ its own; `show` in a fresh session lists what the hardware provides.
 The same service that serves the console answers programs, on the same port.
 Everything but `GET /api/v1/health`, `POST /api/v1/login` and the document
 below sits behind a bearer token — the machine token in
-`/var/lib/sentinel/api-token`, or the one `login` hands back for an account.
+`/var/lib/sentinel/api-token`, or the session token `login` hands back for an
+account. A session lasts 30 minutes without use and 12 hours in all;
+`POST /api/v1/sign-out` ends it sooner, and changing the account's password,
+one-time-code secret or group (or deleting it) ends every session it has open.
+Only a digest of each session is kept on the box, so there is no per-account
+token file to read off it; the machine token is not a session and never expires.
 
 | Route | What |
 |---|---|

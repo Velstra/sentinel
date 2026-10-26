@@ -1604,11 +1604,12 @@ pub fn page() -> String {
         <span>Password</span>
         <input id="password" type="password" autocomplete="current-password">
       </label>
-      <!-- Shown only once the appliance has said this account wants one, so an
-           account without a second factor is not asked a question it has no
-           answer to. -->
-      <label class="field hidden" id="codefield">
-        <span>One-time code</span>
+      <!-- Always offered, and sent with the password in the one request. The
+           appliance used to ask for it only after the password had been
+           accepted, which told anybody guessing that the password was right;
+           an account without a second factor simply leaves it empty. -->
+      <label class="field" id="codefield">
+        <span>One-time code (if enabled)</span>
         <input id="code" inputmode="numeric" autocomplete="one-time-code"
                maxlength="6" placeholder="000000">
       </label>
@@ -2814,8 +2815,13 @@ let token = sessionStorage.getItem(KEY) || "";
 // Who is signed in and what they may do. A read-only account must not be shown
 // buttons that will be refused: the appliance would refuse them correctly, and
 // the operator would learn their permission by being told no.
+//
+// Until the appliance has said which it is, the permission is "unknown" and
+// is treated as read-only: a status call that failed must not hand a
+// read-only account every write control. Least privilege until told otherwise.
 let who = "";
-let permission = "read-write";
+let permission = "unknown";
+const mayWrite = () => permission === "read-write";
 // Re-runs the write gate whenever the page redraws a list: the lists rebuild
 // themselves constantly, and a gate that ran once per view left every row's
 // Edit and Delete enabled for a read-only account.
@@ -2912,6 +2918,10 @@ function el(tag, attrs, kids) {{
     if (k === "class") n.className = v;
     else if (k === "text") n.textContent = v;
     else if (k.startsWith("on")) n[k] = v;
+    // Through the CSSOM, not the attribute: the page's Content-Security-Policy
+    // admits only the style attributes written in the markup, by hash, and a
+    // style attribute set from script is checked against exactly that list.
+    else if (k === "style") n.style.cssText = v;
     else if (v !== null && v !== undefined) n.setAttribute(k, v);
   }}
   for (const kid of kids || []) n.append(kid);
@@ -3200,7 +3210,21 @@ async function refreshDashboardExtras() {{
   }} catch (e) {{ $("dashlog").textContent = "The log could not be read: " + (e.message || e); }}
 }}
 
+// Everything below the React dashboard lives in a collapsed "System details"
+// section: the units, tiles, routes, log and counters it polls every five
+// seconds are a dozen `show` calls and their child processes, spent on a
+// section nobody had open, or a tab nobody was looking at.
+function dashboardDetailsVisible() {{
+  const details = document.querySelector(".dashboard-details");
+  return view === "dashboard" && !!details && details.open &&
+    document.visibilityState === "visible";
+}}
+
 async function refreshDashboard() {{
+  const detailed = dashboardDetailsVisible();
+  // Collapsed, the one thing still worth asking is who is signed in (and the
+  // box's name for the rail), and only until the appliance has said.
+  if (!detailed && permission !== "unknown") return;
   // Services first: a red unit explains every strange number below it.
   try {{
     const s = await (await api("/api/v1/status")).json();
@@ -3212,7 +3236,7 @@ async function refreshDashboard() {{
     // signed in as comes back from the appliance rather than being remembered.
     if (s.you) {{
       who = s.you.user || "";
-      permission = s.you.permission || "read-write";
+      permission = s.you.permission || "unknown";
       renderWho();
     }}
     const out = $("services");
@@ -3229,6 +3253,7 @@ async function refreshDashboard() {{
       ]));
     }}
   }} catch (e) {{ /* the counters below still work; the pill shows the failure */ }}
+  if (!detailed) return;
 
   // The tiles and tables above the graphs, each from its own `show`.
   // Not awaited: the tiles come from six separate `show` calls and the graphs
@@ -3636,7 +3661,7 @@ function stage(label, lines) {{
   // themselves after every fetch and a button can be drawn before the gate
   // runs over it, which is how a read-only account came to hold a pending
   // "delete firewall rule".
-  if (permission === "read-only") {{
+  if (!mayWrite()) {{
     banner("This account may read the configuration, not change it");
     return;
   }}
@@ -5990,11 +6015,21 @@ function renderObjects(o) {{
 function gateWrites() {{
   // React owns permissions and busy state for the migrated management views.
   if (typeof management !== "undefined") management.contextChanged();
-  if (permission !== "read-only") return;
+  if (mayWrite()) {{
+    // The permission was unknown and turned out to allow writes: lift exactly
+    // the gates this function closed, and nothing another rule disabled.
+    for (const b of document.querySelectorAll("main button[data-write-gated]")) {{
+      b.disabled = false;
+      b.title = "";
+      delete b.dataset.writeGated;
+    }}
+    return;
+  }}
   for (const b of document.querySelectorAll("main button")) {{
     if (/^(edit|delete|new|add|stage|apply|validate|generate|lift|capture|roll)/i
         .test(b.textContent.trim())) {{
       b.disabled = true;
+      b.dataset.writeGated = "";
       b.title = "This account may read the configuration, not change it";
     }}
   }}
@@ -7304,11 +7339,17 @@ const HA = [
   ["cluster", "Cluster identifier"],
   ["management-fingerprint", "Local management TLS fingerprint"],
   ["peer-identity", "Peer identity JSON", null, null, "secret"],
+  ["lease-ms", "Witness lease (ms)"],
+  ["io-timeout-ms", "Witness exchange budget (ms)"],
 ];
 const HA_WITNESS = [
   ["listen", "Witness listen IP:port"],
-  ["secret", "Witness enrollment credential", null, null, "secret"],
+  ["key", "Derived witness key", null, null, "secret"],
+  ["member", "Member addresses", null, "list"],
   ["cluster", "Witness cluster identifier"],
+  ["lease-ms", "Lease granted (ms)"],
+  ["peer-silence-ms", "Peer silence before lone takeover (ms)"],
+  ["secret", "Enrollment credential (deprecated)", null, null, "secret"],
 ];
 const CONFIG_SYNC = [
   ["peer", "Peers", null, "list"], ["secret", "Shared secret", null, null, "secret"],
@@ -7745,6 +7786,7 @@ const SYS_FLEET = [
   ["enrollment-token", "Enrollment token", null, null, "secret"], ["ca-certificate", "Controller CA file"],
   ["client-certificate", "Client certificate file"], ["client-key", "Private client key file"],
   ["signing-key", "Ed25519 signing public key"], ["poll-interval", "Check-in interval (seconds)"],
+  ["flow-telemetry", "Per-flow telemetry (addresses)", ["", "true", "false"]],
 ];
 const SYS_UPDATE = [
   ["url", "Default channel URL"], ["public-key", "Signing key"],
@@ -7964,7 +8006,7 @@ async function refreshSystem() {{
     empty: "No kernel parameters set.",
   }});
   settingsPanel("sys-fleet", SYS_FLEET, under("fleet"), "fleet", "Fleet enrollment");
-  $("disconnect-fleet").disabled = permission === "read-only" || !under("fleet")["controller-url"];
+  $("disconnect-fleet").disabled = !mayWrite() || !under("fleet")["controller-url"];
   $("disconnect-fleet").onclick = () => stage("Disconnect fleet", ["delete fleet"]);
   settingsPanel("sys-update", SYS_UPDATE, under("update"), "update", "Update channel");
   renderObjects({{
@@ -9254,7 +9296,20 @@ async function refreshCluster() {{
   }} catch (e) {{ $("clusterrev").textContent = "rev —"; }}
 }}
 
+// Ask again for a permission the appliance has not yet stated (a status call
+// that failed), on every navigation rather than only from the dashboard.
+async function learnPermission() {{
+  try {{
+    const s = await (await api("/api/v1/status")).json();
+    if (s.you && s.you.permission) {{
+      permission = s.you.permission;
+      renderWho();
+    }}
+  }} catch (e) {{ /* still unknown, so still offered nothing to write */ }}
+}}
+
 async function refresh() {{
+  if (permission === "unknown" && view !== "dashboard") learnPermission();
   renderSectionStrip();
   renderPageHeader();
   renderTabs(view);
@@ -9349,10 +9404,10 @@ function renderWho() {{
   if ($("whoname")) $("whoname").textContent = name;
   if ($("whoinit")) $("whoinit").textContent = init;
   if ($("userchip")) $("userchip").title = who ? "signed in as " + who : "signed in with the machine token";
-  const readOnly = permission === "read-only";
+  const readOnly = !mayWrite();
   const pill = $("permpill");
   if (pill) {{
-    pill.textContent = "read-only";
+    pill.textContent = permission === "read-only" ? "read-only" : "checking access";
     pill.classList.toggle("hidden", !readOnly);
   }}
   // Everything that changes the appliance is a POST, and a read-only token is
@@ -9367,6 +9422,9 @@ function renderWho() {{
     gateObserver = new MutationObserver(() => gateWrites());
     gateObserver.observe(document.querySelector("main") || document.body,
       {{ childList: true, subtree: true }});
+  }} else if (!readOnly && gateObserver) {{
+    gateObserver.disconnect();
+    gateObserver = null;
   }}
   gateWrites();
 }}
@@ -9379,7 +9437,7 @@ function signOut(message) {{
   stopManagement();
   token = "";
   who = "";
-  permission = "read-write";
+  permission = "unknown";
   // Nothing of the last session may outlive it: staged commands the next
   // operator would apply as their own, a peer they did not select, and a
   // configuration they were never shown.
@@ -9419,7 +9477,7 @@ function signedIn() {{
 }}
 
 // Signing in as an account: the appliance checks the password and hands back
-// that account's token, which is the same token everything else here uses. The
+// a new session's token, which is the token everything else here uses. The
 // password is never kept — not in a variable that outlives this function, not
 // in storage, not anywhere.
 $("loginform").onsubmit = async (e) => {{
@@ -9439,23 +9497,15 @@ $("loginform").onsubmit = async (e) => {{
     }});
     const body = await r.json().catch(() => ({{}}));
     if (!r.ok) {{
-      // The password was right and a code is what is missing: reveal the field
-      // and say so, rather than repeating "sign-in failed" at somebody who did
-      // nothing wrong.
-      if (/one-time code/i.test(body.error || "")) {{
-        $("codefield").classList.remove("hidden");
-        $("code").focus();
-      }}
       $("loginerr").textContent = body.error || ("Sign-in failed (HTTP " + r.status + ")");
       return;
     }}
     token = body.token;
-    permission = body.permission || "read-write";
+    permission = body.permission || "unknown";
     who = body.user || username;
     sessionStorage.setItem(KEY, token);
     $("password").value = "";
     $("code").value = "";
-    $("codefield").classList.add("hidden");
     $("loginerr").textContent = "";
     signedIn();
   }} catch (err) {{
@@ -9474,14 +9524,26 @@ $("tokenform").onsubmit = (e) => {{
   e.preventDefault();
   token = $("token").value.trim();
   if (!token) return;
-  permission = "read-write";
+  // A pasted token may be any account's: the status call says which.
+  permission = "unknown";
   who = "";
   sessionStorage.setItem(KEY, token);
   $("token").value = "";
   $("loginerr").textContent = "";
   signedIn();
 }};
-$("signout").onclick = () => signOut("");
+// Signing out ends the session on the appliance too, not only in this tab: a
+// token that outlived the tab would still work for whoever copied it. Best
+// effort — an appliance that cannot be reached still gets the tab signed out.
+$("signout").onclick = () => {{
+  if (token) {{
+    fetch("/api/v1/sign-out", {{
+      method: "POST",
+      headers: {{ Authorization: "Bearer " + token }},
+    }}).catch(() => {{}});
+  }}
+  signOut("");
+}};
 // The real header height, including narrow/zoomed wrapping, positions drawers.
 const headerSize = new window.ResizeObserver(([entry]) => {{
   document.documentElement.style.setProperty("--bar-h", Math.ceil(entry.target.getBoundingClientRect().height) + "px");
@@ -9564,6 +9626,14 @@ wireToggle("toggleuser", "adduserpanel", "New");
 wireToggle("togglesyn", "addsynpanel", "New");
 wireToggle("togglevrrp", "addvrrppanel", "New");
 $("groupkind").onchange = () => refreshGroups();
+// Opening the details, or coming back to the tab, shows current numbers at
+// once rather than up to one poll interval later.
+document.querySelector(".dashboard-details").addEventListener("toggle", () => {{
+  if (token && dashboardDetailsVisible()) refreshDashboard();
+}});
+document.addEventListener("visibilitychange", () => {{
+  if (token && dashboardDetailsVisible()) refreshDashboard();
+}});
 $("liftall").onclick = () => clearOp("ids/blocks");
 $("runtrace").onclick = async () => {{
   const btn = $("runtrace");
@@ -10260,6 +10330,68 @@ mod tests {
             html.contains(r#"const committed = tail.includes("commit")"#),
             "applying and validating are not told apart"
         );
+    }
+
+    /// Until the appliance says which account this is, the console offers no
+    /// write control. It used to start as "read-write" and fall back to it
+    /// whenever the status call failed, so a read-only account was shown every
+    /// Apply, Edit and Delete exactly when the box was least able to say no
+    /// gracefully. Pinned as a shape: any of these is that default returning.
+    #[test]
+    fn an_unknown_permission_offers_no_write_controls() {
+        let html = page();
+        assert!(html.contains("let permission = \"unknown\";"));
+        assert!(html.contains("const mayWrite = () => permission === \"read-write\";"));
+        for writable_by_default in [
+            "|| \"read-write\"",
+            "permission = \"read-write\"",
+            "permission !== \"read-only\"",
+            "permission === \"read-only\" ||",
+        ] {
+            assert!(
+                !html.contains(writable_by_default),
+                "the console treats an unknown permission as writable: {writable_by_default}"
+            );
+        }
+        assert!(html.contains("canWrite: () => permission === \"read-write\""));
+    }
+
+    /// The legacy "System details" section polls a dozen `show` endpoints. It
+    /// must do so only while it is open on a visible tab: collapsed, it asks
+    /// for nothing once the signed-in permission is known.
+    #[test]
+    fn the_collapsed_dashboard_details_are_not_polled() {
+        let html = page();
+        let visible = html
+            .split_once("function dashboardDetailsVisible() {")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .expect("dashboardDetailsVisible");
+        assert!(visible.contains("details.open"), "{visible}");
+        assert!(
+            visible.contains("document.visibilityState === \"visible\""),
+            "{visible}"
+        );
+        let refresh = html
+            .split_once("async function refreshDashboard() {")
+            .map(|(_, rest)| rest)
+            .expect("refreshDashboard");
+        let gate = refresh
+            .find("if (!detailed && permission !== \"unknown\") return;")
+            .expect("refreshDashboard must return early while the details are hidden");
+        let first_request = refresh.find("api(").expect("status request");
+        assert!(
+            gate < first_request,
+            "a request precedes the visibility gate"
+        );
+        let details_gate = refresh
+            .find("if (!detailed) return;")
+            .expect("the show calls must sit behind the visibility gate");
+        let first_show = refresh
+            .find("refreshDashboardExtras(")
+            .expect("details refresh");
+        assert!(details_gate < first_show);
+        assert!(details_gate < refresh.find("/api/v1/show/").unwrap());
     }
 
     /// Every element the script reaches for by name has to be in the markup.

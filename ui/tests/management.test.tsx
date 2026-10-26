@@ -111,6 +111,30 @@ describe("React dashboard and packet inspector", () => {
     expect(screen.getByText("0 seconds ago")).toBeVisible();
     expect(screen.getByText("40 active firewall states")).toBeVisible();
   });
+  it("says why a standby could not take over instead of a bare Backup", () => {
+    const { manager } = fixture();
+    manager.acceptFrame(
+      frame({
+        ha: {
+          role: "Backup",
+          cluster: "edge",
+          node: "b",
+          term: 4,
+          sync_age_ms: 2300,
+          ready: false,
+          not_ready:
+            "policy differs from the owner's; awaiting configuration sync",
+        },
+      }),
+    );
+    render(<Dashboard manager={manager} />);
+    expect(
+      screen.getAllByText(
+        "Backup (not ready: policy differs from the owner's; awaiting configuration sync)",
+      ),
+    ).toHaveLength(2);
+    expect(screen.queryByText("Backup")).toBeNull();
+  });
   it("keeps missing measurements unknown and never invents Master sync latency", async () => {
     const { manager } = fixture();
     manager.acceptFrame(
@@ -178,6 +202,28 @@ describe("React dashboard and packet inspector", () => {
     expect(screen.getByText("down")).toHaveClass("health-down");
     expect(screen.getByText(/chart appears after two/)).toBeVisible();
   });
+  it("shows a held zoned link as waiting for the datapath, not as unknown", () => {
+    const { manager } = fixture();
+    const sample = frame();
+    manager.acceptFrame(
+      frame({
+        interfaces: [
+          ...sample.interfaces,
+          {
+            ...sample.interfaces[0],
+            name: "lan0",
+            state: "held: waiting for datapath",
+            held: true,
+            rates: null,
+          },
+        ],
+      }),
+    );
+    render(<Dashboard manager={manager} />);
+    expect(screen.getByText("held: waiting for datapath")).toHaveClass(
+      "health-down",
+    );
+  });
   it("opens real management destinations from the overview without mutating configuration", async () => {
     const { manager, host } = fixture();
     manager.acceptFrame(frame());
@@ -234,6 +280,26 @@ describe("React dashboard and packet inspector", () => {
     expect(
       screen.getAllByText("No events match these filters.").length,
     ).toBeGreaterThan(0);
+  });
+  it("says how many packet events this view lost", () => {
+    const { manager } = fixture();
+    manager.acceptFrame(frame());
+    render(<Flows manager={manager} />);
+    expect(screen.queryByRole("note")).toBeNull();
+    act(() => manager.acceptFrame(frame({ events_lost: 1234 })));
+    expect(screen.getByRole("note")).toHaveTextContent("1,234 events lost");
+  });
+  it("keeps the route table when a frame marks it unchanged", () => {
+    const { manager } = fixture();
+    manager.acceptFrame(frame());
+    manager.acceptFrame(
+      frame({ routing: { bgp: "Idle", routes_unchanged: true } }),
+    );
+    const routing = manager.getSnapshot().frame?.routing;
+    expect(routing?.routes).toBe("10.0.0.0/24 via 192.0.2.2");
+    expect(routing?.bgp).toBe("Idle");
+    manager.acceptFrame(frame({ routing: { bgp: "Idle" } }));
+    expect(manager.getSnapshot().frame?.routing?.routes).toBeUndefined();
   });
   it("bounds packet retention and clears sensitive filters/history on sign-out", async () => {
     const { manager } = fixture();
@@ -421,6 +487,46 @@ describe("React document editor and safe apply", () => {
       await done;
     });
   });
+  it("offers to accept the live network only after recovery gave up", async () => {
+    const { manager, host } = fixture();
+    manager.setPending({ ...pending, reverting: true, recovery_attempts: 2 });
+    render(<Confirmation manager={manager} />);
+    expect(screen.getByRole("status")).toHaveTextContent("failed 2 time");
+    expect(screen.queryByText("Accept current network")).toBeNull();
+    await manager.finishTransaction("recovery/accept");
+    expect(host.api).not.toHaveBeenCalled();
+    act(() =>
+      manager.setPending({
+        ...pending,
+        ready: false,
+        reverting: true,
+        recovery_attempts: 5,
+        recovery_failed: true,
+      }),
+    );
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Automatic recovery failed after 5 attempts",
+    );
+    expect(screen.getByText("Keep change")).toBeDisabled();
+    expect(screen.getByText("Revert now")).toBeDisabled();
+    vi.mocked(host.api).mockImplementationOnce(() =>
+      reply({ abandoned: true, id: pending.id }),
+    );
+    await act(() =>
+      userEvent.click(screen.getByText("Accept current network")),
+    );
+    expect(host.api).toHaveBeenCalledWith(
+      "/api/v1/config/recovery/accept",
+      expect.objectContaining({ body: JSON.stringify({ id: pending.id }) }),
+      120,
+    );
+    expect(manager.getSnapshot().pending).toBeNull();
+    expect(host.completed).toHaveBeenCalledWith(
+      pending.id,
+      "recovery-abandoned",
+      expect.stringContaining("live network was accepted"),
+    );
+  });
   it("restores staged form edits and the TOML draft after server-driven automatic rollback", async () => {
     const { manager, host } = fixture();
     await manager.loadEditor();
@@ -534,7 +640,63 @@ describe("management concurrency protection", () => {
   });
 });
 
+describe("console adapter permissions", () => {
+  // The legacy page's adapter, run as the page runs it: free variables for
+  // the page's own state, and a mount that hands back the host it was given.
+  async function adapter(permission: unknown) {
+    const source = (await import("../../src/management.js?raw")).default;
+    let host: Host | undefined;
+    const window = {
+      SentinelReact: {
+        mount: (h: Host) => {
+          host = h;
+          return {};
+        },
+      },
+    };
+    new Function("window", "permission", "token", "target", source)(
+      window,
+      permission,
+      "token",
+      "",
+    );
+    return host!;
+  }
+  it("offers writes only to an account the appliance said is read-write", async () => {
+    expect((await adapter("read-write")).canWrite()).toBe(true);
+    for (const permission of ["read-only", "unknown", "", undefined])
+      expect((await adapter(permission)).canWrite()).toBe(false);
+  });
+});
+
 describe("authenticated SSE transport", () => {
+  it("aborts a silent (half-open) telemetry connection and reconnects with backoff", async () => {
+    vi.useFakeTimers();
+    const { manager } = fixture();
+    const signals: AbortSignal[] = [];
+    // A stream that stays open and never sends a byte: what a half-open TCP
+    // connection looks like to fetch.
+    const fetcher = vi.fn(async (_url: unknown, options?: RequestInit) => {
+      signals.push(options?.signal as AbortSignal);
+      return new Response(new ReadableStream({}));
+    });
+    vi.stubGlobal("fetch", fetcher);
+    manager.start();
+    await vi.advanceTimersByTimeAsync(14000);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(signals[0].aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(signals[0].aborted).toBe(true);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(manager.getSnapshot().status).toContain("Reconnecting");
+    // Still silent: the next attempt waits longer than the first did.
+    await vi.advanceTimersByTimeAsync(16000);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(2500);
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    manager.stop();
+    expect(signals.every((signal) => signal.aborted)).toBe(true);
+  });
   it("handles split CRLF delimiters, UTF-8, comments and multiple frames", async () => {
     const chunks = [
       ": keepalive\r\n\r",

@@ -122,6 +122,11 @@ in pkgs.testers.runNixOSTest {
         telemetry = last_request()["telemetry"]
         assert telemetry["interfaces"] and "routes" in telemetry["routing"], telemetry
         assert not telemetry["events"], telemetry
+        # Counters only by default: no connection sample, NAT flow or top
+        # talker — nothing naming a client — leaves the box.
+        assert telemetry["flow_detail"] is False and "top_talkers" not in telemetry, telemetry
+        assert "total" in telemetry["conntrack"] and "states" not in telemetry["conntrack"], telemetry
+        assert "nat_flows" not in telemetry["conntrack"], telemetry
         events = fw.succeed("sentinel agent-query 'packet-events 256'")
         assert '"rule":"ping"' in events or '"rule": "ping"' in events, events
         fw.succeed("test $(stat -c %a " + state + ") = 600")
@@ -154,28 +159,48 @@ in pkgs.testers.runNixOSTest {
         fw.succeed("hostname | grep -x fleet-confirmed")
         fw.succeed("grep -q fleet-confirmed " + config)
 
+    with subtest("a signed revision cannot touch local trust anchors"):
+        text = fw.succeed("cat " + config) + '\n[[system.login]]\nusername = "mallory"\nssh-key = ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIabc mallory@controller"]\n'
+        controller.succeed("printf %s " + shlex.quote(text) + " > /var/lib/fleet-test/candidate.toml")
+        queue(4, dict(action="apply-hostname"))
+        poll(False)
+        assert sequence() == 4
+        assert json.loads(fw.succeed("cat " + state))["result"]["state"] == "refused"
+        fw.succeed("test ! -e " + pending)
+        fw.fail("grep -q mallory " + config)
+        fw.fail("id mallory")
+
     with subtest("controller outage cannot prevent automatic rollback local edits or reboot"):
         candidate("fleet-must-revert")
-        queue(4, dict(action="apply-hostname"))
+        queue(5, dict(action="apply-hostname"))
         poll(); wait_ready()
         controller.succeed("systemctl stop fleet-controller.service")
         fw.wait_until_succeeds("test ! -e " + pending, timeout=30)
         fw.succeed("hostname | grep -x fleet-confirmed")
         configure(["set interface eth1 mtu 1400"])
         fw.succeed("test $(cat /sys/class/net/eth1/mtu) = 1400; ping -c 1 -W 2 10.55.0.2")
-        assert sequence() == 4
+        assert sequence() == 5
         fw.shutdown()
         fw.start()
         fw.wait_for_unit("multi-user.target")
         fw.wait_for_unit("sentinel-fleet.timer")
         fw.succeed("hostname | grep -x fleet-confirmed; ping -c 1 -W 2 10.55.0.2")
-        assert sequence() == 4
+        assert sequence() == 5
         controller.succeed("systemctl start fleet-controller.service")
         controller.wait_for_open_port(9443)
         stop_timer()
         queue(3, dict(action="telemetry"))
         poll(False)
-        assert sequence() == 4
+        assert sequence() == 5
+
+    with subtest("flow-level telemetry is sent only after a local opt-in"):
+        configure(["set fleet flow-telemetry true"])
+        stop_timer()
+        queue(6, dict(action="telemetry"))
+        poll(); poll()
+        telemetry = last_request()["telemetry"]
+        assert "flow_detail" not in telemetry and "top_talkers" in telemetry, telemetry
+        assert "states" in telemetry["conntrack"] and "nat_flows" in telemetry["conntrack"], telemetry
 
     with subtest("deleting fleet returns the appliance to standalone without a reboot"):
         configure(["delete fleet"])

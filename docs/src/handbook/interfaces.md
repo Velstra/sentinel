@@ -32,6 +32,62 @@ VLAN's tag, parent or virtual device definition recreates that owned device and
 reattaches its packet hooks. Removing a virtual interface deletes its owned
 kernel device. Unchanged commits retain device identities.
 
+## Zoned links stay down until the firewall has them
+
+A link with a `zone` is the firewall's to filter, so it is held
+administratively **down** until the data plane (`velstra.service`) has
+attached its packet hooks and put the policy in force; only then does the
+agent bring it up. That holds for a link at boot, for one a commit creates or
+recreates (a VLAN whose tag changed, a rebuilt bridge), and on an HA member,
+where the link also waits for the HA guard. A zoned link never forwards
+unfiltered — and the price is that, with no working data plane, it does not
+forward at all.
+
+That state is shown rather than left to look like a cable fault:
+
+```text
+sentinel show interfaces
+...
+lan0: held: waiting for datapath (a zoned link stays down until the firewall has hooked it; see `show status`)
+```
+
+The console's interface table says the same, and when `[services.alerts]` is
+configured, a held link still dark after 30 seconds raises one alert
+(`zoned links held down`, naming whether the data plane is running at all) and
+another when it is up again. A data plane that fails outright also alerts
+through its unit's `OnFailure=`.
+
+Commits treat it strictly in one direction only. A commit that leaves a held
+link dark fails and names the link; disable the interface or remove its zone
+to commit without it. A **rollback** — a commit-confirm revert, or the
+recovery of an unconfirmed console/API change — reports such a link but
+succeeds: it stays dark either way, and refusing the restore would only strand
+the box on the configuration it is leaving.
+
+### Keep a way in that does not depend on the data plane
+
+When the data plane cannot start at all (a datapath the kernel refuses, a
+crash loop), **every zoned interface stays dark — including the LAN the web
+console is usually served on.** Plan for that before it happens:
+
+- **Dedicate a management port with no zone.** An unzoned interface is never
+  filtered and never held, so it stays reachable whatever the data plane does.
+  Give it an address on an isolated management network, bind the console and
+  SSH to it (`set services web listen-address …`, `set services ssh
+  listen-address …`), and consider `set interface <name> ip
+  disable-forwarding true` so it is a way in, not a path through the box.
+- **Enable the serial console** (`set system console device ttyS0`, see
+  [System & management](system.md#the-serial-console)) — the way in when the
+  network is the thing that is broken.
+
+To recover from a dark box: log in on the management port or serial console,
+check `sentinel show interfaces`, `sentinel show status` and
+`journalctl -u velstra.service` for the cause. A configuration change that
+caused it is undone with `rollback <N>`; an unconfirmed console change rolls
+back by itself, and a reboot returns to the saved configuration. A datapath
+that broke with an OS update is undone by booting the previous slot (see
+[A/B rollback](../operations/update.md#the-rollback-guarantee)).
+
 ## VLANs (802.1Q / QinQ)
 
 Name a subinterface `<parent>.<id>` to infer it, or set `parent`/`vlan`
