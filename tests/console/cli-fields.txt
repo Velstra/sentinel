@@ -58,6 +58,14 @@ firewall udp
 firewall udp-stream
 firewall url
 firewall user
+fleet ca-certificate
+fleet client-certificate
+fleet client-key
+fleet controller-url
+fleet enrollment-token
+fleet node-id
+fleet poll-interval
+fleet signing-key
 interface ac-name
 interface accept-dad
 interface ack-filter

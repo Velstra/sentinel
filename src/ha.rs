@@ -830,7 +830,8 @@ pub fn pair(
         facts.priority = 100;
         local.system.ha.as_mut().expect("member").peer_identity = Some(facts);
         local.validate()?;
-        let adjusted = materialize_peer(local.clone())?;
+        let mut adjusted = materialize_peer(local.clone())?;
+        adjusted.fleet = secondary.fleet.clone();
         adjusted.validate()?;
         let plan = PairPlan {
             peer: peer.clone(),

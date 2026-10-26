@@ -1,113 +1,155 @@
 # Velstra Sentinel
 
-A standalone, **immutable** firewall / router appliance OS, built on the
-[Velstra](https://github.com/Velstra/fabric) eBPF/XDP data plane.
+Velstra Sentinel is a declarative, immutable Rust + eBPF/XDP firewall and routing
+appliance. `appliance.toml` is its desired state; CLI, embedded web console and
+optional fleet management reconcile the same document without a reboot.
 
-Where [`Velstra Fabric`](https://github.com/Velstra/fabric) is the engine — an
-XDP firewall, router, load balancer, and VXLAN/Geneve overlay with an HA control
-plane — **Sentinel is the appliance on top**: an open-source firewall/router box,
-Rust-and-eBPF all the way down.
+The v1.0 feature set includes stateful filtering/NAT, VLANs/bridges, WireGuard,
+DHCPv4/v6 and DNS, Wren BGP/OSPF routing, witness-authorized active/passive HA,
+connection-state/config replication, commit-confirm recovery and authenticated
+live telemetry. Local operation requires no cloud service.
 
-**Not VyOS.** It is deliberately *not* a mutable system you SSH into and tweak.
-Sentinel is **image-based and immutable**: the running OS is read-only, and the
-whole box is described by one **declarative config** that the system reconciles
-to atomically (closer in spirit to Talos than to VyOS/pfSense). You change the
-appliance by changing its config and re-applying — never by editing live state.
+## 5-minute quickstart
 
-> **Status: working appliance, pre-1.0.** This is a substantial system
-> (~80k lines of Rust across ~40 modules), not a skeleton, and most of it is
-> exercised by the in-repo nixosTest suite. Implemented today:
->
-> - **Config & apply** — the declarative config model and interactive `configure`
->   CLI (`commit` / `commit-confirm` / `rollback` / `save`), a timestamped config
->   archive with `rollback <N>` and `compare`, and a transactional apply that
->   unwinds already-applied steps in reverse on failure.
-> - **Data plane** — the config→data-plane compiler driving the Velstra XDP
->   firewall, NAT (masquerade / DNAT / CGNAT / NPTv6), L4 load balancing, address
->   and port groups, per-rule rate limits, and QoS (CAKE / fq_codel).
-> - **Immutable OS** — the A/B disk image with dm-verity boot and Secure Boot,
->   **LUKS2 data-partition encryption** (TPM2-sealed with a recovery passphrase),
->   an installer (CLI + interactive TUI) and a live-boot ISO first-boot wizard,
->   and a **signature-enforced update path** (a detached Ed25519 signature over
->   the release manifest verified under an operator-pinned public key; an image
->   whose signature or digest does not verify is refused).
-> - **Management plane** — a **TLS-by-default** REST API and read-only web console
->   (a self-signed cert is minted and persisted on first boot and its public-key
->   pin printed for config-sync peers), a Prometheus `/metrics` endpoint, per-IP
->   and per-account login throttling, plus remote syslog and IPFIX flow export.
-> - **Routing & VPN** — dynamic routing (BGP / OSPF / OSPFv3 / IS-IS / RIP / Babel
->   / VRRP / BFD via the Wren control plane), VPN (WireGuard / IPsec-IKEv2 /
->   OpenConnect), multi-WAN with health-checked failover, and PPPoE client **and**
->   server (the BNG / access-concentrator role).
-> - **Services & security** — on-box PKI + ACME, intrusion detection (Suricata in
->   IDS mode, with enforcement through the eBPF blocklist), AAA (RADIUS / LDAP /
->   TOTP), a captive portal, and box services (DHCP, DNS, NTP, SNMP, LLDP, …).
->
-> It also talks to a Velstra controller over
-> [`velstra-proto`](https://crates.io/crates/velstra-proto): a `ports` query,
-> and `report`, which hands the controller this box's counters — the links, the
-> firewall's own totals, the rules that are carrying traffic. Reporting up is
-> deliberately the first thing it *sends*: taking configuration down would put
-> a second writer next to the declarative document this appliance reconciles
-> to. **Most of the above is
-> verified in the nixosTest VM suite; it is not yet validated end-to-end on
-> physical hardware** — ACME live issuance and the TPM2-sealed unlock in
-> particular exercise real boot/reachability paths a VM check cannot fully stand
-> in for. Pre-1.0: config surface and defaults may still change.
+Start with an available x86_64 installer ISO, a 32 GiB virtual disk, 4 GiB RAM,
+two VirtIO NICs and hardware virtualization. The five minutes cover initial
+setup after the image is available; building/downloading the Nix closure and
+provisioning an independent HA witness take additional time.
 
-## Try it
+### 1. Build and boot the installer
 
-```shell
-# Author the declarative config.
-cargo run -- config init > appliance.toml          # commented starter
-cargo run -- config check appliance.toml           # parse + validate
-cargo run -- config show  appliance.toml           # normalized summary
-cargo run -- config convert appliance.toml --to json  # TOML <-> JSON
+On a Linux build host with Nix flakes enabled:
 
-# Talk to a running Velstra controller.
-cargo run -- ports --controller http://127.0.0.1:50052
+```sh
+nix build .#sentinel-iso --out-link result-iso
+nix build .#qemu-firmware --out-link result-firmware
+qemu-img create -f qcow2 sentinel.qcow2 32G
+cp result-firmware-fd/FV/OVMF_VARS.fd sentinel-vars.fd
+chmod u+w sentinel-vars.fd
+qemu-system-x86_64 -enable-kvm -machine q35 -cpu host -smp 2 -m 4096 \
+  -drive if=pflash,format=raw,readonly=on,file=result-firmware-fd/FV/OVMF_CODE.fd \
+  -drive if=pflash,format=raw,file=sentinel-vars.fd \
+  -drive file=sentinel.qcow2,if=virtio,format=qcow2 \
+  -cdrom result-iso/iso/velstra-sentinel-installer.iso -boot order=d \
+  -netdev user,id=wan -device virtio-net-pci,netdev=wan,mac=52:54:00:10:00:01 \
+  -netdev user,id=lan,net=192.168.50.0/24,host=192.168.50.2,hostfwd=tcp:127.0.0.1:8443-192.168.50.1:8443 \
+  -device virtio-net-pci,netdev=lan,mac=52:54:00:10:00:02
 ```
 
-## Documentation
+The first NIC is WAN; the second is LAN. In the installer choose the empty
+virtual disk, create your administrator/password, set the first NIC to WAN/DHCP
+and the second to LAN/192.168.50.1/24, then confirm installation. Eject the ISO and
+boot from disk (`-boot order=c`, without `-cdrom`). The installed image has no
+factory password or console autologin; use the administrator you just created.
 
-The full handbook — **how to build the images**, the appliance model (verified
-boot, A/B updates, Secure Boot), and how to install/configure/update — lives in
-[`docs/`](docs/) as an [mdBook](https://rust-lang.github.io/mdBook/):
+For **Proxmox**, upload the same ISO and create a q35/OVMF VM with a 32 GiB disk,
+4 GiB RAM and two VirtIO NICs. Attach WAN/LAN to the intended bridges. Install,
+then eject the ISO and put the disk first in the boot order. Use the LAN address
+directly instead of QEMU's localhost forwarding. Firmware setup for your own
+Secure Boot trust is separate; the default source build uses development
+firmware-signing keys. See the [Proxmox VM reference](https://github.com/proxmox/pve-docs/blob/master/qm.adoc)
+and [verified-boot handbook](docs/src/architecture/secure-boot.md).
 
-```shell
-nix run nixpkgs#mdbook -- serve docs   # live preview at http://localhost:3000
-nix run nixpkgs#mdbook -- build docs   # static HTML in docs/book/
+### 2. Apply the sample desired state
 
-# the two build commands the handbook is built around:
-nix build .#sentinel-image             # the flashable, signed appliance disk image
-nix build .#sentinel-iso               # the live-boot installer ISO
+From the appliance console, run `sentinel show interfaces` and identify the WAN
+and LAN NIC names by the MACs above. The samples use `eth0`/`eth1`; substitute
+your actual names before applying. The complete network sample is
+[examples/quickstart.toml](examples/quickstart.toml). Its matching
+[CLI batch](examples/quickstart.cli) preserves the installer-created administrator
+and permission groups while writing the same network settings to canonical
+`/var/lib/sentinel/appliance.toml`:
+
+```sh
+sentinel configure < quickstart.cli
+sentinel config check /var/lib/sentinel/appliance.toml
+sentinel show interfaces
+sentinel show nat
 ```
 
-It is published to GitHub Pages on push (see `.github/workflows/docs.yml`).
-Historical design notes (the original `os.md` / `commit-model.md`) are preserved
-in the book's appendix; the architecture chapters are authoritative where they
-differ.
+Copy `examples/quickstart.cli` to the appliance as `quickstart.cli`, or paste its
+commands into `sentinel configure`. The batch configures DHCP on WAN, LAN
+`192.168.50.1/24`, LAN DHCP/DNS, outbound masquerading and a LAN-only HTTPS console
+on port 8443. WAN input defaults to drop with an explicit DHCP-client reply rule. Keep the installer accounts when
+authoring a complete replacement TOML document.
 
-The config declares interfaces (with zone roles), addresses, and zone-to-zone
-firewall rules; `ports` lists a controller's fabric ports over gRPC — the same
-wire types the Velstra agent and CNI use.
+### 3. Open the console and confirm changes
 
-## Architecture (intended)
+Open **https://localhost:8443/** for the QEMU command above, or
+**https://192.168.50.1:8443/** from the LAN/Proxmox bridge. Compare the self-signed
+management certificate with the identity printed in
+`journalctl -u sentinel-api.service` before trusting it, then log in with the
+installer account. **Dashboard** shows live health; **Policy → Firewall rules**
+includes the live flow/rule inspector; **System → Configuration** offers the
+validated side-by-side TOML editor.
 
+UI/API changes are provisional. Verify connectivity and choose **Keep change**
+within the default 60-second window. Otherwise the saved document and working
+network return automatically—even after API restart or a reboot. Details:
+[management and recovery](docs/management-phase4.md).
+
+### 4. Pair two appliances
+
+Use distinct member addresses and a dedicated control network reachable by an
+independent Sentinel witness. The witness is required for partition-safe leased
+HA; two members alone do not provide that authority. The fully exercised lab
+uses primary `10.3.0.1`, secondary `10.3.0.2`, witness `10.3.0.3` and HTTPS
+management port 8080. Generate one private enrollment credential of at least
+32 bytes. Configure it as `system.ha-witness.secret` on the witness (listen
+`10.3.0.3:5440`) and `system.config-sync.secret` on the secondary.
+
+On the primary, prepare `system.ha.enabled = false` and
+`system.ha.witness = "10.3.0.3:5440"`, then run:
+
+```sh
+read -rs PAIR_TOKEN
+sentinel ha pair 10.3.0.2:8080 --witness 10.3.0.3:5440 --secret "$PAIR_TOKEN"
+unset PAIR_TOKEN
+sentinel show vrrp
 ```
-        Sentinel (this repo) — appliance: config mgmt, admin API, OS image, HA
-                │ velstra-proto (gRPC)
-                ▼
-        Velstra Fabric — data plane (XDP/eBPF) + control plane (controller/agent)
+
+Pairing binds member identities and management TLS pins, reconciles both nodes
+and persists a recoverable plan. The automated pairing check asserts this
+command completes in under 30 seconds once the network/witness are ready.
+For the complete shared VIP/interface preparation and failover guarantees, use
+[the HA guide](docs/ha-phase3.md) and [the executable lab](nix/ha-pair-test.nix).
+
+## Optional fleet management
+
+Provision a node-specific mTLS identity and the controller's command-signing
+public key, then configure `[fleet]` or **System → Fleet enrollment**. The
+controller can request telemetry and deliver signed desired-state revisions;
+changes retain local validation, CAS and explicit commit-confirm recovery.
+Without this section the agent stays stopped. [Configuration and controller
+protocol](docs/fleet-phase5.md).
+
+## Build and verify
+
+```sh
+cargo fmt --all -- --check
+cargo check --locked
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+bash tests/console/run.sh
+nix build .#checks.x86_64-linux.api .#checks.x86_64-linux.quickstart -L
+nix build .#checks.x86_64-linux.ha-pair .#checks.x86_64-linux.install-iso -L
+nix build .#sentinel-image .#sentinel-iso -L
 ```
 
-Sentinel depends on the shared Velstra crates from crates.io. Today that is
-`velstra-proto`; the data-plane crates (`velstra-common`, `velstra-config`) join
-once they leave their git-`aya` dependency behind and publish.
+The web assets are compiled into the Rust binary and Nix appliance; there is no
+separate npm build or runtime asset server. The test suite boots Linux VMs for
+real packet forwarding/NAT, kernel verifier loading, service reconciliation,
+HA/replication, management rollback and mTLS fleet commands. Hardware-specific
+TPM/Secure Boot provisioning and physical NIC compatibility still require
+validation on the deployment hardware. Encrypted installations use LUKS2 and a
+boot-time passphrase; no unattended TPM enrollment is claimed here.
+
+The [mdBook handbook](docs/) covers installation, verified A/B boot, routing,
+services and signed image updates. Build it with `nix run nixpkgs#mdbook -- build
+docs`. The image and ISO are source-build outputs; this README does not imply a
+published vendor update channel or signing authority.
 
 ## License
 
-**AGPL-3.0-or-later** — see [`LICENSE`](LICENSE). Like Velstra Fabric, the
-product is copyleft; a commercial license is available for organisations that
-cannot use the AGPL. Contributions are under the project CLA (to keep
-dual-licensing possible).
+**AGPL-3.0-or-later**. A commercial license is available; contributions are under
+the project CLA.
