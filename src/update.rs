@@ -28,7 +28,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -52,8 +51,6 @@ pub struct Manifest {
 
 // ---- scratch storage ------------------------------------------------------
 
-static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
-
 /// A private temp directory that removes itself (and everything under it) on
 /// drop. Used to stage the fetched manifest/signature/pinned-key and, for a
 /// channel install, the verified image. Public so [`crate::install`] can own the
@@ -63,17 +60,22 @@ pub struct Scratch(std::path::PathBuf);
 impl Scratch {
     /// Create a fresh, uniquely-named scratch dir under the system temp dir.
     pub fn new() -> Result<Self> {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let seq = SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
-        let p = std::env::temp_dir().join(format!(
-            "sentinel-update-{}-{nanos}-{seq}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&p).with_context(|| format!("creating {}", p.display()))?;
-        Ok(Self(p))
+        use std::os::unix::fs::DirBuilderExt;
+        for _ in 0..8 {
+            let mut nonce = [0u8; 16];
+            getrandom::getrandom(&mut nonce)
+                .map_err(|error| anyhow::anyhow!("scratch directory entropy: {error}"))?;
+            let suffix: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
+            let path = std::env::temp_dir().join(format!("sentinel-update-{suffix}"));
+            match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| format!("creating {}", path.display()));
+                }
+            }
+        }
+        bail!("could not create a unique private update scratch directory")
     }
 
     /// A path to `name` inside this scratch dir.
@@ -138,6 +140,61 @@ fn openssl_bin() -> String {
     system::bin("openssl")
 }
 
+/// The commercial gateway binds a subscription to a stable appliance identity.
+/// A volatile `/etc/machine-id` is unsuitable on the tmpfs-root image, so the
+/// identifier lives on the appliance's persistent state partition instead.
+fn update_machine_id_at(path: &Path) -> Result<String> {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    if !path.exists() {
+        let mut bytes = [0u8; 16];
+        getrandom::getrandom(&mut bytes)
+            .map_err(|error| anyhow::anyhow!("update identity entropy: {error}"))?;
+        let id: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+        {
+            Ok(mut file) => {
+                file.write_all(id.as_bytes())?;
+                file.sync_all()?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error).context("creating persistent update identity"),
+        }
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .context("opening persistent update identity")?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o777 != 0o600 {
+        bail!(
+            "persistent update identity at {} is not a private regular file",
+            path.display()
+        );
+    }
+    let mut id = String::new();
+    file.read_to_string(&mut id)
+        .context("reading persistent update identity")?;
+    if id.len() != 32
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        bail!(
+            "persistent update identity at {} is invalid",
+            path.display()
+        );
+    }
+    Ok(id)
+}
+
 /// Fetch `url` to `dest` with `curl -fsSL`. `-f` makes an HTTP error (or a
 /// missing `file://` path) a non-zero exit; `--proto =https,file` refuses any
 /// other scheme even across a redirect. Any failure bails — fetch is fail-closed.
@@ -164,14 +221,23 @@ fn fetch(chan: &UpdateChannel, url: &str, dest: &Path) -> Result<()> {
         url,
     ]);
     if let Some(key) = &chan.subscription_key {
+        let machine_id = update_machine_id_at(Path::new("/var/lib/sentinel/update-machine-id"))?;
         let hdr = scratch.join("auth-header");
-        std::fs::write(&hdr, format!("Authorization: Bearer {key}\n"))
-            .context("staging the subscription header")?;
-        #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&hdr, std::fs::Permissions::from_mode(0o600))
-                .context("tightening the subscription header file")?;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&hdr)
+                .context("creating private subscription header file")?;
+            write!(
+                file,
+                "Authorization: Bearer {key}\nX-Velstra-Machine-ID: {machine_id}\n"
+            )
+            .context("staging the subscription header")?;
         }
         cmd.args(["-H", &format!("@{}", s(&hdr)?)]);
     }
@@ -518,6 +584,32 @@ mod tests {
     use super::*;
 
     // ---- pure tests (no openssl/curl, always run) ----
+
+    #[test]
+    fn commercial_machine_id_is_persistent_and_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new().unwrap();
+        assert_eq!(
+            std::fs::metadata(&scratch.0).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let path = scratch.join("node-id");
+        let first = update_machine_id_at(&path).unwrap();
+        assert_eq!(first.len(), 32);
+        assert_eq!(update_machine_id_at(&path).unwrap(), first);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::write(&path, "invalid").unwrap();
+        assert!(update_machine_id_at(&path).is_err());
+        std::fs::write(&path, first).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(update_machine_id_at(&path).is_err());
+        let link = scratch.join("node-id-link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(update_machine_id_at(&link).is_err());
+    }
 
     #[test]
     fn rejects_unsafe_image_names() {
