@@ -31,6 +31,7 @@ tonic = { version = "0.12", default-features = false, features = ["transport"] }
 # hyper (tonic already pulls hyper 1.x). Every endpoint drives the SAME
 # `Appliance` config model the CLI edits — one config tree, no UI-vs-CLI drift.
 axum = "0.7"
+tokio-stream = { version = "0.1", features = ["sync"] }
 # Management-plane TLS (H3): axum itself has no TLS server, so axum-server adds a
 # rustls listener over the SAME axum Router. `tls-rustls-no-provider` reuses the
 # rustls 0.23 + ring that are already in the tree (via tonic/hyper) rather than

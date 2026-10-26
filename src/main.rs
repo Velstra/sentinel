@@ -46,8 +46,10 @@ mod proxy;
 mod reconcile;
 mod relay;
 mod repl;
+mod safe_apply;
 mod session;
 mod system;
+mod telemetry;
 mod trace;
 mod ui;
 mod unlock;
@@ -395,9 +397,19 @@ enum Command {
     /// hand — it prompts for the passphrase, or does nothing on a box whose data
     /// partition is not encrypted.
     Unlock,
-    /// Revert the running system to the saved config. Invoked by the
-    /// `commit-confirm` auto-rollback timer when its window expires; can also be
-    /// run manually to drop an un-confirmed change immediately.
+    /// Complete a prepared management transaction in its independent unit.
+    ApplyPending {
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+        #[arg(long)]
+        id: String,
+    },
+    /// Recover an expired management transaction (independent systemd watchdog).
+    ApplyRecovery {
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    },
+    /// Revert a provisional management revision or the running CLI configuration.
     ConfirmRollback {
         /// The saved config to revert to (the running/boot baseline).
         #[arg(long, default_value = DEFAULT_CONFIG)]
@@ -650,6 +662,13 @@ async fn main() -> Result<()> {
         }
         Command::ApplyConsole { config } => net::apply_console_settings(&Appliance::load(&config)?),
         Command::Apply { file, out, reload } => apply(&file, &out, reload.as_deref()),
+        Command::ApplyPending { config, id } => {
+            safe_apply::apply_pending(&config, &id, &live_apply(true))
+        }
+        Command::ApplyRecovery { config } => {
+            safe_apply::recover(&config, &live_apply(true), false, false)?;
+            Ok(())
+        }
         Command::ConfirmRollback { config } => confirm_rollback(&config),
         Command::Alert { unit, config } => alert_unit(&unit, &config),
         Command::IdsWatch => {
@@ -981,6 +1000,7 @@ fn apply_boot(
     // stages through the same fixed temp names, so an interleaved writer could
     // corrupt a networkd unit or velstra.toml. Best-effort, held for the stage.
     let _lock = system::apply_lock()?;
+    safe_apply::recover(config, &repl::Apply::off(), true, true)?;
     // load_lenient, not load: this is the boot-time apply of the saved config,
     // and the one place an unknown key must not keep the box from coming up. A
     // rollback to an older image whose saved config carries a newer field would

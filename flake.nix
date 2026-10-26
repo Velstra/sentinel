@@ -718,13 +718,26 @@
           # through the same path a CLI `commit` uses; binds localhost only (widen
           # via ExecStart's `--listen`). The bearer token is minted 0600 into the
           # persistent state dir on first start.
+          systemd.timers.sentinel-apply-recovery = {
+            wantedBy = [ "timers.target" ];
+            timerConfig = { OnBootSec = "1s"; OnUnitInactiveSec = "1s"; AccuracySec = "100ms"; };
+          };
+          systemd.services.sentinel-apply-recovery = {
+            description = "Recover expired Sentinel management transactions";
+            after = [ "sentinel-boot.service" ];
+            unitConfig.StartLimitIntervalSec = 0;
+            serviceConfig = {
+              Type = "oneshot";
+              ExecStart = "${sentinel}/bin/sentinel apply-recovery --config /var/lib/sentinel/appliance.toml";
+            };
+          };
           systemd.services.sentinel-api = {
             description = "Sentinel REST management API (sentinel)";
             after = [
               "network.target"
               "sentinel-boot.service"
             ];
-            requires = [ "sentinel-boot.service" ];
+            requires = [ "sentinel-boot.service" "sentinel-apply-recovery.timer" ];
             # The listen address defaults to localhost, but HA config sync
             # (roadmap C21) widens it to receive pushes: `apply_configsync` writes
             # /run/sentinel/api.env with SENTINEL_API_LISTEN=0.0.0.0:8080 and
@@ -1972,7 +1985,8 @@
       # persisted to the boot config). An invalid body is rejected (400) and not
       # applied.
       #   nix build .#checks.x86_64-linux.api -L
-      api = pkgs.testers.runNixOSTest {
+      api = let
+        apiVm = pkgs.testers.runNixOSTest {
         name = "sentinel-api";
         nodes.machine = {
           imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
@@ -2003,6 +2017,19 @@
           assert perms == "600", f"token file perms {perms} (want 600)"
           token = machine.succeed("cat /var/lib/sentinel/api-token").strip()
           assert token, "token file is empty"
+          import json, shlex, time
+          def confirm_pending():
+              deadline = time.monotonic() + 90
+              while time.monotonic() < deadline:
+                  pending = json.loads(machine.succeed(f"curl -fsSk -H 'Authorization: Bearer {token}' https://127.0.0.1:8080/api/v1/config/transaction"))["pending"]
+                  assert pending is not None, "expected a provisional API revision"
+                  if pending["ready"]:
+                      break
+                  time.sleep(0.2)
+              else:
+                  raise AssertionError("independent apply did not finish")
+              machine.succeed(f"curl -fsSk -H 'Authorization: Bearer {token}' -H 'Content-Type: application/json' --data-binary " + shlex.quote(json.dumps(dict(id=pending["id"]))) + " https://127.0.0.1:8080/api/v1/config/confirm")
+
 
           # /health needs no auth.
           machine.succeed("curl -fsSk https://127.0.0.1:8080/api/v1/health | grep -q ok")
@@ -2021,6 +2048,7 @@
                   f"-H 'Content-Type: application/json' -d '{rbac}' "
                   "https://127.0.0.1:8080/api/v1/config"
               )
+              confirm_pending()
               # The account's token was minted beside the machine one, 0600.
               perms = machine.succeed(
                   "stat -c %a /var/lib/sentinel/api-tokens/vera"
@@ -2060,6 +2088,7 @@
                   f"-H 'Content-Type: application/json' -d '{plain}' "
                   "https://127.0.0.1:8080/api/v1/config"
               )
+              confirm_pending()
               code = machine.succeed(
                   f"curl -sk -o /dev/null -w '%{{http_code}}' "
                   f"-H 'Authorization: Bearer {vera}' "
@@ -2117,7 +2146,8 @@
               f"-H 'Content-Type: application/json' -d '{body}' "
               "https://127.0.0.1:8080/api/v1/config"
           )
-          assert '"applied":true' in out, out
+          assert '"accepted":true' in out, out
+          confirm_pending()
 
           # Applied live: the hostname changed with no reboot.
           machine.wait_until_succeeds("hostname | grep -x api-fw", timeout=20)
@@ -2212,6 +2242,7 @@
               "curl -sSk -X POST -H 'Authorization: Bearer " + token + "' "
               "--data-binary @/tmp/script https://127.0.0.1:8080/api/v1/configure"
           )
+          confirm_pending()
           shown = machine.succeed(
               "curl -fsSk -H 'Authorization: Bearer " + token + "' "
               "https://127.0.0.1:8080/api/v1/show/configuration"
@@ -2248,6 +2279,7 @@
               "curl -sSk -X POST -H 'Authorization: Bearer " + token + "' "
               "--data-binary @/tmp/zones https://127.0.0.1:8080/api/v1/configure"
           )
+          confirm_pending()
           cfg = machine.succeed(
               "curl -fsSk -H 'Authorization: Bearer " + token + "' "
               "https://127.0.0.1:8080/api/v1/show/configuration"
@@ -2264,6 +2296,7 @@
               "curl -sSk -X POST -H 'Authorization: Bearer " + token + "' "
               "--data-binary @/tmp/undo https://127.0.0.1:8080/api/v1/configure"
           )
+          confirm_pending()
           cfg = machine.succeed(
               "curl -fsSk -H 'Authorization: Bearer " + token + "' "
               "https://127.0.0.1:8080/api/v1/show/configuration"
@@ -2309,6 +2342,7 @@
               "curl -sSk -X POST -H 'Authorization: Bearer " + token + "' "
               "--data-binary @/tmp/masks https://127.0.0.1:8080/api/v1/configure"
           )
+          confirm_pending()
           cfg = machine.succeed(
               "curl -fsSk -H 'Authorization: Bearer " + token + "' "
               "https://127.0.0.1:8080/api/v1/show/configuration"
@@ -2338,6 +2372,7 @@
               "curl -sSk -X POST -H 'Authorization: Bearer " + token + "' "
               "--data-binary @/tmp/replay https://127.0.0.1:8080/api/v1/configure"
           )
+          confirm_pending()
           assert "error" not in replay, replay
 
           # The console is operated, not typed into: no command box, no command
@@ -2439,6 +2474,7 @@
               "curl -sSk -X POST -H 'Authorization: Bearer " + token + "' "
               "--data-binary @/tmp/sections https://127.0.0.1:8080/api/v1/configure"
           )
+          confirm_pending()
           cfg = machine.succeed(
               "curl -fsSk -H 'Authorization: Bearer " + token + "' "
               "https://127.0.0.1:8080/api/v1/show/configuration"
@@ -2473,7 +2509,13 @@
           ).strip()
           assert code == "401", f"{paths[0]} served data without a token ({code})"
         '';
-      };
+        };
+      in (pkgs.linkFarm "sentinel-api-verification" [
+        { name = "api"; path = apiVm; }
+        # Existing per-PR API builds include the independent-worker, lockout,
+        # reboot and concurrent real-kernel stream proof automatically.
+        { name = "management"; path = self.checks.${system}.management; }
+      ]) // { driver = apiVm.driver; };
 
       # Admin AAA against a real directory (roadmap C12): a genuine TACACS+
       # server — Shrubbery's tac_plus, from nixpkgs — on the VM, the appliance
@@ -12513,6 +12555,7 @@
         # kernel path: the bridge/bond devices exist with the right kind/mode and
         # their members are enslaved.
         #   nix build .#checks.x86_64-linux.l2 -L
+        management = import ./nix/management-test.nix { inherit pkgs self; };
         reconciliation = import ./nix/reconciliation-test.nix { inherit pkgs self; };
         phase2-dataplane = import ./nix/phase2-dataplane-test.nix { inherit pkgs self; };
 
@@ -15216,6 +15259,17 @@
                   if interface["name"]=="eth1": interface["mtu"]=1450
               primary.succeed("printf %s "+shlex.quote(json.dumps(desired))+" >/tmp/ha-api.json")
               primary.succeed("curl -fsSk -X PUT -H 'Authorization: Bearer shared-token-123' -H 'Content-Type: application/json' --data-binary @/tmp/ha-api.json https://127.0.0.1:8080/api/v1/config")
+              import time
+              deadline = time.monotonic() + 90
+              while time.monotonic() < deadline:
+                  pending_revision = json.loads(primary.succeed("curl -fsSk -H 'Authorization: Bearer shared-token-123' https://127.0.0.1:8080/api/v1/config/transaction"))["pending"]
+                  assert pending_revision is not None
+                  if pending_revision["ready"]:
+                      break
+                  time.sleep(0.2)
+              else:
+                  raise AssertionError("API configuration worker did not finish")
+              primary.succeed("curl -fsSk -H 'Authorization: Bearer shared-token-123' -H 'Content-Type: application/json' --data-binary " + shlex.quote(json.dumps(dict(id=pending_revision["id"]))) + " https://127.0.0.1:8080/api/v1/config/confirm")
               primary.succeed("grep -q api-synced-rule /var/lib/sentinel/configsync/pending.json; test $(stat -c %a /var/lib/sentinel/configsync/pending.json) = 600")
               primary.succeed("systemctl is-active --quiet sentinel-configsync.timer")
               backup.fail("grep -q api-synced-rule /var/lib/sentinel/appliance.toml")

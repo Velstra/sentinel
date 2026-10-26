@@ -30,6 +30,16 @@ work=$(mktemp -d)
 port=${CONSOLE_PORT:-18099}
 trap 'kill "${api_pid:-0}" 2>/dev/null || true; rm -rf "$work"' EXIT
 
+# The API re-executes itself for operational views. Cargo may atomically replace
+# a debug binary while this long browser walk is running; Linux then reports
+# current_exe as "... (deleted)" and every configuration read falsely fails.
+# Nix wrappers still execute their immutable store binary; native runs receive
+# the same immutable lifetime here, independent of later workstation builds.
+cp "$bin" "$work/sentinel"
+chmod 700 "$work/sentinel"
+bin="$work/sentinel"
+
+
 # A small but real configuration: the masks have to show something, and an
 # empty appliance would let a broken reader pass for a clean one.
 cat > "$work/config.toml" <<'TOML'
@@ -85,8 +95,9 @@ if ! grep -q "commit ok" "$work/seed.log"; then
   exit 1
 fi
 
-"$bin" api --listen "127.0.0.1:$port" --config "$work/config.toml" \
-  --token-file "$work/token" --no-apply >"$work/api.log" 2>&1 &
+# Relative document/token paths exercise process-boundary normalization too.
+(cd "$work" && exec "$bin" api --listen "127.0.0.1:$port" --config config.toml \
+  --token-file token --no-apply) >"$work/api.log" 2>&1 &
 api_pid=$!
 
 for _ in $(seq 40); do
@@ -100,7 +111,7 @@ echo "console tests against http://127.0.0.1:$port"
 if ! CONSOLE_URL="http://127.0.0.1:$port/" \
      CONSOLE_TOKEN="consoletoken" \
      CONSOLE_CONFIG="$work/config.toml" \
-     node "$here/console.test.mjs"; then
+     node "$here/${CONSOLE_TEST_FILE:-console.test.mjs}"; then
   echo "--- the appliance API said:" >&2
   tail -40 "$work/api.log" >&2 || true
   exit 1

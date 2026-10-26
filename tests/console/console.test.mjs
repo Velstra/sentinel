@@ -9,6 +9,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { browser, signIn, sleep, test, check, equal, summary } from "./harness.mjs";
 import { instrument, walkAll, collect, sectionFields } from "./coverage.mjs";
+import { managementTests } from "./management.test.mjs";
 
 // Note: this shadows the global `URL` for the whole file — resolve paths next
 // to this file with `fileURLToPath(import.meta.url)`, never with `new URL()`.
@@ -26,6 +27,8 @@ const noThrows = (why) => check(page.thrown.length === 0, why + "\n  " + page.th
 await test("the page loads without the script throwing", () => {
   noThrows("the console threw while loading");
 });
+
+await managementTests(page);
 
 // --- navigation -------------------------------------------------------------
 
@@ -646,7 +649,7 @@ await test("every setting the global firewall posture offers is one the applianc
     `the mask offers a setting the appliance does not have:\n  ${r.cmds.join("\n  ")}`);
 });
 
-await test("a refused change no longer stops the ones staged beside it", async () => {
+await test("a refused batch preserves every staged change without partial application", async () => {
   check(!!CONFIG, "CONSOLE_CONFIG is not set, so there is nothing to read back");
   const outcome = await page.evaluate(`(async () => {
     const wait = (ms) => new Promise((r) => setTimeout(r, ms || 400));
@@ -665,8 +668,8 @@ await test("a refused change no longer stops the ones staged beside it", async (
     return { title, said, left };
   })()`);
   const config = readFileSync(CONFIG, "utf8");
-  check(/saved-anyway/.test(config),
-    `the good change was not saved. The appliance said:\n${outcome.said}`);
+  check(!/saved-anyway/.test(config),
+    `a rejected batch partially changed the configuration. The appliance said:\n${outcome.said}`);
   check(/accepts|refus/i.test(outcome.said),
     `the refusal was not reported: ${outcome.said}`);
   // A refusal an operator cannot place is one they cannot act on: with several

@@ -4438,6 +4438,12 @@ impl Session {
             ["services", "web", "enable", v] => {
                 self.draft.web.enable = parse_bool(v)?;
             }
+            ["services", "web", "confirm-timeout", v] => {
+                self.draft.web.confirm_timeout = Some(
+                    v.parse()
+                        .map_err(|_| anyhow::anyhow!("confirmation timeout must be seconds"))?,
+                );
+            }
             ["services", "web", "port", v] => {
                 self.draft.web.enable = true;
                 self.draft.web.port =
@@ -7298,6 +7304,7 @@ impl Session {
             ["services", "web"] => self.draft.web = WebConsole::default(),
             ["services", "web", field] => match *field {
                 "enable" => self.draft.web.enable = false,
+                "confirm-timeout" => self.draft.web.confirm_timeout = None,
                 "port" => self.draft.web.port = None,
                 "listen-address" => self.draft.web.listen_address = None,
                 // Deleting `tls` restores the secure default rather than clearing
@@ -9739,6 +9746,11 @@ impl Session {
         self.draft.evpn.ip_vrfs.last_mut().unwrap()
     }
 
+    pub(crate) fn replace_candidate(&mut self, appliance: Appliance) {
+        self.draft = Draft::from_appliance(&appliance);
+        self.dirty = true;
+    }
+
     /// Validate + activate the candidate. Returns the committed config.
     pub fn commit(&mut self) -> Result<Appliance> {
         let appliance = self.materialize()?;
@@ -9787,6 +9799,8 @@ pub fn persist_appliance(appliance: &Appliance, path: &Path, archive: bool) -> R
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
+    let _file = crate::system::lock_config_at(&path.with_extension("transaction.lock"))?;
+    crate::safe_apply::ensure_writable(path)?;
     let toml = appliance.to_toml()?;
     crate::system::install_config_file(path, &toml)?;
     if archive {
@@ -11756,6 +11770,9 @@ fn render_draft_masked(
         }
         if web_set {
             svc.push_str("    web {\n");
+            if let Some(seconds) = web.confirm_timeout {
+                svc.push_str(&format!("        confirm-timeout {seconds}\n"));
+            }
             if web.enable {
                 svc.push_str("        enable true\n");
             }
@@ -12996,6 +13013,24 @@ fn validate_bind_address(v: &str) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn save_creates_missing_export_parent_before_locking() {
+        let dir = std::env::temp_dir().join(format!("sentinel-save-parent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("nested/appliance.toml");
+        let appliance =
+            crate::config::Appliance::from_toml("[system]\nhostname=\"exported\"\n").unwrap();
+        super::persist_appliance(&appliance, &path, false).unwrap();
+        assert_eq!(
+            crate::config::Appliance::load(&path)
+                .unwrap()
+                .system
+                .hostname,
+            "exported"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn a_failed_running_publication_does_not_advance_the_sessions_revision() {
         let directory = std::env::temp_dir().join(format!(
