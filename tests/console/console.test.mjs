@@ -1189,16 +1189,32 @@ await test("what already exists is offered rather than typed", async () => {
     first.checked = true;
     first.dispatchEvent(new Event("change"));
     await wait(500);
-    return {
+    const offered = {
       members: ticks,
       zones: [...field("Zone").querySelectorAll("option")].map((o) => o.value).filter(Boolean),
       mtu: field("MTU").querySelector(".hint").textContent,
     };
+    view = "rules"; panel = null; await refresh(); await wait();
+    const newRule = document.getElementById("togglerule");
+    if (!/cancel/i.test(newRule.textContent)) newRule.click();
+    await wait();
+    const fields = [...document.getElementById("addrulepanel").querySelectorAll(".field")];
+    offered.ruleZones = ["From zone", "To zone"].map((label) => {
+      const control = fields.find((f) => f.querySelector("span").firstChild.textContent.trim() === label)
+        .querySelector("select");
+      return { label, choices: control ? [...control.options].map((o) => o.value).filter(Boolean) : [] };
+    });
+    newRule.click();
+    return offered;
   })()`);
   check(offered.members.includes("eth0") && offered.members.includes("eth1"),
     `the interfaces on this box are not offered as members: ${JSON.stringify(offered.members)}`);
   check(offered.zones.includes("lan") && offered.zones.includes("wan"),
     `the zones are not offered: ${JSON.stringify(offered.zones)}`);
+  for (const { label, choices } of offered.ruleZones) {
+    equal(choices, offered.zones,
+      `${label} must offer the same configured zones as an interface`);
+  }
   check(/\d|member/i.test(offered.mtu),
     `the MTU says nothing about the members: ${JSON.stringify(offered.mtu)}`);
 });

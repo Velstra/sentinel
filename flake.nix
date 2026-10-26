@@ -2441,7 +2441,9 @@
           # validators as a typed one — but they are not the interface.
           for surface in ["Run configuration commands", "This will run", "cfgtable"]:
               assert surface not in page, f"the console still exposes {surface!r}"
-          assert "fillZoneSelect" in page, "zone fields are free text"
+          # Zone choices are checked on the rendered interface and rule forms
+          # by the console browser suite. A helper name in the page cannot
+          # prove that a control offers the appliance's configured zones.
 
           # One object language across every section — a section that grew its
           # own renderer is how a console starts writing a setting two ways.
