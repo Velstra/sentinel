@@ -24,6 +24,8 @@ if [ -z "$bin" ]; then
   bin="$root/target/debug/sentinel"
 fi
 
+# Preseeded machine credentials obey the API's private-file contract.
+umask 077
 work=$(mktemp -d)
 port=${CONSOLE_PORT:-18099}
 trap 'kill "${api_pid:-0}" 2>/dev/null || true; rm -rf "$work"' EXIT

@@ -2198,10 +2198,8 @@ pub fn configsync_authority(peer: &str) -> String {
 /// the filename is the authority with every non-alphanumeric byte flattened to
 /// `_` so a `host:port` or a `[v6]:port` is a safe single path component.
 fn configsync_pin_path(authority: &str) -> std::path::PathBuf {
-    let safe: String = authority
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
+    let hash = ring::digest::digest(&ring::digest::SHA256, authority.as_bytes());
+    let safe: String = hash.as_ref().iter().map(|b| format!("{b:02x}")).collect();
     Path::new("/var/lib/sentinel/configsync").join(format!("{safe}.pin"))
 }
 
@@ -2216,72 +2214,52 @@ pub fn peer_pin(cs: &crate::config::ConfigSync, authority: &str) -> Result<Strin
         return Ok(fp.clone());
     }
     let pin_path = configsync_pin_path(authority);
-    if let Ok(stored) = std::fs::read_to_string(&pin_path) {
+    if let Some(stored) = system::read_owned_file(&pin_path)? {
         let stored = stored.trim();
-        if !stored.is_empty() {
-            return Ok(stored.to_string());
-        }
+        anyhow::ensure!(
+            crate::config::is_valid_pinned_sha256(stored),
+            "invalid stored peer TLS fingerprint"
+        );
+        return Ok(stored.into());
     }
-    // First contact: learn the peer's key (over a connection that carries no
-    // secret), record it, and say so — pinning it explicitly with
-    // `peer-fingerprint` removes even this one network-trusted step.
-    let pin = system::learn_peer_pubkey_pin(authority)
-        .with_context(|| format!("learning {authority}'s TLS key (trust-on-first-use)"))?;
-    if let Some(parent) = pin_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(&pin_path, &pin);
-    eprintln!(
-        "{}",
-        crate::ui::yellow(&format!(
-            "config-sync: trusting {authority}'s TLS key on first use (pin sha256//{pin}). \
-             Set `system config-sync peer-fingerprint` to pin it explicitly."
-        ))
-    );
+    let secret = cs
+        .secret
+        .as_deref()
+        .context("config-sync credential missing")?;
+    let pin = crate::ha::authenticate_peer(authority, secret)?;
+    system::ensure_dir_mode(pin_path.parent().context("peer pin directory")?, "0700")?;
+    system::install_config_file(&pin_path, &pin)?;
     Ok(pin)
 }
 
-/// The SENDING side of HA config sync (roadmap C21): push the just-committed config
-/// to every `[system.config-sync] peer` via its Sentinel API (`PUT /api/v1/config-sync`,
-/// bearer = the shared secret), which applies + persists it. Called from the
-/// interactive `commit` ONLY — never from the API's own PUT handler — so a received
-/// sync does not re-push and a pair never loops. Best-effort per peer: a down backup
-/// warns but does not fail the local commit.
-pub fn push_config_to_peers(appliance: &Appliance) -> Result<()> {
-    let cs = &appliance.system.config_sync;
-    if cs.peers.is_empty() {
-        return Ok(());
-    }
-    let Some(secret) = &cs.secret else {
-        return Ok(());
-    };
+/// Deliver one durable-outbox revision over pinned HTTPS. Transport errors must
+/// reach the worker so it retains this peer for retry.
+pub(crate) fn push_config_peer(appliance: &Appliance, peer: &str) -> Result<()> {
+    let secret = appliance
+        .system
+        .config_sync
+        .secret
+        .as_deref()
+        .context("config-sync credential missing")?;
+    push_config_peer_with_secret(appliance, peer, secret)
+}
+pub(crate) fn push_config_peer_with_secret(
+    appliance: &Appliance,
+    peer: &str,
+    secret: &str,
+) -> Result<()> {
+    use std::io::Write;
+    let mut credential = appliance.system.config_sync.clone();
+    credential.secret = Some(secret.into());
+    let cs = &credential;
     let json = serde_json::to_string(appliance).context("serializing config for sync")?;
-    let tmp = Path::new("/run/sentinel/.configsync.json");
-    // The staged copy is the WHOLE running config — WireGuard keys, IPsec PSKs,
-    // the PPPoE password, the SNMP community and the shared bearer secret. Stage it
-    // 0600 (not the umask-default 0644) so it is never world-readable in the
-    // wheel-writable, world-traversable /run/sentinel during the push.
-    system::stage_private(tmp, &json)?;
-    for peer in &cs.peers {
-        let authority = configsync_authority(peer);
-        // H3: HTTPS, with the peer's TLS key pinned (from config, or learned on
-        // first use). This is what keeps the config — WireGuard private keys,
-        // IPsec PSKs, the shared secret — encrypted and authenticated to the peer
-        // instead of crossing the wire in the clear.
-        let pin = match peer_pin(cs, &authority) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("warning: config-sync to {peer} skipped — {e:#}");
-                continue;
-            }
-        };
-        let url = format!("https://{authority}/api/v1/config-sync");
-        match system::curl_put_config(&url, secret, tmp, Some(&pin)) {
-            Ok(()) => eprintln!("  config-sync → {peer}"),
-            Err(e) => eprintln!("warning: config-sync to {peer} failed: {e}"),
-        }
-    }
-    let _ = std::fs::remove_file(tmp);
+    let mut staged = system::PrivateStage::create(Path::new("/run/sentinel"), 0o600)?;
+    staged.file.write_all(json.as_bytes())?;
+    let authority = configsync_authority(peer);
+    let pin = peer_pin(cs, &authority)?;
+    let url = format!("https://{authority}/api/v1/config-sync");
+    system::curl_put_config(&url, secret, &staged.path, Some(&pin))?;
+    eprintln!("config-sync → {peer}");
     Ok(())
 }
 
@@ -3691,6 +3669,9 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
                     bond_primary: bond_primaries.contains(i.name.as_str()),
                 },
             );
+            if crate::ha::guarded_interfaces(appliance).contains(&i.name) && !i.disabled {
+                body.push_str("\n[Link]\nActivationPolicy=manual\n");
+            }
             // 802.1Q port membership on a VLAN-aware bridge (appended as its own
             // [BridgeVLAN] section; empty for a non-filtering port).
             body.push_str(&bridge_vlan_body(&i.vlan_tagged, i.vlan_untagged));
@@ -3859,6 +3840,7 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     // the API when a secret is set. The sending side (push) is driven from commit.
     apply_agent_iface(appliance, mode)?;
     apply_configsync(appliance, mode)?;
+    crate::ha::apply_witness(appliance, mode == ApplyMode::Live)?;
     Ok(())
 }
 
@@ -3885,6 +3867,11 @@ pub fn apply_link_runtime(appliance: &Appliance) -> Result<()> {
     // After QoS, because both touch `tc` on the same devices and mirroring adds
     // a qdisc the shaper must not have just replaced out from under it.
     apply_mirror(appliance)?;
+    if appliance.system.ha.is_some()
+        || system::owned_file_exists(Path::new("/sys/fs/bpf/velstra-ha/deadline"))?
+    {
+        system::ha_guard(Path::new("/run/sentinel/velstra.toml"))?;
+    }
     // Per-NIC offload switches — after the links are up, since ethtool needs the
     // device. A NIC that refuses a feature is a warning, not a failed commit:
     // offload support is a property of the driver, and a configuration that

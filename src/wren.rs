@@ -15,6 +15,8 @@ use serde::Serialize;
 pub struct WrenConfig {
     #[serde(rename = "router-id", skip_serializing_if = "Option::is_none")]
     router_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ha: Option<crate::ha::RoutingHa>,
     #[serde(rename = "static", skip_serializing_if = "Vec::is_empty")]
     statics: Vec<WrenStatic>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -957,6 +959,7 @@ pub fn compile_wren(appliance: &Appliance) -> WrenConfig {
     });
 
     WrenConfig {
+        ha: crate::ha::routing(appliance),
         router_id: p.router_id.clone(),
         statics,
         ospf,
@@ -966,7 +969,11 @@ pub fn compile_wren(appliance: &Appliance) -> WrenConfig {
         babel,
         isis,
         bgp,
-        vrrp,
+        vrrp: if appliance.system.ha.as_ref().is_some_and(|h| !h.enabled) {
+            Vec::new()
+        } else {
+            vrrp
+        },
         vrfs,
         bfd,
         multicast,

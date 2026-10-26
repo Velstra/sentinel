@@ -73,7 +73,7 @@ impl Apply {
 /// one inside quotes is text. The reason for the rule: a password may contain
 /// `#` and must survive, while a pasted block of documented commands — or a
 /// saved `.cli` file with a header — must not fail on its own explanation.
-fn split_line(line: &str) -> Vec<String> {
+pub(crate) fn split_line(line: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut word = String::new();
     let mut have_word = false;
@@ -469,6 +469,14 @@ fn unknown_command(cmd: &str, rest: &[&str], ctx: &[String]) -> anyhow::Error {
 /// plane, and set the hostname live. No rebuild, no reboot. Never exits the
 /// shell. Returns `false`.
 fn commit(session: &mut Session, act: &Apply) -> bool {
+    let _transaction = match system::apply_lock() {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            note_refusal();
+            return false;
+        }
+    };
     // Somebody else got here first. Not refused — an operator may well mean to
     // replace what the other session did — but never silent: this commit
     // replaces the running configuration wholesale, including the parts they
@@ -562,19 +570,23 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
     // config that was never run, and the next operator's `save` would then read
     // as overwriting phantom work. Only when it was really applied — an off-box
     // `--no-apply` edit changed nothing about what is running.
-    if act.enabled {
-        if let Ok(toml) = appliance.to_toml() {
-            session.note_committed(&toml);
-        }
+    if let Err(error) = appliance
+        .to_toml()
+        .and_then(|toml| session.note_committed(&toml))
+    {
+        eprintln!(
+            "{} configuration applied, but the running snapshot could not be recorded: {error:#}",
+            ui::red("error:")
+        );
+        note_refusal();
+        return false;
     }
     if appliance.system.hostname != old_host {
         eprintln!("  hostname: {old_host} -> {}", appliance.system.hostname);
     }
-    // HA config sync (roadmap C21): push the just-applied running config to any
-    // configured peers. Best-effort — a down peer warns but never fails the commit.
-    // Only the interactive commit pushes (never the API's own PUT handler), so a
-    // received sync does not re-push and a pair never loops.
-    if let Err(e) = crate::net::push_config_to_peers(&appliance) {
+    // Queue the applied intent durably; a down peer is retried by the worker.
+    // Local API updates queue too; received revisions never do.
+    if let Err(e) = crate::configsync::enqueue(&appliance, last_good) {
         eprintln!("{} config-sync: {e}", ui::yellow("warning:"));
     }
     eprintln!(
@@ -913,7 +925,7 @@ pub(crate) fn apply_live(
     // reconcile: staging uses fixed temp filenames under /run/sentinel, so two
     // writers at once could splice a networkd unit or a half-written velstra.toml.
     // Held until this function returns.
-    let _lock = system::apply_lock();
+    let _lock = system::apply_lock()?;
 
     // ---- Phase 1: prepare (fallible, NO live side effects) ----
     // Domain groups become address groups here: the compiler matches addresses and
@@ -937,14 +949,31 @@ pub(crate) fn apply_live(
     // ---- Phase 2: apply, each stage undoable on a later failure ----
     let mut rb = Rollback::new();
 
-    // Firewall: install + reload. If this first stage fails nothing else was
-    // touched, so surface the error directly.
-    let undo = apply_service(
+    // Close new HA data links before the old process can detach its hooks.
+    // Restoring a known previous guard is part of the same rollback stack.
+    if crate::ha::needs_guard_preparation(appliance, rollback_to) {
+        let previous = velstra_prev
+            .as_ref()
+            .and_then(|v| String::from_utf8(v.clone()).ok());
+        rb.push("HA fence", move || {
+            let previous =
+                previous.context("no previous dataplane intent; HA links remain safely fenced")?;
+            crate::ha::prepare_guard(&previous)
+        });
+        if let Err(error) = crate::ha::prepare_guard(&rendered) {
+            return Err(unwind_err(rb, error, "HA fence"));
+        }
+    }
+    // Firewall install/reload may now have an earlier guard to unwind.
+    let undo = match apply_service(
         &act.velstra_out,
         &act.unit,
         rendered.as_bytes(),
         velstra_prev.as_deref(),
-    )?;
+    ) {
+        Ok(undo) => undo,
+        Err(error) => return Err(unwind_err(rb, error, "firewall")),
+    };
     rb.push("firewall", undo);
 
     // Routing: install + reload the Wren daemon.
@@ -2731,6 +2760,8 @@ const CONSOLE_FIELDS: &[Cand] = &[
     ("speed", "baud rate (9600, 115200)"),
 ];
 const SYSTEM_FIELDS: &[Cand] = &[
+    ("ha", "witness-authorized active/passive pairing"),
+    ("ha-witness", "independent durable lease witness"),
     ("hostname", "the appliance hostname"),
     (
         "keyboard",
@@ -2769,6 +2800,28 @@ const SYSTEM_FIELDS: &[Cand] = &[
         "conntrack-sync",
         "mirror the conntrack table to peers so NAT flows survive failover (HA, C9)",
     ),
+];
+const HA_FIELDS: &[Cand] = &[
+    ("enabled", "activate leased HA (true|false)"),
+    ("cluster", "stable cluster identifier"),
+    ("node", "member 1 or 2"),
+    ("witness", "independent witness IP:port"),
+    ("sync-interface", "dedicated control interface"),
+    ("priority", "election priority 1..255"),
+    (
+        "preempt",
+        "preempt after a complete state snapshot (true|false)",
+    ),
+    (
+        "management-fingerprint",
+        "this member's management TLS SPKI",
+    ),
+    ("peer-identity", "peer-specific facts as a JSON object"),
+];
+const HA_WITNESS_FIELDS: &[Cand] = &[
+    ("listen", "listen IP:port"),
+    ("secret", "shared enrollment credential"),
+    ("cluster", "cluster identifier (derived when omitted)"),
 ];
 // `system config-sync <Tab>` reveals the HA config-sync fields.
 const CONFIGSYNC_FIELDS: &[Cand] = &[
@@ -3965,6 +4018,8 @@ pub(crate) fn candidates(tokens: &[&str]) -> &'static [Cand] {
         ["set" | "delete", "system", "login", _name] => LOGIN_FIELDS,
         ["set" | "delete", "system", "group", _name] => GROUP_FIELDS,
         ["set", "system", "group", _name, "permission"] => PERMISSIONS,
+        ["set" | "delete", "system", "ha"] => HA_FIELDS,
+        ["set" | "delete", "system", "ha-witness"] => HA_WITNESS_FIELDS,
         ["set" | "delete", "system", "config-sync"] => CONFIGSYNC_FIELDS,
         ["set" | "delete", "system", "conntrack-sync"] => CONNTRACKSYNC_FIELDS,
         ["set" | "delete", "services", "mdns"] => MDNS_FIELDS,
@@ -4882,6 +4937,15 @@ pub(crate) fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, 
         ["set", "services", "web", "listen-address"] => own_cands(&[PH_IPV4]),
         ["set", "services", "ssh", "listen-address"] => own_cands(&[PH_IPV4]),
         ["set", "system", "login", _name, "ssh-key"] => own_cands(&[PH_KEY]),
+        ["set", "system", "ha", "peer-identity"] => {
+            own_cands(&[("<json>", "explicit peer-specific HaIdentity JSON")])
+        }
+        ["set", "system", "ha", "witness"] | ["set", "system", "ha-witness", "listen"] => {
+            own_cands(&[("<host:port>", "numeric IP:port; bracket IPv6")])
+        }
+        ["set", "system", "ha", "node"] => {
+            own_cands(&[("1", "primary member"), ("2", "secondary member")])
+        }
         ["set", "system", "config-sync", "peer"] => own_cands(&[PH_IPV4]),
         ["set", "system", "config-sync", "peer-fingerprint"] => own_cands(&[PH_PUBKEY]),
         ["set", "system", "conntrack-sync", "listen" | "peer"] => own_cands(&[PH_IPV4]),
@@ -5529,6 +5593,8 @@ mod tests {
         assert_eq!(
             kw(&["set", "system"]),
             [
+                "ha",
+                "ha-witness",
                 "hostname",
                 "keyboard",
                 "locale",

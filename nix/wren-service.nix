@@ -34,7 +34,27 @@ in
     # `wren show routes`, etc. work on the box (it doubles as the control client).
     environment.systemPackages = [ cfg.package ];
 
+    systemd.services.sentinel-witness = {
+      description = "Independent durable Sentinel HA lease witness";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "sentinel-boot.service" "network.target" ];
+      requires = [ "sentinel-boot.service" ];
+      unitConfig.ConditionPathExists = "/run/sentinel/witness.json";
+      serviceConfig = {
+        ExecStart = "${cfg.package}/bin/wren-witness --config /run/sentinel/witness.json";
+        StateDirectory = "sentinel/witness";
+        StateDirectoryMode = "0700";
+        Restart = "on-failure";
+        RestartSec = "100ms";
+        NoNewPrivileges = true;
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        PrivateTmp = true;
+        RestrictSUIDSGID = true;
+      };
+    };
     systemd.services.wren = {
+      environment.WREN_WG_BIN = "${pkgs.wireguard-tools}/bin/wg";
       description = "Wren routing daemon (control plane)";
       wantedBy = [ "multi-user.target" ];
       # After the boot service (which compiles /run/sentinel/wren.toml) and after
@@ -53,6 +73,7 @@ in
       # The daemon serves (and the `show` client connects to) this socket.
       serviceConfig = {
         RuntimeDirectory = "wren";
+        ReadWritePaths = [ "/run/velstra/ha" ];
         ExecStart = "${cfg.package}/bin/wren --config /run/sentinel/wren.toml --backend kernel --socket /run/wren/wren.sock";
         Restart = "on-failure";
         RestartSec = 2;
