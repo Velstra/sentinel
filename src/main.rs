@@ -24,6 +24,7 @@ mod diff;
 mod domain;
 mod feed;
 mod grammar_walk;
+mod ha;
 mod identity;
 mod ids;
 mod image;
@@ -126,7 +127,36 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum HaCommand {
+    /// Pair this primary with a secondary using its bootstrap machine token.
+    Pair {
+        peer: String,
+        #[arg(
+            long,
+            required_unless_present = "secret_stdin",
+            conflicts_with = "secret_stdin"
+        )]
+        secret: Option<String>,
+        #[arg(long, hide = true)]
+        secret_stdin: bool,
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+        /// Independent witness IP:port; otherwise use system.ha.witness.
+        #[arg(long)]
+        witness: Option<String>,
+        /// Explicit peer facts for newly declared interfaces (JSON HaIdentity).
+        #[arg(long)]
+        peer_identity: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum Command {
+    /// Manage active/passive high availability.
+    Ha {
+        #[command(subcommand)]
+        command: HaCommand,
+    },
     /// Retry the durable HA configuration outbox (systemd worker).
     #[command(hide = true)]
     SyncConfig,
@@ -499,6 +529,33 @@ async fn main() -> Result<()> {
     }
 
     match Cli::parse().command {
+        Command::Ha {
+            command:
+                HaCommand::Pair {
+                    peer,
+                    secret,
+                    secret_stdin,
+                    config,
+                    witness,
+                    peer_identity,
+                },
+        } => {
+            use std::io::Read;
+            let secret = if secret_stdin {
+                let mut value = String::new();
+                std::io::stdin().take(1025).read_to_string(&mut value)?;
+                value
+            } else {
+                secret.context("--secret required")?
+            };
+            ha::pair(
+                &peer,
+                &secret,
+                &config,
+                witness.as_deref(),
+                peer_identity.as_deref(),
+            )
+        }
         Command::Configure { config, no_apply } => configure(&config, no_apply),
         Command::SyncConfig => configsync::flush(),
         Command::Show { args } => show_op(&args),

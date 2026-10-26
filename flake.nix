@@ -68,7 +68,7 @@
       lib = nixpkgs.lib;
 
       # --- the sentinel CLI (stable rustc is fine) ---------------------------
-      sentinel = pkgs.rustPlatform.buildRustPackage {
+      sentinelCore = pkgs.rustPlatform.buildRustPackage {
         pname = "sentinel";
         # From Cargo.toml, so the boot menu and `show version` cannot disagree —
         # the medium said 0.1.0 while the CLI on it said 0.4.2.
@@ -83,10 +83,7 @@
             && !(builtins.elem (baseNameOf path) [ "flake.lock" "docs" ".github" "README.md" "CHANGELOG.md" ]);
         };
         cargoLock.lockFile = ./Cargo.lock;
-        nativeBuildInputs = [
-          pkgs.protobuf
-          pkgs.makeWrapper
-        ];
+        nativeBuildInputs = [ pkgs.protobuf ];
         PROTOC = "${pkgs.protobuf}/bin/protoc";
         # The password tests hash with the same `openssl passwd` the appliance
         # uses, on purpose — a hash this box cannot recompute is a login nobody
@@ -94,13 +91,22 @@
         # here as well as in the wrapper below; without it `nix build` fails in
         # the check phase on a dependency the binary itself resolves fine.
         SENTINEL_OPENSSL_BIN = "${pkgs.openssl.bin}/bin/openssl";
+      };
+
+      # Runtime tool pins are a separate derivation: updating the HA dataplane
+      # or coordinator must not rebuild and retest an identical Rust binary.
+      sentinel = pkgs.symlinkJoin {
+        name = "sentinel-${sentinelCore.version}";
+        inherit (sentinelCore) version;
+        paths = [ sentinelCore ];
+        nativeBuildInputs = [ pkgs.makeWrapper ];
         # Pin every external tool sentinel shells out to (live hostname/addressing
         # apply, operational `show`) to an absolute store path, and put the setuid
         # `sudo` wrapper on PATH. Without this, a `commit` on a NixOS box can fail
         # with "Failed to execute /run/current-system/sw/..." when a tool isn't on
         # the admin's PATH or in sudo's secure_path. Resolved at build time → no
         # PATH ambiguity at runtime, for both the admin and the boot service.
-        postInstall = ''
+        postBuild = ''
           wrapProgram $out/bin/sentinel \
             --set SENTINEL_HOSTNAME_BIN   ${pkgs.nettools}/bin/hostname \
             --set SENTINEL_IP_BIN         ${pkgs.iproute2}/bin/ip \
@@ -110,6 +116,7 @@
             --set SENTINEL_LOADKEYS_BIN   ${pkgs.kbd}/bin/loadkeys \
             --set SENTINEL_LOGINCTL_BIN   ${pkgs.systemd}/bin/loginctl \
             --set SENTINEL_SELF_BIN       $out/bin/.sentinel-wrapped \
+            --set SENTINEL_PAIR_SELF_BIN  $out/bin/sentinel \
             --set SENTINEL_TIMEDATECTL_BIN ${pkgs.systemd}/bin/timedatectl \
             --set SENTINEL_SYSCTL_BIN     ${pkgs.procps}/bin/sysctl \
             --set SENTINEL_ETHTOOL_BIN    ${pkgs.ethtool}/bin/ethtool \
@@ -132,6 +139,7 @@
             --set SENTINEL_SYSTEMD_RUN_BIN ${pkgs.systemd}/bin/systemd-run \
             --set SENTINEL_JOURNALCTL_BIN ${pkgs.systemd}/bin/journalctl \
             --set SENTINEL_WREN_BIN       ${wrenPkg}/bin/wren \
+            --set SENTINEL_VELSTRA_BIN    ${velstra}/bin/velstra \
             --set SENTINEL_LSBLK_BIN      ${pkgs.util-linux}/bin/lsblk \
             --set SENTINEL_INSTALL_BIN    ${pkgs.coreutils}/bin/install \
             --set SENTINEL_MKDIR_BIN      ${pkgs.coreutils}/bin/mkdir \
@@ -254,7 +262,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-yPIoUxKRF1BJy32VB0MKlOJbuMmEWQnNJBGhvxuv7Gk=";
+      ebpfHash = "sha256-4LNOa/UN4PtIL3ESnm7wIWiAsDPH+zcmgnqbczTx4IU=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -307,6 +315,7 @@
           pkgs.protobuf
           pkgs.bpf-linker
           pkgs.removeReferencesTo
+          pkgs.makeWrapper
         ];
         PROTOC = "${pkgs.protobuf}/bin/protoc";
         # Replace the agent's build.rs with the shim that copies the pre-built
@@ -322,6 +331,10 @@
         # dangling reference. Keeps the closure to the agent + glibc.
         postInstall = ''
           remove-references-to -t ${nightly} "$out/bin/velstra"
+          wrapProgram "$out/bin/velstra" \
+            --set VELSTRA_TC_BIN ${pkgs.iproute2}/bin/tc \
+            --set VELSTRA_IP_BIN ${pkgs.iproute2}/bin/ip \
+            --set VELSTRA_WG_BIN ${pkgs.wireguard-tools}/bin/wg
         '';
         VELSTRA_EBPF_OBJ = velstra-ebpf;
         # Build just the agent binary. --ignore-rust-version: the lockfile (made
@@ -413,6 +426,7 @@
       nixosModules.sentinel =
         { pkgs, lib, ... }:
         {
+          fileSystems."/sys/fs/bpf" = { device = "bpffs"; fsType = "bpf"; options = [ "nosuid" "nodev" "noexec" ]; };
           imports = [
             ./nix/appliance.nix
             ./nix/velstra-service.nix
@@ -728,6 +742,9 @@
 
           systemd.services.sentinel-configsync = {
             description = "Retry the durable Sentinel HA configuration outbox";
+            # A disconnected peer is expected. The one-second timer already
+            # bounds retries; service start limiting must not suppress recovery.
+            startLimitIntervalSec = 0;
             after = [ "network-online.target" "sentinel-boot.service" ];
             wants = [ "network-online.target" ];
             serviceConfig = {
@@ -1360,6 +1377,7 @@
           };
 
           systemd.tmpfiles.rules = [
+            "d /run/velstra/ha 0700 root root -"
             # Must match nix/appliance.nix's rule for this same path: 0775
             # root:wheel, so the admin who runs `configure` (not as root) can stage
             # temp files here (system::stage_private) before the live apply
@@ -1483,7 +1501,7 @@
             machine.start()
             machine.wait_for_unit("multi-user.target")
             result = machine.succeed("velstra verify-ebpf ${velstra-ebpf} 2>&1")
-            for program in ["velstra", "velstra_main", "velstra_guest_delivery", "velstra_forward", "velstra_v6", "velstra_local", "velstra_v6_state", "velstra_egress", "velstra_egress_v4", "velstra_egress_v6", "velstra_bum", "velstra_icmp_nat", "velstra_egress_icmp"]:
+            for program in ["velstra_ha_exit", "velstra_ha_guard", "velstra", "velstra_main", "velstra_guest_delivery", "velstra_forward", "velstra_v6", "velstra_local", "velstra_v6_state", "velstra_egress", "velstra_egress_v4", "velstra_egress_v6", "velstra_bum", "velstra_icmp_nat", "velstra_egress_icmp"]:
                 assert "verified " + program in result, result
             assert "BTF couldn't be loaded" not in result, result
           '';
@@ -8272,6 +8290,11 @@
         ha-kernel = import ./nix/ha-kernel-test.nix { inherit pkgs velstra-ha-tests; };
         ha-synproxy-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; synproxy = true; };
         ha-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; };
+        ha-masquerade-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; leased = true; masquerade = true; };
+        ha-wireguard-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; leased = true; wireguard = true; };
+        ha-pair = import ./nix/ha-pair-test.nix { inherit pkgs self; };
+        ha-witness-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; leased = true; };
+        ha-witness-synproxy-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; leased = true; synproxy = true; };
 
         conntracksync = pkgs.testers.runNixOSTest {
           name = "sentinel-conntracksync";
@@ -15121,6 +15144,9 @@
               backup.wait_until_succeeds(
                   "ss -tlnH 'sport = :8080' | grep -q LISTEN", timeout=30
               )
+              # configure runs as admin in a root-owned wheel-writable directory.
+              # Atomic replacement must preserve the root-only token contract.
+              backup.succeed("test $(stat -c %u /var/lib/sentinel/api-token) = 0; test $(stat -c %a /var/lib/sentinel/api-token) = 600")
 
               # Sanity: the rule is not on the backup yet.
               backup.fail("grep -q 'synced-rule' /var/lib/sentinel/appliance.toml")
@@ -15179,9 +15205,12 @@
                   if interface["name"]=="eth1": interface["mtu"]=1450
               primary.succeed("printf %s "+shlex.quote(json.dumps(desired))+" >/tmp/ha-api.json")
               primary.succeed("curl -fsSk -X PUT -H 'Authorization: Bearer shared-token-123' -H 'Content-Type: application/json' --data-binary @/tmp/ha-api.json https://127.0.0.1:8080/api/v1/config")
-              primary.succeed("grep -q api-synced-rule /var/lib/sentinel/configsync/pending.json; test $(stat -c %a /var/lib/sentinel/configsync/pending.json) = 640")
+              primary.succeed("grep -q api-synced-rule /var/lib/sentinel/configsync/pending.json; test $(stat -c %a /var/lib/sentinel/configsync/pending.json) = 600")
               primary.succeed("systemctl is-active --quiet sentinel-configsync.timer")
               backup.fail("grep -q api-synced-rule /var/lib/sentinel/appliance.toml")
+              import time
+              time.sleep(8)
+              primary.succeed("test -f /var/lib/sentinel/configsync/pending.json; systemctl show sentinel-configsync.service -p Result --value | grep -qx exit-code")
               backup.succeed("systemctl start sentinel-api.service")
               backup.wait_until_succeeds("grep -q api-synced-rule /var/lib/sentinel/appliance.toml",timeout=45)
               primary.wait_until_succeeds("test ! -f /var/lib/sentinel/configsync/pending.json",timeout=20)

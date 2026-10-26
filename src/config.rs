@@ -3988,6 +3988,14 @@ pub struct Acme {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct System {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ha: Option<Ha>,
+    #[serde(
+        default,
+        rename = "ha-witness",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ha_witness: Option<HaWitness>,
     pub hostname: String,
     /// The console keyboard layout (`"de"`, `"us"`, `"fr"`, …).
     ///
@@ -4246,6 +4254,73 @@ impl Console {
     pub fn is_empty(&self) -> bool {
         self.device.is_none() && self.speed.is_none()
     }
+}
+
+/// Leased active/passive mode. A witness endpoint can be prepared before pairing;
+/// `enabled` is set only after both member identities have been validated.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Ha {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub cluster: String,
+    #[serde(default)]
+    pub node: Option<u8>,
+    pub witness: String,
+    #[serde(default)]
+    pub sync_interface: String,
+    #[serde(default)]
+    pub priority: Option<u8>,
+    #[serde(default)]
+    pub preempt: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub management_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_identity: Option<HaIdentity>,
+}
+impl Ha {
+    pub fn node(&self) -> u8 {
+        self.node.unwrap_or(1)
+    }
+    pub fn priority(&self) -> u8 {
+        self.priority
+            .unwrap_or(if self.node() == 1 { 200 } else { 100 })
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct HaIdentity {
+    pub node: u8,
+    pub hostname: String,
+    pub router_id: Option<String>,
+    pub management_endpoint: String,
+    pub management_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub management_web: Option<WebConsole>,
+    pub state_listen: String,
+    pub priority: u8,
+    #[serde(default)]
+    pub interfaces: BTreeMap<String, HaInterfaceIdentity>,
+    /// A dedicated control tunnel remains member-specific. Data VPNs share the
+    /// cluster's long-term identity and rehandshake after promotion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_wireguard: Option<WireguardTunnel>,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct HaInterfaceIdentity {
+    pub address: Option<String>,
+    pub address6: Option<String>,
+    pub local: Option<String>,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HaWitness {
+    pub listen: String,
+    pub secret: String,
+    #[serde(default)]
+    pub cluster: String,
 }
 
 /// HA config sync (`[system.config-sync]`). Local CLI commits and API updates
@@ -7019,6 +7094,7 @@ impl Appliance {
 
     /// Reject configs that parse but are not coherent.
     pub fn validate(&self) -> Result<()> {
+        crate::ha::validate(self)?;
         validate_hostname(&self.system.hostname)?;
         self.firewall.conntrack.validate()?;
 
