@@ -1,0 +1,20 @@
+{
+  "profile": "product-admin",
+  "sourceRoots": ["ui/src"],
+  "locale": "en-US",
+  "canonicalMap": "UX-CONTRACT.md",
+  "requiredCapabilities": ["Form", "Select/Listbox", "Scrollbar", "Toast", "CRUD"],
+  "ownership": {"Select/Listbox": "native"},
+  "requiredCommands": ["format", "typecheck", "unit", "build", "assets"],
+  "commands": {
+    "format": "npm run format:check --prefix ui",
+    "typecheck": "npm run typecheck --prefix ui",
+    "unit": "npm test --prefix ui",
+    "build": "npm run build --prefix ui",
+    "assets": "npm run check:assets --prefix ui"
+  },
+  "evidence": {
+    "crudFullFlow": "tests/console/react.test.mjs",
+    "failurePaths": "ui/tests/management.test.tsx"
+  }
+}

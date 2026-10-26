@@ -4,21 +4,21 @@ export async function managementTests(page) {
   await test("the live inspector filters named IPv6 rules and bounds its history view", async () => {
     const state = await page.evaluate(`(async () => {
       if ($("result").open) $("result").close();
-      telemetryAbort.abort();
-      view = "rules"; panel = null; await refresh();
-      liveFrame = { events: Array.from({length:120}, (_,i) => ({id:i+1,src:"2001:db8::1",dst:"2001:db8::2",src_port:2345,dst_port:443,protocol:6,interface:2,interface_name:"wan0",rule:i%2?"web-in":"default",rule_id:7,action:i%2?"drop":"accept"})), rule_counters:[{rule:"web-in",packets:60}], errors:{} };
-      liveStatus = "Live telemetry connected."; renderLive();
+      management.abortTelemetry();
+      view = "flows"; panel = null; await refresh();
+      management.acceptFrame({ sequence:1,sampled_at:Date.now()/1000,interfaces:[],events: Array.from({length:120}, (_,i) => ({id:i+1,src:"2001:db8::1",dst:"2001:db8::2",src_port:2345,dst_port:443,protocol:6,interface:2,interface_name:"wan0",rule:i%2?"web-in":"default",rule_id:7,action:i%2?"drop":"accept"})), rule_counters:[{rule:"web-in",packets:60}], errors:{} });
+      renderLive(); await new Promise(resolve=>setTimeout(resolve,0));
       const bounded = $("live-flows").rows.length;
-      $("flow-search").value="web-in"; $("flow-search").dispatchEvent(new Event("input"));
-      $("flow-action").value="drop"; $("flow-action").dispatchEvent(new Event("change"));
+      $("flow-search").value="web-in"; $("flow-search").dispatchEvent(new Event("input",{bubbles:true})); await new Promise(resolve=>setTimeout(resolve,0));
+      $("flow-action").value="drop"; $("flow-action").dispatchEvent(new Event("change",{bubbles:true})); await new Promise(resolve=>setTimeout(resolve,0));
       const filtered = $("live-flows").textContent;
-      $("flow-next").click();
+      $("flow-next").click(); await new Promise(resolve=>setTimeout(resolve,0));
       const range = $("flow-range").textContent;
-      $("flow-clear").click();
+      $("flow-clear").click(); await new Promise(resolve=>setTimeout(resolve,0));
       const clearFocus = document.activeElement.id;
-      $("flow-search").value="no-such-rule"; $("flow-search").dispatchEvent(new Event("input"));
+      $("flow-search").value="no-such-rule"; $("flow-search").dispatchEvent(new Event("input",{bubbles:true})); await new Promise(resolve=>setTimeout(resolve,0));
       const empty = $("flow-state").textContent;
-      $("flow-search").value=""; $("flow-action").value=""; flowPage=0;
+      $("flow-search").value=""; $("flow-action").value="";
       startManagement();
       return {bounded,filtered,range,clearFocus,empty};
     })()`);
@@ -32,40 +32,40 @@ export async function managementTests(page) {
   await test("TOML validation retains rejected drafts and applies only after an explicit confirmation", async () => {
     const result = await page.evaluate(`(async () => {
       if ($("result").open) $("result").close();
-      view="config"; panel=null; await refresh(); await loadToml();
-      const baseline=tomlBaseline;
+      view="config"; panel=null; await refresh(); await management.loadEditor(); await new Promise(resolve=>setTimeout(resolve,0));
+      const baseline=management.getSnapshot().editor.baseline;
       $("toml-candidate").value="[system\\nhostname=broken";
-      $("toml-candidate").dispatchEvent(new Event("input"));
-      await submitToml(true);
+      $("toml-candidate").dispatchEvent(new Event("input",{bubbles:true})); await new Promise(resolve=>setTimeout(resolve,0));
+      await management.submitEditor(true); await new Promise(resolve=>setTimeout(resolve,0));
       const invalid=$("toml-candidate").getAttribute("aria-invalid");
       const retained=$("toml-candidate").value;
       $("toml-candidate").value=baseline.replace(/hostname = "[^"]+"/, 'hostname = "management-confirmed"');
-      $("toml-candidate").dispatchEvent(new Event("input"));
-      await submitToml(true);
+      $("toml-candidate").dispatchEvent(new Event("input",{bubbles:true})); await new Promise(resolve=>setTimeout(resolve,0));
+      await management.submitEditor(true); await new Promise(resolve=>setTimeout(resolve,0));
       const diff=$("toml-diff").textContent;
       const draft=$("toml-candidate").value;
       await configure(["set system hostname concurrent-revision","commit","save"]);
-      await submitToml(true);
+      await management.submitEditor(true); await new Promise(resolve=>setTimeout(resolve,0));
       const conflict=$("toml-feedback").textContent;
-      await loadToml(true);
+      await management.loadEditor(true); await new Promise(resolve=>setTimeout(resolve,0));
       const preserved=$("toml-candidate").value===draft;
-      await submitToml(false);
-      const pending=!!pendingTransaction;
+      await management.submitEditor(false); await new Promise(resolve=>setTimeout(resolve,0));
+      const pending=!!management.getSnapshot().pending;
       const visible=!$("confirmation").classList.contains("hidden");
-      const deadline=pendingTransaction?.remaining_seconds;
+      const deadline=management.getSnapshot().pending?.remaining_seconds;
       const realApi=api; let release, calls=0;
       const hold=new Promise(resolve => release=resolve);
       api=async(...args)=>{if(args[0]==="/api/v1/config/confirm"){calls++;await hold;}return realApi(...args);};
       let disabled;
       try {
         $("confirm-change").click(); await new Promise(resolve=>setTimeout(resolve,20));
-        drawConfirmation(); gateWrites();
+        gateWrites();
         disabled=$("confirm-change").disabled;
         $("confirm-change").click(); release();
-        for(let i=0;i<100&&(pendingTransaction || $("confirm-change").classList.contains("busy"));i++) await new Promise(resolve=>setTimeout(resolve,30));
+        for(let i=0;i<100&&(management.getSnapshot().pending || $("confirm-change").classList.contains("busy"));i++) await new Promise(resolve=>setTimeout(resolve,30));
       } finally {release();api=realApi;}
       const stored=(await (await api("/api/v1/config")).json()).system.hostname;
-      const confirmed=!pendingTransaction;
+      const confirmed=!management.getSnapshot().pending;
       await configure(["set system hostname " + JSON.stringify((baseline.match(/hostname = "([^"]+)"/)||[])[1]), "commit", "save"]);
       return {invalid,retained,diff,pending,visible,deadline,stored,confirmed,conflict,preserved,disabled,calls};
     })()`);
@@ -82,7 +82,7 @@ export async function managementTests(page) {
   await test("reverting a provisional form batch restores its staged commands", async () => {
     const result = await page.evaluate(`(async()=>{
       if($("result").open) $("result").close();
-      clearToml();view="config";panel=null;staged=[];
+      management.clearEditor(); await new Promise(resolve=>setTimeout(resolve,0));view="config";panel=null;staged=[];
       const baseline=(await(await api("/api/v1/config")).json()).system.hostname;
       stage("Test hostname change",["set system hostname form-reverted"]);
       const original=JSON.stringify(staged);
@@ -95,12 +95,12 @@ export async function managementTests(page) {
         const reply={ok:true,output:"",...await response.json()};setTransaction(reply.pending);return reply;
       };
       try {await applyStagedNow(["commit","save"]);}finally{configure=realConfigure;}
-      const applying=!!pendingTransaction && staged.length===0;
-      await finishTransaction("revert");
+      const applying=!!management.getSnapshot().pending && staged.length===0;
+      await management.finishTransaction("revert");
       const restored=JSON.stringify(staged)===original;
       const outcome=$("resulttitle").textContent;
       const hostname=(await(await api("/api/v1/config")).json()).system.hostname;
-      staged=[];pendingBatch=null;renderStaged();if($("result").open)$("result").close();
+      staged=[];renderStaged();if($("result").open)$("result").close();
       return {applying,restored,outcome,hostname,baseline};
     })()`);
     check(result.applying && result.restored,"rollback lost the staged form commands: "+JSON.stringify(result));
@@ -111,21 +111,21 @@ export async function managementTests(page) {
   await test("an unconfirmed TOML revision automatically returns to its saved baseline", async () => {
     const result = await page.evaluate(`(async () => {
       await configure(["set services web confirm-timeout 2","commit","save"]);
-      clearToml(); await loadToml();
-      const baseline=tomlBaseline;
+      management.clearEditor(); await new Promise(resolve=>setTimeout(resolve,0)); await management.loadEditor(); await new Promise(resolve=>setTimeout(resolve,0));
+      const baseline=management.getSnapshot().editor.baseline;
       $("toml-candidate").value=baseline.replace(/hostname = "[^"]+"/, 'hostname = "must-roll-back"');
-      $("toml-candidate").dispatchEvent(new Event("input"));
-      await submitToml(false);
-      const id=pendingTransaction?.id;
+      $("toml-candidate").dispatchEvent(new Event("input",{bubbles:true})); await new Promise(resolve=>setTimeout(resolve,0));
+      await management.submitEditor(false); await new Promise(resolve=>setTimeout(resolve,0));
+      const id=management.getSnapshot().pending?.id;
       await new Promise((resolve) => setTimeout(resolve,4200));
       await refreshTransaction();
       const stored=(await (await api("/api/v1/config")).json()).system.hostname;
       let rejected=false;
       try { await api("/api/v1/config/confirm",{method:"POST",headers:{Authorization:"Bearer "+token,"Content-Type":"application/json"},body:JSON.stringify({id})}); } catch (e) {rejected=true;}
       const draftRetained=dirty.has("toml-editor") && $("toml-candidate").value.includes("must-roll-back");
-      clearToml();
+      management.clearEditor(); await new Promise(resolve=>setTimeout(resolve,0));
       await configure(["delete services web confirm-timeout","commit","save"]);
-      return {stored,rejected,draftRetained,pending:!!pendingTransaction};
+      return {stored,rejected,draftRetained,pending:!!management.getSnapshot().pending};
     })()`);
     check(result.stored !== "must-roll-back","expired revision remained persisted");
     check(result.rejected && !result.pending,"late confirmation resurrected an expired revision");

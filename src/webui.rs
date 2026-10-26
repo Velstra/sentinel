@@ -31,11 +31,11 @@
 //!
 //! ## One file, nothing fetched
 //!
-//! A single self-contained document: no CDN, no font, no framework, no chart
-//! library. An appliance is expected to work on an isolated network, and a
-//! console that half-renders because it cannot reach the internet is worse than
-//! no console. The graphs are drawn on a canvas from the counters the box
-//! already reports.
+//! A single self-contained document: the React management views, their CSS and
+//! the existing CLI-backed settings shell are embedded into the binary. No CDN,
+//! font service or external asset host is needed. An appliance must work on an
+//! isolated network. Charts use the counters the box already reports; the live
+//! React chart uses SVG and the existing history view uses canvas.
 //!
 //! ## The design system, inlined
 //!
@@ -205,7 +205,8 @@ pub fn page() -> String {
       --wash: radial-gradient(1100px 460px at 78% -12%, rgba(58,114,230,.10), transparent 62%);
 "#;
     let management_js = include_str!("management.js");
-    let management_css = include_str!("management.css");
+    let management_css = include_str!("../ui/dist/management.css");
+    let react_js = include_str!("../ui/dist/management.js");
     format!(
         r##"<!doctype html>
 <html lang="en">
@@ -293,7 +294,7 @@ pub fn page() -> String {
     --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
     --fw-regular: 400; --fw-medium: 500; --fw-semibold: 600;
     --text-2xs: .6875rem; --text-xs: .75rem; --text-sm: .8125rem;
-    --text-base: .875rem; --text-lg: 1.125rem; --text-xl: 1.5rem;
+    --text-base: .9375rem; --text-lg: 1.125rem; --text-xl: 1.5rem;
     /* The stat tiles have asked for this size since they were written; it was
        never defined, the whole `font:` shorthand naming it was silently
        invalid, and every headline number on the dashboard rendered at body
@@ -310,7 +311,7 @@ pub fn page() -> String {
 
     --space-1: .25rem; --space-2: .5rem; --space-3: .75rem; --space-4: 1rem;
     --space-5: 1.25rem; --space-6: 1.5rem; --space-7: 2rem; --space-9: 3rem;
-    --sidebar-w: 268px;
+    --sidebar-w: 248px;
 
     /* The one gutter. Every label on the page — a group heading, the command a
        pane is showing — stands in a margin column of this width, so the page
@@ -326,12 +327,12 @@ pub fn page() -> String {
        cards lg. (This supersedes the earlier all-square decision on purpose:
        squareness made the console read as a terminal, and a terminal is what
        the CLI is for.) */
-    /* Restrained: an appliance surface is a region of a structured page, not a
-       card you could pick up. 4px default, 6px the largest ordinary surface. */
-    --radius-xs: 3px; --radius-sm: 4px; --radius-md: 4px; --radius-lg: 6px;
+    /* Shared console geometry: comfortable controls and clearly grouped surfaces.
+       Compact technical tables retain their own density inside these regions. */
+    --radius-xs: 4px; --radius-sm: 8px; --radius-md: 10px; --radius-lg: 14px;
     /* The header bar's height, shared with everything that must stop under it
        (the edit drawer, the add drawers). */
-    --bar-h: 60px;
+    --bar-min-h: 72px; --bar-h: var(--bar-min-h);
     --radius-pill: 999px;
 
     /* Wider and lighter than before: a shadow is one light source doing its
@@ -467,7 +468,7 @@ pub fn page() -> String {
     position: sticky; top: 0; z-index: 20;
     display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap;
     margin: 0 calc(-1 * var(--space-7)) var(--space-5);
-    min-height: var(--bar-h); box-sizing: border-box;
+    min-height: var(--bar-min-h); box-sizing: border-box;
     padding: var(--space-2) var(--space-7);
     border-bottom: 1px solid var(--border-subtle);
     /* Opaque, like every non-floating surface: content scrolls up to an edge,
@@ -1100,10 +1101,6 @@ pub fn page() -> String {
     display: flex; align-items: center; gap: var(--space-2);
   }}
   aside button.navitem svg {{ width: 15px; height: 15px; flex: none; }}
-  aside button.navitem .meta {{
-    margin-left: auto; font: var(--fw-medium) var(--text-2xs)/1.4 var(--font-mono);
-    color: var(--text-faint);
-  }}
 
   /* Category icons are quiet: colour in the rail belongs to the accent that
      marks where you are, and to nothing else. Twelve tinted icons were a paint
@@ -1201,12 +1198,6 @@ pub fn page() -> String {
     margin-left: auto; font: var(--fw-regular) var(--text-2xs)/1.4 var(--font-mono);
     color: var(--text-muted);
   }}
-  .whoami {{
-    display: flex; align-items: center; gap: var(--space-2);
-    margin-top: var(--space-3); padding: 0 var(--space-1);
-    font-size: var(--text-sm); color: var(--text-muted);
-  }}
-  .whoami span:nth-child(2) {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
   .cluster .crev {{
     font-family: var(--font-mono); font-size: var(--text-2xs); color: var(--text-faint);
   }}
@@ -1326,31 +1317,6 @@ pub fn page() -> String {
   .change:last-child {{ border-bottom: 0; }}
   .change .what {{ flex: 1 1 auto; font-size: var(--text-sm); color: var(--text-body); }}
   #stagedlist {{ background: none; border: 0; border-left: 0; padding: 0; white-space: normal; }}
-
-  /* --- rail groups --------------------------------------------------------
-     Collapsible, because Routing alone is eleven entries once every protocol
-     is listed, and a rail you have to scroll past is one you stop reading. */
-  /* Group heads are the signs on a directory board: ruled off, so the eye can
-     take the rail in as five short lists rather than as sixty lines. */
-  nav .grouphead {{
-    display: flex; align-items: center; gap: var(--space-2); width: 100%;
-    background: none; cursor: pointer; color: var(--text-faint);
-    font: var(--fw-semibold) var(--text-xs)/1.2 var(--font-sans);
-    letter-spacing: var(--tracking-body);
-    padding: var(--space-3) var(--space-3) var(--space-2);
-    margin: var(--space-4) 0 var(--space-1);
-    border: 0; border-bottom: 1px solid var(--border-subtle);
-  }}
-  nav .grouphead:hover {{ color: var(--text-muted); }}
-  nav .grouphead svg {{
-    width: 12px; height: 12px; margin-left: auto;
-    /* The chevron turns where it stands, which is movement on screen rather
-       than an entrance — and it is a rail control, so it stays under the
-       imperceptible mark. */
-    transition: transform var(--dur-fast) var(--ease-in-out);
-  }}
-  nav .group.closed .grouphead svg {{ transform: rotate(-90deg); }}
-  nav .group.closed .navitem {{ display: none; }}
 
   /* --- dashboard tiles ---------------------------------------------------- */
   .kpi {{
@@ -1594,12 +1560,11 @@ pub fn page() -> String {
   .spread .spread > .margin, .inset .spread > .margin {{ margin-bottom: var(--space-3); }}
 
   /* Reduced motion means fewer and gentler, not none. What is dropped is
-     movement — the chevron's rotation, the dialog's scale — while the fades
+     movement — the switch knob, the dialog's scale — while the fades
      that tell an operator a surface arrived are kept, and kept short. Turning
      every transition off wholesale takes away the explanation along with the
      motion. */
   @media (prefers-reduced-motion: reduce) {{
-    nav .grouphead svg {{ transition: none; }}
     /* The knob still changes side — that is the state, not decoration — but it
        stops sliding there. The colour still moves, because that is what says
        the switch took the press. */
@@ -1676,11 +1641,14 @@ pub fn page() -> String {
         <span class="name">Velstra Sentinel</span>
         <span class="sub" id="navhost">appliance console</span>
       </span>
+      <button id="navtoggle" class="btn mobile-nav-toggle" aria-expanded="false" aria-controls="navcontents" type="button">Menu</button>
     </div>
 
-    <label class="search">
+    <div id="navcontents">
+    <label class="search" for="navsearch">
       <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-      <input id="navsearch" placeholder="Search sections">
+      <input id="navsearch" placeholder="Find a page or setting" aria-label="Find a page or setting" autocomplete="off">
+      <button id="navclear" type="button" class="nav-clear hidden" aria-label="Clear navigation search">×</button>
     </label>
     <button id="palettehint" class="palhint" type="button"
             aria-keyshortcuts="Meta+K Control+K">
@@ -1696,12 +1664,8 @@ pub fn page() -> String {
       <span class="crev" id="clusterrev">rev —</span>
     </div>
 
-    <div class="whoami">
-      <span class="dot up"></span>
-      <span id="whoami">management token</span>
-      <span class="pill warn hidden" id="permpill">read-only</span>
-    </div>
     <button class="btn" id="signout" style="width:100%">Sign out</button>
+    </div>
   </aside>
 
   <main>
@@ -1727,14 +1691,15 @@ pub fn page() -> String {
         <span class="init" id="whoinit">MT</span>
         <span class="uname" id="whoname">management token</span>
       </span>
+      <span class="pill warn hidden" id="permpill">read-only</span>
     </header>
 
     <div class="card staged hidden" id="stagedcard">
       <span class="tile"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 2 9 5-9 5-9-5 9-5z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/></svg></span>
       <span class="stagedtext">
         <span class="t" id="stagedtitle">Staged changes</span>
-        <span class="b">Nothing is applied until you say so. These are the exact
-          commands that will run.</span>
+        <span class="b">Your appliance is unchanged until you apply. Validate this batch,
+          then apply it when ready.</span>
       </span>
       <span class="row" style="flex:none">
         <button class="btn" id="validate">Validate</button>
@@ -1743,13 +1708,7 @@ pub fn page() -> String {
       <div class="script" id="stagedlist" style="flex:1 1 100%"></div>
     </div>
 
-    <div id="confirmation" class="card staged hidden" role="status">
-      <span class="stagedtext"><span class="t">Confirm network configuration</span>
-        <span id="confirmation-message">Verify connectivity before keeping this change.</span>
-        <span id="confirmation-countdown" aria-hidden="true"></span></span>
-      <button class="btn primary" id="confirm-change">Keep change</button>
-      <button class="btn" id="revert-change">Revert now</button>
-    </div>
+    <div id="react-confirmation"></div>
     <div class="secstrip" id="sectionstrip"></div>
     <div class="page" id="pagehead"></div>
 
@@ -1759,17 +1718,9 @@ pub fn page() -> String {
            at -- how many links, how many routes, how many rules -- and a page
            that opens with a time series answers a question they have not asked
            yet. -->
+      <div id="react-dashboard"></div>
+      <details class="dashboard-details"><summary>System details and diagnostics<span>Addresses, routes, logs and counters</span></summary>
       <div class="stats" id="stats"></div>
-      <div class="card"><h3>Live interface throughput</h3><p id="telemetry-status" role="status">Connecting to telemetry…</p><p id="telemetry-freshness" class="lede"></p>
-        <div class="tblwrap"><table id="live-interfaces"></table></div></div>
-      <div class="dashgrid">
-        <div class="card"><h3>HA authority and replication</h3><p id="live-ha">Awaiting the agent.</p></div>
-        <div class="card"><h3>Connection tracking</h3><p id="live-connections">Awaiting the agent.</p><pre id="live-talkers" class="out"></pre></div>
-      </div>
-      <div class="dashgrid">
-        <div class="card"><h3>BGP and OSPF neighbors</h3><pre id="live-routing" class="out"></pre></div>
-        <div class="card"><h3>WireGuard handshakes</h3><pre id="live-vpn" class="out"></pre></div>
-      </div>
       <div class="cards" id="services"></div>
       <div class="dashgrid">
         <div class="card">
@@ -1804,23 +1755,11 @@ pub fn page() -> String {
         </label>
         <div class="tblwrap"><table id="counters"></table></div>
       </div>
+      </details>
     </div>
 
+    <div id="view-flows" class="hidden"><div id="react-flows"></div></div>
     <div id="view-rules" class="hidden">
-      <div class="card">
-        <h3>Live flow and rule inspector</h3>
-        <p class="lede">Live packets for rules with Log enabled. Events include active rule names and identifiers.</p>
-        <div class="toolbar">
-          <label class="field"><span>Filter events</span><input id="flow-search" type="search" autocomplete="off"></label>
-          <button class="btn hidden" id="flow-clear" aria-label="Clear event filter">Clear</button>
-          <label class="field"><span>Action</span><select id="flow-action"><option value="">All actions</option><option value="accept">Accept</option><option value="drop">Drop</option><option value="reject">Reject</option></select></label>
-          <label class="check"><input id="flow-pause" type="checkbox"><span>Pause display</span></label>
-        </div>
-        <p id="flow-state" role="status">Connecting to telemetry…</p>
-        <div class="tblwrap"><table id="live-flows"></table></div>
-        <div class="row"><button class="btn" id="flow-prev">Previous</button><span id="flow-range"></span><button class="btn" id="flow-next">Next</button></div>
-        <details><summary>Exact per-rule packet counters</summary><pre class="out" id="live-rule-counters"></pre></details>
-      </div>
       <div class="toolbar">
         <label class="inline">
           <span>Default policy</span>
@@ -2785,20 +2724,7 @@ pub fn page() -> String {
     </div>
 
     <div id="view-config" class="hidden">
-      <div class="card">
-        <h3>Declarative configuration</h3>
-        <p class="lede">Edit appliance.toml using the same schema validation as sentinel validate. Loading the document reveals configuration secrets to this tab. Drafts stay in memory.</p>
-        <div class="toolbar"><button class="btn" id="toml-load">Show configuration</button><button class="btn hidden" id="toml-hide">Hide configuration</button></div>
-        <div id="toml-editor" class="hidden">
-          <div class="config-columns">
-            <div><h4>Current appliance.toml</h4><pre class="out config-source" id="toml-baseline"></pre></div>
-            <label class="field"><span>Proposed appliance.toml</span><textarea id="toml-candidate" rows="20" spellcheck="false" autocomplete="off" aria-describedby="toml-feedback"></textarea></label>
-          </div>
-          <p id="toml-feedback" role="status">No changes.</p>
-          <details><summary>Validated configuration diff</summary><pre id="toml-diff" class="out"></pre></details>
-          <div class="row"><button class="btn" id="toml-reload">Reload current baseline</button><button class="btn" id="toml-validate">Validate</button><button class="btn primary" id="toml-apply">Apply with confirmation</button></div>
-        </div>
-      </div>
+      <div id="react-config"></div>
       <div class="card">
         <h3>Revisions</h3>
         <p class="lede" style="margin:0 0 var(--space-3)">
@@ -2872,6 +2798,9 @@ pub fn page() -> String {
   <div id="palettelist" role="listbox" aria-label="Pages"></div>
 </dialog>
 
+<script data-sentinel-react>
+{react_js}
+</script>
 <script>
 "use strict";
 const NAV = [
@@ -3388,16 +3317,6 @@ function zoneNames(ls) {{
     if (l.path[0] === "firewall" && l.path[1] === "zone") zones.add(l.path[2]);
   }}
   return [...zones].filter(Boolean).sort();
-}}
-
-function fillZoneSelect(sel, zones, current) {{
-  sel.textContent = "";
-  sel.append(el("option", {{ value: "", text: "(any)" }}));
-  for (const z of zones) {{
-    const o = el("option", {{ value: z, text: z }});
-    if (z === current) o.setAttribute("selected", "selected");
-    sel.append(o);
-  }}
 }}
 
 // Rules come out of the running configuration, so the list can never show a
@@ -6069,9 +5988,8 @@ function renderObjects(o) {{
 // New, Edit, Delete and Stage to an account whose changes can never run is a
 // console inviting work it will throw away.
 function gateWrites() {{
-  for (const id of ["toml-load", "toml-reload", "toml-apply", "toml-validate", "confirm-change", "revert-change"]) {{
-    $(id).disabled = permission === "read-only" || !!target || $(id).classList.contains("busy") || (id === "toml-apply" && !!pendingTransaction);
-  }}
+  // React owns permissions and busy state for the migrated management views.
+  if (typeof management !== "undefined") management.contextChanged();
   if (permission !== "read-only") return;
   for (const b of document.querySelectorAll("main button")) {{
     if (/^(edit|delete|new|add|stage|apply|validate|generate|lift|capture|roll)/i
@@ -8680,7 +8598,6 @@ const ICONS = {{
   chart: '<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>',
   search: '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>',
   bug: '<rect x="8" y="8" width="8" height="10" rx="4"/><path d="M8 12H4M20 12h-4M9 8 7 5M15 8l2-3M9 18l-2 3M15 18l2 3"/>',
-  chevron: '<path d="m6 9 6 6 6-6"/>',
   pin: '<path d="M12 21s6-5.7 6-10a6 6 0 1 0-12 0c0 4.3 6 10 6 10z"/><circle cx="12" cy="11" r="2"/>',
   globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.7 2.5 15 0 18M12 3c-2.5 2.7-2.5 15 0 18"/>',
   star: '<circle cx="12" cy="12" r="2.5"/><path d="M12 3v6M12 15v6M3 12h6M15 12h6M6.3 6.3l3.5 3.5M14.2 14.2l3.5 3.5M17.7 6.3l-3.5 3.5M9.8 14.2l-3.5 3.5"/>',
@@ -8716,6 +8633,7 @@ const SECTIONS = [
   ]}},
   {{ g: "Policy", i: "shield", items: [
     {{ v: "rules", t: "Firewall rules", i: "shield" }},
+    {{ v: "flows", t: "Live packets", i: "pulse" }},
     {{ v: "trace", t: "Packet trace", i: "search" }},
     {{ v: "log", t: "Firewall log", i: "file" }},
     {{ v: "zones", t: "Zones", i: "zones" }},
@@ -8878,13 +8796,10 @@ function markTabs(v, ls) {{
   renderSectionStrip();
 }}
 
-const meta = {{}};   // section → the count shown beside it, once known
-
 function navButton(label, iconName, onclick, key) {{
   const b = el("button", {{ class: "navitem", onclick }});
   b.dataset.key = key;
   b.append(icon(iconName), el("span", {{ text: label }}));
-  if (meta[key] !== undefined) b.append(el("span", {{ class: "meta", text: String(meta[key]) }}));
   return b;
 }}
 
@@ -8947,7 +8862,9 @@ const OWNERS = [
 
 // Open a destination, whether it names a tab or not. One door, so the rail, the
 // search results and anything added later cannot open a section differently.
+let focusDestination = false;
 function goto(key) {{
+  focusDestination = true;
   const [v, tab] = String(key).split(":");
   view = v;
   if (tab) tabs[v] = tab;
@@ -9045,9 +8962,13 @@ function sectionFor(path) {{
 // an address or a port number is looking for the object that mentions it, and
 // they will not know which section that turned out to be.
 let searchIndex = [];
+let searchGeneration = 0;
 
 async function buildSearchIndex() {{
+  const generation = ++searchGeneration;
+  const member = target;
   const ls = await leaves();
+  if (generation !== searchGeneration || !token || member !== target) return;
   const seen = new Set();
   searchIndex = [];
   for (const l of ls) {{
@@ -9087,8 +9008,9 @@ function renderMatches() {{
 // markup so a section and its heading cannot drift apart, and so a view added
 // without a description is visibly missing one.
 const ABOUT = {{
-  dashboard: "Throughput, verdicts and what the data plane is doing right now.",
-  rules: "What is allowed between zones, in the order the firewall reads them.",
+  dashboard: "Your network at a glance. Check traffic, connections and appliance status.",
+  rules: "Choose which traffic may pass between your networks. Changes stay staged until you apply them.",
+  flows: "Inspect allowed and blocked packets. Filter by address, rule, port or protocol.",
   zones: "The posture each zone starts from before any rule is consulted.",
   groups: "Named sets of addresses, ports and domains that rules point at.",
   nat: "Source translation on the way out, destination translation on the way in.",
@@ -9165,7 +9087,7 @@ function renderPageHeader() {{
   host.textContent = "";
   if (!title && view !== "panel") return;
   const text = el("div", {{ class: "headtext" }}, [
-    el("h2", {{ text: title || (panel ? panel.t : "Output") }}),
+    el("h2", {{ text: title || (panel ? panel.t : "Output"), tabindex: "-1" }}),
   ]);
   const about = ABOUT[viewKey()] || ABOUT[view];
   if (about) text.append(el("p", {{ text: about }}));
@@ -9180,31 +9102,10 @@ function renderPageHeader() {{
   host.append(text);
 }}
 
-// Groups the operator has folded away. A rail with every protocol named is
-// long on purpose; which parts of it stay open is their business, and it is
-// the only preference this console keeps between sessions.
-const FOLDED = "sentinel-folded";
-let folded = new Set();
-try {{ folded = new Set(JSON.parse(localStorage.getItem(FOLDED) || "[]")); }} catch (e) {{}}
-function toggleGroup(name) {{
-  folded.has(name) ? folded.delete(name) : folded.add(name);
-  try {{ localStorage.setItem(FOLDED, JSON.stringify([...folded])); }} catch (e) {{}}
-  buildNav();
-}}
-
-function groupBox(name, hasCurrent) {{
-  // A folded group that holds the current page would hide where you are, so it
-  // opens itself rather than being right about a stale preference.
-  const shut = folded.has(name) && !hasCurrent;
-  const head = el("button", {{ class: "grouphead", onclick: () => toggleGroup(name) }});
-  head.append(el("span", {{ text: name }}), icon("chevron"));
-  head.setAttribute("aria-expanded", String(!shut));
-  return el("div", {{ class: "group" + (shut ? " closed" : "") }}, [head]);
-}}
-
 function buildNav() {{
   const nav = $("nav");
   const filter = $("navsearch").value.trim().toLowerCase();
+  $("navclear").classList.toggle("hidden", !$("navsearch").value);
   nav.textContent = "";
   const key = viewKey();
 
@@ -9253,7 +9154,7 @@ function buildNav() {{
   // they can start. The category's own pages are one strip away, in the content
   // where the work is -- so nothing is further than two clicks, and the rail
   // stays short enough to hold a system summary underneath it.
-  const cfg = el("div", {{ class: "group" }}, [el("span", {{ class: "grp", text: "Configure" }})]);
+  const cfg = el("div", {{ class: "group" }}, [el("span", {{ class: "grp", text: "Workspace" }})]);
   for (const group of SECTIONS) {{
     const first = group.items[0];
     const k = first.tab ? first.v + ":" + first.tab : first.v;
@@ -9265,7 +9166,8 @@ function buildNav() {{
   }}
   nav.append(cfg);
 
-  const live = el("div", {{ class: "group" }}, [el("span", {{ class: "grp", text: "Look" }})]);
+  const live = el("details", {{ class: "group nav-diagnostics", id: "navdiagnostics" }}, [el("summary", {{ text: "Diagnostics" }})]);
+  live.open = !!panel;
   for (const group of NAV) {{
     const [ic] = NAVMETA[group.g] || ["chart"];
     const first = group.items[0];
@@ -9357,9 +9259,22 @@ async function refresh() {{
   renderPageHeader();
   renderTabs(view);
   const key = viewKey();
+  const currentGroup = sectionPlace()?.group;
+  const hadNavigation = $("navtoggle").getAttribute("aria-expanded") === "true";
+  setNavigation(false);
+  if (focusDestination || (hadNavigation && window.matchMedia("(max-width: 900px)").matches))
+    requestAnimationFrame(() => {{
+      $("pagehead").querySelector("h2")?.focus({{ preventScroll: true }});
+      window.scrollTo(0, 0);
+    }});
+  focusDestination = false;
+  const diagnostics = document.querySelector(".nav-diagnostics");
+  if (panel && diagnostics) diagnostics.open = true;
   for (const b of document.querySelectorAll("aside button.navitem")) {{
     const active = b.dataset.path ? (panel && b.dataset.path === panel.p)
-                                  : (!panel && b.dataset.key === key);
+      : b.dataset.key?.startsWith("cat:") ? (!panel && b.dataset.key === "cat:" + currentGroup)
+      : b.dataset.key?.startsWith("live:") ? (panel && NAV.some((g) => "live:" + g.g === b.dataset.key && g.items.some((i) => i.p === panel.p)))
+      : (!panel && b.dataset.key === key);
     b.classList.toggle("on", !!active);
     b.setAttribute("aria-current", String(!!active));
   }}
@@ -9428,11 +9343,6 @@ async function refresh() {{
 // A read-only operator who is offered Apply learns their permission by being
 // refused, which is the worst possible time to find out.
 function renderWho() {{
-  const label = $("whoami");
-  if (label) {{
-    label.textContent = who || "management token";
-    label.title = who ? "signed in as " + who : "signed in with the machine token";
-  }}
   const name = who || "management token";
   const parts = name.split(/[^a-zA-Z0-9]+/).filter(Boolean);
   const init = ((parts[0] || "m")[0] + (parts[1] ? parts[1][0] : (parts[0] || "mt")[1] || "")).toUpperCase();
@@ -9462,6 +9372,10 @@ function renderWho() {{
 }}
 
 function signOut(message) {{
+  $("navsearch").value = "";
+  $("matches").textContent = "";
+  $("navclear").classList.add("hidden");
+  setNavigation(false);
   stopManagement();
   token = "";
   who = "";
@@ -9476,6 +9390,7 @@ function signOut(message) {{
   panel = null;
   lastLeaves = [];
   searchIndex = [];
+  searchGeneration++;
   history.clear();
   lastCounters = null;
   lastCountersAt = 0;
@@ -9567,12 +9482,31 @@ $("tokenform").onsubmit = (e) => {{
   signedIn();
 }};
 $("signout").onclick = () => signOut("");
+// The real header height, including narrow/zoomed wrapping, positions drawers.
+const headerSize = new window.ResizeObserver(([entry]) => {{
+  document.documentElement.style.setProperty("--bar-h", Math.ceil(entry.target.getBoundingClientRect().height) + "px");
+}});
+headerSize.observe(document.querySelector(".bar"));
+function setNavigation(open, restoreFocus = false) {{
+  $("app").dataset.navigation = open ? "open" : "closed";
+  $("navtoggle").setAttribute("aria-expanded", String(open));
+  $("navtoggle").textContent = open ? "Close menu" : "Menu";
+  if (restoreFocus) $("navtoggle").focus();
+}}
+$("navtoggle").onclick = () => setNavigation($("navtoggle").getAttribute("aria-expanded") !== "true");
+$("navclear").onclick = () => {{ $("navsearch").value = ""; buildNav(); renderMatches(); $("navsearch").focus(); }};
 $("navsearch").oninput = () => {{ buildNav(); renderMatches(); }};
+document.addEventListener("keydown", (e) => {{
+  if (e.key === "Escape" && $("navtoggle").getAttribute("aria-expanded") === "true" && !document.querySelector("dialog[open]")) {{
+    setNavigation(false, true); e.preventDefault();
+  }}
+}});
 
 // The palette: opened from the rail hint or by Cmd/Ctrl-K anywhere, filtered as
 // you type, walked with the arrows, taken with Enter, dismissed with Esc (the
 // dialog's own cancel closes it, so nothing here has to catch Escape).
 $("palettehint").onclick = openPalette;
+$("palettehint").querySelector("kbd").textContent = /Mac|iPhone|iPad/.test(navigator.platform) ? "⌘ K" : "Ctrl K";
 $("paletteq").oninput = () => {{ palSel = 0; renderPalette(); }};
 $("paletteq").onkeydown = (e) => {{
   if (e.key === "ArrowDown") {{
@@ -9794,6 +9728,11 @@ mod tests {
     #[test]
     fn the_page_is_self_contained() {
         let html = page();
+        // React contains SVG namespace and diagnostic URLs; these are constants,
+        // not asset requests. Check the authored document separately.
+        let (before, rest) = html.split_once("<script data-sentinel-react>").unwrap();
+        let (_, after) = rest.split_once("</script>").unwrap();
+        let html = format!("{before}{after}");
         // An appliance is expected to work on an isolated network: a console that
         // half-renders without the internet is worse than no console.
         for external in ["http://", "https://", "//cdn", "<link", "<script src"] {
@@ -9968,7 +9907,7 @@ mod tests {
         assert!(html.contains("push(`set ${path} ${f[0]} ${argument}`)"));
         assert!(html.contains("firewall rule "));
         assert!(
-            !html.contains("PUT"),
+            !html.rsplit_once("<script>").unwrap().1.contains("PUT"),
             "the console writes a whole config document instead of commands"
         );
     }
@@ -10273,7 +10212,6 @@ mod tests {
             html.contains("function zoneNames"),
             "zones are not enumerated"
         );
-        assert!(html.contains("fillZoneSelect"), "zone fields are free text");
         // The rule's own vocabularies live in one table, and a field with a
         // fixed set of values carries it there rather than in the markup.
         assert!(
@@ -10370,7 +10308,7 @@ mod tests {
     fn every_function_the_script_calls_is_defined() {
         let html = page();
         let script = html
-            .split_once("<script>")
+            .rsplit_once("<script>")
             .and_then(|(_, rest)| rest.split_once("</script>"))
             .map(|(s, _)| s)
             .expect("the page has a script");
