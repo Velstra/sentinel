@@ -15221,7 +15221,17 @@
               backup.fail("grep -q api-synced-rule /var/lib/sentinel/appliance.toml")
               import time
               time.sleep(8)
-              primary.succeed("test -f /var/lib/sentinel/configsync/pending.json; systemctl show sentinel-configsync.service -p Result --value | grep -qx exit-code")
+              # A running retry resets systemd's Result temporarily to success.
+              # Count completed failures beyond the default five-start burst
+              # instead of racing the gap between two one-second attempts.
+              primary.wait_until_succeeds(
+                  "test -f /var/lib/sentinel/configsync/pending.json && "
+                  "test $(journalctl -u sentinel-configsync.service --no-pager -o cat "
+                  "--grep='awaiting configuration delivery' | wc -l) -ge 6",
+                  timeout=10,
+              )
+              primary.succeed("systemctl is-active --quiet sentinel-configsync.timer")
+              primary.fail("systemctl show sentinel-configsync.service -p Result --value | grep -qx start-limit-hit")
               backup.succeed("systemctl start sentinel-api.service")
               backup.wait_until_succeeds("grep -q api-synced-rule /var/lib/sentinel/appliance.toml",timeout=45)
               primary.wait_until_succeeds("test ! -f /var/lib/sentinel/configsync/pending.json",timeout=20)
