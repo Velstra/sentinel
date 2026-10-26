@@ -2437,6 +2437,12 @@ pub fn page() -> String {
         is exactly where a VRRP backup stands.
       </p>
       <div class="card">
+        <h3>Fleet enrollment</h3>
+        <p class="lede">Optional outbound management with a provisioned client identity and a pinned command-signing key. Leave unconfigured for standalone operation. Remove the complete fleet section in the configuration editor to disconnect.</p>
+        <div class="grid" id="sys-fleet"></div>
+        <button class="btn" id="disconnect-fleet">Disconnect fleet</button>
+      </div>
+      <div class="card">
         <h3>Update channel</h3>
         <p class="lede" style="margin:0 0 var(--space-4)">
           Where signed images come from, and the key their manifest must be
@@ -5864,7 +5870,7 @@ function firstGroup(fields) {{
 // to be edited; it is simply not on the board.
 const SECRETS = [
   "psk", "password", "hashed-password", "private-key", "preshared-key",
-  "auth-key", "secret", "passphrase", "macsec-key", "subscription-key",
+  "auth-key", "secret", "passphrase", "macsec-key", "subscription-key", "enrollment-token",
 ];
 
 function shown(key, value) {{
@@ -7816,6 +7822,12 @@ const SYS_IDENT = [
   // here. It was not: the console could read the history and not start it.
   ["metrics enable", "Keep a history", ["", "true", "false"]],
 ];
+const SYS_FLEET = [
+  ["controller-url", "Controller HTTPS URL"], ["node-id", "Enrolled node ID"],
+  ["enrollment-token", "Enrollment token", null, null, "secret"], ["ca-certificate", "Controller CA file"],
+  ["client-certificate", "Client certificate file"], ["client-key", "Private client key file"],
+  ["signing-key", "Ed25519 signing public key"], ["poll-interval", "Check-in interval (seconds)"],
+];
 const SYS_UPDATE = [
   ["url", "Default channel URL"], ["public-key", "Signing key"],
   // Typed rather than picked on purpose: the channel to use may be the one
@@ -8033,6 +8045,9 @@ async function refreshSystem() {{
     rows: entriesUnder(ls, ["system", "sysctl"]),
     empty: "No kernel parameters set.",
   }});
+  settingsPanel("sys-fleet", SYS_FLEET, under("fleet"), "fleet", "Fleet enrollment");
+  $("disconnect-fleet").disabled = permission === "read-only" || !under("fleet")["controller-url"];
+  $("disconnect-fleet").onclick = () => stage("Disconnect fleet", ["delete fleet"]);
   settingsPanel("sys-update", SYS_UPDATE, under("update"), "update", "Update channel");
   renderObjects({{
     listId: "upchanlist", required: "url", toggleId: "toggleupchan",
@@ -8926,6 +8941,7 @@ const OWNERS = [
   [["system", "ha-witness"], "ha"],
   [["system", "conntrack-sync"], "ha"],
   [["system"], "system"],
+  [["fleet"], "system"],
   [["update"], "system"],
 ];
 

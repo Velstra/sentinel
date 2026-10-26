@@ -43,7 +43,7 @@ async fn run(hub: Weak<Hub>) {
             break;
         }
         let result = tokio::task::spawn_blocking(move || {
-            let value = collector.collect();
+            let value = collector.collect(true);
             (collector, value)
         })
         .await;
@@ -63,6 +63,12 @@ async fn run(hub: Weak<Hub>) {
     }
 }
 
+/// Fleet telemetry is a non-draining snapshot. The local API remains the sole
+/// packet-ring consumer; cumulative interface counters let controllers derive rates.
+pub fn fleet_snapshot() -> Value {
+    Collector::default().collect(false)
+}
+
 #[derive(Default)]
 struct Collector {
     previous: Option<(Instant, BTreeMap<String, [u64; 4]>)>,
@@ -71,7 +77,7 @@ struct Collector {
     sequence: u64,
 }
 impl Collector {
-    fn collect(&mut self) -> Value {
+    fn collect(&mut self, include_events: bool) -> Value {
         let queries = [
             ("events", "packet-events 256"),
             ("conntrack", "firewall-state-summary 200"),
@@ -84,6 +90,7 @@ impl Collector {
         std::thread::scope(|scope| {
             let handles: Vec<_> = queries
                 .iter()
+                .filter(|(key, _)| include_events || *key != "events")
                 .map(|(key, query)| (*key, scope.spawn(move || crate::velstra::query(query))))
                 .collect();
             for (key, handle) in handles {
@@ -112,7 +119,11 @@ impl Collector {
                 }
             }
         };
-        let events = answer("events");
+        let events = if include_events {
+            answer("events")
+        } else {
+            None
+        };
         if let Some(text) = events {
             self.append_events(&text);
         }

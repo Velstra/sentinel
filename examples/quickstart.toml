@@ -1,0 +1,53 @@
+# Network sample. On an installed box keep the installer-created login/group
+# sections; examples/quickstart.cli applies these settings without deleting them.
+# Replace eth0/eth1 with the two names reported by `sentinel show interfaces`.
+[system]
+hostname = "edge-a"
+
+[zone.wan]
+default_action = "drop"
+[zone.lan]
+default_action = "accept"
+
+[[interface]]
+name = "eth0"
+zone = "wan"
+address = "dhcp"
+
+[[interface]]
+name = "eth1"
+zone = "lan"
+address = "192.168.50.1/24"
+[interface.dhcp-server]
+pool-offset = 100
+pool-size = 50
+dns = ["192.168.50.1"]
+
+# DHCP bootstrap replies cannot be matched as an ordinary established flow
+# while WAN has not acquired its address yet.
+[[rule]]
+name = "wan-dhcp"
+from = "wan"
+proto = "udp"
+port = "68"
+action = "accept"
+
+[[rule]]
+name = "lan-outbound"
+from = "lan"
+to = "wan"
+action = "accept"
+
+[[nat.source]]
+name = "wan-masquerade"
+zone = "wan"
+
+[services.dns]
+upstream = ["1.1.1.1", "9.9.9.9"]
+serve-on = ["eth1"]
+
+[services.web]
+enable = true
+listen-address = "192.168.50.1"
+port = 8443
+tls = true
