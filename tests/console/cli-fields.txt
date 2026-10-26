@@ -399,6 +399,7 @@ services cache-size
 services certificate
 services collector
 services community
+services confirm-timeout
 services contact
 services description
 services disabled

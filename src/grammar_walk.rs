@@ -782,6 +782,7 @@ fn every_settable_path_is_accepted_shown_persisted_and_deletable() {
     }
 
     let report = std::path::PathBuf::from("target/grammar-walk.txt");
+    std::fs::create_dir_all(report.parent().unwrap()).unwrap();
     let mut f = std::fs::File::create(&report).unwrap();
     writeln!(
         f,
@@ -1143,6 +1144,7 @@ fn every_settable_path_survives_show_configuration_commands() {
     }
 
     let report = std::path::PathBuf::from("target/grammar-walk-flatten.txt");
+    std::fs::create_dir_all(report.parent().unwrap()).unwrap();
     let mut f = std::fs::File::create(&report).unwrap();
     writeln!(
         f,
