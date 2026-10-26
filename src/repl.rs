@@ -1462,6 +1462,7 @@ const TOP: &[Cand] = &[
         "update",
         "signed update channel: URL + pinned release signing key",
     ),
+    ("fleet", "optional authenticated fleet management"),
 ];
 // `policy <Tab>` reveals the two object kinds (VyOS-style, roadmap policy).
 /// `policy route <name> <Tab>` — which traffic consults which table.
@@ -1547,6 +1548,25 @@ const PERMIT_DENY: &[Cand] = &[
     ("deny", "deny (drop) the route"),
 ];
 // `update <Tab>` reveals the signed-update-channel fields (roadmap C13).
+const FLEET_FIELDS: &[Cand] = &[
+    ("controller-url", "HTTPS fleet controller base URL"),
+    ("node-id", "stable enrolled appliance identity"),
+    (
+        "enrollment-token",
+        "private enrollment credential or file:/path",
+    ),
+    ("ca-certificate", "controller TLS CA certificate path"),
+    (
+        "client-certificate",
+        "enrolled mTLS client certificate path",
+    ),
+    ("client-key", "private mTLS client key path (0600)"),
+    ("signing-key", "base64 Ed25519 command verification key"),
+    (
+        "poll-interval",
+        "check-in interval in seconds (1–300, default 5)",
+    ),
+];
 const UPDATE_FIELDS: &[Cand] = &[
     (
         "url",
@@ -4309,6 +4329,7 @@ pub(crate) fn candidates(tokens: &[&str]) -> &'static [Cand] {
 
         // The pki (certificate authority + ACME) sub-tree.
         ["set" | "delete", "pki"] => PKI_NODES,
+        ["set" | "delete", "fleet"] => FLEET_FIELDS,
         ["set" | "delete", "update"] => UPDATE_FIELDS,
         ["set" | "delete", "update", "channel", _name] => UPDATE_CHANNEL_FIELDS,
         ["set" | "delete", "pki", "ca", _name] => PKI_CA_FIELDS,
@@ -5083,6 +5104,21 @@ pub(crate) fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, 
             "set",
             _attr,
         ] => own_cands(&[("<asn:value>", "a community value")]),
+        ["set", "fleet", "controller-url"] => own_cands(&[PH_URL]),
+        ["set", "fleet", "node-id"] => own_cands(&[PH_NAME]),
+        ["set", "fleet", "enrollment-token"] => own_cands(&[(
+            "<enrollment-token>",
+            "private enrollment credential or file:/path",
+        )]),
+        ["set", "fleet", "signing-key"] => {
+            own_cands(&[("<ed25519-base64>", "base64 Ed25519 public key")])
+        }
+        [
+            "set",
+            "fleet",
+            "ca-certificate" | "client-certificate" | "client-key",
+        ] => own_cands(&[("<absolute-path>", "absolute file path")]),
+        ["set", "fleet", "poll-interval"] => own_cands(&[("<seconds>", "1–300 seconds")]),
         ["set", "update", "url"] => own_cands(&[PH_URL]),
         ["set", "update", "public-key"] => {
             own_cands(&[("<pem|file:path>", "PEM key or file:<path>")])
@@ -5593,7 +5629,8 @@ mod tests {
                 "pki",
                 "policy",
                 "evpn",
-                "update"
+                "update",
+                "fleet"
             ]
         );
         assert_eq!(
@@ -6190,7 +6227,8 @@ mod tests {
                 "pki",
                 "policy",
                 "evpn",
-                "update"
+                "update",
+                "fleet"
             ]
         );
         assert_eq!(

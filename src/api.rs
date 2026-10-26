@@ -1179,6 +1179,7 @@ const SECRET_FIELDS: &[&str] = &[
     // a bearer token that buys tested images — anyone holding it can consume
     // the subscription, so it never leaves through the read API.
     "subscription-key",
+    "enrollment-token",
 ];
 
 /// What a redacted secret reads as in the API's config output — a marker, not an
@@ -1308,6 +1309,11 @@ async fn ha_pair(
         .appliance
         .validate()
         .map_err(ApiError::bad_request)?;
+    if request.appliance.fleet != local.fleet {
+        return Err(ApiError::bad_request(anyhow!(
+            "HA enrollment cannot replace the member's fleet identity"
+        )));
+    }
     let desired = crate::ha::revision(&request.appliance).map_err(ApiError::internal)?;
     let current = crate::ha::revision(&local).map_err(ApiError::internal)?;
     if desired == current {
@@ -1555,6 +1561,7 @@ async fn put_config_sync(
 
 /// Keep facts that identify one member of an HA pair on that member.
 fn merge_synced_config(mut incoming: Appliance, local: &Appliance) -> Result<Appliance> {
+    incoming.fleet = local.fleet.clone();
     if let Some(source) = &incoming.system.ha {
         anyhow::ensure!(
             source.peer_identity.is_some(),
@@ -2352,6 +2359,39 @@ mod tests {
         assert!(resolve_caller(&configured, "rotated-token").is_none());
         std::fs::remove_dir_all(token_path.parent().unwrap()).unwrap();
     }
+    #[test]
+    fn fleet_enrollment_tokens_are_redacted_from_every_read_shape() {
+        let mut value = json!({"fleet":{"enrollment-token":"secret-fleet-enrollment","client-key":"/etc/fleet/client.key"}});
+        redact_secrets(&mut value);
+        assert_eq!(value["fleet"]["enrollment-token"], REDACTED);
+        assert_eq!(value["fleet"]["client-key"], "/etc/fleet/client.key");
+    }
+
+    #[test]
+    fn config_sync_preserves_receiver_fleet_identity() {
+        let mut primary = crate::ha::paired_fixture();
+        let mut secondary = crate::ha::materialize_peer(primary.clone()).unwrap();
+        let fleet = crate::config::Fleet {
+            controller_url: "https://fleet.example".into(),
+            node_id: "secondary".into(),
+            enrollment_token: "secondary-enrollment-credential".into(),
+            ca_certificate: "/etc/fleet/ca.pem".into(),
+            client_certificate: "/etc/fleet/client.pem".into(),
+            client_key: "/etc/fleet/client.key".into(),
+            signing_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            poll_interval: None,
+        };
+        secondary.fleet = Some(fleet.clone());
+        let mut source = fleet.clone();
+        source.node_id = "primary".into();
+        source.enrollment_token = "primary-enrollment-credential".into();
+        primary.fleet = Some(source);
+        assert_eq!(
+            merge_synced_config(primary, &secondary).unwrap().fleet,
+            Some(fleet)
+        );
+    }
+
     #[test]
     fn paired_config_sync_swaps_profiles_and_rejects_wrong_cluster() {
         let mut primary = crate::ha::paired_fixture();

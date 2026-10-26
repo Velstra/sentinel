@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-10-26
+
+### Added
+
+- Optional declarative fleet management with provisioned mTLS identity,
+  independent Ed25519 command signatures, challenge/target binding and durable
+  replay protection. Signed revisions use the existing validation, CAS,
+  independent apply worker and explicit commit-confirm recovery engine.
+- Fleet telemetry requests, member-local enrollment across HA synchronization,
+  and a shared-form enrollment/disconnect workflow in the embedded console.
+- Verified network samples and an account-preserving CLI batch, a QEMU/Proxmox
+  quickstart, and pinned QEMU firmware for the installer workflow.
+
+### Fixed
+
+- DHCP WAN acquisition and address replacement refresh Fabric's live SNAT
+  targets without restarting the agent or clearing established connection state.
+- Enrollment rotation rejects late telemetry acknowledgements as well as late
+  signed commands, preserving the new identity's replay-protection state.
+
+### Release verification
+
+- Rust formatting, check, warning-free clippy and workspace tests; full browser
+  console/field coverage; real mTLS, network, HA and recovery VM regressions.
+- Appliance disk image and installer ISO builds and installer/verified-boot
+  checks. Deployment-specific hardware and firmware trust remain operator-owned.
+
+
 ### Added
 
 - **The firewall log is searchable, and reaches back further than fifty lines.**

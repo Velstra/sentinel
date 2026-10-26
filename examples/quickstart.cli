@@ -1,0 +1,30 @@
+# Apply from the local console after the installer created your administrator.
+# Replace eth0/eth1 with the actual WAN/LAN interface names first.
+set system hostname edge-a
+set interface eth0 zone wan
+set interface eth0 address dhcp
+set interface eth1 zone lan
+set interface eth1 address 192.168.50.1/24
+set interface eth1 dhcp-server pool-offset 100
+set interface eth1 dhcp-server pool-size 50
+set interface eth1 dhcp-server dns 192.168.50.1
+set firewall zone wan default-action drop
+set firewall zone lan default-action accept
+set firewall rule wan-dhcp from wan
+set firewall rule wan-dhcp proto udp
+set firewall rule wan-dhcp port 68
+set firewall rule wan-dhcp action accept
+set firewall rule lan-outbound from lan
+set firewall rule lan-outbound to wan
+set firewall rule lan-outbound action accept
+set nat source wan-masquerade zone wan
+set services dns upstream 1.1.1.1
+set services dns upstream 9.9.9.9
+set services dns serve-on eth1
+set services web enable true
+set services web listen-address 192.168.50.1
+set services web port 8443
+set services web tls true
+commit
+save
+exit

@@ -99,3 +99,13 @@ inventing a zero. The native action select accepts platform-owned popup and
 keyboard behavior. Live event filters are intentionally transient because they
 can contain sensitive addresses. Pagination and paused history are bounded;
 packet history is diagnostic, not a lossless audit archive.
+
+Fleet enrollment is an optional singleton on the existing System page. It uses
+settingsPanel/fieldGrid, the staged Stage/Apply lifecycle and the shared secret
+widget. The enrollment credential is masked with an accessible reveal control;
+server-redacted credentials are never replayed while another field is edited.
+Disconnect stages `delete fleet` and uses the ordinary commit-confirm path.
+Rejected enrollment keeps the complete staged correction and the last working
+configuration. Fleet client keys are private file references; private PEM bytes
+never enter this form. No new theme, navigation, dialog or notification owner is
+introduced. Verification: tests/console/fleet.test.mjs and nix/fleet-test.nix.

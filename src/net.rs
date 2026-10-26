@@ -2265,7 +2265,9 @@ pub(crate) fn push_config_peer_with_secret(
     let mut credential = appliance.system.config_sync.clone();
     credential.secret = Some(secret.into());
     let cs = &credential;
-    let json = serde_json::to_string(appliance).context("serializing config for sync")?;
+    let mut shared = appliance.clone();
+    shared.fleet = None; // Enrollment credentials belong only to this member.
+    let json = serde_json::to_string(&shared).context("serializing config for sync")?;
     let mut staged = system::PrivateStage::create(Path::new("/run/sentinel"), 0o600)?;
     staged.file.write_all(json.as_bytes())?;
     let authority = configsync_authority(peer);
@@ -3925,6 +3927,7 @@ pub fn apply_link_runtime(appliance: &Appliance) -> Result<()> {
     // Sentinel-owned daemon (re)started after networkd so the link-scoped ones
     // (LLDP/mDNS/relay) see their interfaces up.
     apply_box_services(appliance)?;
+    crate::fleet::reconcile(appliance, ApplyMode::Live)?;
     // NAT64 + DNS64 (roadmap C10) — tayga's tun/routes need the up links, and the
     // DNS64 unbound binds the serving interface's address, so reconcile them here
     // (after networkd) too.
