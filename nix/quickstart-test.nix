@@ -79,7 +79,8 @@ pkgs.testers.runNixOSTest {
         assert fw.succeed("systemctl show -p MainPID --value velstra.service").strip() == pid
         assert fw.succeed("sha256sum /var/lib/sentinel/appliance.toml").strip() == revision
     with subtest("the embedded HTTPS UI and generated desired document are ready"):
-        lan.succeed("curl -kfsS --max-time 5 https://192.168.50.1:8443/ | grep -q 'Fleet enrollment'")
+        lan.succeed("curl -kfsS --max-time 5 https://192.168.50.1:8443/ -o /tmp/quickstart-console.html")
+        lan.succeed("grep -q 'Fleet enrollment' /tmp/quickstart-console.html")
         document = json.loads(fw.succeed("sentinel config convert /var/lib/sentinel/appliance.toml --to json"))
         assert any(login["username"] == "operator" for login in document["system"]["login"]), document["system"]
         assert document["services"]["web"]["tls"] is True
