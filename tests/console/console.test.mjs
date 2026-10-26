@@ -511,6 +511,101 @@ await test("connection timeouts apply, reject invalid values, and reset to defau
   equal(reset.pending, [], "restoring defaults was refused");
 });
 
+await test("leased HA settings save, validate and protect peer identity", async () => {
+  const identity = { node: 2, hostname: "peer-two", "router-id": null,
+    "management-endpoint": "127.0.0.2:8080", "management-fingerprint": "A".repeat(43) + "=",
+    "state-listen": "127.0.0.2:5429", priority: 100, interfaces: {} };
+  const values = ["false", "127.0.0.9:5440", "eth0", "1", "180", "true",
+    "console-ha-cluster-1", "A".repeat(43) + "=", JSON.stringify(identity, null, 2)];
+  try {
+    const result = await page.evaluate(`(async () => {
+      staged = []; dirty.clear(); renderStaged(); view = "ha"; panel = null; await refresh();
+      const box = document.getElementById("haform");
+      const widgets = [...box.querySelectorAll(".field")].map((f) =>
+        f.querySelector(".secretfield, .switch, .num, select, input"));
+      if (widgets.length !== 9 || widgets.some((w) => !w)) throw Error("HA fields missing");
+      const values = ${JSON.stringify(values)};
+      widgets.forEach((w, i) => { w.value = values[i]; w.dispatchEvent(new Event("input")); });
+      const secret = box.querySelector(".secretfield input");
+      const toggle = box.querySelector(".secretfield button");
+      const label = box.querySelector('label[for="' + secret.id + '"]');
+      label.click();
+      const focused = document.activeElement === secret;
+      const masked = secret.type === "password";
+      toggle.focus(); toggle.click();
+      const revealed = secret.type === "text" && toggle.getAttribute("aria-pressed") === "true";
+      toggle.click();
+      const hiddenAgain = secret.type === "password";
+      [...box.querySelectorAll("button")].find((b) => b.textContent === "Stage").click();
+      const commands = stagedCommands();
+      const safeSummary = !document.getElementById("stagedlist").textContent.includes("peer-two");
+      await applyStaged(["commit", "save"]);
+      const current = fieldsOf(await leaves(), "system ha");
+      return { focused, masked, revealed, hiddenAgain, safeSummary, commands,
+        pending: stagedCommands(), current };
+    })()`);
+    check(result.focused && result.masked && result.revealed && result.hiddenAgain,
+      "peer identity must have an associated label and an accessible masked/reveal control");
+    check(result.safeSummary, "peer identity leaked into the staged summary");
+    equal(result.pending, [], "valid HA settings remained staged");
+    equal(JSON.parse(result.current["peer-identity"]), identity, "JSON identity did not survive CLI quoting");
+    equal(result.current.priority, "180", "HA priority was not saved");
+    check(result.commands.length === 9, "not every HA setting was staged");
+    const before = CONFIG && readFileSync(CONFIG, "utf8");
+    const refused = await page.evaluate(`(async () => {
+      await refresh(); const box = document.getElementById("haform");
+      const field = [...box.querySelectorAll(".field")].find((f) => f.textContent.includes("Election priority"));
+      field.querySelector("input").value = "0";
+      [...box.querySelectorAll("button")].find((b) => b.textContent === "Stage").click();
+      await applyStaged(["commit", "save"]);
+      return { pending: stagedCommands(), output: document.getElementById("resultout").textContent };
+    })()`);
+    check(refused.pending.length > 0 && /priority must be nonzero/.test(refused.output),
+      "invalid election priority was accepted or its staged correction was lost");
+    if (CONFIG) equal(readFileSync(CONFIG, "utf8"), before, "rejected HA settings changed the saved file");
+  } finally {
+    await page.evaluate(`(async () => {
+      staged = []; dirty.clear(); renderStaged();
+      await configure(["delete system ha", "commit", "save"]); await refresh();
+    })()`);
+  }
+});
+
+await test("the independent witness edits preserve its enrollment credential", async () => {
+  const credential = "console-witness-enrollment-credential-123456";
+  try {
+    const result = await page.evaluate(`(async () => {
+      staged = []; dirty.clear(); renderStaged(); view = "ha"; panel = null; await refresh();
+      const box = document.getElementById("hawitnessform");
+      const widgets = [...box.querySelectorAll(".field")].map((f) => f.querySelector(".secretfield, input"));
+      ["127.0.0.9:5440", ${JSON.stringify(credential)}, "console-ha-cluster-1"].forEach((v, i) => {
+        widgets[i].value = v; widgets[i].dispatchEvent(new Event("input"));
+      });
+      [...box.querySelectorAll("button")].find((b) => b.textContent === "Stage").click();
+      await applyStaged(["commit", "save"]); await refresh();
+      const edit = document.getElementById("hawitnessform");
+      edit.querySelector("input").value = "127.0.0.9:5441";
+      [...edit.querySelectorAll("button")].find((b) => b.textContent === "Stage").click();
+      const commands = stagedCommands();
+      await applyStaged(["commit", "save"]);
+      return { commands, pending: stagedCommands() };
+    })()`);
+    equal(result.commands, ["set system ha-witness listen 127.0.0.9:5441"],
+      "editing the witness rewrote its protected credential");
+    equal(result.pending, [], "witness edits did not apply");
+    if (CONFIG) {
+      const saved = readFileSync(CONFIG, "utf8");
+      check(saved.includes(credential) && saved.includes('listen = "127.0.0.9:5441"'),
+        "the saved witness credential was lost or replaced by a redaction marker");
+    }
+  } finally {
+    await page.evaluate(`(async () => {
+      staged = []; dirty.clear(); renderStaged();
+      await configure(["delete system ha-witness", "commit", "save"]); await refresh();
+    })()`);
+  }
+});
+
 await test("every setting the global firewall posture offers is one the appliance has", async () => {
   const r = await page.evaluate(`(async () => {
     const wait = (ms) => new Promise((r) => setTimeout(r, ms || 400));
