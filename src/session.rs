@@ -1315,6 +1315,8 @@ struct Draft {
     /// thing entirely.
     admin_groups: Vec<Group>,
     /// HA config sync (`[system.config-sync]`). A plain owned struct.
+    ha: Option<crate::config::Ha>,
+    ha_witness: Option<crate::config::HaWitness>,
     config_sync: ConfigSync,
     /// HA conntrack sync (`[system.conntrack-sync]`, C9). A plain owned struct.
     conntrack_sync: ConntrackSync,
@@ -2528,6 +2530,8 @@ impl Draft {
             web: a.services.web.clone(),
             logins: a.system.logins.clone(),
             admin_groups: a.system.groups.clone(),
+            ha: a.system.ha.clone(),
+            ha_witness: a.system.ha_witness.clone(),
             config_sync: a.system.config_sync.clone(),
             conntrack_sync: a.system.conntrack_sync.clone(),
             mdns: MdnsDraft {
@@ -4624,6 +4628,30 @@ impl Session {
             // system config-sync: push the running config to peer firewalls on
             // every commit (HA). `peer` is a host or host:port; `secret` the shared
             // bearer token (also arms this box's receiving API).
+            ["system", "ha", field, value] => {
+                let ha = self.draft.ha.get_or_insert_with(Default::default);
+                match *field {
+                    "enabled" => ha.enabled = parse_bool(value)?,
+                    "cluster" => ha.cluster = (*value).into(),
+                    "node" => ha.node = Some(value.parse()?),
+                    "witness" => ha.witness = (*value).into(),
+                    "sync-interface" => ha.sync_interface = (*value).into(),
+                    "priority" => ha.priority = Some(value.parse()?),
+                    "preempt" => ha.preempt = parse_bool(value)?,
+                    "management-fingerprint" => ha.management_fingerprint = Some((*value).into()),
+                    "peer-identity" => ha.peer_identity = Some(serde_json::from_str(value)?),
+                    _ => bail!("unknown HA field: {field}"),
+                }
+            }
+            ["system", "ha-witness", field, value] => {
+                let witness = self.draft.ha_witness.get_or_insert_with(Default::default);
+                match *field {
+                    "listen" => witness.listen = (*value).into(),
+                    "secret" => witness.secret = (*value).into(),
+                    "cluster" => witness.cluster = (*value).into(),
+                    _ => bail!("unknown witness field: {field}"),
+                }
+            }
             ["system", "config-sync", "peer", v] => {
                 append_csv(&mut self.draft.config_sync.peers, v);
             }
@@ -7407,6 +7435,34 @@ impl Session {
             ["system", "group", name, "permission"] => {
                 bail!("a group is its permission; `delete system group {name}` removes it")
             }
+            ["system", "ha"] => self.draft.ha = None,
+            ["system", "ha-witness"] => self.draft.ha_witness = None,
+            ["system", "ha", field] => {
+                if let Some(h) = &mut self.draft.ha {
+                    match *field {
+                        "enabled" => h.enabled = false,
+                        "cluster" => h.cluster.clear(),
+                        "node" => h.node = None,
+                        "witness" => h.witness.clear(),
+                        "sync-interface" => h.sync_interface.clear(),
+                        "priority" => h.priority = None,
+                        "preempt" => h.preempt = false,
+                        "management-fingerprint" => h.management_fingerprint = None,
+                        "peer-identity" => h.peer_identity = None,
+                        _ => bail!("unknown HA field: {field}"),
+                    }
+                }
+            }
+            ["system", "ha-witness", field] => {
+                if let Some(h) = &mut self.draft.ha_witness {
+                    match *field {
+                        "listen" => h.listen.clear(),
+                        "secret" => h.secret.clear(),
+                        "cluster" => h.cluster.clear(),
+                        _ => bail!("unknown witness field: {field}"),
+                    }
+                }
+            }
             ["system", "config-sync"] => self.draft.config_sync = ConfigSync::default(),
             ["system", "config-sync", field] => {
                 let c = &mut self.draft.config_sync;
@@ -9466,6 +9522,8 @@ impl Session {
                 timezone: self.draft.timezone.clone(),
                 logins: self.draft.logins.clone(),
                 groups: self.draft.admin_groups.clone(),
+                ha: self.draft.ha.clone(),
+                ha_witness: self.draft.ha_witness.clone(),
                 config_sync: self.draft.config_sync.clone(),
                 conntrack_sync: self.draft.conntrack_sync.clone(),
                 sysctl: self.draft.sysctl.clone(),
@@ -9831,6 +9889,12 @@ pub fn flatten_config(rendered: &str) -> Vec<String> {
         .into_iter()
         .map(|(path, value)| match value.is_empty() {
             true => format!("set {path}"),
+            false
+                if path == "system ha peer-identity" && value.chars().any(char::is_whitespace) =>
+            {
+                let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("set {path} \"{escaped}\"")
+            }
             false => format!("set {path} {value}"),
         })
         .collect()
@@ -9921,6 +9985,54 @@ fn render_draft_masked(
     // commit-revision count printed no system section at all.
     if want("system") {
         let mut sys = String::new();
+        if let Some(ha) = &draft.ha {
+            sys.push_str(&format!(
+                "    ha {{\n        enabled {}\n        preempt {}\n",
+                ha.enabled, ha.preempt
+            ));
+            if let Some(node) = ha.node {
+                sys.push_str(&format!("        node {node}\n"));
+            }
+            if let Some(priority) = ha.priority {
+                sys.push_str(&format!("        priority {priority}\n"));
+            }
+            for (key, value) in [
+                ("cluster", &ha.cluster),
+                ("witness", &ha.witness),
+                ("sync-interface", &ha.sync_interface),
+            ] {
+                if !value.is_empty() {
+                    sys.push_str(&format!("        {key} {value}\n"));
+                }
+            }
+            if let Some(pin) = &ha.management_fingerprint {
+                sys.push_str(&format!("        management-fingerprint {pin}\n"));
+            }
+            if let Some(identity) = &ha.peer_identity {
+                sys.push_str(&format!(
+                    "        peer-identity {}\n",
+                    serde_json::to_string(identity).expect("serializable identity")
+                ));
+            }
+            sys.push_str("    }\n");
+        }
+        if let Some(w) = &draft.ha_witness {
+            let secret = match secrets {
+                Secrets::Shown => w.secret.as_str(),
+                _ => "********",
+            };
+            sys.push_str("    ha-witness {\n");
+            for (key, value) in [
+                ("listen", w.listen.as_str()),
+                ("cluster", w.cluster.as_str()),
+                ("secret", secret),
+            ] {
+                if !value.is_empty() {
+                    sys.push_str(&format!("        {key} {value}\n"));
+                }
+            }
+            sys.push_str("    }\n");
+        }
         if let Some(h) = &draft.hostname {
             sys.push_str(&format!("    hostname {h}\n"));
         }

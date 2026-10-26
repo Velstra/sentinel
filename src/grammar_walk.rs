@@ -357,6 +357,9 @@ fn from_hint(ph: &str) -> &'static str {
         "<name>" => "t1",
         "<xx:xx:xx:xx:xx:xx>" => "02:00:00:00:00:01",
         "<pubkey>" => "d0JCPLcS8bXlwuA6xdaHrqLdEeQz9M+xUsHhVJnEbn0=",
+        "<json>" => {
+            r#"{"node":2,"hostname":"peer","management-endpoint":"10.0.0.2:8080","management-fingerprint":"d0JCPLcS8bXlwuA6xdaHrqLdEeQz9M+xUsHhVJnEbn0=","state-listen":"10.0.0.2:5429","priority":100}"#
+        }
         "<pem|file:path>" => "file:/tmp/walker.pem",
         _ => "sample",
     }

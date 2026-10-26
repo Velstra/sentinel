@@ -54,77 +54,60 @@ set services ssh listen-address 10.0.0.1
 
 ## HA config sync
 
-`system config-sync` keeps a high-availability pair in step: on every `commit`,
-the shared configuration is pushed to each configured peer, which applies and
-persists it. It rides the box's own management API (bearer-token authenticated),
-so it needs no extra daemon — a declarative analog of pfSense's XMLRPC sync.
+Leased active/passive HA uses two members and an independent witness. The witness
+issues short-lived forwarding authority, enforced by a persistent kernel guard;
+a missing heartbeat alone never authorizes two nodes. Follow the
+[HA pairing and recovery guide](https://github.com/Velstra/sentinel/blob/main/docs/ha-phase3.md)
+for witness provisioning and `sentinel ha pair <peer-endpoint> --secret <token>`.
+Pairing authenticates the first TLS connection before sending the bearer and
+records both member profiles in canonical `appliance.toml`.
+
+`system config-sync` delivers desired policy through the management API. CLI
+commits and API updates queue a durable revision, with retries for an unavailable
+peer; a received revision never queues a reverse push. Apply and persist share
+one transaction lock. Paired revisions materialize the explicit peer identity,
+including management/control endpoints and interface addresses, then validate and
+apply the complete peer-adjusted document. New static links need their peer facts
+in `system.ha.peer-identity` rather than an inferred address.
 
 | Field | Meaning |
 |---|---|
-| `peer` | A peer firewall to push to — `host` or `host:port` (default port 8080, repeatable). |
-| `secret` | The shared bearer token both peers present. Setting it also arms this box's receiving API. |
+| `peer` | Receiver endpoint, `host` or `host:port` (default port 8080). Leased HA uses exactly one peer. |
+| `secret` | Shared machine enrollment credential. It also enables the receiving HTTPS API. |
+| `peer-fingerprint` | Base64 SHA-256 management TLS public-key pin. Pairing records the authenticated peer pin. |
 
-A *received* sync never re-pushes, so a pair never loops. Configure the shared
-secret on both nodes; point the active node at the standby:
-
-```text
-# On the standby (arms its receiving API):
-set system config-sync secret <shared-token>
-
-# On the active node (pushes on every commit):
-set system config-sync secret <shared-token>
-set system config-sync peer 10.0.0.2
-```
-
-> Config sync keeps each receiver's hostname, interfaces, config-sync peers,
-> conntrack-sync endpoint, routing router ID and existing VRRP priorities local. This prevents a primary
-> commit from renaming a standby or moving its management address. Firewall,
-> service and routing policy still converge. Pair it with
-> [VRRP](routing.md#vrrp) for the virtual IP and you have a full
-> active/standby firewall. See the [HA pair example](examples.md#ha-pair).
-
-`config-sync` scales past a pair: `peer` is repeatable, so an active node can push
-to two or more standbys (a full mesh, each node listing the others). Only the
-interactive `commit` pushes — a received sync never re-pushes — so a cluster of
-any size never loops. There is no designated primary and no merge, so drive edits
-from **one** node (last write wins), exactly like pfSense.
+Outside leased HA, legacy config sync can target multiple receivers. It preserves
+existing receiver-local address and identity facts; a new static interface must
+already have its receiver facts declared. Drive changes from one node to avoid
+competing desired states. Legacy VRRP/config-sync alone does not provide the
+witness's split-brain fencing guarantees.
 
 ## HA conntrack sync
 
-VRRP alone hands the virtual IP to a standby on failover, but the standby has
-never seen the active node's flows — so every established, NAT'd connection breaks
-the moment the IP moves. `system conntrack-sync` fixes that: it mirrors the eBPF
-conntrack table to the HA peers (a *pfsync*-analog). The data plane binds a UDP
-socket, pushes its live conntrack entries to each peer every interval, and applies
-the entries a peer pushes — so whichever node VRRP promotes already holds the flow
-table and the connections survive.
+With a pair credential, conntrack sync uses mutually authenticated framed TCP and
+a default 50ms poll interval. It transfers complete snapshots, updates and
+deletions for NAT, dual-stack firewall and SYN-proxy splice state. Kernel reads
+are batched; configuration/policy generations fence incompatible state. Leased HA
+also binds every transfer to the current witness authority. A former master
+imports authoritative successor state before preemption; an incomplete map
+installation does not advertise readiness.
+
+WireGuard promotion uses the shared long-term VPN identity and authenticated
+learned public endpoints to initiate new handshakes. Ephemeral kernel session keys
+are not copied. The dedicated control tunnel remains member-specific and needs
+an independent declared underlay outside the fenced data links.
 
 | Field | Meaning |
 |---|---|
-| `listen` | Local bind endpoint for peer state — `host` or `host:port` (default port `5429`). Defaults to `0.0.0.0:5429`. |
-| `peer` | A peer firewall to push conntrack state to — `host` or `host:port` (default port `5429`, repeatable). |
-| `interval` | Seconds between pushes (default `1`). |
+| `listen` | Local state endpoint, numeric `IP:port` in leased HA (default port `5429`). |
+| `peer` | State receiver endpoint. Leased HA requires one explicit peer. |
+| `interval` | Optional legacy interval in seconds; omit it in leased mode to use 50ms. |
 
-```text
-# Symmetric HA pair — each node pushes to the other:
-# On fw1 (10.0.0.2):
-set system conntrack-sync peer 10.0.0.3
-# On fw2 (10.0.0.3):
-set system conntrack-sync peer 10.0.0.2
-```
-
-Like config-sync, `peer` is repeatable, so a three-or-more node cluster is a full
-mesh: each node pushes its table to every other, and whichever one becomes master
-already has the state. `listen` defaults to `0.0.0.0:5429`, so setting a `peer` is
-enough to enable both directions.
-
-> **Trust the link.** The sync stream is unauthenticated (like pfsync), so it must
-> run over a trusted or dedicated sync segment — a peer that can reach the socket
-> can inject conntrack (hence NAT) state. Gate the port with a firewall rule, or
-> put the sync on its own zone. Together **VRRP + config-sync + conntrack-sync**
-> make a complete stateful active/standby (or active/active-capable) HA cluster;
-> see the [HA pair example](examples.md#ha-pair).
-
+Without a pair credential, the legacy trusted-link UDP mode remains available
+with a default one-second interval and repeatable peers. It is unauthenticated
+and does not provide leased HA fencing. Authenticated TCP protects integrity but
+not confidentiality: use an isolated HA network or a dedicated control
+WireGuard tunnel when flow metadata must remain private.
 
 ## A second factor
 

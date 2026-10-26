@@ -164,6 +164,10 @@ fn token_answer() -> Value {
     })
 }
 
+fn ha_pair_body() -> Value {
+    json!({"type":"object","required":["expected_revision","appliance"],"additionalProperties":false,"properties":{"expected_revision":{"type":"string","pattern":"^[a-f0-9]{64}$"},"appliance":{"type":"object","additionalProperties":true}}})
+}
+
 fn capture_body() -> Value {
     json!({
         "type": "object",
@@ -183,6 +187,46 @@ fn trace_answer() -> Value {
 
 /// Every route `api.rs` serves, in the order the router lists them.
 const OPERATIONS: &[Operation] = &[
+    Operation {
+        method: "get",
+        path: "/api/v1/ha/proof/{nonce}",
+        id: "haProof",
+        summary: "Authenticate a peer before sending enrollment credentials.",
+        description: "TLS only. HMAC-SHA256 over a fresh 32-byte hexadecimal nonce and the actual served TLS SPKI, with an enrollment-specific domain. A client verifies both the proof and pinned TLS connection before sending a bearer token.",
+        parameters: &[(
+            "nonce",
+            "path",
+            "Fresh 32-byte client nonce, encoded as 64 hexadecimal characters.",
+        )],
+        body: None,
+        answer: "Base64 proof; no credential is returned.",
+        answer_shape: Some(("application/json", any_object)),
+        open: true,
+    },
+    Operation {
+        method: "get",
+        path: "/api/v1/ha/enrollment",
+        id: "haEnrollment",
+        summary: "Read private member facts for authenticated HA enrollment.",
+        description: "Requires TLS and the machine credential. Returns the complete canonical appliance and SHA-256 revision with Cache-Control: no-store. Account tokens cannot retrieve this private document.",
+        parameters: &[],
+        body: None,
+        answer: "Private appliance and canonical revision.",
+        answer_shape: Some(("application/json", any_object)),
+        open: false,
+    },
+    Operation {
+        method: "post",
+        path: "/api/v1/ha/pair",
+        id: "haPair",
+        summary: "Apply an explicit member-adjusted HA pairing revision.",
+        description: "Requires TLS and the machine credential. Validates both member profiles and compares expected_revision under the common apply lock. Conflicting edits return 409. Retrying an already saved identical desired revision succeeds without applying twice. The received revision never queues an echo push.",
+        parameters: &[],
+        body: Some(("application/json", ha_pair_body)),
+        answer: "Applied and saved member revision.",
+        answer_shape: Some(("application/json", any_object)),
+        open: false,
+    },
     Operation {
         method: "get",
         path: "/api/v1/health",
@@ -543,7 +587,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_open_routes_are_exactly_the_three_a_client_needs_before_it_has_a_token() {
+    fn the_open_routes_are_exactly_the_pre_authentication_surface() {
         let doc = document();
         let mut open = Vec::new();
         for (path, ops) in doc["paths"].as_object().unwrap() {
@@ -557,6 +601,7 @@ pub(crate) mod tests {
         assert_eq!(
             open,
             [
+                "get /api/v1/ha/proof/{nonce}",
                 "get /api/v1/health",
                 "get /api/v1/openapi.json",
                 "post /api/v1/login"

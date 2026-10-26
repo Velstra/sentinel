@@ -98,6 +98,8 @@ pub struct VelstraConfig {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) blocklist: Vec<String>,
     conntrack: ConntrackOut,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ha: Option<crate::ha::DataplaneHa>,
     #[serde(rename = "policy")]
     pub(crate) policies: Vec<Policy>,
     #[serde(rename = "interface")]
@@ -879,7 +881,10 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                     .source
                     .iter()
                     .find(|s| !s.disabled && s.zone == zone)
-                    .and_then(|s| s.to.clone()),
+                    .and_then(|s| {
+                        s.to.clone()
+                            .or_else(|| crate::ha::masquerade_address(appliance, &i.name))
+                    }),
                 cgnat_base_port: masq_zones.get(zone).map_or(0, |l| l.0),
                 cgnat_block_size: masq_zones.get(zone).map_or(0, |l| l.1),
                 ingress_limit: i.ingress_limit,
@@ -1038,6 +1043,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
     });
 
     VelstraConfig {
+        ha: crate::ha::dataplane(appliance),
         conntrack: ConntrackOut {
             tcp_syn: fw.conntrack.tcp_syn,
             tcp_established: fw.conntrack.tcp_established,
