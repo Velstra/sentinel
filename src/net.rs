@@ -381,6 +381,55 @@ fn wireguard_netdev_body(name: &str, tunnel: &WireguardTunnel) -> String {
     body
 }
 
+/// A WireGuard device's key, port and peers in `wg`'s own configuration format,
+/// for `wg syncconf` — the values the `.netdev` carries, under `wg`'s section
+/// names. syncconf makes the device match the file: changed peers are updated,
+/// absent ones removed. The point of not recreating the device is that its
+/// addresses, routes and data-plane hooks stay. Sessions do not: networkd
+/// re-applies the changed `.netdev` on the reload before this with
+/// `WGDEVICE_F_REPLACE_PEERS`, so every peer handshakes again (WireGuard does
+/// that on its own within its rekey timeout).
+fn wireguard_sync_body(tunnel: &WireguardTunnel) -> String {
+    let mut body = format!("[Interface]\nPrivateKey={}\n", tunnel.private_key);
+    if let Some(port) = tunnel.listen_port {
+        body.push_str(&format!("ListenPort={port}\n"));
+    }
+    for peer in &tunnel.peers {
+        body.push_str(&format!("\n[Peer]\nPublicKey={}\n", peer.public_key));
+        if let Some(psk) = &peer.preshared_key {
+            body.push_str(&format!("PresharedKey={psk}\n"));
+        }
+        if !peer.allowed_ips.is_empty() {
+            body.push_str(&format!("AllowedIPs={}\n", peer.allowed_ips.join(",")));
+        }
+        if let Some(ep) = &peer.endpoint {
+            body.push_str(&format!("Endpoint={ep}\n"));
+        }
+        if let Some(k) = peer.persistent_keepalive {
+            body.push_str(&format!("PersistentKeepalive={k}\n"));
+        }
+    }
+    body
+}
+
+/// Apply a changed key/port/peer set to the live WireGuard device `name`.
+///
+/// The file holds the private key, so it is staged 0600 root and removed again
+/// whatever `wg` made of it.
+fn sync_wireguard(appliance: &Appliance, name: &str) -> Result<()> {
+    let tunnel = appliance
+        .vpn
+        .wireguard
+        .iter()
+        .find(|t| t.name == name)
+        .with_context(|| format!("no vpn wireguard {name} to apply"))?;
+    let path = Path::new("/run/sentinel").join(format!(".wg-{name}.conf"));
+    system::install_private_file(&path, &wireguard_sync_body(tunnel))?;
+    let result = system::wg_syncconf(name, &path);
+    system::remove_file(&path)?;
+    result
+}
+
 /// Render a `.network` unit for `iface`: bind its `address` (if any) and declare
 /// any child VLAN links so networkd attaches them to this (parent) interface.
 /// `"dhcp"` asks networkd to run a DHCP client; anything else is a static CIDR.
@@ -691,8 +740,9 @@ fn network_unit_body(
             body.push_str("EmitDNS=yes\n");
             body.push_str(&format!("DNS={}\n", d.dns.join(" ")));
         }
-        // An override default-router (option 3). Unset ⇒ networkd advertises the
-        // server's own address, so we emit nothing.
+        // An override default-router (option 3) — the operator's, or the
+        // segment's virtual address (`dhcp_server_view`). Unset ⇒ networkd
+        // advertises the server's own address, so we emit nothing.
         if let Some(gw) = &d.default_router {
             body.push_str(&format!("EmitRouter=yes\nRouter={gw}\n"));
         }
@@ -804,6 +854,11 @@ const DNSMASQ_CONF: &str = "sentinel.conf";
 /// reject these, but a hostile value must never reach a generated config intact —
 /// and we prefer erroring loudly over silently mangling it. `field` names the
 /// offending input so the error is actionable.
+/// What else ends a word of an `ARGS=`-style environment file, besides control
+/// characters: systemd splits an unquoted `$VAR` on whitespace, and its
+/// environment-file parser strips quotes and backslashes before that.
+const ENV_WORD_UNSAFE: &[char] = &[' ', '"', '\'', '\\'];
+
 fn reject_unsafe(field: &str, value: &str, extra: &[char]) -> Result<()> {
     if let Some(c) = value.chars().find(|c| c.is_control() || extra.contains(c)) {
         anyhow::bail!(
@@ -814,8 +869,51 @@ fn reject_unsafe(field: &str, value: &str, extra: &[char]) -> Result<()> {
     Ok(())
 }
 
+/// Whether `iface` is held administratively down until the data plane has
+/// attached its hooks — every enabled, zoned link networkd brings up itself.
+///
+/// The fail-closed shape for a link that is new or recreated: a link that is
+/// down neither receives nor transmits, so nothing crosses it before the
+/// firewall can see it, in either address family, however long the agent takes
+/// to notice. The agent is told which links these are (`activate` in its
+/// configuration) and raises each once hooked. Links networkd does not raise
+/// are not held, because it cannot hold them: pppd raises its own session,
+/// ModemManager the modem's link, hostapd the radio.
+///
+/// The cost is deliberate: with the agent not running, a held link stays down.
+/// An unzoned interface is never filtered and never held, which is what keeps
+/// out-of-band management reachable then.
+pub(crate) fn held_until_attached(iface: &Interface) -> bool {
+    !iface.disabled
+        && iface.zone.is_some()
+        && !iface.is_pppoe()
+        && iface.wwan.is_none()
+        && iface.wireless.is_none()
+}
+
+/// The DHCP server as it is rendered: the configured one, with the segment's
+/// virtual address filled in where the operator left the choice to networkd.
+///
+/// Unset, networkd advertises the serving router's own address as gateway, and
+/// that address does not move on failover — the virtual one does. Likewise the
+/// resolver, when this box serves DNS on the segment: dnsmasq follows addresses
+/// as they appear (`bind-dynamic`), so it answers on the virtual address on
+/// whichever member holds it. An explicit `default-router` or `dns` always wins.
+fn dhcp_server_view(appliance: &Appliance, iface: &Interface) -> Option<DhcpServer> {
+    let mut view = iface.dhcp_server.clone()?;
+    if let Some(vip) = appliance.segment_virtual_ipv4(iface) {
+        if view.default_router.is_none() {
+            view.default_router = Some(vip.clone());
+        }
+        if view.dns.is_empty() && appliance.services.dns.serve_on.contains(&iface.name) {
+            view.dns = vec![vip];
+        }
+    }
+    Some(view)
+}
+
 /// Render the dnsmasq drop-in for the LAN resolver, or `None` when no interface
-/// serves DNS. `interface=`/`bind-interfaces` (base config) restrict dnsmasq to
+/// serves DNS. `interface=`/`bind-dynamic` (base config) restrict dnsmasq to
 /// exactly the serving links (so it never fights resolved for 127.0.0.53);
 /// `server=` sets the upstreams, `address=/name/ip` is a host-override, and
 /// `address=/domain/0.0.0.0` (+`::`) sinkholes a blocked domain.
@@ -1129,15 +1227,20 @@ const DNSPROXY_UNIT: &str = "sentinel-dnsproxy.service";
 /// into words itself, with no shell involved, so this uses dnsproxy's
 /// documented command-line flags instead of a config schema. One less thing
 /// that can be subtly wrong, and an upstream's hostname never reaches a shell.
-fn dnsproxy_args_body(dns: &Dns) -> Option<String> {
+///
+/// Every value is one word of that line, so a value systemd would split or
+/// unquote is refused here even though `validate` already rejects it — the
+/// alternative is a proxy started with arguments nobody configured.
+fn dnsproxy_args_body(dns: &Dns) -> Result<Option<String>> {
     if dns.secure_upstream.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut args = vec![
         "--listen=127.0.0.1".to_string(),
         format!("--port={DNSPROXY_PORT}"),
     ];
     for up in &dns.secure_upstream {
+        reject_unsafe("dns secure-upstream", up, ENV_WORD_UNSAFE)?;
         args.push(format!("--upstream={up}"));
     }
     // The bootstrap. An encrypted upstream named by hostname cannot be reached
@@ -1145,17 +1248,18 @@ fn dnsproxy_args_body(dns: &Dns) -> Option<String> {
     // plaintext — so the configured plaintext servers answer exactly one
     // question rather than every question.
     for b in &dns.upstream {
+        reject_unsafe("dns upstream", b, ENV_WORD_UNSAFE)?;
         args.push(format!("--bootstrap={b}"));
     }
-    Some(format!(
+    Ok(Some(format!(
         "# rendered by sentinel — encrypted DNS upstreams\nARGS={}\n",
         args.join(" ")
-    ))
+    )))
 }
 
 /// Reconcile the encrypted-DNS proxy to the configuration.
 fn apply_dnsproxy(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
-    let body = dnsproxy_args_body(&appliance.services.dns);
+    let body = dnsproxy_args_body(&appliance.services.dns)?;
     crate::reconcile::service_file(
         Path::new(DNSPROXY_ARGS),
         body.as_deref(),
@@ -2247,19 +2351,23 @@ pub fn peer_pin(cs: &crate::config::ConfigSync, authority: &str) -> Result<Strin
 
 /// Deliver one durable-outbox revision over pinned HTTPS. Transport errors must
 /// reach the worker so it retains this peer for retry.
-pub(crate) fn push_config_peer(appliance: &Appliance, peer: &str) -> Result<()> {
+pub(crate) fn push_config_peer(appliance: &Appliance, peer: &str, bases: &[String]) -> Result<()> {
     let secret = appliance
         .system
         .config_sync
         .secret
         .as_deref()
         .context("config-sync credential missing")?;
-    push_config_peer_with_secret(appliance, peer, secret)
+    push_config_peer_with_secret(appliance, peer, secret, bases)
 }
+/// Push `appliance` to `peer`. `bases` are the shared revisions the push may
+/// be built on (see [`crate::configsync::shared_revision`]); the peer refuses
+/// it with a `409 Conflict` when it holds none of them.
 pub(crate) fn push_config_peer_with_secret(
     appliance: &Appliance,
     peer: &str,
     secret: &str,
+    bases: &[String],
 ) -> Result<()> {
     use std::io::Write;
     let mut credential = appliance.system.config_sync.clone();
@@ -2272,7 +2380,21 @@ pub(crate) fn push_config_peer_with_secret(
     staged.file.write_all(json.as_bytes())?;
     let authority = configsync_authority(peer);
     let pin = peer_pin(cs, &authority)?;
-    let url = format!("https://{authority}/api/v1/config-sync");
+    let mut url = format!("https://{authority}/api/v1/config-sync");
+    if !bases.is_empty() {
+        // SHA-256s in hex: nothing in them needs escaping in a query.
+        anyhow::ensure!(
+            bases
+                .iter()
+                .all(|b| b.bytes().all(|c| c.is_ascii_hexdigit())),
+            "invalid config-sync base revision"
+        );
+        url.push_str(&format!(
+            "?{}={}",
+            crate::configsync::BASE_PARAMETER,
+            bases.join(",")
+        ));
+    }
     system::curl_put_config(&url, secret, &staged.path, Some(&pin))?;
     eprintln!("config-sync → {peer}");
     Ok(())
@@ -2726,7 +2848,7 @@ fn apply_pppoe_server(appliance: &Appliance, secrets_changed: bool) -> Result<()
     }
 
     let options = pppoe_server_options_body(bng);
-    let args = pppoe_server_args_body(bng);
+    let args = pppoe_server_args_body(bng)?;
     let changed = file_changed(Path::new(PPPOE_SERVER_OPTIONS), &options)
         || file_changed(Path::new(PPPOE_SERVER_ARGS), &args)
         || secrets_changed;
@@ -2753,20 +2875,34 @@ fn apply_pppoe_server(appliance: &Appliance, secrets_changed: bool) -> Result<()
 /// interface is one: which link to serve on and which addresses to hand out are
 /// decisions an operator makes at run time, and a unit rebuilt to change them
 /// would need a new image.
-fn pppoe_server_args_body(bng: &PppoeServer) -> String {
+///
+/// Each value is refused rather than rendered if it would not stay one word —
+/// `validate` already says so, and this is what holds if something reaches the
+/// renderer without passing through it.
+fn pppoe_server_args_body(bng: &PppoeServer) -> Result<String> {
     let iface = bng.interface.as_deref().unwrap_or_default();
     let local = bng.local_address.as_deref().unwrap_or_default();
     let pool = bng.pool_start.as_deref().unwrap_or_default();
     let max = bng.max_sessions.unwrap_or(64);
-    let mut args = format!(
-        "-F -I {iface} -L {local} -R {pool} -N {max} -C \"{}\"",
-        server_name(bng)
-    );
+    let name = server_name(bng);
+    for (field, value) in [
+        ("pppoe-server interface", iface),
+        ("pppoe-server local-address", local),
+        ("pppoe-server pool-start", pool),
+        ("pppoe-server ac-name", name.as_str()),
+        (
+            "pppoe-server service-name",
+            bng.service_name.as_deref().unwrap_or_default(),
+        ),
+    ] {
+        reject_unsafe(field, value, ENV_WORD_UNSAFE)?;
+    }
+    let mut args = format!("-F -I {iface} -L {local} -R {pool} -N {max} -C \"{name}\"");
     if let Some(sn) = &bng.service_name {
         args.push_str(&format!(" -S \"{sn}\""));
     }
     args.push_str(&format!(" -O {PPPOE_SERVER_OPTIONS}"));
-    format!("PPPOE_SERVER_ARGS={args}\n")
+    Ok(format!("PPPOE_SERVER_ARGS={args}\n"))
 }
 
 // --- QoS / traffic shaping (roadmap C8) ------------------------------------
@@ -3663,7 +3799,7 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
                 kids,
                 mv_kids,
                 ms_kids,
-                i.dhcp_server.as_ref(),
+                dhcp_server_view(appliance, i).as_ref(),
                 i.router_advert.as_ref(),
                 master.as_deref(),
                 pd,
@@ -3684,7 +3820,18 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
                     bond_primary: bond_primaries.contains(i.name.as_str()),
                 },
             );
-            if crate::ha::guarded_interfaces(appliance).contains(&i.name) && !i.disabled {
+            // Held down until the data plane has hooked the link: networkd
+            // creates it, the agent attaches XDP/TC, puts the policy in force
+            // and only then brings it up. Without the hold a new or recreated
+            // link forwards unfiltered until the agent's next pass finds it.
+            // HA-guarded links are held for the same reason. The HA guard
+            // releases only those the data plane does not hold; a zoned one
+            // comes up when the guard AND the firewall's hooks are both on it,
+            // raised by the agent alone so neither can open it early.
+            if !i.disabled
+                && (held_until_attached(i)
+                    || crate::ha::guarded_interfaces(appliance).contains(&i.name))
+            {
                 body.push_str("\n[Link]\nActivationPolicy=manual\n");
             }
             // 802.1Q port membership on a VLAN-aware bridge (appended as its own
@@ -3710,6 +3857,9 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     let desired: BTreeMap<String, String> = writes.iter().cloned().collect();
     let journal = Path::new("/run/sentinel/network-retire.json");
     let mut retire = crate::network_reconcile::retire(&previous, &desired);
+    // WireGuard key/port/peer edits go onto the live device instead of
+    // through retirement — see `network_reconcile::wireguard_updates`.
+    let wireguard_updates = crate::network_reconcile::wireguard_updates(&previous, &desired);
     let observed = if mode == ApplyMode::Live {
         let observed = crate::network_reconcile::inventory()?;
         crate::network_reconcile::retire_drifted(&previous, ifaces, &observed, &mut retire);
@@ -3819,9 +3969,39 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
             }
             depth
         });
+        let absent = absent_kernel_links(&reloaded, ifaces, &desired, |name| {
+            Path::new("/sys/class/net").join(name).exists()
+        });
+        for name in &absent {
+            eprintln!(
+                "warning: interface {name:?} is not present on this system; its configuration \
+                 is in place and applies when the device appears"
+            );
+        }
+        reloaded.retain(|name| !absent.contains(name));
         if retry_network || previous != desired || !reloaded.is_empty() || !retire.is_empty() {
             system::networkctl_reload(&reloaded).context("applying live network configuration")?;
         }
+        for name in wireguard_updates
+            .iter()
+            .filter(|name| !retire.contains(*name))
+            .filter(|name| Path::new("/sys/class/net").join(name).exists())
+        {
+            // The unit files already say the new thing, so a retry would see
+            // nothing left to update: a device that refused the sync is
+            // replaced instead, which converges the slow way rather than not
+            // at all.
+            if let Err(e) = sync_wireguard(appliance, name) {
+                eprintln!("warning: updating {name} in place failed ({e:#}); recreating it");
+                system::delete_virtual_link(name)?;
+                system::networkctl_reload(std::slice::from_ref(name))
+                    .with_context(|| format!("recreating {name}"))?;
+            }
+        }
+        release_links(&crate::network_reconcile::released_links(
+            &previous, &desired,
+        ))?;
+        remove_foreign_addresses(appliance)?;
         system::remove_file(journal)?;
     }
 
@@ -3856,6 +4036,88 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     apply_agent_iface(appliance, mode)?;
     apply_configsync(appliance, mode)?;
     crate::ha::apply_witness(appliance, mode == ApplyMode::Live)?;
+    Ok(())
+}
+
+/// The links among `reloaded` that are missing and that nothing here creates:
+/// a NIC, radio or modem the kernel provides, which has been unplugged, moved to
+/// another network namespace or renamed.
+///
+/// `networkctl_reload` waits for each link it reconfigures to exist, because a
+/// device networkd creates from a `.netdev` (a VLAN, a bridge, a tunnel) appears
+/// asynchronously and a commit must not report success over one that never
+/// came. A kernel-provided link is different: no amount of waiting creates it,
+/// and refusing the commit over it — and then the rollback to the last-good
+/// config, which declares it too — would leave every other change on the box
+/// unappliable until the hardware came back. Its unit is written either way, so
+/// networkd configures it (held, if it is zoned) when the device appears.
+fn absent_kernel_links(
+    reloaded: &[String],
+    ifaces: &[Interface],
+    desired: &BTreeMap<String, String>,
+    exists: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    reloaded
+        .iter()
+        .filter(|name| !exists(name))
+        .filter(|name| !desired.contains_key(&netdev_name(name)))
+        .filter(|name| {
+            ifaces
+                .iter()
+                .find(|i| &i.name == *name)
+                .is_some_and(|i| !(i.is_vlan() || i.is_l2tpv3() || i.is_vti() || i.is_pppoe()))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Empty and take down physical links this configuration stopped declaring (see
+/// [`crate::network_reconcile::released_links`]). Link-local addresses stay: they
+/// route nothing, and a link that comes back keeps its neighbours' caches sane.
+fn release_links(names: &std::collections::BTreeSet<String>) -> Result<()> {
+    for name in names {
+        if !Path::new("/sys/class/net").join(name).exists() {
+            continue;
+        }
+        system::ip_addr(&["flush", "dev", name, "scope", "global"])
+            .with_context(|| format!("removing the addresses of released link {name}"))?;
+        system::ip_link(&["set", "dev", name, "down"])
+            .with_context(|| format!("taking released link {name} down"))?;
+    }
+    Ok(())
+}
+
+/// Delete static addresses the configuration does not put on a declared link
+/// (see [`crate::network_reconcile::foreign_addresses`]).
+///
+/// Read after networkd has applied this commit, so an address it is replacing
+/// in the same pass is not mistaken for an intruder. Each deletion is
+/// best-effort: networkd may remove an address it owned between the read and
+/// the delete, and that race ends where it should.
+fn remove_foreign_addresses(appliance: &Appliance) -> Result<()> {
+    let observed = crate::network_reconcile::inventory()?;
+    for iface in &appliance.interfaces {
+        let virtual_addresses: Vec<std::net::IpAddr> = appliance
+            .protocols
+            .vrrp
+            .iter()
+            .filter(|v| v.address_interface.as_deref().unwrap_or(&v.interface) == iface.name)
+            .flat_map(|v| v.virtual_address.iter())
+            .filter_map(|a| a.split('/').next()?.parse().ok())
+            .collect();
+        for (address, prefix) in
+            crate::network_reconcile::foreign_addresses(iface, &observed, &virtual_addresses)
+        {
+            let cidr = format!("{address}/{prefix}");
+            eprintln!(
+                "{}: removing address {cidr} the configuration does not set",
+                iface.name
+            );
+            if let Err(e) = system::ip_addr(&["del", &cidr, "dev", &iface.name]) {
+                eprintln!("warning: removing {cidr} from {}: {e:#}", iface.name);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -3935,25 +4197,76 @@ pub fn apply_link_runtime(appliance: &Appliance) -> Result<()> {
     Ok(())
 }
 
+/// What an apply is for, which decides how it takes a held link the data plane
+/// could not raise (see [`judge_reconcile_reply`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verify {
+    /// A commit moving the box to a new configuration.
+    Forward,
+    /// A rollback or recovery putting back a configuration the box ran before.
+    Restore,
+}
+
 /// Apply the full network config to the running system: the persistent render
 /// (networkd units + co-services) followed by the link-dependent runtime state.
 /// Used by `commit`, where the links are already up so both phases run back to
 /// back. The boot path splits them across two units (see [`apply_persistent`]
 /// and [`apply_link_runtime`]) so the runtime state lands after networkd.
-pub fn apply(appliance: &Appliance) -> Result<()> {
+/// `verify` says whether this moves the box forward or puts a previous
+/// configuration back.
+pub fn apply(appliance: &Appliance, verify: Verify) -> Result<()> {
     apply_persistent(appliance, ApplyMode::Live)?;
     apply_link_runtime(appliance)?;
     if appliance.interfaces.iter().any(|i| i.zone.is_some()) {
         system::service_start(AGENT_UNIT).context("starting the data plane")?;
         let reply = crate::velstra::query("reconcile-links")
             .context("verifying packet hooks after network reconciliation")?;
-        anyhow::ensure!(
-            reply.trim() == "ok",
-            "data-plane interface reconciliation: {}",
-            reply.trim()
-        );
+        judge_reconcile_reply(&reply, verify)?;
     }
     Ok(())
+}
+
+/// Judge the agent's `reconcile-links` answer.
+///
+/// A held link still down (`held-down: <link>…`) is dark, not open: it stays
+/// down rather than forward unfiltered, whatever is decided here. A commit
+/// moving forward fails on it, so nobody is told "applied" over a segment that
+/// went dark — and the way out is named, because disabling the link or taking
+/// its zone away makes the commit succeed without it.
+///
+/// A restore does not. It exists to get back to a configuration that worked,
+/// and the link that will not come up is a property of the NIC or the
+/// datapath, not of either document: refusing the restore would not raise the
+/// link, it would only leave the box on the configuration being abandoned and,
+/// after the recovery timer's bounded attempts, refuse every write until
+/// somebody accepts that state by hand. So it reports the dark links (and the
+/// link watch keeps alerting on them) and succeeds. Anything else the agent
+/// says — a reconcile that itself failed, an agent that does not answer — is
+/// a failed apply either way.
+fn judge_reconcile_reply(reply: &str, verify: Verify) -> Result<()> {
+    let reply = reply.trim();
+    if reply == "ok" {
+        return Ok(());
+    }
+    let Some(links) = reply.strip_prefix("held-down:") else {
+        anyhow::bail!("data-plane interface reconciliation: {reply}");
+    };
+    let links = links.split_whitespace().collect::<Vec<_>>().join(", ");
+    match verify {
+        Verify::Forward => anyhow::bail!(
+            "{links} held down: the data plane could not hook them, so they stay \
+             dark rather than forward unfiltered. Fix the cause (`show interfaces`, \
+             the velstra journal), or disable the interface or remove its zone to \
+             commit without it"
+        ),
+        Verify::Restore => {
+            eprintln!(
+                "warning: restored, but {links} stay held down: the data plane could \
+                 not hook them (`show interfaces`, the velstra journal)"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Apply each interface's offload switches with `ethtool -K`, and its hardware
@@ -4363,6 +4676,29 @@ fn apply_console(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A NIC that cannot take XDP is dark under the old configuration and the
+    /// new one alike. A commit that leaves it dark fails and says how to get
+    /// past it; a rollback to the previous configuration must not, or the
+    /// recovery timer retries it to exhaustion and every write is refused.
+    #[test]
+    fn a_dark_held_link_fails_a_commit_but_not_a_restore() {
+        assert!(judge_reconcile_reply("ok\n", Verify::Forward).is_ok());
+        assert!(judge_reconcile_reply("ok\n", Verify::Restore).is_ok());
+        let dark = "held-down: lan0 eth2\n";
+        let error = judge_reconcile_reply(dark, Verify::Forward)
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("lan0, eth2 held down"), "{error}");
+        assert!(error.contains("remove its zone"), "{error}");
+        assert!(judge_reconcile_reply(dark, Verify::Restore).is_ok());
+        // A reconcile that failed outright fails a restore too: only a link
+        // that is dark — the fail-closed state — is survivable.
+        let failed = "error: reconciling packet hooks: Failed (traffic blocked)\n";
+        for verify in [Verify::Forward, Verify::Restore] {
+            assert!(judge_reconcile_reply(failed, verify).is_err());
+        }
+    }
 
     /// A box with no domain group must not carry the refresh timer at all — an
     /// idle timer that re-applies the whole config every 15 minutes is a moving
@@ -5609,6 +5945,54 @@ mod tests {
         assert!(d.contains("PersistentKeepalive=25"));
     }
 
+    /// What `wg syncconf` is handed when a peer edit is applied to the live
+    /// device: the same key, port and peers as the `.netdev`, in `wg`'s own
+    /// format. syncconf removes every peer the file does not list, so the file
+    /// must list every peer — a missing one would be silently disconnected.
+    #[test]
+    fn wireguard_sync_carries_the_whole_peer_set_in_wg_format() {
+        use crate::config::{WgPeer, WireguardTunnel};
+        let peer = |key: &str, ip: &str| WgPeer {
+            public_key: key.into(),
+            allowed_ips: vec![ip.into(), "fd00::2/128".into()],
+            endpoint: Some("192.0.2.7:51820".into()),
+            persistent_keepalive: Some(25),
+            preshared_key: Some("psk".into()),
+        };
+        let tunnel = WireguardTunnel {
+            name: "wg0".into(),
+            private_key: "priv".into(),
+            listen_port: Some(51820),
+            peers: vec![peer("a", "10.9.0.2/32"), peer("b", "10.9.0.3/32")],
+        };
+        let body = wireguard_sync_body(&tunnel);
+        assert!(
+            body.starts_with("[Interface]\nPrivateKey=priv\nListenPort=51820\n"),
+            "{body}"
+        );
+        assert_eq!(body.matches("[Peer]").count(), 2, "{body}");
+        assert!(
+            !body.contains("WireGuard"),
+            "networkd sections in a wg file:\n{body}"
+        );
+        for line in [
+            "PublicKey=a",
+            "PublicKey=b",
+            "AllowedIPs=10.9.0.3/32,fd00::2/128",
+            "Endpoint=192.0.2.7:51820",
+            "PresharedKey=psk",
+            "PersistentKeepalive=25",
+        ] {
+            assert!(body.lines().any(|l| l == line), "{line} missing:\n{body}");
+        }
+        // No peers left: an [Interface] alone, so syncconf removes them all.
+        let empty = WireguardTunnel {
+            peers: vec![],
+            ..tunnel
+        };
+        assert!(!wireguard_sync_body(&empty).contains("[Peer]"));
+    }
+
     #[test]
     fn vlan_aware_bridge_renders_filtering_and_port_vlans() {
         // A vlan-aware bridge netdev carries VLANFiltering=yes.
@@ -5904,7 +6288,9 @@ mod tests {
             "the plaintext upstream is still an upstream:\n{conf}"
         );
 
-        let args = dnsproxy_args_body(&dns).expect("an encrypted upstream renders a proxy");
+        let args = dnsproxy_args_body(&dns)
+            .unwrap()
+            .expect("an encrypted upstream renders a proxy");
         assert!(args.contains("--upstream=tls://dns.quad9.net"), "{args}");
         assert!(args.contains("--bootstrap=9.9.9.9"), "{args}");
         assert!(
@@ -5919,7 +6305,7 @@ mod tests {
             secure_upstream: vec![],
             ..dns.clone()
         };
-        assert!(dnsproxy_args_body(&plain).is_none());
+        assert!(dnsproxy_args_body(&plain).unwrap().is_none());
         assert!(
             dnsmasq_conf_body(&plain)
                 .unwrap()
@@ -5927,6 +6313,31 @@ mod tests {
                 .contains("server=9.9.9.9"),
             "the plaintext upstream must still be the upstream when nothing is encrypted"
         );
+    }
+
+    /// Defence in depth behind `validate_secure_upstream`: `ARGS=` is split into
+    /// words by systemd, so an upstream (or bootstrap) carrying whitespace, a
+    /// quote, a backslash or a newline is refused at render time — the proxy is
+    /// not started with an argument line somebody else wrote.
+    #[test]
+    fn the_proxy_argument_line_refuses_a_value_that_would_split() {
+        for (secure, bootstrap) in [
+            ("tls://dns.quad9.net --listen=0.0.0.0", "9.9.9.9"),
+            ("tls://dns.quad9.net\nLD_PRELOAD=/x.so", "9.9.9.9"),
+            ("tls://\"dns.quad9.net\"", "9.9.9.9"),
+            ("tls://dns.quad9.net", "9.9.9.9 --listen=0.0.0.0"),
+            ("tls://dns.quad9.net", "9.9.9.9\\"),
+        ] {
+            let dns = Dns {
+                upstream: vec![bootstrap.into()],
+                secure_upstream: vec![secure.into()],
+                ..Default::default()
+            };
+            assert!(
+                dnsproxy_args_body(&dns).is_err(),
+                "{secure:?} / {bootstrap:?} rendered"
+            );
+        }
     }
 
     #[test]
@@ -6043,7 +6454,7 @@ mod tests {
 
     #[test]
     fn the_arguments_name_the_link_the_gateway_and_the_pool() {
-        let args = pppoe_server_args_body(&bng(&[]));
+        let args = pppoe_server_args_body(&bng(&[])).unwrap();
         assert!(args.contains("-I eth1"), "{args}");
         assert!(args.contains("-L 10.90.0.1"), "{args}");
         assert!(args.contains("-R 10.90.0.100"), "{args}");
@@ -6053,15 +6464,38 @@ mod tests {
         );
     }
 
+    /// Defence in depth behind `Appliance::validate`: every value becomes a word
+    /// of `$PPPOE_SERVER_ARGS`, which systemd splits on whitespace after its
+    /// environment-file parser has stripped quotes and backslashes. A value that
+    /// reached the renderer unchecked must be refused, not rendered.
+    #[test]
+    fn the_argument_line_refuses_a_value_that_would_become_another_word() {
+        for poison in [
+            |b: &mut PppoeServer| b.interface = Some("eth1 -O /tmp/evil".into()),
+            |b: &mut PppoeServer| b.local_address = Some("10.90.0.1\nX=1".into()),
+            |b: &mut PppoeServer| b.pool_start = Some("10.90.0.100\t-q".into()),
+            |b: &mut PppoeServer| b.service_name = Some("a\" -O x".into()),
+            |b: &mut PppoeServer| b.ac_name = Some("bng\\ 1".into()),
+        ] {
+            let mut b = bng(&[]);
+            poison(&mut b);
+            assert!(pppoe_server_args_body(&b).is_err(), "{b:?}");
+        }
+    }
+
     #[test]
     fn a_service_name_is_offered_only_when_one_was_asked_for() {
         // Announcing a service name a subscriber did not ask for is how a PADI
         // goes unanswered.
-        let plain = pppoe_server_args_body(&bng(&[]));
+        let plain = pppoe_server_args_body(&bng(&[])).unwrap();
         assert!(!plain.contains("-S"), "{plain}");
         let mut named = bng(&[]);
         named.service_name = Some("velstra".into());
-        assert!(pppoe_server_args_body(&named).contains("-S \"velstra\""));
+        assert!(
+            pppoe_server_args_body(&named)
+                .unwrap()
+                .contains("-S \"velstra\"")
+        );
     }
 
     #[test]
@@ -6634,6 +7068,49 @@ mod tests {
         assert_eq!(routing_sysctls(&a)["net.ipv6.conf.all.forwarding"], "1");
     }
 
+    /// A NIC that has gone (unplugged, moved to another namespace) is not
+    /// waited for: nothing would create it, and failing on it fails the
+    /// rollback too. A link a `.netdev` or Sentinel itself creates still is.
+    #[test]
+    fn a_missing_kernel_link_is_not_awaited_but_a_created_one_is() {
+        let a = Appliance::from_toml(
+            r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "eth0"
+[[interface]]
+name = "wlan1"
+zone = "lan"
+[[interface]]
+name = "lo1"
+type = "dummy"
+[[interface]]
+name = "eth0.20"
+parent = "eth0"
+vlan = 20
+"#,
+        )
+        .unwrap();
+        let reloaded: Vec<String> = ["eth0", "wlan1", "lo1", "eth0.20"]
+            .map(String::from)
+            .to_vec();
+        let desired: BTreeMap<String, String> = [netdev_name("lo1"), netdev_name("eth0.20")]
+            .into_iter()
+            .map(|n| (n, String::new()))
+            .collect();
+        // Only eth0 is present: wlan1 is a kernel link that left, lo1 and the
+        // VLAN are devices networkd has yet to create.
+        let absent = absent_kernel_links(&reloaded, &a.interfaces, &desired, |n| n == "eth0");
+        assert_eq!(absent, vec!["wlan1".to_string()]);
+        // The VLAN is awaited even without a `.netdev` in hand.
+        let absent =
+            absent_kernel_links(&reloaded, &a.interfaces, &BTreeMap::new(), |n| n == "eth0");
+        assert!(!absent.contains(&"eth0.20".to_string()), "{absent:?}");
+        // Nothing is absent when everything is present.
+        assert!(absent_kernel_links(&reloaded, &a.interfaces, &desired, |_| true).is_empty());
+    }
+
     /// The bridge's own settings reach its `.netdev`, under one `[Bridge]`
     /// header shared with VLAN filtering.
     #[test]
@@ -6926,5 +7403,86 @@ igmp-querier = true
         );
         assert!(body.contains("dns64-prefix: 64:ff9b::/96"), "got:\n{body}");
         assert!(body.contains("forward-addr: 10.64.2.2"), "got:\n{body}");
+    }
+}
+
+/// DHCP on a segment whose gateway is a virtual (VRRP / HA) address. Without
+/// `default-router` networkd advertises the serving member's *own* address, and
+/// that address leaves with the member: after a failover every client keeps a
+/// gateway that no longer answers until its lease runs out.
+#[cfg(test)]
+mod dhcp_vip_tests {
+    use super::*;
+    use crate::config::DhcpServer;
+
+    fn ha_with_dhcp() -> Appliance {
+        let mut a = crate::ha::paired_fixture();
+        a.interfaces[0].dhcp_server = Some(DhcpServer {
+            pool_offset: Some(100),
+            pool_size: Some(50),
+            ..Default::default()
+        });
+        a.validate().unwrap();
+        a
+    }
+
+    #[test]
+    fn the_virtual_address_is_the_gateway_handed_out() {
+        let a = ha_with_dhcp();
+        let view = dhcp_server_view(&a, &a.interfaces[0]).expect("a server");
+        assert_eq!(view.default_router.as_deref(), Some("10.10.0.254"));
+        let body = network_body(
+            "wan0",
+            Some("10.10.0.1/24"),
+            None,
+            &[],
+            &[],
+            &[],
+            Some(&view),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(body.contains("Router=10.10.0.254"), "{body}");
+        assert!(!body.contains("Router=10.10.0.1"), "{body}");
+    }
+
+    #[test]
+    fn the_virtual_address_is_the_resolver_when_this_box_serves_dns_there() {
+        let mut a = ha_with_dhcp();
+        // Not serving DNS on the segment: the resolvers are networkd's to choose.
+        let view = dhcp_server_view(&a, &a.interfaces[0]).unwrap();
+        assert!(view.dns.is_empty(), "{:?}", view.dns);
+        a.services.dns.serve_on = vec!["wan0".into()];
+        let view = dhcp_server_view(&a, &a.interfaces[0]).unwrap();
+        assert_eq!(view.dns, vec!["10.10.0.254".to_string()]);
+    }
+
+    #[test]
+    fn an_operator_choice_is_never_overridden() {
+        let mut a = ha_with_dhcp();
+        a.services.dns.serve_on = vec!["wan0".into()];
+        let server = a.interfaces[0].dhcp_server.as_mut().unwrap();
+        server.default_router = Some("10.10.0.250".into());
+        server.dns = vec!["10.10.0.53".into()];
+        let view = dhcp_server_view(&a, &a.interfaces[0]).unwrap();
+        assert_eq!(view.default_router.as_deref(), Some("10.10.0.250"));
+        assert_eq!(view.dns, vec!["10.10.0.53".to_string()]);
+    }
+
+    #[test]
+    fn a_segment_without_a_virtual_address_is_unchanged() {
+        let a = Appliance::from_toml(
+            "[system]\nhostname = \"fw\"\n[[interface]]\nname = \"lan0\"\nzone = \"lan\"\n\
+             address = \"10.1.0.1/24\"\n[interface.dhcp-server]\npool-offset = 100\n[zone.lan]\n",
+        )
+        .unwrap();
+        let view = dhcp_server_view(&a, &a.interfaces[0]).unwrap();
+        assert!(view.default_router.is_none());
+        assert!(view.dns.is_empty());
     }
 }

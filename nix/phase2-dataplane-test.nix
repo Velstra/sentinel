@@ -45,7 +45,7 @@ let
     networking.interfaces.eth1.ipv4.routes = [{ address = "0.0.0.0"; prefixLength = 0; via = gateway4; }];
     # Prefer the appliance over QEMU's management NIC router advertisement.
     networking.interfaces.eth1.ipv6.routes = [{ address = "::"; prefixLength = 0; via = gateway6; options.metric = "100"; }];
-    environment.systemPackages = [ pkgs.python3 pkgs.netcat-openbsd ];
+    environment.systemPackages = [ pkgs.python3 pkgs.netcat-openbsd pkgs.tcpdump ];
   };
 in pkgs.testers.runNixOSTest {
   name = "sentinel-phase2-dataplane";
@@ -80,6 +80,27 @@ in pkgs.testers.runNixOSTest {
         return node.succeed("python3 -c " + shlex.quote(code))
     def show(what):
         return fw.succeed("sentinel show firewall " + what)
+    def configure(*commands, persist=False):
+        # A session edits the SAVED configuration: `commit` alone changes the
+        # running box, and the next session starts again from what was saved.
+        # `persist` saves too, for a change a later session has to see.
+        tail = ["commit", "save", "exit"] if persist else ["commit", "exit"]
+        script = "printf '%s\\n' " + " ".join(shlex.quote(c) for c in list(commands) + tail) + " | sentinel configure"
+        output = fw.succeed("su admin -c " + shlex.quote(script))
+        assert "error:" not in output.lower() and "commit failed" not in output.lower(), output
+    def unsolicited_from_wan():
+        # Counted where it would land, on the LAN host's wire, so the answer
+        # does not depend on whether anything there would have replied. Both
+        # families, TCP and UDP, to ports no rule mentions.
+        client.succeed("rm -f /tmp/inbound.pcap; tcpdump -n -U -i eth1 -w /tmp/inbound.pcap "
+                       "'(tcp dst port 9092 or udp dst port 9093) and (src host 10.2.2.2 or src host 2001:db8:102::2)' "
+                       ">/dev/null 2>&1 & echo $! >/tmp/inbound.pid")
+        client.sleep(1)
+        for address in ("10.1.1.2", "2001:db8:101::2"):
+            server.execute(f"nc -z -w 2 {address} 9092")
+            server.execute(f"echo probe | nc -u -w 1 {address} 9093")
+        client.succeed("kill -INT $(cat /tmp/inbound.pid); sleep 1")
+        return int(client.succeed("tcpdump -n -r /tmp/inbound.pcap 2>/dev/null | wc -l").strip())
     lines = [
         "set interface eth1 zone lan", "set interface eth1 address 10.1.1.1/24",
         "set interface eth1 address6 2001:db8:101::1/64",
@@ -106,6 +127,26 @@ in pkgs.testers.runNixOSTest {
     assert "error:" not in output.lower() and "commit failed" not in output.lower(), output
     fw.wait_until_succeeds("ip -6 addr show eth2 | grep -q 2001:db8:102::1")
     fw.wait_until_succeeds("grep -q snat_address /run/sentinel/velstra.toml")
+
+    with subtest("unsolicited WAN-to-LAN traffic is refused with no rule allowing it"):
+        # The WAN zone states no default action, so the global default (drop)
+        # decides. Nothing in the configuration permits WAN to LAN.
+        crossed = unsolicited_from_wan()
+        assert crossed == 0, f"{crossed} unsolicited WAN packets reached the LAN"
+        # The control: the same probes, with a rule that admits them, do cross.
+        # Without it a broken route would pass the check above for the wrong
+        # reason.
+        configure(
+            "set firewall rule wan-probe-tcp from wan", "set firewall rule wan-probe-tcp proto tcp",
+            "set firewall rule wan-probe-tcp port 9092", "set firewall rule wan-probe-tcp action accept",
+            "set firewall rule wan-probe-udp from wan", "set firewall rule wan-probe-udp proto udp",
+            "set firewall rule wan-probe-udp port 9093", "set firewall rule wan-probe-udp action accept",
+            persist=True,
+        )
+        crossed = unsolicited_from_wan()
+        assert crossed >= 4, f"only {crossed} admitted probes crossed: the path itself is broken"
+        configure("delete firewall rule wan-probe-tcp", "delete firewall rule wan-probe-udp", persist=True)
+        assert unsolicited_from_wan() == 0
 
     with subtest("TCP forwarding, checksums and static SNAT work across both families"):
         for address, result in [("10.2.2.2", "/tmp/tcp4"), ("2001:db8:102::2", "/tmp/tcp6")]:
@@ -142,10 +183,15 @@ in pkgs.testers.runNixOSTest {
         sizes = [int(client.succeed("stat -c %s " + path)) for path in ("/tmp/tcp4", "/tmp/tcp6")]
         time.sleep(3)
         for path, size in zip(("/tmp/tcp4", "/tmp/tcp6"), sizes):
-            assert int(client.succeed("stat -c %s " + path)) > size
-        # Restore logging so the drop probe below must also produce an event.
-        output = fw.succeed("su admin -c " + shlex.quote("printf '%s\\n' 'set firewall rule deny-tcp log true' commit exit | sentinel configure"))
-        assert "error:" not in output.lower() and "commit failed" not in output.lower(), output
+            grown = int(client.succeed("stat -c %s " + path))
+            assert grown > size, f"{path} stopped at {grown} bytes: " + client.succeed("cat /tmp/tcp-probe.log; ss -tni")
+        # Restore logging so the drop probe below must also produce an event,
+        # and the LAN posture: every later check runs against the
+        # configuration it was written for, not one this subtest left behind.
+        # The session starts from the saved configuration, which never had the
+        # LAN default-action (it was committed above, not saved), so committing
+        # it puts the posture back; there is no zone entry left to delete.
+        configure("set firewall rule deny-tcp log true")
 
     with subtest("UDP reply permission expires at the configured idle deadline"):
         python(client, "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(6); "
@@ -153,6 +199,19 @@ in pkgs.testers.runNixOSTest {
                "exec(\"try:\\n s.recv(200)\\n raise AssertionError('expired UDP reply was admitted')\\nexcept socket.timeout:\\n pass\")")
         states = json.loads(show("states"))
         assert not any(s["protocol"] == 17 and (s["src_port"] == 9091 or s["dst_port"] == 9091) for s in states), states
+
+    with subtest("firewall reply state expires on its own, and for IPv6"):
+        # The IPv4 check above cannot tell the two expiries apart: the late
+        # reply is addressed to the SNAT address, so it dies when the NAT entry
+        # does, whatever the firewall state says. IPv6 is not translated here,
+        # so the only thing admitting a late reply through the WAN's drop
+        # default is the stateful firewall entry — and it must have expired.
+        python(client, "import socket; s=socket.socket(socket.AF_INET6,socket.SOCK_DGRAM); s.settimeout(6); "
+               "s.sendto(b'defer',('2001:db8:102::2',9091)); first=s.recv(200); assert b'2001:db8:101::2' in first, first; "
+               "exec(\"try:\\n s.recv(200)\\n raise AssertionError('expired IPv6 UDP reply was admitted')\\nexcept socket.timeout:\\n pass\")")
+        # The control: inside the deadline the same reply path is open.
+        python(client, "import socket; s=socket.socket(socket.AF_INET6,socket.SOCK_DGRAM); s.settimeout(3); "
+               "s.sendto(b'echo',('2001:db8:102::2',9091)); assert b'2001:db8:101::2' in s.recv(200)")
 
     with subtest("drops and allows have exact named counters and ring events"):
         client.fail("nc -z -w 1 10.2.2.2 9099")

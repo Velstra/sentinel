@@ -152,8 +152,12 @@ pub fn deliver(alerts: &Alerts, alert: &Alert) -> usize {
 
 /// POST the JSON body to `url` with curl (already pinned in the image for the
 /// update channel — no TLS stack is added to the appliance for this).
+///
+/// A webhook URL often carries its own credential (a Slack or Teams hook *is*
+/// its secret), so the request runs like every other credentialed curl: no
+/// ambient proxy, key-log or trust-store variables, no `~/.curlrc`.
 fn post_webhook(url: &str, body: &str) -> Result<()> {
-    let out = Command::new(curl_bin())
+    let out = crate::system::curl_command_for(&curl_bin())
         .args([
             "-fsS",
             "--max-time",
