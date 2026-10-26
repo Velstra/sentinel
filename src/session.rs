@@ -2818,9 +2818,14 @@ impl Session {
 
     /// Record what we have just applied, so our own commit does not read as
     /// somebody else's.
-    pub fn note_committed(&mut self, toml: &str) {
-        let _ = crate::system::install_config_file(Path::new(Self::RUNNING), toml);
+    pub fn note_committed(&mut self, toml: &str) -> Result<()> {
+        self.note_committed_at(Path::new(Self::RUNNING), toml)
+    }
+
+    fn note_committed_at(&mut self, path: &Path, toml: &str) -> Result<()> {
+        crate::system::install_config_file(path, toml)?;
         self.seen_running = Some(toml.to_string());
+        Ok(())
     }
 
     /// Open a session, loading `path` as the candidate if it exists.
@@ -12991,6 +12996,30 @@ fn validate_bind_address(v: &str) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_failed_running_publication_does_not_advance_the_sessions_revision() {
+        let directory = std::env::temp_dir().join(format!(
+            "sentinel-commit-publication-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut session = super::Session::load(&directory.join("saved.toml")).unwrap();
+        let previous = session.seen_running.clone();
+        let blocked = directory.join("not-a-directory");
+        std::fs::write(&blocked, "preserved").unwrap();
+        assert!(
+            session
+                .note_committed_at(&blocked.join("running.toml"), "new revision")
+                .is_err()
+        );
+        assert_eq!(session.seen_running, previous);
+        assert_eq!(std::fs::read_to_string(&blocked).unwrap(), "preserved");
+        let running = directory.join("running.toml");
+        session.note_committed_at(&running, "new revision").unwrap();
+        assert_eq!(session.seen_running.as_deref(), Some("new revision"));
+        assert_eq!(std::fs::read_to_string(running).unwrap(), "new revision");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     /// The whole specification of `flatten_config`, as a round trip: render a
     /// config, flatten it to commands, feed those commands back through the

@@ -15147,12 +15147,17 @@
               # configure runs as admin in a root-owned wheel-writable directory.
               # Atomic replacement must preserve the root-only token contract.
               backup.succeed("test $(stat -c %u /var/lib/sentinel/api-token) = 0; test $(stat -c %a /var/lib/sentinel/api-token) = 600")
+              # The privileged installer also publishes into its own staging
+              # directory. This must not attempt install(source, source).
+              backup.succeed("grep -q shared-token-123 /run/sentinel/running.toml; test $(stat -c %u /run/sentinel/running.toml) = 0; test $(stat -c %a /run/sentinel/running.toml) = 640")
 
               # Sanity: the rule is not on the backup yet.
               backup.fail("grep -q 'synced-rule' /var/lib/sentinel/appliance.toml")
 
               # The primary points at the backup and commits a distinctive rule. The
               # commit applies live AND pushes the running config to the backup.
+              # Deliberately omit save until delivery: a worker starting before
+              # save must see the published running revision, not drop its outbox.
               primary.succeed(
                   "su admin -c \"printf '%s\\n' "
                   "'set firewall global default-action accept' "
@@ -15163,9 +15168,11 @@
                   "'set firewall rule synced-rule action accept' "
                   "'set firewall rule synced-rule proto tcp' "
                   "'set firewall rule synced-rule port 12345' "
-                  "commit save exit "
+                  "commit exit "
                   "| sentinel configure\""
               )
+              primary.succeed("grep -q synced-rule /run/sentinel/running.toml; test $(stat -c %u /run/sentinel/running.toml) = 0; test $(stat -c %a /run/sentinel/running.toml) = 640")
+              primary.fail("grep -q synced-rule /var/lib/sentinel/appliance.toml")
 
               # The headline: the backup's SAVED config now carries the primary's
               # rule — the push landed, was applied and persisted by the backup's API.
@@ -15173,6 +15180,10 @@
                   "grep -q 'synced-rule' /var/lib/sentinel/appliance.toml", timeout=30
               )
               backup.succeed("grep -q '12345' /var/lib/sentinel/appliance.toml")
+              primary.succeed(
+                  "su admin -c \"printf '%s\\n' 'save /var/lib/sentinel/appliance.toml' exit "
+                  "| sentinel configure --config /run/sentinel/running.toml\""
+              )
               # And the backup applied it live: the compiled data-plane config has it.
               backup.wait_until_succeeds(
                   "grep -q '12345' /run/sentinel/velstra.toml", timeout=20

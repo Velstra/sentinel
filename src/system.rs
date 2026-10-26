@@ -903,7 +903,12 @@ fn install_owned_atomic(path: &Path, contents: &str, private: bool) -> Result<()
     let mut staged = PrivateStage::create(Path::new("/run/sentinel"), 0o600)?;
     staged.file.write_all(contents.as_bytes())?;
     staged.file.sync_all()?;
-    let target = parent.join(staged.path.file_name().context("staging filename")?);
+    // The destination can itself be /run/sentinel (running.toml). A basename
+    // copied from the source would ask install to copy a file onto itself,
+    // preventing publication of the running snapshot before the outbox starts.
+    let target = parent
+        .join(staged.path.file_name().context("staging filename")?)
+        .with_extension("install");
     let source = staged.path.to_str().context("non-UTF-8 staging path")?;
     let temporary = target.to_str().context("non-UTF-8 config directory")?;
     let destination = path.to_str().context("non-UTF-8 config path")?;

@@ -570,10 +570,17 @@ fn commit(session: &mut Session, act: &Apply) -> bool {
     // config that was never run, and the next operator's `save` would then read
     // as overwriting phantom work. Only when it was really applied — an off-box
     // `--no-apply` edit changed nothing about what is running.
-    if act.enabled {
-        if let Ok(toml) = appliance.to_toml() {
-            session.note_committed(&toml);
-        }
+    if act.enabled
+        && let Err(error) = appliance
+            .to_toml()
+            .and_then(|toml| session.note_committed(&toml))
+    {
+        eprintln!(
+            "{} configuration applied, but the running snapshot could not be recorded: {error:#}",
+            ui::red("error:")
+        );
+        note_refusal();
+        return false;
     }
     if appliance.system.hostname != old_host {
         eprintln!("  hostname: {old_host} -> {}", appliance.system.hostname);
