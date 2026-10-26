@@ -956,12 +956,14 @@ await test("the page still fetches nothing from outside itself", async () => {
   // The hints are the one feature that could have broken this: an operator's
   // console reaching a registry directly would leak what they are configuring
   // and would go blank on an isolated network.
-  const external = await page.evaluate(`(() => {
-    const html = document.documentElement.outerHTML;
-    return (html.match(/https?:\\/\\/[^"' <]+/g) || [])
-      .filter((u) => !u.startsWith("http://127.0.0.1") && !u.startsWith("http://localhost"));
-  })()`);
-  equal(external, [], "the page names an external URL");
+  // React embeds SVG/XML namespace and diagnostic URLs. They are constants,
+  // not requests: inspect actual network traffic and resource-bearing tags.
+  const origin = new globalThis.URL(URL).origin;
+  const external = page.requests.filter((url) => /^https?:/.test(url))
+    .filter((url) => new globalThis.URL(url).origin !== origin);
+  equal(external, [], "the console requested an external URL");
+  const resources = await page.evaluate(`Array.from(document.querySelectorAll('script[src],link[href]')).map(n => n.src || n.href)`);
+  equal(resources.filter(url => new globalThis.URL(url, URL).origin !== origin), [], "the console declares an external asset");
 });
 
 // --- accounts and signing in ------------------------------------------------
@@ -1021,8 +1023,8 @@ await test("that account can then sign in with its username and password", async
     return {
       inside: !document.getElementById("app").classList.contains("hidden"),
       said: document.getElementById("loginerr").textContent,
-      who: document.getElementById("whoami").textContent,
-      readOnly: !document.getElementById("permpill").classList.contains("hidden"),
+      who: document.getElementById("whoname").textContent,
+      readOnly: document.getElementById("permpill").getClientRects().length > 0,
       applyDisabled: document.getElementById("applystaged").disabled,
     };
   })()`);
@@ -1187,16 +1189,32 @@ await test("what already exists is offered rather than typed", async () => {
     first.checked = true;
     first.dispatchEvent(new Event("change"));
     await wait(500);
-    return {
+    const offered = {
       members: ticks,
       zones: [...field("Zone").querySelectorAll("option")].map((o) => o.value).filter(Boolean),
       mtu: field("MTU").querySelector(".hint").textContent,
     };
+    view = "rules"; panel = null; await refresh(); await wait();
+    const newRule = document.getElementById("togglerule");
+    if (!/cancel/i.test(newRule.textContent)) newRule.click();
+    await wait();
+    const fields = [...document.getElementById("addrulepanel").querySelectorAll(".field")];
+    offered.ruleZones = ["From zone", "To zone"].map((label) => {
+      const control = fields.find((f) => f.querySelector("span").firstChild.textContent.trim() === label)
+        .querySelector("select");
+      return { label, choices: control ? [...control.options].map((o) => o.value).filter(Boolean) : [] };
+    });
+    newRule.click();
+    return offered;
   })()`);
   check(offered.members.includes("eth0") && offered.members.includes("eth1"),
     `the interfaces on this box are not offered as members: ${JSON.stringify(offered.members)}`);
   check(offered.zones.includes("lan") && offered.zones.includes("wan"),
     `the zones are not offered: ${JSON.stringify(offered.zones)}`);
+  for (const { label, choices } of offered.ruleZones) {
+    equal(choices, offered.zones,
+      `${label} must offer the same configured zones as an interface`);
+  }
   check(/\d|member/i.test(offered.mtu),
     `the MTU says nothing about the members: ${JSON.stringify(offered.mtu)}`);
 });
@@ -1648,7 +1666,10 @@ await test("every control stages a command the appliance accepts", async () => {
     })()`);
     for (let p = 0; p < pages; p++) {
       const out = await page.evaluate(`(async () => {
-        const wait = (ms) => new Promise((r) => setTimeout(r, ms || 40));
+        // Stage handlers are synchronous. Yield to the event loop for React and
+        // queued work; a fixed sleep for every hidden control on every page
+        // adds minutes without testing another control or waiting for I/O.
+        const wait = (ms = 0) => new Promise((r) => setTimeout(r, ms));
         const out = [];
         const drain = () => {
           for (const e of staged) for (const c of e.cmds || []) out.push(String(c));
@@ -1661,14 +1682,14 @@ await test("every control stages a command the appliance accepts", async () => {
             if (!opt.value) continue;
             sel.value = opt.value;
             sel.dispatchEvent(new Event("change", { bubbles: true }));
-            await wait(25);
+            await wait();
             drain();
           }
         }
         for (const box of [...document.querySelectorAll("input[type=checkbox]")]) {
           box.checked = !box.checked;
           box.dispatchEvent(new Event("change", { bubbles: true }));
-          await wait(25);
+          await wait();
           drain();
         }
         return out;
@@ -1677,6 +1698,7 @@ await test("every control stages a command the appliance accepts", async () => {
     }
   }
 
+  console.log(`  exercised ${staged.length} control commands (${new Set(staged).size} distinct)`);
   check(staged.length > 10, `only ${staged.length} controls did anything at all`);
 
   // Through the same endpoint the console's own Apply uses, and in the same

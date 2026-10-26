@@ -47,6 +47,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - run: npm ci
+        working-directory: ui
+      - run: npm run format:check
+        working-directory: ui
+      - run: npm test
+        working-directory: ui
+      - run: npm run build
+        working-directory: ui
+      - run: git diff --exit-code -- ui/dist
       - uses: Swatinem/rust-cache@v2
       # No system protoc needed: velstra-proto vendors its own.
       # There is no rustfmt.toml here, so stable rustfmt is the whole story and
@@ -82,6 +96,7 @@ jobs:
           - reboot
           - api
           - console
+          - react-ui
           - pki
           - dns
           - lldp
