@@ -11916,7 +11916,7 @@
                 # its mDNS: resolved itself is the appliance's own resolver, and
                 # every commit activates its drop-in — a relay without the unit
                 # refuses every commit ("Unit systemd-resolved.service not found").
-                services.resolved.extraConfig = "MulticastDNS=no";
+                services.resolved.settings.Resolve.MulticastDNS = "no";
                 services.velstra.interface = lib.mkForce "eth1";
               };
           };
