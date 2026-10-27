@@ -86,7 +86,9 @@ export class Management {
       ? "Configuration confirmed and saved."
       : outcome === "apply-failed"
         ? "Application failed. The previous working configuration was restored; review the retained changes before retrying."
-        : "Previous working configuration restored. Your proposed changes remain available for review.";
+        : outcome === "recovery-abandoned"
+          ? "Transaction ended. The saved configuration is unchanged; the live network was accepted as it is."
+          : "Previous working configuration restored. Your proposed changes remain available for review.";
     if (this.batch?.id === id) {
       if (!confirmed)
         for (const change of this.batch.changes)
@@ -144,14 +146,19 @@ export class Management {
       if (epoch === this.epoch) this.polling = false;
     }
   };
-  finishTransaction = async (action: "confirm" | "revert") => {
+  finishTransaction = async (
+    action: "confirm" | "revert" | "recovery/accept",
+  ) => {
     const pending = this.state.pending;
     if (
       !pending ||
       this.state.confirming ||
       !this.writable() ||
       (action === "confirm" &&
-        (!pending.ready || this.state.deadline <= performance.now()))
+        (!pending.ready || this.state.deadline <= performance.now())) ||
+      // Accepting the live network is the way out of a recovery that gave
+      // up, never a shortcut past one that may still succeed.
+      (action === "recovery/accept") !== !!pending.recovery_failed
     )
       return;
     const epoch = this.epoch;
@@ -172,7 +179,11 @@ export class Management {
         this.setPending(null);
         this.complete(
           pending.id,
-          action === "confirm" ? "confirmed" : "reverted",
+          action === "confirm"
+            ? "confirmed"
+            : action === "revert"
+              ? "reverted"
+              : "recovery-abandoned",
         );
         await this.host.refresh();
       }
@@ -307,9 +318,17 @@ export class Management {
     }
   };
   acceptFrame = (frame: Telemetry) => {
+    // The route table arrives once per change; an unchanged frame keeps it.
+    const routes = frame.routing?.routes_unchanged
+      ? this.state.frame?.routing?.routes
+      : frame.routing?.routes;
     // The collector is authoritative, but its bounded window is enforced again at this boundary.
     this.update({
-      frame: { ...frame, events: frame.events.slice(-512) },
+      frame: {
+        ...frame,
+        events: frame.events.slice(-512),
+        ...(frame.routing ? { routing: { ...frame.routing, routes } } : {}),
+      },
       receivedAt: performance.now(),
       connected: true,
       status: "Live telemetry connected.",
@@ -318,11 +337,21 @@ export class Management {
   private async consume(signal: AbortSignal, epoch: number) {
     let delay = 1000;
     while (!signal.aborted && epoch === this.epoch) {
+      // One controller per connection. A half-open link never errors and
+      // never ends, so the read below would wait forever; silence past the
+      // staleness window aborts this connection (not the session) instead.
+      const connection = new AbortController(),
+        forward = () => connection.abort();
+      signal.addEventListener("abort", forward, { once: true });
+      let heard = performance.now();
+      const watchdog = setInterval(() => {
+        if (performance.now() - heard > STALE_MS) connection.abort();
+      }, 1000);
       try {
         const response = await fetch("/api/v1/telemetry", {
           headers: { Authorization: "Bearer " + this.host.credential() },
           cache: "no-store",
-          signal,
+          signal: connection.signal,
         });
         if (response.status === 401) {
           this.host.signOut("That token was not accepted.");
@@ -330,9 +359,10 @@ export class Management {
         }
         if (!response.ok || !response.body)
           throw Error("Telemetry HTTP " + response.status);
-        for await (const value of sseFrames(response.body, signal)) {
+        for await (const value of sseFrames(response.body, connection.signal)) {
           if (signal.aborted || epoch !== this.epoch) return;
           if (isTelemetry(value)) {
+            heard = performance.now();
             this.acceptFrame(value);
             delay = 1000;
           }
@@ -348,6 +378,9 @@ export class Management {
         });
         await wait(delay, signal);
         delay = Math.min(15000, delay * 2);
+      } finally {
+        clearInterval(watchdog);
+        signal.removeEventListener("abort", forward);
       }
     }
   }
@@ -363,7 +396,7 @@ export class Management {
       const now = performance.now();
       this.update({
         now,
-        ...(this.state.frame && now - this.state.receivedAt > 15000
+        ...(this.state.frame && now - this.state.receivedAt > STALE_MS
           ? {
               connected: false,
               status: "Telemetry is stale. Waiting for a fresh sample…",
@@ -392,6 +425,8 @@ export class Management {
     this.abort?.abort();
   };
 }
+/** Silence after which telemetry is stale and its connection is replaced. */
+const STALE_MS = 15000;
 function message(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }

@@ -173,9 +173,16 @@ pkgs.testers.runNixOSTest {
             assert frames[-1]["conntrack"]["total"] >= 1, frames[-1]
             assert len(frames[-1]["conntrack"]["states"]) <= 200, frames[-1]
             assert any(rule["rule"] == "denied" and rule["dropped"] > 0 for rule in frames[-1]["rule_counters"]["rules"]), frames[-1]
-            assert "bgp" in frames[-1]["routing"] and "routes" in frames[-1]["routing"], frames[-1]
+            # The route table is sent once per change per stream, then marked
+            # unchanged; the first frame of each stream carries it in full.
+            assert "routes" in frames[0]["routing"], frames[0]
+            assert "bgp" in frames[-1]["routing"] and ("routes" in frames[-1]["routing"] or frames[-1]["routing"].get("routes_unchanged")), frames[-1]
             common.append(set(events))
         assert common[0] & common[1], "streams stole each other's ring events"
+        # Readers page the agent's event log with their own cursors: the CLI
+        # still sees what both streams already showed.
+        shown = fw.succeed("sentinel show firewall events")
+        assert '"rule":"ping"' in shown or '"rule": "ping"' in shown, shown
 
     with subtest("an unconfirmed persisted document is restored before boot rendering"):
         # A long window ensures this tests reboot recovery, not expiry.

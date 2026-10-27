@@ -9,21 +9,31 @@ rolls back automatically. The architecture is in
 
 ```shell
 # from a new raw image (built with `nix build .#sentinel-image`) plus its
-# detached signature velstra-sentinel.raw.sig
+# signed digest velstra-sentinel.raw.sha256(.sig) beside it
 sentinel update /path/to/velstra-sentinel.raw --commit
 
-# or from a block device / mounted source (no signature — see --allow-unsigned)
+# from a USB stick the image was dd'd onto, with the release's proof from
+# another medium (a signed manifest, or the signed digest)
+sentinel update /dev/sdX --commit --signature /mnt/release/manifest.json.sig
+
+# a trusted device as given, without verification (see --allow-unsigned)
 sentinel update /dev/sdX --commit --allow-unsigned
 ```
 
 What happens:
 
 1. the image's signature is **verified** (see below) unless `--allow-unsigned`;
-2. the **active** slot is detected (via `/dev/mapper/usr`);
-3. the new image's store + verity are written to the **inactive** slot;
-4. that slot is re-typed to the verity GPT GUIDs;
-5. the new UKI is installed as `sentinel-<inactive>+3.efi` with **3 boot tries**;
-6. `loader.conf` `default` is pointed at the new slot.
+2. a release older than the running one is **refused** unless
+   `--allow-downgrade` (when the proof states a version);
+3. the **active** slot is detected (via `/dev/mapper/usr`);
+4. the image is read once and hashed in full against the signed digest —
+   nothing is written unless it matches;
+5. the new image's store + verity are written to the **inactive** slot from that
+   same open file, re-hashed on the way, so an image that changes underneath
+   (a rewritten file, a swapped stick) is refused before the slot is activated;
+6. that slot is re-typed to the verity GPT GUIDs;
+7. the new UKI is installed as `sentinel-<inactive>+3.efi` with **3 boot tries**;
+8. `loader.conf` `default` is pointed at the new slot.
 
 Without `--commit`, the plan is printed but nothing is written.
 
@@ -31,8 +41,10 @@ Without `--commit`, the plan is printed but nothing is written.
 
 A local `sentinel update <image>` now **verifies the image before writing it** —
 the same authenticity gate the channel path applies, so a local install is no
-longer a way around it. It looks for a detached Ed25519 signature `<image>.sig`
-beside the image and verifies it against a pinned release key, tried in order:
+longer a way around it. It looks for a detached Ed25519 proof beside the image
+(`<image>.sha256.sig`, else `<image>.sig`), or takes the one named by
+`--signature <file>`, and verifies it against a pinned release key, tried in
+order:
 
 1. `--pubkey <pem|file:path>` on the command line;
 2. the saved `[update]` channel's `public-key`;
@@ -59,17 +71,59 @@ openssl pkeyutl -sign -inkey release-priv.pem -rawin \
   -in velstra-sentinel.raw -out velstra-sentinel.raw.sig
 ```
 
+A raw signature is verified on a private copy of the image, and that copy is
+what is installed.
+
+### USB sticks and other block devices
+
+Nothing can sit "beside" `/dev/sdX`, and a stick is larger than the image on it,
+so a raw signature cannot say where the image ends. A block device is proven by
+`--signature` naming one of:
+
+- `…/manifest.json.sig` — the channel's signed release manifest (copy the
+  channel directory to a second medium). It names the image's SHA-256 and the
+  release version, so the downgrade check below applies.
+- `…/velstra-sentinel.raw.sha256.sig` — the signed digest (above).
+
+The device is read up to the end of the image its own partition table describes
+(the backup GPT header), and those bytes must hash to the signed value.
+
+### Downgrades
+
+Every old release stays validly signed forever, so a signature alone cannot stop
+a mirror — or anybody in the path — from serving an old manifest and putting a
+box back onto a release with known holes. `update install`, and a local update
+proven by a signed manifest, therefore refuse a release whose version is lower
+than the running one (`show version`, `sentinel:` line), comparing versions the
+semver way (`1.0.0-rc.1` < `1.0.0` < `1.0.1` < `1.10.0`). The same version is
+allowed — that is a re-install. `--allow-downgrade` installs an older release
+deliberately and says so; `update check` reports an older release as "NOT an
+update". A signed digest or raw signature states no version, so for those the
+updater says it could not check rather than refusing.
+
+What this does not give is **freeze** protection: a mirror that keeps serving
+the current (or an older) manifest hides newer releases, and nothing signed says
+how old a manifest may be. The channel protocol carries no expiry yet.
+
+Manifests may carry `"product": "velstra-sentinel"`. When present it must match,
+so a manifest signed for another product by a shared key is refused; manifests
+signed before the field existed are still accepted (and are older releases, so
+the downgrade check covers their replay).
+
+```json
+{"version":"1.1.0","image":"velstra-sentinel.raw","sha256":"…","product":"velstra-sentinel"}
+```
+
 > **`--allow-unsigned` is the trusted-operator escape hatch.** A re-seal from the
-> booted medium or an air-gapped block device has no `.sig` to check; pass
+> booted medium or a trusted block device with no proof at hand; pass
 > `--allow-unsigned` to write it exactly as given. It is loud and logged — never
 > silent — so it can't be mistaken for a verified update.
 
 ## Signed updates (`update check` / `update install`)
 
 The **channel** updater refuses any image whose release manifest isn't signed by
-a key you have pinned. (The local `sentinel update <path>|<device>` form above is
-the trusted-operator path and does no such check.) Pin the channel in config
-(roadmap C13):
+a key you have pinned, and any release older than the running one (see
+Downgrades above). Pin the channel in config (roadmap C13):
 
 ```shell
 configure
@@ -84,6 +138,12 @@ save
 - `public-key` is the pinned Ed25519 release-signing key, PEM. `file:<path>`
   reads it from disk (so the key can live in the immutable image rather than the
   config); an inline PEM also works.
+- The fetch is the pinned curl with `--disable` and an **empty environment**:
+  `HTTPS_PROXY`/`ALL_PROXY`, `SSLKEYLOGFILE`, `CURL_CA_BUNDLE`/`SSL_CERT_FILE`
+  and `~/.curlrc` are ignored. An `https://` channel is checked against the
+  system trust store; proxies are not supported.
+- The whole `[update]` section is local-only: a fleet controller cannot change
+  it (see the fleet documentation).
 
 Both fields are required — `commit` rejects a half-specified channel. With a
 channel pinned:

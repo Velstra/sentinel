@@ -520,8 +520,11 @@ await test("leased HA settings save, validate and protect peer identity", async 
   const identity = { node: 2, hostname: "peer-two", "router-id": null,
     "management-endpoint": "127.0.0.2:8080", "management-fingerprint": "A".repeat(43) + "=",
     "state-listen": "127.0.0.2:5429", priority: 100, interfaces: {} };
+  // The last two are the witness timing budget (lease-ms, io-timeout-ms):
+  // 2 x 80 + 25 poll + 20 margin fits a 300 ms lease.
   const values = ["false", "127.0.0.9:5440", "eth0", "1", "180", "true",
-    "console-ha-cluster-1", "A".repeat(43) + "=", JSON.stringify(identity, null, 2)];
+    "console-ha-cluster-1", "A".repeat(43) + "=", JSON.stringify(identity, null, 2),
+    "300", "80"];
   try {
     const result = await page.evaluate(`(async () => {
       if (document.getElementById("result").open) document.getElementById("resultclose").click();
@@ -529,7 +532,7 @@ await test("leased HA settings save, validate and protect peer identity", async 
       const box = document.getElementById("haform");
       const widgets = [...box.querySelectorAll(".field")].map((f) =>
         f.querySelector(".secretfield, .switch, .num, select, input"));
-      if (widgets.length !== 9 || widgets.some((w) => !w)) throw Error("HA fields missing");
+      if (widgets.length !== ${values.length} || widgets.some((w) => !w)) throw Error("HA fields missing: " + widgets.length);
       const values = ${JSON.stringify(values)};
       widgets.forEach((w, i) => { w.value = values[i]; w.dispatchEvent(new Event("input")); });
       const secret = box.querySelector(".secretfield input");
@@ -556,7 +559,9 @@ await test("leased HA settings save, validate and protect peer identity", async 
     equal(result.pending, [], "valid HA settings remained staged");
     equal(JSON.parse(result.current["peer-identity"]), identity, "JSON identity did not survive CLI quoting");
     equal(result.current.priority, "180", "HA priority was not saved");
-    check(result.commands.length === 9, "not every HA setting was staged");
+    equal(result.current["lease-ms"], "300", "HA lease was not saved");
+    equal(result.current["io-timeout-ms"], "80", "HA exchange budget was not saved");
+    check(result.commands.length === values.length, "not every HA setting was staged");
     const before = CONFIG && readFileSync(CONFIG, "utf8");
     const refused = await page.evaluate(`(async () => {
       document.getElementById("resultclose").click();
@@ -580,17 +585,27 @@ await test("leased HA settings save, validate and protect peer identity", async 
   }
 });
 
-await test("the independent witness edits preserve its enrollment credential", async () => {
-  const credential = "console-witness-enrollment-credential-123456";
+await test("the independent witness edits preserve its derived key", async () => {
+  // A witness now holds the derived key `sentinel ha witness-key` prints (64
+  // hex digits), not the members' enrollment credential; a key-only witness
+  // must name its cluster explicitly.
+  const credential = "0123456789abcdef".repeat(4);
   try {
     const result = await page.evaluate(`(async () => {
       if (document.getElementById("result").open) document.getElementById("resultclose").click();
       staged = []; dirty.clear(); renderStaged(); view = "ha"; panel = null; await refresh();
       const box = document.getElementById("hawitnessform");
-      const widgets = [...box.querySelectorAll(".field")].map((f) => f.querySelector(".secretfield, input"));
-      ["127.0.0.9:5440", ${JSON.stringify(credential)}, "console-ha-cluster-1"].forEach((v, i) => {
-        widgets[i].value = v; widgets[i].dispatchEvent(new Event("input"));
-      });
+      const field = (label) => [...box.querySelectorAll(".field")]
+        .find((f) => f.firstElementChild?.textContent.startsWith(label))
+        ?.querySelector(".secretfield, input");
+      const fill = { "Witness listen IP:port": "127.0.0.9:5440",
+        "Derived witness key": ${JSON.stringify(credential)},
+        "Witness cluster identifier": "console-ha-cluster-1" };
+      for (const [label, v] of Object.entries(fill)) {
+        const w = field(label);
+        if (!w) throw Error("witness field missing: " + label);
+        w.value = v; w.dispatchEvent(new Event("input"));
+      }
       [...box.querySelectorAll("button")].find((b) => b.textContent.startsWith("Stage")).click();
       await applyStaged(["commit", "save"]); await refresh();
       document.getElementById("resultclose").click();
@@ -602,12 +617,12 @@ await test("the independent witness edits preserve its enrollment credential", a
       return { commands, pending: stagedCommands() };
     })()`);
     equal(result.commands, ["set system ha-witness listen 127.0.0.9:5441"],
-      "editing the witness rewrote its protected credential");
+      "editing the witness rewrote its protected key");
     equal(result.pending, [], "witness edits did not apply");
     if (CONFIG) {
       const saved = readFileSync(CONFIG, "utf8");
       check(saved.includes(credential) && saved.includes('listen = "127.0.0.9:5441"'),
-        "the saved witness credential was lost or replaced by a redaction marker");
+        "the saved witness key was lost or replaced by a redaction marker");
     }
   } finally {
     await page.evaluate(`(async () => {
