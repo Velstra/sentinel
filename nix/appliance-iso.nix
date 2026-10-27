@@ -166,8 +166,9 @@ in
     system.nixos.label = lib.mkOverride 60 cfg.label;
     system.nixos.tags = lib.mkOverride 60 [ ];
 
+    image.baseName = lib.mkForce cfg.isoBaseName;
+
     isoImage = {
-      isoBaseName = lib.mkForce cfg.isoBaseName;
       volumeID = lib.mkForce cfg.volumeId;
       makeEfiBootable = true;
       makeUsbBootable = true;

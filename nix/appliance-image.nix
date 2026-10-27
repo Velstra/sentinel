@@ -262,7 +262,7 @@ in
         ''
           mkdir -p "$(dirname "$out/${config.image.filePath}")"
           img="$out/${config.image.filePath}"
-          cp ${config.system.build.finalImage}/${config.image.filePath} "$img"
+          cp ${config.system.build.image}/${config.image.filePath} "$img"
           chmod +w "$img"
           # ESP is the first partition; mtools addresses it at its byte offset.
           start=$(sfdisk -d "$img" | grep 'name="esp"' | grep -oE 'start=[[:space:]]*[0-9]+' | grep -oE '[0-9]+')
@@ -273,12 +273,10 @@ in
           mcopy -o -i "$img@@$off" uki.signed.efi "::/EFI/Linux/${ukiFile}"
         '';
 
-    # Automatic boot assessment: these upstream systemd units aren't NixOS
-    # defaults. With them present, the bless generator marks a clean boot good
-    # (counter stripped); `check-no-failures` gates that on no failed units.
+    # NixOS 26.05 already installs boot-complete.target and bless-boot when
+    # systemd has bootloader support. Add only the optional health gate;
+    # duplicating the built-in units breaks system-units construction.
     systemd.additionalUpstreamSystemUnits = [
-      "boot-complete.target"
-      "systemd-bless-boot.service"
       "systemd-boot-check-no-failures.service"
     ];
 
@@ -299,6 +297,7 @@ in
         device = "/usr/nix/store";
         fsType = "none";
         options = [ "bind" ];
+        neededForBoot = true;
       };
       # The one writable, persistent partition: the editable appliance state.
       # Addressed by ext4 LABEL=data so the same mount works for the image, a
@@ -321,6 +320,9 @@ in
 
     # mdadm RAID support, so a RAID install assembles its data array at boot.
     boot.swraid.enable = true;
+    # mdmon requires an event sink. Keep array failures visible in the journal
+    # even on appliances without a local mail transport.
+    boot.swraid.mdadmConf = "PROGRAM ${pkgs.util-linux}/bin/logger\n";
 
     # The updater mounts the ESP (vfat) to install the new slot's UKI.
     boot.supportedFilesystems.vfat = true;
@@ -345,6 +347,11 @@ in
         "-L"
         "data"
       ];
+      # Repart otherwise inherits the 512-byte disk sector size for EROFS.
+      # Older libblkid versions misvalidate checksums for sub-1KiB EROFS
+      # blocks, leaving a valid verity mapper stuck at SYSTEMD_READY=0.
+      # 4KiB filesystem blocks retain verity/CRC checks and work on 512-byte ESP disks.
+      mkfsOptions.erofs = [ "-b" "4096" ];
       verityStore.enable = true;
       # ukiPath defaults to /EFI/Linux/${ukiFile} — the BLS Type 2 location
       # systemd-boot auto-discovers.
