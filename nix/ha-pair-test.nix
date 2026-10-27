@@ -34,7 +34,9 @@ in pkgs.testers.runNixOSTest {
       networking.firewall.enable=lib.mkForce false;
       services.velstra.interface=lib.mkForce "eth1";
       services.velstra.appliance=lib.mkForce ((pkgs.formats.toml {}).generate "pair-witness-appliance.toml" {
-        system={hostname="witness";ha-witness={listen="10.3.0.3:5440";inherit secret;};};
+        # The derived key `sentinel ha witness-key` prints for this token and
+        # cluster; the witness never holds the members' machine token.
+        system={hostname="witness";ha-witness={listen="10.3.0.3:5440";key="b080d20c3e5dfd7ba3cfc3f7a2713448f452ebd8b56a9ef6dac76ff570b69da8";inherit cluster;member=["10.3.0.1" "10.3.0.2"];};};
         interface=[{name="eth1";address="10.3.0.3/24";zone="control";}];
         firewall.default_action="accept";
       });
@@ -61,18 +63,25 @@ in pkgs.testers.runNixOSTest {
         node.wait_until_succeeds("curl -ksf https://127.0.0.1:8080/api/v1/health",timeout=30)
     witness.wait_for_unit("sentinel-witness.service")
     witness.succeed("test $(stat -c %a /run/sentinel/witness.json) = 600")
+    witness.succeed("! grep -rq '${secret}' /var/lib/sentinel /run/sentinel")
+    # The printed key is what this witness was given.
+    printed=primary.succeed("printf %s '${secret}' | sentinel ha witness-key --secret-stdin")
+    assert 'key = "b080d20c3e5dfd7ba3cfc3f7a2713448f452ebd8b56a9ef6dac76ff570b69da8"' in printed and 'cluster = "${cluster}"' in printed, printed
     # A credential failure must happen before either document changes.
     before=primary.succeed("sha256sum /var/lib/sentinel/appliance.toml").split()[0]
-    primary.fail("sentinel ha pair 10.3.0.2:8080 --witness 10.3.0.3:5440 --secret wrong-credential-with-at-least-32-bytes")
+    primary.fail("printf %s wrong-credential-with-at-least-32-bytes | sentinel ha pair 10.3.0.2:8080 --witness 10.3.0.3:5440 --secret-stdin")
+    # A token on the command line is refused outright, not merely discouraged.
+    refused=primary.fail("sentinel ha pair 10.3.0.2:8080 --witness 10.3.0.3:5440 --secret ${secret} 2>&1")
+    assert "process list" in refused, refused
     assert primary.succeed("sha256sum /var/lib/sentinel/appliance.toml").split()[0]==before
     started=time.monotonic()
-    primary.succeed("su admin -c " + shlex.quote("sentinel ha pair 10.3.0.2:8080 --witness 10.3.0.3:5440 --secret ${secret}"))
+    primary.succeed("su admin -c " + shlex.quote("printf %s '${secret}' | sentinel ha pair 10.3.0.2:8080 --witness 10.3.0.3:5440 --secret-stdin"))
     assert time.monotonic()-started<30,"one-command HA pairing exceeded 30 seconds"
     primary.wait_until_succeeds("ip -o addr show eth1 | grep -q 10.1.0.100",timeout=20)
     secondary.wait_until_succeeds(python_command('import json; assert json.load(open("/run/velstra/ha/agent.json"))["ready_term"] > 0'),timeout=20)
     primary.succeed("test ! -e /var/lib/sentinel/ha-pair.json")
     # Repeating a completed enrollment must retain the same member identities.
-    primary.succeed("sentinel ha pair 10.3.0.2:8080 --witness 10.3.0.3:5440 --secret ${secret}")
+    primary.succeed("echo '${secret}' | sentinel ha pair 10.3.0.2:8080 --witness 10.3.0.3:5440 --secret-stdin")
     for node,number,address in [(primary,1,"10.1.0.1/24"),(secondary,2,"10.1.0.2/24")]:
         config=json.loads(node.succeed(python_command('import tomllib,json; print(json.dumps(tomllib.load(open("/var/lib/sentinel/appliance.toml","rb"))))')))
         assert config["system"]["ha"]["node"]==number
