@@ -344,8 +344,10 @@ in pkgs.testers.runNixOSTest {
     # 1 for the configured peer silence, node 2 alone opens a new empty epoch.
     master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=25)
     backup.wait_until_succeeds(python_command('import json; assert json.load(open("/run/velstra/ha/agent.json"))["ready_term"] > 0'),timeout=20)
-    master.crash()
     lost=time.monotonic()
+    # crash() waits for QEMU to exit. Start before cutting power, otherwise its
+    # blocking wait is wrongly subtracted from the witness's peer-silence age.
+    master.crash()
     backup.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
     backup.succeed("systemctl stop wren velstra")
     backup.succeed("systemctl start velstra wren")
