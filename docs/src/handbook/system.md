@@ -58,7 +58,8 @@ Leased active/passive HA uses two members and an independent witness. The witnes
 issues short-lived forwarding authority, enforced by a persistent kernel guard;
 a missing heartbeat alone never authorizes two nodes. Follow the
 [HA pairing and recovery guide](https://github.com/Velstra/sentinel/blob/main/docs/ha-phase3.md)
-for witness provisioning and `sentinel ha pair <peer-endpoint> --secret <token>`.
+for witness provisioning and `sentinel ha pair <peer-endpoint>` (the token is
+read from stdin with `--secret-stdin`, or prompted for without echo).
 Pairing authenticates the first TLS connection before sending the bearer and
 records both member profiles in canonical `appliance.toml`.
 

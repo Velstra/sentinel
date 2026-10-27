@@ -14,11 +14,12 @@
 
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 
 use crate::config::UpdateChannel;
 use crate::system;
 use crate::update;
+use crate::verified_image::VerifiedImage;
 
 /// A candidate target block device.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1020,20 +1021,7 @@ pub fn seed_config(targets: &[&Disk], raid: Raid, toml: &str, crypto: &Crypto) -
 pub fn update(image: &std::path::Path, commit: bool) -> Result<()> {
     use std::os::unix::fs::FileTypeExt;
 
-    if unsafe { libc::geteuid() } != 0 {
-        bail!("update must run as root (try `sudo sentinel update …`)");
-    }
-    let disk = find_source_disk()?;
-    let active = active_slot(&disk)?;
-    let inactive = if active.name == SLOT_A.name {
-        &SLOT_B
-    } else {
-        &SLOT_A
-    };
-    eprintln!(
-        "active slot: {} — updating inactive slot {} on {disk}",
-        active.name, inactive.name
-    );
+    let (disk, active, inactive) = update_target()?;
     if !commit {
         eprintln!(
             "(dry-run — re-run with --commit to write slot {} and switch the boot default)",
@@ -1053,38 +1041,11 @@ pub fn update(image: &std::path::Path, commit: bool) -> Result<()> {
         (dev.clone(), Some(LoopGuard(dev)))
     };
 
-    // The *identity* of the slot, not only its contents, and it is checked
-    // BEFORE any destructive write. systemd finds a verity pair by partition
-    // GUID -- the two halves of the image's root hash -- so a slot holding the
-    // new image while keeping the old slot's randomly assigned GUIDs is a slot
-    // the initrd cannot find. It then waits for a device that will never appear:
-    // the box hangs rather than failing, so it never resets, so the boot counter
-    // never decrements and the automatic rollback never fires. That is exactly
-    // how an updated appliance went dark on the bench.
-    //
-    // The same mechanism bites the *identical-image* case: if this image is
-    // byte-for-byte the one already running, its slot-A verity/store GUIDs ARE
-    // the active slot's GUIDs, and stamping them onto the inactive slot leaves
-    // two partitions sharing one PARTUUID — which the initrd cannot tell apart,
-    // so it hangs exactly as above. The GUIDs cannot be randomised away (verity
-    // derives them from the root hash the UKI expects), so the only safe answer
-    // is to refuse up front, before the inactive slot is touched.
+    // The slot's identity (its partition GUIDs) is checked before any write;
+    // see [`refuse_identical_image`] for why an identical image must be refused.
     let src_verity = partition_guid(&srcdev, SLOT_A.verity_part)?;
     let src_store = partition_guid(&srcdev, SLOT_A.store_part)?;
-    let active_verity = partition_guid(&disk, active.verity_part)?;
-    let active_store = partition_guid(&disk, active.store_part)?;
-    if src_verity == active_verity || src_store == active_store {
-        bail!(
-            "this image is identical to the running slot {active} (its verity/store \
-             partitions carry the same GUIDs): writing it to slot {inactive} would \
-             leave two partitions with the same PARTUUID, which the initrd cannot \
-             tell apart — the box would hang at boot instead of auto-rolling-back. \
-             Nothing was changed. Update to a freshly built image, which carries its \
-             own verity GUIDs.",
-            active = active.name,
-            inactive = inactive.name,
-        );
-    }
+    refuse_identical_image(&disk, active, inactive, &src_verity, &src_store)?;
 
     // Clone the source's slot-A store + verity hash into our inactive slot.
     eprintln!("writing slot {} from {srcdev} …", inactive.name);
@@ -1117,7 +1078,7 @@ pub fn update(image: &std::path::Path, commit: bool) -> Result<()> {
     run("partprobe", &[&disk]).ok();
     run("udevadm", &["settle"]).ok();
 
-    switch_boot(&disk, &srcdev, active, inactive)?;
+    switch_boot(&disk, UkiSource::Device(&srcdev), active, inactive)?;
     eprintln!(
         "update complete — reboot to boot slot {} (auto-rolls back to {} if it fails 3×)",
         inactive.name, active.name
@@ -1138,23 +1099,206 @@ pub fn update(image: &std::path::Path, commit: bool) -> Result<()> {
     Ok(())
 }
 
-/// Signed-channel update (roadmap C13): verify the channel's signed release
-/// manifest against the pinned key, fetch the image it names and verify its
-/// SHA-256, then hand that verified image to the existing slot-writer
-/// [`update`]. This is the ONLY path from a remote channel to the slot-write,
-/// and it is fail-closed: the call to `update()` is reached only after both
-/// [`update::check`] and [`update::fetch_verified_image`] have returned `Ok`, so
-/// an unsigned, wrong-key, or digest-mismatched image can never be written.
+/// The slot an update writes: the running disk, its active slot, and the
+/// inactive one that receives the image. Root only.
+fn update_target() -> Result<(String, &'static Slot, &'static Slot)> {
+    if unsafe { libc::geteuid() } != 0 {
+        bail!("update must run as root (try `sudo sentinel update …`)");
+    }
+    let disk = find_source_disk()?;
+    let active = active_slot(&disk)?;
+    let inactive = if active.name == SLOT_A.name {
+        &SLOT_B
+    } else {
+        &SLOT_A
+    };
+    eprintln!(
+        "active slot: {} — updating inactive slot {} on {disk}",
+        active.name, inactive.name
+    );
+    Ok((disk, active, inactive))
+}
+
+/// The *identity* of the slot, not only its contents, and it is checked
+/// BEFORE any destructive write. systemd finds a verity pair by partition
+/// GUID -- the two halves of the image's root hash -- so a slot holding the
+/// new image while keeping the old slot's randomly assigned GUIDs is a slot
+/// the initrd cannot find. It then waits for a device that will never appear:
+/// the box hangs rather than failing, so it never resets, so the boot counter
+/// never decrements and the automatic rollback never fires. That is exactly
+/// how an updated appliance went dark on the bench.
 ///
-/// The local-file form (`sentinel update <image>`) still calls [`update`]
-/// directly for a trusted, operator-supplied image; only the channel path goes
-/// through verification.
-pub fn update_from_channel(chan: &UpdateChannel, commit: bool) -> Result<()> {
+/// The same mechanism bites the *identical-image* case: if this image is
+/// byte-for-byte the one already running, its slot-A verity/store GUIDs ARE
+/// the active slot's GUIDs, and stamping them onto the inactive slot leaves
+/// two partitions sharing one PARTUUID — which the initrd cannot tell apart,
+/// so it hangs exactly as above. The GUIDs cannot be randomised away (verity
+/// derives them from the root hash the UKI expects), so the only safe answer
+/// is to refuse up front, before the inactive slot is touched.
+fn refuse_identical_image(
+    disk: &str,
+    active: &Slot,
+    inactive: &Slot,
+    src_verity: &str,
+    src_store: &str,
+) -> Result<()> {
+    let active_verity = partition_guid(disk, active.verity_part)?;
+    let active_store = partition_guid(disk, active.store_part)?;
+    if src_verity.eq_ignore_ascii_case(&active_verity)
+        || src_store.eq_ignore_ascii_case(&active_store)
+    {
+        bail!(
+            "this image is identical to the running slot {active} (its verity/store \
+             partitions carry the same GUIDs): writing it to slot {inactive} would \
+             leave two partitions with the same PARTUUID, which the initrd cannot \
+             tell apart — the box would hang at boot instead of auto-rolling-back. \
+             Nothing was changed. Update to a freshly built image, which carries its \
+             own verity GUIDs.",
+            active = active.name,
+            inactive = inactive.name,
+        );
+    }
+    Ok(())
+}
+
+/// A/B update from an image that must hash to `sha256` — the signed path, for
+/// a local image, a USB stick or a channel download alike.
+///
+/// Unlike [`update`], nothing here looks at the source twice by name: the image
+/// is opened once ([`VerifiedImage`]), hashed in full against the signed digest
+/// before anything is written, and then only the verified partitions are copied
+/// from that same open file — each re-hashed on the way, so a source that
+/// changes underneath (a rewritten file, a swapped stick) is refused before the
+/// slot is re-typed or the boot default moves. The GUIDs stamped on the slot
+/// and the UKI installed come from those verified bytes too; the UKI is read
+/// from a private copy of the image's ESP, not from a mount of the source.
+pub fn update_verified(source: &std::path::Path, sha256: &str, commit: bool) -> Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let (disk, active, inactive) = update_target()?;
+    // Not a let-chain: the appliance's pinned compiler predates them.
+    let same_disk = matches!(
+        (source.canonicalize(), std::path::Path::new(&disk).canonicalize()),
+        (Ok(src), Ok(running)) if src == running
+    );
+    if same_disk {
+        bail!(
+            "{} is the disk this box runs from; re-sealing the booted medium is the trusted \
+             path (--allow-unsigned), not a signed update",
+            source.display()
+        );
+    }
+    let image = VerifiedImage::open(source, sha256)?;
+    eprintln!("image SHA-256 verified against its signed digest");
+    if !commit {
+        eprintln!(
+            "(dry-run — re-run with --commit to write slot {} and switch the boot default)",
+            inactive.name
+        );
+        return Ok(());
+    }
+    refuse_identical_image(
+        &disk,
+        active,
+        inactive,
+        image.guid(SLOT_A.verity_part),
+        image.guid(SLOT_A.store_part),
+    )?;
+    let target = |part: u32, from: u32| -> Result<std::fs::File> {
+        use std::io::{Seek, SeekFrom};
+        let path = part_path(&disk, part);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening {path}"))?;
+        let room = file.seek(SeekFrom::End(0))?;
+        file.seek(SeekFrom::Start(0))?;
+        ensure!(
+            image.len(from) <= room,
+            "image partition {from} ({} bytes) does not fit slot partition {path} ({room} bytes)",
+            image.len(from)
+        );
+        Ok(file)
+    };
+    // Size checks for both before either is written.
+    let mut verity = target(inactive.verity_part, SLOT_A.verity_part)?;
+    let mut store = target(inactive.store_part, SLOT_A.store_part)?;
+    let esp_copy = update::Scratch::new()?;
+    let mut esp = esp_copy.create_private("esp.img")?;
+    eprintln!("writing slot {} from {} …", inactive.name, source.display());
+    let written = image
+        .copy_partition(SLOT_A.verity_part, &mut verity)
+        .and_then(|()| image.copy_partition(SLOT_A.store_part, &mut store))
+        .and_then(|()| image.copy_partition(1, &mut esp));
+    if let Err(error) = written {
+        bail!(
+            "{error:#}\nslot {} may hold a partial copy and was NOT activated: its partition \
+             types and the boot default are unchanged, the running slot {} is untouched.",
+            inactive.name,
+            active.name
+        );
+    }
+    run(
+        "sgdisk",
+        &[
+            &format!("--typecode={}:{USR_VERITY_TYPE}", inactive.verity_part),
+            &format!("--typecode={}:{USR_TYPE}", inactive.store_part),
+            &format!(
+                "--partition-guid={}:{}",
+                inactive.verity_part,
+                image.guid(SLOT_A.verity_part)
+            ),
+            &format!(
+                "--partition-guid={}:{}",
+                inactive.store_part,
+                image.guid(SLOT_A.store_part)
+            ),
+            &disk,
+        ],
+    )?;
+    run("partprobe", &[&disk]).ok();
+    run("udevadm", &["settle"]).ok();
+    switch_boot(
+        &disk,
+        UkiSource::EspImage(&esp_copy.join("esp.img")),
+        active,
+        inactive,
+    )?;
+    eprintln!(
+        "update complete — reboot to boot slot {} (auto-rolls back to {} if it fails 3×)",
+        inactive.name, active.name
+    );
+    if std::fs::metadata(source).is_ok_and(|m| m.file_type().is_block_device()) {
+        eprintln!(
+            "note: {} carries the same verity/store partition GUIDs as slot {} now. \
+             Unplug it before rebooting — while it is attached, the initrd may mount /usr \
+             from the medium instead of the slot.",
+            source.display(),
+            inactive.name
+        );
+    }
+    Ok(())
+}
+
+/// Signed-channel update (roadmap C13): verify the channel's signed release
+/// manifest against the pinned key, refuse a release older than the running one
+/// unless `allow_downgrade`, fetch the image it names and verify its SHA-256,
+/// then hand that image to [`update_verified`] with the manifest's digest — so
+/// the bytes written are hashed once more as they are read for the slot. This
+/// is the ONLY path from a remote channel to the slot-write, and it is
+/// fail-closed: an unsigned, wrong-key, stale or digest-mismatched release can
+/// never be written.
+pub fn update_from_channel(
+    chan: &UpdateChannel,
+    commit: bool,
+    allow_downgrade: bool,
+) -> Result<()> {
     let manifest = update::check(chan)?;
     eprintln!(
         "verified release {} (image {}) — signed by the pinned update key",
         manifest.version, manifest.image
     );
+    update::refuse_downgrade(&manifest.version, allow_downgrade)?;
 
     // Stage the verified image in a self-cleaning scratch dir that outlives the
     // slot-write below (it drops — and deletes the image — when this fn returns).
@@ -1164,7 +1308,7 @@ pub fn update_from_channel(chan: &UpdateChannel, commit: bool) -> Result<()> {
     eprintln!("image SHA-256 verified against the signed manifest");
 
     // Only now, past both crypto gates, does the image reach the slot-writer.
-    update(&image, commit)
+    update_verified(&image, &manifest.sha256, commit)
 }
 
 /// The mountpoint of a block device, if it's currently mounted.
@@ -1180,9 +1324,18 @@ fn mountpoint_of(dev: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Where the new slot's UKI comes from: the ESP of a source device (the
+/// trusted `--allow-unsigned` path, which may be the booted disk itself), or a
+/// private copy of a verified image's ESP.
+enum UkiSource<'a> {
+    Device(&'a str),
+    EspImage(&'a std::path::Path),
+}
+
 /// Install the source image's UKI onto the running ESP as the inactive slot's
 /// boot-counted entry (`<slot>+3.efi`) and point loader.conf's default at it.
-fn switch_boot(disk: &str, srcdev: &str, active: &Slot, inactive: &Slot) -> Result<()> {
+fn switch_boot(disk: &str, source: UkiSource, active: &Slot, inactive: &Slot) -> Result<()> {
+    let self_reseal = matches!(source, UkiSource::Device(dev) if dev == disk);
     // The running ESP is already mounted (systemd-gpt-auto puts it on /boot,
     // read-only). Reuse that mountpoint and flip it writable rather than mounting
     // the device a second time. If somehow unmounted, mount it ourselves.
@@ -1202,25 +1355,22 @@ fn switch_boot(disk: &str, srcdev: &str, active: &Slot, inactive: &Slot) -> Resu
 
     // Source ESP: a self-reseal from the same disk shares the dest ESP; a
     // separate image gets its ESP mounted read-only at a temp path.
-    let (src, _sg): (std::path::PathBuf, Option<MountGuard>) = if srcdev == disk {
+    let (src, _sg): (std::path::PathBuf, Option<MountGuard>) = if self_reseal {
         (dst.clone(), None)
     } else {
         let p = std::path::PathBuf::from("/run/sentinel/upd-src");
         std::fs::create_dir_all(&p)?;
-        run(
-            "mount",
-            &["-o", "ro", &part_path(srcdev, 1), p.to_str().unwrap()],
-        )?;
+        let (options, device) = match source {
+            UkiSource::Device(dev) => ("ro", part_path(dev, 1)),
+            UkiSource::EspImage(file) => ("ro,loop", file.to_string_lossy().into_owned()),
+        };
+        run("mount", &["-o", options, &device, p.to_str().unwrap()])?;
         (p.clone(), Some(MountGuard(p)))
     };
 
     // The source UKI: for a self-reseal pick the active slot's entry; for a
     // separate image there's exactly one UKI in its /EFI/Linux.
-    let want = if srcdev == disk {
-        Some(active.name)
-    } else {
-        None
-    };
+    let want = if self_reseal { Some(active.name) } else { None };
     let uki = std::fs::read_dir(src.join("EFI/Linux"))?
         .flatten()
         .map(|e| e.path())

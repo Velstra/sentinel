@@ -51,13 +51,23 @@ This bless mechanism is verified live (`Marked boot as 'good'`) in the
 
 ## What `sentinel update` does
 
-`sentinel update <image|device> --commit` (in `src/install.rs::update`):
+`sentinel update <image|device> --commit` (in `src/install.rs::update_verified`):
 
 1. detect the **active** slot via `/dev/mapper/usr`;
-2. `dd` the new image's store + verity into the **inactive** slot;
-3. `sgdisk --typecode` re-type that slot to the usr / usr-verity GUIDs;
-4. copy the new UKI to `/EFI/Linux/sentinel-<inactive>+3.efi`;
-5. rewrite `loader.conf` `default` to the slot it just wrote.
+2. open the image once and hash all of it against the signed digest, reading
+   its GPT (partition offsets and GUIDs) from the same bytes; nothing is written
+   unless it matches;
+3. copy the new image's store + verity into the **inactive** slot from that
+   same open file, re-hashing each partition — a source that changed since step
+   2 is refused before anything below happens;
+4. `sgdisk --typecode` re-type that slot to the usr / usr-verity GUIDs, stamping
+   the GUIDs read in step 2;
+5. copy the new UKI to `/EFI/Linux/sentinel-<inactive>+3.efi`, from a private
+   copy of the image's ESP;
+6. rewrite `loader.conf` `default` to the slot it just wrote.
+
+`--allow-unsigned` (`src/install.rs::update`) skips steps 2–3's verification
+and `dd`s from the device as given — the trusted re-seal path.
 
 The running ESP is auto-mounted at `/boot` (systemd-gpt-auto, read-only); the
 updater remounts it read-write in place rather than re-mounting the device.

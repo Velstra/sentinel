@@ -87,6 +87,78 @@ pkgs.testers.runNixOSTest {
         configure([])
         assert fw.succeed("cat /sys/class/net/tenant0/ifindex").strip() == first
 
+    with subtest("a recreated zoned link stays down until the data plane has hooked it"):
+        # With the agent stopped nothing can hook the link, so a link that
+        # comes up anyway forwards unfiltered: exactly the window between a
+        # link appearing and the agent's next pass. networkd recreates the
+        # deleted VLAN from its unit when it configures the parent (a reload
+        # alone leaves an unchanged parent, and so the VLAN, alone); the hold
+        # must keep it down.
+        fw.succeed("systemctl stop velstra.service")
+        fw.succeed("ip link delete tenant0")
+        fw.succeed("networkctl reconfigure eth1")
+        fw.wait_until_succeeds("test -e /sys/class/net/tenant0")
+        for _ in range(5):
+            flags = json.loads(fw.succeed("ip -j link show dev tenant0"))[0]["flags"]
+            assert "UP" not in flags, f"tenant0 came up with no data plane: {flags}"
+            fw.sleep(1)
+        # Dark, and said so: `ip` alone shows it exactly like a link somebody
+        # switched off.
+        shown = fw.succeed("sentinel show interfaces")
+        assert "tenant0: held: waiting for datapath" in shown, shown
+        fw.succeed("systemctl start velstra.service")
+        fw.wait_until_succeeds("ip -o link show dev tenant0 | grep -Eq '[<,]UP[,>]'", timeout=30)
+        fw.succeed("ip -d link show tenant0 | grep -q 'prog/xdp'")
+        fw.wait_until_succeeds("ip -4 addr show tenant0 | grep -q 192.0.2.1")
+        assert "held:" not in fw.succeed("sentinel show interfaces")
+        first = fw.succeed("cat /sys/class/net/tenant0/ifindex").strip()
+
+    with subtest("a zoned link disabled and enabled again comes back up"):
+        # The agent keeps its hook on a link while it is disabled, so enabling
+        # it again attaches nothing new. It must still be raised — otherwise it
+        # stays dark and every later commit fails on it.
+        configure(["set interface tenant0 disabled true"])
+        fw.wait_until_fails("ip -o link show dev tenant0 | grep -Eq '[<,]UP[,>]'")
+        configure(["delete interface tenant0 disabled"])
+        fw.wait_until_succeeds("ip -o link show dev tenant0 | grep -Eq '[<,]UP[,>]'", timeout=30)
+        fw.succeed("ip -d link show tenant0 | grep -q 'prog/xdp'")
+        fw.wait_until_succeeds("ip -4 addr show tenant0 | grep -q 192.0.2.1")
+        configure([])
+        first = fw.succeed("cat /sys/class/net/tenant0/ifindex").strip()
+
+    with subtest("a crashed agent puts its raised zoned links back into the hold"):
+        # The XDP program dies with the agent, so a zoned link left up would
+        # forward with nothing on it until the restart hooks it again. The
+        # unit's ExecStopPost takes it down; the restarted agent raises it.
+        # The journal line is the proof: Restart=on-failure brings the agent
+        # back within seconds, so sampling the link state alone could race.
+        #
+        # A crash kills the agent alone. Killing the whole unit kills the
+        # ExecStopPost with it, so for that the next start's ExecStartPre
+        # repeats the hold before the agent runs; either way the line appears.
+        for whom in ("main", "all"):
+            cursor = fw.succeed("journalctl -n 0 --show-cursor | sed -n 's/^-- cursor: //p'").strip()
+            fw.wait_until_succeeds("ip -o link show dev tenant0 | grep -Eq '[<,]UP[,>]'", timeout=30)
+            fw.succeed(f"systemctl kill --kill-whom={whom} -s KILL velstra.service")
+            fw.wait_until_succeeds(
+                f"journalctl --after-cursor='{cursor}' -u velstra.service "
+                "| grep -q 'hold-links-down: tenant0 held until the data plane hooks it again'",
+                timeout=30,
+            )
+            fw.wait_until_succeeds("systemctl is-active velstra.service", timeout=30)
+            fw.wait_until_succeeds("ip -o link show dev tenant0 | grep -Eq '[<,]UP[,>]'", timeout=30)
+            fw.succeed("ip -d link show tenant0 | grep -q 'prog/xdp'")
+            assert "held:" not in fw.succeed("sentinel show interfaces")
+
+    with subtest("an unchanged commit removes addresses the configuration does not set"):
+        fw.succeed("ip addr add 203.0.113.77/32 dev tenant0")
+        fw.succeed("ip -6 addr add 2001:db8:77::7/64 dev tenant0 nodad")
+        configure([])
+        fw.wait_until_fails("ip -4 addr show tenant0 | grep -q 203.0.113.77")
+        fw.wait_until_fails("ip -6 addr show tenant0 | grep -q 2001:db8:77::7")
+        fw.succeed("ip -4 addr show tenant0 | grep -q 192.0.2.1")
+        assert fw.succeed("cat /sys/class/net/tenant0/ifindex").strip() == first
+
     with subtest("recreating a bridge reattaches its unchanged members"):
         before = fw.succeed("cat /sys/class/net/br0/ifindex").strip()
         configure(["set interface br0 bridge stp true"])
@@ -134,6 +206,16 @@ pkgs.testers.runNixOSTest {
             fw.fail("test -e /run/systemd/network/10-sentinel-" + name + ".netdev")
         fw.fail("test -e /run/sentinel/network-retire.json")
         configure([])
+
+    with subtest("a physical interface removed from the configuration is released"):
+        # networkd only forgets a link whose unit disappears; the address and
+        # the up state would stay, on a link the data plane no longer hooks.
+        configure(["set interface eth1 address 203.0.113.1/24"])
+        fw.wait_until_succeeds("ip -4 addr show eth1 | grep -q 203.0.113.1")
+        configure(["delete interface eth1"])
+        fw.wait_until_fails("ip -4 addr show eth1 | grep -q 203.0.113.1")
+        flags = json.loads(fw.succeed("ip -j link show dev eth1"))[0]["flags"]
+        assert "UP" not in flags, flags
 
     with subtest("DNS changes settle without restarting on every commit"):
         configure(["set services dns upstream 192.0.2.53"])

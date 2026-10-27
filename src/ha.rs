@@ -10,9 +10,84 @@ use std::{
     collections::BTreeSet,
     net::{IpAddr, SocketAddr},
     path::Path,
+    time::{Duration, Instant},
 };
 
 pub const WITNESS_CONFIG: &str = "/run/sentinel/witness.json";
+const WITNESS_KEY_LABEL: &[u8] = b"Velstra Sentinel witness key v1\0";
+
+// The witness timing budget. Wren re-checks the same relation when its
+// coordinator starts; refusing it here turns a pair that would never hold
+// authority into a commit error instead of an outage.
+//
+// A member's lease runs from the instant it started connecting, so round trips
+// are spent out of the lease. One exchange is about three round trips and is
+// abandoned after the I/O budget; the lease must outlast one abandoned exchange,
+// the coordinator's poll and the safety margin.
+pub const LEASE_MS: u64 = 250;
+pub const IO_MS: u64 = 80;
+const POLL_MS: u64 = 25;
+const MARGIN_MS: u64 = 20;
+const MAX_LEASE_MS: u64 = 10_000;
+pub const PEER_SILENCE_MS: u64 = 10_000;
+pub fn check_budget(lease_ms: u64, io_ms: u64) -> Result<()> {
+    ensure!(
+        (1..=MAX_LEASE_MS).contains(&lease_ms) && io_ms > 0,
+        "HA lease-ms must be 1..={MAX_LEASE_MS} and io-timeout-ms nonzero"
+    );
+    ensure!(
+        2 * io_ms + POLL_MS + MARGIN_MS <= lease_ms,
+        "HA io-timeout-ms {io_ms} does not fit lease-ms {lease_ms}: 2 x io-timeout-ms + \
+         {POLL_MS} ms poll + {MARGIN_MS} ms margin must not exceed the lease (set lease-ms \
+         to at least {} here and on the witness)",
+        2 * io_ms + POLL_MS + MARGIN_MS
+    );
+    Ok(())
+}
+/// The coordinator rewrites its role once per exchange, so the agent must
+/// accept a role as old as one I/O budget plus the poll on either side of it.
+/// Staleness only says the coordinator is gone; the lease deadline inside the
+/// role, enforced by the kernel, is what fences forwarding.
+fn role_fresh_ms(io_ms: u64) -> u64 {
+    (io_ms + 2 * POLL_MS).max(100)
+}
+/// Three round trips must fit in three quarters of the I/O budget, leaving the
+/// rest for the witness's own work and an occasional retransmission.
+pub fn check_witness_rtt(rtt: Duration, io_ms: u64) -> Result<()> {
+    let rtt_ms = u64::try_from(rtt.as_millis()).unwrap_or(u64::MAX);
+    ensure!(
+        rtt_ms.saturating_mul(4) <= io_ms,
+        "witness round trip {rtt_ms} ms does not fit io-timeout-ms {io_ms}: set \
+         system ha io-timeout-ms to at least {} and lease-ms (on both members and the \
+         witness) to at least {}, or move the witness closer",
+        rtt_ms.saturating_mul(4),
+        rtt_ms.saturating_mul(8) + POLL_MS + MARGIN_MS
+    );
+    Ok(())
+}
+/// The best of a few TCP handshakes: one round trip, without credentials. A
+/// witness that is unreachable from the primary would leave the pair fenced.
+fn witness_rtt(witness: &str) -> Result<Duration> {
+    let endpoint = numeric_endpoint(witness)?;
+    let mut best: Option<Duration> = None;
+    let mut last = None;
+    for _ in 0..3 {
+        let started = Instant::now();
+        match std::net::TcpStream::connect_timeout(&endpoint, Duration::from_secs(1)) {
+            Ok(_) => best = Some(best.map_or(started.elapsed(), |b| b.min(started.elapsed()))),
+            Err(error) => last = Some(error),
+        }
+    }
+    best.with_context(|| {
+        format!(
+            "witness {witness} is unreachable from this member ({}); the pair would stay fenced",
+            last.map_or_else(String::new, |e| e.to_string())
+        )
+    })
+}
+pub fn witness_key(token: &str, cluster: &str) -> String {
+    derive(token, WITNESS_KEY_LABEL, cluster)
+}
 #[derive(Debug, Serialize)]
 pub struct DataplaneHa {
     enabled: bool,
@@ -23,6 +98,7 @@ pub struct DataplaneHa {
     wireguard_ports: Vec<u16>,
     wireguard: Vec<String>,
     wireguard_policy: String,
+    role_fresh_ms: u64,
 }
 #[derive(Serialize)]
 pub struct RoutingHa {
@@ -34,6 +110,8 @@ pub struct RoutingHa {
     preempt: bool,
     wireguard: Vec<String>,
     wireguard_policy: String,
+    lease_ms: u64,
+    io_ms: u64,
 }
 impl std::fmt::Debug for RoutingHa {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -134,6 +212,7 @@ pub fn dataplane(a: &Appliance) -> Option<DataplaneHa> {
             .map(|i| i.name.clone())
             .collect(),
         interfaces,
+        role_fresh_ms: role_fresh_ms(ha.io_timeout_ms.unwrap_or(IO_MS)),
         wireguard_policy: wireguard_policy(a),
         wireguard: a
             .vpn
@@ -157,11 +236,12 @@ pub fn routing(a: &Appliance) -> Option<RoutingHa> {
         cluster: ha.cluster.clone(),
         node: ha.node(),
         witness: ha.witness.clone(),
-        secret: derive(
+        secret: witness_key(
             a.system.config_sync.secret.as_deref().unwrap_or_default(),
-            b"Velstra Sentinel witness key v1\0",
             &ha.cluster,
         ),
+        lease_ms: ha.lease_ms.unwrap_or(LEASE_MS),
+        io_ms: ha.io_timeout_ms.unwrap_or(IO_MS),
         priority: ha.priority(),
         preempt: ha.preempt,
         wireguard_policy: wireguard_policy(a),
@@ -173,6 +253,81 @@ pub fn routing(a: &Appliance) -> Option<RoutingHa> {
             .map(|w| w.name.clone())
             .collect(),
     })
+}
+fn validate_witness(w: &crate::config::HaWitness) -> Result<()> {
+    numeric_endpoint(&w.listen)?;
+    ensure!(
+        w.key.is_empty() != w.secret.is_empty(),
+        "HA witness needs exactly one of key (derived, from `sentinel ha witness-key`) or the deprecated secret"
+    );
+    if w.key.is_empty() {
+        ensure!(
+            (32..=1024).contains(&w.secret.len()),
+            "HA witness secret must contain 32..1024 bytes"
+        );
+    } else {
+        ensure!(
+            w.key.len() == 64 && w.key.bytes().all(|b| b.is_ascii_hexdigit()),
+            "HA witness key must be the 64 hex digits `sentinel ha witness-key` prints"
+        );
+        // The cluster is derived from the credential, which a key-only
+        // witness deliberately does not hold.
+        ensure!(
+            !w.cluster.is_empty(),
+            "a witness configured with a key needs its explicit cluster identifier"
+        );
+    }
+    ensure!(
+        w.cluster.is_empty() || valid_cluster(&w.cluster),
+        "invalid HA witness cluster identifier"
+    );
+    // Compared in the witness's own form: it maps an IPv4-mapped IPv6 member
+    // (`::ffff:10.0.0.1`) to plain IPv4 before checking the two differ, so a
+    // pair that differs only in that spelling would pass here and leave a
+    // witness that refuses to start.
+    let members = witness_members(w)?;
+    ensure!(
+        members.is_empty()
+            || members.len() == 2
+                && members[0] != members[1]
+                && members.iter().all(|m| !m.is_unspecified()),
+        "HA witness needs the two distinct member addresses"
+    );
+    let lease = w.lease_ms.unwrap_or(LEASE_MS);
+    ensure!(
+        lease > MARGIN_MS && lease <= MAX_LEASE_MS,
+        "HA witness lease-ms must be {}..={MAX_LEASE_MS}",
+        MARGIN_MS + 1
+    );
+    let silence = w.peer_silence_ms.unwrap_or(PEER_SILENCE_MS);
+    ensure!(
+        silence >= 1_000 && silence >= 4 * lease,
+        "HA witness peer-silence-ms must be at least 1000 and four leases"
+    );
+    Ok(())
+}
+/// Commit-time advisories. Neither blocks a commit: refusing a witness that
+/// boots from an older document would take its pair's authority down with it.
+pub fn witness_warnings(a: &Appliance) -> Vec<String> {
+    let Some(w) = &a.system.ha_witness else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if !w.secret.is_empty() {
+        out.push(
+            "system ha-witness secret is the members' enrollment credential and API machine \
+             token; replace it with the derived key from `sentinel ha witness-key`"
+                .into(),
+        );
+    }
+    if w.members.is_empty() {
+        out.push(format!(
+            "system ha-witness has no member addresses: any host that reaches {} can hold \
+             the sessions both members need to renew their leases",
+            w.listen
+        ));
+    }
+    out
 }
 fn interface_address(a: &Appliance, name: &str, address: IpAddr) -> bool {
     a.interfaces
@@ -193,19 +348,15 @@ pub fn validate(a: &Appliance) -> Result<()> {
         "a witness must be independent of either HA member"
     );
     if let Some(w) = &a.system.ha_witness {
-        numeric_endpoint(&w.listen)?;
-        ensure!(
-            (32..=1024).contains(&w.secret.len()),
-            "HA witness secret must contain 32..1024 bytes"
-        );
-        ensure!(
-            w.cluster.is_empty() || valid_cluster(&w.cluster),
-            "invalid HA witness cluster identifier"
-        );
+        validate_witness(w)?;
     }
     let Some(ha) = &a.system.ha else {
         return Ok(());
     };
+    check_budget(
+        ha.lease_ms.unwrap_or(LEASE_MS),
+        ha.io_timeout_ms.unwrap_or(IO_MS),
+    )?;
     let witness = numeric_endpoint(&ha.witness)?;
     ensure!(
         !witness.ip().is_unspecified(),
@@ -490,27 +641,56 @@ pub fn materialize_peer(mut a: Appliance) -> Result<Appliance> {
     Ok(a)
 }
 
+/// The witness's member addresses as the witness compares them: numeric, and
+/// with an IPv4-mapped IPv6 address taken as the IPv4 address it carries — an
+/// IPv4 member reaching a dual-stack listener arrives mapped.
+fn witness_members(w: &crate::config::HaWitness) -> Result<Vec<IpAddr>> {
+    w.members
+        .iter()
+        .map(|m| {
+            m.parse::<IpAddr>()
+                .map(|ip| ip.to_canonical())
+                .with_context(|| format!("HA witness member {m:?} must be a numeric IP address"))
+        })
+        .collect()
+}
 #[derive(Serialize)]
 struct WitnessRuntime {
     cluster: String,
+    /// The derived witness key the members also derive; the handshake is
+    /// keyed by exactly these bytes, whichever way the witness obtained them.
     secret: String,
     listen: String,
     state: &'static str,
+    members: Vec<IpAddr>,
+    lease_ms: u64,
+    peer_silence_ms: u64,
+}
+fn witness_runtime(w: &crate::config::HaWitness) -> Result<WitnessRuntime> {
+    let cluster = if !w.cluster.is_empty() {
+        w.cluster.clone()
+    } else {
+        cluster_id(&w.secret)
+    };
+    let secret = if w.key.is_empty() {
+        witness_key(&w.secret, &cluster)
+    } else {
+        w.key.to_ascii_lowercase()
+    };
+    Ok(WitnessRuntime {
+        secret,
+        cluster,
+        listen: w.listen.clone(),
+        state: "/var/lib/sentinel/witness/state.json",
+        members: witness_members(w)?,
+        lease_ms: w.lease_ms.unwrap_or(LEASE_MS),
+        peer_silence_ms: w.peer_silence_ms.unwrap_or(PEER_SILENCE_MS),
+    })
 }
 pub fn apply_witness(a: &Appliance, live: bool) -> Result<()> {
     let path = Path::new(WITNESS_CONFIG);
     if let Some(w) = &a.system.ha_witness {
-        let cluster = if w.cluster.is_empty() {
-            cluster_id(&w.secret)
-        } else {
-            w.cluster.clone()
-        };
-        let runtime = WitnessRuntime {
-            secret: derive(&w.secret, b"Velstra Sentinel witness key v1\0", &cluster),
-            cluster,
-            listen: w.listen.clone(),
-            state: "/var/lib/sentinel/witness/state.json",
-        };
+        let runtime = witness_runtime(w)?;
         let text = serde_json::to_string(&runtime)?;
         let changed = system::read_owned_file(path)?.as_deref() != Some(&text);
         system::install_ha_secret(path, &text)?;
@@ -620,6 +800,9 @@ fn state_address(a: &Appliance, remote: IpAddr) -> Result<(String, String)> {
     ))
 }
 
+/// How long the primary waits for the peer to apply and acknowledge pairing.
+const PAIR_ACK_SECS: u32 = 25;
+
 pub fn pair(
     peer: &str,
     secret: &str,
@@ -713,6 +896,16 @@ pub fn pair(
         let mut secondary = remote.appliance;
         let witness = witness.map(str::to_owned).or_else(|| local.system.ha.as_ref().map(|h|h.witness.clone())).context("configure system.ha.witness or pass --witness with an independent witness endpoint")?;
         numeric_endpoint(&witness)?;
+        // Timing prepared on the primary applies to both members; check that
+        // this witness can answer inside it before either document changes.
+        let (lease_ms, io_timeout_ms) = local
+            .system
+            .ha
+            .as_ref()
+            .map_or((None, None), |h| (h.lease_ms, h.io_timeout_ms));
+        let io = io_timeout_ms.unwrap_or(IO_MS);
+        check_budget(lease_ms.unwrap_or(LEASE_MS), io)?;
+        check_witness_rtt(witness_rtt(&witness)?, io)?;
         let cluster = local
             .system
             .ha
@@ -760,6 +953,8 @@ pub fn pair(
             sync_interface: local_interface.clone(),
             priority: Some(200),
             preempt: local.system.ha.as_ref().is_some_and(|h| h.preempt),
+            lease_ms,
+            io_timeout_ms,
             ..Default::default()
         });
         secondary.system.ha = Some(crate::config::Ha {
@@ -769,6 +964,8 @@ pub fn pair(
             witness,
             sync_interface: remote_interface,
             priority: Some(100),
+            lease_ms,
+            io_timeout_ms,
             ..Default::default()
         });
         for (a, listen, other) in [
@@ -850,12 +1047,16 @@ pub fn pair(
     staged
         .file
         .write_all(serde_json::to_string(&plan.request)?.as_bytes())?;
+    // The peer answers only after its live apply, which restarts its data
+    // plane: its zoned links, the one carrying this request included, are
+    // held down until the new agent has hooked them again. The budget covers
+    // that restart, not just a round trip.
     system::curl_request(
         &format!("https://{peer}/api/v1/ha/pair"),
         Some(secret),
         "POST",
         Some(&staged.path),
-        10,
+        PAIR_ACK_SECS,
         Some(&plan.pin),
     )
     .context(
@@ -991,6 +1192,107 @@ pub fn masquerade_address(a: &Appliance, interface: &str) -> Option<String> {
     (addresses.len() == 1).then(|| addresses.first().expect("one VIP").to_string())
 }
 
+/// `show ha`: the agent's own view of forwarding authority, with the reason a
+/// standby could not take over. "Backup" alone reads as "covered"; a standby
+/// whose policy or state does not match the owner's is not.
+pub fn render_status(status: &serde_json::Value) -> String {
+    let role = status["role"].as_str().unwrap_or("unknown");
+    if role == "standalone" {
+        return "HA standalone (leased HA is not configured)\n".into();
+    }
+    let mut out = match status["not_ready"].as_str() {
+        Some(reason) if role != "Master" => format!("HA {role} (not ready: {reason})\n"),
+        _ => format!("HA {role}\n"),
+    };
+    let number = |key: &str| status[key].as_u64().map_or("-".into(), |v| v.to_string());
+    out.push_str(&format!(
+        "  node {}  cluster {}  term {}  owner {}\n",
+        number("node"),
+        status["cluster"].as_str().unwrap_or("-"),
+        number("term"),
+        number("owner"),
+    ));
+    if role == "Master" {
+        out.push_str(&format!(
+            "  lease remaining {} ms\n",
+            number("lease_remaining_ms")
+        ));
+    } else {
+        out.push_str(&format!(
+            "  last complete state update {} ms ago\n",
+            number("sync_age_ms")
+        ));
+    }
+    out
+}
+
+/// How long a standby may be unable to take over before somebody is told.
+/// Long enough to cover an ordinary configuration-sync delivery after a
+/// commit, short enough that the gap is not discovered by the next outage.
+pub const STANDBY_ALERT_AFTER: Duration = Duration::from_secs(30);
+const WATCH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Turns a stream of agent HA status reports into at most one alert per
+/// episode of standby unreadiness, and one when it ends.
+#[derive(Default)]
+pub struct ReadinessWatch {
+    since: Option<Instant>,
+    alerted: bool,
+}
+impl ReadinessWatch {
+    pub fn observe(
+        &mut self,
+        status: &serde_json::Value,
+        now: Instant,
+    ) -> Option<crate::alert::Alert> {
+        let reason = matches!(status["role"].as_str(), Some("Backup" | "Fenced"))
+            .then(|| status["not_ready"].as_str())
+            .flatten();
+        let Some(reason) = reason else {
+            self.since = None;
+            return std::mem::take(&mut self.alerted).then(|| crate::alert::Alert {
+                subject: "HA standby ready again".into(),
+                detail: "the standby can take over from the active member again".into(),
+            });
+        };
+        let since = *self.since.get_or_insert(now);
+        let waited = now.saturating_duration_since(since);
+        if self.alerted || waited < STANDBY_ALERT_AFTER {
+            return None;
+        }
+        self.alerted = true;
+        Some(crate::alert::Alert {
+            subject: "HA standby not ready".into(),
+            detail: format!(
+                "{reason} (for {} s): a failure of the active member now would not fail over",
+                waited.as_secs()
+            ),
+        })
+    }
+}
+
+/// `sentinel ha watch`, run by systemd: the alert path for a standby that
+/// cannot take over. Unit failures already alert through `OnFailure=`; this is
+/// the case where every unit is healthy and the pair is still not redundant.
+pub fn watch(config: &Path) -> Result<()> {
+    let mut readiness = ReadinessWatch::default();
+    loop {
+        let status = crate::velstra::query("ha-status")
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+        if let Some(alert) = status.and_then(|s| readiness.observe(&s, Instant::now())) {
+            eprintln!("{}: {}", alert.subject, alert.detail);
+            match Appliance::load(config) {
+                Ok(a) => {
+                    crate::alert::deliver(&a.services.alerts, &alert);
+                }
+                Err(error) => eprintln!("HA watch: cannot read alert targets: {error:#}"),
+            }
+        }
+        std::thread::sleep(WATCH_INTERVAL);
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn paired_fixture() -> Appliance {
     let mut primary = Appliance::from_toml(
@@ -1049,6 +1351,233 @@ virtual-address=["10.10.0.254"]
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn witness_appliance(extra: &str) -> Result<Appliance> {
+        let a = Appliance::from_toml(&format!(
+            "[system]\nhostname=\"witness\"\n[system.ha-witness]\nlisten=\"10.20.0.3:5440\"\n{extra}"
+        ))?;
+        a.validate()?;
+        Ok(a)
+    }
+    #[test]
+    fn a_key_only_witness_holds_no_member_credential_and_keys_the_same_handshake() {
+        let member = paired_fixture();
+        let token = member.system.config_sync.secret.clone().unwrap();
+        let key = witness_key(&token, "test-cluster-0123456789");
+        let witness = witness_appliance(&format!(
+            "key=\"{key}\"\ncluster=\"test-cluster-0123456789\"\nmember=[\"10.20.0.1\",\"10.20.0.2\"]\n"
+        ))
+        .unwrap();
+        let runtime = witness_runtime(witness.system.ha_witness.as_ref().unwrap()).unwrap();
+        // The members derive the handshake key from their credential; the
+        // witness is handed the result and nothing it could sign in with.
+        let routed = serde_json::to_value(routing(&member).unwrap()).unwrap();
+        assert_eq!(routed["secret"], runtime.secret.as_str());
+        assert_ne!(runtime.secret, token);
+        assert!(!witness.to_toml().unwrap().contains(&token));
+        let written = serde_json::to_string(&runtime).unwrap();
+        assert!(!written.contains(&token));
+        assert_eq!(
+            runtime.members,
+            vec![
+                "10.20.0.1".parse::<IpAddr>().unwrap(),
+                "10.20.0.2".parse().unwrap()
+            ]
+        );
+        assert!(witness_warnings(&witness).is_empty());
+    }
+    #[test]
+    fn a_legacy_credential_witness_keeps_its_pair_but_is_told_to_migrate() {
+        let witness = witness_appliance(
+            "secret=\"abcdefghijklmnopqrstuvwxyz0123456789\"\ncluster=\"test-cluster-0123456789\"\n",
+        )
+        .unwrap();
+        let runtime = witness_runtime(witness.system.ha_witness.as_ref().unwrap()).unwrap();
+        let routed = serde_json::to_value(routing(&paired_fixture()).unwrap()).unwrap();
+        assert_eq!(
+            routed["secret"],
+            runtime.secret.as_str(),
+            "upgrade keeps the handshake"
+        );
+        let warnings = witness_warnings(&witness);
+        assert!(
+            warnings.iter().any(|w| w.contains("witness-key")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("no member addresses")),
+            "{warnings:?}"
+        );
+        assert!(witness.warnings().iter().any(|w| w.contains("witness-key")));
+    }
+    #[test]
+    fn witness_configuration_is_refused_when_it_cannot_identify_or_restrict() {
+        let key = "a".repeat(64);
+        for bad in [
+            format!("key=\"{key}\"\n"),
+            format!(
+                "key=\"{key}\"\nsecret=\"abcdefghijklmnopqrstuvwxyz0123456789\"\ncluster=\"test-cluster-0123456789\"\n"
+            ),
+            "key=\"short\"\ncluster=\"test-cluster-0123456789\"\n".into(),
+            format!("key=\"{key}\"\ncluster=\"test-cluster-0123456789\"\nmember=[\"10.20.0.1\"]\n"),
+            format!(
+                "key=\"{key}\"\ncluster=\"test-cluster-0123456789\"\nmember=[\"10.20.0.1\",\"10.20.0.1\"]\n"
+            ),
+            format!(
+                "key=\"{key}\"\ncluster=\"test-cluster-0123456789\"\nmember=[\"witness.example\",\"10.20.0.1\"]\n"
+            ),
+            format!(
+                "key=\"{key}\"\ncluster=\"test-cluster-0123456789\"\nlease-ms=1000\npeer-silence-ms=2000\n"
+            ),
+        ] {
+            assert!(witness_appliance(&bad).is_err(), "accepted {bad}");
+        }
+    }
+    #[test]
+    fn a_v4_mapped_witness_member_is_the_same_member_as_its_ipv4_form() {
+        // The witness compares members after mapping `::ffff:a.b.c.d` to
+        // `a.b.c.d` (an IPv4 member reaching a dual-stack listener arrives
+        // mapped), so these two spellings are one member: a commit that
+        // accepted them would leave a witness that refuses to start.
+        let key = "a".repeat(64);
+        let duplicate = format!(
+            "key=\"{key}\"\ncluster=\"test-cluster-0123456789\"\nmember=[\"10.20.0.1\",\"::ffff:10.20.0.1\"]\n"
+        );
+        let error = witness_appliance(&duplicate).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("two distinct member addresses"),
+            "{error:#}"
+        );
+
+        // A mapped spelling of a distinct member is accepted, and handed to
+        // the witness in the form the witness itself compares in.
+        let mapped = witness_appliance(&format!(
+            "key=\"{key}\"\ncluster=\"test-cluster-0123456789\"\nmember=[\"::ffff:10.20.0.1\",\"10.20.0.2\"]\n"
+        ))
+        .unwrap();
+        let runtime = witness_runtime(mapped.system.ha_witness.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            runtime.members,
+            vec![
+                "10.20.0.1".parse::<IpAddr>().unwrap(),
+                "10.20.0.2".parse().unwrap()
+            ]
+        );
+    }
+    #[test]
+    fn the_witness_timing_budget_is_validated_and_reaches_every_consumer() {
+        check_budget(LEASE_MS, IO_MS).unwrap();
+        let error = check_budget(250, 150).unwrap_err().to_string();
+        assert!(error.contains("at least 345"), "{error}");
+        check_witness_rtt(Duration::from_millis(20), IO_MS).unwrap();
+        let error = check_witness_rtt(Duration::from_millis(50), IO_MS)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("io-timeout-ms to at least 200") && error.contains("at least 445"),
+            "{error}"
+        );
+        let mut a = paired_fixture();
+        let guard = serde_json::to_value(dataplane(&a).unwrap()).unwrap();
+        assert_eq!(guard["role_fresh_ms"], 130);
+        let ha = a.system.ha.as_mut().unwrap();
+        ha.lease_ms = Some(250);
+        ha.io_timeout_ms = Some(150);
+        assert!(a.validate().is_err(), "a budget wren would refuse");
+        a.system.ha.as_mut().unwrap().lease_ms = Some(400);
+        a.validate().unwrap();
+        let routed = serde_json::to_value(routing(&a).unwrap()).unwrap();
+        assert_eq!(
+            (routed["lease_ms"].as_u64(), routed["io_ms"].as_u64()),
+            (Some(400), Some(150))
+        );
+        let guard = serde_json::to_value(dataplane(&a).unwrap()).unwrap();
+        assert_eq!(guard["role_fresh_ms"], 200);
+        let peer = materialize_peer(a).unwrap();
+        assert_eq!(peer.system.ha.as_ref().unwrap().io_timeout_ms, Some(150));
+    }
+    #[test]
+    fn show_ha_names_why_a_standby_cannot_take_over() {
+        let backup = serde_json::json!({"role":"Backup","node":2,"cluster":"c","term":5,"owner":1,
+            "ready":false,"not_ready":"policy differs from the owner's; awaiting configuration sync",
+            "sync_age_ms":40});
+        let text = render_status(&backup);
+        assert!(
+            text.starts_with("HA Backup (not ready: policy differs from the owner's; awaiting configuration sync)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("node 2") && text.contains("40 ms ago"),
+            "{text}"
+        );
+        let master = serde_json::json!({"role":"Master","node":1,"term":5,"owner":1,"lease_remaining_ms":180,"not_ready":null});
+        assert!(render_status(&master).starts_with("HA Master\n"));
+        assert!(render_status(&serde_json::json!({"role":"standalone"})).contains("standalone"));
+    }
+    #[test]
+    fn an_unready_standby_alerts_once_after_the_threshold_and_once_on_recovery() {
+        let mut watch = ReadinessWatch::default();
+        let start = Instant::now();
+        let unready = serde_json::json!({"role":"Backup","not_ready":"state snapshot is stale"});
+        let ready = serde_json::json!({"role":"Backup","not_ready":null});
+        assert!(watch.observe(&unready, start).is_none());
+        assert!(
+            watch
+                .observe(
+                    &unready,
+                    start + STANDBY_ALERT_AFTER - Duration::from_millis(1)
+                )
+                .is_none()
+        );
+        let alert = watch
+            .observe(&unready, start + STANDBY_ALERT_AFTER)
+            .unwrap();
+        assert_eq!(alert.subject, "HA standby not ready");
+        assert!(alert.detail.contains("state snapshot is stale"));
+        assert!(
+            watch
+                .observe(&unready, start + 10 * STANDBY_ALERT_AFTER)
+                .is_none(),
+            "one alert per episode"
+        );
+        assert_eq!(
+            watch
+                .observe(&ready, start + 11 * STANDBY_ALERT_AFTER)
+                .unwrap()
+                .subject,
+            "HA standby ready again"
+        );
+        assert!(
+            watch
+                .observe(&ready, start + 12 * STANDBY_ALERT_AFTER)
+                .is_none()
+        );
+        // A brief gap (a commit awaiting configuration sync) stays quiet.
+        assert!(
+            watch
+                .observe(&unready, start + 13 * STANDBY_ALERT_AFTER)
+                .is_none()
+        );
+        assert!(
+            watch
+                .observe(
+                    &ready,
+                    start + 13 * STANDBY_ALERT_AFTER + Duration::from_secs(3)
+                )
+                .is_none()
+        );
+        // The active member is not a standby, and neither is a standalone box.
+        let master = serde_json::json!({"role":"Master","not_ready":null});
+        assert!(
+            watch
+                .observe(&master, start + 20 * STANDBY_ALERT_AFTER)
+                .is_none()
+        );
+        assert!(
+            watch
+                .observe(&master, start + 30 * STANDBY_ALERT_AFTER)
+                .is_none()
+        );
+    }
     #[test]
     fn profile_swap_is_reversible_and_preserves_shared_intent() {
         let primary = paired_fixture();

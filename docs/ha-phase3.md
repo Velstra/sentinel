@@ -15,20 +15,60 @@ The control interface must remain outside every fenced data interface and its
 bridge/VLAN ancestry. Enable a reachable HTTPS management API on the secondary.
 Use its machine enrollment credential, not an account token.
 
-Provision the independent witness through its own `appliance.toml`:
-
-```toml
-[system.ha-witness]
-listen = "10.3.0.3:5440"
-secret = "a-strong-random-enrollment-credential-of-at-least-32-bytes"
-```
-
-Use the same enrollment credential on the secondary:
+Put the enrollment credential on the secondary:
 
 ```toml
 [system.config-sync]
 secret = "a-strong-random-enrollment-credential-of-at-least-32-bytes"
 ```
+
+The witness never holds that credential: it is also both members' API machine
+token. Derive the witness's own key from it on either member (the token is read
+from stdin, or prompted for without echo; add `--cluster` if the pair uses an
+explicit one):
+
+```sh
+sentinel ha witness-key
+```
+
+and provision the independent witness through its own `appliance.toml` with the
+printed `cluster` and `key`, plus the two members' control addresses:
+
+```toml
+[system.ha-witness]
+listen = "10.3.0.3:5440"
+cluster = "printed-cluster-identifier"
+key = "64-hex-digit-derived-witness-key"
+member = ["10.3.0.1", "10.3.0.2"]
+```
+
+The key authenticates lease sessions and nothing else; it cannot sign in to
+either member. The handshake is keyed by exactly the bytes the members derive,
+so a witness moved from `secret` to `key` keeps serving the same pair.
+
+**Upgrading a witness** that still has `secret`: it keeps working (a refused
+document at boot would take the pair's authority down with it), but every
+commit warns until `secret` is replaced by `key` and `cluster`. A witness
+without `member` likewise warns: any host that reaches the port can then hold
+the sessions both members need. With `member` set, every other source is
+closed before it can occupy a session, and each member has its own small
+session pool, so neither a third party nor one member's abandoned exchanges
+can starve the other's renewals. A witness on a Sentinel box should also only
+admit TCP to its port from the two members in its input policy, for example
+in a default-drop control zone, one rule per member:
+
+```toml
+[[rule]]
+name = "witness-member-1"
+from = "control"
+source = "10.3.0.1"
+proto = "tcp"
+port = 5440
+action = "accept"
+```
+
+A witness on another host needs the equivalent host-firewall allow-list. Upgrade both members and the witness together: the members' and
+witness's runtime files carry the new timing fields.
 
 The secondary's API starts over HTTPS on port 8080 when configuration sync alone
 is enabled. Its self-signed management identity persists in
@@ -46,8 +86,13 @@ witness = "10.3.0.3:5440"
 Then run on the primary:
 
 ```sh
-sentinel ha pair 10.3.0.2:8080 --secret "$PAIR_TOKEN"
+sentinel ha pair 10.3.0.2:8080
 ```
+
+The token is prompted for without echo, or read from standard input with
+`--secret-stdin` (`printf %s "$TOKEN" | sentinel ha pair … --secret-stdin`). A
+`--secret` argument is refused: a token on a command line is visible in the
+process list to every local user and stays in shell history.
 
 The command authenticates possession of the credential using a fresh challenge
 bound to the peer's actual TLS public key **before** sending any bearer or
@@ -89,6 +134,17 @@ that are not already present on the secondary. Existing shared MTU, VLAN,
 bridge, firewall, NAT, routing and service changes converge through the durable
 configuration outbox. Failed deliveries remain pending, including credentials
 needed to deliver a rotation after an outage or ambiguous acknowledgement.
+Each push names the shared revisions it was built on, and a member applies it
+only while it still holds one of them. When both members commit before either
+push lands, both pushes are refused as a conflict instead of each member
+silently taking the other's change: the outbox keeps them, the journal of
+`sentinel-configsync.service` says `CONFLICT`, and `GET /api/v1/stack` reports
+the member's `sync` as `conflict`. Roll back the member whose change should be
+discarded; the other member's held push then applies there. Only the machine
+credential may push (`PUT /api/v1/config-sync`); an account token is refused.
+Both members must run the same Sentinel version: a push from a version that
+does not name its base is refused as a conflict once the receiver has been
+synchronized.
 In leased mode, masquerade uses the egress link's single shared IPv4 VIP. Multiple
 VIPs require an explicit `nat.source.to` so the source identity is unambiguous;
 a member's private WAN address is never selected as the shared masquerade identity.
@@ -99,6 +155,42 @@ witness; the pair fails closed while its authority cannot be authenticated.
 legacy VRRP election. Removing the HA configuration explicitly disables the
 retained guard. An ordinary standalone diagnostic object cannot un-fence an
 existing appliance.
+
+## Witness timing budget
+
+A lease is valid locally from the instant its member *started* connecting,
+minus a 20ms margin, so every round trip to the witness is spent out of the
+lease. One exchange is about three round trips (TCP connect, nonce and tag,
+request and reply) and is abandoned after `io-timeout-ms`. The lease must
+survive one abandoned exchange plus the coordinator's 25ms poll:
+
+    2 x io-timeout-ms + 25 + 20 <= lease-ms
+
+The defaults, `lease-ms = 250` and `io-timeout-ms = 80`, need a witness round
+trip of at most 20ms (three round trips in three quarters of the I/O budget).
+A distant witness needs both raised, for example a 50ms round trip needs
+`io-timeout-ms = 200` and `lease-ms = 445` or more:
+
+```toml
+[system.ha]
+lease-ms = 500
+io-timeout-ms = 200
+
+[system.ha-witness]   # on the witness
+lease-ms = 500
+```
+
+Set the same lease on the witness and both members; a member honours the
+shorter of its own lease and the witness's grant, which is always safe but
+makes a too-short member lease flap. A longer lease lengthens the time a
+failed owner keeps authority, so failover takes correspondingly longer.
+Commit refuses a budget that does not fit; `sentinel ha pair` measures the
+witness round trip first and refuses to pair across a link that cannot fit
+the configured budget. Wren logs a warning whenever an exchange uses more
+than three quarters of its budget. The coordinator's role file is accepted
+by the data plane while it is at most `io-timeout-ms + 50ms` old (at least
+100ms); the lease deadline inside it, enforced by the kernel, is what fences
+forwarding.
 
 ## Authority, readiness and recovery
 
@@ -137,6 +229,32 @@ complete baseline and current agent incarnation, including after a long witness
 outage. A single empty agent cannot displace a warm owner. If both agents lose their
 state, fresh cold votes from both members allow node 1 to establish a new empty
 epoch; flows lost from both machines cannot be recovered.
+
+A **lone survivor** recovers on its own. When one member is gone for good and
+the other restarts its agent (or reboots), the survivor is cold: it has no
+claim to retry and no second cold vote. Once the witness has heard nothing
+authenticated from the other member for `peer-silence-ms` (default 10000, set
+on the witness; at least four leases), it grants the cold survivor a new empty
+epoch under the survivor's own policy fingerprint. The silence is counted from
+the witness's own start, never presumed across a witness restart. It decides
+only that the other member's state is lost; whether authority may move at all
+is still the witness's lease expiry, which the silent member's kernel deadline
+precedes, so this never creates a second forwarding owner. A member that is
+merely slow keeps talking to the witness and is never silent. One that returns
+after such a grant holds a superseded generation and imports the survivor's
+snapshot before it is eligible again. A member partitioned from the witness
+for longer than the silence loses its flows to the survivor's new epoch.
+
+**Readiness after a commit.** A commit changes the owner's policy fingerprint
+at once, and the witness binds authority to it. Until configuration sync
+delivers the same policy to the standby, the standby refuses the owner's state
+and cannot take over. It is not made eligible under the old fingerprint: it
+would then enforce the policy the commit just replaced and import entries
+created under the new one. Instead the gap is reported: `show ha`, `show vrrp`,
+the agent's `ha-status`, telemetry and the console HA card say
+`Backup (not ready: <reason>)`, and the `sentinel-ha-watch` worker sends an
+alert to the configured targets when a standby stays unable to take over for
+more than 30 seconds, and again when it recovers.
 
 State sync uses authenticated framed TCP at a default 50ms polling interval,
 batched kernel map reads, ordered updates/deletions and policy/authority fencing.
@@ -184,7 +302,8 @@ LRU maps, authenticated transport, successor ownership, deletions, accounting an
 concurrent activity updates during batched dumps.
 The five-node witness fixture tests a persistent NAT TCP socket, sub-second
 promotion, paused coordinator/agent processes, control partitions, witness
-outage/restart and synchronized failback. The WireGuard variant sends that socket
+outage/restart, synchronized failback, a non-member witness connection and a
+lone survivor that restarts cold after its peer is lost for good. The WireGuard variant sends that socket
 through an encrypted tunnel with a learned endpoint. The pairing fixture checks
 credential rejection, enrollment in under 30 seconds, repeat enrollment,
 member-specific addresses, both members' cold boots, persisted credentials and

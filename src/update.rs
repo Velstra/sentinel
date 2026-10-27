@@ -28,6 +28,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -40,47 +41,108 @@ use crate::system;
 /// ignored so the manifest can gain fields without breaking older appliances.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Manifest {
-    /// Human-readable release version, e.g. `"0.3.0"` — shown to the operator.
+    /// The release version, e.g. `"1.2.0"`. Compared against the running
+    /// version before anything is installed ([`refuse_downgrade`]).
     pub version: String,
     /// The image file's basename within the channel directory (never a path).
     pub image: String,
     /// Lowercase hex SHA-256 of the image file (an optional `sha256:` prefix is
     /// tolerated). The fetched image must hash to exactly this.
     pub sha256: String,
+    /// What the release is for — [`PRODUCT`]. Optional so that manifests signed
+    /// before the field existed still verify; when present it must match, so a
+    /// manifest for another product signed by a shared key is refused.
+    #[serde(default)]
+    pub product: Option<String>,
 }
 
+/// The product a manifest's `product` field must name.
+pub const PRODUCT: &str = "velstra-sentinel";
+
+/// The version of the running image: the one `show version` prints, which the
+/// release process bumps with every tagged release.
+pub const RUNNING_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 // ---- scratch storage ------------------------------------------------------
+
+static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// A private temp directory that removes itself (and everything under it) on
 /// drop. Used to stage the fetched manifest/signature/pinned-key and, for a
 /// channel install, the verified image. Public so [`crate::install`] can own the
 /// image's scratch dir for the lifetime of the slot-write.
+///
+/// Private from the first instant, not after a chmod: the directory is created
+/// 0700 in one call, and it must be one this process just made. `/tmp` is
+/// shared, so a directory already sitting at the name — another user's, or a
+/// symlink planted there — is refused rather than reused, and the name carries
+/// random bits so it cannot be predicted to plant one in the first place.
 pub struct Scratch(std::path::PathBuf);
 
 impl Scratch {
-    /// Create a fresh, uniquely-named scratch dir under the system temp dir.
+    /// Create a fresh, uniquely-named, 0700 scratch dir under the system temp dir.
     pub fn new() -> Result<Self> {
-        use std::os::unix::fs::DirBuilderExt;
-        for _ in 0..8 {
-            let mut nonce = [0u8; 16];
-            getrandom::getrandom(&mut nonce)
-                .map_err(|error| anyhow::anyhow!("scratch directory entropy: {error}"))?;
-            let suffix: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
-            let path = std::env::temp_dir().join(format!("sentinel-update-{suffix}"));
-            match std::fs::DirBuilder::new().mode(0o700).create(&path) {
-                Ok(()) => return Ok(Self(path)),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => {
-                    return Err(error).with_context(|| format!("creating {}", path.display()));
-                }
-            }
+        Self::new_in(&std::env::temp_dir())
+    }
+
+    fn new_in(parent: &Path) -> Result<Self> {
+        let mut random = [0u8; 8];
+        getrandom::getrandom(&mut random)
+            .map_err(|_| anyhow::anyhow!("scratch name randomness unavailable"))?;
+        let random: String = random.iter().map(|b| format!("{b:02x}")).collect();
+        let seq = SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
+        let p = parent.join(format!(
+            "sentinel-update-{}-{seq}-{random}",
+            std::process::id()
+        ));
+        Self::claim(p)
+    }
+
+    /// Create `p` as this process's private directory, or refuse.
+    fn claim(p: PathBuf) -> Result<Self> {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&p)
+            .with_context(|| {
+                format!(
+                    "creating private scratch {} (refusing an existing one)",
+                    p.display()
+                )
+            })?;
+        // The umask can only remove bits, never add them, but the ownership and
+        // type are re-read rather than assumed: whatever is at the path now is
+        // what every staged file will be written into.
+        let meta = std::fs::symlink_metadata(&p)?;
+        if !meta.is_dir()
+            || meta.uid() != unsafe { libc::geteuid() }
+            || meta.permissions().mode() & 0o077 != 0
+        {
+            bail!(
+                "scratch {} is not a private directory owned by this user",
+                p.display()
+            );
         }
-        bail!("could not create a unique private update scratch directory")
+        Ok(Self(p))
     }
 
     /// A path to `name` inside this scratch dir.
     pub fn join(&self, name: &str) -> std::path::PathBuf {
         self.0.join(name)
+    }
+
+    /// Create `name` in this scratch dir, 0600 from the moment it exists and
+    /// never a file that was already there.
+    pub fn create_private(&self, name: &str) -> Result<std::fs::File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = self.join(name);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+            .with_context(|| format!("creating {}", path.display()))
     }
 }
 
@@ -123,16 +185,6 @@ fn norm_digest(d: &str) -> String {
 fn s(p: &Path) -> Result<&str> {
     p.to_str()
         .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path {}", p.display()))
-}
-
-/// The pinned `curl`: the Nix wrapper sets `SENTINEL_CURL_BIN` to an absolute
-/// store path (so neither `$PATH` nor sudo's `secure_path` can shadow it);
-/// off-box (dev/tests) it falls back to the bare name.
-fn curl_bin() -> String {
-    std::env::var("SENTINEL_CURL_BIN")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "curl".to_string())
 }
 
 /// The pinned `openssl` (same resolution as the PKI path).
@@ -200,48 +252,29 @@ fn update_machine_id_at(path: &Path) -> Result<String> {
 /// other scheme even across a redirect. Any failure bails — fetch is fail-closed.
 ///
 /// A channel with a `subscription-key` sends it as `Authorization: Bearer` on
-/// every request. The header travels via a 0600 file (`-H @file`), never on the
+/// every request. The header travels via a file that is 0600 from its creation,
+/// inside a 0700 directory (`-H @file`), never on the
 /// command line — argv is world-readable through /proc for as long as curl
 /// runs, and a secret must not be.
 fn fetch(chan: &UpdateChannel, url: &str, dest: &Path) -> Result<()> {
     let scratch = Scratch::new()?;
-    let mut cmd = Command::new(curl_bin());
-    cmd.args([
-        "-fsSL",
-        "--proto",
-        "=https,file",
-        "--proto-redir",
-        "=https,file",
-        // The HTTP status, on stdout after the (empty, `-o`-redirected) body —
-        // it is what tells an entitlement refusal apart from a broken mirror.
-        "-w",
-        "%{http_code}",
-        "-o",
-        s(dest)?,
-        url,
-    ]);
-    if let Some(key) = &chan.subscription_key {
-        let machine_id = update_machine_id_at(Path::new("/var/lib/sentinel/update-machine-id"))?;
-        let hdr = scratch.join("auth-header");
-        {
+    let header = match &chan.subscription_key {
+        Some(key) => {
             use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(&hdr)
-                .context("creating private subscription header file")?;
-            write!(
-                file,
-                "Authorization: Bearer {key}\nX-Velstra-Machine-ID: {machine_id}\n"
-            )
-            .context("staging the subscription header")?;
+            let machine_id =
+                update_machine_id_at(Path::new("/var/lib/sentinel/update-machine-id"))?;
+            scratch
+                .create_private("auth-header")?
+                .write_all(
+                    format!("Authorization: Bearer {key}\nX-Velstra-Machine-ID: {machine_id}\n")
+                        .as_bytes(),
+                )
+                .context("staging the subscription header")?;
+            Some(scratch.join("auth-header"))
         }
-        cmd.args(["-H", &format!("@{}", s(&hdr)?)]);
-    }
-    let out = cmd
+        None => None,
+    };
+    let out = fetch_command(url, dest, header.as_deref())?
         .output()
         .with_context(|| format!("running curl for {url}"))?;
     if out.status.success() {
@@ -291,6 +324,34 @@ fn fetch(chan: &UpdateChannel, url: &str, dest: &Path) -> Result<()> {
         out.status.code(),
         code.map(|c| format!(", HTTP {c}")).unwrap_or_default()
     );
+}
+
+/// The fetch itself. The pinned curl comes from [`system::curl_command`]:
+/// `--disable` first and an empty environment, so neither a `~/.curlrc` nor an
+/// ambient proxy, key-log or CA variable decides where a subscription key goes
+/// or which certificates a channel is checked against — the system trust store
+/// is. `-f` makes an HTTP error (or a missing `file://` path) a non-zero exit;
+/// `--proto =https,file` refuses any other scheme even across a redirect.
+fn fetch_command(url: &str, dest: &Path, auth_header: Option<&Path>) -> Result<Command> {
+    let mut cmd = system::curl_command();
+    cmd.args([
+        "-fsSL",
+        "--proto",
+        "=https,file",
+        "--proto-redir",
+        "=https,file",
+        // The HTTP status, on stdout after the (empty, `-o`-redirected) body —
+        // it is what tells an entitlement refusal apart from a broken mirror.
+        "-w",
+        "%{http_code}",
+        "-o",
+        s(dest)?,
+        url,
+    ]);
+    if let Some(header) = auth_header {
+        cmd.args(["-H", &format!("@{}", s(header)?)]);
+    }
+    Ok(cmd)
 }
 
 /// Resolve the pinned public key to a PEM file on disk: a `file:<path>` value is
@@ -408,13 +469,113 @@ pub fn check(chan: &UpdateChannel) -> Result<Manifest> {
             manifest.image
         );
     }
-    if norm_digest(&manifest.sha256).len() != 64 {
+    check_manifest_fields(&manifest)?;
+    Ok(manifest)
+}
+
+/// The checks every verified manifest gets, from a channel or from a medium.
+fn check_manifest_fields(manifest: &Manifest) -> Result<()> {
+    let digest = norm_digest(&manifest.sha256);
+    if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
         bail!(
             "manifest sha256 {:?} is not a 64-hex-char SHA-256",
             manifest.sha256
         );
     }
-    Ok(manifest)
+    if let Some(product) = manifest.product.as_ref().filter(|p| *p != PRODUCT) {
+        bail!("the signed manifest is for {product:?}, not {PRODUCT:?} — refusing the update");
+    }
+    Ok(())
+}
+
+/// Refuse to install a release older than the one running, unless the operator
+/// asked for exactly that.
+///
+/// A signature says a release is genuine, not that it is current: every old
+/// release stays validly signed forever, so a mirror (or anybody in the path)
+/// serving yesterday's manifest could put a box back onto a release with known
+/// holes. The same version again is allowed — that is a re-install, not a step
+/// back. A version that cannot be compared is refused too: "cannot tell" must
+/// not read as "newer".
+pub fn refuse_downgrade(offered: &str, allow_downgrade: bool) -> Result<()> {
+    let verdict = compare_versions(offered, RUNNING_VERSION);
+    if matches!(
+        verdict,
+        Some(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater)
+    ) {
+        return Ok(());
+    }
+    let what = match verdict {
+        Some(_) => format!("release {offered} is OLDER than the running {RUNNING_VERSION}"),
+        None => format!(
+            "release version {offered:?} cannot be compared with the running {RUNNING_VERSION}"
+        ),
+    };
+    if allow_downgrade {
+        eprintln!("warning: --allow-downgrade: {what}; installing it as asked");
+        return Ok(());
+    }
+    bail!(
+        "{what} — refusing a downgrade. An old release stays validly signed forever, so this \
+         is how a box is put back onto known holes. If going back is what you mean, pass \
+         --allow-downgrade."
+    )
+}
+
+/// Order two versions the way semantic versioning does: numeric dot-separated
+/// core (a leading `v` and `+build` metadata ignored, missing components read as
+/// zero), and a `-pre.release` sorting before the release it precedes —
+/// numeric identifiers numerically and below alphanumeric ones. `None` when
+/// either side is not a version at all.
+pub fn compare_versions(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    fn parse(v: &str) -> Option<(Vec<u64>, Vec<&str>)> {
+        let v = v.trim();
+        let v = v.strip_prefix('v').unwrap_or(v);
+        let v = v.split_once('+').map_or(v, |(core, _)| core);
+        let (core, pre) = match v.split_once('-') {
+            Some((core, pre)) => (core, pre.split('.').collect()),
+            None => (v, Vec::new()),
+        };
+        let mut numbers = core
+            .split('.')
+            .map(|n| {
+                (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| n.parse().ok())
+                    .flatten()
+            })
+            .collect::<Option<Vec<u64>>>()?;
+        if numbers.is_empty() || numbers.len() > 4 || pre.iter().any(|p: &&str| p.is_empty()) {
+            return None;
+        }
+        numbers.resize(4, 0);
+        Some((numbers, pre))
+    }
+    let (a_core, a_pre) = parse(a)?;
+    let (b_core, b_pre) = parse(b)?;
+    let core = a_core.cmp(&b_core);
+    if core != Ordering::Equal {
+        return Some(core);
+    }
+    Some(match (a_pre.is_empty(), b_pre.is_empty()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => {
+            for (x, y) in a_pre.iter().zip(&b_pre) {
+                let order = match (x.parse::<u64>(), y.parse::<u64>()) {
+                    (Ok(x), Ok(y)) => x.cmp(&y),
+                    (Ok(_), Err(_)) => Ordering::Less,
+                    (Err(_), Ok(_)) => Ordering::Greater,
+                    (Err(_), Err(_)) => x.cmp(y),
+                };
+                if order != Ordering::Equal {
+                    return Some(order);
+                }
+            }
+            a_pre.len().cmp(&b_pre.len())
+        }
+    })
 }
 
 /// Fetch the image named by a verified `manifest` into `dest` and verify its
@@ -452,62 +613,169 @@ pub fn signature_path(image: &Path) -> std::path::PathBuf {
     std::path::PathBuf::from(name)
 }
 
-/// Verify an operator-supplied **local** image against a pinned key before it is
-/// written to a slot — the local counterpart of the channel's manifest check,
-/// closing the same supply-chain hole for `sentinel update <image>`.
+/// What a verified local proof vouches for: the SHA-256 the image must hash to,
+/// the release version when the proof states one, and which file to install —
+/// the image itself, or (for a raw signature) the private copy that was
+/// verified. Holding the copy's scratch keeps it alive until the install ends.
+pub struct LocalProof {
+    pub sha256: String,
+    pub version: Option<String>,
+    pub source: PathBuf,
+    _copy: Option<Scratch>,
+}
+
+/// Read a small proof file (a digest or a manifest) once, bounded.
+fn read_small(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .with_context(|| format!("reading {}", path.display()))?
+        .take(limit + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        bail!("{} is too large to be a signed proof", path.display());
+    }
+    Ok(bytes)
+}
+
+/// Verify `signature` over `bytes` already held in memory. The bytes are staged
+/// privately and openssl verifies that copy, so what was verified is what the
+/// caller goes on to trust — never the file at the original path, read again.
+fn verify_bytes(public_key: &str, bytes: &[u8], signature: &Path) -> Result<()> {
+    use std::io::Write;
+    let scratch = Scratch::new()?;
+    let pubkey = resolve_pubkey_pem(public_key, &scratch)?;
+    scratch.create_private("signed")?.write_all(bytes)?;
+    verify_signature(&pubkey, &scratch.join("signed"), signature)
+}
+
+/// Verify an operator-supplied **local** image (a file or a block device)
+/// against a pinned key before it is written to a slot — the local counterpart
+/// of the channel's manifest check, closing the same supply-chain hole for
+/// `sentinel update <image>`.
 ///
-/// Reuses the channel's signing infra exactly: an Ed25519 detached signature
-/// (`<image>.sig`) over the image's *own bytes*, verified under `public_key` (a
-/// `file:<path>` reference or an inline PEM). Fails closed — a missing signature,
-/// an unreadable/…invalid key, or a signature that does not verify all return
-/// `Err`, and the caller never reaches the slot-writer.
+/// Three proofs, all Ed25519 under `public_key` (a `file:<path>` reference or an
+/// inline PEM), named by `signature` or found beside the image:
 ///
-/// Large images may instead carry `<image>.sha256` (one hex digest) and its
-/// Ed25519 signature `<image>.sha256.sig`. The signature authenticates the
-/// digest, then a streaming hash authenticates the complete image. When supplied,
-/// this proof takes precedence; a bad proof never falls back to a raw signature.
-pub fn verify_local_image(image: &Path, public_key: &str) -> Result<()> {
-    // Ed25519/OpenSSL buffers its input in one shot; signing a multi-GiB
-    // appliance directly can fail. Prefer a small signed digest when supplied,
-    // and never fall back to another proof after a failed digest verification.
-    let mut digest_name = image.as_os_str().to_os_string();
-    digest_name.push(".sha256");
-    let digest_path = PathBuf::from(digest_name);
-    if digest_path.exists() {
-        use std::io::Read;
-        let mut bytes = Vec::new();
-        std::fs::File::open(&digest_path)?
-            .take(129)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() > 128 {
-            bail!("signed image digest is too large");
+/// * a signed **release manifest** (`--signature …/manifest.json.sig`): the
+///   channel's own `manifest.json`, copied to a medium. It names the image's
+///   SHA-256 and the release version, so the downgrade check applies.
+/// * a signed **digest** (`<image>.sha256` + `<image>.sha256.sig`): one hex
+///   SHA-256 of the image file. OpenSSL's Ed25519 buffers its whole input, so
+///   this is the form for a multi-GiB appliance image.
+/// * a raw signature over the image bytes (`<image>.sig`), for small images.
+///   The image is copied privately first and the copy is what is verified and
+///   installed. A block device cannot be proven this way: nothing in a raw
+///   signature says where the image ends on a larger stick.
+///
+/// A supplied digest takes precedence over a raw signature beside the image,
+/// and a bad proof never falls back to another one. The image itself is not
+/// hashed here: [`crate::verified_image::VerifiedImage`] hashes it while
+/// reading it for the install, so it is read for trust exactly once.
+pub fn verify_local_image(
+    image: &Path,
+    signature: Option<&Path>,
+    public_key: &str,
+) -> Result<LocalProof> {
+    use std::os::unix::fs::FileTypeExt;
+    let is_block = std::fs::metadata(image)
+        .with_context(|| format!("reading {}", image.display()))?
+        .file_type()
+        .is_block_device();
+    let (signed, sig) = match signature {
+        Some(sig) => {
+            let Some(signed) = sig.to_str().and_then(|s| s.strip_suffix(".sig")) else {
+                bail!(
+                    "--signature {} must name a detached signature file ending in .sig",
+                    sig.display()
+                );
+            };
+            (PathBuf::from(signed), sig.to_path_buf())
         }
+        None => {
+            let mut digest = image.as_os_str().to_os_string();
+            digest.push(".sha256");
+            let digest = PathBuf::from(digest);
+            if digest.exists() {
+                let sig = signature_path(&digest);
+                (digest, sig)
+            } else {
+                (image.to_path_buf(), signature_path(image))
+            }
+        }
+    };
+    let name = signed.to_string_lossy();
+    if name.ends_with(".json") {
+        let bytes = read_small(&signed, 65536)?;
+        verify_bytes(public_key, &bytes, &sig)?;
+        let manifest: Manifest =
+            serde_json::from_slice(&bytes).context("parsing the (verified) release manifest")?;
+        check_manifest_fields(&manifest)?;
+        return Ok(LocalProof {
+            sha256: norm_digest(&manifest.sha256),
+            version: Some(manifest.version),
+            source: image.to_path_buf(),
+            _copy: None,
+        });
+    }
+    if name.ends_with(".sha256") {
+        let bytes = read_small(&signed, 128)?;
         let digest = std::str::from_utf8(&bytes)?.trim();
         if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
             bail!("signed image digest must contain one SHA-256 hex value");
         }
-        let scratch = Scratch::new()?;
-        let pubkey = resolve_pubkey_pem(public_key, &scratch)?;
-        let signed_bytes = scratch.join("image.sha256");
-        std::fs::write(&signed_bytes, &bytes)?;
-        verify_signature(&pubkey, &signed_bytes, &signature_path(&digest_path))?;
-        if !sha256_hex(image)?.eq_ignore_ascii_case(digest) {
-            bail!("image does not match its signed SHA-256 digest");
-        }
-        return Ok(());
+        verify_bytes(public_key, &bytes, &sig)?;
+        return Ok(LocalProof {
+            sha256: digest.to_ascii_lowercase(),
+            version: None,
+            source: image.to_path_buf(),
+            _copy: None,
+        });
     }
-    let sig = signature_path(image);
+    if is_block {
+        bail!(
+            "{} is a block device: a raw signature cannot say where the image ends on it. \
+             Pass --signature with the release's signed digest (<image>.sha256.sig) or signed \
+             manifest (manifest.json.sig); for a trusted device, --allow-unsigned.",
+            image.display()
+        );
+    }
+    let same = |a: &Path, b: &Path| {
+        a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
+    };
+    if !same(&signed, image) {
+        bail!(
+            "--signature {} signs {}, which is neither this image, a .sha256 digest nor a \
+             release manifest",
+            sig.display(),
+            signed.display()
+        );
+    }
     if !sig.exists() {
         bail!(
             "no detached signature next to the image: expected {} — refusing to write an \
-             unverified image. Sign it with the release key (openssl pkeyutl -sign -rawin), or, \
-             for a trusted local image/device, pass --allow-unsigned.",
+             unverified image. Sign it with the release key (openssl pkeyutl -sign -rawin), pass \
+             --signature <file>, or, for a trusted local image/device, pass --allow-unsigned.",
             sig.display()
         );
     }
-    let scratch = Scratch::new()?;
-    let pubkey = resolve_pubkey_pem(public_key, &scratch)?;
-    verify_signature(&pubkey, image, &sig)
+    // Raw form: copy first, verify the copy, install the copy.
+    let copy = Scratch::new()?;
+    let source = copy.join("image.raw");
+    std::io::copy(
+        &mut std::fs::File::open(image)?,
+        &mut copy.create_private("image.raw")?,
+    )
+    .context("staging the image privately")?;
+    let pubkey = resolve_pubkey_pem(public_key, &copy)?;
+    verify_signature(&pubkey, &source, &sig)?;
+    let sha256 = sha256_hex(&source)?;
+    Ok(LocalProof {
+        sha256,
+        version: None,
+        source,
+        _copy: Some(copy),
+    })
 }
 
 // ---- subscription state, visible ------------------------------------------
@@ -809,7 +1077,9 @@ mod tests {
         let img = dir.join("image.raw");
         std::fs::write(&img, b"pretend image").unwrap();
         // No image.raw.sig beside it.
-        let err = verify_local_image(&img, "does-not-matter").unwrap_err();
+        let err = verify_local_image(&img, None, "does-not-matter")
+            .err()
+            .unwrap();
         assert!(format!("{err}").contains("no detached signature"), "{err}");
     }
 
@@ -866,30 +1136,36 @@ mod tests {
                 .success()
         );
         let key = format!("file:{}", public.display());
-        verify_local_image(&image, &key).unwrap();
-        use std::io::{Seek, SeekFrom, Write};
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&image)
-            .unwrap();
-        file.seek(SeekFrom::End(-1)).unwrap();
-        file.write_all(b"x").unwrap();
-        assert!(
-            verify_local_image(&image, &key)
-                .unwrap_err()
-                .to_string()
-                .contains("does not match")
+        let proof = verify_local_image(&image, None, &key).unwrap();
+        assert_eq!(proof.sha256, sha256_hex(&image).unwrap());
+        assert_eq!(
+            proof.source, image,
+            "a digest proof installs the image itself"
         );
+        assert!(proof.version.is_none());
+        // The same proof named explicitly, from another directory — a USB
+        // stick's proof lives on some other medium.
+        let elsewhere = Scratch::new().unwrap();
+        let moved = elsewhere.join("velstra-sentinel.raw.sha256");
+        std::fs::copy(&digest, &moved).unwrap();
+        std::fs::copy(&signature, signature_path(&moved)).unwrap();
+        let named = verify_local_image(&image, Some(&signature_path(&moved)), &key).unwrap();
+        assert_eq!(named.sha256, proof.sha256);
         // A malformed supplied digest never falls back to another signature.
         std::fs::write(&digest, b"not a digest").unwrap();
-        assert!(verify_local_image(&image, &key).is_err());
+        assert!(verify_local_image(&image, None, &key).is_err());
         std::fs::write(&digest, [b'a'; 129]).unwrap();
         assert!(
-            verify_local_image(&image, &key)
-                .unwrap_err()
+            verify_local_image(&image, None, &key)
+                .err()
+                .unwrap()
                 .to_string()
                 .contains("too large")
         );
+        // A digest that is not the one signed is refused before the image is
+        // ever read.
+        std::fs::write(&digest, format!("{}\n", "0".repeat(64))).unwrap();
+        assert!(verify_local_image(&image, None, &key).is_err());
     }
 
     /// The local path reuses the channel's Ed25519 infra: a detached signature
@@ -955,15 +1231,206 @@ mod tests {
 
         // Pinned by inline PEM and by `file:` reference — both accepted.
         let pem = std::fs::read_to_string(&pub_pem).unwrap();
-        verify_local_image(&img, &pem).expect("a correctly signed image must verify");
-        verify_local_image(&img, &format!("file:{}", pub_pem.to_str().unwrap()))
+        let proof =
+            verify_local_image(&img, None, &pem).expect("a correctly signed image must verify");
+        verify_local_image(&img, None, &format!("file:{}", pub_pem.to_str().unwrap()))
             .expect("a file: pinned key must verify too");
 
-        // Tamper the image: the signature no longer covers these bytes.
+        // What gets installed is the private copy that was verified, so
+        // rewriting the original afterwards changes nothing that is written.
+        assert_ne!(proof.source, img);
         std::fs::write(&img, b"a whole appliance image, TAMPERED").unwrap();
+        assert_eq!(
+            std::fs::read(&proof.source).unwrap(),
+            b"a whole appliance image, pretend"
+        );
+        assert_eq!(proof.sha256, sha256_hex(&proof.source).unwrap());
+
+        // Tamper the image: the signature no longer covers these bytes.
         assert!(
-            verify_local_image(&img, &pem).is_err(),
+            verify_local_image(&img, None, &pem).is_err(),
             "a tampered image must fail closed"
         );
+        // A --signature naming some other file's raw signature is refused.
+        let other = dir.join("other.raw");
+        std::fs::write(&other, b"other").unwrap();
+        assert!(
+            verify_local_image(&img, Some(&signature_path(&other)), &pem)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("neither this image")
+        );
+    }
+
+    /// A signed manifest copied to a medium proves an image and states its
+    /// version — the form that brings downgrade protection to a USB install.
+    #[test]
+    fn a_signed_manifest_proves_a_local_image_and_its_version() {
+        if !openssl_available() {
+            return;
+        }
+        let dir = Scratch::new().unwrap();
+        let private = dir.join("private.pem");
+        let public = dir.join("public.pem");
+        let ob = openssl_bin();
+        let sh = |args: &[&str]| assert!(Command::new(&ob).args(args).status().unwrap().success());
+        sh(&[
+            "genpkey",
+            "-algorithm",
+            "ed25519",
+            "-out",
+            s(&private).unwrap(),
+        ]);
+        sh(&[
+            "pkey",
+            "-in",
+            s(&private).unwrap(),
+            "-pubout",
+            "-out",
+            s(&public).unwrap(),
+        ]);
+        let image = dir.join("velstra-sentinel.raw");
+        std::fs::write(&image, b"pretend appliance image").unwrap();
+        let manifest = dir.join("manifest.json");
+        let sign = |body: String| {
+            std::fs::write(&manifest, body).unwrap();
+            sh(&[
+                "pkeyutl",
+                "-sign",
+                "-rawin",
+                "-inkey",
+                s(&private).unwrap(),
+                "-in",
+                s(&manifest).unwrap(),
+                "-out",
+                s(&signature_path(&manifest)).unwrap(),
+            ]);
+        };
+        let digest = sha256_hex(&image).unwrap();
+        sign(format!(
+            r#"{{"version":"9.1.0","image":"velstra-sentinel.raw","sha256":"{digest}","product":"velstra-sentinel"}}"#
+        ));
+        let key = format!("file:{}", public.display());
+        let proof = verify_local_image(&image, Some(&signature_path(&manifest)), &key).unwrap();
+        assert_eq!(proof.version.as_deref(), Some("9.1.0"));
+        assert_eq!(proof.sha256, digest);
+        // Signed for another product: refused.
+        sign(format!(
+            r#"{{"version":"9.1.0","image":"x.raw","sha256":"{digest}","product":"velstra-cloud"}}"#
+        ));
+        assert!(
+            verify_local_image(&image, Some(&signature_path(&manifest)), &key)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("velstra-cloud")
+        );
+        // A manifest changed after signing: refused.
+        std::fs::write(&manifest, b"{\"version\":\"9.9.9\"}").unwrap();
+        assert!(verify_local_image(&image, Some(&signature_path(&manifest)), &key).is_err());
+    }
+
+    #[test]
+    fn versions_order_like_semver() {
+        use std::cmp::Ordering::*;
+        for (a, b, want) in [
+            ("1.0.0", "1.0.0", Equal),
+            ("v1.0", "1.0.0", Equal),
+            ("1.0.0+build.7", "1.0.0", Equal),
+            ("1.0.1", "1.0.0", Greater),
+            ("1.10.0", "1.9.0", Greater),
+            ("0.3.0", "1.0.0", Less),
+            ("2", "1.99.99", Greater),
+            ("1.0.0-rc.1", "1.0.0", Less),
+            ("1.0.0-rc.2", "1.0.0-rc.10", Less),
+            ("1.0.0-alpha", "1.0.0-1", Greater),
+            ("1.0.0-alpha", "1.0.0-alpha.1", Less),
+        ] {
+            assert_eq!(compare_versions(a, b), Some(want), "{a} vs {b}");
+        }
+        for bad in ["", "latest", "1..0", "1.0.0-", "1.x", "1.2.3.4.5"] {
+            assert_eq!(compare_versions(bad, "1.0.0"), None, "{bad:?}");
+        }
+    }
+
+    /// An older signed release is refused unless asked for; the same or a
+    /// newer one passes; an uncomparable version is not read as newer.
+    #[test]
+    fn a_downgrade_is_refused_unless_explicitly_allowed() {
+        let error = refuse_downgrade("0.3.0", false).unwrap_err().to_string();
+        assert!(
+            error.contains("OLDER") && error.contains("--allow-downgrade"),
+            "{error}"
+        );
+        refuse_downgrade("0.3.0", true).unwrap();
+        refuse_downgrade(RUNNING_VERSION, false).unwrap();
+        refuse_downgrade("99.0.0", false).unwrap();
+        assert!(refuse_downgrade("nightly", false).is_err());
+        refuse_downgrade("nightly", true).unwrap();
+    }
+
+    /// Manifests signed before `product` existed still parse and pass; one
+    /// naming another product does not.
+    #[test]
+    fn a_manifest_bound_to_another_product_is_refused() {
+        let digest = "ab".repeat(32);
+        let old: Manifest = serde_json::from_str(&format!(
+            r#"{{"version":"1.0.0","image":"a.img","sha256":"{digest}"}}"#
+        ))
+        .unwrap();
+        check_manifest_fields(&old).unwrap();
+        let other: Manifest = serde_json::from_str(&format!(
+            r#"{{"version":"1.0.0","image":"a.img","sha256":"{digest}","product":"velstra-cloud"}}"#
+        ))
+        .unwrap();
+        assert!(check_manifest_fields(&other).is_err());
+        let bad: Manifest = serde_json::from_str(&format!(
+            r#"{{"version":"1.0.0","image":"a.img","sha256":"{}"}}"#,
+            "zz".repeat(32)
+        ))
+        .unwrap();
+        assert!(check_manifest_fields(&bad).is_err());
+    }
+
+    /// The scratch directory is private from creation, refuses a directory
+    /// that already exists at its name, and its files are 0600 at open.
+    #[test]
+    fn scratch_is_private_from_creation_and_refuses_an_existing_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = Scratch::new().unwrap();
+        let scratch = Scratch::new_in(&parent.0).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&scratch.0), 0o700);
+        scratch.create_private("auth-header").unwrap();
+        assert_eq!(mode(&scratch.join("auth-header")), 0o600);
+        assert!(
+            scratch.create_private("auth-header").is_err(),
+            "never reuses a file"
+        );
+        // Somebody else's directory (or a planted one) at the name is refused.
+        let planted = parent.join("planted");
+        std::fs::create_dir(&planted).unwrap();
+        std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(Scratch::claim(planted.clone()).is_err());
+        std::os::unix::fs::symlink(&planted, parent.join("link")).unwrap();
+        assert!(Scratch::claim(parent.join("link")).is_err());
+    }
+
+    /// The channel fetch runs curl with `--disable` first and nothing of the
+    /// caller's environment, and the subscription header stays off argv.
+    #[test]
+    fn the_channel_fetch_ignores_curlrc_and_the_ambient_environment() {
+        let cmd = fetch_command(
+            "https://updates.example.test/manifest.json",
+            Path::new("/tmp/x/manifest.json"),
+            Some(Path::new("/tmp/x/auth-header")),
+        )
+        .unwrap();
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(args.first(), Some(&"--disable"), "{args:?}");
+        assert!(args.contains(&"@/tmp/x/auth-header"));
+        let envs: Vec<_> = cmd.get_envs().map(|(k, _)| k.to_str().unwrap()).collect();
+        assert!(envs.iter().all(|k| *k == "PATH"), "{envs:?}");
     }
 }
