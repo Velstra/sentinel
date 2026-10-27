@@ -6,12 +6,12 @@
   #   nix build .#velstra                         # the eBPF agent (this milestone)
   #   nixos-rebuild build-vm --flake .#appliance  # the appliance VM
   #
-  # nixpkgs must ship rustc >= 1.85 (edition 2024); 25.05 does. The velstra agent
+  # nixpkgs must ship rustc >= 1.85 (edition 2024); 26.05 does. The velstra agent
   # needs a NIGHTLY toolchain with rust-src + bpf-linker to compile its eBPF, so
   # it is built with fenix's nightly, not nixpkgs' stable rustc.
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     fenix = {
       url = "github:nix-community/fenix";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -233,11 +233,9 @@
       # fenix's `complete` nightly bundles rust-src, which the BPF target's
       # build-std needs. The agent's build.rs (aya-build) compiles the eBPF crate
       # for the bpf target during this build.
-      # Pin a nightly whose LLVM matches nixpkgs' bpf-linker (LLVM 20). The latest
-      # nightly emits LLVM 22 bitcode, which nixpkgs' LLVM-20 bpf-linker can't
-      # read ("Unknown attribute kind"). nixpkgs 25.05 ships at most LLVM 20, so
-      # the toolchain must be from the LLVM-20 era. Replace fakeHash with the
-      # value the first build reports.
+      # Keep the known BPF Rust frontend pinned. Its LLVM-20 bitcode is
+      # accepted by the packaged LLVM-21 linker; actual object loading is
+      # gated by ebpf-verifier on the appliance kernel.
       nightlyDate = "2025-06-15";
       nightlySha = "sha256-hMlbNn0xAaLK+EDwdxW/8ZlC8/GHLpFhqB2fhCoj/iU=";
       nightlyProfile = fenix.packages.${system}.toolchainOf {
@@ -303,7 +301,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-7xdatzpBry18cbSy7MIzwWbXLsgylwD8fFLlhUb1lTc=";
+      ebpfHash = "sha256-foJKSk0w0HxCthdR0nBTL1WPxv2X24Vg3V3hRAGb61k=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -469,6 +467,10 @@
       nixosModules.sentinel =
         { pkgs, lib, ... }:
         {
+          # Retain the appliance's verified LTS kernel ABI across the base
+          # upgrade. Linux 6.18 currently exceeds the IPv6 egress verifier
+          # budget with both the old and new object; it is not certified.
+          boot.kernelPackages = lib.mkDefault pkgs.linuxPackages_6_12;
           fileSystems."/sys/fs/bpf" = { device = "bpffs"; fsType = "bpf"; options = [ "nosuid" "nodev" "noexec" ]; };
           imports = [
             ./nix/appliance.nix
@@ -687,7 +689,7 @@
               # Unbraced on purpose: systemd splits that form into words, which
               # is what makes the rendered argument list an argument list rather
               # than one long argument.
-              ExecStart = "${pkgs.rpPPPoE}/bin/pppoe-server $PPPOE_SERVER_ARGS";
+              ExecStart = "${pkgs."rp-pppoe"}/bin/pppoe-server $PPPOE_SERVER_ARGS";
               Restart = "on-failure";
               RestartSec = "5s";
             };
@@ -1649,6 +1651,7 @@
         ebpf-verifier = pkgs.testers.runNixOSTest {
           name = "sentinel-ebpf-verifier";
           nodes.machine = { ... }: {
+            boot.kernelPackages = self.nixosConfigurations.appliance.config.boot.kernelPackages;
             virtualisation.memorySize = 2048;
             environment.systemPackages = [ velstra ];
           };
@@ -6244,7 +6247,7 @@
             subprocess.run([
               "${nodes.machine.virtualisation.qemu.package}/bin/qemu-img",
               "create", "-f", "qcow2",
-              "-b", "${nodes.machine.system.build.finalImage}/${nodes.machine.image.filePath}",
+              "-b", "${nodes.machine.system.build.image}/${nodes.machine.image.filePath}",
               "-F", "raw", tmp.name,
             ], check=True)
             os.environ["NIX_DISK_IMAGE"] = tmp.name
@@ -6420,7 +6423,7 @@
               subprocess.run([
                 "${nodes.machine.virtualisation.qemu.package}/bin/qemu-img",
                 "create", "-f", "qcow2",
-                "-b", "${nodes.machine.system.build.finalImage}/${nodes.machine.image.filePath}",
+                "-b", "${nodes.machine.system.build.image}/${nodes.machine.image.filePath}",
                 "-F", "raw", tmp.name,
               ], check=True)
               os.environ["NIX_DISK_IMAGE"] = tmp.name
@@ -6554,7 +6557,7 @@
               subprocess.run([
                 "${nodes.machine.virtualisation.qemu.package}/bin/qemu-img",
                 "create", "-f", "qcow2",
-                "-b", "${nodes.machine.system.build.finalImage}/${nodes.machine.image.filePath}",
+                "-b", "${nodes.machine.system.build.image}/${nodes.machine.image.filePath}",
                 "-F", "raw", tmp.name,
               ], check=True)
               os.environ["NIX_DISK_IMAGE"] = tmp.name
@@ -6984,7 +6987,7 @@
               subprocess.run([
                 "${nodes.machine.virtualisation.qemu.package}/bin/qemu-img",
                 "create", "-f", "qcow2",
-                "-b", "${nodes.machine.system.build.finalImage}/${nodes.machine.image.filePath}",
+                "-b", "${nodes.machine.system.build.image}/${nodes.machine.image.filePath}",
                 "-F", "raw", tmp.name,
               ], check=True)
               os.environ["NIX_DISK_IMAGE"] = tmp.name
@@ -6992,7 +6995,7 @@
               subprocess.run([
                 "${nodes.machine.virtualisation.qemu.package}/bin/qemu-img",
                 "create", "-f", "qcow2",
-                "-b", "${nodes.donor.system.build.finalImage}/${nodes.donor.image.filePath}",
+                "-b", "${nodes.donor.system.build.image}/${nodes.donor.image.filePath}",
                 "-F", "raw", tmp_donor.name,
               ], check=True)
               machine.wait_for_unit("multi-user.target")
@@ -12256,14 +12259,14 @@
                   # still needs them resolvable for exec.
                   path = [
                     pkgs.ppp
-                    pkgs.rpPPPoE
+                    pkgs."rp-pppoe"
                   ];
                   serviceConfig = {
                     ExecStartPre = "${pkgs.iproute2}/bin/ip link set eth1 up";
                     # -F: foreground (systemd owns it). -I: raw NIC. -L/-R: local +
                     # remote-pool addresses. -N: max sessions. -O: our options file.
                     ExecStart =
-                      "${pkgs.rpPPPoE}/bin/pppoe-server -F -I eth1 "
+                      "${pkgs."rp-pppoe"}/bin/pppoe-server -F -I eth1 "
                       + "-L 10.0.0.1 -R 10.0.0.100 -N 10 -O /etc/ppp/pppoe-server-options";
                     Restart = "on-failure";
                     RestartSec = "2s";
