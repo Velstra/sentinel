@@ -933,7 +933,7 @@ mappings. Ordinary rule edits retain the existing sessions.
 ```text
 show firewall states     # active IPv4/IPv6 tuples, phase and idle time (JSON)
 show firewall counters   # named L3/L4 rule packet/byte/accept/drop totals (JSON)
-show firewall events     # bounded drain of packet events (JSON lines)
+show firewall events     # newest 100 packet events (JSON lines); consumes nothing
 ```
 
 Use `log true` on a rule to emit its accepted and dropped packet events. Events

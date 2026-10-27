@@ -45,15 +45,27 @@ distinguish confirmation from recovery. Repeated confirmation of the same
 current revision is idempotent. The console retains reverted drafts and staged
 form changes for review.
 
-The independent recovery timer retries failures every second and retains its
-private journal until saved bytes and the working network have been restored.
+The independent recovery timer restores the exact saved bytes first, then
+reconciles the previous working network. A failed reconcile is retried with a
+doubling backoff (2, 4, 8, 16 s); after five failures recovery gives up rather
+than rewriting the network forever. The transaction then reports
+`recovery_failed` (outcome `recovery-failed`), the recovery unit fails once so
+its `OnFailure=` alert fires, and writes stay blocked until an administrator
+inspects the box and runs `sentinel config recover --accept-current` or uses
+the console's Accept current network (`POST /api/v1/config/recovery/accept`),
+both refused while recovery is still retrying. A reboot also ends it, booting
+the restored saved document.
 An unconfirmed journal is recovered before boot rendering, even if its deadline
 had not elapsed when power was lost. Apply workers have a bounded 180-second
 runtime; an interrupted application also retains recovery protection. Other
 CLI/API commits and saves cannot overwrite a pending transaction. Confirmed
 revisions enter the normal revision archive and durable HA outbox; provisional
-configurations are not sent to the peer. SSH administrators can use `confirm`
-in configuration mode, or `sentinel confirm-rollback` to recover immediately.
+configurations are not sent to the peer. SSH administrators can use
+`confirm <transaction-id>` in configuration mode — a bare `confirm` keeps only
+the shell's own `commit-confirm` — or `sentinel confirm-rollback` to recover
+immediately. A CLI `commit-confirm` and a management transaction are mutually
+exclusive: starting either while the other is pending is refused, and the
+`commit-confirm` timer never reverts a management transaction.
 
 ## Document editor and API
 

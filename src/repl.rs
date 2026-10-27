@@ -224,7 +224,7 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
         "compare" => do_compare(session, rest),
         "commit" => return commit(session, act),
         "commit-confirm" => return commit_confirm_line(session, act, rest),
-        "confirm" => crate::confirm::confirm(act),
+        "confirm" => crate::confirm::confirm(act, rest.first().copied()),
         "rollback" => return rollback_line(session, act, rest),
         "save" => {
             let to = rest.first().map(Path::new);
@@ -802,7 +802,7 @@ fn unwind_err_mixed(rb: Rollback, cause: anyhow::Error) -> anyhow::Error {
         )
     };
     anyhow!(
-        "applying system configuration failed: {cause}\n  \
+        "applying system configuration failed: {cause:#}\n  \
          MIXED STATE — {rolled}, but the rest of this commit (DNS, NTP, PKI, \
          sshd, login passwords, IPsec, the VPNs and the box services) has no \
          automatic undo and may be partly applied. The running system now \
@@ -841,7 +841,9 @@ fn unwind_to_last_good(
     prev: &crate::config::Appliance,
 ) -> anyhow::Error {
     // The level-triggered rollback: reconcile the ~30 sub-systems to last-good.
-    let reconcile = crate::net::apply(prev);
+    // A restore: a held link that stays dark does not fail it (see
+    // `net::judge_reconcile_reply`).
+    let reconcile = crate::net::apply(prev, crate::net::Verify::Restore);
     // Then the three stages the undo stack does cover, in reverse.
     let failures = rb.unwind();
     mixed_or_rolled_message(&cause, &reconcile, failures)
@@ -870,7 +872,7 @@ fn mixed_or_rolled_message(
              a bad value."
         ),
         Ok(()) => anyhow!(
-            "applying system configuration failed: {cause}\n  \
+            "applying system configuration failed: {cause:#}\n  \
              the broad system apply was rolled back to the last-good config, but \
              restoring the firewall/routing/hostname did not fully complete ({}). \
              Re-check those, or reboot to return to the saved config.",
@@ -886,9 +888,9 @@ fn mixed_or_rolled_message(
                 )
             };
             anyhow!(
-                "applying system configuration failed: {cause}\n  \
+                "applying system configuration failed: {cause:#}\n  \
                  MIXED STATE — reconciling back to the last-good config ALSO \
-                 failed ({re}); {rolled}. The broad system apply (DNS, NTP, PKI, \
+                 failed ({re:#}); {rolled}. The broad system apply (DNS, NTP, PKI, \
                  sshd, login passwords, IPsec, the VPNs and the box services) may \
                  be partly on the new config and partly on the old, so the running \
                  system matches neither cleanly.\n  \
@@ -920,6 +922,26 @@ pub(crate) fn apply_live(
     appliance: &crate::config::Appliance,
     act: &Apply,
     rollback_to: Option<&crate::config::Appliance>,
+) -> Result<()> {
+    apply_live_as(appliance, act, rollback_to, crate::net::Verify::Forward)
+}
+
+/// [`apply_live`] for the paths that put back a configuration the box ran
+/// before — a commit-confirm revert, a management transaction's recovery —
+/// rather than moving it forward. The one difference: a held link the data
+/// plane cannot raise is reported, not fatal, because it stays dark either way
+/// and failing the restore would only wedge the box on the configuration it is
+/// leaving (see `net::judge_reconcile_reply`). No last-good to reconcile back
+/// to, for the same reason as every revert.
+pub(crate) fn restore_live(appliance: &crate::config::Appliance, act: &Apply) -> Result<()> {
+    apply_live_as(appliance, act, None, crate::net::Verify::Restore)
+}
+
+fn apply_live_as(
+    appliance: &crate::config::Appliance,
+    act: &Apply,
+    rollback_to: Option<&crate::config::Appliance>,
+    verify: crate::net::Verify,
 ) -> Result<()> {
     // Serialise the whole apply against a concurrent commit / API PUT / boot-late
     // reconcile: staging uses fixed temp filenames under /run/sentinel, so two
@@ -1002,7 +1024,7 @@ pub(crate) fn apply_live(
     // TRUE rollback. Only where there is no last-good to reconcile to
     // (`None` — the revert paths, and a first-ever commit) does it fall back to
     // the honest MIXED-STATE report that undoes just firewall/routing/hostname.
-    if let Err(e) = crate::net::apply(appliance) {
+    if let Err(e) = crate::net::apply(appliance, verify) {
         return Err(match rollback_to {
             Some(prev) => unwind_to_last_good(rb, e, prev),
             None => unwind_err_mixed(rb, e),
@@ -1144,10 +1166,11 @@ const CMD_HELP: &[CmdHelp] = &[
     },
     CmdHelp {
         name: "confirm",
-        usage: "confirm",
+        usage: "confirm [<transaction-id>]",
         summary: "keep a commit-confirm change (cancel the revert)",
-        detail: "",
-        examples: &[],
+        detail: "A bare `confirm` keeps only this shell's `commit-confirm`. A change \
+                 applied from the API or console is kept by naming its transaction id.",
+        examples: &["confirm"],
     },
     CmdHelp {
         name: "save",
@@ -1360,6 +1383,7 @@ const OP_SHOW_TOP: &[Cand] = &[
     ("isis", "IS-IS adjacencies / interfaces / database"),
     ("babel", "Babel neighbours / routes"),
     ("vrrp", "VRRP virtual-router state"),
+    ("ha", "leased HA authority and standby readiness"),
     ("bfd", "BFD sessions"),
     ("vrf", "the VRFs that are running, and their devices"),
     (
@@ -1372,7 +1396,7 @@ const OP_SHOW_TOP: &[Cand] = &[
     ),
     (
         "firewall",
-        "firewall summary / statistics / counters / events / states / hits / log",
+        "firewall summary / statistics / counters / events [since <id>] / states / hits / log",
     ),
     ("nat", "NAT configuration summary"),
     ("ids", "intrusion detection: what is watched, what fired"),
@@ -1565,6 +1589,10 @@ const FLEET_FIELDS: &[Cand] = &[
     (
         "poll-interval",
         "check-in interval in seconds (1–300, default 5)",
+    ),
+    (
+        "flow-telemetry",
+        "send per-flow detail (addresses) in telemetry; default counters only",
     ),
 ];
 const UPDATE_FIELDS: &[Cand] = &[
@@ -2842,11 +2870,26 @@ const HA_FIELDS: &[Cand] = &[
         "this member's management TLS SPKI",
     ),
     ("peer-identity", "peer-specific facts as a JSON object"),
+    (
+        "lease-ms",
+        "witness lease in ms (default 250; same on the witness)",
+    ),
+    (
+        "io-timeout-ms",
+        "bound on one witness exchange in ms (default 80; about 3 round trips)",
+    ),
 ];
 const HA_WITNESS_FIELDS: &[Cand] = &[
     ("listen", "listen IP:port"),
-    ("secret", "shared enrollment credential"),
-    ("cluster", "cluster identifier (derived when omitted)"),
+    ("key", "derived witness key (sentinel ha witness-key)"),
+    ("member", "the two member source addresses"),
+    ("cluster", "cluster identifier (required with key)"),
+    ("lease-ms", "lease granted in ms (default 250)"),
+    (
+        "peer-silence-ms",
+        "silence before a lone cold member may take over (default 10000)",
+    ),
+    ("secret", "deprecated: the members' credential; use key"),
 ];
 // `system config-sync <Tab>` reveals the HA config-sync fields.
 const CONFIGSYNC_FIELDS: &[Cand] = &[
@@ -5119,6 +5162,13 @@ pub(crate) fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, 
             "ca-certificate" | "client-certificate" | "client-key",
         ] => own_cands(&[("<absolute-path>", "absolute file path")]),
         ["set", "fleet", "poll-interval"] => own_cands(&[("<seconds>", "1–300 seconds")]),
+        ["set", "fleet", "flow-telemetry"] => own_cands(&[
+            (
+                "true",
+                "include connection states, NAT flows and top talkers",
+            ),
+            ("false", "counters only (the default)"),
+        ]),
         ["set", "update", "url"] => own_cands(&[PH_URL]),
         ["set", "update", "public-key"] => {
             own_cands(&[("<pem|file:path>", "PEM key or file:<path>")])

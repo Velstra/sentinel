@@ -40,6 +40,9 @@ in
       after = [ "sentinel-boot.service" "network.target" ];
       requires = [ "sentinel-boot.service" ];
       unitConfig.ConditionPathExists = "/run/sentinel/witness.json";
+      # Both members fence within one lease of the witness going away, so a
+      # crash loop must never trip the default start limit and leave it down.
+      startLimitIntervalSec = 0;
       serviceConfig = {
         ExecStart = "${cfg.package}/bin/wren-witness --config /run/sentinel/witness.json";
         StateDirectory = "sentinel/witness";

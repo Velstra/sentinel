@@ -122,7 +122,10 @@ in pkgs.testers.runNixOSTest {
       networking.firewall.enable=lib.mkForce false;
       services.velstra.interface=lib.mkForce "eth1";
       services.velstra.appliance=lib.mkForce ((pkgs.formats.toml {}).generate "witness-appliance.toml" {
-        system={hostname="witness";ha-witness={listen="10.3.0.3:5440";inherit secret;cluster="vm-cluster-0123456789";};};
+        # Only the derived witness key (`sentinel ha witness-key`), never the
+        # members' credential; only the two members may open sessions. A long
+        # peer silence gives the lone-survivor check room to observe the wait.
+        system={hostname="witness";ha-witness={listen="10.3.0.3:5440";key="c0b85d40a476e906218005259304678cbafc193059b70394a58334edfb13882b";cluster="vm-cluster-0123456789";member=["10.3.0.1" "10.3.0.2"];peer-silence-ms=20000;};};
         interface=[{name="eth1";address="10.3.0.3/24";zone="control";}];
         firewall.default_action="accept";
       });
@@ -170,8 +173,13 @@ in pkgs.testers.runNixOSTest {
     for node in (master,backup):
         node.wait_for_unit("sentinel-api.service")
         node.succeed("curl -skN --max-time 180 -H 'Authorization: Bearer ${secret}' https://127.0.0.1:8080/api/v1/telemetry > /tmp/live-management 2>/tmp/live-management-errors &")
+    witness.succeed("! grep -rq '${secret}' /var/lib/sentinel /run/sentinel")
+    # A source that is not a member is closed before it can hold a session.
+    witness.succeed(python_command('import socket; s=socket.create_connection(("10.3.0.3",5440),1); s.settimeout(1); assert s.recv(1)==b""'))
     master.wait_until_succeeds(python_command('import json,subprocess; state=json.loads(subprocess.check_output(["sentinel","agent-query","ha-status"])); assert state["role"]=="Master" and state["sync_age_ms"] is None'),timeout=20)
     backup.wait_until_succeeds(python_command('import json,subprocess; state=json.loads(subprocess.check_output(["sentinel","agent-query","ha-status"])); assert state["role"]=="Backup" and state["sync_age_ms"] is not None and state["sync_age_ms"]<1500'),timeout=20)
+    backup.wait_until_succeeds("sentinel show ha | grep -qx 'HA Backup'",timeout=20)
+    master.succeed("sentinel show ha | grep -qx 'HA Master'")
     for node in (master,backup):
         print(node.succeed(python_command('import json,time; r=json.load(open("/run/velstra/ha/role.json")); a=json.load(open("/run/velstra/ha/agent.json")); print(json.dumps({"role":r,"agent":a,"remaining_ms":(r["deadline_ns"]-time.clock_gettime_ns(time.CLOCK_BOOTTIME))/1000000,"policy_match":a["policy"]==r["authority"]["policy"],"agent_match":a["agent_boot"]==r["claimed_agent_boot"]}))')))
         print(node.execute("bpftool -j map dump pinned /sys/fs/bpf/velstra-ha/deadline")[1])
@@ -328,6 +336,26 @@ in pkgs.testers.runNixOSTest {
     master.succeed("${self.packages.x86_64-linux.velstra}/bin/velstra ha-guard /run/sentinel/velstra.toml")
     master.succeed("tc filter show dev dmz0 ingress | grep -q bpf; tc filter show dev dmz0 egress | grep -q bpf")
     master.succeed("systemctl start velstra wren")
+    ''}
+    ${pkgs.lib.optionalString leased ''
+    # A lone survivor. Node 1 is lost for good and node 2 then restarts its
+    # agent and coordinator, so it is cold and can neither retry a claim nor
+    # win a two-member cold vote. Once the witness has heard nothing from node
+    # 1 for the configured peer silence, node 2 alone opens a new empty epoch.
+    master.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=25)
+    backup.wait_until_succeeds(python_command('import json; assert json.load(open("/run/velstra/ha/agent.json"))["ready_term"] > 0'),timeout=20)
+    master.crash()
+    lost=time.monotonic()
+    backup.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=10)
+    backup.succeed("systemctl stop wren velstra")
+    backup.succeed("systemctl start velstra wren")
+    backup.wait_until_succeeds("sentinel show ha | grep -q '^HA Backup (not ready: '",timeout=10)
+    print(backup.succeed("sentinel show ha; sentinel show vrrp"))
+    backup.wait_until_succeeds("ip -o address show eth2 | grep -q 10.2.0.100",timeout=40)
+    waited=time.monotonic()-lost
+    assert waited>=19.5,f"lone cold member took over {waited:.1f}s after its peer went silent"
+    backup.wait_until_succeeds("sentinel show ha | grep -qx 'HA Master'",timeout=10)
+    client.wait_until_succeeds(python_command('import socket; s=socket.create_connection(("10.1.0.10",8443),4); data=b"survivor"+bytes([10]); s.sendall(data); assert s.recv(100)==data'),timeout=15)
     ''}
     print(f"ungraceful failover {elapsed:.3f}s; one TCP socket, ${if synproxy then "preserved SYN-proxy splice" else "preserved SNAT"}, {after}")
   '';

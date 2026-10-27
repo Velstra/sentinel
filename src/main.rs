@@ -13,6 +13,7 @@ mod aaa;
 mod acme;
 mod alert;
 mod api;
+mod api_session;
 mod archive;
 mod capture;
 mod clock;
@@ -26,6 +27,7 @@ mod feed;
 mod fleet;
 mod grammar_walk;
 mod ha;
+mod held_links;
 mod identity;
 mod ids;
 mod image;
@@ -47,6 +49,7 @@ mod proxy;
 #[cfg(test)]
 mod quickstart;
 mod reconcile;
+mod redact;
 mod relay;
 mod repl;
 mod safe_apply;
@@ -58,6 +61,7 @@ mod ui;
 mod unlock;
 mod update;
 mod velstra;
+mod verified_image;
 mod webui;
 mod wgkey;
 mod wireless;
@@ -85,6 +89,20 @@ fn saved_config_path() -> std::path::PathBuf {
     std::env::var_os("SENTINEL_CONFIG")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_CONFIG))
+}
+
+/// Load the configuration for a `show` to print, with its secrets withheld as
+/// far as whoever asked may not see them.
+///
+/// Every `show` that reads the configuration reads it through here, so a view
+/// added tomorrow inherits the redaction rather than having to remember it. On
+/// the box's own CLI nothing is withheld (`SENTINEL_REDACT` is unset — whoever
+/// runs it can read the file anyway); the management API sets the variable for
+/// any caller that is not the machine credential, which is what keeps a
+/// read-only account from reading the config-sync secret — the machine's
+/// full-access token — out of `show configuration commands`.
+fn load_shown(path: &std::path::Path) -> Result<Appliance> {
+    redact::appliance(&Appliance::load(path)?, redact::Disclosure::from_env())
 }
 use velstra_proto::{
     Counter, ListPortsRequest, StatsReport, velstra_control_client::VelstraControlClient,
@@ -134,15 +152,17 @@ struct Cli {
 #[derive(Subcommand)]
 enum HaCommand {
     /// Pair this primary with a secondary using its bootstrap machine token.
+    ///
+    /// The token is read from standard input (`--secret-stdin`), or prompted
+    /// for without echo on a terminal. It is the secondary's API machine token:
+    /// on a command line it would sit in the process list and shell history.
     Pair {
         peer: String,
-        #[arg(
-            long,
-            required_unless_present = "secret_stdin",
-            conflicts_with = "secret_stdin"
-        )]
+        /// Refused: a token in argv is visible to every local user.
+        #[arg(long, hide = true, conflicts_with = "secret_stdin")]
         secret: Option<String>,
-        #[arg(long, hide = true)]
+        /// Read the machine token from standard input.
+        #[arg(long)]
         secret_stdin: bool,
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
@@ -153,6 +173,47 @@ enum HaCommand {
         #[arg(long)]
         peer_identity: Option<PathBuf>,
     },
+    /// Print the witness's `[system.ha-witness]` key and cluster for a pair
+    /// token (read like `pair` does). The witness never needs the token itself.
+    WitnessKey {
+        /// The pair's cluster identifier, when one was set explicitly.
+        #[arg(long)]
+        cluster: Option<String>,
+        /// Read the machine token from standard input.
+        #[arg(long)]
+        secret_stdin: bool,
+    },
+    /// Alert when a standby stays unable to take over (systemd worker).
+    #[command(hide = true)]
+    Watch {
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    },
+}
+
+/// The pair token, from standard input or a no-echo prompt. One trailing line
+/// ending is the terminator `echo` or a here-string adds, not part of the token.
+fn read_pair_token(from_stdin: bool, argv: Option<String>) -> Result<String> {
+    use std::io::{IsTerminal, Read};
+    anyhow::ensure!(
+        argv.is_none(),
+        "--secret puts the machine token in the process list and shell history; \
+         pipe it with --secret-stdin, or omit both to be prompted"
+    );
+    let mut value = if !from_stdin && std::io::stdin().is_terminal() {
+        prompt_secret("HA pair token: ")?
+    } else {
+        let mut value = String::new();
+        std::io::stdin().take(1026).read_to_string(&mut value)?;
+        value
+    };
+    if value.ends_with('\n') {
+        value.pop();
+        if value.ends_with('\r') {
+            value.pop();
+        }
+    }
+    Ok(value)
 }
 
 #[derive(Subcommand)]
@@ -308,9 +369,10 @@ enum Command {
     /// state a reboot wipes — tc qdiscs (QoS), Multi-WAN routes, IPsec SAs. Used
     /// by the sentinel-boot-late service.
     ApplyBootLate {
-        /// The active appliance config to apply.
-        #[arg(long, default_value = DEFAULT_CONFIG)]
-        config: PathBuf,
+        /// The appliance config to apply. Without it, what a commit applied
+        /// since boot, else the saved config.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     /// Ask the data plane agent's query socket and print the reply.
     ///
@@ -401,6 +463,17 @@ enum Command {
         /// channel's `public-key`, then to a key baked into the image.
         #[arg(long)]
         pubkey: Option<String>,
+        /// The detached signature proving a LOCAL image or block device, when it
+        /// does not sit beside the image: `…/manifest.json.sig` (a signed
+        /// release manifest), `…/<image>.sha256.sig` (a signed digest) or a raw
+        /// `<image>.sig`. A USB stick is proven this way — nothing can sit
+        /// "beside" `/dev/sdb`.
+        #[arg(long)]
+        signature: Option<std::path::PathBuf>,
+        /// Install a release OLDER than the running one. Refused by default: an
+        /// old release stays validly signed forever.
+        #[arg(long)]
+        allow_downgrade: bool,
     },
     /// Unlock the encrypted data partition (LUKS2). Run by
     /// `sentinel-unlock.service` before `/var/lib/sentinel` is mounted, not by
@@ -424,6 +497,10 @@ enum Command {
         /// The saved config to revert to (the running/boot baseline).
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
+        /// Set by the `commit-confirm` timer: revert only that change, never a
+        /// pending management transaction.
+        #[arg(long, hide = true)]
+        commit_confirm: bool,
     },
     /// Deliver an alert for a failed unit (roadmap C23). Invoked by systemd's
     /// `OnFailure=` on the units Sentinel owns, not by hand — it reads the saved
@@ -455,6 +532,23 @@ enum Command {
     /// Run by `sentinel-ids-watch.service` while `block-on-alert` is set, not by
     /// hand. Every block it asks for expires, and none survive an agent restart.
     IdsWatch,
+    /// Put zoned links back into the hold when the data-plane agent stops, so
+    /// none forwards without its XDP program. Run as `velstra.service`'s
+    /// `ExecStopPost=`, not by hand.
+    #[command(hide = true)]
+    HoldLinksDown {
+        /// Read when no committed snapshot is available.
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    },
+    /// Alert when zoned links stay held down because the data plane has not
+    /// hooked them. Run by `sentinel-link-watch.service`, not by hand.
+    #[command(hide = true)]
+    LinkWatch {
+        /// Where the alert targets are read from.
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    },
     /// Carry UDP broadcasts between segments (roadmap C18). Run by
     /// `sentinel-broadcast-relay.service` from the config an apply rendered, not
     /// by hand.
@@ -528,6 +622,16 @@ enum ConfigAction {
         #[arg(long, value_enum)]
         to: Format,
     },
+    /// End a management transaction whose automatic recovery gave up.
+    Recover {
+        /// Accept the live network as it is and end the transaction. The saved
+        /// configuration stays the one the transaction started from. Refused
+        /// while recovery is still retrying.
+        #[arg(long, required = true)]
+        accept_current: bool,
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -562,14 +666,7 @@ async fn main() -> Result<()> {
                     peer_identity,
                 },
         } => {
-            use std::io::Read;
-            let secret = if secret_stdin {
-                let mut value = String::new();
-                std::io::stdin().take(1025).read_to_string(&mut value)?;
-                value
-            } else {
-                secret.context("--secret required")?
-            };
+            let secret = read_pair_token(secret_stdin, secret)?;
             ha::pair(
                 &peer,
                 &secret,
@@ -578,6 +675,27 @@ async fn main() -> Result<()> {
                 peer_identity.as_deref(),
             )
         }
+        Command::Ha {
+            command:
+                HaCommand::WitnessKey {
+                    cluster,
+                    secret_stdin,
+                },
+        } => {
+            let token = read_pair_token(secret_stdin, None)?;
+            anyhow::ensure!(
+                (32..=1024).contains(&token.len()),
+                "the pair token must contain 32..1024 bytes"
+            );
+            let cluster = cluster.unwrap_or_else(|| ha::cluster_id(&token));
+            println!("[system.ha-witness]");
+            println!("cluster = \"{cluster}\"");
+            println!("key = \"{}\"", ha::witness_key(&token, &cluster));
+            Ok(())
+        }
+        Command::Ha {
+            command: HaCommand::Watch { config },
+        } => ha::watch(&config),
         Command::Configure { config, no_apply } => configure(&config, no_apply),
         Command::SyncConfig => configsync::flush(),
         Command::Show { args } => show_op(&args),
@@ -663,13 +781,24 @@ async fn main() -> Result<()> {
             commit,
             allow_unsigned,
             pubkey,
-        } => update_cmd(target.as_deref(), commit, allow_unsigned, pubkey.as_deref()),
+            signature,
+            allow_downgrade,
+        } => update_cmd(
+            target.as_deref(),
+            UpdateFlags {
+                commit,
+                allow_unsigned,
+                allow_downgrade,
+                pubkey: pubkey.as_deref(),
+                signature: signature.as_deref(),
+            },
+        ),
         Command::ApplyBoot {
             config,
             out,
             wren_out,
         } => apply_boot(&config, &out, &wren_out),
-        Command::ApplyBootLate { config } => apply_boot_late(&config),
+        Command::ApplyBootLate { config } => apply_boot_late(config.as_deref()),
         Command::AgentQuery { command, socket } => {
             let path = socket.unwrap_or_else(|| PathBuf::from(velstra::SOCKET));
             print!("{}", velstra::query_at(&path, &command)?);
@@ -681,15 +810,27 @@ async fn main() -> Result<()> {
             safe_apply::apply_pending(&config, &id, &live_apply(true))
         }
         Command::ApplyRecovery { config } => {
-            safe_apply::recover(&config, &live_apply(true), false, false)?;
-            Ok(())
+            match safe_apply::recover(&config, &live_apply(true), false, false) {
+                // One failed attempt on the way to the bound is logged, not a
+                // failed unit: the unit's OnFailure= alert is for giving up.
+                Err(error) if safe_apply::will_retry(&error) => {
+                    eprintln!("warning: {error:#}");
+                    Ok(())
+                }
+                other => other.map(drop),
+            }
         }
-        Command::ConfirmRollback { config } => confirm_rollback(&config),
+        Command::ConfirmRollback {
+            config,
+            commit_confirm,
+        } => confirm_rollback(&config, commit_confirm),
         Command::Alert { unit, config } => alert_unit(&unit, &config),
         Command::IdsWatch => {
             system::ignore_sigpipe();
             ids::watch()
         }
+        Command::LinkWatch { config } => held_links::watch(&config),
+        Command::HoldLinksDown { config } => held_links::hold_down(&config),
         Command::BroadcastRelay => {
             system::ignore_sigpipe();
             relay::run()
@@ -837,8 +978,8 @@ fn live_apply(enabled: bool) -> repl::Apply {
 /// The `commit-confirm` timer runs this when its window expires; an operator can
 /// also run it (or `run confirm-rollback` from config mode) to drop an
 /// un-confirmed change at once.
-fn confirm_rollback(config: &std::path::Path) -> Result<()> {
-    confirm::rollback(&live_apply(true), config)
+fn confirm_rollback(config: &std::path::Path, from_timer: bool) -> Result<()> {
+    confirm::rollback(&live_apply(true), config, from_timer)
 }
 
 /// The interactive configuration session — a VyOS/JunOS-style edit context.
@@ -1066,31 +1207,67 @@ fn apply_boot(
 /// runtime-only network state that a reboot wipes and that could not be applied
 /// before the links existed — tc egress qdiscs (QoS), the Multi-WAN policy
 /// routes, and the IPsec SAs. Run by the `sentinel-boot-late` service.
-fn apply_boot_late(config: &std::path::Path) -> Result<()> {
+fn apply_boot_late(config: Option<&std::path::Path>) -> Result<()> {
     // Lenient for the same reason as apply_boot: the second boot stage applies
     // the same saved config, and must survive an unknown key just the same.
     let _lock = system::apply_lock()?;
-    let appliance = Appliance::load_lenient(config)?;
+    let source = boot_late_source(
+        config,
+        std::path::Path::new(DEFAULT_CONFIG),
+        std::path::Path::new(session::Session::RUNNING),
+    );
+    let appliance = Appliance::load_lenient(source)?;
     net::apply_link_runtime(&appliance)
+}
+
+/// Which configuration the second boot stage re-applies: the one a live commit
+/// put in place since boot, if there was one, otherwise the saved one.
+///
+/// This stage waits (bounded) for a link to come online first, and zoned links
+/// stay down until the data plane has hooked them, so it can start well after
+/// an operator's first commit. Re-applying the *saved* configuration then
+/// rolled the commit's runtime state back underneath it — the commit's
+/// `sentinel-macsec` unit, say, was stopped seconds after the commit reported
+/// success, because the saved file did not have it yet. `running.toml` lives on
+/// a tmpfs and is written only by a commit that applied, under the same lock
+/// this stage holds, so its presence means "a commit has run since boot".
+///
+/// A config named on the command line is applied as named: the choice above is
+/// the unit's default, not a reinterpretation of what an operator asked for.
+fn boot_late_source<'a>(
+    explicit: Option<&'a std::path::Path>,
+    saved: &'a std::path::Path,
+    running: &'a std::path::Path,
+) -> &'a std::path::Path {
+    match explicit {
+        Some(path) => path,
+        None if running.is_file() => running,
+        None => saved,
+    }
 }
 
 /// `sentinel install`: with no target on a terminal, run the interactive wizard
 /// (pick mode + disks); with target(s), validate the selection and show the
 /// plan. Destructive execution happens on `--commit` (or after the wizard's
 /// confirmation).
+/// The options of `sentinel update`, as given.
+struct UpdateFlags<'a> {
+    commit: bool,
+    allow_unsigned: bool,
+    allow_downgrade: bool,
+    pubkey: Option<&'a str>,
+    signature: Option<&'a std::path::Path>,
+}
+
 /// Dispatch `sentinel update <target> [--commit]`. `target` is a local
 /// image/block-device path (written directly by the existing slot-writer), or a
 /// signed-channel keyword driving roadmap C13's authenticity gate against the
 /// saved `[update]` channel.
-fn update_cmd(
-    target: Option<&str>,
-    commit: bool,
-    allow_unsigned: bool,
-    pubkey: Option<&str>,
-) -> Result<()> {
+fn update_cmd(target: Option<&str>, flags: UpdateFlags) -> Result<()> {
     match target {
         None => anyhow::bail!(
-            "usage: sentinel update <image>|check|install [--commit] [--allow-unsigned]\n\
+            "usage: sentinel update <image>|check|install [--commit] [--signature <file>] \
+             [--allow-downgrade] [--allow-unsigned]\n\
              (`check`/`install` use the saved [update] channel; a path writes that image directly)"
         ),
         Some("check") => {
@@ -1100,12 +1277,28 @@ fn update_cmd(
             // one would hope it went.
             match update::check(&chan) {
                 Ok(manifest) => {
-                    update::record_status(
-                        &chan,
-                        &format!("release {} available", manifest.version),
-                    );
+                    // A signed release older than this one is not an update. It
+                    // is reported, not hidden: a channel that serves it may be a
+                    // stale mirror or somebody replaying an old manifest.
+                    let older = update::refuse_downgrade(&manifest.version, false).is_err();
+                    let (outcome, verb) = if older {
+                        (
+                            format!(
+                                "release {} offered, older than the running {}",
+                                manifest.version,
+                                update::RUNNING_VERSION
+                            ),
+                            "NOT an update (older than the running release)",
+                        )
+                    } else {
+                        (
+                            format!("release {} available", manifest.version),
+                            "update available",
+                        )
+                    };
+                    update::record_status(&chan, &outcome);
                     println!(
-                        "channel {:?}: update available: {} (image {}, sha256 {})",
+                        "channel {:?}: {verb}: {} (image {}, sha256 {})",
                         chan.label(),
                         manifest.version,
                         manifest.image,
@@ -1121,11 +1314,11 @@ fn update_cmd(
         }
         Some("install") => {
             let chan = load_update_channel()?;
-            match install::update_from_channel(&chan, commit) {
+            match install::update_from_channel(&chan, flags.commit, flags.allow_downgrade) {
                 Ok(()) => {
                     update::record_status(
                         &chan,
-                        if commit {
+                        if flags.commit {
                             "image verified and written to the inactive slot"
                         } else {
                             "image verified (dry-run; nothing written)"
@@ -1140,35 +1333,33 @@ fn update_cmd(
             }
         }
         // Any other value is a local image/block-device path.
-        Some(path) => update_local(path, commit, allow_unsigned, pubkey),
+        Some(path) => update_local(path, &flags),
     }
 }
 
 /// Write a LOCAL image to the inactive slot, verifying its signature FIRST unless
 /// the operator explicitly opts out.
 ///
-/// Verification is now the default for a local image too — the local path used to
+/// Verification is the default for a local image too — the local path used to
 /// write anything given to it, which was the supply-chain hole. A detached
-/// `<image>.sig` is checked against a pinned Ed25519 key (the `--pubkey` flag, the
-/// saved channel's `public-key`, or a key baked into the image) before a single
-/// byte reaches the slot-writer. `--allow-unsigned` keeps the old escape hatch for
-/// a re-seal or an air-gapped block device — loud and logged, never silent.
-fn update_local(
-    path: &str,
-    commit: bool,
-    allow_unsigned: bool,
-    pubkey: Option<&str>,
-) -> Result<()> {
+/// signature (beside the image, or named by `--signature`) is checked against a
+/// pinned Ed25519 key (the `--pubkey` flag, the saved channel's `public-key`, or
+/// a key baked into the image), and the image is then installed from the bytes
+/// that matched it — see [`install::update_verified`]. A signed manifest also
+/// states the release version, which must not be older than the running one
+/// unless `--allow-downgrade`. `--allow-unsigned` keeps the old escape hatch for
+/// a re-seal or a trusted device — loud and logged, never silent.
+fn update_local(path: &str, flags: &UpdateFlags) -> Result<()> {
     let image = std::path::Path::new(path);
-    if allow_unsigned {
+    if flags.allow_unsigned {
         eprintln!(
             "warning: --allow-unsigned: writing {path} to the inactive slot WITHOUT signature \
              verification. A local image/device is trusted exactly as given; make sure you \
              trust its source."
         );
-        return install::update(image, commit);
+        return install::update(image, flags.commit);
     }
-    let key = local_update_pubkey(pubkey).ok_or_else(|| {
+    let key = local_update_pubkey(flags.pubkey).ok_or_else(|| {
         anyhow::anyhow!(
             "refusing to write an unverified image: no release public key to verify against.\n\
              Pin one with --pubkey <pem|file:path>, set an [update] channel public-key and save, \
@@ -1176,9 +1367,25 @@ fn update_local(
              pass --allow-unsigned."
         )
     })?;
-    update::verify_local_image(image, &key)?;
+    let proof = update::verify_local_image(image, flags.signature, &key)?;
     eprintln!("signature verified against the pinned release key");
-    install::update(image, commit)
+    match &proof.version {
+        Some(version) => {
+            eprintln!("signed release {version}");
+            update::refuse_downgrade(version, flags.allow_downgrade)?;
+        }
+        // A digest or raw signature vouches for bytes, not for a release, so
+        // there is no version to hold against the running one. The input here
+        // is chosen by root at the console, not served by a mirror, which is
+        // why this is said rather than refused; a signed manifest closes it.
+        None => eprintln!(
+            "note: this proof states no release version, so it cannot be checked against \
+             the running {} — use the release's signed manifest (--signature \
+             …/manifest.json.sig) for downgrade protection",
+            update::RUNNING_VERSION
+        ),
+    }
+    install::update_verified(&proof.source, &proof.sha256, flags.commit)
 }
 
 /// Where a local image's signing key is looked for, in order of precedence:
@@ -1236,7 +1443,7 @@ fn load_update_channel() -> Result<config::UpdateChannel> {
 /// box computed itself would be a guess, and this view does not guess.
 fn show_subscription() -> Result<()> {
     let saved = saved_config_path();
-    let appliance = Appliance::load(saved.as_path())?;
+    let appliance = load_shown(saved.as_path())?;
     let Some(up) = &appliance.update else {
         println!(
             "no update channel configured — set update url <https-url> + public-key, or \
@@ -1902,7 +2109,7 @@ fn show_zones() -> Result<()> {
         println!("no saved configuration");
         return Ok(());
     }
-    let a = Appliance::load(&saved)?;
+    let a = load_shown(&saved)?;
 
     // A zone exists because an interface names it. The posture block is
     // optional and may name a zone no interface is in — that block simply has
@@ -1991,7 +2198,7 @@ fn show_rule_hits() -> Result<()> {
         println!("no saved configuration to attribute flows to");
         return Ok(());
     }
-    let appliance = Appliance::load(&saved)?;
+    let appliance = load_shown(&saved)?;
     let cfg = crate::compile::compile(&appliance);
     let table = velstra::query("flows --limit 0")
         .or_else(|_| velstra::query("flows"))
@@ -2165,6 +2372,16 @@ fn show_multiwan() -> Result<()> {
     Ok(())
 }
 
+/// Under the kernel's listing, the zoned links that are DOWN because the data
+/// plane has not hooked them — which `ip` shows exactly like a link somebody
+/// switched off. Silent when the running configuration cannot be read.
+fn show_held_links() {
+    if let Some(appliance) = held_links::running_appliance() {
+        let dark = held_links::dark(&appliance, held_links::link_down);
+        print!("{}", held_links::show_lines(&dark));
+    }
+}
+
 fn show_op(args: &[String]) -> Result<()> {
     let ip = system::bin("ip");
     let v: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -2193,7 +2410,9 @@ fn show_op(args: &[String]) -> Result<()> {
                 println!("clock:      {}", time.describe());
             }
             println!("interfaces:");
-            run_show(&ip, &["-brief", "address", "show"])
+            run_show(&ip, &["-brief", "address", "show"])?;
+            show_held_links();
+            Ok(())
         }
         // Config revision history (roadmap C21): `show system commit` lists the
         // archived revisions; `show system commit <N>` shows one in config syntax.
@@ -2202,7 +2421,11 @@ fn show_op(args: &[String]) -> Result<()> {
         ["interfaces", rest @ ..] => {
             let mut a = vec!["-brief", "address", "show"];
             a.extend(rest);
-            run_show(&ip, &a)
+            run_show(&ip, &a)?;
+            if rest.is_empty() {
+                show_held_links();
+            }
+            Ok(())
         }
         ["arp", rest @ ..] | ["neighbors", rest @ ..] => {
             let mut a = vec!["neighbor", "show"];
@@ -2233,6 +2456,12 @@ fn show_op(args: &[String]) -> Result<()> {
         ["isis", rest @ ..] => wren_show_words("isis", rest),
         ["babel", rest @ ..] => wren_show_words("babel", rest),
         ["vrrp"] => wren_show(&["vrrp"]),
+        ["ha"] => {
+            let status: serde_json::Value = serde_json::from_str(&velstra::query("ha-status")?)
+                .context("reading the data plane's HA status")?;
+            print!("{}", ha::render_status(&status));
+            Ok(())
+        }
         // The routing daemon knows which VRFs it is running; the kernel knows
         // which devices exist. Either answer is more use than none.
         ["vrf"] | ["vrfs"] => {
@@ -2266,7 +2495,7 @@ fn show_op(args: &[String]) -> Result<()> {
             let saved = saved_config_path();
             let path = saved.as_path();
             if path.exists() {
-                print!("{}", Appliance::load(path)?.summary());
+                print!("{}", load_shown(path)?.summary());
             }
             Ok(())
         }
@@ -2278,7 +2507,15 @@ fn show_op(args: &[String]) -> Result<()> {
         ["firewall", "zones"] | ["zones"] => show_zones(),
         ["firewall", "states"] => show_agent_query("firewall-states", "firewall connection states"),
         ["firewall", "counters"] => show_agent_query("rule-stats", "rule packet counters"),
-        ["firewall", "events"] => show_agent_query("packet-events 100", "packet events"),
+        // The newest events, read without consuming them: the console's live
+        // view reads the same agent log through its own cursor.
+        ["firewall", "events"] => show_agent_query("packet-events-tail 100", "packet events"),
+        // Only what came after an event already seen (every event carries its
+        // `id`): one page of the agent's log, with the `cursor` to ask from
+        // next and how many events were `missed` in between. Consumes nothing.
+        ["firewall", "events", "since", id] => {
+            show_agent_query(&firewall_events_since_query(id)?, "packet events")
+        }
         ["firewall", "statistics" | "stats"] => show_firewall_stats(),
         // Which rules are carrying traffic, and which are carrying none.
         ["firewall", "hits"] | ["firewall", "rules"] => show_rule_hits(),
@@ -2362,7 +2599,7 @@ fn show_op(args: &[String]) -> Result<()> {
             let saved = saved_config_path();
             let path = saved.as_path();
             if path.exists() {
-                let rendered = session::render_appliance(&Appliance::load(path)?);
+                let rendered = session::render_appliance(&load_shown(path)?);
                 for line in session::flatten_config(&rendered) {
                     println!("{line}");
                 }
@@ -2384,7 +2621,7 @@ fn show_op(args: &[String]) -> Result<()> {
                 // be copied and therefore the one that must carry it.
                 print!(
                     "{}",
-                    session::render_appliance_for_reading(&Appliance::load(path)?)
+                    session::render_appliance_for_reading(&load_shown(path)?)
                 );
             } else {
                 println!(
@@ -2398,7 +2635,7 @@ fn show_op(args: &[String]) -> Result<()> {
             let saved = saved_config_path();
             let path = saved.as_path();
             if path.exists() {
-                print!("{}", Appliance::load(path)?.summary());
+                print!("{}", load_shown(path)?.summary());
             } else {
                 println!(
                     "no saved config at {} (run `configure` + `save`)",
@@ -2500,7 +2737,7 @@ fn show_op(args: &[String]) -> Result<()> {
              show ip rip | show ipv6 ripng\n  \
              show isis [neighbors|interfaces|database]\n  \
              show babel [neighbors|routes]\n  \
-             show vrrp | show bfd [sessions]\n  \
+             show vrrp | show ha | show bfd [sessions]\n  \
              show firewall [statistics|counters|events|states|log]\n  \
              show flows [| top-talkers]        live state table / hosts by volume\n  \
              show nat                          NAT configuration\n  \
@@ -2592,6 +2829,17 @@ fn show_agent_query(command: &str, what: &str) -> Result<()> {
     }
 }
 
+/// The agent request behind `show firewall events since <id>`. The id is the
+/// `id` of the last event the operator saw; anything but a number is refused
+/// here rather than sent on as a word the agent would read as a different
+/// request.
+fn firewall_events_since_query(id: &str) -> Result<String> {
+    let id: u64 = id
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid event id {id:?}: expected the `id` of an event"))?;
+    Ok(format!("packet-events-since {id} 512"))
+}
+
 /// `show users`: the accounts, their management group and what it allows.
 ///
 /// Read from the **saved** configuration rather than from the token directory:
@@ -2599,7 +2847,7 @@ fn show_agent_query(command: &str, what: &str) -> Result<()> {
 /// only the secret. Listing the files instead would show an account as having
 /// access after its group was taken away.
 fn show_users() -> Result<()> {
-    let appliance = Appliance::load(&saved_config_path())?;
+    let appliance = load_shown(&saved_config_path())?;
     if appliance.system.logins.is_empty() {
         println!("no accounts configured");
         return Ok(());
@@ -2786,7 +3034,10 @@ fn show_revision(n: &str) -> Result<()> {
         .parse()
         .map_err(|_| anyhow::anyhow!("revision must be a number (see `show system commit`)"))?;
     let toml = archive::read_revision(&saved_config_path(), n)?;
-    let appliance = Appliance::from_toml(&toml)?;
+    let appliance = redact::appliance(
+        &Appliance::from_toml(&toml)?,
+        redact::Disclosure::from_env(),
+    )?;
     // A past revision is read, not replayed, so it is shown the same way the
     // running one is.
     print!("{}", session::render_appliance_for_reading(&appliance));
@@ -2804,7 +3055,7 @@ fn show_nat() -> Result<()> {
         );
         return Ok(());
     }
-    let a = Appliance::load(path)?;
+    let a = load_shown(path)?;
     if a.nat.is_empty() {
         println!("no NAT configured");
         return Ok(());
@@ -2982,7 +3233,7 @@ fn show_broadcast_relay() -> Result<()> {
         );
         return Ok(());
     }
-    let relays = Appliance::load(path)?.services.broadcast_relay;
+    let relays = load_shown(path)?.services.broadcast_relay;
     if relays.is_empty() {
         println!("no broadcast relay is configured");
         return Ok(());
@@ -3001,7 +3252,7 @@ fn show_broadcast_relay() -> Result<()> {
     // A relay whose port the firewall drops carries nothing while looking
     // perfectly configured, so the same advisory the commit prints is repeated
     // here — this is where someone looks when it is not working.
-    let appliance = Appliance::load(path)?;
+    let appliance = load_shown(path)?;
     for w in appliance.warnings() {
         if w.contains("broadcast-relay") {
             println!("warning: {w}");
@@ -3023,7 +3274,7 @@ fn show_ids() -> Result<()> {
         );
         return Ok(());
     }
-    let ids = Appliance::load(path)?.services.ids;
+    let ids = load_shown(path)?.services.ids;
     if ids.is_empty() {
         println!("intrusion detection is off (no `services ids interface` is set)");
         return Ok(());
@@ -3089,7 +3340,7 @@ fn show_load_balancer() -> Result<()> {
         );
         return Ok(());
     }
-    let a = Appliance::load(path)?;
+    let a = load_shown(path)?;
     if a.load_balancers.is_empty() {
         println!("no load-balanced services configured");
         return Ok(());
@@ -3122,7 +3373,7 @@ fn show_pki() -> Result<()> {
         );
         return Ok(());
     }
-    let a = Appliance::load(path)?;
+    let a = load_shown(path)?;
     if a.pki.is_empty() {
         println!("no PKI configured");
         return Ok(());
@@ -3284,6 +3535,14 @@ fn config_cmd(action: ConfigAction) -> Result<()> {
             print!("{out}");
             Ok(())
         }
+        ConfigAction::Recover { config, .. } => {
+            safe_apply::accept_current(&config, None)?;
+            eprintln!(
+                "transaction ended; the saved configuration is unchanged. The live network \
+                 may still differ from it — `sentinel confirm-rollback` re-applies it live."
+            );
+            Ok(())
+        }
     }
 }
 
@@ -3372,7 +3631,39 @@ async fn ports(endpoint: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::firewall_log_args;
+    use super::{boot_late_source, firewall_events_since_query, firewall_log_args};
+
+    #[test]
+    fn boot_late_reapplies_a_commit_made_since_boot_not_the_saved_file() {
+        let dir = std::env::temp_dir().join(format!("sentinel-boot-late-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let saved = dir.join("appliance.toml");
+        let running = dir.join("running.toml");
+        std::fs::write(&saved, "saved").unwrap();
+        let _ = std::fs::remove_file(&running);
+        // Nothing committed since boot: the saved configuration.
+        assert_eq!(boot_late_source(None, &saved, &running), saved.as_path());
+        // A commit ran before this stage got the lock: what it applied.
+        std::fs::write(&running, "committed").unwrap();
+        assert_eq!(boot_late_source(None, &saved, &running), running.as_path());
+        // A config named on the command line wins over both.
+        let named = dir.join("named.toml");
+        assert_eq!(
+            boot_late_source(Some(&named), &saved, &running),
+            named.as_path()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn events_since_pages_the_agent_log_from_the_given_id() {
+        assert_eq!(
+            firewall_events_since_query("42").unwrap(),
+            "packet-events-since 42 512"
+        );
+        assert!(firewall_events_since_query("42 512").is_err());
+        assert!(firewall_events_since_query("-1").is_err());
+    }
 
     #[test]
     fn the_log_reads_fifty_lines_unless_asked_otherwise() {

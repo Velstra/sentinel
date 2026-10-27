@@ -418,6 +418,10 @@ pub(crate) struct Interface {
     pub(crate) bind_mac: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) bind_addresses: Vec<String>,
+    /// The link is held down until the agent has hooked it, and the agent
+    /// brings it up (see `net::held_until_attached`). Omitted when false.
+    #[serde(skip_serializing_if = "is_false")]
+    pub(crate) activate: bool,
 }
 
 fn is_zero_u16(v: &u16) -> bool {
@@ -890,6 +894,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                 ingress_limit: i.ingress_limit,
                 bind_mac: i.bind_mac.clone(),
                 bind_addresses: i.bind_addresses.clone(),
+                activate: crate::net::held_until_attached(i),
             })
         })
         .collect();
@@ -2993,5 +2998,88 @@ underlay-interface = "eth0"
             "the peer trust list is missing: {out}"
         );
         assert!(!out.contains("[overlay]"), "{out}");
+    }
+}
+
+/// New and recreated links must not forward before the data plane hooks them.
+/// The appliance holds every zoned link down (networkd `ActivationPolicy=manual`)
+/// and tells the agent which links those are, so it brings each one up once its
+/// hooks are attached and the policy is in force.
+#[cfg(test)]
+mod held_link_tests {
+    use super::*;
+
+    const DOC: &str = r#"
+[system]
+hostname = "fw"
+
+[[interface]]
+name = "wan0"
+zone = "wan"
+address = "dhcp"
+
+[[interface]]
+name = "lan0"
+zone = "lan"
+address = "10.0.0.1/24"
+
+[[interface]]
+name = "mgmt0"
+address = "192.0.2.1/24"
+
+[[interface]]
+name = "eth9"
+
+[[interface]]
+name = "ppp0"
+zone = "wan"
+type = "pppoe"
+parent = "eth9"
+[interface.pppoe]
+username = "u"
+password = "p"
+
+[zone.wan]
+[zone.lan]
+"#;
+
+    #[test]
+    fn every_zoned_networkd_link_is_held_and_named_to_the_agent() {
+        let appliance = Appliance::from_toml(DOC).unwrap();
+        let held = |name: &str| {
+            let iface = appliance
+                .interfaces
+                .iter()
+                .find(|i| i.name == name)
+                .unwrap();
+            crate::net::held_until_attached(iface)
+        };
+        assert!(held("wan0") && held("lan0"));
+        // Unfiltered by design, so there is nothing to wait for.
+        assert!(!held("mgmt0"));
+        // pppd creates and raises its own link; networkd cannot hold it.
+        assert!(!held("ppp0"));
+
+        let out = toml::to_string(&compile(&appliance)).unwrap();
+        let cfg: toml::Value = toml::from_str(&out).unwrap();
+        let activate = |name: &str| {
+            cfg["interface"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|i| i["name"].as_str() == Some(name))
+                .and_then(|i| i.get("activate"))
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(false)
+        };
+        assert!(activate("wan0") && activate("lan0"), "{out}");
+        assert!(!activate("ppp0"), "{out}");
+    }
+
+    #[test]
+    fn a_disabled_link_is_not_held_it_is_down() {
+        let mut appliance = Appliance::from_toml(DOC).unwrap();
+        appliance.interfaces[1].disabled = true;
+        assert!(!crate::net::held_until_attached(&appliance.interfaces[1]));
     }
 }
