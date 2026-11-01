@@ -28,7 +28,12 @@ pub(crate) struct KernelLink {
 
 #[derive(Debug, Deserialize)]
 struct LinkInfo {
-    info_kind: String,
+    /// The link's own kind (`vlan`, `bridge`, …). iproute2 omits it on a
+    /// kernel-provided link that only reports what it is enslaved to: a plain
+    /// NIC that is a bridge port or bond member carries `info_slave_kind`
+    /// alone. Absent means "not a device of any kind of ours".
+    #[serde(default)]
+    info_kind: Option<String>,
     info_data: Option<serde_json::Value>,
 }
 
@@ -38,6 +43,13 @@ struct KernelAddress {
     prefixlen: u8,
     #[serde(default)]
     dadfailed: bool,
+    /// A finite lifetime: a DHCP lease, SLAAC, a delegated prefix. Somebody
+    /// is managing it, so it is never treated as an out-of-band address.
+    #[serde(default)]
+    dynamic: bool,
+    /// `global`, `link`, `host`. Absent is read as global, the strict side.
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 pub(crate) fn inventory() -> Result<BTreeMap<String, KernelLink>> {
@@ -105,6 +117,101 @@ pub(crate) fn drifted(
         })
 }
 
+/// Static, global addresses on a declared link that the configuration does not
+/// put there: added by hand, or left behind by an earlier configuration with a
+/// different prefix length.
+///
+/// Drift used to be one-sided — a *missing* address was repaired, an *extra* one
+/// survived every commit, and with it whatever it made the box reachable as.
+/// Excluded: addresses with a finite lifetime (leases, SLAAC, delegated
+/// prefixes — each has its own manager), link-local scope, `tolerated` (the
+/// virtual addresses the routing daemon adds and removes as mastership moves),
+/// and every address of a family whose addresses something else assigns: a
+/// DHCP/SLAAC family, a prefix-delegation downstream, and the router's own
+/// address out of each prefix it advertises (networkd's `Assign=yes`, which
+/// carries no lifetime). A disabled link is down and left alone, as is one the
+/// kernel does not have.
+pub(crate) fn foreign_addresses(
+    iface: &crate::config::Interface,
+    observed: &BTreeMap<String, KernelLink>,
+    tolerated: &[IpAddr],
+) -> Vec<(IpAddr, u8)> {
+    if iface.disabled || iface.is_pppoe() {
+        return Vec::new();
+    }
+    let Some(link) = observed.get(&iface.name) else {
+        return Vec::new();
+    };
+    let desired: Vec<(IpAddr, u8)> = [iface.address.as_deref(), iface.address6.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter_map(|cidr| cidr.split_once('/'))
+        .filter_map(|(address, prefix)| Some((address.parse().ok()?, prefix.parse().ok()?)))
+        .collect();
+    let leased_v4 = iface.address.as_deref() == Some("dhcp");
+    let leased_v6 =
+        matches!(iface.address6.as_deref(), Some("auto" | "dhcp")) || iface.pd_from.is_some();
+    let advertised: Vec<&str> = iface
+        .router_advert
+        .iter()
+        .flat_map(|ra| ra.prefixes.iter().map(String::as_str))
+        .collect();
+    link.addr_info
+        .iter()
+        .filter(|a| !a.dynamic && a.scope.as_deref().is_none_or(|s| s == "global"))
+        .filter(|a| match a.local {
+            IpAddr::V4(_) => !leased_v4,
+            IpAddr::V6(_) => {
+                !leased_v6 && !advertised.iter().any(|prefix| in_prefix(a.local, prefix))
+            }
+        })
+        .map(|a| (a.local, a.prefixlen))
+        .filter(|found| !desired.contains(found) && !tolerated.contains(&found.0))
+        .collect()
+}
+
+/// Whether `address` lies inside `cidr`. A malformed prefix contains nothing.
+fn in_prefix(address: IpAddr, cidr: &str) -> bool {
+    let Some((network, len)) = cidr.split_once('/') else {
+        return false;
+    };
+    let (Ok(network), Ok(len)) = (network.parse::<IpAddr>(), len.parse::<u32>()) else {
+        return false;
+    };
+    match (address, network) {
+        (IpAddr::V4(a), IpAddr::V4(n)) if len <= 32 => {
+            let mask = u32::MAX.checked_shl(32 - len).unwrap_or(0);
+            u32::from(a) & mask == u32::from(n) & mask
+        }
+        (IpAddr::V6(a), IpAddr::V6(n)) if len <= 128 => {
+            let mask = u128::MAX.checked_shl(128 - len).unwrap_or(0);
+            u128::from(a) & mask == u128::from(n) & mask
+        }
+        _ => false,
+    }
+}
+
+/// Physical links whose unit this configuration no longer renders.
+///
+/// networkd stops managing a link when its `.network` goes away, and stopping
+/// is all it does: the addresses stay, the link stays up, and the data plane —
+/// which only attaches to declared interfaces — no longer filters it. A device
+/// of our own (a `.netdev`) is deleted by retirement instead; this is for the
+/// hardware, which can only be emptied and taken down.
+pub(crate) fn released_links(
+    previous: &BTreeMap<String, String>,
+    desired: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    previous
+        .keys()
+        .filter(|file| !desired.contains_key(*file))
+        .filter_map(|file| file.strip_prefix("10-sentinel-")?.strip_suffix(".network"))
+        .filter(|name| device_name(&format!("10-sentinel-{name}.netdev")).is_some())
+        .filter(|name| !previous.contains_key(&format!("10-sentinel-{name}.netdev")))
+        .map(str::to_string)
+        .collect()
+}
+
 /// Recover vanished or replaced owned netdevs, including their dependencies.
 /// Existing VLAN identifiers, protocols and parents are immutable in networkd;
 /// retire them when the actual link no longer matches the unchanged config.
@@ -129,7 +236,7 @@ pub(crate) fn retire_drifted(
                 !link
                     .linkinfo
                     .as_ref()
-                    .is_some_and(|info| info.info_kind == kind)
+                    .is_some_and(|info| info.info_kind.as_deref() == Some(kind))
             })
         {
             retired.insert(iface.name.clone());
@@ -138,7 +245,7 @@ pub(crate) fn retire_drifted(
         if let Some(id) = iface.vlan {
             let expected_parent = iface.parent.as_ref().and_then(|p| observed.get(p));
             let vlan_matches = link.linkinfo.as_ref().is_some_and(|info| {
-                info.info_kind == "vlan"
+                info.info_kind.as_deref() == Some("vlan")
                     && info.info_data.as_ref().is_some_and(|data| {
                         data["id"].as_u64() == Some(u64::from(id))
                             && data["protocol"].as_str().is_some_and(|protocol| {
@@ -213,7 +320,60 @@ pub(crate) fn network_changed(
     ["network", "netdev", "link"].iter().any(|kind| {
         let file = format!("10-sentinel-{name}.{kind}");
         previous.get(&file) != desired.get(&file)
+            && !(*kind == "netdev" && wireguard_in_place(previous.get(&file), desired.get(&file)))
     })
+}
+
+/// The `[NetDev]` section of a rendered `.netdev`: what makes the device the
+/// device (its name and kind). Everything after it configures the device.
+fn netdev_identity(body: &str) -> String {
+    let mut out = String::new();
+    let mut inside = false;
+    for line in body.lines() {
+        if line.starts_with('[') {
+            inside = line.trim() == "[NetDev]";
+        }
+        if inside {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Whether a changed WireGuard `.netdev` can be applied to the live device.
+///
+/// A WireGuard link's key, listen port and peers are all settable on an
+/// existing device (`wg syncconf`), and recreating it for them drops the
+/// tunnel's addresses, routes and data-plane hooks along with the link — so a
+/// peer edit used to cut the whole VPN. (Peer sessions are reset either way:
+/// networkd re-applies a changed `.netdev` replacing every peer, and the peers
+/// handshake again.) Only a change to the device's identity, its `[NetDev]`
+/// section, still needs a new device.
+fn wireguard_in_place(previous: Option<&String>, desired: Option<&String>) -> bool {
+    let (Some(previous), Some(desired)) = (previous, desired) else {
+        return false;
+    };
+    let identity = netdev_identity(previous);
+    identity == netdev_identity(desired)
+        && identity.lines().any(|line| line.trim() == "Kind=wireguard")
+}
+
+/// WireGuard devices whose configuration changed in a way the live device can
+/// take: they are kept, and their new key/port/peer set is synced onto them.
+pub(crate) fn wireguard_updates(
+    previous: &BTreeMap<String, String>,
+    desired: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    previous
+        .iter()
+        .filter_map(|(file, body)| {
+            let name = device_name(file)?;
+            let wanted = desired.get(file)?;
+            (wanted != body && wireguard_in_place(Some(body), Some(wanted)))
+                .then(|| name.to_string())
+        })
+        .collect()
 }
 
 /// Recreating a VLAN/macvlan/tunnel also requires its unchanged parent to
@@ -271,7 +431,9 @@ pub(crate) fn retire(
         let Some(name) = device_name(file) else {
             continue;
         };
-        if desired.get(file) != Some(body) || old_parents.get(name) != new_parents.get(name) {
+        let replaced =
+            desired.get(file) != Some(body) && !wireguard_in_place(Some(body), desired.get(file));
+        if replaced || old_parents.get(name) != new_parents.get(name) {
             retired.insert(name.to_string());
         }
     }
@@ -454,6 +616,152 @@ mod tests {
         );
     }
 
+    /// `ip -details -json address show` as iproute2 6.x prints it for a VLAN-aware
+    /// bridge, a plain NIC enslaved to it, a bond member, an unenslaved NIC and
+    /// a VLAN (trimmed to the keys that matter, values as printed). A bridge port
+    /// or bond member reports `info_slave_kind` and no `info_kind` of its own;
+    /// requiring one refused every commit on a box with a bridge or a bond.
+    const REAL_INVENTORY: &str = r#"[
+      {"ifindex":2,"ifname":"eth1","flags":["BROADCAST","MULTICAST","UP","LOWER_UP"],
+       "mtu":1500,"qdisc":"fq_codel","master":"br0","operstate":"UP","group":"default",
+       "txqlen":1000,"link_type":"ether","address":"52:54:00:12:01:01",
+       "broadcast":"ff:ff:ff:ff:ff:ff","promiscuity":1,"allmulti":1,"min_mtu":68,
+       "max_mtu":65535,
+       "linkinfo":{"info_slave_kind":"bridge","info_slave_data":{"state":"forwarding",
+         "priority":32,"cost":100,"hairpin":false,"guard":false,"root_block":false,
+         "fastleave":false,"learning":false,"flood":true,"id":"0x8001","no":"0x1",
+         "designated_port":32769,"designated_cost":0,"bridge_id":"1000.52:54:0:12:1:1",
+         "root_id":"1000.52:54:0:12:1:1","hold_timer":0.00,"message_age_timer":0.00,
+         "forward_delay_timer":0.00,"topology_change_ack":0,"config_pending":0,
+         "proxy_arp":false,"proxy_arp_wifi":false,"multicast_router":1,
+         "mcast_flood":true,"bcast_flood":true,"mcast_to_unicast":false,
+         "neigh_suppress":false,"group_fwd_mask":"0","group_fwd_mask_str":"0x0",
+         "vlan_tunnel":false,"isolated":false,"locked":false,"mab":false}},
+       "num_tx_queues":1,"num_rx_queues":1,"gso_max_size":65536,"gso_max_segs":65535,
+       "addr_info":[{"family":"inet6","local":"fe80::5054:ff:fe12:101","prefixlen":64,
+         "scope":"link","protocol":"kernel_ll","valid_life_time":4294967295,
+         "preferred_life_time":4294967295}]},
+      {"ifindex":3,"ifname":"eth2","flags":["BROADCAST","MULTICAST","SLAVE","UP","LOWER_UP"],
+       "mtu":1500,"qdisc":"fq_codel","master":"bond0","operstate":"UP","group":"default",
+       "link_type":"ether","address":"52:54:00:12:02:01","broadcast":"ff:ff:ff:ff:ff:ff",
+       "linkinfo":{"info_slave_kind":"bond","info_slave_data":{"state":"ACTIVE",
+         "mii_status":"UP","link_failure_count":0,"perm_hwaddr":"52:54:00:12:02:01",
+         "queue_id":0,"prio":0}},
+       "addr_info":[]},
+      {"ifindex":4,"ifname":"eth3","flags":["BROADCAST","MULTICAST","UP","LOWER_UP"],
+       "mtu":1500,"qdisc":"fq_codel","operstate":"UP","group":"default",
+       "link_type":"ether","address":"52:54:00:12:03:01","broadcast":"ff:ff:ff:ff:ff:ff",
+       "addr_info":[{"family":"inet","local":"192.0.2.10","prefixlen":24,
+         "broadcast":"192.0.2.255","scope":"global","label":"eth3",
+         "valid_life_time":4294967295,"preferred_life_time":4294967295}]},
+      {"ifindex":5,"ifname":"br0","flags":["BROADCAST","MULTICAST","UP","LOWER_UP"],
+       "mtu":1500,"qdisc":"noqueue","operstate":"UP","group":"default",
+       "link_type":"ether","address":"52:54:00:12:01:01","broadcast":"ff:ff:ff:ff:ff:ff",
+       "linkinfo":{"info_kind":"bridge","info_data":{"forward_delay":400,
+         "hello_time":200,"max_age":2000,"ageing_time":12000,"stp_state":1,
+         "priority":4096,"vlan_filtering":1,"vlan_protocol":"802.1Q",
+         "bridge_id":"1000.52:54:0:12:1:1","root_id":"1000.52:54:0:12:1:1",
+         "mcast_snooping":1,"mcast_querier":1}},
+       "addr_info":[{"family":"inet","local":"10.0.0.1","prefixlen":24,
+         "broadcast":"10.0.0.255","scope":"global","label":"br0",
+         "valid_life_time":4294967295,"preferred_life_time":4294967295}]},
+      {"ifindex":6,"ifname":"bond0","flags":["BROADCAST","MULTICAST","MASTER","UP","LOWER_UP"],
+       "mtu":1500,"qdisc":"noqueue","operstate":"UP","group":"default",
+       "link_type":"ether","address":"52:54:00:12:02:01","broadcast":"ff:ff:ff:ff:ff:ff",
+       "linkinfo":{"info_kind":"bond","info_data":{"mode":"active-backup",
+         "miimon":100,"primary":"eth2","min_links":1}},
+       "addr_info":[]},
+      {"ifindex":7,"ifname":"tenant0","link":"eth3",
+       "flags":["BROADCAST","MULTICAST","UP","LOWER_UP"],"mtu":1500,"qdisc":"noqueue",
+       "operstate":"UP","group":"default","link_type":"ether",
+       "address":"52:54:00:12:03:01","broadcast":"ff:ff:ff:ff:ff:ff",
+       "linkinfo":{"info_kind":"vlan","info_data":{"protocol":"802.1Q","id":10,
+         "flags":["REORDER_HDR"]}},
+       "addr_info":[]}
+    ]"#;
+
+    #[test]
+    fn real_iproute2_inventory_with_bridge_and_bond_members_parses() {
+        let inventory = parse_inventory(REAL_INVENTORY.as_bytes()).unwrap();
+        assert_eq!(inventory.len(), 6);
+        // A bridge port and a bond member have no kind of their own.
+        assert!(
+            inventory["eth1"]
+                .linkinfo
+                .as_ref()
+                .is_some_and(|i| i.info_kind.is_none())
+        );
+        assert_eq!(inventory["eth1"].master.as_deref(), Some("br0"));
+        assert!(
+            inventory["eth2"]
+                .linkinfo
+                .as_ref()
+                .is_some_and(|i| i.info_kind.is_none())
+        );
+        assert!(inventory["eth3"].linkinfo.is_none());
+        assert_eq!(
+            inventory["br0"]
+                .linkinfo
+                .as_ref()
+                .and_then(|i| i.info_kind.as_deref()),
+            Some("bridge")
+        );
+        assert_eq!(
+            inventory["tenant0"]
+                .linkinfo
+                .as_ref()
+                .and_then(|i| i.info_kind.as_deref()),
+            Some("vlan")
+        );
+    }
+
+    #[test]
+    fn a_member_link_is_never_mistaken_for_an_owned_device() {
+        let inventory = parse_inventory(REAL_INVENTORY.as_bytes()).unwrap();
+        let ifaces = toml::from_str::<crate::config::Appliance>(
+            r#"
+            [system]
+            hostname = "test"
+            [[interface]]
+            name = "br0"
+            type = "bridge"
+            member = ["eth1"]
+            [[interface]]
+            name = "eth1"
+            [[interface]]
+            name = "eth3"
+            [[interface]]
+            name = "tenant0"
+            parent = "eth3"
+            vlan = 10
+        "#,
+        )
+        .unwrap()
+        .interfaces;
+        // The bridge and the VLAN match their `.netdev`s and stay.
+        let previous = BTreeMap::from([
+            (
+                "10-sentinel-br0.netdev".to_string(),
+                "[NetDev]\nName=br0\nKind=bridge\n".to_string(),
+            ),
+            (
+                "10-sentinel-tenant0.netdev".to_string(),
+                "[NetDev]\nName=tenant0\nKind=vlan\n".to_string(),
+            ),
+        ]);
+        let mut retired = BTreeSet::new();
+        retire_drifted(&previous, &ifaces, &inventory, &mut retired);
+        assert!(retired.is_empty(), "{retired:?}");
+        // A `.netdev` that claims a kind-less member as its own device is a
+        // mismatch: the link there is not the device we made.
+        let claimed = BTreeMap::from([(
+            "10-sentinel-eth1.netdev".to_string(),
+            "[NetDev]\nName=eth1\nKind=dummy\n".to_string(),
+        )]);
+        retire_drifted(&claimed, &ifaces, &inventory, &mut retired);
+        assert_eq!(retired, BTreeSet::from(["eth1".to_string()]));
+    }
+
     #[test]
     fn default_mtu_does_not_retain_removed_overrides() {
         let appliance: crate::config::Appliance = toml::from_str(
@@ -604,5 +912,218 @@ mod recreation_tests {
         assert!(!recreates_child("wan0", &desired, &retired));
         assert!(!network_changed("wan0", &previous, &desired));
         assert!(!recreates_child("eth1", &desired, &BTreeSet::new()));
+    }
+}
+
+#[cfg(test)]
+mod wireguard_tests {
+    use super::*;
+
+    fn wg(peers: &str, port: u16) -> String {
+        format!(
+            "[NetDev]\nName=wg0\nKind=wireguard\n\n[WireGuard]\nPrivateKey=priv\n\
+             ListenPort={port}\n{peers}"
+        )
+    }
+
+    const PEER_A: &str = "\n[WireGuardPeer]\nPublicKey=a\nAllowedIPs=10.8.0.2/32\n";
+    const PEER_B: &str = "\n[WireGuardPeer]\nPublicKey=b\nAllowedIPs=10.8.0.3/32\n";
+
+    fn files(netdev: String) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("10-sentinel-wg0.netdev".into(), netdev),
+            (
+                "10-sentinel-wg0.network".into(),
+                "[Network]\nAddress=10.8.0.1/24\n".into(),
+            ),
+        ])
+    }
+
+    /// Deleting wg0 to add, change or remove a peer drops every other peer's
+    /// session and takes the tunnel's routes down with the link — for an edit
+    /// the kernel can apply in place.
+    #[test]
+    fn a_peer_edit_updates_wireguard_in_place_instead_of_recreating_it() {
+        let previous = files(wg(PEER_A, 51820));
+        for desired in [
+            files(wg(&format!("{PEER_A}{PEER_B}"), 51820)),
+            files(wg("", 51820)),
+            files(wg(&PEER_A.replace("10.8.0.2/32", "10.8.0.0/24"), 51820)),
+            files(wg(PEER_A, 51821)),
+            files(wg(PEER_A, 51820).replace("PrivateKey=priv", "PrivateKey=other")),
+        ] {
+            assert!(retire(&previous, &desired).is_empty(), "{desired:?}");
+            assert!(!network_changed("wg0", &previous, &desired), "{desired:?}");
+            assert_eq!(
+                wireguard_updates(&previous, &desired),
+                BTreeSet::from(["wg0".to_string()])
+            );
+        }
+        assert!(wireguard_updates(&previous, &previous).is_empty());
+    }
+
+    #[test]
+    fn a_new_device_identity_still_recreates_it() {
+        let previous = files(wg(PEER_A, 51820));
+        for desired in [
+            files(wg(PEER_A, 51820).replace("Kind=wireguard", "Kind=dummy")),
+            files(wg(PEER_A, 51820).replace("[NetDev]\n", "[NetDev]\nMTUBytes=1300\n")),
+        ] {
+            assert_eq!(
+                retire(&previous, &desired),
+                BTreeSet::from(["wg0".to_string()]),
+                "{desired:?}"
+            );
+            assert!(wireguard_updates(&previous, &desired).is_empty());
+        }
+        // Removed altogether: retired, and nothing left to update.
+        let mut gone = previous.clone();
+        gone.remove("10-sentinel-wg0.netdev");
+        assert_eq!(
+            retire(&previous, &gone),
+            BTreeSet::from(["wg0".to_string()])
+        );
+        assert!(wireguard_updates(&previous, &gone).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod foreign_address_tests {
+    use super::*;
+
+    fn lan() -> Vec<crate::config::Interface> {
+        toml::from_str::<crate::config::Appliance>(
+            r#"
+            [system]
+            hostname = "test"
+            [[interface]]
+            name = "lan0"
+            address = "192.0.2.1/24"
+            address6 = "2001:db8:10::1/64"
+            [[interface]]
+            name = "wan0"
+            address = "dhcp"
+        "#,
+        )
+        .unwrap()
+        .interfaces
+    }
+
+    fn link(name: &str, addresses: serde_json::Value) -> BTreeMap<String, KernelLink> {
+        let value = serde_json::json!({
+            "ifname": name, "ifindex": 4, "mtu": 1500, "flags": ["UP"],
+            "addr_info": addresses,
+        });
+        parse_inventory(&serde_json::to_vec(&vec![value]).unwrap()).unwrap()
+    }
+
+    /// An address somebody added by hand is not configuration. Convergence used
+    /// to look only for missing addresses, so an out-of-band one survived every
+    /// commit — and with it whatever it made the box reachable as.
+    #[test]
+    fn an_out_of_band_static_address_is_found() {
+        let ifaces = lan();
+        let observed = link(
+            "lan0",
+            serde_json::json!([
+                {"local": "192.0.2.1", "prefixlen": 24, "scope": "global"},
+                {"local": "2001:db8:10::1", "prefixlen": 64, "scope": "global"},
+                {"local": "198.51.100.7", "prefixlen": 32, "scope": "global"},
+                {"local": "2001:db8:99::7", "prefixlen": 64, "scope": "global"},
+                // Not foreign: link-local, a lease/SLAAC (finite lifetime),
+                // the group's virtual address, and the same address with a
+                // different prefix length (that is a changed one, so it goes).
+                {"local": "fe80::1", "prefixlen": 64, "scope": "link"},
+                {"local": "2001:db8:10::abcd", "prefixlen": 64, "scope": "global", "dynamic": true},
+                {"local": "192.0.2.254", "prefixlen": 24, "scope": "global"},
+                {"local": "192.0.2.1", "prefixlen": 16, "scope": "global"}
+            ]),
+        );
+        let vip: IpAddr = "192.0.2.254".parse().unwrap();
+        let mut found = foreign_addresses(&ifaces[0], &observed, &[vip]);
+        found.sort();
+        let mut want: Vec<(IpAddr, u8)> = vec![
+            ("198.51.100.7".parse().unwrap(), 32),
+            ("2001:db8:99::7".parse().unwrap(), 64),
+            ("192.0.2.1".parse().unwrap(), 16),
+        ];
+        want.sort();
+        assert_eq!(found, want);
+    }
+
+    /// networkd's `Assign=yes` gives the router an address out of each prefix
+    /// it advertises, with no lifetime — permanent, global, and not in the
+    /// configuration. Removing it every commit would be a flap, not a repair.
+    #[test]
+    fn addresses_another_manager_assigns_are_not_foreign() {
+        let mut ifaces = lan();
+        ifaces[0].router_advert = Some(crate::config::RouterAdvert {
+            prefixes: vec!["2001:db8:9::/64".into()],
+            dns: vec![],
+            managed: false,
+            other_config: false,
+            router_lifetime: None,
+            dhcp6_pool: None,
+        });
+        let observed = link(
+            "lan0",
+            serde_json::json!([
+                {"local": "2001:db8:9::5054:ff:fe12:3456", "prefixlen": 64, "scope": "global"},
+                {"local": "2001:db8:99::7", "prefixlen": 64, "scope": "global"}
+            ]),
+        );
+        assert_eq!(
+            foreign_addresses(&ifaces[0], &observed, &[]),
+            vec![("2001:db8:99::7".parse().unwrap(), 64)]
+        );
+        ifaces[0].address6 = Some("auto".into());
+        assert!(foreign_addresses(&ifaces[0], &observed, &[]).is_empty());
+        // A permanent lease (infinite lifetime) on a DHCP link is still a lease.
+        let lease = link(
+            "wan0",
+            serde_json::json!([{"local": "203.0.113.9", "prefixlen": 24, "scope": "global"}]),
+        );
+        assert!(foreign_addresses(&ifaces[1], &lease, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_dhcp_link_keeps_its_lease_and_a_disabled_or_absent_one_is_left_alone() {
+        let mut ifaces = lan();
+        let lease = link(
+            "wan0",
+            serde_json::json!([{"local": "203.0.113.9", "prefixlen": 24, "scope": "global", "dynamic": true}]),
+        );
+        assert!(foreign_addresses(&ifaces[1], &lease, &[]).is_empty());
+        let static_extra = link(
+            "lan0",
+            serde_json::json!([{"local": "198.51.100.7", "prefixlen": 32, "scope": "global"}]),
+        );
+        assert_eq!(foreign_addresses(&ifaces[0], &static_extra, &[]).len(), 1);
+        ifaces[0].disabled = true;
+        assert!(foreign_addresses(&ifaces[0], &static_extra, &[]).is_empty());
+        assert!(foreign_addresses(&ifaces[1], &static_extra, &[]).is_empty());
+    }
+
+    /// A NIC taken out of the configuration loses its unit, and networkd then
+    /// leaves the link exactly as it was — addressed, up, and with no firewall
+    /// hook, because the data plane only attaches to declared interfaces.
+    #[test]
+    fn a_physical_link_removed_from_the_config_is_released() {
+        let previous = BTreeMap::from([
+            ("10-sentinel-eth0.network".into(), "[Network]\n".into()),
+            ("10-sentinel-eth1.network".into(), "[Network]\n".into()),
+            ("10-sentinel-vlan10.network".into(), "[Network]\n".into()),
+            ("10-sentinel-vlan10.netdev".into(), "[NetDev]\n".into()),
+        ]);
+        let mut desired = previous.clone();
+        desired.remove("10-sentinel-eth1.network");
+        desired.remove("10-sentinel-vlan10.network");
+        desired.remove("10-sentinel-vlan10.netdev");
+        // vlan10 is a device of ours: retirement deletes it. eth1 is hardware.
+        assert_eq!(
+            released_links(&previous, &desired),
+            BTreeSet::from(["eth1".to_string()])
+        );
+        assert!(released_links(&previous, &previous).is_empty());
     }
 }

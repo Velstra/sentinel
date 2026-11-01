@@ -527,6 +527,20 @@ pub fn ip_route(args: &[&str]) -> Result<()> {
     run_priv("ip", &all)
 }
 
+/// Add, delete or flush interface addresses. The arguments are the caller's.
+pub fn ip_addr(args: &[&str]) -> Result<()> {
+    let mut all = vec!["address"];
+    all.extend_from_slice(args);
+    run_priv("ip", &all)
+}
+
+/// Change a link's state. The arguments are the caller's.
+pub fn ip_link(args: &[&str]) -> Result<()> {
+    let mut all = vec!["link"];
+    all.extend_from_slice(args);
+    run_priv("ip", &all)
+}
+
 /// The addresses the box currently holds, as `ip -o addr show` prints them.
 ///
 /// Read from the kernel rather than from the configuration on purpose: an
@@ -758,6 +772,8 @@ pub fn arm_confirm(minutes: u32, cfg: &Path) -> Result<()> {
     args.push("confirm-rollback".into());
     args.push("--config".into());
     args.push(cfg_s.to_string());
+    // The timer reverts its own change only (see `confirm::rollback`).
+    args.push("--commit-confirm".into());
     let argref: Vec<&str> = args.iter().map(String::as_str).collect();
     run_priv("systemd-run", &argref)
 }
@@ -1187,6 +1203,48 @@ pub fn curl_request(
     timeout_secs: u32,
     pin: Option<&str>,
 ) -> Result<String> {
+    curl_request_with_header(url, token, method, body, None, timeout_secs, pin)
+}
+
+/// A management request the far end refused with an HTTP status, kept as a
+/// value rather than a sentence so a caller can tell a refusal it must act on
+/// (a `409 Conflict` from config-sync) from a peer that simply was not there.
+#[derive(Debug)]
+pub struct HttpStatus {
+    pub status: u16,
+    pub request: String,
+}
+
+impl std::fmt::Display for HttpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "management request {} was refused (HTTP {})",
+            self.request, self.status
+        )
+    }
+}
+
+impl std::error::Error for HttpStatus {}
+
+/// The status curl's `-f` reports on stderr ("The requested URL returned
+/// error: 409"), when that is why it failed.
+fn curl_http_status(stderr: &str) -> Option<u16> {
+    let rest = stderr.split("returned error: ").nth(1)?;
+    rest.get(..3)?.parse().ok()
+}
+
+/// [`curl_request`] with one extra request header (`Name: value`). The header
+/// goes through curl's private config on stdin like the bearer, never argv.
+fn curl_request_with_header(
+    url: &str,
+    token: Option<&str>,
+    method: &str,
+    body: Option<&Path>,
+    extra_header: Option<&str>,
+    timeout_secs: u32,
+    pin: Option<&str>,
+) -> Result<String> {
     use std::io::Write;
     let mut args = vec![
         "-sS".to_string(),
@@ -1210,8 +1268,17 @@ pub fn curl_request(
     }
     add_pin_args(&mut args, pin);
     args.push(url.into());
-    let config = curl_auth_config(token)?;
-    let mut child = Command::new(bin("curl"))
+    let mut config = curl_auth_config(token)?;
+    if let Some(extra) = extra_header {
+        anyhow::ensure!(
+            !extra
+                .chars()
+                .any(|c| c.is_control() || c == '"' || c == '\\'),
+            "invalid request header"
+        );
+        config.push_str(&format!("header = \"{extra}\"\n"));
+    }
+    let mut child = curl_command()
         .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1229,13 +1296,45 @@ pub fn curl_request(
         return Err(error.into());
     }
     let out = child.wait_with_output()?;
-    anyhow::ensure!(
-        out.status.success(),
-        "management request {method} {url} failed ({})",
-        out.status
-    );
+    if !out.status.success() {
+        if let Some(status) = curl_http_status(&String::from_utf8_lossy(&out.stderr)) {
+            return Err(HttpStatus {
+                status,
+                request: format!("{method} {url}"),
+            }
+            .into());
+        }
+        bail!("management request {method} {url} failed ({})", out.status);
+    }
     String::from_utf8(out.stdout).context("non-UTF8 management response")
 }
+/// The pinned curl for a request that carries a credential or decides whom to
+/// trust, with nothing of the caller's environment.
+///
+/// `--disable` (which only works as the FIRST argument) keeps `~/.curlrc` out,
+/// but curl also reads its environment: `HTTPS_PROXY`/`ALL_PROXY` would route a
+/// bearer token through somebody's proxy, `SSLKEYLOGFILE` would write the TLS
+/// session keys to a file, `CURL_CA_BUNDLE`/`SSL_CERT_FILE` would swap the trust
+/// store the certificate is checked against. A `sudo -E`, a service drop-in or a
+/// login profile is enough to set any of them. None of them is a setting of
+/// this appliance, so the child starts with an empty environment; only `PATH`
+/// is carried, which curl never reads and the lookup of a bare `curl` (off the
+/// appliance, where no pinned store path is set) needs. A proxy, if one is ever
+/// wanted, belongs in explicit configuration.
+pub fn curl_command() -> Command {
+    curl_command_for(&bin("curl"))
+}
+
+pub fn curl_command_for(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command.env_clear();
+    if let Some(path) = std::env::var_os("PATH") {
+        command.env("PATH", path);
+    }
+    command.arg("--disable");
+    command
+}
+
 fn curl_auth_config(token: Option<&str>) -> Result<String> {
     let Some(token) = token else {
         return Ok(String::new());
@@ -1249,6 +1348,25 @@ fn curl_auth_config(token: Option<&str>) -> Result<String> {
 }
 pub fn curl_get(url: &str, token: &str, timeout_secs: u32, pin: Option<&str>) -> Result<String> {
     curl_request(url, Some(token), "GET", None, timeout_secs, pin)
+}
+
+/// [`curl_get`] with one extra request header (`Name: value`).
+pub fn curl_get_with_header(
+    url: &str,
+    token: &str,
+    header: &str,
+    timeout_secs: u32,
+    pin: Option<&str>,
+) -> Result<String> {
+    curl_request_with_header(
+        url,
+        Some(token),
+        "GET",
+        None,
+        Some(header),
+        timeout_secs,
+        pin,
+    )
 }
 
 /// Add curl's public-key pinning for a self-signed peer (H3): `--insecure` drops
@@ -1615,15 +1733,32 @@ pub fn networkctl_reload(ifaces: &[String]) -> Result<()> {
         // Netdev creation is asynchronous. In particular a new VLAN is not
         // necessarily present when `reload` returns. Never turn that race into
         // a successful commit with no configured interface.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let link = Path::new("/sys/class/net").join(iface);
-        while !link.exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        anyhow::ensure!(link.exists(), "network interface {iface} was not created");
+        anyhow::ensure!(
+            wait_for_link(iface, std::time::Duration::from_secs(10)),
+            "network interface {iface} was not created"
+        );
         run_priv("networkctl", &["reconfigure", iface])?;
     }
     Ok(())
+}
+
+/// Wait up to `timeout` for the kernel link `iface` to exist; whether it does.
+pub fn wait_for_link(iface: &str, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    let link = Path::new("/sys/class/net").join(iface);
+    while !link.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    link.exists()
+}
+
+/// Make the live WireGuard device `iface` match the `wg`-format file at `path`
+/// (key, port, peers), keeping the sessions of peers that did not change.
+pub fn wg_syncconf(iface: &str, path: &Path) -> Result<()> {
+    let Some(p) = path.to_str() else {
+        bail!("non-UTF-8 path");
+    };
+    run_priv("wg", &["syncconf", iface, p])
 }
 
 /// Retire a device created by a Sentinel netdev. Physical NICs are never deleted.
@@ -1672,6 +1807,7 @@ pub fn bin(name: &str) -> String {
         "wren" => "SENTINEL_WREN_BIN",
         "velstra" => "SENTINEL_VELSTRA_BIN",
         "tc" => "SENTINEL_TC_BIN",
+        "wg" => "SENTINEL_WG_BIN",
         "loadkeys" => "SENTINEL_LOADKEYS_BIN",
         "loginctl" => "SENTINEL_LOGINCTL_BIN",
         "timedatectl" => "SENTINEL_TIMEDATECTL_BIN",
@@ -2141,6 +2277,20 @@ mod tests {
 #[cfg(test)]
 mod ha_curl_tests {
     use super::*;
+    /// A peer's refusal survives as a status a caller can act on: curl's `-f`
+    /// says it only on stderr.
+    #[test]
+    fn an_http_refusal_is_read_off_curls_stderr() {
+        assert_eq!(
+            curl_http_status("curl: (22) The requested URL returned error: 409\n"),
+            Some(409)
+        );
+        assert_eq!(
+            curl_http_status("curl: (22) The requested URL returned error: 401 Unauthorized"),
+            Some(401)
+        );
+        assert_eq!(curl_http_status("curl: (7) Failed to connect"), None);
+    }
     #[test]
     fn bearer_config_escapes_and_rejects_injection() {
         assert_eq!(
@@ -2151,5 +2301,47 @@ mod ha_curl_tests {
         for bad in ["", "secret\nurl = https://attacker", "secret\r\n", "nul\0"] {
             assert!(curl_auth_config(Some(bad)).is_err());
         }
+    }
+
+    /// The credentialed curl sees none of the caller's environment — a proxy,
+    /// a key log file or a CA override set around `sentinel` never reaches it —
+    /// and `--disable` is its first argument, the only place curl honours it.
+    #[test]
+    fn credentialed_curl_runs_with_an_empty_environment_and_no_curlrc() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("sentinel-curl-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("curl");
+        std::fs::write(&fake, "#!/bin/sh\nprintf 'first=%s\\n' \"$1\"\nenv\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // SAFETY: test-only; nothing else in the test binary spawns curl, the
+        // only reader of these two variables.
+        unsafe {
+            std::env::set_var("HTTPS_PROXY", "http://proxy.attacker.example:3128");
+            std::env::set_var("SSLKEYLOGFILE", "/tmp/stolen-keys");
+        }
+        let out = curl_command_for(fake.to_str().unwrap())
+            .arg("https://peer.example")
+            .output()
+            .unwrap();
+        unsafe {
+            std::env::remove_var("HTTPS_PROXY");
+            std::env::remove_var("SSLKEYLOGFILE");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        let text = String::from_utf8(out.stdout).unwrap();
+        let mut lines = text.lines();
+        assert_eq!(lines.next(), Some("first=--disable"), "{text}");
+        // What a POSIX shell exports by itself (PWD, SHLVL, _) is the only
+        // thing allowed beside PATH.
+        // Names only: a failure must not print the environment's values.
+        let leaked: Vec<_> = lines
+            .filter_map(|l| l.split_once('=').map(|(name, _)| name))
+            .filter(|name| !["PATH", "PWD", "SHLVL", "_"].contains(name))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "ambient environment reached curl: {leaked:?}"
+        );
     }
 }

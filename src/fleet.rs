@@ -22,6 +22,12 @@ const RUNTIME: &str = "/run/sentinel/fleet.json";
 const TIMER_DROPIN: &str = "/run/systemd/system/sentinel-fleet.timer.d/interval.conf";
 const DOMAIN: &[u8] = b"Velstra Sentinel Fleet command v1\0";
 const LIMIT: usize = 2_097_152;
+/// Where fleet credentials are provisioned. A `file:` enrollment token must be a
+/// file directly in here: the token is sent to whatever `controller-url` says,
+/// so a reference that could name any root-owned 0600 file (an SSH host key, the
+/// config-sync secret, `/etc/shadow`'s neighbours) would let anyone able to set
+/// these two fields post that file to a server of their choosing.
+const CREDENTIAL_DIR: &str = "/var/lib/sentinel/fleet";
 
 pub fn validate(f: &Fleet) -> Result<()> {
     let url: axum::http::Uri = f
@@ -62,10 +68,7 @@ pub fn validate(f: &Fleet) -> Result<()> {
         "fleet enrollment-token must contain 16–4096 characters without control characters"
     );
     if let Some(path) = f.enrollment_token.strip_prefix("file:") {
-        ensure!(
-            Path::new(path).is_absolute(),
-            "fleet enrollment-token file reference must be absolute"
-        );
+        token_file_name(path)?;
     }
     ensure!(
         STANDARD
@@ -240,7 +243,7 @@ pub fn poll(path: &Path, act: &Apply) -> Result<()> {
     getrandom::getrandom(&mut random)
         .map_err(|_| anyhow::anyhow!("fleet challenge randomness unavailable"))?;
     let nonce = hash(&random);
-    let request = json!({"protocol":1,"node":f.node_id,"nonce":nonce,"revision":crate::ha::revision(&a)?,"sequence":state.sequence,"result":state.result,"transaction":safe_apply::status(path)?,"telemetry":if state.telemetry_requested {crate::telemetry::fleet_snapshot()} else {Value::Null}});
+    let request = json!({"protocol":1,"node":f.node_id,"nonce":nonce,"revision":crate::ha::revision(&a)?,"sequence":state.sequence,"result":state.result,"transaction":safe_apply::status(path)?,"telemetry":if state.telemetry_requested {crate::telemetry::fleet_snapshot(f.flow_telemetry)} else {Value::Null}});
     let reply: Reply = serde_json::from_str(&request_controller(f, &request)?)
         .context("invalid fleet check-in response")?;
     if let Some(envelope) = reply.command {
@@ -311,10 +314,7 @@ fn execute(path: &Path, f: &Fleet, command: FleetCommand, digest: &str, act: &Ap
                 );
                 let next = Appliance::from_toml(&toml)
                     .map_err(|_| anyhow::anyhow!("fleet configuration failed schema validation"))?;
-                ensure!(
-                    next.fleet == a.fleet,
-                    "fleet trust/identity can only be changed locally"
-                );
+                refuse_local_only_changes(&a, &next)?;
                 safe_apply::begin(
                     path,
                     &next,
@@ -340,15 +340,137 @@ fn execute(path: &Path, f: &Fleet, command: FleetCommand, digest: &str, act: &Ap
     result.map(|_| ())
 }
 
-fn private_credential(path: &Path) -> Result<String> {
+/// The settings a fleet controller may never change: who can manage this box,
+/// how, and whom it trusts. Each is a trust anchor in its own right — a
+/// controller able to rewrite any of them could make itself (or anyone) a
+/// permanent local administrator, swap the key that vouches for OS images, or
+/// re-pair the box with a peer of its choosing, and then the commit-confirm
+/// window would be the controller confirming its own takeover. Changing them is
+/// a local management act, exactly like re-enrolling fleet itself.
+///
+/// In the set:
+/// * `fleet` — enrollment, the controller URL and the command-signing key.
+/// * `system.login` — accounts, SSH authorized keys, password hashes, TOTP.
+/// * `system.group` — what each account may do through the management API.
+/// * `system.aaa` — RADIUS/LDAP/TACACS servers and their secrets decide who
+///   logs in; a controller pointing them at its own server is a login for
+///   anyone it likes.
+/// * `update` — channel URLs, their pinned public keys and subscription keys.
+///   The channel key also verifies local images (`sentinel update <image>`).
+/// * `system.ha`, `system.ha-witness`, `system.config-sync`,
+///   `system.conntrack-sync` — the pairing identity, witness secret, the
+///   config-sync peers/secret/pinned fingerprint and the state-sync endpoints.
+///   Config-sync pushes the whole configuration to its peers, so whoever
+///   chooses the peer receives every secret; the HA receiver already keeps its
+///   own copies of these (`merge_synced_config`), this keeps them local on the
+///   fleet road too.
+/// * `services.ssh`, `services.web`, `system.console` — the ways the local
+///   operator reaches the box (listen addresses, ports, TLS material, password
+///   authentication, the serial console). A controller that can close them can
+///   lock the operator out of the one place these settings can be repaired.
+///
+/// Deliberately NOT in the set — the policy a fleet exists to manage: rules,
+/// zones, NAT, interfaces, routing, VPN tunnels (their keys authorize data
+/// traffic, not management), PKI definitions (key material is minted on the box,
+/// and the console's certificate is pinned through `services.web`), services
+/// such as DNS/DHCP/syslog/alerts, metrics and sysctl. A policy change that cuts
+/// the controller's own reachability is what the commit-confirm watchdog is for.
+fn local_only_sections(a: &Appliance) -> Result<[(&'static str, Value); 12]> {
+    use serde_json::to_value;
+    Ok([
+        ("fleet", to_value(&a.fleet)?),
+        ("system.login", to_value(&a.system.logins)?),
+        ("system.group", to_value(&a.system.groups)?),
+        ("system.aaa", to_value(&a.system.aaa)?),
+        ("update", to_value(&a.update)?),
+        ("system.ha", to_value(&a.system.ha)?),
+        ("system.ha-witness", to_value(&a.system.ha_witness)?),
+        ("system.config-sync", to_value(&a.system.config_sync)?),
+        ("system.conntrack-sync", to_value(&a.system.conntrack_sync)?),
+        ("services.ssh", to_value(&a.services.ssh)?),
+        ("services.web", to_value(&a.services.web)?),
+        ("system.console", to_value(&a.system.console)?),
+    ])
+}
+
+/// Refuse a fleet revision that differs from the running one anywhere in
+/// [`local_only_sections`], naming every section it would have changed so the
+/// controller's operator knows what to take out of the document.
+fn refuse_local_only_changes(current: &Appliance, next: &Appliance) -> Result<()> {
+    let changed: Vec<&str> = local_only_sections(current)?
+        .into_iter()
+        .zip(local_only_sections(next)?)
+        .filter(|((_, before), (_, after))| before != after)
+        .map(|((name, _), _)| name)
+        .collect();
+    ensure!(
+        changed.is_empty(),
+        "fleet cannot change local-only trust settings ({}); change them on the appliance itself",
+        changed.join(", ")
+    );
+    Ok(())
+}
+
+/// The file name a `file:` enrollment-token reference names inside
+/// [`CREDENTIAL_DIR`], or a refusal for anything else: another directory, a
+/// subdirectory, a `..` climb.
+fn token_file_name(path: &str) -> Result<&str> {
+    let name = path
+        .strip_prefix(CREDENTIAL_DIR)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .filter(|name| {
+            !name.is_empty()
+                && !matches!(*name, "." | "..")
+                && !name.contains('/')
+                && !name.chars().any(char::is_control)
+        });
+    name.with_context(|| {
+        format!("fleet enrollment-token file must be a file directly in {CREDENTIAL_DIR}/")
+    })
+}
+
+/// Read a credential file `name` from `dir` without following a link at
+/// either step. The directory is opened `O_NOFOLLOW` and must belong to this
+/// process and be writable by nobody else, so the entry cannot be swapped
+/// underneath us; the file is then opened relative to that handle, again
+/// `O_NOFOLLOW`, so a symlink planted as the token cannot point back out.
+fn private_credential_in(dir: &Path, name: &str) -> Result<String> {
     use std::{
+        ffi::CString,
         io::Read,
-        os::unix::fs::{MetadataExt, OpenOptionsExt},
+        os::unix::{
+            ffi::OsStrExt,
+            fs::{MetadataExt, OpenOptionsExt},
+            io::{AsRawFd, FromRawFd},
+        },
     };
-    let file = std::fs::OpenOptions::new()
+    let directory = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)?;
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir)
+        .with_context(|| format!("opening fleet credential directory {}", dir.display()))?;
+    let meta = directory.metadata()?;
+    ensure!(
+        meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o022 == 0,
+        "fleet credential directory {} must be owned by this process and writable by nobody else",
+        dir.display()
+    );
+    let c_name = CString::new(Path::new(name).as_os_str().as_bytes())?;
+    // SAFETY: a valid directory descriptor and NUL-terminated name; the
+    // returned descriptor is owned by the File constructed from it.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c_name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    ensure!(
+        fd >= 0,
+        "opening fleet credential {name}: {}",
+        std::io::Error::last_os_error()
+    );
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
     let meta = file.metadata()?;
     ensure!(
         meta.is_file()
@@ -364,6 +486,48 @@ fn private_credential(path: &Path) -> Result<String> {
         "fleet credential file exceeds receive limit"
     );
     Ok(text.trim().into())
+}
+
+/// The check-in request, credential-free on its command line (the bearer token
+/// and the body travel over stdin as curl config). [`system::curl_command`]
+/// supplies `--disable` as the first option and an empty environment, so neither
+/// `~/.curlrc` nor an ambient proxy/key-log/CA variable can weaken TLS, add
+/// proxy credentials or redirects, or log the token.
+fn check_in_command(f: &Fleet) -> Command {
+    let mut command = system::curl_command();
+    command.args([
+        "--silent",
+        "--show-error",
+        "--fail",
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+        "--tlsv1.2",
+        "--max-time",
+        "10",
+        "--connect-timeout",
+        "5",
+        "--max-filesize",
+        "2097152",
+        "--cacert",
+        &f.ca_certificate,
+        "--cert",
+        &f.client_certificate,
+        "--key",
+        &f.client_key,
+        "--request",
+        "POST",
+        "--header",
+        "Content-Type: application/json",
+        "--config",
+        "-",
+        &format!(
+            "{}/api/v1/sentinel/check-in",
+            f.controller_url.trim_end_matches('/')
+        ),
+    ]);
+    command
 }
 
 fn config_string(value: &str) -> String {
@@ -386,7 +550,7 @@ fn request_controller(f: &Fleet, body: &Value) -> Result<String> {
         "fleet client-key must be an owned private regular file (0600)"
     );
     let token = if let Some(path) = f.enrollment_token.strip_prefix("file:") {
-        private_credential(Path::new(path))?
+        private_credential_in(Path::new(CREDENTIAL_DIR), token_file_name(path)?)?
     } else {
         f.enrollment_token.clone()
     };
@@ -394,42 +558,7 @@ fn request_controller(f: &Fleet, body: &Value) -> Result<String> {
         token.len() >= 16 && token.len() <= 4096 && !token.chars().any(char::is_control),
         "invalid fleet enrollment credential"
     );
-    // --disable must be the first option: ambient ~/.curlrc cannot weaken TLS,
-    // add proxy credentials, redirects, or diagnostic token logging.
-    let mut child = Command::new(system::bin("curl"))
-        .args([
-            "--disable",
-            "--silent",
-            "--show-error",
-            "--fail",
-            "--proto",
-            "=https",
-            "--proto-redir",
-            "=https",
-            "--tlsv1.2",
-            "--max-time",
-            "10",
-            "--connect-timeout",
-            "5",
-            "--max-filesize",
-            "2097152",
-            "--cacert",
-            &f.ca_certificate,
-            "--cert",
-            &f.client_certificate,
-            "--key",
-            &f.client_key,
-            "--request",
-            "POST",
-            "--header",
-            "Content-Type: application/json",
-            "--config",
-            "-",
-            &format!(
-                "{}/api/v1/sentinel/check-in",
-                f.controller_url.trim_end_matches('/')
-            ),
-        ])
+    let mut child = check_in_command(f)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -477,6 +606,7 @@ mod tests {
             client_key: "/etc/fleet/client.key".into(),
             signing_key: STANDARD.encode([0u8; 32]),
             poll_interval: Some(5),
+            flow_telemetry: false,
         }
     }
     fn key() -> signature::Ed25519KeyPair {
@@ -725,6 +855,194 @@ mod tests {
         std::fs::write(state_path(&path), "broken").unwrap();
         assert!(load_state(&path, f).is_err());
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+    /// Every class of local trust anchor is refused on the fleet road, by name,
+    /// and the refusal leaves the saved configuration and pending state alone;
+    /// the same delivery path still accepts an ordinary policy change.
+    #[test]
+    fn fleet_apply_refuses_every_local_only_trust_section() {
+        let (path, a) = fixture();
+        let f = a.fleet.as_ref().unwrap();
+        let base = a.to_toml().unwrap();
+        let cases = [
+            (
+                "system.login",
+                "[[system.login]]\nusername = \"mallory\"\n\
+                 ssh-key = [\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIabc mallory@controller\"]\n",
+            ),
+            (
+                "system.group",
+                "[[system.group]]\nname = \"ops\"\npermission = \"read-write\"\n",
+            ),
+            (
+                "system.aaa",
+                "[[system.aaa.radius]]\nserver = \"192.0.2.9\"\nsecret = \"controller-chosen\"\n",
+            ),
+            (
+                "update",
+                "[update]\nurl = \"https://updates.attacker.example/sentinel\"\n\
+                 public-key = \"file:/var/lib/sentinel/attacker.pem\"\n",
+            ),
+            ("system.ha", "[system.ha]\nwitness = \"192.0.2.10:5400\"\n"),
+            (
+                "system.ha-witness",
+                "[system.ha-witness]\nlisten = \"0.0.0.0:5400\"\nsecret = \"controller-chosen-witness-secret-0123456789\"\n",
+            ),
+            (
+                "system.config-sync",
+                "[system.config-sync]\npeer = [\"192.0.2.11\"]\nsecret = \"controller-chosen-sync\"\n",
+            ),
+            (
+                "system.conntrack-sync",
+                "[system.conntrack-sync]\npeer = [\"192.0.2.12\"]\n",
+            ),
+            (
+                "services.ssh",
+                "[services.ssh]\npassword-authentication = true\n",
+            ),
+            (
+                "services.web",
+                "[services.web]\nenable = true\nlisten-address = \"0.0.0.0\"\n",
+            ),
+            (
+                "system.console",
+                "[system.console]\ndevice = \"ttyS0\"\nspeed = 9600\n",
+            ),
+        ];
+        for (sequence, (section, fragment)) in (1..).zip(cases) {
+            let toml = format!("{base}\n{fragment}");
+            Appliance::from_toml(&toml)
+                .unwrap_or_else(|e| panic!("{section} fixture must be schema-valid: {e:#}"));
+            let error = deliver(
+                &path,
+                f,
+                sequence,
+                Operation::Apply {
+                    expected_revision: crate::ha::revision(&a).unwrap(),
+                    toml,
+                },
+            )
+            .expect_err(section);
+            assert!(
+                error.to_string().contains(section) && error.to_string().contains("local-only"),
+                "{section}: {error:#}"
+            );
+            assert!(safe_apply::status(&path).unwrap()["pending"].is_null());
+        }
+        let mut rotated = a.clone();
+        rotated.fleet.as_mut().unwrap().poll_interval = Some(30);
+        let error = deliver(
+            &path,
+            f,
+            100,
+            Operation::Apply {
+                expected_revision: crate::ha::revision(&a).unwrap(),
+                toml: rotated.to_toml().unwrap(),
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("(fleet)"), "{error:#}");
+        assert_eq!(Appliance::load(&path).unwrap().system.hostname, "working");
+
+        let mut policy = a.clone();
+        policy.system.hostname = "edge-policy".into();
+        policy.system.timezone = Some("Europe/Berlin".into());
+        deliver(
+            &path,
+            f,
+            101,
+            Operation::Apply {
+                expected_revision: crate::ha::revision(&a).unwrap(),
+                toml: policy.to_toml().unwrap(),
+            },
+        )
+        .unwrap();
+        assert!(
+            safe_apply::status(&path).unwrap()["pending"]["ready"]
+                .as_bool()
+                .unwrap()
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+    /// The check-in curl starts from an empty environment with `--disable`
+    /// first; the only variable it is handed is PATH, which curl never reads.
+    #[test]
+    fn the_check_in_request_ignores_curlrc_and_the_ambient_environment() {
+        let command = check_in_command(&identity());
+        let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(args.first(), Some(&"--disable"), "{args:?}");
+        assert_eq!(
+            args.last(),
+            Some(&"https://fleet.example/api/v1/sentinel/check-in")
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.contains("test-enrollment-credential"))
+        );
+        let envs: Vec<_> = command
+            .get_envs()
+            .map(|(k, _)| k.to_str().unwrap())
+            .collect();
+        assert!(envs.iter().all(|k| *k == "PATH"), "{envs:?}");
+    }
+    /// A `file:` token can only name a file directly in the fleet credential
+    /// directory, and is read without following a link at the directory or at
+    /// the file — so it cannot be aimed at another root-owned 0600 file.
+    #[test]
+    fn an_enrollment_token_file_is_confined_to_the_credential_directory() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        for good in [
+            "file:/var/lib/sentinel/fleet/token",
+            "inline-token-value-xyz",
+        ] {
+            let mut f = identity();
+            f.enrollment_token = good.into();
+            validate(&f).unwrap_or_else(|e| panic!("{good}: {e:#}"));
+        }
+        for bad in [
+            "file:/etc/ssh/ssh_host_ed25519_key",
+            "file:/var/lib/sentinel/fleet/../.appliance.toml.fleet.json",
+            "file:/var/lib/sentinel/fleet/sub/token",
+            "file:/var/lib/sentinel/fleet/",
+            "file:/var/lib/sentinel/fleetx/token",
+            "file:relative/token-file-name",
+        ] {
+            let mut f = identity();
+            f.enrollment_token = bad.into();
+            assert!(validate(&f).is_err(), "{bad}");
+        }
+
+        let (path, _) = fixture();
+        let root = path.parent().unwrap();
+        let dir = root.join("fleet");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let write_private = |p: &Path, text: &str| {
+            std::fs::write(p, text).unwrap();
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        write_private(&dir.join("token"), "fleet-enrollment-credential\n");
+        assert_eq!(
+            private_credential_in(&dir, "token").unwrap(),
+            "fleet-enrollment-credential"
+        );
+        // A link planted as the token, pointing at a private file elsewhere.
+        let outside = root.join("outside-secret");
+        write_private(&outside, "some-other-private-secret");
+        symlink(&outside, dir.join("link")).unwrap();
+        assert!(private_credential_in(&dir, "link").is_err());
+        // The directory itself replaced by a link.
+        symlink(root, root.join("fleet-link")).unwrap();
+        assert!(private_credential_in(&root.join("fleet-link"), "outside-secret").is_err());
+        // A directory others may write to cannot vouch for its entries.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(private_credential_in(&dir, "token").is_err());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(dir.join("token"), std::fs::Permissions::from_mode(0o640))
+            .unwrap();
+        assert!(private_credential_in(&dir, "token").is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn a_local_identity_rotation_invalidates_an_in_flight_controller_command() {
