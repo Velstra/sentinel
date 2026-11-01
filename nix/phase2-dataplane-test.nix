@@ -80,8 +80,12 @@ in pkgs.testers.runNixOSTest {
         return node.succeed("python3 -c " + shlex.quote(code))
     def show(what):
         return fw.succeed("sentinel show firewall " + what)
-    def configure(*commands):
-        script = "printf '%s\\n' " + " ".join(shlex.quote(c) for c in list(commands) + ["commit", "exit"]) + " | sentinel configure"
+    def configure(*commands, persist=False):
+        # A session edits the SAVED configuration: `commit` alone changes the
+        # running box, and the next session starts again from what was saved.
+        # `persist` saves too, for a change a later session has to see.
+        tail = ["commit", "save", "exit"] if persist else ["commit", "exit"]
+        script = "printf '%s\\n' " + " ".join(shlex.quote(c) for c in list(commands) + tail) + " | sentinel configure"
         output = fw.succeed("su admin -c " + shlex.quote(script))
         assert "error:" not in output.lower() and "commit failed" not in output.lower(), output
     def unsolicited_from_wan():
@@ -137,10 +141,11 @@ in pkgs.testers.runNixOSTest {
             "set firewall rule wan-probe-tcp port 9092", "set firewall rule wan-probe-tcp action accept",
             "set firewall rule wan-probe-udp from wan", "set firewall rule wan-probe-udp proto udp",
             "set firewall rule wan-probe-udp port 9093", "set firewall rule wan-probe-udp action accept",
+            persist=True,
         )
         crossed = unsolicited_from_wan()
         assert crossed >= 4, f"only {crossed} admitted probes crossed: the path itself is broken"
-        configure("delete firewall rule wan-probe-tcp", "delete firewall rule wan-probe-udp")
+        configure("delete firewall rule wan-probe-tcp", "delete firewall rule wan-probe-udp", persist=True)
         assert unsolicited_from_wan() == 0
 
     with subtest("TCP forwarding, checksums and static SNAT work across both families"):
@@ -178,11 +183,15 @@ in pkgs.testers.runNixOSTest {
         sizes = [int(client.succeed("stat -c %s " + path)) for path in ("/tmp/tcp4", "/tmp/tcp6")]
         time.sleep(3)
         for path, size in zip(("/tmp/tcp4", "/tmp/tcp6"), sizes):
-            assert int(client.succeed("stat -c %s " + path)) > size
+            grown = int(client.succeed("stat -c %s " + path))
+            assert grown > size, f"{path} stopped at {grown} bytes: " + client.succeed("cat /tmp/tcp-probe.log; ss -tni")
         # Restore logging so the drop probe below must also produce an event,
         # and the LAN posture: every later check runs against the
         # configuration it was written for, not one this subtest left behind.
-        configure("set firewall rule deny-tcp log true", "delete firewall zone lan default-action")
+        # The session starts from the saved configuration, which never had the
+        # LAN default-action (it was committed above, not saved), so committing
+        # it puts the posture back; there is no zone entry left to delete.
+        configure("set firewall rule deny-tcp log true")
 
     with subtest("UDP reply permission expires at the configured idle deadline"):
         python(client, "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(6); "

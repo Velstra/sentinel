@@ -3966,6 +3966,16 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
             }
             depth
         });
+        let absent = absent_kernel_links(&reloaded, ifaces, &desired, |name| {
+            Path::new("/sys/class/net").join(name).exists()
+        });
+        for name in &absent {
+            eprintln!(
+                "warning: interface {name:?} is not present on this system; its configuration \
+                 is in place and applies when the device appears"
+            );
+        }
+        reloaded.retain(|name| !absent.contains(name));
         if retry_network || previous != desired || !reloaded.is_empty() || !retire.is_empty() {
             system::networkctl_reload(&reloaded).context("applying live network configuration")?;
         }
@@ -4024,6 +4034,38 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     apply_configsync(appliance, mode)?;
     crate::ha::apply_witness(appliance, mode == ApplyMode::Live)?;
     Ok(())
+}
+
+/// The links among `reloaded` that are missing and that nothing here creates:
+/// a NIC, radio or modem the kernel provides, which has been unplugged, moved to
+/// another network namespace or renamed.
+///
+/// `networkctl_reload` waits for each link it reconfigures to exist, because a
+/// device networkd creates from a `.netdev` (a VLAN, a bridge, a tunnel) appears
+/// asynchronously and a commit must not report success over one that never
+/// came. A kernel-provided link is different: no amount of waiting creates it,
+/// and refusing the commit over it — and then the rollback to the last-good
+/// config, which declares it too — would leave every other change on the box
+/// unappliable until the hardware came back. Its unit is written either way, so
+/// networkd configures it (held, if it is zoned) when the device appears.
+fn absent_kernel_links(
+    reloaded: &[String],
+    ifaces: &[Interface],
+    desired: &BTreeMap<String, String>,
+    exists: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    reloaded
+        .iter()
+        .filter(|name| !exists(name))
+        .filter(|name| !desired.contains_key(&netdev_name(name)))
+        .filter(|name| {
+            ifaces
+                .iter()
+                .find(|i| &i.name == *name)
+                .is_some_and(|i| !(i.is_vlan() || i.is_l2tpv3() || i.is_vti() || i.is_pppoe()))
+        })
+        .cloned()
+        .collect()
 }
 
 /// Empty and take down physical links this configuration stopped declaring (see
@@ -7021,6 +7063,49 @@ mod tests {
         assert_eq!(routing_sysctls(&a)["net.ipv6.conf.all.forwarding"], "0");
         a.system.sysctl.clear();
         assert_eq!(routing_sysctls(&a)["net.ipv6.conf.all.forwarding"], "1");
+    }
+
+    /// A NIC that has gone (unplugged, moved to another namespace) is not
+    /// waited for: nothing would create it, and failing on it fails the
+    /// rollback too. A link a `.netdev` or Sentinel itself creates still is.
+    #[test]
+    fn a_missing_kernel_link_is_not_awaited_but_a_created_one_is() {
+        let a = Appliance::from_toml(
+            r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "eth0"
+[[interface]]
+name = "wlan1"
+zone = "lan"
+[[interface]]
+name = "lo1"
+type = "dummy"
+[[interface]]
+name = "eth0.20"
+parent = "eth0"
+vlan = 20
+"#,
+        )
+        .unwrap();
+        let reloaded: Vec<String> = ["eth0", "wlan1", "lo1", "eth0.20"]
+            .map(String::from)
+            .to_vec();
+        let desired: BTreeMap<String, String> = [netdev_name("lo1"), netdev_name("eth0.20")]
+            .into_iter()
+            .map(|n| (n, String::new()))
+            .collect();
+        // Only eth0 is present: wlan1 is a kernel link that left, lo1 and the
+        // VLAN are devices networkd has yet to create.
+        let absent = absent_kernel_links(&reloaded, &a.interfaces, &desired, |n| n == "eth0");
+        assert_eq!(absent, vec!["wlan1".to_string()]);
+        // The VLAN is awaited even without a `.netdev` in hand.
+        let absent =
+            absent_kernel_links(&reloaded, &a.interfaces, &BTreeMap::new(), |n| n == "eth0");
+        assert!(!absent.contains(&"eth0.20".to_string()), "{absent:?}");
+        // Nothing is absent when everything is present.
+        assert!(absent_kernel_links(&reloaded, &a.interfaces, &desired, |_| true).is_empty());
     }
 
     /// The bridge's own settings reach its `.netdev`, under one `[Bridge]`

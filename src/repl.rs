@@ -802,7 +802,7 @@ fn unwind_err_mixed(rb: Rollback, cause: anyhow::Error) -> anyhow::Error {
         )
     };
     anyhow!(
-        "applying system configuration failed: {cause}\n  \
+        "applying system configuration failed: {cause:#}\n  \
          MIXED STATE — {rolled}, but the rest of this commit (DNS, NTP, PKI, \
          sshd, login passwords, IPsec, the VPNs and the box services) has no \
          automatic undo and may be partly applied. The running system now \
@@ -872,7 +872,7 @@ fn mixed_or_rolled_message(
              a bad value."
         ),
         Ok(()) => anyhow!(
-            "applying system configuration failed: {cause}\n  \
+            "applying system configuration failed: {cause:#}\n  \
              the broad system apply was rolled back to the last-good config, but \
              restoring the firewall/routing/hostname did not fully complete ({}). \
              Re-check those, or reboot to return to the saved config.",
@@ -888,9 +888,9 @@ fn mixed_or_rolled_message(
                 )
             };
             anyhow!(
-                "applying system configuration failed: {cause}\n  \
+                "applying system configuration failed: {cause:#}\n  \
                  MIXED STATE — reconciling back to the last-good config ALSO \
-                 failed ({re}); {rolled}. The broad system apply (DNS, NTP, PKI, \
+                 failed ({re:#}); {rolled}. The broad system apply (DNS, NTP, PKI, \
                  sshd, login passwords, IPsec, the VPNs and the box services) may \
                  be partly on the new config and partly on the old, so the running \
                  system matches neither cleanly.\n  \
