@@ -514,8 +514,15 @@ pub fn ip_rule_list() -> Result<String> {
 /// Add or delete one routing-policy rule. The arguments are built by the caller
 /// from the configuration; nothing here interprets them.
 pub fn ip_rule(args: &[&str]) -> Result<()> {
-    let mut all = vec!["rule"];
-    all.extend_from_slice(args);
+    let mut all = Vec::with_capacity(args.len() + 1);
+    if let Some((&family @ ("-4" | "-6"), rest)) = args.split_first() {
+        all.push(family);
+        all.push("rule");
+        all.extend_from_slice(rest);
+    } else {
+        all.push("rule");
+        all.extend_from_slice(args);
+    }
     run_priv("ip", &all)
 }
 
