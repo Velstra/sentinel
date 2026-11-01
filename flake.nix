@@ -303,7 +303,7 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-/f5uwWq9OE+CU6gG2Okryvi/Hdx71I3A8E7Mgsm9b+M=";
+      ebpfHash = "sha256-k2Dp/3LmAEpCM9R5XMfakm/2CzgRWP2Qz6SKEVKTorE=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
@@ -11907,8 +11907,11 @@
                   }
                 ];
                 # The sentinel-mdns avahi is the only mDNS stack on the reflector;
-                # disable systemd-resolved's so they don't race on 5353.
-                services.resolved.enable = lib.mkForce false;
+                # turn off systemd-resolved's mDNS so they don't race on 5353. Only
+                # its mDNS: resolved itself is the appliance's own resolver, and
+                # every commit activates its drop-in — a relay without the unit
+                # refuses every commit ("Unit systemd-resolved.service not found").
+                services.resolved.extraConfig = "MulticastDNS=no";
                 services.velstra.interface = lib.mkForce "eth1";
               };
           };
