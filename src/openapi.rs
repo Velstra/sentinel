@@ -260,6 +260,18 @@ const OPERATIONS: &[Operation] = &[
         open: false,
     },
     Operation {
+        method: "post",
+        path: "/api/v1/config/recovery/accept",
+        id: "accept-current-config",
+        summary: "End a transaction whose automatic recovery failed.",
+        description: "Body id must match the pending transaction, and its recovery must have given up (recovery_failed in config/transaction); 409 while it is still retrying. Keeps the restored saved document and accepts the live network as it is.",
+        parameters: &[],
+        body: Some(("application/json", any_object)),
+        answer: "The operation result.",
+        answer_shape: Some(("application/json", any_object)),
+        open: false,
+    },
+    Operation {
         method: "get",
         path: "/api/v1/ha/proof/{nonce}",
         id: "haProof",

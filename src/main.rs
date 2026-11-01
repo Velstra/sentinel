@@ -424,6 +424,10 @@ enum Command {
         /// The saved config to revert to (the running/boot baseline).
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
+        /// Set by the `commit-confirm` timer: revert only that change, never a
+        /// pending management transaction.
+        #[arg(long, hide = true)]
+        commit_confirm: bool,
     },
     /// Deliver an alert for a failed unit (roadmap C23). Invoked by systemd's
     /// `OnFailure=` on the units Sentinel owns, not by hand — it reads the saved
@@ -527,6 +531,16 @@ enum ConfigAction {
         /// Output format.
         #[arg(long, value_enum)]
         to: Format,
+    },
+    /// End a management transaction whose automatic recovery gave up.
+    Recover {
+        /// Accept the live network as it is and end the transaction. The saved
+        /// configuration stays the one the transaction started from. Refused
+        /// while recovery is still retrying.
+        #[arg(long, required = true)]
+        accept_current: bool,
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
     },
 }
 
@@ -681,10 +695,20 @@ async fn main() -> Result<()> {
             safe_apply::apply_pending(&config, &id, &live_apply(true))
         }
         Command::ApplyRecovery { config } => {
-            safe_apply::recover(&config, &live_apply(true), false, false)?;
-            Ok(())
+            match safe_apply::recover(&config, &live_apply(true), false, false) {
+                // One failed attempt on the way to the bound is logged, not a
+                // failed unit: the unit's OnFailure= alert is for giving up.
+                Err(error) if safe_apply::will_retry(&error) => {
+                    eprintln!("warning: {error:#}");
+                    Ok(())
+                }
+                other => other.map(drop),
+            }
         }
-        Command::ConfirmRollback { config } => confirm_rollback(&config),
+        Command::ConfirmRollback {
+            config,
+            commit_confirm,
+        } => confirm_rollback(&config, commit_confirm),
         Command::Alert { unit, config } => alert_unit(&unit, &config),
         Command::IdsWatch => {
             system::ignore_sigpipe();
@@ -837,8 +861,8 @@ fn live_apply(enabled: bool) -> repl::Apply {
 /// The `commit-confirm` timer runs this when its window expires; an operator can
 /// also run it (or `run confirm-rollback` from config mode) to drop an
 /// un-confirmed change at once.
-fn confirm_rollback(config: &std::path::Path) -> Result<()> {
-    confirm::rollback(&live_apply(true), config)
+fn confirm_rollback(config: &std::path::Path, from_timer: bool) -> Result<()> {
+    confirm::rollback(&live_apply(true), config, from_timer)
 }
 
 /// The interactive configuration session — a VyOS/JunOS-style edit context.
@@ -2278,7 +2302,9 @@ fn show_op(args: &[String]) -> Result<()> {
         ["firewall", "zones"] | ["zones"] => show_zones(),
         ["firewall", "states"] => show_agent_query("firewall-states", "firewall connection states"),
         ["firewall", "counters"] => show_agent_query("rule-stats", "rule packet counters"),
-        ["firewall", "events"] => show_agent_query("packet-events 100", "packet events"),
+        // The newest events, read without consuming them: the console's live
+        // view reads the same agent log through its own cursor.
+        ["firewall", "events"] => show_agent_query("packet-events-tail 100", "packet events"),
         ["firewall", "statistics" | "stats"] => show_firewall_stats(),
         // Which rules are carrying traffic, and which are carrying none.
         ["firewall", "hits"] | ["firewall", "rules"] => show_rule_hits(),
@@ -3282,6 +3308,14 @@ fn config_cmd(action: ConfigAction) -> Result<()> {
                 Format::Json => appliance.to_json()?,
             };
             print!("{out}");
+            Ok(())
+        }
+        ConfigAction::Recover { config, .. } => {
+            safe_apply::accept_current(&config, None)?;
+            eprintln!(
+                "transaction ended; the saved configuration is unchanged. The live network \
+                 may still differ from it — `sentinel confirm-rollback` re-applies it live."
+            );
             Ok(())
         }
     }

@@ -224,7 +224,7 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
         "compare" => do_compare(session, rest),
         "commit" => return commit(session, act),
         "commit-confirm" => return commit_confirm_line(session, act, rest),
-        "confirm" => crate::confirm::confirm(act),
+        "confirm" => crate::confirm::confirm(act, rest.first().copied()),
         "rollback" => return rollback_line(session, act, rest),
         "save" => {
             let to = rest.first().map(Path::new);
@@ -1144,10 +1144,11 @@ const CMD_HELP: &[CmdHelp] = &[
     },
     CmdHelp {
         name: "confirm",
-        usage: "confirm",
+        usage: "confirm [<transaction-id>]",
         summary: "keep a commit-confirm change (cancel the revert)",
-        detail: "",
-        examples: &[],
+        detail: "A bare `confirm` keeps only this shell's `commit-confirm`. A change \
+                 applied from the API or console is kept by naming its transaction id.",
+        examples: &["confirm"],
     },
     CmdHelp {
         name: "save",

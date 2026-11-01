@@ -276,6 +276,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/api/v1/config/transaction", get(get_transaction))
         .route("/api/v1/config/confirm", post(post_confirm))
         .route("/api/v1/config/revert", post(post_revert))
+        .route("/api/v1/config/recovery/accept", post(post_accept_current))
         .route("/api/v1/ha/enrollment", get(ha_enrollment))
         .route("/api/v1/ha/pair", post(ha_pair))
         // A config-sync peer is not a second administrator. Its document is
@@ -1406,21 +1407,25 @@ async fn get_telemetry(
         .and_then(|value| value.strip_prefix("Bearer "))
         .unwrap_or_default()
         .to_string();
-    let stream =
-        tokio_stream::wrappers::WatchStream::new(state.telemetry.subscribe()).map(move |value| {
-            if resolve_caller(&state, &credential).is_none() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "telemetry credential revoked",
-                ));
-            }
-            Ok::<_, std::io::Error>(
-                axum::response::sse::Event::default()
-                    .event("telemetry")
-                    .json_data(value)
-                    .expect("JSON telemetry value"),
-            )
-        });
+    // Re-checked every few seconds, not per frame, and off the async runtime:
+    // resolving a caller reads and parses files.
+    let receiver = state.telemetry.subscribe();
+    let stream = crate::telemetry::client_stream(receiver, move || {
+        let (state, credential) = (state.clone(), credential.clone());
+        async move {
+            tokio::task::spawn_blocking(move || resolve_caller(&state, &credential).is_some())
+                .await
+                .unwrap_or(false)
+        }
+    })
+    .map(|frame| {
+        frame.map(|value| {
+            axum::response::sse::Event::default()
+                .event("telemetry")
+                .json_data(value)
+                .expect("JSON telemetry value")
+        })
+    });
     let mut response = axum::response::Sse::new(stream)
         .keep_alive(axum::response::sse::KeepAlive::default())
         .into_response();
@@ -1468,6 +1473,21 @@ async fn post_revert(
             sync_user_tokens(&state).map_err(ApiError::internal)?;
         }
         Ok(Json(json!({"reverted":reverted,"reverting":!reverted})))
+    })
+    .await
+    .map_err(|error| ApiError::internal(anyhow!("recovery request: {error}")))?
+}
+
+/// The administrator's way out of a recovery that gave up. Write-gated like
+/// every other POST; refused (409) while recovery is still retrying.
+async fn post_accept_current(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<Confirmation>,
+) -> Result<Json<Value>, ApiError> {
+    tokio::task::spawn_blocking(move || {
+        crate::safe_apply::accept_current(&state.config_path, Some(&request.id))
+            .map(Json)
+            .map_err(|e| ApiError::new(StatusCode::CONFLICT, e))
     })
     .await
     .map_err(|error| ApiError::internal(anyhow!("recovery request: {error}")))?
@@ -2958,6 +2978,33 @@ virtual-address = ["10.43.0.253"]
         assert_eq!(response.status(), StatusCode::OK);
         assert!(!crate::safe_apply::recover(&path, &Apply::off(), true, false).unwrap());
         assert_eq!(Appliance::load(&path).unwrap().system.hostname, "confirmed");
+    }
+
+    #[tokio::test]
+    async fn accepting_the_current_network_is_refused_while_recovery_can_still_succeed() {
+        let path = seed("working");
+        let app = router(state(path.clone()));
+        let revision = crate::ha::revision(&Appliance::load(&path).unwrap()).unwrap();
+        let response = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/config/document",
+                json!({"toml":"[system]\nhostname=\"provisional\"\n","expected_revision":revision}),
+            ))
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_str(&body_string(response).await).unwrap();
+        let response = app
+            .oneshot(post_json(
+                "/api/v1/config/recovery/accept",
+                json!({"id":result["pending"]["id"]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(body_string(response).await.contains("still in progress"));
+        assert!(crate::safe_apply::status(&path).unwrap()["pending"].is_object());
+        crate::safe_apply::recover(&path, &Apply::off(), true, false).unwrap();
     }
 
     #[tokio::test]

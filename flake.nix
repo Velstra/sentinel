@@ -759,6 +759,14 @@
             description = "Recover expired Sentinel management transactions";
             after = [ "sentinel-boot.service" ];
             unitConfig.StartLimitIntervalSec = 0;
+            # The timer fires every second, but the unit fails exactly once: when
+            # recovery gives up after its bounded retries (an attempt on the way
+            # logs and succeeds). That one failure is an incident nothing else
+            # announces — writes stay blocked until an administrator accepts the
+            # live network — so it alerts statically rather than through the
+            # config-driven drop-ins; with no `[services.alerts]` the handler is
+            # a no-op.
+            onFailure = [ "sentinel-alert@%n.service" ];
             serviceConfig = {
               Type = "oneshot";
               ExecStart = "${sentinel}/bin/sentinel apply-recovery --config /var/lib/sentinel/appliance.toml";

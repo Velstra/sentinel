@@ -669,6 +669,14 @@ export function Flows({ manager }: { manager: Management }) {
             ? "Packet logging is currently unavailable."
             : status}
         </p>
+        {!state.remote && !!state.frame?.events_lost && (
+          <p id="flow-lost" role="note" className="stream-status">
+            {state.frame.events_lost.toLocaleString()}{" "}
+            {state.frame.events_lost === 1 ? "event" : "events"} lost: the
+            packet log filled faster than this view read it. Rule counters stay
+            exact.
+          </p>
+        )}
         {state.frame?.errors.events && !state.remote && (
           <details className="inline-diagnostic">
             <summary>Connection details</summary>
@@ -1011,13 +1019,22 @@ export function Confirmation({ manager }: { manager: Management }) {
         : "") ||
     (!pending
       ? ""
-      : pending.reverting
-        ? "Rollback requested. The independent recovery service is restoring the previous working configuration."
-        : !pending.ready
-          ? "Applying configuration in the independent worker. The confirmation window starts when reconciliation completes."
-          : seconds
-            ? "Verify management access and forwarding, then keep this revision. Without confirmation the previous working configuration returns automatically."
-            : "The confirmation window expired. Reconnecting to check recovery…");
+      : pending.recovery_failed
+        ? "Automatic recovery failed after " +
+          (pending.recovery_attempts ?? 0) +
+          " attempts. The saved configuration is restored, but the live network may not match it. Inspect the appliance, then accept the current network to allow changes again, or reboot to apply the saved configuration."
+        : pending.reverting
+          ? (pending.recovery_attempts
+              ? "Restoring the previous working configuration failed " +
+                pending.recovery_attempts +
+                " time(s); retrying with backoff. "
+              : "") +
+            "Rollback requested. The independent recovery service is restoring the previous working configuration."
+          : !pending.ready
+            ? "Applying configuration in the independent worker. The confirmation window starts when reconciliation completes."
+            : seconds
+              ? "Verify management access and forwarding, then keep this revision. Without confirmation the previous working configuration returns automatically."
+              : "The confirmation window expired. Reconnecting to check recovery…");
   return (
     <section
       id="confirmation"
@@ -1030,11 +1047,24 @@ export function Confirmation({ manager }: { manager: Management }) {
           {message}
         </span>
         <span id="confirmation-countdown" role="timer" aria-live="off">
-          {pending?.ready
-            ? seconds + " seconds until automatic rollback"
-            : "Preparing the confirmation window…"}
+          {pending?.recovery_failed
+            ? "Automatic recovery stopped"
+            : pending?.ready
+              ? seconds + " seconds until automatic rollback"
+              : "Preparing the confirmation window…"}
         </span>
       </span>
+      {pending?.recovery_failed && (
+        <button
+          className="btn primary"
+          id="accept-current"
+          disabled={!state.writable || state.remote || state.confirming}
+          aria-busy={state.confirming}
+          onClick={() => void manager.finishTransaction("recovery/accept")}
+        >
+          Accept current network
+        </button>
+      )}
       <button
         className="btn primary"
         id="confirm-change"
@@ -1044,6 +1074,7 @@ export function Confirmation({ manager }: { manager: Management }) {
           state.confirming ||
           !pending?.ready ||
           !!pending.reverting ||
+          !!pending.recovery_failed ||
           !seconds
         }
         aria-busy={state.confirming}
@@ -1059,7 +1090,8 @@ export function Confirmation({ manager }: { manager: Management }) {
           state.remote ||
           state.confirming ||
           !pending ||
-          pending.reverting
+          pending.reverting ||
+          pending.recovery_failed
         }
         aria-busy={state.confirming}
         onClick={() => void manager.finishTransaction("revert")}

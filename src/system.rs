@@ -758,6 +758,8 @@ pub fn arm_confirm(minutes: u32, cfg: &Path) -> Result<()> {
     args.push("confirm-rollback".into());
     args.push("--config".into());
     args.push(cfg_s.to_string());
+    // The timer reverts its own change only (see `confirm::rollback`).
+    args.push("--commit-confirm".into());
     let argref: Vec<&str> = args.iter().map(String::as_str).collect();
     run_priv("systemd-run", &argref)
 }
