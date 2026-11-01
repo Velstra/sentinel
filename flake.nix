@@ -6793,6 +6793,28 @@
                   ./nix/image.nix
                 ];
                 system.name = "machine";
+                # The release proof for the donor, as an operator would carry
+                # it on a second medium: the image's SHA-256 signed by a release
+                # key, and that key's public half to pin. Built from the donor's
+                # raw image, so it vouches for exactly the bytes on the stick.
+                environment.etc."sentinel-update-proof".source =
+                  let
+                    raw = "${nodes.donor.system.build.finalImage}/${nodes.donor.image.filePath}";
+                  in
+                  pkgs.runCommand "sentinel-update-proof" { nativeBuildInputs = [ pkgs.openssl ]; } ''
+                    mkdir -p $out
+                    openssl genpkey -algorithm ed25519 -out release.pem
+                    openssl pkey -in release.pem -pubout -out $out/release-pub.pem
+                    sha256sum ${raw} | cut -d ' ' -f 1 > $out/velstra-sentinel.raw.sha256
+                    openssl pkeyutl -sign -rawin -inkey release.pem \
+                      -in $out/velstra-sentinel.raw.sha256 -out $out/velstra-sentinel.raw.sha256.sig
+                    # A proof for some OTHER image, to show a stick is held to
+                    # its own digest and not to whatever proof is at hand.
+                    echo 0000000000000000000000000000000000000000000000000000000000000000 \
+                      > $out/other.raw.sha256
+                    openssl pkeyutl -sign -rawin -inkey release.pem \
+                      -in $out/other.raw.sha256 -out $out/other.raw.sha256.sig
+                  '';
                 virtualisation = {
                   directBoot.enable = false;
                   mountHostNixStore = false;
@@ -6875,12 +6897,26 @@
                   assert guid(disk, 4) != guid(disk, 2), "the refused update stamped slot B's verity GUID"
                   assert guid(disk, 5) != guid(disk, 3), "the refused update stamped slot B's store GUID"
 
-              with subtest("update writes + verity-types the inactive slot B from the donor"):
-                  # A block device with no detached signature — the
-                  # trusted-operator escape hatch, so it takes --allow-unsigned.
-                  # (The default-secure refusal and the signed-image path are
-                  # proven by checks.updatelocal.)
-                  machine.succeed(f"sentinel update --commit --allow-unsigned {donor_disk}")
+              proof = "/etc/sentinel-update-proof"
+              signed = f"--pubkey file:{proof}/release-pub.pem"
+
+              with subtest("a USB stick is refused without a proof, and against another image's proof"):
+                  status, out = machine.execute(f"sentinel update --commit {signed} {donor_disk} 2>&1")
+                  assert status != 0 and "block device" in out, out
+                  status, out = machine.execute(
+                      f"sentinel update --commit {signed} --signature {proof}/other.raw.sha256.sig {donor_disk} 2>&1")
+                  assert status != 0 and "does not match its signed SHA-256" in out, out
+                  # Refused after hashing, before writing: slot B is untouched.
+                  assert guid(disk, 4) != guid(donor_disk, 2), "a refused update stamped slot B"
+
+              with subtest("update writes + verity-types the inactive slot B from the SIGNED donor"):
+                  # The stick carries no signature of its own; the release's
+                  # signed digest comes from another medium via --signature.
+                  # The stick is hashed in full against it, then the slot is
+                  # written from the same open device, re-hashed on the way.
+                  out = machine.succeed(
+                      f"sentinel update --commit {signed} --signature {proof}/velstra-sentinel.raw.sha256.sig {donor_disk} 2>&1")
+                  assert "signature verified" in out and "image SHA-256 verified" in out, out
                   machine.succeed("udevadm settle")
                   usr = "8484680c-9521-48c6-9c11-b0720656f69e"
                   usrv = "77ff5f63-e7b6-4633-acf4-1565b864c0e6"
@@ -6969,20 +7005,27 @@
                 machine.succeed("openssl pkey -in /tmp/priv.pem -pubout -out /tmp/pub.pem")
                 machine.succeed("openssl genpkey -algorithm ed25519 -out /tmp/wrong.pem")
                 # A small fixture "image" and a manifest naming it + its sha256.
-                machine.succeed("head -c 4096 /dev/urandom > /tmp/chan/sentinel-0.3.0.img")
+                # The version is far ahead of any running release, so it is an
+                # update; the downgrade case re-signs it as an old release below.
+                machine.succeed("head -c 4096 /dev/urandom > /tmp/chan/sentinel-99.0.0.img")
                 sha = machine.succeed(
-                    "openssl dgst -sha256 /tmp/chan/sentinel-0.3.0.img | awk '{print $NF}'"
+                    "openssl dgst -sha256 /tmp/chan/sentinel-99.0.0.img | awk '{print $NF}'"
                 ).strip()
-                machine.succeed(
-                    "printf '%s' "
-                    "'{\"version\":\"0.3.0\",\"image\":\"sentinel-0.3.0.img\",\"sha256\":\"'"
-                    + sha + "'\"}' > /tmp/chan/manifest.json"
-                )
-                # Detached Ed25519 signature over the EXACT manifest bytes.
-                machine.succeed(
-                    "openssl pkeyutl -sign -inkey /tmp/priv.pem -rawin "
-                    "-in /tmp/chan/manifest.json -out /tmp/chan/manifest.json.sig"
-                )
+
+                def publish(version, product="velstra-sentinel"):
+                    machine.succeed(
+                        "printf '%s' "
+                        "'{\"version\":\"" + version + "\",\"image\":\"sentinel-99.0.0.img\","
+                        "\"sha256\":\"" + sha + "\",\"product\":\"" + product + "\"}' "
+                        "> /tmp/chan/manifest.json"
+                    )
+                    # Detached Ed25519 signature over the EXACT manifest bytes.
+                    machine.succeed(
+                        "openssl pkeyutl -sign -inkey /tmp/priv.pem -rawin "
+                        "-in /tmp/chan/manifest.json -out /tmp/chan/manifest.json.sig"
+                    )
+
+                publish("99.0.0")
 
             with subtest("pin the channel in the appliance config"):
                 machine.succeed(
@@ -6996,7 +7039,7 @@
 
             with subtest("GOOD: `update check` verifies the manifest and prints the version"):
                 out = machine.succeed("sentinel update check")
-                assert "0.3.0" in out, f"check should report the signed version: {out}"
+                assert "99.0.0" in out, f"check should report the signed version: {out}"
 
             with subtest("GOOD: a verified image reaches the slot-writer (crypto passed)"):
                 # No A/B disk here, so the writer fails at find_source_disk — but
@@ -7007,9 +7050,33 @@
                     f"verification should pass and control reach the slot-writer: {out}"
                 )
 
+            with subtest("an OLD signed release is refused as a downgrade unless asked for"):
+                # Still genuinely signed by the pinned key — a replayed old
+                # manifest is exactly that. `check` says it is not an update;
+                # `install` refuses before fetching the image.
+                publish("0.3.0")
+                out = machine.succeed("sentinel update check")
+                assert "NOT an update" in out, f"an older release must not read as an update: {out}"
+                status, out = machine.execute("sentinel update install 2>&1")
+                assert status != 0 and "OLDER" in out and "--allow-downgrade" in out, out
+                assert "could not resolve the source disk" not in out, (
+                    f"a downgrade must be refused before the slot-writer: {out}"
+                )
+                status, out = machine.execute("sentinel update install --allow-downgrade 2>&1")
+                assert status != 0, out
+                assert "could not resolve the source disk" in out, (
+                    f"--allow-downgrade must let a verified old release reach the writer: {out}"
+                )
+
+            with subtest("a release signed for another product is refused"):
+                publish("99.0.0", product="velstra-cloud")
+                status, out = machine.execute("sentinel update check 2>&1")
+                assert status != 0 and "velstra-cloud" in out, out
+                publish("99.0.0")
+
             with subtest("TAMPERED image: SHA-256 mismatch refuses the update"):
                 machine.succeed(
-                    "printf 'X' | dd of=/tmp/chan/sentinel-0.3.0.img bs=1 seek=0 "
+                    "printf 'X' | dd of=/tmp/chan/sentinel-99.0.0.img bs=1 seek=0 "
                     "count=1 conv=notrunc"
                 )
                 status, out = machine.execute("sentinel update install 2>&1")
@@ -7133,6 +7200,51 @@
                 assert "signature verified" in out.lower(), (
                     f"the channel public-key should verify the local image: {out}"
                 )
+
+            with subtest("a block device needs --signature: nothing can sit beside /dev/loopN"):
+                dev = machine.succeed("losetup -f --show /tmp/img.raw").strip()
+                status, out = machine.execute(f"sentinel update {dev} --pubkey file:/tmp/pub.pem 2>&1")
+                assert status != 0 and "block device" in out, out
+                machine.succeed("sha256sum /tmp/img.raw | cut -d ' ' -f 1 > /tmp/proof.sha256")
+                machine.succeed(
+                    "openssl pkeyutl -sign -inkey /tmp/priv.pem -rawin "
+                    "-in /tmp/proof.sha256 -out /tmp/proof.sha256.sig"
+                )
+                status, out = machine.execute(
+                    f"sentinel update {dev} --pubkey file:/tmp/pub.pem --signature /tmp/proof.sha256.sig 2>&1"
+                )
+                assert "signature verified" in out.lower(), out
+                assert "could not resolve the source disk" in out, (
+                    f"a signed device must reach the slot-writer: {out}"
+                )
+                machine.succeed(f"losetup -d {dev}")
+
+            with subtest("a signed manifest on the medium proves the image AND refuses a downgrade"):
+                sha = machine.succeed("sha256sum /tmp/img.raw | cut -d ' ' -f 1").strip()
+
+                def manifest(version):
+                    machine.succeed(
+                        "mkdir -p /tmp/medium && printf '%s' "
+                        "'{\"version\":\"" + version + "\",\"image\":\"img.raw\","
+                        "\"sha256\":\"" + sha + "\",\"product\":\"velstra-sentinel\"}' "
+                        "> /tmp/medium/manifest.json"
+                    )
+                    machine.succeed(
+                        "openssl pkeyutl -sign -inkey /tmp/priv.pem -rawin "
+                        "-in /tmp/medium/manifest.json -out /tmp/medium/manifest.json.sig"
+                    )
+
+                use = "--pubkey file:/tmp/pub.pem --signature /tmp/medium/manifest.json.sig"
+                manifest("99.0.0")
+                status, out = machine.execute(f"sentinel update /tmp/img.raw {use} 2>&1")
+                assert "signed release 99.0.0" in out, out
+                assert "could not resolve the source disk" in out, out
+                manifest("0.3.0")
+                status, out = machine.execute(f"sentinel update /tmp/img.raw {use} 2>&1")
+                assert status != 0 and "OLDER" in out, out
+                assert "could not resolve the source disk" not in out, out
+                status, out = machine.execute(f"sentinel update /tmp/img.raw {use} --allow-downgrade 2>&1")
+                assert "could not resolve the source disk" in out, out
           '';
         };
 
@@ -7145,9 +7257,10 @@
         # makes new images from that channel unavailable). Like updatechannel
         # this proves the gate only, no A/B disk. The channel server is a small
         # scripted HTTPS responder inside the VM; its certificate is minted at
-        # build time and handed to the fetch via CURL_CA_BUNDLE, since a test
-        # CA in the real trust store would prove less about a real deployment,
-        # not more.
+        # build time and trusted through the system trust store — the only
+        # place the fetch takes a CA from, since it runs curl with an empty
+        # environment (a CURL_CA_BUNDLE, proxy or key-log variable around
+        # `sentinel` must not decide whom a subscription key is sent to).
         #   nix build .#checks.x86_64-linux.updatesub -L
         updatesub =
           let
@@ -7207,12 +7320,11 @@
                 pkgs.openssl
                 pkgs.python3
               ];
+              # The channel's certificate is trusted through the system store:
+              # the update fetch reads no CA from its environment.
+              security.pki.certificateFiles = [ "${tls}/cert.pem" ];
             };
             testScript = ''
-              # The fetch path is the pinned curl; the test CA rides an env var
-              # rather than the system trust store (see the comment above).
-              CA = "CURL_CA_BUNDLE=${tls}/cert.pem"
-
               machine.wait_for_unit("multi-user.target")
               machine.wait_for_unit("sentinel-boot.service")
               machine.succeed("test -f /var/lib/sentinel/appliance.toml")
@@ -7221,13 +7333,13 @@
                   machine.succeed("mkdir -p /tmp/chan")
                   machine.succeed("openssl genpkey -algorithm ed25519 -out /tmp/priv.pem")
                   machine.succeed("openssl pkey -in /tmp/priv.pem -pubout -out /tmp/pub.pem")
-                  machine.succeed("head -c 4096 /dev/urandom > /tmp/chan/sentinel-0.3.0.img")
+                  machine.succeed("head -c 4096 /dev/urandom > /tmp/chan/sentinel-99.0.0.img")
                   sha = machine.succeed(
-                      "openssl dgst -sha256 /tmp/chan/sentinel-0.3.0.img | awk '{print $NF}'"
+                      "openssl dgst -sha256 /tmp/chan/sentinel-99.0.0.img | awk '{print $NF}'"
                   ).strip()
                   machine.succeed(
                       "printf '%s' "
-                      "'{\"version\":\"0.3.0\",\"image\":\"sentinel-0.3.0.img\",\"sha256\":\"'"
+                      "'{\"version\":\"99.0.0\",\"image\":\"sentinel-99.0.0.img\",\"sha256\":\"'"
                       + sha + "'\"}' > /tmp/chan/manifest.json"
                   )
                   machine.succeed(
@@ -7257,7 +7369,7 @@
                   before = machine.succeed(
                       "sha256sum /var/lib/sentinel/appliance.toml"
                   ).strip()
-                  status, out = machine.execute(f"{CA} sentinel update check 2>&1")
+                  status, out = machine.execute("sentinel update check 2>&1")
                   assert status != 0, f"a 401 must fail the check: {out}"
                   assert "not valid for this channel" in out, (
                       f"expected the honest entitlement refusal: {out}"
@@ -7293,14 +7405,26 @@
                       "commit save exit "
                       "| sentinel configure --no-apply\""
                   )
-                  out = machine.succeed(f"{CA} sentinel update check")
-                  assert "0.3.0" in out, f"check should report the signed version: {out}"
+                  out = machine.succeed("sentinel update check")
+                  assert "99.0.0" in out, f"check should report the signed version: {out}"
+
+              with subtest("an ambient CA override or proxy does not reach the fetch"):
+                  # Each of these would break the fetch if curl honoured it: an
+                  # empty CA bundle fails every certificate, a dead proxy every
+                  # connection. The fetch runs with none of them.
+                  out = machine.succeed(
+                      "CURL_CA_BUNDLE=/dev/null SSL_CERT_FILE=/dev/null "
+                      "HTTPS_PROXY=http://127.0.0.1:9 ALL_PROXY=http://127.0.0.1:9 "
+                      "SSLKEYLOGFILE=/tmp/keylog sentinel update check"
+                  )
+                  assert "99.0.0" in out, out
+                  machine.fail("test -e /tmp/keylog")
 
               with subtest("…and a verified image reaches the slot-writer"):
                   # No A/B disk here, so the writer fails at find_source_disk —
                   # but ONLY a crypto-verified, entitlement-served image gets
                   # that far, which is the proof.
-                  status, out = machine.execute(f"{CA} sentinel update install 2>&1")
+                  status, out = machine.execute("sentinel update install 2>&1")
                   assert status != 0, f"expected the writer to fail without a disk: {out}"
                   assert "could not resolve the source disk" in out, (
                       f"verification should pass and control reach the slot-writer: {out}"

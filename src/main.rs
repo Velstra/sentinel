@@ -58,6 +58,7 @@ mod ui;
 mod unlock;
 mod update;
 mod velstra;
+mod verified_image;
 mod webui;
 mod wgkey;
 mod wireless;
@@ -401,6 +402,17 @@ enum Command {
         /// channel's `public-key`, then to a key baked into the image.
         #[arg(long)]
         pubkey: Option<String>,
+        /// The detached signature proving a LOCAL image or block device, when it
+        /// does not sit beside the image: `…/manifest.json.sig` (a signed
+        /// release manifest), `…/<image>.sha256.sig` (a signed digest) or a raw
+        /// `<image>.sig`. A USB stick is proven this way — nothing can sit
+        /// "beside" `/dev/sdb`.
+        #[arg(long)]
+        signature: Option<std::path::PathBuf>,
+        /// Install a release OLDER than the running one. Refused by default: an
+        /// old release stays validly signed forever.
+        #[arg(long)]
+        allow_downgrade: bool,
     },
     /// Unlock the encrypted data partition (LUKS2). Run by
     /// `sentinel-unlock.service` before `/var/lib/sentinel` is mounted, not by
@@ -663,7 +675,18 @@ async fn main() -> Result<()> {
             commit,
             allow_unsigned,
             pubkey,
-        } => update_cmd(target.as_deref(), commit, allow_unsigned, pubkey.as_deref()),
+            signature,
+            allow_downgrade,
+        } => update_cmd(
+            target.as_deref(),
+            UpdateFlags {
+                commit,
+                allow_unsigned,
+                allow_downgrade,
+                pubkey: pubkey.as_deref(),
+                signature: signature.as_deref(),
+            },
+        ),
         Command::ApplyBoot {
             config,
             out,
@@ -1078,19 +1101,24 @@ fn apply_boot_late(config: &std::path::Path) -> Result<()> {
 /// (pick mode + disks); with target(s), validate the selection and show the
 /// plan. Destructive execution happens on `--commit` (or after the wizard's
 /// confirmation).
+/// The options of `sentinel update`, as given.
+struct UpdateFlags<'a> {
+    commit: bool,
+    allow_unsigned: bool,
+    allow_downgrade: bool,
+    pubkey: Option<&'a str>,
+    signature: Option<&'a std::path::Path>,
+}
+
 /// Dispatch `sentinel update <target> [--commit]`. `target` is a local
 /// image/block-device path (written directly by the existing slot-writer), or a
 /// signed-channel keyword driving roadmap C13's authenticity gate against the
 /// saved `[update]` channel.
-fn update_cmd(
-    target: Option<&str>,
-    commit: bool,
-    allow_unsigned: bool,
-    pubkey: Option<&str>,
-) -> Result<()> {
+fn update_cmd(target: Option<&str>, flags: UpdateFlags) -> Result<()> {
     match target {
         None => anyhow::bail!(
-            "usage: sentinel update <image>|check|install [--commit] [--allow-unsigned]\n\
+            "usage: sentinel update <image>|check|install [--commit] [--signature <file>] \
+             [--allow-downgrade] [--allow-unsigned]\n\
              (`check`/`install` use the saved [update] channel; a path writes that image directly)"
         ),
         Some("check") => {
@@ -1100,12 +1128,28 @@ fn update_cmd(
             // one would hope it went.
             match update::check(&chan) {
                 Ok(manifest) => {
-                    update::record_status(
-                        &chan,
-                        &format!("release {} available", manifest.version),
-                    );
+                    // A signed release older than this one is not an update. It
+                    // is reported, not hidden: a channel that serves it may be a
+                    // stale mirror or somebody replaying an old manifest.
+                    let older = update::refuse_downgrade(&manifest.version, false).is_err();
+                    let (outcome, verb) = if older {
+                        (
+                            format!(
+                                "release {} offered, older than the running {}",
+                                manifest.version,
+                                update::RUNNING_VERSION
+                            ),
+                            "NOT an update (older than the running release)",
+                        )
+                    } else {
+                        (
+                            format!("release {} available", manifest.version),
+                            "update available",
+                        )
+                    };
+                    update::record_status(&chan, &outcome);
                     println!(
-                        "channel {:?}: update available: {} (image {}, sha256 {})",
+                        "channel {:?}: {verb}: {} (image {}, sha256 {})",
                         chan.label(),
                         manifest.version,
                         manifest.image,
@@ -1121,11 +1165,11 @@ fn update_cmd(
         }
         Some("install") => {
             let chan = load_update_channel()?;
-            match install::update_from_channel(&chan, commit) {
+            match install::update_from_channel(&chan, flags.commit, flags.allow_downgrade) {
                 Ok(()) => {
                     update::record_status(
                         &chan,
-                        if commit {
+                        if flags.commit {
                             "image verified and written to the inactive slot"
                         } else {
                             "image verified (dry-run; nothing written)"
@@ -1140,35 +1184,33 @@ fn update_cmd(
             }
         }
         // Any other value is a local image/block-device path.
-        Some(path) => update_local(path, commit, allow_unsigned, pubkey),
+        Some(path) => update_local(path, &flags),
     }
 }
 
 /// Write a LOCAL image to the inactive slot, verifying its signature FIRST unless
 /// the operator explicitly opts out.
 ///
-/// Verification is now the default for a local image too — the local path used to
+/// Verification is the default for a local image too — the local path used to
 /// write anything given to it, which was the supply-chain hole. A detached
-/// `<image>.sig` is checked against a pinned Ed25519 key (the `--pubkey` flag, the
-/// saved channel's `public-key`, or a key baked into the image) before a single
-/// byte reaches the slot-writer. `--allow-unsigned` keeps the old escape hatch for
-/// a re-seal or an air-gapped block device — loud and logged, never silent.
-fn update_local(
-    path: &str,
-    commit: bool,
-    allow_unsigned: bool,
-    pubkey: Option<&str>,
-) -> Result<()> {
+/// signature (beside the image, or named by `--signature`) is checked against a
+/// pinned Ed25519 key (the `--pubkey` flag, the saved channel's `public-key`, or
+/// a key baked into the image), and the image is then installed from the bytes
+/// that matched it — see [`install::update_verified`]. A signed manifest also
+/// states the release version, which must not be older than the running one
+/// unless `--allow-downgrade`. `--allow-unsigned` keeps the old escape hatch for
+/// a re-seal or a trusted device — loud and logged, never silent.
+fn update_local(path: &str, flags: &UpdateFlags) -> Result<()> {
     let image = std::path::Path::new(path);
-    if allow_unsigned {
+    if flags.allow_unsigned {
         eprintln!(
             "warning: --allow-unsigned: writing {path} to the inactive slot WITHOUT signature \
              verification. A local image/device is trusted exactly as given; make sure you \
              trust its source."
         );
-        return install::update(image, commit);
+        return install::update(image, flags.commit);
     }
-    let key = local_update_pubkey(pubkey).ok_or_else(|| {
+    let key = local_update_pubkey(flags.pubkey).ok_or_else(|| {
         anyhow::anyhow!(
             "refusing to write an unverified image: no release public key to verify against.\n\
              Pin one with --pubkey <pem|file:path>, set an [update] channel public-key and save, \
@@ -1176,9 +1218,25 @@ fn update_local(
              pass --allow-unsigned."
         )
     })?;
-    update::verify_local_image(image, &key)?;
+    let proof = update::verify_local_image(image, flags.signature, &key)?;
     eprintln!("signature verified against the pinned release key");
-    install::update(image, commit)
+    match &proof.version {
+        Some(version) => {
+            eprintln!("signed release {version}");
+            update::refuse_downgrade(version, flags.allow_downgrade)?;
+        }
+        // A digest or raw signature vouches for bytes, not for a release, so
+        // there is no version to hold against the running one. The input here
+        // is chosen by root at the console, not served by a mirror, which is
+        // why this is said rather than refused; a signed manifest closes it.
+        None => eprintln!(
+            "note: this proof states no release version, so it cannot be checked against \
+             the running {} — use the release's signed manifest (--signature \
+             …/manifest.json.sig) for downgrade protection",
+            update::RUNNING_VERSION
+        ),
+    }
+    install::update_verified(&proof.source, &proof.sha256, flags.commit)
 }
 
 /// Where a local image's signing key is looked for, in order of precedence:

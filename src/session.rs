@@ -6140,6 +6140,7 @@ impl Session {
                         fleet.poll_interval =
                             Some(v.parse().context("fleet poll interval must be seconds")?)
                     }
+                    "flow-telemetry" => fleet.flow_telemetry = parse_bool(v)?,
                     _ => bail!("unknown fleet field {field}"),
                 }
             }
@@ -8604,6 +8605,7 @@ impl Session {
                         "client-key" => fleet.client_key.clear(),
                         "signing-key" => fleet.signing_key.clear(),
                         "poll-interval" => fleet.poll_interval = None,
+                        "flow-telemetry" => fleet.flow_telemetry = false,
                         _ => bail!("unknown fleet field {field}"),
                     }
                 }
@@ -12413,6 +12415,9 @@ fn render_draft_masked(
             }
             if let Some(seconds) = fleet.poll_interval {
                 out.push_str(&format!("    poll-interval {seconds}\n"));
+            }
+            if fleet.flow_telemetry {
+                out.push_str("    flow-telemetry true\n");
             }
             out.push_str("}\n");
         }

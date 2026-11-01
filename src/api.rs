@@ -2380,6 +2380,7 @@ mod tests {
             client_key: "/etc/fleet/client.key".into(),
             signing_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
             poll_interval: None,
+            flow_telemetry: false,
         };
         secondary.fleet = Some(fleet.clone());
         let mut source = fleet.clone();

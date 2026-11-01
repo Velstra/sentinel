@@ -1566,6 +1566,10 @@ const FLEET_FIELDS: &[Cand] = &[
         "poll-interval",
         "check-in interval in seconds (1–300, default 5)",
     ),
+    (
+        "flow-telemetry",
+        "send per-flow detail (addresses) in telemetry; default counters only",
+    ),
 ];
 const UPDATE_FIELDS: &[Cand] = &[
     (
@@ -5119,6 +5123,13 @@ pub(crate) fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, 
             "ca-certificate" | "client-certificate" | "client-key",
         ] => own_cands(&[("<absolute-path>", "absolute file path")]),
         ["set", "fleet", "poll-interval"] => own_cands(&[("<seconds>", "1–300 seconds")]),
+        ["set", "fleet", "flow-telemetry"] => own_cands(&[
+            (
+                "true",
+                "include connection states, NAT flows and top talkers",
+            ),
+            ("false", "counters only (the default)"),
+        ]),
         ["set", "update", "url"] => own_cands(&[PH_URL]),
         ["set", "update", "public-key"] => {
             own_cands(&[("<pem|file:path>", "PEM key or file:<path>")])

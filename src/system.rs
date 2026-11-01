@@ -1211,7 +1211,7 @@ pub fn curl_request(
     add_pin_args(&mut args, pin);
     args.push(url.into());
     let config = curl_auth_config(token)?;
-    let mut child = Command::new(bin("curl"))
+    let mut child = curl_command()
         .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1236,6 +1236,33 @@ pub fn curl_request(
     );
     String::from_utf8(out.stdout).context("non-UTF8 management response")
 }
+/// The pinned curl for a request that carries a credential or decides whom to
+/// trust, with nothing of the caller's environment.
+///
+/// `--disable` (which only works as the FIRST argument) keeps `~/.curlrc` out,
+/// but curl also reads its environment: `HTTPS_PROXY`/`ALL_PROXY` would route a
+/// bearer token through somebody's proxy, `SSLKEYLOGFILE` would write the TLS
+/// session keys to a file, `CURL_CA_BUNDLE`/`SSL_CERT_FILE` would swap the trust
+/// store the certificate is checked against. A `sudo -E`, a service drop-in or a
+/// login profile is enough to set any of them. None of them is a setting of
+/// this appliance, so the child starts with an empty environment; only `PATH`
+/// is carried, which curl never reads and the lookup of a bare `curl` (off the
+/// appliance, where no pinned store path is set) needs. A proxy, if one is ever
+/// wanted, belongs in explicit configuration.
+pub fn curl_command() -> Command {
+    curl_command_for(&bin("curl"))
+}
+
+fn curl_command_for(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command.env_clear();
+    if let Some(path) = std::env::var_os("PATH") {
+        command.env("PATH", path);
+    }
+    command.arg("--disable");
+    command
+}
+
 fn curl_auth_config(token: Option<&str>) -> Result<String> {
     let Some(token) = token else {
         return Ok(String::new());
@@ -2151,5 +2178,47 @@ mod ha_curl_tests {
         for bad in ["", "secret\nurl = https://attacker", "secret\r\n", "nul\0"] {
             assert!(curl_auth_config(Some(bad)).is_err());
         }
+    }
+
+    /// The credentialed curl sees none of the caller's environment — a proxy,
+    /// a key log file or a CA override set around `sentinel` never reaches it —
+    /// and `--disable` is its first argument, the only place curl honours it.
+    #[test]
+    fn credentialed_curl_runs_with_an_empty_environment_and_no_curlrc() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("sentinel-curl-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("curl");
+        std::fs::write(&fake, "#!/bin/sh\nprintf 'first=%s\\n' \"$1\"\nenv\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // SAFETY: test-only; nothing else in the test binary spawns curl, the
+        // only reader of these two variables.
+        unsafe {
+            std::env::set_var("HTTPS_PROXY", "http://proxy.attacker.example:3128");
+            std::env::set_var("SSLKEYLOGFILE", "/tmp/stolen-keys");
+        }
+        let out = curl_command_for(fake.to_str().unwrap())
+            .arg("https://peer.example")
+            .output()
+            .unwrap();
+        unsafe {
+            std::env::remove_var("HTTPS_PROXY");
+            std::env::remove_var("SSLKEYLOGFILE");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        let text = String::from_utf8(out.stdout).unwrap();
+        let mut lines = text.lines();
+        assert_eq!(lines.next(), Some("first=--disable"), "{text}");
+        // What a POSIX shell exports by itself (PWD, SHLVL, _) is the only
+        // thing allowed beside PATH.
+        // Names only: a failure must not print the environment's values.
+        let leaked: Vec<_> = lines
+            .filter_map(|l| l.split_once('=').map(|(name, _)| name))
+            .filter(|name| !["PATH", "PWD", "SHLVL", "_"].contains(name))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "ambient environment reached curl: {leaked:?}"
+        );
     }
 }

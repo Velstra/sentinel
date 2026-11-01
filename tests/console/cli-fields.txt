@@ -63,6 +63,7 @@ fleet client-certificate
 fleet client-key
 fleet controller-url
 fleet enrollment-token
+fleet flow-telemetry
 fleet node-id
 fleet poll-interval
 fleet signing-key

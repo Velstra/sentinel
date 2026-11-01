@@ -65,8 +65,38 @@ async fn run(hub: Weak<Hub>) {
 
 /// Fleet telemetry is a non-draining snapshot. The local API remains the sole
 /// packet-ring consumer; cumulative interface counters let controllers derive rates.
-pub fn fleet_snapshot() -> Value {
-    Collector::default().collect(false)
+///
+/// Counters only unless `[fleet] flow-telemetry` says otherwise: the console
+/// on the box itself may show who talks to whom, but a controller elsewhere
+/// receives that only where this box's operator opted in.
+pub fn fleet_snapshot(flow_detail: bool) -> Value {
+    let snapshot = Collector::default().collect(false);
+    if flow_detail {
+        snapshot
+    } else {
+        without_flow_detail(snapshot)
+    }
+}
+
+/// The snapshot minus everything that names an endpoint: the conntrack state
+/// sample, the NAT flow table and the top talkers (and any collector error
+/// text about them). The totals and every counter stay.
+fn without_flow_detail(mut snapshot: Value) -> Value {
+    if let Some(conntrack) = snapshot["conntrack"].as_object_mut() {
+        conntrack.remove("states");
+        conntrack.remove("sample_limit");
+        conntrack.remove("nat_flows");
+    }
+    if let Some(errors) = snapshot["errors"].as_object_mut() {
+        errors.remove("nat_flows");
+        errors.remove("top_talkers");
+    }
+    if let Some(root) = snapshot.as_object_mut() {
+        root.remove("top_talkers");
+        root.remove("top_talkers_scope");
+        root.insert("flow_detail".into(), json!(false));
+    }
+    snapshot
 }
 
 #[derive(Default)]
@@ -333,5 +363,26 @@ mod tests {
         a.changed().await.unwrap();
         assert_eq!(a.borrow_and_update()["sequence"], 999);
         assert_eq!(b.borrow()["sequence"], 999);
+    }
+    /// The default fleet payload carries counters and no endpoint: no state
+    /// sample, NAT flow or top talker survives, while the totals do.
+    #[test]
+    fn fleet_telemetry_without_opt_in_names_no_endpoint() {
+        let full = json!({"sequence":1,"interfaces":[{"name":"eth0","rx_bytes":5}],
+            "conntrack":{"total":2,"states":[{"src":"192.0.2.7","dst":"198.51.100.9"}],
+                "sample_limit":200,"nat_flows":"192.0.2.7:5000 -> 198.51.100.9:443"},
+            "top_talkers":"192.0.2.7 9000 bytes","top_talkers_scope":"NAT flows; node-local counters",
+            "rule_counters":{"web":3},"errors":{"top_talkers":"192.0.2.7 timed out","routes":"down"}});
+        let counters = without_flow_detail(full);
+        let text = counters.to_string();
+        assert!(
+            !text.contains("192.0.2.7") && !text.contains("198.51.100.9"),
+            "{text}"
+        );
+        assert_eq!(counters["conntrack"]["total"], 2);
+        assert_eq!(counters["rule_counters"]["web"], 3);
+        assert_eq!(counters["interfaces"][0]["rx_bytes"], 5);
+        assert_eq!(counters["errors"]["routes"], "down");
+        assert_eq!(counters["flow_detail"], false);
     }
 }

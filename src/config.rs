@@ -542,6 +542,15 @@ pub struct Fleet {
     pub signing_key: String,
     /// Omitted means five seconds; zero and values above 300 are refused.
     pub poll_interval: Option<u32>,
+    /// Include flow-level detail in fleet telemetry: the sampled connection
+    /// states, the NAT flow table and the top talkers — every one of them a
+    /// list of client and server addresses. Off by default, so a controller
+    /// receives counters (totals, rule hits, interfaces, HA, routing, VPN
+    /// handshakes) and learns who talked to whom only where the operator of
+    /// this box has said so. Part of `[fleet]`, so a controller cannot turn it
+    /// on for itself.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub flow_telemetry: bool,
 }
 impl std::fmt::Debug for Fleet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

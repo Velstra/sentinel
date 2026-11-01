@@ -7745,6 +7745,7 @@ const SYS_FLEET = [
   ["enrollment-token", "Enrollment token", null, null, "secret"], ["ca-certificate", "Controller CA file"],
   ["client-certificate", "Client certificate file"], ["client-key", "Private client key file"],
   ["signing-key", "Ed25519 signing public key"], ["poll-interval", "Check-in interval (seconds)"],
+  ["flow-telemetry", "Per-flow telemetry (addresses)", ["", "true", "false"]],
 ];
 const SYS_UPDATE = [
   ["url", "Default channel URL"], ["public-key", "Signing key"],
