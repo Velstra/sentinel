@@ -1558,10 +1558,11 @@ async fn get_config(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, A
 /// the validation error before anything is applied or saved.
 async fn put_config(
     State(state): State<Arc<ApiState>>,
+    axum::Extension(caller): axum::Extension<Caller>,
     body: String,
 ) -> Result<Json<Value>, ApiError> {
     let appliance = Appliance::from_json(&body).map_err(ApiError::bad_request)?;
-    tokio::task::spawn_blocking(move || management_replace(&state, appliance))
+    tokio::task::spawn_blocking(move || management_replace(&state, &caller, appliance))
         .await
         .map_err(|error| ApiError::internal(anyhow!("configuration task: {error}")))?
 }
@@ -1569,10 +1570,21 @@ async fn put_config(
 /// All administrator writes use the same transaction; HA enrollment and
 /// config-sync retain their authenticated machine protocol and refuse a pending
 /// local transaction. Off-box CLI emulation has no live network to lock out.
-fn management_replace(state: &ApiState, appliance: Appliance) -> Result<Json<Value>, ApiError> {
+fn management_replace(
+    state: &ApiState,
+    caller: &Caller,
+    appliance: Appliance,
+) -> Result<Json<Value>, ApiError> {
     let _transaction = system::apply_lock().map_err(ApiError::internal)?;
     let _file = system::lock_config_at(&state.config_path.with_extension("transaction.lock"))
         .map_err(ApiError::internal)?;
+    // An account exists only in a saved configuration, so for one there is
+    // always a document to compare with; the machine caller may be writing
+    // the first.
+    if caller.user.is_some() {
+        let current = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
+        refuse_machine_trust_change(caller, &current, &appliance)?;
+    }
     crate::safe_apply::ensure_writable(&state.config_path)
         .map_err(|error| ApiError::new(StatusCode::CONFLICT, error))?;
     if state.apply.enabled {
@@ -1733,16 +1745,16 @@ async fn post_config_document(
     axum::Extension(caller): axum::Extension<Caller>,
     Json(request): Json<DocumentRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let disclosure = Disclosure::for_caller(caller.user.as_deref(), caller.permission);
-    tokio::task::spawn_blocking(move || apply_document(&state, request, disclosure))
+    tokio::task::spawn_blocking(move || apply_document(&state, request, &caller))
         .await
         .map_err(|error| ApiError::internal(anyhow!("document task: {error}")))?
 }
 fn apply_document(
     state: &ApiState,
     request: DocumentRequest,
-    disclosure: Disclosure,
+    caller: &Caller,
 ) -> Result<Json<Value>, ApiError> {
+    let disclosure = Disclosure::for_caller(caller.user.as_deref(), caller.permission);
     let _lock = system::apply_lock().map_err(ApiError::internal)?;
     let _file = system::lock_config_at(&state.config_path.with_extension("transaction.lock"))
         .map_err(ApiError::internal)?;
@@ -1755,6 +1767,9 @@ fn apply_document(
             anyhow!("configuration changed; reload and review the new baseline"),
         ));
     }
+    // Refused at review already, not only at apply: a diff the console shows
+    // as reviewable should be one it can then apply.
+    refuse_machine_trust_change(caller, &previous, &candidate)?;
     if request.validate_only {
         // The review diff is read back like the document itself: a context
         // line beside an edited `[system.config-sync]` would otherwise print
@@ -1792,6 +1807,102 @@ fn restore_withheld_credential(text: &str, current: &Appliance) -> Result<String
     let restored: toml::Value =
         serde_json::from_value(candidate).map_err(|e| ApiError::internal(e.into()))?;
     toml::to_string(&restored).map_err(|e| ApiError::internal(e.into()))
+}
+
+/// What decides who holds the machine credential and where it is sent, by the
+/// name the CLI gives it and its path in a serialised [`Appliance`].
+///
+/// The credential itself first — the config-sync secret is written to this
+/// box's API token file, so whoever chooses it holds a full-access token that
+/// no account change can withdraw; the witness secret is the same pairing
+/// credential and the witness key is derived from it. Then the places it is
+/// sent: the config-sync push and the stack view present it to every
+/// `config-sync peer`, verified against `peer-fingerprint` — set, it pins the
+/// peer and skips the proof a trust-on-first-use contact has to give, so a
+/// fingerprint of the account's own key is the credential delivered to its
+/// host. A paired member's peer derives its own peer and pin from this
+/// member's `ha management-fingerprint` and the `peer-identity` endpoint and
+/// fingerprint, so those decide the same thing one push later.
+///
+/// Not in the list: the management listen address and port the pair's
+/// endpoint is also derived from. Moving the console is ordinary
+/// administration, and with the pin out of reach the credential still only
+/// reaches the key this member was paired with.
+const MACHINE_TRUST: &[(&str, &[&str])] = &[
+    (
+        "system config-sync secret",
+        &["system", "config-sync", "secret"],
+    ),
+    (
+        "system config-sync peer",
+        &["system", "config-sync", "peer"],
+    ),
+    (
+        "system config-sync peer-fingerprint",
+        &["system", "config-sync", "peer-fingerprint"],
+    ),
+    (
+        "system ha-witness secret",
+        &["system", "ha-witness", "secret"],
+    ),
+    ("system ha-witness key", &["system", "ha-witness", "key"]),
+    (
+        "system ha management-fingerprint",
+        &["system", "ha", "management-fingerprint"],
+    ),
+    (
+        "system ha peer-identity management-endpoint",
+        &["system", "ha", "peer-identity", "management-endpoint"],
+    ),
+    (
+        "system ha peer-identity management-fingerprint",
+        &["system", "ha", "peer-identity", "management-fingerprint"],
+    ),
+];
+
+/// The [`MACHINE_TRUST`] fields whose value differs between `current` and
+/// `next`. Values, not presence of a write: a document sent back unchanged —
+/// the withheld credential restored from its marker included — changes none.
+fn machine_trust_changes(current: &Appliance, next: &Appliance) -> Result<Vec<&'static str>> {
+    let (current, next) = (serde_json::to_value(current)?, serde_json::to_value(next)?);
+    let at = |value: &Value, path: &[&str]| path.iter().try_fold(value, |v, k| v.get(*k)).cloned();
+    Ok(MACHINE_TRUST
+        .iter()
+        .filter(|(_, path)| at(&current, path) != at(&next, path))
+        .map(|(name, _)| *name)
+        .collect())
+}
+
+/// Refuse an account's write that changes anything in [`MACHINE_TRUST`].
+///
+/// Withholding the machine credential from an account on read only means
+/// something if the account cannot write one of its own choosing, or keep the
+/// hidden one and point the hosts it is sent to elsewhere. Every account write
+/// path — the document, the whole-config `PUT` and the CLI lines of
+/// `/configure` — calls this with the configuration it is about to replace.
+/// The machine caller (the peer that pairs and pushes) and the CLI on the box
+/// itself, which does not come through here, may still change all of it.
+fn refuse_machine_trust_change(
+    caller: &Caller,
+    current: &Appliance,
+    next: &Appliance,
+) -> Result<(), ApiError> {
+    if caller.user.is_none() {
+        return Ok(());
+    }
+    let changed = machine_trust_changes(current, next).map_err(ApiError::internal)?;
+    if changed.is_empty() {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        StatusCode::FORBIDDEN,
+        anyhow!(
+            "{} decides who holds this firewall's machine credential or where it is sent, \
+             and an account cannot change it; change it on the appliance itself with \
+             `sentinel configure` (or `sentinel ha pair` for a pairing)",
+            changed.join(", ")
+        ),
+    ))
 }
 
 /// Receive the shared half of another firewall's configuration.
@@ -2155,6 +2266,7 @@ fn show_command(
 /// validation output, with no partial application.
 async fn post_configure(
     State(state): State<Arc<ApiState>>,
+    axum::Extension(caller): axum::Extension<Caller>,
     body: String,
 ) -> Result<Json<Value>, ApiError> {
     if body.len() > 256 * 1024 {
@@ -2192,7 +2304,7 @@ async fn post_configure(
             Ok(value) => value,
             Err(error) => return Ok(Json(json!({"ok":false,"output":format!("error: {error:#}")}))),
         };
-        let mut response = if commit { management_replace(&state, appliance)?.0 } else { json!({}) };
+        let mut response = if commit { management_replace(&state, &caller, appliance)?.0 } else { json!({}) };
         response["ok"] = json!(true);
         response["output"] = json!(if response.get("pending").is_some() { "commit ok; provisional application started; confirmation required" } else if commit { "commit ok; configuration applied and saved" } else { "validation ok; nothing applied" });
         Ok(Json(response))
@@ -3909,6 +4021,302 @@ virtual-address = ["10.43.0.253"]
         let mut widening = axum::http::HeaderMap::new();
         widening.insert(REDACT_HEADER, "machine-credential".parse().unwrap());
         assert_eq!(level(&viewer, &widening).as_deref(), Some("secrets"));
+    }
+
+    /// A request from `token`, with `body` as given.
+    fn request_as(method: &str, uri: &str, token: &str, body: String) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    /// The document `token` is handed, as `(toml, revision)`.
+    async fn document_for(app: &Router, token: &str) -> (String, Value) {
+        let resp = app
+            .clone()
+            .oneshot(get("/api/v1/config/document", Some(token)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let document: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        (
+            document["toml"].as_str().unwrap().to_string(),
+            document["revision"].clone(),
+        )
+    }
+
+    /// Review follow-up H1: hiding the machine credential from an account is
+    /// pointless if the account can write a credential of its own choosing
+    /// (and then present it), or keep the hidden one and point the peers it
+    /// is sent to at another host. Neither is possible through any write door
+    /// an account has; the machine caller still can.
+    #[tokio::test]
+    async fn an_account_cannot_choose_or_redirect_the_machine_credential() {
+        let (st, _, vera) = secret_state();
+        let app = router(st.clone());
+        let before = Appliance::load(&st.config_path).unwrap();
+        let (toml, revision) = document_for(&app, &vera).await;
+        let refused = |status: StatusCode, body: &str, field: &str| {
+            assert_eq!(status, StatusCode::FORBIDDEN, "{field}: {body}");
+            assert!(body.contains(field), "names {field}: {body}");
+            assert!(body.contains("sentinel configure"), "says how: {body}");
+        };
+
+        // The document door, in review and for real: a credential of the
+        // account's own choosing, a peer of its choosing behind the restored
+        // marker, a fingerprint, and the witness credential.
+        let marker = format!("\"{REDACTED}\"");
+        let chosen = "\"account-chosen-credential-0123456789\"";
+        // The marker's first occurrence after a section header: both withheld
+        // credentials read the same.
+        let choose_in = |section: &str| {
+            let (head, rest) = toml.split_once(section).unwrap();
+            format!("{head}{section}{}", rest.replacen(&marker, chosen, 1))
+        };
+        let cases = [
+            (
+                choose_in("[system.config-sync]"),
+                "system config-sync secret",
+            ),
+            (
+                toml.replace("\"10.0.0.2\"", "\"203.0.113.66\""),
+                "system config-sync peer",
+            ),
+            (
+                toml.replace(
+                    "[system.config-sync]",
+                    "[system.config-sync]\npeer-fingerprint = \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"",
+                ),
+                "system config-sync peer-fingerprint",
+            ),
+            (
+                choose_in("[system.ha-witness]"),
+                "system ha-witness secret",
+            ),
+        ];
+        for (edited, field) in &cases {
+            assert_ne!(edited, &toml, "{field}: the case edits nothing");
+            for validate_only in [true, false] {
+                let resp = app
+                    .clone()
+                    .oneshot(request_as(
+                        "POST",
+                        "/api/v1/config/document",
+                        &vera,
+                        json!({"toml": edited, "expected_revision": revision, "validate_only": validate_only})
+                            .to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                refused(status, &body_string(resp).await, field);
+            }
+        }
+
+        // The CLI door the console uses: the same verbs, the same refusal.
+        for (script, field) in [
+            (
+                "set system config-sync secret account-chosen-credential-0123456789\ncommit\n",
+                "system config-sync secret",
+            ),
+            (
+                "set system config-sync peer 203.0.113.66\ncommit\n",
+                "system config-sync peer",
+            ),
+            ("delete system config-sync\ncommit\n", "system config-sync"),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(request_as(
+                    "POST",
+                    "/api/v1/configure",
+                    &vera,
+                    script.into(),
+                ))
+                .await
+                .unwrap();
+            let status = resp.status();
+            refused(status, &body_string(resp).await, field);
+        }
+
+        // The whole-document PUT.
+        let mut redirected = before.clone();
+        redirected.system.config_sync.peers = vec!["203.0.113.66".into()];
+        let resp = app
+            .clone()
+            .oneshot(request_as(
+                "PUT",
+                "/api/v1/config",
+                &vera,
+                serde_json::to_string(&redirected).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let status = resp.status();
+        refused(status, &body_string(resp).await, "system config-sync peer");
+
+        let after = Appliance::load(&st.config_path).unwrap();
+        assert_eq!(
+            serde_json::to_value(&after.system).unwrap(),
+            serde_json::to_value(&before.system).unwrap(),
+            "nothing was written"
+        );
+        assert!(crate::safe_apply::status(&st.config_path).unwrap()["pending"].is_null());
+
+        // An account's change to anything else still goes through, the
+        // withheld credential riding along unchanged.
+        let resp = app
+            .clone()
+            .oneshot(request_as(
+                "POST",
+                "/api/v1/config/document",
+                &vera,
+                json!({"toml": toml.replace("hostname = \"fixture\"", "hostname = \"edited\""), "expected_revision": revision})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = body_string(resp).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let pending: Value = serde_json::from_str(&body).unwrap();
+        let resp = app
+            .clone()
+            .oneshot(request_as(
+                "POST",
+                "/api/v1/config/confirm",
+                &vera,
+                json!({"id": pending["pending"]["id"]}).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let after = Appliance::load(&st.config_path).unwrap();
+        assert_eq!(after.system.hostname, "edited");
+        assert_eq!(
+            serde_json::to_value(&after.system.config_sync).unwrap(),
+            serde_json::to_value(&before.system.config_sync).unwrap()
+        );
+
+        // The machine caller — the peer that pairs and pushes — may still
+        // change all of it.
+        let (full, revision) = document_for(&app, TOKEN).await;
+        let rotated = full
+            .replace(
+                MACHINE_CREDENTIALS[0],
+                "rotated-machine-credential-0123456789",
+            )
+            .replace("\"10.0.0.2\"", "\"10.0.0.9\"");
+        let resp = app
+            .clone()
+            .oneshot(request_as(
+                "POST",
+                "/api/v1/config/document",
+                TOKEN,
+                json!({"toml": rotated, "expected_revision": revision}).to_string(),
+            ))
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = body_string(resp).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let pending: Value = serde_json::from_str(&body).unwrap();
+        let resp = app
+            .clone()
+            .oneshot(post_json(
+                "/api/v1/config/confirm",
+                json!({"id": pending["pending"]["id"]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let after = Appliance::load(&st.config_path).unwrap();
+        assert_eq!(after.system.config_sync.peers, ["10.0.0.9"]);
+        assert_eq!(
+            after.system.config_sync.secret.as_deref(),
+            Some("rotated-machine-credential-0123456789")
+        );
+    }
+
+    /// The comparison itself, field by field: what decides who holds the
+    /// machine credential and where it is sent is named; everything else,
+    /// and an unchanged value, is not.
+    #[test]
+    fn every_machine_trust_field_is_compared_old_against_new() {
+        let paired = crate::ha::paired_fixture();
+        let unchanged = |a: &Appliance| machine_trust_changes(&paired, a).unwrap();
+        assert!(unchanged(&paired).is_empty());
+        let mut other = paired.clone();
+        other.system.hostname = "renamed".into();
+        other.firewall.stateful = !other.firewall.stateful;
+        assert!(unchanged(&other).is_empty());
+
+        let pin = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=".to_string();
+        type Edit = fn(&mut Appliance, &str);
+        let edits: [(&str, Edit); 6] = [
+            ("system config-sync secret", |a, _| {
+                a.system.config_sync.secret = Some("another-credential-0123456789".into())
+            }),
+            ("system config-sync peer", |a, _| {
+                a.system.config_sync.peers = vec!["203.0.113.66:8080".into()]
+            }),
+            ("system config-sync peer-fingerprint", |a, pin| {
+                a.system.config_sync.peer_fingerprint = Some(pin.into())
+            }),
+            ("system ha management-fingerprint", |a, pin| {
+                a.system.ha.as_mut().unwrap().management_fingerprint = Some(pin.into())
+            }),
+            ("system ha peer-identity management-endpoint", |a, _| {
+                a.system
+                    .ha
+                    .as_mut()
+                    .unwrap()
+                    .peer_identity
+                    .as_mut()
+                    .unwrap()
+                    .management_endpoint = "203.0.113.66:8080".into()
+            }),
+            (
+                "system ha peer-identity management-fingerprint",
+                |a, pin| {
+                    a.system
+                        .ha
+                        .as_mut()
+                        .unwrap()
+                        .peer_identity
+                        .as_mut()
+                        .unwrap()
+                        .management_fingerprint = pin.into()
+                },
+            ),
+        ];
+        for (field, edit) in edits {
+            let mut next = paired.clone();
+            edit(&mut next, &pin);
+            assert_eq!(unchanged(&next), [field]);
+        }
+
+        let witness = |extra: &str| {
+            Appliance::from_toml(&format!(
+                "[system]\nhostname=\"witness\"\n[system.ha-witness]\nlisten=\"10.20.0.3:5440\"\ncluster=\"test-cluster-0123456789\"\n{extra}"
+            ))
+            .unwrap()
+        };
+        let keyed = witness(&format!("key=\"{}\"\n", "a".repeat(64)));
+        assert_eq!(
+            machine_trust_changes(&keyed, &witness(&format!("key=\"{}\"\n", "b".repeat(64))))
+                .unwrap(),
+            ["system ha-witness key"]
+        );
+        let legacy = witness("secret=\"abcdefghijklmnopqrstuvwxyz0123456789\"\n");
+        assert_eq!(
+            machine_trust_changes(&legacy, &keyed).unwrap(),
+            ["system ha-witness secret", "system ha-witness key"]
+        );
     }
 
     /// CRITICAL #2: the stack proxy forwards only plain `show` words, so no

@@ -281,14 +281,11 @@ fn validate_witness(w: &crate::config::HaWitness) -> Result<()> {
         w.cluster.is_empty() || valid_cluster(&w.cluster),
         "invalid HA witness cluster identifier"
     );
-    let members = w
-        .members
-        .iter()
-        .map(|m| {
-            m.parse::<IpAddr>()
-                .with_context(|| format!("HA witness member {m:?} must be a numeric IP address"))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    // Compared in the witness's own form: it maps an IPv4-mapped IPv6 member
+    // (`::ffff:10.0.0.1`) to plain IPv4 before checking the two differ, so a
+    // pair that differs only in that spelling would pass here and leave a
+    // witness that refuses to start.
+    let members = witness_members(w)?;
     ensure!(
         members.is_empty()
             || members.len() == 2
@@ -644,6 +641,19 @@ pub fn materialize_peer(mut a: Appliance) -> Result<Appliance> {
     Ok(a)
 }
 
+/// The witness's member addresses as the witness compares them: numeric, and
+/// with an IPv4-mapped IPv6 address taken as the IPv4 address it carries — an
+/// IPv4 member reaching a dual-stack listener arrives mapped.
+fn witness_members(w: &crate::config::HaWitness) -> Result<Vec<IpAddr>> {
+    w.members
+        .iter()
+        .map(|m| {
+            m.parse::<IpAddr>()
+                .map(|ip| ip.to_canonical())
+                .with_context(|| format!("HA witness member {m:?} must be a numeric IP address"))
+        })
+        .collect()
+}
 #[derive(Serialize)]
 struct WitnessRuntime {
     cluster: String,
@@ -672,11 +682,7 @@ fn witness_runtime(w: &crate::config::HaWitness) -> Result<WitnessRuntime> {
         cluster,
         listen: w.listen.clone(),
         state: "/var/lib/sentinel/witness/state.json",
-        members: w
-            .members
-            .iter()
-            .map(|m| m.parse().context("HA witness member"))
-            .collect::<Result<_>>()?,
+        members: witness_members(w)?,
         lease_ms: w.lease_ms.unwrap_or(LEASE_MS),
         peer_silence_ms: w.peer_silence_ms.unwrap_or(PEER_SILENCE_MS),
     })
@@ -1418,6 +1424,37 @@ mod tests {
         ] {
             assert!(witness_appliance(&bad).is_err(), "accepted {bad}");
         }
+    }
+    #[test]
+    fn a_v4_mapped_witness_member_is_the_same_member_as_its_ipv4_form() {
+        // The witness compares members after mapping `::ffff:a.b.c.d` to
+        // `a.b.c.d` (an IPv4 member reaching a dual-stack listener arrives
+        // mapped), so these two spellings are one member: a commit that
+        // accepted them would leave a witness that refuses to start.
+        let key = "a".repeat(64);
+        let duplicate = format!(
+            "key=\"{key}\"\ncluster=\"test-cluster-0123456789\"\nmember=[\"10.20.0.1\",\"::ffff:10.20.0.1\"]\n"
+        );
+        let error = witness_appliance(&duplicate).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("two distinct member addresses"),
+            "{error:#}"
+        );
+
+        // A mapped spelling of a distinct member is accepted, and handed to
+        // the witness in the form the witness itself compares in.
+        let mapped = witness_appliance(&format!(
+            "key=\"{key}\"\ncluster=\"test-cluster-0123456789\"\nmember=[\"::ffff:10.20.0.1\",\"10.20.0.2\"]\n"
+        ))
+        .unwrap();
+        let runtime = witness_runtime(mapped.system.ha_witness.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            runtime.members,
+            vec![
+                "10.20.0.1".parse::<IpAddr>().unwrap(),
+                "10.20.0.2".parse().unwrap()
+            ]
+        );
     }
     #[test]
     fn the_witness_timing_budget_is_validated_and_reaches_every_consumer() {
