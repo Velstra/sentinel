@@ -841,7 +841,9 @@ fn unwind_to_last_good(
     prev: &crate::config::Appliance,
 ) -> anyhow::Error {
     // The level-triggered rollback: reconcile the ~30 sub-systems to last-good.
-    let reconcile = crate::net::apply(prev);
+    // A restore: a held link that stays dark does not fail it (see
+    // `net::judge_reconcile_reply`).
+    let reconcile = crate::net::apply(prev, crate::net::Verify::Restore);
     // Then the three stages the undo stack does cover, in reverse.
     let failures = rb.unwind();
     mixed_or_rolled_message(&cause, &reconcile, failures)
@@ -920,6 +922,26 @@ pub(crate) fn apply_live(
     appliance: &crate::config::Appliance,
     act: &Apply,
     rollback_to: Option<&crate::config::Appliance>,
+) -> Result<()> {
+    apply_live_as(appliance, act, rollback_to, crate::net::Verify::Forward)
+}
+
+/// [`apply_live`] for the paths that put back a configuration the box ran
+/// before — a commit-confirm revert, a management transaction's recovery —
+/// rather than moving it forward. The one difference: a held link the data
+/// plane cannot raise is reported, not fatal, because it stays dark either way
+/// and failing the restore would only wedge the box on the configuration it is
+/// leaving (see `net::judge_reconcile_reply`). No last-good to reconcile back
+/// to, for the same reason as every revert.
+pub(crate) fn restore_live(appliance: &crate::config::Appliance, act: &Apply) -> Result<()> {
+    apply_live_as(appliance, act, None, crate::net::Verify::Restore)
+}
+
+fn apply_live_as(
+    appliance: &crate::config::Appliance,
+    act: &Apply,
+    rollback_to: Option<&crate::config::Appliance>,
+    verify: crate::net::Verify,
 ) -> Result<()> {
     // Serialise the whole apply against a concurrent commit / API PUT / boot-late
     // reconcile: staging uses fixed temp filenames under /run/sentinel, so two
@@ -1002,7 +1024,7 @@ pub(crate) fn apply_live(
     // TRUE rollback. Only where there is no last-good to reconcile to
     // (`None` — the revert paths, and a first-ever commit) does it fall back to
     // the honest MIXED-STATE report that undoes just firewall/routing/hostname.
-    if let Err(e) = crate::net::apply(appliance) {
+    if let Err(e) = crate::net::apply(appliance, verify) {
         return Err(match rollback_to {
             Some(prev) => unwind_to_last_good(rb, e, prev),
             None => unwind_err_mixed(rb, e),

@@ -80,14 +80,14 @@ function rate(n: number | null | undefined) {
   }
   return `${n.toLocaleString("en-US", { maximumFractionDigits: 1 })} ${units[i]}`;
 }
-function Health({ state }: { state: string | null }) {
+function Health({ state, held }: { state: string | null; held?: boolean }) {
   return (
     <span
       className={
         "health " +
         (state === "up"
           ? "health-up"
-          : state === "down"
+          : state === "down" || held
             ? "health-down"
             : "health-unknown")
       }
@@ -418,7 +418,7 @@ export function Dashboard({ manager }: { manager: Management }) {
             ]}
             rows={(f?.interfaces || []).map((i) => [
               <code>{i.name}</code>,
-              <Health state={i.state} />,
+              <Health state={i.state} held={i.held} />,
               rate(i.rates?.rx_bytes_per_second),
               rate(i.rates?.tx_bytes_per_second),
               number(i.rates?.rx_pps),

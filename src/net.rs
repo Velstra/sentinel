@@ -3821,8 +3821,10 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
             // creates it, the agent attaches XDP/TC, puts the policy in force
             // and only then brings it up. Without the hold a new or recreated
             // link forwards unfiltered until the agent's next pass finds it.
-            // HA-guarded links are held for the same reason, and the HA guard
-            // releases those.
+            // HA-guarded links are held for the same reason. The HA guard
+            // releases only those the data plane does not hold; a zoned one
+            // comes up when the guard AND the firewall's hooks are both on it,
+            // raised by the agent alone so neither can open it early.
             if !i.disabled
                 && (held_until_attached(i)
                     || crate::ha::guarded_interfaces(appliance).contains(&i.name))
@@ -4150,25 +4152,76 @@ pub fn apply_link_runtime(appliance: &Appliance) -> Result<()> {
     Ok(())
 }
 
+/// What an apply is for, which decides how it takes a held link the data plane
+/// could not raise (see [`judge_reconcile_reply`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verify {
+    /// A commit moving the box to a new configuration.
+    Forward,
+    /// A rollback or recovery putting back a configuration the box ran before.
+    Restore,
+}
+
 /// Apply the full network config to the running system: the persistent render
 /// (networkd units + co-services) followed by the link-dependent runtime state.
 /// Used by `commit`, where the links are already up so both phases run back to
 /// back. The boot path splits them across two units (see [`apply_persistent`]
 /// and [`apply_link_runtime`]) so the runtime state lands after networkd.
-pub fn apply(appliance: &Appliance) -> Result<()> {
+/// `verify` says whether this moves the box forward or puts a previous
+/// configuration back.
+pub fn apply(appliance: &Appliance, verify: Verify) -> Result<()> {
     apply_persistent(appliance, ApplyMode::Live)?;
     apply_link_runtime(appliance)?;
     if appliance.interfaces.iter().any(|i| i.zone.is_some()) {
         system::service_start(AGENT_UNIT).context("starting the data plane")?;
         let reply = crate::velstra::query("reconcile-links")
             .context("verifying packet hooks after network reconciliation")?;
-        anyhow::ensure!(
-            reply.trim() == "ok",
-            "data-plane interface reconciliation: {}",
-            reply.trim()
-        );
+        judge_reconcile_reply(&reply, verify)?;
     }
     Ok(())
+}
+
+/// Judge the agent's `reconcile-links` answer.
+///
+/// A held link still down (`held-down: <link>…`) is dark, not open: it stays
+/// down rather than forward unfiltered, whatever is decided here. A commit
+/// moving forward fails on it, so nobody is told "applied" over a segment that
+/// went dark — and the way out is named, because disabling the link or taking
+/// its zone away makes the commit succeed without it.
+///
+/// A restore does not. It exists to get back to a configuration that worked,
+/// and the link that will not come up is a property of the NIC or the
+/// datapath, not of either document: refusing the restore would not raise the
+/// link, it would only leave the box on the configuration being abandoned and,
+/// after the recovery timer's bounded attempts, refuse every write until
+/// somebody accepts that state by hand. So it reports the dark links (and the
+/// link watch keeps alerting on them) and succeeds. Anything else the agent
+/// says — a reconcile that itself failed, an agent that does not answer — is
+/// a failed apply either way.
+fn judge_reconcile_reply(reply: &str, verify: Verify) -> Result<()> {
+    let reply = reply.trim();
+    if reply == "ok" {
+        return Ok(());
+    }
+    let Some(links) = reply.strip_prefix("held-down:") else {
+        anyhow::bail!("data-plane interface reconciliation: {reply}");
+    };
+    let links = links.split_whitespace().collect::<Vec<_>>().join(", ");
+    match verify {
+        Verify::Forward => anyhow::bail!(
+            "{links} held down: the data plane could not hook them, so they stay \
+             dark rather than forward unfiltered. Fix the cause (`show interfaces`, \
+             the velstra journal), or disable the interface or remove its zone to \
+             commit without it"
+        ),
+        Verify::Restore => {
+            eprintln!(
+                "warning: restored, but {links} stay held down: the data plane could \
+                 not hook them (`show interfaces`, the velstra journal)"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Apply each interface's offload switches with `ethtool -K`, and its hardware
@@ -4578,6 +4631,29 @@ fn apply_console(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A NIC that cannot take XDP is dark under the old configuration and the
+    /// new one alike. A commit that leaves it dark fails and says how to get
+    /// past it; a rollback to the previous configuration must not, or the
+    /// recovery timer retries it to exhaustion and every write is refused.
+    #[test]
+    fn a_dark_held_link_fails_a_commit_but_not_a_restore() {
+        assert!(judge_reconcile_reply("ok\n", Verify::Forward).is_ok());
+        assert!(judge_reconcile_reply("ok\n", Verify::Restore).is_ok());
+        let dark = "held-down: lan0 eth2\n";
+        let error = judge_reconcile_reply(dark, Verify::Forward)
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("lan0, eth2 held down"), "{error}");
+        assert!(error.contains("remove its zone"), "{error}");
+        assert!(judge_reconcile_reply(dark, Verify::Restore).is_ok());
+        // A reconcile that failed outright fails a restore too: only a link
+        // that is dark — the fail-closed state — is survivable.
+        let failed = "error: reconciling packet hooks: Failed (traffic blocked)\n";
+        for verify in [Verify::Forward, Verify::Restore] {
+            assert!(judge_reconcile_reply(failed, verify).is_err());
+        }
+    }
 
     /// A box with no domain group must not carry the refresh timer at all — an
     /// idle timer that re-applies the whole config every 15 minutes is a moving

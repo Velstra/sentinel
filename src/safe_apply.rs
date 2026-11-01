@@ -517,7 +517,10 @@ pub fn revert(path: &Path, id: &str, act: &Apply) -> Result<bool> {
 pub fn recover(path: &Path, act: &Apply, force: bool, booting: bool) -> Result<bool> {
     recover_with(path, act, force, booting, |next| {
         if act.enabled {
-            repl::apply_live(next, act, None)?;
+            // A restore: a held link the data plane cannot raise stays dark
+            // and is reported, rather than failing every bounded attempt and
+            // leaving all writes blocked behind `recovery_failed`.
+            repl::restore_live(next, act)?;
         }
         Ok(())
     })

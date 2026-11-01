@@ -22,7 +22,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 
 use crate::config::Appliance;
-use crate::repl::{Apply, apply_live};
+use crate::repl::{Apply, apply_live, restore_live};
 use crate::session::Session;
 use crate::system;
 
@@ -83,8 +83,9 @@ pub fn commit_confirm(session: &mut Session, act: &Apply, minutes: u32) -> Resul
     // live without protection — revert immediately and surface the failure.
     if let Err(e) = system::arm_confirm(minutes, &cfg_path) {
         // A revert: no last-good to reconcile to (reconciling back to the
-        // un-confirmed candidate would defeat it), so `None`.
-        let revert = Appliance::load(&cfg_path).and_then(|prev| apply_live(&prev, act, None));
+        // un-confirmed candidate would defeat it), and a held link that stays
+        // dark is reported rather than failing it: `restore_live`.
+        let revert = Appliance::load(&cfg_path).and_then(|prev| restore_live(&prev, act));
         return match revert {
             Ok(()) => {
                 Err(e).context("arming the rollback timer failed; reverted to the saved config")
@@ -210,8 +211,9 @@ pub fn rollback(act: &Apply, cfg_path: &Path, from_timer: bool) -> Result<()> {
     system::disarm_confirm();
     // A revert to saved: there is no last-good to reconcile a partial failure
     // to (reconciling back to the un-confirmed config would defeat the revert),
-    // so `None` — a failure here reports mixed-state honestly.
-    apply_live(&appliance, act, None).context("reverting to the saved config")?;
+    // so a failure here reports mixed-state honestly. A restore, so a held link
+    // that stays dark is reported rather than failing the revert.
+    restore_live(&appliance, act).context("reverting to the saved config")?;
     eprintln!("reverted the running system to the saved config.");
     Ok(())
 }

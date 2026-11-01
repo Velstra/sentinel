@@ -240,10 +240,14 @@ struct Collector {
     /// so only overflows during it are counted as its loss.
     ring_lost_base: Option<u64>,
     sequence: u64,
+    /// The running configuration's text and the links it holds for the data
+    /// plane, re-derived only when the text changes: a held link that is down
+    /// is shown as waiting for the datapath, not as merely "down".
+    held: Option<(String, std::collections::BTreeSet<String>)>,
 }
 impl Collector {
     fn collect(&mut self, include_events: bool) -> Value {
-        let events_query = format!("packet-events-since {} 512", self.cursor);
+        let events_query = events_query(self.cursor, self.epoch);
         let queries = [
             ("events", events_query.as_str()),
             ("conntrack", "firewall-state-summary 200"),
@@ -330,8 +334,11 @@ impl Collector {
                 None
             }
         };
+        let held = self.held_links();
         let interfaces = match std::fs::read_to_string("/proc/net/dev") {
-            Ok(text) => self.interfaces(&text, Instant::now()),
+            Ok(text) => self.interfaces(&text, Instant::now(), |name| {
+                held.contains(name) && crate::held_links::link_down(name)
+            }),
             Err(e) => {
                 errors.insert("interfaces".into(), json!(e.to_string()));
                 Vec::new()
@@ -356,7 +363,12 @@ impl Collector {
     fn append_page(&mut self, page: &Value) {
         let epoch = page["epoch"].as_u64();
         let first = self.epoch.is_none() || page["restarted"] == true;
-        if self.epoch.is_some() && epoch != self.epoch {
+        if self.epoch.is_some() && epoch != self.epoch && page["restarted"] == true {
+            // The agent recognised the old run's cursor (it was sent its epoch)
+            // and served this page from the start of the new run: take it.
+            self.ring_lost_base = None;
+            self.events.clear();
+        } else if self.epoch.is_some() && epoch != self.epoch {
             // Ask again from the start of the new run on the next sample;
             // nothing in this page belongs to the old cursor.
             self.epoch = epoch;
@@ -396,15 +408,48 @@ impl Collector {
             }
         }
     }
-    fn interfaces(&mut self, text: &str, now: Instant) -> Vec<Value> {
+    /// The links the running configuration holds for the data plane (see
+    /// [`crate::held_links`]), parsed again only when the configuration moved.
+    fn held_links(&mut self) -> std::collections::BTreeSet<String> {
+        let text = crate::session::Session::running_snapshot()
+            .or_else(|| std::fs::read_to_string(crate::session::DEFAULT_CONFIG).ok());
+        let Some(text) = text else {
+            return Default::default();
+        };
+        if let Some((seen, held)) = &self.held
+            && *seen == text
+        {
+            return held.clone();
+        }
+        let held = crate::config::Appliance::from_toml(&text)
+            .map(|a| crate::held_links::held(&a))
+            .unwrap_or_default();
+        self.held = Some((text, held.clone()));
+        held
+    }
+    /// One row per link. `held` says whether the link is a held link that is
+    /// down right now; such a link is reported as waiting for the datapath,
+    /// because "down" alone sends the operator to the cabling.
+    fn interfaces(&mut self, text: &str, now: Instant, held: impl Fn(&str) -> bool) -> Vec<Value> {
         let counters = parse_interfaces(text);
         let rows=counters.iter().map(|(name,values)| {
             let rates=self.previous.as_ref().and_then(|(at,old)| old.get(name).and_then(|old| rates(*old,*values,now.duration_since(*at).as_secs_f64())));
-            let carrier=std::fs::read_to_string(format!("/sys/class/net/{name}/operstate")).ok().map(|v|v.trim().to_string());
-            json!({"name":name,"state":carrier,"rx_bytes":values[0],"tx_bytes":values[1],"rx_packets":values[2],"tx_packets":values[3],"rates":rates.map(|r|json!({"rx_bytes_per_second":r[0],"tx_bytes_per_second":r[1],"rx_pps":r[2],"tx_pps":r[3]}))})
+            let held=held(name);
+            let carrier=if held {Some(crate::held_links::HELD_STATE.to_string())} else {std::fs::read_to_string(format!("/sys/class/net/{name}/operstate")).ok().map(|v|v.trim().to_string())};
+            json!({"name":name,"state":carrier,"held":held,"rx_bytes":values[0],"tx_bytes":values[1],"rx_packets":values[2],"tx_packets":values[3],"rates":rates.map(|r|json!({"rx_bytes_per_second":r[0],"tx_bytes_per_second":r[1],"rx_pps":r[2],"tx_pps":r[3]}))})
         }).collect();
         self.previous = Some((now, counters));
         rows
+    }
+}
+/// The `packet-events-since` request for a cursor. The run the cursor belongs
+/// to goes along, so the agent can tell an old run's cursor from one of its own
+/// even when it is behind the new run's ids; an agent that predates the
+/// argument ignores it.
+fn events_query(cursor: u64, epoch: Option<u64>) -> String {
+    match epoch {
+        Some(epoch) => format!("packet-events-since {cursor} 512 {epoch}"),
+        None => format!("packet-events-since {cursor} 512"),
     }
 }
 fn parse_interfaces(text: &str) -> BTreeMap<String, [u64; 4]> {
@@ -542,6 +587,41 @@ mod tests {
         c.append_page(&page(2, 1..=2, 0, 0));
         assert_eq!(c.cursor, 2);
         assert_eq!(c.lost, 12);
+    }
+    /// The agent now recognises an old run's cursor by its epoch and serves the
+    /// new run from its start, flagged `restarted`. That page is the right one
+    /// and is taken at once, not thrown away for another round trip.
+    #[test]
+    fn a_restarted_page_from_a_new_run_is_taken_at_once() {
+        let mut c = Collector::default();
+        c.append_page(&page(1, 1..=5, 0, 7));
+        assert_eq!(
+            events_query(c.cursor, c.epoch),
+            "packet-events-since 5 512 1"
+        );
+        let mut restarted = page(2, 1..=3, 0, 0);
+        restarted["restarted"] = json!(true);
+        c.append_page(&restarted);
+        assert_eq!((c.epoch, c.cursor), (Some(2), 3));
+        let ids: Vec<_> = c.events.iter().map(|e| e["id"].as_u64().unwrap()).collect();
+        assert_eq!(ids, [1, 2, 3], "only the new run's events, none of the old");
+        assert_eq!(c.lost, 0);
+        assert_eq!(events_query(0, None), "packet-events-since 0 512");
+    }
+    /// A zoned link held down for the data plane reads as waiting for it, not
+    /// as a plain "down" that sends the operator to the cabling.
+    #[test]
+    fn a_held_dark_link_is_reported_as_waiting_for_the_datapath() {
+        let mut c = Collector::default();
+        let text =
+            " lan0: 1 1 0 0 0 0 0 0 1 1 0 0 0 0 0 0\n wan0: 1 1 0 0 0 0 0 0 1 1 0 0 0 0 0 0\n";
+        let rows = c.interfaces(text, Instant::now(), |name| name == "lan0");
+        let lan = rows.iter().find(|r| r["name"] == "lan0").unwrap();
+        assert_eq!(lan["state"], crate::held_links::HELD_STATE);
+        assert_eq!(lan["held"], true);
+        let wan = rows.iter().find(|r| r["name"] == "wan0").unwrap();
+        assert_eq!(wan["held"], false);
+        assert_ne!(wan["state"], crate::held_links::HELD_STATE);
     }
     #[test]
     fn the_route_table_is_sent_to_a_client_once_per_change() {

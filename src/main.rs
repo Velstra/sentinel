@@ -27,6 +27,7 @@ mod feed;
 mod fleet;
 mod grammar_walk;
 mod ha;
+mod held_links;
 mod identity;
 mod ids;
 mod image;
@@ -530,6 +531,14 @@ enum Command {
     /// Run by `sentinel-ids-watch.service` while `block-on-alert` is set, not by
     /// hand. Every block it asks for expires, and none survive an agent restart.
     IdsWatch,
+    /// Alert when zoned links stay held down because the data plane has not
+    /// hooked them. Run by `sentinel-link-watch.service`, not by hand.
+    #[command(hide = true)]
+    LinkWatch {
+        /// Where the alert targets are read from.
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    },
     /// Carry UDP broadcasts between segments (roadmap C18). Run by
     /// `sentinel-broadcast-relay.service` from the config an apply rendered, not
     /// by hand.
@@ -810,6 +819,7 @@ async fn main() -> Result<()> {
             system::ignore_sigpipe();
             ids::watch()
         }
+        Command::LinkWatch { config } => held_links::watch(&config),
         Command::BroadcastRelay => {
             system::ignore_sigpipe();
             relay::run()
@@ -2320,6 +2330,16 @@ fn show_multiwan() -> Result<()> {
     Ok(())
 }
 
+/// Under the kernel's listing, the zoned links that are DOWN because the data
+/// plane has not hooked them — which `ip` shows exactly like a link somebody
+/// switched off. Silent when the running configuration cannot be read.
+fn show_held_links() {
+    if let Some(appliance) = held_links::running_appliance() {
+        let dark = held_links::dark(&appliance, held_links::link_down);
+        print!("{}", held_links::show_lines(&dark));
+    }
+}
+
 fn show_op(args: &[String]) -> Result<()> {
     let ip = system::bin("ip");
     let v: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -2348,7 +2368,9 @@ fn show_op(args: &[String]) -> Result<()> {
                 println!("clock:      {}", time.describe());
             }
             println!("interfaces:");
-            run_show(&ip, &["-brief", "address", "show"])
+            run_show(&ip, &["-brief", "address", "show"])?;
+            show_held_links();
+            Ok(())
         }
         // Config revision history (roadmap C21): `show system commit` lists the
         // archived revisions; `show system commit <N>` shows one in config syntax.
@@ -2357,7 +2379,11 @@ fn show_op(args: &[String]) -> Result<()> {
         ["interfaces", rest @ ..] => {
             let mut a = vec!["-brief", "address", "show"];
             a.extend(rest);
-            run_show(&ip, &a)
+            run_show(&ip, &a)?;
+            if rest.is_empty() {
+                show_held_links();
+            }
+            Ok(())
         }
         ["arp", rest @ ..] | ["neighbors", rest @ ..] => {
             let mut a = vec!["neighbor", "show"];

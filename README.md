@@ -73,6 +73,14 @@ commands into `sentinel configure`. The batch configures DHCP on WAN, LAN
 on port 8443. WAN input defaults to drop with an explicit DHCP-client reply rule. Keep the installer accounts when
 authoring a complete replacement TOML document.
 
+Zoned interfaces (WAN and LAN here) stay down until the firewall data plane
+has hooked them, so a data plane that cannot start leaves the LAN — and the
+console on it — dark. The quickstart uses two NICs for brevity; on a real
+deployment add an **unzoned management port** and/or the serial console as a
+way in that does not depend on the data plane. `sentinel show interfaces` marks
+such a link `held: waiting for datapath`; recovery is covered in the
+[interfaces handbook](docs/src/handbook/interfaces.md#zoned-links-stay-down-until-the-firewall-has-them).
+
 ### 3. Open the console and confirm changes
 
 Open **https://localhost:8443/** for the QEMU command above, or

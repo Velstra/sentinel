@@ -14,6 +14,9 @@ export interface PacketEvent {
 export interface Link {
   name: string;
   state: string | null;
+  /** A zoned link held down until the data plane has hooked it. Its `state`
+   * then says so; dark is the fail-closed state, not a cabling fault. */
+  held?: boolean;
   rx_bytes: number;
   tx_bytes: number;
   rx_packets: number;

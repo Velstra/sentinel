@@ -100,10 +100,28 @@ pkgs.testers.runNixOSTest {
             flags = json.loads(fw.succeed("ip -j link show dev tenant0"))[0]["flags"]
             assert "UP" not in flags, f"tenant0 came up with no data plane: {flags}"
             fw.sleep(1)
+        # Dark, and said so: `ip` alone shows it exactly like a link somebody
+        # switched off.
+        shown = fw.succeed("sentinel show interfaces")
+        assert "tenant0: held: waiting for datapath" in shown, shown
         fw.succeed("systemctl start velstra.service")
         fw.wait_until_succeeds("ip -o link show dev tenant0 | grep -Eq '[<,]UP[,>]'", timeout=30)
         fw.succeed("ip -d link show tenant0 | grep -q 'prog/xdp'")
         fw.wait_until_succeeds("ip -4 addr show tenant0 | grep -q 192.0.2.1")
+        assert "held:" not in fw.succeed("sentinel show interfaces")
+        first = fw.succeed("cat /sys/class/net/tenant0/ifindex").strip()
+
+    with subtest("a zoned link disabled and enabled again comes back up"):
+        # The agent keeps its hook on a link while it is disabled, so enabling
+        # it again attaches nothing new. It must still be raised — otherwise it
+        # stays dark and every later commit fails on it.
+        configure(["set interface tenant0 disabled true"])
+        fw.wait_until_fails("ip -o link show dev tenant0 | grep -Eq '[<,]UP[,>]'")
+        configure(["delete interface tenant0 disabled"])
+        fw.wait_until_succeeds("ip -o link show dev tenant0 | grep -Eq '[<,]UP[,>]'", timeout=30)
+        fw.succeed("ip -d link show tenant0 | grep -q 'prog/xdp'")
+        fw.wait_until_succeeds("ip -4 addr show tenant0 | grep -q 192.0.2.1")
+        configure([])
         first = fw.succeed("cat /sys/class/net/tenant0/ifindex").strip()
 
     with subtest("an unchanged commit removes addresses the configuration does not set"):

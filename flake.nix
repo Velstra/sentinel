@@ -867,6 +867,26 @@
             };
           };
 
+          # A zoned link stays down until the data plane has hooked it, so an
+          # agent that cannot start, or a NIC that cannot take XDP, leaves its
+          # segments dark — the console's LAN among them. A running agent that
+          # cannot hook one NIC fails no unit, so OnFailure alerts never see it.
+          # This worker reads the links themselves (never the agent, which may
+          # be the thing that is broken) and alerts once per episode that
+          # outlasts an ordinary agent start.
+          systemd.services.sentinel-link-watch = {
+            description = "Alert when zoned links stay held down for the data plane";
+            wantedBy = [ "multi-user.target" ];
+            after = [ "sentinel-boot.service" ];
+            startLimitIntervalSec = 0;
+            serviceConfig = {
+              ExecStart = "${sentinel}/bin/sentinel link-watch --config /var/lib/sentinel/appliance.toml";
+              Restart = "always";
+              RestartSec = "5s";
+              UMask = "0077";
+            };
+          };
+
           # Persistence guard for the editable config itself: order the
           # config-seeding boot service after the /var/lib/sentinel mount, so on a
           # deployment where that path is its own partition (as on the appliance

@@ -202,6 +202,28 @@ describe("React dashboard and packet inspector", () => {
     expect(screen.getByText("down")).toHaveClass("health-down");
     expect(screen.getByText(/chart appears after two/)).toBeVisible();
   });
+  it("shows a held zoned link as waiting for the datapath, not as unknown", () => {
+    const { manager } = fixture();
+    const sample = frame();
+    manager.acceptFrame(
+      frame({
+        interfaces: [
+          ...sample.interfaces,
+          {
+            ...sample.interfaces[0],
+            name: "lan0",
+            state: "held: waiting for datapath",
+            held: true,
+            rates: null,
+          },
+        ],
+      }),
+    );
+    render(<Dashboard manager={manager} />);
+    expect(screen.getByText("held: waiting for datapath")).toHaveClass(
+      "health-down",
+    );
+  });
   it("opens real management destinations from the overview without mutating configuration", async () => {
     const { manager, host } = fixture();
     manager.acceptFrame(frame());
