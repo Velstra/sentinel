@@ -2478,6 +2478,12 @@ fn show_op(args: &[String]) -> Result<()> {
         // The newest events, read without consuming them: the console's live
         // view reads the same agent log through its own cursor.
         ["firewall", "events"] => show_agent_query("packet-events-tail 100", "packet events"),
+        // Only what came after an event already seen (every event carries its
+        // `id`): one page of the agent's log, with the `cursor` to ask from
+        // next and how many events were `missed` in between. Consumes nothing.
+        ["firewall", "events", "since", id] => {
+            show_agent_query(&firewall_events_since_query(id)?, "packet events")
+        }
         ["firewall", "statistics" | "stats"] => show_firewall_stats(),
         // Which rules are carrying traffic, and which are carrying none.
         ["firewall", "hits"] | ["firewall", "rules"] => show_rule_hits(),
@@ -2789,6 +2795,17 @@ fn show_agent_query(command: &str, what: &str) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// The agent request behind `show firewall events since <id>`. The id is the
+/// `id` of the last event the operator saw; anything but a number is refused
+/// here rather than sent on as a word the agent would read as a different
+/// request.
+fn firewall_events_since_query(id: &str) -> Result<String> {
+    let id: u64 = id
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid event id {id:?}: expected the `id` of an event"))?;
+    Ok(format!("packet-events-since {id} 512"))
 }
 
 /// `show users`: the accounts, their management group and what it allows.
@@ -3582,7 +3599,17 @@ async fn ports(endpoint: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::firewall_log_args;
+    use super::{firewall_events_since_query, firewall_log_args};
+
+    #[test]
+    fn events_since_pages_the_agent_log_from_the_given_id() {
+        assert_eq!(
+            firewall_events_since_query("42").unwrap(),
+            "packet-events-since 42 512"
+        );
+        assert!(firewall_events_since_query("42 512").is_err());
+        assert!(firewall_events_since_query("-1").is_err());
+    }
 
     #[test]
     fn the_log_reads_fifty_lines_unless_asked_otherwise() {

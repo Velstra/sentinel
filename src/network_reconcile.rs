@@ -339,10 +339,12 @@ fn netdev_identity(body: &str) -> String {
 /// Whether a changed WireGuard `.netdev` can be applied to the live device.
 ///
 /// A WireGuard link's key, listen port and peers are all settable on an
-/// existing device (`wg syncconf`), and recreating it for them drops every
-/// other peer's session and the tunnel's routes along with the link — so a peer
-/// edit used to cut the whole VPN. Only a change to the device's identity, its
-/// `[NetDev]` section, still needs a new device.
+/// existing device (`wg syncconf`), and recreating it for them drops the
+/// tunnel's addresses, routes and data-plane hooks along with the link — so a
+/// peer edit used to cut the whole VPN. (Peer sessions are reset either way:
+/// networkd re-applies a changed `.netdev` replacing every peer, and the peers
+/// handshake again.) Only a change to the device's identity, its `[NetDev]`
+/// section, still needs a new device.
 fn wireguard_in_place(previous: Option<&String>, desired: Option<&String>) -> bool {
     let (Some(previous), Some(desired)) = (previous, desired) else {
         return false;

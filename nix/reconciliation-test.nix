@@ -91,10 +91,12 @@ pkgs.testers.runNixOSTest {
         # With the agent stopped nothing can hook the link, so a link that
         # comes up anyway forwards unfiltered: exactly the window between a
         # link appearing and the agent's next pass. networkd recreates the
-        # deleted VLAN from its unit; the hold must keep it down.
+        # deleted VLAN from its unit when it configures the parent (a reload
+        # alone leaves an unchanged parent, and so the VLAN, alone); the hold
+        # must keep it down.
         fw.succeed("systemctl stop velstra.service")
         fw.succeed("ip link delete tenant0")
-        fw.succeed("networkctl reload")
+        fw.succeed("networkctl reconfigure eth1")
         fw.wait_until_succeeds("test -e /sys/class/net/tenant0")
         for _ in range(5):
             flags = json.loads(fw.succeed("ip -j link show dev tenant0"))[0]["flags"]
@@ -130,17 +132,23 @@ pkgs.testers.runNixOSTest {
         # unit's ExecStopPost takes it down; the restarted agent raises it.
         # The journal line is the proof: Restart=on-failure brings the agent
         # back within seconds, so sampling the link state alone could race.
-        cursor = fw.succeed("journalctl -n 0 --show-cursor | sed -n 's/^-- cursor: //p'").strip()
-        fw.succeed("systemctl kill -s KILL velstra.service")
-        fw.wait_until_succeeds(
-            f"journalctl --after-cursor='{cursor}' -u velstra.service "
-            "| grep -q 'hold-links-down: tenant0 held until the data plane hooks it again'",
-            timeout=30,
-        )
-        fw.wait_until_succeeds("systemctl is-active velstra.service", timeout=30)
-        fw.wait_until_succeeds("ip -o link show dev tenant0 | grep -Eq '[<,]UP[,>]'", timeout=30)
-        fw.succeed("ip -d link show tenant0 | grep -q 'prog/xdp'")
-        assert "held:" not in fw.succeed("sentinel show interfaces")
+        #
+        # A crash kills the agent alone. Killing the whole unit kills the
+        # ExecStopPost with it, so for that the next start's ExecStartPre
+        # repeats the hold before the agent runs; either way the line appears.
+        for whom in ("main", "all"):
+            cursor = fw.succeed("journalctl -n 0 --show-cursor | sed -n 's/^-- cursor: //p'").strip()
+            fw.wait_until_succeeds("ip -o link show dev tenant0 | grep -Eq '[<,]UP[,>]'", timeout=30)
+            fw.succeed(f"systemctl kill --kill-whom={whom} -s KILL velstra.service")
+            fw.wait_until_succeeds(
+                f"journalctl --after-cursor='{cursor}' -u velstra.service "
+                "| grep -q 'hold-links-down: tenant0 held until the data plane hooks it again'",
+                timeout=30,
+            )
+            fw.wait_until_succeeds("systemctl is-active velstra.service", timeout=30)
+            fw.wait_until_succeeds("ip -o link show dev tenant0 | grep -Eq '[<,]UP[,>]'", timeout=30)
+            fw.succeed("ip -d link show tenant0 | grep -q 'prog/xdp'")
+            assert "held:" not in fw.succeed("sentinel show interfaces")
 
     with subtest("an unchanged commit removes addresses the configuration does not set"):
         fw.succeed("ip addr add 203.0.113.77/32 dev tenant0")

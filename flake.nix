@@ -881,8 +881,18 @@
           # its hooks are back. `+` runs it with full privileges whatever the
           # unit's own sandbox. The cost is deliberate: a commit that restarts
           # the agent bounces the zoned links for the length of its start.
+          #
+          # ExecStopPost is itself a process in the unit, and a stop that
+          # kills the whole unit (`systemctl kill -s KILL velstra`, which an
+          # operator reaches for on a wedged agent) kills it too, before it
+          # has downed anything. So every start repeats it before the agent
+          # runs: at worst the links forward unfiltered for RestartSec, not
+          # until the next start hooks them. `-` because a start must never
+          # fail on it: the agent is what hooks the links.
           systemd.services.velstra.serviceConfig.ExecStopPost =
             "+${sentinel}/bin/sentinel hold-links-down --config /var/lib/sentinel/appliance.toml";
+          systemd.services.velstra.serviceConfig.ExecStartPre =
+            "-+${sentinel}/bin/sentinel hold-links-down --config /var/lib/sentinel/appliance.toml";
 
           systemd.services.sentinel-link-watch = {
             description = "Alert when zoned links stay held down for the data plane";

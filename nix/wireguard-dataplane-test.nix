@@ -116,14 +116,20 @@ in pkgs.testers.runNixOSTest {
         assert rows["vpn-allow"]["accepted"] > 0, counters
         assert rows["vpn-deny"]["dropped"] > 0, counters
         assert counters["events_lost"] == 0, counters
-        events = []
+        # Page the agent's event log from the start with a cursor: reading
+        # consumes nothing (`show firewall events` is the newest 100, every
+        # time), so the walk ends when a page comes back empty, and a window
+        # that evicted events before we saw them would say so in `missed`.
+        events, cursor = [], 0
         for _ in range(41):
-            batch = [json.loads(line) for line in fw.succeed("sentinel show firewall events").splitlines()]
-            events.extend(batch)
-            if len(batch) < 100:
+            page = json.loads(fw.succeed(f"sentinel show firewall events since {cursor}"))
+            assert page["missed"] == 0, page
+            if not page["events"]:
                 break
+            events.extend(page["events"])
+            cursor = page["cursor"]
         else:
-            raise AssertionError("packet event stream did not drain")
+            raise AssertionError("packet event log did not end")
         for family in (4, 6):
             assert any(e["family"] == family and e["rule"] == "vpn-deny" and e["action"] == "drop" for e in events), events
         links = json.loads(fw.succeed("bpftool -j link show"))
@@ -152,14 +158,22 @@ in pkgs.testers.runNixOSTest {
         configure([])
         assert fw.succeed("cat /sys/class/net/wg0/ifindex") == index
         client.succeed(connection("10.9.0.1", 9090))
-        # A peer edit is applied to the live device: the link (and with it every
-        # other peer's session and the tunnel's routes) survives it.
+        # A peer edit is applied to the live device: the link, its address,
+        # routes and data-plane hooks survive it. The sessions do not:
+        # networkd re-applies a changed .netdev with WGDEVICE_F_REPLACE_PEERS,
+        # so every peer is re-added without its keys and the client's next
+        # packets name a session the box no longer has. WireGuard repairs that
+        # itself — the client handshakes again once its packets go unanswered
+        # (REKEY_TIMEOUT + KEEPALIVE_TIMEOUT, 15 s) — which is what the wait
+        # covers. A recreated device would have lost its routes and hooks too.
         configure(["set vpn wireguard wg0 peer ${otherPub} allowed-ips 10.9.0.3/32"])
         assert fw.succeed("cat /sys/class/net/wg0/ifindex") == index
         peers = fw.succeed("wg show wg0 peers")
         assert "${otherPub}" in peers and "${clientPub}" in peers, peers
         fw.succeed("wg show wg0 allowed-ips | grep '${otherPub}' | grep -q 10.9.0.3/32")
-        client.succeed(connection("10.9.0.1", 9090))
+        fw.succeed("ip -4 addr show wg0 | grep -q 10.9.0.1/24")
+        fw.succeed("ip -d link show wg0 | grep -q 'prog/xdp'")
+        client.wait_until_succeeds(connection("10.9.0.1", 9090), timeout=60)
         configure(["delete vpn wireguard wg0 peer ${otherPub}"])
         assert fw.succeed("cat /sys/class/net/wg0/ifindex") == index
         assert "${otherPub}" not in fw.succeed("wg show wg0 peers")

@@ -384,8 +384,11 @@ fn wireguard_netdev_body(name: &str, tunnel: &WireguardTunnel) -> String {
 /// A WireGuard device's key, port and peers in `wg`'s own configuration format,
 /// for `wg syncconf` — the values the `.netdev` carries, under `wg`'s section
 /// names. syncconf makes the device match the file: changed peers are updated,
-/// absent ones removed, and an unchanged peer keeps its session, which is the
-/// point of not recreating the device.
+/// absent ones removed. The point of not recreating the device is that its
+/// addresses, routes and data-plane hooks stay. Sessions do not: networkd
+/// re-applies the changed `.netdev` on the reload before this with
+/// `WGDEVICE_F_REPLACE_PEERS`, so every peer handshakes again (WireGuard does
+/// that on its own within its rekey timeout).
 fn wireguard_sync_body(tunnel: &WireguardTunnel) -> String {
     let mut body = format!("[Interface]\nPrivateKey={}\n", tunnel.private_key);
     if let Some(port) = tunnel.listen_port {

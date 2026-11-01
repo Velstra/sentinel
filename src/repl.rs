@@ -1396,7 +1396,7 @@ const OP_SHOW_TOP: &[Cand] = &[
     ),
     (
         "firewall",
-        "firewall summary / statistics / counters / events / states / hits / log",
+        "firewall summary / statistics / counters / events [since <id>] / states / hits / log",
     ),
     ("nat", "NAT configuration summary"),
     ("ids", "intrusion detection: what is watched, what fired"),
