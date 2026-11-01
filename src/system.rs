@@ -1733,15 +1733,23 @@ pub fn networkctl_reload(ifaces: &[String]) -> Result<()> {
         // Netdev creation is asynchronous. In particular a new VLAN is not
         // necessarily present when `reload` returns. Never turn that race into
         // a successful commit with no configured interface.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let link = Path::new("/sys/class/net").join(iface);
-        while !link.exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        anyhow::ensure!(link.exists(), "network interface {iface} was not created");
+        anyhow::ensure!(
+            wait_for_link(iface, std::time::Duration::from_secs(10)),
+            "network interface {iface} was not created"
+        );
         run_priv("networkctl", &["reconfigure", iface])?;
     }
     Ok(())
+}
+
+/// Wait up to `timeout` for the kernel link `iface` to exist; whether it does.
+pub fn wait_for_link(iface: &str, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    let link = Path::new("/sys/class/net").join(iface);
+    while !link.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    link.exists()
 }
 
 /// Make the live WireGuard device `iface` match the `wg`-format file at `path`

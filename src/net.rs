@@ -164,7 +164,12 @@ fn l2tp_setup_body(ifaces: &[Interface]) -> Option<String> {
         body.push_str(&format!(
             "ip l2tp add session name {dev} tunnel_id {id} session_id {id} peer_session_id {id}\n"
         ));
-        body.push_str(&format!("ip link set {dev} up\n"));
+        // A zoned pseudowire is held down until the data plane has hooked it
+        // (`held_until_attached`); raising it here would forward unfiltered
+        // until then. networkd and the agent raise it in that case.
+        if !held_until_attached(i) {
+            body.push_str(&format!("ip link set {dev} up\n"));
+        }
         any = true;
     }
     any.then_some(body)
@@ -3969,9 +3974,13 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
             }
             depth
         });
-        let absent = absent_kernel_links(&reloaded, ifaces, &desired, |name| {
-            Path::new("/sys/class/net").join(name).exists()
-        });
+        let exists = |name: &str| Path::new("/sys/class/net").join(name).exists();
+        // Not yet built: their unit runs after this reload (`apply_box_services`)
+        // and networkd configures each from its `.network` as it appears. A
+        // commit checks they came, once their unit has run (`apply`).
+        let scripted = unbuilt_scripted_links(&reloaded, ifaces, exists);
+        reloaded.retain(|name| !scripted.contains(name));
+        let absent = absent_kernel_links(&reloaded, ifaces, &desired, exists);
         for name in &absent {
             eprintln!(
                 "warning: interface {name:?} is not present on this system; its configuration \
@@ -4068,6 +4077,39 @@ fn absent_kernel_links(
                 .is_some_and(|i| !(i.is_vlan() || i.is_l2tpv3() || i.is_vti() || i.is_pppoe()))
         })
         .cloned()
+        .collect()
+}
+
+/// Links among `reloaded` that do not exist yet and that a Sentinel unit builds
+/// imperatively rather than networkd: the L2TPv3 pseudowires (`sentinel-l2tp`,
+/// since networkd has no L2TPv3 netdev). That unit runs in the link runtime
+/// stage, after networkd has been reloaded, so waiting for such a link inside the
+/// reload waits for something that cannot happen yet and fails every commit
+/// that adds one.
+fn unbuilt_scripted_links(
+    reloaded: &[String],
+    ifaces: &[Interface],
+    exists: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    reloaded
+        .iter()
+        .filter(|name| !exists(name))
+        .filter(|name| ifaces.iter().any(|i| &i.name == *name && i.is_l2tpv3()))
+        .cloned()
+        .collect()
+}
+
+/// The script-built links (see [`unbuilt_scripted_links`]) this configuration
+/// asks for that did not appear once their unit ran. A commit does not report
+/// success over a pseudowire that was never created.
+fn missing_scripted_links(appliance: &Appliance, exists: impl Fn(&str) -> bool) -> Vec<String> {
+    appliance
+        .interfaces
+        .iter()
+        .filter(|i| i.is_l2tpv3() && !i.disabled)
+        .filter(|i| i.local.is_some() && i.remote.is_some() && i.tunnel_key.is_some())
+        .map(|i| i.name.clone())
+        .filter(|name| !exists(name))
         .collect()
 }
 
@@ -4217,13 +4259,44 @@ pub enum Verify {
 pub fn apply(appliance: &Appliance, verify: Verify) -> Result<()> {
     apply_persistent(appliance, ApplyMode::Live)?;
     apply_link_runtime(appliance)?;
-    if appliance.interfaces.iter().any(|i| i.zone.is_some()) {
+    let missing = missing_scripted_links(appliance, |name| {
+        system::wait_for_link(name, LINK_CREATE_TIMEOUT)
+    });
+    anyhow::ensure!(
+        missing.is_empty(),
+        "network interface {} was not created",
+        missing.join(", ")
+    );
+    if needs_data_plane_verify(appliance, |name| {
+        Path::new("/sys/class/net").join(name).exists()
+    }) {
         system::service_start(AGENT_UNIT).context("starting the data plane")?;
         let reply = crate::velstra::query("reconcile-links")
             .context("verifying packet hooks after network reconciliation")?;
         judge_reconcile_reply(&reply, verify)?;
     }
     Ok(())
+}
+
+/// How long a commit waits for a link something else creates asynchronously.
+const LINK_CREATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether a commit must hear from the data plane that it hooked the zoned
+/// links: whenever any enabled, zoned link exists on the box.
+///
+/// When none does — every zoned link is a NIC that is unplugged, moved to
+/// another namespace or not there at all — there is nothing to hook and
+/// nothing that can forward, and the agent, which needs its uplink, cannot
+/// start to say so. The apply has already warned that the data plane is not
+/// filtering (`apply_agent_iface`); demanding an answer from an agent that
+/// cannot run would turn that warning into a refused commit, and the rollback
+/// to a configuration naming the same NIC would fail the same way. A zoned
+/// link that does exist is still held down until hooked, and still verified.
+fn needs_data_plane_verify(appliance: &Appliance, exists: impl Fn(&str) -> bool) -> bool {
+    appliance
+        .interfaces
+        .iter()
+        .any(|i| i.zone.is_some() && !i.disabled && exists(&i.name))
 }
 
 /// Judge the agent's `reconcile-links` answer.
@@ -5025,6 +5098,12 @@ mod tests {
             "{s}"
         );
         assert!(s.contains("ip link set l2tp0 up"), "{s}");
+        // A zoned pseudowire is held for the data plane: the script creates it
+        // and leaves raising it to the agent.
+        l.zone = Some("wan".into());
+        let held = l2tp_setup_body(std::slice::from_ref(&l)).expect("configured");
+        assert!(held.contains("ip l2tp add session name l2tp0"), "{held}");
+        assert!(!held.contains("ip link set l2tp0 up"), "{held}");
         // No l2tpv3 interfaces ⇒ no script.
         assert!(l2tp_setup_body(&[iface_addr("eth0", "10.0.0.1/24")]).is_none());
     }
@@ -7109,6 +7188,66 @@ vlan = 20
         assert!(!absent.contains(&"eth0.20".to_string()), "{absent:?}");
         // Nothing is absent when everything is present.
         assert!(absent_kernel_links(&reloaded, &a.interfaces, &desired, |_| true).is_empty());
+    }
+
+    const L2TP_APPLIANCE: &str = r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "eth1"
+zone = "wan"
+address = "10.0.0.1/24"
+[[interface]]
+name = "l2tp0"
+type = "l2tpv3"
+local = "10.0.0.1"
+remote = "10.0.0.2"
+key = 100
+address = "192.168.5.1/24"
+"#;
+
+    /// An L2TPv3 pseudowire is built by `sentinel-l2tp`, which runs after the
+    /// networkd reload. Waiting for it inside the reload failed every commit that
+    /// added one ("network interface l2tp0 was not created"), so it is taken out
+    /// of the reload until it exists — and checked once its unit has run.
+    #[test]
+    fn a_script_built_link_is_awaited_after_its_script_not_in_the_reload() {
+        let a = Appliance::from_toml(L2TP_APPLIANCE).unwrap();
+        let reloaded: Vec<String> = ["eth1", "l2tp0"].map(String::from).to_vec();
+        assert_eq!(
+            unbuilt_scripted_links(&reloaded, &a.interfaces, |n| n == "eth1"),
+            vec!["l2tp0".to_string()]
+        );
+        // Once it exists it is reconfigured like any other link.
+        assert!(unbuilt_scripted_links(&reloaded, &a.interfaces, |_| true).is_empty());
+        // ...and its absence after the script ran fails the commit.
+        assert_eq!(
+            missing_scripted_links(&a, |n| n == "eth1"),
+            vec!["l2tp0".to_string()]
+        );
+        assert!(missing_scripted_links(&a, |_| true).is_empty());
+        // A disabled pseudowire is not built, so it is not missing.
+        let mut disabled = a.clone();
+        disabled.interfaces[1].disabled = true;
+        assert!(missing_scripted_links(&disabled, |n| n == "eth1").is_empty());
+    }
+
+    /// The data plane is asked to confirm its hooks whenever a zoned link
+    /// exists; with every zoned link absent there is nothing to hook, and an
+    /// agent that cannot start must not turn the "not filtering" warning into a
+    /// refused commit.
+    #[test]
+    fn data_plane_verification_needs_a_zoned_link_that_exists() {
+        let a = Appliance::from_toml(L2TP_APPLIANCE).unwrap();
+        assert!(needs_data_plane_verify(&a, |_| true));
+        assert!(needs_data_plane_verify(&a, |n| n == "eth1"));
+        // Only the unzoned pseudowire is there: nothing zoned to verify.
+        assert!(!needs_data_plane_verify(&a, |n| n == "l2tp0"));
+        assert!(!needs_data_plane_verify(&a, |_| false));
+        // A disabled zoned link is never raised, so it needs no hooks.
+        let mut disabled = a.clone();
+        disabled.interfaces[0].disabled = true;
+        assert!(!needs_data_plane_verify(&disabled, |_| true));
     }
 
     /// The bridge's own settings reach its `.netdev`, under one `[Bridge]`

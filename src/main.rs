@@ -1210,8 +1210,27 @@ fn apply_boot_late(config: &std::path::Path) -> Result<()> {
     // Lenient for the same reason as apply_boot: the second boot stage applies
     // the same saved config, and must survive an unknown key just the same.
     let _lock = system::apply_lock()?;
-    let appliance = Appliance::load_lenient(config)?;
+    let source = boot_late_source(config, std::path::Path::new(session::Session::RUNNING));
+    let appliance = Appliance::load_lenient(source)?;
     net::apply_link_runtime(&appliance)
+}
+
+/// Which configuration the second boot stage re-applies: the one a live commit
+/// put in place since boot, if there was one, otherwise the saved one.
+///
+/// This stage waits (bounded) for a link to come online first, and zoned links
+/// stay down until the data plane has hooked them, so it can start well after
+/// an operator's first commit. Re-applying the *saved* configuration then
+/// rolled the commit's runtime state back underneath it — the commit's
+/// `sentinel-macsec` unit, say, was stopped seconds after the commit reported
+/// success, because the saved file did not have it yet. `running.toml` lives on
+/// a tmpfs and is written only by a commit that applied, under the same lock
+/// this stage holds, so its presence means "a commit has run since boot".
+fn boot_late_source<'a>(
+    saved: &'a std::path::Path,
+    running: &'a std::path::Path,
+) -> &'a std::path::Path {
+    if running.is_file() { running } else { saved }
 }
 
 /// `sentinel install`: with no target on a terminal, run the interactive wizard
@@ -3599,7 +3618,23 @@ async fn ports(endpoint: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{firewall_events_since_query, firewall_log_args};
+    use super::{boot_late_source, firewall_events_since_query, firewall_log_args};
+
+    #[test]
+    fn boot_late_reapplies_a_commit_made_since_boot_not_the_saved_file() {
+        let dir = std::env::temp_dir().join(format!("sentinel-boot-late-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let saved = dir.join("appliance.toml");
+        let running = dir.join("running.toml");
+        std::fs::write(&saved, "saved").unwrap();
+        let _ = std::fs::remove_file(&running);
+        // Nothing committed since boot: the saved configuration.
+        assert_eq!(boot_late_source(&saved, &running), saved.as_path());
+        // A commit ran before this stage got the lock: what it applied.
+        std::fs::write(&running, "committed").unwrap();
+        assert_eq!(boot_late_source(&saved, &running), running.as_path());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn events_since_pages_the_agent_log_from_the_given_id() {

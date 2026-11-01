@@ -28,7 +28,12 @@ pub(crate) struct KernelLink {
 
 #[derive(Debug, Deserialize)]
 struct LinkInfo {
-    info_kind: String,
+    /// The link's own kind (`vlan`, `bridge`, …). iproute2 omits it on a
+    /// kernel-provided link that only reports what it is enslaved to: a plain
+    /// NIC that is a bridge port or bond member carries `info_slave_kind`
+    /// alone. Absent means "not a device of any kind of ours".
+    #[serde(default)]
+    info_kind: Option<String>,
     info_data: Option<serde_json::Value>,
 }
 
@@ -231,7 +236,7 @@ pub(crate) fn retire_drifted(
                 !link
                     .linkinfo
                     .as_ref()
-                    .is_some_and(|info| info.info_kind == kind)
+                    .is_some_and(|info| info.info_kind.as_deref() == Some(kind))
             })
         {
             retired.insert(iface.name.clone());
@@ -240,7 +245,7 @@ pub(crate) fn retire_drifted(
         if let Some(id) = iface.vlan {
             let expected_parent = iface.parent.as_ref().and_then(|p| observed.get(p));
             let vlan_matches = link.linkinfo.as_ref().is_some_and(|info| {
-                info.info_kind == "vlan"
+                info.info_kind.as_deref() == Some("vlan")
                     && info.info_data.as_ref().is_some_and(|data| {
                         data["id"].as_u64() == Some(u64::from(id))
                             && data["protocol"].as_str().is_some_and(|protocol| {
@@ -609,6 +614,152 @@ mod tests {
             parse_inventory(&serde_json::to_vec(&vec![observed_link(), observed_link()]).unwrap())
                 .is_err()
         );
+    }
+
+    /// `ip -details -json address show` as iproute2 6.x prints it for a VLAN-aware
+    /// bridge, a plain NIC enslaved to it, a bond member, an unenslaved NIC and
+    /// a VLAN (trimmed to the keys that matter, values as printed). A bridge port
+    /// or bond member reports `info_slave_kind` and no `info_kind` of its own;
+    /// requiring one refused every commit on a box with a bridge or a bond.
+    const REAL_INVENTORY: &str = r#"[
+      {"ifindex":2,"ifname":"eth1","flags":["BROADCAST","MULTICAST","UP","LOWER_UP"],
+       "mtu":1500,"qdisc":"fq_codel","master":"br0","operstate":"UP","group":"default",
+       "txqlen":1000,"link_type":"ether","address":"52:54:00:12:01:01",
+       "broadcast":"ff:ff:ff:ff:ff:ff","promiscuity":1,"allmulti":1,"min_mtu":68,
+       "max_mtu":65535,
+       "linkinfo":{"info_slave_kind":"bridge","info_slave_data":{"state":"forwarding",
+         "priority":32,"cost":100,"hairpin":false,"guard":false,"root_block":false,
+         "fastleave":false,"learning":false,"flood":true,"id":"0x8001","no":"0x1",
+         "designated_port":32769,"designated_cost":0,"bridge_id":"1000.52:54:0:12:1:1",
+         "root_id":"1000.52:54:0:12:1:1","hold_timer":0.00,"message_age_timer":0.00,
+         "forward_delay_timer":0.00,"topology_change_ack":0,"config_pending":0,
+         "proxy_arp":false,"proxy_arp_wifi":false,"multicast_router":1,
+         "mcast_flood":true,"bcast_flood":true,"mcast_to_unicast":false,
+         "neigh_suppress":false,"group_fwd_mask":"0","group_fwd_mask_str":"0x0",
+         "vlan_tunnel":false,"isolated":false,"locked":false,"mab":false}},
+       "num_tx_queues":1,"num_rx_queues":1,"gso_max_size":65536,"gso_max_segs":65535,
+       "addr_info":[{"family":"inet6","local":"fe80::5054:ff:fe12:101","prefixlen":64,
+         "scope":"link","protocol":"kernel_ll","valid_life_time":4294967295,
+         "preferred_life_time":4294967295}]},
+      {"ifindex":3,"ifname":"eth2","flags":["BROADCAST","MULTICAST","SLAVE","UP","LOWER_UP"],
+       "mtu":1500,"qdisc":"fq_codel","master":"bond0","operstate":"UP","group":"default",
+       "link_type":"ether","address":"52:54:00:12:02:01","broadcast":"ff:ff:ff:ff:ff:ff",
+       "linkinfo":{"info_slave_kind":"bond","info_slave_data":{"state":"ACTIVE",
+         "mii_status":"UP","link_failure_count":0,"perm_hwaddr":"52:54:00:12:02:01",
+         "queue_id":0,"prio":0}},
+       "addr_info":[]},
+      {"ifindex":4,"ifname":"eth3","flags":["BROADCAST","MULTICAST","UP","LOWER_UP"],
+       "mtu":1500,"qdisc":"fq_codel","operstate":"UP","group":"default",
+       "link_type":"ether","address":"52:54:00:12:03:01","broadcast":"ff:ff:ff:ff:ff:ff",
+       "addr_info":[{"family":"inet","local":"192.0.2.10","prefixlen":24,
+         "broadcast":"192.0.2.255","scope":"global","label":"eth3",
+         "valid_life_time":4294967295,"preferred_life_time":4294967295}]},
+      {"ifindex":5,"ifname":"br0","flags":["BROADCAST","MULTICAST","UP","LOWER_UP"],
+       "mtu":1500,"qdisc":"noqueue","operstate":"UP","group":"default",
+       "link_type":"ether","address":"52:54:00:12:01:01","broadcast":"ff:ff:ff:ff:ff:ff",
+       "linkinfo":{"info_kind":"bridge","info_data":{"forward_delay":400,
+         "hello_time":200,"max_age":2000,"ageing_time":12000,"stp_state":1,
+         "priority":4096,"vlan_filtering":1,"vlan_protocol":"802.1Q",
+         "bridge_id":"1000.52:54:0:12:1:1","root_id":"1000.52:54:0:12:1:1",
+         "mcast_snooping":1,"mcast_querier":1}},
+       "addr_info":[{"family":"inet","local":"10.0.0.1","prefixlen":24,
+         "broadcast":"10.0.0.255","scope":"global","label":"br0",
+         "valid_life_time":4294967295,"preferred_life_time":4294967295}]},
+      {"ifindex":6,"ifname":"bond0","flags":["BROADCAST","MULTICAST","MASTER","UP","LOWER_UP"],
+       "mtu":1500,"qdisc":"noqueue","operstate":"UP","group":"default",
+       "link_type":"ether","address":"52:54:00:12:02:01","broadcast":"ff:ff:ff:ff:ff:ff",
+       "linkinfo":{"info_kind":"bond","info_data":{"mode":"active-backup",
+         "miimon":100,"primary":"eth2","min_links":1}},
+       "addr_info":[]},
+      {"ifindex":7,"ifname":"tenant0","link":"eth3",
+       "flags":["BROADCAST","MULTICAST","UP","LOWER_UP"],"mtu":1500,"qdisc":"noqueue",
+       "operstate":"UP","group":"default","link_type":"ether",
+       "address":"52:54:00:12:03:01","broadcast":"ff:ff:ff:ff:ff:ff",
+       "linkinfo":{"info_kind":"vlan","info_data":{"protocol":"802.1Q","id":10,
+         "flags":["REORDER_HDR"]}},
+       "addr_info":[]}
+    ]"#;
+
+    #[test]
+    fn real_iproute2_inventory_with_bridge_and_bond_members_parses() {
+        let inventory = parse_inventory(REAL_INVENTORY.as_bytes()).unwrap();
+        assert_eq!(inventory.len(), 6);
+        // A bridge port and a bond member have no kind of their own.
+        assert!(
+            inventory["eth1"]
+                .linkinfo
+                .as_ref()
+                .is_some_and(|i| i.info_kind.is_none())
+        );
+        assert_eq!(inventory["eth1"].master.as_deref(), Some("br0"));
+        assert!(
+            inventory["eth2"]
+                .linkinfo
+                .as_ref()
+                .is_some_and(|i| i.info_kind.is_none())
+        );
+        assert!(inventory["eth3"].linkinfo.is_none());
+        assert_eq!(
+            inventory["br0"]
+                .linkinfo
+                .as_ref()
+                .and_then(|i| i.info_kind.as_deref()),
+            Some("bridge")
+        );
+        assert_eq!(
+            inventory["tenant0"]
+                .linkinfo
+                .as_ref()
+                .and_then(|i| i.info_kind.as_deref()),
+            Some("vlan")
+        );
+    }
+
+    #[test]
+    fn a_member_link_is_never_mistaken_for_an_owned_device() {
+        let inventory = parse_inventory(REAL_INVENTORY.as_bytes()).unwrap();
+        let ifaces = toml::from_str::<crate::config::Appliance>(
+            r#"
+            [system]
+            hostname = "test"
+            [[interface]]
+            name = "br0"
+            type = "bridge"
+            member = ["eth1"]
+            [[interface]]
+            name = "eth1"
+            [[interface]]
+            name = "eth3"
+            [[interface]]
+            name = "tenant0"
+            parent = "eth3"
+            vlan = 10
+        "#,
+        )
+        .unwrap()
+        .interfaces;
+        // The bridge and the VLAN match their `.netdev`s and stay.
+        let previous = BTreeMap::from([
+            (
+                "10-sentinel-br0.netdev".to_string(),
+                "[NetDev]\nName=br0\nKind=bridge\n".to_string(),
+            ),
+            (
+                "10-sentinel-tenant0.netdev".to_string(),
+                "[NetDev]\nName=tenant0\nKind=vlan\n".to_string(),
+            ),
+        ]);
+        let mut retired = BTreeSet::new();
+        retire_drifted(&previous, &ifaces, &inventory, &mut retired);
+        assert!(retired.is_empty(), "{retired:?}");
+        // A `.netdev` that claims a kind-less member as its own device is a
+        // mismatch: the link there is not the device we made.
+        let claimed = BTreeMap::from([(
+            "10-sentinel-eth1.netdev".to_string(),
+            "[NetDev]\nName=eth1\nKind=dummy\n".to_string(),
+        )]);
+        retire_drifted(&claimed, &ifaces, &inventory, &mut retired);
+        assert_eq!(retired, BTreeSet::from(["eth1".to_string()]));
     }
 
     #[test]
