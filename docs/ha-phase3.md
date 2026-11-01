@@ -89,6 +89,17 @@ that are not already present on the secondary. Existing shared MTU, VLAN,
 bridge, firewall, NAT, routing and service changes converge through the durable
 configuration outbox. Failed deliveries remain pending, including credentials
 needed to deliver a rotation after an outage or ambiguous acknowledgement.
+Each push names the shared revisions it was built on, and a member applies it
+only while it still holds one of them. When both members commit before either
+push lands, both pushes are refused as a conflict instead of each member
+silently taking the other's change: the outbox keeps them, the journal of
+`sentinel-configsync.service` says `CONFLICT`, and `GET /api/v1/stack` reports
+the member's `sync` as `conflict`. Roll back the member whose change should be
+discarded; the other member's held push then applies there. Only the machine
+credential may push (`PUT /api/v1/config-sync`); an account token is refused.
+Both members must run the same Sentinel version: a push from a version that
+does not name its base is refused as a conflict once the receiver has been
+synchronized.
 In leased mode, masquerade uses the egress link's single shared IPv4 VIP. Multiple
 VIPs require an explicit `nat.source.to` so the source identity is unambiguous;
 a member's private WAN address is never selected as the shared masquerade identity.

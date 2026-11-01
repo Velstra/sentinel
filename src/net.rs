@@ -2247,19 +2247,23 @@ pub fn peer_pin(cs: &crate::config::ConfigSync, authority: &str) -> Result<Strin
 
 /// Deliver one durable-outbox revision over pinned HTTPS. Transport errors must
 /// reach the worker so it retains this peer for retry.
-pub(crate) fn push_config_peer(appliance: &Appliance, peer: &str) -> Result<()> {
+pub(crate) fn push_config_peer(appliance: &Appliance, peer: &str, bases: &[String]) -> Result<()> {
     let secret = appliance
         .system
         .config_sync
         .secret
         .as_deref()
         .context("config-sync credential missing")?;
-    push_config_peer_with_secret(appliance, peer, secret)
+    push_config_peer_with_secret(appliance, peer, secret, bases)
 }
+/// Push `appliance` to `peer`. `bases` are the shared revisions the push may
+/// be built on (see [`crate::configsync::shared_revision`]); the peer refuses
+/// it with a `409 Conflict` when it holds none of them.
 pub(crate) fn push_config_peer_with_secret(
     appliance: &Appliance,
     peer: &str,
     secret: &str,
+    bases: &[String],
 ) -> Result<()> {
     use std::io::Write;
     let mut credential = appliance.system.config_sync.clone();
@@ -2272,7 +2276,21 @@ pub(crate) fn push_config_peer_with_secret(
     staged.file.write_all(json.as_bytes())?;
     let authority = configsync_authority(peer);
     let pin = peer_pin(cs, &authority)?;
-    let url = format!("https://{authority}/api/v1/config-sync");
+    let mut url = format!("https://{authority}/api/v1/config-sync");
+    if !bases.is_empty() {
+        // SHA-256s in hex: nothing in them needs escaping in a query.
+        anyhow::ensure!(
+            bases
+                .iter()
+                .all(|b| b.bytes().all(|c| c.is_ascii_hexdigit())),
+            "invalid config-sync base revision"
+        );
+        url.push_str(&format!(
+            "?{}={}",
+            crate::configsync::BASE_PARAMETER,
+            bases.join(",")
+        ));
+    }
     system::curl_put_config(&url, secret, &staged.path, Some(&pin))?;
     eprintln!("config-sync → {peer}");
     Ok(())

@@ -1187,6 +1187,48 @@ pub fn curl_request(
     timeout_secs: u32,
     pin: Option<&str>,
 ) -> Result<String> {
+    curl_request_with_header(url, token, method, body, None, timeout_secs, pin)
+}
+
+/// A management request the far end refused with an HTTP status, kept as a
+/// value rather than a sentence so a caller can tell a refusal it must act on
+/// (a `409 Conflict` from config-sync) from a peer that simply was not there.
+#[derive(Debug)]
+pub struct HttpStatus {
+    pub status: u16,
+    pub request: String,
+}
+
+impl std::fmt::Display for HttpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "management request {} was refused (HTTP {})",
+            self.request, self.status
+        )
+    }
+}
+
+impl std::error::Error for HttpStatus {}
+
+/// The status curl's `-f` reports on stderr ("The requested URL returned
+/// error: 409"), when that is why it failed.
+fn curl_http_status(stderr: &str) -> Option<u16> {
+    let rest = stderr.split("returned error: ").nth(1)?;
+    rest.get(..3)?.parse().ok()
+}
+
+/// [`curl_request`] with one extra request header (`Name: value`). The header
+/// goes through curl's private config on stdin like the bearer, never argv.
+fn curl_request_with_header(
+    url: &str,
+    token: Option<&str>,
+    method: &str,
+    body: Option<&Path>,
+    extra_header: Option<&str>,
+    timeout_secs: u32,
+    pin: Option<&str>,
+) -> Result<String> {
     use std::io::Write;
     let mut args = vec![
         "-sS".to_string(),
@@ -1210,7 +1252,16 @@ pub fn curl_request(
     }
     add_pin_args(&mut args, pin);
     args.push(url.into());
-    let config = curl_auth_config(token)?;
+    let mut config = curl_auth_config(token)?;
+    if let Some(extra) = extra_header {
+        anyhow::ensure!(
+            !extra
+                .chars()
+                .any(|c| c.is_control() || c == '"' || c == '\\'),
+            "invalid request header"
+        );
+        config.push_str(&format!("header = \"{extra}\"\n"));
+    }
     let mut child = Command::new(bin("curl"))
         .args(&args)
         .stdin(Stdio::piped())
@@ -1229,11 +1280,16 @@ pub fn curl_request(
         return Err(error.into());
     }
     let out = child.wait_with_output()?;
-    anyhow::ensure!(
-        out.status.success(),
-        "management request {method} {url} failed ({})",
-        out.status
-    );
+    if !out.status.success() {
+        if let Some(status) = curl_http_status(&String::from_utf8_lossy(&out.stderr)) {
+            return Err(HttpStatus {
+                status,
+                request: format!("{method} {url}"),
+            }
+            .into());
+        }
+        bail!("management request {method} {url} failed ({})", out.status);
+    }
     String::from_utf8(out.stdout).context("non-UTF8 management response")
 }
 fn curl_auth_config(token: Option<&str>) -> Result<String> {
@@ -1249,6 +1305,25 @@ fn curl_auth_config(token: Option<&str>) -> Result<String> {
 }
 pub fn curl_get(url: &str, token: &str, timeout_secs: u32, pin: Option<&str>) -> Result<String> {
     curl_request(url, Some(token), "GET", None, timeout_secs, pin)
+}
+
+/// [`curl_get`] with one extra request header (`Name: value`).
+pub fn curl_get_with_header(
+    url: &str,
+    token: &str,
+    header: &str,
+    timeout_secs: u32,
+    pin: Option<&str>,
+) -> Result<String> {
+    curl_request_with_header(
+        url,
+        Some(token),
+        "GET",
+        None,
+        Some(header),
+        timeout_secs,
+        pin,
+    )
 }
 
 /// Add curl's public-key pinning for a self-signed peer (H3): `--insecure` drops
@@ -2141,6 +2216,20 @@ mod tests {
 #[cfg(test)]
 mod ha_curl_tests {
     use super::*;
+    /// A peer's refusal survives as a status a caller can act on: curl's `-f`
+    /// says it only on stderr.
+    #[test]
+    fn an_http_refusal_is_read_off_curls_stderr() {
+        assert_eq!(
+            curl_http_status("curl: (22) The requested URL returned error: 409\n"),
+            Some(409)
+        );
+        assert_eq!(
+            curl_http_status("curl: (22) The requested URL returned error: 401 Unauthorized"),
+            Some(401)
+        );
+        assert_eq!(curl_http_status("curl: (7) Failed to connect"), None);
+    }
     #[test]
     fn bearer_config_escapes_and_rejects_injection() {
         assert_eq!(

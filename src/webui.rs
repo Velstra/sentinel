@@ -2912,6 +2912,10 @@ function el(tag, attrs, kids) {{
     if (k === "class") n.className = v;
     else if (k === "text") n.textContent = v;
     else if (k.startsWith("on")) n[k] = v;
+    // Through the CSSOM, not the attribute: the page's Content-Security-Policy
+    // admits only the style attributes written in the markup, by hash, and a
+    // style attribute set from script is checked against exactly that list.
+    else if (k === "style") n.style.cssText = v;
     else if (v !== null && v !== undefined) n.setAttribute(k, v);
   }}
   for (const kid of kids || []) n.append(kid);

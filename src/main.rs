@@ -47,6 +47,7 @@ mod proxy;
 #[cfg(test)]
 mod quickstart;
 mod reconcile;
+mod redact;
 mod relay;
 mod repl;
 mod safe_apply;
@@ -85,6 +86,20 @@ fn saved_config_path() -> std::path::PathBuf {
     std::env::var_os("SENTINEL_CONFIG")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_CONFIG))
+}
+
+/// Load the configuration for a `show` to print, with its secrets withheld as
+/// far as whoever asked may not see them.
+///
+/// Every `show` that reads the configuration reads it through here, so a view
+/// added tomorrow inherits the redaction rather than having to remember it. On
+/// the box's own CLI nothing is withheld (`SENTINEL_REDACT` is unset — whoever
+/// runs it can read the file anyway); the management API sets the variable for
+/// any caller that is not the machine credential, which is what keeps a
+/// read-only account from reading the config-sync secret — the machine's
+/// full-access token — out of `show configuration commands`.
+fn load_shown(path: &std::path::Path) -> Result<Appliance> {
+    redact::appliance(&Appliance::load(path)?, redact::Disclosure::from_env())
 }
 use velstra_proto::{
     Counter, ListPortsRequest, StatsReport, velstra_control_client::VelstraControlClient,
@@ -1236,7 +1251,7 @@ fn load_update_channel() -> Result<config::UpdateChannel> {
 /// box computed itself would be a guess, and this view does not guess.
 fn show_subscription() -> Result<()> {
     let saved = saved_config_path();
-    let appliance = Appliance::load(saved.as_path())?;
+    let appliance = load_shown(saved.as_path())?;
     let Some(up) = &appliance.update else {
         println!(
             "no update channel configured — set update url <https-url> + public-key, or \
@@ -1902,7 +1917,7 @@ fn show_zones() -> Result<()> {
         println!("no saved configuration");
         return Ok(());
     }
-    let a = Appliance::load(&saved)?;
+    let a = load_shown(&saved)?;
 
     // A zone exists because an interface names it. The posture block is
     // optional and may name a zone no interface is in — that block simply has
@@ -1991,7 +2006,7 @@ fn show_rule_hits() -> Result<()> {
         println!("no saved configuration to attribute flows to");
         return Ok(());
     }
-    let appliance = Appliance::load(&saved)?;
+    let appliance = load_shown(&saved)?;
     let cfg = crate::compile::compile(&appliance);
     let table = velstra::query("flows --limit 0")
         .or_else(|_| velstra::query("flows"))
@@ -2266,7 +2281,7 @@ fn show_op(args: &[String]) -> Result<()> {
             let saved = saved_config_path();
             let path = saved.as_path();
             if path.exists() {
-                print!("{}", Appliance::load(path)?.summary());
+                print!("{}", load_shown(path)?.summary());
             }
             Ok(())
         }
@@ -2362,7 +2377,7 @@ fn show_op(args: &[String]) -> Result<()> {
             let saved = saved_config_path();
             let path = saved.as_path();
             if path.exists() {
-                let rendered = session::render_appliance(&Appliance::load(path)?);
+                let rendered = session::render_appliance(&load_shown(path)?);
                 for line in session::flatten_config(&rendered) {
                     println!("{line}");
                 }
@@ -2384,7 +2399,7 @@ fn show_op(args: &[String]) -> Result<()> {
                 // be copied and therefore the one that must carry it.
                 print!(
                     "{}",
-                    session::render_appliance_for_reading(&Appliance::load(path)?)
+                    session::render_appliance_for_reading(&load_shown(path)?)
                 );
             } else {
                 println!(
@@ -2398,7 +2413,7 @@ fn show_op(args: &[String]) -> Result<()> {
             let saved = saved_config_path();
             let path = saved.as_path();
             if path.exists() {
-                print!("{}", Appliance::load(path)?.summary());
+                print!("{}", load_shown(path)?.summary());
             } else {
                 println!(
                     "no saved config at {} (run `configure` + `save`)",
@@ -2599,7 +2614,7 @@ fn show_agent_query(command: &str, what: &str) -> Result<()> {
 /// only the secret. Listing the files instead would show an account as having
 /// access after its group was taken away.
 fn show_users() -> Result<()> {
-    let appliance = Appliance::load(&saved_config_path())?;
+    let appliance = load_shown(&saved_config_path())?;
     if appliance.system.logins.is_empty() {
         println!("no accounts configured");
         return Ok(());
@@ -2786,7 +2801,10 @@ fn show_revision(n: &str) -> Result<()> {
         .parse()
         .map_err(|_| anyhow::anyhow!("revision must be a number (see `show system commit`)"))?;
     let toml = archive::read_revision(&saved_config_path(), n)?;
-    let appliance = Appliance::from_toml(&toml)?;
+    let appliance = redact::appliance(
+        &Appliance::from_toml(&toml)?,
+        redact::Disclosure::from_env(),
+    )?;
     // A past revision is read, not replayed, so it is shown the same way the
     // running one is.
     print!("{}", session::render_appliance_for_reading(&appliance));
@@ -2804,7 +2822,7 @@ fn show_nat() -> Result<()> {
         );
         return Ok(());
     }
-    let a = Appliance::load(path)?;
+    let a = load_shown(path)?;
     if a.nat.is_empty() {
         println!("no NAT configured");
         return Ok(());
@@ -2982,7 +3000,7 @@ fn show_broadcast_relay() -> Result<()> {
         );
         return Ok(());
     }
-    let relays = Appliance::load(path)?.services.broadcast_relay;
+    let relays = load_shown(path)?.services.broadcast_relay;
     if relays.is_empty() {
         println!("no broadcast relay is configured");
         return Ok(());
@@ -3001,7 +3019,7 @@ fn show_broadcast_relay() -> Result<()> {
     // A relay whose port the firewall drops carries nothing while looking
     // perfectly configured, so the same advisory the commit prints is repeated
     // here — this is where someone looks when it is not working.
-    let appliance = Appliance::load(path)?;
+    let appliance = load_shown(path)?;
     for w in appliance.warnings() {
         if w.contains("broadcast-relay") {
             println!("warning: {w}");
@@ -3023,7 +3041,7 @@ fn show_ids() -> Result<()> {
         );
         return Ok(());
     }
-    let ids = Appliance::load(path)?.services.ids;
+    let ids = load_shown(path)?.services.ids;
     if ids.is_empty() {
         println!("intrusion detection is off (no `services ids interface` is set)");
         return Ok(());
@@ -3089,7 +3107,7 @@ fn show_load_balancer() -> Result<()> {
         );
         return Ok(());
     }
-    let a = Appliance::load(path)?;
+    let a = load_shown(path)?;
     if a.load_balancers.is_empty() {
         println!("no load-balanced services configured");
         return Ok(());
@@ -3122,7 +3140,7 @@ fn show_pki() -> Result<()> {
         );
         return Ok(());
     }
-    let a = Appliance::load(path)?;
+    let a = load_shown(path)?;
     if a.pki.is_empty() {
         println!("no PKI configured");
         return Ok(());
