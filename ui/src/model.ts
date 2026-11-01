@@ -41,6 +41,8 @@ export interface Telemetry {
     node?: string;
     term?: number;
     sync_age_ms?: number | null;
+    ready?: boolean;
+    not_ready?: string | null;
   } | null;
   routing?: { bgp?: string; ospf?: string; routes?: string };
   wireguard?: string | null;
@@ -232,4 +234,14 @@ export function isTelemetry(value: unknown): value is Telemetry {
     Array.isArray(f.events) &&
     !!f.errors
   );
+}
+
+/** The member's role, and for a member that is not forwarding, why the
+ * witness would refuse it authority. A bare "Backup" reads as "covered". */
+export function haRole(ha: Telemetry["ha"]): string {
+  if (!ha) return "—";
+  if (ha.role === "standalone") return "Standalone";
+  return ha.role !== "Master" && ha.not_ready
+    ? `${ha.role} (not ready: ${ha.not_ready})`
+    : ha.role;
 }

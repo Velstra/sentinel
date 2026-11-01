@@ -134,15 +134,17 @@ struct Cli {
 #[derive(Subcommand)]
 enum HaCommand {
     /// Pair this primary with a secondary using its bootstrap machine token.
+    ///
+    /// The token is read from standard input (`--secret-stdin`), or prompted
+    /// for without echo on a terminal. It is the secondary's API machine token:
+    /// on a command line it would sit in the process list and shell history.
     Pair {
         peer: String,
-        #[arg(
-            long,
-            required_unless_present = "secret_stdin",
-            conflicts_with = "secret_stdin"
-        )]
+        /// Refused: a token in argv is visible to every local user.
+        #[arg(long, hide = true, conflicts_with = "secret_stdin")]
         secret: Option<String>,
-        #[arg(long, hide = true)]
+        /// Read the machine token from standard input.
+        #[arg(long)]
         secret_stdin: bool,
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
@@ -153,6 +155,47 @@ enum HaCommand {
         #[arg(long)]
         peer_identity: Option<PathBuf>,
     },
+    /// Print the witness's `[system.ha-witness]` key and cluster for a pair
+    /// token (read like `pair` does). The witness never needs the token itself.
+    WitnessKey {
+        /// The pair's cluster identifier, when one was set explicitly.
+        #[arg(long)]
+        cluster: Option<String>,
+        /// Read the machine token from standard input.
+        #[arg(long)]
+        secret_stdin: bool,
+    },
+    /// Alert when a standby stays unable to take over (systemd worker).
+    #[command(hide = true)]
+    Watch {
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    },
+}
+
+/// The pair token, from standard input or a no-echo prompt. One trailing line
+/// ending is the terminator `echo` or a here-string adds, not part of the token.
+fn read_pair_token(from_stdin: bool, argv: Option<String>) -> Result<String> {
+    use std::io::{IsTerminal, Read};
+    anyhow::ensure!(
+        argv.is_none(),
+        "--secret puts the machine token in the process list and shell history; \
+         pipe it with --secret-stdin, or omit both to be prompted"
+    );
+    let mut value = if !from_stdin && std::io::stdin().is_terminal() {
+        prompt_secret("HA pair token: ")?
+    } else {
+        let mut value = String::new();
+        std::io::stdin().take(1026).read_to_string(&mut value)?;
+        value
+    };
+    if value.ends_with('\n') {
+        value.pop();
+        if value.ends_with('\r') {
+            value.pop();
+        }
+    }
+    Ok(value)
 }
 
 #[derive(Subcommand)]
@@ -562,14 +605,7 @@ async fn main() -> Result<()> {
                     peer_identity,
                 },
         } => {
-            use std::io::Read;
-            let secret = if secret_stdin {
-                let mut value = String::new();
-                std::io::stdin().take(1025).read_to_string(&mut value)?;
-                value
-            } else {
-                secret.context("--secret required")?
-            };
+            let secret = read_pair_token(secret_stdin, secret)?;
             ha::pair(
                 &peer,
                 &secret,
@@ -578,6 +614,27 @@ async fn main() -> Result<()> {
                 peer_identity.as_deref(),
             )
         }
+        Command::Ha {
+            command:
+                HaCommand::WitnessKey {
+                    cluster,
+                    secret_stdin,
+                },
+        } => {
+            let token = read_pair_token(secret_stdin, None)?;
+            anyhow::ensure!(
+                (32..=1024).contains(&token.len()),
+                "the pair token must contain 32..1024 bytes"
+            );
+            let cluster = cluster.unwrap_or_else(|| ha::cluster_id(&token));
+            println!("[system.ha-witness]");
+            println!("cluster = \"{cluster}\"");
+            println!("key = \"{}\"", ha::witness_key(&token, &cluster));
+            Ok(())
+        }
+        Command::Ha {
+            command: HaCommand::Watch { config },
+        } => ha::watch(&config),
         Command::Configure { config, no_apply } => configure(&config, no_apply),
         Command::SyncConfig => configsync::flush(),
         Command::Show { args } => show_op(&args),
@@ -2233,6 +2290,12 @@ fn show_op(args: &[String]) -> Result<()> {
         ["isis", rest @ ..] => wren_show_words("isis", rest),
         ["babel", rest @ ..] => wren_show_words("babel", rest),
         ["vrrp"] => wren_show(&["vrrp"]),
+        ["ha"] => {
+            let status: serde_json::Value = serde_json::from_str(&velstra::query("ha-status")?)
+                .context("reading the data plane's HA status")?;
+            print!("{}", ha::render_status(&status));
+            Ok(())
+        }
         // The routing daemon knows which VRFs it is running; the kernel knows
         // which devices exist. Either answer is more use than none.
         ["vrf"] | ["vrfs"] => {
@@ -2500,7 +2563,7 @@ fn show_op(args: &[String]) -> Result<()> {
              show ip rip | show ipv6 ripng\n  \
              show isis [neighbors|interfaces|database]\n  \
              show babel [neighbors|routes]\n  \
-             show vrrp | show bfd [sessions]\n  \
+             show vrrp | show ha | show bfd [sessions]\n  \
              show firewall [statistics|counters|events|states|log]\n  \
              show flows [| top-talkers]        live state table / hosts by volume\n  \
              show nat                          NAT configuration\n  \

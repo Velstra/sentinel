@@ -7,7 +7,7 @@ import {
 } from "react";
 import type { ReactNode } from "react";
 import { diffLines } from "diff";
-import { endpoint, protocolName, selectEvents } from "./model";
+import { endpoint, haRole, protocolName, selectEvents } from "./model";
 import type { Link, PacketEvent } from "./model";
 import type { Management } from "./controller";
 
@@ -178,7 +178,7 @@ function Overview({ manager }: { manager: Management }) {
     },
     {
       label: "High availability",
-      value: f?.ha?.role === "standalone" ? "Standalone" : f?.ha?.role || "—",
+      value: haRole(f?.ha),
       detail:
         f?.ha?.role === "Backup"
           ? "Standby replica"
@@ -434,7 +434,7 @@ export function Dashboard({ manager }: { manager: Management }) {
                 <>
                   <strong className="ha-role">
                     <span className="metric-label">Current role</span>
-                    {ha.role}
+                    {haRole(ha)}
                   </strong>
                   {ha.cluster && (
                     <p>

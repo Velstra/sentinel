@@ -95,17 +95,19 @@ independent Sentinel witness. The witness is required for partition-safe leased
 HA; two members alone do not provide that authority. The fully exercised lab
 uses primary `10.3.0.1`, secondary `10.3.0.2`, witness `10.3.0.3` and HTTPS
 management port 8080. Generate one private enrollment credential of at least
-32 bytes. Configure it as `system.ha-witness.secret` on the witness (listen
-`10.3.0.3:5440`) and `system.config-sync.secret` on the secondary.
+32 bytes and configure it as `system.config-sync.secret` on the secondary. The
+witness never receives it: `sentinel ha witness-key` (token on stdin) prints the
+derived `key` and `cluster` for `[system.ha-witness]`, which also lists the two
+member addresses (`member = ["10.3.0.1", "10.3.0.2"]`) and listens on
+`10.3.0.3:5440`.
 
 On the primary, prepare `system.ha.enabled = false` and
-`system.ha.witness = "10.3.0.3:5440"`, then run:
+`system.ha.witness = "10.3.0.3:5440"`, then run (the token is prompted for
+without echo; it never appears on a command line):
 
 ```sh
-read -rs PAIR_TOKEN
-sentinel ha pair 10.3.0.2:8080 --witness 10.3.0.3:5440 --secret "$PAIR_TOKEN"
-unset PAIR_TOKEN
-sentinel show vrrp
+sentinel ha pair 10.3.0.2:8080 --witness 10.3.0.3:5440
+sentinel show ha
 ```
 
 Pairing binds member identities and management TLS pins, reconciles both nodes

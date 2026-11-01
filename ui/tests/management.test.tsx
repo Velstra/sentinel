@@ -111,6 +111,29 @@ describe("React dashboard and packet inspector", () => {
     expect(screen.getByText("0 seconds ago")).toBeVisible();
     expect(screen.getByText("40 active firewall states")).toBeVisible();
   });
+  it("says why a standby could not take over instead of a bare Backup", () => {
+    const { manager } = fixture();
+    manager.acceptFrame(
+      frame({
+        ha: {
+          role: "Backup",
+          cluster: "edge",
+          node: "b",
+          term: 4,
+          sync_age_ms: 2300,
+          ready: false,
+          not_ready: "policy differs from the owner's; awaiting configuration sync",
+        },
+      }),
+    );
+    render(<Dashboard manager={manager} />);
+    expect(
+      screen.getAllByText(
+        "Backup (not ready: policy differs from the owner's; awaiting configuration sync)",
+      ),
+    ).toHaveLength(2);
+    expect(screen.queryByText("Backup")).toBeNull();
+  });
   it("keeps missing measurements unknown and never invents Master sync latency", async () => {
     const { manager } = fixture();
     manager.acceptFrame(

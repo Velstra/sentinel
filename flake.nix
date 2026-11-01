@@ -827,6 +827,24 @@
             timerConfig = { OnBootSec = "5s"; OnUnitInactiveSec = "1s"; AccuracySec = "100ms"; Unit = "sentinel-configsync.service"; };
           };
 
+          # A standby that cannot take over (its policy awaits config sync, or
+          # its state replica went stale) fails no unit, so OnFailure alerts never
+          # see it. This worker reads the agent's own readiness and alerts once
+          # per episode that outlasts an ordinary sync delivery. A box without
+          # leased HA reports "standalone" and the worker stays silent.
+          systemd.services.sentinel-ha-watch = {
+            description = "Alert when the HA standby cannot take over";
+            wantedBy = [ "multi-user.target" ];
+            after = [ "velstra.service" "sentinel-boot.service" ];
+            startLimitIntervalSec = 0;
+            serviceConfig = {
+              ExecStart = "${sentinel}/bin/sentinel ha watch";
+              Restart = "always";
+              RestartSec = "5s";
+              UMask = "0077";
+            };
+          };
+
           # Persistence guard for the editable config itself: order the
           # config-seeding boot service after the /var/lib/sentinel mount, so on a
           # deployment where that path is its own partition (as on the appliance

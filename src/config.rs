@@ -4314,6 +4314,14 @@ pub struct Ha {
     pub management_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_identity: Option<HaIdentity>,
+    /// The witness lease in milliseconds (default 250). Set the witness's
+    /// `lease-ms` to the same value: a member honours the shorter of the two.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_ms: Option<u64>,
+    /// Bound on one complete witness exchange (default 80), about three round
+    /// trips. `2 x io-timeout-ms + 45` must not exceed `lease-ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io_timeout_ms: Option<u64>,
 }
 impl Ha {
     pub fn node(&self) -> u8 {
@@ -4354,9 +4362,31 @@ pub struct HaInterfaceIdentity {
 #[serde(deny_unknown_fields)]
 pub struct HaWitness {
     pub listen: String,
+    /// Deprecated: the members' enrollment credential, which is also their
+    /// API machine token. Still honoured so an upgraded witness keeps serving
+    /// its pair, but `key` gives the witness only what it needs.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub secret: String,
+    /// The derived witness key (`sentinel ha witness-key`). It authenticates
+    /// lease sessions and nothing else; it cannot sign in to either member.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub key: String,
     #[serde(default)]
     pub cluster: String,
+    /// The two members' source addresses; every other source is refused
+    /// before it can hold a session.
+    #[serde(rename = "member", default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<String>,
+    #[serde(rename = "lease-ms", default, skip_serializing_if = "Option::is_none")]
+    pub lease_ms: Option<u64>,
+    /// How long one member must be silent before the other may start a new,
+    /// empty epoch alone (default 10000).
+    #[serde(
+        rename = "peer-silence-ms",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub peer_silence_ms: Option<u64>,
 }
 
 /// HA config sync (`[system.config-sync]`). Local CLI commits and API updates
@@ -11111,6 +11141,7 @@ impl Appliance {
     #[allow(dead_code)]
     pub fn warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
+        out.extend(crate::ha::witness_warnings(self));
         // An encrypted upstream named by hostname cannot be reached until
         // something resolves that hostname, and that something has to be
         // plaintext. Without one the box looks like "DNS is broken" rather than

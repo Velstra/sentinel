@@ -7304,11 +7304,17 @@ const HA = [
   ["cluster", "Cluster identifier"],
   ["management-fingerprint", "Local management TLS fingerprint"],
   ["peer-identity", "Peer identity JSON", null, null, "secret"],
+  ["lease-ms", "Witness lease (ms)"],
+  ["io-timeout-ms", "Witness exchange budget (ms)"],
 ];
 const HA_WITNESS = [
   ["listen", "Witness listen IP:port"],
-  ["secret", "Witness enrollment credential", null, null, "secret"],
+  ["key", "Derived witness key", null, null, "secret"],
+  ["member", "Member addresses", null, "list"],
   ["cluster", "Witness cluster identifier"],
+  ["lease-ms", "Lease granted (ms)"],
+  ["peer-silence-ms", "Peer silence before lone takeover (ms)"],
+  ["secret", "Enrollment credential (deprecated)", null, null, "secret"],
 ];
 const CONFIG_SYNC = [
   ["peer", "Peers", null, "list"], ["secret", "Shared secret", null, null, "secret"],

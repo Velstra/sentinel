@@ -1360,6 +1360,7 @@ const OP_SHOW_TOP: &[Cand] = &[
     ("isis", "IS-IS adjacencies / interfaces / database"),
     ("babel", "Babel neighbours / routes"),
     ("vrrp", "VRRP virtual-router state"),
+    ("ha", "leased HA authority and standby readiness"),
     ("bfd", "BFD sessions"),
     ("vrf", "the VRFs that are running, and their devices"),
     (
@@ -2842,11 +2843,26 @@ const HA_FIELDS: &[Cand] = &[
         "this member's management TLS SPKI",
     ),
     ("peer-identity", "peer-specific facts as a JSON object"),
+    (
+        "lease-ms",
+        "witness lease in ms (default 250; same on the witness)",
+    ),
+    (
+        "io-timeout-ms",
+        "bound on one witness exchange in ms (default 80; about 3 round trips)",
+    ),
 ];
 const HA_WITNESS_FIELDS: &[Cand] = &[
     ("listen", "listen IP:port"),
-    ("secret", "shared enrollment credential"),
-    ("cluster", "cluster identifier (derived when omitted)"),
+    ("key", "derived witness key (sentinel ha witness-key)"),
+    ("member", "the two member source addresses"),
+    ("cluster", "cluster identifier (required with key)"),
+    ("lease-ms", "lease granted in ms (default 250)"),
+    (
+        "peer-silence-ms",
+        "silence before a lone cold member may take over (default 10000)",
+    ),
+    ("secret", "deprecated: the members' credential; use key"),
 ];
 // `system config-sync <Tab>` reveals the HA config-sync fields.
 const CONFIGSYNC_FIELDS: &[Cand] = &[

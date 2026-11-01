@@ -4653,6 +4653,8 @@ impl Session {
                     "preempt" => ha.preempt = parse_bool(value)?,
                     "management-fingerprint" => ha.management_fingerprint = Some((*value).into()),
                     "peer-identity" => ha.peer_identity = Some(serde_json::from_str(value)?),
+                    "lease-ms" => ha.lease_ms = Some(value.parse()?),
+                    "io-timeout-ms" => ha.io_timeout_ms = Some(value.parse()?),
                     _ => bail!("unknown HA field: {field}"),
                 }
             }
@@ -4661,7 +4663,11 @@ impl Session {
                 match *field {
                     "listen" => witness.listen = (*value).into(),
                     "secret" => witness.secret = (*value).into(),
+                    "key" => witness.key = (*value).into(),
                     "cluster" => witness.cluster = (*value).into(),
+                    "member" => append_csv(&mut witness.members, value),
+                    "lease-ms" => witness.lease_ms = Some(value.parse()?),
+                    "peer-silence-ms" => witness.peer_silence_ms = Some(value.parse()?),
                     _ => bail!("unknown witness field: {field}"),
                 }
             }
@@ -7487,6 +7493,8 @@ impl Session {
                         "preempt" => h.preempt = false,
                         "management-fingerprint" => h.management_fingerprint = None,
                         "peer-identity" => h.peer_identity = None,
+                        "lease-ms" => h.lease_ms = None,
+                        "io-timeout-ms" => h.io_timeout_ms = None,
                         _ => bail!("unknown HA field: {field}"),
                     }
                 }
@@ -7496,7 +7504,11 @@ impl Session {
                     match *field {
                         "listen" => h.listen.clear(),
                         "secret" => h.secret.clear(),
+                        "key" => h.key.clear(),
                         "cluster" => h.cluster.clear(),
+                        "member" => h.members.clear(),
+                        "lease-ms" => h.lease_ms = None,
+                        "peer-silence-ms" => h.peer_silence_ms = None,
                         _ => bail!("unknown witness field: {field}"),
                     }
                 }
@@ -10071,6 +10083,12 @@ fn render_draft_masked(
             if let Some(pin) = &ha.management_fingerprint {
                 sys.push_str(&format!("        management-fingerprint {pin}\n"));
             }
+            if let Some(ms) = ha.lease_ms {
+                sys.push_str(&format!("        lease-ms {ms}\n"));
+            }
+            if let Some(ms) = ha.io_timeout_ms {
+                sys.push_str(&format!("        io-timeout-ms {ms}\n"));
+            }
             if let Some(identity) = &ha.peer_identity {
                 sys.push_str(&format!(
                     "        peer-identity {}\n",
@@ -10084,14 +10102,31 @@ fn render_draft_masked(
                 Secrets::Shown => w.secret.as_str(),
                 _ => "********",
             };
+            // The derived key cannot sign in anywhere, but it can still take
+            // the pair's authority away; it is masked like the credential.
+            let key = match secrets {
+                Secrets::Shown => w.key.as_str(),
+                _ => "********",
+            };
+            let members = w.members.join(",");
             sys.push_str("    ha-witness {\n");
-            for (key, value) in [
+            for (name, value) in [
                 ("listen", w.listen.as_str()),
                 ("cluster", w.cluster.as_str()),
-                ("secret", secret),
+                ("member", members.as_str()),
+                ("secret", if w.secret.is_empty() { "" } else { secret }),
+                ("key", if w.key.is_empty() { "" } else { key }),
             ] {
                 if !value.is_empty() {
-                    sys.push_str(&format!("        {key} {value}\n"));
+                    sys.push_str(&format!("        {name} {value}\n"));
+                }
+            }
+            for (name, value) in [
+                ("lease-ms", w.lease_ms),
+                ("peer-silence-ms", w.peer_silence_ms),
+            ] {
+                if let Some(value) = value {
+                    sys.push_str(&format!("        {name} {value}\n"));
                 }
             }
             sys.push_str("    }\n");
