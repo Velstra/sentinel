@@ -179,10 +179,20 @@ pub fn watch(config: &Path) -> Result<()> {
 /// ever covered a link that was *created* while the agent was away; this is the
 /// other half: a link the agent leaves behind is put back into the hold, and
 /// the agent raises it again once its hooks are in place, exactly as at boot.
-/// (An HA member is already fenced by its pinned guard; dropping the link as
-/// well costs nothing there.)
+///
+/// A link the HA guard fences is left alone. Its pinned TC guard outlives the
+/// agent and drops every frame the moment the exit tracepoint clears the
+/// owner, so it is already closed — and taking it down as well is not free:
+/// `ip link set down` flushes its addresses, the shared VIPs and the neighbour
+/// table, so a member that recovers and preempts comes back with established
+/// flows stalled until all of that is relearned. A zoned link outside the HA
+/// guard (on an HA box or not) has no other fence and is still held.
 pub fn to_hold_down(appliance: &Appliance, up: impl Fn(&str) -> bool) -> Vec<String> {
-    held(appliance).into_iter().filter(|n| up(n)).collect()
+    let fenced = crate::ha::guarded_interfaces(appliance);
+    held(appliance)
+        .into_iter()
+        .filter(|n| !fenced.contains(n) && up(n))
+        .collect()
 }
 
 /// Whether `name` exists and is administratively up.
@@ -350,5 +360,42 @@ name = "eth2"
         // eth0 is already down; eth2 is unzoned and never held.
         let up = |n: &str| n != "eth0";
         assert_eq!(to_hold_down(&appliance, up), vec!["eth1".to_string()]);
+    }
+
+    #[test]
+    fn an_ha_member_leaves_guard_fenced_links_up_and_holds_the_rest() {
+        let mut appliance = Appliance::from_toml(
+            r#"
+[system]
+hostname = "fw"
+[zone.lan]
+[zone.sync]
+[[interface]]
+name = "lan0"
+zone = "lan"
+[[interface]]
+name = "sync0"
+zone = "sync"
+"#,
+        )
+        .unwrap();
+        // Pairing material is beside the point here; only the mapping from
+        // `system.ha` to the guarded links matters.
+        appliance.system.ha = Some(crate::config::Ha {
+            enabled: true,
+            witness: "192.0.2.10:5440".into(),
+            sync_interface: "sync0".into(),
+            ..Default::default()
+        });
+        assert!(crate::ha::guarded_interfaces(&appliance).contains("lan0"));
+        assert!(!crate::ha::guarded_interfaces(&appliance).contains("sync0"));
+        // lan0 is fenced by the pinned HA guard, which outlives the agent;
+        // downing it would flush its addresses, VIPs and neighbours and stall
+        // established flows after recovery. sync0 is zoned but outside the
+        // guard, so nothing else closes it: it is still held.
+        assert_eq!(
+            to_hold_down(&appliance, |_| true),
+            vec!["sync0".to_string()]
+        );
     }
 }

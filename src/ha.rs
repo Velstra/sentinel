@@ -800,6 +800,9 @@ fn state_address(a: &Appliance, remote: IpAddr) -> Result<(String, String)> {
     ))
 }
 
+/// How long the primary waits for the peer to apply and acknowledge pairing.
+const PAIR_ACK_SECS: u32 = 25;
+
 pub fn pair(
     peer: &str,
     secret: &str,
@@ -1044,12 +1047,16 @@ pub fn pair(
     staged
         .file
         .write_all(serde_json::to_string(&plan.request)?.as_bytes())?;
+    // The peer answers only after its live apply, which restarts its data
+    // plane: its zoned links, the one carrying this request included, are
+    // held down until the new agent has hooked them again. The budget covers
+    // that restart, not just a round trip.
     system::curl_request(
         &format!("https://{peer}/api/v1/ha/pair"),
         Some(secret),
         "POST",
         Some(&staged.path),
-        10,
+        PAIR_ACK_SECS,
         Some(&plan.pin),
     )
     .context(

@@ -881,6 +881,9 @@
           # its hooks are back. `+` runs it with full privileges whatever the
           # unit's own sandbox. The cost is deliberate: a commit that restarts
           # the agent bounces the zoned links for the length of its start.
+          # Links an HA member's pinned guard fences are skipped: the guard
+          # already drops their traffic, and downing them would flush VIPs and
+          # neighbours and stall established flows across a failover.
           systemd.services.velstra.serviceConfig.ExecStopPost =
             "+${sentinel}/bin/sentinel hold-links-down --config /var/lib/sentinel/appliance.toml";
 
