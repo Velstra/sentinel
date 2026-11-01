@@ -4288,13 +4288,10 @@ impl Session {
             // that append rather than replace, like every other member set.
             ["services", "dns", "secure-upstream", v] => {
                 for one in v.split(',').map(str::trim).filter(|x| !x.is_empty()) {
-                    if !(one.starts_with("tls://") || one.starts_with("https://")) {
-                        bail!(
-                            "services dns secure-upstream {one:?}: tls://<host> or \
-                             https://<host>/dns-query — the scheme is what says how it is \
-                             encrypted"
-                        );
-                    }
+                    // The same grammar commit enforces, so a value refused there
+                    // is refused here first, where the operator is still typing.
+                    crate::config::validate_secure_upstream(one)
+                        .with_context(|| format!("services dns secure-upstream {one:?}"))?;
                     push_unique(&mut self.draft.dns.secure_upstream, one);
                 }
             }

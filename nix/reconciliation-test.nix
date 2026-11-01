@@ -87,6 +87,34 @@ pkgs.testers.runNixOSTest {
         configure([])
         assert fw.succeed("cat /sys/class/net/tenant0/ifindex").strip() == first
 
+    with subtest("a recreated zoned link stays down until the data plane has hooked it"):
+        # With the agent stopped nothing can hook the link, so a link that
+        # comes up anyway forwards unfiltered: exactly the window between a
+        # link appearing and the agent's next pass. networkd recreates the
+        # deleted VLAN from its unit; the hold must keep it down.
+        fw.succeed("systemctl stop velstra.service")
+        fw.succeed("ip link delete tenant0")
+        fw.succeed("networkctl reload")
+        fw.wait_until_succeeds("test -e /sys/class/net/tenant0")
+        for _ in range(5):
+            flags = json.loads(fw.succeed("ip -j link show dev tenant0"))[0]["flags"]
+            assert "UP" not in flags, f"tenant0 came up with no data plane: {flags}"
+            fw.sleep(1)
+        fw.succeed("systemctl start velstra.service")
+        fw.wait_until_succeeds("ip -o link show dev tenant0 | grep -Eq '[<,]UP[,>]'", timeout=30)
+        fw.succeed("ip -d link show tenant0 | grep -q 'prog/xdp'")
+        fw.wait_until_succeeds("ip -4 addr show tenant0 | grep -q 192.0.2.1")
+        first = fw.succeed("cat /sys/class/net/tenant0/ifindex").strip()
+
+    with subtest("an unchanged commit removes addresses the configuration does not set"):
+        fw.succeed("ip addr add 203.0.113.77/32 dev tenant0")
+        fw.succeed("ip -6 addr add 2001:db8:77::7/64 dev tenant0 nodad")
+        configure([])
+        fw.wait_until_fails("ip -4 addr show tenant0 | grep -q 203.0.113.77")
+        fw.wait_until_fails("ip -6 addr show tenant0 | grep -q 2001:db8:77::7")
+        fw.succeed("ip -4 addr show tenant0 | grep -q 192.0.2.1")
+        assert fw.succeed("cat /sys/class/net/tenant0/ifindex").strip() == first
+
     with subtest("recreating a bridge reattaches its unchanged members"):
         before = fw.succeed("cat /sys/class/net/br0/ifindex").strip()
         configure(["set interface br0 bridge stp true"])
@@ -134,6 +162,16 @@ pkgs.testers.runNixOSTest {
             fw.fail("test -e /run/systemd/network/10-sentinel-" + name + ".netdev")
         fw.fail("test -e /run/sentinel/network-retire.json")
         configure([])
+
+    with subtest("a physical interface removed from the configuration is released"):
+        # networkd only forgets a link whose unit disappears; the address and
+        # the up state would stay, on a link the data plane no longer hooks.
+        configure(["set interface eth1 address 203.0.113.1/24"])
+        fw.wait_until_succeeds("ip -4 addr show eth1 | grep -q 203.0.113.1")
+        configure(["delete interface eth1"])
+        fw.wait_until_fails("ip -4 addr show eth1 | grep -q 203.0.113.1")
+        flags = json.loads(fw.succeed("ip -j link show dev eth1"))[0]["flags"]
+        assert "UP" not in flags, flags
 
     with subtest("DNS changes settle without restarting on every commit"):
         configure(["set services dns upstream 192.0.2.53"])

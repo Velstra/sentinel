@@ -527,6 +527,20 @@ pub fn ip_route(args: &[&str]) -> Result<()> {
     run_priv("ip", &all)
 }
 
+/// Add, delete or flush interface addresses. The arguments are the caller's.
+pub fn ip_addr(args: &[&str]) -> Result<()> {
+    let mut all = vec!["address"];
+    all.extend_from_slice(args);
+    run_priv("ip", &all)
+}
+
+/// Change a link's state. The arguments are the caller's.
+pub fn ip_link(args: &[&str]) -> Result<()> {
+    let mut all = vec!["link"];
+    all.extend_from_slice(args);
+    run_priv("ip", &all)
+}
+
 /// The addresses the box currently holds, as `ip -o addr show` prints them.
 ///
 /// Read from the kernel rather than from the configuration on purpose: an
@@ -1626,6 +1640,15 @@ pub fn networkctl_reload(ifaces: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Make the live WireGuard device `iface` match the `wg`-format file at `path`
+/// (key, port, peers), keeping the sessions of peers that did not change.
+pub fn wg_syncconf(iface: &str, path: &Path) -> Result<()> {
+    let Some(p) = path.to_str() else {
+        bail!("non-UTF-8 path");
+    };
+    run_priv("wg", &["syncconf", iface, p])
+}
+
 /// Retire a device created by a Sentinel netdev. Physical NICs are never deleted.
 pub fn delete_virtual_link(name: &str) -> Result<()> {
     if !Path::new("/sys/class/net").join(name).exists() {
@@ -1672,6 +1695,7 @@ pub fn bin(name: &str) -> String {
         "wren" => "SENTINEL_WREN_BIN",
         "velstra" => "SENTINEL_VELSTRA_BIN",
         "tc" => "SENTINEL_TC_BIN",
+        "wg" => "SENTINEL_WG_BIN",
         "loadkeys" => "SENTINEL_LOADKEYS_BIN",
         "loginctl" => "SENTINEL_LOGINCTL_BIN",
         "timedatectl" => "SENTINEL_TIMEDATECTL_BIN",

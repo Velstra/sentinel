@@ -144,6 +144,7 @@
             --set SENTINEL_CAT_BIN        ${pkgs.coreutils}/bin/cat \
             --set SENTINEL_TEST_BIN       ${pkgs.coreutils}/bin/test \
             --set SENTINEL_TC_BIN         ${pkgs.iproute2}/bin/tc \
+            --set SENTINEL_WG_BIN         ${pkgs.wireguard-tools}/bin/wg \
             --set SENTINEL_LOADKEYS_BIN   ${pkgs.kbd}/bin/loadkeys \
             --set SENTINEL_LOGINCTL_BIN   ${pkgs.systemd}/bin/loginctl \
             --set SENTINEL_SELF_BIN       $out/bin/.sentinel-wrapped \
@@ -614,14 +615,18 @@
           # DNS: systemd-resolved stays the box's own resolver (127.0.0.53);
           # dnsmasq is the LAN-facing resolver that `[services.dns]` drives via a
           # conf-dir drop-in Sentinel renders to /run/sentinel/dnsmasq.d. The base
-          # config binds dnsmasq to loopback only (bind-interfaces + interface=lo)
+          # config binds dnsmasq to loopback only (bind-dynamic + interface=lo)
           # so with no drop-in it never fights resolved for :53 on a real link;
           # the drop-in adds `interface=<serve-on>` to serve the LAN.
+          # bind-dynamic rather than bind-interfaces: both bind per address, but
+          # only bind-dynamic picks up an address that appears later — a VRRP/HA
+          # virtual address arrives after dnsmasq started, and DHCP hands it out
+          # as the segment's resolver.
           services.dnsmasq = {
             enable = true;
             resolveLocalQueries = false;
             settings = {
-              bind-interfaces = true;
+              bind-dynamic = true;
               interface = "lo";
               conf-dir = "/run/sentinel/dnsmasq.d/,*.conf";
             };
