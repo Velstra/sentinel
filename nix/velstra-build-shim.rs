@@ -2,7 +2,7 @@
 //!
 //! In the Nix build the eBPF object is compiled by a separate fixed-output
 //! derivation (which is allowed network for `-Z build-std`). This replaces the
-//! normal aya-build invocation: instead of building the eBPF here (which would
+//! normal Cargo BPF invocation: instead of building the eBPF here (which would
 //! need offline build-std and fail in the sandbox), it copies the pre-built
 //! object the derivation hands us via $VELSTRA_EBPF_OBJ into $OUT_DIR/velstra,
 //! exactly where the agent's `include_bytes_aligned!(OUT_DIR/velstra)` expects.

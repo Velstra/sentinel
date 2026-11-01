@@ -87,11 +87,32 @@ jobs:
           - lldp
           - bgp
           - nat
+          - masq
           - ebpf-verifier
+          - startup-continuity
+          - rule-contexts
+          - scope-lifecycle
+          - stateful-packet-validation
           - reconcile
           - wren-reconcile
           - config-transaction
           - egress-transaction
+          - state-device
+          - login-reconcile
+          - service-reconcile
+          - network-reconcile
+          - vlan-lifecycle
+          - link-defaults
+          - link-driver-limit
+          - ipv6-egress
+          - masquerade-policy
+          - napt-reservation
+          - datapath-lifetime
+          - agent-readiness
+          - flowspec
+          - xdp-mode-transition
+          - wireguard
+          - update
     steps:
       - uses: actions/checkout@v7
       # nixosTests build a full NixOS VM (kernel + qemu + system closure), which

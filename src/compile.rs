@@ -235,6 +235,7 @@ const DEFAULT_SYNPROXY_MSS: u16 = 1460;
 pub(crate) struct Policy {
     pub(crate) id: u32,
     pub(crate) name: String,
+    pub(crate) state_scope: String,
     pub(crate) default_action: &'static str,
     pub(crate) stateful: bool,
     pub(crate) drop_icmp: bool,
@@ -254,9 +255,9 @@ pub(crate) struct Policy {
 
 /// Which policy id each zone in use compiles to.
 ///
-/// Assigned by sorted zone name so a recompile is deterministic — the map keys
-/// the data plane uses for conntrack and rules must not move because an
-/// interface was added. Exposed because the portal has to name a zone's policy
+/// Assigned by sorted zone name, deterministic for a fixed set of zones.
+/// Adding/removing a zone can renumber existing IDs. The separate state_scope
+/// emitted for each zone preserves connection identity across those changes. Exposed because the portal has to name a zone's policy
 /// to the agent, and a second implementation of this rule would eventually
 /// admit devices to the wrong zone.
 pub fn zone_policy_ids(appliance: &Appliance) -> BTreeMap<&str, u32> {
@@ -460,10 +461,73 @@ pub(crate) struct PortForwardOut {
 /// The Nix contract check verifies this against Fabric's ABI constant.
 pub const MAX_RATE_LIMITED_RULES: usize = 127;
 
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct RuleMatchKey<'a> {
+    trie: u8,
+    protocol: &'a str,
+    icmp_type: u8,
+    port: u16,
+    interface: &'a str,
+    prefix: u8,
+    address: u128,
+}
+fn rule_match_key(rule: &PortRule) -> anyhow::Result<(RuleMatchKey<'_>, Option<&str>)> {
+    use std::net::IpAddr;
+    let mut family = rule.family.as_deref();
+    let (trie, prefix, address) = if let Some(text) = rule.src.as_deref().or(rule.dst.as_deref()) {
+        let (ip, prefix) = text
+            .split_once('/')
+            .map_or((text, None), |(ip, prefix)| (ip, Some(prefix)));
+        let ip: IpAddr = ip.parse()?;
+        let (address, width, actual_family) = match ip {
+            IpAddr::V4(ip) => (u32::from(ip) as u128, 32, "ipv4"),
+            IpAddr::V6(ip) => (u128::from(ip), 128, "ipv6"),
+        };
+        let prefix: u8 = prefix.map(str::parse).transpose()?.unwrap_or(width);
+        if prefix > width {
+            anyhow::bail!("rule {:?}: invalid prefix length", rule.name);
+        }
+        if family.is_some_and(|wanted| wanted != actual_family) {
+            anyhow::bail!("rule {:?}: address contradicts its IP family", rule.name);
+        }
+        let address = if prefix == 0 {
+            0
+        } else {
+            address & (u128::MAX << (width - prefix))
+        };
+        let ipv6 = actual_family == "ipv6";
+        family = Some(actual_family);
+        (
+            u8::from(ipv6) * 2 + u8::from(rule.dst.is_some()),
+            prefix,
+            address,
+        )
+    } else {
+        (0, 0, 0)
+    };
+    Ok((
+        RuleMatchKey {
+            trie,
+            protocol: rule.proto,
+            icmp_type: rule.icmp_type.map_or(0, |kind| kind.wrapping_add(1)),
+            port: if rule.icmp_type.is_some() {
+                0
+            } else {
+                rule.port
+            },
+            interface: rule.in_interface.as_deref().unwrap_or(""),
+            prefix,
+            address,
+        },
+        family,
+    ))
+}
+
 impl VelstraConfig {
     /// Count emitted rules, including protocol, group and zone expansion.
     /// Reject overflow before a commit can install an unlimited fallback.
     pub fn validate_capacity(&self) -> anyhow::Result<()> {
+        self.validate_rule_scopes()?;
         let limited = self
             .policies
             .iter()
@@ -474,6 +538,31 @@ impl VelstraConfig {
             anyhow::bail!(
                 "firewall: {limited} rate-limited rules after expansion exceeds the data plane's {MAX_RATE_LIMITED_RULES}; reduce the number of rate-limited rules or their expansion"
             );
+        }
+        Ok(())
+    }
+
+    /// The dataplane keys each wire context independently. Validate the
+    /// expanded representation before a commit can exceed a physical trie.
+    fn validate_rule_scopes(&self) -> anyhow::Result<()> {
+        let mut counts = [0usize; 4];
+        for policy in &self.policies {
+            for rule in &policy.port_rules {
+                if rule.src_mac.is_some() {
+                    continue;
+                }
+                let (key, family) = rule_match_key(rule)?;
+                let families = if family.is_some() { 1 } else { 2 };
+                let directions = if rule.direction.is_some() { 1 } else { 2 };
+                counts[key.trie as usize] += families * directions;
+            }
+        }
+        for (trie, count) in counts.into_iter().enumerate() {
+            if count > 8192 {
+                anyhow::bail!(
+                    "firewall trie {trie}: {count} expanded rules exceeds the data plane's 8192"
+                );
+            }
         }
         Ok(())
     }
@@ -825,6 +914,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
             Policy {
                 id: ids[zone],
                 name: zone.to_string(),
+                state_scope: format!("zone/{zone}"),
                 default_action,
                 stateful: posture.stateful,
                 drop_icmp: posture.block_icmp,
@@ -1234,6 +1324,56 @@ fn cidr_contains(cidr: &str, addr: std::net::IpAddr) -> Option<u8> {
 mod tests {
     use super::*;
     use crate::config::Appliance;
+
+    #[test]
+    fn zone_scope_limits_are_rejected_before_agent_apply() {
+        for zone in [
+            "".to_owned(),
+            "a".repeat(124),
+            "é".repeat(62),
+            "bad\nzone".to_owned(),
+        ] {
+            let mut appliance = Appliance::from_toml(
+                "[system]\nhostname='fw'\n[[interface]]\nname='wan0'\nzone='a'\n",
+            )
+            .unwrap();
+            appliance.interfaces[0].zone = Some(zone);
+            let error = appliance.validate().unwrap_err().to_string();
+            assert!(error.contains("zone name must contain"), "{error}");
+        }
+        let mut appliance =
+            Appliance::from_toml("[system]\nhostname='fw'\n[[interface]]\nname='wan0'\nzone='a'\n")
+                .unwrap();
+        appliance.interfaces[0].zone = Some("a".repeat(123));
+        appliance.validate().unwrap();
+        let config = compile(&appliance);
+        assert!(config.policies.iter().any(|p| p.state_scope.len() == 128));
+    }
+
+    #[test]
+    fn zone_scope_is_stable_when_policy_ordinals_move() {
+        let original =
+            Appliance::from_toml("[system]\nhostname='fw'\n[[interface]]\nname='wan0'\nzone='b'\n")
+                .unwrap();
+        let moved = Appliance::from_toml("[system]\nhostname='fw'\n[[interface]]\nname='wan0'\nzone='b'\n[[interface]]\nname='lan0'\nzone='a'\n").unwrap();
+        let first = compile(&original);
+        let second = compile(&moved);
+        let before = first.policies.iter().find(|p| p.name == "b").unwrap();
+        let after = second.policies.iter().find(|p| p.name == "b").unwrap();
+        assert_ne!(before.id, after.id);
+        assert_eq!(before.state_scope, "zone/b");
+        assert_eq!(before.state_scope, after.state_scope);
+        let encoded: toml::Value = toml::from_str(&second.to_toml().unwrap()).unwrap();
+        for policy in encoded["policy"].as_array().unwrap() {
+            assert_eq!(
+                policy["state_scope"].as_str().unwrap(),
+                format!("zone/{}", policy["name"].as_str().unwrap())
+            );
+        }
+        for interface in encoded["interface"].as_array().unwrap() {
+            assert!(interface.get("state_scope").is_none());
+        }
+    }
 
     /// Point the country database at a temporary directory holding two small
     /// countries, so the expansion can be asserted exactly rather than against
@@ -2975,5 +3115,58 @@ underlay-interface = "eth0"
             "the peer trust list is missing: {out}"
         );
         assert!(!out.contains("[overlay]"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod rule_scope_validation_tests {
+    use crate::config::Appliance;
+    #[test]
+    fn zero_address_prefixes_keep_their_explicit_wire_family() {
+        for field in ["source", "destination"] {
+            for network in ["0.0.0.0/0", "0.0.0.0/1", "0.0.0.0/32"] {
+                let cfg: Appliance = toml::from_str(&format!("[system]\nhostname='fw'\n[[interface]]\nname='wan0'\nzone='wan'\n[[rule]]\nname='zero'\nfrom='wan'\nproto='tcp'\nport=443\naction='drop'\n{field}='{network}'")).unwrap();
+                let compiled = super::compile(&cfg);
+                let rule = &compiled
+                    .policies
+                    .iter()
+                    .find(|p| p.name == "wan")
+                    .unwrap()
+                    .port_rules[0];
+                assert_eq!(super::rule_match_key(rule).unwrap().1, Some("ipv4"));
+            }
+        }
+    }
+    #[test]
+    fn independent_families_are_preserved_before_commit_and_save() {
+        let config = "[system]\nhostname='fw'\n[[interface]]\nname='wan0'\nzone='wan'\n[[rule]]\nname='deny-v4'\nfrom='wan'\nproto='udp'\nport=18091\naction='drop'\nfamily='ipv4'\n[[rule]]\nname='allow-v6'\nfrom='wan'\nproto='udp'\nport=18091\naction='accept'\nfamily='ipv6'\n";
+        let appliance = Appliance::from_toml(config).unwrap();
+        let compiled = super::compile(&appliance);
+        let rules = &compiled
+            .policies
+            .iter()
+            .find(|p| p.name == "wan")
+            .unwrap()
+            .port_rules;
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].family.as_deref(), Some("ipv4"));
+        assert_eq!(rules[1].family.as_deref(), Some("ipv6"));
+        compiled.to_toml().unwrap();
+    }
+    #[test]
+    fn independent_directions_and_same_scope_overrides_are_preserved() {
+        let make = |direction: &str| {
+            format!(
+                "[system]\nhostname='fw'\n[[interface]]\nname='wan0'\nzone='wan'\n[[rule]]\nname='one'\nfrom='wan'\nproto='tcp'\nport=443\naction='drop'\ndirection='in'\n[[rule]]\nname='two'\nfrom='wan'\nproto='tcp'\nport=443\naction='accept'\ndirection='{direction}'\n"
+            )
+        };
+        Appliance::from_toml(&make("out"))
+            .unwrap()
+            .validate()
+            .unwrap();
+        Appliance::from_toml(&make("in"))
+            .unwrap()
+            .validate()
+            .unwrap();
     }
 }

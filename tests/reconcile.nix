@@ -41,6 +41,8 @@ in pkgs.testers.runNixOSTest {
     machine.wait_for_unit("multi-user.target")
     machine.wait_for_unit("sentinel-boot.service")
     machine.succeed("systemctl stop velstra.service")
+    # Service stop intentionally retains enforcement; this fixture owns a new agent.
+    machine.succeed("if test -d /sys/fs/bpf/sentinel; then ${velstra}/bin/velstra detach --datapath-state-dir /sys/fs/bpf/sentinel; fi")
     machine.succeed("systemctl mask --runtime velstra.service")
     machine.succeed("ip netns add verify-client")
     machine.succeed("ip link add verify-u type veth peer name verify-up")

@@ -1498,21 +1498,39 @@ async fn get_show(
 async fn post_validate_configure(
     State(state): State<Arc<ApiState>>,
     body: String,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     if body.len() > 256 * 1024 {
         return Err(ApiError::bad_request(anyhow!(
             "configuration script too large"
         )));
     }
     let path = state.config_path.clone();
-    tokio::task::spawn_blocking(move || repl::validate_script(&path, &body))
+    let result = tokio::task::spawn_blocking(move || repl::validate_script(&path, &body))
         .await
-        .map_err(|e| ApiError::internal(anyhow!("configuration validation task: {e}")))?
-        .map_err(ApiError::bad_request)?;
-    Ok(Json(json!({
-        "ok": true,
-        "output": "✔ configuration is valid; nothing was applied or saved\n",
-    })))
+        .map_err(|e| ApiError::internal(anyhow!("configuration validation task: {e}")))?;
+    match result {
+        Ok(_) => Ok(Json(json!({
+            "ok": true,
+            "output": "✔ configuration is valid; nothing was applied or saved\n",
+        }))
+        .into_response()),
+        Err(error) => {
+            // Only an edit refusal identifies an individual line. A domain
+            // error concerns the complete candidate and must never authorize
+            // the UI to drop one of its dependencies and retry a subset.
+            let line = error
+                .downcast_ref::<repl::ScriptEditError>()
+                .map(|e| e.line);
+            Ok((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!("{error:#}"),
+                    "edit_line": line,
+                })),
+            )
+                .into_response())
+        }
+    }
 }
 
 /// `POST /api/v1/configure` — run configuration commands.
@@ -1554,30 +1572,9 @@ async fn post_configure(
         if no_apply {
             cmd.arg("--no-apply");
         }
-        let mut child = cmd
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| std::io::Error::other("configure has no stdin"))?;
-        // Drain both output pipes while feeding stdin. Writing the whole script
-        // first deadlocks when diagnostics fill stderr before stdin is consumed.
-        std::thread::scope(|scope| {
-            let writer = scope.spawn(move || {
-                use std::io::Write as _;
-                stdin.write_all(body.as_bytes())
-            });
-            let output = child.wait_with_output();
-            let written = writer
-                .join()
-                .map_err(|_| std::io::Error::other("configure input writer panicked"))?;
-            let output = output?;
-            written?;
-            Ok(output)
-        })
+        // Share the deadlock-free, early-exit-safe pipe transport with private
+        // password updates; neither caller puts sensitive input into argv.
+        system::command_output_with_input(cmd, body.as_bytes())
     })
     .await
     .map_err(|e| ApiError::internal(anyhow!("running configure: {e}")))?
@@ -1636,16 +1633,38 @@ async fn post_clear(UrlPath(path): UrlPath<String>) -> Result<Response, ApiError
 /// capture runs, and a `GET` that does that is one a browser or a proxy will
 /// happily repeat. Bounded by [`capture::Capture`] before anything is run, so
 /// the endpoint cannot be asked to hold the connection open indefinitely.
-async fn post_capture(Json(req): Json<Value>) -> Result<Response, ApiError> {
-    let field = |k: &str| req.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-    let num = |k: &str, d: u32| req.get(k).and_then(Value::as_u64).unwrap_or(d as u64) as u32;
-    let capture = capture::Capture::new(
-        &field("interface"),
-        &field("filter"),
-        num("packets", 50),
-        num("seconds", 10),
+/// Decode before starting any diagnostic process. Defaults apply only to
+/// omitted fields; malformed values must never silently broaden a capture.
+/// Large unsigned limits retain the CLI's saturating/clamping semantics.
+fn capture_request(req: &Value) -> Result<capture::Capture> {
+    anyhow::ensure!(req.is_object(), "a capture request must be an object");
+    let interface = req
+        .get("interface")
+        .and_then(Value::as_str)
+        .context("capture interface must be a string")?;
+    let filter = match req.get("filter") {
+        None => "",
+        Some(value) => value.as_str().context("capture filter must be a string")?,
+    };
+    let count = |name: &str, default: u32| -> Result<u32> {
+        let Some(value) = req.get(name) else {
+            return Ok(default);
+        };
+        let number = value
+            .as_u64()
+            .with_context(|| format!("capture {name} must be a non-negative integer"))?;
+        Ok(u32::try_from(number).unwrap_or(u32::MAX))
+    };
+    capture::Capture::new(
+        interface,
+        filter,
+        count("packets", 50)?,
+        count("seconds", 10)?,
     )
-    .map_err(ApiError::bad_request)?;
+}
+
+async fn post_capture(Json(req): Json<Value>) -> Result<Response, ApiError> {
+    let capture = capture_request(&req).map_err(ApiError::bad_request)?;
 
     // Blocking work on the async runtime would stall every other request for as
     // long as the capture runs, and the whole point is that it runs for a while.
@@ -2033,6 +2052,46 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_limits_saturate_without_wrapping_and_keep_defaults() {
+        for (request, packets, seconds) in [
+            (json!({"interface": "lo"}), 50, 10),
+            (json!({"interface": "lo", "packets": 0, "seconds": 0}), 1, 1),
+            (json!({"interface": "lo", "packets": 3, "seconds": 2}), 3, 2),
+            (
+                json!({"interface": "lo", "packets": 4294967297u64, "seconds": 4294967297u64}),
+                500,
+                60,
+            ),
+            (
+                json!({"interface": "lo", "packets": u64::MAX, "seconds": u64::MAX}),
+                500,
+                60,
+            ),
+        ] {
+            let capture = capture_request(&request).unwrap();
+            assert_eq!((capture.packets, capture.seconds), (packets, seconds));
+        }
+    }
+
+    #[test]
+    fn capture_fields_do_not_silently_ignore_invalid_types() {
+        for value in [json!(null), json!(false), json!("1"), json!(-1), json!(1.5)] {
+            for field in ["packets", "seconds"] {
+                let mut request = json!({"interface": "lo"});
+                request[field] = value.clone();
+                let error = capture_request(&request).unwrap_err();
+                assert!(error.to_string().contains(field), "{error}");
+            }
+        }
+        for value in [json!(null), json!(false), json!([]), json!({})] {
+            let error = capture_request(&json!({"interface": "lo", "filter": value})).unwrap_err();
+            assert!(error.to_string().contains("filter"), "{error}");
+        }
+        assert!(capture_request(&json!([])).is_err());
+        assert!(capture_request(&json!({})).is_err());
+    }
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use tower::ServiceExt;

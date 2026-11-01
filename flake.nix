@@ -135,11 +135,14 @@
             --set SENTINEL_JOURNALCTL_BIN ${pkgs.systemd}/bin/journalctl \
             --set SENTINEL_WREN_BIN       ${wrenPkg}/bin/wren \
             --set SENTINEL_LSBLK_BIN      ${pkgs.util-linux}/bin/lsblk \
+            --set SENTINEL_BLKID_BIN      ${pkgs.util-linux}/bin/blkid \
             --set SENTINEL_INSTALL_BIN    ${pkgs.coreutils}/bin/install \
             --set SENTINEL_MV_BIN         ${pkgs.coreutils}/bin/mv \
             --set SENTINEL_MKDIR_BIN      ${pkgs.coreutils}/bin/mkdir \
             --set SENTINEL_USERADD_BIN    ${pkgs.shadow}/bin/useradd \
             --set SENTINEL_USERMOD_BIN    ${pkgs.shadow}/bin/usermod \
+            --set SENTINEL_CHPASSWD_BIN   ${pkgs.shadow}/bin/chpasswd \
+            --set SENTINEL_SYNC_BIN       ${pkgs.coreutils}/bin/sync \
             --set SENTINEL_ID_BIN         ${pkgs.coreutils}/bin/id \
             --set SENTINEL_CHMOD_BIN      ${pkgs.coreutils}/bin/chmod \
             --set SENTINEL_RM_BIN         ${pkgs.coreutils}/bin/rm \
@@ -183,7 +186,7 @@
 
       # --- the velstra eBPF/XDP agent (needs nightly + rust-src + bpf-linker) -
       # fenix's `complete` nightly bundles rust-src, which the BPF target's
-      # build-std needs. The agent's build.rs (aya-build) compiles the eBPF crate
+      # build-std needs. The agent's build.rs compiles the eBPF crate
       # for the bpf target during this build.
       # Match Fabric's verified LLVM-22 toolchain. Older LLVM cannot lower the
       # current datapath; rolling LLVM-23 builds have emitted invalid r11 uses.
@@ -274,10 +277,16 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its observed output hash. Updating the datapath requires a
       # fresh build and verification of the resulting object before repinning.
-      ebpfHash = "sha256-skXnUxs5uu1CmA+YnRgIMeKuMWXORpa+5xu5OmPL+bo=";
+      ebpfHash = "sha256-2B7fO3mo0ZuSoYCj2015rd5Twyt6gaHl8SSPuNrwjek=";
       fabricBuildId = builtins.substring 0 12 (
         fabric.rev or (builtins.hashString "sha256" fabric.outPath)
       );
+      # Older public Fabric revisions predate the atomic target. Keep their
+      # pinned object reproducible until the dependency is advanced together
+      # with its verified object hash.
+      atomicBpfTarget = builtins.pathExists "${fabric}/velstra-ebpf/targets/bpfel-atomic.json";
+      bpfTarget = if atomicBpfTarget then "velstra-ebpf/targets/bpfel-atomic.json" else "bpfel-unknown-none";
+      bpfTargetDirectory = if atomicBpfTarget then "bpfel-atomic" else "bpfel-unknown-none";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         # A fixed-output path is identified by hash AND name. Include its
         # source/toolchain identity so advancing the Fabric pin cannot silently
@@ -301,14 +310,14 @@
 
         buildPhase = ''
           export CARGO_HOME=$TMPDIR/cargo
-          # Same flags aya-build uses for the BPF target, plus the explicit
-          # bpf-linker selection.
-          export RUSTFLAGS='--cfg=bpf_target_arch="x86_64" -Cdebuginfo=2 -Clinker=bpf-linker -Clink-arg=--btf'
+          # Match the normal Cargo build: BTF, explicit linker and the
+          # versioned target, including real 32/64-bit CAS support.
+          export RUSTFLAGS='--cfg=bpf_target_arch="x86_64" -Cdebuginfo=2 -Clinker=bpf-linker -Clink-arg=--btf${pkgs.lib.optionalString atomicBpfTarget " -Dwarnings -Dlinker-messages"}'
           cargo build -p velstra-ebpf --bins --release --locked \
-            --target bpfel-unknown-none -Z build-std=core
+            --target ${bpfTarget} ${pkgs.lib.optionalString atomicBpfTarget "-Z json-target-spec"} -Z build-std=core
         '';
         installPhase = ''
-          cp target/bpfel-unknown-none/release/velstra "$out"
+          cp target/${bpfTargetDirectory}/release/velstra "$out"
         '';
       };
 
@@ -316,6 +325,9 @@
         pname = "velstra";
         version = "0.1.0";
         src = fabric;
+        passthru.supportsPersistentDatapath =
+          ((builtins.fromTOML (builtins.readFile "${fabric}/velstra-app/Cargo.toml"))
+            .package.metadata.velstra.persistent-datapath or false);
         cargoLock = {
           lockFile = "${fabric}/Cargo.lock";
           outputHashes = ayaOutputHashes;
@@ -569,14 +581,16 @@
           # DNS: systemd-resolved stays the box's own resolver (127.0.0.53);
           # dnsmasq is the LAN-facing resolver that `[services.dns]` drives via a
           # conf-dir drop-in Sentinel renders to /run/sentinel/dnsmasq.d. The base
-          # config binds dnsmasq to loopback only (bind-interfaces + interface=lo)
+          # config binds dnsmasq to loopback only (bind-dynamic + interface=lo)
           # so with no drop-in it never fights resolved for :53 on a real link;
           # the drop-in adds `interface=<serve-on>` to serve the LAN.
+          # Bind only selected addresses, but follow future and recreated links
+          # without a restart; VLANs may intentionally remain DOWN during apply.
           services.dnsmasq = {
             enable = true;
             resolveLocalQueries = false;
             settings = {
-              bind-interfaces = true;
+              bind-dynamic = true;
               interface = "lo";
               conf-dir = "/run/sentinel/dnsmasq.d/,*.conf";
             };
@@ -1499,6 +1513,25 @@
 
         # Load every embedded program with the real agent and inspect actual
         # kernel attachments, including the overlay-only BUM classifier.
+        stateful-packet-validation = import ./tests/stateful-packet-validation.nix {
+          inherit pkgs velstra;
+          sentinelModule = self.nixosModules.sentinel;
+        };
+        scope-lifecycle = import ./tests/scope-lifecycle.nix {
+          inherit pkgs;
+          controller = testController;
+          sentinelModule = self.nixosModules.sentinel;
+          velstra = velstra;
+        };
+        rule-contexts = import ./tests/rule-contexts.nix {
+          inherit pkgs;
+          sentinelModule = self.nixosModules.sentinel;
+        };
+
+        startup-continuity = import ./tests/startup-continuity.nix {
+          inherit pkgs velstra;
+        };
+
         ebpf-verifier = import ./tests/ebpf-kernel.nix {
           inherit pkgs sentinel velstra fabric;
           sentinelModule = self.nixosModules.sentinel;
@@ -1517,6 +1550,17 @@
           sentinelModule = self.nixosModules.sentinel;
         };
 
+        state-device = import ./tests/state-device.nix {
+          inherit pkgs sentinel;
+          sentinelModule = self.nixosModules.sentinel;
+          imageModule = ./nix/image.nix;
+        };
+
+        login-reconcile = import ./tests/login-reconcile.nix {
+          inherit pkgs;
+          sentinelModule = self.nixosModules.sentinel;
+        };
+
         # Capacity/permission failures exercise real map writes and packets.
         config-transaction = import ./tests/config-transaction.nix {
           inherit pkgs sentinel velstra;
@@ -1527,6 +1571,56 @@
           inherit pkgs sentinel velstra;
           sentinelModule = self.nixosModules.sentinel;
           controller = testController;
+        };
+
+        service-reconcile = import ./tests/service-reconcile.nix {
+          inherit pkgs sentinel;
+          sentinelModule = self.nixosModules.sentinel;
+        };
+        rate-budget = import ./tests/rate-budget.nix {
+          inherit pkgs;
+          sentinelModule = self.nixosModules.sentinel;
+        };
+        napt-reservation = import ./tests/napt-reservation.nix {
+          inherit pkgs sentinel;
+          sentinelModule = self.nixosModules.sentinel;
+        };
+        masquerade-policy = import ./tests/masquerade-policy.nix {
+          inherit pkgs sentinel;
+          sentinelModule = self.nixosModules.sentinel;
+        };
+        ipv6-egress = import ./tests/ipv6-egress.nix {
+          inherit pkgs sentinel;
+          sentinelModule = self.nixosModules.sentinel;
+        };
+        link-driver-limit = import ./tests/link-defaults.nix {
+          inherit pkgs sentinel;
+          sentinelModule = self.nixosModules.sentinel;
+          limitedMtu = true;
+        };
+        link-defaults = import ./tests/link-defaults.nix {
+          inherit pkgs sentinel;
+          sentinelModule = self.nixosModules.sentinel;
+        };
+        vlan-lifecycle = import ./tests/vlan-lifecycle.nix {
+          inherit pkgs sentinel;
+          sentinelModule = self.nixosModules.sentinel;
+        };
+        network-reconcile = import ./tests/network-reconcile.nix {
+          inherit pkgs sentinel;
+          sentinelModule = self.nixosModules.sentinel;
+        };
+        datapath-lifetime = import ./tests/datapath-lifetime.nix {
+          inherit pkgs sentinel velstra;
+          sentinelModule = self.nixosModules.sentinel;
+        };
+        agent-readiness = import ./tests/agent-readiness.nix {
+          inherit pkgs sentinel;
+          sentinelModule = self.nixosModules.sentinel;
+        };
+        xdp-mode-transition = import ./tests/xdp-mode-transition.nix {
+          inherit pkgs sentinel velstra;
+          sentinelModule = self.nixosModules.sentinel;
         };
 
         # The web console, driven in a real browser.
@@ -1936,8 +2030,8 @@
           machine.wait_for_unit("velstra.service")
 
           # VLAN subinterface: declare a tagged link on eth0 in its own `iot`
-          # zone. Sentinel writes the .netdev; networkd creates the real 802.1Q
-          # link; the agent attaches XDP to it like any other zoned interface
+          # zone. Sentinel creates the owned 802.1Q link DOWN; networkd configures
+          # its address, then the agent attaches XDP like any zoned interface
           # (its config-interface reconcile path) — so per-VLAN firewalling works
           # with no eBPF VLAN decoding.
           machine.succeed(
@@ -1947,10 +2041,10 @@
               "commit save exit "
               "| sentinel configure\""
           )
-          # Sentinel wrote the VLAN netdev unit ...
-          machine.succeed("test -f /run/systemd/network/10-sentinel-eth0.50.netdev")
-          machine.succeed("grep -q 'Kind=vlan' /run/systemd/network/10-sentinel-eth0.50.netdev")
-          # ... and networkd created the real tagged link with id 50.
+          # The real device is owned and protected before activation.
+          machine.succeed("test ! -e /run/systemd/network/10-sentinel-eth0.50.netdev")
+          machine.succeed("grep -q ActivationPolicy=manual /run/systemd/network/10-sentinel-eth0.50.network")
+          # The actual tagged link has ID 50.
           machine.wait_until_succeeds("ip -d link show eth0.50 | grep -q 'id 50'", timeout=20)
           machine.wait_until_succeeds("ip addr show eth0.50 | grep -q 10.0.50.1", timeout=20)
           # The compiled config binds the VLAN interface to the iot policy, and the
@@ -2881,7 +2975,7 @@
           machine.succeed("grep -q '\"wg0\"' /run/sentinel/velstra.toml")
           # save persisted the wireguard interface (private key + peer).
           machine.succeed("grep -q 'private-key' /var/lib/sentinel/appliance.toml")
-        '';
+        '' + builtins.readFile ./tests/private-network-idempotency.py;
       };
 
       # IPsec site-to-site (roadmap C2): two Sentinel appliances (`left`/`right`)
@@ -3850,6 +3944,23 @@
           )
           assert fw.succeed("systemctl show -p MainPID --value haproxy.service").strip() == proxy_pid
           client.succeed("curl -fsSk https://10.0.0.1:443/ | grep -qE 'BACKEND-[AB]'")
+          import shlex
+          with subtest("a client verifies the reverse-proxy certificate against its issuing CA"):
+              certificate = fw.succeed("cat /var/lib/sentinel/pki/ca/web-ca/ca.crt")
+              client.succeed("printf '%s' " + shlex.quote(certificate) + " > /tmp/trusted-proxy-ca.pem")
+              client.succeed("curl -fsS --noproxy '*' --max-time 10 --cacert /tmp/trusted-proxy-ca.pem https://10.0.0.1:443/ | grep -qE 'BACKEND-[AB]'")
+          with subtest("a trusted certificate is rejected for a different hostname"):
+              code, output = client.execute("curl -fsS --noproxy '*' --max-time 10 --cacert /tmp/trusted-proxy-ca.pem --resolve wrong.invalid:443:10.0.0.1 https://wrong.invalid:443/ 2>&1")
+              assert code == 60, (code, output)
+          with subtest("a client rejects a certificate issued by an untrusted CA"):
+              fw.succeed("su admin -c \"printf '%s\\n' 'set pki ca unrelated-ca common-name unrelated-ca' commit save exit | sentinel configure\"")
+              other = fw.succeed("cat /var/lib/sentinel/pki/ca/unrelated-ca/ca.crt")
+              client.succeed("printf '%s' " + shlex.quote(other) + " > /tmp/untrusted-proxy-ca.pem")
+              code, output = client.execute("curl -fsS --noproxy '*' --max-time 10 --cacert /tmp/untrusted-proxy-ca.pem https://10.0.0.1:443/ 2>&1")
+              assert code == 60, (code, output)
+              assert fw.succeed("systemctl show -p MainPID --value haproxy.service").strip() == proxy_pid
+              assert fw.succeed("stat -c %a /run/sentinel/haproxy/certs/web.pem").strip() == "600"
+              fw.fail("su admin -c 'cat /var/lib/sentinel/pki/certs/web-cert/cert.key'")
         '';
       };
 
@@ -4770,6 +4881,8 @@
                 }
               ];
               services.velstra.interface = lib.mkForce "eth1";
+              environment.systemPackages = [ pkgs.python3 pkgs.bpftools ];
+              environment.etc."fw-flow-ownership.py".source = ./tests/fw-flow-ownership.py;
             };
         };
         testScript = ''
@@ -4823,6 +4936,9 @@
                   "set interface eth1 zone wan",
                   "set firewall zone wan default-action accept",
                   "set firewall global default-action accept",
+                  "set firewall zone wan stateful true",
+                  "set system conntrack-sync listen 127.0.0.1:5429",
+                  "set system conntrack-sync peer 127.0.0.1:5430",
                   "set protocols router-id 10.7.0.2",
                   "set protocols bgp local-as 65010",
                   "set protocols bgp neighbor 10.7.0.1 remote-as 65010",
@@ -4840,6 +4956,9 @@
               )
               # And the box is reachable, so the drop below is a change.
               origin.wait_until_succeeds("ping -c 2 -W 5 10.7.0.2", timeout=30)
+              fw.wait_until_succeeds("journalctl -u velstra --no-pager | grep -q 'conntrack-sync: listening on 127.0.0.1:5429'", timeout=30)
+              fw.succeed("python3 /etc/fw-flow-ownership.py seed")
+              fw.wait_until_succeeds("python3 /etc/fw-flow-ownership.py present", timeout=20)
 
           with subtest("an advertised rule is enforced, not merely displayed"):
               originate(True)
@@ -4855,6 +4974,9 @@
               out = fw.succeed("su admin -c 'sentinel show firewall flowspec'")
               assert "1 rule(s) in force" in out, out
               assert "10.7.0.2/32" in out, out
+              # HA sync must not take revocation access away from FlowSpec.
+              # Inspect the map actually referenced by eth1's attached program.
+              fw.wait_until_succeeds("python3 /etc/fw-flow-ownership.py absent", timeout=20)
 
           with subtest("withdrawing it gives the traffic back"):
               # The other half of the same claim: a rule that is withdrawn and
@@ -4893,6 +5015,86 @@
               assert "constrains one end" in out, out
               # …and the traffic still flows, because refusing is not dropping.
               origin.succeed("ping -c 2 -W 5 10.7.0.2")
+
+          with subtest("HA state synchronization cannot bypass an explicit discard"):
+              originate(False)
+              fw.wait_until_succeeds(
+                  "sentinel agent-query flowspec | grep -q 'no flowspec rules in force'",
+                  timeout=90,
+              )
+              apply(
+                  "set system conntrack-sync listen 0.0.0.0:5429",
+                  "set firewall rule bgp-egress from wan",
+                  "set firewall rule bgp-egress action accept",
+                  "set firewall rule bgp-egress proto tcp",
+                  "set firewall rule bgp-egress port 179",
+                  "set firewall rule bgp-egress direction out",
+              )
+              fw.wait_until_succeeds(
+                  "journalctl -u velstra.service | grep -q 'conntrack-sync: listening'",
+                  timeout=30,
+              )
+              agent_pid = fw.succeed("systemctl show -p MainPID --value velstra.service").strip()
+              # Populate the stateful table AFTER the sync task takes its handle.
+              # ICMP flow keys persist across separate ping processes, so this
+              # exercises an existing admission rather than only a new flow.
+              origin.succeed("ping -c 3 -W 2 10.7.0.2")
+              fw.wait_until_succeeds(
+                  "sentinel show firewall statistics | awk '$1==\"tx_packets\"{seen=1;n=$2} END{exit !(seen && n>0)}'",
+                  timeout=30,
+              )
+              originate(True)
+              fw.wait_until_succeeds(
+                  "sentinel agent-query flowspec | grep -q '1 rule(s) in force'",
+                  timeout=90,
+              )
+              origin.wait_until_fails("ping -c 2 -W 2 10.7.0.2", timeout=30)
+              for _ in range(3):
+                  origin.fail("ping -c 2 -W 2 10.7.0.2")
+              # The local egress hook can create reply-state entries even after
+              # a discard is installed. Removing old entries once is insufficient.
+              fw.fail("ping -c 2 -W 2 10.7.0.1")
+              fw.succeed("wren show bgp neighbors | grep -qi established")
+              assert fw.succeed("systemctl show -p MainPID --value velstra.service").strip() == agent_pid
+
+              originate(False)
+              fw.wait_until_succeeds(
+                  "sentinel agent-query flowspec | grep -q 'no flowspec rules in force'",
+                  timeout=90,
+              )
+              origin.succeed("ping -c 3 -W 2 10.7.0.2")
+              fw.succeed("ping -c 2 -W 2 10.7.0.1")
+              assert fw.succeed("systemctl show -p MainPID --value velstra.service").strip() == agent_pid
+
+          with subtest("global FlowSpec enforcement works without zoned interfaces"):
+              # Remove the previous scenario's zone-scoped rule in the same
+              # candidate; a rule cannot reference a zone with no interfaces.
+              apply("delete firewall rule bgp-egress", "delete interface eth1 zone", "delete firewall zone wan")
+              fw.succeed("! grep -q '^VELSTRA_IFACE=' /run/sentinel/velstra.env")
+              fw.succeed("grep -q -- '--flowspec' /run/sentinel/velstra.env")
+              process = fw.succeed("systemctl show -p MainPID --value velstra.service").strip()
+              args = fw.succeed("ps -ww -p " + process + " -o args=").split()
+              assert args[args.index("--iface") + 1] == "eth1", args
+              fw.wait_until_succeeds("wren show bgp neighbors | grep -qi established", timeout=90)
+              origin.wait_until_succeeds("ping -c 2 -W 2 10.7.0.2", timeout=30)
+              originate(True)
+              fw.wait_until_succeeds("sentinel agent-query flowspec | grep -q '1 rule(s) in force'", timeout=90)
+              origin.wait_until_fails("ping -c 2 -W 2 10.7.0.2", timeout=30)
+
+          with subtest("enforcement can be disabled and reenabled without zones or manual restarts"):
+              apply("set protocols bgp flowspec-enforce false")
+              fw.succeed("grep -q '^VELSTRA_FLOWSPEC_ARGS=$' /run/sentinel/velstra.env")
+              fw.wait_until_succeeds("wren show bgp neighbors | grep -qi established", timeout=90)
+              # The rule is still learned; this switch only controls enforcement.
+              fw.wait_until_succeeds("wren show bgp flowspec | grep -q 10.7.0.2", timeout=90)
+              fw.succeed("sentinel agent-query flowspec | grep -q 'no flowspec rules in force'")
+              origin.wait_until_succeeds("ping -c 2 -W 2 10.7.0.2", timeout=30)
+              apply("set protocols bgp flowspec-enforce true")
+              fw.wait_until_succeeds("sentinel agent-query flowspec | grep -q '1 rule(s) in force'", timeout=90)
+              origin.wait_until_fails("ping -c 2 -W 2 10.7.0.2", timeout=30)
+              originate(False)
+              fw.wait_until_succeeds("sentinel agent-query flowspec | grep -q 'no flowspec rules in force'", timeout=90)
+              origin.wait_until_succeeds("ping -c 3 -W 2 10.7.0.2", timeout=90)
         '';
       };
 
@@ -5171,6 +5373,7 @@
                 m.wait_for_unit("multi-user.target")
                 # The appliance's own agent would hold eth1; this test needs it.
                 m.succeed("systemctl stop velstra.service")
+                m.succeed("if test -d /sys/fs/bpf/sentinel; then ${velstra}/bin/velstra detach --datapath-state-dir /sys/fs/bpf/sentinel; fi")
 
             # Each locator is a routed /64, so the two ends can actually reach each
             # other. Asserted before anything is sent: a green run against a dead
@@ -6391,9 +6594,9 @@
         # the encrypted volume.
         #
         # It exercises the on-disk half here (install + cryptsetup open). The
-        # boot-time `sentinel-unlock.service` ordering is asserted by the unit
-        # tests' device chooser plus this volume being a real, openable LUKS2; a
-        # full reboot-into-encrypted is the same OVMF limit checks.update documents.
+        # The state-device check additionally proves real plaintext RAID and
+        # encrypted RAID reboots, including the boot password request, fsck,
+        # mount identity and persistence of a state marker.
         #   nix build .#checks.x86_64-linux.luks -L
         luks = pkgs.testers.runNixOSTest {
           name = "sentinel-luks";
@@ -6436,14 +6639,15 @@
 
               secret = "correct-horse-battery-staple"
 
-              with subtest("`sentinel unlock` is a no-op while no volume is encrypted"):
-                  # The booted appliance's own data partition is not encrypted and
-                  # nothing else is a LUKS device yet, so the boot-time unlock
-                  # command finds nothing to do and exits 0 (checked BEFORE the
-                  # encrypted install below adds a crypto_LUKS device).
-                  # unlock logs to stderr (a boot-service convention), so fold it in.
-                  out = machine.succeed("sentinel unlock 2>&1")
-                  assert "nothing to unlock" in out.lower(), out
+              with subtest("plaintext state is prepared without a password prompt"):
+                  # Preparing plaintext state now resolves the boot-owned device
+                  # too. Verify the real mount identity rather than a legacy
+                  # no-op message, before adding the encrypted target below.
+                  out = machine.succeed("sentinel unlock 2>&1", timeout=10)
+                  assert "persistent data device ready" in out.lower(), out
+                  selected = machine.succeed("lsblk -dnro MAJ:MIN /run/sentinel-data/device").strip()
+                  mounted = machine.succeed("findmnt -nro MAJ:MIN /var/lib/sentinel").strip()
+                  assert selected == mounted, f"prepared state {selected} differs from mounted state {mounted}"
 
               with subtest("an encrypted install lays down a LUKS2 data partition"):
                   machine.succeed(
@@ -6869,6 +7073,9 @@
 
               with subtest("active slot A backs /dev/mapper/usr (store partition #3)"):
                   assert f"{src}3" in machine.succeed("lsblk -nsro NAME /dev/mapper/usr")
+                  state = machine.succeed("findmnt -nro MAJ:MIN /var/lib/sentinel").strip()
+                  assert state == machine.succeed(f"lsblk -dnro MAJ:MIN {disk}6").strip(), f"persistent state came from update media: {state}"
+                  machine.succeed("echo boot-disk-state > /var/lib/sentinel/boot-disk-marker; sync")
 
               with subtest("the donor is a different image: other bytes, other GUIDs"):
                   machine.succeed(f"test -b {donor_disk}3")
@@ -6951,6 +7158,9 @@
                   backing = machine.succeed("lsblk -nsro NAME /dev/mapper/usr")
                   assert f"{src}5" in backing, (
                       f"/usr is not backed by slot B: {backing.strip()!r}")
+                  state = machine.succeed("findmnt -nro MAJ:MIN /var/lib/sentinel").strip()
+                  assert state == machine.succeed(f"lsblk -dnro MAJ:MIN {disk}6").strip(), f"updated appliance changed data devices: {state}"
+                  assert machine.succeed("cat /var/lib/sentinel/boot-disk-marker").strip() == "boot-disk-state"
             '';
         };
 
@@ -6981,6 +7191,9 @@
             machine.succeed("test -f /var/lib/sentinel/appliance.toml")
 
             with subtest("build a file:// channel signed by a pinned Ed25519 key"):
+                # This check proves the cryptographic gate, not disk writing.
+                # A real A/B image and reboot are exercised by checks.update.
+                machine.fail("test -e /dev/mapper/usr")
                 machine.succeed("mkdir -p /tmp/chan")
                 # The pinned release key, plus a DIFFERENT key for the wrong-key case.
                 machine.succeed("openssl genpkey -algorithm ed25519 -out /tmp/priv.pem")
@@ -7021,8 +7234,10 @@
                 # ONLY the crypto-verified image gets that far, which is the proof.
                 status, out = machine.execute("sentinel update install 2>&1")
                 assert status != 0, f"expected the writer to fail without a disk: {out}"
-                assert "could not resolve the source disk" in out, (
-                    f"verification should pass and control reach the slot-writer: {out}"
+                assert "verified release 0.3.0" in out, out
+                assert "image SHA-256 verified against the signed manifest" in out, out
+                assert "lsblk could not inspect /dev/mapper/usr" in out, (
+                    f"the verified image must reach the missing-boot-device safety guard: {out}"
                 )
 
             with subtest("TAMPERED image: SHA-256 mismatch refuses the update"):
@@ -7067,6 +7282,7 @@
             machine.wait_for_unit("multi-user.target")
 
             with subtest("a pinned Ed25519 key, a fixture image, and a WRONG key"):
+                machine.fail("test -e /dev/mapper/usr")
                 machine.succeed("openssl genpkey -algorithm ed25519 -out /tmp/priv.pem")
                 machine.succeed("openssl pkey -in /tmp/priv.pem -pubout -out /tmp/pub.pem")
                 machine.succeed("openssl genpkey -algorithm ed25519 -out /tmp/wrong-priv.pem")
@@ -7105,8 +7321,8 @@
                 assert "signature verified" in out.lower(), (
                     f"verification should report success: {out}"
                 )
-                assert "could not resolve the source disk" in out, (
-                    f"a verified image must reach the slot-writer: {out}"
+                assert "lsblk could not inspect /dev/mapper/usr" in out, (
+                    f"the verified image must reach the missing-boot-device safety guard: {out}"
                 )
 
             with subtest("WRONG key: verification fails closed (image never written)"):
@@ -7126,9 +7342,10 @@
                 )
                 # Warns loudly, skips verification, and reaches the writer (which
                 # fails for want of a disk — the proof it got past the gate).
+                assert status != 0, f"an unsigned override must still refuse a missing boot disk: {out}"
                 assert "allow-unsigned" in out.lower(), f"the bypass must warn: {out}"
-                assert "could not resolve the source disk" in out, (
-                    f"--allow-unsigned must reach the slot-writer: {out}"
+                assert "lsblk could not inspect /dev/mapper/usr" in out, (
+                    f"--allow-unsigned must still enforce the missing-boot-device safety guard: {out}"
                 )
 
             with subtest("a channel public-key is used to verify a local image too"):
@@ -7236,6 +7453,7 @@
               machine.succeed("test -f /var/lib/sentinel/appliance.toml")
 
               with subtest("a signed channel directory + the bearer-gated server"):
+                  machine.fail("test -e /dev/mapper/usr")
                   machine.succeed("mkdir -p /tmp/chan")
                   machine.succeed("openssl genpkey -algorithm ed25519 -out /tmp/priv.pem")
                   machine.succeed("openssl pkey -in /tmp/priv.pem -pubout -out /tmp/pub.pem")
@@ -7320,8 +7538,10 @@
                   # that far, which is the proof.
                   status, out = machine.execute(f"{CA} sentinel update install 2>&1")
                   assert status != 0, f"expected the writer to fail without a disk: {out}"
-                  assert "could not resolve the source disk" in out, (
-                      f"verification should pass and control reach the slot-writer: {out}"
+                  assert "verified release 0.3.0" in out, out
+                  assert "image SHA-256 verified against the signed manifest" in out, out
+                  assert "lsblk could not inspect /dev/mapper/usr" in out, (
+                      f"the verified image must reach the missing-boot-device safety guard: {out}"
                   )
             '';
           };
@@ -7696,9 +7916,9 @@
             assert "not both" in both, f"a two-ended rule was accepted: {both}"
 
             # C15 per-rule rate limits. Asserted as a ratio rather than a count:
-            # the bucket is shared across CPUs and updated without locking, so a
-            # race may let a token be spent twice. The point is that a limit of 2/s
-            # admits a small fraction of 40 attempts, not an exact number.
+            # elapsed time matters because a refused attempt consumes its connect
+            # timeout and the shared budget refills during that wait. Exact SMP
+            # accounting is proved separately by the rate-budget kernel check.
             fw.succeed(
                 "su admin -c \"printf '%s\\n' "
                 "'set firewall rule limited from wan' "
@@ -7726,8 +7946,8 @@
                 "done; echo $n $(( $(date +%%s) - s ))" % attempts
             ).split()
             ok, secs = int(res[0]), int(res[1])
-            # +1 for the whole-second clock, +1 for the cross-CPU race on the bucket.
-            bound = 2 + 2 * (secs + 1) + 1
+            # One second of tolerance for the whole-second measurement.
+            bound = 2 + 2 * (secs + 1)
             assert ok <= bound, f"{ok} passed in {secs}s, above the 2/s bound of {bound}"
             assert ok < attempts, f"the limit did not bite at all: {ok}/{attempts}"
             assert ok > 0, "the limit blocked everything, including its burst"
@@ -8335,7 +8555,7 @@
                 "| sentinel configure\" 2>&1"
             )
             fw.wait_for_unit("velstra.service")
-            fw.succeed("grep -q '\[flow_export\]' /run/sentinel/velstra.toml")
+            fw.succeed(r"grep -q '\[flow_export\]' /run/sentinel/velstra.toml")
 
             # Traffic to export, then wait for a datagram to land.
             client.succeed("curl -s --max-time 10 http://10.1.0.2:80/ >/dev/null")
@@ -8401,7 +8621,7 @@
             # cannot drift apart into two different stories about one table.
             flows = fw.succeed("sentinel show flows")
             assert "packets" in flows, f"the flow table lost its counter column:\n{flows}"
-          '';
+          '' + "\nPYTHON = \"${pkgs.python3}/bin/python3\"\n" + builtins.readFile ./tests/commit-idempotency.py;
         };
 
         # Stateful-HA conntrack sync (roadmap C9): the pfsync-analog for the eBPF
@@ -12809,20 +13029,14 @@
             assert "Mode=bridge" in mvdev, mvdev
             eth1net = fw.succeed("cat /run/systemd/network/10-sentinel-eth1.network")
             assert "MACVLAN=mv0" in eth1net, eth1net
-            assert "VLAN=eth1.100" in eth1net, eth1net
+            assert "VLAN=eth1.100" not in eth1net, eth1net
 
-            # The S-VLAN netdev carries Protocol=802.1ad; the stacked C-VLAN netdev
-            # is a plain 802.1q link (no Protocol=) and rides on the S-VLAN, whose
-            # .network references it via VLAN= (generic parent keying → QinQ).
-            svdev = fw.succeed("cat /run/systemd/network/10-sentinel-eth1.100.netdev")
-            assert "Kind=vlan" in svdev, svdev
-            assert "Id=100" in svdev, svdev
-            assert "Protocol=802.1ad" in svdev, svdev
-            cvdev = fw.succeed("cat /run/systemd/network/10-sentinel-eth1.100.20.netdev")
-            assert "Id=20" in cvdev, cvdev
-            assert "Protocol=" not in cvdev, cvdev
+            # Sentinel owns immutable VLAN lifetimes; networkd configures
+            # their addresses and membership without racing link activation.
+            fw.succeed("test ! -e /run/systemd/network/10-sentinel-eth1.100.netdev")
+            fw.succeed("test ! -e /run/systemd/network/10-sentinel-eth1.100.20.netdev")
             svnet = fw.succeed("cat /run/systemd/network/10-sentinel-eth1.100.network")
-            assert "VLAN=eth1.100.20" in svnet, svnet
+            assert "ActivationPolicy=manual" in svnet, svnet
 
             # networkd realised them in the kernel. The macvlan is mode bridge with
             # its own hardware address distinct from the parent eth1.

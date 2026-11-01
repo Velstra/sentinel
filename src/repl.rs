@@ -116,6 +116,23 @@ fn split_line(line: &str) -> Vec<String> {
     out
 }
 
+/// An editing command was refused before complete-candidate validation. The
+/// line identifies an edit, never a value or an arbitrarily selected domain
+/// dependency, so callers can keep a whole staged change together.
+#[derive(Debug)]
+pub(crate) struct ScriptEditError {
+    pub(crate) line: usize,
+    cause: anyhow::Error,
+}
+
+impl std::fmt::Display for ScriptEditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "line {}: {:#}", self.line, self.cause)
+    }
+}
+
+impl std::error::Error for ScriptEditError {}
+
 /// Validate an editing script against the complete candidate without executing
 /// operational, apply or persistence commands. Parsing and domain validation
 /// use the same lexer, setters and materialization as an interactive commit.
@@ -149,7 +166,10 @@ pub(crate) fn validate_script(path: &Path, source: &str) -> Result<Appliance> {
                 "validation accepts only set, delete, edit, up and top commands"
             )),
         };
-        result.with_context(|| format!("line {}", index + 1))?;
+        result.map_err(|cause| ScriptEditError {
+            line: index + 1,
+            cause,
+        })?;
     }
     session
         .commit()
@@ -709,15 +729,46 @@ fn rollback_line(session: &mut Session, act: &Apply, rest: &[&str]) -> bool {
 /// fails, so a partial `commit` never leaves the running system in a state
 /// *worse* than "commit refused" (e.g. a new firewall live over stale routing).
 /// A named best-effort undo action.
-type UndoStep = (&'static str, Box<dyn FnOnce() -> Result<()>>);
+type ServiceUndo = Box<dyn FnOnce() -> Result<()>>;
+type UndoStep = (&'static str, ServiceUndo);
 
 struct Rollback {
     steps: Vec<UndoStep>,
+    units: Vec<(&'static str, String)>,
+}
+
+struct Restored {
+    failures: Vec<String>,
+    units: Vec<(&'static str, String)>,
+}
+
+impl Restored {
+    /// Verify after link reconciliation, so a routing daemon that needs a
+    /// restored VLAN can recover before it is judged. Also include a failed
+    /// apply stage whose undo was never registered: its internal restore may
+    /// itself have failed, leaving a real service unavailable.
+    fn verify(mut self) -> Vec<String> {
+        for (what, unit) in self.units {
+            if let Err(error) = system::wait_for_unit_ready(&unit) {
+                self.failures.push(format!("{what} ({error:#})"));
+            }
+        }
+        self.failures
+    }
 }
 
 impl Rollback {
     fn new() -> Self {
-        Self { steps: Vec::new() }
+        Self {
+            steps: Vec::new(),
+            units: Vec::new(),
+        }
+    }
+
+    fn watch_unit(&mut self, what: &'static str, unit: &str) {
+        if !self.units.iter().any(|(_, watched)| watched == unit) {
+            self.units.push((what, unit.to_owned()));
+        }
     }
 
     fn push(&mut self, what: &'static str, undo: impl FnOnce() -> Result<()> + 'static) {
@@ -727,14 +778,21 @@ impl Rollback {
     /// Run every recorded undo in reverse order. Returns the names of any that
     /// themselves failed, so the operator learns exactly what is left
     /// inconsistent (rather than a bare "commit failed").
-    fn unwind(self) -> Vec<String> {
+    fn restore(self) -> Restored {
         let mut failures = Vec::new();
         for (what, undo) in self.steps.into_iter().rev() {
             if let Err(e) = undo() {
                 failures.push(format!("{what} ({e})"));
             }
         }
-        failures
+        Restored {
+            failures,
+            units: self.units,
+        }
+    }
+
+    fn unwind(self) -> Vec<String> {
+        self.restore().verify()
     }
 }
 
@@ -761,30 +819,47 @@ fn restore_file(path: &Path, prev: Option<&[u8]>) -> Result<()> {
 }
 
 /// Install a compiled config file and reload its unit as one unit of work. On
-/// failure it restores the previous file (best-effort) and returns the error,
-/// having made no lasting change. On success it returns an undo that restores
-/// the previous file + reloads, so a *later* stage's failure can roll this back
-/// too. Returns the undo boxed for the rollback stack.
+/// failure it restores the previous file and reloads, reporting any recovery
+/// failure honestly. Readiness is verified after link configuration, since the
+/// new policy may depend on an address/interface created by this commit. The
+/// rollback verifies the restored service after the previous links are in place.
+/// An identical config on a ready service needs neither a restart nor an undo;
+/// restarting the firewall would discard live connection state.
 fn apply_service(
     out: &Path,
     unit: &str,
     new: &[u8],
     prev: Option<&[u8]>,
-) -> Result<Box<dyn FnOnce() -> Result<()>>> {
+    unchanged_appliance: bool,
+) -> Result<Option<ServiceUndo>> {
+    if unchanged_appliance && prev == Some(new) && system::unit_ready(unit) {
+        return Ok(None);
+    }
     atomic_install(out, new).with_context(|| format!("installing {}", out.display()))?;
     if let Err(e) = system::reload_velstra(unit) {
         // Reload failed: put the previous file back so we don't leave a new
         // config staged under a daemon still running the old one.
-        let _ = restore_file(out, prev);
-        return Err(e).with_context(|| format!("reloading {unit}"));
+        let recovery = restore_file(out, prev).and_then(|()| {
+            if prev.is_none() {
+                return Err(anyhow!("no previous compiled configuration to reload"));
+            }
+            system::reload_velstra(unit)?;
+            system::wait_for_unit_ready(unit)
+        });
+        return Err(match recovery {
+            Ok(()) => e.context(format!("reloading {unit}; previous configuration restored")),
+            Err(recovery) => {
+                anyhow!("reloading {unit} failed: {e:#}; rollback incomplete: {recovery:#}")
+            }
+        });
     }
     let out = out.to_path_buf();
     let unit = unit.to_string();
     let prev = prev.map(<[u8]>::to_vec);
-    Ok(Box::new(move || {
+    Ok(Some(Box::new(move || {
         restore_file(&out, prev.as_deref())?;
         system::reload_velstra(&unit)
-    }))
+    })))
 }
 
 /// Combine the original stage error with the rollback outcome into one report.
@@ -864,9 +939,18 @@ fn unwind_to_last_good(
 ) -> anyhow::Error {
     // The level-triggered rollback: reconcile the ~30 sub-systems to last-good.
     let reconcile = crate::net::apply(prev);
-    // Then the three stages the undo stack does cover, in reverse.
-    let failures = rb.unwind();
-    mixed_or_rolled_message(&cause, &reconcile, failures)
+    // Restore service files after the old links exist. A guarded VLAN may
+    // correctly refuse activation while the candidate's zone policy is still
+    // loaded. Once the undo reloads the previous firewall, retry the declarative
+    // reconcile so that activation is acknowledged by that previous policy.
+    let restored = rb.restore();
+    let reconcile = match reconcile {
+        Ok(()) => Ok(()),
+        Err(first) => crate::net::apply(prev).with_context(|| {
+            format!("retrying last-good network after service rollback (first attempt: {first:#})")
+        }),
+    };
+    mixed_or_rolled_message(&cause, &reconcile, restored.verify())
 }
 
 /// Compose the honest report for a failed broad apply from the two outcomes of
@@ -893,9 +977,10 @@ fn mixed_or_rolled_message(
         ),
         Ok(()) => anyhow!(
             "applying system configuration failed: {cause}\n  \
-             the broad system apply was rolled back to the last-good config, but \
-             restoring the firewall/routing/hostname did not fully complete ({}). \
-             Re-check those, or reboot to return to the saved config.",
+             ROLLBACK INCOMPLETE — the broad system apply was rolled back to the \
+             last-good config, but restoring the firewall/routing/hostname did not \
+             fully complete ({}). Retry the configuration after the reported \
+             dependency recovers.",
             unwind_failures.join("; ")
         ),
         Err(re) => {
@@ -951,6 +1036,14 @@ pub(crate) fn apply_live(
 
     let desired = appliance;
     let previous_running = Appliance::load(Path::new(Session::RUNNING)).ok();
+    // A network setting can affect the daemon without changing its compiled
+    // file. Keep the existing refresh path for actual appliance changes; only
+    // an identical desired document may take the connection-preserving path.
+    let unchanged_appliance = previous_running
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()?
+        == Some(serde_json::to_value(desired)?);
     // A caller asking for rollback needs the state found under this lock, not
     // a saved snapshot loaded before a concurrent commit. Revert callers that
     // deliberately pass None keep their existing mixed-state error behavior.
@@ -977,16 +1070,42 @@ pub(crate) fn apply_live(
 
     // ---- Phase 2: apply, each stage undoable on a later failure ----
     let mut rb = Rollback::new();
+    rb.watch_unit("firewall", &act.unit);
+    rb.watch_unit("routing", &act.wren_unit);
 
-    // Firewall: install + reload. If this first stage fails nothing else was
-    // touched, so surface the error directly.
-    let undo = apply_service(
+    // Prove ownership and close links that will lose their old policy BEFORE
+    // applying that policy change. A refusal cannot briefly unfilter a VLAN.
+    let links_staged = match crate::vlan::stage(appliance) {
+        Ok(staged) => staged,
+        Err(error) => {
+            return Err(match rollback_to {
+                Some(prev) => unwind_to_last_good(rb, error, prev),
+                None => unwind_err_mixed(rb, error),
+            });
+        }
+    };
+    let recover_early = |rb: Rollback, error: anyhow::Error, stage: &str| match rollback_to
+        .filter(|_| links_staged)
+    {
+        Some(prev) => unwind_to_last_good(rb, error, prev),
+        None => unwind_err(rb, error, stage),
+    };
+
+    // Firewall: install + reload. If a staged link was brought DOWN, even an
+    // early service error must reconcile it back to its previous guarded state.
+    let undo = match apply_service(
         &act.velstra_out,
         &act.unit,
         rendered.as_bytes(),
         velstra_prev.as_deref(),
-    )?;
-    rb.push("firewall", undo);
+        unchanged_appliance,
+    ) {
+        Ok(undo) => undo,
+        Err(error) => return Err(recover_early(rb, error, "firewall")),
+    };
+    if let Some(undo) = undo {
+        rb.push("firewall", undo);
+    }
 
     // Routing: install + reload the Wren daemon.
     match apply_service(
@@ -994,14 +1113,16 @@ pub(crate) fn apply_live(
         &act.wren_unit,
         wren_rendered.as_bytes(),
         wren_prev.as_deref(),
+        unchanged_appliance,
     ) {
-        Ok(undo) => rb.push("routing", undo),
-        Err(e) => return Err(unwind_err(rb, e, "routing")),
+        Ok(Some(undo)) => rb.push("routing", undo),
+        Ok(None) => {}
+        Err(e) => return Err(recover_early(rb, e, "routing")),
     }
 
     // Hostname: set it live.
     if let Err(e) = system::set_hostname(&appliance.system.hostname) {
-        return Err(unwind_err(rb, e, "hostname"));
+        return Err(recover_early(rb, e, "hostname"));
     }
     rb.push("hostname", move || system::set_hostname(&old_host));
 
@@ -1018,6 +1139,17 @@ pub(crate) fn apply_live(
             Some(prev) => unwind_to_last_good(rb, e, prev),
             None => unwind_err_mixed(rb, e),
         });
+    }
+    // systemd's simple-service start job can succeed before the real daemon
+    // rejects a configuration. Publish/save only after it acknowledges Ready.
+    // Wait here so this commit's interface/address setup can complete first.
+    for unit in [&act.unit, &act.wren_unit] {
+        if let Err(e) = system::wait_for_unit_ready(unit) {
+            return Err(match rollback_to {
+                Some(prev) => unwind_to_last_good(rb, e, prev),
+                None => unwind_err_mixed(rb, e),
+            });
+        }
     }
     if let Err(e) = Session::publish_running(desired, &_lock) {
         return Err(match rollback_to {
@@ -3668,7 +3800,7 @@ const RULE_DIRECTIONS: &[Cand] = &[
     ("in", "traffic arriving on the zone's interfaces"),
     (
         "out",
-        "traffic leaving them, including what this box originates (IPv4 only)",
+        "traffic leaving them, including what this box originates",
     ),
 ];
 /// `firewall rule <n> icmp-type <Tab>` — the names worth offering, both families.
@@ -3725,7 +3857,7 @@ const RULE_FIELDS: &[Cand] = &[
     ("family", "restrict to one address family (ipv4 / ipv6)"),
     (
         "direction",
-        "restrict to arriving (in) or leaving (out) traffic; out is IPv4 only",
+        "restrict to arriving (in) or leaving (out) traffic",
     ),
     ("log", "log packets matching this rule (true / false)"),
     (
@@ -5355,6 +5487,23 @@ mod tests {
             "{error:#}"
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn validation_identifies_edit_refusals_but_not_domain_failures() {
+        let (dir, path) = validation_fixture("edit-line");
+        let error = validate_script(
+            &path,
+            "set interface eth0 description preview\nset firewall nonsense true\n",
+        )
+        .unwrap_err();
+        assert_eq!(error.downcast_ref::<ScriptEditError>().unwrap().line, 2);
+        assert!(format!("{error:#}").contains("unknown set path"));
+        let domain = validate_script(&path, "set protocols static not-a-network via 192.0.2.2\n")
+            .unwrap_err();
+        assert!(domain.downcast_ref::<ScriptEditError>().is_none());
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("preview"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -73,7 +73,8 @@ class ReadPermissions(unittest.TestCase):
 
     @classmethod
     def start(cls, name, tls=False, peer=None, fingerprint=None, environment=None, config_mode=0o600,
-              password_hash=None):
+              password_hash=None, binary=None):
+        binary = binary or BINARY
         root = cls.root / name
         root.mkdir(mode=0o700)
         config = (
@@ -123,7 +124,7 @@ bfd-auth-key-id = 9
         path.write_text(config)
         path.chmod(config_mode)
         valid = subprocess.run(
-            [BINARY, "config", "check", str(path)],
+            [binary, "config", "check", str(path)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         if valid.returncode:
@@ -145,7 +146,7 @@ bfd-auth-key-id = 9
         env.pop("SENTINEL_API_TOKEN", None)
         env.update(environment or {})
         proc = subprocess.Popen(
-            [BINARY, "api", "--listen", f"127.0.0.1:{port}",
+            [binary, "api", "--listen", f"127.0.0.1:{port}",
              "--config", str(path), "--token-file", str(token), "--no-apply"],
             stdout=log, stderr=subprocess.STDOUT, env=env,
         )
@@ -276,6 +277,76 @@ bfd-auth-key-id = 9
                              f"credentials are readable by everyone: {revision.name}")
         self.assertTrue(any(SECRET in revision.read_text() for revision in revisions))
 
+    def test_ipv6_egress_rule_upload_and_preview_preserve_scope(self):
+        base, root = self.start("ipv6-egress-validation")
+        before = (root / "appliance.toml").read_bytes()
+        source = ("set interface eth0 zone wan\n"
+                  "set firewall rule outbound from wan\n"
+                  "set firewall rule outbound proto tcp\n"
+                  "set firewall rule outbound port 18090\n"
+                  "set firewall rule outbound action drop\n"
+                  "set firewall rule outbound family ipv6\n"
+                  "set firewall rule outbound direction out\n")
+        req = urllib.request.Request(base + "/api/v1/configure/validate", method="POST",
+                                     data=source.encode(), headers={
+                                         "Authorization": "Bearer " + SECRET,
+                                         "Content-Type": "text/plain",
+                                     })
+        with OPENER.open(req, timeout=10) as response:
+            self.assertEqual(response.status, 200)
+            self.assertTrue(json.load(response)["ok"])
+        self.assertEqual(before, (root / "appliance.toml").read_bytes())
+        document = {"system": {"hostname": "ipv6-egress-validation", "config-sync": {"secret": SECRET}},
+                    "interface": [{"name": "eth0", "zone": "wan"}],
+                    "rule": [{"name": "outbound", "from": "wan", "proto": "tcp", "port": 18090,
+                              "action": "drop", "family": "ipv6", "direction": "out"}]}
+        req = urllib.request.Request(base + "/api/v1/config", method="PUT",
+                                     data=json.dumps(document).encode(), headers={
+                                         "Authorization": "Bearer " + SECRET,
+                                         "Content-Type": "application/json",
+                                     })
+        with OPENER.open(req, timeout=10) as response:
+            self.assertEqual(response.status, 200)
+        rule = tomllib.loads((root / "appliance.toml").read_text())["rule"][0]
+        self.assertEqual(rule["family"], "ipv6")
+        self.assertEqual(rule["direction"], "out")
+
+    def test_invalid_clone_macs_are_refused_without_publishing_or_archiving(self):
+        base, root = self.start("clone-validation")
+        path = root / "appliance.toml"
+        before = path.read_bytes()
+        archive = sorted((root / "archive").glob("config-*.toml"))
+        for mac in ["00:00:00:00:00:00", "01:66:77:88:99:aa", "FF:FF:FF:FF:FF:FF"]:
+            document = {"system": {"hostname": "clone-validation"},
+                        "interface": [{"name": "eth0", "mac": mac}]}
+            cases = [
+                ("config", "PUT", json.dumps(document).encode(), "application/json", 400),
+                ("configure/validate", "POST", f"set interface eth0 mac {mac}\n".encode(), "text/plain", 400),
+                ("configure", "POST", f"set interface eth0 mac {mac}\ncommit\nsave\nexit\n".encode(), "text/plain", 200),
+            ]
+            for endpoint, method, data, content_type, expected in cases:
+                with self.subTest(mac=mac, endpoint=endpoint):
+                    req = urllib.request.Request(base + "/api/v1/" + endpoint,
+                                                 method=method, data=data, headers={
+                                                     "Authorization": "Bearer " + SECRET,
+                                                     "Content-Type": content_type,
+                                                 })
+                    try:
+                        with OPENER.open(req, timeout=10) as response:
+                            status, result = response.status, json.load(response)
+                    except urllib.error.HTTPError as error:
+                        with error:
+                            status, result = error.code, json.load(error)
+                    self.assertEqual(status, expected, result)
+                    message = result.get("error", result.get("output", ""))
+                    self.assertIn("non-zero unicast", message, result)
+                    if endpoint == "configure":
+                        self.assertFalse(result["ok"], result)
+                        self.assertNotIn("commit ok", message)
+                    self.assertEqual(before, path.read_bytes())
+                    self.assertEqual(archive, sorted((root / "archive").glob("config-*.toml")))
+                    self.assertNotIn(SECRET, json.dumps(result))
+
     def test_large_configuration_scripts_do_not_deadlock_the_child_pipes(self):
         before = self.config.read_bytes()
         req = urllib.request.Request(
@@ -288,6 +359,19 @@ bfd-auth-key-id = 9
             self.assertEqual(response.status, 200)
         self.assertFalse(result["ok"], "invalid commands were reported as successful")
         self.assertIn("unknown-configuration-verb", result["output"])
+        self.assertEqual(before, self.config.read_bytes())
+
+    def test_large_script_exit_does_not_run_later_mutations(self):
+        before = self.config.read_bytes()
+        script = b"exit\n" + b"set system hostname must-not-save\n" * 5000 + b"commit\nsave\n"
+        req = urllib.request.Request(
+            self.base + "/api/v1/configure", method="POST", data=script,
+            headers={"Authorization": "Bearer " + SECRET, "Content-Type": "text/plain"},
+        )
+        with OPENER.open(req, timeout=10) as response:
+            result = json.load(response)
+            self.assertEqual(response.status, 200)
+        self.assertTrue(result["ok"], result)
         self.assertEqual(before, self.config.read_bytes())
 
     def test_peer_adjustment_is_validated_before_persistence(self):
@@ -477,6 +561,15 @@ bfd-auth-key-id = 9
             ("set system hostname preview\n", SECRET, 200),
             ("set protocols static not-a-network via 192.0.2.1\n", SECRET, 400),
             ("set services dns serve-on missing0\n", SECRET, 400),
+            ("set interface cyclea parent cyclea\nset interface cyclea vlan 42\n", SECRET, 400),
+            ("set interface cyclea parent cycleb\nset interface cyclea vlan 42\n"
+             "set interface cycleb parent cyclea\nset interface cycleb vlan 43\n", SECRET, 400),
+            ("set interface carrier description Carrier\nset interface taga parent carrier\n"
+             "set interface taga vlan 42\nset interface tagb parent carrier\n"
+             "set interface tagb vlan 42\n", SECRET, 400),
+            ("set interface carrier description Carrier\nset interface taga parent carrier\n"
+             "set interface taga vlan 42\nset interface tagb parent carrier\n"
+             "set interface tagb vlan 42\nset interface tagb vlan-protocol 802.1ad\n", SECRET, 200),
             ("set system hostname preview\nsave\n", SECRET, 400),
             ("commit\n", SECRET, 400),
             ("run clear ids blocks\n", SECRET, 400),
@@ -504,6 +597,26 @@ bfd-auth-key-id = 9
                     self.assertTrue(result["error"])
                 self.assertEqual(before, self.config.read_bytes())
                 self.assertEqual(archive, sorted((self.config.parent / "archive").iterdir()))
+
+    def test_validation_attributes_only_edit_refusals_without_saving(self):
+        before = self.config.read_bytes()
+        for script, line in [
+            ("set system hostname preview\nset firewall nonsense true\n", 2),
+            ("set protocols static not-a-network via 192.0.2.1\n", None),
+        ]:
+            with self.subTest(line=line):
+                req = urllib.request.Request(self.base + "/api/v1/configure/validate",
+                                             data=script.encode(), method="POST", headers={
+                                                 "Authorization": "Bearer " + SECRET,
+                                                 "Content-Type": "text/plain",
+                                             })
+                with self.assertRaises(urllib.error.HTTPError) as failure:
+                    OPENER.open(req, timeout=10)
+                with failure.exception as response:
+                    self.assertEqual(response.code, 400)
+                    result = json.load(response)
+                self.assertEqual(result["edit_line"], line)
+                self.assertEqual(before, self.config.read_bytes())
 
     def test_candidate_rejects_expanded_rate_limit_overflow_without_saving(self):
         before = self.config.read_bytes()
@@ -539,6 +652,109 @@ bfd-auth-key-id = 9
                     self.assertEqual(status, 400, body)
         finally:
             revision.write_bytes(original)
+
+
+    def test_refused_configuration_script_does_not_execute_later_commit_and_save(self):
+        base, root = self.start("refused-script")
+        config = root / "appliance.toml"
+        before = config.read_bytes()
+        script = "set system hostname must-not-save\nset nonsense value\ncommit\nsave\nexit\n"
+        req = urllib.request.Request(
+            base + "/api/v1/configure", data=script.encode(), method="POST",
+            headers={"Authorization": "Bearer " + SECRET, "Content-Type": "text/plain"},
+        )
+        with OPENER.open(req, timeout=10) as response:
+            result = json.load(response)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("error:", result["output"].lower())
+        self.assertEqual(config.read_bytes(), before,
+                         "a refused script still executed its trailing commit/save")
+
+    def capture_process_probe(self, name):
+        """Observe the process boundary without capturing workstation traffic.
+
+        The appliance VM test separately exercises tcpdump with real packets.
+        These requests check what may reach that boundary, not packet capture.
+        """
+        tools = self.root / name
+        tools.mkdir(mode=0o700)
+        arguments = tools / "arguments.json"
+        timeout = tools / "timeout"
+        timeout.write_text(
+            "#!" + sys.executable + "\n"
+            "import json, os, pathlib, sys\n"
+            "pathlib.Path(os.environ['CAPTURE_ARGUMENTS']).write_text(json.dumps(sys.argv[1:]))\n"
+            "print('capture process boundary reached')\n"
+        )
+        timeout.chmod(0o700)
+        # The packaged launcher deliberately pins tool paths. Only these
+        # process-boundary probes invoke its underlying compiled binary, so
+        # the fixture cannot accidentally run a real capture instead. Other
+        # tests, including real VM traffic, retain the normal launcher.
+        binary = Path(BINARY)
+        with binary.open("rb") as program:
+            is_elf = program.read(4) == b"\x7fELF"
+        if not is_elf:
+            binary = binary.with_name("." + binary.name + "-wrapped")
+            with binary.open("rb") as program:
+                if program.read(4) != b"\x7fELF":
+                    raise RuntimeError("capture process probe needs the compiled appliance binary")
+        base, _ = self.start(name + "-api", environment={
+            "SENTINEL_TIMEOUT_BIN": str(timeout),
+            "CAPTURE_ARGUMENTS": str(arguments),
+        }, binary=str(binary))
+        return base, arguments
+
+    def test_capture_rejects_wrong_field_types_before_starting_a_process(self):
+        base, arguments = self.capture_process_probe("capture-types")
+        for field, value in [
+            ("interface", 1), ("interface", None),
+            ("filter", False), ("filter", []), ("filter", {}), ("filter", None),
+            ("packets", "3"), ("packets", -1), ("packets", 1.5),
+            ("packets", True), ("packets", None),
+            ("seconds", "2"), ("seconds", -1), ("seconds", 1.5),
+            ("seconds", False), ("seconds", None),
+        ]:
+            with self.subTest(field=field, value=value):
+                arguments.unlink(missing_ok=True)
+                body = {"interface": "lo", "packets": 3, "seconds": 2, field: value}
+                req = urllib.request.Request(
+                    base + "/api/v1/capture", data=json.dumps(body).encode(), method="POST",
+                    headers={"Authorization": "Bearer " + SECRET,
+                             "Content-Type": "application/json"},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as failure:
+                    OPENER.open(req, timeout=10)
+                with failure.exception as response:
+                    self.assertEqual(response.code, 400)
+                    error = json.load(response)["error"]
+                    self.assertIn(field, error)
+                self.assertFalse(arguments.exists(), "invalid capture input reached a process")
+
+    def test_capture_limits_do_not_wrap_large_unsigned_integers(self):
+        base, arguments = self.capture_process_probe("capture-limits")
+        for packets, seconds, expected_packets, expected_seconds in [
+            (None, None, 50, 10), (0, 0, 1, 1), (3, 2, 3, 2),
+            (501, 61, 500, 60), (2**32 + 1, 2**32 + 1, 500, 60),
+            (2**64 - 1, 2**64 - 1, 500, 60),
+        ]:
+            with self.subTest(packets=packets, seconds=seconds):
+                body = {"interface": "lo"}
+                if packets is not None:
+                    body["packets"] = packets
+                if seconds is not None:
+                    body["seconds"] = seconds
+                req = urllib.request.Request(
+                    base + "/api/v1/capture", data=json.dumps(body).encode(), method="POST",
+                    headers={"Authorization": "Bearer " + SECRET,
+                             "Content-Type": "application/json"},
+                )
+                with OPENER.open(req, timeout=10) as response:
+                    self.assertEqual(response.status, 200)
+                    response.read()
+                actual = json.loads(arguments.read_text())
+                self.assertEqual(actual[0], str(expected_seconds), actual)
+                self.assertEqual(actual[actual.index("-c") + 1], str(expected_packets), actual)
 
 
 if __name__ == "__main__":

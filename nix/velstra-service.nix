@@ -15,6 +15,8 @@
 }:
 let
   cfg = config.services.velstra;
+  persistent = cfg.package.supportsPersistentDatapath or false;
+  persistenceArgs = lib.optionalString persistent " --datapath-state-dir /sys/fs/bpf/sentinel";
 in
 {
   options.services.velstra = {
@@ -43,6 +45,9 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    # systemd mounts bpffs as a kernel API filesystem before units start. It
+    # refuses .mount units for this path. The agent validates the actual fs type
+    # and creates only its private pin directory; it never remounts live pins.
     # Seed the runtime firewall config at boot: compile the **active** appliance
     # config (operator-edited /var/lib if present, else the factory default
     # baked into the image) into the writable /run path the agent reads. This is
@@ -84,8 +89,9 @@ in
     # Conditional by design: the SAME image serves plaintext and encrypted
     # installs, so `sentinel unlock` inspects the disk and does nothing on a
     # plaintext box (a no-op exit 0 — see src/unlock.rs). On an encrypted box it
-    # opens the LUKS volume as /dev/mapper/data, whose LABEL=data ext4 the
-    # `/var/lib/sentinel` mount then finds. The mount takes an
+    # opens the LUKS volume as /dev/mapper/data. On the verified image it also
+    # publishes /run/sentinel-data/device for the boot disk's own state volume,
+    # including a plaintext or assembled RAID volume. The mount takes an
     # `x-systemd.requires=sentinel-unlock.service` dependency (see nix/image.nix),
     # so it is ordered after this and only runs once the volume is open.
     #
@@ -93,7 +99,7 @@ in
     # the boot-time console password agent answers. TPM2 unattended unlock is a
     # documented follow-up (the on-disk format is standard LUKS2).
     systemd.services.sentinel-unlock = {
-      description = "Unlock the encrypted Sentinel data volume";
+      description = "Resolve and unlock the Sentinel data volume";
       wantedBy = [ "local-fs.target" ];
       before = [
         "local-fs.target"
@@ -175,7 +181,7 @@ in
         # form into words and drops it entirely when empty, which is how A3
         # enforcement goes on and off without rebuilding the unit. The braced
         # form would pass one argument containing spaces.
-        ExecStart = "${cfg.package}/bin/velstra run --iface \${VELSTRA_IFACE} --config /run/sentinel/velstra.toml --query-socket /run/velstra/query.sock --portal-socket /run/velstra/portal.sock --mapping-socket /run/velstra/mapping.sock $VELSTRA_FLOWSPEC_ARGS";
+        ExecStart = "${cfg.package}/bin/velstra run --iface \${VELSTRA_IFACE} --config /run/sentinel/velstra.toml${persistenceArgs} --query-socket /run/velstra/query.sock --portal-socket /run/velstra/portal.sock --mapping-socket /run/velstra/mapping.sock $VELSTRA_FLOWSPEC_ARGS";
         RuntimeDirectory = "velstra";
         RuntimeDirectoryMode = "0700";
         Restart = "on-failure";

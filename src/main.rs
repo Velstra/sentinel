@@ -19,6 +19,7 @@ mod clock;
 mod compile;
 mod config;
 mod confirm;
+mod data_device;
 mod diff;
 mod domain;
 mod feed;
@@ -29,7 +30,9 @@ mod image;
 mod install;
 mod installer_tui;
 mod ipsec;
+mod link_defaults;
 mod lockout;
+mod logins;
 mod lookup;
 mod metrics;
 mod net;
@@ -50,6 +53,7 @@ mod ui;
 mod unlock;
 mod update;
 mod velstra;
+mod vlan;
 mod webui;
 mod wgkey;
 mod wireless;
@@ -278,6 +282,10 @@ enum Command {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// Internal privileged file reader. Its framed response distinguishes an
+    /// absent private file from denied access without parsing diagnostic text.
+    #[command(hide = true)]
+    PrivateRead { path: PathBuf },
     /// Re-apply the console keyboard, locale and timezone from the saved config.
     ///
     /// Its own command because systemd owns the virtual console and re-runs
@@ -585,6 +593,7 @@ async fn main() -> Result<()> {
             print!("{}", velstra::query_at(&path, &command)?);
             Ok(())
         }
+        Command::PrivateRead { path } => system::private_read_response(&path),
         Command::ApplyConsole { config } => net::apply_console_settings(&Appliance::load(&config)?),
         Command::Apply { file, out, reload } => apply(&file, &out, reload.as_deref()),
         Command::ConfirmRollback { config } => confirm_rollback(&config),
@@ -846,25 +855,28 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
     } else {
         let stdin = std::io::stdin();
         let mut ctx: Vec<String> = Vec::new();
-        for line in stdin.lock().lines() {
-            if repl::exec_line(
+        for (index, line) in stdin.lock().lines().enumerate() {
+            let failed_before = repl::failed_lines();
+            let exit = repl::exec_line(
                 &mut session,
                 &act,
                 &mut ctx,
                 &line.context("reading stdin")?,
-            ) {
+            );
+            // A script's trailing `save` must not persist a candidate whose
+            // commit just failed, nor apply a valid subset after a refused
+            // edit. Interactive sessions can repair a candidate; batches stop
+            // at the failing command and report any earlier actions honestly.
+            if repl::failed_lines() > failed_before {
+                anyhow::bail!(
+                    "configuration stopped at line {} after a refused command; \
+                     earlier successful actions remain in effect",
+                    index + 1
+                );
+            }
+            if exit {
                 break;
             }
-        }
-        // Answer for what was refused. Scripts and the REST API judge by exit
-        // status, and printing an error while exiting 0 told them a change had
-        // been made that had not.
-        let failed = repl::failed_lines();
-        if failed > 0 {
-            anyhow::bail!(
-                "{failed} line(s) were refused — see the errors above; nothing they \
-                 asked for was applied"
-            );
         }
     }
     Ok(())

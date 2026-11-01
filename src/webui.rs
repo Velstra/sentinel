@@ -2787,7 +2787,16 @@ async function api(path, opts, patience) {{
   if (r.status === 401) {{ signOut("That token was not accepted."); throw new Error("unauthorised"); }}
   if (!r.ok) {{
     const body = await r.text();
-    throw new Error(unwrapError(body) || body.trim() || ("HTTP " + r.status));
+    const error = new Error(unwrapError(body) || body.trim() || ("HTTP " + r.status));
+    // Preserve typed validation metadata at the shared transport boundary.
+    // No other endpoint/status can authorize excluding a staged change.
+    if (path === "/api/v1/configure/validate" && r.status === 400) {{
+      try {{
+        const details = JSON.parse(body);
+        if (Number.isSafeInteger(details.edit_line) && details.edit_line > 0) error.editLine = details.edit_line;
+      }} catch (ignored) {{ /* an unstructured refusal cannot identify an edit */ }}
+    }}
+    throw error;
   }}
   return r;
 }}
@@ -2827,9 +2836,7 @@ async function configure(lines, validateOnly = false) {{
     headers: {{ Authorization: "Bearer " + token, "Content-Type": "text/plain" }},
     body: lines.join("\n") + "\n",
   }}, 120);
-  const result = await r.json();
-  if (!r.ok) throw new Error(result.error || "The configuration request was refused (HTTP " + r.status + ").");
-  return result;
+  return await r.json();
 }}
 
 function el(tag, attrs, kids) {{
@@ -3450,7 +3457,7 @@ function ruleFields(zones) {{
     ["source-mac-group", "Sender MAC group"],
     ["interface-group", "Only on these links"],
     // A rule with no address applies to both families; this is how it says
-    // otherwise. `out` covers traffic this box originates, and is IPv4 only.
+    // otherwise. `out` also covers traffic this box originates, in either family.
     ["family", "Address family", ["", "ipv4", "ipv6"]],
     ["direction", "Direction", ["", "in", "out"]],
     // The schedule is three leaves under one word, and `set … schedule days …`
@@ -3610,7 +3617,8 @@ function renderStaged() {{
       el("span", {{ class: "what", text: entry.label }}),
       el("button", {{
         class: "btn", text: "Remove",
-        onclick: () => {{ staged.splice(i, 1); renderStaged(); }},
+        disabled: applying ? "" : null,
+        onclick: () => {{ if (!applying) {{ staged.splice(i, 1); renderStaged(); }} }},
       }}),
     ]));
   }});
@@ -3619,6 +3627,7 @@ function renderStaged() {{
 // `tail` is what turns a script into an intention: nothing commits, `commit`
 // applies for this boot, `commit save` also persists.
 async function applyStaged(tail) {{
+  if (applying) return;
   // Only `show` is proxied to a peer; `configure` always runs here. Applying
   // while a peer's configuration is on screen would change the wrong firewall
   // — and on a config-synced pair the object names match by construction, so
@@ -3642,9 +3651,10 @@ async function applyStaged(tail) {{
   // Say that it is happening. An apply takes a second or two on the box and
   // longer on a slow link, and a button that goes quiet for that long reads
   // as a button that did nothing — which is when somebody presses it again.
-  const working = busy(["applystaged", "applystaged2", "validate"], "Applying…");
+  const origin = document.activeElement;
+  const working = busy(["applystaged", "applystaged2", "validate", "discard"], "Applying…");
   try {{
-    await applyStagedNow(tail);
+    await applyStagedNow(tail, origin);
   }} finally {{
     working();
   }}
@@ -3676,85 +3686,59 @@ function busy(ids, label) {{
   }};
 }}
 
-async function applyStagedNow(tail) {{
-  // The batch runs once, and the appliance's own report is the answer.
-  //
-  // Applying used to run every command twice: once with no `commit` to see
-  // whether the batch "would be refused", and then again for real. The check
-  // could not know anything the real run would not — it ran the same lines
-  // against the same configuration — so all it bought was a second execution
-  // of the whole batch on every single apply. What it cost was worse: any
-  // reply with an `error:` line in it stopped the apply outright, so one
-  // refused command meant the changes staged *beside* it were never applied
-  // either, and since the refusal names the setting but not which staged
-  // change contained it, an operator with several waiting could be left unable
-  // to save any of them. The appliance runs a batch line by line, commits what
-  // survived and says what it refused; that report is what to show.
-  //
-  // Checking first is still here — it is what Validate is, and an operator who
-  // wants to know before touching the box presses it. What is gone is the
-  // hidden second run that every apply paid for and that could refuse a change
-  // the appliance was willing to take.
-  //
-  // Validate materializes and checks the complete candidate through a pure
-  // endpoint. No commit or operational command can run there. The staged list
-  // must survive it. Clearing on a *validate* was the
-  // worst possible bug in this panel: the check said "fine", the panel emptied
-  // itself, and the change an operator had just been told was good could no
-  // longer be applied.
+async function applyStagedNow(tail, origin) {{
   const committed = tail.includes("commit");
+  // Validation is pure: no subprocess can apply or save anything here. Keep
+  // each logical change intact. Only an explicitly identified editing refusal
+  // can exclude a change; full-candidate/domain errors block the entire apply.
+  const pending = staged.slice();
+  const rejected = [];
+  let applyRequested = false;
   let r;
   try {{
-    r = await configure(stagedCommands().concat(tail), !committed);
-  }} catch (e) {{
-    // An apply that never reached the appliance has to say so. Left to throw,
-    // the page swallowed it: no dialog, no banner, the changes still staged —
-    // an operator pressing Apply and being answered with nothing at all.
-    showResult({{ ok: false, output: "error: " + (e.message || e) }}, committed);
+    for (;;) {{
+      try {{
+        r = await configure(pending.flatMap((entry) => entry.cmds), true);
+        break;
+      }} catch (error) {{
+        if (!committed || staged.length > 12 || !error.editLine) throw error;
+        let line = 0;
+        const index = pending.findIndex((entry) => {{
+          const start = line;
+          line += entry.cmds.join("\n").split("\n").length;
+          return error.editLine > start && error.editLine <= line;
+        }});
+        if (index < 0) throw error;
+        const [entry] = pending.splice(index, 1);
+        rejected.push({{ label: entry.label, output: "error: " + error.message }});
+        if (!pending.length) throw error;
+      }}
+    }}
+    if (committed) {{
+      applyRequested = true;
+      r = await configure(pending.flatMap((entry) => entry.cmds).concat(tail));
+    }}
+  }} catch (error) {{
+    // No automatic retry after an apply: a transport error may mean that the
+    // request completed. Keep the candidate and let the operator inspect it.
+    showResult({{ ok: false, output: "error: " + (error.message || error) }}, committed,
+      rejected.map((entry) => entry.label).join(", ") || null, applyRequested, origin);
     return;
   }}
-  const refused = !r.ok || summarise(r.output).some((n) => n.kind === "bad");
-  showResult(r, committed, refused ? await culprit() : null);
-  // Only clear once they have actually run. A refused commit leaves the
-  // commands staged, so the operator can fix one and try again rather than
-  // reconstructing what they had clicked.
-  if (committed && !refused) {{
-    staged = [];
+  const failed = !r.ok || summarise(r.output).some((note) => note.kind === "bad");
+  if (rejected.length) {{
+    r = {{ ok: false, output: r.output + "\n" + rejected.map((entry) => entry.output).join("\n") }};
+  }}
+  showResult(r, committed, rejected.map((entry) => entry.label).join(", ") || null, false, origin);
+  // Retain the full candidate on partial application so the operator can
+  // review what changed. A completely successful Apply clears it; Validate
+  // never does. Changes staged while a request was in flight are kept too.
+  if (committed && !failed && !rejected.length) {{
+    staged = staged.filter((entry) => !pending.includes(entry));
     renderStaged();
   }}
   await buildSearchIndex();
   await refresh();
-}}
-
-// Which staged change the appliance refused.
-//
-// The reply says what was wrong and never which line said it, and "That
-// setting is not one this appliance accepts" is an unanswerable sentence when
-// six changes are waiting: the operator cannot tell which one to correct, so
-// the batch stays broken and nothing they do afterwards can be applied either.
-//
-// So the batch is replayed a change at a time — same lines, same order, no
-// `commit`, so nothing is applied — and the first prefix that draws a refusal
-// names the change that carries it. Only ever after a refusal, and only while
-// the list is short enough for that to be quick: this is a hint that costs a
-// few seconds in the one case where an operator is stuck, not something every
-// apply pays for.
-async function culprit() {{
-  if (staged.length < 2 || staged.length > 12) return null;
-  const sofar = [];
-  for (const entry of staged) {{
-    sofar.push(...entry.cmds);
-    let r;
-    try {{
-      r = await configure(sofar);
-    }} catch (e) {{
-      return null;   // a hint is never worth losing the answer over
-    }}
-    if (!r.ok || summarise(r.output).some((n) => n.kind === "bad")) return entry.label;
-  }}
-  // The lines that survived were committed and saved, so a replay can come back
-  // clean — better to say nothing than to blame the wrong change.
-  return null;
 }}
 
 // What came back, as an outcome — never as a transcript.
@@ -3798,16 +3782,15 @@ function summarise(output) {{
   return notes;
 }}
 
-function showResult(r, committed, blamed) {{
+function showResult(r, committed, blamed, uncertain = false, origin = document.activeElement) {{
   const notes = summarise(r.output);
   const failed = !r.ok || notes.some((n) => n.kind === "bad");
-  // The appliance runs the commands it can and reports what it could not: a
-  // batch that is refused *and* committed leaves the box changed, and calling
-  // that "Not applied" sends an operator to re-run commands that already ran.
+  // An explicitly validated subset may have been applied. Its commit result
+  // must not be hidden by the editing refusals beside it.
   const partly = failed && /commit ok/i.test(r.output || "");
   // Validating and applying are different answers to different questions, and
   // a dialog that says "Applied" after a validate is a lie an operator acts on.
-  $("resulttitle").textContent = failed
+  $("resulttitle").textContent = uncertain ? "Check appliance state" : failed
     ? (committed ? (partly ? "Partly applied" : "Not applied") : "This would be refused")
     : (committed ? "Applied" : "This would be accepted");
   const box = $("resultout");
@@ -3823,10 +3806,15 @@ function showResult(r, committed, blamed) {{
   if (!committed && !failed) {{
     notes.push({{ kind: "ok", text: "Press Apply when you are ready." }});
   }}
+  if (uncertain) {{
+    notes.unshift({{ kind: "warn", text:
+      "The apply request could not be confirmed. Check the appliance state " +
+      "before retrying; the request may have completed." }});
+  }}
   if (partly) {{
     notes.unshift({{ kind: "warn", text:
-      "Some of this was applied and saved before the refusal — the appliance " +
-      "runs what it can. Check the section before applying again." }});
+      "The valid changes were applied. Refused changes were excluded before " +
+      "applying. Review the changes before applying again." }});
   }}
   // Which of the waiting changes it came from. First, because a refusal an
   // operator cannot place is one they cannot act on.
@@ -3840,6 +3828,14 @@ function showResult(r, committed, blamed) {{
       el("span", {{ class: "what", text: n.text }}),
     ]));
   }}
+  // Busy controls lose focus before the native dialog can remember their identity.
+  // Register before opening: an operator can close the result while the
+  // background refresh is still running. Never focus a removed/disabled action.
+  $("result").addEventListener("close", () => {{
+    const destination = origin && origin.isConnected && !origin.disabled && origin.getClientRects().length
+      ? origin : $("refresh");
+    if (destination && destination.getClientRects().length) destination.focus({{ preventScroll: true }});
+  }}, {{ once: true }});
   $("result").showModal();
 }}
 
@@ -9837,7 +9833,7 @@ mod tests {
         // so must a *validate*, which applies nothing at all. Clearing on a
         // validate meant the check said "fine" and then emptied the panel.
         assert!(
-            html.contains("if (committed && !refused)"),
+            html.contains("if (committed && !failed && !rejected.length)"),
             "staged commands clear even when nothing was applied"
         );
         assert!(

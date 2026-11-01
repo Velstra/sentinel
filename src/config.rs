@@ -4372,6 +4372,19 @@ fn with_default_port(host: &str, port: u16) -> String {
     format!("{host}:{port}")
 }
 
+/// The same safe account-name boundary for desired configuration and persisted
+/// ownership metadata. Neither may become a pathname or usermod option.
+pub(crate) fn valid_login_username(name: &str) -> bool {
+    let mut chars = name.chars();
+    let first = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    !name.is_empty()
+        && name.len() <= 32
+        && first
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 /// A local login account (`[[system.login]]`). Users are reconciled onto the box
 /// at commit time (mutableUsers): a named account is created if missing, its SSH
 /// keys and (pre-hashed) password are set. The password is for console + sudo;
@@ -4607,6 +4620,7 @@ impl Firewall {
             && self.source_validation == SourceValidation::Disable
             && self.geoip_block.is_empty()
             && self.group.is_empty()
+            && self.syn_protect.is_empty()
     }
 }
 
@@ -4758,7 +4772,7 @@ pub struct ResolvedZone {
     pub geoip_block: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Interface {
     pub name: String,
     /// A free-text label shown in `show` and rendered as a comment header on the
@@ -6546,8 +6560,8 @@ pub struct Rule {
     ///
     /// `out` is the only way to describe traffic **this box originates**: the
     /// egress hook is where a locally-generated packet is seen, and rules that
-    /// only ever run on arrival cannot say anything about it. IPv4 only, because
-    /// the egress hook is.
+    /// only ever run on arrival cannot say anything about it. Both address
+    /// families use the same direction constraint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direction: Option<String>,
     /// Log packets matching this (port) rule, independent of the zone's `log`.
@@ -6792,6 +6806,40 @@ enum UnknownKeys {
     Warn,
 }
 
+/// Stacked devices require a real root link. Walk iteratively, with completed
+/// chains shared between roots, so deep declarative topologies cannot overflow
+/// the validator's stack or leave impossible dependency cycles to networkd.
+fn validate_interface_parent_graph(interfaces: &[Interface]) -> Result<()> {
+    let parents: BTreeMap<&str, &str> = interfaces
+        .iter()
+        .filter_map(|iface| {
+            iface
+                .parent
+                .as_deref()
+                .map(|parent| (iface.name.as_str(), parent))
+        })
+        .collect();
+    let mut complete = HashSet::new();
+    for iface in interfaces {
+        let mut chain = Vec::new();
+        let mut active = HashSet::new();
+        let mut current = Some(iface.name.as_str());
+        while let Some(name) = current {
+            if complete.contains(name) {
+                break;
+            }
+            if !active.insert(name) {
+                chain.push(name);
+                bail!("interface parent cycle: {}", chain.join(" -> "));
+            }
+            chain.push(name);
+            current = parents.get(name).copied();
+        }
+        complete.extend(chain);
+    }
+    Ok(())
+}
+
 impl Appliance {
     /// Parse and validate a config from TOML text.
     pub fn from_toml(toml_text: &str) -> Result<Self> {
@@ -6949,6 +6997,18 @@ impl Appliance {
     pub fn validate(&self) -> Result<()> {
         validate_hostname(&self.system.hostname)?;
 
+        // The compiler emits zone/<name> as the agent's semantic state scope.
+        // Reject unrepresentable identities during validation, before apply.
+        for zone in self.zones.keys().map(String::as_str).chain(
+            self.interfaces
+                .iter()
+                .filter_map(|iface| iface.zone.as_deref()),
+        ) {
+            if zone.is_empty() || zone.len() > 123 || zone.chars().any(char::is_control) {
+                bail!("zone name must contain 1–123 UTF-8 bytes without control characters");
+            }
+        }
+
         // Every blocklist entry must be a valid IPv4 address or CIDR.
         for entry in &self.firewall.blocklist {
             validate_cidr_or_ip(entry).context("firewall.blocklist")?;
@@ -6966,6 +7026,8 @@ impl Appliance {
         }
 
         let names: HashSet<&str> = self.interfaces.iter().map(|i| i.name.as_str()).collect();
+        validate_interface_parent_graph(&self.interfaces)?;
+        let mut vlan_devices = BTreeMap::new();
         let mut seen = HashSet::new();
         for iface in &self.interfaces {
             validate_iface_name(&iface.name)?;
@@ -7013,7 +7075,8 @@ impl Appliance {
                 }
             }
             if let Some(mac) = &iface.mac {
-                validate_mac(mac).with_context(|| format!("interface {:?} mac", iface.name))?;
+                validate_clone_mac(mac)
+                    .with_context(|| format!("interface {:?} mac", iface.name))?;
             }
             // QoS: validate the shaping parameters and enforce that only knobs
             // that belong to the chosen discipline are set (cross-discipline knobs
@@ -7038,6 +7101,15 @@ impl Appliance {
                         if !names.contains(parent.as_str()) {
                             bail!(
                                 "interface {:?}: parent {parent:?} is not a declared interface",
+                                iface.name
+                            );
+                        }
+                        let protocol = iface.vlan_protocol.as_deref().unwrap_or("802.1q");
+                        if let Some(previous) = vlan_devices
+                            .insert((parent.as_str(), protocol, vlan), iface.name.as_str())
+                        {
+                            bail!(
+                                "interface {:?}: vlan {vlan} ({protocol}) on {parent:?} is already declared by {previous:?}",
                                 iface.name
                             );
                         }
@@ -8172,16 +8244,6 @@ impl Appliance {
             if let Some(d) = &rule.direction {
                 if !matches!(d.as_str(), "in" | "out") {
                     bail!("rule {:?}: direction {d:?} is not in or out", rule.name);
-                }
-                // The egress hook is IPv4 only. A v6 rule scoped to `out` would
-                // be written and never consulted, so it is refused rather than
-                // enforcing nothing quietly.
-                if d == "out" && rule.family.as_deref() == Some("ipv6") {
-                    bail!(
-                        "rule {:?}: direction out is IPv4 only — an ipv6 rule on the way \
-                         out would never be consulted",
-                        rule.name
-                    );
                 }
             }
             if rule.source.is_some() && rule.source_group.is_some() {
@@ -9566,12 +9628,7 @@ impl Appliance {
             if !seen_users.insert(u.as_str()) {
                 bail!("system login {u:?}: duplicate username");
             }
-            let mut chars = u.chars();
-            let ok_first = chars
-                .next()
-                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
-            let ok_rest = chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-            if u.is_empty() || u.len() > 32 || !ok_first || !ok_rest {
+            if !valid_login_username(u) {
                 bail!(
                     "system login {u:?}: not a valid username \
                      (letter/underscore then letters/digits/-/_, max 32)"
@@ -11388,6 +11445,18 @@ pub(crate) fn validate_mac(s: &str) -> Result<()> {
     Ok(())
 }
 
+/// A link's own source address must be non-zero unicast. Keep this separate
+/// from MAC rule/group validation, where multicast and broadcast are valid
+/// match keys. networkd otherwise silently clears the multicast bit.
+fn validate_clone_mac(mac: &str) -> Result<()> {
+    validate_mac(mac)?;
+    let first = u8::from_str_radix(&mac[..2], 16)?;
+    if first & 1 != 0 || mac == "00:00:00:00:00:00" {
+        bail!("cloned MAC must be a non-zero unicast Ethernet address");
+    }
+    Ok(())
+}
+
 /// tc rate units accepted for a QoS `bandwidth` (case as tc prints them).
 const TC_RATE_UNITS: &[&str] = &[
     "bit", "kbit", "mbit", "gbit", "tbit", "kibit", "mibit", "gibit", "tibit", "bps", "kbps",
@@ -13027,6 +13096,57 @@ action = "accept"
     }
 
     #[test]
+    fn outbound_rules_support_both_address_families() {
+        for family in ["ipv4", "ipv6"] {
+            let text = format!(
+                "[system]\nhostname = \"fw\"\n[[interface]]\nname = \"wan0\"\nzone = \"wan\"\n[[rule]]\nname = \"outbound\"\nfrom = \"wan\"\nproto = \"tcp\"\nport = 18090\naction = \"drop\"\nfamily = {family:?}\ndirection = \"out\"\n"
+            );
+            let appliance = Appliance::from_toml(&text).expect("outbound rule validates");
+            let round_trip = Appliance::from_toml(&appliance.to_toml().unwrap()).unwrap();
+            assert_eq!(round_trip.rules[0].family.as_deref(), Some(family));
+            assert_eq!(round_trip.rules[0].direction.as_deref(), Some("out"));
+        }
+    }
+
+    #[test]
+    fn cloned_interface_mac_rejects_non_unicast_or_unspecified_addresses() {
+        for mac in [
+            "00:00:00:00:00:00",
+            "01:66:77:88:99:aa",
+            "FF:FF:FF:FF:FF:FF",
+            "33:33:00:00:00:01",
+        ] {
+            let source = format!(
+                "[system]\nhostname = \"fw\"\n[[interface]]\nname = \"wan0\"\nmac = {mac:?}\n"
+            );
+            let error = Appliance::from_toml(&source)
+                .expect_err("invalid source MAC must be refused before apply");
+            assert!(
+                format!("{error:#}").contains("non-zero unicast"),
+                "{mac}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn unicast_clones_preserve_multicast_firewall_matching() {
+        for mac in [
+            "00:01:02:03:04:05",
+            "02:66:77:88:99:aa",
+            "52:54:00:12:34:56",
+            "FE:AA:BB:CC:DD:EE",
+        ] {
+            let source = format!(
+                "[system]\nhostname = \"fw\"\n[firewall.group.mac]\nmulticast = [\"01:00:5e:00:00:01\", \"33:33:00:00:00:01\"]\nbroadcast = [\"ff:ff:ff:ff:ff:ff\"]\n[[interface]]\nname = \"wan0\"\nmac = {mac:?}\n"
+            );
+            let appliance =
+                Appliance::from_toml(&source).expect("valid unicast clone and multicast matches");
+            assert_eq!(appliance.firewall.group.mac["multicast"].len(), 2);
+            Appliance::from_toml(&appliance.to_toml().unwrap()).expect("configuration round trip");
+        }
+    }
+
+    #[test]
     fn mtu_and_mac_parse_and_validate() {
         let toml = r#"
 [system]
@@ -13768,6 +13888,45 @@ zone = "iot"
 address = "10.0.20.1/24"
 "#;
         assert!(Appliance::from_toml(mismatch).is_err());
+    }
+
+    #[test]
+    fn cyclic_interface_parents_are_rejected() {
+        for body in [
+            "[[interface]]\nname='alpha'\nparent='alpha'\nvlan=42\n",
+            "[[interface]]\nname='alpha'\nparent='beta'\nvlan=42\n[[interface]]\nname='beta'\nparent='alpha'\nvlan=43\n",
+            "[[interface]]\nname='alpha'\nparent='beta'\nvlan=42\n[[interface]]\nname='beta'\ntype='macvlan'\nparent='gamma'\n[[interface]]\nname='gamma'\nparent='alpha'\nvlan=43\n",
+        ] {
+            let input = format!("[system]\nhostname='fw'\n{body}");
+            let error = Appliance::from_toml(&input).unwrap_err().to_string();
+            assert!(error.contains("interface parent cycle"), "{error}");
+            assert!(error.contains("alpha"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_vlan_tag_and_protocol_can_only_occupy_a_parent_once() {
+        let base = "[system]\nhostname='fw'\n[[interface]]\nname='eth0'\n[[interface]]\nname='alpha'\nparent='eth0'\nvlan=42\n[[interface]]\nname='beta'\nparent='eth0'\nvlan=42\n";
+        for protocol in ["", "vlan-protocol='802.1q'\n"] {
+            let error = Appliance::from_toml(&format!("{base}{protocol}"))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("already declared by"), "{error}");
+            assert!(error.contains("alpha") && error.contains("beta"), "{error}");
+        }
+        // Equal IDs are distinct on different TPIDs or different parents.
+        Appliance::from_toml(&format!("{base}vlan-protocol='802.1ad'\n")).unwrap();
+        Appliance::from_toml(
+            &base.replace("name='beta'\nparent='eth0'", "name='beta'\nparent='alpha'"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn qinq_dependency_order_does_not_depend_on_document_order() {
+        let input = "[system]\nhostname='fw'\n[[interface]]\nname='inner'\nparent='outer'\nvlan=42\n[[interface]]\nname='outer'\nparent='eth0'\nvlan=42\nvlan-protocol='802.1ad'\n[[interface]]\nname='eth0'\n";
+        let appliance = Appliance::from_toml(input).unwrap();
+        assert_eq!(appliance.interfaces[0].parent.as_deref(), Some("outer"));
     }
 
     #[test]
@@ -14898,5 +15057,33 @@ virtual-address = ["10.0.0.254"]
             ))
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod synproxy_persistence_tests {
+    use super::*;
+    #[test]
+    fn default_posture_retains_syn_protection_when_saved() {
+        let before = Appliance::from_toml(
+            r#"
+[system]
+hostname = "fw"
+[firewall]
+syn-protect = [{ port = 443, mss = 1400 }]
+"#,
+        )
+        .unwrap();
+        assert_eq!(before.firewall.syn_protect.len(), 1);
+        let saved = before.to_toml().unwrap();
+        let after = Appliance::from_toml(&saved).unwrap();
+        assert_eq!(
+            after.firewall.syn_protect, before.firewall.syn_protect,
+            "saved config discarded SYN protection: {saved}"
+        );
+        let compiled = crate::compile::compile(&after).to_toml().unwrap();
+        let table: toml::Value = toml::from_str(&compiled).unwrap();
+        assert_eq!(table["synproxy"][0]["port"].as_integer(), Some(443));
+        assert_eq!(table["synproxy"][0]["mss"].as_integer(), Some(1400));
     }
 }

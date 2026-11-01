@@ -263,9 +263,8 @@ pub enum Crypto {
 }
 
 /// The device-mapper name the unlocked data volume is opened as, both at install
-/// time and at boot (`sentinel unlock`). The ext4 filesystem — LABEL=data — lives
-/// *inside* it, so the appliance's existing `/dev/disk/by-label/data` mount finds
-/// it unchanged once the volume is open.
+/// time and at boot (`sentinel unlock`). The boot-owned data-device resolver
+/// publishes this mapping for the state mount once the volume is open.
 pub const DATA_MAPPER: &str = "data";
 
 /// The `/dev/mapper` path of the unlocked data volume.
@@ -416,23 +415,31 @@ impl Drop for CryptGuard {
 /// medium we clone from. Follows the **active** dm-verity device
 /// (`/dev/mapper/usr`) down to its backing disk; a partlabel would be ambiguous
 /// once a target has been installed (it copies the same labels).
-fn find_source_disk() -> Result<String> {
+pub(crate) fn find_source_disk() -> Result<String> {
     // `-s` walks the dependency tree downward; `-r` (raw) avoids tree-drawing
     // characters in the NAME column. Pick the entry whose TYPE is `disk`.
     let out = Command::new(system::bin("lsblk"))
         .args(["-nsro", "NAME,TYPE", "/dev/mapper/usr"])
         .output()
         .context("locating the source disk")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "lsblk could not inspect /dev/mapper/usr"
+    );
     let text = String::from_utf8_lossy(&out.stdout);
-    let name = text
+    let disks: std::collections::BTreeSet<_> = text
         .lines()
         .filter_map(|l| {
             let mut f = l.split_whitespace();
             let (name, kind) = (f.next()?, f.next()?);
             (kind == "disk").then(|| name.to_string())
         })
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("could not resolve the source disk from /dev/mapper/usr"))?;
+        .collect();
+    anyhow::ensure!(
+        disks.len() == 1,
+        "could not resolve one unambiguous source disk from /dev/mapper/usr"
+    );
+    let name = disks.first().expect("exactly one source disk");
     Ok(format!("/dev/{name}"))
 }
 

@@ -1,15 +1,6 @@
-//! Live L3 addressing + VLAN subinterfaces via systemd-networkd.
-//!
-//! Each interface that carries an `address` is rendered to a `.network` unit in
-//! networkd's **runtime** dir (`/run/systemd/network`, tmpfs) and networkd is
-//! told to re-apply it — so `set interface eth0 address 10.0.0.1/24` configures
-//! the NIC immediately, with no rebuild. A VLAN subinterface (`parent` + `vlan`)
-//! additionally gets a `.netdev` that creates the 802.1Q link, and its parent's
-//! `.network` gains a `VLAN=` reference so networkd attaches it. The units are
-//! named so they take precedence over the image defaults, and the boot service
-//! re-renders them from the saved config each boot (the same runtime-apply model
-//! the hostname uses). Removing config removes the units, so changes reconcile
-//! both ways.
+//! Live link and L3 reconciliation. networkd owns addressing, DHCP and link
+//! tunables; the VLAN lifecycle module owns immutable VLAN devices and guarded
+//! activation. Runtime units are restored from the canonical appliance at boot.
 
 use std::collections::{BTreeMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -29,6 +20,10 @@ use crate::system::{self, NETWORKD_RUNTIME_DIR};
 /// image/test defaults so our config wins; the marker lets us reconcile
 /// (remove ours without touching anyone else's).
 const PREFIX: &str = "10-sentinel-";
+
+/// Kept until networkd acknowledges the rendered units. A failed reload or an
+/// interrupted apply must be retried even when the next render has equal bytes.
+const NETWORKD_RELOAD_PENDING: &str = "/run/sentinel/networkd-reload.pending";
 
 fn network_name(iface: &str) -> String {
     format!("{PREFIX}{iface}.network")
@@ -53,12 +48,12 @@ fn link_body(iface: &str, mac: &str) -> String {
     format!("[Match]\nMACAddress={mac}\n\n[Link]\nName={iface}\n")
 }
 
-/// The `.netdev` that creates a VLAN link `iface` with the given id. `protocol`
+/// Exact legacy VLAN unit renderer, retained to verify migration provenance. `protocol`
 /// selects the tag TPID: `802.1q` (or `None` — the default C-VLAN) renders no
 /// `Protocol=` line, while `802.1ad` emits `Protocol=802.1ad` for an S-VLAN
 /// (service tag). Stacking an `802.1q` VLAN on an `802.1ad` VLAN gives 802.1ad
 /// QinQ (roadmap C14).
-fn netdev_body(iface: &str, vlan: u16, protocol: Option<&str>) -> String {
+pub(crate) fn netdev_body(iface: &str, vlan: u16, protocol: Option<&str>) -> String {
     let mut body = format!("[NetDev]\nName={iface}\nKind=vlan\n\n[VLAN]\nId={vlan}\n");
     if protocol == Some("802.1ad") {
         body.push_str("Protocol=802.1ad\n");
@@ -69,7 +64,7 @@ fn netdev_body(iface: &str, vlan: u16, protocol: Option<&str>) -> String {
 /// The `.netdev` for a MACVLAN pseudo-interface (roadmap C14): `Kind=macvlan`
 /// plus a `[MACVLAN] Mode=` (default `bridge`). The device attaches to its
 /// `parent` NIC through the parent's `.network` (`MACVLAN=<name>`), not here —
-/// mirroring how a VLAN child attaches via the parent's `VLAN=`.
+/// while owned VLAN lifetime is reconciled separately.
 fn macvlan_netdev_body(iface: &Interface) -> String {
     let mode = iface.macvlan_mode.as_deref().unwrap_or("bridge");
     format!(
@@ -1612,29 +1607,40 @@ fn dhcp6_conf_body(ifaces: &[Interface]) -> Option<String> {
 
 /// Reconcile one Sentinel-owned box service to its rendered config: write the
 /// file (0640 when it carries a secret) and (re)start the unit when the config
-/// changed, or stop the unit and drop the file when the service is unconfigured.
+/// changed, ensure it is started on an unchanged apply, or stop the unit and
+/// drop the file when the service is unconfigured. Unit failures abort the
+/// transaction, so a failed start or stop cannot be saved as successful state.
 /// The generic core behind [`apply_lldp`]/[`apply_snmp`]/… — mirrors
 /// [`apply_multiwan`]'s model, parameterised over unit + path + body.
 fn apply_box_service(unit: &str, path: &Path, body: Option<String>, secret: bool) -> Result<()> {
     match body {
         Some(body) => {
-            let changed = file_changed(path, &body);
+            let changed = if secret {
+                system::private_file_changed(path, body.as_bytes())?
+            } else {
+                file_changed(path, &body)
+            };
             if secret {
                 system::install_service_secret(path, &body)?;
             } else {
                 system::install_file(path, &body)?;
             }
             if changed {
-                if let Err(e) = system::service_restart(unit) {
-                    eprintln!("warning: (re)starting {unit} failed (applies on next start): {e}");
-                }
+                system::service_restart(unit)
+                    .with_context(|| format!("restarting configured service {unit}"))?;
+            } else {
+                // Start is idempotent for an active service and also waits for
+                // an in-progress start. File equality alone is not runtime health.
+                system::service_start(unit)
+                    .with_context(|| format!("starting configured service {unit}"))?;
             }
         }
         None => {
+            // Stop also cancels a pending automatic restart. Do this even if
+            // drift removed the rendered file while the daemon was still live.
+            system::service_stop(unit)
+                .with_context(|| format!("stopping unconfigured service {unit}"))?;
             if path.exists() {
-                if let Err(e) = system::service_stop(unit) {
-                    eprintln!("warning: stopping {unit}: {e}");
-                }
                 system::remove_file(path)?;
             }
         }
@@ -1929,6 +1935,7 @@ fn apply_box_services(appliance: &Appliance) -> Result<()> {
 const SSH_DIR: &str = "/run/sentinel-ssh";
 const SSH_DROPIN: &str = "/run/sentinel-ssh/10-sentinel.conf";
 const SSH_UNIT: &str = "sshd.service";
+const SSH_ENABLED: &str = "/run/sentinel-ssh/enabled";
 
 /// The sshd drop-in (`Port`/`ListenAddress`, and a `Match all` that flips on
 /// password auth when `[services.ssh] password-authentication` is set), or `None`
@@ -1985,35 +1992,35 @@ fn apply_ssh(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
         }
     };
 
+    // The unit's condition also gates its normal boot start. A live stop alone
+    // would let WantedBy=multi-user.target reopen a disabled service on reboot.
+    if ssh.enable {
+        system::install_file(Path::new(SSH_ENABLED), "enabled\n")?;
+    } else {
+        system::remove_file(Path::new(SSH_ENABLED))?;
+    }
+
     if mode == ApplyMode::Live {
         if ssh.enable {
             // Ensure running without cutting live sessions; restart only to rebind
             // a changed Port/ListenAddress (or a password-auth toggle).
-            if let Err(e) = system::service_start(SSH_UNIT) {
-                eprintln!("warning: starting {SSH_UNIT} failed: {e}");
-            }
+            system::service_start(SSH_UNIT).context("starting the configured SSH service")?;
             if dropin_changed {
-                if let Err(e) = system::service_restart(SSH_UNIT) {
-                    eprintln!("warning: restarting {SSH_UNIT} failed: {e}");
-                }
+                system::service_restart(SSH_UNIT)
+                    .context("restarting the configured SSH service")?;
             }
-        } else if let Err(e) = system::service_stop(SSH_UNIT) {
-            eprintln!("warning: stopping {SSH_UNIT}: {e}");
+        } else {
+            system::service_stop(SSH_UNIT).context("stopping the disabled SSH service")?;
         }
     }
     Ok(())
 }
 
-/// Reconcile the local login accounts (`[[system.login]]`, VyOS-style). Each named
-/// account is created if missing (mutableUsers: `useradd -m -G wheel`), its pre-
-/// hashed password is set (`chpasswd -e`) when given, and its SSH keys are rendered
-/// to `/run/sentinel-ssh/authorized_keys.<user>`. Key files for users no longer in
-/// the config are removed so revoking a login revokes its key access (the account
-/// itself is left in place — we never `userdel`, so the built-in admin is safe).
-/// Live only creates users / sets passwords; at boot the accounts already exist and
-/// only the (tmpfs) key files are re-rendered.
+/// Reconcile local credentials at boot and on each commit. Missing password
+/// grants disable password authentication; removed managed logins lose passwords
+/// and generated SSH keys. Keep account IDs and homes rather than deleting OS
+/// users. Unmanaged accounts, including the factory admin, are not revoked.
 fn apply_logins(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
-    use std::collections::BTreeSet;
     let logins = &appliance.system.logins;
 
     // An interface the box does not have. The installer names links as the
@@ -2059,10 +2066,12 @@ fn apply_logins(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
         }
     }
 
+    // Persist ownership before side effects, including password-only accounts.
+    // A failed apply or rollback can then reconcile every account it touched.
+    let ownership = crate::logins::begin(logins, Path::new(SSH_DIR))?;
+
     // Render each configured user's authorized_keys file (root-owned, 0644).
-    let mut wanted: BTreeSet<String> = BTreeSet::new();
     for login in logins {
-        wanted.insert(login.username.clone());
         let path = format!("{SSH_DIR}/authorized_keys.{}", login.username);
         if login.ssh_keys.is_empty() {
             system::remove_file(Path::new(&path))?;
@@ -2078,35 +2087,16 @@ fn apply_logins(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
             system::install_file(Path::new(&path), &body)?;
         }
 
-        // Account + password are live-only side effects on the OS user database.
-        // Created at boot as well, not only on a commit. "At boot the accounts
-        // already exist" holds for a box that has been configured at least once
-        // — and is exactly wrong for a freshly installed one, whose first boot
-        // is its first apply. The account the operator created in the installer
-        // did not exist, so the password they set could not be used.
-        // `ensure_login_account` checks before it creates, and setting the same
-        // hash twice is a no-op, so this is safe to run every boot.
-        {
-            system::ensure_login_account(&login.username)?;
-            if let Some(hash) = &login.hashed_password {
-                system::set_login_password(&login.username, hash)?;
-            }
-        }
+        system::ensure_login_account(&login.username)?;
+        system::set_login_password(
+            &login.username,
+            login
+                .hashed_password
+                .as_deref()
+                .unwrap_or(system::DISABLED_LOGIN_PASSWORD),
+        )?;
     }
-
-    // Revoke key files for users dropped from the config (the account lingers, but
-    // key access is gone; at boot only wanted files are re-created on the tmpfs).
-    if let Ok(entries) = std::fs::read_dir(SSH_DIR) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if let Some(user) = name.strip_prefix("authorized_keys.") {
-                if !wanted.contains(user) {
-                    let _ = system::remove_file(&entry.path());
-                }
-            }
-        }
-    }
+    ownership.finish(Path::new(SSH_DIR))?;
     Ok(())
 }
 
@@ -3419,8 +3409,8 @@ fn apply_multiwan(appliance: &Appliance) -> Result<()> {
     Ok(())
 }
 
-/// Render the persistent network config: write a `.netdev` for every VLAN
-/// subinterface and a `.network` for every interface that needs one (it has an
+/// Render the persistent network config: reserve VLAN ownership and write a
+/// `.network` for every interface that needs one (it has an
 /// address, is a VLAN, or is a parent carrying VLANs), remove any stale sentinel
 /// units, then reconcile the always-on co-services (resolved / dnsmasq / chrony)
 /// by writing their drop-ins. In `ApplyMode::Boot` this is ALL it does — pure
@@ -3435,7 +3425,6 @@ fn apply_multiwan(appliance: &Appliance) -> Result<()> {
 /// has, so a config naming a link that is not there cannot leave the agent
 /// pointed at nothing.
 fn agent_uplink(appliance: &Appliance) -> Option<String> {
-    let present = system::discover_interfaces();
     let zoned: Vec<&str> = appliance
         .interfaces
         .iter()
@@ -3444,33 +3433,21 @@ fn agent_uplink(appliance: &Appliance) -> Option<String> {
         .collect();
     zoned
         .iter()
-        .find(|n| present.iter().any(|p| p == *n))
-        .or(zoned.first())
-        .map(|n| n.to_string())
+        .copied()
+        .find(|name| {
+            Path::new("/sys/class/net")
+                .join(name)
+                .join("ifindex")
+                .is_file()
+        })
+        .or_else(|| zoned.first().copied())
+        .map(str::to_owned)
 }
 
-/// Tell the agent's unit which link to attach to, and restart it when that
-/// changes. Without this the choice was a build-time constant.
-fn apply_agent_iface(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
-    let Some(iface) = agent_uplink(appliance) else {
-        // Worth saying out loud: with no interface to attach to, the data plane
-        // does not run, and a box whose firewall is not running looks exactly
-        // like one whose rules all permit.
-        if mode == ApplyMode::Live {
-            eprintln!(
-                "warning: no interface has a zone, so the firewall data plane has \
-                 nothing to attach to and is not filtering. Give the uplink a zone: \
-                 `set interface <name> zone <zone>`."
-            );
-        }
-        return Ok(());
-    };
-    if mode == ApplyMode::Live && !system::discover_interfaces().contains(&iface) {
-        eprintln!(
-            "warning: this box has no interface {iface:?}, so the firewall data plane \
-             cannot attach and is not filtering. `show interfaces` lists the real names."
-        );
-    }
+/// Omit the interface override when there are no zoned interfaces: systemd then
+/// uses the appliance's configured fallback. FlowSpec is independent of zones
+/// and must still be enabled or cleared in that case.
+fn agent_environment(appliance: &Appliance, iface: Option<&str>) -> String {
     // A3: whether the agent enforces what BGP peers advertise, as arguments the
     // unit splices in. Written here rather than baked into the unit for the same
     // reason the interface is: it is a decision an operator makes at run time,
@@ -3488,19 +3465,46 @@ fn apply_agent_iface(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
         // enforcement is turned off.
         None => "VELSTRA_FLOWSPEC_ARGS=\n".to_string(),
     };
-    let env = format!("VELSTRA_IFACE={iface}\n{flowspec}");
-    let changed = file_changed(Path::new(AGENT_ENV), &env);
-    system::install_file(Path::new(AGENT_ENV), &env)?;
-    if changed && mode == ApplyMode::Live {
-        if let Err(e) = system::service_restart(AGENT_UNIT) {
-            eprintln!("warning: restarting {AGENT_UNIT} failed: {e}");
+    match iface {
+        Some(iface) => format!("VELSTRA_IFACE={iface}\n{flowspec}"),
+        None => flowspec,
+    }
+}
+
+/// Reconcile both agent overrides, including removal. Leaving yesterday's
+/// environment file in place keeps the process attached to an undeclared link.
+fn apply_agent_iface(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
+    let iface = agent_uplink(appliance);
+    if let Some(iface) = iface
+        .as_ref()
+        .filter(|_| mode == ApplyMode::Live)
+        .filter(|iface| {
+            !Path::new("/sys/class/net")
+                .join(iface)
+                .join("ifindex")
+                .is_file()
+        })
+    {
+        eprintln!(
+            "warning: interface {iface:?} is not present yet; firewall readiness \
+             will be checked after network configuration."
+        );
+    }
+    let env = agent_environment(appliance, iface.as_deref());
+    if file_changed(Path::new(AGENT_ENV), &env) {
+        system::install_file(Path::new(AGENT_ENV), &env)?;
+        if mode == ApplyMode::Live {
+            system::service_restart(AGENT_UNIT)
+                .context("restarting the firewall for its interface configuration")?;
         }
     }
     Ok(())
 }
 
 pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
+    let defaults = crate::link_defaults::prepare(appliance, mode)?;
     let ifaces = &appliance.interfaces;
+    crate::vlan::prepare(appliance)?;
 
     // A PPPoE client's raw uplink NIC (`parent`) must be link-up for pppd's
     // discovery to run, but carries no address itself — so it still needs a bare
@@ -3587,16 +3591,9 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     // Files that carry a secret (a WireGuard private key): 0640 root:systemd-network.
     let mut secrets: HashSet<String> = HashSet::new();
 
-    // VLAN .netdev units. `vlan_protocol` selects the tag TPID (802.1q default /
-    // 802.1ad S-VLAN); a VLAN whose parent is itself a VLAN stacks (QinQ).
-    for i in ifaces {
-        if let (Some(_), Some(vlan)) = (&i.parent, i.vlan) {
-            let name = netdev_name(&i.name);
-            let body = netdev_body(&i.name, vlan, i.vlan_protocol.as_deref());
-            writes.push((name.clone(), body));
-            keep.insert(name);
-        }
-    }
+    // VLAN device lifetime is reconciled explicitly after networkd forgets
+    // legacy netdevs. Its .network units still own L3 configuration. Letting
+    // networkd create these devices would race ownership and guarded activation.
 
     // MACVLAN .netdev units (roadmap C14): a pseudo-NIC with its own MAC on a
     // parent link. The parent's `.network` references it via `MACVLAN=` below.
@@ -3715,6 +3712,8 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
                     || i.pd_from.is_some()
                     || i.mtu.is_some()
                     || i.mac.is_some()
+                    || defaults.mtu(&i.name).is_some()
+                    || defaults.mac(&i.name).is_some()
                     || i.qos.is_some()
                     // Without these an interface configured *only* with per-link
                     // behaviour would get no `.network` unit, and the half of
@@ -3728,10 +3727,8 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
                     || pppoe_parents.contains(i.name.as_str()))
         })
         .for_each(|i| {
-            let kids = children
-                .get(i.name.as_str())
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
+            // Sentinel creates VLANs DOWN; no VLAN= trigger may race it.
+            let kids: &[String] = &[];
             let mv_kids = macvlan_children
                 .get(i.name.as_str())
                 .map(Vec::as_slice)
@@ -3782,6 +3779,22 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
                     bond_primary: bond_primaries.contains(i.name.as_str()),
                 },
             );
+            if let Some(mac) = defaults.permanent_mac(&i.name) {
+                // systemd.network [Match] uses the permanent address even when
+                // MACAddress cloning changes the current address.
+                body.push_str(&format!("\n[Match]\nPermanentMACAddress={mac}\n"));
+            }
+            if let Some(mtu) = defaults.mtu(&i.name) {
+                body.push_str(&format!("\n[Link]\nMTUBytes={mtu}\n"));
+            }
+            if let Some(mac) = defaults.mac(&i.name) {
+                body.push_str(&format!("\n[Link]\nMACAddress={mac}\n"));
+            }
+            if i.vlan.is_some() {
+                // Even an addressed VLAN must stay DOWN until its exact
+                // ifindex has the declared firewall policy and required TCX.
+                body.push_str("\n[Link]\nActivationPolicy=manual\nRequiredForOnline=no\n\n[Network]\nConfigureWithoutCarrier=yes\n");
+            }
             // 802.1Q port membership on a VLAN-aware bridge (appended as its own
             // [BridgeVLAN] section; empty for a non-filtering port).
             body.push_str(&bridge_vlan_body(&i.vlan_tagged, i.vlan_untagged));
@@ -3789,9 +3802,31 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
             keep.insert(name);
         });
 
+    // Removing the entire interface must also restore properties Sentinel owned.
+    // Keep a small defaults-only unit; never restore onto a different physical NIC.
+    for name in defaults
+        .names()
+        .filter(|name| !ifaces.iter().any(|i| i.name == *name))
+    {
+        let filename = network_name(name);
+        let mut body = format!("[Match]\nName={name}\n");
+        if let Some(mac) = defaults.permanent_mac(name) {
+            body.push_str(&format!("PermanentMACAddress={mac}\n"));
+        }
+        body.push_str("\n[Link]\n");
+        if let Some(mtu) = defaults.mtu(name) {
+            body.push_str(&format!("MTUBytes={mtu}\n"));
+        }
+        if let Some(mac) = defaults.mac(name) {
+            body.push_str(&format!("MACAddress={mac}\n"));
+        }
+        writes.push((filename.clone(), body));
+        keep.insert(filename);
+    }
+
     // Unrelated commits must not reconfigure DHCP links and discard leases.
     // Only reload networkd when its actual unit content changes.
-    let mut network_changed = false;
+    let mut removals = Vec::new();
     // Remove sentinel units (either kind) no longer wanted.
     if let Ok(entries) = std::fs::read_dir(NETWORKD_RUNTIME_DIR) {
         for entry in entries.flatten() {
@@ -3799,8 +3834,7 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
             let ours = name.starts_with(PREFIX)
                 && (name.ends_with(".network") || name.ends_with(".netdev"));
             if ours && !keep.contains(&name) {
-                system::remove_file(&entry.path())?;
-                network_changed = true;
+                removals.push(entry.path());
             }
         }
     }
@@ -3808,15 +3842,44 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     // Write the wanted units. A WireGuard `.netdev` embeds the private key, so
     // it is installed 0640 root:systemd-network (readable by networkd, not by
     // ordinary users); everything else stays the default 0644.
+    let mut changed_writes = Vec::new();
     for (name, body) in &writes {
         let path = Path::new(NETWORKD_RUNTIME_DIR).join(name);
-        if !file_changed(&path, body) {
+        let changed = if secrets.contains(name) {
+            system::private_file_changed(&path, body.as_bytes())?
+        } else {
+            file_changed(&path, body)
+        };
+        if !changed {
             if secrets.contains(name) {
                 system::set_mode(&path, "0640")?;
             }
             continue;
         }
-        network_changed = true;
+        changed_writes.push((name, body));
+    }
+
+    let changed_links = changed_writes
+        .iter()
+        .filter_map(|(name, _)| {
+            name.strip_prefix(PREFIX)?
+                .strip_suffix(".network")
+                .map(str::to_owned)
+        })
+        .collect();
+    let pending = Path::new(NETWORKD_RELOAD_PENDING);
+    let reload_required =
+        !removals.is_empty() || !changed_writes.is_empty() || pending.try_exists()?;
+    if mode == ApplyMode::Live && reload_required {
+        // Record intent before the first unit mutation, not after it. Otherwise
+        // an interrupted writer can leave equal files that were never applied.
+        system::install_file(pending, "networkd reload required\n")?;
+    }
+    for path in removals {
+        system::remove_file(&path)?;
+    }
+    for (name, body) in changed_writes {
+        let path = Path::new(NETWORKD_RUNTIME_DIR).join(name);
         if secrets.contains(name) {
             system::install_secret_file(&path, body)?;
         } else {
@@ -3828,10 +3891,14 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     // reads them on its own start, and a `networkctl reload` here would D-Bus-
     // activate networkd out of order (sentinel-boot is Before networkd) and
     // deadlock the boot.
-    if mode == ApplyMode::Live && network_changed {
-        if let Err(e) = system::networkctl_reload() {
-            eprintln!("warning: networkctl reload failed (networkd applies units on start): {e}");
-        }
+    if mode == ApplyMode::Live && reload_required {
+        system::networkctl_reload().context("applying network configuration with networkd")?;
+        system::remove_file(pending).context("completing networkd reload")?;
+    }
+
+    if mode == ApplyMode::Live {
+        defaults.reconcile_unchanged(&changed_links)?;
+        defaults.verify()?;
     }
 
     // DNS: resolved is the box's own forwarder (`[services.dns] upstream`),
@@ -3864,15 +3931,15 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     // the API when a secret is set. The sending side (push) is driven from commit.
     apply_agent_iface(appliance, mode)?;
     apply_configsync(appliance, mode)?;
-    // A commit that reports success while the firewall is not running is a false
-    // statement on this of all products.
+    // Readiness is verified by the transaction after link-dependent state is
+    // installed. A stopped management process may still have retained policy.
     if mode == ApplyMode::Live
         && appliance.interfaces.iter().any(|i| i.zone.is_some())
         && !system::unit_active(AGENT_UNIT)
     {
         eprintln!(
-            "warning: {AGENT_UNIT} is not running, so these rules are not being \
-             enforced. `systemctl status {AGENT_UNIT}` says why."
+            "warning: {AGENT_UNIT} is not running; kernel policy may still be \
+             retained. `systemctl status {AGENT_UNIT}` says why."
         );
     }
     Ok(())
@@ -3888,6 +3955,7 @@ pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
 /// are already up), while at boot the dedicated `sentinel-boot-late` unit (ordered
 /// after systemd-networkd) re-applies it.
 pub fn apply_link_runtime(appliance: &Appliance) -> Result<()> {
+    crate::vlan::apply(appliance)?;
     // PPPoE clients (pppd peer options + secrets + the MSS-clamp ruleset). This
     // *starts* the `sentinel-pppoe@` sessions, so it belongs after networkd (the
     // pppd discovery needs the parent NIC up) and out of the early sentinel-boot:
@@ -4317,6 +4385,51 @@ fn apply_console(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn no_zoned_uplink_clears_the_override_and_keeps_the_appliance_fallback() {
+        let appliance = Appliance::from_toml("[system]\nhostname='fw'\n").unwrap();
+        assert_eq!(
+            agent_environment(&appliance, None),
+            "VELSTRA_FLOWSPEC_ARGS=\n"
+        );
+        assert_eq!(
+            agent_environment(&appliance, Some("eth1")),
+            "VELSTRA_IFACE=eth1\nVELSTRA_FLOWSPEC_ARGS=\n"
+        );
+    }
+
+    #[test]
+    fn flowspec_arguments_are_independent_of_a_zoned_uplink() {
+        for (setting, expected) in [("", "8"), ("flowspec-min-prefix=16", "16")] {
+            let appliance = Appliance::from_toml(&format!(
+                "[system]\nhostname='fw'\n[protocols.bgp]\nlocal-as=65010\nflowspec-enforce=true\n{setting}\n"
+            )).unwrap();
+            let env = agent_environment(&appliance, None);
+            assert!(!env.contains("VELSTRA_IFACE="), "{env}");
+            assert_eq!(
+                env.split_whitespace().collect::<Vec<_>>(),
+                [
+                    "VELSTRA_FLOWSPEC_ARGS=--flowspec",
+                    "--wren-socket",
+                    WREN_SOCKET,
+                    "--flowspec-min-prefix",
+                    expected,
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn disabling_flowspec_always_clears_previous_arguments() {
+        let appliance = Appliance::from_toml(
+            "[system]\nhostname='fw'\n[protocols.bgp]\nlocal-as=65010\nflowspec-enforce=false\nflowspec-min-prefix=16\n"
+        ).unwrap();
+        assert_eq!(
+            agent_environment(&appliance, None),
+            "VELSTRA_FLOWSPEC_ARGS=\n"
+        );
+    }
 
     /// A box with no domain group must not carry the refresh timer at all — an
     /// idle timer that re-applies the whole config every 15 minutes is a moving

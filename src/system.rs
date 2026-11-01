@@ -230,6 +230,47 @@ pub fn unit_active(unit: &str) -> bool {
     matches!(out, Ok(o) if String::from_utf8_lossy(&o.stdout).trim() == "active")
 }
 
+fn is_firewall_unit(unit: &str) -> bool {
+    matches!(unit, "velstra" | "velstra.service")
+}
+
+/// A running process alone does not establish that its policy is usable. The
+/// appliance agent publishes Ready only after its complete datapath is applied.
+pub fn unit_ready(unit: &str) -> bool {
+    unit_active(unit)
+        && (!is_firewall_unit(unit)
+            || matches!(crate::velstra::query("status"), Ok(reply) if reply.lines().next() == Some("Ready")))
+}
+
+/// Verify after network/link configuration, not immediately after systemctl:
+/// the agent may need an address or interface that this same commit creates.
+/// An auto-restart can recover a transient startup failure within this bound.
+pub fn wait_for_unit_ready(unit: &str) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let status = if unit_active(unit) {
+            if !is_firewall_unit(unit) {
+                return Ok(());
+            }
+            match crate::velstra::query("status") {
+                Ok(reply) if reply.lines().next() == Some("Ready") => return Ok(()),
+                Ok(reply) => reply
+                    .lines()
+                    .next()
+                    .unwrap_or("no readiness status")
+                    .to_owned(),
+                Err(error) => error.to_string(),
+            }
+        } else {
+            "service is not running".to_owned()
+        };
+        if std::time::Instant::now() >= deadline {
+            bail!("waiting for {unit} to become Ready failed: {status}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// Restart `unit` to pick up a freshly written drop-in — but ONLY when it is
 /// already running. These are always-enabled co-services (resolved/chrony/
 /// dnsmasq): at boot the sentinel-boot service writes their drop-in and they
@@ -315,6 +356,30 @@ pub fn ethtool_offload(dev: &str, feature: &str, on: bool) -> Result<()> {
         "ethtool",
         &["-K", dev, feature, if on { "on" } else { "off" }],
     )
+}
+
+/// Read the driver's permanent address even when Netlink omits IFLA_PERM_ADDRESS
+/// because the current address already equals it. This is a read-only ioctl.
+pub fn permanent_mac(dev: &str) -> Result<String> {
+    let output = Command::new(bin("ethtool"))
+        .args(["--show-permaddr", dev])
+        .output()
+        .context("reading permanent NIC address")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "{dev}: driver permanent address query failed"
+    );
+    let text = std::str::from_utf8(&output.stdout)?;
+    let mac = text
+        .trim()
+        .strip_prefix("Permanent address: ")
+        .context("driver returned an invalid permanent address response")?;
+    crate::config::validate_mac(mac)?;
+    anyhow::ensure!(
+        mac != "00:00:00:00:00:00",
+        "{dev}: driver has no permanent address"
+    );
+    Ok(mac.to_ascii_lowercase())
 }
 
 /// Force a NIC's link speed and duplex (`ethtool -s <dev> speed N duplex D
@@ -762,6 +827,17 @@ pub fn install_config_file(path: &Path, contents: impl AsRef<[u8]>) -> Result<()
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let contents = contents.as_ref();
+    let parent_path = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    // Keep the directory descriptor across publication. A synced temporary
+    // file alone does not make its subsequent rename durable after power loss.
+    let parent = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY)
+        .open(parent_path)
+        .context("opening the configuration directory for synchronization")?;
     let mut random = [0u8; 16];
     getrandom::getrandom(&mut random)
         .map_err(|e| anyhow::anyhow!("config staging entropy: {e}"))?;
@@ -787,12 +863,15 @@ pub fn install_config_file(path: &Path, contents: impl AsRef<[u8]>) -> Result<()
             let result = (|| -> Result<()> {
                 file.write_all(contents).context("writing configuration")?;
                 file.set_permissions(std::fs::Permissions::from_mode(0o640))?;
-                file.sync_all().context("syncing configuration")?;
                 // Best-effort off-box, where the operator need not own wheel.
                 if let Some(gid) = wheel_gid() {
                     let _ = std::os::unix::fs::chown(&tmp, None, Some(gid));
                 }
+                file.sync_all().context("syncing configuration")?;
                 std::fs::rename(&tmp, path).context("publishing configuration")?;
+                parent
+                    .sync_all()
+                    .context("syncing the configuration directory")?;
                 Ok(())
             })();
             let _ = std::fs::remove_file(&tmp);
@@ -824,7 +903,18 @@ pub fn install_config_file(path: &Path, contents: impl AsRef<[u8]>) -> Result<()
             "install",
             &["-m", "0640", "-g", "wheel", "--", src, destination],
         )?;
-        sudo("mv", &["-fT", "--", destination, dst])
+        // install copied to a different filesystem from the private /run
+        // source. Flush that destination before the atomic rename, then flush
+        // the directory just as in the direct writer above. It is root:wheel
+        // 0640, so the authorized operator can synchronize a read descriptor.
+        std::fs::File::open(&tmp)
+            .context("opening staged configuration for synchronization")?
+            .sync_all()
+            .context("syncing staged configuration")?;
+        sudo("mv", &["-fT", "--", destination, dst])?;
+        parent
+            .sync_all()
+            .context("syncing the configuration directory")
     })();
     if source_owned {
         let _ = std::fs::remove_file(&staged);
@@ -865,22 +955,85 @@ pub fn secure_config_file(path: &Path) -> Result<()> {
 /// Read private appliance material as an authorized operator without widening
 /// its file permissions. Privileged output stays in memory, never the terminal.
 pub fn read_private_file(path: &Path) -> Result<String> {
-    match std::fs::read_to_string(path) {
+    String::from_utf8(read_private_bytes(path)?).context("private file is not UTF-8")
+}
+
+/// Compare rendered private data without making an authorized operator's
+/// inability to read it directly look like a configuration change. Comparing
+/// bytes also permits replacing corrupt, non-UTF-8 runtime data.
+pub fn private_file_changed(path: &Path, contents: &[u8]) -> Result<bool> {
+    match read_private_bytes(path) {
+        Ok(previous) => Ok(previous != contents),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|cause| cause.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(true)
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("comparing private runtime configuration {}", path.display())),
+    }
+}
+
+fn read_private_bytes(path: &Path) -> Result<Vec<u8>> {
+    match std::fs::read(path) {
         Ok(contents) => Ok(contents),
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
             let path_arg = path.to_str().context("non-UTF-8 private file path")?;
-            let output = escalated_output("cat", &["--", path_arg])?;
+            let output = escalated_output("sentinel-self", &["private-read", "--", path_arg])?;
             anyhow::ensure!(
                 output.status.success(),
                 "could not read private file {}",
                 path.display()
             );
-            String::from_utf8(output.stdout).context("private file is not UTF-8")
+            decode_private_read(&output.stdout)
         }
         Err(error) => {
             Err(error).with_context(|| format!("reading private file {}", path.display()))
         }
     }
+}
+
+fn decode_private_read(response: &[u8]) -> Result<Vec<u8>> {
+    match response.split_first() {
+        Some((1, contents)) => Ok(contents.to_vec()),
+        Some((0, [])) => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "private file does not exist",
+        )
+        .into()),
+        _ => bail!("private reader returned an invalid response"),
+    }
+}
+
+/// Root-only internal response: byte 0 means absence, byte 1 prefixes file
+/// contents. Errors produce no response and a failing exit status. An operator
+/// cannot infer absence merely because a root-only parent denies traversal.
+pub fn private_read_response(path: &Path) -> Result<()> {
+    use std::io::Write;
+
+    // SAFETY: geteuid has no arguments or memory-safety preconditions.
+    anyhow::ensure!(
+        unsafe { libc::geteuid() } == 0,
+        "the internal private reader requires root"
+    );
+    let contents = match std::fs::read(path) {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading private file {}", path.display()));
+        }
+    };
+    let mut output = std::io::stdout().lock();
+    match contents {
+        Some(contents) => {
+            output.write_all(&[1])?;
+            output.write_all(&contents)?;
+        }
+        None => output.write_all(&[0])?,
+    }
+    output.flush().context("sending private reader response")
 }
 
 /// Install a secret file `contents` at a (root-owned) `path` readable by
@@ -1077,12 +1230,92 @@ pub fn ensure_login_account(user: &str) -> Result<()> {
     )
 }
 
-/// Set a login account's password to a pre-hashed crypt(3) value (`chpasswd`-style)
-/// via `usermod -p`. The hash is passed as an argv element — never through a shell —
-/// so its `$`-laden crypt form needs no escaping and cannot be expanded or logged by
-/// a shell. Validation already guarantees it is a hash, not a plaintext password.
+/// Set a validated crypt(3) hash or the internal disabled marker through private
+/// stdin. Password hashes must never appear in process arguments or diagnostics.
 pub fn set_login_password(user: &str, hash: &str) -> Result<()> {
-    run_priv("usermod", &["-p", hash, user])
+    let shadow = read_private_file(Path::new("/etc/shadow"))
+        .context("reading the current local password state")?;
+    if shadow_password_matches(&shadow, user, hash) {
+        // chpasswd also updates the password-change date. A no-op reconcile
+        // must not keep extending an account's password-aging window.
+        return Ok(());
+    }
+    let executable = bin("chpasswd");
+    let mut command = if is_root() {
+        Command::new(&executable)
+    } else {
+        let mut command = Command::new(bin("sudo"));
+        command.args(["-n", "--", executable.as_str()]);
+        command
+    };
+    command.arg("--encrypted");
+    let input = format!("{user}:{hash}\n");
+    let output = command_output_with_input(command, input.as_bytes())
+        .with_context(|| format!("setting the local password for {user}"))?;
+    // A failing password utility may include its input in diagnostics. Keep
+    // credentials private even on an error; the account and status identify
+    // the failed operation without putting its hash into logs or an API reply.
+    anyhow::ensure!(
+        output.status.success(),
+        "local password update for {user} failed (exit {:?}); check account database permissions and locks",
+        output.status.code()
+    );
+    Ok(())
+}
+
+fn shadow_password_matches(shadow: &str, user: &str, hash: &str) -> bool {
+    shadow
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split(':');
+            (fields.next() == Some(user)).then(|| fields.next() == Some(hash))
+        })
+        .unwrap_or(false)
+}
+
+/// Feed private input while concurrently draining both output pipes. A child
+/// can refuse input or explicitly exit before reading a large body: retain its
+/// status/diagnostics on BrokenPipe, and propagate every other transport error.
+pub fn command_output_with_input(
+    mut command: Command,
+    input: &[u8],
+) -> std::io::Result<std::process::Output> {
+    use std::io::Write as _;
+
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::other("child command has no stdin"))?;
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(move || stdin.write_all(input));
+        let output = child.wait_with_output();
+        let written = writer
+            .join()
+            .map_err(|_| std::io::Error::other("command input writer panicked"))?;
+        let output = output?;
+        if let Err(error) = written {
+            if error.kind() != std::io::ErrorKind::BrokenPipe {
+                return Err(error);
+            }
+        }
+        Ok(output)
+    })
+}
+
+/// An unusable shadow password, with no retained hash to accidentally unlock.
+/// PAM still permits a configured public key for an otherwise active account.
+pub const DISABLED_LOGIN_PASSWORD: &str = "!";
+
+/// Make a revoked local credential durable before its ownership record can be
+/// retired. Shadow and passwd may be on another filesystem from appliance state.
+pub fn sync_login_database() -> Result<()> {
+    sudo("sync", &["--", "/etc/passwd", "/etc/shadow", "/etc"])
+        .context("syncing revoked local credentials")
 }
 
 /// Install the shared HA-sync bearer token at `path`, mode 0600 (root). Staged in
@@ -1531,11 +1764,53 @@ fn openssl_filter(args: &[&str], input: &[u8]) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
+/// Inspect actual link kind, parent, TPID and ownership. A failed dump is an
+/// error, never an empty cloud of absent devices.
+pub fn ip_link_list() -> Result<String> {
+    let output = Command::new(bin("ip"))
+        .args(["-N", "-j", "-d", "link", "show"])
+        .output()
+        .context("querying kernel network links")?;
+    if !output.status.success() {
+        bail!(
+            "querying kernel links failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    String::from_utf8(output.stdout).context("kernel link dump is not UTF-8")
+}
+
+/// Mutate a link once. Do not retry a failed root mutation through sudo: its
+/// error may describe a partially completed operation that needs reconciliation.
+pub fn ip_link(args: &[&str]) -> Result<()> {
+    let resolved = bin("ip");
+    let mut command = if is_root() {
+        Command::new(&resolved)
+    } else {
+        let mut command = Command::new("sudo");
+        command.args(["-n", &resolved]);
+        command
+    };
+    let output = command
+        .arg("link")
+        .args(args)
+        .output()
+        .context("updating kernel link")?;
+    if !output.status.success() {
+        bail!(
+            "ip link {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// Tell systemd-networkd to re-read its unit files. Reload automatically
 /// reconfigures links whose network files changed; forcing another reconfigure
 /// would discard DHCP leases again, including on unchanged links.
-/// Best-effort: at early boot networkd may not be up yet (it reads the files on
-/// start anyway), so failures are reported by the caller, not fatal here.
+/// A live caller must propagate failures and retain its pending-reload intent.
+/// Early boot renders files without calling this function at all.
 pub fn networkctl_reload() -> Result<()> {
     // NOTE: this talks to networkd over D-Bus, which on-demand *activates* it if
     // down — fatal at early boot where sentinel-boot is ordered Before networkd
@@ -1543,6 +1818,12 @@ pub fn networkctl_reload() -> Result<()> {
     // this only in `ApplyMode::Live` (networkd already up); at boot networkd
     // reads the freshly written `.network` units on its own start.
     run_priv("networkctl", &["reload"])
+}
+
+/// Reapply one unchanged networkd unit whose owned physical properties drifted.
+/// Other links, their DHCP leases and their traffic are left alone.
+pub fn networkctl_reconfigure(dev: &str) -> Result<()> {
+    run_priv("networkctl", &["reconfigure", dev])
 }
 
 /// Resolve a logical tool name to an absolute path. The Nix wrapper injects
@@ -1585,6 +1866,7 @@ pub fn bin(name: &str) -> String {
         "ethtool" => "SENTINEL_ETHTOOL_BIN",
         "lego" => "SENTINEL_LEGO_BIN",
         "lsblk" => "SENTINEL_LSBLK_BIN",
+        "blkid" => "SENTINEL_BLKID_BIN",
         "tcpdump" => "SENTINEL_TCPDUMP_BIN",
         "timeout" => "SENTINEL_TIMEOUT_BIN",
         "install" => "SENTINEL_INSTALL_BIN",
@@ -1594,6 +1876,8 @@ pub fn bin(name: &str) -> String {
         // local login accounts ([[system.login]], roadmap C21)
         "useradd" => "SENTINEL_USERADD_BIN",
         "usermod" => "SENTINEL_USERMOD_BIN",
+        "chpasswd" => "SENTINEL_CHPASSWD_BIN",
+        "sync" => "SENTINEL_SYNC_BIN",
         "id" => "SENTINEL_ID_BIN",
         "uname" => "SENTINEL_UNAME_BIN",
         // installer tools
@@ -1752,6 +2036,90 @@ pub(crate) fn sudo(cmd: &str, args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_read_protocol_distinguishes_absence_from_failure_and_binary_data() {
+        let missing = decode_private_read(&[0]).unwrap_err();
+        assert_eq!(
+            missing.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            decode_private_read(&[1, 0xff, 0, 10]).unwrap(),
+            [0xff, 0, 10]
+        );
+        assert!(decode_private_read(&[1]).unwrap().is_empty());
+        for invalid in [&[][..], &[2][..], &[0, 1][..]] {
+            let error = decode_private_read(invalid).unwrap_err();
+            assert!(error.downcast_ref::<std::io::Error>().is_none());
+        }
+    }
+
+    #[test]
+    fn private_comparison_handles_binary_drift_without_mutating_permissions_or_data() {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let dir =
+            std::env::temp_dir().join(format!("sentinel-private-compare-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config");
+        assert!(private_file_changed(&path, b"rendered\n").unwrap());
+        assert!(
+            !path.exists(),
+            "a comparison must not install a missing file"
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        file.write_all(&[0xff, b'\n']).unwrap();
+        drop(file);
+        assert!(!private_file_changed(&path, &[0xff, b'\n']).unwrap());
+        assert!(private_file_changed(&path, b"rendered\n").unwrap());
+        assert!(read_private_file(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), [0xff, b'\n']);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(private_file_changed(&dir, b"rendered\n").is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn password_noop_matches_the_exact_account_and_first_record() {
+        let shadow = "ops-other:$6$other:1:0:99999:7:::\nops:$6$current:2:0:99999:7:::\n";
+        assert!(shadow_password_matches(shadow, "ops", "$6$current"));
+        assert!(!shadow_password_matches(shadow, "ops", "$6$other"));
+        assert!(!shadow_password_matches(shadow, "missing", "$6$current"));
+        assert!(!shadow_password_matches(
+            "ops:wrong\nops:right\n",
+            "ops",
+            "right"
+        ));
+    }
+
+    #[test]
+    fn disabled_password_noop_does_not_retain_an_old_hash() {
+        assert!(shadow_password_matches(
+            "ops:!:1\n",
+            "ops",
+            DISABLED_LOGIN_PASSWORD
+        ));
+        assert!(!shadow_password_matches(
+            "ops:!$6$old:1\n",
+            "ops",
+            DISABLED_LOGIN_PASSWORD
+        ));
+        assert!(!shadow_password_matches(
+            "ops::1\n",
+            "ops",
+            DISABLED_LOGIN_PASSWORD
+        ));
+    }
 
     fn openssl_available() -> bool {
         std::process::Command::new(bin("openssl"))

@@ -67,6 +67,7 @@ write, which is how ten sections that could be typed and not clicked were found.
 | `contract` | the compiled agent config keeps the shape the data plane reads |
 | `reconcile` | failed VXLAN/SRv6 controller updates preserve active filtering and retry the same revision; a late egress device installs its deferred route and carries real traffic without restarting |
 | `wren-reconcile` | real Wren/XDP traffic: failed installs and withdrawals retry without duplicate advertisements; unavailable ARP observations preserve forwarding; recovery applies cached routes; empty withdrawals need no ARP lookup; gateway MAC changes converge without a route event |
+| `state-device` | boot-owned state despite colliding labels; real plaintext and encrypted RAID reboots, password requests, fsck, operator diagnostics and persistent markers; foreign data remains untouched |
 | `shipped` | what the image actually carries |
 | `wizard` | the installer's click-through, answered end to end |
 
@@ -75,6 +76,10 @@ write, which is how ten sections that could be typed and not clicked were found.
 | Check | Proves |
 |---|---|
 | `ebpf-verifier` | real-kernel verification and JIT of every embedded XDP/TC program; tenant hooks recover after interface replacement without descriptor leaks; broken statistics output and exhausted descriptors preserve packet filtering, and query/portal/mapping sockets recover without a restart |
+| `startup-continuity` | fresh verification fails closed; an established IPv6 TCP socket survives a killed agent, paused kernel verification and activation, retaining state maps |
+| `scope-lifecycle` | stable semantic policy scopes through renumbering, deletion, restart and API import/export |
+| `stateful-packet-validation` | actual packaged IPv6 packet entries reject truncated and inconsistent protocol headers |
+| `rule-contexts` | independent IPv4/IPv6 ingress/egress rules at the same match, 64 real HTTP verdicts, deletion, saved configuration and cold boot |
 | `config-transaction` | a full kernel map rejects the candidate without admitting forbidden packets; the same revision recovers after capacity returns; temporary NAT grants survive rollback and successful updates; standalone configured forwards cannot be replaced or removed by temporary grants; failed rollback blocks traffic |
 | `egress-transaction` | packet capture at the receiving namespace proves a failed update never detaches the previous egress filter; an unresponsive controller cannot prevent bounded agent shutdown |
 | `reject` | a rejected TCP port answers with a **RST**, not a silent drop |
@@ -88,6 +93,7 @@ write, which is how ten sections that could be typed and not clicked were found.
 | `v6exthdr` | IPv6 extension headers do not bypass a rule — the chain is walked to the real protocol |
 | `icmptype` | a rule that names an ICMP **type** matches that type and not the protocol: a ping is stopped by an `echo-request` rule and not by one for a different type, and the two families are numbered apart (`echo-request` is 8 in ICMP, 128 in ICMPv6) |
 | `rulescope` | a rule scoped to one address family stops that family and leaves the other alone, and one scoped to `out` refuses a connection **this box originates** while the same port arriving from outside is untouched |
+| `flowspec` | real Wren advertisements stop packets and withdrawal restores traffic; unsupported matches are refused; an established flow cannot bypass a discard with HA state synchronization active; global enforcement works without zones and can be disabled and reenabled through config alone |
 | `evpn` | the appliance's one `[evpn]` statement reaches **both** lower halves: two boxes bring up a BGP session with the EVPN address family negotiated, and each data plane's own loader accepts the overlay it was given |
 | `macgroup` | a rule naming a `mac-group` stops the device whose address it holds, and a group naming a different device does not — so the match is on the address, not on everything |
 
@@ -105,11 +111,11 @@ write, which is how ten sections that could be typed and not clicked were found.
 |---|---|
 | `nat` | a `[[port-forward]]` DNATs an inbound connection to an internal host; a load-balanced VIP reaches a pool in **another zone** and its reply is un-NAT'd; both still work when the internal zone denies by default |
 | `synproxy` | a client reaches a syn-protected server through the full cookie splice, and 200 spoofed SYNs are absorbed without one reaching it |
-| `masq` | masquerade SNATs a private LAN client out of the WAN address; a 1 MiB transfer is accounted to that client in `show top-talkers`; and the IPFIX exporter's datagram is a well-formed RFC 7011 message in the configured observation domain |
+| `masq` | masquerade SNATs a private LAN client out of the WAN address; a 1 MiB transfer is accounted to that client in `show top-talkers`; the IPFIX exporter sends a well-formed RFC 7011 message; an acknowledged TCP stream survives an unchanged commit without replacing runtime files or restarting the firewall and routing daemons |
 | `hairpin` | an internal client reaches a port-forwarded service via the box's **own** public IP |
 | `npt66` | stateless, checksum-neutral IPv6 prefix translation (RFC 6296) |
 | `nat64` | an IPv6-only client reaches an IPv4-only server through the box, DNS64 included |
-| `conntracksync` | the conntrack map is mirrored to the peer, so an established flow survives failover |
+| `conntracksync` | NAT traffic creates state that is transferred to two peers; this check verifies replication, not survival of an established TCP connection during failover |
 
 ## Routing (Wren control plane)
 
@@ -173,7 +179,7 @@ write, which is how ten sections that could be typed and not clicked were found.
 
 | Check | Proves |
 |---|---|
-| `wireguard` | a WireGuard interface and tunnel render to a `Kind=wireguard` netdev with a 0640 key |
+| `wireguard` | a real WireGuard interface and peer; private 0640 units remain unreadable to an ordinary operator, unchanged commits preserve the unit, interface and daemon identities, and binary drift and restrictive permission drift recover |
 | `ipsec` | an IKEv2 site-to-site tunnel establishes and carries traffic between protected subnets |
 | `openconnect` | a road-warrior client dials in and reaches a host behind the box |
 
@@ -182,10 +188,17 @@ write, which is how ten sections that could be typed and not clicked were found.
 | Check | Proves |
 |---|---|
 | `ssh` | `set services ssh` tunes the daemon; `set system login` creates real accounts and keys |
+| `login-reconcile` | real SSH/PAM verifies password removal, rotation, whole-login revocation, private password transport, password-only ownership, legacy keys, idempotency, write/service failures, boot reconciliation, power-loss recovery and disabled SSH without deleting account IDs or touching unrelated users |
+| `service-reconcile` | real daemon recovery after a unit stop, unchanged-configuration idempotency, missing-file drift, refused starts/stops, rollback and retry without saving a false success |
+| `vlan-lifecycle` | actual tagged HTTP and firewall drops; ownership and no-op identity; immutable ID/parent and QinQ replacement; foreign-device/dependency refusal; DOWN staging during a real agent startup fault and automatic recovery; interrupted alias recovery, proven legacy migration, kernel deletion and saved VLAN recreation after reboot |
+| `network-reconcile` | VLAN parent cycles are refused before runtime changes and duplicate tag constraints match the real kernel, including different TPIDs; unavailable networkd prevents a false successful commit/save; pending reloads retry even after all unit files were written, acknowledged unchanged units need no reload, and saved addressing survives a real reboot |
+| `datapath-lifetime` | real XDP ingress and TC egress policies survive SIGKILL and service stop; per-interface readiness rejects actual detached hooks and wrong policy mappings; restarts adopt pinned links under a shared closed gate, conflicting writers are refused, partial replacement stays closed, failed hook retirement reports its cause and recovers without a restart, and only explicit privileged cleanup removes owned hooks |
+| `agent-readiness` | real daemon startup failure cannot be committed/saved as success through CLI or API; rollback preserves desired state, retry converges, a repeated apply repairs a blocked active daemon with a frozen configuration map, healthy unchanged services preserve their identities, and removing the last zoned interface restores the actual fallback without stale hooks |
+| `xdp-mode-transition` | a real jumbo-MTU native-to-generic replacement uses a pinned ingress guard; a partial startup failure and a kernel state with no XDP hook remain closed without a daemon, then retry restores TCP connectivity and filtering and retires the guard |
 | `snmp` | a read-only v2c poll answers, and the rendered config stays 0640 |
 | `lldp` | LLDP neighbours are discovered between two boxes (the daemon is off by default) |
 | `pki` | a local CA and a leaf signed by it land under `/var/lib/sentinel/pki` with the right modes |
-| `reverseproxy` | TLS terminates on :443 with an on-box leaf and load-balances to a backend |
+| `reverseproxy` | Operator commits keep TLS keys private; HTTPS/TCP balancing, issuing-CA verification, wrong-hostname/untrusted-CA rejection, and unchanged proxy identity across unrelated commits |
 | `geoip` | a neighbour is reachable, then unreachable once its country is blocked, then reachable again — with a substituted database so the assertion is about the mechanism |
 | `acme` | a certificate is really issued — the appliance registers with a Pebble directory, serves the http-01 challenge on :80, and Pebble fetches it back before signing |
 | `bcastrelay` | a broadcast on one segment reaches another carrying the ORIGINAL sender's address — the property request/response discovery depends on — and arrives exactly once |
@@ -225,3 +238,28 @@ root to attach XDP). The nixosTests run that inside their sandboxed VMs — whic
 why the firewall and NAT checks above, not the unit tests, are the real proof of the
 datapath. On a dev box, loading the agent against a live kernel is a manual,
 root-only step; it is not part of `cargo test`.
+
+`link-defaults` checks measured physical MTU/MAC restoration, unchanged apply and targeted drift repair, actual IPv4/IPv6 HTTP and denied IPv4 ICMP, early invalid-source-MAC refusal, persistent state after warm reboot, full-interface removal, and a real foreign same-name device appearing before another commit.
+
+`link-driver-limit` repeats the physical-link lifecycle with a real virtio MTU ceiling of 1500 and verifies direct kernel rejection of 9000 plus networkd clamping, unchanged saved/running configuration, rollback and IPv4/IPv6 connectivity.
+
+`ipv6-egress` checks actual IPv4/IPv6 TCP and UDP traffic, live outbound policy updates, family/direction scopes, IPv6 source/destination CIDRs, destination blocklist counters, ICMPv6 type filtering and captured Destination Options TCP packets. The separate privileged packet suite checks IPv6 TCP, UDP and echo protocol-state admission, resets, explicit prohibitions and shared rule budgets.
+
+`masquerade-policy` exercises a real LAN namespace through a WAN to a separate VM. It checks policy before source translation, local WAN TCP/ICMP stateful replies, source CIDRs, live deny/allow changes and destination blocklists. Negative requests require both an egress drop counter increase and no SYN at the peer; positive captures and translated source addresses prevent reply-only drops from masquerading as outbound enforcement.
+
+`napt-reservation` uses real forwarded TCP/UDP connections and four CPU-pinned senders to exhaust a one-port CGNAT block. It requires drops before packets reach the peer, stable translated ports, exact payload delivery and continued traffic on the existing connection. It also exercises competing reservations for a free port; no fallback may escape the subscriber block or replace its owner.
+
+### Shared rate budgets
+
+`nix build .#checks.x86_64-linux.rate-budget -L` runs the actual XDP
+entry point on four pinned CPUs. It checks exact shared packet/byte credits,
+exhaustion, bounded lock contention, counters, and traffic recovery. The test
+injects a future refill clock to separate concurrency correctness from VM
+scheduling time. It does not qualify connection lifecycle tracking or IPv6
+stateful replies.
+
+### FlowSpec with HA synchronization
+
+The `flowspec` VM check enables conntrack synchronization, imports a firewall grant through the peer socket, and verifies the grant in the map referenced by the attached XDP program. A BGP FlowSpec discard must remove the matching grants while synchronization remains enabled; withdrawal restores connectivity.
+
+This checks shared map ownership and revocation. It does not qualify authenticated synchronization or complete stateful failover.

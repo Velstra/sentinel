@@ -111,6 +111,10 @@
   # Before networkd, so this does not delay a routable network).
   systemd.services.sshd.after = [ "sentinel-boot.service" ];
   systemd.services.sshd.wants = [ "sentinel-boot.service" ];
+  # Created only after credentials and daemon settings have reconciled. This
+  # honours `services.ssh.enable = false` during boot, too, and keeps an early
+  # credential-apply failure from starting an unprepared SSH listener.
+  systemd.services.sshd.unitConfig.ConditionPathExists = "/run/sentinel-ssh/enabled";
   # The host keys now live on the persistent partition, and sshd generates any
   # that are missing on its first start. If it ran before that partition were
   # mounted it would generate a fresh pair onto the tmpfs underneath the

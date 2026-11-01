@@ -553,16 +553,129 @@ await test("a refused change no longer stops the ones staged beside it", async (
   equal(outcome.left.length, 2, "a batch that was refused in part was thrown away");
 });
 
+await test("domain failures never apply a guessed subset of staged changes", async () => {
+  const before = readFileSync(CONFIG, "utf8");
+  const outcome = await page.evaluate(`(async () => {
+    staged = []; dirty.clear(); renderStaged();
+    stage("Independent description", ["set interface eth1 description must-not-apply"]);
+    stage("Invalid route", ["set protocols static not-a-network via 192.0.2.1"]);
+    let applies = 0;
+    const real = window.fetch;
+    window.fetch = (url, opts) => {
+      if (String(url) === "/api/v1/configure") applies++;
+      return real(url, opts);
+    };
+    try {
+      await applyStaged(["commit", "save"]);
+      return { applies, left: staged.length, title: document.getElementById("resulttitle").textContent };
+    } finally {
+      window.fetch = real;
+      const dialog = document.getElementById("result"); if (dialog.open) dialog.close();
+      staged = []; dirty.clear(); renderStaged();
+    }
+  })()`);
+  equal(outcome.applies, 0, "a complete-candidate failure reached the runtime");
+  equal(outcome.left, 2, "domain failure discarded staged changes");
+  equal(outcome.title, "Not applied", "domain failure was reported as success");
+  equal(readFileSync(CONFIG, "utf8"), before, "domain failure changed saved configuration");
+});
+
+await test("a rejected logical change cannot leak its earlier edits into the applied subset", async () => {
+  const outcome = await page.evaluate(`(async () => {
+    staged = []; dirty.clear(); renderStaged();
+    stage("Refused composite", ["set interface eth1 description must-not-leak", "set firewall nonsense true"]);
+    stage("Accepted composite", ["set interface eth1 description isolated-good"]);
+    stage("Second refusal", ["set firewall nonsense true"]);
+    await applyStaged(["commit", "save"]);
+    const result = { left: staged.length, title: document.getElementById("resulttitle").textContent,
+      said: document.getElementById("resultout").innerText };
+    const dialog = document.getElementById("result"); if (dialog.open) dialog.close();
+    staged = []; dirty.clear(); renderStaged();
+    return result;
+  })()`);
+  const config = readFileSync(CONFIG, "utf8");
+  check(config.includes("isolated-good"), "the valid independent change was not saved");
+  check(!config.includes("must-not-leak"), "part of a rejected logical change was applied");
+  equal(outcome.title, "Partly applied", "partial completion was hidden");
+  check(outcome.said.includes("Refused composite") && outcome.said.includes("Second refusal"),
+    "not all refused changes were identified");
+  equal(outcome.left, 3, "partial application discarded the review candidate");
+});
+
+await test("pending Apply prevents duplicates and preserves changes staged while waiting", async () => {
+  const outcome = await page.evaluate(`(async () => {
+    staged = []; dirty.clear(); renderStaged();
+    stage("Initial description", ["set interface eth1 description initial-request"]);
+    const real = window.fetch;
+    let release;
+    const gate = new Promise(resolve => release = resolve);
+    let applies = 0;
+    window.fetch = async (url, opts) => {
+      if (String(url) === "/api/v1/configure/validate") await gate;
+      if (String(url) === "/api/v1/configure") applies++;
+      return real(url, opts);
+    };
+    try {
+      const first = applyStaged(["commit", "save"]);
+      const busy = applying && document.getElementById("applystaged").disabled &&
+        document.getElementById("discard").disabled &&
+        [...document.querySelectorAll("#stagedlist button")].every(button => button.disabled);
+      stage("Next description", ["set interface eth1 description staged-during-request"]);
+      await applyStaged(["commit", "save"]);
+      release(); await first;
+      return { busy, applies, pending: stagedCommands(), applying };
+    } finally {
+      release(); window.fetch = real;
+      const dialog = document.getElementById("result"); if (dialog.open) dialog.close();
+      staged = []; dirty.clear(); renderStaged();
+    }
+  })()`);
+  check(outcome.busy, "pending mutation did not protect review controls");
+  equal(outcome.applies, 1, "a repeated Apply sent duplicate mutations");
+  equal(outcome.applying, false, "Apply stayed busy after completion");
+  equal(outcome.pending.join(""), "set interface eth1 description staged-during-request", "new edits were lost");
+  check(readFileSync(CONFIG, "utf8").includes("initial-request"), "initial change was not applied");
+});
+
+await test("an unconfirmed apply is never retried or reported as definitely unapplied", async () => {
+  const outcome = await page.evaluate(`(async () => {
+    staged = []; dirty.clear(); renderStaged();
+    stage("Uncertain description", ["set interface eth1 description uncertain-request"]);
+    const real = window.fetch;
+    let applies = 0;
+    window.fetch = async (url, opts) => {
+      if (String(url) === "/api/v1/configure") {
+        applies++;
+        throw new Error("Simulated lost apply response");
+      }
+      return real(url, opts);
+    };
+    try {
+      await applyStaged(["commit", "save"]);
+      return { applies, left: staged.length, title: document.getElementById("resulttitle").textContent,
+        said: document.getElementById("resultout").textContent };
+    } finally {
+      window.fetch = real;
+      const dialog = document.getElementById("result"); if (dialog.open) dialog.close();
+      staged = []; dirty.clear(); renderStaged();
+    }
+  })()`);
+  equal(outcome.applies, 1, "an uncertain mutation was retried automatically");
+  equal(outcome.title, "Check appliance state", "an uncertain outcome was misrepresented");
+  equal(outcome.left, 1, "an uncertain outcome discarded the candidate");
+  check(outcome.said.includes("may have completed"), "uncertain completion has no recovery guidance");
+});
+
 await test("applying runs the batch once, not twice", async () => {
-  // Applying used to validate first and then apply, so every command ran twice
-  // on the appliance and every apply cost two round trips.
+  // Pure validation may inspect the candidate, but only one request may execute
+  // the editing script with commit/save. Validation must never be an apply.
   const runs = await page.evaluate(`(async () => {
     const wait = (ms) => new Promise((r) => setTimeout(r, ms || 400));
     staged = []; dirty.clear(); renderStaged();
     let posts = 0;
     const real = window.fetch;
     window.fetch = (url, opts) => {
-      if (String(url).includes("/api/v1/configure")) posts++;
+      if (String(url) === "/api/v1/configure") posts++;
       return real(url, opts);
     };
     stage("Interface eth1", ["set interface eth1 description one-run"]);
@@ -577,6 +690,70 @@ await test("applying runs the batch once, not twice", async () => {
   })()`);
   equal(runs.title, "Applied", "the change was not applied");
   equal(runs.posts, 1, "the appliance was asked to run the batch more than once");
+});
+
+await test("the validation result restores keyboard focus to its trigger", async () => {
+  const outcome = await page.evaluate(`(async () => {
+    staged = []; dirty.clear(); renderStaged();
+    stage("Focus review", ["set interface eth1 description focus-review-only"]);
+    document.getElementById("validate").focus();
+    await applyStaged([]);
+    const dialog = document.getElementById("result");
+    const opened = dialog.open && document.activeElement.id === "resultclose";
+    dialog.close();
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const focused = document.activeElement.id;
+    staged = []; dirty.clear(); renderStaged();
+    return { opened, focused };
+  })()`);
+  check(outcome.opened, "the result did not focus its Close action");
+  equal(outcome.focused, "validate", "closing the result lost the operator's keyboard position");
+});
+
+await test("a completed Apply returns keyboard focus to a visible page action", async () => {
+  const outcome = await page.evaluate(`(async () => {
+    staged = []; dirty.clear(); renderStaged();
+    stage("Focus apply", ["set interface eth1 description focused-apply"]);
+    document.getElementById("applystaged").focus();
+    await applyStaged(["commit", "save"]);
+    const dialog = document.getElementById("result");
+    const title = document.getElementById("resulttitle").textContent;
+    dialog.close();
+    await new Promise(resolve => setTimeout(resolve, 50));
+    return { title, focused: document.activeElement.id, pending: staged.length };
+  })()`);
+  equal(outcome.title, "Applied", "the change was not applied");
+  equal(outcome.pending, 0, "successful Apply left a stale candidate");
+  equal(outcome.focused, "refresh", "closing the result focused a removed Apply action");
+});
+
+await test("closing a result during refresh retains a usable keyboard target", async () => {
+  const outcome = await page.evaluate(`(async () => {
+    staged = []; dirty.clear(); renderStaged();
+    stage("Early close review", ["set interface eth1 description early-close-only"]);
+    const realRefresh = refresh;
+    let release;
+    const gate = new Promise(resolve => release = resolve);
+    refresh = async () => { await gate; return realRefresh(); };
+    document.getElementById("validate").focus();
+    const running = applyStaged([]);
+    try {
+      for (let i = 0; i < 200 && !document.getElementById("result").open; i++)
+        await new Promise(resolve => setTimeout(resolve, 10));
+      const dialog = document.getElementById("result");
+      const openedWhileBusy = dialog.open && applying;
+      dialog.close();
+      await new Promise(resolve => setTimeout(resolve, 50));
+      const focused = document.activeElement.id;
+      release(); await running;
+      return { openedWhileBusy, focused };
+    } finally {
+      release(); await running; refresh = realRefresh;
+      staged = []; dirty.clear(); renderStaged();
+    }
+  })()`);
+  check(outcome.openedWhileBusy, "the delayed-refresh fixture was not exercised");
+  equal(outcome.focused, "refresh", "an early close returned focus to a busy control");
 });
 
 // --- reading ----------------------------------------------------------------

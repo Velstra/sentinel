@@ -10,12 +10,17 @@
 //! installs, so a static "always unlock" would break every unencrypted box. So it
 //! looks at what is actually on the disk and does the right thing —
 //!
-//!   * the data volume is already open → nothing to do;
-//!   * there is no LUKS data volume (a plaintext install) → nothing to do, and
-//!     the ordinary `/dev/disk/by-label/data` mount takes it from here;
+//!   * on a verified image, follow the running store to its own data partition,
+//!     including an assembled RAID array, and publish its exact mount device;
+//!   * an owned data volume is already open → reuse that mapping;
+//!   * plaintext state → publish its owned device without a password prompt;
 //!   * there IS a locked LUKS data volume → prompt for the passphrase (via
 //!     `systemd-ask-password`, so a console operator or a remote
 //!     `systemd-tty-ask-password-agent` can answer) and open it.
+//!
+//! Outside the verified image, a manual unlock still supports a uniquely
+//! identifiable LUKS data volume. Globally duplicated labels never select an
+//! image's persistent state.
 //!
 //! Passphrase-based only, for now: TPM2 unattended unlock is a documented
 //! follow-up (`systemd-cryptenroll`), and the on-disk format is standard LUKS2 so
@@ -26,6 +31,7 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
+use crate::data_device;
 use crate::install::{DATA_MAPPER, data_mapper_path};
 use crate::system;
 
@@ -37,8 +43,8 @@ const LUKS_FSTYPE: &str = "crypto_LUKS";
 /// shell, but an endless loop is its own denial of service.
 const MAX_ATTEMPTS: u32 = 3;
 
-/// Open the encrypted data volume, prompting for its passphrase — or do nothing
-/// if there is no encrypted volume (or it is already open).
+/// Prepare the boot-owned state device, opening LUKS when needed. A manual
+/// invocation outside the verified image retains the standalone unlock path.
 ///
 /// Run by `sentinel-unlock.service` before `/var/lib/sentinel` is mounted, not by
 /// hand. Needs root (it drives `cryptsetup`).
@@ -46,13 +52,15 @@ pub fn run() -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         bail!("unlock must run as root (it opens a LUKS volume)");
     }
+    if Path::new("/dev/mapper/usr").exists() {
+        return prepare_boot_volume();
+    }
     if Path::new(&data_mapper_path()).exists() {
         eprintln!("data volume already unlocked");
         return Ok(());
     }
     let Some(dev) = find_luks_data()? else {
-        // A plaintext install: the by-label/data mount handles it. Say so plainly
-        // rather than looking like a failure.
+        // A manual invocation outside the verified image with nothing to unlock.
         eprintln!("no encrypted data volume found — nothing to unlock");
         return Ok(());
     };
@@ -68,6 +76,36 @@ pub fn run() -> Result<()> {
         }
     }
     bail!("could not unlock the data volume after {MAX_ATTEMPTS} attempts")
+}
+
+/// The image mount consumes this exact device link, not the globally ambiguous
+/// LABEL=data. A foreign mounted/unlocked volume is never adopted.
+fn prepare_boot_volume() -> Result<()> {
+    let volume = data_device::wait_for_boot_volume()?;
+    if let Some(device) = &volume.ready {
+        data_device::publish(device)?;
+        eprintln!("persistent data device ready on {device}");
+        return Ok(());
+    }
+    if Path::new(&data_mapper_path()).exists() {
+        bail!("the data mapper is already occupied by a different volume");
+    }
+    eprintln!(
+        "unlocking the boot disk's encrypted data volume on {} …",
+        volume.base
+    );
+    for attempt in 1..=MAX_ATTEMPTS {
+        let passphrase = ask_passphrase()?;
+        match open(&volume.base, &passphrase) {
+            Ok(()) => {
+                data_device::publish(&data_mapper_path())?;
+                eprintln!("boot disk data volume unlocked");
+                return Ok(());
+            }
+            Err(error) => eprintln!("attempt {attempt}/{MAX_ATTEMPTS} failed: {error}"),
+        }
+    }
+    bail!("could not unlock the boot disk's data volume after {MAX_ATTEMPTS} attempts")
 }
 
 /// How the data volume is protected at rest, as one line for `show version`.
@@ -96,6 +134,10 @@ pub fn data_at_rest() -> String {
 /// crypto_LUKS device — see [`pick_luks_data`]. Kept apart from that pure chooser
 /// so the choice logic is tested without a disk.
 fn find_luks_data() -> Result<Option<String>> {
+    if Path::new("/dev/mapper/usr").exists() {
+        let volume = data_device::boot_volume()?;
+        return Ok(volume.encrypted.then_some(volume.base));
+    }
     let out = Command::new(system::bin("lsblk"))
         .args(["-rno", "NAME,FSTYPE,PARTLABEL"])
         .output()

@@ -24,6 +24,12 @@ of SSH public keys and an optional pre-hashed login password.
 | `set system login <user> hashed-password <hash>` | A crypt(3) hash (`$6$…`) for console + sudo — never a plaintext password. |
 | `set system login <user> totp <base32-secret>` | A one-time-code secret. The account then needs a code as well as a password. |
 
+Removing `hashed-password` disables that account's local password immediately; its
+configured SSH keys still work. Removing the login revokes both managed
+password and key access while preserving the account ID and home directory.
+Sentinel tracks the accounts it manages and leaves unrelated OS accounts alone.
+Changes apply to new authentications; existing sessions are not terminated.
+
 The password is for the console and `sudo`; **SSH stays key-only** unless you
 also enable password auth on the daemon (below). Generate a hash off-box:
 
@@ -46,6 +52,8 @@ default; the keys come from `system login` above.
 | `port` | TCP port sshd listens on (default 22). |
 | `listen-address` | Restrict sshd to one local address (default: all). |
 | `password-authentication` | Allow password logins over SSH (default `false`, key-only). |
+
+SSH settings apply live. Disabling SSH also prevents it from starting after a reboot.
 
 ```text
 set services ssh port 2222

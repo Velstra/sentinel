@@ -615,7 +615,7 @@ ordinary; `show firewall statistics` reports what happened:
 |---|---|
 | `synproxy_challenged` | SYNs answered with a cookie. Under attack this is the flood being absorbed. |
 | `synproxy_admitted` | Clients that returned a valid cookie and reached the server. |
-| `synproxy_rejected` | ACKs carrying no cookie this appliance minted — spoofed, or expired. |
+| `synproxy_rejected` | Invalid cookies or unsupported/malformed protected TCP packets. |
 | `synproxy_spliced` | Servers that answered and had their connection joined to a client's. |
 
 Read `challenged` and `admitted` together: a large gap between them *is* the
@@ -629,16 +629,21 @@ connection's receive window at 64 KiB (about 6 MB/s on a 10 ms path) and makes
 loss recovery slower. Protect the ports where a flood is the greater risk, not
 every port.
 
-Two further limits worth knowing:
+Protection limits:
 
-- It is **TCP over IPv4** only.
+- It is **TCP over IPv4** only, with no IPv4 options. Unsupported protected
+  headers are dropped rather than forwarded without protection.
+- The cookie can represent client MSS values of **536 bytes or greater**.
+  Smaller or malformed/duplicate MSS options are rejected. An absent MSS uses
+  the IPv4 default of 536; a valid MSS may appear anywhere in the option list.
 - A port-forward that also **changes** the port cannot be protected: the proxy
   matches the two directions of a connection by the service port, which a port
   rewrite breaks. Forwarding the address is fine — `443 → 10.0.0.10:443` works,
   `443 → 10.0.0.10:8443` does not.
 
 The cookie key is drawn from the kernel's random source when the first protected
-port is configured, and never leaves the appliance.
+port is configured, and never leaves the appliance. If key material is missing,
+protected TCP ports fail closed; unrelated ports retain their configured policy.
 
 ## Application-layer gateways: there are none
 

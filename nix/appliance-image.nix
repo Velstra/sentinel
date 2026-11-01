@@ -129,6 +129,15 @@ in
       default = "/var/lib/sentinel";
       description = "Mount point of the one writable, persistent partition (LABEL=data).";
     };
+    stateDevice = lib.mkOption {
+      type = lib.types.str;
+      default = "/dev/disk/by-label/data";
+      description = ''
+        Device holding writable appliance state. Products can provide a
+        boot-disk-bound device link prepared by their unlock unit, avoiding
+        collisions with labels on attached installer or update media.
+      '';
+    };
     unlockUnit = lib.mkOption {
       type = lib.types.str;
       default = "sentinel-unlock.service";
@@ -301,10 +310,10 @@ in
         options = [ "bind" ];
       };
       # The one writable, persistent partition: the editable appliance state.
-      # Addressed by ext4 LABEL=data so the same mount works for the image, a
-      # single-disk install, and an installer-built mdadm RAID array.
+      # The product selects the device. Sentinel resolves the running boot
+      # disk's own plaintext, RAID or encrypted state before this mount starts.
       ${cfg.stateDir} = {
-        device = "/dev/disk/by-label/data";
+        device = cfg.stateDevice;
         fsType = "ext4";
         options = [
           "rw"
