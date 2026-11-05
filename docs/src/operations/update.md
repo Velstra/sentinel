@@ -259,3 +259,33 @@ nix build .#checks.x86_64-linux.update -L
 The test verifies the slot is written, re-typed, and the bootloader switched. The
 cross-reboot switch itself isn't auto-tested (OVMF `machine.reboot()` hangs in the
 harness); the bless/rollback mechanism is proven in the `verified-boot` test.
+
+## Bounded metadata and atomic channel promotion
+
+The channel reader prefers `release.json`: one JSON object with `schema = 1`,
+`manifest` (base64 of the exact signed bytes) and `signature` (base64 of the
+64-byte Ed25519 signature). The envelope is at most 128 KiB and its decoded
+manifest at most 64 KiB. The pinned key authenticates the exact manifest bytes
+before any release fields are trusted; the envelope is not a new trust root.
+
+Only an absent endpoint (HTTP 404, or a missing local file for a file channel)
+allows compatibility fallback to `manifest.json` and `manifest.json.sig`.
+Malformed, oversized, unauthorized, timed-out or incorrectly signed envelopes
+never fall back. Publishers must keep the old root manifest/signature pair
+frozen while upgrading legacy readers, upload immutable versioned resources
+first, and promote only the single envelope object last. Both public and native
+Enterprise readers must be upgraded before production channel migration.
+
+Connections are limited to ten seconds. Metadata has a 60-second overall and
+15-second no-progress budget. Image downloads have a separate six-hour overall,
+60-second no-progress and 64-GiB transfer ceiling (native Enterprise resources
+retain their stricter individual limits). Limits are enforced during transfer,
+including chunked responses, with appliance-pinned curl 8.4 or newer. Incomplete
+downloads are removed and failures leave the active slot unchanged. On Linux,
+the curl child is killed automatically if its update owner exits.
+
+The persistent subscription identity is published only after its private contents
+are complete and synced. Concurrent first use converges on one identity;
+corrupt or insecure existing files are refused rather than silently replaced
+with a new subscription seat. No deployed node is changed by a source update:
+fresh image and OTA/rollback qualification are required before rollout.
