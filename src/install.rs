@@ -1030,6 +1030,10 @@ pub fn update(image: &std::path::Path, commit: bool) -> Result<()> {
         return Ok(());
     }
 
+    // Boot selection is part of the safety gate, even for a deliberately
+    // unsigned local image. Refuse unsafe firmware state before any slot write.
+    preflight_boot_selection()?;
+
     // Resolve the source to a partitioned block device.
     let is_block = std::fs::metadata(image)
         .map(|m| m.file_type().is_block_device())
@@ -1197,6 +1201,7 @@ pub fn update_verified(source: &std::path::Path, sha256: &str, commit: bool) -> 
         );
         return Ok(());
     }
+    preflight_boot_selection()?;
     refuse_identical_image(
         &disk,
         active,
@@ -1332,9 +1337,135 @@ enum UkiSource<'a> {
     EspImage(&'a std::path::Path),
 }
 
+const LOADER_VENDOR_GUID: &str = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f";
+const MAX_EFI_VARIABLE_BYTES: usize = 4096;
+
+/// Read an efivarfs payload without trusting its reported file size. Missing
+/// optional variables are normal; unreadable, oversized or malformed ones are
+/// not permission to stage a candidate whose fallback policy is unknown.
+fn read_bounded(path: &std::path::Path, maximum: usize) -> Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    let mut bytes = Vec::new();
+    file.take(maximum as u64 + 1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= maximum, "{} is oversized", path.display());
+    Ok(Some(bytes))
+}
+
+fn decode_loader_variable(bytes: &[u8]) -> Result<String> {
+    ensure!(
+        (4..=MAX_EFI_VARIABLE_BYTES).contains(&bytes.len()) && (bytes.len() - 4) % 2 == 0,
+        "malformed efivarfs UTF-16 payload"
+    );
+    let attributes = u32::from_le_bytes(bytes[..4].try_into().expect("four attributes bytes"));
+    // Loader variables are boot-service/runtime variables, either volatile
+    // (6) or nonvolatile (7), not authenticated-key or append-write payloads.
+    ensure!(
+        matches!(attributes, 6 | 7),
+        "unexpected EFI loader-variable attributes"
+    );
+    let words: Vec<_> = bytes[4..]
+        .chunks_exact(2)
+        .map(|word| u16::from_le_bytes([word[0], word[1]]))
+        .collect();
+    let end = words
+        .iter()
+        .position(|word| *word == 0)
+        .unwrap_or(words.len());
+    ensure!(
+        words[end..].iter().all(|word| *word == 0),
+        "data after EFI loader-variable string terminator"
+    );
+    String::from_utf16(&words[..end]).context("invalid EFI loader-variable UTF-16")
+}
+
+fn validate_boot_selection(loader: Option<&str>, overrides: &[(&str, &str)]) -> Result<()> {
+    let version = loader
+        .and_then(|value| value.strip_prefix("systemd-boot "))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|value| value.split(['.', '~', '-', '+']).next())
+        .and_then(|value| value.parse::<u32>().ok());
+    ensure!(
+        version.is_some_and(|version| version >= 260),
+        "safe A/B updates require the running UEFI systemd-boot version 260 or newer; \
+         LoaderInfo is missing, unsupported or too old. Review bootloader maintenance \
+         before retrying; no slot write was authorized"
+    );
+    for (name, value) in overrides {
+        let command = match *name {
+            "LoaderEntryDefault" => "set-default",
+            "LoaderEntryPreferred" => "set-preferred",
+            "LoaderEntryOneShot" => "set-oneshot",
+            _ => bail!("unexpected EFI boot-selection override"),
+        };
+        ensure!(
+            value.is_empty(),
+            "UEFI {name} overrides appliance A/B selection; review it and explicitly \
+             clear it with `bootctl {command} ''` before retrying. Sentinel does not \
+             clear firmware variables automatically"
+        );
+    }
+    Ok(())
+}
+
+fn preflight_boot_selection() -> Result<()> {
+    let directory = std::path::Path::new("/sys/firmware/efi/efivars");
+    let read = |name: &str| -> Result<Option<String>> {
+        let path = directory.join(format!("{name}-{LOADER_VENDOR_GUID}"));
+        read_bounded(&path, MAX_EFI_VARIABLE_BYTES)?
+            .map(|bytes| decode_loader_variable(&bytes))
+            .transpose()
+            .with_context(|| format!("validating EFI {name}"))
+    };
+    let loader = read("LoaderInfo")?;
+    let names = [
+        "LoaderEntryDefault",
+        "LoaderEntryPreferred",
+        "LoaderEntryOneShot",
+    ];
+    let overrides: Vec<_> = names
+        .into_iter()
+        .map(|name| Ok((name, read(name)?.unwrap_or_default())))
+        .collect::<Result<_>>()?;
+    let borrowed: Vec<_> = overrides
+        .iter()
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect();
+    validate_boot_selection(loader.as_deref(), &borrowed)
+}
+
+/// A preferred pattern honors boot assessment; a hard per-slot default does
+/// not (systemd-boot 260). The broad fallback still matches the retained good
+/// slot, sorted ahead of an exhausted candidate. Remove ALL old exact keys,
+/// including duplicate directives, without eating comments or unrelated keys.
+fn render_loader_selection(previous: &str, slot: &Slot) -> String {
+    let mut output = String::new();
+    for line in previous.lines() {
+        if matches!(
+            line.split_whitespace().next(),
+            Some("default" | "preferred")
+        ) {
+            continue;
+        }
+        output.push_str(line);
+        output.push('\n');
+    }
+    output.push_str(&format!("preferred {}*\ndefault sentinel-*\n", slot.name));
+    output
+}
+
 /// Install the source image's UKI onto the running ESP as the inactive slot's
-/// boot-counted entry (`<slot>+3.efi`) and point loader.conf's default at it.
+/// boot-counted entry (`<slot>+3.efi`) and prefer it without forcing an exhausted
+/// entry ahead of the healthy fallback.
 fn switch_boot(disk: &str, source: UkiSource, active: &Slot, inactive: &Slot) -> Result<()> {
+    // Recheck immediately before ESP mutation as well as before partition
+    // writes. A newly introduced firmware override must not be hidden by a
+    // successful copy of the inactive slot.
+    preflight_boot_selection()?;
     let self_reseal = matches!(source, UkiSource::Device(dev) if dev == disk);
     // The running ESP is already mounted (systemd-gpt-auto puts it on /boot,
     // read-only). Reuse that mountpoint and flip it writable rather than mounting
@@ -1384,6 +1515,10 @@ fn switch_boot(disk: &str, source: UkiSource, active: &Slot, inactive: &Slot) ->
         .ok_or_else(|| anyhow::anyhow!("no UKI in the source ESP"))?;
 
     let lin = dst.join("EFI/Linux");
+    let conf = dst.join("loader/loader.conf");
+    let previous = read_bounded(&conf, 65_536)?.unwrap_or_default();
+    let previous = String::from_utf8(previous).context("loader.conf is not valid UTF-8")?;
+    let selection = render_loader_selection(&previous, inactive);
     std::fs::create_dir_all(&lin)?;
     // Replace any prior entry for this slot, then install the new one with 3 tries.
     for e in std::fs::read_dir(&lin)?.flatten() {
@@ -1393,30 +1528,167 @@ fn switch_boot(disk: &str, source: UkiSource, active: &Slot, inactive: &Slot) ->
     }
     std::fs::copy(&uki, lin.join(format!("{}+3.efi", inactive.name)))?;
 
-    // Point the boot default at the new slot (a glob, so it keeps matching after
-    // a successful boot blesses the entry and strips the `+N` counter).
-    let conf = dst.join("loader/loader.conf");
-    let mut out = String::new();
-    let mut replaced = false;
-    for line in std::fs::read_to_string(&conf).unwrap_or_default().lines() {
-        if line.trim_start().starts_with("default") {
-            out.push_str(&format!("default {}*\n", inactive.name));
-            replaced = true;
-        } else {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    if !replaced {
-        out.push_str(&format!("default {}*\n", inactive.name));
-    }
-    std::fs::write(&conf, out)?;
+    // Globs survive the successful bless removing +N, but only `preferred`
+    // checks tries_left. The broad default permits assessment-based fallback.
+    std::fs::create_dir_all(dst.join("loader"))?;
+    std::fs::write(&conf, selection)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn loader_variable(attributes: u32, value: &str) -> Vec<u8> {
+        let mut bytes = attributes.to_le_bytes().to_vec();
+        for word in value.encode_utf16().chain([0]) {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn loader_variables_decode_attributes_utf16_and_empty_values() {
+        for attributes in [6, 7] {
+            assert_eq!(
+                decode_loader_variable(&loader_variable(attributes, "systemd-boot 260.5")).unwrap(),
+                "systemd-boot 260.5"
+            );
+            assert_eq!(
+                decode_loader_variable(&attributes.to_le_bytes()).unwrap(),
+                ""
+            );
+            assert_eq!(
+                decode_loader_variable(&loader_variable(attributes, "")).unwrap(),
+                ""
+            );
+        }
+        assert_eq!(
+            decode_loader_variable(&loader_variable(7, "é-fixture")).unwrap(),
+            "é-fixture"
+        );
+        let mut padded = loader_variable(6, "systemd-boot 260.5");
+        padded.extend_from_slice(&[0, 0]);
+        assert_eq!(
+            decode_loader_variable(&padded).unwrap(),
+            "systemd-boot 260.5"
+        );
+    }
+
+    #[test]
+    fn malformed_loader_variables_are_not_treated_as_absent_overrides() {
+        for bytes in [
+            vec![],
+            vec![0; 3],
+            vec![0; 5],
+            vec![0; MAX_EFI_VARIABLE_BYTES + 2],
+        ] {
+            assert!(decode_loader_variable(&bytes).is_err());
+        }
+        for attributes in [0, 1, 2, 3, 4, 8, 0x27, u32::MAX] {
+            assert!(decode_loader_variable(&loader_variable(attributes, "sentinel-a*")).is_err());
+        }
+        let mut surrogate = 6u32.to_le_bytes().to_vec();
+        surrogate.extend_from_slice(&0xd800u16.to_le_bytes());
+        assert!(decode_loader_variable(&surrogate).is_err());
+        assert!(decode_loader_variable(&loader_variable(6, "sentinel-a*\0sentinel-b*")).is_err());
+    }
+
+    #[test]
+    fn only_supported_running_systemd_boot_can_stage_a_candidate() {
+        for version in [
+            "systemd-boot 260",
+            "systemd-boot 260.5",
+            "systemd-boot 261~rc1",
+            "systemd-boot 262+nixos",
+        ] {
+            validate_boot_selection(Some(version), &[]).unwrap();
+        }
+        for loader in [
+            None,
+            Some(""),
+            Some("GRUB 260"),
+            Some("systemd-boot 259.99"),
+            Some("systemd-boot 260garbage"),
+            Some("systemd-boot unknown"),
+        ] {
+            assert!(
+                validate_boot_selection(loader, &[]).is_err(),
+                "accepted {loader:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn efi_selection_overrides_require_explicit_operator_review() {
+        for (name, command) in [
+            ("LoaderEntryDefault", "set-default"),
+            ("LoaderEntryPreferred", "set-preferred"),
+            ("LoaderEntryOneShot", "set-oneshot"),
+        ] {
+            validate_boot_selection(Some("systemd-boot 260.5"), &[(name, "")]).unwrap();
+            for value in [
+                "sentinel-a*",
+                "sentinel-*",
+                "@saved",
+                " ",
+                "unrelated-os.conf",
+            ] {
+                let error = validate_boot_selection(Some("systemd-boot 260.5"), &[(name, value)])
+                    .unwrap_err();
+                let message = error.to_string();
+                assert!(
+                    message.contains(name) && message.contains(command),
+                    "{message}"
+                );
+            }
+        }
+        assert!(validate_boot_selection(Some("systemd-boot 260.5"), &[("unknown", "")]).is_err());
+    }
+
+    #[test]
+    fn loader_selection_migrates_all_hard_defaults_without_eating_other_options() {
+        let previous = "# default sentinel-a*\ntimeout 3\n default\tsentinel-a*\npreferred sentinel-a*\ndefault sentinel-b*\neditor no\ndefault-timeout 4\n# preferred keep-comment\n";
+        let rendered = render_loader_selection(previous, &SLOT_B);
+        assert_eq!(
+            rendered,
+            "# default sentinel-a*\ntimeout 3\neditor no\ndefault-timeout 4\n# preferred keep-comment\npreferred sentinel-b*\ndefault sentinel-*\n"
+        );
+        assert_eq!(render_loader_selection(&rendered, &SLOT_B), rendered);
+        let reversed = render_loader_selection(&rendered, &SLOT_A);
+        assert!(reversed.ends_with("preferred sentinel-a*\ndefault sentinel-*\n"));
+        assert_eq!(
+            reversed
+                .lines()
+                .filter(|line| line.starts_with("default "))
+                .count(),
+            1
+        );
+        assert_eq!(
+            reversed
+                .lines()
+                .filter(|line| line.starts_with("preferred "))
+                .count(),
+            1
+        );
+        assert_eq!(
+            render_loader_selection("", &SLOT_A),
+            "preferred sentinel-a*\ndefault sentinel-*\n"
+        );
+    }
+
+    #[test]
+    fn bounded_boot_policy_reads_do_not_accept_truncation_or_hide_io_failures() {
+        use std::io::Write;
+        let mut stage = system::PrivateStage::create(&std::env::temp_dir(), 0o600).unwrap();
+        stage.file.write_all(b"12345678").unwrap();
+        assert_eq!(read_bounded(&stage.path, 8).unwrap().unwrap(), b"12345678");
+        assert!(read_bounded(&stage.path, 7).is_err());
+        assert!(read_bounded(&std::env::temp_dir(), 8).is_err());
+        let absent = stage.path.with_extension("missing");
+        assert!(read_bounded(&absent, 8).unwrap().is_none());
+        assert!(std::fs::read(stage.path.clone()).unwrap() == b"12345678");
+    }
 
     #[test]
     fn active_and_inactive_slots_are_distinct() {

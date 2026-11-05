@@ -22,6 +22,7 @@ pub struct Hub {
     /// a client arriving at that moment would wait on a collector that just
     /// quit.
     running: Mutex<bool>,
+    snapshot_until: Mutex<Option<Instant>>,
     sample: Arc<Sampler>,
     interval: Duration,
 }
@@ -39,6 +40,7 @@ impl Hub {
         Self {
             sender,
             running: Mutex::new(false),
+            snapshot_until: Mutex::new(None),
             sample: Arc::new(sample),
             interval,
         }
@@ -54,11 +56,41 @@ impl Hub {
         }
         receiver
     }
+    /// Full frame for bounded HTTP polling. A short idle lease preserves the
+    /// shared collector (and measured counter deltas) between peer requests;
+    /// it does not create a collector or a keepalive task per HTTP client.
+    pub async fn snapshot(self: &Arc<Self>) -> Result<Value> {
+        *self
+            .snapshot_until
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(Instant::now() + Duration::from_secs(10));
+        let mut receiver = self.subscribe();
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                let value = receiver.borrow_and_update().clone();
+                if value.get("collecting").is_none() {
+                    return Ok(value);
+                }
+                receiver
+                    .changed()
+                    .await
+                    .context("telemetry collector stopped")?;
+            }
+        })
+        .await
+        .context("telemetry collection timed out")?
+    }
     /// Stop when nobody is subscribed. Checked under the same lock a subscriber
     /// takes, so a subscriber either is counted here or starts a new collector.
     fn stop_if_unwatched(&self) -> bool {
         let mut running = self.running.lock().unwrap_or_else(|p| p.into_inner());
-        if self.sender.receiver_count() > 0 {
+        if self.sender.receiver_count() > 0
+            || self
+                .snapshot_until
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_some_and(|deadline| deadline > Instant::now())
+        {
             return false;
         }
         *running = false;
@@ -643,6 +675,32 @@ mod tests {
             elide_unchanged_routes(frame("b"), &mut last)["routing"]["routes"],
             "b"
         );
+    }
+    #[tokio::test]
+    async fn snapshot_polling_shares_the_collector_and_expires_its_idle_lease() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let samples = Arc::new(AtomicU64::new(0));
+        let counter = samples.clone();
+        let hub = Arc::new(Hub::with_sampler(Duration::from_millis(10), move |_| {
+            json!({"sequence":counter.fetch_add(1, Ordering::SeqCst),
+                "routing":{"routes":"full route table"}})
+        }));
+        let first = hub.snapshot().await.unwrap();
+        assert_eq!(hub.sender.receiver_count(), 0);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let second = hub.snapshot().await.unwrap();
+        assert!(second["sequence"].as_u64() > first["sequence"].as_u64());
+        assert_eq!(second["routing"]["routes"], "full route table");
+        // No per-poll subscription or task is retained. Expiring the single
+        // lease stops the collector; the next poll must await a fresh frame.
+        *hub.snapshot_until.lock().unwrap() = Some(Instant::now());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!*hub.running.lock().unwrap());
+        assert_eq!(hub.sender.borrow()["collecting"], true);
+        let idle = samples.load(Ordering::SeqCst);
+        let next = hub.snapshot().await.unwrap();
+        assert!(next["sequence"].as_u64().unwrap() >= idle);
+        *hub.snapshot_until.lock().unwrap() = None;
     }
     #[tokio::test]
     async fn the_collector_runs_only_while_somebody_is_subscribed() {

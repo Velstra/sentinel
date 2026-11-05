@@ -33,7 +33,18 @@ What happens:
    (a rewritten file, a swapped stick) is refused before the slot is activated;
 6. that slot is re-typed to the verity GPT GUIDs;
 7. the new UKI is installed as `sentinel-<inactive>+3.efi` with **3 boot tries**;
-8. `loader.conf` `default` is pointed at the new slot.
+8. `loader.conf` prefers the new slot with `preferred sentinel-<inactive>*`,
+   retaining `default sentinel-*` so an exhausted candidate can fall back.
+
+Before any inactive-slot write, both signed and unsigned commits require the
+**running UEFI systemd-boot version 260 or newer** and no nonempty firmware
+default, preferred or one-shot entry override. Older/non-systemd loaders and
+malformed or unreadable EFI state are refused. Sentinel does not silently clear
+firmware variables: inspect the override named in the error and explicitly
+review the suggested `bootctl` clearing command before retrying. Bootloader
+maintenance is a separate operation, not a package-manager update on the node.
+A hard per-slot `default` is unsafe here: systemd-boot 260 honors that selection
+even when its boot counter reaches zero.
 
 Without `--commit`, the plan is printed but nothing is written.
 

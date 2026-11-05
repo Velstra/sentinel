@@ -290,7 +290,9 @@ pub fn router(state: Arc<ApiState>) -> Router {
         // can reach the normal apply path.
         .route("/api/v1/config-sync", axum::routing::put(put_config_sync))
         .route("/api/v1/status", get(get_status))
+        .route("/api/v1/system/health", get(get_system_health))
         .route("/api/v1/telemetry", get(get_telemetry))
+        .route("/api/v1/telemetry/snapshot", get(get_telemetry_snapshot))
         .route("/api/v1/show/*path", get(get_show))
         .route("/api/v1/rule-hits", get(get_rule_hits))
         .route("/api/v1/trace", get(get_trace))
@@ -313,6 +315,8 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/api/v1/choices/:kind", get(get_choices))
         .route("/api/v1/stack", get(get_stack))
         .route("/api/v1/stack/:member/show/*path", get(get_stack_show))
+        .route("/api/v1/stack/:member/telemetry", get(get_stack_telemetry))
+        .route("/api/v1/stack/:member/system/health", get(get_stack_health))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
     Router::new()
         .route("/api/v1/health", get(health))
@@ -1602,6 +1606,15 @@ fn management_replace(
     }
 }
 
+async fn get_telemetry_snapshot(State(state): State<Arc<ApiState>>) -> Result<Response, ApiError> {
+    let frame = state
+        .telemetry
+        .snapshot()
+        .await
+        .map_err(|error| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, error))?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(frame)).into_response())
+}
+
 async fn get_telemetry(
     State(state): State<Arc<ApiState>>,
     headers: axum::http::HeaderMap,
@@ -2120,6 +2133,14 @@ fn replace_config(state: &ApiState, appliance: Appliance) -> Result<Json<Value>,
     })))
 }
 
+/// Authenticated diagnostics, also available to read-only accounts. Collection
+/// never changes system state and its bounded subprocesses run off the runtime.
+async fn get_system_health(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, ApiError> {
+    tokio::task::spawn_blocking(move || Json(crate::health::collect(&state.config_path)))
+        .await
+        .map_err(|_| ApiError::internal(anyhow!("system diagnostics unavailable")))
+}
+
 /// `GET /api/v1/status` — hostname, service states and interfaces, the same
 /// facts `sentinel show status` reports (systemd unit state + iproute2 brief).
 async fn get_status(
@@ -2536,6 +2557,71 @@ async fn get_stack_show(
     Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response())
 }
 
+async fn get_stack_telemetry(
+    State(state): State<Arc<ApiState>>,
+    UrlPath(member): UrlPath<String>,
+) -> Result<Response, ApiError> {
+    stack_observation(state, member, "telemetry/snapshot").await
+}
+
+async fn get_stack_health(
+    State(state): State<Arc<ApiState>>,
+    UrlPath(member): UrlPath<String>,
+) -> Result<Response, ApiError> {
+    stack_observation(state, member, "system/health").await
+}
+
+/// Fixed read-only capabilities, never a caller-supplied URL/path. A browser
+/// uses its own local session; only the server uses the pinned machine link.
+/// Peer errors are 502, not 401: losing peer trust must not log out a valid
+/// local session. Older peers without these endpoints remain unavailable.
+async fn stack_observation(
+    state: Arc<ApiState>,
+    member: String,
+    endpoint: &'static str,
+) -> Result<Response, ApiError> {
+    let appliance = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
+    let cs = &appliance.system.config_sync;
+    if !cs.peers.contains(&member) {
+        return Err(ApiError::bad_request(anyhow!(
+            "not a configured stack member"
+        )));
+    }
+    let secret = cs
+        .secret
+        .clone()
+        .ok_or_else(|| ApiError::bad_request(anyhow!("no config-sync secret is set")))?;
+    let cs = cs.clone();
+    let secrets = redact::secret_values(&appliance);
+    let body = tokio::task::spawn_blocking(move || {
+        peer_get_redacted(&cs, &member, endpoint, &secret)
+    }).await.map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, anyhow!("peer request failed")))?
+        .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, anyhow!("Selected member observations unavailable; check its connection, TLS trust and software version")))?;
+    // Scrub string leaves, not serialized JSON: a credential containing quotes
+    // must not evade redaction or turn a valid response into malformed JSON.
+    let mut value: Value = serde_json::from_str(&body).map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            anyhow!("invalid peer observations"),
+        )
+    })?;
+    scrub_observation(&mut value, &secrets);
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(value)).into_response())
+}
+
+fn scrub_observation(value: &mut Value, secrets: &[String]) {
+    match value {
+        Value::String(text) => *text = redact::scrub_text(text, secrets),
+        Value::Array(values) => values
+            .iter_mut()
+            .for_each(|v| scrub_observation(v, secrets)),
+        Value::Object(values) => values
+            .values_mut()
+            .for_each(|v| scrub_observation(v, secrets)),
+        _ => {}
+    }
+}
+
 /// The peer endpoint for a proxied `show`, rebuilt from validated words.
 ///
 /// Never the caller's path as given: curl resolves dot segments before it
@@ -2774,6 +2860,9 @@ mod tests {
     /// State with apply DISABLED — `PUT` validates + saves but never touches the
     /// live system (no systemctl/networkd in a unit test).
     fn state(config_path: PathBuf) -> Arc<ApiState> {
+        // Each fixture represents a separate appliance. A shared directory lets
+        // another test's config save/sweep revoke this appliance's live session.
+        let tokens_dir = config_path.parent().unwrap().join("tokens");
         Arc::new(ApiState {
             telemetry: Arc::default(),
             token: TOKEN.to_string(),
@@ -2781,9 +2870,27 @@ mod tests {
             tls_pin: None,
             config_path,
             apply: Apply::off(),
-            tokens_dir: std::env::temp_dir().join("sentinel-test-tokens"),
+            tokens_dir,
             directory: Arc::new(ConfiguredServers),
         })
+    }
+
+    #[test]
+    fn one_appliance_fixture_cannot_sweep_another_appliances_session() {
+        let path = temp_config();
+        let appliance = Appliance::from_toml(
+            "[system]\nhostname=\"viewer-test\"\n[[system.group]]\nname=\"viewers\"\npermission=\"read-only\"\n[[system.login]]\nusername=\"viewer\"\ngroup=\"viewers\"\n",
+        ).unwrap();
+        session::persist_appliance(&appliance, &path, false).unwrap();
+        let first = state(path);
+        let credential = open_test_session(&first, "viewer");
+        assert!(resolve_caller(&first, &credential).is_some());
+        let unrelated = state(seed("another-appliance"));
+        sync_user_tokens(&unrelated).unwrap();
+        assert!(
+            resolve_caller(&first, &credential).is_some(),
+            "another appliance revoked this fixture's valid local browser session"
+        );
     }
 
     #[tokio::test]
@@ -3538,6 +3645,132 @@ virtual-address = ["10.43.0.253"]
     }
 
     #[tokio::test]
+    async fn member_observations_require_auth_and_exact_configured_membership() {
+        let app = router(state(seed("working")));
+        for uri in [
+            "/api/v1/telemetry/snapshot",
+            "/api/v1/stack/127.0.0.1/telemetry",
+            "/api/v1/stack/127.0.0.1/system/health",
+        ] {
+            assert_eq!(
+                app.clone().oneshot(get(uri, None)).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED,
+                "{uri}"
+            );
+        }
+        for uri in [
+            "/api/v1/stack/127.0.0.1/telemetry",
+            "/api/v1/stack/127.0.0.1/system/health",
+            "/api/v1/stack/%2e%2e/telemetry",
+            "/api/v1/stack/127.0.0.1%2fother/system/health",
+        ] {
+            let response = app.clone().oneshot(get(uri, Some(TOKEN))).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            assert!(
+                body_string(response)
+                    .await
+                    .contains("not a configured stack member")
+            );
+        }
+    }
+
+    #[test]
+    fn observation_redaction_handles_escaped_json_secrets() {
+        let secret = "quoted-credential-\"abc\\def".to_string();
+        let mut value = json!({"errors":{"agent":format!("failed {secret}")},
+            "events":[{"rule":secret}],"count":42,"ok":true});
+        scrub_observation(&mut value, std::slice::from_ref(&secret));
+        assert!(!value.to_string().contains("quoted-credential"));
+        assert_eq!(value["count"], 42);
+        assert_eq!(value["ok"], true);
+        assert!(
+            value["errors"]["agent"]
+                .as_str()
+                .unwrap()
+                .contains("failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn member_observations_use_real_pinned_https_and_contain_peer_auth_failures() {
+        // Two real API routers, connected through TLS and curl, not an HTTP
+        // adapter mock. Neither API may mutate the host's network.
+        let remote_path = seed("remote-observation-test");
+        let directory = remote_path.parent().unwrap();
+        let cert = directory.join("cert.pem");
+        let key = directory.join("key.pem");
+        system::ensure_self_signed_cert(&cert, &key, "peer", &["127.0.0.1".into()]).unwrap();
+        let pin = system::cert_pubkey_pin(&cert).unwrap();
+        install_crypto_provider();
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
+            .await
+            .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let remote = router(state(remote_path));
+        let server = tokio::spawn(async move {
+            axum_server::from_tcp_rustls(listener, tls)
+                .serve(remote.into_make_service())
+                .await
+                .unwrap();
+        });
+        let local_path = seed("local-observation-test");
+        let mut appliance = Appliance::load(&local_path).unwrap();
+        appliance.system.config_sync.peers = vec![address.to_string()];
+        appliance.system.config_sync.secret = Some(TOKEN.into());
+        appliance.system.config_sync.peer_fingerprint = Some(pin);
+        // Exercise the read-only account boundary as well as machine transport.
+        let viewers = Appliance::from_toml("[system]\nhostname=\"viewer-test\"\n[[system.group]]\nname=\"viewers\"\npermission=\"read-only\"\n[[system.login]]\nusername=\"viewer\"\ngroup=\"viewers\"\n").unwrap();
+        appliance.system.groups = viewers.system.groups;
+        appliance.system.logins = viewers.system.logins;
+        session::persist_appliance(&appliance, &local_path, false).unwrap();
+        let local = state(local_path.clone());
+        let session = open_test_session(&local, "viewer");
+        let app = router(local);
+        for suffix in ["telemetry", "system/health"] {
+            let uri = format!("/api/v1/stack/{address}/{suffix}");
+            let response = app
+                .clone()
+                .oneshot(get(&uri, Some(&session)))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{suffix}: {}",
+                body_string(response).await
+            );
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            let value: Value = serde_json::from_str(&body_string(response).await).unwrap();
+            if suffix == "telemetry" {
+                assert!(value["sequence"].as_u64().is_some());
+                assert!(value["interfaces"].is_array());
+                assert!(value["events"].is_array());
+                assert!(value["errors"].is_object());
+            } else {
+                assert!(value["clock"].is_object());
+                assert!(value["tpm"].is_object());
+            }
+        }
+        // A mismatched pin is never retried without verification. Peer errors
+        // must not impersonate expiration of the browser's valid local session.
+        appliance.system.config_sync.peer_fingerprint =
+            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into());
+        session::persist_appliance(&appliance, &local_path, false).unwrap();
+        let uri = format!("/api/v1/stack/{address}/telemetry");
+        let response = app.clone().oneshot(get(&uri, Some(TOKEN))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(!body_string(response).await.contains(TOKEN));
+        appliance.system.config_sync.peer_fingerprint =
+            Some(system::cert_pubkey_pin(&cert).unwrap());
+        appliance.system.config_sync.secret = Some("wrong-peer-credential-0123456789".into());
+        session::persist_appliance(&appliance, &local_path, false).unwrap();
+        let response = app.oneshot(get(&uri, Some(TOKEN))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn telemetry_is_authenticated_and_not_buffered_or_cached() {
         let app = router(state(seed("working")));
         assert_eq!(
@@ -3638,6 +3871,52 @@ virtual-address = ["10.43.0.253"]
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(body_string(resp).await.contains("ok"));
+    }
+
+    #[tokio::test]
+    async fn system_health_requires_authentication_and_is_read_only() {
+        let path = seed("diagnostic-host");
+        let st = state(path.clone());
+        let original = std::fs::read(&path).unwrap();
+        let denied = router(st.clone())
+            .oneshot(get("/api/v1/system/health", None))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        let response = router(st)
+            .oneshot(get("/api/v1/system/health", Some(TOKEN)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let result: Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert!(result["clock"].is_object());
+        assert!(result["systemd"].is_object());
+        assert!(result["tpm"].is_object());
+        assert!(result["issues"].is_array());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn read_only_account_can_observe_system_health() {
+        let path = seed("diagnostic-viewer");
+        let password = "health-test-password";
+        let hash = crate::passwd::hash(password).unwrap();
+        std::fs::write(
+            &path,
+            format!("[system]\nhostname=\"diagnostic-viewer\"\n[[system.group]]\nname=\"viewers\"\npermission=\"read-only\"\n[[system.login]]\nusername=\"viewer\"\nhashed-password=\"{hash}\"\ngroup=\"viewers\"\n"),
+        ).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut st = state(path.clone());
+        let tokens = path.parent().unwrap().join("health-tokens");
+        Arc::get_mut(&mut st).unwrap().tokens_dir = tokens;
+        let login = sign_in(&st, "viewer", password, "").unwrap();
+        let credential = login["token"].as_str().unwrap();
+        let response = router(st)
+            .oneshot(get("/api/v1/system/health", Some(credential)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 
     /// The document a client reads before it has a token, so it is open like

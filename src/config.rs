@@ -4301,6 +4301,32 @@ impl Console {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum HaMode {
+    #[default]
+    Witness,
+    TwoNode,
+}
+impl HaMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Witness => "witness",
+            Self::TwoNode => "two-node",
+        }
+    }
+}
+impl std::str::FromStr for HaMode {
+    type Err = anyhow::Error;
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "witness" => Ok(Self::Witness),
+            "two-node" => Ok(Self::TwoNode),
+            _ => bail!("HA mode must be witness or two-node"),
+        }
+    }
+}
+
 /// Leased active/passive mode. A witness endpoint can be prepared before pairing;
 /// `enabled` is set only after both member identities have been validated.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -4312,7 +4338,18 @@ pub struct Ha {
     pub cluster: String,
     #[serde(default)]
     pub node: Option<u8>,
+    #[serde(default)]
+    pub mode: HaMode,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub witness: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub heartbeat_listen: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub heartbeat_peer: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_delay_ms: Option<u64>,
     #[serde(default)]
     pub sync_interface: String,
     #[serde(default)]
@@ -4352,13 +4389,26 @@ pub struct HaIdentity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub management_web: Option<WebConsole>,
     pub state_listen: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub heartbeat_listen: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub heartbeat_peer: Vec<String>,
     pub priority: u8,
     #[serde(default)]
     pub interfaces: BTreeMap<String, HaInterfaceIdentity>,
+    /// Member-local dedicated control links. The peer need not use the same
+    /// physical NIC name or MAC binding. Only this complete, validated control
+    /// ancestry is replaced; shared data interface names remain canonical.
+    /// Omitted by legacy pairings, which retain their same-name behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<HaControlIdentity>,
     /// A dedicated control tunnel remains member-specific. Data VPNs share the
     /// cluster's long-term identity and rehandshake after promotion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_wireguard: Option<WireguardTunnel>,
+    /// Additional dedicated heartbeat tunnels, each member's own keys/endpoints.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub control_wireguards: Vec<WireguardTunnel>,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
@@ -4366,6 +4416,33 @@ pub struct HaInterfaceIdentity {
     pub address: Option<String>,
     pub address6: Option<String>,
     pub local: Option<String>,
+    /// Local hardware/endpoint facts for a shared logical link. An absent
+    /// legacy profile retains the source facts; a present empty field clears
+    /// the source's binding rather than accidentally installing its MAC here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<HaInterfaceLinkIdentity>,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct HaInterfaceLinkIdentity {
+    pub hw_id: Option<String>,
+    /// A data tunnel's destination is member-local just like its source;
+    /// copying it unchanged would make the standby tunnel to itself.
+    pub remote: Option<String>,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct HaControlIdentity {
+    pub sync_interface: String,
+    #[serde(rename = "interface", default)]
+    pub interfaces: Vec<HaControlInterface>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct HaControlInterface {
+    /// Preserve document ordering across an exact member-profile round trip.
+    pub position: usize,
+    pub configuration: Interface,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -1,6 +1,42 @@
 .resize-none {
   resize: none;
 }
+.system-health-state {
+  min-height: 3rem;
+}
+.system-health-state p {
+  flex: 1 1 18rem;
+  color: var(--text-muted);
+}
+.system-health-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr));
+  gap: var(--space-4);
+  margin: var(--space-5) 0;
+}
+.system-health-summary dt {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+.system-health-summary dd {
+  margin: var(--space-1) 0 0;
+  overflow-wrap: anywhere;
+}
+.system-health-issues,
+.system-health-units {
+  padding-inline-start: var(--space-5);
+  overflow-wrap: anywhere;
+}
+.system-health-issues li + li {
+  margin-top: var(--space-3);
+}
+.system-health-issues p {
+  margin: var(--space-1) 0;
+  color: var(--text-muted);
+}
+.system-health-actions {
+  margin-top: var(--space-4);
+}
 /* Consume the console's canonical light/dark tokens; no parallel palette. */
 .config-columns {
   display: grid;
