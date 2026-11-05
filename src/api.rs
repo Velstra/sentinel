@@ -2860,6 +2860,9 @@ mod tests {
     /// State with apply DISABLED — `PUT` validates + saves but never touches the
     /// live system (no systemctl/networkd in a unit test).
     fn state(config_path: PathBuf) -> Arc<ApiState> {
+        // Each fixture represents a separate appliance. A shared directory lets
+        // another test's config save/sweep revoke this appliance's live session.
+        let tokens_dir = config_path.parent().unwrap().join("tokens");
         Arc::new(ApiState {
             telemetry: Arc::default(),
             token: TOKEN.to_string(),
@@ -2867,9 +2870,27 @@ mod tests {
             tls_pin: None,
             config_path,
             apply: Apply::off(),
-            tokens_dir: std::env::temp_dir().join("sentinel-test-tokens"),
+            tokens_dir,
             directory: Arc::new(ConfiguredServers),
         })
+    }
+
+    #[test]
+    fn one_appliance_fixture_cannot_sweep_another_appliances_session() {
+        let path = temp_config();
+        let appliance = Appliance::from_toml(
+            "[system]\nhostname=\"viewer-test\"\n[[system.group]]\nname=\"viewers\"\npermission=\"read-only\"\n[[system.login]]\nusername=\"viewer\"\ngroup=\"viewers\"\n",
+        ).unwrap();
+        session::persist_appliance(&appliance, &path, false).unwrap();
+        let first = state(path);
+        let credential = open_test_session(&first, "viewer");
+        assert!(resolve_caller(&first, &credential).is_some());
+        let unrelated = state(seed("another-appliance"));
+        sync_user_tokens(&unrelated).unwrap();
+        assert!(
+            resolve_caller(&first, &credential).is_some(),
+            "another appliance revoked this fixture's valid local browser session"
+        );
     }
 
     #[tokio::test]
