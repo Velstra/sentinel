@@ -27,6 +27,7 @@ mod feed;
 mod fleet;
 mod grammar_walk;
 mod ha;
+mod health;
 mod held_links;
 mod identity;
 mod ids;
@@ -169,6 +170,10 @@ enum HaCommand {
         /// Independent witness IP:port; otherwise use system.ha.witness.
         #[arg(long)]
         witness: Option<String>,
+        /// Witness (default) or witnessless two-node mode. A total partition
+        /// can promote both members in two-node mode; independent paths help.
+        #[arg(long, value_enum)]
+        mode: Option<config::HaMode>,
         /// Explicit peer facts for newly declared interfaces (JSON HaIdentity).
         #[arg(long)]
         peer_identity: Option<PathBuf>,
@@ -663,6 +668,7 @@ async fn main() -> Result<()> {
                     secret_stdin,
                     config,
                     witness,
+                    mode,
                     peer_identity,
                 },
         } => {
@@ -673,6 +679,7 @@ async fn main() -> Result<()> {
                 &config,
                 witness.as_deref(),
                 peer_identity.as_deref(),
+                mode,
             )
         }
         Command::Ha {
@@ -2457,8 +2464,13 @@ fn show_op(args: &[String]) -> Result<()> {
         ["babel", rest @ ..] => wren_show_words("babel", rest),
         ["vrrp"] => wren_show(&["vrrp"]),
         ["ha"] => {
-            let status: serde_json::Value = serde_json::from_str(&velstra::query("ha-status")?)
+            let mut status: serde_json::Value = serde_json::from_str(&velstra::query("ha-status")?)
                 .context("reading the data plane's HA status")?;
+            if let Ok(config) = config::Appliance::load(&saved_config_path()) {
+                if let Some(ha) = config.system.ha.filter(|h| h.enabled) {
+                    status["configured_mode"] = ha.mode.as_str().into();
+                }
+            }
             print!("{}", ha::render_status(&status));
             Ok(())
         }
@@ -2749,6 +2761,55 @@ fn show_op(args: &[String]) -> Result<()> {
              show version",
             other.join(" ")
         ),
+    }
+}
+
+#[cfg(test)]
+mod ha_cli_tests {
+    use super::*;
+    #[test]
+    fn pair_modes_parse_without_putting_the_token_in_arguments() {
+        let cli = Cli::try_parse_from([
+            "sentinel",
+            "ha",
+            "pair",
+            "10.20.0.2:8080",
+            "--mode",
+            "two-node",
+            "--secret-stdin",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Ha {
+                command: HaCommand::Pair {
+                    mode: Some(config::HaMode::TwoNode),
+                    secret_stdin: true,
+                    ..
+                }
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "sentinel",
+                "ha",
+                "pair",
+                "10.20.0.2:8080",
+                "--mode",
+                "automatic"
+            ])
+            .is_err()
+        );
+        let error = ha::pair(
+            "10.20.0.2:8080",
+            "non-secret-unit-test-token-at-least-32bytes",
+            std::path::Path::new("/nonexistent-test-config"),
+            Some("10.20.0.3:5440"),
+            None,
+            Some(config::HaMode::TwoNode),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("conflicts with --witness"));
     }
 }
 

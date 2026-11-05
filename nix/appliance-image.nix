@@ -41,12 +41,13 @@ let
   inherit (config.image.repart.verityStore) partitionIds;
   efiArch = config.nixpkgs.hostPlatform.efiArch;
   sdBoot = "${pkgs.systemd}/lib/systemd/boot/efi/systemd-boot${efiArch}.efi";
-  # systemd-boot config: short timeout, default to slot A's entry (a glob so it
-  # keeps matching after bless strips the `+N` counter). The updater rewrites
-  # `default` to the slot it just wrote.
+  # A hard per-slot `default` in systemd-boot 260 ignores exhausted boot tries.
+  # Prefer A while it is bootable; the broad default retains healthy fallback.
+  # Globs keep matching after bless strips +N. Updates move only the preference.
   loaderConf = pkgs.writeText "loader.conf" ''
     timeout 3
-    default ${cfg.slotPrefix}-a*
+    preferred ${cfg.slotPrefix}-a*
+    default ${cfg.slotPrefix}-*
     editor no
     auto-entries no
     auto-firmware no
@@ -189,6 +190,10 @@ in
   };
 
   config = {
+    assertions = [ {
+      assertion = lib.versionAtLeast pkgs.systemd.version "260";
+      message = "The appliance A/B boot-selection policy requires systemd-boot 260 or newer.";
+    } ];
     # systemd-boot is baked into the ESP offline (it can't be `bootctl install`ed
     # in a repart build), so keep the imperative NixOS installers off. Don't touch
     # EFI NVRAM — the appliance is immutable.

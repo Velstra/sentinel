@@ -109,6 +109,7 @@ echo "console tests against http://127.0.0.1:$port"
 # The API's own log is what explains a test that could not reach it, so a
 # failure prints it rather than leaving the reader with "connection refused".
 if ! CONSOLE_URL="http://127.0.0.1:$port/" \
+     CONSOLE_BINARY="$bin" \
      CONSOLE_TOKEN="consoletoken" \
      CONSOLE_CONFIG="$work/config.toml" \
      node "$here/${CONSOLE_TEST_FILE:-console.test.mjs}"; then

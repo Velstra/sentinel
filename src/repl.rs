@@ -2813,7 +2813,7 @@ const CONSOLE_FIELDS: &[Cand] = &[
     ("speed", "baud rate (9600, 115200)"),
 ];
 const SYSTEM_FIELDS: &[Cand] = &[
-    ("ha", "witness-authorized active/passive pairing"),
+    ("ha", "witness or two-node active/passive pairing"),
     ("ha-witness", "independent durable lease witness"),
     ("hostname", "the appliance hostname"),
     (
@@ -2859,6 +2859,23 @@ const HA_FIELDS: &[Cand] = &[
     ("cluster", "stable cluster identifier"),
     ("node", "member 1 or 2"),
     ("witness", "independent witness IP:port"),
+    (
+        "mode",
+        "witness (default) or two-node (total partition can split brain)",
+    ),
+    (
+        "heartbeat-listen",
+        "local numeric IP:port paths (1..4, two-node mode)",
+    ),
+    (
+        "heartbeat-peer",
+        "peer numeric IP:port paths, matching listen order",
+    ),
+    ("peer-timeout-ms", "two-node peer silence timeout in ms"),
+    (
+        "startup-delay-ms",
+        "two-node cold-start wait, at least twice peer timeout",
+    ),
     ("sync-interface", "dedicated control interface"),
     ("priority", "election priority 1..255"),
     (
@@ -5010,9 +5027,22 @@ pub(crate) fn dyn_candidates(tokens: &[&str], names: &DynNames) -> Vec<(String, 
         ["set", "system", "ha", "peer-identity"] => {
             own_cands(&[("<json>", "explicit peer-specific HaIdentity JSON")])
         }
-        ["set", "system", "ha", "witness"] | ["set", "system", "ha-witness", "listen"] => {
+        [
+            "set",
+            "system",
+            "ha",
+            "witness" | "heartbeat-listen" | "heartbeat-peer",
+        ]
+        | ["set", "system", "ha-witness", "listen"] => {
             own_cands(&[("<host:port>", "numeric IP:port; bracket IPv6")])
         }
+        ["set", "system", "ha", "mode"] => own_cands(&[
+            ("witness", "external arbiter (default)"),
+            (
+                "two-node",
+                "peer heartbeats; total partition can split brain",
+            ),
+        ]),
         ["set", "system", "ha", "node"] => {
             own_cands(&[("1", "primary member"), ("2", "secondary member")])
         }

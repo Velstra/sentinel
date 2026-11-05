@@ -34,11 +34,54 @@ The fields inherit shared labels, focus treatment, keyboard behavior, themes
 and responsive layout. Tests must cover applying every timeout, invalid input,
 reading persisted values, restoring defaults and complete CLI-field coverage.
 
+## Shared settings-control validation
+
+fieldGrid/bindField associates visible labels, helper text and inline errors
+with each native/composite control. Required creation fields, integer bounds
+and complete update URLs are checked before Stage/Add; the first invalid field
+is revealed and focused, a form summary explains refusal, and entered values
+remain available for correction. Blank optional values retain the existing
+delete/default semantics. Appliance schema validation remains authoritative for
+addresses, dependencies, credentials and full candidate commits.
+
+Object identifiers use specific labels where they are not arbitrary names:
+destination/aggregate/authorised prefixes, neighbour IP addresses, WireGuard
+public keys, TCP ports and numeric policy sequences. Sequence bounds follow
+the CLI's u32 representation. Both inline object editors and the rule dialog
+reuse fieldGrid validation; dialog headings provide their accessible names.
+
+Switches activate on completed native button clicks, including keyboard and
+assistive activation; canceled pointer gestures do not change the value.
+Suggestion controls are button disclosures, not authored ARIA comboboxes:
+the trigger has a field-specific name and expanded/controls relationships,
+ArrowDown enters suggestions, Escape closes and restores trigger focus, and
+selection restores input focus. Arbitrary valid typed values remain possible.
+
+Live command failures share the existing unavailable/technical-details visual
+variant. Retry really repeats that read, busy state is exposed, and older
+responses cannot overwrite a newer request for the same pane. Error output is
+retained in a disclosure, not displayed as an empty/healthy protocol table.
+
+Verification: tests/console/ux.test.mjs and tests/console/layout.test.mjs use real
+Chromium against the disposable --no-apply API. The layout suite walks every
+palette destination at 1440, 390 and 320 CSS pixels, checking labels, overlapping
+grid fields, clipping outside deliberate scroll regions and document width.
+
 Leased HA and the independent witness use the same settingsPanel/fieldGrid,
 Stage, Validate, Apply and delete semantics on the existing HA page. Their
 configuration and security rules remain owned by src/ha.rs, src/config.rs and
 docs/ha-phase3.md. They do not introduce another apply or enrollment path;
 initial pairing remains the authenticated `sentinel ha pair` operation.
+
+The HA election-mode selector uses the same native select and staged form owner.
+Witness mode remains the compatibility default; two-node mode exposes local and
+peer heartbeat endpoints plus millisecond timing fields. The HA page explicitly
+warns that complete heartbeat isolation can activate both members without a
+witness. It never labels this as quorum-backed protection, infers independent
+physical paths from VLANs, or enrolls a peer merely by changing the selector.
+Mode, timing, control-link ancestry and credential checks remain server-owned in
+src/config.rs, src/ha.rs and src/session.rs. Switching modes retains entered
+values so rejected configurations can be corrected through the normal workflow.
 
 HA identity JSON, witness credentials and the configuration-sync credential use
 the shared secretWidget: a masked input with an associated label and a keyboard
@@ -94,8 +137,9 @@ the compatibility shell. All production assets, including React, are built with
 a pinned npm lockfile and embedded into the Rust binary. Node is a build/test
 dependency only; there is no runtime asset host.
 
-Telemetry is local to the selected appliance; peer views explicitly withhold
-local measurements. Source failures remain unknown and visible rather than
+Telemetry belongs to the selected appliance. Peer views use configured-member-only
+read endpoints over the server's pinned config-sync transport, never direct
+browser credentials or fallback local measurements. Source failures remain unknown and visible rather than
 becoming healthy zeros. Counter rates use measured elapsed time; resets create
 an unknown sample. Standby sync age means elapsed time since its last complete
 authenticated replica update. VCS2 does not acknowledge remote apply latency to
@@ -136,8 +180,9 @@ in-app navigation preserves the draft without extra confirmation.
 Tables render 50 rows per page from at most 512 retained events. Search is local,
 so updates and clear are immediate; IME composition does not submit a mutation.
 Action/search/page state stays in memory because it can include private addresses.
-Unavailable source data remains unknown; switching to a peer withholds local
-telemetry. HA Backup sync age is the age of its last authenticated baseline;
+Unavailable source data remains unknown; switching members immediately clears
+measurements, routes, chart history and paused packets and invalidates old reads.
+HA Backup sync age is the age of its last authenticated baseline;
 Master remote application latency remains explicitly unmeasured.
 
 The editor's side-by-side diff uses bounded line comparison and the canonical
@@ -198,3 +243,37 @@ The header is the sole rendered account-identity surface. Its existing read-only
 badge is visible beside the account; the unused hidden sidebar identity and its
 duplicate renderer were retired. Browser authentication checks assert actual
 badge visibility rather than the absence of a hidden class on a hidden subtree.
+
+## System health observations
+
+ReactSystemHealth is the shared read-only diagnostic surface on the dashboard
+(compact notices) and System page (complete observations). Its source is the
+authenticated GET /api/v1/system/health endpoint in src/health.rs and src/api.rs.
+Management owns the 15-second polling, duplicate/timeout guards and session/member
+invalidation. Unknown, failed or stale probes never appear healthy; a peer view
+reads that member's diagnostics through the pinned backend proxy. Sign-out clears observations and invalidates pending
+responses. Read-only accounts may inspect and retry; Configure NTP navigates to
+the existing services:resolution settingsPanel and grants no additional writes.
+Clock synchronisation and optional LAN NTP serving remain distinct. Diagnostics
+never reset the TPM, clear failed service state or change configuration.
+Verification: ui/tests/health.test.tsx plus authenticated API and system-probe tests.
+
+## Selected-member observation boundary
+
+Management and Host.member own exact member identity, not merely a remote/local
+flag. Dashboard, throughput, HA role, routing, packet events, rule counters and
+system health all share this target. Local telemetry remains SSE; peer telemetry
+polls authenticated full snapshots. One collector with a bounded ten-second idle
+lease retains counter deltas between polls. Duplicate snapshots never renew
+freshness. Unsupported/offline peers show unavailable, never local data. Member
+and session changes abort requests and reject late frames, errors and 401s.
+
+The full document, staged writes and confirmation transaction remain local;
+switching members hides but does not discard a local draft. Configure NTP is
+disabled in peer diagnostics with an explicit local-member explanation. The
+compatibility System details disclosure is local-only and hidden for peers;
+historical metrics explicitly require the local member rather than mislabeling
+local history. These are read-only display boundaries, not new permissions.
+Transport/membership/redaction policy is owned by src/api.rs and src/net.rs.
+Verification: Rust pinned HTTPS two-router tests, ui/tests/management.test.tsx,
+ui/tests/health.test.tsx and tests/console/react.test.mjs.

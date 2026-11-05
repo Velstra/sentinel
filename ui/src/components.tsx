@@ -24,6 +24,217 @@ function Panel({ title, children }: { title: string; children: ReactNode }) {
     </section>
   );
 }
+/** One shared observation surface; the overview uses its compact variant. */
+export function ReactSystemHealth({
+  manager,
+  compact = false,
+}: {
+  manager: Management;
+  compact?: boolean;
+}) {
+  const state = useManagement(manager);
+  const health = state.health;
+  const stale =
+    !!health &&
+    (state.now - state.healthReceivedAt > 30000 || !!state.healthError);
+  const status = !health || stale ? "unknown" : health.status;
+  const summary =
+    state.healthError ||
+    (health
+      ? stale
+        ? "Observations are stale. Retry before relying on these values."
+        : "Read-only observations from the selected member; refreshed every 15 seconds."
+      : state.healthBusy
+        ? "Checking system health…"
+        : "System health has not been checked yet.");
+  return (
+    <Panel title="System health">
+      <div className="telemetry-meta system-health-state" aria-live="polite">
+        <span
+          className={
+            "pill " +
+            (status === "warning" ? "warn" : status === "ok" ? "ok" : "rest")
+          }
+        >
+          {status === "warning"
+            ? "Needs attention"
+            : status === "ok"
+              ? "Healthy"
+              : "Unknown"}
+          {stale ? " · stale" : ""}
+        </span>
+        <p role="status">{summary}</p>
+      </div>
+      {
+        <>
+          {health && !compact && (
+            <dl className="system-health-summary">
+              <div>
+                <dt>Appliance clock (UTC)</dt>
+                <dd>
+                  <code>{health.clock.utc}</code>
+                </dd>
+              </div>
+              <div>
+                <dt>Clock synchronisation</dt>
+                <dd>
+                  {health.clock.synchronised === true
+                    ? "Synchronised"
+                    : health.clock.synchronised === false
+                      ? "Not synchronised"
+                      : "Unknown"}
+                </dd>
+              </div>
+              <div>
+                <dt>Custom NTP upstreams</dt>
+                <dd>
+                  {health.clock.ntp_servers === null
+                    ? "Unknown"
+                    : health.clock.ntp_servers.length
+                      ? health.clock.ntp_servers.join(", ")
+                      : "None configured; image defaults apply"}
+                </dd>
+              </div>
+              <div>
+                <dt>NTP service</dt>
+                <dd>
+                  <code>{health.clock.service?.unit || "chronyd.service"}</code>{" "}
+                  · {health.clock.service?.active_state || "Unknown"}
+                </dd>
+              </div>
+              <div>
+                <dt>Default route</dt>
+                <dd>
+                  {health.network.default_route === true
+                    ? "Present (IPv4 or IPv6)"
+                    : health.network.default_route === false
+                      ? "No IPv4 or IPv6 default route"
+                      : "Unknown"}
+                </dd>
+              </div>
+              <div>
+                <dt>TPM setup</dt>
+                <dd>
+                  {health.tpm.status === "not-present"
+                    ? "No TPM detected"
+                    : health.tpm.status === "warning"
+                      ? "Failed / needs attention"
+                      : health.tpm.status === "ok"
+                        ? "Completed"
+                        : "Unverified"}
+                  {health.tpm.setup?.exit_status != null && (
+                    <> · exit status {health.tpm.setup.exit_status}</>
+                  )}
+                </dd>
+              </div>
+            </dl>
+          )}
+          {!!health?.issues.length && (
+            <ul className="system-health-issues">
+              {(compact ? health.issues.slice(0, 3) : health.issues).map(
+                (issue) => (
+                  <li key={issue.code}>
+                    <strong>{issue.message}</strong>
+                    {!compact && <p>{issue.action}</p>}
+                  </li>
+                ),
+              )}
+            </ul>
+          )}
+          {compact && !!health && health.issues.length > 3 && (
+            <p className="lede">
+              {health.issues.length - 3} additional health notice(s). Open
+              system health for all details.
+            </p>
+          )}
+          {health && !compact && (
+            <div>
+              <h4>Failed system services</h4>
+              {!health.systemd.available ||
+              health.systemd.failed_units === null ? (
+                <p>
+                  Service status is unknown; the appliance could not enumerate
+                  failed units.
+                </p>
+              ) : health.systemd.failed_units.length ? (
+                <>
+                  <ul className="system-health-units">
+                    {health.systemd.failed_units.slice(0, 20).map((unit) => (
+                      <li key={unit.unit}>
+                        <code>{unit.unit}</code> ·{" "}
+                        {unit.active_state || "Unknown"} /{" "}
+                        {unit.sub_state || "Unknown"}
+                      </li>
+                    ))}
+                  </ul>
+                  {health.systemd.failed_units.length > 20 && (
+                    <p>
+                      Showing the first 20 of{" "}
+                      {health.systemd.failed_units.length} failed units. Inspect
+                      the complete list with <code>systemctl --failed</code>.
+                    </p>
+                  )}
+                </>
+              ) : (
+                <p>No failed system services observed.</p>
+              )}
+              {health.tpm.present &&
+                health.tpm.status !== "ok" &&
+                !health.issues.some((issue) =>
+                  issue.code.startsWith("tpm-"),
+                ) && <p>{health.tpm.advice}</p>}
+            </div>
+          )}
+          <div className="row system-health-actions">
+            <button
+              type="button"
+              className="btn"
+              disabled={state.healthBusy}
+              aria-busy={state.healthBusy}
+              onClick={() => void manager.refreshHealth()}
+            >
+              Retry health check
+            </button>
+            {compact && (
+              <button
+                type="button"
+                className="btn"
+                onClick={() => manager.navigate("system")}
+              >
+                Open system health
+              </button>
+            )}
+            <button
+              type="button"
+              className="btn"
+              disabled={state.remote}
+              title={
+                state.remote
+                  ? "Select the local member to configure NTP"
+                  : undefined
+              }
+              onClick={() => manager.navigate("services:resolution")}
+            >
+              Configure NTP
+            </button>
+          </div>
+          {state.remote && (
+            <p className="lede">
+              Select the local member to configure NTP. Peer diagnostics are
+              read-only.
+            </p>
+          )}
+          {!compact && (
+            <p className="lede">
+              Changing NTP uses the existing staged configuration workflow.
+              Diagnostics never reset the TPM or clear service failures.
+            </p>
+          )}
+        </>
+      }
+    </Panel>
+  );
+}
 function Table({
   id,
   headers,
@@ -148,7 +359,7 @@ function Glyph({
 }
 function Overview({ manager }: { manager: Management }) {
   const state = useManagement(manager),
-    f = state.remote ? null : state.frame;
+    f = state.frame;
   const links = (f?.interfaces || []).filter((link) => link.name !== "lo");
   const peers = (f?.wireguard || "")
     .trim()
@@ -200,7 +411,7 @@ function Overview({ manager }: { manager: Management }) {
   ] as const;
   return (
     <>
-      {state.frame && !state.connected && !state.remote && (
+      {state.frame && !state.connected && (
         <p className="overview-stale" role="status">
           Last known measurements · telemetry connection interrupted.
         </p>
@@ -244,16 +455,9 @@ function Overview({ manager }: { manager: Management }) {
     </>
   );
 }
-function Throughput({
-  links,
-  sequence,
-  remote,
-}: {
-  links: Link[];
-  sequence: number;
-  remote: boolean;
-}) {
+function Throughput({ links, sequence }: { links: Link[]; sequence: number }) {
   const [history, setHistory] = useState<number[]>([]);
+  const previousSequence = useRef(0);
   const measured = links.length > 0 && links.every((link) => link.rates);
   const receive = measured
     ? links.reduce((sum, link) => sum + link.rates!.rx_bytes_per_second, 0)
@@ -264,9 +468,13 @@ function Throughput({
   const sample =
     receive !== null && transmit !== null ? receive + transmit : null;
   useEffect(() => {
-    if (!sequence || remote) setHistory([]);
-    else if (sample !== null) setHistory((old) => [...old, sample].slice(-40));
-  }, [sequence, remote, sample]);
+    if (!sequence) setHistory([]);
+    else if (sequence < previousSequence.current)
+      setHistory(sample === null ? [] : [sample]);
+    else if (sequence !== previousSequence.current && sample !== null)
+      setHistory((old) => [...old, sample].slice(-40));
+    previousSequence.current = sequence;
+  }, [sequence, sample]);
   const max = Math.max(...history, 1);
   const points = history
     .map(
@@ -278,15 +486,15 @@ function Throughput({
     <div className="throughput-strip">
       <div className="traffic-readout">
         <span className="metric-label">Aggregate RX + TX</span>
-        <strong>{remote ? "Unavailable" : rate(sample)}</strong>
+        <strong>{rate(sample)}</strong>
         <div className="traffic-directions">
           <div>
             <span className="metric-label">↓ Receive</span>
-            <span>{remote ? "—" : rate(receive)}</span>
+            <span>{rate(receive)}</span>
           </div>
           <div>
             <span className="metric-label">↑ Transmit</span>
-            <span>{remote ? "—" : rate(transmit)}</span>
+            <span>{rate(transmit)}</span>
           </div>
         </div>
       </div>
@@ -294,12 +502,12 @@ function Throughput({
         <div className="chart-caption">
           <span>Measured traffic</span>
           <span>
-            {history.length > 1 && !remote && sample !== null
+            {history.length > 1 && sample !== null
               ? `Peak ${rate(Math.max(...history))}`
               : "Collecting samples"}
           </span>
         </div>
-        {history.length > 1 && !remote && sample !== null ? (
+        {history.length > 1 && sample !== null ? (
           <svg
             role="img"
             aria-label="Last 40 received throughput samples; aggregate RX plus TX"
@@ -312,9 +520,7 @@ function Throughput({
           </svg>
         ) : (
           <div className="chart-waiting">
-            {remote
-              ? "Measurements are unavailable in a peer view."
-              : "The chart appears after two measured samples."}
+            The chart appears after two measured samples.
           </div>
         )}
         <div className="chart-caption">
@@ -371,15 +577,14 @@ function WireGuard({
 }
 export function Dashboard({ manager }: { manager: Management }) {
   const state = useManagement(manager),
-    f = state.remote ? null : state.frame,
+    f = state.frame,
     errors = f?.errors || {},
     ha = f?.ha;
-  const status = state.remote
-    ? "Live telemetry belongs to this appliance. Select the local member to inspect it."
-    : state.status;
+  const status = state.status;
   return (
     <div data-react-view="dashboard">
       <Overview manager={manager} />
+      <ReactSystemHealth manager={manager} compact />
       <div className="dashboard-primary">
         <Panel title="Live interface throughput">
           <div className="telemetry-meta">
@@ -387,8 +592,7 @@ export function Dashboard({ manager }: { manager: Management }) {
               id="telemetry-status"
               role="status"
               className={
-                "stream-status" +
-                (state.connected && !state.remote ? " stream-connected" : "")
+                "stream-status" + (state.connected ? " stream-connected" : "")
               }
             >
               {status}
@@ -401,9 +605,9 @@ export function Dashboard({ manager }: { manager: Management }) {
             </p>
           </div>
           <Throughput
+            key={state.member}
             links={f?.interfaces || []}
             sequence={f?.sequence || 0}
-            remote={state.remote}
           />
           {errors.interfaces && <p role="status">{errors.interfaces}</p>}
           <Table
@@ -522,14 +726,26 @@ export function Flows({ manager }: { manager: Management }) {
     [query, setQuery] = useState(""),
     [action, setAction] = useState(""),
     [page, setPage] = useState(0);
-  const [frozen, setFrozen] = useState<PacketEvent[] | null>(null),
+  const [paused, setPaused] = useState<{
+      member: string;
+      events: PacketEvent[];
+    } | null>(null),
     search = useRef<HTMLInputElement>(null);
-  const events = state.remote ? [] : frozen || state.frame?.events || [];
+  const frozen = paused?.member === state.member ? paused.events : null;
+  const setFrozen = (events: PacketEvent[] | null) =>
+    setPaused(events ? { member: state.member, events } : null);
+  const events = frozen || state.frame?.events || [];
   const selected = useMemo(
     () => selectEvents(events, query, action, page),
     [events, query, action, page],
   );
   const streamSequence = useRef(0);
+  useEffect(() => {
+    setPaused(null);
+    setQuery("");
+    setAction("");
+    setPage(0);
+  }, [state.member]);
   useEffect(() => {
     if (state.frame && state.frame.sequence < streamSequence.current) {
       setFrozen(null);
@@ -545,19 +761,18 @@ export function Flows({ manager }: { manager: Management }) {
       setAction("");
       setPage(0);
     }
-  }, [state.frame, state.connected]);
-  const status = state.remote
-    ? "Select this appliance to inspect local packet events."
-    : state.frame?.errors.events ||
-      (frozen
-        ? "Display paused. Live collection continues."
-        : !state.frame
-          ? state.status
-          : !selected.total
-            ? query || action
-              ? "No events match these filters."
-              : "No packet events received. Enable Log on a firewall rule to collect matches."
-            : state.status);
+  }, [state.frame, state.connected, state.member]);
+  const status =
+    state.frame?.errors.events ||
+    (frozen
+      ? "Display paused. Live collection continues."
+      : !state.frame
+        ? state.status
+        : !selected.total
+          ? query || action
+            ? "No events match these filters."
+            : "No packet events received. Enable Log on a firewall rule to collect matches."
+          : state.status);
   return (
     <section className="card management-panel" data-react-view="flows">
       <header className="panel-heading">
@@ -652,7 +867,7 @@ export function Flows({ manager }: { manager: Management }) {
             id="flow-pause"
             type="checkbox"
             checked={frozen !== null}
-            disabled={state.remote}
+            disabled={!state.frame}
             onChange={(e) => {
               setFrozen(
                 e.target.checked ? [...(state.frame?.events || [])] : null,
@@ -665,11 +880,11 @@ export function Flows({ manager }: { manager: Management }) {
       </div>
       <div className="flow-feedback">
         <p id="flow-state" role="status" className="stream-status">
-          {state.frame?.errors.events && !state.remote
+          {state.frame?.errors.events
             ? "Packet logging is currently unavailable."
             : status}
         </p>
-        {!state.remote && !!state.frame?.events_lost && (
+        {!!state.frame?.events_lost && (
           <p id="flow-lost" role="note" className="stream-status">
             {state.frame.events_lost.toLocaleString()}{" "}
             {state.frame.events_lost === 1 ? "event" : "events"} lost: the
@@ -677,7 +892,7 @@ export function Flows({ manager }: { manager: Management }) {
             exact.
           </p>
         )}
-        {state.frame?.errors.events && !state.remote && (
+        {state.frame?.errors.events && (
           <details className="inline-diagnostic">
             <summary>Connection details</summary>
             <pre className="out react-source">{state.frame.errors.events}</pre>
@@ -748,11 +963,9 @@ export function Flows({ manager }: { manager: Management }) {
       <details>
         <summary>Exact per-rule packet counters</summary>
         <pre className="out react-source" id="live-rule-counters">
-          {state.remote
-            ? "Select the local member."
-            : state.frame?.rule_counters
-              ? JSON.stringify(state.frame.rule_counters, null, 2)
-              : state.frame?.errors.rule_counters || "Counters unavailable."}
+          {state.frame?.rule_counters
+            ? JSON.stringify(state.frame.rule_counters, null, 2)
+            : state.frame?.errors.rule_counters || "Counters unavailable."}
         </pre>
       </details>
     </section>

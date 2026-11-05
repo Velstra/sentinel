@@ -7,6 +7,7 @@ const management = window.SentinelReact.mount({
   // Only a confirmed read-write account writes; "unknown" offers nothing.
   canWrite: () => permission === "read-write",
   remote: () => !!target,
+  member: () => target,
   refresh: () => refresh(),
   navigate: destination => goto(destination),
   signOut: message => signOut(message),

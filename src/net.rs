@@ -1004,8 +1004,8 @@ fn dnsmasq_conf_body(dns: &Dns) -> Result<Option<String>> {
 }
 
 /// chrony's runtime confdir (the image enables `services.chrony` and includes
-/// this dir). A `.conf` here layers the LAN NTP-server config onto the base
-/// chrony config, re-asserted from the saved config each boot like the rest.
+/// this dir). This drop-in owns all appliance time sources, plus optional LAN
+/// serving, re-asserted from the saved config each boot like the rest.
 const CHRONY_CONFDIR: &str = "/run/sentinel/chrony.d";
 const CHRONY_CONF: &str = "sentinel.conf";
 
@@ -1028,16 +1028,19 @@ fn ipv4_network(cidr: &str) -> Option<String> {
     Some(format!("{}/{prefix}", Ipv4Addr::from(net)))
 }
 
-/// Render chrony's confdir drop-in for the NTP server, or `None` when none is
-/// configured. `server <up> iburst` syncs the box to each upstream; `allow
-/// <subnet>` lets each serving interface's subnet query the box for time.
-fn chrony_conf_body(ntp: &Ntp, ifaces: &[Interface]) -> Option<String> {
-    if ntp.is_empty() {
-        return None;
-    }
+/// Always keep the appliance clock synchronized. Explicit upstreams replace
+/// public defaults rather than merely adding sources the operator did not ask
+/// to trust. Serving LAN clients is independent and remains opt-in via `allow`.
+fn chrony_conf_body(ntp: &Ntp, ifaces: &[Interface]) -> String {
     let mut body = String::new();
-    for up in &ntp.upstream {
-        body.push_str(&format!("server {up} iburst\n"));
+    if ntp.upstream.is_empty() {
+        body.push_str("pool 0.nixos.pool.ntp.org iburst maxsources 4\n");
+        body.push_str("pool 1.nixos.pool.ntp.org iburst maxsources 4\n");
+        body.push_str("pool 2.nixos.pool.ntp.org iburst maxsources 2\n");
+    } else {
+        for up in &ntp.upstream {
+            body.push_str(&format!("server {up} iburst\n"));
+        }
     }
     for name in &ntp.serve_on {
         if let Some(net) = ifaces
@@ -1053,7 +1056,7 @@ fn chrony_conf_body(ntp: &Ntp, ifaces: &[Interface]) -> Option<String> {
     for net in &ntp.allow_from {
         body.push_str(&format!("allow {net}\n"));
     }
-    Some(body)
+    body
 }
 
 /// Which stage of the system's life a `net::apply` runs in — the difference is
@@ -1077,25 +1080,20 @@ pub enum ApplyMode {
 }
 
 /// Reconcile the chrony confdir drop-in to `appliance.services.ntp`: write it
-/// when an NTP server is configured, remove it otherwise, and (only in `Live`
+/// for appliance clock sources and optional LAN serving, and (only in `Live`
 /// mode, and only when it changed) restart chrony — so a non-NTP commit never
 /// disturbs the box's timekeeping, and boot never restarts a service out of
 /// order (chronyd reads the drop-in on its own start).
 fn apply_chrony(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     let path = Path::new(CHRONY_CONFDIR).join(CHRONY_CONF);
-    crate::reconcile::service_file(
-        &path,
-        chrony_conf_body(&appliance.services.ntp, &appliance.interfaces).as_deref(),
-        mode,
-        system::install_file,
-        |changed| {
-            if changed {
-                system::reload_chrony()
-            } else {
-                system::service_start("chronyd.service")
-            }
-        },
-    )
+    let body = chrony_conf_body(&appliance.services.ntp, &appliance.interfaces);
+    crate::reconcile::service_file(&path, Some(&body), mode, system::install_file, |changed| {
+        if changed {
+            system::reload_chrony()
+        } else {
+            system::service_start("chronyd.service")
+        }
+    })
 }
 
 /// Reconcile the box's resolver, retaining failed activations for retry.
@@ -5540,12 +5538,68 @@ mod tests {
             description: None,
             disabled: false,
         }];
-        let body = chrony_conf_body(&ntp, &ifaces).expect("ntp configured");
+        let body = chrony_conf_body(&ntp, &ifaces);
         assert!(body.contains("server pool.ntp.org iburst"));
         assert!(body.contains("server 10.0.0.99 iburst"));
         // The serving interface's *subnet* is allowed, not its host address.
         assert!(body.contains("allow 10.0.0.0/24"), "got:\n{body}");
-        assert!(chrony_conf_body(&Ntp::default(), &ifaces).is_none());
+        let defaults = chrony_conf_body(&Ntp::default(), &ifaces);
+        assert!(defaults.contains("pool 0.nixos.pool.ntp.org iburst"));
+        assert!(
+            !defaults.contains("allow "),
+            "default clock client must not serve the LAN"
+        );
+    }
+
+    #[test]
+    fn ntp_custom_upstreams_are_exclusive_client_sources() {
+        let ntp = Ntp {
+            upstream: vec![
+                "10.10.10.1".into(),
+                "2001:db8::123".into(),
+                "clock.example.net".into(),
+            ],
+            ..Ntp::default()
+        };
+        let body = chrony_conf_body(&ntp, &[]);
+        assert_eq!(
+            body,
+            "server 10.10.10.1 iburst\nserver 2001:db8::123 iburst\nserver clock.example.net iburst\n"
+        );
+        assert!(!body.contains("pool "));
+        assert!(!body.contains("allow "));
+    }
+
+    #[test]
+    fn ntp_reset_restores_default_sources_and_never_server_permissions() {
+        let custom = chrony_conf_body(
+            &Ntp {
+                upstream: vec!["10.0.0.99".into()],
+                allow_from: vec!["198.18.0.0/24".into()],
+                ..Ntp::default()
+            },
+            &[],
+        );
+        assert!(custom.contains("allow 198.18.0.0/24\n"));
+        let reset = chrony_conf_body(&Ntp::default(), &[]);
+        assert_eq!(reset.lines().count(), 3);
+        assert!(reset.lines().all(|line| line.starts_with("pool ")));
+        assert!(!reset.contains("10.0.0.99"));
+        assert!(!reset.contains("allow "));
+        assert_eq!(reset, chrony_conf_body(&Ntp::default(), &[]));
+    }
+
+    #[test]
+    fn ntp_server_permissions_do_not_disable_default_clock_sources() {
+        let body = chrony_conf_body(
+            &Ntp {
+                allow_from: vec!["198.18.0.0/24".into()],
+                ..Ntp::default()
+            },
+            &[],
+        );
+        assert!(body.contains("pool 0.nixos.pool.ntp.org iburst"));
+        assert!(body.contains("allow 198.18.0.0/24\n"));
     }
 
     #[test]

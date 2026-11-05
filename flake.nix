@@ -131,6 +131,8 @@
         # here as well as in the wrapper below; without it `nix build` fails in
         # the check phase on a dependency the binary itself resolves fine.
         SENTINEL_OPENSSL_BIN = "${pkgs.openssl.bin}/bin/openssl";
+        # The peer-observation integration test exercises real pinned HTTPS.
+        SENTINEL_CURL_BIN = "${pkgs.curl.bin}/bin/curl";
       };
 
       # Runtime tool pins are a separate derivation: updating the HA dataplane
@@ -476,6 +478,7 @@
             ./nix/appliance.nix
             ./nix/velstra-service.nix
             ./nix/wren-service.nix
+            ./nix/time-sync.nix
           ];
           # `sentinel` is the CLI; `ppp` provides `pppd` + its bundled `pppoe.so`
           # plugin for `type = pppoe` uplinks (roadmap C5). The plugin dir is
@@ -581,46 +584,6 @@
           services.wren = {
             enable = true;
             package = wrenPkg;
-          };
-
-          # NTP: the box always runs chrony to keep its own clock; the
-          # `[services.ntp]` config layers LAN-serving (`server`/`allow`) on top
-          # via a confdir drop-in that Sentinel renders to /run/sentinel/chrony.d
-          # and applies with a chrony restart. tmpfiles pre-creates the dir so
-          # chronyd can read it even before the first commit.
-          services.chrony = {
-            enable = true;
-            # `servers = [ ]` on purpose: the NixOS module renders
-            # `server <name> iburst` lines plus a one-shot `initstepslew`, and
-            # every one of those resolves its name exactly once, at startup.
-            #
-            # A firewall normally boots *before* its own uplink is up. On the
-            # test box chrony started with no route, failed to resolve all four
-            # pool names, and then sat with **zero sources** for the rest of the
-            # uptime — `NTP service: active`, `System clock synchronized: no`,
-            # clock five years slow, and nothing anywhere saying so. Restarting
-            # chronyd by hand fixed it in twelve seconds, which is the tell: the
-            # names were never retried.
-            #
-            # `pool` is the directive that keeps re-resolving and keeps looking
-            # for sources, so the clock corrects itself once the link comes up
-            # instead of staying wrong until somebody notices.
-            servers = [ ];
-            extraConfig = ''
-              pool 0.nixos.pool.ntp.org iburst maxsources 4
-              pool 1.nixos.pool.ntp.org iburst maxsources 4
-              pool 2.nixos.pool.ntp.org iburst maxsources 2
-
-              # This appliance has no battery-backed clock — `RTC time: n/a` on
-              # the test box — so it boots at whatever date its image carries.
-              # Chrony only steps during its first few updates by default and
-              # slews after that; slewing a five-year gap would take longer than
-              # the hardware will live. Step whenever the offset exceeds a
-              # second, however late it is noticed.
-              makestep 1.0 -1
-
-              confdir /run/sentinel/chrony.d
-            '';
           };
 
           # DNS: systemd-resolved stays the box's own resolver (127.0.0.53);
@@ -1540,7 +1503,6 @@
             # escalates. A second, differing rule (0755 root:root) would win and
             # break that staging with EACCES.
             "d /run/sentinel 0775 root wheel -"
-            "d /run/sentinel/chrony.d 0755 root root -"
             "d /run/sentinel/dnsmasq.d 0755 root root -"
             # The radio configs carry the pre-shared key, so the directory is
             # 0700 and each file inside it 0600.
@@ -1732,7 +1694,7 @@
             };
           }
           ''
-            set -eu
+            set -euo pipefail
             export CHROMIUM=${pkgs.chromium}/bin/chromium
             export CONSOLE_PORT=18099
             # A build sandbox is slower than a workstation, and every `show` the
@@ -1745,6 +1707,7 @@
             cp -r ${./tests/console} tests-console
             chmod -R u+w tests-console
             bash tests-console/run.sh ${sentinel}/bin/sentinel | tee output
+            CONSOLE_TEST_FILE=peer.test.mjs bash tests-console/run.sh ${sentinel}/bin/sentinel | tee -a output
             # The runner already exits non-zero on any failed test; this catches
             # the other way to be green — a run that asserted nothing at all.
             grep -Eq "^[1-9][0-9]*/[1-9][0-9]* passed" output
@@ -8671,6 +8634,8 @@
         ha-masquerade-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; leased = true; masquerade = true; };
         ha-wireguard-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; leased = true; wireguard = true; };
         ha-pair = import ./nix/ha-pair-test.nix { inherit pkgs self; };
+        ha-two-node = import ./nix/ha-two-node-test.nix { inherit pkgs self; };
+        ha-two-node-flow = import ./nix/ha-two-node-flow-test.nix { inherit pkgs self; };
         ha-witness-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; leased = true; };
         ha-witness-synproxy-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; leased = true; synproxy = true; };
 
@@ -13308,39 +13273,33 @@
             fw.wait_for_unit("multi-user.target")
             fw.wait_for_unit("velstra.service")
 
-            # The base config keeps looking for time. This guards a failure the
-            # test box showed and no VM would: NixOS renders `server <name>` plus
-            # a one-shot `initstepslew`, both of which resolve their names once,
-            # at startup. A firewall boots before its uplink, so chrony came up
-            # with no route, failed every lookup, and then sat with zero sources
-            # — "NTP service: active", "System clock synchronized: no", clock
-            # five years slow. `pool` re-resolves; `server` does not.
-            # The config lives in the store and the unit points at it with -f;
-            # there is no /etc/chrony.conf on NixOS. Read the one chronyd is
-            # actually started with rather than a path that only looks right.
+            fw.wait_for_unit("chronyd.service")
+            fw.fail("systemctl is-active systemd-timesyncd.service")
+            # Source ownership is entirely in Sentinel's runtime drop-in, not
+            # hidden public servers layered underneath an operator's upstreams.
             base = fw.succeed(
                 "cat $(systemctl cat chronyd | sed -n 's/.*-f \\([^ ]*\\).*/\\1/p' | head -1)"
             )
-            assert "pool " in base, base
-            assert "initstepslew" not in base, (
-                "a one-shot startup lookup is back; a box that boots before its "
-                "uplink will never get the time\n" + base
-            )
-            # No battery-backed clock on the appliance, so the boot-time offset is
-            # years, not seconds. Chrony steps only during its first updates by
-            # default and slews afterwards, and slewing a gap that large outlives
-            # the hardware.
+            assert not any(line.startswith(("pool ", "server ", "initstepslew ")) for line in base.splitlines()), base
             assert "makestep 1.0 -1" in base, base
+            assert sum(line.startswith("makestep ") for line in base.splitlines()) == 1, base
+            initial = fw.succeed("cat /run/sentinel/chrony.d/sentinel.conf")
+            assert "pool 0.nixos.pool.ntp.org iburst" in initial, initial
+            assert "allow " not in initial, initial
 
-            # Turn on the LAN NTP server on eth1 (static addr + lan accept so XDP
-            # passes udp/123), syncing to the upstream node. ONE `set` per line.
+            # A late upstream and a dead RTC must recover without restarting
+            # chronyd after connectivity becomes available.
+            upstream.succeed("ip link set eth1 down")
+            fw.succeed("date -s @978307200")
+
+            # Configure appliance-client synchronization without enabling a LAN
+            # NTP listener. ONE `set` per line.
             fw.succeed(
                 "su admin -c \"printf '%s\\n' "
                 "'set interface eth1 address 10.0.0.1/24' "
                 "'set interface eth1 zone lan' "
                 "'set firewall zone lan default-action accept' "
                 "'set services ntp upstream 10.0.0.99' "
-                "'set services ntp serve-on eth1' "
                 "commit save exit "
                 "| sentinel configure\""
             )
@@ -13352,7 +13311,10 @@
             )
             conf = fw.succeed("cat /run/sentinel/chrony.d/sentinel.conf")
             assert "server 10.0.0.99 iburst" in conf, conf
-            assert "allow 10.0.0.0/24" in conf, conf
+            assert "pool " not in conf and "allow " not in conf, conf
+            fw.fail("ss -uln | grep -q ':123'")
+            pid = fw.succeed("systemctl show chronyd -p MainPID --value").strip()
+            upstream.succeed("ip link set eth1 up")
 
             # The fw synchronises to the upstream (its Reference ID becomes the
             # upstream's IP) and opens the NTP server socket for the LAN.
@@ -13360,6 +13322,15 @@
             fw.wait_until_succeeds(
                 "chronyc -n tracking | grep -q '10.0.0.99'", timeout=120
             )
+            assert fw.succeed("systemctl show chronyd -p MainPID --value").strip() == pid
+            assert abs(int(fw.succeed("date +%s")) - int(upstream.succeed("date +%s"))) < 5
+
+            # Serving LAN clients is a separate explicit operation.
+            fw.succeed("printf '%s\\n' 'set services ntp serve-on eth1' commit save exit | sentinel configure")
+            conf = fw.succeed("cat /run/sentinel/chrony.d/sentinel.conf")
+            assert "server 10.0.0.99 iburst" in conf and "pool " not in conf, conf
+            assert "allow 10.0.0.0/24" in conf, conf
+            fw.wait_until_succeeds("chronyc -n tracking | grep -q '10.0.0.99'", timeout=120)
             fw.wait_until_succeeds("ss -uln | grep -q ':123'", timeout=10)
 
             # Deliberately NOT asserted here: that `show version` and
@@ -13378,6 +13349,19 @@
             client.wait_until_succeeds(
                 "chronyc -n tracking | grep -q '10.0.0.1'", timeout=90
             )
+
+            # Deleting the optional block restores the clock-client defaults,
+            # never stale custom sources or LAN permissions; reboot re-renders it.
+            fw.succeed("printf '%s\\n' 'delete services ntp' commit save exit | sentinel configure")
+            reset = fw.succeed("cat /run/sentinel/chrony.d/sentinel.conf")
+            assert "pool 0.nixos.pool.ntp.org iburst" in reset, reset
+            assert "10.0.0.99" not in reset and "allow " not in reset, reset
+            fw.fail("ss -uln | grep -q ':123'")
+            fw.shutdown()
+            fw.start()
+            fw.wait_for_unit("chronyd.service")
+            assert fw.succeed("cat /run/sentinel/chrony.d/sentinel.conf") == reset
+            fw.fail("systemctl is-active systemd-timesyncd.service")
           '';
         };
 
