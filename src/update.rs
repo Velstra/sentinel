@@ -5,8 +5,8 @@
 //! signature check — that is the supply-chain hole this module closes. Before an
 //! image from a remote channel is ever handed to the slot-writer, we:
 //!
-//!   1. fetch a signed release **manifest** (`manifest.json`) plus its detached
-//!      signature (`manifest.json.sig`),
+//!   1. fetch one atomic `release.json` envelope containing the exact manifest
+//!      and signature bytes (legacy channels use the frozen detached pair),
 //!   2. verify that signature is a valid Ed25519 signature over the *exact* bytes
 //!      of `manifest.json` under the operator-**pinned** public key, and only
 //!      then trust the version + image name + digest the manifest carries,
@@ -204,22 +204,27 @@ fn update_machine_id_at(path: &Path) -> Result<String> {
         getrandom::getrandom(&mut bytes)
             .map_err(|error| anyhow::anyhow!("update identity entropy: {error}"))?;
         let id: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)
-        {
-            Ok(mut file) => {
-                file.write_all(id.as_bytes())?;
-                file.sync_all()?;
-            }
+        // Prepare a complete, private, synced inode on the same filesystem.
+        // hard_link publishes it atomically without replacing another caller's
+        // winner. A crash before publication can leave only temporary scratch,
+        // never an empty/partial identity at the persistent final path.
+        let parent = path
+            .parent()
+            .context("update identity has no parent directory")?;
+        let staged = Scratch::new_in(parent)?;
+        let mut file = staged.create_private("identity")?;
+        file.write_all(id.as_bytes())?;
+        file.sync_all()?;
+        match std::fs::hard_link(staged.join("identity"), path) {
+            Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error).context("creating persistent update identity"),
+            Err(error) => return Err(error).context("publishing persistent update identity"),
         }
+        // A losing caller also synchronizes the directory before returning:
+        // the winner may have been interrupted immediately after publication.
+        std::fs::File::open(parent)?.sync_all()?;
     }
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
@@ -232,7 +237,8 @@ fn update_machine_id_at(path: &Path) -> Result<String> {
         );
     }
     let mut id = String::new();
-    file.read_to_string(&mut id)
+    file.take(33)
+        .read_to_string(&mut id)
         .context("reading persistent update identity")?;
     if id.len() != 32
         || !id
@@ -247,6 +253,74 @@ fn update_machine_id_at(path: &Path) -> Result<String> {
     Ok(id)
 }
 
+/// Bounds apply during transfer, before an untrusted response reaches crypto
+/// or JSON parsing. The appliance pins curl >= 8.4, whose --max-filesize also
+/// bounds unknown-length/chunked responses. Images get a separate, larger budget.
+#[derive(Clone, Copy)]
+struct FetchPolicy {
+    max_bytes: u64,
+    total_seconds: u32,
+    idle_seconds: u32,
+}
+
+const MANIFEST_FETCH: FetchPolicy = FetchPolicy {
+    max_bytes: 64 * 1024,
+    total_seconds: 60,
+    idle_seconds: 15,
+};
+const SIGNATURE_FETCH: FetchPolicy = FetchPolicy {
+    max_bytes: 64, // Ed25519 detached signatures have exactly 64 bytes.
+    ..MANIFEST_FETCH
+};
+const ENVELOPE_FETCH: FetchPolicy = FetchPolicy {
+    max_bytes: 128 * 1024,
+    ..MANIFEST_FETCH
+};
+const IMAGE_FETCH: FetchPolicy = FetchPolicy {
+    max_bytes: 64 * 1024 * 1024 * 1024,
+    total_seconds: 6 * 60 * 60,
+    idle_seconds: 60,
+};
+
+/// Always reap curl and remove incomplete/oversized destinations on refusal.
+/// curl itself enforces the connection, no-progress and wall-clock deadlines.
+fn fetch_output(
+    mut command: Command,
+    dest: &Path,
+    policy: FetchPolicy,
+) -> Result<std::process::Output> {
+    let result = (|| {
+        let output = command
+            .output()
+            .context("running bounded update download")?;
+        if output.status.success() && std::fs::metadata(dest)?.len() > policy.max_bytes {
+            bail!(
+                "update download exceeds its {} byte limit",
+                policy.max_bytes
+            );
+        }
+        Ok(output)
+    })();
+    if result
+        .as_ref()
+        .map_or(true, |out: &std::process::Output| !out.status.success())
+    {
+        let _ = std::fs::remove_file(dest);
+    }
+    result
+}
+
+#[derive(Debug)]
+struct MetadataNotFound;
+
+impl std::fmt::Display for MetadataNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("update metadata was not found")
+    }
+}
+
+impl std::error::Error for MetadataNotFound {}
+
 /// Fetch `url` to `dest` with `curl -fsSL`. `-f` makes an HTTP error (or a
 /// missing `file://` path) a non-zero exit; `--proto =https,file` refuses any
 /// other scheme even across a redirect. Any failure bails — fetch is fail-closed.
@@ -256,7 +330,7 @@ fn update_machine_id_at(path: &Path) -> Result<String> {
 /// inside a 0700 directory (`-H @file`), never on the
 /// command line — argv is world-readable through /proc for as long as curl
 /// runs, and a secret must not be.
-fn fetch(chan: &UpdateChannel, url: &str, dest: &Path) -> Result<()> {
+fn fetch(chan: &UpdateChannel, url: &str, dest: &Path, policy: FetchPolicy) -> Result<()> {
     let scratch = Scratch::new()?;
     let header = match &chan.subscription_key {
         Some(key) => {
@@ -274,9 +348,12 @@ fn fetch(chan: &UpdateChannel, url: &str, dest: &Path) -> Result<()> {
         }
         None => None,
     };
-    let out = fetch_command(url, dest, header.as_deref())?
-        .output()
-        .with_context(|| format!("running curl for {url}"))?;
+    let out = fetch_output(
+        fetch_command(url, dest, header.as_deref(), policy)?,
+        dest,
+        policy,
+    )
+    .with_context(|| format!("running curl for {url}"))?;
     if out.status.success() {
         return Ok(());
     }
@@ -286,6 +363,9 @@ fn fetch(chan: &UpdateChannel, url: &str, dest: &Path) -> Result<()> {
         .next()
         .and_then(|t| t.parse().ok())
         .filter(|c| *c >= 100);
+    if code == Some(404) || (url.starts_with("file://") && out.status.code() == Some(37)) {
+        return Err(MetadataNotFound.into());
+    }
     // PRODUCT COMMITMENT, not an implementation detail: an expired or rejected
     // subscription must never brick, degrade or nag-block the appliance. This
     // function only ever *reads*; on any refusal the box keeps routing, keeps
@@ -320,7 +400,8 @@ fn fetch(chan: &UpdateChannel, url: &str, dest: &Path) -> Result<()> {
         );
     }
     bail!(
-        "fetch of {url} failed (curl exit {:?}{})",
+        "fetch of {url} failed (curl exit {:?}{}); connection, progress, time or size \
+         limits may have been exceeded; partial download removed",
         out.status.code(),
         code.map(|c| format!(", HTTP {c}")).unwrap_or_default()
     );
@@ -332,7 +413,12 @@ fn fetch(chan: &UpdateChannel, url: &str, dest: &Path) -> Result<()> {
 /// or which certificates a channel is checked against — the system trust store
 /// is. `-f` makes an HTTP error (or a missing `file://` path) a non-zero exit;
 /// `--proto =https,file` refuses any other scheme even across a redirect.
-fn fetch_command(url: &str, dest: &Path, auth_header: Option<&Path>) -> Result<Command> {
+fn fetch_command(
+    url: &str,
+    dest: &Path,
+    auth_header: Option<&Path>,
+    policy: FetchPolicy,
+) -> Result<Command> {
     let mut cmd = system::curl_command();
     cmd.args([
         "-fsSL",
@@ -340,6 +426,16 @@ fn fetch_command(url: &str, dest: &Path, auth_header: Option<&Path>) -> Result<C
         "=https,file",
         "--proto-redir",
         "=https,file",
+        "--connect-timeout",
+        "10",
+        "--max-time",
+        &policy.total_seconds.to_string(),
+        "--speed-limit",
+        "1",
+        "--speed-time",
+        &policy.idle_seconds.to_string(),
+        "--max-filesize",
+        &policy.max_bytes.to_string(),
         // The HTTP status, on stdout after the (empty, `-o`-redirected) body —
         // it is what tells an entitlement refusal apart from a broken mirror.
         "-w",
@@ -350,6 +446,32 @@ fn fetch_command(url: &str, dest: &Path, auth_header: Option<&Path>) -> Result<C
     ]);
     if let Some(header) = auth_header {
         cmd.args(["-H", &format!("@{}", s(header)?)]);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        let parent = std::process::id() as libc::pid_t;
+        // SAFETY: only allocation-free libc/syscall operations run between
+        // fork and exec. Do not leave a download alive after its update owner
+        // is killed/cancelled; close the fork-to-prctl parent-death race too.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::prctl(
+                    libc::PR_SET_PDEATHSIG,
+                    libc::SIGKILL as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                ) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    libc::_exit(128 + libc::SIGKILL);
+                }
+                Ok(())
+            });
+        }
     }
     Ok(cmd)
 }
@@ -452,14 +574,55 @@ pub fn check(chan: &UpdateChannel) -> Result<Manifest> {
     let manifest_path = scratch.join("manifest.json");
     let sig_path = scratch.join("manifest.json.sig");
 
-    fetch(chan, &format!("{base}/manifest.json"), &manifest_path)?;
-    fetch(chan, &format!("{base}/manifest.json.sig"), &sig_path)?;
+    let envelope_path = scratch.join("release.json");
+    match fetch(
+        chan,
+        &format!("{base}/release.json"),
+        &envelope_path,
+        ENVELOPE_FETCH,
+    ) {
+        Ok(()) => {
+            let (manifest, signature) =
+                decode_envelope(&read_small(&envelope_path, ENVELOPE_FETCH.max_bytes)?)?;
+            use std::io::Write;
+            scratch
+                .create_private("manifest.json")?
+                .write_all(&manifest)?;
+            scratch
+                .create_private("manifest.json.sig")?
+                .write_all(&signature)?;
+        }
+        Err(error) if error.downcast_ref::<MetadataNotFound>().is_some() => {
+            // Compatibility only when the atomic endpoint is absent. Corrupt,
+            // oversized, unauthorized or timed-out envelopes never fall back.
+            fetch(
+                chan,
+                &format!("{base}/manifest.json"),
+                &manifest_path,
+                MANIFEST_FETCH,
+            )?;
+            fetch(
+                chan,
+                &format!("{base}/manifest.json.sig"),
+                &sig_path,
+                SIGNATURE_FETCH,
+            )?;
+        }
+        Err(error) => return Err(error),
+    }
+
+    // Defense in depth: bound the actual inputs handed to verification and the
+    // exact bytes parsed, even if a transport implementation regresses.
+    let bytes = read_small(&manifest_path, MANIFEST_FETCH.max_bytes)?;
+    let signature = read_small(&sig_path, SIGNATURE_FETCH.max_bytes)?;
+    if signature.len() != SIGNATURE_FETCH.max_bytes as usize {
+        bail!("release signature must be exactly 64 bytes");
+    }
 
     // Verify the signature BEFORE parsing/trusting any manifest field.
     let pubkey = resolve_pubkey(chan, &scratch)?;
     verify_signature(&pubkey, &manifest_path, &sig_path)?;
 
-    let bytes = std::fs::read(&manifest_path).context("reading the verified manifest")?;
     let manifest: Manifest =
         serde_json::from_slice(&bytes).context("parsing the (verified) release manifest")?;
 
@@ -471,6 +634,34 @@ pub fn check(chan: &UpdateChannel) -> Result<Manifest> {
     }
     check_manifest_fields(&manifest)?;
     Ok(manifest)
+}
+
+fn decode_envelope(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    use base64::Engine;
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Envelope {
+        schema: u32,
+        manifest: String,
+        signature: String,
+    }
+    if bytes.len() as u64 > ENVELOPE_FETCH.max_bytes {
+        bail!("signed release envelope is oversized");
+    }
+    let envelope: Envelope =
+        serde_json::from_slice(bytes).context("parsing signed release envelope")?;
+    if envelope.schema != 1 {
+        bail!("unsupported signed release envelope schema");
+    }
+    let manifest = base64::engine::general_purpose::STANDARD.decode(&envelope.manifest)?;
+    let signature = base64::engine::general_purpose::STANDARD.decode(&envelope.signature)?;
+    if manifest.is_empty()
+        || manifest.len() as u64 > MANIFEST_FETCH.max_bytes
+        || signature.len() != 64
+    {
+        bail!("invalid signed release envelope lengths");
+    }
+    Ok((manifest, signature))
 }
 
 /// The checks every verified manifest gets, from a channel or from a medium.
@@ -590,7 +781,7 @@ pub fn fetch_verified_image(chan: &UpdateChannel, manifest: &Manifest, dest: &Pa
         bail!("refusing to fetch unsafe image path {:?}", manifest.image);
     }
     let url = format!("{}/{}", base_url(chan), manifest.image);
-    fetch(chan, &url, dest)?;
+    fetch(chan, &url, dest, IMAGE_FETCH)?;
 
     let got = sha256_hex(dest)?;
     let want = norm_digest(&manifest.sha256);
@@ -851,6 +1042,96 @@ fn status_path() -> std::path::PathBuf {
 mod tests {
     use super::*;
 
+    #[test]
+    fn atomic_channel_verifies_exact_enclosed_bytes_and_never_falls_back_on_tampering() {
+        use base64::Engine;
+        let dir = Scratch::new().unwrap();
+        let private = dir.join("release.key");
+        let public = dir.join("release.pub");
+        let manifest = dir.join("manifest.json");
+        let signature = dir.join("manifest.json.sig");
+        let original = serde_json::to_vec(&serde_json::json!({
+            "version": "9.1.0", "image": "image.raw", "sha256": "a".repeat(64),
+            "product": PRODUCT,
+        }))
+        .unwrap();
+        std::fs::write(&manifest, &original).unwrap();
+        for args in [
+            vec![
+                "genpkey",
+                "-algorithm",
+                "ED25519",
+                "-out",
+                s(&private).unwrap(),
+            ],
+            vec![
+                "pkey",
+                "-in",
+                s(&private).unwrap(),
+                "-pubout",
+                "-out",
+                s(&public).unwrap(),
+            ],
+            vec![
+                "pkeyutl",
+                "-sign",
+                "-rawin",
+                "-inkey",
+                s(&private).unwrap(),
+                "-in",
+                s(&manifest).unwrap(),
+                "-out",
+                s(&signature).unwrap(),
+            ],
+        ] {
+            assert!(
+                Command::new(openssl_bin())
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+        let chan = UpdateChannel {
+            name: None,
+            url: format!("file://{}", dir.0.display()),
+            public_key: format!("file:{}", public.display()),
+            subscription_key: None,
+        };
+        // An absent atomic endpoint is the only compatibility fallback.
+        assert_eq!(check(&chan).unwrap().version, "9.1.0");
+        let proof = std::fs::read(&signature).unwrap();
+        let encode = |body: &[u8]| {
+            serde_json::to_vec(&serde_json::json!({
+                "schema": 1,
+                "manifest": base64::engine::general_purpose::STANDARD.encode(body),
+                "signature": base64::engine::general_purpose::STANDARD.encode(&proof),
+            }))
+            .unwrap()
+        };
+        std::fs::write(dir.join("release.json"), encode(&original)).unwrap();
+        std::fs::write(&manifest, b"unrelated legacy manifest").unwrap();
+        std::fs::write(&signature, b"unrelated legacy signature").unwrap();
+        assert_eq!(check(&chan).unwrap().version, "9.1.0");
+        // Even a valid legacy pair must not rescue an invalid atomic envelope.
+        std::fs::write(&manifest, &original).unwrap();
+        std::fs::write(&signature, &proof).unwrap();
+        let mut tampered = original.clone();
+        tampered.push(b' ');
+        std::fs::write(dir.join("release.json"), encode(&tampered)).unwrap();
+        assert!(
+            check(&chan)
+                .unwrap_err()
+                .to_string()
+                .contains("signature verification FAILED")
+        );
+        for invalid in [b"{}".as_slice(), br#"{"schema":2}"#, br#"{"schema":true}"#] {
+            std::fs::write(dir.join("release.json"), invalid).unwrap();
+            assert!(check(&chan).is_err());
+        }
+    }
+
     // ---- pure tests (no openssl/curl, always run) ----
 
     #[test]
@@ -877,6 +1158,140 @@ mod tests {
         let link = scratch.join("node-id-link");
         std::os::unix::fs::symlink(&path, &link).unwrap();
         assert!(update_machine_id_at(&link).is_err());
+    }
+
+    #[test]
+    fn concurrent_first_use_publishes_one_complete_identity() {
+        let scratch = Scratch::new().unwrap();
+        let path = scratch.join("node-id");
+        // An interrupted initializer's private, incomplete scratch must not
+        // reserve or corrupt the final name.
+        let interrupted = Scratch::new_in(&scratch.0).unwrap();
+        std::io::Write::write_all(
+            &mut interrupted.create_private("identity").unwrap(),
+            b"partial",
+        )
+        .unwrap();
+        assert!(!path.exists());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(32));
+        let callers: Vec<_> = (0..32)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    update_machine_id_at(&path).unwrap()
+                })
+            })
+            .collect();
+        let identities: Vec<_> = callers.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(identities[0].len(), 32);
+        assert!(identities.iter().all(|id| id == &identities[0]));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), identities[0]);
+    }
+
+    /// Exercise the actual curl transfer, not just argv construction. HTTP is
+    /// permitted only by this isolated loopback test; production remains HTTPS.
+    fn loopback_download(response: Vec<u8>, stall: bool, policy: FetchPolicy, tls: bool) {
+        use std::io::{Read, Write};
+        use std::time::{Duration, Instant};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (finished, wait) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("test server accept: {e}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).unwrap() > 0);
+            let _ = socket.write_all(&response);
+            if stall {
+                let _ = wait.recv_timeout(Duration::from_secs(5));
+            }
+        });
+        let scratch = Scratch::new().unwrap();
+        let dest = scratch.join("download");
+        let scheme = if tls { "https" } else { "http" };
+        let mut command = fetch_command(
+            &format!("{scheme}://{address}/metadata"),
+            &dest,
+            None,
+            policy,
+        )
+        .unwrap();
+        if !tls {
+            command.args(["--proto", "=http"]);
+        }
+        let started = Instant::now();
+        let output = fetch_output(command, &dest, policy).unwrap();
+        let _ = finished.send(());
+        server.join().unwrap();
+        assert!(
+            !output.status.success(),
+            "must refuse oversized or stalled input"
+        );
+        assert!(!dest.exists(), "partial downloads must be removed");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "transfer exceeded its deadline"
+        );
+        if stall {
+            assert_eq!(output.status.code(), Some(28), "curl timeout expected");
+        } else {
+            assert_eq!(output.status.code(), Some(63), "curl size limit expected");
+        }
+    }
+
+    #[test]
+    fn metadata_bounds_abort_known_and_unknown_length_transfers_and_clean_files() {
+        for policy in [MANIFEST_FETCH, SIGNATURE_FETCH] {
+            let body = vec![b'x'; policy.max_bytes as usize + 16384];
+            let mut known =
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+            known.extend_from_slice(&body);
+            loopback_download(known, false, policy, false);
+            let mut chunked = format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+                body.len()
+            )
+            .into_bytes();
+            chunked.extend_from_slice(&body);
+            chunked.extend_from_slice(b"\r\n0\r\n\r\n");
+            loopback_download(chunked, false, policy, false);
+        }
+    }
+
+    #[test]
+    fn stalled_tls_handshake_and_mid_body_have_bounded_lifetimes() {
+        let policy = FetchPolicy {
+            total_seconds: 1,
+            idle_seconds: 1,
+            ..MANIFEST_FETCH
+        };
+        loopback_download(Vec::new(), true, policy, true);
+        loopback_download(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nabc".to_vec(),
+            true,
+            policy,
+            false,
+        );
     }
 
     #[test]
@@ -1425,11 +1840,21 @@ mod tests {
             "https://updates.example.test/manifest.json",
             Path::new("/tmp/x/manifest.json"),
             Some(Path::new("/tmp/x/auth-header")),
+            MANIFEST_FETCH,
         )
         .unwrap();
         let args: Vec<_> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
         assert_eq!(args.first(), Some(&"--disable"), "{args:?}");
         assert!(args.contains(&"@/tmp/x/auth-header"));
+        for pair in [
+            ["--proto", "=https,file"],
+            ["--connect-timeout", "10"],
+            ["--max-time", "60"],
+            ["--speed-time", "15"],
+            ["--max-filesize", "65536"],
+        ] {
+            assert!(args.windows(2).any(|window| window == pair), "{args:?}");
+        }
         let envs: Vec<_> = cmd.get_envs().map(|(k, _)| k.to_str().unwrap()).collect();
         assert!(envs.iter().all(|k| *k == "PATH"), "{envs:?}");
     }

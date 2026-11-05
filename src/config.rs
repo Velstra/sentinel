@@ -7921,15 +7921,23 @@ impl Appliance {
                 }
             }
         }
-        // A domain group shares the address groups' namespace — a rule references
-        // either through the same field, so a name in both would resolve by
-        // whichever the merge happened to write last.
-        for name in self.firewall.group.domain.keys() {
-            if self.firewall.group.address.contains_key(name) {
-                bail!(
-                    "firewall group domain-group {name:?}: a group of that name already \
-                     exists as an address-group; rules reference both the same way"
-                );
+        // All four address-like group types share one rule-reference namespace.
+        // Never union static membership with a VPN identity or a dynamic feed:
+        // that would silently broaden the authorization attached to the name.
+        let mut address_group_types = BTreeMap::new();
+        for (kind, groups) in [
+            ("address-group", &self.firewall.group.address),
+            ("domain-group", &self.firewall.group.domain),
+            ("feed-group", &self.firewall.group.feed),
+            ("user-group", &self.firewall.group.user),
+        ] {
+            for name in groups.keys() {
+                if let Some(previous) = address_group_types.insert(name, kind) {
+                    bail!(
+                        "firewall group {kind} {name:?}: a group of that name already \
+                         exists as an {previous}; address-like group names must be unique"
+                    );
+                }
             }
         }
         for (name, domains) in &self.firewall.group.domain {
@@ -12830,6 +12838,38 @@ fn proto_str(p: Proto) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn address_like_group_names_are_unique_across_every_type_pair() {
+        let kinds = [
+            ("address", "10.0.0.0/24"),
+            ("domain", "example.com"),
+            ("feed", "https://example.com/addresses.txt"),
+            ("user", "alice"),
+        ];
+        for (left, left_value) in kinds {
+            for (right, right_value) in kinds {
+                if left == right {
+                    continue;
+                }
+                let document = format!(
+                    "[system]\nhostname = \"fw\"\n\
+                     [firewall.group.{left}]\nadmins = [{left_value:?}]\n\
+                     [firewall.group.{right}]\nadmins = [{right_value:?}]\n"
+                );
+                let error = super::Appliance::from_toml(&document).unwrap_err();
+                assert!(
+                    error.to_string().contains("group names must be unique"),
+                    "{left} and {right}: {error:#}"
+                );
+                let distinct = document.replace(
+                    &format!("[firewall.group.{right}]\nadmins"),
+                    &format!("[firewall.group.{right}]\nother"),
+                );
+                super::Appliance::from_toml(&distinct).unwrap();
+            }
+        }
+    }
 
     #[test]
     fn ipv6_egress_rules_validate_and_round_trip() {
