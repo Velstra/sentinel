@@ -2,7 +2,13 @@ import { createRoot } from "react-dom/client";
 import { flushSync } from "react-dom";
 import { Management } from "./controller";
 import type { Host } from "./model";
-import { Dashboard, Flows, ConfigEditor, Confirmation } from "./components";
+import {
+  Dashboard,
+  Flows,
+  ConfigEditor,
+  Confirmation,
+  ReactSystemHealth,
+} from "./components";
 import "./shell.css";
 import "./style.css";
 
@@ -21,6 +27,7 @@ window.SentinelReact = {
       ["react-flows", Flows],
       ["react-config", ConfigEditor],
       ["react-confirmation", Confirmation],
+      ["react-system-health", ReactSystemHealth],
     ] as const) {
       const root = document.getElementById(id);
       if (!root) throw Error("Missing React mount " + id);

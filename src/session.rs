@@ -4645,6 +4645,11 @@ impl Session {
                     "cluster" => ha.cluster = (*value).into(),
                     "node" => ha.node = Some(value.parse()?),
                     "witness" => ha.witness = (*value).into(),
+                    "mode" => ha.mode = value.parse()?,
+                    "heartbeat-listen" => append_csv(&mut ha.heartbeat_listen, value),
+                    "heartbeat-peer" => append_csv(&mut ha.heartbeat_peer, value),
+                    "peer-timeout-ms" => ha.peer_timeout_ms = Some(value.parse()?),
+                    "startup-delay-ms" => ha.startup_delay_ms = Some(value.parse()?),
                     "sync-interface" => ha.sync_interface = (*value).into(),
                     "priority" => ha.priority = Some(value.parse()?),
                     "preempt" => ha.preempt = parse_bool(value)?,
@@ -7486,6 +7491,11 @@ impl Session {
                         "cluster" => h.cluster.clear(),
                         "node" => h.node = None,
                         "witness" => h.witness.clear(),
+                        "mode" => h.mode = Default::default(),
+                        "heartbeat-listen" => h.heartbeat_listen.clear(),
+                        "heartbeat-peer" => h.heartbeat_peer.clear(),
+                        "peer-timeout-ms" => h.peer_timeout_ms = None,
+                        "startup-delay-ms" => h.startup_delay_ms = None,
                         "sync-interface" => h.sync_interface.clear(),
                         "priority" => h.priority = None,
                         "preempt" => h.preempt = false,
@@ -10071,6 +10081,7 @@ fn render_draft_masked(
                 sys.push_str(&format!("        priority {priority}\n"));
             }
             for (key, value) in [
+                ("mode", &ha.mode.as_str().to_owned()),
                 ("cluster", &ha.cluster),
                 ("witness", &ha.witness),
                 ("sync-interface", &ha.sync_interface),
@@ -10087,6 +10098,22 @@ fn render_draft_masked(
             }
             if let Some(ms) = ha.io_timeout_ms {
                 sys.push_str(&format!("        io-timeout-ms {ms}\n"));
+            }
+            for (key, values) in [
+                ("heartbeat-listen", &ha.heartbeat_listen),
+                ("heartbeat-peer", &ha.heartbeat_peer),
+            ] {
+                if !values.is_empty() {
+                    sys.push_str(&format!("        {key} {}\n", values.join(",")));
+                }
+            }
+            for (key, value) in [
+                ("peer-timeout-ms", ha.peer_timeout_ms),
+                ("startup-delay-ms", ha.startup_delay_ms),
+            ] {
+                if let Some(ms) = value {
+                    sys.push_str(&format!("        {key} {ms}\n"));
+                }
             }
             if let Some(identity) = &ha.peer_identity {
                 sys.push_str(&format!(
@@ -13125,6 +13152,44 @@ fn validate_bind_address(v: &str) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn two_node_ha_commands_round_trip_and_delete_without_losing_fields() {
+        let mut s = super::Session::empty();
+        for command in [
+            "set system ha mode two-node",
+            "set system ha heartbeat-listen 10.20.0.1:5441,[2001:db8::1]:5441",
+            "set system ha heartbeat-peer 10.20.0.2:5441,[2001:db8::2]:5441",
+            "set system ha peer-timeout-ms 1100",
+            "set system ha startup-delay-ms 3000",
+        ] {
+            run(&mut s, command).unwrap();
+        }
+        let rendered = super::render_draft_only(&s.draft, false, None);
+        let mut copy = super::Session::empty();
+        for command in super::flatten_config(&rendered) {
+            run(&mut copy, &command).unwrap();
+        }
+        assert_eq!(super::render_draft_only(&copy.draft, false, None), rendered);
+        assert_eq!(
+            copy.draft.ha.as_ref().unwrap().mode,
+            crate::config::HaMode::TwoNode
+        );
+        assert_eq!(copy.draft.ha.as_ref().unwrap().heartbeat_listen.len(), 2);
+        for field in [
+            "heartbeat-listen",
+            "heartbeat-peer",
+            "peer-timeout-ms",
+            "startup-delay-ms",
+            "mode",
+        ] {
+            run(&mut copy, &format!("delete system ha {field}")).unwrap();
+        }
+        let h = copy.draft.ha.as_ref().unwrap();
+        assert!(h.heartbeat_listen.is_empty() && h.heartbeat_peer.is_empty());
+        assert!(h.peer_timeout_ms.is_none() && h.startup_delay_ms.is_none());
+        assert_eq!(h.mode, crate::config::HaMode::Witness);
+        assert!(run(&mut s, "set system ha mode automatic").is_err());
+    }
     #[test]
     fn save_creates_missing_export_parent_before_locking() {
         let dir = std::env::temp_dir().join(format!("sentinel-save-parent-{}", std::process::id()));

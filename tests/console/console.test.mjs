@@ -522,9 +522,9 @@ await test("leased HA settings save, validate and protect peer identity", async 
     "state-listen": "127.0.0.2:5429", priority: 100, interfaces: {} };
   // The last two are the witness timing budget (lease-ms, io-timeout-ms):
   // 2 x 80 + 25 poll + 20 margin fits a 300 ms lease.
-  const values = ["false", "127.0.0.9:5440", "eth0", "1", "180", "true",
+  const values = ["witness", "false", "127.0.0.9:5440", "eth0", "1", "180", "true",
     "console-ha-cluster-1", "A".repeat(43) + "=", JSON.stringify(identity, null, 2),
-    "300", "80"];
+    "300", "80", "", "", "", ""];
   try {
     const result = await page.evaluate(`(async () => {
       if (document.getElementById("result").open) document.getElementById("resultclose").click();
@@ -561,7 +561,7 @@ await test("leased HA settings save, validate and protect peer identity", async 
     equal(result.current.priority, "180", "HA priority was not saved");
     equal(result.current["lease-ms"], "300", "HA lease was not saved");
     equal(result.current["io-timeout-ms"], "80", "HA exchange budget was not saved");
-    check(result.commands.length === values.length, "not every HA setting was staged");
+    check(result.commands.length === values.filter(Boolean).length, "not every supplied HA setting was staged");
     const before = CONFIG && readFileSync(CONFIG, "utf8");
     const refused = await page.evaluate(`(async () => {
       document.getElementById("resultclose").click();

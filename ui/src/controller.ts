@@ -1,4 +1,10 @@
-import { emptyEditor, initialState, isTelemetry, sseFrames } from "./model";
+import {
+  emptyEditor,
+  initialState,
+  isSystemHealth,
+  isTelemetry,
+  sseFrames,
+} from "./model";
 import type { Host, Pending, StagedChange, State, Telemetry } from "./model";
 
 export class Management {
@@ -8,6 +14,9 @@ export class Management {
   private abort: AbortController | null = null;
   private epoch = 0;
   private polling = false;
+  private healthAbort: AbortController | null = null;
+  private healthGeneration = 0;
+  private healthCredential = "";
   private transactionGeneration = 0;
   private appliedCandidate: string | null = null;
   private batch: { id: string; changes: StagedChange[] } | null = null;
@@ -31,12 +40,111 @@ export class Management {
   }
   contextChanged = () => {
     const writable = this.host.canWrite(),
-      remote = this.host.remote();
+      remote = this.host.remote(),
+      member = this.host.member();
+    const healthContextChanged =
+      remote !== this.state.remote ||
+      member !== this.state.member ||
+      this.healthCredential !== this.host.credential();
+    if (healthContextChanged) {
+      this.healthGeneration++;
+      this.healthAbort?.abort();
+      this.healthAbort = null;
+      this.healthCredential = this.host.credential();
+      this.update({
+        health: null,
+        healthBusy: false,
+        healthError: "",
+        healthReceivedAt: 0,
+        frame: null,
+        connected: false,
+        receivedAt: 0,
+        status: "Connecting to selected member telemetry…",
+        member,
+      });
+      if (this.abort) {
+        this.abort.abort();
+        this.abort = new AbortController();
+        void this.consume(this.abort.signal, this.epoch);
+      }
+    }
     if (writable !== this.state.writable || remote !== this.state.remote)
       this.update({ writable, remote });
     // Revoke revealed documents when write access is lost. A peer view hides
     // the local editor while retaining its in-memory draft for the local member.
     if (!writable && this.state.editor.visible) this.clearEditor();
+    if (healthContextChanged && this.timer) void this.refreshHealth();
+  };
+  refreshHealth = async () => {
+    if (!this.host.credential() || this.healthAbort) return;
+    const epoch = this.epoch,
+      generation = this.healthGeneration,
+      member = this.host.member(),
+      credential = this.host.credential();
+    const abort = new AbortController();
+    this.healthAbort = abort;
+    this.update({ healthBusy: true });
+    const timer = setTimeout(() => abort.abort(), HEALTH_TIMEOUT_MS);
+    const interrupted = new Promise<never>((_, reject) => {
+      abort.signal.addEventListener(
+        "abort",
+        () => reject(Error("Diagnostics request interrupted")),
+        { once: true },
+      );
+    });
+    const current = () =>
+      epoch === this.epoch &&
+      generation === this.healthGeneration &&
+      credential === this.host.credential() &&
+      member === this.host.member();
+    try {
+      const request = this.host
+        .api(
+          member
+            ? "/api/v1/stack/" + encodeURIComponent(member) + "/system/health"
+            : "/api/v1/system/health",
+          { signal: abort.signal },
+          HEALTH_TIMEOUT_MS / 1000,
+        )
+        .then(async (response) => {
+          if (response.status === 401) {
+            if (current()) this.host.signOut("That token was not accepted.");
+            throw Error("Session expired");
+          }
+          if (!response.ok)
+            throw Object.assign(Error("Diagnostics unavailable"), {
+              status: response.status,
+            });
+          return response.json();
+        });
+      const result: unknown = await Promise.race([request, interrupted]);
+      if (!current() || abort.signal.aborted) return;
+      if (!isSystemHealth(result)) throw Error("Invalid diagnostics response");
+      this.update({
+        health: result,
+        healthError: "",
+        healthReceivedAt: performance.now(),
+        now: performance.now(),
+      });
+    } catch (error) {
+      if (current())
+        this.update({
+          healthError:
+            typeof error === "object" &&
+            error !== null &&
+            "status" in error &&
+            error.status === 403
+              ? "This account cannot view system diagnostics. Ask an administrator to check its access. Displayed observations may be stale."
+              : "System health is unavailable. Displayed observations may be stale; retry to check this appliance.",
+        });
+    } finally {
+      clearTimeout(timer);
+      abort.abort();
+      if (epoch === this.epoch && generation === this.healthGeneration) {
+        this.healthAbort = null;
+        this.update({ healthBusy: false });
+      }
+    }
   };
   private writable() {
     return this.host.canWrite() && !this.host.remote();
@@ -335,8 +443,18 @@ export class Management {
     });
   };
   private async consume(signal: AbortSignal, epoch: number) {
+    const member = this.host.member(),
+      credential = this.host.credential();
+    const current = () =>
+      !signal.aborted &&
+      epoch === this.epoch &&
+      member === this.host.member() &&
+      credential === this.host.credential();
+    const path = member
+      ? "/api/v1/stack/" + encodeURIComponent(member) + "/telemetry"
+      : "/api/v1/telemetry";
     let delay = 1000;
-    while (!signal.aborted && epoch === this.epoch) {
+    while (current()) {
       // One controller per connection. A half-open link never errors and
       // never ends, so the read below would wait forever; silence past the
       // staleness window aborts this connection (not the session) instead.
@@ -348,19 +466,37 @@ export class Management {
         if (performance.now() - heard > STALE_MS) connection.abort();
       }, 1000);
       try {
-        const response = await fetch("/api/v1/telemetry", {
-          headers: { Authorization: "Bearer " + this.host.credential() },
+        const response = await fetch(path, {
+          headers: { Authorization: "Bearer " + credential },
           cache: "no-store",
           signal: connection.signal,
         });
+        if (!current()) return;
         if (response.status === 401) {
           this.host.signOut("That token was not accepted.");
           return;
         }
         if (!response.ok || !response.body)
           throw Error("Telemetry HTTP " + response.status);
+        if (member) {
+          const value: unknown = await response.json();
+          if (!current()) return;
+          if (connection.signal.aborted) throw Error("Peer request timed out");
+          if (!isTelemetry(value)) throw Error("Invalid peer telemetry");
+          // Repeated HTTP snapshots are not new measurements. Do not extend
+          // freshness or duplicate history when the peer collector is stalled.
+          if (
+            !this.state.frame ||
+            value.sequence !== this.state.frame.sequence ||
+            value.sampled_at !== this.state.frame.sampled_at
+          )
+            this.acceptFrame(value);
+          delay = 1000;
+          await wait(1000, signal);
+          continue;
+        }
         for await (const value of sseFrames(response.body, connection.signal)) {
-          if (signal.aborted || epoch !== this.epoch) return;
+          if (!current()) return;
           if (isTelemetry(value)) {
             heard = performance.now();
             this.acceptFrame(value);
@@ -370,15 +506,17 @@ export class Management {
         if (signal.aborted) return;
         throw Error("Telemetry connection closed");
       } catch {
-        if (signal.aborted || epoch !== this.epoch) return;
+        if (!current()) return;
         this.update({
           connected: false,
-          status:
-            "Telemetry disconnected; displayed values are stale. Reconnecting…",
+          status: member
+            ? "Selected member telemetry unavailable; check its connection, TLS trust and software version. Retrying…"
+            : "Telemetry disconnected; displayed values are stale. Reconnecting…",
         });
         await wait(delay, signal);
         delay = Math.min(15000, delay * 2);
       } finally {
+        connection.abort();
         clearInterval(watchdog);
         signal.removeEventListener("abort", forward);
       }
@@ -389,6 +527,7 @@ export class Management {
     this.contextChanged();
     const epoch = this.epoch;
     void this.refreshTransaction();
+    void this.refreshHealth();
     this.abort = new AbortController();
     void this.consume(this.abort.signal, epoch);
     let tick = 0;
@@ -405,10 +544,15 @@ export class Management {
       });
       this.contextChanged();
       if (++tick % 5 === 0) void this.refreshTransaction();
+      if (tick % 15 === 0) void this.refreshHealth();
     }, 1000);
   };
   stop = () => {
     this.epoch++;
+    this.healthGeneration++;
+    this.healthAbort?.abort();
+    this.healthAbort = null;
+    this.healthCredential = "";
     this.abort?.abort();
     this.abort = null;
     if (this.timer) clearInterval(this.timer);
@@ -427,6 +571,7 @@ export class Management {
 }
 /** Silence after which telemetry is stale and its connection is replaced. */
 const STALE_MS = 15000;
+const HEALTH_TIMEOUT_MS = 10000;
 function message(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }

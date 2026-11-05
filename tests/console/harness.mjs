@@ -92,6 +92,7 @@ export async function browser({ port = 0, width = 1600, height = 1000 } = {}) {
   const pending = new Map();
   const thrown = [];
   const requests = [];
+  const responses = [], failedRequests = [], consoleMessages = [], logs = [];
   ws.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
     if (m.id && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); return; }
@@ -105,6 +106,18 @@ export async function browser({ port = 0, width = 1600, height = 1000 } = {}) {
       const d = m.params.exceptionDetails;
       thrown.push(`${d.exception?.description || d.text} (line ${d.lineNumber})`);
     }
+    if (m.method === "Network.responseReceived") {
+      const r = m.params.response;
+      responses.push({url:r.url,status:r.status,type:m.params.type});
+    }
+    if (m.method === "Network.loadingFailed") {
+      failedRequests.push({requestId:m.params.requestId,error:m.params.errorText,canceled:!!m.params.canceled});
+    }
+    if (m.method === "Runtime.consoleAPICalled") {
+      consoleMessages.push({level:m.params.type,text:m.params.args.map(a=>a.value??a.description).join(" ")});
+    }
+    if (m.method === "Log.entryAdded") logs.push(m.params.entry);
+    for (const list of [responses,failedRequests,consoleMessages,logs]) if(list.length>16384)list.shift();
     if (m.method === "Runtime.consoleAPICalled" && m.params.type === "error") {
       thrown.push("console.error: " +
         m.params.args.map((a) => a.value ?? a.description).join(" "));
@@ -161,12 +174,17 @@ export async function browser({ port = 0, width = 1600, height = 1000 } = {}) {
   await send("Runtime.enable");
   await send("Page.enable");
   await send("Network.enable");
+  await send("Log.enable");
 
   return {
     evaluate,
     send,
     requests,
     thrown,
+    responses,
+    failedRequests,
+    consoleMessages,
+    logs,
     async goto(url) { await send("Page.navigate", { url }); await sleep(1200); },
     async screenshot() {
       return (await send("Page.captureScreenshot", { format: "png" })).result.data;
