@@ -200,7 +200,19 @@ export async function browser({ port = 0, width = 1600, height = 1000 } = {}) {
 /// Sign in with the machine token, the way an operator does before any account
 /// exists — through the form, not by writing the token into storage, so the
 /// sign-in path is covered too.
+async function waitForSignInForm(page, id) {
+  // Navigation completion is asynchronous. Finding server-rendered inputs
+  // does not mean the trailing script has installed their submit handlers.
+  // Under load, dispatching before that point is a silent test-only no-op.
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (await page.evaluate(`typeof document.getElementById(${JSON.stringify(id)})?.onsubmit === "function"`)) return;
+    await sleep(100);
+  }
+  throw new Error(`the sign-in form did not become interactive (${id})`);
+}
+
 export async function signIn(page, token) {
+  await waitForSignInForm(page, "tokenform");
   await page.evaluate(`(() => {
     document.getElementById("tokentoggle").click();
     document.getElementById("token").value = ${JSON.stringify(token)};
@@ -217,6 +229,7 @@ export async function signIn(page, token) {
 
 /// Sign in as an account, with a username and a password.
 export async function signInAs(page, username, password) {
+  await waitForSignInForm(page, "loginform");
   await page.evaluate(`(() => {
     document.getElementById("username").value = ${JSON.stringify(username)};
     document.getElementById("password").value = ${JSON.stringify(password)};

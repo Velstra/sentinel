@@ -28,7 +28,16 @@ fi
 umask 077
 work=$(mktemp -d)
 port=${CONSOLE_PORT:-18099}
-trap 'kill "${api_pid:-0}" 2>/dev/null || true; rm -rf "$work"' EXIT
+cleanup() {
+  # A seed/build failure may happen before the API child exists. Never send
+  # SIGTERM to PID0: that targets the caller's entire process group.
+  if [[ ${api_pid:-} =~ ^[1-9][0-9]*$ ]]; then
+    kill "$api_pid" 2>/dev/null || true
+    wait "$api_pid" 2>/dev/null || true
+  fi
+  rm -rf -- "$work"
+}
+trap cleanup EXIT
 
 # The API re-executes itself for operational views. Cargo may atomically replace
 # a debug binary while this long browser walk is running; Linux then reports
