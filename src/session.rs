@@ -2858,9 +2858,9 @@ impl Session {
         }
     }
 
-    /// An empty in-memory session (no backing file) — used by tests.
-    #[cfg(test)]
-    fn empty() -> Self {
+    /// A fresh in-memory draft for the installer and isolated tests. Does not
+    /// read a backing file or the live appliance's running configuration.
+    pub(crate) fn empty() -> Self {
         Self {
             draft: Draft::default(),
             path: PathBuf::from("/dev/null"),
@@ -6156,7 +6156,8 @@ impl Session {
                 self.draft.update_mut().url = Some((*v).to_string());
             }
             ["update", "public-key", rest @ ..] if !rest.is_empty() => {
-                self.draft.update_mut().public_key = Some(rest.join(" "));
+                let key = crate::update_key::reference_or_pem(&rest.join(" "))?;
+                self.draft.update_mut().public_key = Some(key);
             }
             // Bare `set update channel <name>` SELECTS the active channel
             // (creating an empty entry if it is new — the next lines fill it).
@@ -6177,7 +6178,8 @@ impl Session {
                 self.draft.update_channel_mut(name).url = Some((*v).to_string());
             }
             ["update", "channel", name, "public-key", rest @ ..] if !rest.is_empty() => {
-                self.draft.update_channel_mut(name).public_key = Some(rest.join(" "));
+                let key = crate::update_key::reference_or_pem(&rest.join(" "))?;
+                self.draft.update_channel_mut(name).public_key = Some(key);
             }
             ["update", "channel", name, "subscription-key", v] => {
                 // The marker `show configuration` prints in place of a key is
@@ -12497,7 +12499,12 @@ fn render_draft_masked(
                 out.push_str(&format!("    url {url}\n"));
             }
             if let Some(key) = &u.public_key {
-                out.push_str(&format!("    public-key {key}\n"));
+                // One replayable CLI leaf, even for a multi-line PEM. The
+                // setter/verifier canonicalize formatting, never key bytes.
+                out.push_str(&format!(
+                    "    public-key {}\n",
+                    crate::update_key::cli_value(key)
+                ));
             }
             // The selection first, then the channels it selects among: replayed
             // top to bottom, the bare `channel <name>` line both creates and
@@ -12511,7 +12518,10 @@ fn render_draft_masked(
                     out.push_str(&format!("        url {url}\n"));
                 }
                 if let Some(key) = &c.public_key {
-                    out.push_str(&format!("        public-key {key}\n"));
+                    out.push_str(&format!(
+                        "        public-key {}\n",
+                        crate::update_key::cli_value(key)
+                    ));
                 }
                 if let Some(k) = &c.subscription_key {
                     let shown = match secrets {
@@ -14721,6 +14731,18 @@ backends = ["10.0.0.11:8443"]
         }
     }
 
+    // Representation regressions must use the shipped quote-aware REPL
+    // lexer. split_whitespace deliberately cannot model quoted filenames.
+    fn run_cli_tokens(session: &mut Session, line: &str) -> Result<()> {
+        let owned = crate::repl::split_line(line);
+        let parts: Vec<&str> = owned.iter().map(String::as_str).collect();
+        match parts[0] {
+            "set" => session.set(&parts[1..]),
+            "delete" => session.delete(&parts[1..]),
+            _ => panic!("test helper only does set/delete"),
+        }
+    }
+
     #[test]
     fn dhcp6_pool_grammar_sets_shows_commits_and_deletes() {
         let mut s = Session::empty();
@@ -16808,6 +16830,107 @@ backends = ["10.0.0.11:8443"]
         assert!(run(&mut s, "set protocols ripng bfd true").is_err());
         assert!(run(&mut s, "set protocols ripng vrf blue").is_err());
         assert!(run(&mut s, "set protocols ripng network 10.0.0.0/8").is_err());
+    }
+
+    #[test]
+    fn update_public_pem_is_one_replayable_leaf_for_default_and_named_channels() {
+        let pem = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=\n-----END PUBLIC KEY-----\n";
+        let mut session = Session::empty();
+        for command in [
+            "set system hostname key-test",
+            "set update url https://updates.example.com/default",
+            "set update channel business",
+            "set update channel business url https://updates.example.com/business",
+        ] {
+            run(&mut session, command).unwrap();
+        }
+        for prefix in [
+            "set update public-key ",
+            "set update channel business public-key ",
+        ] {
+            run(
+                &mut session,
+                &(prefix.to_string() + &pem.replace('\n', " ")),
+            )
+            .unwrap();
+        }
+        let shown = session.show_only("update");
+        let commands = super::flatten_config(&shown);
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|line| line.contains("-----BEGIN PUBLIC KEY-----"))
+                .count(),
+            2
+        );
+        assert!(commands.iter().all(|line| !line.contains('\n')));
+        let mut replayed = Session::empty();
+        run(&mut replayed, "set system hostname key-test").unwrap();
+        for command in commands {
+            run_cli_tokens(&mut replayed, &command).unwrap();
+        }
+        for appliance in [session.commit().unwrap(), replayed.commit().unwrap()] {
+            let update = appliance.update.unwrap();
+            assert_eq!(update.public_key.as_deref(), Some(pem));
+            assert_eq!(update.channels[0].public_key.as_deref(), Some(pem));
+            assert_eq!(update.channel.as_deref(), Some("business"));
+        }
+    }
+
+    #[test]
+    fn invalid_update_key_set_does_not_replace_or_create_a_pin() {
+        let mut session = Session::empty();
+        run(
+            &mut session,
+            "set update public-key file:/etc/sentinel/release.pem",
+        )
+        .unwrap();
+        let before = session.show_only("update");
+        for command in [
+            "set update public-key -----BEGIN PRIVATE KEY----- secret -----END PRIVATE KEY-----",
+            "set update channel new-name public-key -----BEGIN PUBLIC KEY----- junk -----END PUBLIC KEY-----",
+        ] {
+            assert!(run(&mut session, command).is_err());
+            assert_eq!(session.show_only("update"), before);
+        }
+    }
+
+    #[test]
+    fn update_key_file_paths_keep_spaces_quotes_and_backslashes_on_export_and_replay() {
+        for key in [
+            "file:/etc/sentinel/releases/clé  publique.pem ",
+            "file:/etc/sentinel/key with \\\"quotes\\\".pem",
+        ] {
+            let mut original = Session::empty();
+            for command in [
+                "set system hostname file-key-test",
+                "set update url https://updates.example.com/default",
+                "set update channel business url https://updates.example.com/business",
+            ] {
+                run(&mut original, command).unwrap();
+            }
+            for prefix in [
+                "set update public-key ",
+                "set update channel business public-key ",
+            ] {
+                run_cli_tokens(
+                    &mut original,
+                    &(prefix.to_string() + &crate::update_key::cli_value(key)),
+                )
+                .unwrap();
+            }
+            let mut replayed = Session::empty();
+            run(&mut replayed, "set system hostname file-key-test").unwrap();
+            for command in flatten_config(&original.show_only("update")) {
+                assert!(!command.contains('\n'));
+                run_cli_tokens(&mut replayed, &command).unwrap();
+            }
+            for appliance in [original.commit().unwrap(), replayed.commit().unwrap()] {
+                let update = appliance.update.unwrap();
+                assert_eq!(update.public_key.as_deref(), Some(key));
+                assert_eq!(update.channels[0].public_key.as_deref(), Some(key));
+            }
+        }
     }
 
     #[test]

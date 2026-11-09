@@ -150,9 +150,9 @@ pub fn human_size(bytes: u64) -> String {
 /// A floor below which no build of the appliance could ever fit — enough to
 /// reject an obviously wrong disk without reading anything.
 ///
-/// It is deliberately NOT the real requirement: that is the source medium's own
-/// layout, which grows whenever the sealed store does, and is measured from the
-/// source by [`source_layout_bytes`] before a single byte is erased. That
+/// It is deliberately NOT the real requirement: that is the source medium's
+/// protected layout plus fresh data, prepared by [`InstallLayout`] before a
+/// single byte is erased. The source's disposable grown data is not cloned. That
 /// per-source check is the authority and it runs pre-erase, so a disk that
 /// clears this floor but is still too small is rejected before any wipe. The
 /// floor stays a coarse sanity gate, but no lower than it needs to be: the real
@@ -168,11 +168,7 @@ pub const MIN_TARGET_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 /// Parsed from `sgdisk -p` output — pure, so the arithmetic is testable without
 /// a disk. Returns `None` if the listing carries no partition rows at all.
 fn parse_layout_bytes(sgdisk_print: &str) -> Option<u64> {
-    let sector = sgdisk_print
-        .lines()
-        .find_map(|l| l.split_once("Sector size (logical/physical):"))
-        .and_then(|(_, rest)| rest.trim().split(['/', ' ']).next()?.parse::<u64>().ok())
-        .unwrap_or(512);
+    let sector = printed_sector_size(sgdisk_print).unwrap_or(512);
     // Partition rows begin with the partition number; every other line either
     // has a non-numeric first field or too few fields to be one.
     let last_end = sgdisk_print
@@ -188,18 +184,203 @@ fn parse_layout_bytes(sgdisk_print: &str) -> Option<u64> {
         .max()?;
     // The backup GPT sits in the last 33 sectors; `sgdisk --move-second-header`
     // has to have somewhere to put it.
-    Some((last_end + 1 + 33) * sector)
+    last_end.checked_add(34)?.checked_mul(sector)
 }
 
-/// Ask `sgdisk` what the source layout needs, in bytes. See [`parse_layout_bytes`].
-fn source_layout_bytes(source: &str) -> Result<u64> {
+fn printed_sector_size(text: &str) -> Option<u64> {
+    let bytes = text
+        .lines()
+        .find_map(|line| {
+            line.split_once("Sector size (logical/physical):")
+                .or_else(|| line.split_once("Sector size (logical):"))
+        })?
+        .1
+        .trim()
+        .split(['/', ' '])
+        .next()?
+        .parse()
+        .ok()?;
+    matches!(bytes, 512 | 1024 | 2048 | 4096).then_some(bytes)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstallGeometry {
+    sector: u64,
+    parts: Vec<(u32, u64, u64)>,
+}
+
+impl InstallGeometry {
+    fn parse(text: &str) -> Result<Self> {
+        let sector =
+            printed_sector_size(text).context("missing/invalid GPT logical sector size")?;
+        let parts: Vec<_> = text
+            .lines()
+            .filter_map(|line| {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                let [number, start, end, ..] = fields.as_slice() else {
+                    return None;
+                };
+                Some((
+                    number.parse::<u32>().ok()?,
+                    start.parse::<u64>().ok()?,
+                    end.parse::<u64>().ok()?,
+                ))
+            })
+            .collect();
+        ensure!(
+            parts.len() == 6,
+            "install requires the six-partition factory layout"
+        );
+        let mut previous_end = 0;
+        for (index, &(number, start, end)) in parts.iter().enumerate() {
+            ensure!(
+                number as usize == index + 1 && start > previous_end && end >= start,
+                "factory partitions are missing, reordered or overlapping"
+            );
+            ensure!(
+                start.checked_mul(sector).is_some_and(|n| n >= 1024 * 1024),
+                "factory partition overlaps the GPT prefix"
+            );
+            end.checked_add(34)
+                .and_then(|n| n.checked_mul(sector))
+                .context("factory geometry overflows byte capacity")?;
+            previous_end = end;
+        }
+        Ok(Self { sector, parts })
+    }
+
+    fn fresh_data(&self) -> Self {
+        let mut result = self.clone();
+        let (_, start, end) = result.parts[5];
+        // Match the factory's normal128MiB floor, never enlarge a smaller
+        // explicitly built floor. Installed/grown state is recreated, not copied.
+        let sectors = (end - start + 1).min(128 * 1024 * 1024 / self.sector);
+        result.parts[5].2 = start + sectors - 1;
+        result
+    }
+
+    /// GPT uses logical sectors; Linux sysfs always reports 512-byte sectors.
+    /// A successful disk write is not enough if the kernel still exposes old
+    /// partition extents. Never format or clone through stale device nodes.
+    fn require_kernel_view(&self, target: &str) -> Result<()> {
+        for &(number, start, end) in &self.parts {
+            let device = part_path(target, number);
+            let canonical = std::fs::canonicalize(&device)
+                .with_context(|| format!("installed partition is unavailable: {device}"))?;
+            let name = canonical
+                .file_name()
+                .context("partition has no kernel name")?;
+            let sysfs = std::path::Path::new("/sys/class/block").join(name);
+            let read = |field: &str| -> Result<u64> {
+                std::fs::read_to_string(sysfs.join(field))?
+                    .trim()
+                    .parse()
+                    .with_context(|| format!("invalid kernel {field} for {device}"))
+            };
+            let expected_start = start
+                .checked_mul(self.sector / 512)
+                .context("partition start overflows kernel sectors")?;
+            let expected_size = (end - start + 1)
+                .checked_mul(self.sector / 512)
+                .context("partition size overflows kernel sectors")?;
+            ensure!(
+                read("start")? == expected_start && read("size")? == expected_size,
+                "kernel partition view does not match the installed GPT for {device}; refusing to clone or format stale extents"
+            );
+        }
+        Ok(())
+    }
+}
+
+fn inspect_layout(args: &[&str]) -> Result<String> {
     let out = Command::new(system::bin("sgdisk"))
-        .args(["-p", source])
+        .args(args)
+        .env_clear()
+        .env("LANG", "C.UTF-8")
+        .env("LC_ALL", "C")
         .output()
-        .with_context(|| format!("reading the partition layout of {source}"))?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    parse_layout_bytes(&text)
-        .ok_or_else(|| anyhow::anyhow!("{source} reports no partitions to clone"))
+        .context("preparing the private install GPT layout")?;
+    ensure!(
+        out.status.success(),
+        "install GPT preflight refused: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    ensure!(
+        out.stdout.len() <= 64 * 1024,
+        "oversized install GPT inspection"
+    );
+    String::from_utf8(out.stdout).context("non-UTF-8 install GPT inspection")
+}
+
+/// A small private GPT backup, NOT another appliance image. The protected
+/// entries retain their identities; source data is replaced IN MEMORY ONLY.
+/// All tools inspecting the source/targets use --pretend before the erase gate.
+struct InstallLayout {
+    _scratch: update::Scratch,
+    backup: std::path::PathBuf,
+    geometry: InstallGeometry,
+    bytes: u64,
+}
+
+impl InstallLayout {
+    fn new(source: &str) -> Result<Self> {
+        let original = inspect_layout(&["--pretend", "--print", source])?;
+        let geometry = InstallGeometry::parse(&original)?.fresh_data();
+        let scratch = update::Scratch::new()?;
+        drop(scratch.create_private("install-layout.gpt")?);
+        let backup = scratch.join("install-layout.gpt");
+        let filename = backup
+            .to_str()
+            .context("non-UTF-8 private GPT backup path")?;
+        let (_, start, end) = geometry.parts[5];
+        let text = inspect_layout(&[
+            "--pretend",
+            "--set-alignment=1",
+            "--delete=6",
+            &format!("--new=6:{start}:{end}"),
+            "--typecode=6:8300",
+            "--change-name=6:data",
+            &format!("--backup={filename}"),
+            "--print",
+            source,
+        ])?;
+        ensure!(
+            InstallGeometry::parse(&text)? == geometry,
+            "private install template changed protected partition geometry"
+        );
+        let bytes = parse_layout_bytes(&text).context("private GPT has no measurable layout")?;
+        let size = std::fs::metadata(&backup)?.len();
+        ensure!(
+            size > 0 && size <= 1024 * 1024,
+            "invalid private install GPT backup size"
+        );
+        Ok(Self {
+            _scratch: scratch,
+            backup,
+            geometry,
+            bytes,
+        })
+    }
+
+    fn validate_target(&self, target: &str) -> Result<()> {
+        let filename = self
+            .backup
+            .to_str()
+            .context("non-UTF-8 private GPT backup path")?;
+        let text = inspect_layout(&[
+            "--pretend",
+            &format!("--load-backup={filename}"),
+            "--move-second-header",
+            "--print",
+            target,
+        ])?;
+        ensure!(
+            InstallGeometry::parse(&text)? == self.geometry,
+            "target logical sectors or protected GPT layout do not match the source; nothing erased"
+        );
+        Ok(())
+    }
 }
 
 /// Validate a target selection against a RAID level: enough disks, each big
@@ -279,8 +460,11 @@ pub fn data_mapper_path() -> String {
 pub const DATA_PART: u32 = 6;
 /// Partitions cloned block-for-block on install: the ESP and slot A's verity
 /// hash + store. Slot B (4,5) is reserved empty space — its GPT entries are
-/// cloned by `--replicate`, and a later `sentinel update` fills it.
-pub const SEALED_PARTS: std::ops::RangeInclusive<u32> = 1..=3;
+/// retained in the private install template, and a later update fills it.
+// ESP selects a UKI from either slot after a real A/B update. Copy BOTH pairs,
+// including an empty factory B, so no copied boot entry points at missing bytes.
+// The writable data partition is always freshly created and never cloned.
+pub const SEALED_PARTS: std::ops::RangeInclusive<u32> = 1..=5;
 
 /// The partition device path for partition `n` on `disk` — `nvme0n1` →
 /// `nvme0n1p2`, `sda`/`vda` → `sda2`. (A trailing digit needs the `p`.)
@@ -417,7 +601,7 @@ impl Drop for CryptGuard {
 /// medium we clone from. Follows the **active** dm-verity device
 /// (`/dev/mapper/usr`) down to its backing disk; a partlabel would be ambiguous
 /// once a target has been installed (it copies the same labels).
-fn find_source_disk() -> Result<String> {
+pub(crate) fn find_source_disk() -> Result<String> {
     // `-s` walks the dependency tree downward; `-r` (raw) avoids tree-drawing
     // characters in the NAME column. Pick the entry whose TYPE is `disk`.
     let out = Command::new(system::bin("lsblk"))
@@ -504,12 +688,11 @@ pub fn execute(
         }
     }
 
-    // Pre-flight: every target must be big enough for the source's own layout.
-    // `sgdisk --replicate` writes the source's partition table verbatim, so a
-    // disk that is merely over `MIN_TARGET_BYTES` is not enough — and finding
-    // that out inside `prepare_disk` means finding it out after `wipefs`, which
-    // is how this check came to exist.
-    let need = source_layout_bytes(&source)?;
+    // Pre-flight ALL targets against the prepared factory layout. The source's
+    // grown writable state is never cloned, so must not raise the hardware floor.
+    // No target/source GPT write is permitted during these --pretend inspections.
+    let layout = InstallLayout::new(&source)?;
+    let need = layout.bytes;
     for t in targets {
         if t.size < need {
             bail!(
@@ -519,6 +702,7 @@ pub fn execute(
                 human_size(need)
             );
         }
+        layout.validate_target(&t.dev_path())?;
     }
 
     // From here on disks are being erased. Track which, so a mid-way failure
@@ -529,7 +713,7 @@ pub fn execute(
         let dev = t.dev_path();
         eprintln!("preparing {dev} (ERASING) …");
         erased.push(dev.clone());
-        if let Err(e) = prepare_disk(&source, &dev, raid) {
+        if let Err(e) = prepare_disk(&source, &dev, raid, &layout) {
             return Err(partial_install_error(e, &erased));
         }
     }
@@ -833,10 +1017,28 @@ fn holder_is_confined(
     visit(holder, disk, slaves, &mut std::collections::BTreeSet::new())
 }
 
-/// Lay the image's A/B partition layout onto `target` and clone the sealed
-/// partitions block-for-block from `source`. The data partition (the last one)
-/// is recreated to fill the target, typed for a filesystem or a RAID member.
-fn prepare_disk(source: &str, target: &str, raid: Raid) -> Result<()> {
+/// One ordered GPT transaction, retaining the signed store pair's UUIDs.
+fn install_gpt_args(backup: &str, target: &str, raid: Raid, data_start: u64) -> Vec<String> {
+    let typecode = if raid.mdadm_level().is_some() {
+        "FD00"
+    } else {
+        "8300"
+    };
+    vec![
+        format!("--load-backup={backup}"),
+        "--move-second-header".into(),
+        "--disk-guid=R".into(),
+        "--set-alignment=1".into(),
+        format!("--delete={DATA_PART}"),
+        format!("--new={DATA_PART}:{data_start}:0"),
+        format!("--typecode={DATA_PART}:{typecode}"),
+        format!("--change-name={DATA_PART}:data"),
+        target.into(),
+    ]
+}
+
+/// Clone the sealed layout and create a fresh full-sized data partition.
+fn prepare_disk(source: &str, target: &str, raid: Raid, layout: &InstallLayout) -> Result<()> {
     // Everything the kernel is still holding this disk open with, taken down
     // first. Without it `wipefs` fails with `probing initialization failed:
     // Device or resource busy` and the install stops before it has written
@@ -851,12 +1053,12 @@ fn prepare_disk(source: &str, target: &str, raid: Raid) -> Result<()> {
     // YES, and is told the device is busy with no indication of what by.
     release_holders(target)?;
     run("wipefs", &["-a", target])?;
-    // Replicate the source GPT onto the target (`--replicate=<dest>` takes the
-    // DESTINATION; the source is the positional device), then move the backup
-    // header to the end of the (larger) target. This also lays down the (empty)
-    // slot-B partition entries for later updates.
-    run("sgdisk", &[&format!("--replicate={target}"), source])?;
-    run("sgdisk", &["--move-second-header", target])?;
+    // Load the already checked private template, not the source's full grown
+    // data entry. It fits smaller targets too; no live source GPT is modified.
+    let backup = layout
+        .backup
+        .to_str()
+        .context("non-UTF-8 private GPT backup path")?;
     // Give the disk a fresh **disk** GUID so it doesn't collide with the source
     // medium — but do NOT randomize the *partition* GUIDs. The dm-verity store
     // relies on the systemd Discoverable Partitions convention: the verity and
@@ -870,27 +1072,31 @@ fn prepare_disk(source: &str, target: &str, raid: Raid) -> Result<()> {
     // fine). `--disk-guid=R` randomizes only the disk GUID and leaves every
     // partition UUID as replicated. The data partition below is recreated and so
     // gets its own fresh UUID regardless.
-    run("sgdisk", &["--disk-guid=R", target])?;
-    // Recreate the data partition to fill the disk, typed for the install mode.
-    let typecode = if raid.mdadm_level().is_some() {
-        "FD00" // Linux RAID
-    } else {
-        "8300" // Linux filesystem
-    };
-    run("sgdisk", &[&format!("--delete={DATA_PART}"), target])?;
+    // Commit ONE complete GPT. Publishing an intermediate clone and then
+    // deleting/recreating its partitions lets duplicate PARTUUID device events
+    // stop the live source's systemd-veritysetup@usr.service. Never reset that
+    // failure or weaken verity binding to hide it. sgdisk itself notifies the
+    // kernel after its final write; a second destructive reread is unnecessary.
+    let args = install_gpt_args(backup, target, raid, layout.geometry.parts[5].1);
     run(
         "sgdisk",
-        &[
-            &format!("--new={DATA_PART}:0:0"),
-            &format!("--typecode={DATA_PART}:{typecode}"),
-            &format!("--change-name={DATA_PART}:data"),
-            target,
-        ],
+        &args.iter().map(String::as_str).collect::<Vec<_>>(),
     )?;
-    run("partprobe", &[target]).ok();
-    run("udevadm", &["settle"]).ok();
-    // Clone the sealed partitions (ESP/UKI + slot A's verity hash + store).
-    // Slot B (the reserved generic partitions) is left empty for a future update.
+    run("udevadm", &["settle"])?;
+    let actual = InstallGeometry::parse(&inspect_layout(&["--pretend", "--print", target])?)?;
+    ensure!(
+        actual.sector == layout.geometry.sector
+            && actual.parts[..5] == layout.geometry.parts[..5]
+            && actual.parts[5].1 == layout.geometry.parts[5].1
+            && actual.parts[5].2 >= layout.geometry.parts[5].2,
+        "installed GPT changed protected geometry or truncated the fresh data partition"
+    );
+    actual.require_kernel_view(target)?;
+    // Clone every bootable payload represented by the copied ESP. A booted,
+    // updated source can have active B and a still-valid fallback A: copying
+    // only A would silently install stale bytes and leave B's selected UKI
+    // pointing at an empty verity pair. Preserve both slots without rewriting
+    // signed UKIs, renumbering hash-derived UUIDs or changing boot preference.
     for n in SEALED_PARTS {
         run(
             "dd",
@@ -997,7 +1203,10 @@ pub fn seed_config(targets: &[&Disk], raid: Raid, toml: &str, crypto: &Crypto) -
     };
     let mnt = std::path::Path::new("/run/sentinel-seed");
     std::fs::create_dir_all(mnt).context("creating the seed mountpoint")?;
-    run("mount", &[&dev, mnt.to_str().unwrap()])?;
+    // execute() always creates ext4 here, including inside LUKS. Do not let
+    // mount's image-specific auto-detection/helper order guess EROFS for fresh
+    // data: that fails seeding after the destructive copy already completed.
+    run("mount", &["-t", "ext4", &dev, mnt.to_str().unwrap()])?;
     let _guard = MountGuard(mnt.to_path_buf());
 
     // The data partition IS /var/lib/sentinel on the installed system — it is
@@ -1537,6 +1746,10 @@ fn switch_boot(disk: &str, source: UkiSource, active: &Slot, inactive: &Slot) ->
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn installation_copies_both_sealed_slots_but_never_persistent_data() {
+        assert_eq!(super::SEALED_PARTS.collect::<Vec<_>>(), [1, 2, 3, 4, 5]);
+    }
     use super::*;
 
     fn loader_variable(attributes: u32, value: &str) -> Vec<u8> {
@@ -1824,6 +2037,133 @@ Number  Start (sector)    End (sector)  Size       Code  Name
    1            2048          264191   1.0 GiB     EF00  esp
 ";
         assert_eq!(parse_layout_bytes(printed), Some((264_191u64 + 34) * 4096));
+    }
+
+    fn factory_geometry(data_sectors: u64) -> String {
+        let mut text =
+            "Sector size (logical): 512 bytes\nNumber Start End Size Code Name\n".to_string();
+        let mut start = 2048;
+        for number in 1..=6 {
+            let sectors = if number == 6 { data_sectors } else { 8192 };
+            text.push_str(&format!(
+                "{number} {start} {} 4 MiB 8300 p{number}\n",
+                start + sectors - 1
+            ));
+            start += sectors;
+        }
+        text
+    }
+
+    #[test]
+    fn install_gpt_is_one_ordered_complete_transaction() {
+        assert_eq!(
+            install_gpt_args(
+                "/private/install-layout.gpt",
+                "/dev/nvme0n1",
+                Raid::None,
+                11536384
+            ),
+            [
+                "--load-backup=/private/install-layout.gpt",
+                "--move-second-header",
+                "--disk-guid=R",
+                "--set-alignment=1",
+                "--delete=6",
+                "--new=6:11536384:0",
+                "--typecode=6:8300",
+                "--change-name=6:data",
+                "/dev/nvme0n1",
+            ]
+        );
+    }
+
+    #[test]
+    fn install_gpt_raid_only_changes_the_fresh_data_type() {
+        for raid in [Raid::Stripe, Raid::Mirror, Raid::Mirror10] {
+            let args = install_gpt_args("/private/layout.gpt", "/dev/vdb", raid, 11536384);
+            assert!(args.iter().any(|arg| arg == "--typecode=6:FD00"));
+            assert_eq!(
+                args.iter()
+                    .filter(|arg| arg.starts_with("--delete="))
+                    .count(),
+                1
+            );
+            assert!(
+                !args
+                    .iter()
+                    .any(|arg| arg.contains("randomize-guids")
+                        || arg.starts_with("--partition-guid="))
+            );
+            assert_eq!(args.last().unwrap(), "/dev/vdb");
+        }
+    }
+
+    #[test]
+    fn fresh_install_layout_does_not_clone_grown_source_data_capacity() {
+        let source = InstallGeometry::parse(&factory_geometry(16 * 1024 * 1024)).unwrap();
+        let prepared = source.fresh_data();
+        assert_eq!(prepared.parts[..5], source.parts[..5]);
+        assert_eq!(prepared.parts[5].1, source.parts[5].1);
+        assert_eq!(
+            (prepared.parts[5].2 - prepared.parts[5].1 + 1) * prepared.sector,
+            128 * 1024 * 1024
+        );
+        assert!(prepared.parts[5].2 < source.parts[5].2);
+    }
+
+    #[test]
+    fn fresh_install_layout_never_enlarges_an_explicit_smaller_factory_floor() {
+        let source = InstallGeometry::parse(&factory_geometry(8192)).unwrap();
+        assert_eq!(source.fresh_data(), source);
+    }
+
+    #[test]
+    fn install_geometry_reads_actual_modern_and_legacy_sector_headers() {
+        let modern = factory_geometry(1024 * 1024).replace("512 bytes", "4096 bytes");
+        let legacy = modern.replace("(logical): 4096", "(logical/physical): 4096/4096");
+        let parsed = InstallGeometry::parse(&modern).unwrap();
+        assert_eq!(parsed.sector, 4096);
+        assert_eq!(InstallGeometry::parse(&legacy).unwrap(), parsed);
+        let fresh = parsed.fresh_data();
+        assert_eq!(
+            (fresh.parts[5].2 - fresh.parts[5].1 + 1) * 4096,
+            128 * 1024 * 1024
+        );
+        assert_eq!(
+            parse_layout_bytes("Sector size (logical): 4096 bytes\n1 2048 264191 x\n"),
+            Some((264_191 + 34) * 4096)
+        );
+    }
+
+    #[test]
+    fn install_geometry_refuses_missing_duplicate_overlapping_and_overflow_rows() {
+        let source = factory_geometry(8192);
+        for text in [
+            source.replace("512 bytes", "8192 bytes"),
+            source
+                .lines()
+                .filter(|l| !l.starts_with("6 "))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            source.replace("4 26624", "3 26624"),
+            source.replace("2 10240", "2 2048"),
+            source.replace("1 2048", "1 1"),
+            source.replace("51199", "18446744073709551615"),
+        ] {
+            assert!(
+                InstallGeometry::parse(&text).is_err(),
+                "accepted invalid geometry: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn install_layout_capacity_arithmetic_never_wraps() {
+        assert_eq!(parse_layout_bytes("1 2048 18446744073709551615 x\n"), None);
+        assert_eq!(
+            parse_layout_bytes("Sector size (logical): 4096 bytes\n1 2048 4503599627370496 x\n"),
+            None
+        );
     }
 
     fn disk(name: &str, gib: u64, removable: bool) -> Disk {

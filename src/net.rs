@@ -657,8 +657,16 @@ fn network_unit_body(
     // alone rather than from `address = "dhcp"`: commit already refuses one
     // without the other, so the two can never disagree here, and reading the
     // address again would be a second place to get that rule slightly wrong.
-    if let Some(d) = tun.dhcp.filter(|d| !d.is_empty()) {
+    if v4dhcp || tun.dhcp.is_some_and(|d| !d.is_empty()) {
         body.push_str("\n[DHCPv4]\n");
+        // Initial offers otherwise target an address not yet owned by this
+        // appliance. Keep bootstrap replies local without opening forwarded
+        // UDP/68 traffic through a default-drop firewall.
+        if v4dhcp {
+            body.push_str("RequestBroadcast=yes\n");
+        }
+    }
+    if let Some(d) = tun.dhcp.filter(|d| !d.is_empty()) {
         // `ClientIdentifier=`, not `SendOption=61:…`. Option 61 is one the
         // network layer builds itself, so an arbitrary one handed to it is
         // discarded — a VM check watching the server's log found the option
@@ -1557,14 +1565,16 @@ fn ddclient_conf_body(dd: &Dyndns) -> Result<Option<String>> {
     // newline in any of them would inject a directive; the password is additionally
     // single-quoted, so a literal `'` would break out of the quoting.
     reject_unsafe("dyndns hostname", hostname, &[])?;
+    let provider = dd.provider.as_deref().unwrap_or("dyndns2");
+    crate::config::validate_dyndns_provider(provider)?;
     let mut body = String::from("# rendered by sentinel — dynamic DNS (ddclient)\n");
     body.push_str("daemon=300\nsyslog=yes\nssl=yes\n");
-    body.push_str(&format!(
-        "protocol={}\n",
-        dd.provider.as_deref().unwrap_or("dyndns2")
-    ));
+    body.push_str(&format!("protocol={provider}\n"));
     match &dd.interface {
-        Some(iface) => body.push_str(&format!("use=if, if={iface}\n")),
+        Some(iface) => {
+            reject_unsafe("dyndns interface", iface, ENV_WORD_UNSAFE)?;
+            body.push_str(&format!("use=if, if={iface}\n"));
+        }
         None => body.push_str("use=web\n"),
     }
     if let Some(server) = &dd.server {
@@ -1979,23 +1989,20 @@ fn apply_box_services(appliance: &Appliance) -> Result<()> {
 // sshd is ordered after sentinel-boot so they are present on its first start.
 //   /run/sentinel-ssh/authorized_keys.<user> — a login's allowed public keys (the
 //     image's authorizedKeysFiles is `…/authorized_keys.%u`)
-//   /run/sentinel-ssh/10-sentinel.conf       — a Port/ListenAddress (+ optional
-//     PasswordAuthentication) drop-in the image `Include`s.
+//   /run/sentinel-ssh/10-sentinel.conf — listen settings and the explicit
+//     password-transport policy, including the key-only default.
 const SSH_DIR: &str = "/run/sentinel-ssh";
 const SSH_DROPIN: &str = "/run/sentinel-ssh/10-sentinel.conf";
+// Root-owned effective policy, rebuilt on every boot and live commit. The
+// shipped unit checks this before starting; reading the saved TOML instead
+// would incorrectly reject a live enable that has not been saved yet.
+const SSH_ENABLED: &str = "/run/sentinel-ssh/enabled";
 const SSH_UNIT: &str = "sshd.service";
 
-/// The sshd drop-in (`Port`/`ListenAddress`, and a `Match all` that flips on
-/// password auth when `[services.ssh] password-authentication` is set), or `None`
-/// when everything is at its default (port 22, all addresses, key-only).
-fn ssh_dropin_body(ssh: &Ssh) -> Option<String> {
-    if ssh.port.is_none()
-        && ssh.listen_address.is_none()
-        && ssh.loglevel.is_none()
-        && !ssh.password_authentication
-    {
-        return None;
-    }
+/// Render BOTH password transports explicitly, even at defaults. An omitted
+/// PasswordAuthentication setting must not inherit a permissive daemon policy,
+/// and PAM keyboard-interactive must not bypass the operator's key-only choice.
+fn ssh_dropin_body(ssh: &Ssh) -> String {
     let mut body = String::from("# rendered by sentinel — [services.ssh]\n");
     if let Some(p) = ssh.port {
         body.push_str(&format!("Port {p}\n"));
@@ -2006,17 +2013,21 @@ fn ssh_dropin_body(ssh: &Ssh) -> Option<String> {
     if let Some(l) = &ssh.loglevel {
         body.push_str(&format!("LogLevel {l}\n"));
     }
-    if ssh.password_authentication {
-        // A trailing `Match all` overrides the image's global `PasswordAuthentication
-        // no` (Port/ListenAddress must stay in the global context above the Match).
-        body.push_str("Match all\n    PasswordAuthentication yes\n");
-    }
-    Some(body)
+    // Port/ListenAddress must precede Match; these authentication directives
+    // are permitted within it and apply to every connecting account.
+    body.push_str("Match all\n    KbdInteractiveAuthentication no\n");
+    body.push_str(if ssh.password_authentication {
+        "    PasswordAuthentication yes\n"
+    } else {
+        "    PasswordAuthentication no\n"
+    });
+    body
 }
 
 /// Reconcile sshd + the login accounts to the config. Files are written in BOTH
 /// modes (re-rendered at boot from the saved config); unit ops (start/stop/restart)
-/// run in Live only — at boot sshd starts on its own with the files in place.
+/// run in Live only. At boot the unit's condition honors the rendered enable
+/// marker, rather than starting an explicitly disabled management listener.
 fn apply_ssh(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     let ssh = &appliance.services.ssh;
 
@@ -2025,20 +2036,14 @@ fn apply_ssh(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
     apply_logins(appliance, mode)?;
 
     let dropin = Path::new(SSH_DROPIN);
-    let dropin_changed = match ssh_dropin_body(ssh) {
-        Some(body) => {
-            let changed = file_changed(dropin, &body);
-            system::install_file(dropin, &body)?;
-            changed
-        }
-        None => {
-            let existed = dropin.exists();
-            if existed {
-                system::remove_file(dropin)?;
-            }
-            existed
-        }
-    };
+    let body = ssh_dropin_body(ssh);
+    let dropin_changed = file_changed(dropin, &body);
+    system::install_file(dropin, &body)?;
+    if ssh.enable {
+        system::install_file(Path::new(SSH_ENABLED), "enabled\n")?;
+    } else {
+        system::remove_file(Path::new(SSH_ENABLED))?;
+    }
 
     if mode == ApplyMode::Live {
         if ssh.enable {
@@ -2108,7 +2113,7 @@ fn apply_logins(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
                 "warning: {} has a password but no SSH key, and this appliance accepts \
                  keys only — that password will not work over SSH. Allow it with \
                  `set services ssh password-authentication true`, or give the account \
-                 a key with `set system login {} public-key <key>`.",
+                 a key with `set system login {} ssh-key <key>`.",
                 login.username, login.username
             );
         }
@@ -3580,6 +3585,7 @@ fn apply_agent_iface(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
 }
 
 pub fn apply_persistent(appliance: &Appliance, mode: ApplyMode) -> Result<()> {
+    crate::ipsec_guards::prepare(appliance)?;
     let ifaces = &appliance.interfaces;
 
     // The members named as a bond's `primary`. Collected from the bonds, applied
@@ -4931,6 +4937,29 @@ mod tests {
     }
 
     #[test]
+    fn ssh_key_only_dropin_disables_both_password_transports() {
+        let body = ssh_dropin_body(&Ssh::default());
+        assert!(body.contains(
+            "Match all\n    KbdInteractiveAuthentication no\n    PasswordAuthentication no\n"
+        ));
+        assert!(!body.contains("Authentication yes"));
+    }
+
+    #[test]
+    fn ssh_password_opt_in_does_not_reopen_keyboard_interactive() {
+        let body = ssh_dropin_body(&Ssh {
+            password_authentication: true,
+            port: Some(2222),
+            listen_address: Some("198.18.88.100".into()),
+            loglevel: Some("VERBOSE".into()),
+            ..Ssh::default()
+        });
+        assert!(body.starts_with("# rendered by sentinel — [services.ssh]\nPort 2222\nListenAddress 198.18.88.100\nLogLevel VERBOSE\nMatch all\n"));
+        assert!(body.contains("KbdInteractiveAuthentication no\n    PasswordAuthentication yes\n"));
+        assert_eq!(body.matches("Match all").count(), 1);
+    }
+
+    #[test]
     fn dhcp_address_renders_dhcp_directive() {
         let u = network_body(
             "eth0",
@@ -4949,6 +4978,8 @@ mod tests {
             false,
         );
         assert!(u.contains("DHCP=yes"));
+        assert_eq!(u.matches("[DHCPv4]").count(), 1);
+        assert!(u.contains("RequestBroadcast=yes"));
         assert!(!u.contains("Address="));
     }
 
@@ -6988,6 +7019,23 @@ mod tests {
 
     #[test]
     fn ddclient_rejects_injection_in_fields() {
+        for provider in [
+            "dyndns2\nssl=no",
+            "dyndns2\rssl=no",
+            "dyndns2,ssl=no",
+            "",
+            "dyndns2 ssl=no",
+        ] {
+            let dd = Dyndns {
+                hostname: Some("fw.example.com".into()),
+                provider: Some(provider.into()),
+                ..Dyndns::default()
+            };
+            assert!(
+                ddclient_conf_body(&dd).is_err(),
+                "unsafe provider {provider:?}"
+            );
+        }
         // A `'` in the single-quoted password breaks out of the quoting.
         let pw = Dyndns {
             hostname: Some("fw.example.com".into()),
@@ -7155,6 +7203,8 @@ mod tests {
         // Every [Network] directive has to precede the first sub-section, or it
         // lands in [DHCPv4] and is ignored.
         let first_section = u.find("\n[DHCPv4]").expect("a [DHCPv4] section");
+        assert_eq!(u.matches("[DHCPv4]").count(), 1);
+        assert!(u.contains("RequestBroadcast=yes"));
         assert!(u[..first_section].contains("IPv4ProxyARP=yes"));
 
         // The ARP switches have no networkd directive and must not be invented.

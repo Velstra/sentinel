@@ -9,6 +9,10 @@
 //! recent**, matching VyOS's `show system commit`. The archive is pruned to the
 //! last [`ARCHIVE_KEEP`] revisions.
 
+use std::fs::{File, OpenOptions};
+use std::io::Read;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -33,8 +37,6 @@ pub struct Revision {
     pub index: usize,
     /// Epoch nanoseconds the revision was archived at (from the filename).
     pub nanos: u128,
-    /// The revision file.
-    pub path: PathBuf,
 }
 
 impl Revision {
@@ -50,13 +52,131 @@ fn archive_dir(config_path: &Path) -> PathBuf {
     parent.join(ARCHIVE_SUBDIR)
 }
 
+fn open_directory(dir: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir)
+}
+
+/// Resolve children relative to the already-open directory, not a pathname
+/// that could have been replaced since the no-follow check. Linux appliances
+/// mount procfs; this descriptor is never handed to a child process.
+fn descriptor_path(directory: &File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+}
+
+fn permissions(file: &File, uid: u32, gid: u32, mode: u32) -> Result<()> {
+    let metadata = file.metadata()?;
+    if metadata.uid() != uid || metadata.gid() != gid {
+        // Use the descriptor throughout: chown(path) would follow a substituted
+        // symlink. Keep an already-correct uid unchanged for unprivileged saves.
+        let owner = if metadata.uid() == uid { !0 } else { uid };
+        anyhow::ensure!(
+            unsafe { libc::fchown(file.as_raw_fd(), owner, gid) } == 0,
+            std::io::Error::last_os_error()
+        );
+    }
+    if metadata.mode() & 0o7777 != mode {
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
+}
+
+/// Restrict historical copies as well as new ones. This runs before logins and
+/// management services at boot and on every archive write. Do not follow links
+/// or chmod a hard-linked file outside this dedicated directory. A malformed
+/// archive fails closed and needs an administrator, never a recursive chmod.
+fn protect_local(config_path: &Path, create: bool) -> Result<Option<File>> {
+    let dir = archive_dir(config_path);
+    if create {
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error).context("creating private configuration archive"),
+        }
+    }
+    let directory = match open_directory(&dir) {
+        Ok(directory) => directory,
+        Err(error) if !create && error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).context("opening configuration archive without following links");
+        }
+    };
+    let parent = dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let owner = std::fs::metadata(parent)?;
+    let gid = crate::system::wheel_gid().unwrap_or(owner.gid());
+    // Remove public traversal FIRST, including on legacy 0755 directories.
+    // Keep wheel access (like the saved config), but no group write permission.
+    permissions(&directory, owner.uid(), gid, 0o750)?;
+    let stable = descriptor_path(&directory);
+    for entry in std::fs::read_dir(&stable)? {
+        let entry = entry?;
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(entry.path())
+            .context("opening historical configuration archive without following links")?;
+        let metadata = file.metadata()?;
+        anyhow::ensure!(
+            metadata.is_file() && metadata.nlink() == 1,
+            "configuration archive contains a non-regular or multiply-linked entry"
+        );
+        permissions(&file, owner.uid(), gid, 0o640)?;
+    }
+    directory.sync_all()?;
+    Ok(Some(directory))
+}
+
+/// Boot-time permission migration, intentionally independent of config parsing
+/// and the apply lock: even an invalid saved config must not expose old secrets.
+/// The privileged re-invocation must not deadlock its parent's held apply lock.
+pub fn protect_archives(config_path: &Path, create: bool) -> Result<()> {
+    protect_local(config_path, create).map(|_| ())
+}
+
+fn prepare_archive(config_path: &Path) -> Result<File> {
+    match protect_local(config_path, true) {
+        Ok(Some(directory)) => Ok(directory),
+        Ok(None) => unreachable!("creation requested"),
+        Err(error)
+            if !crate::system::is_root()
+                && error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+                }) =>
+        {
+            let absolute = std::path::absolute(config_path)?;
+            crate::system::sudo(
+                "sentinel-self",
+                &[
+                    "protect-archives",
+                    "--create",
+                    "--config",
+                    absolute.to_str().context("non-UTF-8 config path")?,
+                ],
+            )?;
+            open_directory(&archive_dir(config_path))
+                .context("opening protected configuration archive")
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Snapshot `contents` (the just-saved config TOML) as a new revision, then prune
 /// to the most recent [`ARCHIVE_KEEP`]. Best-effort by design: a failure to
 /// archive must never fail the `save` itself, so callers log rather than
-/// propagate. The archive dir sits under `/var/lib/sentinel` (wheel-writable), so
-/// no privilege escalation is needed.
+/// propagate. Revisions carry the SAME secrets as the saved config: 0640 with
+/// wheel read access in a 0750 directory. Operators escalate through the shared
+/// atomic installer when the directory is root-owned.
 pub fn archive_config(config_path: &Path, contents: &str, keep: usize) -> Result<()> {
+    let _transaction = crate::system::apply_lock()?;
     let dir = archive_dir(config_path);
+    let _directory = prepare_archive(config_path)?;
 
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -66,36 +186,7 @@ pub fn archive_config(config_path: &Path, contents: &str, keep: usize) -> Result
     let name = format!("{ARCHIVE_PREFIX}{nanos:020}{ARCHIVE_SUFFIX}");
     let path = dir.join(&name);
 
-    // Write it as ourselves if we can, and escalate if we cannot — the same
-    // shape as the config file's own install, and for the same reason. The
-    // comment above used to assert that this directory is wheel-writable; on a
-    // real appliance it is the mount point of the data partition, whose root the
-    // installer made root:root, and the tmpfiles rule that would have widened it
-    // never applies to an already-mounted filesystem. So every commit an
-    // operator made printed "could not archive this config revision" and left
-    // the revision history empty — `rollback` had nothing to roll back to, and
-    // the only sign was a warning nobody has to read.
-    if std::fs::create_dir_all(&dir).is_ok() {
-        // Atomic: temp + rename, so a reader never sees a half-written revision.
-        let tmp = dir.join(format!(".{name}.tmp"));
-        if std::fs::write(&tmp, contents).is_ok() {
-            if std::fs::rename(&tmp, &path).is_ok() {
-                prune(&dir, keep);
-                return Ok(());
-            }
-            let _ = std::fs::remove_file(&tmp);
-        }
-    }
-    let staged = Path::new("/run/sentinel").join(".archive.toml.tmp");
-    crate::system::stage_private(&staged, contents)?;
-    let (Some(d), Some(src), Some(dst)) = (dir.to_str(), staged.to_str(), path.to_str()) else {
-        anyhow::bail!("non-UTF-8 path");
-    };
-    crate::system::sudo("install", &["-d", "-m", "0755", d])
-        .with_context(|| format!("creating {d}"))?;
-    crate::system::sudo("install", &["-m", "0644", src, dst])
-        .with_context(|| format!("installing {dst}"))?;
-    let _ = std::fs::remove_file(&staged);
+    crate::system::install_config_file(&path, contents)?;
     prune(&dir, keep);
     Ok(())
 }
@@ -122,15 +213,25 @@ fn prune(dir: &Path, keep: usize) {
 /// The revision files in `dir` as `(path, nanos)`, unsorted. Non-matching names
 /// are ignored.
 fn revision_files(dir: &Path) -> Vec<(PathBuf, u128)> {
+    let Ok(directory) = open_directory(dir) else {
+        return Vec::new();
+    };
+    revision_files_in(&directory, dir)
+}
+
+fn revision_files_in(directory: &File, dir: &Path) -> Vec<(PathBuf, u128)> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(entries) = std::fs::read_dir(descriptor_path(directory)) else {
         return out;
     };
     for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         if let Some(nanos) = parse_revision_nanos(name) {
-            out.push((entry.path(), nanos));
+            out.push((dir.join(name), nanos));
         }
     }
     out
@@ -153,17 +254,33 @@ pub fn list_revisions(config_path: &Path) -> Vec<Revision> {
     files
         .into_iter()
         .enumerate()
-        .map(|(index, (path, nanos))| Revision { index, nanos, path })
+        .map(|(index, (_, nanos))| Revision { index, nanos })
         .collect()
 }
 
 /// The TOML content of revision `n` (0 = newest).
 pub fn read_revision(config_path: &Path, n: usize) -> Result<String> {
-    let revs = list_revisions(config_path);
-    let rev = revs
+    let dir = archive_dir(config_path);
+    let directory =
+        open_directory(&dir).context("opening configuration archive without following links")?;
+    let mut revs = revision_files_in(&directory, &dir);
+    revs.sort_by_key(|f| std::cmp::Reverse(f.1));
+    let (path, _) = revs
         .get(n)
         .ok_or_else(|| anyhow::anyhow!("no revision {n} (have {})", revs.len()))?;
-    std::fs::read_to_string(&rev.path).with_context(|| format!("reading {}", rev.path.display()))
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(descriptor_path(&directory).join(path.file_name().context("revision filename")?))?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.nlink() == 1,
+        "revision is not a private regular file"
+    );
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .context("reading configuration revision")?;
+    Ok(content)
 }
 
 /// Revert the running system to archived revision `n`: apply it live (when
@@ -228,6 +345,119 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Directory(PathBuf);
+    impl Directory {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("sentinel-archive-{name}-{}", std::process::id()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn config(&self) -> PathBuf {
+            self.0.join("appliance.toml")
+        }
+    }
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn new_and_historical_archives_match_the_saved_config_access_boundary() {
+        let dir = Directory::new("privacy");
+        let config = dir.config();
+        let archive = archive_dir(&config);
+        std::fs::create_dir(&archive).unwrap();
+        std::fs::set_permissions(&archive, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Legacy revision and an interrupted old predictable temporary copy.
+        for name in ["config-00000000000000000001.toml", ".config-2.toml.tmp"] {
+            let path = archive.join(name);
+            std::fs::write(&path, "test credential, never a real secret").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        archive_config(&config, "new test credential", 10).unwrap();
+        let metadata = std::fs::metadata(&archive).unwrap();
+        assert_eq!(metadata.mode() & 0o7777, 0o750);
+        assert_eq!(metadata.uid(), std::fs::metadata(&dir.0).unwrap().uid());
+        for entry in std::fs::read_dir(&archive).unwrap() {
+            let file = entry.unwrap().metadata().unwrap();
+            assert_eq!(file.mode() & 0o7777, 0o640);
+            assert_eq!(file.uid(), metadata.uid());
+            assert_eq!(file.gid(), metadata.gid());
+        }
+        assert_eq!(read_revision(&config, 0).unwrap(), "new test credential");
+        protect_archives(&config, false).unwrap(); // repeat migration is harmless
+        assert_eq!(list_revisions(&config).len(), 2);
+    }
+
+    #[test]
+    fn missing_history_is_not_created_by_boot_migration() {
+        let dir = Directory::new("missing");
+        protect_archives(&dir.config(), false).unwrap();
+        assert!(!archive_dir(&dir.config()).exists());
+    }
+
+    #[test]
+    fn linked_archive_directory_is_refused_without_touching_its_target() {
+        let dir = Directory::new("linked-directory");
+        let outside = dir.0.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let victim = outside.join("config-9999999999999999999.toml");
+        std::fs::write(&victim, "unrelated content").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&outside, archive_dir(&dir.config())).unwrap();
+        assert!(archive_config(&dir.config(), "never write", 10).is_err());
+        assert!(read_revision(&dir.config(), 0).is_err());
+        assert!(list_revisions(&dir.config()).is_empty());
+        assert_eq!(std::fs::metadata(&outside).unwrap().mode() & 0o7777, 0o755);
+        assert_eq!(std::fs::metadata(&victim).unwrap().mode() & 0o7777, 0o644);
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "unrelated content"
+        );
+    }
+
+    #[test]
+    fn linked_revision_is_not_read_or_chmodded() {
+        for hard in [false, true] {
+            let dir = Directory::new(if hard { "hardlink" } else { "symlink" });
+            let victim = dir.0.join("outside.toml");
+            std::fs::write(&victim, "unrelated content").unwrap();
+            std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let archive = archive_dir(&dir.config());
+            std::fs::create_dir(&archive).unwrap();
+            let linked = archive.join("config-9999999999999999999.toml");
+            if hard {
+                std::fs::hard_link(&victim, &linked).unwrap();
+            } else {
+                std::os::unix::fs::symlink(&victim, &linked).unwrap();
+            }
+            assert!(archive_config(&dir.config(), "never write", 10).is_err());
+            assert!(read_revision(&dir.config(), 0).is_err());
+            assert_eq!(std::fs::metadata(&victim).unwrap().mode() & 0o7777, 0o644);
+            assert_eq!(
+                std::fs::read_to_string(&victim).unwrap(),
+                "unrelated content"
+            );
+            assert_eq!(std::fs::metadata(&archive).unwrap().mode() & 0o7777, 0o750);
+        }
+    }
+
+    #[test]
+    fn non_regular_revision_cannot_block_a_reader_or_permission_migration() {
+        let dir = Directory::new("fifo");
+        let archive = archive_dir(&dir.config());
+        std::fs::create_dir(&archive).unwrap();
+        let fifo = archive.join("config-9999999999999999999.toml");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(list_revisions(&dir.config()).is_empty());
+        assert!(read_revision(&dir.config(), 0).is_err());
+        assert!(protect_archives(&dir.config(), false).is_err());
+    }
 
     #[test]
     fn civil_from_days_matches_known_dates() {
