@@ -43,6 +43,24 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    # Archive files contain the same API/HA/VPN credentials as appliance.toml.
+    # Migrate legacy public copies independently of config parsing, and fail
+    # closed before unprivileged logins or the management API can start. The
+    # data volume must be mounted even when it is declared nofail.
+    systemd.services.sentinel-archive-protect = {
+      description = "Protect saved Sentinel configuration revisions";
+      wantedBy = [ "multi-user.target" ];
+      requiredBy = [ "systemd-user-sessions.service" "sshd.service" "sentinel-boot.service" "sentinel-api.service" ];
+      before = [ "systemd-user-sessions.service" "sshd.service" "sentinel-boot.service" "sentinel-api.service" ];
+      after = [ "systemd-tmpfiles-setup.service" ];
+      unitConfig.RequiresMountsFor = [ "/var/lib/sentinel" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        UMask = "0077";
+        ExecStart = "${cfg.sentinel}/bin/sentinel protect-archives --config /var/lib/sentinel/appliance.toml";
+      };
+    };
     # Seed the runtime firewall config at boot: compile the **active** appliance
     # config (operator-edited /var/lib if present, else the factory default
     # baked into the image) into the writable /run path the agent reads. This is

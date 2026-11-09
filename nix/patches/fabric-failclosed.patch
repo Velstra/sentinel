@@ -1,0 +1,427 @@
+--- a/velstra-app/src/ha.rs
++++ b/velstra-app/src/ha.rs
+@@ -253,6 +253,16 @@
+         }
+     }
+ }
++/// Publish `deadline` into the kernel fence. A failed update attempts to clear
++/// it before returning the error. If the map refuses both writes, the old
++/// bounded lease can only expire; never report that a clear succeeded.
++fn publish_kernel_fence(mut write: impl FnMut(u64) -> Result<()>, deadline: u64) -> Result<()> {
++    if let Err(error) = write(deadline) {
++        let _ = write(0);
++        return Err(error);
++    }
++    Ok(())
++}
+ pub fn now_ns() -> u64 {
+     let mut time = libc::timespec {
+         tv_sec: 0,
+@@ -730,11 +740,16 @@
+                 now.saturating_sub(state.role.updated_ns) / 1_000_000
+             );
+         }
+-        if let Err(error) = fw.ha_deadline(deadline) {
+-            log::error!("HA kernel fence update failed: {error:#}");
+-            continue;
+-        }
+-        if active {
++        let fence_ok = match publish_kernel_fence(|value| fw.ha_deadline(value), deadline) {
++            Ok(()) => true,
++            Err(error) => {
++                log::error!(
++                    "HA kernel fence update failed; fence reset attempted and forwarding readiness withdrawn: {error:#}"
++                );
++                false
++            }
++        };
++        if fence_ok && active {
+             state.cold = false;
+             state.active_term = state.role.authority.term;
+             state.ready_term = state.active_term;
+@@ -769,6 +784,51 @@
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    #[test]
++    fn failed_fence_publication_clears_the_previous_lease() {
++        let mut writes = Vec::new();
++        let error = publish_kernel_fence(
++            |deadline| {
++                writes.push(deadline);
++                if deadline != 0 {
++                    anyhow::bail!("HA deadline map update rejected");
++                }
++                Ok(())
++            },
++            9_000_000_000,
++        );
++        assert!(error.is_err());
++        assert_eq!(writes, [9_000_000_000, 0]);
++    }
++
++    #[test]
++    fn fence_clear_is_attempted_when_every_map_write_fails() {
++        let mut writes = Vec::new();
++        let error = publish_kernel_fence(
++            |deadline| {
++                writes.push(deadline);
++                anyhow::bail!("HA deadline map unavailable");
++            },
++            0,
++        );
++        assert!(error.is_err());
++        assert_eq!(writes, [0, 0]);
++    }
++
++    #[test]
++    fn successful_fence_publication_does_not_clear() {
++        let mut writes = Vec::new();
++        publish_kernel_fence(
++            |deadline| {
++                writes.push(deadline);
++                Ok(())
++            },
++            4_000_000_000,
++        )
++        .unwrap();
++        assert_eq!(writes, [4_000_000_000]);
++    }
++
+     fn config() -> HaConfig {
+         HaConfig {
+             enabled: true,
+--- a/velstra-cni/src/main.rs
++++ b/velstra-cni/src/main.rs
+@@ -201,9 +201,12 @@
+     let _ = net::teardown(&net::veth_name(&container_id));
+ 
+     if !conf.controllers.is_empty() {
+-        if let Some(port_id) = take_port(Path::new(DEFAULT_STATE_ROOT), &container_id) {
+-            let _ = controller::remove_port(&conf.controllers, &conf.tls_options(), &port_id);
+-        }
++        // Keep the port record until the controller accepts deletion. Dropping
++        // it first makes a failed DEL unrecoverable: the retry no longer knows
++        // which port still holds the address.
++        release_recorded_port(Path::new(DEFAULT_STATE_ROOT), &container_id, |port_id| {
++            controller::remove_port(&conf.controllers, &conf.tls_options(), port_id)
++        })?;
+         return Ok(None);
+     }
+ 
+@@ -295,13 +298,38 @@
+ }
+ 
+ /// Read and delete the port id recorded for `container_id` (idempotent).
++#[cfg(test)]
+ fn take_port(state_root: &Path, container_id: &str) -> Option<String> {
++    let id = read_port(state_root, container_id)?;
++    forget_port(state_root, container_id);
++    Some(id)
++}
++
++fn read_port(state_root: &Path, container_id: &str) -> Option<String> {
+     let path = port_record_path(state_root, container_id);
+     let id = std::fs::read_to_string(&path).ok()?.trim().to_string();
+-    let _ = std::fs::remove_file(&path);
+     (!id.is_empty()).then_some(id)
+ }
+ 
++fn forget_port(state_root: &Path, container_id: &str) {
++    let _ = std::fs::remove_file(port_record_path(state_root, container_id));
++}
++
++/// Delete the controller port, then the local record. `remove` failing leaves
++/// the record in place so the next DEL can retry the same port id.
++fn release_recorded_port(
++    state_root: &Path,
++    container_id: &str,
++    mut remove: impl FnMut(&str) -> Result<()>,
++) -> Result<Option<String>> {
++    let Some(port_id) = read_port(state_root, container_id) else {
++        return Ok(None);
++    };
++    remove(&port_id)?;
++    forget_port(state_root, container_id);
++    Ok(Some(port_id))
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -334,6 +362,28 @@
+         // Unknown container ids are simply absent.
+         assert_eq!(take_port(&root, "never-seen"), None);
+ 
++        record_port(&root, "container-retry", "port-5001").unwrap();
++        let failure = release_recorded_port(&root, "container-retry", |_| {
++            bail!("controller unavailable")
++        });
++        assert!(failure.is_err());
++        assert_eq!(
++            read_port(&root, "container-retry").as_deref(),
++            Some("port-5001")
++        );
++        assert_eq!(
++            release_recorded_port(&root, "container-retry", |_| Ok(()))
++                .unwrap()
++                .as_deref(),
++            Some("port-5001")
++        );
++        assert_eq!(read_port(&root, "container-retry"), None);
++        assert_eq!(
++            release_recorded_port(&root, "container-retry", |_| bail!("must not be called"))
++                .unwrap(),
++            None
++        );
++
+         let _ = std::fs::remove_dir_all(&root);
+     }
+ }
+--- a/velstra-common/src/dhcp.rs
++++ b/velstra-common/src/dhcp.rs
+@@ -2,6 +2,24 @@
+ //! This is not DHCP authentication: the local client still verifies transactions,
+ //! options and checksums. It must never open arbitrary traffic on UDP port 68.
+ 
++/// Kernel uapi `BPF_FIB_LKUP_RET_NOT_FWDED`. A unicast destination with a
++/// non-unicast route type (local, broadcast, anycast) produces this code, and
++/// only after `bpf_ipv4_fib_lookup` has passed the ingress forwarding check.
++pub const DHCP_FIB_NOT_FORWARDED: i32 = 4;
++
++/// Whether `bpf_fib_lookup` proved that a unicast DHCPv4 reply is local.
++///
++/// `BPF_FIB_LKUP_RET_FWD_DISABLED` (5) is returned before any route lookup when
++/// forwarding is disabled on the ingress interface (Linux 6.12
++/// `net/core/filter.c`, `bpf_ipv4_fib_lookup`). It does not distinguish a local
++/// address from a stale owned-address entry that is now routable, so it must
++/// not admit the firewall exception. Success and `NO_NEIGH` mean the
++/// destination is forwarded unicast.
++#[inline(always)]
++pub fn dhcp_fib_is_local(rc: i64) -> bool {
++    rc == i64::from(DHCP_FIB_NOT_FORWARDED)
++}
++
+ /// Check the fixed headers without copying the 240-byte BOOTP prefix onto the
+ /// BPF stack. The caller bounds-checks the full IPv4 datagram and separately
+ /// proves that its destination is broadcast or an address owned by this NIC.
+@@ -126,4 +144,17 @@
+             assert!(!dhcpv4_reply_matches(&bad, &udp, &bootp, &mac));
+         }
+     }
++
++    #[test]
++    fn unicast_dhcp_exception_requires_a_not_forwarded_fib_result() {
++        assert!(dhcp_fib_is_local(i64::from(DHCP_FIB_NOT_FORWARDED)));
++        // FWD_DISABLED, SUCCESS, BLACKHOLE, UNREACHABLE, PROHIBIT, NO_NEIGH,
++        // FRAG_NEEDED, NO_SRC_ADDR, and a helper refusal (-ENODEV = -19).
++        for rc in [5i64, 0, 1, 2, 3, 7, 8, 9, -19] {
++            assert!(
++                !dhcp_fib_is_local(rc),
++                "rc {rc} must not prove a local destination"
++            );
++        }
++    }
+ }
+--- a/velstra-common/src/lib.rs
++++ b/velstra-common/src/lib.rs
+@@ -55,7 +55,7 @@
+ pub use cidr::{Cidr4, Cidr6, CidrError, mask_v4, mask_v6, parse_cidr_v4, parse_cidr_v6};
+ pub use config::{ConfigFlags, GlobalConfig, SourceValidation};
+ pub use conntrack::{ConntrackTimeouts, FirewallKey, FirewallState};
+-pub use dhcp::dhcpv4_reply_matches;
++pub use dhcp::{DHCP_FIB_NOT_FORWARDED, dhcp_fib_is_local, dhcpv4_reply_matches};
+ pub use forward::{
+     ForwardOutcome, Rewrite, RouteEntry, csum_replace_u16, decrement_ttl, ipv4_checksum,
+     plan_forward,
+@@ -66,8 +66,8 @@
+ };
+ pub use mac::{MacError, parse_mac};
+ pub use masquerade::{
+-    UNADDRESSED, legacy_napt_seed, napt_binding_matches, napt_find_existing, napt_port, napt_seed,
+-    unaddressed_uplink_drops,
++    MasqueradeCommit, UNADDRESSED, legacy_napt_seed, masquerade_commit, napt_binding_matches,
++    napt_find_existing, napt_port, napt_seed, unaddressed_uplink_drops,
+ };
+ pub use npt::{Npt66, npt66_rewrite, oc_add};
+ pub use overlay::{
+--- a/velstra-common/src/masquerade.rs
++++ b/velstra-common/src/masquerade.rs
+@@ -105,6 +105,43 @@
+     32768 + (seed.wrapping_add(i as u32) % 32768) as u16
+ }
+ 
++/// What the egress masquerade path may do after the port probe.
++///
++/// A translated packet and its reverse conntrack entry are one publication.
++/// Installing either without the other leaves a private source on the wire or
++/// a public port that DNATs an unsolicited packet to the inside host.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum MasqueradeCommit {
++    /// Reverse state exists and this packet was rewritten to the public tuple.
++    Translated,
++    /// Do not emit the packet. Leave any pre-existing binding in place.
++    Drop,
++    /// Do not emit the packet, and delete the reverse binding just created.
++    DropAndForget,
++}
++
++/// `existing` is a live binding for this inside endpoint. `inserted` is a new
++/// reverse entry created for this packet. `rewritten` is true only when the
++/// source translation of this packet succeeded.
++#[inline(always)]
++pub fn masquerade_commit(existing: bool, inserted: bool, rewritten: bool) -> MasqueradeCommit {
++    if existing {
++        return if rewritten {
++            MasqueradeCommit::Translated
++        } else {
++            MasqueradeCommit::Drop
++        };
++    }
++    if !inserted || !rewritten {
++        return if inserted {
++            MasqueradeCommit::DropAndForget
++        } else {
++            MasqueradeCommit::Drop
++        };
++    }
++    MasqueradeCommit::Translated
++}
++
+ #[cfg(test)]
+ mod tests {
+     use std::collections::BTreeSet;
+@@ -326,4 +363,39 @@
+         ));
+         assert!(!unaddressed_uplink_drops(None, [192, 168, 1, 10]));
+     }
++
++    #[test]
++    fn masquerade_drops_when_reverse_state_or_rewrite_is_missing() {
++        // Map insert failed, or every probe was occupied: do not translate.
++        assert_eq!(
++            masquerade_commit(false, false, false),
++            MasqueradeCommit::Drop
++        );
++        // A rewrite reported without a binding is still not publishable.
++        assert_eq!(
++            masquerade_commit(false, false, true),
++            MasqueradeCommit::Drop
++        );
++        // New binding installed, packet rewrite failed: forget the binding so
++        // the public port cannot DNAT an unsolicited packet, and do not emit
++        // the original private source.
++        assert_eq!(
++            masquerade_commit(false, true, false),
++            MasqueradeCommit::DropAndForget
++        );
++        // Existing binding, this packet could not be rewritten: drop it and
++        // keep the binding created by an earlier successful packet.
++        assert_eq!(
++            masquerade_commit(true, false, false),
++            MasqueradeCommit::Drop
++        );
++        assert_eq!(
++            masquerade_commit(false, true, true),
++            MasqueradeCommit::Translated
++        );
++        assert_eq!(
++            masquerade_commit(true, false, true),
++            MasqueradeCommit::Translated
++        );
++    }
+ }
+--- a/velstra-ebpf/src/main.rs
++++ b/velstra-ebpf/src/main.rs
+@@ -96,7 +96,7 @@
+     TcpSynth, TunnelEndpoint, TunnelKey, admit_established_egress_reply, build_encap,
+     build_srv6_encap, check_cookie, csum_replace_u32, decide, decide_egress, decode_vni, epoch_of,
+     gate_admits_unauthenticated, icmp, icmp_checksum, icmp_type_probe, ip_proto, ipv6_ext_len,
+-    is_ipv6_ext, is_overlay_dport, legacy_napt_seed, lpm_key_addr, make_cookie,
++    is_ipv6_ext, is_overlay_dport, legacy_napt_seed, lpm_key_addr, make_cookie, masquerade_commit,
+     napt_binding_matches, napt_find_existing, napt_port, napt_seed, plan_arp_reply, plan_forward,
+     plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat, plan_server_ack, plan_server_syn,
+     plan_srv6_irb, plan_syn_ack, plan_tcp_rst, select_backend, session_hash, tcp_flags,
+@@ -2186,6 +2186,8 @@
+     // unconditional insert would have reset the counters on every packet, and a
+     // lookup refreshes the LRU just as an insert did.
+     let bytes = (ctx.data_end() - ctx.data()) as u64;
++    let mut existing = false;
++    let mut inserted = false;
+     match CONNTRACK.get_ptr_mut(&rkey) {
+         // SAFETY: as in `account_flow` — a pointer into this CPU's map value,
+         // read and written before any other operation on the map.
+@@ -2193,13 +2195,34 @@
+             (*entry).account(bytes);
+             (*entry).last_seen_ns = bpf_ktime_get_ns();
+             (*entry).age_ns = 0;
++            existing = true;
+         },
+-        // No entry, or a slot the port probe had to take from another flow on
+-        // exhaustion: this flow starts the accounting over, as it must.
++        // A free or expired slot. Insert failure must not translate: the reply
++        // would have no reverse binding. Never replace a live foreign binding.
+         _ => {
+             let mut first = fwd;
+             first.account(bytes);
+-            let _ = insert_nat(&rkey, &first);
++            inserted = insert_nat(&rkey, &first);
++        }
++    }
++    let rewritten = if existing || inserted {
++        snat_tc(ctx, src_addr, wan_ip, src_port, wan_port, proto).is_ok()
++    } else {
++        false
++    };
++    // Translation and reverse state are published together. A failed rewrite
++    // must not leave a private source on the wire, and a new binding that
++    // never left the host must not DNAT a later unsolicited packet.
++    match masquerade_commit(existing, inserted, rewritten) {
++        velstra_common::MasqueradeCommit::Translated => {}
++        velstra_common::MasqueradeCommit::DropAndForget => {
++            let _ = CONNTRACK.remove(&rkey);
++            bump(Counter::EgressDropped);
++            return Ok(TC_ACT_SHOT as i32);
++        }
++        velstra_common::MasqueradeCommit::Drop => {
++            bump(Counter::EgressDropped);
++            return Ok(TC_ACT_SHOT as i32);
+         }
+     }
+     // …and let that reply pass the WAN zone's deny-by-default stateful firewall.
+@@ -2207,11 +2230,6 @@
+         &rkey,
+         ct_control(ctx.data(), ctx.data_end(), EthHdr::LEN + ihl_bytes, proto),
+     );
+-
+-    if snat_tc(ctx, src_addr, wan_ip, src_port, wan_port, proto).is_err() {
+-        // Too short to rewrite — let it out un-NAT'd rather than black-hole it.
+-        return Ok(TC_ACT_OK as i32);
+-    }
+     let public_key = ct_key4(
+         FlowKey::new(policy_id, wan_ip, dst_addr, wan_port, dst_port, proto),
+         ctx.data(),
+@@ -3740,6 +3758,11 @@
+ const AF_INET: u8 = 2;
+ const AF_INET6: u8 = 10;
+ 
++// `BPF_FIB_LKUP_RET_NOT_FWDED` is the only completed lookup that proves a
++// unicast DHCPv4 destination is local. Keep the shared classifier on that code.
++const _: () =
++    assert!(BPF_FIB_LKUP_RET_NOT_FWDED as u32 == velstra_common::DHCP_FIB_NOT_FORWARDED as u32);
++
+ /// Narrow local-control admission, never a forwarding exception. Initial
+ /// acquisition requests broadcast replies; renewals may address the NIC's
+ /// already-owned IPv4. The FIB check prevents stale address metadata from
+@@ -3799,8 +3822,9 @@
+             0,
+         )
+     };
+-    rc >= 0
+-        && (rc as u32 == BPF_FIB_LKUP_RET_NOT_FWDED || rc as u32 == BPF_FIB_LKUP_RET_FWD_DISABLED)
++    // Only NOT_FWDED is a completed lookup of a non-unicast (local) route.
++    // FWD_DISABLED is returned before lookup when ingress forwarding is off.
++    velstra_common::dhcp_fib_is_local(rc)
+ }
+ 
+ /// Source-address validation (uRPF, RFC 3704) for IPv4. Returns `true` when the

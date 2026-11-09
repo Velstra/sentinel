@@ -1,0 +1,295 @@
+diff --git a/velstra-common/src/lib.rs b/velstra-common/src/lib.rs
+--- a/velstra-common/src/lib.rs
++++ b/velstra-common/src/lib.rs
+@@ -63,7 +63,10 @@
+     plan_icmp_echo_nat, plan_nat, select_backend, session_hash,
+ };
+ pub use mac::{MacError, parse_mac};
+-pub use masquerade::{UNADDRESSED, napt_port, napt_seed, unaddressed_uplink_drops};
++pub use masquerade::{
++    UNADDRESSED, legacy_napt_seed, napt_binding_matches, napt_find_existing, napt_port, napt_seed,
++    unaddressed_uplink_drops,
++};
+ pub use npt::{Npt66, npt66_rewrite, oc_add};
+ pub use overlay::{
+     ARP_REPLY, ARP_REQUEST, ArpEntry, ArpKey, ArpReply, ETHERTYPE_ARP, Encap, FloodSet,
+diff --git a/velstra-common/src/masquerade.rs b/velstra-common/src/masquerade.rs
+--- a/velstra-common/src/masquerade.rs
++++ b/velstra-common/src/masquerade.rs
+@@ -50,6 +50,54 @@
+     hash ^ (hash >> 16)
+ }
+ 
++/// Allocator used by deployed images before the avalanche correction.
++///
++/// Only search for an EXISTING replicated binding with this seed. Never
++/// allocate a new flow from it: its poor distribution is the bug corrected by
++/// [`napt_seed`]. Keep this compatibility search while rolling upgrades from
++/// that allocator are supported. A chosen public port is connection state, not
++/// something an upgraded peer may replace with its own preferred candidate.
++#[inline(always)]
++pub fn legacy_napt_seed(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16) -> u32 {
++    (u32::from_le_bytes(src)
++        ^ u32::from_le_bytes(dst).rotate_left(16)
++        ^ ((sport as u32) << 16)
++        ^ dport as u32)
++        .wrapping_mul(2654435761)
++}
++
++/// An allocation belongs to this inside endpoint only when it is a genuine
++/// single-ended masquerade entry, not a coincident DNAT/hairpin target.
++#[inline(always)]
++pub fn napt_binding_matches(state: &crate::FlowState, origin: [u8; 4], port: u16) -> bool {
++    state.flags == crate::FlowState::ORIGIN
++        && state.nat_ip == origin
++        && state.nat_port == port
++        && state.nat2_ip == [0; 4]
++        && state.nat2_port == 0
++}
++
++/// Bounded existing-binding search shared with the real egress dataplane.
++/// A free/foreign/expired earlier slot is NOT a reason to stop looking for the
++/// allocation this connection already owns. Zero means no existing allocation.
++#[inline(always)]
++pub fn napt_find_existing(
++    src: [u8; 4],
++    seed: u32,
++    layout: &crate::CgnatLayout,
++    mut belongs_to_flow: impl FnMut(u16) -> bool,
++) -> u16 {
++    for probe in 0..8 {
++        let candidate = layout
++            .candidate(src, seed, probe)
++            .unwrap_or_else(|| napt_port(seed, probe));
++        if belongs_to_flow(candidate) {
++            return candidate;
++        }
++    }
++    0
++}
++
+ /// Candidate `i` in the inclusive ephemeral range32768..65535, never port0.
+ /// The dataplane retains its separate small, verifier-bounded probe count.
+ #[inline(always)]
+@@ -64,6 +112,103 @@
+     use super::*;
+ 
+     #[test]
++    fn mixed_version_native_reset_tuple_has_distinct_old_and_new_windows() {
++        // Actual two-node rolling trace: old owner39759, upgraded owner57646,
++        // same TCP sequence; the independent backend reset the new tuple.
++        let src = [198, 18, 20, 50];
++        let dst = [198, 18, 10, 253];
++        let old = legacy_napt_seed(src, dst, 43251, 19251);
++        let current = napt_seed(src, dst, 43251, 19251);
++        assert_eq!(napt_port(old, 0), 39759);
++        assert_eq!(napt_port(current, 0), 57646);
++        assert!((0..8).all(|i| napt_port(current, i) != napt_port(old, 0)));
++        assert!(napt_binding_matches(
++            &crate::FlowState::masquerade(src, 43251),
++            src,
++            43251
++        ));
++        let layout = crate::CgnatLayout::default();
++        let allocated = napt_port(old, 0);
++        assert_eq!(
++            napt_find_existing(src, current, &layout, |p| p == allocated),
++            0
++        );
++        assert_eq!(
++            napt_find_existing(src, old, &layout, |p| p == allocated),
++            allocated
++        );
++    }
++
++    #[test]
++    fn free_earlier_collision_slots_cannot_renumber_an_established_flow() {
++        let src = [198, 18, 20, 50];
++        let seed = napt_seed(src, [198, 18, 10, 253], 43251, 19251);
++        for layout in [
++            crate::CgnatLayout::default(),
++            crate::CgnatLayout::new(1024, 64),
++        ] {
++            for occupied_probe in 1..8 {
++                let allocated = layout
++                    .candidate(src, seed, occupied_probe)
++                    .unwrap_or_else(|| napt_port(seed, occupied_probe));
++                let mut observed = Vec::new();
++                assert_eq!(
++                    napt_find_existing(src, seed, &layout, |candidate| {
++                        observed.push(candidate);
++                        candidate == allocated
++                    }),
++                    allocated
++                );
++                assert_eq!(observed.len(), usize::from(occupied_probe) + 1);
++            }
++            let mut probes = 0;
++            assert_eq!(
++                napt_find_existing(src, seed, &layout, |_| {
++                    probes += 1;
++                    false
++                }),
++                0
++            );
++            assert_eq!(probes, 8);
++        }
++    }
++
++    #[test]
++    fn masquerade_ownership_never_accepts_dnat_hairpin_or_another_endpoint() {
++        let ip = [192, 0, 2, 7];
++        let state = crate::FlowState::masquerade(ip, 43000);
++        assert!(napt_binding_matches(&state, ip, 43000));
++        assert!(!napt_binding_matches(&state, [192, 0, 2, 8], 43000));
++        assert!(!napt_binding_matches(&state, ip, 43001));
++        assert!(!napt_binding_matches(
++            &crate::FlowState::forward(ip, 43000),
++            ip,
++            43000
++        ));
++        assert!(!napt_binding_matches(
++            &crate::FlowState::reverse(ip, 43000),
++            ip,
++            43000
++        ));
++        for changed in [
++            crate::FlowState {
++                nat2_ip: [192, 0, 2, 1],
++                ..state
++            },
++            crate::FlowState {
++                nat2_port: 7,
++                ..state
++            },
++            crate::FlowState {
++                flags: state.flags | crate::FlowState::REVERSE,
++                ..state
++            },
++        ] {
++            assert!(!napt_binding_matches(&changed, ip, 43000));
++        }
++    }
++
++    #[test]
+     fn native_ten_session_regression_no_longer_collapses_to_one_eight_port_window() {
+         let src = [198, 18, 20, 50];
+         let dst = [198, 18, 10, 254];
+diff --git a/velstra-ebpf/src/main.rs b/velstra-ebpf/src/main.rs
+--- a/velstra-ebpf/src/main.rs
++++ b/velstra-ebpf/src/main.rs
+@@ -95,11 +95,12 @@
+     TcpSynth, TunnelEndpoint, TunnelKey, admit_established_egress_reply, build_encap,
+     build_srv6_encap, check_cookie, csum_replace_u32, decide, decide_egress, decode_vni, epoch_of,
+     gate_admits_unauthenticated, icmp, icmp_checksum, icmp_type_probe, ip_proto, ipv6_ext_len,
+-    is_ipv6_ext, is_overlay_dport, lpm_key_addr, make_cookie, napt_port, napt_seed, plan_arp_reply,
+-    plan_forward, plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat, plan_server_ack,
+-    plan_server_syn, plan_srv6_irb, plan_syn_ack, plan_tcp_rst, select_backend, session_hash,
+-    tcp_flags, translate_to_client, translate_to_server, unaddressed_uplink_drops,
+-    v6_source_is_v4_mapped, write_encap, write_srv6_encap,
++    is_ipv6_ext, is_overlay_dport, legacy_napt_seed, lpm_key_addr, make_cookie,
++    napt_binding_matches, napt_find_existing, napt_port, napt_seed, plan_arp_reply, plan_forward,
++    plan_icmp_unreachable, plan_irb, plan_na_reply, plan_nat, plan_server_ack, plan_server_syn,
++    plan_srv6_irb, plan_syn_ack, plan_tcp_rst, select_backend, session_hash, tcp_flags,
++    translate_to_client, translate_to_server, unaddressed_uplink_drops, v6_source_is_v4_mapped,
++    write_encap, write_srv6_encap,
+ };
+ 
+ /// Absolute CLOCK_BOOTTIME deadline, shared with the persistent TC guard. Zero
+@@ -1989,6 +1990,40 @@
+ /// complexity budget. Candidate mixing is shared with the host regression tests.
+ const NAPT_PROBES: u16 = 8;
+ 
++/// Search the whole candidate window for existing state BEFORE considering a
++/// free slot. Otherwise an expired earlier collision silently changes an
++/// established flow's public port. A second bounded compatibility search lets
++/// an upgraded owner use the actual port replicated by the deployed allocator.
++#[inline(never)]
++fn existing_napt_port(
++    flow: &FlowKey,
++    origin: [u8; 4],
++    wan_ip: [u8; 4],
++    layout: &CgnatLayout,
++    seed: u32,
++) -> u16 {
++    let now = unsafe { bpf_ktime_get_ns() };
++    let timeouts = conntrack::timeouts();
++    napt_find_existing(flow.src_ip, seed, layout, |candidate| {
++        let key = FlowKey::new(
++            flow.policy,
++            flow.dst_ip,
++            wan_ip,
++            flow.dst_port,
++            candidate,
++            flow.proto,
++        );
++        if let Some(state) = unsafe { CONNTRACK.get(&key) }.copied() {
++            if napt_binding_matches(&state, origin, flow.src_port)
++                && !state.expired(flow.proto, now, timeouts)
++            {
++                return true;
++            }
++        }
++        false
++    })
++}
++
+ /// Phase 4b **masquerade** (source NAT + NAPT). A packet leaving a masquerade
+ /// interface has its source rewritten to that interface's public `wan_ip` and its
+ /// source port to a per-flow-unique WAN port, so a private network reaches the
+@@ -2074,9 +2109,9 @@
+     // two internal hosts sending from the same source port to the same destination
+     // would otherwise share one reverse conntrack key and misroute each other's
+     // replies (pure SNAT without PAT). Probe a small window of ephemeral ports
+-    // seeded by the flow hash — reuse the slot already recording THIS flow (a
+-    // retransmit reuses the same port), take the first free slot, else fall back to
+-    // the client's own port (the pre-NAPT behaviour) on exhaustion.
++    // seeded by the flow hash. Existing state wins over a free earlier candidate
++    // and over a new allocator's preferred port. Only a NEW flow takes a free
++    // slot; exhaustion drops rather than stealing another client's mapping.
+     // `masquerade` rather than `forward`: the rewrite is identical (restore the
+     // destination on the reply), but the entry additionally records that its NAT
+     // target is the client that *originated* the connection — the only place that
+@@ -2093,8 +2128,21 @@
+         Some(l) => *l,
+         None => CgnatLayout::default(),
+     };
+-    let mut wan_port = 0;
++    let flow = FlowKey::new(policy_id, src_addr, dst_addr, src_port, dst_port, proto);
++    let mut wan_port = existing_napt_port(&flow, reply_target, wan_ip, &layout, seed);
++    if wan_port == 0 {
++        wan_port = existing_napt_port(
++            &flow,
++            reply_target,
++            wan_ip,
++            &layout,
++            legacy_napt_seed(src_addr, dst_addr, src_port, dst_port),
++        );
++    }
+     for i in 0..NAPT_PROBES {
++        if wan_port != 0 {
++            break;
++        }
+         let cand = match layout.candidate(src_addr, seed, i) {
+             Some(p) => p,
+             None => napt_port(seed, i),
+@@ -2107,7 +2155,7 @@
+             }
+             Some(s)
+                 if s.expired(proto, unsafe { bpf_ktime_get_ns() }, conntrack::timeouts())
+-                    || (s.nat_ip == reply_target && s.nat_port == src_port) =>
++                    || napt_binding_matches(&s, reply_target, src_port) =>
+             {
+                 wan_port = cand;
+                 break;
+@@ -2135,9 +2183,7 @@
+     match CONNTRACK.get_ptr_mut(&rkey) {
+         // SAFETY: as in `account_flow` — a pointer into this CPU's map value,
+         // read and written before any other operation on the map.
+-        Some(entry)
+-            if unsafe { (*entry).nat_ip == reply_target && (*entry).nat_port == src_port } =>
+-        unsafe {
++        Some(entry) if unsafe { napt_binding_matches(&*entry, reply_target, src_port) } => unsafe {
+             (*entry).account(bytes);
+             (*entry).last_seen_ns = bpf_ktime_get_ns();
+             (*entry).age_ns = 0;

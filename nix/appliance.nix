@@ -1,12 +1,7 @@
 # The Sentinel appliance NixOS configuration.
 #
-# Minimal and immutable-leaning: SSH on (key-only), a firewall, and the
-# `sentinel` CLI available. Each `nixos-rebuild` is a new generation in the boot
-# menu, so a bad change is undone by booting the previous one — the "reload and
-# it works again" guarantee.
-#
-# Wiring the Velstra agent (the eBPF data plane) as a systemd service that loads
-# `sentinel compile`'s output is the next slice.
+# Immutable A/B images, persistent declarative configuration and key-only SSH
+# by default. Customer nodes update through signed images, not runtime rebuilds.
 {
   config,
   pkgs,
@@ -26,9 +21,10 @@
   # was refused with a correct hash in the shadow file and `sshd -T` reporting
   # `passwordauthentication yes`.
   #
-  # This does not weaken the default: sshd still refuses password auth until
-  # the appliance config enables it. It only stops the image from deciding, at
-  # build time, something the operator is supposed to decide at runtime.
+  # Both SSH password transports are disabled below. Disabling only the RFC
+  # password method would leave PAM passwords reachable through keyboard-
+  # interactive. PAM account/session processing remains available to key logins,
+  # and the explicit runtime password opt-in uses PasswordAuthentication only.
   security.pam.services.sshd.unixAuth = lib.mkForce true;
 
   # There is exactly one firewall on this box, and it is the one the operator
@@ -98,6 +94,7 @@
       # Key-only by default; a [services.ssh] password-authentication=true renders a
       # `Match all` drop-in that overrides this to `yes`.
       PasswordAuthentication = false;
+      KbdInteractiveAuthentication = false;
       PermitRootLogin = "no";
     };
   };
@@ -110,13 +107,22 @@
   # order it after the boot service that renders them (sentinel-boot runs early,
   # Before networkd, so this does not delay a routable network).
   systemd.services.sshd.after = [ "sentinel-boot.service" ];
-  systemd.services.sshd.wants = [ "sentinel-boot.service" ];
-  # The host keys now live on the persistent partition, and sshd generates any
-  # that are missing on its first start. If it ran before that partition were
-  # mounted it would generate a fresh pair onto the tmpfs underneath the
-  # mountpoint — reintroducing the churn this is meant to end, and hiding it
-  # behind a directory that looks right afterwards.
+  systemd.services.sshd.requires = [ "sentinel-boot.service" ];
+  # A statically enabled NixOS unit must not override services.ssh.enable=false
+  # after reboot. Sentinel renders this root-owned marker from validated config
+  # before the unit starts, and updates it BEFORE live start/stop operations.
+  # Use effective runtime intent, not saved TOML: commit without save must work.
+  # A missing marker skips the listener (including a failed/incomplete boot).
+  systemd.services.sshd.serviceConfig.ExecCondition =
+    "${pkgs.coreutils}/bin/test -f /run/sentinel-ssh/enabled";
+  # The host keys live on the persistent partition. NixOS generates missing
+  # keys in a SEPARATE sshd-keygen unit, independently pulled in by multi-user.
+  # Ordering only sshd does not order keygen. If keygen ran before the partition
+  # were mounted it could replace a persisted identity after its missing-key
+  # condition had already succeeded against the tmpfs beneath the mountpoint.
+  # Both consumers must wait for the real mount, including a nofail mount.
   systemd.services.sshd.unitConfig.RequiresMountsFor = "/var/lib/sentinel";
+  systemd.services.sshd-keygen.unitConfig.RequiresMountsFor = "/var/lib/sentinel";
 
   users.users.admin = {
     isNormalUser = true;
@@ -128,9 +134,8 @@
   };
   security.sudo.wheelNeedsPassword = lib.mkDefault false;
 
-  # `sentinel commit` shells out to nixos-rebuild (and rollback). The admin is in
-  # `wheel`, which is passwordless above — so commit/rollback work without a
-  # prompt. (Tighten to a specific command rule for production.)
+  # Live declarative apply needs privileged service/network operations. OS
+  # updates remain signed immutable A/B swaps, never runtime Nix rebuilds.
 
   # Test-VM convenience: a console login (SSH is key-only, so the QEMU console
   # would otherwise be a dead end). The flashable appliance image overrides

@@ -34,6 +34,7 @@
   lib,
   pkgs,
   modulesPath,
+  utils,
   ...
 }:
 let
@@ -180,7 +181,7 @@ in
     dataSize = lib.mkOption {
       type = lib.types.str;
       default = "128M";
-      description = "Data partition floor in the built image (the installer grows it to the disk).";
+      description = "Data partition floor in the built image (grown on install or first direct-image boot).";
     };
     secureBootCommonName = lib.mkOption {
       type = lib.types.str;
@@ -313,6 +314,11 @@ in
         options = [
           "rw"
           "nofail"
+          # Direct RAW/QCOW2 imports skip the installer. Grow the verified
+          # existing partition BEFORE mounting, then grow ext4 online without
+          # formatting it. Installer-managed LUKS/RAID members are not resized.
+          "x-systemd.requires=${cfg.slotPrefix}-state-grow.service"
+          "x-systemd.growfs"
           # On an ENCRYPTED install the LABEL=data ext4 lives inside a LUKS volume,
           # so it does not exist until the unlock unit has opened it.
           # `x-systemd.requires=` makes this mount Require + After that service. On a
@@ -337,7 +343,39 @@ in
     # persistent storage, not tmpfs.
     systemd.services = lib.genAttrs cfg.stateDirServices (_: {
       unitConfig.RequiresMountsFor = [ cfg.stateDir ];
-    });
+    }) // {
+      "${cfg.slotPrefix}-state-grow" = {
+        description = "Grow only the verified appliance data partition";
+        wantedBy = [ "local-fs.target" ];
+        after = [ "local-fs-pre.target" ];
+        before = [
+          "local-fs.target"
+          "${utils.escapeSystemdPath cfg.stateDir}.mount"
+          cfg.unlockUnit
+        ];
+        unitConfig = {
+          DefaultDependencies = false;
+          RequiresMountsFor = [ "/usr" ];
+        };
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          TimeoutStartSec = "90s";
+          UMask = "0077";
+          NoNewPrivileges = true;
+          ProtectHome = true;
+          ProtectSystem = "strict";
+          ReadWritePaths = [ "/run" ];
+          # Do not isolate /dev: the helper checks the real mapper/sysfs
+          # ancestry and must see the actual block device, not a private /dev.
+          ExecStart = "${pkgs.python3}/bin/python3 -I ${./grow-state.py} --apply"
+            + " --sfdisk ${pkgs.util-linux}/bin/sfdisk"
+            + " --blkid ${pkgs.util-linux}/bin/blkid"
+            + " --repart ${pkgs.systemd}/bin/systemd-repart"
+            + " --udevadm ${pkgs.systemd}/bin/udevadm";
+        };
+      };
+    };
 
     # Read-only /usr: skip the /usr/bin/env activation step (nixpkgs' verity
     # appliance pattern).

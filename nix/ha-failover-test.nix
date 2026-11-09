@@ -330,7 +330,25 @@ in pkgs.testers.runNixOSTest {
     # Persistent filters must also reconcile removals: a former data link can
     # become a control link without rebooting or deleting unrelated TC filters.
     master.succeed("systemctl stop wren velstra")
-    master.succeed(python_command('import tomllib,json,re; from pathlib import Path; text=Path("/run/sentinel/velstra.toml").read_text(); names=tomllib.loads(text)["ha"]["interfaces"]; names.remove("dmz0"); section=re.search(r"(?ms)^\\[ha\\]\\n(.*?)(?=^\\[|\\Z)",text); assert section; block=re.sub(r"(?ms)^interfaces\\s*=\\s*\\[.*?\\]","interfaces = "+json.dumps(names),section.group()); assert tomllib.loads(block)["ha"]["interfaces"]==names; Path("/tmp/guard-scope.toml").write_text(text[:section.start()]+block+text[section.end():])'))
+    # Reclassifying a resolved binding requires an explicit exact partition.
+    # The incomplete old fixture must be rejected without removing any guard.
+    scope_script = "\n".join([
+        "import tomllib,json,re; from pathlib import Path",
+        'text=Path("/run/sentinel/velstra.toml").read_text(); cfg=tomllib.loads(text)',
+        'names=cfg["ha"]["interfaces"]; names.remove("dmz0")',
+        r'section=re.search(r"(?ms)^\[ha\]\n(.*?)(?=^\[|\Z)",text); assert section',
+        r'block=re.sub(r"(?ms)^interfaces\s*=\s*\[.*?\]","interfaces = "+json.dumps(names),section.group())',
+        'assert tomllib.loads(block)["ha"]["interfaces"]==names',
+        'Path("/tmp/guard-scope-incomplete.toml").write_text(text[:section.start()]+block+text[section.end():])',
+        'controls=cfg["ha"]["control_interfaces"]; assert "dmz0" not in controls; controls.append("dmz0")',
+        r'block=re.sub(r"(?ms)^control_interfaces\s*=\s*\[.*?\]","control_interfaces = "+json.dumps(controls),block)',
+        'moved=tomllib.loads(block)["ha"]; assert moved["interfaces"]==names and moved["control_interfaces"]==controls and set(names).isdisjoint(controls)',
+        'Path("/tmp/guard-scope.toml").write_text(text[:section.start()]+block+text[section.end():])',
+    ])
+    master.succeed(python_command(scope_script))
+    status, diagnostic = master.execute("${self.packages.x86_64-linux.velstra}/bin/velstra ha-guard /tmp/guard-scope-incomplete.toml 2>&1")
+    assert status != 0 and "HA guard/control sets must cover every resolved binding" in diagnostic, diagnostic
+    master.succeed("tc filter show dev dmz0 ingress | grep -q bpf; tc filter show dev dmz0 egress | grep -q bpf; tc filter show dev eth2 ingress | grep -q bpf")
     master.succeed("${self.packages.x86_64-linux.velstra}/bin/velstra ha-guard /tmp/guard-scope.toml")
     master.succeed("! tc filter show dev dmz0 ingress | grep -q bpf; ! tc filter show dev dmz0 egress | grep -q bpf; tc filter show dev eth2 ingress | grep -q bpf")
     master.succeed("${self.packages.x86_64-linux.velstra}/bin/velstra ha-guard /run/sentinel/velstra.toml")
