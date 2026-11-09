@@ -890,6 +890,8 @@ pub fn install_ha_secret(path: &Path, contents: &str) -> Result<()> {
 }
 fn install_owned_atomic(path: &Path, contents: &str, private: bool) -> Result<()> {
     use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::io::AsRawFd;
     let _transaction = apply_lock()?;
     let parent = path
         .parent()
@@ -903,10 +905,22 @@ fn install_owned_atomic(path: &Path, contents: &str, private: bool) -> Result<()
     if std::fs::metadata(parent)?.uid() == unsafe { libc::geteuid() } {
         match PrivateStage::create(parent, if private { 0o600 } else { 0o640 }) {
             Ok(mut stage) => {
-                stage.file.write_all(contents.as_bytes())?;
                 if let Some(gid) = (!private).then(wheel_gid).flatten() {
-                    std::os::unix::fs::chown(&stage.path, None, Some(gid))?;
+                    anyhow::ensure!(
+                        unsafe { libc::fchown(stage.file.as_raw_fd(), !0, gid) } == 0,
+                        std::io::Error::last_os_error()
+                    );
                 }
+                // Creation mode is masked by umask. Set the final mode through
+                // the private descriptor BEFORE writing any secret bytes.
+                stage
+                    .file
+                    .set_permissions(std::fs::Permissions::from_mode(if private {
+                        0o600
+                    } else {
+                        0o640
+                    }))?;
+                stage.file.write_all(contents.as_bytes())?;
                 stage.file.sync_all()?;
                 std::fs::rename(&stage.path, path)
                     .with_context(|| format!("atomically replacing {}", path.display()))?;
@@ -1992,6 +2006,106 @@ pub(crate) fn sudo(cmd: &str, args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atomic_config_modes_are_umask_independent_in_child_processes() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::process::CommandExt;
+
+        fn mask() -> u32 {
+            let status = std::fs::read_to_string("/proc/self/status").unwrap();
+            let value = status
+                .lines()
+                .find_map(|line| line.strip_prefix("Umask:"))
+                .expect("Linux process umask observation");
+            u32::from_str_radix(value.trim(), 8).unwrap()
+        }
+
+        let child_mask = match std::env::args().next().as_deref() {
+            Some("sentinel-atomic-config-umask-child-022") => Some(0o022),
+            Some("sentinel-atomic-config-umask-child-077") => Some(0o077),
+            _ => None,
+        };
+        if let Some(expected) = child_mask {
+            assert_eq!(
+                mask(),
+                expected,
+                "the child must inherit the requested mask"
+            );
+            let directory = std::env::temp_dir().join(format!(
+                "sentinel-atomic-mode-{}-{expected:03o}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let config = directory.join("appliance.toml");
+            let private = directory.join("private-state");
+            for _ in 0..2 {
+                install_config_file(&config, "public permission regression fixture").unwrap();
+                install_ha_secret(&private, "public private-mode regression fixture").unwrap();
+                let configuration = std::fs::metadata(&config).unwrap();
+                let secret = std::fs::metadata(&private).unwrap();
+                assert_eq!(configuration.mode() & 0o7777, 0o640);
+                assert_eq!(secret.mode() & 0o7777, 0o600);
+                assert_eq!(configuration.uid(), unsafe { libc::geteuid() });
+                assert_eq!(secret.uid(), configuration.uid());
+                if let Some(wheel) = wheel_gid() {
+                    assert_eq!(configuration.gid(), wheel);
+                }
+                assert_eq!(
+                    std::fs::read_to_string(&config).unwrap(),
+                    "public permission regression fixture"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&private).unwrap(),
+                    "public private-mode regression fixture"
+                );
+                assert!(!std::fs::read_dir(&directory).unwrap().any(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".sentinel-config-")
+                }));
+                assert_eq!(mask(), expected, "installation must not change the umask");
+            }
+            std::fs::remove_dir_all(directory).unwrap();
+            return;
+        }
+
+        let original_mask = mask();
+        for (name, expected) in [
+            ("sentinel-atomic-config-umask-child-022", 0o022),
+            ("sentinel-atomic-config-umask-child-077", 0o077),
+        ] {
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child.arg0(name).args([
+                "--exact",
+                "system::tests::atomic_config_modes_are_umask_independent_in_child_processes",
+                "--nocapture",
+                "--test-threads=1",
+            ]);
+            // SAFETY: after fork, change only the child's mask with one libc
+            // call. No allocation, environment access or locks in this closure;
+            // the parent test process and its concurrent tests are untouched.
+            unsafe {
+                child.pre_exec(move || {
+                    libc::umask(expected);
+                    Ok(())
+                });
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "umask {expected:03o} child failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(stdout.contains("1 passed; 0 failed; 0 ignored"), "{stdout}");
+            assert_eq!(mask(), original_mask, "child changed the parent mask");
+        }
+    }
 
     #[test]
     fn atomic_config_replacement_does_not_follow_the_old_predictable_temp_path() {
