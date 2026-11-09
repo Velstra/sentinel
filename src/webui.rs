@@ -207,6 +207,7 @@ pub fn page() -> String {
     let management_js = include_str!("management.js");
     let management_css = include_str!("../ui/dist/management.css");
     let react_js = include_str!("../ui/dist/management.js");
+    let max_port_range = crate::config::MAX_PORT_RANGE;
     format!(
         r##"<!doctype html>
 <html lang="en">
@@ -954,6 +955,7 @@ pub fn page() -> String {
     background: var(--surface-sunken);
     border-left: 3px solid var(--border-strong);
   }}
+  #write-boundary, #stack-sync-note {{ padding: var(--space-3) var(--space-4); margin: 0 0 var(--space-4); }}
   .ok {{ color: var(--status-up); }}
 
   dialog {{
@@ -1198,11 +1200,18 @@ pub fn page() -> String {
     font: var(--fw-semibold) var(--text-xs)/1.2 var(--font-sans); color: var(--text-muted);
   }}
   .cluster button {{
-    display: flex; align-items: center; gap: var(--space-2); font-size: var(--text-sm);
+    display: grid; grid-template-columns: max-content minmax(0, 1fr);
+    align-items: center; column-gap: var(--space-2); row-gap: var(--space-1);
+    font-size: var(--text-sm); text-align: left;
   }}
   .cluster .role {{
-    margin-left: auto; font: var(--fw-regular) var(--text-2xs)/1.4 var(--font-mono);
+    margin-left: 0; font: var(--fw-regular) var(--text-2xs)/1.4 var(--font-mono);
     color: var(--text-muted);
+  }}
+  .cluster .member-name {{ min-width: 0; overflow-wrap: anywhere; }}
+  .cluster .member-state {{
+    grid-column: 2; margin-left: 0; display: flex; align-items: center;
+    flex-wrap: wrap; gap: var(--space-1) var(--space-2); text-align: left;
   }}
   .cluster .crev {{
     font-family: var(--font-mono); font-size: var(--text-2xs); color: var(--text-faint);
@@ -1668,6 +1677,7 @@ pub fn page() -> String {
     <div class="cluster">
       <span class="clabel">Cluster</span>
       <div id="clusterlist"></div>
+      <p id="cluster-sync-note" class="hint hidden" role="status"></p>
       <span class="crev" id="clusterrev">rev —</span>
     </div>
 
@@ -1718,6 +1728,7 @@ pub fn page() -> String {
     <div id="react-confirmation"></div>
     <div class="secstrip" id="sectionstrip"></div>
     <div class="page" id="pagehead"></div>
+    <p class="note hidden" id="write-boundary" role="status"></p>
 
     <div id="view-dashboard">
       <!-- What the box is, in numbers, before any chart. An operator opening a
@@ -1778,7 +1789,7 @@ pub fn page() -> String {
           </select>
         </label>
         <span class="spacer"></span>
-        <button class="btn" id="togglerule">New rule</button>
+        <button class="btn" id="togglerule" disabled data-config-loading aria-busy="true" title="Loading configuration…">New rule</button>
       </div>
 
       <!-- Built by `renderAddPanel` from the same field table as the editor. -->
@@ -1813,7 +1824,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Zones</h3>
         <span class="spacer"></span>
-        <button class="btn" id="togglezone">New zone</button>
+        <button class="btn" id="togglezone" disabled data-config-loading aria-busy="true" title="Loading configuration…">New zone</button>
       </div>
       <div class="card addpanel hidden" id="addzonepanel"></div>
       <div id="zonelist"></div>
@@ -1823,7 +1834,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Source NAT</h3>
         <span class="spacer"></span>
-        <button class="btn" id="togglesnat">New source rule</button>
+        <button class="btn" id="togglesnat" disabled data-config-loading aria-busy="true" title="Loading configuration…">New source rule</button>
       </div>
       <div class="card addpanel hidden" id="addsnatpanel"></div>
       <div id="snatlist"></div>
@@ -1831,7 +1842,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Destination NAT</h3>
         <span class="spacer"></span>
-        <button class="btn" id="toggleddnat">New port forward</button>
+        <button class="btn" id="toggleddnat" disabled data-config-loading aria-busy="true" title="Loading configuration…">New port forward</button>
       </div>
       <div class="card addpanel hidden" id="adddnatpanel"></div>
       <div id="dnatlist"></div>
@@ -1848,7 +1859,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Prefix translation</h3>
         <span class="spacer"></span>
-        <button class="btn" id="togglenpt">New translation</button>
+        <button class="btn" id="togglenpt" disabled data-config-loading aria-busy="true" title="Loading configuration…">New translation</button>
       </div>
       <p class="lede inset" style="margin:0 0 var(--space-4)">
         Translate IPv6 prefixes at the border while preserving host addresses.
@@ -1867,7 +1878,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Site-to-site tunnels</h3>
         <span class="spacer"></span>
-        <button class="btn" id="toggleipsec">New tunnel</button>
+        <button class="btn" id="toggleipsec" disabled data-config-loading aria-busy="true">New tunnel</button>
       </div>
       <div class="card addpanel hidden" id="addipsecpanel"></div>
       <div id="ipseclist"></div>
@@ -1880,7 +1891,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Interfaces</h3>
         <span class="spacer"></span>
-        <button class="btn" id="togglewg">New interface</button>
+        <button class="btn" id="togglewg" disabled data-config-loading aria-busy="true" title="Loading configuration…">New interface</button>
       </div>
       <div class="card addpanel hidden" id="addwgpanel"></div>
       <div id="wglist"></div>
@@ -1893,7 +1904,7 @@ pub fn page() -> String {
         <h3>Peers</h3>
         <span class="spacer"></span>
         <label class="inline"><span>on</span><select id="wgtunnel"></select></label>
-        <button class="btn" id="togglewgpeer">New peer</button>
+        <button class="btn" id="togglewgpeer" disabled data-config-loading aria-busy="true" title="Loading configuration…">New peer</button>
       </div>
       <div class="card addpanel hidden" id="addwgpeerpanel"></div>
       <div id="wgpeerlist"></div>
@@ -1932,7 +1943,7 @@ pub fn page() -> String {
         <h3>Reservations</h3>
         <span class="spacer"></span>
         <label class="inline"><span>on</span><select id="mapiface"></select></label>
-        <button class="btn" id="togglemap">New</button>
+        <button class="btn" id="togglemap" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
       </div>
       <p class="lede inset" style="margin:0 0 var(--space-4)">
         The same address every time, for a machine that has to be findable. The
@@ -1962,7 +1973,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Interfaces</h3>
         <span class="spacer"></span>
-        <button class="btn" id="toggleiface">New</button>
+        <button class="btn" id="toggleiface" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
       </div>
       <div class="card addpanel hidden" id="addifacepanel"></div>
       <div id="ifacelist"></div>
@@ -1986,7 +1997,7 @@ pub fn page() -> String {
           </select>
         </label>
         <span class="spacer"></span>
-        <button class="btn" id="togglegroup">New</button>
+        <button class="btn" id="togglegroup" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
       </div>
       <div class="card addpanel hidden" id="addgrouppanel"></div>
       <div id="grouplist"></div>
@@ -2000,7 +2011,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Load-balanced services</h3>
         <span class="spacer"></span>
-        <button class="btn" id="togglelb">New</button>
+        <button class="btn" id="togglelb" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
       </div>
       <div class="card addpanel hidden" id="addlbpanel"></div>
       <div id="lblist"></div>
@@ -2013,7 +2024,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Certificate authorities</h3>
         <span class="spacer"></span>
-        <button class="btn" id="toggleca">New</button>
+        <button class="btn" id="toggleca" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
       </div>
       <div class="card addpanel hidden" id="addcapanel"></div>
       <div id="calist"></div>
@@ -2032,7 +2043,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Certificates</h3>
         <span class="spacer"></span>
-        <button class="btn" id="togglecert">New</button>
+        <button class="btn" id="togglecert" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
       </div>
       <div class="card addpanel hidden" id="addcertpanel"></div>
       <div id="certlist"></div>
@@ -2045,7 +2056,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Administrators</h3>
         <span class="spacer"></span>
-        <button class="btn" id="toggleuser">New</button>
+        <button class="btn" id="toggleuser" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
       </div>
       <div class="card addpanel hidden" id="adduserpanel"></div>
       <div id="userlist"></div>
@@ -2057,7 +2068,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Permission groups</h3>
         <span class="spacer"></span>
-        <button class="btn" id="toggleadmingroup">New group</button>
+        <button class="btn" id="toggleadmingroup" disabled data-config-loading aria-busy="true" title="Loading configuration…">New group</button>
       </div>
       <div class="card addpanel hidden" id="addadmingrouppanel"></div>
       <div id="admingrouplist"></div>
@@ -2073,7 +2084,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Authentication servers</h3>
         <span class="spacer"></span>
-        <button class="btn" id="toggleradius">New RADIUS server</button>
+        <button class="btn" id="toggleradius" disabled data-config-loading aria-busy="true" title="Loading configuration…">New RADIUS server</button>
       </div>
       <div class="card addpanel hidden" id="addradiuspanel"></div>
       <div id="radiuslist"></div>
@@ -2081,7 +2092,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Directories (LDAP)</h3>
         <span class="spacer"></span>
-        <button class="btn" id="toggleldap">New directory</button>
+        <button class="btn" id="toggleldap" disabled data-config-loading aria-busy="true" title="Loading configuration…">New directory</button>
       </div>
       <p class="lede inset" style="margin:0 0 var(--space-4)">
         Authenticate with a direct user bind. Set the account base and username
@@ -2093,7 +2104,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>TACACS+ servers</h3>
         <span class="spacer"></span>
-        <button class="btn" id="toggletacacs">New TACACS+ server</button>
+        <button class="btn" id="toggletacacs" disabled data-config-loading aria-busy="true" title="Loading configuration…">New TACACS+ server</button>
       </div>
       <div class="card addpanel hidden" id="addtacacspanel"></div>
       <div id="tacacslist"></div>
@@ -2112,7 +2123,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>SYN-protected ports</h3>
         <span class="spacer"></span>
-        <button class="btn" id="togglesyn">New</button>
+        <button class="btn" id="togglesyn" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
       </div>
       <div class="card addpanel hidden" id="addsynpanel"></div>
       <div id="synlist"></div>
@@ -2158,7 +2169,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Segments</h3>
         <span class="spacer"></span>
-        <button class="btn" id="toggleevi">New</button>
+        <button class="btn" id="toggleevi" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
       </div>
       <p class="lede">
         A layer-2 segment and the local ports on it. The VNI is the segment's id
@@ -2170,7 +2181,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Tenants</h3>
         <span class="spacer"></span>
-        <button class="btn" id="toggleipvrf">New</button>
+        <button class="btn" id="toggleipvrf" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
       </div>
       <p class="lede">
         Routing <em>between</em> segments, for a tenant with more than one
@@ -2210,7 +2221,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Virtual router groups</h3>
         <span class="spacer"></span>
-        <button class="btn" id="togglevrrp">New</button>
+        <button class="btn" id="togglevrrp" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
       </div>
       <p class="lede">
         A tracked interface is what makes failover mean something: when it goes
@@ -2265,7 +2276,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Uplinks</h3>
         <span class="spacer"></span>
-        <button class="btn" id="togglewan">New uplink</button>
+        <button class="btn" id="togglewan" disabled data-config-loading aria-busy="true" title="Loading configuration…">New uplink</button>
       </div>
       <div class="card addpanel hidden" id="addwanpanel"></div>
       <div id="wanlist"></div>
@@ -2273,7 +2284,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Steering</h3>
         <span class="spacer"></span>
-        <button class="btn" id="togglewanpolicy">New policy</button>
+        <button class="btn" id="togglewanpolicy" disabled data-config-loading aria-busy="true" title="Loading configuration…">New policy</button>
       </div>
       <p class="lede inset" style="margin:0 0 var(--space-4)">
         Assign traffic to preferred uplinks and define when it should move to a
@@ -2290,7 +2301,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Accounts</h3>
         <span class="spacer"></span>
-        <button class="btn" id="toggleocuser">New account</button>
+        <button class="btn" id="toggleocuser" disabled data-config-loading aria-busy="true" title="Loading configuration…">New account</button>
       </div>
       <div class="card addpanel hidden" id="addocuserpanel"></div>
       <div id="oculist"></div>
@@ -2311,7 +2322,7 @@ pub fn page() -> String {
           <label class="inline"><span>List</span><select id="pllist-pick"></select></label>
           <label class="inline"><span>New list</span><input id="plnew" placeholder="e.g. customer-prefixes" style="max-width:14rem"></label>
           <span class="spacer"></span>
-          <button class="btn" id="togglepl">New rule</button>
+          <button class="btn" id="togglepl" disabled data-config-loading aria-busy="true" title="Loading configuration…">New rule</button>
         </div>
         <div class="card addpanel hidden" id="addplpanel"></div>
         <div id="pllist"></div>
@@ -2322,7 +2333,7 @@ pub fn page() -> String {
           <label class="inline"><span>Map</span><select id="rmlist-pick"></select></label>
           <label class="inline"><span>New map</span><input id="rmnew" placeholder="e.g. export-transit" style="max-width:14rem"></label>
           <span class="spacer"></span>
-          <button class="btn" id="togglerm">New rule</button>
+          <button class="btn" id="togglerm" disabled data-config-loading aria-busy="true" title="Loading configuration…">New rule</button>
         </div>
         <div class="card"><h3>Map</h3><div class="grid" id="rmglobal"></div></div>
         <div class="card addpanel hidden" id="addrmpanel"></div>
@@ -2333,7 +2344,7 @@ pub fn page() -> String {
         <div class="section">
           <h3>Rules</h3>
           <span class="spacer"></span>
-          <button class="btn" id="togglepbr">New rule</button>
+          <button class="btn" id="togglepbr" disabled data-config-loading aria-busy="true" title="Loading configuration…">New rule</button>
         </div>
         <div class="card addpanel hidden" id="addpbrpanel"></div>
         <div id="pbrlist"></div>
@@ -2349,7 +2360,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Kernel parameters</h3>
         <span class="spacer"></span>
-        <button class="btn" id="togglesysctl">New</button>
+        <button class="btn" id="togglesysctl" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
       </div>
       <div class="card addpanel hidden" id="addsysctlpanel"></div>
       <div id="sysctllist"></div>
@@ -2373,7 +2384,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Update channels</h3>
         <span class="spacer"></span>
-        <button class="btn" id="toggleupchan">New channel</button>
+        <button class="btn" id="toggleupchan" disabled data-config-loading aria-busy="true" title="Loading configuration…">New channel</button>
       </div>
       <p class="lede inset" style="margin:0 0 var(--space-4)">
         Each channel has its own signing key. Subscriptions gate updates, not features;
@@ -2394,7 +2405,7 @@ pub fn page() -> String {
         <div class="section">
           <h3>Routes</h3>
           <span class="spacer"></span>
-          <button class="btn" id="toggleroute">New</button>
+          <button class="btn" id="toggleroute" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
         </div>
         <div class="card addpanel hidden" id="addroutepanel"></div>
         <div id="routelist"></div>
@@ -2406,7 +2417,7 @@ pub fn page() -> String {
         <div class="section">
           <h3>Aggregates</h3>
           <span class="spacer"></span>
-          <button class="btn" id="toggleagg">New aggregate</button>
+          <button class="btn" id="toggleagg" disabled data-config-loading aria-busy="true" title="Loading configuration…">New aggregate</button>
         </div>
         <p class="lede inset" style="margin:0 0 var(--space-4)">
           One prefix announced in place of the more specific ones inside it.
@@ -2418,7 +2429,7 @@ pub fn page() -> String {
         <div class="section">
           <h3>Route origin authorisations</h3>
           <span class="spacer"></span>
-          <button class="btn" id="toggleroa">New authorisation</button>
+          <button class="btn" id="toggleroa" disabled data-config-loading aria-busy="true" title="Loading configuration…">New authorisation</button>
         </div>
         <p class="lede inset" style="margin:0 0 var(--space-4)">
           Which AS may originate a prefix, stated locally rather than fetched
@@ -2429,7 +2440,7 @@ pub fn page() -> String {
         <div class="section">
           <h3>Neighbours</h3>
           <span class="spacer"></span>
-          <button class="btn" id="togglebgp">New neighbour</button>
+          <button class="btn" id="togglebgp" disabled data-config-loading aria-busy="true" title="Loading configuration…">New neighbour</button>
         </div>
         <div class="card addpanel hidden" id="addbgppanel"></div>
         <div id="bgplist"></div>
@@ -2481,7 +2492,7 @@ pub fn page() -> String {
         <div class="section">
           <h3>Interfaces</h3>
           <span class="spacer"></span>
-          <button class="btn" id="togglemcastif">New</button>
+          <button class="btn" id="togglemcastif" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
         </div>
         <div class="card addpanel hidden" id="addmcastifpanel"></div>
         <div id="mcastiflist"></div>
@@ -2494,7 +2505,7 @@ pub fn page() -> String {
         <div class="section">
           <h3>Instances</h3>
           <span class="spacer"></span>
-          <button class="btn" id="togglevrf">New VRF</button>
+          <button class="btn" id="togglevrf" disabled data-config-loading aria-busy="true" title="Loading configuration…">New VRF</button>
         </div>
         <div class="card addpanel hidden" id="addvrfpanel"></div>
         <div id="vrflist"></div>
@@ -2541,7 +2552,7 @@ pub fn page() -> String {
         <div class="section">
           <h3>PPPoE subscribers</h3>
           <span class="spacer"></span>
-          <button class="btn" id="togglepppoeuser">New subscriber</button>
+          <button class="btn" id="togglepppoeuser" disabled data-config-loading aria-busy="true" title="Loading configuration…">New subscriber</button>
         </div>
         <div class="card addpanel hidden" id="addpppoeuserpanel"></div>
         <div id="pppoeusers"></div>
@@ -2553,7 +2564,7 @@ pub fn page() -> String {
         <div class="section">
           <h3>Reverse proxy</h3>
           <span class="spacer"></span>
-          <button class="btn" id="togglerp">New frontend</button>
+          <button class="btn" id="togglerp" disabled data-config-loading aria-busy="true" title="Loading configuration…">New frontend</button>
         </div>
         <div class="card addpanel hidden" id="addrppanel"></div>
         <div id="rplist"></div>
@@ -2561,7 +2572,7 @@ pub fn page() -> String {
         <div class="section">
           <h3>Broadcast relays</h3>
           <span class="spacer"></span>
-          <button class="btn" id="togglebr">New relay</button>
+          <button class="btn" id="togglebr" disabled data-config-loading aria-busy="true" title="Loading configuration…">New relay</button>
         </div>
         <div class="card addpanel hidden" id="addbrpanel"></div>
         <div id="brlist"></div>
@@ -2594,7 +2605,7 @@ pub fn page() -> String {
         <div class="section">
           <h3>Syslog collectors</h3>
           <span class="spacer"></span>
-          <button class="btn" id="togglesl">New collector</button>
+          <button class="btn" id="togglesl" disabled data-config-loading aria-busy="true" title="Loading configuration…">New collector</button>
         </div>
         <div class="card addpanel hidden" id="addslpanel"></div>
         <div id="sllist"></div>
@@ -2715,6 +2726,7 @@ pub fn page() -> String {
     <div id="view-stack" class="hidden">
       <div class="card">
         <h3>Members</h3>
+        <p id="stack-sync-note" class="note hidden" role="status"></p>
         <div class="tblwrap"><table id="stacktable"></table></div>
         <p class="lede" style="margin:var(--space-3) 0 0">
           A member is a <code>system config-sync peer</code> — the boxes this one
@@ -2805,7 +2817,17 @@ let gateObserver = null;
 let view = "dashboard";
 let panel = null;
 let target = "";           // "" = this appliance, otherwise a stack member
+// Account permission and selected-member context are separate. Both legacy
+// staging and its shared render gate consume this reason; React keeps the same
+// boundary through Host.canWrite + Host.remote, never a new permission grant.
+const writeBlockReason = () => !mayWrite()
+  ? "This account may read the configuration, not change it"
+  : target ? "Peer view is read-only. Select this appliance to make changes."
+           : "";
 let timer = null;
+let memberRead = null;
+let memberReadAbort = null;
+let memberReadEpoch = 0;
 const history = new Map(); // counter -> recent values, for the sparklines
 let lastCounters = null;
 let lastCountersAt = 0;
@@ -3663,8 +3685,9 @@ function stage(label, lines) {{
   // themselves after every fetch and a button can be drawn before the gate
   // runs over it, which is how a read-only account came to hold a pending
   // "delete firewall rule".
-  if (!mayWrite()) {{
-    banner("This account may read the configuration, not change it");
+  const refusal = writeBlockReason();
+  if (refusal) {{
+    banner(refusal, "note");
     return;
   }}
   const cmds = lines.filter(Boolean);
@@ -3687,8 +3710,8 @@ function renderStaged() {{
     $("stagedbadge").textContent = "applying";
     $("stagedbadge").className = "pill busy";
   }} else {{
-    $("stagedbadge").textContent = n ? n + " pending change" + (n === 1 ? "" : "s")
-                                     : "no pending changes";
+    $("stagedbadge").textContent = n ? n + " staged change" + (n === 1 ? "" : "s")
+                                     : "no staged changes";
     $("stagedbadge").className = "pill" + (n ? " warn" : " rest");
   }}
   $("stagedbadge").title = n ? "Review the staged changes" : "";
@@ -3697,7 +3720,7 @@ function renderStaged() {{
   $("discard").classList.toggle("hidden", n === 0);
   $("applystaged").classList.toggle("hidden", n === 0);
   $("stagedcard").classList.toggle("hidden", n === 0);
-  $("stagedtitle").textContent = n + " pending change" + (n === 1 ? "" : "s");
+  $("stagedtitle").textContent = n + " staged change" + (n === 1 ? "" : "s");
 
   const list = $("stagedlist");
   list.textContent = "";
@@ -4197,6 +4220,10 @@ const HINTS = {{
 // One hint per field, recomputed as it is typed into. Debounced because the
 // asynchronous ones cross the network, and a keystroke is not a question.
 function wireHint(field, widget, box, values) {{
+  if (isUpdateSigningKey(field[0])) {{
+    box.textContent = "Paste an Ed25519 PUBLIC KEY PEM or use file:/etc/sentinel/release.pem; never paste a private key.";
+    return () => {{}};
+  }}
   const compute = HINTS[field[0]];
   // What the appliance does with an empty box, where that is a sentence rather
   // than a value. It stands under the field, not in it: a placeholder is as
@@ -4463,7 +4490,7 @@ const PATH_DEFAULTS = {{
   // A burst left alone is one second's worth of the limit, which is what
   // "a hundred a second" already means to the person who typed it.
   "firewall rule": {{ burst: "one second's worth of the limit" }},
-  "services reverse-proxy": {{ port: "443" }},
+  "services reverse-proxy": {{ port: "443", mode: "http" }},
   "services portal": {{ port: "8082", "session-timeout": "3600" }},
   "services syslog": {{ port: "514" }},
   "services ssh": {{ port: "22" }},
@@ -4901,6 +4928,9 @@ const OFFERED = {{
 // name alone would offer this box's DHCP reservations in both. Longest prefix
 // wins, as everywhere else that a path decides what a word means.
 const PATH_OFFERS = {{
+  // IKE endpoints are IPv4 in the appliance schema. Do not recommend an
+  // IPv6 local address while retaining dual-stack offers for other protocols.
+  "vpn ipsec": {{ local: () => localAddresses().filter((address) => !address.includes(":")) }},
   "firewall rule": {{
     port: wellKnownPorts,
     source: anySubnet, destination: anySubnet,
@@ -5289,12 +5319,51 @@ function secretWidget(name, value) {{
   return box;
 }}
 
+function isUpdateSigningKey(key, path = fieldPath) {{
+  return key === "public-key" && (path === "update" || path.startsWith("update channel "));
+}}
+
+function updateSigningKeyValue(value) {{
+  const raw = String(value || "");
+  // Whitespace is valid filename material, not PEM formatting. Do not
+  // silently replace a configured key reference with a different pathname.
+  return raw.startsWith("file:") ? raw : raw.trim();
+}}
+
+function updateSigningKeyError(value) {{
+  if (value.startsWith("file:")) {{
+    return value.length > 5 && new TextEncoder().encode(value.slice(5)).length <= 4096 && !/[\u0000-\u001f\u007f-\u009f]/.test(value)
+      ? "" : "Use file: followed by the public-key file path.";
+  }}
+  const begin = "-----BEGIN PUBLIC KEY-----", end = "-----END PUBLIC KEY-----";
+  const problem = "Use an Ed25519 PUBLIC KEY PEM or file:/etc/sentinel/release.pem.";
+  if (value.length > 4096 || !value.startsWith(begin) || !value.endsWith(end)) return problem;
+  const body = value.slice(begin.length, -end.length).replace(/[ \t\r\n\f\v]/g, "");
+  try {{
+    const der = atob(body), prefix = [48,42,48,5,6,3,43,101,112,3,33,0];
+    return der.length === 44 && btoa(der) === body && prefix.every((byte, i) => der.charCodeAt(i) === byte) ? "" : problem;
+  }} catch {{ return problem; }}
+}}
+
+function displayedUpdateKey(value) {{
+  const key = updateSigningKeyValue(value);
+  if (!key || key.startsWith("file:") || updateSigningKeyError(key)) return key;
+  const body = key.slice("-----BEGIN PUBLIC KEY-----".length, -"-----END PUBLIC KEY-----".length).replace(/[ \t\r\n\f\v]/g, "");
+  return "-----BEGIN PUBLIC KEY-----\n" + body + "\n-----END PUBLIC KEY-----";
+}}
+
 function fieldWidget(field, value) {{
   // A heading, not a setting: eighteen inputs in one flat grid is a form nobody
   // reads top to bottom, and the groups are how an operator already thinks
   // about the protocol — where it speaks, how fast, who it trusts.
   if (field[0] === "#") return null;
-  if (field[4] === "secret") return secretWidget(field[1], value);
+  if (isSecretField(field)) return secretWidget(field[1], value);
+  if (isUpdateSigningKey(field[0])) {{
+    const box = el("textarea", {{ class: "resize-none", rows: "4", spellcheck: "false",
+      placeholder: "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=\n-----END PUBLIC KEY-----" }});
+    box.value = displayedUpdateKey(value);
+    return box;
+  }}
   // A field that points at something the appliance already has is a choice,
   // not a spelling test. A key that carries its path — `import bgp`, `export
   // ospf` — is answered by the first word: what may go there is decided by the
@@ -5415,6 +5484,42 @@ function fieldWidget(field, value) {{
 // is not a sentence anybody wrote on purpose.
 const defaultLabel = (v) => (v.includes(" ") ? "defaults to " + v : "default " + v);
 
+// Ranged port matches remain text: a number input would erase valid lists and
+// ranges. Validate their structure before staging, using the backend's limit.
+const FIREWALL_PORT_RANGE_MAX = {max_port_range};
+function firewallPortsError(value) {{
+  for (const entry of value.split(",").map((part) => part.trim()).filter(Boolean)) {{
+    const match = entry.match(/^(\+?\d+)(?:\s*-\s*(\+?\d+))?$/);
+    if (!match) return "Use ports 1–65535, separated by commas, or ranges such as 8000-8100.";
+    const start = Number(match[1]), end = match[2] === undefined ? start : Number(match[2]);
+    if (start < 1 || start > 65535 || end < 1 || end > 65535) return "Ports must be 1–65535.";
+    if (start > end) return "Range start must not exceed its end.";
+    if (end - start + 1 > FIREWALL_PORT_RANGE_MAX) return "Limit each range to " + FIREWALL_PORT_RANGE_MAX + " ports.";
+  }}
+  return "";
+}}
+
+// Blur runs during pointer-down, before the eventual click. Revealing an error
+// at that point can move the pressed target out from under pointer-up and lose
+// the click. Keep one shared queue for every grammar form; keyboard blur remains
+// immediate, and validation on Add/Stage is never delayed or bypassed.
+const validationPointers = new Set();
+const deferredBlurChecks = new Set();
+function flushBlurChecks() {{
+  setTimeout(() => {{
+    if (validationPointers.size) return;
+    const pending = [...deferredBlurChecks]; deferredBlurChecks.clear();
+    for (const check of pending) check();
+  }}, 0);
+}}
+document.addEventListener("pointerdown", (event) => validationPointers.add(event.pointerId), true);
+for (const type of ["pointerup", "pointercancel"]) {{
+  document.addEventListener(type, (event) => {{
+    validationPointers.delete(event.pointerId); flushBlurChecks();
+  }}, true);
+}}
+window.addEventListener("blur", () => {{ validationPointers.clear(); flushBlurChecks(); }});
+
 // Associate the shared field's hint/error with the actual input, including
 // composite number/secret/suggestion widgets. Client checks prevent malformed
 // staging; the complete appliance schema remains the final validator.
@@ -5435,11 +5540,16 @@ function bindField(field, widget, hint, label = field[1], required = false) {{
   hint.after(error);
   input.setAttribute("aria-describedby", hint.id + " " + error.id);
   input.setAttribute("aria-errormessage", error.id);
+  // Capture the owner now: fieldPath changes while other forms are rendered.
+  const firewallPorts = field[0] === "port" && fieldPath.startsWith("firewall rule");
+  const updateKey = isUpdateSigningKey(field[0]);
   let touched = false;
   const check = (show = true) => {{
     let message = "";
-    const value = String(widget.value || "").trim();
+    const value = updateKey ? updateSigningKeyValue(widget.value) : String(widget.value || "").trim();
     if (required && !value) message = "Set " + label.toLowerCase() + ".";
+    else if (updateKey && value) message = updateSigningKeyError(value);
+    else if (firewallPorts && value) message = firewallPortsError(value);
     else if (input.type === "number") {{
       if (input.validity.badInput || value && !/^\d+$/.test(value)) message = "Enter a whole number.";
       else if (value && (input.validity.rangeUnderflow || input.validity.rangeOverflow)) {{
@@ -5456,7 +5566,12 @@ function bindField(field, widget, hint, label = field[1], required = false) {{
     return !message;
   }};
   input.addEventListener("input", () => {{ touched = true; check(); }});
-  input.addEventListener("blur", () => {{ touched = true; check(); }});
+  const blurCheck = () => {{ if (input.isConnected) check(); }};
+  input.addEventListener("blur", () => {{
+    touched = true;
+    if (validationPointers.size) deferredBlurChecks.add(blurCheck);
+    else blurCheck();
+  }});
   widget.addEventListener("change", () => {{ if (touched) check(); }});
   return check;
 }}
@@ -5614,7 +5729,7 @@ function fieldGrid(fields, row, required, form) {{
     const owns = kind.includes("pick") || kind.includes("switch") || secret;
     // A set of tick boxes needs the run; a single figure does not, and neither
     // does a switch — two states take less room than a sentence, not more.
-    const size = kind.includes("pick") || kind.includes("chips") ? " w-l"
+    const size = widgets[i].tagName === "TEXTAREA" || kind.includes("pick") || kind.includes("chips") ? " w-l"
       : kind.includes("switch") ? " w-auto"
       : (WIDTH[f[0]] ? " " + WIDTH[f[0]] : " w-m");
     const box = el(owns ? "div" : "label", {{ class: "field" + size }}, [label, widgets[i], hint]);
@@ -5735,13 +5850,15 @@ function fieldLines(fields, widgets, path, before) {{
   const push = (line) => {{ if (!lines.includes(line)) lines.push(line); }};
   fields.forEach((f, i) => {{
     if (!widgets[i]) return;   // a heading writes nothing
-    const v = (widgets[i].value || "").trim();
+    const raw = widgets[i].value || "";
+    const updateKey = isUpdateSigningKey(f[0], path);
+    const v = updateKey ? updateSigningKeyValue(raw) : isSecretField(f) ? raw : raw.trim();
     const had = (before && before[f[0]]) || "";
     if (!v) {{
       if (had) push(`delete ${{path}} ${{CLEARS[f[0]] || f[0]}}`);
       return;
     }}
-    if (v === had) return;
+    if (updateKey ? displayedUpdateKey(v) === displayedUpdateKey(had) : v === had) return;
     // A repeatable setting *adds*. Editing "CN,RU" down to "CN" by setting the
     // new value would leave RU blocked and nothing on screen would say so, so
     // the list is cleared first and then written. Not `pick`: that one names a
@@ -5758,7 +5875,13 @@ function fieldLines(fields, widgets, path, before) {{
     }} else {{
       // Peer identity is one JSON token, including spaces and escaped keys.
       // Quote protected values as well so a credential is never a CLI fragment.
-      const argument = f[0] === "peer-identity" || f[4] === "secret" ? JSON.stringify(v) : v;
+      // A port list/range is ONE CLI argument even when an operator spaces its
+      // commas or dash. Keep the same token encoder as credentials/identities.
+      const spacedPorts = path.startsWith("firewall rule ") && f[0] === "port" && /\s/.test(v);
+      // Keep PEM in one CLI token/line, never turn a literal newline into a
+      // command boundary. The field-specific setter restores canonical PEM.
+      const argument = isUpdateSigningKey(f[0], path) ? JSON.stringify(v.replace(/[\r\n]+/g, " "))
+        : f[0] === "peer-identity" || isSecretField(f) || spacedPorts ? JSON.stringify(v) : v;
       push(`set ${{path}} ${{f[0]}} ${{argument}}`);
     }}
   }});
@@ -5888,7 +6011,14 @@ function firstGroup(fields) {{
 const SECRETS = [
   "psk", "password", "hashed-password", "private-key", "preshared-key",
   "auth-key", "secret", "passphrase", "macsec-key", "subscription-key", "enrollment-token",
+  "ao-key", "totp", "peer-identity",
 ];
+
+// One classification owns both readback redaction and editing. Otherwise adding
+// a credential to an ordinary settings mask silently creates a plaintext input.
+function isSecretField(field) {{
+  return field[4] === "secret" || SECRETS.includes(field[0]);
+}}
 
 function shown(key, value) {{
   if (!SECRETS.includes(key)) return value;
@@ -6054,7 +6184,14 @@ function markSpread(node, head, first, bar) {{
 
 // `o` carries: listId, addId?, noun, fields, path(name), rows, badge?, nameHint, empty.
 function renderObjects(o) {{
-  if (!configReadable && !o.rows.length) return unreadable(o.listId);
+  if (!configReadable && !o.rows.length) {{
+    const trigger = o.toggleId && $(o.toggleId);
+    if (trigger && trigger.hasAttribute("data-config-loading")) {{
+      trigger.setAttribute("aria-busy", "false");
+      trigger.title = "Read the configuration successfully before creating an object.";
+    }}
+    return unreadable(o.listId);
+  }}
   const list = $(o.listId);
   list.textContent = "";
   if (!o.rows.length) {{
@@ -6089,22 +6226,47 @@ function renderObjects(o) {{
 function gateWrites() {{
   // React owns permissions and busy state for the migrated management views.
   if (typeof management !== "undefined") management.contextChanged();
-  if (mayWrite()) {{
+  const reason = writeBlockReason();
+  const notice = $("write-boundary");
+  if (notice.textContent !== reason) notice.textContent = reason;
+  notice.classList.toggle("hidden", !reason);
+  const pill = $("permpill");
+  const permissionLabel = target ? "peer · read-only"
+    : permission === "read-only" ? "read-only" : "checking access";
+  if (pill.textContent !== permissionLabel) pill.textContent = permissionLabel;
+  pill.classList.toggle("hidden", !reason);
+  // Target changes call this gate before awaiting a read. Keep observing late
+  // async renders for peer views as well as read-only/unknown accounts.
+  if (reason && !gateObserver) {{
+    gateObserver = new MutationObserver(() => gateWrites());
+    gateObserver.observe(document.body,
+      {{ childList: true, subtree: true }});
+  }} else if (!reason && gateObserver) {{
+    gateObserver.disconnect(); gateObserver = null;
+  }}
+  if (!reason) {{
     // The permission was unknown and turned out to allow writes: lift exactly
     // the gates this function closed, and nothing another rule disabled.
-    for (const b of document.querySelectorAll("main button[data-write-gated]")) {{
+    for (const b of document.querySelectorAll("main [data-write-gated], #editor [data-write-gated]")) {{
       b.disabled = false;
-      b.title = "";
+      b.title = b.dataset.writeGated;
+      const descriptions = (b.getAttribute("aria-describedby") || "").split(/\s+/)
+        .filter((id) => id && id !== "write-boundary");
+      if (descriptions.length) b.setAttribute("aria-describedby", descriptions.join(" "));
+      else b.removeAttribute("aria-describedby");
       delete b.dataset.writeGated;
     }}
     return;
   }}
-  for (const b of document.querySelectorAll("main button")) {{
-    if (/^(edit|delete|new|add|stage|apply|validate|generate|lift|capture|roll)/i
-        .test(b.textContent.trim())) {{
+  for (const b of document.querySelectorAll("main button, #editor button, #defaultpolicy")) {{
+    if ((b.id === "defaultpolicy" || /^(edit|delete|new|add|stage|apply|validate|generate|lift|capture|roll|disconnect)/i
+        .test(b.textContent.trim())) && (!b.disabled || b.hasAttribute("data-write-gated"))) {{
+      if (!b.hasAttribute("data-write-gated")) b.dataset.writeGated = b.title;
       b.disabled = true;
-      b.dataset.writeGated = "";
-      b.title = "This account may read the configuration, not change it";
+      b.title = reason;
+      const descriptions = (b.getAttribute("aria-describedby") || "").split(/\s+/).filter(Boolean);
+      if (!descriptions.includes("write-boundary")) descriptions.push("write-boundary");
+      b.setAttribute("aria-describedby", descriptions.join(" "));
     }}
   }}
 }}
@@ -6114,6 +6276,24 @@ function renderAddPanel(o) {{
   // as it was when the page loaded.
   const box = $(o.addId);
   box.textContent = "";
+  box.setAttribute("role", "region");
+  box.setAttribute("aria-label", o.toggleLabel || "New " + o.noun.toLowerCase());
+  const dismiss = () => {{
+    box.classList.add("hidden");
+    const trigger = o.toggleId && $(o.toggleId);
+    if (trigger) {{
+      trigger.textContent = o.toggleLabel || "New";
+      trigger.setAttribute("aria-expanded", "false");
+      trigger.focus();
+    }}
+  }};
+  // A drawer can cover its toolbar toggle. Its own Cancel and Escape remain
+  // reachable; closing retains the unstaged values and never changes a batch.
+  box.onkeydown = (event) => {{
+    if (event.key === "Escape" && !event.defaultPrevented) {{
+      event.preventDefault(); event.stopPropagation(); dismiss();
+    }}
+  }};
   maskHost(box);
   fieldPath = o.path("<n>");
   // Object identifiers are not all names: route prefixes, neighbor addresses
@@ -6167,19 +6347,31 @@ function renderAddPanel(o) {{
       // everything else `lines` is non-empty by the check above.
       const body = lines.length ? lines : [`set ${{o.path(n)}}`];
       stage(`${{o.noun}} ${{n}}`, (o.prelude ? o.prelude(n) : []).concat(body));
-      box.classList.add("hidden");
-      // The toolbar button says "Cancel" while the panel is open; closing it
-      // from in here has to put that back or the next click reopens nothing.
-      if (o.toggleId && $(o.toggleId)) $(o.toggleId).textContent = o.toggleLabel || "New";
+      dismiss();
       // Rebuild the section so the thing just staged can be chosen by the next
       // one: creating a permission group and then an account in it is one piece
       // of work, and a form built before the group existed cannot offer it.
       refresh();
     }},
   }});
-  const foot = el("div", {{ class: "maskfoot" }}, [add]);
+  const cancel = el("button", {{ class: "btn", type: "button", text: "Cancel", onclick: dismiss }});
+  const foot = el("div", {{ class: "maskfoot" }}, [add, cancel]);
   if (more) foot.append(more);
   box.append(foot, err);
+  // The form owner also owns its disclosure. A hand-maintained startup list
+  // left valid, rendered forms (including update channels and AAA) unreachable.
+  // Rebinding onclick is idempotent and preserves the drawer's current state.
+  const trigger = o.toggleId && $(o.toggleId);
+  if (trigger) wireToggle(o.toggleId, o.addId, o.toggleLabel || "New");
+  // Initial creation controls wait for this actual configuration/form. Never
+  // lift another prerequisite/permission gate.
+  if (trigger && trigger.hasAttribute("data-config-loading")) {{
+    trigger.removeAttribute("data-config-loading");
+    trigger.removeAttribute("aria-busy");
+    trigger.title = "";
+    trigger.disabled = false;
+    gateWrites();
+  }}
 }}
 
 // The human name of a field, for a message about it. A message that names the
@@ -6253,10 +6445,15 @@ function explain(message) {{
 }}
 
 function wireToggle(buttonId, panelId, label) {{
+  $(buttonId).setAttribute("aria-controls", panelId);
+  $(buttonId).setAttribute("aria-expanded", String(!$(panelId).classList.contains("hidden")));
   $(buttonId).onclick = () => {{
     const panel = $(panelId);
     panel.classList.toggle("hidden");
-    $(buttonId).textContent = panel.classList.contains("hidden") ? label : "Cancel";
+    const open = !panel.classList.contains("hidden");
+    $(buttonId).textContent = open ? "Cancel" : label;
+    $(buttonId).setAttribute("aria-expanded", String(open));
+    if (open) panel.querySelector("input,select,textarea,button")?.focus();
   }};
 }}
 
@@ -6305,10 +6502,18 @@ function parseConfig(doc) {{
     filled[filled.length - 1] = true;
     const node = [].concat(...stack);
     const words = line.split(/\s+/);
+    let value = isUpdateSigningKey(words[0], node.join(" "))
+      ? line.slice(words[0].length).trimStart() : words.slice(1).join(" ");
+    // The release-key renderer quotes filenames/PEM as one CLI token. Decode
+    // only this owned variant; do not reinterpret other protocols' values.
+    if (isUpdateSigningKey(words[0], node.join(" ")) && value.startsWith('"')) {{
+      value = JSON.parse(value);
+      if (typeof value !== "string") throw new Error("Invalid update public-key representation");
+    }}
     out.push({{
       path: node.concat(words[0]),
       node: node.join(" "),
-      value: words.slice(1).join(" "),
+      value,
     }});
   }}
   return out;
@@ -6621,7 +6826,9 @@ const IPSEC = [
 ];
 
 async function refreshIpsec() {{
-  await showInto("ipsecshow", "/api/v1/show/vpn/ipsec");
+  // A missing/slow daemon must not prevent correcting its configuration or
+  // leave an enabled New button opening an empty drawer. Render configuration
+  // first; the independent diagnostic retains its own pending/error owner.
   renderObjects({{
     listId: "ipseclist", form: FORMS.ipsec, required: "remote", toggleId: "toggleipsec", toggleLabel: "New tunnel", addId: "addipsecpanel", noun: "Tunnel",
     fields: IPSEC, nameHint: "branch-office",
@@ -6631,6 +6838,9 @@ async function refreshIpsec() {{
                                         : {{ text: "incomplete", cls: "warn" }},
     empty: "No IPsec tunnels configured.",
   }});
+  // showInto owns read pending/error/generation state. Its diagnostic is not
+  // part of the form transaction, so it must not keep Validate/Apply busy.
+  void showInto("ipsecshow", "/api/v1/show/vpn/ipsec");
 }}
 
 // ---- WireGuard -----------------------------------------------------------
@@ -6810,7 +7020,7 @@ async function refreshDhcp() {{
 // masks had the same problem the interface one did.
 const FORMS = {{
   bgpNeighbour: {{ essential: ["remote-as", "description", "update-source"] }},
-  ipsec: {{ essential: ["remote", "local", "psk"] }},
+  ipsec: {{ essential: ["remote", "local", "local-subnet", "remote-subnet", "psk"] }},
   wireguard: {{ essential: ["private-key", "listen-port"] }},
   wgPeer: {{ essential: ["allowed-ips", "endpoint"] }},
   loadBalancer: {{ essential: ["zone", "vip", "port", "backend"] }},
@@ -8697,14 +8907,53 @@ async function refreshConfig() {{
 
 // ---- stack ---------------------------------------------------------------
 
+// Delivery status is not connectivity, nor proof of bidirectional equality.
+// The API reports this member's durable outbox; never infer it from reachable.
+function configSyncState(member) {{
+  if (member.name === "self") return {{ text: "Local", cls: "", help: "This appliance" }};
+  const states = {{
+    "in-sync": {{ text: "Delivered", cls: "up", help: "No local changes await delivery to this peer." }},
+    "pending": {{ text: "Pending delivery", cls: "warn", help: "Local changes are queued for this peer." }},
+    "conflict": {{ text: "Conflict", cls: "warn", help: "Compare member configurations before choosing which change to keep." }},
+  }};
+  return Object.hasOwn(states, member.sync) ? states[member.sync]
+    : {{ text: "Unknown", cls: "warn", help: "Configuration delivery status could not be checked." }};
+}}
+
+function configSyncBadge(member) {{
+  const state = configSyncState(member);
+  return el("span", {{ class: "pill " + state.cls, text: state.text,
+    title: state.help, "aria-label": "Configuration: " + state.text }});
+}}
+
+function renderConfigSyncNotice(id, members) {{
+  const peers = members?.filter((m) => m.name !== "self");
+  const message = !peers ? "Configuration delivery is unavailable. Reload to check again."
+    : peers.some((m) => m.sync === "conflict")
+    ? "Configuration conflict. Compare member configurations in Stack before choosing a revision."
+    : peers.some((m) => m.sync === "pending")
+    ? "Local changes await peer delivery. See Stack for status."
+    : peers.some((m) => m.sync !== "in-sync")
+    ? "Configuration delivery is unknown. See Stack for status." : "";
+  const note = $(id);
+  if (note.textContent !== message) note.textContent = message;
+  note.classList.toggle("hidden", !message);
+}}
+
 async function refreshStack() {{
+  return refreshCluster();
+}}
+
+function renderStackMembers(members, failure) {{
   const t = $("stacktable");
   t.textContent = "";
-  t.append(el("tr", {{}}, ["member", "hostname", "state", ""].map((h) => el("th", {{ text: h }}))));
-  let data;
-  try {{ data = await (await api("/api/v1/stack")).json(); }}
-  catch (e) {{ t.append(el("tr", {{}}, [el("td", {{ colspan: "4", text: String(e.message || e) }})])); return; }}
-  for (const m of data.members) {{
+  t.append(el("tr", {{}}, ["member", "hostname", "state", "configuration", ""].map((h) => el("th", {{ text: h }}))));
+  if (!members) {{
+    renderConfigSyncNotice("stack-sync-note", null);
+    t.append(el("tr", {{}}, [el("td", {{ colspan: "5", text: String(failure?.message || failure || "Member status unavailable") }})])); return;
+  }}
+  renderConfigSyncNotice("stack-sync-note", members);
+  for (const m of members) {{
     const isSelf = m.name === "self";
     const name = isSelf ? "" : m.name;
     const select = el("button", {{
@@ -8716,7 +8965,7 @@ async function refreshStack() {{
       // appliances is not a rate.
       onclick: () => {{
         target = name; history.clear(); lastCounters = null;
-        refresh(); refreshCluster(); refreshStack();
+        refresh();
       }},
     }});
     t.append(el("tr", {{}}, [
@@ -8726,12 +8975,13 @@ async function refreshStack() {{
         class: "pill " + (m.reachable ? "up" : "down"),
         text: m.reachable ? "reachable" : "unreachable",
       }})]),
+      el("td", {{}}, [configSyncBadge(m)]),
       el("td", {{}}, [select]),
     ]));
   }}
-  if (data.members.length === 1) {{
+  if (members.length === 1) {{
     t.append(el("tr", {{}}, [el("td", {{
-      colspan: "4",
+      colspan: "5",
       text: "No peers configured — set system config-sync peer <host> to add one.",
     }})]));
   }}
@@ -9382,35 +9632,80 @@ function renderSectionStrip() {{
   }}
 }}
 
-// The rail's cluster card: the same members the Stack view lists, kept where an
-// operator can see at a glance which box they are actually driving.
-async function refreshCluster() {{
+// One bounded, session-owned read drives BOTH member surfaces. Separate reads
+// allowed a reachable peer to say Conflict in Stack and Delivered in the rail.
+function refreshCluster() {{
+  if (!token) return Promise.resolve();
+  if (memberRead) return memberRead;
+  const requestToken = token, epoch = ++memberReadEpoch;
+  const controller = new AbortController();
+  memberReadAbort = controller;
+  const current = () => token === requestToken && memberReadEpoch === epoch && !controller.signal.aborted;
+  for (const id of ["stacktable", "clusterlist"]) $(id).setAttribute("aria-busy", "true");
+  const pending = (async () => {{
+    try {{
+      const data = await (await api("/api/v1/stack", {{ signal: controller.signal }})).json();
+      if (!current()) return;
+      if (!Array.isArray(data.members)) throw new Error("Member status unavailable");
+      renderStackMembers(data.members);
+      renderClusterMembers(data.members);
+      // Revision is a separate selected-member observation; never hold up a
+      // subsequent delivery refresh while a slow CLI-backed revision loads.
+      refreshClusterRevision(epoch, requestToken, target);
+    }} catch (error) {{
+      if (current()) {{
+        renderStackMembers(null, error);
+        renderClusterMembers(null);
+        $("clusterrev").textContent = "rev —";
+      }}
+    }} finally {{
+      if (memberRead === pending) {{
+        memberRead = null; memberReadAbort = null;
+        for (const id of ["stacktable", "clusterlist"]) $(id).setAttribute("aria-busy", "false");
+      }}
+    }}
+  }})();
+  memberRead = pending;
+  return pending;
+}}
+
+// The rail's cluster card is rendered from that same authoritative snapshot.
+function renderClusterMembers(members) {{
   const list = $("clusterlist");
   list.textContent = "";
-  let data;
-  try {{ data = await (await api("/api/v1/stack")).json(); }} catch (e) {{ return; }}
-  for (const m of data.members) {{
+  if (!members) {{
+    renderConfigSyncNotice("cluster-sync-note", null); return;
+  }}
+  for (const m of members) {{
     const isSelf = m.name === "self";
     const name = isSelf ? "" : m.name;
     const b = el("button", {{
       onclick: () => {{
         target = name; history.clear(); lastCounters = null;
-        refresh(); refreshCluster();
+        refresh();
       }},
     }});
     b.setAttribute("aria-current", String(target === name));
     b.append(
       el("span", {{ class: "dot " + (m.reachable ? "up" : "down") }}),
-      el("span", {{ text: m.hostname || (isSelf ? "this appliance" : m.name) }}),
-      el("span", {{ class: "role", text: isSelf ? "local" : "peer" }}),
+      el("span", {{ class: "member-name", text: m.hostname || (isSelf ? "this appliance" : m.name) }}),
+      el("span", {{ class: "member-state" }}, [
+        el("span", {{ class: "role", text: isSelf ? "local" : "peer" }}),
+        ...(!isSelf ? [configSyncBadge(m)] : []),
+      ]),
     );
     list.append(b);
   }}
+  renderConfigSyncNotice("cluster-sync-note", members);
+}}
+
+async function refreshClusterRevision(epoch, requestToken, member) {{
+  const current = () => memberReadEpoch === epoch && token === requestToken && target === member;
   try {{
     const revs = (await text("/api/v1/show/system/commit")).trim().split("\n");
     const first = revs.find((l) => /\d/.test(l));
-    $("clusterrev").textContent = first ? "rev " + first.trim().split(/\s+/)[0] : "rev —";
-  }} catch (e) {{ $("clusterrev").textContent = "rev —"; }}
+    if (current()) $("clusterrev").textContent = first ? "rev " + first.trim().split(/\s+/)[0] : "rev —";
+  }} catch (e) {{ if (current()) $("clusterrev").textContent = "rev —"; }}
 }}
 
 // Ask again for a permission the appliance has not yet stated (a status call
@@ -9428,6 +9723,7 @@ async function learnPermission() {{
 async function refresh() {{
   // Invalidate observations before any slower CLI-backed page request yields.
   renderLive();
+  if (token && view !== "stack") refreshCluster();
   if (permission === "unknown" && view !== "dashboard") learnPermission();
   renderSectionStrip();
   renderPageHeader();
@@ -9524,11 +9820,6 @@ function renderWho() {{
   if ($("whoinit")) $("whoinit").textContent = init;
   if ($("userchip")) $("userchip").title = who ? "signed in as " + who : "signed in with the machine token";
   const readOnly = !mayWrite();
-  const pill = $("permpill");
-  if (pill) {{
-    pill.textContent = permission === "read-only" ? "read-only" : "checking access";
-    pill.classList.toggle("hidden", !readOnly);
-  }}
   // Everything that changes the appliance is a POST, and a read-only token is
   // refused every one of them. Saying so here beats saying it afterwards.
   for (const id of ["applystaged", "applystaged2", "validate", "discard"]) {{
@@ -9536,14 +9827,6 @@ function renderWho() {{
     if (!b) continue;
     b.disabled = readOnly;
     b.title = readOnly ? "This account may read the configuration, not change it" : "";
-  }}
-  if (readOnly && !gateObserver) {{
-    gateObserver = new MutationObserver(() => gateWrites());
-    gateObserver.observe(document.querySelector("main") || document.body,
-      {{ childList: true, subtree: true }});
-  }} else if (!readOnly && gateObserver) {{
-    gateObserver.disconnect();
-    gateObserver = null;
   }}
   gateWrites();
 }}
@@ -9554,6 +9837,16 @@ function signOut(message) {{
   $("navclear").classList.add("hidden");
   setNavigation(false);
   stopManagement();
+  memberReadEpoch++;
+  memberReadAbort?.abort();
+  memberRead = null; memberReadAbort = null;
+  for (const id of ["stacktable", "clusterlist"]) {{
+    $(id).textContent = ""; $(id).setAttribute("aria-busy", "false");
+  }}
+  for (const id of ["stack-sync-note", "cluster-sync-note"]) {{
+    $(id).textContent = ""; $(id).classList.add("hidden");
+  }}
+  $("clusterrev").textContent = "rev —";
   token = "";
   who = "";
   permission = "unknown";
@@ -9587,7 +9880,6 @@ function signedIn() {{
   buildNav();
   renderStaged();
   startManagement();
-  refreshCluster();
   buildSearchIndex();
   refresh();
   // Only the dashboard polls: a panel refreshing under a reader who is trying to
@@ -9663,11 +9955,25 @@ $("signout").onclick = () => {{
   }}
   signOut("");
 }};
-// The real header height, including narrow/zoomed wrapping, positions drawers.
-const headerSize = new window.ResizeObserver(([entry]) => {{
-  document.documentElement.style.setProperty("--bar-h", Math.ceil(entry.target.getBoundingClientRect().height) + "px");
-}});
-headerSize.observe(document.querySelector(".bar"));
+// Drawers start below the header's VIEWPORT edge, not merely its own height:
+// the mobile brand row sits above it until the document scrolls. Observe both
+// rows and scrolling so focused fields never disappear beneath sticky chrome.
+const appHeader = document.querySelector(".bar");
+let headerFrame = null;
+function measureHeader() {{
+  if (headerFrame !== null) return;
+  headerFrame = requestAnimationFrame(() => {{
+    headerFrame = null;
+    const edge = Math.ceil(Math.max(0, Math.min(innerHeight, appHeader.getBoundingClientRect().bottom)));
+    document.documentElement.style.setProperty("--bar-h", edge + "px");
+  }});
+}}
+const headerSize = new window.ResizeObserver(measureHeader);
+headerSize.observe(appHeader);
+headerSize.observe(document.querySelector(".app > aside"));
+window.addEventListener("scroll", measureHeader, {{ passive: true }});
+window.addEventListener("resize", measureHeader);
+measureHeader();
 function setNavigation(open, restoreFocus = false) {{
   $("app").dataset.navigation = open ? "open" : "closed";
   $("navtoggle").setAttribute("aria-expanded", String(open));
@@ -9735,15 +10041,6 @@ $("applystaged2").onclick = () => applyStaged(["commit", "save"]);
 $("validate").onclick = () => applyStaged([]);
 $("refresh").onclick = () => refresh();
 $("allcounters").onchange = () => refreshDashboard();
-wireToggle("toggleiface", "addifacepanel", "New");
-wireToggle("toggleroute", "addroutepanel", "New");
-wireToggle("togglegroup", "addgrouppanel", "New");
-wireToggle("togglelb", "addlbpanel", "New");
-wireToggle("toggleca", "addcapanel", "New");
-wireToggle("togglecert", "addcertpanel", "New");
-wireToggle("toggleuser", "adduserpanel", "New");
-wireToggle("togglesyn", "addsynpanel", "New");
-wireToggle("togglevrrp", "addvrrppanel", "New");
 $("groupkind").onchange = () => refreshGroups();
 // Opening the details, or coming back to the tab, shows current numbers at
 // once rather than up to one poll interval later.
@@ -9816,21 +10113,6 @@ $("runcapture").onclick = async () => {{
   btn.disabled = false;
   btn.textContent = "Capture";
 }};
-wireToggle("togglezone", "addzonepanel", "New zone");
-wireToggle("togglesnat", "addsnatpanel", "New source rule");
-wireToggle("toggleddnat", "adddnatpanel", "New port forward");
-wireToggle("togglebgp", "addbgppanel", "New neighbour");
-wireToggle("toggleipsec", "addipsecpanel", "New tunnel");
-wireToggle("togglewg", "addwgpanel", "New interface");
-wireToggle("togglewgpeer", "addwgpeerpanel", "New peer");
-wireToggle("togglerp", "addrppanel", "New frontend");
-wireToggle("togglebr", "addbrpanel", "New relay");
-wireToggle("togglesl", "addslpanel", "New collector");
-wireToggle("toggleadmingroup", "addadmingrouppanel", "New group");
-wireToggle("togglewan", "addwanpanel", "New uplink");
-wireToggle("toggleocuser", "addocuserpanel", "New account");
-wireToggle("togglepl", "addplpanel", "New rule");
-wireToggle("togglerm", "addrmpanel", "New rule");
 $("wgtunnel").onchange = () => refreshWireguard();
 $("pllist-pick").onchange = () => {{ $("plnew").value = ""; refreshRoutePolicy(); }};
 $("rmlist-pick").onchange = () => {{ $("rmnew").value = ""; refreshRoutePolicy(); }};
@@ -10482,6 +10764,32 @@ mod tests {
         assert!(html.contains("canWrite: () => permission === \"read-write\""));
     }
 
+    #[test]
+    fn peer_settings_share_a_local_write_boundary_and_independent_delivery_state() {
+        let html = page();
+        assert!(html.contains("const writeBlockReason = () => !mayWrite()"));
+        assert!(html.contains("const refusal = writeBlockReason();"));
+        assert!(html.contains("const reason = writeBlockReason();"));
+        assert!(html.contains("Peer view is read-only. Select this appliance"));
+        assert!(html.contains(r#"id="write-boundary" role="status""#));
+        assert!(html.contains("function configSyncState(member)"));
+        assert!(html.contains("Object.hasOwn(states, member.sync)"));
+        for state in ["Delivered", "Pending delivery", "Conflict", "Unknown"] {
+            assert!(html.contains(&format!(r#"text: "{state}""#)));
+        }
+        assert!(html.contains("configSyncBadge(m)"));
+        assert!(html.contains(r#"id="cluster-sync-note""#));
+        assert!(html.contains("function renderStackMembers(members, failure)"));
+        assert!(html.contains("function renderClusterMembers(members)"));
+        assert!(html.contains("if (memberRead) return memberRead;"));
+        assert!(html.contains("memberReadAbort?.abort();"));
+        assert!(
+            html.contains(
+                "memberReadEpoch === epoch && token === requestToken && target === member"
+            )
+        );
+    }
+
     /// The legacy "System details" section polls a dozen `show` endpoints. It
     /// must do so only while it is open on a visible tab: collapsed, it asks
     /// for nothing once the signed-in permission is known.
@@ -10652,6 +10960,13 @@ mod tests {
             "URL",
             "AbortController",
             "TextDecoder",
+            // Standard Encoding API, also exercised by the actual browser's
+            // UTF-8 update-key file-reference validation.
+            "TextEncoder",
+            // Standard HTML base64 codecs; exercised by the physical PEM
+            // paste/refusal/CLI round trips, not page-owned functions.
+            "atob",
+            "btoa",
             // Typed arrays and the crypto interface: a page that generates a
             // secret in the browser needs both, and both are as much a builtin
             // as `Array` is.

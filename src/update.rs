@@ -59,9 +59,35 @@ pub struct Manifest {
 /// The product a manifest's `product` field must name.
 pub const PRODUCT: &str = "velstra-sentinel";
 
-/// The version of the running image: the one `show version` prints, which the
-/// release process bumps with every tagged release.
-pub const RUNNING_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Development fallback only. An appliance image release can change without
+/// changing this package version, so it must never be its downgrade floor.
+const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Use the same immutable OS release shown by `show version`. If an actual
+/// verity/slot boot has no usable release identity, refuse instead of quietly
+/// weakening its downgrade floor to the CLI package version. Ordinary non-image
+/// development/test hosts keep the documented package-version fallback.
+pub fn running_version() -> Result<String> {
+    if let Some(version) = crate::image::release_version() {
+        return resolve_running_version(Some(&version), true);
+    }
+    let identity = crate::image::current();
+    resolve_running_version(None, identity.verity.is_some() || identity.slot.is_some())
+}
+
+fn resolve_running_version(declared: Option<&str>, immutable_boot: bool) -> Result<String> {
+    match declared {
+        Some(version) if compare_versions(version, version).is_some() => Ok(version.to_string()),
+        Some(version) => bail!(
+            "running image release {version:?} cannot be compared safely; refusing the update"
+        ),
+        None if immutable_boot => bail!(
+            "running immutable image has no usable IMAGE_VERSION; refusing the update, \
+             not substituting the Sentinel package version"
+        ),
+        None => Ok(PACKAGE_VERSION.to_string()),
+    }
+}
 
 // ---- scratch storage ------------------------------------------------------
 
@@ -489,14 +515,12 @@ fn resolve_pubkey(chan: &UpdateChannel, scratch: &Scratch) -> Result<std::path::
 /// path and the local-image path so both accept a pinned key the same way.
 pub fn resolve_pubkey_pem(public_key: &str, scratch: &Scratch) -> Result<std::path::PathBuf> {
     let pem = if let Some(path) = public_key.strip_prefix("file:") {
-        std::fs::read_to_string(path)
+        String::from_utf8(read_small(Path::new(path), 4096)?)
             .with_context(|| format!("reading pinned update public key from {path}"))?
     } else {
         public_key.to_string()
     };
-    if !pem.contains("BEGIN PUBLIC KEY") {
-        bail!("pinned update public-key is not a PEM public key (-----BEGIN PUBLIC KEY-----)");
-    }
+    let pem = crate::update_key::canonical_pem(&pem)?;
     let dst = scratch.join("pinned-pub.pem");
     std::fs::write(&dst, pem).context("staging the pinned public key")?;
     Ok(dst)
@@ -689,7 +713,15 @@ fn check_manifest_fields(manifest: &Manifest) -> Result<()> {
 /// back. A version that cannot be compared is refused too: "cannot tell" must
 /// not read as "newer".
 pub fn refuse_downgrade(offered: &str, allow_downgrade: bool) -> Result<()> {
-    let verdict = compare_versions(offered, RUNNING_VERSION);
+    refuse_downgrade_against(offered, &running_version()?, allow_downgrade)
+}
+
+pub(crate) fn refuse_downgrade_against(
+    offered: &str,
+    running: &str,
+    allow_downgrade: bool,
+) -> Result<()> {
+    let verdict = compare_versions(offered, running);
     if matches!(
         verdict,
         Some(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater)
@@ -697,10 +729,10 @@ pub fn refuse_downgrade(offered: &str, allow_downgrade: bool) -> Result<()> {
         return Ok(());
     }
     let what = match verdict {
-        Some(_) => format!("release {offered} is OLDER than the running {RUNNING_VERSION}"),
-        None => format!(
-            "release version {offered:?} cannot be compared with the running {RUNNING_VERSION}"
-        ),
+        Some(_) => format!("release {offered} is OLDER than the running {running}"),
+        None => {
+            format!("release version {offered:?} cannot be compared with the running {running}")
+        }
     };
     if allow_downgrade {
         eprintln!("warning: --allow-downgrade: {what}; installing it as asked");
@@ -1382,6 +1414,24 @@ mod tests {
     // there rather than fail the package build. Real crypto coverage lives in the
     // `checks.updatechannel` nixosTest.
 
+    #[test]
+    fn key_loader_repairs_legacy_public_format_and_bounds_file_reads() {
+        let pem = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=\n-----END PUBLIC KEY-----\n";
+        let scratch = Scratch::new().unwrap();
+        let path = resolve_pubkey_pem(&pem.replace('\n', ""), &scratch).unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), pem);
+        let bad = Scratch::new().unwrap();
+        std::fs::write(bad.join("oversized-public-key"), vec![b'x'; 4097]).unwrap();
+        assert!(
+            resolve_pubkey_pem(
+                &format!("file:{}", bad.join("oversized-public-key").display()),
+                &bad
+            )
+            .is_err()
+        );
+        assert!(!bad.join("pinned-pub.pem").exists());
+    }
+
     fn openssl_available() -> bool {
         Command::new(openssl_bin())
             .arg("version")
@@ -1779,10 +1829,41 @@ mod tests {
             "{error}"
         );
         refuse_downgrade("0.3.0", true).unwrap();
-        refuse_downgrade(RUNNING_VERSION, false).unwrap();
+        refuse_downgrade(&running_version().unwrap(), false).unwrap();
         refuse_downgrade("99.0.0", false).unwrap();
         assert!(refuse_downgrade("nightly", false).is_err());
         refuse_downgrade("nightly", true).unwrap();
+    }
+
+    #[test]
+    fn image_release_not_package_version_is_the_replay_floor() {
+        let running = resolve_running_version(Some("2.0.0-qa7"), true).unwrap();
+        assert_eq!(running, "2.0.0-qa7");
+        // Native1226: both image releases exceed the unchanged package1.0.0.
+        let error = refuse_downgrade_against("2.0.0-qa6", &running, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("OLDER") && error.contains("running 2.0.0-qa7"));
+        refuse_downgrade_against("2.0.0-qa7", &running, false).unwrap();
+        refuse_downgrade_against("2.0.0-qa8", &running, false).unwrap();
+        refuse_downgrade_against("2.0.0-qa6", &running, true).unwrap();
+
+        // A legitimate image series below the package must not be rejected.
+        let early = resolve_running_version(Some("0.0.1-lts"), true).unwrap();
+        refuse_downgrade_against("0.0.2-lts", &early, false).unwrap();
+        assert!(refuse_downgrade_against("0.0.0-lts", &early, false).is_err());
+    }
+
+    #[test]
+    fn immutable_missing_or_invalid_release_never_falls_back_to_package() {
+        assert!(resolve_running_version(None, true).is_err());
+        for bad in ["", "latest", "1..0", "1.0.0-", "1.x"] {
+            assert!(resolve_running_version(Some(bad), true).is_err());
+        }
+        assert_eq!(
+            resolve_running_version(None, false).unwrap(),
+            PACKAGE_VERSION
+        );
     }
 
     /// Manifests signed before `product` existed still parse and pass; one

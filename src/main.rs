@@ -35,6 +35,7 @@ mod image;
 mod install;
 mod installer_tui;
 mod ipsec;
+mod ipsec_guards;
 mod lockout;
 mod lookup;
 mod metrics;
@@ -61,6 +62,7 @@ mod trace;
 mod ui;
 mod unlock;
 mod update;
+mod update_key;
 mod velstra;
 mod verified_image;
 mod webui;
@@ -378,6 +380,14 @@ enum Command {
         /// since boot, else the saved config.
         #[arg(long)]
         config: Option<PathBuf>,
+    },
+    /// Protect persisted revision credentials before management/login starts.
+    #[command(hide = true)]
+    ProtectArchives {
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+        #[arg(long)]
+        create: bool,
     },
     /// Ask the data plane agent's query socket and print the reply.
     ///
@@ -806,6 +816,7 @@ async fn main() -> Result<()> {
             wren_out,
         } => apply_boot(&config, &out, &wren_out),
         Command::ApplyBootLate { config } => apply_boot_late(config.as_deref()),
+        Command::ProtectArchives { config, create } => archive::protect_archives(&config, create),
         Command::AgentQuery { command, socket } => {
             let path = socket.unwrap_or_else(|| PathBuf::from(velstra::SOCKET));
             print!("{}", velstra::query_at(&path, &command)?);
@@ -1287,20 +1298,28 @@ fn update_cmd(target: Option<&str>, flags: UpdateFlags) -> Result<()> {
                     // A signed release older than this one is not an update. It
                     // is reported, not hidden: a channel that serves it may be a
                     // stale mirror or somebody replaying an old manifest.
-                    let older = update::refuse_downgrade(&manifest.version, false).is_err();
+                    let running = match update::running_version() {
+                        Ok(version) => version,
+                        Err(error) => {
+                            update::record_status(&chan, &format!("refused: {error:#}"));
+                            return Err(error);
+                        }
+                    };
+                    let older =
+                        update::refuse_downgrade_against(&manifest.version, &running, false)
+                            .is_err();
                     let (outcome, verb) = if older {
                         (
                             format!(
                                 "release {} offered, older than the running {}",
-                                manifest.version,
-                                update::RUNNING_VERSION
+                                manifest.version, running
                             ),
-                            "NOT an update (older than the running release)",
+                            format!("NOT an update (older than the running release {running})"),
                         )
                     } else {
                         (
                             format!("release {} available", manifest.version),
-                            "update available",
+                            "update available".to_string(),
                         )
                     };
                     update::record_status(&chan, &outcome);
@@ -1389,7 +1408,7 @@ fn update_local(path: &str, flags: &UpdateFlags) -> Result<()> {
             "note: this proof states no release version, so it cannot be checked against \
              the running {} — use the release's signed manifest (--signature \
              …/manifest.json.sig) for downgrade protection",
-            update::RUNNING_VERSION
+            update::running_version().unwrap_or_else(|_| "unidentified image release".to_string())
         ),
     }
     install::update_verified(&proof.source, &proof.sha256, flags.commit)
@@ -1685,32 +1704,44 @@ fn ask_yes(msg: &str, default_yes: bool) -> Result<bool> {
     })
 }
 
-/// The first settings the wizard collects, as `set …` lines.
-///
-/// Built as CLI lines and replayed through the real command parser rather than
-/// assembled into a document here. That is the whole reason this is safe to add:
-/// every value the wizard collects is judged by the same grammar and the same
-/// `validate()` an operator's own `configure` session goes through, so the
-/// wizard cannot invent a configuration the appliance would refuse — and it
-/// cannot drift from the CLI as either one changes.
-///
-/// Both front ends — the full-screen installer and the line-by-line one — end
-/// here, so the two cannot produce different configurations from the same
-/// answers.
+/// Preserve a collected value as exactly one word in the real CLI lexer.
+fn wizard_word(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|c| !c.is_whitespace() && !matches!(c, '"' | '\\' | '#'))
+    {
+        value.to_string()
+    } else {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+}
+
+fn wizard_review_line(line: &str) -> String {
+    match line.split_once(" password ") {
+        Some((head, _)) => format!("{head} password ********"),
+        None => line.to_string(),
+    }
+}
+
+/// The settings collected by both installer front ends, replayed through the
+/// real CLI grammar and configuration validation rather than a second schema.
 fn wizard_lines_from(a: &installer_tui::Answers) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    out.push(format!("set system keyboard {}", a.keyboard));
-    out.push(format!("set system locale {}", a.locale));
-    out.push(format!("set system timezone {}", a.timezone));
-    out.push(format!("set system hostname {}", a.hostname));
+    out.push(format!("set system keyboard {}", wizard_word(&a.keyboard)));
+    out.push(format!("set system locale {}", wizard_word(&a.locale)));
+    out.push(format!("set system timezone {}", wizard_word(&a.timezone)));
+    out.push(format!("set system hostname {}", wizard_word(&a.hostname)));
     out.push(format!(
         "set system login {} password {}",
-        a.username, a.password
+        wizard_word(&a.username),
+        wizard_word(&a.password)
     ));
     if !a.ssh_key.is_empty() {
         out.push(format!(
-            "set system login {} public-key {}",
-            a.username, a.ssh_key
+            "set system login {} ssh-key {}",
+            wizard_word(&a.username),
+            wizard_word(&a.ssh_key)
         ));
     }
     // Without a permission group the account can log in and can do nothing in
@@ -1718,7 +1749,10 @@ fn wizard_lines_from(a: &installer_tui::Answers) -> Vec<String> {
     // creates the box's only account; leaving it unable to manage the box is not
     // a decision anyone made on purpose.
     out.push("set system group operators permission read-write".into());
-    out.push(format!("set system login {} group operators", a.username));
+    out.push(format!(
+        "set system login {} group operators",
+        wizard_word(&a.username)
+    ));
     out.push("set services ssh port 22".into());
     // The appliance is key-only by design, which is right — but the wizard asks
     // for a password and only *offers* a key. An operator who has no key to
@@ -1734,15 +1768,20 @@ fn wizard_lines_from(a: &installer_tui::Answers) -> Vec<String> {
     // interface at all and the box is set up from the console.
     let configured: Vec<&installer_tui::NicPlan> = a.nics.iter().filter(|n| n.configure).collect();
     for nic in &configured {
-        out.push(format!("set interface {} zone {}", nic.name, nic.zone));
+        out.push(format!(
+            "set interface {} zone {}",
+            wizard_word(&nic.name),
+            wizard_word(&nic.zone)
+        ));
         out.push(format!(
             "set interface {} address {}",
-            nic.name, nic.address
+            wizard_word(&nic.name),
+            wizard_word(&nic.address)
         ));
         if nic.address != "dhcp" && !nic.gateway.is_empty() {
             out.push(format!(
                 "set protocols static 0.0.0.0/0 via {}",
-                nic.gateway
+                wizard_word(&nic.gateway)
             ));
         }
     }
@@ -1759,6 +1798,8 @@ fn wizard_lines_from(a: &installer_tui::Answers) -> Vec<String> {
         zones.dedup();
         for zone in zones {
             let rule = format!("install-ssh-{zone}");
+            let rule = wizard_word(&rule);
+            let zone = wizard_word(zone);
             out.push(format!("set firewall rule {rule} from {zone}"));
             out.push(format!("set firewall rule {rule} proto tcp"));
             out.push(format!("set firewall rule {rule} port 22"));
@@ -1921,24 +1962,27 @@ fn collect_text(
 
 /// Turn the collected lines into a validated appliance document.
 fn wizard_config(lines: &[String]) -> Result<String> {
-    let dir = std::env::temp_dir().join(format!("sentinel-wizard-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).context("creating the wizard scratch directory")?;
-    let path = dir.join("appliance.toml");
-    let _ = std::fs::remove_file(&path);
-    let mut session = session::Session::load(&path)?;
-    let act = repl::Apply::off();
-    let mut ctx: Vec<String> = Vec::new();
-    for line in lines {
-        if repl::exec_line(&mut session, &act, &mut ctx, line) {
-            anyhow::bail!("the wizard ended the session at {line:?}");
-        }
+    // A fresh in-memory draft cannot inherit a stale or attacker-prepared
+    // PID-named temporary config. The interactive REPL prints command errors
+    // and returns only an exit flag: it is not a transactional parser result.
+    let mut session = session::Session::empty();
+    for (index, line) in lines.iter().enumerate() {
+        let words = repl::split_line(line);
+        let args: Vec<&str> = words.iter().map(String::as_str).collect();
+        anyhow::ensure!(
+            args.first() == Some(&"set"),
+            "invalid installer command at step {}",
+            index + 1
+        );
+        session.set(&args[1..]).with_context(|| {
+            // Never include the generated line: it may carry a password.
+            format!("invalid installer configuration at step {}", index + 1)
+        })?;
     }
     // `commit` is what runs `validate()`. A wizard that wrote an invalid
     // document would produce a box that will not boot into its own config.
     let appliance = session.commit()?;
-    let toml = appliance.to_toml()?;
-    let _ = std::fs::remove_dir_all(&dir);
-    Ok(toml)
+    appliance.to_toml()
 }
 
 /// The guided installer: collect the first settings, pick the disks, confirm,
@@ -2008,12 +2052,7 @@ fn interactive_install(
         // The password is the one answer that must not be echoed back at the
         // end of an install, where it would sit in the scrollback of whatever
         // terminal or IPMI session did the install.
-        if line.contains(" password ") {
-            let redacted = line.rsplit_once(' ').map(|(head, _)| head).unwrap_or(line);
-            println!("  {redacted} ********");
-        } else {
-            println!("  {line}");
-        }
+        println!("  {}", wizard_review_line(line));
     }
 
     if !confirmed {
@@ -2721,6 +2760,13 @@ fn show_op(args: &[String]) -> Result<()> {
             // are printed every time rather than behind a flag.
             let id = image::current();
             println!("{:<12}{}", "image:", id.describe());
+            println!(
+                "{:<12}{}",
+                "release:",
+                image::release_version()
+                    .as_deref()
+                    .unwrap_or("not reported by the running OS")
+            );
             println!("{:<12}{}", "binaries:", id.binaries_line());
             println!("{:<12}{}", "clock:", clock::current().describe());
             println!("{:<12}{}", "data:", crate::unlock::data_at_rest());
@@ -3693,6 +3739,129 @@ async fn ports(endpoint: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{boot_late_source, firewall_events_since_query, firewall_log_args};
+
+    fn wizard_answers() -> super::installer_tui::Answers {
+        super::installer_tui::Answers {
+            raid: super::install::Raid::None,
+            picks: vec![0],
+            keyboard: "us".into(),
+            locale: "en_US.UTF-8".into(),
+            timezone: "UTC".into(),
+            hostname: "wizard-regression".into(),
+            username: "admin".into(),
+            password: "installer-test-password".into(),
+            ssh_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIabc qa@example".into(),
+            encrypt: false,
+            passphrase: String::new(),
+            nics: vec![super::installer_tui::NicPlan {
+                name: "eth0".into(),
+                configure: true,
+                zone: "wan".into(),
+                address: "dhcp".into(),
+                gateway: String::new(),
+            }],
+            permit_ssh: true,
+        }
+    }
+
+    #[test]
+    fn wizard_preserves_the_supplied_ssh_key_and_keeps_key_only_authentication() {
+        let answers = wizard_answers();
+        let lines = super::wizard_lines_from(&answers);
+        let document = super::wizard_config(&lines).unwrap();
+        let appliance = super::config::Appliance::from_toml(&document).unwrap();
+        assert_eq!(appliance.system.logins[0].ssh_keys, [answers.ssh_key]);
+        assert!(!appliance.services.ssh.password_authentication);
+    }
+
+    #[test]
+    fn wizard_without_a_key_permits_the_password_it_collected() {
+        let mut answers = wizard_answers();
+        answers.ssh_key.clear();
+        let document = super::wizard_config(&super::wizard_lines_from(&answers)).unwrap();
+        let appliance = super::config::Appliance::from_toml(&document).unwrap();
+        assert!(appliance.system.logins[0].ssh_keys.is_empty());
+        assert!(appliance.services.ssh.password_authentication);
+        assert!(
+            super::passwd::verify(
+                &answers.password,
+                appliance.system.logins[0]
+                    .hashed_password
+                    .as_deref()
+                    .unwrap()
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn wizard_rejects_an_unknown_generated_path_instead_of_printing_and_continuing() {
+        let lines = vec![
+            "set system hostname wizard-regression".into(),
+            "set system login admin public-key wrong-old-generator-path".into(),
+        ];
+        assert!(super::wizard_config(&lines).is_err());
+    }
+
+    #[test]
+    fn wizard_preserves_password_spaces_quotes_hash_and_backslash_exactly() {
+        let mut answers = wizard_answers();
+        answers.ssh_key.clear();
+        answers.password = "#with  repeated spaces \"quoted\" \\ tail".into();
+        let document = super::wizard_config(&super::wizard_lines_from(&answers)).unwrap();
+        let appliance = super::config::Appliance::from_toml(&document).unwrap();
+        assert!(
+            super::passwd::verify(
+                &answers.password,
+                appliance.system.logins[0]
+                    .hashed_password
+                    .as_deref()
+                    .unwrap()
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn wizard_words_round_trip_through_the_real_cli_lexer() {
+        for word in [
+            "",
+            "simple",
+            "two  spaces",
+            "#comment",
+            "a\\b",
+            "\"quoted\"",
+            "tab\t文字",
+        ] {
+            assert_eq!(super::repl::split_line(&super::wizard_word(word)), [word]);
+        }
+    }
+
+    #[test]
+    fn wizard_review_never_reveals_a_partial_multiword_password() {
+        for secret in [
+            "simple-secret",
+            "secret first last",
+            "#first  \"middle\" \\last",
+        ] {
+            let line = format!(
+                "set system login admin password {}",
+                super::wizard_word(secret)
+            );
+            assert_eq!(
+                super::wizard_review_line(&line),
+                "set system login admin password ********"
+            );
+        }
+        let public = "set system hostname wizard-regression";
+        assert_eq!(super::wizard_review_line(public), public);
+    }
+
+    #[test]
+    fn wizard_rejects_operational_or_non_set_lines() {
+        assert!(super::wizard_config(&["show".into()]).is_err());
+        assert!(super::wizard_config(&["exit".into()]).is_err());
+    }
 
     #[test]
     fn boot_late_reapplies_a_commit_made_since_boot_not_the_saved_file() {

@@ -1371,10 +1371,11 @@ pub struct Snmp {
 /// SSH management access (`[services.ssh]`). The image ships a key-only sshd; this
 /// section makes it runtime-configurable: which public keys may log in (as the
 /// `admin` user), whether the daemon runs at all, and an optional non-default port
-/// / listen-address. **Key-only by design** — no password authentication is ever
-/// rendered. The keys + a `Port`/`ListenAddress` drop-in are written to the
-/// persistent `/var/lib/sentinel/ssh/` so they survive a reboot and sshd reads
-/// them on its normal start (no unit-ordering dance).
+/// / listen-address. Key-only by default; the explicit password opt-in enables
+/// only PasswordAuthentication, never the equivalent PAM keyboard-interactive
+/// path. Keys/settings are re-rendered under root-owned `/run/sentinel-ssh` from
+/// the persistent configuration before sshd starts; host keys persist separately
+/// under `/var/lib/sentinel/ssh/`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ssh {
     /// Run the SSH daemon. Defaults to `true` (an appliance is managed over SSH);
@@ -4395,6 +4396,9 @@ pub struct HaIdentity {
     pub heartbeat_peer: Vec<String>,
     pub priority: u8,
     #[serde(default)]
+    // Also holds explicitly prepared facts for shared links not declared yet.
+    // Reverse config-sync retains these local intentions while fresh captured
+    // peer facts replace entries for links that the sender actually declares.
     pub interfaces: BTreeMap<String, HaInterfaceIdentity>,
     /// Member-local dedicated control links. The peer need not use the same
     /// physical NIC name or MAC binding. Only this complete, validated control
@@ -9452,15 +9456,16 @@ impl Appliance {
                 validate_cidr_or_ip(net)
                     .with_context(|| format!("protocols bgp network {net:?}"))?;
             }
-            // Communities attached to every originated route are shape-checked
-            // through the same helper the filter rules use.
-            for c in bgp
-                .community
-                .iter()
-                .chain(&bgp.large_community)
-                .chain(&bgp.ext_community)
-            {
+            // Each wire attribute has its own encoding and numeric bounds.
+            // Sharing only a colon-shape check admits values Wren cannot encode.
+            for c in &bgp.community {
                 validate_community(c).with_context(|| "protocols bgp community")?;
+            }
+            for c in &bgp.large_community {
+                validate_large_community(c).with_context(|| "protocols bgp large-community")?;
+            }
+            for c in &bgp.ext_community {
+                validate_ext_community(c).with_context(|| "protocols bgp ext-community")?;
             }
             for a in &bgp.aggregate {
                 validate_cidr_or_ip(&a.prefix)
@@ -10088,6 +10093,9 @@ impl Appliance {
         if !dd.is_empty() && dd.hostname.is_none() {
             bail!("services dyndns: a `hostname` is required");
         }
+        if let Some(provider) = &dd.provider {
+            validate_dyndns_provider(provider)?;
+        }
         if let Some(h) = &dd.hostname {
             validate_host(h).with_context(|| "services dyndns hostname")?;
         }
@@ -10710,6 +10718,21 @@ impl Appliance {
                     None => {}
                 }
             }
+            let default_selector = |net: &Option<String>| {
+                net.as_deref().is_some_and(|s| {
+                    s.rsplit_once('/')
+                        .is_some_and(|(_, prefix)| prefix.parse::<u8>().ok() == Some(0))
+                })
+            };
+            if c.vti.is_none()
+                && default_selector(&c.local_subnet)
+                && default_selector(&c.remote_subnet)
+            {
+                bail!(
+                    "vpn ipsec {:?}: policy IPsec cannot use /0 on both sides; bind a `vti` and configure routes instead (otherwise the inbound policy also requires LAN ingress to be encrypted)",
+                    c.name
+                );
+            }
             // The interface a route-based tunnel binds to has to exist and has to
             // be one — binding to an ordinary NIC would load, and encrypt nothing.
             if let Some(vti) = &c.vti {
@@ -11091,10 +11114,9 @@ impl Appliance {
         }
 
         // Signed update channel(s) (roadmap C13): every URL must be a fetchable
-        // channel and every pinned key must be present (a key's cryptographic
-        // validity is checked by openssl at update time — here we reject the
-        // obvious mistakes so a `commit` fails fast rather than an update
-        // later). One shared checker, because the legacy bare channel and each
+        // channel and every inline key must be a complete Ed25519 public SPKI,
+        // not merely contain a PEM heading. Signature validity remains checked
+        // by OpenSSL at update time. One checker, because the bare channel and each
         // named channel must be held to exactly the same bar.
         if let Some(up) = &self.update {
             let check_url = |what: &str, url: &str| -> Result<()> {
@@ -11108,16 +11130,11 @@ impl Appliance {
                 Ok(())
             };
             let check_key = |what: &str, key: &str| -> Result<()> {
-                let key = key.trim();
-                if key.is_empty() {
+                if key.trim().is_empty() {
                     bail!("{what}: public-key is required (the pinned release signing key)");
                 }
-                if !key.contains("BEGIN PUBLIC KEY") && !key.starts_with("file:") {
-                    bail!(
-                        "{what}: public-key must be a PEM public key \
-                         (-----BEGIN PUBLIC KEY-----) or a `file:<path>` reference"
-                    );
-                }
+                crate::update_key::reference_or_pem(key)
+                    .map_err(|error| anyhow::anyhow!("{what}: {error}"))?;
                 Ok(())
             };
             // The legacy unnamed channel: `url` and `public-key` come together.
@@ -12439,6 +12456,25 @@ fn validate_filter(f: &Filter) -> Result<()> {
     for (i, r) in f.rules.iter().enumerate() {
         validate_filter_action(&r.action)
             .with_context(|| format!("protocols filter {:?} rule {i} action", f.name))?;
+        if let Some(protocol) = &r.protocol {
+            if !matches!(
+                protocol.trim().to_ascii_lowercase().as_str(),
+                "connected" | "static" | "kernel" | "rip" | "ospf" | "isis" | "babel" | "bgp"
+            ) {
+                bail!(
+                    "protocols filter {:?} rule {i}: unknown protocol {protocol:?}",
+                    f.name
+                );
+            }
+        }
+        if let Some(next_hop) = &r.set_next_hop {
+            next_hop.parse::<std::net::IpAddr>().with_context(|| {
+                format!(
+                    "protocols filter {:?} rule {i} set-next-hop must be an IP address",
+                    f.name
+                )
+            })?;
+        }
         for p in &r.prefix {
             if p.is_empty() {
                 bail!(
@@ -12450,19 +12486,39 @@ fn validate_filter(f: &Filter) -> Result<()> {
                 .with_context(|| format!("protocols filter {:?} rule {i} prefix", f.name))?;
         }
         let communities = [
-            r.set_community.as_deref().unwrap_or(&[]),
-            &r.add_community,
-            r.set_large_community.as_deref().unwrap_or(&[]),
-            &r.add_large_community,
-            r.set_ext_community.as_deref().unwrap_or(&[]),
-            &r.add_ext_community,
+            (r.set_community.as_deref().unwrap_or(&[]), 0),
+            (r.add_community.as_slice(), 0),
+            (r.set_large_community.as_deref().unwrap_or(&[]), 1),
+            (r.add_large_community.as_slice(), 1),
+            (r.set_ext_community.as_deref().unwrap_or(&[]), 2),
+            (r.add_ext_community.as_slice(), 2),
         ];
-        for set in communities {
+        for (set, kind) in communities {
             for c in set {
-                validate_community(c)
-                    .with_context(|| format!("protocols filter {:?} rule {i}", f.name))?;
+                match kind {
+                    0 => validate_community(c),
+                    1 => validate_large_community(c),
+                    _ => validate_ext_community(c),
+                }
+                .with_context(|| format!("protocols filter {:?} rule {i}", f.name))?;
             }
         }
+    }
+    Ok(())
+}
+
+/// A ddclient protocol is one token, not an arbitrary configuration fragment.
+/// Keep extension protocols possible without allowing commas, whitespace or
+/// control characters to introduce another ddclient directive.
+pub(crate) fn validate_dyndns_provider(provider: &str) -> Result<()> {
+    if provider.is_empty()
+        || !provider
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        bail!(
+            "services dyndns provider: expected a non-empty protocol name (letters, digits, hyphen or underscore)"
+        );
     }
     Ok(())
 }
@@ -12470,13 +12526,31 @@ fn validate_filter(f: &Filter) -> Result<()> {
 /// Validate a route-filter prefix pattern: an IPv4 or IPv6 CIDR, optionally with
 /// a Wren match-modifier suffix — a trailing `+` (this and more-specific), `-`
 /// (this and less-specific), or a `{min,max}` length range. The base CIDR is
-/// checked v4-or-v6; the modifier is stripped first so it does not confuse the
-/// parse.
+/// checked v4-or-v6; the whole modifier grammar must also be valid.
 fn validate_filter_prefix(p: &str) -> Result<()> {
-    // Drop a `{min,max}` length-range suffix, then a trailing `+`/`-` modifier.
-    let base = p.split('{').next().unwrap_or(p);
-    let base = base.trim_end_matches(['+', '-']);
-    route_prefix_family(base)
+    let p = p.trim();
+    let base = if let Some(base) = p.strip_suffix('+').or_else(|| p.strip_suffix('-')) {
+        base
+    } else if let Some((base, window)) = p.split_once('{') {
+        let window = window
+            .strip_suffix('}')
+            .context("unterminated prefix length window")?;
+        let (lo, hi) = window
+            .split_once(',')
+            .context("prefix length window needs min,max")?;
+        // Wren intentionally clamps/orders u8 windows to the prefix's family.
+        // Validate the complete syntax, not only the CIDR before the opening brace.
+        lo.trim()
+            .parse::<u8>()
+            .context("invalid minimum prefix length")?;
+        hi.trim()
+            .parse::<u8>()
+            .context("invalid maximum prefix length")?;
+        base
+    } else {
+        p
+    };
+    route_prefix_family(base.trim())
         .map(|_| ())
         .with_context(|| format!("prefix pattern {p:?} is not a valid IPv4/IPv6 CIDR"))
 }
@@ -12489,17 +12563,61 @@ fn validate_filter_action(a: &str) -> Result<()> {
     Ok(())
 }
 
-/// A community tag is a well-known name or an `asn:value`-shaped token (this is
-/// a shape check; the Wren daemon does the definitive parse).
+/// RFC 1997, with exactly the numeric bounds accepted by Wren's wire encoder.
 pub(crate) fn validate_community(c: &str) -> Result<()> {
+    let c = c.trim();
     const WELL_KNOWN: &[&str] = &["no-export", "no-advertise", "no-export-subconfed"];
-    if WELL_KNOWN.contains(&c) {
+    if WELL_KNOWN.contains(&c.to_ascii_lowercase().as_str()) {
         return Ok(());
     }
-    if c.split(':').count() < 2 || c.split(':').any(|p| p.is_empty()) {
-        bail!("community {c:?}: expected a well-known name or `asn:value`");
+    let valid = match c.split_once(':') {
+        Some((asn, value)) => asn.parse::<u16>().is_ok() && value.parse::<u16>().is_ok(),
+        None => c.parse::<u32>().is_ok(),
+    };
+    if !valid {
+        bail!("community {c:?}: expected a well-known name, u32 integer or u16:u16");
     }
     Ok(())
+}
+
+fn validate_large_community(c: &str) -> Result<()> {
+    let parts: Vec<_> = c.trim().split(':').collect();
+    if parts.len() != 3 || parts.iter().any(|part| part.parse::<u32>().is_err()) {
+        bail!("large community {c:?}: expected three u32 integers global:local1:local2");
+    }
+    Ok(())
+}
+
+fn validate_ext_community(c: &str) -> Result<()> {
+    let value = c.trim();
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        if hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(());
+        }
+    } else if let Some((kind, rest)) = value.split_once(':') {
+        if matches!(kind.to_ascii_lowercase().as_str(), "rt" | "ro" | "soo") {
+            if let Some((admin, local)) = rest.split_once(':') {
+                let valid = if admin.parse::<Ipv4Addr>().is_ok() {
+                    local.parse::<u16>().is_ok()
+                } else if let Ok(asn) = admin.parse::<u32>() {
+                    if asn <= u16::MAX as u32 {
+                        local.parse::<u32>().is_ok()
+                    } else {
+                        local.parse::<u16>().is_ok()
+                    }
+                } else {
+                    false
+                };
+                if valid {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    bail!("extended community {c:?}: expected rt/ro/soo:ASN:value, IPv4:value or 0x<16 hex digits>")
 }
 
 /// Validate an OSPF/OSPFv3 `network-type` (`broadcast` / `point-to-point`).
@@ -13010,6 +13128,31 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn default_and_named_inline_update_keys_require_complete_public_ed25519_material() {
+        let valid = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=\n-----END PUBLIC KEY-----";
+        for section in [
+            "[update]",
+            "[update]\nchannel='business'\n[[update.channels]]\nname='business'",
+        ] {
+            for key in [
+                valid,
+                "-----BEGIN PUBLIC KEY----- junk -----END PUBLIC KEY-----",
+                "-----BEGIN PRIVATE KEY----- private-fixture -----END PRIVATE KEY-----",
+            ] {
+                let text = format!(
+                    "[system]\nhostname='fw'\n{section}\nurl='https://updates.example.com'\npublic-key='''{key}'''\n"
+                );
+                let parsed = super::Appliance::from_toml(&text);
+                if key == valid {
+                    assert!(parsed.is_ok(), "{parsed:?}");
+                } else {
+                    assert!(parsed.unwrap_err().to_string().contains("public-key"));
+                }
+            }
+        }
     }
 
     #[test]
@@ -15091,6 +15234,97 @@ name = "to-peer"
         // Round-trips through TOML losslessly.
         let b = Appliance::from_toml(&a.to_toml().unwrap()).expect("re-parses");
         assert_eq!(a.summary(), b.summary());
+    }
+
+    #[test]
+    fn dyndns_provider_is_one_safe_protocol_token() {
+        for provider in ["dyndns2", "cloudflare", "noip", "custom-provider_v2"] {
+            let text = format!(
+                "[system]\nhostname=\"qa\"\n[services.dyndns]\nhostname=\"qa.example\"\nprovider={}\n",
+                toml::Value::String(provider.into())
+            );
+            Appliance::from_toml(&text).unwrap();
+        }
+        for provider in [
+            "",
+            "dyndns2\nssl=no",
+            "dyndns2\rssl=no",
+            "dyndns2,ssl=no",
+            "dyndns2 ssl=no",
+            "dyndns2\tssl=no",
+            "'dyndns2'",
+            "dyndns2\0",
+        ] {
+            let text = format!(
+                "[system]\nhostname=\"qa\"\n[services.dyndns]\nhostname=\"qa.example\"\nprovider={}\n",
+                toml::Value::String(provider.into())
+            );
+            assert!(
+                Appliance::from_toml(&text).is_err(),
+                "unsafe provider {provider:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn route_map_validation_checks_the_complete_engine_grammar() {
+        let base = "[system]\nhostname=\"qa\"\n[[policy.route-map]]\nname=\"qa\"\n[[policy.route-map.rule]]\naction=\"accept\"\n";
+        for clause in [
+            "set-next-hop=\"not-an-ip\"",
+            "protocol=\"not-a-protocol\"",
+            "set-community=[\"AS:VALUE\"]",
+            "add-community=[\"65536:1\"]",
+            "set-large-community=[\"AS:VALUE:OTHER\"]",
+            "add-large-community=[\"1:2\"]",
+            "set-ext-community=[\"unknown:65001:1\"]",
+            "add-ext-community=[\"rt:65536:65536\"]",
+            "prefix=[\"198.19.244.0/24{bad,32}\"]",
+            "prefix=[\"198.19.244.0/24{24,32\"]",
+            "prefix=[\"198.19.244.0/24++\"]",
+            "prefix=[\"198.19.244.0/24{24,32}junk\"]",
+        ] {
+            assert!(
+                Appliance::from_toml(&format!("{base}{clause}\n")).is_err(),
+                "admitted {clause}"
+            );
+        }
+        for clause in [
+            "set-next-hop=\"2001:db8::1\"",
+            "protocol=\"STATIC\"",
+            "set-community=[\"65535:65535\",\"4294967295\",\"NO-EXPORT\"]",
+            "set-large-community=[\"4294967295:0:4294967295\"]",
+            "set-ext-community=[\"rt:65001:4294967295\",\"rt:65536:65535\",\"soo:192.0.2.1:65535\",\"0x0002fde900000001\"]",
+            "prefix=[\"198.19.244.0/24-\",\"198.19.244.0/24{24,99}\",\"2001:db8::/64+\"]",
+        ] {
+            Appliance::from_toml(&format!("{base}{clause}\n"))
+                .unwrap_or_else(|e| panic!("refused {clause}: {e:#}"));
+        }
+    }
+
+    #[test]
+    fn originated_bgp_communities_use_their_own_wire_grammar() {
+        let base = "[system]\nhostname=\"qa\"\n[protocols.bgp]\nlocal-as=65001\n";
+        for clause in [
+            "community=[\"no-export\",\"65535:65535\"]",
+            "large-community=[\"65001:1:2\",\"4294967295:0:4294967295\"]",
+            "ext-community=[\"rt:65001:4294967295\",\"rt:65536:65535\",\"soo:192.0.2.1:65535\"]",
+        ] {
+            Appliance::from_toml(&format!("{base}{clause}\n"))
+                .unwrap_or_else(|e| panic!("refused {clause}: {e:#}"));
+        }
+        for clause in [
+            "community=[\"65001:1:2\"]",
+            "community=[\"65536:1\"]",
+            "large-community=[\"65001:1\"]",
+            "large-community=[\"4294967296:1:2\"]",
+            "ext-community=[\"no-export\"]",
+            "ext-community=[\"rt:65536:65536\"]",
+        ] {
+            assert!(
+                Appliance::from_toml(&format!("{base}{clause}\n")).is_err(),
+                "admitted {clause}"
+            );
+        }
     }
 
     #[test]

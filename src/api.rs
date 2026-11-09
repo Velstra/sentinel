@@ -217,9 +217,9 @@ pub async fn serve(listen: &str, config: &Path, apply: Apply, token_file: &Path)
 /// Decide how the management server terminates TLS (H3). Returns the PEM
 /// certificate and key paths to serve HTTPS with, or `None` when `[services.web]
 /// tls = false` deliberately asked for plaintext. With no operator-supplied
-/// certificate, a self-signed one is minted once and persisted beside the API
-/// token — on the appliance that is the A/B-stable `/var/lib/sentinel`, so the
-/// certificate (and its pin) survives reboots and image updates.
+/// certificate, a self-signed one is persisted beside the API token. Renew a
+/// missing address or expiring certificate using the SAME persistent key, so
+/// the A/B-stable public-key pin survives rebinds, reboots and image updates.
 pub(crate) fn resolve_web_tls(
     config: &Path,
     token_file: &Path,
@@ -2013,7 +2013,30 @@ fn merge_synced_config(mut incoming: Appliance, local: &Appliance) -> Result<App
                 && target.node() != source.node(),
             "config-sync HA cluster/member mismatch"
         );
-        let adjusted = crate::ha::materialize_peer(incoming)?;
+        let mut adjusted = crate::ha::materialize_peer(incoming)?;
+        // The sender can capture only its declared interfaces. The receiver
+        // may already hold peer-specific addresses/MACs for a future link; an
+        // unrelated reverse policy push must not silently discard that intent.
+        // Fresh captured facts always win for existing links. Only absent
+        // entries are retained from this receiver's own trusted peer profile;
+        // deleting one locally remains an explicit, durable operator action.
+        let reverse = adjusted
+            .system
+            .ha
+            .as_mut()
+            .and_then(|ha| ha.peer_identity.as_mut())
+            .context("materialized HA peer identity missing")?;
+        for (name, facts) in &target
+            .peer_identity
+            .as_ref()
+            .expect("checked above")
+            .interfaces
+        {
+            reverse
+                .interfaces
+                .entry(name.clone())
+                .or_insert_with(|| facts.clone());
+        }
         adjusted.validate()?;
         return Ok(adjusted);
     }
@@ -3054,6 +3077,105 @@ mod tests {
         );
         primary.system.ha.as_mut().unwrap().cluster = "different-cluster-12345".into();
         assert!(merge_synced_config(primary, &secondary).is_err());
+    }
+
+    #[test]
+    fn paired_sync_retains_predeclared_peer_interface_facts_on_reverse_policy_push() {
+        use crate::config::{HaInterfaceIdentity, HaInterfaceLinkIdentity};
+        let mut primary = crate::ha::paired_fixture();
+        let prepared = HaInterfaceIdentity {
+            address: Some("203.0.113.2/24".into()),
+            address6: Some("2001:db8:42::2/64".into()),
+            local: None,
+            link: Some(HaInterfaceLinkIdentity {
+                hw_id: Some("02:00:00:00:42:02".into()),
+                remote: None,
+            }),
+        };
+        primary
+            .system
+            .ha
+            .as_mut()
+            .unwrap()
+            .peer_identity
+            .as_mut()
+            .unwrap()
+            .interfaces
+            .insert("future0".into(), prepared.clone());
+        primary.validate().unwrap();
+        let mut secondary = crate::ha::materialize_peer(primary.clone()).unwrap();
+        assert!(!secondary.interfaces.iter().any(|i| i.name == "future0"));
+        // A legitimate policy change on B must not discard the address/MAC
+        // predeclared on A for a future B link which B cannot capture yet.
+        secondary.firewall.stateful = false;
+        secondary.interfaces[0].address = Some("10.10.0.3/24".into());
+        let returned = merge_synced_config(secondary.clone(), &primary).unwrap();
+        assert!(!returned.firewall.stateful);
+        let peer = returned
+            .system
+            .ha
+            .as_ref()
+            .unwrap()
+            .peer_identity
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&peer.interfaces["future0"]).unwrap(),
+            serde_json::to_value(&prepared).unwrap()
+        );
+        // Current declared facts still come from B, not A's older profile.
+        assert_eq!(
+            peer.interfaces["wan0"].address.as_deref(),
+            Some("10.10.0.3/24")
+        );
+        assert_eq!(
+            returned.interfaces[0].address.as_deref(),
+            Some("10.10.0.1/24")
+        );
+        assert_eq!(
+            crate::configsync::shared_revision(&returned).unwrap(),
+            crate::configsync::shared_revision(&secondary).unwrap()
+        );
+
+        // The prepared identity is usable when the link is later declared.
+        let mut future = returned.interfaces[0].clone();
+        future.name = "future0".into();
+        future.address = Some("203.0.113.1/24".into());
+        let mut expanded = returned.clone();
+        expanded.interfaces.push(future);
+        expanded.validate().unwrap();
+        let peer = crate::ha::materialize_peer(expanded).unwrap();
+        let future = peer
+            .interfaces
+            .iter()
+            .find(|i| i.name == "future0")
+            .unwrap();
+        assert_eq!(future.address.as_deref(), Some("203.0.113.2/24"));
+        assert_eq!(future.hw_id.as_deref(), Some("02:00:00:00:42:02"));
+
+        // An explicit local removal must not be resurrected by a later push.
+        let mut removed = returned;
+        removed
+            .system
+            .ha
+            .as_mut()
+            .unwrap()
+            .peer_identity
+            .as_mut()
+            .unwrap()
+            .interfaces
+            .remove("future0");
+        let next = merge_synced_config(secondary, &removed).unwrap();
+        assert!(
+            !next
+                .system
+                .ha
+                .unwrap()
+                .peer_identity
+                .unwrap()
+                .interfaces
+                .contains_key("future0")
+        );
     }
 
     #[test]
