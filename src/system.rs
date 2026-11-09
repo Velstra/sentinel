@@ -1886,11 +1886,20 @@ pub fn bin(name: &str) -> String {
 pub fn escalated_output(cmd: &str, args: &[&str]) -> Result<std::process::Output> {
     let resolved = bin(cmd);
     let is_root = unsafe { libc::geteuid() } == 0;
+    escalated_output_with(cmd, &resolved, args, is_root, |program, arguments| {
+        Command::new(program).args(arguments).output()
+    })
+}
+
+fn escalated_output_with(
+    cmd: &str,
+    resolved: &str,
+    args: &[&str],
+    is_root: bool,
+    mut output: impl FnMut(&str, &[&str]) -> std::io::Result<std::process::Output>,
+) -> Result<std::process::Output> {
     if is_root {
-        return Command::new(&resolved)
-            .args(args)
-            .output()
-            .with_context(|| format!("running {resolved}"));
+        return output(resolved, args).with_context(|| format!("running {resolved}"));
     }
     // Try it plainly first. Most of what this runs only needs a socket the
     // caller may already be allowed to open, and escalating regardless turns a
@@ -1904,17 +1913,15 @@ pub fn escalated_output(cmd: &str, args: &[&str]) -> Result<std::process::Output
     // agent socket forked 1481 nested `sentinel agent-query` processes and
     // wedged the API that spawned the first one.
     let direct = if plain_attempt_is_useful(cmd) {
-        Command::new(&resolved).args(args).output().ok()
+        output(resolved, args).ok()
     } else {
         None
     };
-    if let Some(out) = &direct {
-        if out.status.success() {
-            return Ok(direct.unwrap());
-        }
+    if let Some(out) = direct.filter(|out| out.status.success()) {
+        return Ok(out);
     }
 
-    let mut all = vec!["-n", resolved.as_str()];
+    let mut all = vec!["-n", resolved];
     all.extend_from_slice(args);
     // `-n`: never prompt. Without it, a `sudo` configured to ask — for a
     // password, or on a workstation for a fingerprint — blocks until *its*
@@ -1922,21 +1929,12 @@ pub fn escalated_output(cmd: &str, args: &[&str]) -> Result<std::process::Output
     // A `show` that sat for thirty-two seconds before admitting it could not
     // escalate is how the console came to look like it had hung: the routing
     // section makes one such call per protocol.
-    let escalated = Command::new("sudo")
-        .args(&all)
-        .output()
-        .with_context(|| format!("running `sudo {}`", all.join(" ")))?;
-    if escalated.status.success() {
-        return Ok(escalated);
-    }
-    // Neither worked. The unescalated attempt is the more useful of the two to
-    // report: it names what the command itself objected to, where sudo only
-    // says it declined to ask. When there was no such attempt, sudo's own
-    // refusal is all there is.
-    match direct {
-        Some(out) => Ok(out),
-        None => Ok(escalated),
-    }
+    // A completed privileged invocation is authoritative even when nonzero.
+    // For example, nft's exit 1/ENOENT proves a table is absent; replacing it
+    // with the earlier unprivileged EPERM changes the caller's meaning. A sudo
+    // refusal or signal also remains a failure, never a stale plain result.
+    // Spawn/read/wait errors remain Err through the same contextual boundary.
+    output("sudo", &all).with_context(|| format!("running `sudo {}`", all.join(" ")))
 }
 
 /// Whether running `cmd` unprivileged, before escalating, can tell us anything.
@@ -2196,6 +2194,239 @@ mod tests {
         for tool in ["ip", "networkctl", "systemctl", "journalctl"] {
             assert!(plain_attempt_is_useful(tool), "{tool}");
         }
+    }
+
+    fn process_output(raw_status: i32, stdout: &[u8], stderr: &[u8]) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(raw_status),
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        }
+    }
+
+    type Invocation = (String, Vec<String>);
+
+    fn simulated_escalation(
+        cmd: &str,
+        root: bool,
+        outcomes: Vec<std::io::Result<std::process::Output>>,
+    ) -> (Result<std::process::Output>, Vec<Invocation>) {
+        let mut outcomes = std::collections::VecDeque::from(outcomes);
+        let mut invocations = Vec::new();
+        let result = escalated_output_with(
+            cmd,
+            "/nix/store/qa-tool/bin/tool",
+            &["-s", "literal spaces;$(never-a-shell)"],
+            root,
+            |program, arguments| {
+                invocations.push((
+                    program.to_owned(),
+                    arguments.iter().map(|arg| (*arg).to_owned()).collect(),
+                ));
+                outcomes.pop_front().expect("unexpected extra invocation")
+            },
+        );
+        assert!(outcomes.is_empty(), "an expected invocation did not occur");
+        (result, invocations)
+    }
+
+    fn check_privileged_invocation(invocations: &[Invocation]) {
+        assert_eq!(
+            invocations.last().unwrap(),
+            &(
+                "sudo".into(),
+                vec![
+                    "-n".into(),
+                    "/nix/store/qa-tool/bin/tool".into(),
+                    "-s".into(),
+                    "literal spaces;$(never-a-shell)".into(),
+                ],
+            )
+        );
+    }
+
+    #[test]
+    fn escalated_output_root_runs_once_and_retains_nonzero_output() {
+        let (result, invocations) = simulated_escalation(
+            "nft",
+            true,
+            vec![Ok(process_output(1 << 8, b"root stdout", b"root ENOENT"))],
+        );
+        let result = result.unwrap();
+        assert_eq!(result.status.code(), Some(1));
+        assert_eq!(result.stdout, b"root stdout");
+        assert_eq!(result.stderr, b"root ENOENT");
+        assert_eq!(
+            invocations,
+            vec![(
+                "/nix/store/qa-tool/bin/tool".into(),
+                vec!["-s".into(), "literal spaces;$(never-a-shell)".into()]
+            )]
+        );
+    }
+
+    #[test]
+    fn escalated_output_root_spawn_error_is_not_retried_via_sudo() {
+        let (result, invocations) = simulated_escalation(
+            "nft",
+            true,
+            vec![Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "root executable absent",
+            ))],
+        );
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(invocations.len(), 1);
+        assert_ne!(invocations[0].0, "sudo");
+    }
+
+    #[test]
+    fn escalated_output_plain_success_never_requests_privilege() {
+        let (result, invocations) =
+            simulated_escalation("ip", false, vec![Ok(process_output(0, b"public", b""))]);
+        assert_eq!(result.unwrap().stdout, b"public");
+        assert_eq!(invocations.len(), 1);
+        assert_ne!(invocations[0].0, "sudo");
+    }
+
+    #[test]
+    fn escalated_output_privileged_enoent_replaces_unprivileged_eperm() {
+        let (result, invocations) = simulated_escalation(
+            "nft",
+            false,
+            vec![
+                Ok(process_output(1 << 8, b"", b"Operation not permitted")),
+                Ok(process_output(
+                    1 << 8,
+                    b"privileged table lookup",
+                    b"No such file or directory",
+                )),
+            ],
+        );
+        let result = result.unwrap();
+        assert_eq!(result.status.code(), Some(1));
+        assert_eq!(result.stdout, b"privileged table lookup");
+        assert_eq!(result.stderr, b"No such file or directory");
+        assert_eq!(invocations.len(), 2);
+        check_privileged_invocation(&invocations);
+    }
+
+    #[test]
+    fn escalated_output_privileged_success_preserves_binary_streams() {
+        let (result, invocations) = simulated_escalation(
+            "nft",
+            false,
+            vec![
+                Ok(process_output(1 << 8, b"stale", b"EPERM")),
+                Ok(process_output(0, &[0, 255, 1], &[255, 0])),
+            ],
+        );
+        let result = result.unwrap();
+        assert!(result.status.success());
+        assert_eq!(result.stdout, [0, 255, 1]);
+        assert_eq!(result.stderr, [255, 0]);
+        check_privileged_invocation(&invocations);
+    }
+
+    #[test]
+    fn escalated_output_genuine_privileged_permission_denial_remains_failure() {
+        for (status, message) in [
+            (1, "privileged operation denied"),
+            (1, "sudo: a password is required"),
+            (127, "sudo: tool: command not found"),
+        ] {
+            let (result, invocations) = simulated_escalation(
+                "nft",
+                false,
+                vec![
+                    Ok(process_output(1 << 8, b"stale", b"unprivileged EPERM")),
+                    Ok(process_output(status << 8, b"", message.as_bytes())),
+                ],
+            );
+            let result = result.unwrap();
+            assert!(!result.status.success());
+            assert_eq!(result.status.code(), Some(status));
+            assert_eq!(result.stderr, message.as_bytes());
+            assert_ne!(result.stderr, b"unprivileged EPERM");
+            check_privileged_invocation(&invocations);
+        }
+    }
+
+    #[test]
+    fn escalated_output_signalled_privileged_result_is_not_replaced() {
+        use std::os::unix::process::ExitStatusExt;
+        let (result, invocations) = simulated_escalation(
+            "nft",
+            false,
+            vec![
+                Ok(process_output(1 << 8, b"", b"unprivileged EPERM")),
+                Ok(process_output(9, b"partial", b"terminated")),
+            ],
+        );
+        let result = result.unwrap();
+        assert_eq!(result.status.signal(), Some(9));
+        assert_eq!(result.status.code(), None);
+        assert_eq!(result.stdout, b"partial");
+        assert_eq!(result.stderr, b"terminated");
+        check_privileged_invocation(&invocations);
+    }
+
+    #[test]
+    fn escalated_output_sudo_io_failure_remains_error_not_stale_output() {
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::BrokenPipe,
+        ] {
+            let (result, invocations) = simulated_escalation(
+                "nft",
+                false,
+                vec![
+                    Ok(process_output(1 << 8, b"", b"unprivileged EPERM")),
+                    Err(std::io::Error::new(kind, "sudo spawn/read/wait failed")),
+                ],
+            );
+            let error = result.unwrap_err();
+            assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(), kind);
+            assert!(format!("{error:#}").contains("sudo spawn/read/wait failed"));
+            assert!(!format!("{error:#}").contains("unprivileged EPERM"));
+            check_privileged_invocation(&invocations);
+        }
+    }
+
+    #[test]
+    fn escalated_output_plain_io_failure_still_allows_one_privileged_attempt() {
+        let (result, invocations) = simulated_escalation(
+            "nft",
+            false,
+            vec![
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "unprivileged cannot execute",
+                )),
+                Ok(process_output(0, b"privileged result", b"")),
+            ],
+        );
+        assert_eq!(result.unwrap().stdout, b"privileged result");
+        assert_eq!(invocations.len(), 2);
+        check_privileged_invocation(&invocations);
+    }
+
+    #[test]
+    fn escalated_output_self_never_recurses_plainly_even_when_sudo_fails() {
+        let (result, invocations) = simulated_escalation(
+            "sentinel-self",
+            false,
+            vec![Ok(process_output(1 << 8, b"", b"sudo refusal"))],
+        );
+        assert_eq!(result.unwrap().stderr, b"sudo refusal");
+        assert_eq!(invocations.len(), 1);
+        check_privileged_invocation(&invocations);
     }
 
     /// The picker only helps if what it offers is what the validator takes. A
