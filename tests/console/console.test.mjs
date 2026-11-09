@@ -363,7 +363,7 @@ await test("what a create panel stages is a command the appliance parses", async
       nameInput.value = ${JSON.stringify(name)};
       for (const [label, value] of Object.entries(${JSON.stringify(fields)})) {
         const f = [...box.querySelectorAll(".field")]
-          .find((l) => l.querySelector("span").firstChild.textContent.trim() === label);
+          .find((l) => l.firstElementChild?.firstChild?.textContent.trim() === label);
         if (!f) return { error: "no field named " + label };
         // A repeatable setting whose answers the appliance already knows is a
         // set of tick boxes, not a box to type in. It carries a value of its
@@ -1004,7 +1004,7 @@ await test("an administrator can be created from the console", async () => {
     box.querySelector("input").value = "vera";
     const set = (label, value) => {
       const f = [...box.querySelectorAll(".field")]
-        .find((l) => l.querySelector("span").firstChild.textContent.trim() === label);
+        .find((l) => l.firstElementChild?.firstChild?.textContent.trim() === label);
       if (!f) throw new Error("no field named " + label);
       f.querySelector("input, select").value = value;
     };

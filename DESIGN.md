@@ -69,6 +69,11 @@ normal document flow and use the existing responsive breakpoints. Timeouts
 belong beside the global firewall posture, with seconds in every field label
 and explicit bounds/default guidance above the form.
 
+The member rail keeps each appliance name in its own flexible grid row. Role
+and full delivery status sit beneath it and wrap within the same native button;
+a long status must not compress an identifying name into single characters.
+This reuses the existing spacing, type, badge, focus and theme tokens.
+
 ## Elevation & Depth
 
 Inherit the existing tonal surfaces and borders. A settings addition does not

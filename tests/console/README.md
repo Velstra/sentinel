@@ -10,7 +10,7 @@ From the repository root, run the complete frontend gate:
 ```sh
 cargo build
 (
-  for suite in ux layout console react health ha-mode peer; do
+  for suite in ux layout console react health ha-mode peer archive; do
     CONSOLE_TEST_FILE="$suite.test.mjs" tests/console/run.sh target/debug/sentinel || exit 1
   done
 )
@@ -29,7 +29,8 @@ a concurrent rebuild cannot change the executable underneath a running test.
 | `react` | Dashboard/flows/editor, safe apply/confirm/expiry, drafts, mobile navigation, both themes and sensitive-state cleanup |
 | `health` | Real health API; explicitly synthetic clock/TPM/failure cases; retry and NTP navigation |
 | `ha-mode` | Election controls, risk guidance, canonical staging, invalid timing and narrow themes; does not enroll a cluster |
-| `peer` | Two disposable APIs with real pinned HTTPS, member observations, pin mismatch and session isolation |
+| `peer` | Two disposable APIs with real pinned HTTPS, member observations, read-only peer write gates/local draft preservation, late renders, pin mismatch and session isolation; actual Refresh/sign-out lifecycle with explicitly synthetic delivery-state/delay fixtures, not native config-sync certification |
+| `archive` | Actual CLI/UI saves and revision rollbacks, invalid Validate without a write, on-disk private modes and preserved credentials; the separate `archive-privacy` VM gate proves UID isolation and live OS behavior |
 
 Optional evidence output:
 
