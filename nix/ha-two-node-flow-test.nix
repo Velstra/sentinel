@@ -1,5 +1,6 @@
-{ pkgs, self }:
+{ pkgs, self, legacyPackage ? null }:
 let
+  legacyPath = if legacyPackage == null then "" else toString legacyPackage;
   secret = "two-node-flow-vm-only-credential-at-least-32-bytes";
   cluster = "two-node-flow-cluster-0123456789";
   appliance = node: (pkgs.formats.toml {}).generate "two-node-flow-member.toml" {
@@ -58,6 +59,8 @@ let
     networking.firewall.enable = lib.mkForce false;
     services.velstra.interface = lib.mkForce "eth1";
     services.velstra.appliance = lib.mkForce (appliance node);
+    services.velstra.package = lib.mkIf (node == 1 && legacyPackage != null)
+      (lib.mkForce legacyPackage);
     environment.systemPackages = [ pkgs.python3 pkgs.bpftools pkgs.tcpdump ];
     systemd.services.wren.environment.RUST_LOG = "wren::vrrp=debug";
     systemd.services.velstra.environment.RUST_LOG = "velstra::conntrack_sync=debug,velstra::ha=debug";
@@ -141,7 +144,7 @@ let
             time.sleep(0.02)
   '';
 in pkgs.testers.runNixOSTest {
-  name = "sentinel-ha-two-node-established-snat-flow";
+  name = "sentinel-ha-two-node-established-snat-flow${pkgs.lib.optionalString (legacyPackage != null) "-mixed-version"}";
   nodes = {
     primary = member 1;
     secondary = member 2;
@@ -224,6 +227,16 @@ in pkgs.testers.runNixOSTest {
         accepted = [json.loads(line) for line in server.succeed("cat /tmp/accepted").splitlines()]
         assert len(accepted) == 1 and accepted[0]["host"] == "10.1.0.100", accepted
         translated = accepted[0]
+        if ${if legacyPackage != null then "True" else "False"}:
+            # Actual old agent/object on owner, current object on standby.
+            # Keep Python indentation literal, not stripped by a nested Nix
+            # indented string. No test-written NAT or replacement program.
+            old_command = primary.succeed("systemctl show velstra.service -p ExecStart --value")
+            new_command = secondary.succeed("systemctl show velstra.service -p ExecStart --value")
+            assert "${legacyPath}/bin/velstra" in old_command, old_command
+            assert "${self.packages.x86_64-linux.velstra}/bin/velstra" in new_command, new_command
+            assert "${legacyPath}" != "${self.packages.x86_64-linux.velstra}"
+            assert translated["port"] == 47009, translated
         owner = json.loads(primary.succeed("cat /run/velstra/ha/role.json"))["authority"]
         # A flow entry AND a fresh complete matching-generation snapshot must
         # already exist on the real standby before disrupting its owner.

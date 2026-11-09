@@ -1,0 +1,41 @@
+# Real interactive installer with a generated public key and complex password.
+# No piped answers, seeded config replacement or post-install key repair.
+set timeout 120
+log_user 1
+proc answer {question reply} {
+    expect {
+        $question { send -- "$reply\r" }
+        timeout { puts "Missing installer prompt: $question"; exit 3 }
+        eof { puts "Installer exited at: $question"; exit 4 }
+    }
+}
+spawn sentinel install --text
+answer "Mode " "1"
+answer "Disk number" "$env(PICK)"
+answer "Console keyboard layout" "us"
+answer "to check the layout" "hello-123"
+answer "Locale" "en_US.UTF-8"
+answer "Timezone" "UTC"
+answer "Encrypt the data partition" "n"
+answer "Hostname" "wizard-key-fw"
+answer "Username" "admin"
+answer "Password:" "$env(WIZARD_PASSWORD)"
+answer "SSH public key" "$env(SSH_PUBLIC_KEY)"
+answer "Configure an interface now" "y"
+answer "Configure " "y"
+answer "zone" "wan"
+answer "address" "dhcp"
+expect {
+    "Configure " { send -- "n\r"; exp_continue }
+    "Permit SSH" { send -- "y\r" }
+    timeout { puts "Missing SSH permission prompt"; exit 3 }
+    eof { puts "Installer exited during network questions"; exit 4 }
+}
+answer "Type YES to proceed" "YES"
+set timeout 900
+expect {
+    eof {}
+    timeout { puts "Installer did not finish"; exit 5 }
+}
+catch wait result
+exit [lindex $result 3]
