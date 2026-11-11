@@ -85,7 +85,10 @@ pub fn commit_confirm(session: &mut Session, act: &Apply, minutes: u32) -> Resul
         // A revert: no last-good to reconcile to (reconciling back to the
         // un-confirmed candidate would defeat it), and a held link that stays
         // dark is reported rather than failing it: `restore_live`.
-        let revert = Appliance::load(&cfg_path).and_then(|prev| restore_live(&prev, act));
+        let revert = Appliance::load(&cfg_path).and_then(|prev| {
+            restore_live(&prev, act)?;
+            record_restored(&prev, act)
+        });
         return match revert {
             Ok(()) => {
                 Err(e).context("arming the rollback timer failed; reverted to the saved config")
@@ -96,6 +99,14 @@ pub fn commit_confirm(session: &mut Session, act: &Apply, minutes: u32) -> Resul
             )),
         };
     }
+
+    // Boot-late reconciliation and later operators read the same running
+    // intent as a plain commit. Publish only AFTER a successful apply and an
+    // armed rollback timer, under the common lock. A publication failure must
+    // not disarm that protection or claim the commit completed successfully.
+    session
+        .note_committed(&appliance.to_toml()?)
+        .context("candidate applied and rollback timer armed, but recording the running configuration failed")?;
 
     eprintln!("commit-confirm: {summary}; applied live.");
     eprintln!(
@@ -214,7 +225,20 @@ pub fn rollback(act: &Apply, cfg_path: &Path, from_timer: bool) -> Result<()> {
     // so a failure here reports mixed-state honestly. A restore, so a held link
     // that stays dark is reported rather than failing the revert.
     restore_live(&appliance, act).context("reverting to the saved config")?;
+    record_restored(&appliance, act)?;
     eprintln!("reverted the running system to the saved config.");
+    Ok(())
+}
+
+/// A successful restore must replace any earlier unsaved running snapshot.
+/// Otherwise the delayed boot stage can reconcile back to the very candidate
+/// the timer just reverted. Never publish intent for off-box validation.
+fn record_restored(appliance: &Appliance, act: &Apply) -> Result<()> {
+    if act.enabled {
+        system::install_config_file(Path::new(Session::RUNNING), &appliance.to_toml()?).context(
+            "saved configuration restored, but recording the running configuration failed",
+        )?;
+    }
     Ok(())
 }
 
