@@ -5331,6 +5331,10 @@ function isUpdateSigningKey(key, path = fieldPath) {{
   return key === "public-key" && (path === "update" || path.startsWith("update channel "));
 }}
 
+function isUpdateChannelUrl(key, path = fieldPath) {{
+  return key === "url" && (path === "update" || path.startsWith("update channel "));
+}}
+
 function updateSigningKeyValue(value) {{
   const raw = String(value || "");
   // Whitespace is valid filename material, not PEM formatting. Do not
@@ -5552,12 +5556,16 @@ function bindField(field, widget, hint, label = field[1], required = false) {{
   // Capture the owner now: fieldPath changes while other forms are rendered.
   const firewallPorts = field[0] === "port" && fieldPath.startsWith("firewall rule");
   const updateKey = isUpdateSigningKey(field[0]);
+  const updateUrl = isUpdateChannelUrl(field[0]);
   let touched = false;
   const check = (show = true) => {{
     let message = "";
     const value = updateKey ? updateSigningKeyValue(widget.value) : String(widget.value || "").trim();
     if (required && !value) message = "Set " + label.toLowerCase() + ".";
     else if (updateKey && value) message = updateSigningKeyError(value);
+    else if (updateUrl && value && !(value.startsWith("https:" + "//") || value.startsWith("file://"))) {{
+      message = "Use an https:" + "// or file:// update URL.";
+    }}
     else if (firewallPorts && value) message = firewallPortsError(value);
     else if (input.type === "number") {{
       if (input.validity.badInput || value && !/^\d+$/.test(value)) message = "Enter a whole number.";
@@ -10846,6 +10854,21 @@ mod tests {
                 "memberReadEpoch === epoch && token === requestToken && target === member"
             )
         );
+    }
+
+    #[test]
+    fn update_url_validation_is_shared_and_captures_the_field_owner() {
+        let html = page();
+        assert!(html.contains("function isUpdateChannelUrl(key, path = fieldPath)"));
+        assert!(html.contains("const updateUrl = isUpdateChannelUrl(field[0]);"));
+        assert!(html.contains(
+            "updateUrl && value && !(value.startsWith(\"https:\" + \"//\") || value.startsWith(\"file://\"))"
+        ));
+        assert!(html.contains("Use an https:\" + \"// or file:// update URL."));
+        // Scheme policy supplements, rather than replaces, complete-URL and
+        // associated inline validation. API/config validation stays authoritative.
+        assert!(html.contains("input.type === \"url\" && value && input.validity.typeMismatch"));
+        assert!(html.contains("input.setAttribute(\"aria-errormessage\", error.id)"));
     }
 
     /// The legacy "System details" section polls a dozen `show` endpoints. It

@@ -1,4 +1,5 @@
-// What the console can actually write, as reported by the console itself.
+// Field exposure inventory, as reported by the console's real builders.
+// This is NOT behavioral validation, persistence or live-network coverage.
 //
 // Regexing the source for field tables gets this wrong — several are wired up
 // in ways a pattern does not see, and a miss reads as a gap that is not there.
@@ -79,8 +80,9 @@ export const instrument = (page, { swallow = true, live = false } = {}) =>
   return true;
 })()`);
 
-/// Operate every control the current view offers, and let the wrappers record
-/// what each one wanted to write.
+/// Exercise controls to discover the builders and paths they expose. Stage
+/// handlers and real CLI acceptance are checked by stage-contract.mjs; values
+/// observed here do not count as functional proof for a field.
 ///
 /// `panels` opens the "New"/"Edit" buttons as well. Off by default: the add
 /// panel's own mask is built by `renderAddPanel` on every render, so it is
