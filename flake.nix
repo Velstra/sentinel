@@ -63,7 +63,8 @@
             prev.fetchurl args;
       };
 
-      pkgs = nixpkgs.legacyPackages.${system}.extend crateSource;
+      pkgs = (nixpkgs.legacyPackages.${system}.extend crateSource).extend
+        (import ./nix/compact-tests.nix);
       lib = nixpkgs.lib;
 
       # Compile and test React in the sandbox. Cargo embeds these exact assets;
