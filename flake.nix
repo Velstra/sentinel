@@ -14955,6 +14955,33 @@
             machine.succeed("hostname | grep -x fw-base")
             machine.succeed("grep -q 'fw-base' /var/lib/sentinel/appliance.toml")
 
+            # A failed snapshot publication is NOT a successful commit. The
+            # actual CLI must return failure while retaining its armed safety
+            # timer; the saved baseline stays unchanged. This is a real atomic
+            # rename failure, not a mocked apply or systemd response.
+            saved_hash = machine.succeed("sha256sum /var/lib/sentinel/appliance.toml").split()[0]
+            machine.succeed(
+                "mv /run/sentinel/running.toml /run/sentinel/running-before-publication.toml; "
+                "mkdir -m 0700 /run/sentinel/running.toml"
+            )
+            refused = machine.fail(
+                "su admin -c \"printf '%s\\n' "
+                "'set system hostname fw-unrecorded' 'commit-confirm 10' exit "
+                "| sentinel configure 2>&1\""
+            )
+            assert "candidate applied and rollback timer armed" in refused, refused
+            assert "recording the running configuration failed" in refused, refused
+            machine.succeed("hostname | grep -x fw-unrecorded")
+            machine.succeed("systemctl is-active sentinel-confirm.timer")
+            assert machine.succeed("sha256sum /var/lib/sentinel/appliance.toml").split()[0] == saved_hash
+            machine.succeed(
+                "rmdir /run/sentinel/running.toml; "
+                "mv /run/sentinel/running-before-publication.toml /run/sentinel/running.toml"
+            )
+            machine.succeed("sentinel confirm-rollback")
+            machine.succeed("hostname | grep -x fw-base")
+            machine.succeed("grep -q 'fw-base' /run/sentinel/running.toml")
+
             # --- commit-confirm + confirm (keep the change) ---------------------
             # A 10-minute window: the new hostname is applied live AND the
             # auto-rollback timer is armed.
@@ -14964,6 +14991,9 @@
                 "| sentinel configure\""
             )
             machine.succeed("hostname | grep -x fw-c1")
+            machine.succeed("grep -q 'fw-c1' /run/sentinel/running.toml")
+            machine.succeed("test $(stat -c %a /run/sentinel/running.toml) = 640")
+            machine.succeed("test $(stat -c %U /run/sentinel/running.toml) = root")
             machine.succeed("systemctl is-active sentinel-confirm.timer")
             # `confirm` cancels the timer; the change stays live.
             machine.succeed(
@@ -14971,6 +15001,7 @@
             )
             machine.wait_until_fails("systemctl is-active sentinel-confirm.timer", timeout=20)
             machine.succeed("hostname | grep -x fw-c1")
+            machine.succeed("grep -q 'fw-c1' /run/sentinel/running.toml")
             # commit-confirm never persists: the saved baseline is untouched.
             machine.succeed("grep -q 'fw-base' /var/lib/sentinel/appliance.toml")
 
@@ -14981,11 +15012,13 @@
                 "| sentinel configure\""
             )
             machine.succeed("hostname | grep -x fw-c2")
+            machine.succeed("grep -q 'fw-c2' /run/sentinel/running.toml")
             machine.succeed("systemctl is-active sentinel-confirm.timer")
             # Forcing the revert (the exact command the timer runs) restores the
             # saved config and disarms the timer.
             machine.succeed("sentinel confirm-rollback")
             machine.succeed("hostname | grep -x fw-base")
+            machine.succeed("grep -q 'fw-base' /run/sentinel/running.toml")
             machine.wait_until_fails("systemctl is-active sentinel-confirm.timer", timeout=20)
 
             # --- the real timer fires and auto-reverts (the headline) -----------
@@ -14998,8 +15031,11 @@
                 "| sentinel configure\""
             )
             machine.succeed("hostname | grep -x fw-c3")
+            machine.succeed("grep -q 'fw-c3' /run/sentinel/running.toml")
             machine.succeed("systemctl is-active sentinel-confirm.timer")
             machine.wait_until_succeeds("hostname | grep -x fw-base", timeout=120)
+            machine.wait_until_succeeds("grep -q 'fw-base' /run/sentinel/running.toml", timeout=20)
+            machine.succeed("grep -q 'fw-base' /var/lib/sentinel/appliance.toml")
           '';
         };
 
