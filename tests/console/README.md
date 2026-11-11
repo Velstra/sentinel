@@ -25,7 +25,9 @@ a concurrent rebuild cannot change the executable underneath a running test.
 | --- | --- |
 | `ux` | Switch cancellation/keyboard activation; suggestion disclosure; invalid/valid numbers and URLs; rule port ranges; retryable diagnostics; identifier labels; shared alignment and HA mobile copy |
 | `layout` | Every palette destination at 1440, 390 and 320 px; associated input labels; overlapping grid fields; clipped controls outside intentional scroll regions; no document overflow |
-| `console` | Navigation/tabs, all create panels, staged changes, real persistence/defaults, authentication/permissions, dialog flows, secrets and CLI-field inventory |
+| `console` | Navigation/tabs, create panels, staged changes, persistence/defaults, authentication/permissions, dialog flows, secrets; includes the strict Stage contract below and a separate grammar-field exposure inventory |
+| `stage-contract` | Explicit form/value cases: actual controls and physical Stage clicks, strict real API and installed CLI validation, unchanged-value feedback and invalid inputs. Runs inside `console`; standalone execution is available for focused diagnosis |
+| `update-url` | Shared default/Add/Edit channel URL policy: invalid schemes, HTTPS/offline mirrors, keyboard Stage, associated error and focus recovery at 1440/390/320 px. Runs inside `ux`; standalone execution is available for diagnosis |
 | `react` | Dashboard/flows/editor, safe apply/confirm/expiry, drafts, mobile navigation, both themes and sensitive-state cleanup |
 | `health` | Real health API; explicitly synthetic clock/TPM/failure cases; retry and NTP navigation |
 | `ha-mode` | Election controls, risk guidance, canonical staging, invalid timing and narrow themes; does not enroll a cluster |
