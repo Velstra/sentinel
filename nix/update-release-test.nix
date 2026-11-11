@@ -30,6 +30,14 @@ let
   node = version: {
     system.image.version = version;
     virtualisation.memorySize = 768;
+    # Channel installs now require genuine persistent ext4 staging, not a RAW
+    # on volatile tmpfs. This remains a small, non-bootable crypto fixture.
+    virtualisation.emptyDiskImages = [ 1024 ];
+    virtualisation.fileSystems."/var/lib/sentinel" = {
+      device = "/dev/vdb";
+      fsType = "ext4";
+      autoFormat = true;
+    };
     environment.systemPackages = [ sentinel pkgs.openssl pkgs.python3 ];
     environment.etc."qa-release/appliance.toml".text = ''
       [system]

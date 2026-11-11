@@ -1409,12 +1409,12 @@
               "sentinel-boot.service"
             ];
             wantedBy = [ ];
+            unitConfig.StartLimitIntervalSec = 0;
             serviceConfig = {
               Type = "exec";
               ExecStart = "${pkgs.hostapd}/bin/hostapd /run/sentinel/wireless/%i.conf";
               Restart = "on-failure";
               RestartSec = 5;
-              StartLimitIntervalSec = 0;
             };
           };
           systemd.services."sentinel-supplicant@" = {
@@ -1424,13 +1424,13 @@
               "sentinel-boot.service"
             ];
             wantedBy = [ ];
+            unitConfig.StartLimitIntervalSec = 0;
             serviceConfig = {
               Type = "exec";
               ExecStart =
                 "${pkgs.wpa_supplicant}/bin/wpa_supplicant -c /run/sentinel/wireless/%i.conf -i %i";
               Restart = "on-failure";
               RestartSec = 5;
-              StartLimitIntervalSec = 0;
             };
             # wpa_supplicant wants its control-socket directory to exist.
             unitConfig.ConditionPathExists = "/run/sentinel/wireless/%i.conf";
@@ -1449,13 +1449,13 @@
               "sentinel-boot.service"
             ];
             wantedBy = [ ];
+            unitConfig.StartLimitIntervalSec = 0;
             path = [ pkgs.modemmanager ];
             serviceConfig = {
               Type = "exec";
               ExecStart = "/bin/sh /run/sentinel/wwan/%i.sh";
               Restart = "on-failure";
               RestartSec = 10;
-              StartLimitIntervalSec = 0;
             };
             unitConfig.ConditionPathExists = "/run/sentinel/wwan/%i.sh";
           };
@@ -1640,6 +1640,7 @@
         boothealth = import ./nix/boot-health-test.nix { inherit pkgs self; };
         bootfallback = import ./nix/boot-fallback-test.nix { inherit pkgs self; };
         update-release = import ./nix/update-release-test.nix { inherit pkgs sentinel; };
+        update-capacity = import ./nix/update-capacity-test.nix { inherit pkgs self; };
         napt-concurrency = import ./nix/napt-test.nix { inherit pkgs self; };
         ipsec-failclosed = import ./nix/ipsec-failclosed-test.nix { inherit pkgs self; };
         ipsec-provenance = import ./nix/ipsec-failclosed-test.nix { inherit pkgs self; withAllDirections = true; };
@@ -3357,6 +3358,15 @@
           fw.wait_until_succeeds("ip link show wlan0", timeout=60)
           fw.wait_until_succeeds("ip link show wlan1", timeout=60)
 
+          # Inspect systemd's effective property, not just the Nix source. This
+          # option belongs to [Unit]; [Service] silently ignored the old value.
+          for kind in ("hostapd", "supplicant", "wwan"):
+              unit = f"sentinel-{kind}@wlan0.service"
+              interval = fw.succeed(
+                  f"systemctl show {unit} --property=StartLimitIntervalUSec --value"
+              ).strip()
+              assert interval == "0", (unit, interval)
+
           psk = "correcthorsebattery"
 
           fw.succeed(
@@ -3376,8 +3386,8 @@
               "| sentinel configure\""
           )
 
-          # The rendered config carries the key, so it is 0600 and its directory
-          # 0700 — there is no separate secrets file to split a radio's key into.
+          # The rendered config carries the key, so it is 0600. Its directory
+          # stays listable for ordinary admin reconciliation (checked below).
           fw.wait_until_succeeds(
               "test -f /run/sentinel/wireless/wlan0.conf", timeout=30
           )
@@ -3411,15 +3421,16 @@
           # appliance's own station config writes it; this throwaway client is
           # built by hand and does not get it for free.
           fw.succeed(
-              "mkdir -p /tmp/sta && "
-              + "echo 'ctrl_interface=/run/wpa_supplicant' > /tmp/sta/wpa.conf && "
+              "umask 077; mkdir -m 700 -p /tmp/sta/control /tmp/sta/client && "
+              + "echo 'ctrl_interface=/tmp/sta/control' > /tmp/sta/wpa.conf && "
               + f"wpa_passphrase velstra {psk} >> /tmp/sta/wpa.conf"
           )
           fw.succeed(
               "ip netns exec sta wpa_supplicant -B -i wlan1 -c /tmp/sta/wpa.conf"
           )
           fw.wait_until_succeeds(
-              "ip netns exec sta wpa_cli -i wlan1 status | grep -q 'wpa_state=COMPLETED'",
+              "ip netns exec sta wpa_cli -p /tmp/sta/control -s /tmp/sta/client -i wlan1 status "
+              "> /tmp/sta/status && grep -qx 'wpa_state=COMPLETED' /tmp/sta/status",
               timeout=90,
           )
           # hostapd saw the association from its own side, which is the proof the
@@ -7007,8 +7018,9 @@
         #
         # The cross-reboot slot switch is then driven for real: the machine
         # comes back on slot B, and the donor's marker file is the proof of
-        # which slot it booted. The boot-counting/bless mechanism itself is
-        # proven by checks.verified-boot.
+        # which slot it booted. Both successful boots require a real configured
+        # XDP dataplane and the ordinary counted-boot assessment. The separate
+        # checks.bootfallback exercises three genuinely broken candidate boots.
         #   nix build .#checks.x86_64-linux.update -L
         update = pkgs.testers.runNixOSTest {
           name = "sentinel-update";
@@ -7016,7 +7028,7 @@
             # Never started: only its image is used.
             donor = {
               imports = [
-                self.nixosModules.sentinel ./nix/test-network-seed.nix
+                self.nixosModules.sentinel ./nix/update-test-seed.nix
                 ./nix/image.nix
               ];
               # The driver names a machine after `system.name`, and the
@@ -7028,6 +7040,7 @@
               # reboot as the proof of which slot came up.
               environment.etc."sentinel-update-donor".text = "slot B came from the donor image\n";
               virtualisation = {
+                vlans = [ 1 ];
                 directBoot.enable = false;
                 mountHostNixStore = false;
                 useEFIBoot = true;
@@ -7039,7 +7052,7 @@
               { nodes, ... }:
               {
                 imports = [
-                  self.nixosModules.sentinel ./nix/test-network-seed.nix
+                  self.nixosModules.sentinel ./nix/update-test-seed.nix
                   ./nix/image.nix
                 ];
                 system.name = "machine";
@@ -7066,6 +7079,7 @@
                       -in $out/other.raw.sha256 -out $out/other.raw.sha256.sig
                   '';
                 virtualisation = {
+                  vlans = [ 1 ];
                   directBoot.enable = false;
                   mountHostNixStore = false;
                   useEFIBoot = true;
@@ -7074,16 +7088,51 @@
                   # Attach the update stick AFTER boot, just as an operator
                   # would. Booting with two appliance images races their equal
                   # LABEL=data mounts and can put live state on the donor.
-                  qemu.options = [ "-device qemu-xhci,id=update-usb" ];
+                  qemu.options = [
+                    "-device qemu-xhci,id=update-usb"
+                    # Same virtual hardware across cold boots; never inject or
+                    # repair the product's volatile /etc/machine-id.
+                    "-uuid 49cbd410-429c-4cdb-bc48-49c74f12e3db"
+                  ];
                 };
               };
           };
           testScript =
             { nodes, ... }:
             ''
+              import importlib.util
+              import json
               import os
+              import shlex
               import subprocess
               import tempfile
+
+              specification = importlib.util.spec_from_file_location(
+                  "update_observer", "${./nix/update-test-observer.py}")
+              assert specification is not None and specification.loader is not None
+              observer = importlib.util.module_from_spec(specification)
+              specification.loader.exec_module(observer)
+              expected = json.loads(r"""${builtins.toJSON {
+                ipv4 = map (a: "${a.address}/${toString a.prefixLength}") nodes.machine.networking.interfaces.eth1.ipv4.addresses;
+                ipv6 = map (a: "${a.address}/${toString a.prefixLength}") nodes.machine.networking.interfaces.eth1.ipv6.addresses;
+              }}""")
+
+              def healthy_snapshot(phase):
+                  # Only normal startup and the real product's bounded read-only
+                  # checker: no manual unit start, target repair, bless or retry.
+                  machine.wait_for_unit("velstra.service")
+                  machine.wait_for_unit("wren.service")
+                  machine.wait_for_unit("systemd-bless-boot.service")
+                  machine.succeed("${pkgs.python3}/bin/python3 -I ${./nix/boot-health.py} verify "
+                                  "--sentinel ${nodes.machine.services.velstra.sentinel}/bin/sentinel "
+                                  "--systemctl ${pkgs.systemd}/bin/systemctl --ip ${pkgs.iproute2}/bin/ip --timeout 30")
+                  result = json.loads(machine.succeed(
+                      "${pkgs.python3}/bin/python3 -I /etc/sentinel-update-observer.py "
+                      f"--disk {shlex.quote(disk)} --phase {shlex.quote(phase)} "
+                      f"--expected-json {shlex.quote(json.dumps(expected))}"))
+                  # Test-driver output preserves hashes/public identities only.
+                  print(json.dumps({"immutable_update_observation": result}, sort_keys=True))
+                  return result
 
               tmp = tempfile.NamedTemporaryFile()
               subprocess.run([
@@ -7111,6 +7160,10 @@
               assert src, "no source disk"
               disk = "/dev/" + src
               donor_disk = "/dev/sda"
+
+              with subtest("the first counted A boot has real configured XDP before normal blessing"):
+                  original = healthy_snapshot("initial")
+
               with subtest("the appliance owns its data before the USB update medium arrives"):
                   assert machine.succeed("findmnt -n -o SOURCE /var/lib/sentinel").strip() == disk + "6"
                   machine.succeed("printf persistent-target-data > /var/lib/sentinel/update-data-proof")
@@ -7196,6 +7249,10 @@
                   assert guid(disk, 5) == guid(donor_disk, 3), (
                       f"slot B store GUID {guid(disk, 5)} does not match the donor's {guid(donor_disk, 3)}")
 
+              with subtest("signed inactive-slot staging preserves live A, keys, config and fallback"):
+                  staged = healthy_snapshot("staged")
+                  observer.compare(original, staged, "staged")
+
               # Slot B now has the donor's GUIDs. The hot-plugged USB medium
               # must be absent at the next boot, or the initrd could select its
               # store instead. QEMU hot-plug state is deliberately not part of
@@ -7212,13 +7269,13 @@
                   # The donor's marker: only its store has it, so its presence
                   # says slot B is what booted, not merely that something did.
                   machine.succeed("test -f /etc/sentinel-update-donor")
-                  machine.succeed("sentinel show version")
-                  machine.wait_for_unit("velstra.service")
-                  # And the attached store is slot B, verity intact — a
-                  # mismatched pair would have failed to open at all.
                   backing = machine.succeed("lsblk -nsro NAME /dev/mapper/usr")
                   assert f"{src}5" in backing, (
                       f"/usr is not backed by slot B: {backing.strip()!r}")
+                  machine.succeed("sentinel show version")
+                  machine.wait_for_unit("velstra.service")
+                  booted = healthy_snapshot("booted")
+                  observer.compare(original, booted, "booted")
             '';
         };
 

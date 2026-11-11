@@ -63,6 +63,7 @@ mod ui;
 mod unlock;
 mod update;
 mod update_key;
+mod update_stage;
 mod velstra;
 mod verified_image;
 mod webui;
@@ -389,6 +390,9 @@ enum Command {
         #[arg(long)]
         create: bool,
     },
+    /// Internal root-only presence/absence proof for a protected state path.
+    #[command(hide = true)]
+    OwnedFileProbe { path: PathBuf },
     /// Ask the data plane agent's query socket and print the reply.
     ///
     /// Internal: `show` re-invokes this under sudo when the socket is not
@@ -817,6 +821,10 @@ async fn main() -> Result<()> {
         } => apply_boot(&config, &out, &wren_out),
         Command::ApplyBootLate { config } => apply_boot_late(config.as_deref()),
         Command::ProtectArchives { config, create } => archive::protect_archives(&config, create),
+        Command::OwnedFileProbe { path } => {
+            print!("{}", system::owned_file_probe(&path)?);
+            Ok(())
+        }
         Command::AgentQuery { command, socket } => {
             let path = socket.unwrap_or_else(|| PathBuf::from(velstra::SOCKET));
             print!("{}", velstra::query_at(&path, &command)?);
@@ -3739,6 +3747,29 @@ async fn ports(endpoint: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{boot_late_source, firewall_events_since_query, firewall_log_args};
+
+    #[test]
+    fn owned_file_probe_cli_keeps_literal_path_values_after_the_option_terminator() {
+        use clap::Parser;
+        for path in [
+            "/root/private state",
+            "--looks-like-option",
+            "'quote';$(no-shell)\n*",
+        ] {
+            let cli =
+                super::Cli::try_parse_from(["sentinel", "owned-file-probe", "--", path]).unwrap();
+            match cli.command {
+                super::Command::OwnedFileProbe { path: actual } => {
+                    assert_eq!(actual, std::path::Path::new(path));
+                }
+                _ => panic!("wrong command dispatch"),
+            }
+        }
+        assert!(super::Cli::try_parse_from(["sentinel", "owned-file-probe"]).is_err());
+        assert!(
+            super::Cli::try_parse_from(["sentinel", "owned-file-probe", "/one", "/two"]).is_err()
+        );
+    }
 
     fn wizard_answers() -> super::installer_tui::Answers {
         super::installer_tui::Answers {
