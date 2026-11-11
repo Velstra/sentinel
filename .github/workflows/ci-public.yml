@@ -27,7 +27,7 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
       - name: Appliance fixture regressions
-        run: python3 -B -m unittest nix.test_update_capacity nix.test_update_fixture nix.test_visible_mount nix.test_radio_units -v
+        run: python3 -B -m unittest nix.test_update_capacity nix.test_update_fixture nix.test_visible_mount nix.test_radio_units nix.test_ha_kernel_oracle -v
 
   source-sbom:
     runs-on: ubuntu-24.04
