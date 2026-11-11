@@ -405,3 +405,12 @@ answer cannot repopulate either the signed-out or a later session. This changes
 display freshness only, never delivery/conflict/permission semantics. The peer
 browser suite drives the actual Refresh and Sign out controls, including delayed
 responses and unavailable snapshots, rather than manually refreshing both panes.
+
+## Update URL validation
+
+The shared bindField owner captures update/default and named-channel ownership
+when each form is built. Both forms accept only the https:// and file:// schemes
+defined by src/config.rs and src/session.rs; offline file mirrors remain valid.
+Invalid schemes retain the entered value and show an associated inline error
+before Stage. Generic URL syntax checks and authoritative API/CLI validation
+remain in place. This is a business-backed field variant, not a new form owner.
