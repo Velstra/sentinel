@@ -295,6 +295,31 @@ including chunked responses, with appliance-pinned curl 8.4 or newer. Incomplete
 downloads are removed and failures leave the active slot unchanged. On Linux,
 the curl child is killed automatically if its update owner exits.
 
+Channel RAW images are staged sparsely in an anonymous 0600 file on the mounted
+ext4 state filesystem (`/var/lib/sentinel`), not in RAM-backed `/tmp` and not
+in an operator-selected `TMPDIR`. Every zero byte still contributes to the
+signed image digest and exact logical length; only nonzero blocks allocate
+payload space. The open descriptor survives through whole-image verification
+and partition copying, and is automatically reclaimed when the updater exits.
+There is no persistent image cache to clear after a crash.
+
+The updater checks a reserve of the greater of 512 MiB or 5% of the state filesystem,
+with additional metadata headroom, and refuses an extent that exceeds its
+staging budget. Concurrent unrelated filesystem writers can still consume
+space; such allocation or sync failures safely refuse the update. A genuine
+signed dense image can require more staging space than a sparse release.
+Missing/unmounted/volatile/read-only state and insufficient capacity are
+explicit errors; the updater never deletes configuration, archives, logs or a
+fallback slot to make room. The recommended 32 GiB appliance disk provides room
+for state and releases; a smaller disk that can boot is not a guarantee that
+every future release will fit. The bounded ESP copy is verified before any
+inactive-slot payload is overwritten.
+
+Only one image update can run at a time, including signed local and deliberately
+unsigned local writes. A second writer receives `another update is in progress`.
+This update lock does not block ordinary configuration commits or metadata
+checks while a download is in progress.
+
 The persistent subscription identity is published only after its private contents
 are complete and synced. Concurrent first use converges on one identity;
 corrupt or insecure existing files are refused rather than silently replaced

@@ -65,6 +65,11 @@ Keyboard blur, input correction and explicit Add/Stage validation remain
 immediate. A canceled gesture never activates an action. This prevents a newly
 visible required-field error from moving the clicked target before release;
 it does not waive validation, stage a command or add an alternate submit path.
+Informational field hints use that same queue for native change and delayed
+completion: a wrapping CIDR explanation must not move a physically held Add.
+Stale values/detached controls cannot repaint the active form. The empty-policy
+regression holds the real Add for 400ms, verifies stable geometry/no early
+staging, then requires the ordinary release to stage exactly one valid rule.
 Verification includes physically held Chrome mouse presses on desktop/mobile
 and keyboard validation in tests/console/ux.test.mjs.
 
@@ -92,6 +97,23 @@ and generation guards; no observation is invented or silently treated healthy.
 Its local-IKE address suggestions contain only IPv4 endpoints, as required by
 the appliance schema. The shared local-address inventory remains dual-stack
 for protocols that support it; arbitrary valid IPv4 endpoints remain typeable.
+
+An absent prefix-list, route-map, WireGuard interface or DHCP server is an
+explicit prerequisite-unavailable state, not a pending configuration read.
+The shared object/form owner disables New with visible associated guidance,
+retires the old handler/disclosure and clears its hidden panel when that parent
+disappears. Selecting or naming a valid current parent rebinds the same owner
+once and reapplies account/member gates. A stale picker option is never accepted
+as a current parent. Draft-only name/picker changes synchronously reuse the last
+genuine configuration read, so an old parent's handler is never offered during
+an unnecessary fetch. Their rule Add uses the same draft-vocabulary refresh
+without starting a configuration read; explicit Refresh still reads the backend.
+Naming/selecting a parent alone stages no command; Discard retains its existing
+local-batch meaning, and Refresh reconciles its vocabulary.
+tests/console/empty-policy.mjs removes the real private-fixture parents and
+exercises physical creation, native selection, discard/reload, disappearance,
+real read-only login and admin recovery at actual 1440/390 CSS pixels. It does
+not replace native fixed-image verification.
 
 Switches activate on completed native button clicks, including keyboard and
 assistive activation; canceled pointer gestures do not change the value.

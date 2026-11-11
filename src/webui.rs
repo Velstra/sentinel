@@ -4237,15 +4237,23 @@ function wireHint(field, widget, box, values) {{
   const run = () => {{
     const value = widget.value || "";
     const idle = value ? "" : gloss;
-    if (!compute) {{ box.textContent = idle; return; }}
+    // Hints can wrap just like errors. Native change/async completion during
+    // pointer-down must not move the pressed Add/Stage before pointer-up.
+    // Reuse the shared validation feedback queue, including its cancel path.
+    const paint = (text) => {{
+      const update = () => {{ if ((widget.value || "") === value) box.textContent = text; }};
+      if (validationPointers.size) deferredBlurChecks.add(() => {{ if (widget.isConnected) update(); }});
+      else update();
+    }};
+    if (!compute) {{ paint(idle); return; }}
     let answer;
     try {{ answer = compute(value, values ? values() : {{}}); }} catch (e) {{ answer = ""; }}
     if (answer && typeof answer.then === "function") {{
-      box.textContent = idle;
-      answer.then((text) => {{ if (widget.value === value) box.textContent = text || idle; }});
+      paint(idle);
+      answer.then((text) => paint(text || idle));
       return;
     }}
-    box.textContent = answer || idle;
+    paint(answer || idle);
   }};
   widget.addEventListener("input", () => {{
     clearTimeout(timer);
@@ -5499,10 +5507,11 @@ function firewallPortsError(value) {{
   return "";
 }}
 
-// Blur runs during pointer-down, before the eventual click. Revealing an error
-// at that point can move the pressed target out from under pointer-up and lose
-// the click. Keep one shared queue for every grammar form; keyboard blur remains
-// immediate, and validation on Add/Stage is never delayed or bypassed.
+// Blur/native change and delayed hints can run during pointer-down, before the
+// eventual click. Revealing feedback then can move the pressed target out from
+// under pointer-up and lose the click. Keep one shared queue for every grammar
+// form; keyboard blur remains immediate, and validation on Add/Stage is never
+// delayed or bypassed.
 const validationPointers = new Set();
 const deferredBlurChecks = new Set();
 function flushBlurChecks() {{
@@ -6182,14 +6191,50 @@ function markSpread(node, head, first, bar) {{
   node.append(line);
 }}
 
-// `o` carries: listId, addId?, noun, fields, path(name), rows, badge?, nameHint, empty.
+// A completed read with no parent is unavailable, not still loading. Retire
+// the previous parent's entire disclosure so a stale closure can never create
+// a child under an object that disappeared. The list supplies visible guidance.
+function unavailableCreation(o, reason) {{
+  const trigger = o.toggleId && $(o.toggleId);
+  const panelId = o.addId || (trigger && trigger.getAttribute("aria-controls"));
+  const box = panelId && $(panelId);
+  if (box) {{
+    if (box.contains(document.activeElement) && o.parentFocusId) $(o.parentFocusId)?.focus();
+    box.classList.add("hidden");
+    box.textContent = "";
+    box.onkeydown = null;
+    box.removeAttribute("role");
+    box.removeAttribute("aria-label");
+    dirty.delete(panelId);
+  }}
+  if (!trigger) return;
+  trigger.disabled = true;
+  trigger.onclick = null;
+  trigger.textContent = o.toggleLabel || "New";
+  trigger.title = reason;
+  trigger.removeAttribute("data-config-loading");
+  trigger.removeAttribute("aria-busy");
+  trigger.removeAttribute("aria-controls");
+  trigger.removeAttribute("aria-expanded");
+  const previous = trigger.dataset.creationDescription;
+  const descriptions = (trigger.getAttribute("aria-describedby") || "").split(/\s+/)
+    .filter((id) => id && id !== previous && id !== "write-boundary");
+  if (o.listId && !descriptions.includes(o.listId)) descriptions.push(o.listId);
+  if (descriptions.length) trigger.setAttribute("aria-describedby", descriptions.join(" "));
+  else trigger.removeAttribute("aria-describedby");
+  trigger.dataset.creationDescription = o.listId || "";
+  trigger.dataset.creationUnavailable = reason;
+  // This prerequisite now owns the disabled state; a later permission change
+  // must not resurrect a gateWrites snapshot from the previous parent.
+  delete trigger.dataset.writeGated;
+  gateWrites();
+}}
+
+// `o` carries listId, addId?, toggleId?, unavailable?, parentFocusId?, refreshDraft?, noun,
+// fields, path(name), rows, badge?, nameHint and empty.
 function renderObjects(o) {{
   if (!configReadable && !o.rows.length) {{
-    const trigger = o.toggleId && $(o.toggleId);
-    if (trigger && trigger.hasAttribute("data-config-loading")) {{
-      trigger.setAttribute("aria-busy", "false");
-      trigger.title = "Read the configuration successfully before creating an object.";
-    }}
+    unavailableCreation(o, "Read the configuration successfully before creating an object.");
     return unreadable(o.listId);
   }}
   const list = $(o.listId);
@@ -6212,7 +6257,10 @@ function renderObjects(o) {{
     ]));
   }}
 
-  if (o.addId) renderAddPanel(o);
+  if (o.addId) {{
+    if (o.unavailable) unavailableCreation(o, o.unavailable);
+    else renderAddPanel(o);
+  }}
 }}
 
 // The panel that makes a new object. Split out because the firewall rules keep
@@ -6351,7 +6399,8 @@ function renderAddPanel(o) {{
       // Rebuild the section so the thing just staged can be chosen by the next
       // one: creating a permission group and then an account in it is one piece
       // of work, and a form built before the group existed cannot offer it.
-      refresh();
+      if (o.refreshDraft) o.refreshDraft();
+      else refresh();
     }},
   }});
   const cancel = el("button", {{ class: "btn", type: "button", text: "Cancel", onclick: dismiss }});
@@ -6362,14 +6411,23 @@ function renderAddPanel(o) {{
   // left valid, rendered forms (including update channels and AAA) unreachable.
   // Rebinding onclick is idempotent and preserves the drawer's current state.
   const trigger = o.toggleId && $(o.toggleId);
-  if (trigger) wireToggle(o.toggleId, o.addId, o.toggleLabel || "New");
-  // Initial creation controls wait for this actual configuration/form. Never
-  // lift another prerequisite/permission gate.
-  if (trigger && trigger.hasAttribute("data-config-loading")) {{
-    trigger.removeAttribute("data-config-loading");
-    trigger.removeAttribute("aria-busy");
-    trigger.title = "";
-    trigger.disabled = false;
+  if (trigger) {{
+    wireToggle(o.toggleId, o.addId, o.toggleLabel || "New");
+    // Only this form's loading/prerequisite gates may be lifted. Permissions
+    // are reapplied after every rebind, including a newly named parent.
+    if (trigger.hasAttribute("data-config-loading") || trigger.hasAttribute("data-creation-unavailable")) {{
+      trigger.removeAttribute("data-config-loading");
+      trigger.removeAttribute("aria-busy");
+      trigger.removeAttribute("data-creation-unavailable");
+      const explanation = trigger.dataset.creationDescription;
+      const descriptions = (trigger.getAttribute("aria-describedby") || "").split(/\s+/)
+        .filter((id) => id && id !== explanation);
+      if (descriptions.length) trigger.setAttribute("aria-describedby", descriptions.join(" "));
+      else trigger.removeAttribute("aria-describedby");
+      delete trigger.dataset.creationDescription;
+      trigger.title = "";
+      trigger.disabled = false;
+    }}
     gateWrites();
   }}
 }}
@@ -6887,13 +6945,9 @@ async function refreshWireguard() {{
   // With no interface there is nothing to add a peer *to*: the panel used to
   // build `vpn wireguard undefined peer …`, a command the appliance can only
   // refuse. The control is disabled instead, and says why.
-  const canAddPeer = !!iface;
-  $("togglewgpeer").disabled = !canAddPeer;
-  $("togglewgpeer").title = canAddPeer ? "" : "Add a WireGuard interface first";
-  if (!canAddPeer) $("addwgpeerpanel").classList.add("hidden");
   renderObjects({{
     listId: "wgpeerlist", form: FORMS.wgPeer, required: "allowed-ips", toggleId: "togglewgpeer", toggleLabel: "New peer",
-    addId: canAddPeer ? "addwgpeerpanel" : null, noun: "Peer",
+    addId: "addwgpeerpanel", unavailable: iface ? "" : "Add a WireGuard interface first.", parentFocusId: "wgtunnel", noun: "Peer",
     fields: WG_PEER, nameLabel: "Public key", nameHint: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
     nameHelp: "Base64 WireGuard public key supplied by the peer; never its private key.",
     path: (n) => `vpn wireguard ${{iface}} peer ${{n}}`,
@@ -6967,15 +7021,14 @@ async function refreshDhcp() {{
   // Reservations belong to one server, so the interface is chosen first and the
   // rows are that server's — the same shape as a prefix list's rules.
   const withServer = [...servers.keys()].sort().map((name) => ({{ name }}));
-  const on = $("mapiface").value || (withServer[0] || {{}}).name || "";
+  const on = chosenName("mapiface", null, withServer);
   fillPicker("mapiface", withServer, on);
   // With no server chosen the path has a hole in it, and `set interface
   // dhcp-server static-mapping printer mac …` is a command that can only be
   // refused — so there is nothing to press rather than something that fails.
-  $("togglemap").disabled = !on;
   renderObjects({{
     listId: "maplist", required: "mac", toggleId: "togglemap", toggleLabel: "New",
-    addId: "addmappanel", noun: "Reservation",
+    addId: "addmappanel", unavailable: on ? "" : "Enable a DHCP server first.", parentFocusId: "mapiface", noun: "Reservation",
     fields: DHCP_MAPPING, nameHint: "printer",
     path: (n) => `interface ${{on}} dhcp-server static-mapping ${{n}}`,
     rows: on ? entriesUnder(ls, ["interface", on, "dhcp-server", "static-mapping"]) : [],
@@ -8238,10 +8291,12 @@ async function refreshOpenconnect() {{
 // one that does not exist yet — a list is only real once it has a rule, so the
 // name has to exist somewhere before that rule can be written.
 function chosenName(pickId, newId, names) {{
-  const typed = ($(newId).value || "").trim();
+  const typed = newId ? ($(newId).value || "").trim() : "";
   if (typed) return typed;
   const pick = $(pickId);
-  return pick.value || (names[0] && names[0].name) || "";
+  // A stale option is not a parent after deletion/discard. Resolve against the
+  // freshly read/staged vocabulary before rebuilding the picker and form.
+  return names.some((n) => n.name === pick.value) ? pick.value : (names[0] && names[0].name) || "";
 }}
 
 function fillPicker(pickId, names, current) {{
@@ -8255,8 +8310,11 @@ function fillPicker(pickId, names, current) {{
   if (!names.length) pick.append(el("option", {{ value: "", text: "(none yet)" }}));
 }}
 
-async function refreshRoutePolicy() {{
-  const ls = await leaves();
+async function refreshRoutePolicy(localContext = false) {{
+  // A parent picker/name changes only this draft's context. Rebind from the
+  // actual last read synchronously: awaiting another read leaves the previous
+  // parent's New handler briefly usable. Explicit Refresh still fetches anew.
+  const ls = localContext ? lastLeaves : await leaves();
   markTabs("routepolicy", ls);
 
   renderObjects({{
@@ -8277,7 +8335,8 @@ async function refreshRoutePolicy() {{
   renderObjects({{
     listId: "pllist", required: "prefix",
     toggleId: "togglepl", toggleLabel: "New rule",
-    addId: list ? "addplpanel" : null, noun: "Rule",
+    addId: "addplpanel", unavailable: list ? "" : "Select or name a prefix list first.", parentFocusId: "plnew", noun: "Rule",
+    refreshDraft: () => refreshRoutePolicy(true),
     fields: PLIST_RULE, nameHint: "10", nameLabel: "Sequence", nameBounds: [0, 4294967295],
     nameHelp: "Rules are evaluated in ascending sequence order.",
     // The rule's *name* is its sequence number, which is what orders them.
@@ -8287,7 +8346,6 @@ async function refreshRoutePolicy() {{
     empty: list ? "No rules in " + list + " yet."
                 : "Type a name beside the picker to start a list.",
   }});
-  $("togglepl").disabled = !list;
 
   const maps = entriesWithStaged(entriesUnder(ls, ["policy", "route-map"]), ["policy", "route-map"]);
   const map = chosenName("rmlist-pick", "rmnew", maps);
@@ -8305,7 +8363,8 @@ async function refreshRoutePolicy() {{
   renderObjects({{
     listId: "rmlist", required: "action",
     toggleId: "togglerm", toggleLabel: "New rule",
-    addId: map ? "addrmpanel" : null, noun: "Rule",
+    addId: "addrmpanel", unavailable: map ? "" : "Select or name a route map first.", parentFocusId: "rmnew", noun: "Rule",
+    refreshDraft: () => refreshRoutePolicy(true),
     fields: RMAP_RULE, nameHint: "10", nameLabel: "Sequence", nameBounds: [0, 4294967295],
     nameHelp: "Rules are evaluated in ascending sequence order.",
     path: (seq) => `policy route-map ${{map}} rule ${{seq}}`,
@@ -8315,7 +8374,6 @@ async function refreshRoutePolicy() {{
     empty: map ? "No rules in " + map + " yet."
                : "Type a name beside the picker to start a map.",
   }});
-  $("togglerm").disabled = !map;
 }}
 
 async function refreshSystem() {{
@@ -10114,14 +10172,14 @@ $("runcapture").onclick = async () => {{
   btn.textContent = "Capture";
 }};
 $("wgtunnel").onchange = () => refreshWireguard();
-$("pllist-pick").onchange = () => {{ $("plnew").value = ""; refreshRoutePolicy(); }};
-$("rmlist-pick").onchange = () => {{ $("rmnew").value = ""; refreshRoutePolicy(); }};
+$("pllist-pick").onchange = () => {{ $("plnew").value = ""; refreshRoutePolicy(true); }};
+$("rmlist-pick").onchange = () => {{ $("rmnew").value = ""; refreshRoutePolicy(true); }};
 // `oninput`, not `onchange`: a text field only fires change when it is left,
 // so naming a map and reaching straight for "New rule" -- the path an operator
 // actually takes -- never refreshed, and the button sat disabled with nothing
 // saying why.
-$("plnew").oninput = () => refreshRoutePolicy();
-$("rmnew").oninput = () => refreshRoutePolicy();
+$("plnew").oninput = () => refreshRoutePolicy(true);
+$("rmnew").oninput = () => refreshRoutePolicy(true);
 $("qosiface").onchange = () => refreshQos();
 $("historyres").onchange = () => refreshHistory();
 $("enabledhcp").onclick = () => {{

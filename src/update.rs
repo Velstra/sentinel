@@ -358,7 +358,18 @@ impl std::error::Error for MetadataNotFound {}
 /// runs, and a secret must not be.
 fn fetch(chan: &UpdateChannel, url: &str, dest: &Path, policy: FetchPolicy) -> Result<()> {
     let scratch = Scratch::new()?;
-    let header = match &chan.subscription_key {
+    let header = auth_header(chan, &scratch)?;
+    let out = fetch_output(
+        fetch_command(url, dest, header.as_deref(), policy)?,
+        dest,
+        policy,
+    )
+    .with_context(|| format!("running curl for {url}"))?;
+    fetch_result(chan, url, &out)
+}
+
+fn auth_header(chan: &UpdateChannel, scratch: &Scratch) -> Result<Option<PathBuf>> {
+    Ok(match &chan.subscription_key {
         Some(key) => {
             use std::io::Write;
             let machine_id =
@@ -373,13 +384,10 @@ fn fetch(chan: &UpdateChannel, url: &str, dest: &Path, policy: FetchPolicy) -> R
             Some(scratch.join("auth-header"))
         }
         None => None,
-    };
-    let out = fetch_output(
-        fetch_command(url, dest, header.as_deref(), policy)?,
-        dest,
-        policy,
-    )
-    .with_context(|| format!("running curl for {url}"))?;
+    })
+}
+
+fn fetch_result(chan: &UpdateChannel, url: &str, out: &std::process::Output) -> Result<()> {
     if out.status.success() {
         return Ok(());
     }
@@ -445,6 +453,16 @@ fn fetch_command(
     auth_header: Option<&Path>,
     policy: FetchPolicy,
 ) -> Result<Command> {
+    fetch_command_output(url, dest, auth_header, policy, false)
+}
+
+fn fetch_command_output(
+    url: &str,
+    dest: &Path,
+    auth_header: Option<&Path>,
+    policy: FetchPolicy,
+    sparse: bool,
+) -> Result<Command> {
     let mut cmd = system::curl_command();
     cmd.args([
         "-fsSL",
@@ -465,7 +483,11 @@ fn fetch_command(
         // The HTTP status, on stdout after the (empty, `-o`-redirected) body —
         // it is what tells an entitlement refusal apart from a broken mirror.
         "-w",
-        "%{http_code}",
+        if sparse {
+            "%{stderr}\nSENTINEL_HTTP_STATUS:%{http_code}\n"
+        } else {
+            "%{http_code}"
+        },
         "-o",
         s(dest)?,
         url,
@@ -801,31 +823,39 @@ pub fn compare_versions(a: &str, b: &str) -> Option<std::cmp::Ordering> {
     })
 }
 
-/// Fetch the image named by a verified `manifest` into `dest` and verify its
-/// SHA-256 equals the manifest's digest. On mismatch the unverified file is
-/// removed and the call bails — so a caller can only ever hand a digest-matched
-/// image to the slot-writer.
+/// Fetch into an anonymous sparse file on mounted persistent state, not the
+/// volatile system temp directory. Keep the same descriptor through the later
+/// whole-image verification and partition copy; no mutable pathname is reopened.
 ///
 /// `manifest` must be one returned by [`check`] (so its signature was verified);
 /// the image-name is re-validated here as belt-and-braces.
-pub fn fetch_verified_image(chan: &UpdateChannel, manifest: &Manifest, dest: &Path) -> Result<()> {
+pub fn fetch_verified_image(chan: &UpdateChannel, manifest: &Manifest) -> Result<std::fs::File> {
+    fetch_verified_image_using(chan, manifest, crate::update_stage::download)
+}
+
+fn fetch_verified_image_using(
+    chan: &UpdateChannel,
+    manifest: &Manifest,
+    download: impl FnOnce(Command, u64) -> Result<(std::fs::File, String, std::process::Output)>,
+) -> Result<std::fs::File> {
     if !valid_image_name(&manifest.image) {
         bail!("refusing to fetch unsafe image path {:?}", manifest.image);
     }
     let url = format!("{}/{}", base_url(chan), manifest.image);
-    fetch(chan, &url, dest, IMAGE_FETCH)?;
-
-    let got = sha256_hex(dest)?;
+    let scratch = Scratch::new()?; // Only small credentials, never the RAW.
+    let header = auth_header(chan, &scratch)?;
+    let command = fetch_command_output(&url, Path::new("-"), header.as_deref(), IMAGE_FETCH, true)?;
+    let (image, got, output) = download(command, IMAGE_FETCH.max_bytes)?;
+    fetch_result(chan, &url, &output)?;
     let want = norm_digest(&manifest.sha256);
     if got != want {
-        // Don't leave an unverified image lying around to be picked up by mistake.
-        let _ = std::fs::remove_file(dest);
+        // The unlinked image disappears automatically on any refusal.
         bail!(
             "image SHA-256 mismatch — refusing the update: manifest names {want}, fetched image \
              is {got}"
         );
     }
-    Ok(())
+    Ok(image)
 }
 
 /// The detached-signature path for a local image: `<image>.sig`, the same
@@ -1082,8 +1112,11 @@ mod tests {
         let public = dir.join("release.pub");
         let manifest = dir.join("manifest.json");
         let signature = dir.join("manifest.json.sig");
+        let mut image = vec![0u8; 1024 * 1024 + 31];
+        image[4096..8192].fill(0x45);
+        std::fs::write(dir.join("image.raw"), &image).unwrap();
         let original = serde_json::to_vec(&serde_json::json!({
-            "version": "9.1.0", "image": "image.raw", "sha256": "a".repeat(64),
+            "version": "9.1.0", "image": "image.raw", "sha256": sha256_hex(&dir.join("image.raw")).unwrap(),
             "product": PRODUCT,
         }))
         .unwrap();
@@ -1133,6 +1166,27 @@ mod tests {
         };
         // An absent atomic endpoint is the only compatibility fallback.
         assert_eq!(check(&chan).unwrap().version, "9.1.0");
+        let checked = check(&chan).unwrap();
+        let staged = fetch_verified_image_using(&chan, &checked, |command, maximum| {
+            crate::update_stage::test_download_in(command, &dir.0, maximum)
+        })
+        .unwrap();
+        assert_eq!(staged.metadata().unwrap().len(), image.len() as u64);
+        use std::os::unix::fs::{FileExt, MetadataExt};
+        assert_eq!(staged.metadata().unwrap().nlink(), 0);
+        let mut actual = vec![0u8; image.len()];
+        staged.read_exact_at(&mut actual, 0).unwrap();
+        assert_eq!(actual, image);
+        // A signed manifest is not enough: an altered image must never return
+        // a descriptor that an install caller can hand to the writer.
+        image[12345] ^= 1;
+        std::fs::write(dir.join("image.raw"), &image).unwrap();
+        let error = fetch_verified_image_using(&chan, &checked, |command, maximum| {
+            crate::update_stage::test_download_in(command, &dir.0, maximum)
+        })
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("SHA-256 mismatch"));
         let proof = std::fs::read(&signature).unwrap();
         let encode = |body: &[u8]| {
             serde_json::to_vec(&serde_json::json!({
@@ -1938,5 +1992,38 @@ mod tests {
         }
         let envs: Vec<_> = cmd.get_envs().map(|(k, _)| k.to_str().unwrap()).collect();
         assert!(envs.iter().all(|k| *k == "PATH"), "{envs:?}");
+        let sparse = fetch_command_output(
+            "https://updates.example.test/image.raw",
+            Path::new("-"),
+            Some(Path::new("/tmp/x/auth-header")),
+            IMAGE_FETCH,
+            true,
+        )
+        .unwrap();
+        let args: Vec<_> = sparse.get_args().map(|arg| arg.to_str().unwrap()).collect();
+        assert_eq!(args.first(), Some(&"--disable"));
+        assert!(args.windows(2).any(|pair| pair == ["-o", "-"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--proto-redir", "=https,file"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--max-filesize", "68719476736"])
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg.starts_with("%{stderr}") && arg.contains("SENTINEL_HTTP_STATUS:"))
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.starts_with("--retry") || arg.starts_with("--continue"))
+        );
+        let envs: Vec<_> = sparse
+            .get_envs()
+            .map(|(key, _)| key.to_str().unwrap())
+            .collect();
+        assert!(envs.iter().all(|key| *key == "PATH"));
     }
 }

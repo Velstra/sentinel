@@ -693,6 +693,7 @@ pub fn execute(
     // No target/source GPT write is permitted during these --pretend inspections.
     let layout = InstallLayout::new(&source)?;
     let need = layout.bytes;
+    let mut signatures = Vec::with_capacity(targets.len());
     for t in targets {
         if t.size < need {
             bail!(
@@ -703,17 +704,22 @@ pub fn execute(
             );
         }
         layout.validate_target(&t.dev_path())?;
+        // Refuse unsupported whole-disk signature coexistence on EVERY target
+        // before any target is erased or any holder is released. A mixed GPT
+        // and whole-disk RAID/filesystem is not permission to erase the GPT
+        // early: its PARTUUIDs may also bind the running verified medium.
+        signatures.push(inspect_install_signatures(&t.dev_path())?);
     }
 
     // From here on disks are being erased. Track which, so a mid-way failure
     // reports exactly which disks are left blank (none are recoverable once
     // wipefs has run — but the operator must know which to re-install).
     let mut erased: Vec<String> = Vec::new();
-    for t in targets {
+    for (t, signatures) in targets.iter().zip(&signatures) {
         let dev = t.dev_path();
         eprintln!("preparing {dev} (ERASING) …");
         erased.push(dev.clone());
-        if let Err(e) = prepare_disk(&source, &dev, raid, &layout) {
+        if let Err(e) = prepare_disk(&source, &dev, raid, &layout, signatures) {
             return Err(partial_install_error(e, &erased));
         }
     }
@@ -1037,8 +1043,113 @@ fn install_gpt_args(backup: &str, target: &str, raid: Raid, data_start: u64) -> 
     ]
 }
 
+/// The complete trusted wipefs probe, NOT a guessed list of partition-table
+/// names. `PMBR` is distinct from `gpt`/`dos`, and other tables exist too.
+#[derive(Debug, serde::Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+struct InstallSignature {
+    #[serde(rename = "type")]
+    kind: String,
+    usage: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstallSignatures {
+    signatures: Vec<InstallSignature>,
+}
+
+impl InstallSignatures {
+    fn parse(bytes: &[u8]) -> Result<Self> {
+        ensure!(
+            bytes.len() <= 64 * 1024,
+            "oversized install signature probe"
+        );
+        let mut value: Self =
+            serde_json::from_slice(bytes).context("invalid whole-disk install signature probe")?;
+        ensure!(
+            value.signatures.len() <= 64,
+            "too many whole-disk install signatures"
+        );
+        for row in &value.signatures {
+            // wipefs --types uses a pattern language, not arbitrary opaque
+            // names. Never let a probed type become a negation, wildcard,
+            // comma-separated argument or an option.
+            ensure!(
+                !row.kind.is_empty()
+                    && row.kind.len() <= 64
+                    && !row.kind.starts_with("no")
+                    && row
+                        .kind
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                    && matches!(
+                        row.usage.as_str(),
+                        "partition-table" | "filesystem" | "raid" | "crypto" | "other"
+                    ),
+                "unsupported whole-disk signature type or usage"
+            );
+        }
+        let table = value
+            .signatures
+            .iter()
+            .any(|row| row.usage == "partition-table");
+        ensure!(
+            !table
+                || value
+                    .signatures
+                    .iter()
+                    .all(|row| row.usage == "partition-table"),
+            "refusing a target with both a partition table and whole-disk filesystem/RAID signatures; \
+             Back up the target and remove conflicting \
+             whole-disk signatures from a separate recovery environment before retrying"
+        );
+        value.signatures.sort();
+        Ok(value)
+    }
+
+    fn erase_args(&self, target: &str) -> Option<Vec<String>> {
+        let types: std::collections::BTreeSet<_> = self
+            .signatures
+            .iter()
+            .filter(|row| row.usage != "partition-table")
+            .map(|row| row.kind.as_str())
+            .collect();
+        if types.is_empty() {
+            return None;
+        }
+        Some(vec![
+            "--all".into(),
+            "--types".into(),
+            types.into_iter().collect::<Vec<_>>().join(","),
+            "--".into(),
+            target.into(),
+        ])
+    }
+}
+
+fn inspect_install_signatures(target: &str) -> Result<InstallSignatures> {
+    let output = Command::new(system::bin("wipefs"))
+        .args(["--json", "--output", "TYPE,USAGE", "--", target])
+        .env_clear()
+        .env("LC_ALL", "C")
+        .output()
+        .context("inspecting whole-disk signatures before install")?;
+    ensure!(
+        output.status.success(),
+        "whole-disk install signature probe failed; refusing to erase"
+    );
+    InstallSignatures::parse(&output.stdout)
+}
+
 /// Clone the sealed layout and create a fresh full-sized data partition.
-fn prepare_disk(source: &str, target: &str, raid: Raid, layout: &InstallLayout) -> Result<()> {
+fn prepare_disk(
+    source: &str,
+    target: &str,
+    raid: Raid,
+    layout: &InstallLayout,
+    signatures: &InstallSignatures,
+) -> Result<()> {
     // Everything the kernel is still holding this disk open with, taken down
     // first. Without it `wipefs` fails with `probing initialization failed:
     // Device or resource busy` and the install stops before it has written
@@ -1052,7 +1163,25 @@ fn prepare_disk(source: &str, target: &str, raid: Raid, layout: &InstallLayout) 
     // candidate listing — so the operator sees a disk offered, picks it, says
     // YES, and is told the device is busy with no indication of what by.
     release_holders(target)?;
-    run("wipefs", &["-a", target])?;
+    let current = inspect_install_signatures(target)?;
+    ensure!(
+        current.signatures == signatures.signatures,
+        "target signatures changed after install preflight; refusing signature erasure"
+    );
+    if let Some(args) = current.erase_args(target) {
+        // A positive list contains ONLY already classified non-partition
+        // types. Never wipe GPT/PMBR (or any other partition table) before the
+        // complete final GPT transaction: wipefs would issue BLKRRPART while
+        // the shared signed-root PARTUUIDs are temporarily absent.
+        run(
+            "wipefs",
+            &args.iter().map(String::as_str).collect::<Vec<_>>(),
+        )?;
+        ensure!(
+            inspect_install_signatures(target)?.signatures.is_empty(),
+            "target still has signatures after non-partition cleanup; refusing GPT installation"
+        );
+    }
     // Load the already checked private template, not the source's full grown
     // data entry. It fits smaller targets too; no live source GPT is modified.
     let backup = layout
@@ -1230,6 +1359,7 @@ pub fn seed_config(targets: &[&Disk], raid: Raid, toml: &str, crypto: &Crypto) -
 pub fn update(image: &std::path::Path, commit: bool) -> Result<()> {
     use std::os::unix::fs::FileTypeExt;
 
+    let _update = crate::update_stage::UpdateLock::acquire()?;
     let (disk, active, inactive) = update_target()?;
     if !commit {
         eprintln!(
@@ -1388,6 +1518,7 @@ fn refuse_identical_image(
 pub fn update_verified(source: &std::path::Path, sha256: &str, commit: bool) -> Result<()> {
     use std::os::unix::fs::FileTypeExt;
 
+    let _update = crate::update_stage::UpdateLock::acquire()?;
     let (disk, active, inactive) = update_target()?;
     // Not a let-chain: the appliance's pinned compiler predates them.
     let same_disk = matches!(
@@ -1402,6 +1533,21 @@ pub fn update_verified(source: &std::path::Path, sha256: &str, commit: bool) -> 
         );
     }
     let image = VerifiedImage::open(source, sha256)?;
+    let is_block = std::fs::metadata(source).is_ok_and(|m| m.file_type().is_block_device());
+    write_verified(image, &disk, active, inactive, source, is_block, commit)
+}
+
+/// Both channel and local sources converge here only after the whole image has
+/// matched its signed digest. The caller holds the exclusive update lock.
+fn write_verified(
+    image: VerifiedImage,
+    disk: &str,
+    active: &Slot,
+    inactive: &Slot,
+    source: &std::path::Path,
+    is_block: bool,
+    commit: bool,
+) -> Result<()> {
     eprintln!("image SHA-256 verified against its signed digest");
     if !commit {
         eprintln!(
@@ -1412,7 +1558,7 @@ pub fn update_verified(source: &std::path::Path, sha256: &str, commit: bool) -> 
     }
     preflight_boot_selection()?;
     refuse_identical_image(
-        &disk,
+        disk,
         active,
         inactive,
         image.guid(SLOT_A.verity_part),
@@ -1420,7 +1566,7 @@ pub fn update_verified(source: &std::path::Path, sha256: &str, commit: bool) -> 
     )?;
     let target = |part: u32, from: u32| -> Result<std::fs::File> {
         use std::io::{Seek, SeekFrom};
-        let path = part_path(&disk, part);
+        let path = part_path(disk, part);
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
@@ -1439,11 +1585,13 @@ pub fn update_verified(source: &std::path::Path, sha256: &str, commit: bool) -> 
     let mut store = target(inactive.store_part, SLOT_A.store_part)?;
     let esp_copy = update::Scratch::new()?;
     let mut esp = esp_copy.create_private("esp.img")?;
+    // Insufficient ESP staging must not first damage the inactive store. The
+    // bounded temporary ESP copy is also verified before any target write.
+    image.copy_partition(1, &mut esp)?;
     eprintln!("writing slot {} from {} …", inactive.name, source.display());
     let written = image
         .copy_partition(SLOT_A.verity_part, &mut verity)
-        .and_then(|()| image.copy_partition(SLOT_A.store_part, &mut store))
-        .and_then(|()| image.copy_partition(1, &mut esp));
+        .and_then(|()| image.copy_partition(SLOT_A.store_part, &mut store));
     if let Err(error) = written {
         bail!(
             "{error:#}\nslot {} may hold a partial copy and was NOT activated: its partition \
@@ -1467,13 +1615,13 @@ pub fn update_verified(source: &std::path::Path, sha256: &str, commit: bool) -> 
                 inactive.store_part,
                 image.guid(SLOT_A.store_part)
             ),
-            &disk,
+            disk,
         ],
     )?;
-    run("partprobe", &[&disk]).ok();
+    run("partprobe", &[disk]).ok();
     run("udevadm", &["settle"]).ok();
     switch_boot(
-        &disk,
+        disk,
         UkiSource::EspImage(&esp_copy.join("esp.img")),
         active,
         inactive,
@@ -1482,7 +1630,7 @@ pub fn update_verified(source: &std::path::Path, sha256: &str, commit: bool) -> 
         "update complete — reboot to boot slot {} (auto-rolls back to {} if it fails 3×)",
         inactive.name, active.name
     );
-    if std::fs::metadata(source).is_ok_and(|m| m.file_type().is_block_device()) {
+    if is_block {
         eprintln!(
             "note: {} carries the same verity/store partition GUIDs as slot {} now. \
              Unplug it before rebooting — while it is attached, the initrd may mount /usr \
@@ -1507,6 +1655,9 @@ pub fn update_from_channel(
     commit: bool,
     allow_downgrade: bool,
 ) -> Result<()> {
+    // Lock before fetching to bound aggregate staging and serialize local,
+    // remote and unsigned update writers without locking config commits.
+    let _update = crate::update_stage::UpdateLock::acquire()?;
     let manifest = update::check(chan)?;
     eprintln!(
         "verified release {} (image {}) — signed by the pinned update key",
@@ -1514,15 +1665,16 @@ pub fn update_from_channel(
     );
     update::refuse_downgrade(&manifest.version, allow_downgrade)?;
 
-    // Stage the verified image in a self-cleaning scratch dir that outlives the
-    // slot-write below (it drops — and deletes the image — when this fn returns).
-    let scratch = update::Scratch::new()?;
-    let image = scratch.join("image.img");
-    update::fetch_verified_image(chan, &manifest, &image)?;
+    // Anonymous persistent sparse staging keeps every signed RAW byte without
+    // consuming a multi-GiB volatile tmpfs or trusting a mutable path.
+    let file = update::fetch_verified_image(chan, &manifest)?;
     eprintln!("image SHA-256 verified against the signed manifest");
 
     // Only now, past both crypto gates, does the image reach the slot-writer.
-    update_verified(&image, &manifest.sha256, commit)
+    let (disk, active, inactive) = update_target()?;
+    let source = std::path::Path::new("<anonymous signed channel image>");
+    let image = VerifiedImage::from_file(file, source, &manifest.sha256)?;
+    write_verified(image, &disk, active, inactive, source, false, commit)
 }
 
 /// The mountpoint of a block device, if it's currently mounted.
@@ -1746,6 +1898,183 @@ fn switch_boot(disk: &str, source: UkiSource, active: &Slot, inactive: &Slot) ->
 
 #[cfg(test)]
 mod tests {
+    fn install_signatures(rows: serde_json::Value) -> anyhow::Result<super::InstallSignatures> {
+        super::InstallSignatures::parse(&serde_json::to_vec(
+            &serde_json::json!({"signatures": rows}),
+        )?)
+    }
+
+    #[test]
+    fn install_signature_cleanup_preserves_gpt_and_distinct_protective_mbr() {
+        let plan = install_signatures(serde_json::json!([
+            {"type": "gpt", "usage": "partition-table"},
+            {"type": "gpt", "usage": "partition-table"},
+            {"type": "PMBR", "usage": "partition-table"}
+        ]))
+        .unwrap();
+        assert!(plan.erase_args("/dev/vdb").is_none());
+    }
+
+    #[test]
+    fn install_signature_cleanup_does_not_guess_an_exhaustive_partition_type_list() {
+        for kind in [
+            "dos",
+            "mac",
+            "bsd",
+            "sgi",
+            "sun",
+            "atari",
+            "aix",
+            "ultrix",
+            "future_table",
+        ] {
+            let plan = install_signatures(serde_json::json!([
+                {"type": kind, "usage": "partition-table"}
+            ]))
+            .unwrap();
+            assert!(plan.erase_args("/dev/vdb").is_none(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn install_signature_cleanup_empty_disk_needs_no_wipe() {
+        assert!(
+            install_signatures(serde_json::json!([]))
+                .unwrap()
+                .erase_args("/dev/vdb")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn install_signature_cleanup_only_generates_strict_positive_types_for_exact_target() {
+        let plan = install_signatures(serde_json::json!([
+            {"type": "linux_raid_member", "usage": "raid"},
+            {"type": "ext4", "usage": "filesystem"},
+            {"type": "ext4", "usage": "filesystem"}
+        ]))
+        .unwrap();
+        assert_eq!(
+            plan.erase_args("/dev/nvme0n1").unwrap(),
+            [
+                "--all",
+                "--types",
+                "ext4,linux_raid_member",
+                "--",
+                "/dev/nvme0n1"
+            ]
+        );
+    }
+
+    #[test]
+    fn install_signature_cleanup_accepts_unpartitioned_crypto_and_other_members() {
+        for (kind, usage) in [
+            ("crypto_LUKS", "crypto"),
+            ("LVM2_member", "other"),
+            ("swap", "other"),
+        ] {
+            let plan =
+                install_signatures(serde_json::json!([{"type": kind, "usage": usage}])).unwrap();
+            assert_eq!(
+                plan.erase_args("/dev/sdb").unwrap(),
+                ["--all", "--types", kind, "--", "/dev/sdb"]
+            );
+        }
+    }
+
+    #[test]
+    fn install_signature_cleanup_mixed_table_and_whole_disk_data_refuses_before_args() {
+        for (kind, usage) in [
+            ("ext4", "filesystem"),
+            ("linux_raid_member", "raid"),
+            ("crypto_LUKS", "crypto"),
+            ("LVM2_member", "other"),
+        ] {
+            let error = install_signatures(serde_json::json!([
+                {"type": "gpt", "usage": "partition-table"},
+                {"type": "PMBR", "usage": "partition-table"},
+                {"type": kind, "usage": usage}
+            ]))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("both a partition table")
+                    && error.contains("separate recovery environment"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn install_signature_cleanup_refuses_pattern_injection_and_unknown_usage() {
+        for kind in [
+            "",
+            "noext4",
+            "nogpt,dos",
+            "ext4,gpt",
+            "*",
+            "--all",
+            "ext4\n",
+            "x y",
+            "é",
+            "gpt;false",
+        ] {
+            assert!(
+                install_signatures(serde_json::json!([{"type": kind, "usage": "filesystem"}]))
+                    .is_err(),
+                "{kind}"
+            );
+        }
+        for usage in ["", "unknown", "partition", "partition-table\n"] {
+            assert!(
+                install_signatures(serde_json::json!([{"type": "ext4", "usage": usage}])).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn install_signature_cleanup_probe_schema_is_bounded_and_strict() {
+        for bytes in [
+            b"not-json".as_slice(),
+            b"{}",
+            b"{\"signatures\":null}",
+            b"{\"signatures\":[],\"unknown\":1}",
+            b"{\"signatures\":[{\"type\":\"ext4\",\"usage\":\"filesystem\",\"unknown\":1}]}",
+        ] {
+            assert!(super::InstallSignatures::parse(bytes).is_err());
+        }
+        assert!(super::InstallSignatures::parse(&vec![b' '; 64 * 1024 + 1]).is_err());
+        assert!(
+            install_signatures(serde_json::json!([
+                {"type": "a".repeat(65), "usage": "filesystem"}
+            ]))
+            .is_err()
+        );
+        assert!(
+            install_signatures(serde_json::Value::Array(vec![
+                serde_json::json!({"type": "ext4", "usage": "filesystem"});
+                65
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn install_signature_cleanup_recheck_is_order_independent_but_detects_new_signatures() {
+        let one = install_signatures(serde_json::json!([
+            {"type": "gpt", "usage": "partition-table"}, {"type": "PMBR", "usage": "partition-table"}
+        ])).unwrap();
+        let reordered = install_signatures(serde_json::json!([
+            {"type": "PMBR", "usage": "partition-table"}, {"type": "gpt", "usage": "partition-table"}
+        ])).unwrap();
+        assert_eq!(one.signatures, reordered.signatures);
+        let changed = install_signatures(serde_json::json!([
+            {"type": "dos", "usage": "partition-table"}
+        ]))
+        .unwrap();
+        assert_ne!(one.signatures, changed.signatures);
+    }
+
     #[test]
     fn installation_copies_both_sealed_slots_but_never_persistent_data() {
         assert_eq!(super::SEALED_PARTS.collect::<Vec<_>>(), [1, 2, 3, 4, 5]);

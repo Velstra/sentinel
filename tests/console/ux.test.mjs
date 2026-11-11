@@ -4,12 +4,14 @@ import {browser,signIn,sleep,test,check,equal,summary} from './harness.mjs';
 import {mkdirSync,writeFileSync} from 'node:fs';
 import {creationTests} from './creation.mjs';
 import {updateKeyTests} from './update-key.mjs';
+import {emptyPolicyTests} from './empty-policy.mjs';
 const page=await browser({width:1440,height:1000});
 const go=async key=>{await page.evaluate(`goto(${JSON.stringify(key)})`);await sleep(250);};
 try {
  await page.goto(process.env.CONSOLE_URL);await signIn(page,process.env.CONSOLE_TOKEN);
  await creationTests();
  await updateKeyTests();
+ await emptyPolicyTests();
  await test('staged badge never claims a provisional network change is already clear',async()=>{
   const states=await page.evaluate(`(()=>{
    const oldStaged=staged,oldApplying=applying,rows=[];
