@@ -3,17 +3,17 @@
     "fabric": {
       "flake": false,
       "locked": {
-        "lastModified": 1794501931,
-        "narHash": "sha256-HMnzI7jVhfUlRyMetNYdwvF7Y+OSyiA1pCVYRRk5IGk=",
+        "lastModified": 1794508504,
+        "narHash": "sha256-uQxW9e6O35ibZrH+29WG8cnMOSgEhhxxtTQKhoKJvDE=",
         "owner": "Velstra",
         "repo": "fabric",
-        "rev": "913b9ae274e7624b471e52b8a5f4cf677688c32c",
+        "rev": "e0a802c43477fb43ef329717112867878faf12bf",
         "type": "github"
       },
       "original": {
         "owner": "Velstra",
         "repo": "fabric",
-        "rev": "913b9ae274e7624b471e52b8a5f4cf677688c32c",
+        "rev": "e0a802c43477fb43ef329717112867878faf12bf",
         "type": "github"
       }
     },
