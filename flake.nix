@@ -1234,17 +1234,17 @@
           };
 
           # Time-based firewall rules (roadmap C15): the oneshot that re-applies the
-          # saved config so the compiler re-emits the rule set for the current time.
+          # current live intent so a timer never undoes an unsaved CLI commit.
           # Triggered by a dynamic `sentinel-fwsched.timer` that Sentinel renders to
           # /run/systemd/system with an OnCalendar per scheduled rule's window
-          # boundary. `--reload` restarts the agent (no ExecReload) to pick up the
+          # boundary. The helper restarts the agent (no ExecReload) to pick up the
           # new rules — a few times a day at boundaries, like a manual commit.
           systemd.services.sentinel-fwsched = {
             description = "re-apply time-based firewall rules (sentinel)";
             after = [ "velstra.service" ];
             serviceConfig = {
               Type = "oneshot";
-              ExecStart = "${sentinel}/bin/sentinel apply /var/lib/sentinel/appliance.toml --out /run/sentinel/velstra.toml --reload velstra.service";
+              ExecStart = "${sentinel}/bin/sentinel refresh-firewall";
             };
           };
 
@@ -9525,6 +9525,8 @@
             machine.fail("systemctl is-active sentinel-fwdomain.timer")
           '';
         };
+
+        refresh-running = import ./nix/refresh-running-test.nix { inherit pkgs self; };
 
         fwschedule = pkgs.testers.runNixOSTest {
           name = "sentinel-fwschedule";
