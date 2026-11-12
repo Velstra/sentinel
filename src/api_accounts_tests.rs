@@ -64,6 +64,7 @@ fn bench(config: &str, directory: Arc<dyn Authenticator>) -> Arc<ApiState> {
     std::fs::write(&config_path, config).unwrap();
     Arc::new(ApiState {
         telemetry: Arc::default(),
+        updates: Arc::default(),
         token: "machine-token-for-accounts-tests".into(),
         token_path: None,
         tls_pin: None,

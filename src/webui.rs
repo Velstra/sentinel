@@ -207,6 +207,7 @@ pub fn page() -> String {
     let management_js = include_str!("management.js");
     let management_css = include_str!("../ui/dist/management.css");
     let react_js = include_str!("../ui/dist/management.js");
+    let max_port_range = crate::config::MAX_PORT_RANGE;
     format!(
         r##"<!doctype html>
 <html lang="en">
@@ -748,7 +749,7 @@ pub fn page() -> String {
      cell. A column is the width of the thing in it, and the row ends where the
      fields end. */
   .grid {{
-    display: grid; gap: var(--space-4) var(--space-5); align-items: end;
+    display: grid; gap: var(--space-4) var(--space-5); align-items: start;
     grid-template-columns: repeat(auto-fill, 232px);
   }}
   @media (max-width: 620px) {{
@@ -769,6 +770,7 @@ pub fn page() -> String {
   .pick {{ display: flex; flex-wrap: wrap; gap: var(--space-2); }}
   .pickone {{
     display: inline-flex; align-items: center; gap: var(--space-2);
+    min-height: 38px; box-sizing: border-box;
     padding: var(--space-1) var(--space-3);
     border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
     background: var(--surface-sunken); color: var(--text-muted);
@@ -784,7 +786,7 @@ pub fn page() -> String {
      because "off" is a decision somebody made and "not set" is not, and a
      control that draws them the same way is a control that lies about which
      one is in front of you. */
-  .switch {{ display: inline-flex; align-items: center; gap: var(--space-2); }}
+  .switch {{ display: inline-flex; align-items: center; gap: var(--space-2); min-height: 38px; flex-wrap: wrap; }}
   /* The value, kept out of sight: one control to operate, one value to read.
      `display: none` rather than a clipped box, so it is out of the tab order
      and the accessibility tree without being told to be, and so anything that
@@ -922,6 +924,11 @@ pub fn page() -> String {
     overflow-wrap: anywhere;
   }}
   .hint:empty {{ min-height: 0; }}
+  .field-error {{ color: var(--status-down); font-size: var(--text-xs); line-height: 1.4; overflow-wrap: anywhere; }}
+  .field [aria-invalid="true"] {{ border-color: var(--status-down); }}
+  .pairing-help {{ margin: 0 0 var(--space-4); color: var(--text-muted); font-size: var(--text-sm); }}
+  .pairing-help summary {{ cursor: pointer; color: var(--link); padding-block: var(--space-2); }}
+  .pairing-help p {{ max-width: 70ch; margin: var(--space-2) 0; line-height: 1.6; }}
   /* A group heading inside a settings mask. It stands in the margin column
      beside its fields rather than across them: a heading row every four fields
      is what turned a protocol's settings into a questionnaire. */
@@ -948,6 +955,7 @@ pub fn page() -> String {
     background: var(--surface-sunken);
     border-left: 3px solid var(--border-strong);
   }}
+  #write-boundary, #stack-sync-note {{ padding: var(--space-3) var(--space-4); margin: 0 0 var(--space-4); }}
   .ok {{ color: var(--status-up); }}
 
   dialog {{
@@ -1192,11 +1200,18 @@ pub fn page() -> String {
     font: var(--fw-semibold) var(--text-xs)/1.2 var(--font-sans); color: var(--text-muted);
   }}
   .cluster button {{
-    display: flex; align-items: center; gap: var(--space-2); font-size: var(--text-sm);
+    display: grid; grid-template-columns: max-content minmax(0, 1fr);
+    align-items: center; column-gap: var(--space-2); row-gap: var(--space-1);
+    font-size: var(--text-sm); text-align: left;
   }}
   .cluster .role {{
-    margin-left: auto; font: var(--fw-regular) var(--text-2xs)/1.4 var(--font-mono);
+    margin-left: 0; font: var(--fw-regular) var(--text-2xs)/1.4 var(--font-mono);
     color: var(--text-muted);
+  }}
+  .cluster .member-name {{ min-width: 0; overflow-wrap: anywhere; }}
+  .cluster .member-state {{
+    grid-column: 2; margin-left: 0; display: flex; align-items: center;
+    flex-wrap: wrap; gap: var(--space-1) var(--space-2); text-align: left;
   }}
   .cluster .crev {{
     font-family: var(--font-mono); font-size: var(--text-2xs); color: var(--text-faint);
@@ -1234,9 +1249,9 @@ pub fn page() -> String {
     display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3);
     margin-bottom: var(--space-4);
   }}
-  .inline {{ display: flex; align-items: center; gap: var(--space-2); }}
+  .inline {{ display: flex; align-items: center; gap: var(--space-2); min-width: 0; max-width: 100%; }}
   .inline > span {{ font-size: var(--text-sm); color: var(--text-muted); white-space: nowrap; }}
-  .inline select, .inline input {{ width: auto; }}
+  .inline select, .inline input {{ width: auto; min-width: 0; max-width: 100%; }}
 
   /* The one surface that is about to change something, marked by an amber edge.
      It lays out nothing itself — the mask inside it brings its own groups and
@@ -1662,6 +1677,7 @@ pub fn page() -> String {
     <div class="cluster">
       <span class="clabel">Cluster</span>
       <div id="clusterlist"></div>
+      <p id="cluster-sync-note" class="hint hidden" role="status"></p>
       <span class="crev" id="clusterrev">rev —</span>
     </div>
 
@@ -1712,6 +1728,7 @@ pub fn page() -> String {
     <div id="react-confirmation"></div>
     <div class="secstrip" id="sectionstrip"></div>
     <div class="page" id="pagehead"></div>
+    <p class="note hidden" id="write-boundary" role="status"></p>
 
     <div id="view-dashboard">
       <!-- What the box is, in numbers, before any chart. An operator opening a
@@ -1772,7 +1789,7 @@ pub fn page() -> String {
           </select>
         </label>
         <span class="spacer"></span>
-        <button class="btn" id="togglerule">New rule</button>
+        <button class="btn" id="togglerule" disabled data-config-loading aria-busy="true" title="Loading configuration…">New rule</button>
       </div>
 
       <!-- Built by `renderAddPanel` from the same field table as the editor. -->
@@ -1807,7 +1824,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Zones</h3>
         <span class="spacer"></span>
-        <button class="btn" id="togglezone">New zone</button>
+        <button class="btn" id="togglezone" disabled data-config-loading aria-busy="true" title="Loading configuration…">New zone</button>
       </div>
       <div class="card addpanel hidden" id="addzonepanel"></div>
       <div id="zonelist"></div>
@@ -1817,7 +1834,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Source NAT</h3>
         <span class="spacer"></span>
-        <button class="btn" id="togglesnat">New source rule</button>
+        <button class="btn" id="togglesnat" disabled data-config-loading aria-busy="true" title="Loading configuration…">New source rule</button>
       </div>
       <div class="card addpanel hidden" id="addsnatpanel"></div>
       <div id="snatlist"></div>
@@ -1825,7 +1842,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Destination NAT</h3>
         <span class="spacer"></span>
-        <button class="btn" id="toggleddnat">New port forward</button>
+        <button class="btn" id="toggleddnat" disabled data-config-loading aria-busy="true" title="Loading configuration…">New port forward</button>
       </div>
       <div class="card addpanel hidden" id="adddnatpanel"></div>
       <div id="dnatlist"></div>
@@ -1833,10 +1850,8 @@ pub fn page() -> String {
       <div class="card">
         <h3>NAT64</h3>
         <p class="lede" style="margin:0 0 var(--space-4)">
-          Give an IPv6-only network its way to the IPv4 internet: hosts resolve a
-          v4-only name to an address inside the prefix, and the appliance
-          translates. DNS64 is what makes them ask for it — without it a
-          v6-only client never learns an address in the prefix at all.
+          Translate IPv6 clients to IPv4 using this prefix. Clients also need
+          DNS64 to resolve IPv4-only names into the translation prefix.
         </p>
         <div class="grid" id="nat64form"></div>
       </div>
@@ -1844,13 +1859,11 @@ pub fn page() -> String {
       <div class="section">
         <h3>Prefix translation</h3>
         <span class="spacer"></span>
-        <button class="btn" id="togglenpt">New translation</button>
+        <button class="btn" id="togglenpt" disabled data-config-loading aria-busy="true" title="Loading configuration…">New translation</button>
       </div>
       <p class="lede inset" style="margin:0 0 var(--space-4)">
-        NPTv6 swaps one IPv6 prefix for another as a packet leaves, and back on
-        the way in. Addresses keep their host part and nothing is tracked, so
-        this is not NAT: it is renumbering at the border, which is how a network
-        with provider-assigned space keeps its own addressing inside.
+        Translate IPv6 prefixes at the border while preserving host addresses.
+        NPTv6 is stateless; it does not track connections.
       </p>
       <div class="card addpanel hidden" id="addnptpanel"></div>
       <div id="nptlist"></div>
@@ -1865,7 +1878,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Site-to-site tunnels</h3>
         <span class="spacer"></span>
-        <button class="btn" id="toggleipsec">New tunnel</button>
+        <button class="btn" id="toggleipsec" disabled data-config-loading aria-busy="true">New tunnel</button>
       </div>
       <div class="card addpanel hidden" id="addipsecpanel"></div>
       <div id="ipseclist"></div>
@@ -1878,7 +1891,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Interfaces</h3>
         <span class="spacer"></span>
-        <button class="btn" id="togglewg">New interface</button>
+        <button class="btn" id="togglewg" disabled data-config-loading aria-busy="true" title="Loading configuration…">New interface</button>
       </div>
       <div class="card addpanel hidden" id="addwgpanel"></div>
       <div id="wglist"></div>
@@ -1891,7 +1904,7 @@ pub fn page() -> String {
         <h3>Peers</h3>
         <span class="spacer"></span>
         <label class="inline"><span>on</span><select id="wgtunnel"></select></label>
-        <button class="btn" id="togglewgpeer">New peer</button>
+        <button class="btn" id="togglewgpeer" disabled data-config-loading aria-busy="true" title="Loading configuration…">New peer</button>
       </div>
       <div class="card addpanel hidden" id="addwgpeerpanel"></div>
       <div id="wgpeerlist"></div>
@@ -1930,7 +1943,7 @@ pub fn page() -> String {
         <h3>Reservations</h3>
         <span class="spacer"></span>
         <label class="inline"><span>on</span><select id="mapiface"></select></label>
-        <button class="btn" id="togglemap">New</button>
+        <button class="btn" id="togglemap" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
       </div>
       <p class="lede inset" style="margin:0 0 var(--space-4)">
         The same address every time, for a machine that has to be findable. The
@@ -1960,7 +1973,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Interfaces</h3>
         <span class="spacer"></span>
-        <button class="btn" id="toggleiface">New</button>
+        <button class="btn" id="toggleiface" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
       </div>
       <div class="card addpanel hidden" id="addifacepanel"></div>
       <div id="ifacelist"></div>
@@ -1984,7 +1997,7 @@ pub fn page() -> String {
           </select>
         </label>
         <span class="spacer"></span>
-        <button class="btn" id="togglegroup">New</button>
+        <button class="btn" id="togglegroup" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
       </div>
       <div class="card addpanel hidden" id="addgrouppanel"></div>
       <div id="grouplist"></div>
@@ -1998,7 +2011,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Load-balanced services</h3>
         <span class="spacer"></span>
-        <button class="btn" id="togglelb">New</button>
+        <button class="btn" id="togglelb" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
       </div>
       <div class="card addpanel hidden" id="addlbpanel"></div>
       <div id="lblist"></div>
@@ -2011,7 +2024,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Certificate authorities</h3>
         <span class="spacer"></span>
-        <button class="btn" id="toggleca">New</button>
+        <button class="btn" id="toggleca" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
       </div>
       <div class="card addpanel hidden" id="addcapanel"></div>
       <div id="calist"></div>
@@ -2030,7 +2043,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Certificates</h3>
         <span class="spacer"></span>
-        <button class="btn" id="togglecert">New</button>
+        <button class="btn" id="togglecert" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
       </div>
       <div class="card addpanel hidden" id="addcertpanel"></div>
       <div id="certlist"></div>
@@ -2043,21 +2056,19 @@ pub fn page() -> String {
       <div class="section">
         <h3>Administrators</h3>
         <span class="spacer"></span>
-        <button class="btn" id="toggleuser">New</button>
+        <button class="btn" id="toggleuser" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
       </div>
       <div class="card addpanel hidden" id="adduserpanel"></div>
       <div id="userlist"></div>
       <p class="lede" style="margin:var(--space-3) 0 var(--space-6)">
-        An account without a group can log in to the box and reach nothing
-        through this console or the API. Shell access and management access are
-        separate grants on purpose — otherwise every operator who needed to read
-        a rule would have a shell.
+        Assign a permission group for console/API access. Shell access is a
+        separate grant; an account without a group has no management access.
       </p>
 
       <div class="section">
         <h3>Permission groups</h3>
         <span class="spacer"></span>
-        <button class="btn" id="toggleadmingroup">New group</button>
+        <button class="btn" id="toggleadmingroup" disabled data-config-loading aria-busy="true" title="Loading configuration…">New group</button>
       </div>
       <div class="card addpanel hidden" id="addadmingrouppanel"></div>
       <div id="admingrouplist"></div>
@@ -2065,18 +2076,15 @@ pub fn page() -> String {
       <div class="card">
         <h3>Where a password is checked</h3>
         <p class="lede" style="margin:0 0 var(--space-4)">
-          A local account list is a shadow account list: it has to be kept
-          alongside the real one, and it is the one nobody remembers to remove
-          somebody from. A server here answers instead — but the local password
-          is always tried first, because the moment a directory is unreachable
-          is exactly the moment somebody needs to get in.
+          Use an authentication server for central accounts. Local passwords are
+          tried first, retaining access when the directory is unreachable.
         </p>
         <div class="grid" id="aaa-form"></div>
       </div>
       <div class="section">
         <h3>Authentication servers</h3>
         <span class="spacer"></span>
-        <button class="btn" id="toggleradius">New RADIUS server</button>
+        <button class="btn" id="toggleradius" disabled data-config-loading aria-busy="true" title="Loading configuration…">New RADIUS server</button>
       </div>
       <div class="card addpanel hidden" id="addradiuspanel"></div>
       <div id="radiuslist"></div>
@@ -2084,12 +2092,11 @@ pub fn page() -> String {
       <div class="section">
         <h3>Directories (LDAP)</h3>
         <span class="spacer"></span>
-        <button class="btn" id="toggleldap">New directory</button>
+        <button class="btn" id="toggleldap" disabled data-config-loading aria-busy="true" title="Loading configuration…">New directory</button>
       </div>
       <p class="lede inset" style="margin:0 0 var(--space-4)">
-        A simple bind as the user, so what is needed is where the accounts live
-        and what names one. There is no service account here on purpose:
-        searching first would mean a second password living on the firewall.
+        Authenticate with a direct user bind. Set the account base and username
+        attribute; no directory-search service account is required.
       </p>
       <div class="card addpanel hidden" id="addldappanel"></div>
       <div id="ldaplist"></div>
@@ -2097,7 +2104,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>TACACS+ servers</h3>
         <span class="spacer"></span>
-        <button class="btn" id="toggletacacs">New TACACS+ server</button>
+        <button class="btn" id="toggletacacs" disabled data-config-loading aria-busy="true" title="Loading configuration…">New TACACS+ server</button>
       </div>
       <div class="card addpanel hidden" id="addtacacspanel"></div>
       <div id="tacacslist"></div>
@@ -2107,10 +2114,8 @@ pub fn page() -> String {
         <pre class="out" id="usersshow">…</pre>
       </div>
       <p class="lede" style="margin:var(--space-3) 0 0">
-        Two levels, deliberately: read-only may read everything and change
-        nothing, read-write may do anything the CLI can. A finer split invites
-        the question "may this person change <em>that</em> setting", which on a
-        firewall is a question about the ruleset rather than about the person.
+        Read-only inspects permitted data. Read-write can stage and apply
+        configuration through the same validated workflow as the CLI.
       </p>
     </div>
 
@@ -2118,15 +2123,14 @@ pub fn page() -> String {
       <div class="section">
         <h3>SYN-protected ports</h3>
         <span class="spacer"></span>
-        <button class="btn" id="togglesyn">New</button>
+        <button class="btn" id="togglesyn" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
       </div>
       <div class="card addpanel hidden" id="addsynpanel"></div>
       <div id="synlist"></div>
       <p class="lede" style="margin:var(--space-3) 0 0">
-        The firewall answers every SYN to these ports itself and only opens the
-        real connection once a client returns its cookie. Protected connections
-        lose window scaling, SACK and timestamps — protect where a flood is the
-        greater risk.
+        Challenge clients before opening TCP connections. Protected connections
+        lose window scaling, SACK and timestamps; use only where flood protection
+        outweighs those limitations.
       </p>
     </div>
 
@@ -2137,20 +2141,15 @@ pub fn page() -> String {
         <button class="btn" id="liftall">Lift every block</button>
       </div>
       <p class="lede" style="margin:0 0 var(--space-4)">
-        The detector adds these; they take effect at once and are nowhere in the
-        saved configuration, so lifting one is an operation rather than a staged
-        change. Blocking an address by hand is not something the CLI can do, so
-        it is not offered here either.
+        Detector blocks take effect immediately and are not saved configuration.
+        Lifting a block is an immediate operation, not a staged change.
       </p>
       <div id="blocklist"></div>
       <div class="card">
         <h3>What is watched, and what a hit costs</h3>
         <p class="lede" style="margin:0 0 var(--space-4)">
-          A detector with no rules detects nothing, so a ruleset or a rule is
-          required before the links mean anything. Blocking on an alert is the
-          setting worth thinking twice about: name your own way in under
-          <em>never block</em> first, or an alert on the management network takes
-          it away.
+          Add a ruleset or rule to enable detection. Before blocking on alerts,
+          add management networks to <em>never block</em> to avoid locking yourself out.
         </p>
         <div class="grid" id="svc-ids"></div>
       </div>
@@ -2162,17 +2161,15 @@ pub fn page() -> String {
       <div class="card">
         <h3>This box</h3>
         <p class="lede" style="margin:0 0 var(--space-4)">
-          The tunnel endpoint address is the outer source of everything this box
-          encapsulates and the next hop it announces itself under. VXLAN is what
-          every switch speaks; Geneve carries options VXLAN cannot and costs
-          eight more bytes per packet.
+          Set this appliance's tunnel source and advertised next hop. Choose
+          VXLAN or Geneve to match the other tunnel endpoints.
         </p>
         <div class="grid" id="evpnform"></div>
       </div>
       <div class="section">
         <h3>Segments</h3>
         <span class="spacer"></span>
-        <button class="btn" id="toggleevi">New</button>
+        <button class="btn" id="toggleevi" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
       </div>
       <p class="lede">
         A layer-2 segment and the local ports on it. The VNI is the segment's id
@@ -2184,7 +2181,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Tenants</h3>
         <span class="spacer"></span>
-        <button class="btn" id="toggleipvrf">New</button>
+        <button class="btn" id="toggleipvrf" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
       </div>
       <p class="lede">
         Routing <em>between</em> segments, for a tenant with more than one
@@ -2196,14 +2193,21 @@ pub fn page() -> String {
 
     <div id="view-ha" class="hidden">
       <div class="card">
-        <h3>Leased active/passive pair</h3>
+        <h3>Active/passive pair</h3>
         <p class="lede" style="margin:0 0 var(--space-4)">
-          An independent witness grants forwarding authority to one member.
-          Prepare the witness address, then run <code>sentinel ha pair</code>
-          to enroll both members and record their identities. The control link
-          must remain separate from the guarded data links. Disabling a
-          prepared pair closes its data links; it does not restore standalone mode.
+          Choose witness-backed or two-node election. Keep the control link
+          separate from guarded data links.
         </p>
+        <p class="lede" style="margin:0 0 var(--space-4)">
+          Without a witness, losing every heartbeat path can activate both members
+          (split-brain). VLANs on one NIC are not independent paths.
+        </p>
+        <details class="pairing-help"><summary>Pairing and fail-safe behaviour</summary>
+          <p>Run <code>sentinel ha pair --mode two-node</code> to enroll both members,
+            or prepare an independent witness and use witness mode.
+            Changing this form only stages settings; it does not pair devices or certify failover.</p>
+          <p>Disabling a prepared pair closes its guarded data links; it does not restore standalone mode.</p>
+        </details>
         <div class="grid" id="haform"></div>
       </div>
       <div class="card">
@@ -2217,7 +2221,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Virtual router groups</h3>
         <span class="spacer"></span>
-        <button class="btn" id="togglevrrp">New</button>
+        <button class="btn" id="togglevrrp" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
       </div>
       <p class="lede">
         A tracked interface is what makes failover mean something: when it goes
@@ -2231,21 +2235,15 @@ pub fn page() -> String {
       <div class="card">
         <h3>Configuration sync</h3>
         <p class="lede" style="margin:0 0 var(--space-4)">
-          Every commit on this box is pushed to its peers, so the standby is
-          running the configuration that was just approved rather than the one
-          somebody last remembered to copy. Both ends present the same secret.
-          A peer is <code>host</code> or <code>host:port</code>; repeat the field
-          to add more, separated by spaces.
+          Replicate approved commits to peers using the same credential.
+          Enter peers as <code>host</code> or <code>host:port</code>.
         </p>
         <div class="grid" id="configsyncform"></div>
       </div>
       <div class="card">
         <h3>Connection sync</h3>
         <p class="lede" style="margin:0 0 var(--space-4)">
-          Without this a failover is a reconnect for every session in flight:
-          the standby takes the address and then drops the traffic, because it
-          has no state for connections it never saw start. With it, the flow
-          table is pushed to the peer continuously.
+          Continuously replicate connection state so the standby can resume existing sessions.
         </p>
         <div class="grid" id="conntracksyncform"></div>
       </div>
@@ -2278,7 +2276,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Uplinks</h3>
         <span class="spacer"></span>
-        <button class="btn" id="togglewan">New uplink</button>
+        <button class="btn" id="togglewan" disabled data-config-loading aria-busy="true" title="Loading configuration…">New uplink</button>
       </div>
       <div class="card addpanel hidden" id="addwanpanel"></div>
       <div id="wanlist"></div>
@@ -2286,14 +2284,11 @@ pub fn page() -> String {
       <div class="section">
         <h3>Steering</h3>
         <span class="spacer"></span>
-        <button class="btn" id="togglewanpolicy">New policy</button>
+        <button class="btn" id="togglewanpolicy" disabled data-config-loading aria-busy="true" title="Loading configuration…">New policy</button>
       </div>
       <p class="lede inset" style="margin:0 0 var(--space-4)">
-        Failover answers "the uplink died, now what". Steering answers the
-        question before it: this traffic belongs on that uplink, and moves only
-        when the uplink stops being good enough for it. A video call and a backup
-        want opposite things from the same two links, and priority alone cannot
-        say so — which is why the uplinks above carry limits as well as targets.
+        Assign traffic to preferred uplinks and define when it should move to a
+        fallback. Uplink health targets and limits govern availability.
       </p>
       <div class="card addpanel hidden" id="addwanpolicypanel"></div>
       <div id="wanpolicylist"></div>
@@ -2306,7 +2301,7 @@ pub fn page() -> String {
       <div class="section">
         <h3>Accounts</h3>
         <span class="spacer"></span>
-        <button class="btn" id="toggleocuser">New account</button>
+        <button class="btn" id="toggleocuser" disabled data-config-loading aria-busy="true" title="Loading configuration…">New account</button>
       </div>
       <div class="card addpanel hidden" id="addocuserpanel"></div>
       <div id="oculist"></div>
@@ -2325,9 +2320,9 @@ pub fn page() -> String {
       <div class="tabpane hidden" data-tab="prefix">
         <div class="toolbar">
           <label class="inline"><span>List</span><select id="pllist-pick"></select></label>
-          <input id="plnew" placeholder="or a new list name" style="max-width:14rem">
+          <label class="inline"><span>New list</span><input id="plnew" placeholder="e.g. customer-prefixes" style="max-width:14rem"></label>
           <span class="spacer"></span>
-          <button class="btn" id="togglepl">New rule</button>
+          <button class="btn" id="togglepl" disabled data-config-loading aria-busy="true" title="Loading configuration…">New rule</button>
         </div>
         <div class="card addpanel hidden" id="addplpanel"></div>
         <div id="pllist"></div>
@@ -2336,9 +2331,9 @@ pub fn page() -> String {
       <div class="tabpane hidden" data-tab="maps">
         <div class="toolbar">
           <label class="inline"><span>Map</span><select id="rmlist-pick"></select></label>
-          <input id="rmnew" placeholder="or a new map name" style="max-width:14rem">
+          <label class="inline"><span>New map</span><input id="rmnew" placeholder="e.g. export-transit" style="max-width:14rem"></label>
           <span class="spacer"></span>
-          <button class="btn" id="togglerm">New rule</button>
+          <button class="btn" id="togglerm" disabled data-config-loading aria-busy="true" title="Loading configuration…">New rule</button>
         </div>
         <div class="card"><h3>Map</h3><div class="grid" id="rmglobal"></div></div>
         <div class="card addpanel hidden" id="addrmpanel"></div>
@@ -2349,7 +2344,7 @@ pub fn page() -> String {
         <div class="section">
           <h3>Rules</h3>
           <span class="spacer"></span>
-          <button class="btn" id="togglepbr">New rule</button>
+          <button class="btn" id="togglepbr" disabled data-config-loading aria-busy="true" title="Loading configuration…">New rule</button>
         </div>
         <div class="card addpanel hidden" id="addpbrpanel"></div>
         <div id="pbrlist"></div>
@@ -2360,21 +2355,18 @@ pub fn page() -> String {
     </div>
 
     <div id="view-system" class="hidden">
+      <div id="react-system-health"></div>
       <div class="card"><h3>Identity</h3><div class="grid" id="sys-ident"></div></div>
       <div class="section">
         <h3>Kernel parameters</h3>
         <span class="spacer"></span>
-        <button class="btn" id="togglesysctl">New</button>
+        <button class="btn" id="togglesysctl" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
       </div>
       <div class="card addpanel hidden" id="addsysctlpanel"></div>
       <div id="sysctllist"></div>
       <p class="lede" style="margin:var(--space-3) 0 var(--space-6)">
-        The settings this schema has no opinion about. Only <code>net.*</code>
-        and <code>vm.*</code> — everything else on a firewall is a way to make
-        the box unbootable from a file it reads at start-up.
-        <code>net.ipv4.ip_nonlocal_bind</code> is the usual one: it lets a
-        service bind a virtual address this box does not hold right now, which
-        is exactly where a VRRP backup stands.
+        Only <code>net.*</code> and <code>vm.*</code> parameters are allowed.
+        For example, <code>net.ipv4.ip_nonlocal_bind</code> permits binding an address not held locally.
       </p>
       <div class="card">
         <h3>Fleet enrollment</h3>
@@ -2385,23 +2377,18 @@ pub fn page() -> String {
       <div class="card">
         <h3>Update channel</h3>
         <p class="lede" style="margin:0 0 var(--space-4)">
-          Where signed images come from, and the key their manifest must be
-          signed with. Without the key nothing is installed — the channel is a
-          URL, the trust is the key. Name a channel below to run several side
-          by side; the active one is chosen here.
+          Select a download channel and its trusted signing key. Unsigned or untrusted images are refused.
         </p>
         <div class="grid" id="sys-update"></div>
       </div>
       <div class="section">
         <h3>Update channels</h3>
         <span class="spacer"></span>
-        <button class="btn" id="toggleupchan">New channel</button>
+        <button class="btn" id="toggleupchan" disabled data-config-loading aria-busy="true" title="Loading configuration…">New channel</button>
       </div>
       <p class="lede inset" style="margin:0 0 var(--space-4)">
-        Each channel is signed by its own key, so trusting one channel pins one
-        key. A subscription key buys tested, delayed-stability images — never
-        features — and if it expires the appliance keeps running unchanged:
-        only new images from that channel become unavailable.
+        Each channel has its own signing key. Subscriptions gate updates, not features;
+        expiry stops new downloads without changing the running appliance.
       </p>
       <div class="card addpanel hidden" id="addupchanpanel"></div>
       <div id="upchanlist"></div>
@@ -2418,7 +2405,7 @@ pub fn page() -> String {
         <div class="section">
           <h3>Routes</h3>
           <span class="spacer"></span>
-          <button class="btn" id="toggleroute">New</button>
+          <button class="btn" id="toggleroute" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
         </div>
         <div class="card addpanel hidden" id="addroutepanel"></div>
         <div id="routelist"></div>
@@ -2430,7 +2417,7 @@ pub fn page() -> String {
         <div class="section">
           <h3>Aggregates</h3>
           <span class="spacer"></span>
-          <button class="btn" id="toggleagg">New aggregate</button>
+          <button class="btn" id="toggleagg" disabled data-config-loading aria-busy="true" title="Loading configuration…">New aggregate</button>
         </div>
         <p class="lede inset" style="margin:0 0 var(--space-4)">
           One prefix announced in place of the more specific ones inside it.
@@ -2442,7 +2429,7 @@ pub fn page() -> String {
         <div class="section">
           <h3>Route origin authorisations</h3>
           <span class="spacer"></span>
-          <button class="btn" id="toggleroa">New authorisation</button>
+          <button class="btn" id="toggleroa" disabled data-config-loading aria-busy="true" title="Loading configuration…">New authorisation</button>
         </div>
         <p class="lede inset" style="margin:0 0 var(--space-4)">
           Which AS may originate a prefix, stated locally rather than fetched
@@ -2453,7 +2440,7 @@ pub fn page() -> String {
         <div class="section">
           <h3>Neighbours</h3>
           <span class="spacer"></span>
-          <button class="btn" id="togglebgp">New neighbour</button>
+          <button class="btn" id="togglebgp" disabled data-config-loading aria-busy="true" title="Loading configuration…">New neighbour</button>
         </div>
         <div class="card addpanel hidden" id="addbgppanel"></div>
         <div id="bgplist"></div>
@@ -2499,16 +2486,13 @@ pub fn page() -> String {
       <div class="tabpane hidden" data-tab="multicast">
         <div class="card"><div class="grid" id="mcastform"></div></div>
         <p class="lede inset" style="margin:0 0 var(--space-4)">
-          The querier carries multicast <em>within</em> a segment; PIM routes it
-          <em>between</em> them. Every join is sent toward the rendezvous point
-          until somebody learns who the source is, which is why sparse mode has
-          no meaning without an RP address — and each link PIM speaks on must
-          also be a multicast interface below.
+          Configure a querier within each segment and PIM between segments.
+          Sparse mode needs a rendezvous point; add every PIM link as a multicast interface below.
         </p>
         <div class="section">
           <h3>Interfaces</h3>
           <span class="spacer"></span>
-          <button class="btn" id="togglemcastif">New</button>
+          <button class="btn" id="togglemcastif" disabled data-config-loading aria-busy="true" title="Loading configuration…">New</button>
         </div>
         <div class="card addpanel hidden" id="addmcastifpanel"></div>
         <div id="mcastiflist"></div>
@@ -2521,7 +2505,7 @@ pub fn page() -> String {
         <div class="section">
           <h3>Instances</h3>
           <span class="spacer"></span>
-          <button class="btn" id="togglevrf">New VRF</button>
+          <button class="btn" id="togglevrf" disabled data-config-loading aria-busy="true" title="Loading configuration…">New VRF</button>
         </div>
         <div class="card addpanel hidden" id="addvrfpanel"></div>
         <div id="vrflist"></div>
@@ -2549,7 +2533,10 @@ pub fn page() -> String {
 
       <div class="tabpane hidden" data-tab="resolution">
         <div class="card"><h3>DNS resolver</h3><div class="grid" id="svc-dns"></div></div>
-        <div class="card"><h3>NTP</h3><div class="grid" id="svc-ntp"></div></div>
+        <div class="card"><h3>NTP · appliance clock and optional LAN service</h3>
+          <p class="lede">Upstreams synchronise this appliance; leave empty for image defaults. LAN serving (<code>serve-on</code>) is optional and not required for clock synchronisation.</p>
+          <p class="lede">Restrict <code>allow-from</code> to trusted LANs. Never expose NTP to <code>0.0.0.0/0</code> or <code>::/0</code>.</p>
+          <div class="grid" id="svc-ntp"></div></div>
       </div>
 
       <div class="tabpane hidden" data-tab="management">
@@ -2565,7 +2552,7 @@ pub fn page() -> String {
         <div class="section">
           <h3>PPPoE subscribers</h3>
           <span class="spacer"></span>
-          <button class="btn" id="togglepppoeuser">New subscriber</button>
+          <button class="btn" id="togglepppoeuser" disabled data-config-loading aria-busy="true" title="Loading configuration…">New subscriber</button>
         </div>
         <div class="card addpanel hidden" id="addpppoeuserpanel"></div>
         <div id="pppoeusers"></div>
@@ -2577,7 +2564,7 @@ pub fn page() -> String {
         <div class="section">
           <h3>Reverse proxy</h3>
           <span class="spacer"></span>
-          <button class="btn" id="togglerp">New frontend</button>
+          <button class="btn" id="togglerp" disabled data-config-loading aria-busy="true" title="Loading configuration…">New frontend</button>
         </div>
         <div class="card addpanel hidden" id="addrppanel"></div>
         <div id="rplist"></div>
@@ -2585,7 +2572,7 @@ pub fn page() -> String {
         <div class="section">
           <h3>Broadcast relays</h3>
           <span class="spacer"></span>
-          <button class="btn" id="togglebr">New relay</button>
+          <button class="btn" id="togglebr" disabled data-config-loading aria-busy="true" title="Loading configuration…">New relay</button>
         </div>
         <div class="card addpanel hidden" id="addbrpanel"></div>
         <div id="brlist"></div>
@@ -2618,7 +2605,7 @@ pub fn page() -> String {
         <div class="section">
           <h3>Syslog collectors</h3>
           <span class="spacer"></span>
-          <button class="btn" id="togglesl">New collector</button>
+          <button class="btn" id="togglesl" disabled data-config-loading aria-busy="true" title="Loading configuration…">New collector</button>
         </div>
         <div class="card addpanel hidden" id="addslpanel"></div>
         <div id="sllist"></div>
@@ -2739,6 +2726,7 @@ pub fn page() -> String {
     <div id="view-stack" class="hidden">
       <div class="card">
         <h3>Members</h3>
+        <p id="stack-sync-note" class="note hidden" role="status"></p>
         <div class="tblwrap"><table id="stacktable"></table></div>
         <p class="lede" style="margin:var(--space-3) 0 0">
           A member is a <code>system config-sync peer</code> — the boxes this one
@@ -2756,7 +2744,7 @@ pub fn page() -> String {
   </main>
 </div>
 
-<dialog id="editor">
+<dialog id="editor" aria-labelledby="editortitle">
   <h3 style="margin:0 0 .8rem" id="editortitle">Rule</h3>
   <!-- The fields are built from the same table the add panel uses, so a rule
        cannot be creatable with a setting that is not editable afterwards. -->
@@ -2764,7 +2752,7 @@ pub fn page() -> String {
        one: a `.field` whose label is a `<span>`. It was a `<div>` with a
        `<label for>` beside it, and anything walking the mask's fields for their
        names — the browser suite does — found a field with no name in it. -->
-  <label class="field w-m" id="r-namefield"><span>Name</span><input id="r-name"></label>
+  <label class="field w-m" id="r-namefield"><span>Name</span><input id="r-name" placeholder="e.g. allow-https" aria-describedby="editorerr" aria-errormessage="editorerr"></label>
   <!-- `flush`, because a modal has no margin column: the group headings go
        back above what they name, and nothing is pushed sideways to line up
        with a gutter that is not there. -->
@@ -2780,7 +2768,7 @@ pub fn page() -> String {
   </div>
 </dialog>
 
-<dialog id="result">
+<dialog id="result" aria-labelledby="resulttitle">
   <h3 style="margin:0 0 var(--space-4)" id="resulttitle">Applied</h3>
   <div id="resultout"></div>
   <div class="row" style="margin-top:.9rem"><button class="btn" id="resultclose">Close</button></div>
@@ -2829,7 +2817,17 @@ let gateObserver = null;
 let view = "dashboard";
 let panel = null;
 let target = "";           // "" = this appliance, otherwise a stack member
+// Account permission and selected-member context are separate. Both legacy
+// staging and its shared render gate consume this reason; React keeps the same
+// boundary through Host.canWrite + Host.remote, never a new permission grant.
+const writeBlockReason = () => !mayWrite()
+  ? "This account may read the configuration, not change it"
+  : target ? "Peer view is read-only. Select this appliance to make changes."
+           : "";
 let timer = null;
+let memberRead = null;
+let memberReadAbort = null;
+let memberReadEpoch = 0;
 const history = new Map(); // counter -> recent values, for the sparklines
 let lastCounters = null;
 let lastCountersAt = 0;
@@ -2848,13 +2846,15 @@ async function api(path, opts, patience) {{
   // the whole batch, so it gets its own, longer patience.
   const seconds = patience || 30;
   const deadline = new AbortController();
+  const requestToken = token;
+  const signal = opts?.signal
+    ? AbortSignal.any([deadline.signal, opts.signal]) : deadline.signal;
   const timer = setTimeout(() => deadline.abort(), seconds * 1000);
   let r;
   try {{
     r = await fetch(path, Object.assign({{
-      signal: deadline.signal,
-      headers: {{ Authorization: "Bearer " + token }},
-    }}, opts || {{}}));
+      headers: {{ Authorization: "Bearer " + requestToken }},
+    }}, opts || {{}}, {{ signal }}));
   }} catch (e) {{
     clearTimeout(timer);
     throw new Error(e.name === "AbortError"
@@ -2862,7 +2862,10 @@ async function api(path, opts, patience) {{
       : "the appliance could not be reached: " + (e.message || e));
   }}
   clearTimeout(timer);
-  if (r.status === 401) {{ signOut("That token was not accepted."); throw new Error("unauthorised"); }}
+  if (r.status === 401) {{
+    if (!signal.aborted && requestToken === token) signOut("That token was not accepted.");
+    throw new Error("unauthorised");
+  }}
   if (!r.ok) {{
     const body = await r.text();
     const failure = new Error(unwrapError(body) || body.trim() || ("HTTP " + r.status));
@@ -3032,12 +3035,19 @@ function perSecond(v) {{
 }}
 
 async function refreshHistory() {{
+  const member = target;
   const res = $("historyres").value || "minute";
   const box = $("historycharts");
+  if (member) {{
+    box.textContent = "Historical metrics are stored locally. Select this appliance for its history; use the dashboard for live peer measurements.";
+    return;
+  }}
   let listing;
   try {{
     listing = await (await api("/api/v1/metrics")).json();
+    if (member !== target) return;
   }} catch (e) {{
+    if (member !== target) return;
     box.textContent = "";
     box.append(el("p", {{ class: "sub", text: "The appliance did not answer: " + e }}));
     return;
@@ -3063,6 +3073,7 @@ async function refreshHistory() {{
       api("/api/v1/metrics/" + res + "/iface." + iface + ".rx").then((r) => r.json()),
       api("/api/v1/metrics/" + res + "/iface." + iface + ".tx").then((r) => r.json()),
     ]);
+    if (member !== target) return;
     const peak = Math.max(0, ...[...rx.points, ...tx.points]
       .map((p) => p.value || 0));
     const card = el("div", {{ class: "card" }}, [
@@ -3079,6 +3090,7 @@ async function refreshHistory() {{
   }}
   if (names.includes("gauge.sessions")) {{
     const s = await (await api("/api/v1/metrics/" + res + "/gauge.sessions")).json();
+    if (member !== target) return;
     const card = el("div", {{ class: "card" }}, [
       el("h3", {{ text: "Tracked connections" }}),
       el("p", {{ class: "sub", text: "how many flows the data plane held" }}),
@@ -3221,6 +3233,15 @@ function dashboardDetailsVisible() {{
 }}
 
 async function refreshDashboard() {{
+  const details = document.querySelector(".dashboard-details");
+  // This compatibility disclosure combines local account/status and several
+  // independent show calls. Never label its local status as peer diagnostics;
+  // selected-member measurements and health are owned by React above it.
+  if (details) details.hidden = !!target;
+  if (target) {{
+    if (permission === "unknown") learnPermission();
+    return;
+  }}
   const detailed = dashboardDetailsVisible();
   // Collapsed, the one thing still worth asking is who is signed in (and the
   // box's name for the rail), and only until the appliance has said.
@@ -3617,7 +3638,9 @@ function openEditor(rule, zones) {{
   $("r-name").value = rule ? rule.name : "";
   $("r-name").readOnly = !!rule;
   const fields = ruleFields(zones || []);
-  const {{ grid, widgets, more }} = fieldGrid(fields, rule, null, FORMS.rule);
+  fieldPath = "firewall rule " + (rule ? rule.name : "<new>");
+  fieldSubject = "";
+  const {{ grid, widgets, more, validate }} = fieldGrid(fields, rule, null, FORMS.rule);
   const box = $("editorfields");
   // Held before the box is emptied: after the second open the name field is a
   // child of the mask this is about to throw away, and emptying first would
@@ -3635,7 +3658,8 @@ function openEditor(rule, zones) {{
   const moreHost = $("editormore");
   moreHost.textContent = "";
   if (more) moreHost.append(more);
-  editing = {{ fields, widgets, before: rule }};
+  editing = {{ fields, widgets, before: rule, validate }};
+  $("r-name").removeAttribute("aria-invalid");
   $("editorerr").textContent = "";
   $("editor").showModal();
 }}
@@ -3661,8 +3685,9 @@ function stage(label, lines) {{
   // themselves after every fetch and a button can be drawn before the gate
   // runs over it, which is how a read-only account came to hold a pending
   // "delete firewall rule".
-  if (!mayWrite()) {{
-    banner("This account may read the configuration, not change it");
+  const refusal = writeBlockReason();
+  if (refusal) {{
+    banner(refusal, "note");
     return;
   }}
   const cmds = lines.filter(Boolean);
@@ -3685,8 +3710,8 @@ function renderStaged() {{
     $("stagedbadge").textContent = "applying";
     $("stagedbadge").className = "pill busy";
   }} else {{
-    $("stagedbadge").textContent = n ? n + " pending change" + (n === 1 ? "" : "s")
-                                     : "no pending changes";
+    $("stagedbadge").textContent = n ? n + " staged change" + (n === 1 ? "" : "s")
+                                     : "no staged changes";
     $("stagedbadge").className = "pill" + (n ? " warn" : " rest");
   }}
   $("stagedbadge").title = n ? "Review the staged changes" : "";
@@ -3695,7 +3720,7 @@ function renderStaged() {{
   $("discard").classList.toggle("hidden", n === 0);
   $("applystaged").classList.toggle("hidden", n === 0);
   $("stagedcard").classList.toggle("hidden", n === 0);
-  $("stagedtitle").textContent = n + " pending change" + (n === 1 ? "" : "s");
+  $("stagedtitle").textContent = n + " staged change" + (n === 1 ? "" : "s");
 
   const list = $("stagedlist");
   list.textContent = "";
@@ -4195,6 +4220,10 @@ const HINTS = {{
 // One hint per field, recomputed as it is typed into. Debounced because the
 // asynchronous ones cross the network, and a keystroke is not a question.
 function wireHint(field, widget, box, values) {{
+  if (isUpdateSigningKey(field[0])) {{
+    box.textContent = "Paste an Ed25519 PUBLIC KEY PEM or use file:/etc/sentinel/release.pem; never paste a private key.";
+    return () => {{}};
+  }}
   const compute = HINTS[field[0]];
   // What the appliance does with an empty box, where that is a sentence rather
   // than a value. It stands under the field, not in it: a placeholder is as
@@ -4208,15 +4237,23 @@ function wireHint(field, widget, box, values) {{
   const run = () => {{
     const value = widget.value || "";
     const idle = value ? "" : gloss;
-    if (!compute) {{ box.textContent = idle; return; }}
+    // Hints can wrap just like errors. Native change/async completion during
+    // pointer-down must not move the pressed Add/Stage before pointer-up.
+    // Reuse the shared validation feedback queue, including its cancel path.
+    const paint = (text) => {{
+      const update = () => {{ if ((widget.value || "") === value) box.textContent = text; }};
+      if (validationPointers.size) deferredBlurChecks.add(() => {{ if (widget.isConnected) update(); }});
+      else update();
+    }};
+    if (!compute) {{ paint(idle); return; }}
     let answer;
     try {{ answer = compute(value, values ? values() : {{}}); }} catch (e) {{ answer = ""; }}
     if (answer && typeof answer.then === "function") {{
-      box.textContent = idle;
-      answer.then((text) => {{ if (widget.value === value) box.textContent = text || idle; }});
+      paint(idle);
+      answer.then((text) => paint(text || idle));
       return;
     }}
-    box.textContent = answer || idle;
+    paint(answer || idle);
   }};
   widget.addEventListener("input", () => {{
     clearTimeout(timer);
@@ -4461,13 +4498,13 @@ const PATH_DEFAULTS = {{
   // A burst left alone is one second's worth of the limit, which is what
   // "a hundred a second" already means to the person who typed it.
   "firewall rule": {{ burst: "one second's worth of the limit" }},
-  "services reverse-proxy": {{ port: "443" }},
+  "services reverse-proxy": {{ port: "443", mode: "http" }},
   "services portal": {{ port: "8082", "session-timeout": "3600" }},
   "services syslog": {{ port: "514" }},
   "services ssh": {{ port: "22" }},
   "services flow-export": {{ interval: "30", domain: "1" }},
   "system conntrack-sync": {{ port: "5429", interval: "1" }},
-  "system ha": {{ enabled: "off", preempt: "off", node: "1", priority: "200 for member 1, 100 for member 2" }},
+  "system ha": {{ mode: "witness", enabled: "off", preempt: "off", node: "1", priority: "200 for member 1, 100 for member 2", "peer-timeout-ms": "1000", "startup-delay-ms": "3000" }},
   "system aaa radius": {{ port: "1812", timeout: "3" }},
   "system aaa ldap": {{
     timeout: "5", tls: "ldaps", port: "636 with ldaps, 389 otherwise",
@@ -4899,6 +4936,9 @@ const OFFERED = {{
 // name alone would offer this box's DHCP reservations in both. Longest prefix
 // wins, as everywhere else that a path decides what a word means.
 const PATH_OFFERS = {{
+  // IKE endpoints are IPv4 in the appliance schema. Do not recommend an
+  // IPv6 local address while retaining dual-stack offers for other protocols.
+  "vpn ipsec": {{ local: () => localAddresses().filter((address) => !address.includes(":")) }},
   "firewall rule": {{
     port: wellKnownPorts,
     source: anySubnet, destination: anySubnet,
@@ -5093,19 +5133,9 @@ function switchWidget(key, value, name) {{
     paint();
     box.dispatchEvent(new Event("change"));
   }};
-  // On pointer-down, not on the click: the press is when the decision is made,
-  // and a control that waits for the release to move feels like it is thinking.
-  knob.onpointerdown = (e) => {{
-    // Prevented so the press does not select the text beside it — and focus
-    // moved by hand, because preventing the press is also what would have
-    // stopped the button being focused at all.
-    e.preventDefault();
-    knob.focus();
-    put(carrier.value === "true" ? "false" : "true");
-  }};
-  knob.onclick = (e) => e.preventDefault();
-  knob.onkeydown = (e) => {{
-    if (e.key !== " " && e.key !== "Enter") return;
+  // Native button activation covers pointer release, Enter, Space and assistive
+  // clicks exactly once. A cancelled touch/scroll must not change policy.
+  knob.onclick = (e) => {{
     e.preventDefault();
     put(carrier.value === "true" ? "false" : "true");
   }};
@@ -5135,7 +5165,7 @@ function numberWidget(key, value, bounds) {{
   // around one, and the sentence is under the field where it fits.
   const input = el("input", {{
     type: "number", inputmode: "numeric", value: value || "",
-    placeholder: defaultHead(key),
+    placeholder: defaultHead(key) || exampleOf(key) || String(min ?? 0),
   }});
   if (min !== null && min !== undefined) input.setAttribute("min", String(min));
   if (max !== null && max !== undefined) input.setAttribute("max", String(max));
@@ -5165,10 +5195,12 @@ function numberWidget(key, value, bounds) {{
 const optValue = (o) => (o && typeof o === "object" ? o.value : o);
 const optLabel = (o) => (o && typeof o === "object" ? o.label : o);
 
-function comboWidget(input, options) {{
+let controlSerial = 0;
+function comboWidget(input, options, label = "this field") {{
   const box = el("span", {{ class: "combo" }}, [input]);
-  const menu = el("div", {{ class: "menu hidden" }});
-  const close = () => menu.classList.add("hidden");
+  const menu = el("div", {{ class: "menu hidden", id: "suggestions-" + (++controlSerial) }});
+  let caret;
+  const close = () => {{ menu.classList.add("hidden"); caret?.setAttribute("aria-expanded", "false"); }};
   for (const option of options) {{
     const one = optValue(option);
     menu.append(el("button", {{
@@ -5177,6 +5209,7 @@ function comboWidget(input, options) {{
         e.preventDefault();
         input.value = one;
         close();
+        input.focus();
         // Through the input, so everything listening to the field — the hint,
         // the mask that folds by what is chosen, the not-staged-yet mark —
         // hears a value arriving the same way it hears one typed.
@@ -5184,11 +5217,23 @@ function comboWidget(input, options) {{
       }},
     }}));
   }}
-  box.append(el("button", {{
+  caret = el("button", {{
     class: "caret", type: "button", text: "▾",
-    title: "What this appliance already holds",
-    onclick: (e) => {{ e.preventDefault(); menu.classList.toggle("hidden"); }},
-  }}), menu);
+    "aria-label": "Show suggestions for " + label, "aria-controls": menu.id, "aria-expanded": "false",
+    onclick: (e) => {{ e.preventDefault();
+      const open = menu.classList.contains("hidden");
+      menu.classList.toggle("hidden", !open); caret.setAttribute("aria-expanded", String(open));
+    }},
+  }});
+  box.append(caret, menu);
+  box.addEventListener("keydown", (e) => {{
+    if (e.key === "Escape" && !menu.classList.contains("hidden")) {{
+      e.preventDefault(); e.stopPropagation(); close(); caret.focus();
+    }} else if (e.key === "ArrowDown" && e.target === caret) {{
+      e.preventDefault(); menu.classList.remove("hidden"); caret.setAttribute("aria-expanded", "true");
+      menu.querySelector("button")?.focus();
+    }}
+  }});
   // Leaving the field closes it: a menu left open over the next row is a menu
   // about a field nobody is looking at any more.
   box.addEventListener("focusout", (e) => {{
@@ -5282,12 +5327,55 @@ function secretWidget(name, value) {{
   return box;
 }}
 
+function isUpdateSigningKey(key, path = fieldPath) {{
+  return key === "public-key" && (path === "update" || path.startsWith("update channel "));
+}}
+
+function isUpdateChannelUrl(key, path = fieldPath) {{
+  return key === "url" && (path === "update" || path.startsWith("update channel "));
+}}
+
+function updateSigningKeyValue(value) {{
+  const raw = String(value || "");
+  // Whitespace is valid filename material, not PEM formatting. Do not
+  // silently replace a configured key reference with a different pathname.
+  return raw.startsWith("file:") ? raw : raw.trim();
+}}
+
+function updateSigningKeyError(value) {{
+  if (value.startsWith("file:")) {{
+    return value.length > 5 && new TextEncoder().encode(value.slice(5)).length <= 4096 && !/[\u0000-\u001f\u007f-\u009f]/.test(value)
+      ? "" : "Use file: followed by the public-key file path.";
+  }}
+  const begin = "-----BEGIN PUBLIC KEY-----", end = "-----END PUBLIC KEY-----";
+  const problem = "Use an Ed25519 PUBLIC KEY PEM or file:/etc/sentinel/release.pem.";
+  if (value.length > 4096 || !value.startsWith(begin) || !value.endsWith(end)) return problem;
+  const body = value.slice(begin.length, -end.length).replace(/[ \t\r\n\f\v]/g, "");
+  try {{
+    const der = atob(body), prefix = [48,42,48,5,6,3,43,101,112,3,33,0];
+    return der.length === 44 && btoa(der) === body && prefix.every((byte, i) => der.charCodeAt(i) === byte) ? "" : problem;
+  }} catch {{ return problem; }}
+}}
+
+function displayedUpdateKey(value) {{
+  const key = updateSigningKeyValue(value);
+  if (!key || key.startsWith("file:") || updateSigningKeyError(key)) return key;
+  const body = key.slice("-----BEGIN PUBLIC KEY-----".length, -"-----END PUBLIC KEY-----".length).replace(/[ \t\r\n\f\v]/g, "");
+  return "-----BEGIN PUBLIC KEY-----\n" + body + "\n-----END PUBLIC KEY-----";
+}}
+
 function fieldWidget(field, value) {{
   // A heading, not a setting: eighteen inputs in one flat grid is a form nobody
   // reads top to bottom, and the groups are how an operator already thinks
   // about the protocol — where it speaks, how fast, who it trusts.
   if (field[0] === "#") return null;
-  if (field[4] === "secret") return secretWidget(field[1], value);
+  if (isSecretField(field)) return secretWidget(field[1], value);
+  if (isUpdateSigningKey(field[0])) {{
+    const box = el("textarea", {{ class: "resize-none", rows: "4", spellcheck: "false",
+      placeholder: "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=\n-----END PUBLIC KEY-----" }});
+    box.value = displayedUpdateKey(value);
+    return box;
+  }}
   // A field that points at something the appliance already has is a choice,
   // not a spelling test. A key that carries its path — `import bgp`, `export
   // ospf` — is answered by the first word: what may go there is decided by the
@@ -5353,6 +5441,7 @@ function fieldWidget(field, value) {{
     const fallback = defaultHead(field[0]);
     const shape = exampleOf(field[0]);
     const box = el("input", {{
+      type: field[0] === "url" ? "url" : "text",
       value: value || "",
       placeholder: fallback ? defaultLabel(fallback) : shape ? "e.g. " + shape : "",
     }});
@@ -5382,7 +5471,7 @@ function fieldWidget(field, value) {{
       const offered = offerList(OFFERED[field[0]]);
       if (offered) box.setAttribute("list", offered);
     }}
-    return comboWidget(box, offers);
+    return comboWidget(box, offers, field[1]);
   }}
   const sel = el("select", {{}});
   const fallback = defaultOf(field[0]);
@@ -5406,6 +5495,103 @@ function fieldWidget(field, value) {{
 // sometimes another setting rather than a constant, and "default the router id"
 // is not a sentence anybody wrote on purpose.
 const defaultLabel = (v) => (v.includes(" ") ? "defaults to " + v : "default " + v);
+
+// Ranged port matches remain text: a number input would erase valid lists and
+// ranges. Validate their structure before staging, using the backend's limit.
+const FIREWALL_PORT_RANGE_MAX = {max_port_range};
+function firewallPortsError(value) {{
+  for (const entry of value.split(",").map((part) => part.trim()).filter(Boolean)) {{
+    const match = entry.match(/^(\+?\d+)(?:\s*-\s*(\+?\d+))?$/);
+    if (!match) return "Use ports 1–65535, separated by commas, or ranges such as 8000-8100.";
+    const start = Number(match[1]), end = match[2] === undefined ? start : Number(match[2]);
+    if (start < 1 || start > 65535 || end < 1 || end > 65535) return "Ports must be 1–65535.";
+    if (start > end) return "Range start must not exceed its end.";
+    if (end - start + 1 > FIREWALL_PORT_RANGE_MAX) return "Limit each range to " + FIREWALL_PORT_RANGE_MAX + " ports.";
+  }}
+  return "";
+}}
+
+// Blur/native change and delayed hints can run during pointer-down, before the
+// eventual click. Revealing feedback then can move the pressed target out from
+// under pointer-up and lose the click. Keep one shared queue for every grammar
+// form; keyboard blur remains immediate, and validation on Add/Stage is never
+// delayed or bypassed.
+const validationPointers = new Set();
+const deferredBlurChecks = new Set();
+function flushBlurChecks() {{
+  setTimeout(() => {{
+    if (validationPointers.size) return;
+    const pending = [...deferredBlurChecks]; deferredBlurChecks.clear();
+    for (const check of pending) check();
+  }}, 0);
+}}
+document.addEventListener("pointerdown", (event) => validationPointers.add(event.pointerId), true);
+for (const type of ["pointerup", "pointercancel"]) {{
+  document.addEventListener(type, (event) => {{
+    validationPointers.delete(event.pointerId); flushBlurChecks();
+  }}, true);
+}}
+window.addEventListener("blur", () => {{ validationPointers.clear(); flushBlurChecks(); }});
+
+// Associate the shared field's hint/error with the actual input, including
+// composite number/secret/suggestion widgets. Client checks prevent malformed
+// staging; the complete appliance schema remains the final validator.
+function bindField(field, widget, hint, label = field[1], required = false) {{
+  const input = widget.matches("input,select,textarea") ? widget
+    : widget.querySelector('button[role="switch"]')
+      || [...widget.querySelectorAll("input,select,textarea")].find((node) => node.type !== "checkbox" && !node.hidden);
+  if (!input) {{
+    widget.setAttribute("role", "group"); widget.setAttribute("aria-label", label);
+    return () => true;
+  }}
+  if (!input.id) input.id = "field-" + (++controlSerial);
+  // Wrapping labels remain the visible owner; matrices and composite switches
+  // need the complete row/column or group name as well.
+  input.setAttribute("aria-label", label);
+  hint.id = input.id + "-hint";
+  const error = el("span", {{ class: "field-error hidden", id: input.id + "-error" }});
+  hint.after(error);
+  input.setAttribute("aria-describedby", hint.id + " " + error.id);
+  input.setAttribute("aria-errormessage", error.id);
+  // Capture the owner now: fieldPath changes while other forms are rendered.
+  const firewallPorts = field[0] === "port" && fieldPath.startsWith("firewall rule");
+  const updateKey = isUpdateSigningKey(field[0]);
+  const updateUrl = isUpdateChannelUrl(field[0]);
+  let touched = false;
+  const check = (show = true) => {{
+    let message = "";
+    const value = updateKey ? updateSigningKeyValue(widget.value) : String(widget.value || "").trim();
+    if (required && !value) message = "Set " + label.toLowerCase() + ".";
+    else if (updateKey && value) message = updateSigningKeyError(value);
+    else if (updateUrl && value && !(value.startsWith("https:" + "//") || value.startsWith("file://"))) {{
+      message = "Use an https:" + "// or file:// update URL.";
+    }}
+    else if (firewallPorts && value) message = firewallPortsError(value);
+    else if (input.type === "number") {{
+      if (input.validity.badInput || value && !/^\d+$/.test(value)) message = "Enter a whole number.";
+      else if (value && (input.validity.rangeUnderflow || input.validity.rangeOverflow)) {{
+        message = input.min && input.max ? "Enter " + input.min + "–" + input.max + "."
+          : input.min ? "Enter " + input.min + " or more." : "Enter " + input.max + " or less.";
+      }}
+    }} else if (input.type === "url" && value && input.validity.typeMismatch) {{
+      message = "Enter a complete URL, for example https:" + "//updates.example.com.";
+    }}
+    if (show) {{
+      error.textContent = message; error.classList.toggle("hidden", !message);
+      input.setAttribute("aria-invalid", String(!!message));
+    }}
+    return !message;
+  }};
+  input.addEventListener("input", () => {{ touched = true; check(); }});
+  const blurCheck = () => {{ if (input.isConnected) check(); }};
+  input.addEventListener("blur", () => {{
+    touched = true;
+    if (validationPointers.size) deferredBlurChecks.add(blurCheck);
+    else blurCheck();
+  }});
+  widget.addEventListener("change", () => {{ if (touched) check(); }});
+  return check;
+}}
 
 // A field whose choices are exactly yes and no, however the table spells them.
 function isBool(options) {{
@@ -5443,6 +5629,22 @@ function fieldGrid(fields, row, required, form) {{
   // it speaks, how fast, who it trusts — so they are given the page's own shape
   // rather than a heading row cutting the fields in half.
   const grid = el("div", {{ class: "mask" }});
+  const checks = [];
+  const summary = el("p", {{ class: "err formerr hidden", role: "alert" }});
+  const validate = () => {{
+    const valid = checks.map((check) => check());
+    const passed = valid.every(Boolean);
+    summary.textContent = passed ? "" : "Correct the highlighted fields before staging.";
+    summary.classList.toggle("hidden", passed);
+    summary.classList.toggle("formerr", !passed);
+    if (!summary.parentNode) grid.append(summary);
+    if (passed) return true;
+    const first = grid.querySelector('[aria-invalid="true"]');
+    // A folded field with a rejected value must be reachable for correction.
+    for (let node = first?.parentElement; node && node !== grid; node = node.parentElement) node.classList.remove("hidden");
+    first?.focus(); first?.scrollIntoView({{ block: "center", behavior: "instant" }});
+    return false;
+  }};
   // Fields that come before the first heading belong to no group and lead the
   // mask. The body is empty for a mask that starts with a heading, and an empty
   // one takes no room.
@@ -5490,6 +5692,7 @@ function fieldGrid(fields, row, required, form) {{
           boxes[i] = cellBox;
           cell.append(cellBox);
           wireHint(fields[i], widgets[i], hint, values);
+          checks.push(bindField(fields[i], widgets[i], hint, rowLabel + " " + col[1]));
         }}
         tr.append(cell);
       }}
@@ -5504,7 +5707,7 @@ function fieldGrid(fields, row, required, form) {{
     grid.append(el("div", {{ class: "tblwrap" }}, [
       el("table", {{ class: "mtx" }}, [el("thead", {{}}, [head]), rows]),
     ]));
-    return {{ grid, widgets, more: null, refresh: () => {{}} }};
+    return {{ grid, widgets, more: null, refresh: () => {{}}, validate }};
   }}
   fields.forEach((f, i) => {{
     if (!widgets[i]) {{
@@ -5543,7 +5746,7 @@ function fieldGrid(fields, row, required, form) {{
     const owns = kind.includes("pick") || kind.includes("switch") || secret;
     // A set of tick boxes needs the run; a single figure does not, and neither
     // does a switch — two states take less room than a sentence, not more.
-    const size = kind.includes("pick") || kind.includes("chips") ? " w-l"
+    const size = widgets[i].tagName === "TEXTAREA" || kind.includes("pick") || kind.includes("chips") ? " w-l"
       : kind.includes("switch") ? " w-auto"
       : (WIDTH[f[0]] ? " " + WIDTH[f[0]] : " w-m");
     const box = el(owns ? "div" : "label", {{ class: "field" + size }}, [label, widgets[i], hint]);
@@ -5561,6 +5764,7 @@ function fieldGrid(fields, row, required, form) {{
     body.append(box);
     boxes.push(box);
     const repaint = wireHint(f, widgets[i], hint, values);
+    checks.push(bindField(f, widgets[i], hint, f[1], f[0] === required));
     // A field filled from the appliance has nothing to say until the answer
     // comes back, and by then nobody is listening. This is how it gets a
     // second chance to say it.
@@ -5624,7 +5828,7 @@ function fieldGrid(fields, row, required, form) {{
   }});
   apply();
   return {{
-    grid, widgets,
+    grid, widgets, validate,
     // The control that reveals the rest, for a caller that wants to place it.
     // A mask with nothing folded away has nothing to reveal.
     more: form && form.essential
@@ -5663,13 +5867,15 @@ function fieldLines(fields, widgets, path, before) {{
   const push = (line) => {{ if (!lines.includes(line)) lines.push(line); }};
   fields.forEach((f, i) => {{
     if (!widgets[i]) return;   // a heading writes nothing
-    const v = (widgets[i].value || "").trim();
+    const raw = widgets[i].value || "";
+    const updateKey = isUpdateSigningKey(f[0], path);
+    const v = updateKey ? updateSigningKeyValue(raw) : isSecretField(f) ? raw : raw.trim();
     const had = (before && before[f[0]]) || "";
     if (!v) {{
       if (had) push(`delete ${{path}} ${{CLEARS[f[0]] || f[0]}}`);
       return;
     }}
-    if (v === had) return;
+    if (updateKey ? displayedUpdateKey(v) === displayedUpdateKey(had) : v === had) return;
     // A repeatable setting *adds*. Editing "CN,RU" down to "CN" by setting the
     // new value would leave RU blocked and nothing on screen would say so, so
     // the list is cleared first and then written. Not `pick`: that one names a
@@ -5686,7 +5892,13 @@ function fieldLines(fields, widgets, path, before) {{
     }} else {{
       // Peer identity is one JSON token, including spaces and escaped keys.
       // Quote protected values as well so a credential is never a CLI fragment.
-      const argument = f[0] === "peer-identity" || f[4] === "secret" ? JSON.stringify(v) : v;
+      // A port list/range is ONE CLI argument even when an operator spaces its
+      // commas or dash. Keep the same token encoder as credentials/identities.
+      const spacedPorts = path.startsWith("firewall rule ") && f[0] === "port" && /\s/.test(v);
+      // Keep PEM in one CLI token/line, never turn a literal newline into a
+      // command boundary. The field-specific setter restores canonical PEM.
+      const argument = isUpdateSigningKey(f[0], path) ? JSON.stringify(v.replace(/[\r\n]+/g, " "))
+        : f[0] === "peer-identity" || isSecretField(f) || spacedPorts ? JSON.stringify(v) : v;
       push(`set ${{path}} ${{f[0]}} ${{argument}}`);
     }}
   }});
@@ -5708,13 +5920,14 @@ function settingsPanel(boxId, fields, current, path, label, form) {{
   // the caller says otherwise — the first group is what somebody came to set,
   // and the rest is why the page looked like a questionnaire.
   const shape = form || (fields.some((f) => f[0] === "#") ? {{ essential: firstGroup(fields) }} : null);
-  const {{ grid, widgets, more }} = fieldGrid(fields, current, null, shape);
+  const {{ grid, widgets, more, validate }} = fieldGrid(fields, current, null, shape);
   maskHost(box);
   box.append(grid);
   const mark = el("span", {{ class: "pill warn hidden", text: "not staged yet" }});
   const button = el("button", {{
     class: "btn primary", text: "Stage",
     onclick: () => {{
+      if (!validate()) return;
       const lines = fieldLines(fields, widgets, path, current);
       if (!lines.length) {{
         // Pressing Stage with nothing changed should say so rather than look
@@ -5815,7 +6028,14 @@ function firstGroup(fields) {{
 const SECRETS = [
   "psk", "password", "hashed-password", "private-key", "preshared-key",
   "auth-key", "secret", "passphrase", "macsec-key", "subscription-key", "enrollment-token",
+  "ao-key", "totp", "peer-identity",
 ];
+
+// One classification owns both readback redaction and editing. Otherwise adding
+// a credential to an ordinary settings mask silently creates a plaintext input.
+function isSecretField(field) {{
+  return field[4] === "secret" || SECRETS.includes(field[0]);
+}}
 
 function shown(key, value) {{
   if (!SECRETS.includes(key)) return value;
@@ -5879,10 +6099,11 @@ function objectCard(o, row, cols, span) {{
       cell.textContent = "";
       fieldSubject = row.name;
       fieldPath = path;
-      const {{ grid, widgets, more }} = fieldGrid(o.fields, row, null, o.form);
+      const {{ grid, widgets, more, validate }} = fieldGrid(o.fields, row, null, o.form);
       const stageit = el("button", {{
         class: "btn primary", text: "Stage",
         onclick: () => {{
+          if (!validate()) return;
           const lines = fieldLines(o.fields, widgets, path, row);
           // `stage` drops an empty list without a word, which reads as "it
           // worked" — the settings masks already say so, and this must too.
@@ -5978,9 +6199,52 @@ function markSpread(node, head, first, bar) {{
   node.append(line);
 }}
 
-// `o` carries: listId, addId?, noun, fields, path(name), rows, badge?, nameHint, empty.
+// A completed read with no parent is unavailable, not still loading. Retire
+// the previous parent's entire disclosure so a stale closure can never create
+// a child under an object that disappeared. The list supplies visible guidance.
+function unavailableCreation(o, reason) {{
+  const trigger = o.toggleId && $(o.toggleId);
+  const panelId = o.addId || (trigger && trigger.getAttribute("aria-controls"));
+  const box = panelId && $(panelId);
+  if (box) {{
+    if (box.contains(document.activeElement) && o.parentFocusId) $(o.parentFocusId)?.focus();
+    box.classList.add("hidden");
+    box.textContent = "";
+    box.onkeydown = null;
+    box.removeAttribute("role");
+    box.removeAttribute("aria-label");
+    dirty.delete(panelId);
+  }}
+  if (!trigger) return;
+  trigger.disabled = true;
+  trigger.onclick = null;
+  trigger.textContent = o.toggleLabel || "New";
+  trigger.title = reason;
+  trigger.removeAttribute("data-config-loading");
+  trigger.removeAttribute("aria-busy");
+  trigger.removeAttribute("aria-controls");
+  trigger.removeAttribute("aria-expanded");
+  const previous = trigger.dataset.creationDescription;
+  const descriptions = (trigger.getAttribute("aria-describedby") || "").split(/\s+/)
+    .filter((id) => id && id !== previous && id !== "write-boundary");
+  if (o.listId && !descriptions.includes(o.listId)) descriptions.push(o.listId);
+  if (descriptions.length) trigger.setAttribute("aria-describedby", descriptions.join(" "));
+  else trigger.removeAttribute("aria-describedby");
+  trigger.dataset.creationDescription = o.listId || "";
+  trigger.dataset.creationUnavailable = reason;
+  // This prerequisite now owns the disabled state; a later permission change
+  // must not resurrect a gateWrites snapshot from the previous parent.
+  delete trigger.dataset.writeGated;
+  gateWrites();
+}}
+
+// `o` carries listId, addId?, toggleId?, unavailable?, parentFocusId?, refreshDraft?, noun,
+// fields, path(name), rows, badge?, nameHint and empty.
 function renderObjects(o) {{
-  if (!configReadable && !o.rows.length) return unreadable(o.listId);
+  if (!configReadable && !o.rows.length) {{
+    unavailableCreation(o, "Read the configuration successfully before creating an object.");
+    return unreadable(o.listId);
+  }}
   const list = $(o.listId);
   list.textContent = "";
   if (!o.rows.length) {{
@@ -6001,7 +6265,10 @@ function renderObjects(o) {{
     ]));
   }}
 
-  if (o.addId) renderAddPanel(o);
+  if (o.addId) {{
+    if (o.unavailable) unavailableCreation(o, o.unavailable);
+    else renderAddPanel(o);
+  }}
 }}
 
 // The panel that makes a new object. Split out because the firewall rules keep
@@ -6015,22 +6282,47 @@ function renderObjects(o) {{
 function gateWrites() {{
   // React owns permissions and busy state for the migrated management views.
   if (typeof management !== "undefined") management.contextChanged();
-  if (mayWrite()) {{
+  const reason = writeBlockReason();
+  const notice = $("write-boundary");
+  if (notice.textContent !== reason) notice.textContent = reason;
+  notice.classList.toggle("hidden", !reason);
+  const pill = $("permpill");
+  const permissionLabel = target ? "peer · read-only"
+    : permission === "read-only" ? "read-only" : "checking access";
+  if (pill.textContent !== permissionLabel) pill.textContent = permissionLabel;
+  pill.classList.toggle("hidden", !reason);
+  // Target changes call this gate before awaiting a read. Keep observing late
+  // async renders for peer views as well as read-only/unknown accounts.
+  if (reason && !gateObserver) {{
+    gateObserver = new MutationObserver(() => gateWrites());
+    gateObserver.observe(document.body,
+      {{ childList: true, subtree: true }});
+  }} else if (!reason && gateObserver) {{
+    gateObserver.disconnect(); gateObserver = null;
+  }}
+  if (!reason) {{
     // The permission was unknown and turned out to allow writes: lift exactly
     // the gates this function closed, and nothing another rule disabled.
-    for (const b of document.querySelectorAll("main button[data-write-gated]")) {{
+    for (const b of document.querySelectorAll("main [data-write-gated], #editor [data-write-gated]")) {{
       b.disabled = false;
-      b.title = "";
+      b.title = b.dataset.writeGated;
+      const descriptions = (b.getAttribute("aria-describedby") || "").split(/\s+/)
+        .filter((id) => id && id !== "write-boundary");
+      if (descriptions.length) b.setAttribute("aria-describedby", descriptions.join(" "));
+      else b.removeAttribute("aria-describedby");
       delete b.dataset.writeGated;
     }}
     return;
   }}
-  for (const b of document.querySelectorAll("main button")) {{
-    if (/^(edit|delete|new|add|stage|apply|validate|generate|lift|capture|roll)/i
-        .test(b.textContent.trim())) {{
+  for (const b of document.querySelectorAll("main button, #editor button, #defaultpolicy")) {{
+    if ((b.id === "defaultpolicy" || /^(edit|delete|new|add|stage|apply|validate|generate|lift|capture|roll|disconnect)/i
+        .test(b.textContent.trim())) && (!b.disabled || b.hasAttribute("data-write-gated"))) {{
+      if (!b.hasAttribute("data-write-gated")) b.dataset.writeGated = b.title;
       b.disabled = true;
-      b.dataset.writeGated = "";
-      b.title = "This account may read the configuration, not change it";
+      b.title = reason;
+      const descriptions = (b.getAttribute("aria-describedby") || "").split(/\s+/).filter(Boolean);
+      if (!descriptions.includes("write-boundary")) descriptions.push("write-boundary");
+      b.setAttribute("aria-describedby", descriptions.join(" "));
     }}
   }}
 }}
@@ -6040,23 +6332,51 @@ function renderAddPanel(o) {{
   // as it was when the page loaded.
   const box = $(o.addId);
   box.textContent = "";
+  box.setAttribute("role", "region");
+  box.setAttribute("aria-label", o.toggleLabel || "New " + o.noun.toLowerCase());
+  const dismiss = () => {{
+    box.classList.add("hidden");
+    const trigger = o.toggleId && $(o.toggleId);
+    if (trigger) {{
+      trigger.textContent = o.toggleLabel || "New";
+      trigger.setAttribute("aria-expanded", "false");
+      trigger.focus();
+    }}
+  }};
+  // A drawer can cover its toolbar toggle. Its own Cancel and Escape remain
+  // reachable; closing retains the unstaged values and never changes a batch.
+  box.onkeydown = (event) => {{
+    if (event.key === "Escape" && !event.defaultPrevented) {{
+      event.preventDefault(); event.stopPropagation(); dismiss();
+    }}
+  }};
   maskHost(box);
   fieldPath = o.path("<n>");
-  // No `nameHint`, no placeholder: "name" under a box labelled Name is the
-  // label again, which is the one thing a placeholder must never be.
-  const name = el("input", {{ placeholder: o.nameHint || "" }});
-  const {{ grid, widgets, more }} = fieldGrid(o.fields, null, o.required, o.form);
+  // Object identifiers are not all names: route prefixes, neighbor addresses
+  // and ordered policy sequences must say which format they expect.
+  const nameLabel = o.nameLabel || "Name";
+  const name = el("input", {{ placeholder: o.nameHint ? "e.g. " + o.nameHint : "",
+    type: o.nameBounds ? "number" : "text" }});
+  if (o.nameBounds) {{
+    name.min = String(o.nameBounds[0]); name.max = String(o.nameBounds[1]);
+    name.inputMode = "numeric";
+  }}
+  const {{ grid, widgets, more, validate }} = fieldGrid(o.fields, null, o.required, o.form);
   // The name leads the mask rather than standing above it: it is the first
   // thing asked for, not a separate step before the form starts.
-  grid.firstElementChild.prepend(
-    el("label", {{ class: "field w-m" }}, [el("span", {{ text: "Name" }}), name]));
+  const nameHint = el("span", {{ class: "hint", text: o.nameHelp || "" }});
+  const nameBox = el("label", {{ class: "field w-m" }}, [el("span", {{ text: nameLabel }}), name, nameHint]);
+  const validateName = bindField(["name", nameLabel], name, nameHint, nameLabel, true);
+  grid.firstElementChild.prepend(nameBox);
   box.append(grid);
   const err = el("p", {{ class: "err formerr" }});
   const add = el("button", {{
     class: "btn primary", text: "Add",
     onclick: () => {{
       const n = name.value.trim();
-      if (!n) {{ err.textContent = "Give it a name."; name.focus(); return; }}
+      if (!validateName()) {{ err.textContent = "Set a valid " + nameLabel.toLowerCase() + "."; name.focus(); return; }}
+      err.textContent = "";
+      if (!validate()) return;
       const lines = fieldLines(o.fields, widgets, o.path(n), null);
       // A name on its own is not an object. The appliance stores settings, so a
       // path with no leaf under it is a path it does not know — `set nat source
@@ -6083,19 +6403,41 @@ function renderAddPanel(o) {{
       // everything else `lines` is non-empty by the check above.
       const body = lines.length ? lines : [`set ${{o.path(n)}}`];
       stage(`${{o.noun}} ${{n}}`, (o.prelude ? o.prelude(n) : []).concat(body));
-      box.classList.add("hidden");
-      // The toolbar button says "Cancel" while the panel is open; closing it
-      // from in here has to put that back or the next click reopens nothing.
-      if (o.toggleId && $(o.toggleId)) $(o.toggleId).textContent = o.toggleLabel || "New";
+      dismiss();
       // Rebuild the section so the thing just staged can be chosen by the next
       // one: creating a permission group and then an account in it is one piece
       // of work, and a form built before the group existed cannot offer it.
-      refresh();
+      if (o.refreshDraft) o.refreshDraft();
+      else refresh();
     }},
   }});
-  const foot = el("div", {{ class: "maskfoot" }}, [add]);
+  const cancel = el("button", {{ class: "btn", type: "button", text: "Cancel", onclick: dismiss }});
+  const foot = el("div", {{ class: "maskfoot" }}, [add, cancel]);
   if (more) foot.append(more);
   box.append(foot, err);
+  // The form owner also owns its disclosure. A hand-maintained startup list
+  // left valid, rendered forms (including update channels and AAA) unreachable.
+  // Rebinding onclick is idempotent and preserves the drawer's current state.
+  const trigger = o.toggleId && $(o.toggleId);
+  if (trigger) {{
+    wireToggle(o.toggleId, o.addId, o.toggleLabel || "New");
+    // Only this form's loading/prerequisite gates may be lifted. Permissions
+    // are reapplied after every rebind, including a newly named parent.
+    if (trigger.hasAttribute("data-config-loading") || trigger.hasAttribute("data-creation-unavailable")) {{
+      trigger.removeAttribute("data-config-loading");
+      trigger.removeAttribute("aria-busy");
+      trigger.removeAttribute("data-creation-unavailable");
+      const explanation = trigger.dataset.creationDescription;
+      const descriptions = (trigger.getAttribute("aria-describedby") || "").split(/\s+/)
+        .filter((id) => id && id !== explanation);
+      if (descriptions.length) trigger.setAttribute("aria-describedby", descriptions.join(" "));
+      else trigger.removeAttribute("aria-describedby");
+      delete trigger.dataset.creationDescription;
+      trigger.title = "";
+      trigger.disabled = false;
+    }}
+    gateWrites();
+  }}
 }}
 
 // The human name of a field, for a message about it. A message that names the
@@ -6127,9 +6469,33 @@ async function showInto(boxId, path) {{
     else box.parentNode.insertBefore(cap, box);
   }}
   cap.textContent = "show " + path.replace("/api/v1/show/", "").split("/").join(" ");
+  const generation = box.sourceGeneration = (box.sourceGeneration || 0) + 1;
+  const previous = box.parentNode.querySelector('[data-diagnostic-for="' + boxId + '"]');
+  if (previous) previous.remove();
+  box.classList.remove("hidden");
+  box.setAttribute("aria-busy", "true");
   box.textContent = "…";
-  try {{ box.textContent = (await text(path)).trimEnd() || "(nothing to show)"; }}
-  catch (e) {{ box.textContent = explain(String(e.message || e)); }}
+  try {{
+    const output = await text(path);
+    if (box.sourceGeneration !== generation) return;
+    box.textContent = output.trimEnd() || "(nothing to show)";
+  }} catch (e) {{
+    if (box.sourceGeneration !== generation) return;
+    box.textContent = "";
+    box.classList.add("hidden");
+    // Reuse the dashboard's unavailable/technical-details presentation. A
+    // failed command is not an empty protocol table or a healthy zero.
+    const retry = el("button", {{ class: "btn", type: "button", text: "Retry",
+      "aria-label": "Retry " + cap.textContent, onclick: () => showInto(boxId, path) }});
+    const details = el("details", {{}}, [el("summary", {{ text: "Technical details" }}),
+      el("pre", {{ class: "out source-error", text: explain(String(e.message || e)) }})]);
+    box.after(el("div", {{ class: "source-notice", "data-diagnostic-for": boxId }}, [
+      el("p", {{ text: "Status unavailable", role: "status" }}),
+      el("span", {{ text: "This command did not return live state. " }}), retry, details,
+    ]));
+  }} finally {{
+    if (box.sourceGeneration === generation) box.setAttribute("aria-busy", "false");
+  }}
 }}
 
 // A failure an operator can act on. The appliance's own words are kept, because
@@ -6145,10 +6511,15 @@ function explain(message) {{
 }}
 
 function wireToggle(buttonId, panelId, label) {{
+  $(buttonId).setAttribute("aria-controls", panelId);
+  $(buttonId).setAttribute("aria-expanded", String(!$(panelId).classList.contains("hidden")));
   $(buttonId).onclick = () => {{
     const panel = $(panelId);
     panel.classList.toggle("hidden");
-    $(buttonId).textContent = panel.classList.contains("hidden") ? label : "Cancel";
+    const open = !panel.classList.contains("hidden");
+    $(buttonId).textContent = open ? "Cancel" : label;
+    $(buttonId).setAttribute("aria-expanded", String(open));
+    if (open) panel.querySelector("input,select,textarea,button")?.focus();
   }};
 }}
 
@@ -6197,10 +6568,18 @@ function parseConfig(doc) {{
     filled[filled.length - 1] = true;
     const node = [].concat(...stack);
     const words = line.split(/\s+/);
+    let value = isUpdateSigningKey(words[0], node.join(" "))
+      ? line.slice(words[0].length).trimStart() : words.slice(1).join(" ");
+    // The release-key renderer quotes filenames/PEM as one CLI token. Decode
+    // only this owned variant; do not reinterpret other protocols' values.
+    if (isUpdateSigningKey(words[0], node.join(" ")) && value.startsWith('"')) {{
+      value = JSON.parse(value);
+      if (typeof value !== "string") throw new Error("Invalid update public-key representation");
+    }}
     out.push({{
       path: node.concat(words[0]),
       node: node.join(" "),
-      value: words.slice(1).join(" "),
+      value,
     }});
   }}
   return out;
@@ -6513,16 +6892,21 @@ const IPSEC = [
 ];
 
 async function refreshIpsec() {{
-  await showInto("ipsecshow", "/api/v1/show/vpn/ipsec");
+  // A missing/slow daemon must not prevent correcting its configuration or
+  // leave an enabled New button opening an empty drawer. Render configuration
+  // first; the independent diagnostic retains its own pending/error owner.
   renderObjects({{
     listId: "ipseclist", form: FORMS.ipsec, required: "remote", toggleId: "toggleipsec", toggleLabel: "New tunnel", addId: "addipsecpanel", noun: "Tunnel",
-    fields: IPSEC, nameHint: "tunnel name",
+    fields: IPSEC, nameHint: "branch-office",
     path: (n) => `vpn ipsec ${{n}}`,
     rows: entriesUnder(await leaves(), ["vpn", "ipsec"]),
     badge: (r) => (r.local && r.remote) ? {{ text: "ike" + (r["ike-version"] || "2") }}
                                         : {{ text: "incomplete", cls: "warn" }},
     empty: "No IPsec tunnels configured.",
   }});
+  // showInto owns read pending/error/generation state. Its diagnostic is not
+  // part of the form transaction, so it must not keep Validate/Apply busy.
+  void showInto("ipsecshow", "/api/v1/show/vpn/ipsec");
 }}
 
 // ---- WireGuard -----------------------------------------------------------
@@ -6569,14 +6953,11 @@ async function refreshWireguard() {{
   // With no interface there is nothing to add a peer *to*: the panel used to
   // build `vpn wireguard undefined peer …`, a command the appliance can only
   // refuse. The control is disabled instead, and says why.
-  const canAddPeer = !!iface;
-  $("togglewgpeer").disabled = !canAddPeer;
-  $("togglewgpeer").title = canAddPeer ? "" : "Add a WireGuard interface first";
-  if (!canAddPeer) $("addwgpeerpanel").classList.add("hidden");
   renderObjects({{
     listId: "wgpeerlist", form: FORMS.wgPeer, required: "allowed-ips", toggleId: "togglewgpeer", toggleLabel: "New peer",
-    addId: canAddPeer ? "addwgpeerpanel" : null, noun: "Peer",
-    fields: WG_PEER, nameHint: "peer public key",
+    addId: "addwgpeerpanel", unavailable: iface ? "" : "Add a WireGuard interface first.", parentFocusId: "wgtunnel", noun: "Peer",
+    fields: WG_PEER, nameLabel: "Public key", nameHint: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+    nameHelp: "Base64 WireGuard public key supplied by the peer; never its private key.",
     path: (n) => `vpn wireguard ${{iface}} peer ${{n}}`,
     rows: iface ? entriesUnder(ls, ["vpn", "wireguard", iface, "peer"]) : [],
     empty: iface ? "No peers on " + iface + "." : "Add an interface first.",
@@ -6648,15 +7029,14 @@ async function refreshDhcp() {{
   // Reservations belong to one server, so the interface is chosen first and the
   // rows are that server's — the same shape as a prefix list's rules.
   const withServer = [...servers.keys()].sort().map((name) => ({{ name }}));
-  const on = $("mapiface").value || (withServer[0] || {{}}).name || "";
+  const on = chosenName("mapiface", null, withServer);
   fillPicker("mapiface", withServer, on);
   // With no server chosen the path has a hole in it, and `set interface
   // dhcp-server static-mapping printer mac …` is a command that can only be
   // refused — so there is nothing to press rather than something that fails.
-  $("togglemap").disabled = !on;
   renderObjects({{
     listId: "maplist", required: "mac", toggleId: "togglemap", toggleLabel: "New",
-    addId: "addmappanel", noun: "Reservation",
+    addId: "addmappanel", unavailable: on ? "" : "Enable a DHCP server first.", parentFocusId: "mapiface", noun: "Reservation",
     fields: DHCP_MAPPING, nameHint: "printer",
     path: (n) => `interface ${{on}} dhcp-server static-mapping ${{n}}`,
     rows: on ? entriesUnder(ls, ["interface", on, "dhcp-server", "static-mapping"]) : [],
@@ -6701,7 +7081,7 @@ async function refreshDhcp() {{
 // masks had the same problem the interface one did.
 const FORMS = {{
   bgpNeighbour: {{ essential: ["remote-as", "description", "update-source"] }},
-  ipsec: {{ essential: ["remote", "local", "psk"] }},
+  ipsec: {{ essential: ["remote", "local", "local-subnet", "remote-subnet", "psk"] }},
   wireguard: {{ essential: ["private-key", "listen-port"] }},
   wgPeer: {{ essential: ["allowed-ips", "endpoint"] }},
   loadBalancer: {{ essential: ["zone", "vip", "port", "backend"] }},
@@ -7039,7 +7419,7 @@ async function refreshGroups() {{
   renderObjects({{
     listId: "grouplist", toggleId: "togglegroup", toggleLabel: "New", addId: "addgrouppanel", noun: "Group",
     fields: [[member, member.charAt(0).toUpperCase() + member.slice(1) + "es", null, "list"]],
-    nameHint: "group name",
+    nameHint: "branch-offices",
     path: (n) => `firewall group ${{kind}} ${{n}}`,
     rows: entriesUnder(await leaves(), ["firewall", "group", kind]),
     badge: (r) => r[member] ? {{ text: member }} : {{ text: "empty", cls: "warn" }},
@@ -7211,7 +7591,7 @@ async function refreshUsers() {{
 async function refreshSynproxy() {{
   renderObjects({{
     listId: "synlist", form: FORMS.syn, allowBare: true, toggleId: "togglesyn", toggleLabel: "New", addId: "addsynpanel", noun: "Port",
-    fields: [["mss", "MSS"]], nameHint: "443",
+    fields: [["mss", "MSS"]], nameHint: "443", nameLabel: "TCP port", nameBounds: [1, 65535],
     path: (n) => `firewall syn-protect ${{n}}`,
     // `syn-protect` is written as one flat line under `firewall`, not as a
     // named block, so `entriesUnder` cannot see it: the port IS the value.
@@ -7330,8 +7710,9 @@ const VRRP = [
 // does — a pair with VRRP alone fails over to a firewall that has neither the
 // configuration nor the connections.
 const HA = [
-  ["enabled", "Activate leased HA", ["", "true", "false"]],
-  ["witness", "Witness IP:port"],
+  ["mode", "Election mode", ["", "witness", "two-node"]],
+  ["enabled", "Activate HA", ["", "true", "false"]],
+  ["witness", "Witness IP:port (witness mode only)"],
   ["sync-interface", "Dedicated control interface"],
   ["node", "Member", ["", "1", "2"]],
   ["priority", "Election priority"],
@@ -7339,8 +7720,12 @@ const HA = [
   ["cluster", "Cluster identifier"],
   ["management-fingerprint", "Local management TLS fingerprint"],
   ["peer-identity", "Peer identity JSON", null, null, "secret"],
-  ["lease-ms", "Witness lease (ms)"],
-  ["io-timeout-ms", "Witness exchange budget (ms)"],
+  ["lease-ms", "Forwarding lease (ms)"],
+  ["io-timeout-ms", "Heartbeat exchange budget (ms)"],
+  ["heartbeat-listen", "Local heartbeat IP:port endpoints", null, "list"],
+  ["heartbeat-peer", "Peer heartbeat IP:port endpoints", null, "list"],
+  ["peer-timeout-ms", "Two-node peer timeout (ms)"],
+  ["startup-delay-ms", "Two-node startup delay (ms)"],
 ];
 const HA_WITNESS = [
   ["listen", "Witness listen IP:port"],
@@ -7914,10 +8299,12 @@ async function refreshOpenconnect() {{
 // one that does not exist yet — a list is only real once it has a rule, so the
 // name has to exist somewhere before that rule can be written.
 function chosenName(pickId, newId, names) {{
-  const typed = ($(newId).value || "").trim();
+  const typed = newId ? ($(newId).value || "").trim() : "";
   if (typed) return typed;
   const pick = $(pickId);
-  return pick.value || (names[0] && names[0].name) || "";
+  // A stale option is not a parent after deletion/discard. Resolve against the
+  // freshly read/staged vocabulary before rebuilding the picker and form.
+  return names.some((n) => n.name === pick.value) ? pick.value : (names[0] && names[0].name) || "";
 }}
 
 function fillPicker(pickId, names, current) {{
@@ -7931,8 +8318,11 @@ function fillPicker(pickId, names, current) {{
   if (!names.length) pick.append(el("option", {{ value: "", text: "(none yet)" }}));
 }}
 
-async function refreshRoutePolicy() {{
-  const ls = await leaves();
+async function refreshRoutePolicy(localContext = false) {{
+  // A parent picker/name changes only this draft's context. Rebind from the
+  // actual last read synchronously: awaiting another read leaves the previous
+  // parent's New handler briefly usable. Explicit Refresh still fetches anew.
+  const ls = localContext ? lastLeaves : await leaves();
   markTabs("routepolicy", ls);
 
   renderObjects({{
@@ -7953,8 +8343,10 @@ async function refreshRoutePolicy() {{
   renderObjects({{
     listId: "pllist", required: "prefix",
     toggleId: "togglepl", toggleLabel: "New rule",
-    addId: list ? "addplpanel" : null, noun: "Rule",
-    fields: PLIST_RULE, nameHint: "10",
+    addId: "addplpanel", unavailable: list ? "" : "Select or name a prefix list first.", parentFocusId: "plnew", noun: "Rule",
+    refreshDraft: () => refreshRoutePolicy(true),
+    fields: PLIST_RULE, nameHint: "10", nameLabel: "Sequence", nameBounds: [0, 4294967295],
+    nameHelp: "Rules are evaluated in ascending sequence order.",
     // The rule's *name* is its sequence number, which is what orders them.
     path: (seq) => `policy prefix-list ${{list}} rule ${{seq}}`,
     rows: list ? entriesUnder(ls, ["policy", "prefix-list", list, "rule"]) : [],
@@ -7962,7 +8354,6 @@ async function refreshRoutePolicy() {{
     empty: list ? "No rules in " + list + " yet."
                 : "Type a name beside the picker to start a list.",
   }});
-  $("togglepl").disabled = !list;
 
   const maps = entriesWithStaged(entriesUnder(ls, ["policy", "route-map"]), ["policy", "route-map"]);
   const map = chosenName("rmlist-pick", "rmnew", maps);
@@ -7980,8 +8371,10 @@ async function refreshRoutePolicy() {{
   renderObjects({{
     listId: "rmlist", required: "action",
     toggleId: "togglerm", toggleLabel: "New rule",
-    addId: map ? "addrmpanel" : null, noun: "Rule",
-    fields: RMAP_RULE, nameHint: "10",
+    addId: "addrmpanel", unavailable: map ? "" : "Select or name a route map first.", parentFocusId: "rmnew", noun: "Rule",
+    refreshDraft: () => refreshRoutePolicy(true),
+    fields: RMAP_RULE, nameHint: "10", nameLabel: "Sequence", nameBounds: [0, 4294967295],
+    nameHelp: "Rules are evaluated in ascending sequence order.",
     path: (seq) => `policy route-map ${{map}} rule ${{seq}}`,
     rows: map ? entriesUnder(ls, ["policy", "route-map", map, "rule"]) : [],
     badge: (r) => r.action ? {{ text: r.action, cls: r.action === "deny" ? "drop" : "accept" }}
@@ -7989,7 +8382,6 @@ async function refreshRoutePolicy() {{
     empty: map ? "No rules in " + map + " yet."
                : "Type a name beside the picker to start a map.",
   }});
-  $("togglerm").disabled = !map;
 }}
 
 async function refreshSystem() {{
@@ -8058,7 +8450,8 @@ async function refreshRouting() {{
   renderObjects({{
     listId: "routelist", form: FORMS.route, required: "via",
     toggleId: "toggleroute", toggleLabel: "New", addId: "addroutepanel", noun: "Route",
-    fields: ROUTE, nameHint: "0.0.0.0/0",
+    fields: ROUTE, nameHint: "0.0.0.0/0", nameLabel: "Destination prefix",
+    nameHelp: "IPv4 or IPv6 network in CIDR notation.",
     path: (n) => `protocols static ${{n}}`,
     rows: entriesUnder(ls, ["protocols", "static"]),
     badge: (r) => r.via ? {{ text: "via " + r.via }} : {{ text: "no next hop", cls: "warn" }},
@@ -8067,7 +8460,7 @@ async function refreshRouting() {{
   renderObjects({{
     listId: "bgplist", form: FORMS.bgpNeighbour, required: "remote-as",
     toggleId: "togglebgp", toggleLabel: "New neighbour", addId: "addbgppanel", noun: "Neighbour",
-    fields: BGP_NEIGHBOR, nameHint: "neighbour address",
+    fields: BGP_NEIGHBOR, nameHint: "192.0.2.2", nameLabel: "Neighbour IP address",
     path: (n) => `protocols bgp neighbor ${{n}}`,
     rows: entriesUnder(ls, ["protocols", "bgp", "neighbor"]),
     // A neighbour without a remote AS is not yet a session, and saying so is
@@ -8079,7 +8472,7 @@ async function refreshRouting() {{
   renderObjects({{
     listId: "agglist", toggleId: "toggleagg", toggleLabel: "New aggregate",
     addId: "addaggpanel", noun: "Aggregate",
-    fields: BGP_AGGREGATE, nameHint: "10.0.0.0/8",
+    fields: BGP_AGGREGATE, nameHint: "10.0.0.0/8", nameLabel: "Aggregate prefix",
     path: (n) => `protocols bgp aggregate ${{n}}`,
     rows: entriesUnder(ls, ["protocols", "bgp", "aggregate"]),
     badge: (r) => r["summary-only"] === "true"
@@ -8089,7 +8482,7 @@ async function refreshRouting() {{
   renderObjects({{
     listId: "roalist", required: "origin-as", toggleId: "toggleroa",
     toggleLabel: "New authorisation", addId: "addroapanel", noun: "Authorisation",
-    fields: BGP_ROA, nameHint: "192.0.2.0/24",
+    fields: BGP_ROA, nameHint: "192.0.2.0/24", nameLabel: "Authorised prefix",
     path: (n) => `protocols bgp roa ${{n}}`,
     rows: entriesUnder(ls, ["protocols", "bgp", "roa"]),
     badge: (r) => r["origin-as"] ? {{ text: "AS " + r["origin-as"] }}
@@ -8281,7 +8674,7 @@ async function refreshHa() {{
   // the same way BGP's router settings are rather than as objects with names.
   const ls = await leaves();
   const under = (node) => fieldsOf(ls, node);
-  settingsPanel("haform", HA, under("system ha"), "system ha", "Leased HA");
+  settingsPanel("haform", HA, under("system ha"), "system ha", "HA");
   settingsPanel("hawitnessform", HA_WITNESS, under("system ha-witness"),
                 "system ha-witness", "Independent witness");
   settingsPanel(
@@ -8580,14 +8973,53 @@ async function refreshConfig() {{
 
 // ---- stack ---------------------------------------------------------------
 
+// Delivery status is not connectivity, nor proof of bidirectional equality.
+// The API reports this member's durable outbox; never infer it from reachable.
+function configSyncState(member) {{
+  if (member.name === "self") return {{ text: "Local", cls: "", help: "This appliance" }};
+  const states = {{
+    "in-sync": {{ text: "Delivered", cls: "up", help: "No local changes await delivery to this peer." }},
+    "pending": {{ text: "Pending delivery", cls: "warn", help: "Local changes are queued for this peer." }},
+    "conflict": {{ text: "Conflict", cls: "warn", help: "Compare member configurations before choosing which change to keep." }},
+  }};
+  return Object.hasOwn(states, member.sync) ? states[member.sync]
+    : {{ text: "Unknown", cls: "warn", help: "Configuration delivery status could not be checked." }};
+}}
+
+function configSyncBadge(member) {{
+  const state = configSyncState(member);
+  return el("span", {{ class: "pill " + state.cls, text: state.text,
+    title: state.help, "aria-label": "Configuration: " + state.text }});
+}}
+
+function renderConfigSyncNotice(id, members) {{
+  const peers = members?.filter((m) => m.name !== "self");
+  const message = !peers ? "Configuration delivery is unavailable. Reload to check again."
+    : peers.some((m) => m.sync === "conflict")
+    ? "Configuration conflict. Compare member configurations in Stack before choosing a revision."
+    : peers.some((m) => m.sync === "pending")
+    ? "Local changes await peer delivery. See Stack for status."
+    : peers.some((m) => m.sync !== "in-sync")
+    ? "Configuration delivery is unknown. See Stack for status." : "";
+  const note = $(id);
+  if (note.textContent !== message) note.textContent = message;
+  note.classList.toggle("hidden", !message);
+}}
+
 async function refreshStack() {{
+  return refreshCluster();
+}}
+
+function renderStackMembers(members, failure) {{
   const t = $("stacktable");
   t.textContent = "";
-  t.append(el("tr", {{}}, ["member", "hostname", "state", ""].map((h) => el("th", {{ text: h }}))));
-  let data;
-  try {{ data = await (await api("/api/v1/stack")).json(); }}
-  catch (e) {{ t.append(el("tr", {{}}, [el("td", {{ colspan: "4", text: String(e.message || e) }})])); return; }}
-  for (const m of data.members) {{
+  t.append(el("tr", {{}}, ["member", "hostname", "state", "configuration", ""].map((h) => el("th", {{ text: h }}))));
+  if (!members) {{
+    renderConfigSyncNotice("stack-sync-note", null);
+    t.append(el("tr", {{}}, [el("td", {{ colspan: "5", text: String(failure?.message || failure || "Member status unavailable") }})])); return;
+  }}
+  renderConfigSyncNotice("stack-sync-note", members);
+  for (const m of members) {{
     const isSelf = m.name === "self";
     const name = isSelf ? "" : m.name;
     const select = el("button", {{
@@ -8599,7 +9031,7 @@ async function refreshStack() {{
       // appliances is not a rate.
       onclick: () => {{
         target = name; history.clear(); lastCounters = null;
-        refresh(); refreshCluster(); refreshStack();
+        refresh();
       }},
     }});
     t.append(el("tr", {{}}, [
@@ -8609,12 +9041,13 @@ async function refreshStack() {{
         class: "pill " + (m.reachable ? "up" : "down"),
         text: m.reachable ? "reachable" : "unreachable",
       }})]),
+      el("td", {{}}, [configSyncBadge(m)]),
       el("td", {{}}, [select]),
     ]));
   }}
-  if (data.members.length === 1) {{
+  if (members.length === 1) {{
     t.append(el("tr", {{}}, [el("td", {{
-      colspan: "4",
+      colspan: "5",
       text: "No peers configured — set system config-sync peer <host> to add one.",
     }})]));
   }}
@@ -9059,43 +9492,43 @@ const ABOUT = {{
   synproxy: "Which listeners have their handshake completed by the appliance.",
   interfaces: "Links, addresses and the zone each one belongs to.",
   dhcp: "Addresses handed out on each segment, and the reservations that are not.",
-  qos: "Shaping belongs on the link that is actually congested, on the way out. Set the bandwidth slightly below what the line really carries: the point is to hold the queue here, where it can be managed, instead of in the modem, where it cannot.",
+  qos: "Shape congested egress links; set bandwidth below the measured line rate.",
   lb: "Virtual addresses in front of backend pools.",
   routing: "Everything that decides where a packet goes next.",
-  evpn: "One tenant network across several boxes: BGP carries who is where — a MAC learned here is announced to the others — and the data plane carries the frames toward whichever box announced the destination. Neither half is any use alone, so both are set here.",
-  "routing:ospf": "The interior protocol most networks are built on: a link-state view of one area, or several joined at this box. It is off until it is given an interface to speak on.",
-  "routing:ospf3": "OSPF for IPv6 — a separate protocol with its own adjacencies, not an address family of the one beside it. Running both is normal.",
-  "routing:isis": "Link-state routing that carries both address families over one set of adjacencies. The system ID and area are what an adjacency is formed on, so they are set before an interface is added.",
-  "routing:rip": "Distance-vector, and bounded to fifteen hops by design. It is here for the networks that still speak it, not as a first choice.",
+  evpn: "Configure BGP endpoint discovery and the VXLAN or Geneve data plane for tenant networks.",
+  "routing:ospf": "Exchange IPv4 routes with OSPFv2; choose an area and participating interfaces.",
+  "routing:ospf3": "Exchange IPv6 routes using independent OSPFv3 adjacencies.",
+  "routing:isis": "Exchange dual-stack routes; set a system ID and area before adding interfaces.",
+  "routing:rip": "Configure RIP for legacy IPv4 networks, with a maximum of fifteen hops.",
   "routing:ripng": "RIP for IPv6, with the same reach and the same limits.",
-  "routing:babel": "Distance-vector built for links that come and go — wireless, and meshes where the cost of a path is not the number of hops.",
-  "routing:bfd": "Sub-second failure detection the protocols beside it subscribe to with their own bfd field. On its own it detects nothing.",
-  "routing:multicast": "Multicast is not forwarded until this box is told to listen for the reports that say who wants a group. IGMP is the IPv4 half, MLD the IPv6 one, and an interface either faces receivers or faces the source.",
-  "routing:vrf": "A separate routing table with its own interfaces, so two tenants can use the same addresses without meeting. Route targets are what let something deliberately cross between them.",
-  "routing:filters": "Which routes cross between the protocols and this box's routing table, and which route map decides. A protocol's own redistribution offers its routes; these say which of them are taken, and which go back out.",
-  "routing:table": "What the protocols above actually agreed on. A route is here once however many of them offered it — this is the answer, not the argument.",
-  "routing:static": "Routes written by hand. They win over anything a protocol learns, which is what makes them useful and what makes a forgotten one hard to find.",
-  "routing:bgp": "The exterior protocol: who this appliance is to another network, the neighbours it says it to, and what came of that. A neighbour without a remote AS is not a session.",
-  "services:resolution": "Answering names, and agreeing what time it is. Each is off until it is given something to do — staging a field and committing is what starts it, and clearing the fields is what stops it.",
-  "services:management": "How this box is reached and read from outside itself. Every one of these is a way in or a way out, and none of them should be listening on an untrusted zone.",
-  "services:addressing": "Addresses and names for the segments behind this box — relayed to a server elsewhere, reflected across segments, or published upstream.",
-  "services:publishing": "What this box puts in front of something else: a name terminated here, a broadcast carried across a segment boundary, a guest held at a login, a port an inside host asked for.",
-  "services:notification": "Where the appliance speaks up, and who hears it. An alert is sent when a watched unit fails; the journal is forwarded continuously, whether or not anything is wrong.",
-  history: "What the box looked like before now. Live counters cannot say whether this was also happening at three in the morning last Tuesday — and a gap in a line is a gap in the record, drawn as one rather than joined up.",
+  "routing:babel": "Configure routing for wireless meshes and changing link conditions.",
+  "routing:bfd": "Set failure-detection timers; enable BFD on each routing peer that should use them.",
+  "routing:multicast": "Configure IGMP/MLD membership and multicast forwarding between interfaces.",
+  "routing:vrf": "Isolate routing tables and control route sharing between tenants.",
+  "routing:filters": "Select route maps for importing and exporting each protocol's routes.",
+  "routing:table": "Inspect selected routes and their next hops.",
+  "routing:static": "Configure explicit next hops, interfaces and route preferences.",
+  "routing:bgp": "Set the local AS, originated prefixes and neighbours; each neighbour needs a remote AS.",
+  "services:resolution": "Configure DNS resolution, clock synchronisation and optional LAN time service.",
+  "services:management": "Configure remote management; restrict listening services to trusted networks.",
+  "services:addressing": "Configure address relays, name reflection and dynamic DNS.",
+  "services:publishing": "Configure reverse proxies, broadcast relays, captive portals and port-mapping services.",
+  "services:notification": "Choose destinations for failure alerts, logs and flow records.",
+  history: "Review recorded measurements. Gaps indicate missing observations, not zero traffic.",
   routepolicy: "Prefix lists and route maps — what is accepted, and what is changed.",
-  "routepolicy:prefix": "Named sets of prefixes a route map or a neighbour filter points at. Rules are read in sequence order, ge and le widen one to a range of lengths, and a list exists once it has a rule.",
-  "routepolicy:maps": "What is accepted, and what is changed on the way through. Each rule matches and then sets; the map's default decides what happens to a route no rule matched.",
-  "routepolicy:pbr": "Traffic sent by where it came from, over which link and to which port, rather than by where it is going. That is how a guest network leaves by the cheap uplink while everything else takes the good one.",
+  "routepolicy:prefix": "Build ordered prefix rules; ge and le constrain accepted prefix lengths.",
+  "routepolicy:maps": "Match routes, accept or reject them, and adjust attributes before redistribution.",
+  "routepolicy:pbr": "Choose routing tables by source address, interface, protocol or port.",
   wan: "Which uplink carries new connections, and what happens when one fails.",
   ipsec: "Site-to-site IKEv2 tunnels.",
   wireguard: "Site-to-site WireGuard interfaces and their peers.",
-  openconnect: "The road-warrior server: a client connects with a username and password and lands in the zone named below. IPsec and WireGuard are site-to-site — this is the one people carry.",
+  openconnect: "Configure remote-access VPN accounts and the zone used by connected clients.",
   pki: "Local certificate authorities.",
   certs: "Issued certificates and what they are used for.",
   ids: "Detection, and what an alert is allowed to do about it.",
-  trace: "Ask before you send: which zone a packet arrives in, what a port-forward makes of it, where the routing table sends it, which rule wins and why the others did not. Answered from the saved configuration, so nothing is touched — and nothing the box only learns at runtime is known.",
-  log: "What the data plane already refused, read back out of the journal. Search it, narrow it to a period, and hand any line to the tracer to find out which rule would decide it.",
-  capture: "See the wire itself: never more than 500 packets or 60 seconds, headers only, and nothing written to disk. A capture that finds nothing is an answer too.",
+  trace: "Check a packet against saved NAT, routing and firewall policy without sending traffic; runtime-learned state is excluded.",
+  log: "Search refused packets in the journal and trace a selected entry against saved policy.",
+  capture: "Inspect packet headers for up to 500 packets or 60 seconds; captures are not saved to disk.",
   services: "The box services: resolution, time, management access, notification.",
   system: "Identity, and where signed images come from.",
   ha: "The pair: who holds the address, and what the other box knows when it does.",
@@ -9265,35 +9698,80 @@ function renderSectionStrip() {{
   }}
 }}
 
-// The rail's cluster card: the same members the Stack view lists, kept where an
-// operator can see at a glance which box they are actually driving.
-async function refreshCluster() {{
+// One bounded, session-owned read drives BOTH member surfaces. Separate reads
+// allowed a reachable peer to say Conflict in Stack and Delivered in the rail.
+function refreshCluster() {{
+  if (!token) return Promise.resolve();
+  if (memberRead) return memberRead;
+  const requestToken = token, epoch = ++memberReadEpoch;
+  const controller = new AbortController();
+  memberReadAbort = controller;
+  const current = () => token === requestToken && memberReadEpoch === epoch && !controller.signal.aborted;
+  for (const id of ["stacktable", "clusterlist"]) $(id).setAttribute("aria-busy", "true");
+  const pending = (async () => {{
+    try {{
+      const data = await (await api("/api/v1/stack", {{ signal: controller.signal }})).json();
+      if (!current()) return;
+      if (!Array.isArray(data.members)) throw new Error("Member status unavailable");
+      renderStackMembers(data.members);
+      renderClusterMembers(data.members);
+      // Revision is a separate selected-member observation; never hold up a
+      // subsequent delivery refresh while a slow CLI-backed revision loads.
+      refreshClusterRevision(epoch, requestToken, target);
+    }} catch (error) {{
+      if (current()) {{
+        renderStackMembers(null, error);
+        renderClusterMembers(null);
+        $("clusterrev").textContent = "rev —";
+      }}
+    }} finally {{
+      if (memberRead === pending) {{
+        memberRead = null; memberReadAbort = null;
+        for (const id of ["stacktable", "clusterlist"]) $(id).setAttribute("aria-busy", "false");
+      }}
+    }}
+  }})();
+  memberRead = pending;
+  return pending;
+}}
+
+// The rail's cluster card is rendered from that same authoritative snapshot.
+function renderClusterMembers(members) {{
   const list = $("clusterlist");
   list.textContent = "";
-  let data;
-  try {{ data = await (await api("/api/v1/stack")).json(); }} catch (e) {{ return; }}
-  for (const m of data.members) {{
+  if (!members) {{
+    renderConfigSyncNotice("cluster-sync-note", null); return;
+  }}
+  for (const m of members) {{
     const isSelf = m.name === "self";
     const name = isSelf ? "" : m.name;
     const b = el("button", {{
       onclick: () => {{
         target = name; history.clear(); lastCounters = null;
-        refresh(); refreshCluster();
+        refresh();
       }},
     }});
     b.setAttribute("aria-current", String(target === name));
     b.append(
       el("span", {{ class: "dot " + (m.reachable ? "up" : "down") }}),
-      el("span", {{ text: m.hostname || (isSelf ? "this appliance" : m.name) }}),
-      el("span", {{ class: "role", text: isSelf ? "local" : "peer" }}),
+      el("span", {{ class: "member-name", text: m.hostname || (isSelf ? "this appliance" : m.name) }}),
+      el("span", {{ class: "member-state" }}, [
+        el("span", {{ class: "role", text: isSelf ? "local" : "peer" }}),
+        ...(!isSelf ? [configSyncBadge(m)] : []),
+      ]),
     );
     list.append(b);
   }}
+  renderConfigSyncNotice("cluster-sync-note", members);
+}}
+
+async function refreshClusterRevision(epoch, requestToken, member) {{
+  const current = () => memberReadEpoch === epoch && token === requestToken && target === member;
   try {{
     const revs = (await text("/api/v1/show/system/commit")).trim().split("\n");
     const first = revs.find((l) => /\d/.test(l));
-    $("clusterrev").textContent = first ? "rev " + first.trim().split(/\s+/)[0] : "rev —";
-  }} catch (e) {{ $("clusterrev").textContent = "rev —"; }}
+    if (current()) $("clusterrev").textContent = first ? "rev " + first.trim().split(/\s+/)[0] : "rev —";
+  }} catch (e) {{ if (current()) $("clusterrev").textContent = "rev —"; }}
 }}
 
 // Ask again for a permission the appliance has not yet stated (a status call
@@ -9309,6 +9787,9 @@ async function learnPermission() {{
 }}
 
 async function refresh() {{
+  // Invalidate observations before any slower CLI-backed page request yields.
+  renderLive();
+  if (token && view !== "stack") refreshCluster();
   if (permission === "unknown" && view !== "dashboard") learnPermission();
   renderSectionStrip();
   renderPageHeader();
@@ -9405,11 +9886,6 @@ function renderWho() {{
   if ($("whoinit")) $("whoinit").textContent = init;
   if ($("userchip")) $("userchip").title = who ? "signed in as " + who : "signed in with the machine token";
   const readOnly = !mayWrite();
-  const pill = $("permpill");
-  if (pill) {{
-    pill.textContent = permission === "read-only" ? "read-only" : "checking access";
-    pill.classList.toggle("hidden", !readOnly);
-  }}
   // Everything that changes the appliance is a POST, and a read-only token is
   // refused every one of them. Saying so here beats saying it afterwards.
   for (const id of ["applystaged", "applystaged2", "validate", "discard"]) {{
@@ -9417,14 +9893,6 @@ function renderWho() {{
     if (!b) continue;
     b.disabled = readOnly;
     b.title = readOnly ? "This account may read the configuration, not change it" : "";
-  }}
-  if (readOnly && !gateObserver) {{
-    gateObserver = new MutationObserver(() => gateWrites());
-    gateObserver.observe(document.querySelector("main") || document.body,
-      {{ childList: true, subtree: true }});
-  }} else if (!readOnly && gateObserver) {{
-    gateObserver.disconnect();
-    gateObserver = null;
   }}
   gateWrites();
 }}
@@ -9435,6 +9903,16 @@ function signOut(message) {{
   $("navclear").classList.add("hidden");
   setNavigation(false);
   stopManagement();
+  memberReadEpoch++;
+  memberReadAbort?.abort();
+  memberRead = null; memberReadAbort = null;
+  for (const id of ["stacktable", "clusterlist"]) {{
+    $(id).textContent = ""; $(id).setAttribute("aria-busy", "false");
+  }}
+  for (const id of ["stack-sync-note", "cluster-sync-note"]) {{
+    $(id).textContent = ""; $(id).classList.add("hidden");
+  }}
+  $("clusterrev").textContent = "rev —";
   token = "";
   who = "";
   permission = "unknown";
@@ -9468,7 +9946,6 @@ function signedIn() {{
   buildNav();
   renderStaged();
   startManagement();
-  refreshCluster();
   buildSearchIndex();
   refresh();
   // Only the dashboard polls: a panel refreshing under a reader who is trying to
@@ -9544,11 +10021,25 @@ $("signout").onclick = () => {{
   }}
   signOut("");
 }};
-// The real header height, including narrow/zoomed wrapping, positions drawers.
-const headerSize = new window.ResizeObserver(([entry]) => {{
-  document.documentElement.style.setProperty("--bar-h", Math.ceil(entry.target.getBoundingClientRect().height) + "px");
-}});
-headerSize.observe(document.querySelector(".bar"));
+// Drawers start below the header's VIEWPORT edge, not merely its own height:
+// the mobile brand row sits above it until the document scrolls. Observe both
+// rows and scrolling so focused fields never disappear beneath sticky chrome.
+const appHeader = document.querySelector(".bar");
+let headerFrame = null;
+function measureHeader() {{
+  if (headerFrame !== null) return;
+  headerFrame = requestAnimationFrame(() => {{
+    headerFrame = null;
+    const edge = Math.ceil(Math.max(0, Math.min(innerHeight, appHeader.getBoundingClientRect().bottom)));
+    document.documentElement.style.setProperty("--bar-h", edge + "px");
+  }});
+}}
+const headerSize = new window.ResizeObserver(measureHeader);
+headerSize.observe(appHeader);
+headerSize.observe(document.querySelector(".app > aside"));
+window.addEventListener("scroll", measureHeader, {{ passive: true }});
+window.addEventListener("resize", measureHeader);
+measureHeader();
 function setNavigation(open, restoreFocus = false) {{
   $("app").dataset.navigation = open ? "open" : "closed";
   $("navtoggle").setAttribute("aria-expanded", String(open));
@@ -9616,15 +10107,6 @@ $("applystaged2").onclick = () => applyStaged(["commit", "save"]);
 $("validate").onclick = () => applyStaged([]);
 $("refresh").onclick = () => refresh();
 $("allcounters").onchange = () => refreshDashboard();
-wireToggle("toggleiface", "addifacepanel", "New");
-wireToggle("toggleroute", "addroutepanel", "New");
-wireToggle("togglegroup", "addgrouppanel", "New");
-wireToggle("togglelb", "addlbpanel", "New");
-wireToggle("toggleca", "addcapanel", "New");
-wireToggle("togglecert", "addcertpanel", "New");
-wireToggle("toggleuser", "adduserpanel", "New");
-wireToggle("togglesyn", "addsynpanel", "New");
-wireToggle("togglevrrp", "addvrrppanel", "New");
 $("groupkind").onchange = () => refreshGroups();
 // Opening the details, or coming back to the tab, shows current numbers at
 // once rather than up to one poll interval later.
@@ -9697,30 +10179,15 @@ $("runcapture").onclick = async () => {{
   btn.disabled = false;
   btn.textContent = "Capture";
 }};
-wireToggle("togglezone", "addzonepanel", "New zone");
-wireToggle("togglesnat", "addsnatpanel", "New source rule");
-wireToggle("toggleddnat", "adddnatpanel", "New port forward");
-wireToggle("togglebgp", "addbgppanel", "New neighbour");
-wireToggle("toggleipsec", "addipsecpanel", "New tunnel");
-wireToggle("togglewg", "addwgpanel", "New interface");
-wireToggle("togglewgpeer", "addwgpeerpanel", "New peer");
-wireToggle("togglerp", "addrppanel", "New frontend");
-wireToggle("togglebr", "addbrpanel", "New relay");
-wireToggle("togglesl", "addslpanel", "New collector");
-wireToggle("toggleadmingroup", "addadmingrouppanel", "New group");
-wireToggle("togglewan", "addwanpanel", "New uplink");
-wireToggle("toggleocuser", "addocuserpanel", "New account");
-wireToggle("togglepl", "addplpanel", "New rule");
-wireToggle("togglerm", "addrmpanel", "New rule");
 $("wgtunnel").onchange = () => refreshWireguard();
-$("pllist-pick").onchange = () => {{ $("plnew").value = ""; refreshRoutePolicy(); }};
-$("rmlist-pick").onchange = () => {{ $("rmnew").value = ""; refreshRoutePolicy(); }};
+$("pllist-pick").onchange = () => {{ $("plnew").value = ""; refreshRoutePolicy(true); }};
+$("rmlist-pick").onchange = () => {{ $("rmnew").value = ""; refreshRoutePolicy(true); }};
 // `oninput`, not `onchange`: a text field only fires change when it is left,
 // so naming a map and reaching straight for "New rule" -- the path an operator
 // actually takes -- never refreshed, and the button sat disabled with nothing
 // saying why.
-$("plnew").oninput = () => refreshRoutePolicy();
-$("rmnew").oninput = () => refreshRoutePolicy();
+$("plnew").oninput = () => refreshRoutePolicy(true);
+$("rmnew").oninput = () => refreshRoutePolicy(true);
 $("qosiface").onchange = () => refreshQos();
 $("historyres").onchange = () => refreshHistory();
 $("enabledhcp").onclick = () => {{
@@ -9741,6 +10208,13 @@ $("mapiface").onchange = () => refreshDhcp();
 $("cancel").onclick = () => $("editor").close();
 $("resultclose").onclick = () => $("result").close();
 $("applysave").onclick = () => {{
+  if (!$("r-name").value.trim()) {{
+    $("editorerr").textContent = "Set a rule name.";
+    $("r-name").setAttribute("aria-invalid", "true");
+    $("r-name").focus(); return;
+  }}
+  $("r-name").setAttribute("aria-invalid", "false");
+  if (editing && !editing.validate()) return;
   const lines = script();
   if (!lines.length) {{ $("editorerr").textContent = "A rule needs a name and at least one setting."; return; }}
   $("editor").close();
@@ -10356,6 +10830,47 @@ mod tests {
         assert!(html.contains("canWrite: () => permission === \"read-write\""));
     }
 
+    #[test]
+    fn peer_settings_share_a_local_write_boundary_and_independent_delivery_state() {
+        let html = page();
+        assert!(html.contains("const writeBlockReason = () => !mayWrite()"));
+        assert!(html.contains("const refusal = writeBlockReason();"));
+        assert!(html.contains("const reason = writeBlockReason();"));
+        assert!(html.contains("Peer view is read-only. Select this appliance"));
+        assert!(html.contains(r#"id="write-boundary" role="status""#));
+        assert!(html.contains("function configSyncState(member)"));
+        assert!(html.contains("Object.hasOwn(states, member.sync)"));
+        for state in ["Delivered", "Pending delivery", "Conflict", "Unknown"] {
+            assert!(html.contains(&format!(r#"text: "{state}""#)));
+        }
+        assert!(html.contains("configSyncBadge(m)"));
+        assert!(html.contains(r#"id="cluster-sync-note""#));
+        assert!(html.contains("function renderStackMembers(members, failure)"));
+        assert!(html.contains("function renderClusterMembers(members)"));
+        assert!(html.contains("if (memberRead) return memberRead;"));
+        assert!(html.contains("memberReadAbort?.abort();"));
+        assert!(
+            html.contains(
+                "memberReadEpoch === epoch && token === requestToken && target === member"
+            )
+        );
+    }
+
+    #[test]
+    fn update_url_validation_is_shared_and_captures_the_field_owner() {
+        let html = page();
+        assert!(html.contains("function isUpdateChannelUrl(key, path = fieldPath)"));
+        assert!(html.contains("const updateUrl = isUpdateChannelUrl(field[0]);"));
+        assert!(html.contains(
+            "updateUrl && value && !(value.startsWith(\"https:\" + \"//\") || value.startsWith(\"file://\"))"
+        ));
+        assert!(html.contains("Use an https:\" + \"// or file:// update URL."));
+        // Scheme policy supplements, rather than replaces, complete-URL and
+        // associated inline validation. API/config validation stays authoritative.
+        assert!(html.contains("input.type === \"url\" && value && input.validity.typeMismatch"));
+        assert!(html.contains("input.setAttribute(\"aria-errormessage\", error.id)"));
+    }
+
     /// The legacy "System details" section polls a dozen `show` endpoints. It
     /// must do so only while it is open on a visible tab: collapsed, it asks
     /// for nothing once the signed-in permission is known.
@@ -10526,6 +11041,13 @@ mod tests {
             "URL",
             "AbortController",
             "TextDecoder",
+            // Standard Encoding API, also exercised by the actual browser's
+            // UTF-8 update-key file-reference validation.
+            "TextEncoder",
+            // Standard HTML base64 codecs; exercised by the physical PEM
+            // paste/refusal/CLI round trips, not page-owned functions.
+            "atob",
+            "btoa",
             // Typed arrays and the crypto interface: a page that generates a
             // secret in the browser needs both, and both are as much a builtin
             // as `Array` is.

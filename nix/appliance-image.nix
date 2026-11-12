@@ -34,6 +34,7 @@
   lib,
   pkgs,
   modulesPath,
+  utils,
   ...
 }:
 let
@@ -41,12 +42,13 @@ let
   inherit (config.image.repart.verityStore) partitionIds;
   efiArch = config.nixpkgs.hostPlatform.efiArch;
   sdBoot = "${pkgs.systemd}/lib/systemd/boot/efi/systemd-boot${efiArch}.efi";
-  # systemd-boot config: short timeout, default to slot A's entry (a glob so it
-  # keeps matching after bless strips the `+N` counter). The updater rewrites
-  # `default` to the slot it just wrote.
+  # A hard per-slot `default` in systemd-boot 260 ignores exhausted boot tries.
+  # Prefer A while it is bootable; the broad default retains healthy fallback.
+  # Globs keep matching after bless strips +N. Updates move only the preference.
   loaderConf = pkgs.writeText "loader.conf" ''
     timeout 3
-    default ${cfg.slotPrefix}-a*
+    preferred ${cfg.slotPrefix}-a*
+    default ${cfg.slotPrefix}-*
     editor no
     auto-entries no
     auto-firmware no
@@ -179,7 +181,7 @@ in
     dataSize = lib.mkOption {
       type = lib.types.str;
       default = "128M";
-      description = "Data partition floor in the built image (the installer grows it to the disk).";
+      description = "Data partition floor in the built image (grown on install or first direct-image boot).";
     };
     secureBootCommonName = lib.mkOption {
       type = lib.types.str;
@@ -189,6 +191,10 @@ in
   };
 
   config = {
+    assertions = [ {
+      assertion = lib.versionAtLeast pkgs.systemd.version "260";
+      message = "The appliance A/B boot-selection policy requires systemd-boot 260 or newer.";
+    } ];
     # systemd-boot is baked into the ESP offline (it can't be `bootctl install`ed
     # in a repart build), so keep the imperative NixOS installers off. Don't touch
     # EFI NVRAM — the appliance is immutable.
@@ -308,6 +314,11 @@ in
         options = [
           "rw"
           "nofail"
+          # Direct RAW/QCOW2 imports skip the installer. Grow the verified
+          # existing partition BEFORE mounting, then grow ext4 online without
+          # formatting it. Installer-managed LUKS/RAID members are not resized.
+          "x-systemd.requires=${cfg.slotPrefix}-state-grow.service"
+          "x-systemd.growfs"
           # On an ENCRYPTED install the LABEL=data ext4 lives inside a LUKS volume,
           # so it does not exist until the unlock unit has opened it.
           # `x-systemd.requires=` makes this mount Require + After that service. On a
@@ -332,7 +343,39 @@ in
     # persistent storage, not tmpfs.
     systemd.services = lib.genAttrs cfg.stateDirServices (_: {
       unitConfig.RequiresMountsFor = [ cfg.stateDir ];
-    });
+    }) // {
+      "${cfg.slotPrefix}-state-grow" = {
+        description = "Grow only the verified appliance data partition";
+        wantedBy = [ "local-fs.target" ];
+        after = [ "local-fs-pre.target" ];
+        before = [
+          "local-fs.target"
+          "${utils.escapeSystemdPath cfg.stateDir}.mount"
+          cfg.unlockUnit
+        ];
+        unitConfig = {
+          DefaultDependencies = false;
+          RequiresMountsFor = [ "/usr" ];
+        };
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          TimeoutStartSec = "90s";
+          UMask = "0077";
+          NoNewPrivileges = true;
+          ProtectHome = true;
+          ProtectSystem = "strict";
+          ReadWritePaths = [ "/run" ];
+          # Do not isolate /dev: the helper checks the real mapper/sysfs
+          # ancestry and must see the actual block device, not a private /dev.
+          ExecStart = "${pkgs.python3}/bin/python3 -I ${./grow-state.py} --apply"
+            + " --sfdisk ${pkgs.util-linux}/bin/sfdisk"
+            + " --blkid ${pkgs.util-linux}/bin/blkid"
+            + " --repart ${pkgs.systemd}/bin/systemd-repart"
+            + " --udevadm ${pkgs.systemd}/bin/udevadm";
+        };
+      };
+    };
 
     # Read-only /usr: skip the /usr/bin/env activation step (nixpkgs' verity
     # appliance pattern).

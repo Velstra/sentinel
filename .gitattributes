@@ -1,0 +1,3 @@
+# Unified diffs require a single space on blank context lines. Rust source is
+# checked in the Wren repository; preserve the backport's patch format here.
+nix/patches/*.patch whitespace=-blank-at-eol

@@ -68,6 +68,113 @@ export interface Pending {
   /** Recovery gave up; only an explicit accept (or a reboot) ends it. */
   recovery_failed?: boolean;
 }
+export interface SystemUnit {
+  unit: string;
+  load_state: string | null;
+  active_state: string | null;
+  sub_state: string | null;
+  result: string | null;
+  exit_status: number | null;
+  condition_result: boolean | null;
+}
+export interface SystemHealth {
+  status: "ok" | "warning" | "unknown";
+  clock: {
+    unix_seconds: number;
+    utc: string;
+    synchronised: boolean | null;
+    ntp_configured: boolean | null;
+    ntp_servers: string[] | null;
+    service: SystemUnit | null;
+  };
+  systemd: {
+    available: boolean;
+    failed_units: SystemUnit[] | null;
+    error: string | null;
+  };
+  network: { default_route: boolean | null };
+  tpm: {
+    present: boolean;
+    devices: string[];
+    setup: SystemUnit | null;
+    status: "ok" | "warning" | "not-present" | "unknown";
+    advice: string;
+  };
+  issues: {
+    code: string;
+    severity: "warning" | "unknown";
+    message: string;
+    action: string;
+  }[];
+}
+
+/** This boundary never interprets malformed or missing observations as healthy. */
+export function isSystemHealth(value: unknown): value is SystemHealth {
+  const record = (v: unknown): v is Record<string, unknown> =>
+    typeof v === "object" && v !== null && !Array.isArray(v);
+  const text = (v: unknown) => typeof v === "string";
+  const nullableText = (v: unknown) => v === null || text(v);
+  const nullableBool = (v: unknown) => v === null || typeof v === "boolean";
+  const strings = (v: unknown) => Array.isArray(v) && v.every(text);
+  const unit = (v: unknown) =>
+    v === null ||
+    (record(v) &&
+      text(v.unit) &&
+      [v.load_state, v.active_state, v.sub_state, v.result].every(
+        nullableText,
+      ) &&
+      (v.exit_status === null || Number.isInteger(v.exit_status)) &&
+      nullableBool(v.condition_result));
+  if (!record(value)) return false;
+  const { clock, systemd, network, tpm, issues } = value;
+  return (
+    ["ok", "warning", "unknown"].includes(String(value.status)) &&
+    record(clock) &&
+    typeof clock.unix_seconds === "number" &&
+    Number.isFinite(clock.unix_seconds) &&
+    text(clock.utc) &&
+    nullableBool(clock.synchronised) &&
+    nullableBool(clock.ntp_configured) &&
+    (clock.ntp_servers === null || strings(clock.ntp_servers)) &&
+    unit(clock.service) &&
+    record(systemd) &&
+    typeof systemd.available === "boolean" &&
+    (systemd.failed_units === null ||
+      (Array.isArray(systemd.failed_units) &&
+        systemd.failed_units.every((v) => v !== null && unit(v)))) &&
+    nullableText(systemd.error) &&
+    record(network) &&
+    nullableBool(network.default_route) &&
+    record(tpm) &&
+    typeof tpm.present === "boolean" &&
+    strings(tpm.devices) &&
+    unit(tpm.setup) &&
+    ["ok", "warning", "not-present", "unknown"].includes(String(tpm.status)) &&
+    text(tpm.advice) &&
+    Array.isArray(issues) &&
+    issues.every(
+      (v) =>
+        record(v) &&
+        text(v.code) &&
+        ["warning", "unknown"].includes(String(v.severity)) &&
+        text(v.message) &&
+        text(v.action),
+    ) &&
+    // Even a syntactically valid but contradictory "ok" envelope must not
+    // turn missing/failed observations into a healthy badge.
+    (value.status !== "ok" ||
+      (clock.synchronised === true &&
+        record(clock.service) &&
+        clock.service.active_state === "active" &&
+        systemd.available === true &&
+        Array.isArray(systemd.failed_units) &&
+        systemd.failed_units.length === 0 &&
+        network.default_route === true &&
+        issues.length === 0 &&
+        ((tpm.present === false && tpm.status === "not-present") ||
+          (tpm.present === true && tpm.status === "ok"))))
+  );
+}
 export interface StagedChange {
   label: string;
   cmds: string[];
@@ -81,10 +188,19 @@ export interface Host {
   credential(): string;
   canWrite(): boolean;
   remote(): boolean;
+  /** Empty for this appliance, otherwise the exact configured stack member. */
+  member(): string;
   refresh(): Promise<unknown>;
   navigate(
     destination:
-      "interfaces" | "rules" | "ha" | "wireguard" | "config" | "flows",
+      | "interfaces"
+      | "rules"
+      | "ha"
+      | "wireguard"
+      | "config"
+      | "flows"
+      | "system"
+      | "services:resolution",
   ): void;
   signOut(message: string): void;
   notice(message: string): void;
@@ -105,6 +221,10 @@ export interface Editor {
   uncertain: boolean;
 }
 export interface State {
+  health: SystemHealth | null;
+  healthBusy: boolean;
+  healthError: string;
+  healthReceivedAt: number;
   frame: Telemetry | null;
   status: string;
   connected: boolean;
@@ -117,6 +237,7 @@ export interface State {
   editor: Editor;
   writable: boolean;
   remote: boolean;
+  member: string;
 }
 export const emptyEditor = (): Editor => ({
   baseline: "",
@@ -130,6 +251,10 @@ export const emptyEditor = (): Editor => ({
   uncertain: false,
 });
 export const initialState = (): State => ({
+  health: null,
+  healthBusy: false,
+  healthError: "",
+  healthReceivedAt: 0,
   frame: null,
   status: "Connecting to telemetry…",
   connected: false,
@@ -142,6 +267,7 @@ export const initialState = (): State => ({
   editor: emptyEditor(),
   writable: false,
   remote: false,
+  member: "",
 });
 export function endpoint(address: string, port: number) {
   return `${address.includes(":") ? "[" + address + "]" : address}:${port}`;

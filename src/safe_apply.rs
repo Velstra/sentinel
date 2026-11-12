@@ -175,7 +175,7 @@ fn now_ms() -> u64 {
 }
 
 fn read(path: &Path) -> Result<Option<Pending>> {
-    let Some(text) = system::read_owned_file(&journal(path))? else {
+    let Some(text) = system::read_owned_regular(&journal(path), 64 * 1024 * 1024)? else {
         return Ok(None);
     };
     let pending: Pending =

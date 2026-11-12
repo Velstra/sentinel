@@ -47,6 +47,46 @@ const CMDLINE: &str = "/proc/cmdline";
 /// The device-mapper node the verity-protected store is mounted from.
 const USR_DM: &str = "/dev/mapper/usr";
 
+/// The declared OS release is useful to operators but is not a substitute for
+/// verity identity: two rebuilt images may deliberately use the same version.
+pub fn release_version() -> Option<String> {
+    use std::io::Read;
+    let mut text = String::new();
+    std::fs::File::open("/etc/os-release")
+        .ok()?
+        .take(65537)
+        .read_to_string(&mut text)
+        .ok()?;
+    (text.len() <= 65536)
+        .then(|| parse_release_version(&text))
+        .flatten()
+}
+
+fn parse_release_version(text: &str) -> Option<String> {
+    let mut values = text
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("IMAGE_VERSION="));
+    let raw = values.next()?.trim();
+    if values.next().is_some() {
+        return None;
+    }
+    let value = if raw.starts_with('"') {
+        raw.strip_prefix('"')?.strip_suffix('"')?
+    } else if raw.starts_with('\'') {
+        raw.strip_prefix('\'')?.strip_suffix('\'')?
+    } else {
+        raw
+    };
+    // Never source a shell file or render terminal escapes/substitutions.
+    // Sentinel release identifiers are bounded ASCII version tokens.
+    (!value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._+-".contains(&byte)))
+    .then(|| value.to_string())
+}
+
 /// The Nix store path hash is 32 characters of Nix's own base-32 alphabet —
 /// `e`, `o`, `t` and `u` are absent so no word forms by accident.
 const NIX_BASE32: &str = "0123456789abcdfghijklmnpqrsvwxyz";
@@ -208,6 +248,40 @@ fn exec_start_path(value: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_release_metadata_accepts_quoted_and_unquoted_version_tokens() {
+        for text in [
+            "IMAGE_VERSION=2.0.0-qa2\n",
+            "IMAGE_VERSION=\"2.0.0-qa2\"\n",
+            "IMAGE_VERSION='2.0.0-qa2'\n",
+        ] {
+            assert_eq!(parse_release_version(text).as_deref(), Some("2.0.0-qa2"));
+        }
+        assert_eq!(
+            parse_release_version("VERSION_ID=wrong\nIMAGE_VERSION=v2.1+build.3"),
+            Some("v2.1+build.3".into())
+        );
+    }
+
+    #[test]
+    fn missing_ambiguous_or_unsafe_release_metadata_is_unknown() {
+        for text in [
+            "VERSION_ID=1.0\n",
+            "# IMAGE_VERSION=comment\n",
+            "IMAGE_VERSION=\n",
+            "IMAGE_VERSION=\"unterminated\n",
+            "IMAGE_VERSION=x\nIMAGE_VERSION=y\n",
+            "IMAGE_VERSION=\"$(id)\"",
+            "IMAGE_VERSION=\"two words\"",
+            "IMAGE_VERSION=\"x\u{1b}[31m\"",
+            "IMAGE_VERSION=\"x\\ny\"",
+            "IMAGE_VERSION=\"quote\"inside\"",
+        ] {
+            assert_eq!(parse_release_version(text), None, "{text:?}");
+        }
+        assert!(parse_release_version(&format!("IMAGE_VERSION={}", "a".repeat(129))).is_none());
+    }
 
     /// The one source that is proof rather than inference, and the shapes that
     /// are not it. A command line is a flat string; `usrhash` has to be the

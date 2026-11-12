@@ -58,6 +58,14 @@ pub fn document() -> Value {
         if let Some((media, schema)) = op.answer_shape {
             o["responses"]["200"]["content"] = json!({ media: { "schema": schema() } });
         }
+        if matches!(op.id, "updateCheck" | "updateStage") {
+            o["responses"]["202"] = o["responses"]
+                .as_object_mut()
+                .expect("response map")
+                .remove("200")
+                .expect("success response");
+            o["responses"]["202"]["headers"] = json!({"Location":{"description":"Authenticated local job observation endpoint","schema":{"type":"string"}}});
+        }
         entry[op.method] = o;
     }
     json!({
@@ -72,7 +80,7 @@ pub fn document() -> Value {
                 the box reconciles to; `configure` runs a script of `set`/`delete`/`commit` \
                 lines exactly as the CLI would, and `config` reads or replaces the whole \
                 thing. Nothing here changes the box except `config` (PUT), `configure`, \
-                `clear` and `capture`.",
+                `clear`, `capture` and local signed update jobs. Update jobs never reboot implicitly.",
         },
         "servers": [{ "url": "/" }],
         "security": [{ "bearer": [] }],
@@ -141,6 +149,49 @@ fn text() -> Value {
     json!({ "type": "string" })
 }
 
+fn update_context() -> Value {
+    let mut properties = Map::new();
+    for name in [
+        "boot_id",
+        "mutation_epoch",
+        "config_revision",
+        "public_key_sha256",
+        "release",
+        "slot",
+        "verity",
+        "selected_entry",
+        "next_entry",
+        "uki_sha256",
+        "verity_guid",
+        "store_guid",
+    ] {
+        properties.insert(name.into(), json!({"type":"string"}));
+    }
+    properties.insert("permanent".into(), json!({"type":"boolean"}));
+    json!({"type":"object","additionalProperties":false,
+        "required":["boot_id","mutation_epoch","config_revision","public_key_sha256","release","slot","verity","selected_entry","next_entry","uki_sha256","verity_guid","store_guid","permanent"],
+        "properties":properties})
+}
+fn update_request() -> Value {
+    json!({"type":"object","additionalProperties":false,
+        "required":["request_id","expected_generation","expected"],
+        "properties":{"request_id":{"type":"string","pattern":"^[a-f0-9]{64}$"},
+            "expected_generation":{"type":"string","pattern":"^[a-f0-9]{64}$"},
+            "expected":update_context(),"offer_id":{"type":["string","null"],"pattern":"^[a-f0-9]{64}$"}}})
+}
+fn update_job() -> Value {
+    json!({"type":"object","additionalProperties":false,
+        "required":["id","request_id","action","phase","started_utc","boot_id","error","message","staged","offer"],
+        "properties":{"id":{"type":"string"},"request_id":{"type":"string"},
+            "action":{"type":"string","enum":["check","stage"]},
+            "phase":{"type":"string","enum":["accepted","metadata","downloading","verifying","preflight","writing","publishing","checked","staged","failed","interrupted"]},
+            "started_utc":{"type":"integer"},"boot_id":{"type":"string"},
+            "observation":{"type":"object","description":"GET responses include freshness/age of the shared observation; stale observations never grant update capability."},
+            "error":{"type":["string","null"]},"message":{"type":["string","null"]},
+            "offer":{"type":["object","null"],"description":"Verified signed release and opaque offer ID only; no saved configuration context or channel credentials."},
+            "staged":{"type":["object","null"],"description":"Only a fully verified inactive image plus durable boot-selection readback; not boot/reboot success."}}})
+}
+
 fn login_body() -> Value {
     json!({
         "type": "object",
@@ -187,6 +238,42 @@ fn trace_answer() -> Value {
 
 /// Every route `api.rs` serves, in the order the router lists them.
 const OPERATIONS: &[Operation] = &[
+    Operation {
+        method: "get",
+        path: "/api/v1/telemetry/snapshot",
+        id: "telemetry-snapshot",
+        summary: "Full bounded telemetry snapshot.",
+        description: "Authenticated JSON from the shared collector, including the full route table. Ten-second idle lease preserves measured counter rates between polls; collection then stops without viewers. Never cached.",
+        parameters: &[],
+        body: None,
+        answer: "Full telemetry frame, or 503 while collection is unavailable.",
+        answer_shape: Some(("application/json", any_object)),
+        open: false,
+    },
+    Operation {
+        method: "get",
+        path: "/api/v1/stack/{member}/telemetry",
+        id: "stack-telemetry",
+        summary: "Selected member telemetry over the pinned sync link.",
+        description: "Configured members only. Uses the server-held machine credential and pinned TLS; secrets never reach the browser. Returns 502 when the peer is unavailable or incompatible, never local fallback data.",
+        parameters: &[("member", "path", "Exact configured stack member.")],
+        body: None,
+        answer: "Full peer telemetry frame. No caching.",
+        answer_shape: Some(("application/json", any_object)),
+        open: false,
+    },
+    Operation {
+        method: "get",
+        path: "/api/v1/stack/{member}/system/health",
+        id: "stack-health",
+        summary: "Selected member read-only system diagnostics.",
+        description: "Configured members only, authenticated using the pinned sync link. Peer errors are 502, not a local-session 401. Does not change configuration or probe state.",
+        parameters: &[("member", "path", "Exact configured stack member.")],
+        body: None,
+        answer: "Peer system health observations. No caching.",
+        answer_shape: Some(("application/json", any_object)),
+        open: false,
+    },
     Operation {
         method: "get",
         path: "/api/v1/telemetry",
@@ -405,6 +492,66 @@ const OPERATIONS: &[Operation] = &[
         body: None,
         answer: "The status.",
         answer_shape: Some(("application/json", any_object)),
+        open: false,
+    },
+    Operation {
+        method: "get",
+        path: "/api/v1/system/health",
+        id: "systemHealth",
+        summary: "Read-only clock, NTP, failed-service and TPM diagnostics.",
+        description: "Authenticated observation, also available to read-only accounts. Reads kernel clock discipline and bounded systemd status without changing clock/TPM state or exposing journals, secrets or raw command errors. Unknown observations are not reported healthy.",
+        parameters: &[],
+        body: None,
+        answer: "System health, failed unit identities, NTP configuration and actionable non-destructive advice.",
+        answer_shape: Some(("application/json", any_object)),
+        open: false,
+    },
+    Operation {
+        method: "get",
+        path: "/api/v1/system/updates",
+        id: "updatesStatus",
+        summary: "Observe local signed update state without network contact.",
+        description: "Bearer authenticated, read-only permitted. Reports current and next boot separately, retained redacted jobs and exact verified offer. Mutation context includes the unredacted config CAS digest only for write-capable accounts. Does not check a channel, activate a machine, run a writer, bless or reboot. Off-box/no-apply returns an explicit unsupported capability. No peer proxy.",
+        parameters: &[],
+        body: None,
+        answer: "Typed local capabilities, observations, offer and bounded retained job state.",
+        answer_shape: Some(("application/json", any_object)),
+        open: false,
+    },
+    Operation {
+        method: "get",
+        path: "/api/v1/system/updates/jobs/{id}",
+        id: "updateJob",
+        summary: "Observe a retained local update job.",
+        description: "Read-only permitted;64 lower-case hex job identity. Unknown or pruned identity404. Independent workers survive browser/API disconnect. Interrupted writers are unknown, never silently retried or labelled safe. No credentials, URL, config document or raw engine error is disclosed.",
+        parameters: &[("id", "path", "Exact opaque local job ID.")],
+        body: None,
+        answer: "Typed job, phase, static redacted error and optional staged identity.",
+        answer_shape: Some(("application/json", update_job)),
+        open: false,
+    },
+    Operation {
+        method: "post",
+        path: "/api/v1/system/updates/check",
+        id: "updateCheck",
+        summary: "Admit a bounded independent signed-release check.",
+        description: "Write access; live root-owned canonical A/B appliance only, no off-box/no-apply. Strict JSON≤4096 bytes; expected context/generation and opaque request_id mandatory; offer_id absent. Browser Origin must match actual listener scheme/authority; cross-site requests refused. Returns202 after durable idempotent admission, not verification success. Poll Location. Atomic-envelope Ed25519 and existing channel/downgrade policy apply.240s worker bound. No slot writes, auto retry or reboot.",
+        parameters: &[],
+        body: Some(("application/json", update_request)),
+        answer: "Accepted or retained idempotent job; inspect its terminal result.",
+        answer_shape: Some(("application/json", update_job)),
+        open: false,
+    },
+    Operation {
+        method: "post",
+        path: "/api/v1/system/updates/stage",
+        id: "updateStage",
+        summary: "Download and stage exactly the reviewed signed image locally.",
+        description: "Write access, actual canonical A/B runtime, expected generation/context and current verified offer_id required. Same strict JSON/origin/idempotency policy as check. Independent8h bounded worker uses existing exclusive UpdateLock and sparse verified engine. Rechecks exact signed offer, config, canonical file-key contents, stable boot and actual product readiness immediately before first write. Conflicts never silently choose another release.202 is admission only; staged is next-boot selection, NOT reboot or boot health. No unsigned/downgrade flags, remote member, OS rollback or implicit reboot.",
+        parameters: &[],
+        body: Some(("application/json", update_request)),
+        answer: "Accepted or retained idempotent job; poll Location before considering a separate reboot.",
+        answer_shape: Some(("application/json", update_job)),
         open: false,
     },
     Operation {

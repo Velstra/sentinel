@@ -69,6 +69,11 @@ normal document flow and use the existing responsive breakpoints. Timeouts
 belong beside the global firewall posture, with seconds in every field label
 and explicit bounds/default guidance above the form.
 
+The member rail keeps each appliance name in its own flexible grid row. Role
+and full delivery status sit beneath it and wrap within the same native button;
+a long status must not compress an identifying name into single characters.
+This reuses the existing spacing, type, badge, focus and theme tokens.
+
 ## Elevation & Depth
 
 Inherit the existing tonal surfaces and borders. A settings addition does not
@@ -123,3 +128,11 @@ Confirm without adding an alternative mutation or validation path.
 Global scrollbar thumb, track, hover and active roles are defined in ui/src/style.css
 as aliases to the existing text, surface and brand tokens. They apply to all
 application-owned overflow surfaces, with system colors in forced-color mode.
+
+Settings grids align fields at the top of each row, so wrapping helper/error
+text cannot shift neighboring inputs. Single-choice chips and switches retain
+the shared control height. Inline filter rows shrink inside narrow viewports;
+technical tables keep their deliberate horizontal scroll rather than expanding
+the document. Page introductions use short task-oriented copy. HA split-brain,
+management lockout and TPM recovery warnings remain visible; procedural pairing
+instructions and raw failed-command diagnostics use native disclosures.

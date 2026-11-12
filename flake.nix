@@ -18,18 +18,17 @@
     };
     # The Velstra Fabric source (the data-plane agent lives here). Source only —
     # we build it with our own toolchain, so it needs no flake of its own.
-    # Public upstream so the build works on CI and for others; the exact revision
-    # is pinned in flake.lock (bump with `nix flake update fabric`).
+    # Reviewed signed public basis; update this URL and the lock together.
+    # Local safety fixes are explicit, strictly checked build-time backports.
     fabric = {
-      url = "github:Velstra/fabric";
+      url = "github:Velstra/fabric/f72cf32c001293ee1a1d9873f4e145cdc1a7287d";
       flake = false;
     };
     # The Wren routing daemon (BGP/OSPF/IS-IS/RIP/Babel/VRRP control plane).
     # Source only — stable Rust, built with nixpkgs' rustc (no flake of its own).
-    # Public upstream; the exact revision is pinned in flake.lock (bump with
-    # `nix flake update wren`).
+    # Reviewed signed public basis, with the exact routing-safety backport below.
     wren = {
-      url = "github:Velstra/wren";
+      url = "github:Velstra/wren/547bd1b43d32dbdd9b4078ba35a4d99615eb7e85";
       flake = false;
     };
   };
@@ -64,7 +63,8 @@
             prev.fetchurl args;
       };
 
-      pkgs = nixpkgs.legacyPackages.${system}.extend crateSource;
+      pkgs = (nixpkgs.legacyPackages.${system}.extend crateSource).extend
+        (import ./nix/compact-tests.nix);
       lib = nixpkgs.lib;
 
       # Compile and test React in the sandbox. Cargo embeds these exact assets;
@@ -114,9 +114,14 @@
         src = lib.cleanSourceWith {
           src = ./.;
           filter = path: type:
+            let rel = lib.removePrefix (toString ./. + "/") (toString path);
+            in
             lib.cleanSourceFilter path type
             && !(lib.hasSuffix ".nix" path)
-            && !(builtins.elem (baseNameOf path) [ "flake.lock" "docs" ".github" "README.md" "CHANGELOG.md" ]);
+            # Browser drivers are not Rust inputs. Keep the golden CLI field
+            # inventory: grammar_walk's unit test really reads that one file.
+            && !(lib.hasPrefix "tests/console/" rel && rel != "tests/console/cli-fields.txt")
+            && !(builtins.elem (baseNameOf path) [ "flake.lock" "nix" "docs" ".github" ".gitattributes" "README.md" "CHANGELOG.md" ]);
         };
         cargoLock.lockFile = ./Cargo.lock;
         preBuild = ''
@@ -131,6 +136,17 @@
         # here as well as in the wrapper below; without it `nix build` fails in
         # the check phase on a dependency the binary itself resolves fine.
         SENTINEL_OPENSSL_BIN = "${pkgs.openssl.bin}/bin/openssl";
+        # The peer-observation integration test exercises real pinned HTTPS.
+        SENTINEL_CURL_BIN = "${pkgs.curl.bin}/bin/curl";
+        # Test the actual wrapper variable names without bringing Nix/VM
+        # sources into the Rust source filter or depending on tool store paths.
+        SENTINEL_TEST_TOOL_PINS = lib.concatStringsSep " " (
+          builtins.concatMap
+            (line:
+              let pin = builtins.match "[[:space:]]*--set[[:space:]]+(SENTINEL_[A-Z0-9_]+_BIN).*" line;
+              in if pin == null then [ ] else pin)
+            (lib.splitString "\n" (builtins.readFile ./flake.nix))
+        );
       };
 
       # Runtime tool pins are a separate derivation: updating the HA dataplane
@@ -150,6 +166,7 @@
           wrapProgram $out/bin/sentinel \
             --set SENTINEL_HOSTNAME_BIN   ${pkgs.nettools}/bin/hostname \
             --set SENTINEL_IP_BIN         ${pkgs.iproute2}/bin/ip \
+            --set SENTINEL_NFT_BIN        ${pkgs.nftables}/bin/nft \
             --set SENTINEL_CAT_BIN        ${pkgs.coreutils}/bin/cat \
             --set SENTINEL_TEST_BIN       ${pkgs.coreutils}/bin/test \
             --set SENTINEL_TC_BIN         ${pkgs.iproute2}/bin/tc \
@@ -178,6 +195,11 @@
             --set SENTINEL_MSMTP_BIN      ${pkgs.msmtp}/bin/msmtp \
             --set SENTINEL_SURICATA_SHARE ${pkgs.suricata}/etc/suricata \
             --set SENTINEL_SYSTEMD_RUN_BIN ${pkgs.systemd}/bin/systemd-run \
+            --set SENTINEL_BOOTCTL_BIN    ${pkgs.systemd}/bin/bootctl \
+            --set SENTINEL_BOOT_HEALTH_BIN ${pkgs.writeShellScript "sentinel-readonly-boot-health" ''
+              exec ${pkgs.python3}/bin/python3 -I ${./nix/boot-health.py} verify \
+                --systemctl ${pkgs.systemd}/bin/systemctl --ip ${pkgs.iproute2}/bin/ip "$@"
+            ''} \
             --set SENTINEL_JOURNALCTL_BIN ${pkgs.systemd}/bin/journalctl \
             --set SENTINEL_WREN_BIN       ${wrenPkg}/bin/wren \
             --set SENTINEL_VELSTRA_BIN    ${velstra}/bin/velstra \
@@ -220,6 +242,15 @@
         version = "0.1.0";
         src = wren;
         cargoLock.lockFile = "${wren}/Cargo.lock";
+        # Backport OSQA-026/166/167 to the locked upstream too, rather than
+        # testing only an unpublished local Wren override. An HA/source override
+        # that already has these exact changes is accepted only after a complete
+        # reverse dry-run; a partial/different backport fails the build closed.
+        # Remove this backport after the input pin contains the upstream fixes.
+        prePatch = ''
+          ${pkgs.bash}/bin/bash ${./nix/apply-source-patches.sh} \
+            ${pkgs.patch}/bin/patch ${./nix/patches/wren-routing-safety.patch}
+        '';
         cargoBuildFlags = [
           "-p"
           "wren-daemon"
@@ -301,12 +332,24 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      ebpfHash = "sha256-foJKSk0w0HxCthdR0nBTL1WPxv2X24Vg3V3hRAGb61k=";
+      fabricSafetyPatches = ''
+        ${pkgs.bash}/bin/bash ${./nix/apply-source-patches.sh} \
+          ${pkgs.patch}/bin/patch \
+          ${./nix/patches/fabric-reply-tos.patch} \
+          ${./nix/patches/fabric-napt.patch} \
+          ${./nix/patches/fabric-conntrack-reply.patch} \
+          ${./nix/patches/fabric-ha-napt-port.patch} \
+          ${./nix/patches/fabric-dhcp-client.patch} \
+          ${./nix/patches/fabric-failclosed.patch}
+      '';
+      ebpfHash = "sha256-ZaTzCatwITEGJNS4INPaXyogZSVFNk/dBzHruAHtFgg=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
         src = fabric;
         nativeBuildInputs = [ nightly pkgs.bpf-linker pkgs.python3 pkgs.llvm ];
+
+        prePatch = fabricSafetyPatches;
 
         outputHashMode = "flat";
         outputHashAlgo = "sha256";
@@ -359,6 +402,7 @@
         PROTOC = "${pkgs.protobuf}/bin/protoc";
         # Replace the agent's build.rs with the shim that copies the pre-built
         # eBPF object — so this build is fully offline (no build-std here).
+        prePatch = fabricSafetyPatches;
         postPatch = ''
           cp ${./nix/velstra-build-shim.rs} velstra-app/build.rs
         '';
@@ -383,6 +427,19 @@
         # The workspace's tests need root (they load eBPF) — skip in the sandbox.
         doCheck = false;
       };
+
+      # The exact public pre-backport dataplane used by deployed QA7 images.
+      # Test-only: exercise real mixed-allocator HA, not a synthetic map writer
+      # or a runtime hotpatch. Its independently measured old BPF hash remains
+      # fixed while the default dataplane receives the current safety patches.
+      legacy-napt-ebpf = velstra-ebpf.overrideAttrs (_: {
+        prePatch = "";
+        outputHash = "sha256-dpvGqzkkpxS8BlGtEHsgstx/zmWDX9HRk/MFLe33dFE=";
+      });
+      legacy-napt-velstra = velstra.overrideAttrs (_: {
+        prePatch = "";
+        VELSTRA_EBPF_OBJ = legacy-napt-ebpf;
+      });
 
       # Run the state-replication acceptance test with real kernel LRU maps in
       # an isolated VM. The sandbox builds the harness but never needs CAP_BPF.
@@ -476,6 +533,7 @@
             ./nix/appliance.nix
             ./nix/velstra-service.nix
             ./nix/wren-service.nix
+            ./nix/time-sync.nix
           ];
           # `sentinel` is the CLI; `ppp` provides `pppd` + its bundled `pppoe.so`
           # plugin for `type = pppoe` uplinks (roadmap C5). The plugin dir is
@@ -581,46 +639,6 @@
           services.wren = {
             enable = true;
             package = wrenPkg;
-          };
-
-          # NTP: the box always runs chrony to keep its own clock; the
-          # `[services.ntp]` config layers LAN-serving (`server`/`allow`) on top
-          # via a confdir drop-in that Sentinel renders to /run/sentinel/chrony.d
-          # and applies with a chrony restart. tmpfiles pre-creates the dir so
-          # chronyd can read it even before the first commit.
-          services.chrony = {
-            enable = true;
-            # `servers = [ ]` on purpose: the NixOS module renders
-            # `server <name> iburst` lines plus a one-shot `initstepslew`, and
-            # every one of those resolves its name exactly once, at startup.
-            #
-            # A firewall normally boots *before* its own uplink is up. On the
-            # test box chrony started with no route, failed to resolve all four
-            # pool names, and then sat with **zero sources** for the rest of the
-            # uptime — `NTP service: active`, `System clock synchronized: no`,
-            # clock five years slow, and nothing anywhere saying so. Restarting
-            # chronyd by hand fixed it in twelve seconds, which is the tell: the
-            # names were never retried.
-            #
-            # `pool` is the directive that keeps re-resolving and keeps looking
-            # for sources, so the clock corrects itself once the link comes up
-            # instead of staying wrong until somebody notices.
-            servers = [ ];
-            extraConfig = ''
-              pool 0.nixos.pool.ntp.org iburst maxsources 4
-              pool 1.nixos.pool.ntp.org iburst maxsources 4
-              pool 2.nixos.pool.ntp.org iburst maxsources 2
-
-              # This appliance has no battery-backed clock — `RTC time: n/a` on
-              # the test box — so it boots at whatever date its image carries.
-              # Chrony only steps during its first few updates by default and
-              # slews after that; slewing a five-year gap would take longer than
-              # the hardware will live. Step whenever the offset exceeds a
-              # second, however late it is noticed.
-              makestep 1.0 -1
-
-              confdir /run/sentinel/chrony.d
-            '';
           };
 
           # DNS: systemd-resolved stays the box's own resolver (127.0.0.53);
@@ -1230,17 +1248,17 @@
           };
 
           # Time-based firewall rules (roadmap C15): the oneshot that re-applies the
-          # saved config so the compiler re-emits the rule set for the current time.
+          # current live intent so a timer never undoes an unsaved CLI commit.
           # Triggered by a dynamic `sentinel-fwsched.timer` that Sentinel renders to
           # /run/systemd/system with an OnCalendar per scheduled rule's window
-          # boundary. `--reload` restarts the agent (no ExecReload) to pick up the
+          # boundary. The helper restarts the agent (no ExecReload) to pick up the
           # new rules — a few times a day at boundaries, like a manual commit.
           systemd.services.sentinel-fwsched = {
             description = "re-apply time-based firewall rules (sentinel)";
             after = [ "velstra.service" ];
             serviceConfig = {
               Type = "oneshot";
-              ExecStart = "${sentinel}/bin/sentinel apply /var/lib/sentinel/appliance.toml --out /run/sentinel/velstra.toml --reload velstra.service";
+              ExecStart = "${sentinel}/bin/sentinel refresh-firewall";
             };
           };
 
@@ -1406,12 +1424,12 @@
               "sentinel-boot.service"
             ];
             wantedBy = [ ];
+            unitConfig.StartLimitIntervalSec = 0;
             serviceConfig = {
               Type = "exec";
               ExecStart = "${pkgs.hostapd}/bin/hostapd /run/sentinel/wireless/%i.conf";
               Restart = "on-failure";
               RestartSec = 5;
-              StartLimitIntervalSec = 0;
             };
           };
           systemd.services."sentinel-supplicant@" = {
@@ -1421,13 +1439,13 @@
               "sentinel-boot.service"
             ];
             wantedBy = [ ];
+            unitConfig.StartLimitIntervalSec = 0;
             serviceConfig = {
               Type = "exec";
               ExecStart =
                 "${pkgs.wpa_supplicant}/bin/wpa_supplicant -c /run/sentinel/wireless/%i.conf -i %i";
               Restart = "on-failure";
               RestartSec = 5;
-              StartLimitIntervalSec = 0;
             };
             # wpa_supplicant wants its control-socket directory to exist.
             unitConfig.ConditionPathExists = "/run/sentinel/wireless/%i.conf";
@@ -1446,18 +1464,25 @@
               "sentinel-boot.service"
             ];
             wantedBy = [ ];
+            unitConfig.StartLimitIntervalSec = 0;
             path = [ pkgs.modemmanager ];
             serviceConfig = {
               Type = "exec";
               ExecStart = "/bin/sh /run/sentinel/wwan/%i.sh";
               Restart = "on-failure";
               RestartSec = 10;
-              StartLimitIntervalSec = 0;
             };
             unitConfig.ConditionPathExists = "/run/sentinel/wwan/%i.sh";
           };
 
           services.strongswan-swanctl.enable = true;
+          # The stock daemon's ExecStartPost reloads /etc/swanctl/swanctl.conf.
+          # Include the product's PRIVATE runtime document by reference so a
+          # normal charon restart restores the applied tunnels, not an empty
+          # immutable default. No PSK or generated document enters the store.
+          # Early boot may precede the file; sentinel-boot-late still renders
+          # and loads it once links are up. swanctl tolerates a missing include.
+          services.strongswan-swanctl.includes = [ "/run/sentinel/swanctl/swanctl.conf" ];
           # charon does NOT install routes of its own.
           #
           # A route-based tunnel's traffic selectors are `0.0.0.0/0` — the routing
@@ -1540,7 +1565,6 @@
             # escalates. A second, differing rule (0755 root:root) would win and
             # break that staging with EACCES.
             "d /run/sentinel 0775 root wheel -"
-            "d /run/sentinel/chrony.d 0755 root root -"
             "d /run/sentinel/dnsmasq.d 0755 root root -"
             # The radio configs carry the pre-shared key, so the directory is
             # 0700 and each file inside it 0600.
@@ -1623,7 +1647,87 @@
       # the data plane stays up.
       #   nix build .#checks.x86_64-linux.commit -L
       checks.${system} = {
+        ota-stage = import ./nix/ota-stage-test.nix { inherit pkgs self; };
+        ota-publication-failure = import ./nix/ota-stage-test.nix {
+          inherit pkgs self;
+          publicationFailure = true;
+        };
+        ota-mutation = import ./nix/ota-mutation-test.nix { inherit pkgs self; };
+        ota-confirmation = import ./nix/ota-confirmation-test.nix { inherit pkgs self; };
+        ota-journal = import ./nix/ota-journal-test.nix { inherit pkgs self; };
         react-ui = sentinelFrontend;
+        staticimport = import ./nix/static-import-test.nix { inherit pkgs self; };
+        ssh-persistence = import ./nix/ssh-persistence-test.nix { inherit pkgs self; };
+        ssh-policy = import ./nix/ssh-policy-test.nix { inherit pkgs self; };
+        archive-privacy = import ./nix/archive-privacy-test.nix { inherit pkgs self; };
+        boothealth = import ./nix/boot-health-test.nix { inherit pkgs self; };
+        bootfallback = import ./nix/boot-fallback-test.nix { inherit pkgs self; };
+        update-release = import ./nix/update-release-test.nix { inherit pkgs sentinel; };
+        update-capacity = import ./nix/update-capacity-test.nix { inherit pkgs self; };
+        napt-concurrency = import ./nix/napt-test.nix { inherit pkgs self; };
+        ipsec-failclosed = import ./nix/ipsec-failclosed-test.nix { inherit pkgs self; };
+        ipsec-provenance = import ./nix/ipsec-failclosed-test.nix { inherit pkgs self; withAllDirections = true; };
+        ipsec-full-selectors = import ./nix/ipsec-failclosed-test.nix { inherit pkgs self; withAllSelectors = true; };
+        ipsec-shunt-ownership = import ./nix/ipsec-failclosed-test.nix { inherit pkgs self; withOwnership = true; };
+        ipsec-route-ownership = import ./nix/ipsec-failclosed-test.nix { inherit pkgs self; withRouteOwnership = true; };
+        ipsec-sa-lifecycle = import ./nix/ipsec-failclosed-test.nix { inherit pkgs self; withLifecycle = true; };
+        install-updated-boot = import ./nix/install-boot-test.nix { inherit pkgs self; withUpdate = true; };
+        routed-reply = import ./nix/routed-reply-test.nix { inherit pkgs self; };
+        conntrack-reuse = import ./nix/routed-reply-test.nix { inherit pkgs self; withTupleReuse = true; };
+        fabric-napt-unit = pkgs.rustPlatform.buildRustPackage {
+          pname = "fabric-common-regressions";
+          version = "0.4.1";
+          src = fabric;
+          prePatch = fabricSafetyPatches;
+          cargoLock = { lockFile = "${fabric}/Cargo.lock"; outputHashes = ayaOutputHashes; };
+          cargoBuildFlags = [ "-p" "velstra-common" ];
+          cargoTestFlags = [ "-p" "velstra-common" "--lib" ];
+          doCheck = true;
+          installPhase = ''
+            mkdir -p "$out"
+            touch "$out/tests-passed"
+          '';
+        };
+        source-patches-unit = pkgs.runCommand "sentinel-source-patches-unit" {
+          nativeBuildInputs = [ pkgs.python3 pkgs.bash pkgs.patch ];
+          SOURCE_PATCHES_SCRIPT = ./nix/apply-source-patches.sh;
+          BASH_BIN = "${pkgs.bash}/bin/bash";
+          PATCH_BIN = "${pkgs.patch}/bin/patch";
+        } ''
+          python3 ${./nix/test_source_patches.py}
+          touch "$out"
+        '';
+        state-growth = import ./nix/state-growth-test.nix { inherit pkgs self; };
+        state-growth-install = import ./nix/state-growth-test.nix { inherit pkgs self; withInstallTarget = true; };
+        install-boot = import ./nix/install-boot-test.nix { inherit pkgs self; };
+        install-wizard-ssh-key = import ./nix/install-wizard-key-test.nix { inherit pkgs self; };
+        dhcp-late-client = import ./nix/dhcp-late-client-test.nix { inherit pkgs self; };
+        dhcp-late-client-stateless = import ./nix/dhcp-late-client-test.nix { inherit pkgs self; stateful = false; };
+        install-boot-luks = import ./nix/install-storage-boot-test.nix { inherit pkgs self; storage = "luks"; };
+        install-boot-luks-retry = import ./nix/install-storage-boot-test.nix { inherit pkgs self; storage = "luks"; invalidAttempts = 2; };
+        install-boot-raid1 = import ./nix/install-storage-boot-test.nix { inherit pkgs self; storage = "raid1"; };
+        install-boot-raid1-luks = import ./nix/install-storage-boot-test.nix { inherit pkgs self; storage = "raid1-luks"; };
+        state-growth-unit = pkgs.runCommand "sentinel-state-growth-unit" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+          mkdir -p test
+          cp ${./nix/grow-state.py} test/grow-state.py
+          cp ${./nix/test_grow_state.py} test/test_grow_state.py
+          python3 -m unittest discover -s test -v
+          touch $out
+        '';
+        management-tls = pkgs.runCommand "sentinel-management-tls" {
+          nativeBuildInputs = [ pkgs.python3 pkgs.openssl ];
+          SENTINEL_BIN = "${sentinel}/bin/sentinel";
+        } ''
+          python3 ${./tests/management_tls.py} -v
+          touch $out
+        '';
+        boothealth-unit = pkgs.runCommand "sentinel-boot-health-unit" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+          mkdir -p test
+          cp ${./nix/boot-health.py} test/boot-health.py
+          cp ${./nix/test_boot_health.py} test/test_boot_health.py
+          python3 -m unittest discover -s test -v
+          touch $out
+        '';
         # Every map the agent looks up by name exists in the object it loads.
         #
         # This exists because of one specific trap. `velstra-ebpf` is a
@@ -1732,7 +1836,7 @@
             };
           }
           ''
-            set -eu
+            set -euo pipefail
             export CHROMIUM=${pkgs.chromium}/bin/chromium
             export CONSOLE_PORT=18099
             # A build sandbox is slower than a workstation, and every `show` the
@@ -1745,11 +1849,20 @@
             cp -r ${./tests/console} tests-console
             chmod -R u+w tests-console
             bash tests-console/run.sh ${sentinel}/bin/sentinel | tee output
+            CONSOLE_TEST_FILE=peer.test.mjs bash tests-console/run.sh ${sentinel}/bin/sentinel | tee -a output
+            CONSOLE_TEST_FILE=archive.test.mjs bash tests-console/run.sh ${sentinel}/bin/sentinel | tee -a output
             # The runner already exits non-zero on any failed test; this catches
             # the other way to be green — a run that asserted nothing at all.
             grep -Eq "^[1-9][0-9]*/[1-9][0-9]* passed" output
             cp output $out
           '';
+
+        # Shared field validation and responsive/keyboard regressions must be
+        # part of the flake gates, not an unreferenced optional test script.
+        console-ux = self.checks.${system}.console.overrideAttrs (_: {
+          name = "sentinel-console-ux";
+          CONSOLE_TEST_FILE = "ux.test.mjs";
+        });
 
         # The seam between this repository and the data plane's.
         #
@@ -2513,8 +2626,8 @@
               "'set protocols bgp router-id 10.0.0.1' "
               "'set protocols bgp neighbor 192.0.2.1 remote-as 65002' "
               "'set protocols bgp neighbor 192.0.2.1 description upstream link' "
-              "'set vpn ipsec site-a local 203.0.113.2' "
-              "'set vpn ipsec site-a remote 198.51.100.2' "
+              "'set vpn ipsec site-a local 10.0.0.1' "
+              "'set vpn ipsec site-a remote 10.0.0.2' "
               "'set vpn ipsec site-a psk secret123' "
               "'set vpn ipsec site-a local-subnet 10.0.0.0/24' "
               "'set vpn ipsec site-a remote-subnet 10.9.0.0/24' "
@@ -2537,6 +2650,15 @@
           )
           for want in ["65002", "site-a", "wg0", "dhcp-server"]:
               assert want in cfg, masks + cfg
+
+          # This positive API grammar fixture needs a real assigned source and
+          # reachable next hop. Route reconciliation must not be weakened to
+          # accommodate documentation-only/unassigned outer tunnel addresses.
+          addresses = json.loads(machine.succeed("ip -j -4 address show dev eth0"))
+          assert any(a.get("local") == "10.0.0.1" for link in addresses for a in link.get("addr_info", [])), addresses
+          routes = json.loads(machine.succeed("ip -j -4 route show table main exact 10.9.0.0/24"))
+          owned = [r for r in routes if str(r.get("protocol")) == "201" and r.get("metric") == 42760]
+          assert len(owned) == 1 and owned[0].get("gateway") == "10.0.0.2" and owned[0].get("prefsrc") == "10.0.0.1", routes
 
           # The flat command view is what the console's generic editor reads and
           # what an operator copies. It has to name every setting with the path
@@ -2922,7 +3044,11 @@
               "ssh-keygen -lf /var/lib/sentinel/ssh/ssh_host_ed25519_key.pub").split()[1]
           assert before == after, f"ssh host key changed across a reboot: {before} -> {after}"
           # And it is the key sshd actually offers, not merely a file lying around.
-          machine.succeed("sshd -T | grep -q '^hostkey /var/lib/sentinel/ssh/ssh_host_ed25519_key$'")
+          machine.wait_for_unit("sshd.service")
+          offered = machine.succeed("ssh-keyscan -T 5 -t ed25519 127.0.0.1 2>/dev/null")
+          public = machine.succeed("cut -d' ' -f2 /var/lib/sentinel/ssh/ssh_host_ed25519_key.pub").strip()
+          assert {fields[2] for line in offered.splitlines()
+                  if len(fields := line.split()) == 3 and fields[1] == "ssh-ed25519"} == {public}
 
           # The saved config survived on the persistent partition, unchanged.
           machine.succeed("grep -q 'hostname = \"fw-reboot\"' /var/lib/sentinel/appliance.toml")
@@ -3255,6 +3381,15 @@
           fw.wait_until_succeeds("ip link show wlan0", timeout=60)
           fw.wait_until_succeeds("ip link show wlan1", timeout=60)
 
+          # Inspect systemd's effective property, not just the Nix source. This
+          # option belongs to [Unit]; [Service] silently ignored the old value.
+          for kind in ("hostapd", "supplicant", "wwan"):
+              unit = f"sentinel-{kind}@wlan0.service"
+              interval = fw.succeed(
+                  f"systemctl show {unit} --property=StartLimitIntervalUSec --value"
+              ).strip()
+              assert interval == "0", (unit, interval)
+
           psk = "correcthorsebattery"
 
           fw.succeed(
@@ -3274,8 +3409,8 @@
               "| sentinel configure\""
           )
 
-          # The rendered config carries the key, so it is 0600 and its directory
-          # 0700 — there is no separate secrets file to split a radio's key into.
+          # The rendered config carries the key, so it is 0600. Its directory
+          # stays listable for ordinary admin reconciliation (checked below).
           fw.wait_until_succeeds(
               "test -f /run/sentinel/wireless/wlan0.conf", timeout=30
           )
@@ -3309,15 +3444,16 @@
           # appliance's own station config writes it; this throwaway client is
           # built by hand and does not get it for free.
           fw.succeed(
-              "mkdir -p /tmp/sta && "
-              + "echo 'ctrl_interface=/run/wpa_supplicant' > /tmp/sta/wpa.conf && "
+              "umask 077; mkdir -m 700 -p /tmp/sta/control /tmp/sta/client && "
+              + "echo 'ctrl_interface=/tmp/sta/control' > /tmp/sta/wpa.conf && "
               + f"wpa_passphrase velstra {psk} >> /tmp/sta/wpa.conf"
           )
           fw.succeed(
               "ip netns exec sta wpa_supplicant -B -i wlan1 -c /tmp/sta/wpa.conf"
           )
           fw.wait_until_succeeds(
-              "ip netns exec sta wpa_cli -i wlan1 status | grep -q 'wpa_state=COMPLETED'",
+              "ip netns exec sta wpa_cli -p /tmp/sta/control -s /tmp/sta/client -i wlan1 status "
+              "> /tmp/sta/status && grep -qx 'wpa_state=COMPLETED' /tmp/sta/status",
               timeout=90,
           )
           # hostapd saw the association from its own side, which is the proof the
@@ -5947,7 +6083,7 @@
               neighbour.succeed("ping -4 -c 2 -W 1 fw >/dev/null || true")
               return "velstra ids echo request" in fw.succeed("sentinel show ids alerts")
 
-          retry(alerted, timeout=180)
+          retry(alerted, timeout_seconds=180)
 
           # The alert carries who talked to whom — an alert without endpoints
           # sends the operator looking, which is most of the delay it removes.
@@ -6003,7 +6139,7 @@
               neighbour.succeed("ping -4 -c 2 -W 1 fw >/dev/null || true")
               return "192.168.1." in fw.succeed("sentinel show ids blocks")
 
-          retry(blocked, timeout=180)
+          retry(blocked, timeout_seconds=180)
           blocks = fw.succeed("sentinel show ids blocks")
           # The deadline is the whole reason this is safe to switch on: whatever
           # the detector decides, it undoes itself.
@@ -6067,7 +6203,7 @@
               )
               return "192.168.1." in fw.succeed("sentinel show ids blocks")
 
-          retry(refused, timeout=180)
+          retry(refused, timeout_seconds=180)
           blocks = fw.succeed("sentinel show ids blocks")
           # The neighbour is the server here, and it is the neighbour that got
           # blocked — the address in the list is the one that was asked for.
@@ -6086,7 +6222,7 @@
           # The same source can be blocked again once the period is over: the
           # watcher's memory of having asked expires with the block, so a manual
           # clear is a reprieve rather than a permanent exemption nothing shows.
-          retry(blocked, timeout=180)
+          retry(blocked, timeout_seconds=180)
 
           # Left alone this time, the block lifts itself. This is the property the
           # feature rests on, so it is asserted rather than assumed.
@@ -6905,8 +7041,9 @@
         #
         # The cross-reboot slot switch is then driven for real: the machine
         # comes back on slot B, and the donor's marker file is the proof of
-        # which slot it booted. The boot-counting/bless mechanism itself is
-        # proven by checks.verified-boot.
+        # which slot it booted. Both successful boots require a real configured
+        # XDP dataplane and the ordinary counted-boot assessment. The separate
+        # checks.bootfallback exercises three genuinely broken candidate boots.
         #   nix build .#checks.x86_64-linux.update -L
         update = pkgs.testers.runNixOSTest {
           name = "sentinel-update";
@@ -6914,7 +7051,7 @@
             # Never started: only its image is used.
             donor = {
               imports = [
-                self.nixosModules.sentinel ./nix/test-network-seed.nix
+                self.nixosModules.sentinel ./nix/update-test-seed.nix
                 ./nix/image.nix
               ];
               # The driver names a machine after `system.name`, and the
@@ -6926,6 +7063,7 @@
               # reboot as the proof of which slot came up.
               environment.etc."sentinel-update-donor".text = "slot B came from the donor image\n";
               virtualisation = {
+                vlans = [ 1 ];
                 directBoot.enable = false;
                 mountHostNixStore = false;
                 useEFIBoot = true;
@@ -6937,7 +7075,7 @@
               { nodes, ... }:
               {
                 imports = [
-                  self.nixosModules.sentinel ./nix/test-network-seed.nix
+                  self.nixosModules.sentinel ./nix/update-test-seed.nix
                   ./nix/image.nix
                 ];
                 system.name = "machine";
@@ -6964,6 +7102,7 @@
                       -in $out/other.raw.sha256 -out $out/other.raw.sha256.sig
                   '';
                 virtualisation = {
+                  vlans = [ 1 ];
                   directBoot.enable = false;
                   mountHostNixStore = false;
                   useEFIBoot = true;
@@ -6972,16 +7111,51 @@
                   # Attach the update stick AFTER boot, just as an operator
                   # would. Booting with two appliance images races their equal
                   # LABEL=data mounts and can put live state on the donor.
-                  qemu.options = [ "-device qemu-xhci,id=update-usb" ];
+                  qemu.options = [
+                    "-device qemu-xhci,id=update-usb"
+                    # Same virtual hardware across cold boots; never inject or
+                    # repair the product's volatile /etc/machine-id.
+                    "-uuid 49cbd410-429c-4cdb-bc48-49c74f12e3db"
+                  ];
                 };
               };
           };
           testScript =
             { nodes, ... }:
             ''
+              import importlib.util
+              import json
               import os
+              import shlex
               import subprocess
               import tempfile
+
+              specification = importlib.util.spec_from_file_location(
+                  "update_observer", "${./nix/update-test-observer.py}")
+              assert specification is not None and specification.loader is not None
+              observer = importlib.util.module_from_spec(specification)
+              specification.loader.exec_module(observer)
+              expected = json.loads(r"""${builtins.toJSON {
+                ipv4 = map (a: "${a.address}/${toString a.prefixLength}") nodes.machine.networking.interfaces.eth1.ipv4.addresses;
+                ipv6 = map (a: "${a.address}/${toString a.prefixLength}") nodes.machine.networking.interfaces.eth1.ipv6.addresses;
+              }}""")
+
+              def healthy_snapshot(phase):
+                  # Only normal startup and the real product's bounded read-only
+                  # checker: no manual unit start, target repair, bless or retry.
+                  machine.wait_for_unit("velstra.service")
+                  machine.wait_for_unit("wren.service")
+                  machine.wait_for_unit("systemd-bless-boot.service")
+                  machine.succeed("${pkgs.python3}/bin/python3 -I ${./nix/boot-health.py} verify "
+                                  "--sentinel ${nodes.machine.services.velstra.sentinel}/bin/sentinel "
+                                  "--systemctl ${pkgs.systemd}/bin/systemctl --ip ${pkgs.iproute2}/bin/ip --timeout 30")
+                  result = json.loads(machine.succeed(
+                      "${pkgs.python3}/bin/python3 -I /etc/sentinel-update-observer.py "
+                      f"--disk {shlex.quote(disk)} --phase {shlex.quote(phase)} "
+                      f"--expected-json {shlex.quote(json.dumps(expected))}"))
+                  # Test-driver output preserves hashes/public identities only.
+                  print(json.dumps({"immutable_update_observation": result}, sort_keys=True))
+                  return result
 
               tmp = tempfile.NamedTemporaryFile()
               subprocess.run([
@@ -7009,6 +7183,10 @@
               assert src, "no source disk"
               disk = "/dev/" + src
               donor_disk = "/dev/sda"
+
+              with subtest("the first counted A boot has real configured XDP before normal blessing"):
+                  original = healthy_snapshot("initial")
+
               with subtest("the appliance owns its data before the USB update medium arrives"):
                   assert machine.succeed("findmnt -n -o SOURCE /var/lib/sentinel").strip() == disk + "6"
                   machine.succeed("printf persistent-target-data > /var/lib/sentinel/update-data-proof")
@@ -7094,6 +7272,10 @@
                   assert guid(disk, 5) == guid(donor_disk, 3), (
                       f"slot B store GUID {guid(disk, 5)} does not match the donor's {guid(donor_disk, 3)}")
 
+              with subtest("signed inactive-slot staging preserves live A, keys, config and fallback"):
+                  staged = healthy_snapshot("staged")
+                  observer.compare(original, staged, "staged")
+
               # Slot B now has the donor's GUIDs. The hot-plugged USB medium
               # must be absent at the next boot, or the initrd could select its
               # store instead. QEMU hot-plug state is deliberately not part of
@@ -7110,13 +7292,13 @@
                   # The donor's marker: only its store has it, so its presence
                   # says slot B is what booted, not merely that something did.
                   machine.succeed("test -f /etc/sentinel-update-donor")
-                  machine.succeed("sentinel show version")
-                  machine.wait_for_unit("velstra.service")
-                  # And the attached store is slot B, verity intact — a
-                  # mismatched pair would have failed to open at all.
                   backing = machine.succeed("lsblk -nsro NAME /dev/mapper/usr")
                   assert f"{src}5" in backing, (
                       f"/usr is not backed by slot B: {backing.strip()!r}")
+                  machine.succeed("sentinel show version")
+                  machine.wait_for_unit("velstra.service")
+                  booted = healthy_snapshot("booted")
+                  observer.compare(original, booted, "booted")
             '';
         };
 
@@ -8180,7 +8362,27 @@
                     }
                   ];
                 };
-                environment.systemPackages = [ pkgs.curl ];
+                environment.systemPackages = [ pkgs.curl pkgs.python3 ];
+                environment.etc."synproxy-dscp.py".text = ''
+                  import socket
+
+                  for dscp in (0, 10, 46, 63):
+                      with socket.socket() as connection:
+                          connection.settimeout(5)
+                          connection.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, dscp << 2)
+                          connection.connect(("10.2.0.2", 443))
+                          connection.sendall(b"GET / HTTP/1.0\r\nHost: protected\r\n\r\n")
+                          response = b""
+                          while True:
+                              part = connection.recv(65536)
+                              if not part:
+                                  break
+                              response += part
+                              assert len(response) < 1048576
+                          assert b"200 OK" in response.split(b"\r\n", 1)[0], (dscp, response[:100])
+                          assert b"hello-from-protected" in response, dscp
+                  print("four real DSCP-marked SYN-proxy HTTP transfers completed")
+                '';
               };
             # The protected server, on the LAN side.
             server =
@@ -8301,6 +8503,12 @@
                 raise AssertionError(
                     "no connection both reached the server and was challenged by the proxy"
                 )
+
+            # OSQA-169 also affected write_synth's TOS-zero checksum. Verify
+            # actual protected application bytes, not just an accepted SYN.
+            base = challenged()
+            client.succeed("python3 /etc/synproxy-dscp.py")
+            assert challenged() >= base + 4, "DSCP traffic bypassed SYN-proxy"
 
             # A bulk transfer, so the connection lives well past the handshake:
             # a translation that is right for the first packet and wrong later
@@ -8671,6 +8879,12 @@
         ha-masquerade-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; leased = true; masquerade = true; };
         ha-wireguard-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; leased = true; wireguard = true; };
         ha-pair = import ./nix/ha-pair-test.nix { inherit pkgs self; };
+        ha-two-node = import ./nix/ha-two-node-test.nix { inherit pkgs self; };
+        ha-two-node-flow = import ./nix/ha-two-node-flow-test.nix { inherit pkgs self; };
+        ha-napt-mixed-version = import ./nix/ha-two-node-flow-test.nix {
+          inherit pkgs self;
+          legacyPackage = legacy-napt-velstra;
+        };
         ha-witness-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; leased = true; };
         ha-witness-synproxy-failover = import ./nix/ha-failover-test.nix { inherit pkgs self; leased = true; synproxy = true; };
 
@@ -9152,7 +9366,32 @@
                     }
                   ];
                 };
-                environment.systemPackages = [ pkgs.curl ];
+                environment.systemPackages = [ pkgs.curl pkgs.python3 ];
+                environment.etc."reject-dscp.py".text = ''
+                  import socket
+                  from pathlib import Path
+
+                  def header_errors():
+                      lines = Path("/proc/net/snmp").read_text().splitlines()
+                      for index, line in enumerate(lines[:-1]):
+                          if line.startswith("Ip:"):
+                              return int(dict(zip(line.split()[1:], lines[index + 1].split()[1:]))["InHdrErrors"])
+                      raise AssertionError("missing native IP checksum counters")
+
+                  before = header_errors()
+                  for dscp in range(64):
+                      with socket.socket() as connection:
+                          connection.settimeout(2)
+                          connection.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, dscp << 2)
+                          try:
+                              connection.connect(("10.1.0.1", 9999))
+                          except ConnectionRefusedError:
+                              pass
+                          else:
+                              raise AssertionError(f"DSCP {dscp} was not rejected")
+                  assert header_errors() == before, "RST introduced an invalid IPv4 checksum"
+                  print("64 DSCP classes refused by the native TCP stack; no IPv4 header errors")
+                '';
               };
             fw =
               { lib, ... }:
@@ -9215,6 +9454,11 @@
 
             # The headline: the rejected port fails FAST with a connect error (the RST).
             retry(lambda _: probe(9999) == 7)
+
+            # OSQA-169: the old writer left the SYN's TOS byte under a checksum
+            # computed for TOS zero. Test every DSCP class using real sockets;
+            # don't turn off checksum/GSO offloads to make a reply acceptable.
+            client.succeed("python3 /etc/reject-dscp.py")
 
             # The contrast that gives that its meaning: a port with no rule falls to the
             # default (drop) and times out instead. Without this, a box that refused
@@ -9303,6 +9547,8 @@
             machine.fail("systemctl is-active sentinel-fwdomain.timer")
           '';
         };
+
+        refresh-running = import ./nix/refresh-running-test.nix { inherit pkgs self; };
 
         fwschedule = pkgs.testers.runNixOSTest {
           name = "sentinel-fwschedule";
@@ -13308,39 +13554,33 @@
             fw.wait_for_unit("multi-user.target")
             fw.wait_for_unit("velstra.service")
 
-            # The base config keeps looking for time. This guards a failure the
-            # test box showed and no VM would: NixOS renders `server <name>` plus
-            # a one-shot `initstepslew`, both of which resolve their names once,
-            # at startup. A firewall boots before its uplink, so chrony came up
-            # with no route, failed every lookup, and then sat with zero sources
-            # — "NTP service: active", "System clock synchronized: no", clock
-            # five years slow. `pool` re-resolves; `server` does not.
-            # The config lives in the store and the unit points at it with -f;
-            # there is no /etc/chrony.conf on NixOS. Read the one chronyd is
-            # actually started with rather than a path that only looks right.
+            fw.wait_for_unit("chronyd.service")
+            fw.fail("systemctl is-active systemd-timesyncd.service")
+            # Source ownership is entirely in Sentinel's runtime drop-in, not
+            # hidden public servers layered underneath an operator's upstreams.
             base = fw.succeed(
                 "cat $(systemctl cat chronyd | sed -n 's/.*-f \\([^ ]*\\).*/\\1/p' | head -1)"
             )
-            assert "pool " in base, base
-            assert "initstepslew" not in base, (
-                "a one-shot startup lookup is back; a box that boots before its "
-                "uplink will never get the time\n" + base
-            )
-            # No battery-backed clock on the appliance, so the boot-time offset is
-            # years, not seconds. Chrony steps only during its first updates by
-            # default and slews afterwards, and slewing a gap that large outlives
-            # the hardware.
+            assert not any(line.startswith(("pool ", "server ", "initstepslew ")) for line in base.splitlines()), base
             assert "makestep 1.0 -1" in base, base
+            assert sum(line.startswith("makestep ") for line in base.splitlines()) == 1, base
+            initial = fw.succeed("cat /run/sentinel/chrony.d/sentinel.conf")
+            assert "pool 0.nixos.pool.ntp.org iburst" in initial, initial
+            assert "allow " not in initial, initial
 
-            # Turn on the LAN NTP server on eth1 (static addr + lan accept so XDP
-            # passes udp/123), syncing to the upstream node. ONE `set` per line.
+            # A late upstream and a dead RTC must recover without restarting
+            # chronyd after connectivity becomes available.
+            upstream.succeed("ip link set eth1 down")
+            fw.succeed("date -s @978307200")
+
+            # Configure appliance-client synchronization without enabling a LAN
+            # NTP listener. ONE `set` per line.
             fw.succeed(
                 "su admin -c \"printf '%s\\n' "
                 "'set interface eth1 address 10.0.0.1/24' "
                 "'set interface eth1 zone lan' "
                 "'set firewall zone lan default-action accept' "
                 "'set services ntp upstream 10.0.0.99' "
-                "'set services ntp serve-on eth1' "
                 "commit save exit "
                 "| sentinel configure\""
             )
@@ -13352,7 +13592,10 @@
             )
             conf = fw.succeed("cat /run/sentinel/chrony.d/sentinel.conf")
             assert "server 10.0.0.99 iburst" in conf, conf
-            assert "allow 10.0.0.0/24" in conf, conf
+            assert "pool " not in conf and "allow " not in conf, conf
+            fw.fail("ss -uln | grep -q ':123'")
+            pid = fw.succeed("systemctl show chronyd -p MainPID --value").strip()
+            upstream.succeed("ip link set eth1 up")
 
             # The fw synchronises to the upstream (its Reference ID becomes the
             # upstream's IP) and opens the NTP server socket for the LAN.
@@ -13360,6 +13603,15 @@
             fw.wait_until_succeeds(
                 "chronyc -n tracking | grep -q '10.0.0.99'", timeout=120
             )
+            assert fw.succeed("systemctl show chronyd -p MainPID --value").strip() == pid
+            assert abs(int(fw.succeed("date +%s")) - int(upstream.succeed("date +%s"))) < 5
+
+            # Serving LAN clients is a separate explicit operation.
+            fw.succeed("printf '%s\\n' 'set services ntp serve-on eth1' commit save exit | sentinel configure")
+            conf = fw.succeed("cat /run/sentinel/chrony.d/sentinel.conf")
+            assert "server 10.0.0.99 iburst" in conf and "pool " not in conf, conf
+            assert "allow 10.0.0.0/24" in conf, conf
+            fw.wait_until_succeeds("chronyc -n tracking | grep -q '10.0.0.99'", timeout=120)
             fw.wait_until_succeeds("ss -uln | grep -q ':123'", timeout=10)
 
             # Deliberately NOT asserted here: that `show version` and
@@ -13378,6 +13630,19 @@
             client.wait_until_succeeds(
                 "chronyc -n tracking | grep -q '10.0.0.1'", timeout=90
             )
+
+            # Deleting the optional block restores the clock-client defaults,
+            # never stale custom sources or LAN permissions; reboot re-renders it.
+            fw.succeed("printf '%s\\n' 'delete services ntp' commit save exit | sentinel configure")
+            reset = fw.succeed("cat /run/sentinel/chrony.d/sentinel.conf")
+            assert "pool 0.nixos.pool.ntp.org iburst" in reset, reset
+            assert "10.0.0.99" not in reset and "allow " not in reset, reset
+            fw.fail("ss -uln | grep -q ':123'")
+            fw.shutdown()
+            fw.start()
+            fw.wait_for_unit("chronyd.service")
+            assert fw.succeed("cat /run/sentinel/chrony.d/sentinel.conf") == reset
+            fw.fail("systemctl is-active systemd-timesyncd.service")
           '';
         };
 
@@ -14715,6 +14980,33 @@
             machine.succeed("hostname | grep -x fw-base")
             machine.succeed("grep -q 'fw-base' /var/lib/sentinel/appliance.toml")
 
+            # A failed snapshot publication is NOT a successful commit. The
+            # actual CLI must return failure while retaining its armed safety
+            # timer; the saved baseline stays unchanged. This is a real atomic
+            # rename failure, not a mocked apply or systemd response.
+            saved_hash = machine.succeed("sha256sum /var/lib/sentinel/appliance.toml").split()[0]
+            machine.succeed(
+                "mv /run/sentinel/running.toml /run/sentinel/running-before-publication.toml; "
+                "mkdir -m 0700 /run/sentinel/running.toml"
+            )
+            refused = machine.fail(
+                "su admin -c \"printf '%s\\n' "
+                "'set system hostname fw-unrecorded' 'commit-confirm 10' exit "
+                "| sentinel configure 2>&1\""
+            )
+            assert "candidate applied and rollback timer armed" in refused, refused
+            assert "recording the running configuration failed" in refused, refused
+            machine.succeed("hostname | grep -x fw-unrecorded")
+            machine.succeed("systemctl is-active sentinel-confirm.timer")
+            assert machine.succeed("sha256sum /var/lib/sentinel/appliance.toml").split()[0] == saved_hash
+            machine.succeed(
+                "rmdir /run/sentinel/running.toml; "
+                "mv /run/sentinel/running-before-publication.toml /run/sentinel/running.toml"
+            )
+            machine.succeed("sentinel confirm-rollback")
+            machine.succeed("hostname | grep -x fw-base")
+            machine.succeed("grep -q 'fw-base' /run/sentinel/running.toml")
+
             # --- commit-confirm + confirm (keep the change) ---------------------
             # A 10-minute window: the new hostname is applied live AND the
             # auto-rollback timer is armed.
@@ -14724,6 +15016,9 @@
                 "| sentinel configure\""
             )
             machine.succeed("hostname | grep -x fw-c1")
+            machine.succeed("grep -q 'fw-c1' /run/sentinel/running.toml")
+            machine.succeed("test $(stat -c %a /run/sentinel/running.toml) = 640")
+            machine.succeed("test $(stat -c %U /run/sentinel/running.toml) = root")
             machine.succeed("systemctl is-active sentinel-confirm.timer")
             # `confirm` cancels the timer; the change stays live.
             machine.succeed(
@@ -14731,6 +15026,7 @@
             )
             machine.wait_until_fails("systemctl is-active sentinel-confirm.timer", timeout=20)
             machine.succeed("hostname | grep -x fw-c1")
+            machine.succeed("grep -q 'fw-c1' /run/sentinel/running.toml")
             # commit-confirm never persists: the saved baseline is untouched.
             machine.succeed("grep -q 'fw-base' /var/lib/sentinel/appliance.toml")
 
@@ -14741,11 +15037,13 @@
                 "| sentinel configure\""
             )
             machine.succeed("hostname | grep -x fw-c2")
+            machine.succeed("grep -q 'fw-c2' /run/sentinel/running.toml")
             machine.succeed("systemctl is-active sentinel-confirm.timer")
             # Forcing the revert (the exact command the timer runs) restores the
             # saved config and disarms the timer.
             machine.succeed("sentinel confirm-rollback")
             machine.succeed("hostname | grep -x fw-base")
+            machine.succeed("grep -q 'fw-base' /run/sentinel/running.toml")
             machine.wait_until_fails("systemctl is-active sentinel-confirm.timer", timeout=20)
 
             # --- the real timer fires and auto-reverts (the headline) -----------
@@ -14758,8 +15056,11 @@
                 "| sentinel configure\""
             )
             machine.succeed("hostname | grep -x fw-c3")
+            machine.succeed("grep -q 'fw-c3' /run/sentinel/running.toml")
             machine.succeed("systemctl is-active sentinel-confirm.timer")
             machine.wait_until_succeeds("hostname | grep -x fw-base", timeout=120)
+            machine.wait_until_succeeds("grep -q 'fw-base' /run/sentinel/running.toml", timeout=20)
+            machine.succeed("grep -q 'fw-base' /var/lib/sentinel/appliance.toml")
           '';
         };
 

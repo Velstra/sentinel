@@ -1,0 +1,495 @@
+--- a/velstra-app/src/firewall.rs
++++ b/velstra-app/src/firewall.rs
+@@ -3515,7 +3515,7 @@
+ ) -> HashSet<[u8; 8]> {
+     interfaces
+         .iter()
+-        .filter(|i| i.masquerade)
++        .filter(|i| i.masquerade || i.dhcp_client)
+         .flat_map(|i| {
+             let Ok(ifindex) = index(&i.name) else {
+                 return Vec::new();
+@@ -3593,6 +3593,28 @@
+ /// called on policy changes AND ordinary link polling: leases can arrive well
+ /// after apply and can change while the desired configuration stays identical.
+ fn program_masquerade(ebpf: &mut Ebpf, interfaces: &[ResolvedInterface]) -> Result<()> {
++    let clients: BTreeMap<_, _> = interfaces
++        .iter()
++        .filter(|i| i.dhcp_client)
++        .filter_map(|i| {
++            let index = if_nametoindex(&i.name).ok()?;
++            let mac = read_iface_mac(&i.name).ok()?;
++            Some((
++                index,
++                [mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 0, 0],
++            ))
++        })
++        .collect();
++    {
++        let mut map: HashMap<_, u32, [u8; 8]> = HashMap::try_from(
++            ebpf.map_mut("DHCP_CLIENTS")
++                .ok_or_else(|| anyhow!("DHCP_CLIENTS map missing"))?,
++        )?;
++        drop_unlisted(&mut map, &clients.keys().copied().collect())?;
++        for (index, mac) in clients {
++            map.insert(index, mac, 0)?;
++        }
++    }
+     let prepared = masquerade_targets(interfaces, if_nametoindex, read_iface_ipv4);
+     let local = local_egress_addresses(interfaces, if_nametoindex, read_iface_ipv4_all);
+     {
+@@ -5091,6 +5113,7 @@
+         let iface = |name: &str, activate: bool| ResolvedInterface {
+             name: name.into(),
+             policy: 0,
++            dhcp_client: false,
+             vni: 0,
+             masquerade: false,
+             snat_address: None,
+@@ -5141,6 +5164,7 @@
+         let iface = |name: &str| ResolvedInterface {
+             name: name.into(),
+             policy: 0,
++            dhcp_client: false,
+             vni: 0,
+             masquerade: false,
+             snat_address: None,
+@@ -5175,6 +5199,7 @@
+         let lan = ResolvedInterface {
+             name: "lan0".into(),
+             policy: 0,
++            dhcp_client: false,
+             vni: 0,
+             masquerade: false,
+             snat_address: None,
+@@ -5191,6 +5216,26 @@
+     }
+ 
+     #[test]
++    fn local_dhcp_addresses_are_scoped_to_the_actual_client_interface() {
++        let cfg = serde_json::from_value::<velstra_config::FileConfig>(serde_json::json!({
++            "interface": [{"name":"wan0", "policy":0, "dhcp_client":true},
++                          {"name":"lan0", "policy":0}]
++        }))
++        .unwrap()
++        .resolve()
++        .unwrap();
++        let keys = local_egress_addresses(
++            &cfg.interfaces,
++            |name| Ok(if name == "wan0" { 10 } else { 11 }),
++            |_| Ok(vec![[198, 18, 88, 100]]),
++        );
++        assert_eq!(keys.len(), 1);
++        assert!(keys.contains(&local_egress_address_key(10, [198, 18, 88, 100])));
++        assert!(!keys.contains(&local_egress_address_key(11, [198, 18, 88, 100])));
++        assert!(local_egress_addresses(&cfg.interfaces, |_| Ok(10), |_| Ok(vec![])).is_empty());
++    }
++
++    #[test]
+     fn local_control_sources_are_distinguished_from_forwarded_nat_clients() {
+         let cfg = serde_json::from_value::<velstra_config::FileConfig>(serde_json::json!({
+             "interface": [{"name":"wan0", "policy":0, "masquerade":true},
+@@ -5255,6 +5300,7 @@
+         cfg.interfaces.push(ResolvedInterface {
+             name: "tap0".into(),
+             policy: 100,
++            dhcp_client: false,
+             vni: 100,
+             masquerade: false,
+             snat_address: None,
+@@ -5268,6 +5314,7 @@
+         cfg.interfaces.push(ResolvedInterface {
+             name: "eth0".into(),
+             policy: 0,
++            dhcp_client: false,
+             vni: 0,
+             masquerade: true,
+             snat_address: None,
+@@ -5308,6 +5355,7 @@
+         let iface = |name: &str, policy: PolicyId| ResolvedInterface {
+             name: name.into(),
+             policy,
++            dhcp_client: false,
+             vni: 0,
+             masquerade: false,
+             snat_address: None,
+--- a/velstra-common/src/lib.rs
++++ b/velstra-common/src/lib.rs
+@@ -34,6 +34,7 @@
+ mod cidr;
+ mod config;
+ mod conntrack;
++mod dhcp;
+ mod forward;
+ mod lb;
+ mod mac;
+@@ -54,6 +55,7 @@
+ pub use cidr::{Cidr4, Cidr6, CidrError, mask_v4, mask_v6, parse_cidr_v4, parse_cidr_v6};
+ pub use config::{ConfigFlags, GlobalConfig, SourceValidation};
+ pub use conntrack::{ConntrackTimeouts, FirewallKey, FirewallState};
++pub use dhcp::dhcpv4_reply_matches;
+ pub use forward::{
+     ForwardOutcome, Rewrite, RouteEntry, csum_replace_u16, decrement_ttl, ipv4_checksum,
+     plan_forward,
+--- /dev/null
++++ b/velstra-common/src/dhcp.rs
+@@ -0,0 +1,129 @@
++//! Narrow validation for replies to a declared local Ethernet DHCPv4 client.
++//! This is not DHCP authentication: the local client still verifies transactions,
++//! options and checksums. It must never open arbitrary traffic on UDP port 68.
++
++/// Check the fixed headers without copying the 240-byte BOOTP prefix onto the
++/// BPF stack. The caller bounds-checks the full IPv4 datagram and separately
++/// proves that its destination is broadcast or an address owned by this NIC.
++#[inline(always)]
++pub fn dhcpv4_reply_matches(
++    ip: &[u8; 20],
++    udp: &[u8; 8],
++    bootp: &[u8; 240],
++    local_mac: &[u8; 8],
++) -> bool {
++    let ihl = (ip[0] & 15) as u16 * 4;
++    let total = u16::from_be_bytes([ip[2], ip[3]]);
++    let length = u16::from_be_bytes([udp[4], udp[5]]);
++    ip[0] >> 4 == 4
++        // DHCP does not need source-route or other IPv4 options. Do not admit
++        // a nominally local datagram which an option could make routable.
++        && ihl == 20
++        && ip[9] == 17
++        && u16::from_be_bytes([ip[6], ip[7]]) & 0xbfff == 0
++        && total >= ihl + 248
++        && length == total - ihl
++        && udp[0] == 0
++        && udp[1] == 67
++        && udp[2] == 0
++        && udp[3] == 68
++        && ip[12] != 0
++        && ip[12] != 127
++        && ip[12] < 224
++        && bootp[0] == 2
++        && bootp[1] == 1
++        && bootp[2] == 6
++        && bootp[28] == local_mac[0]
++        && bootp[29] == local_mac[1]
++        && bootp[30] == local_mac[2]
++        && bootp[31] == local_mac[3]
++        && bootp[32] == local_mac[4]
++        && bootp[33] == local_mac[5]
++        && bootp[236] == 99
++        && bootp[237] == 130
++        && bootp[238] == 83
++        && bootp[239] == 99
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn fixture() -> ([u8; 20], [u8; 8], [u8; 240], [u8; 8]) {
++        let mut ip = [0; 20];
++        ip[0] = 0x45;
++        ip[2..4].copy_from_slice(&268u16.to_be_bytes());
++        ip[9] = 17;
++        ip[12..16].copy_from_slice(&[198, 18, 88, 1]);
++        let udp = [0, 67, 0, 68, 0, 248, 0, 0];
++        let mac = [2, 3, 4, 5, 6, 7, 0, 0];
++        let mut bootp = [0; 240];
++        bootp[0..3].copy_from_slice(&[2, 1, 6]);
++        bootp[28..34].copy_from_slice(&mac[..6]);
++        bootp[236..240].copy_from_slice(&[99, 130, 83, 99]);
++        (ip, udp, bootp, mac)
++    }
++
++    #[test]
++    fn accepts_valid_reply_with_ethernet_client_identity() {
++        let (ip, udp, bootp, mac) = fixture();
++        assert!(dhcpv4_reply_matches(&ip, &udp, &bootp, &mac));
++    }
++
++    #[test]
++    fn refuses_wrong_ports_protocol_and_ip_version() {
++        let (ip, udp, bootp, mac) = fixture();
++        for field in 0..4 {
++            let mut bad = udp;
++            bad[field] ^= 1;
++            assert!(!dhcpv4_reply_matches(&ip, &bad, &bootp, &mac));
++        }
++        for (offset, value) in [(0, 0x65), (0, 0x44), (0, 0x46), (9, 6)] {
++            let mut bad = ip;
++            bad[offset] = value;
++            assert!(!dhcpv4_reply_matches(&bad, &udp, &bootp, &mac));
++        }
++    }
++
++    #[test]
++    fn refuses_fragments_and_inconsistent_lengths() {
++        let (ip, udp, bootp, mac) = fixture();
++        for (offset, value) in [(6, 0x20), (6, 0x80), (7, 1), (2, 0), (3, 0)] {
++            let mut bad = ip;
++            bad[offset] = value;
++            assert!(!dhcpv4_reply_matches(&bad, &udp, &bootp, &mac));
++        }
++        for value in [247u16, 249, 65535] {
++            let mut bad = udp;
++            bad[4..6].copy_from_slice(&value.to_be_bytes());
++            assert!(!dhcpv4_reply_matches(&ip, &bad, &bootp, &mac));
++        }
++    }
++
++    #[test]
++    fn allows_dont_fragment_but_no_other_fragment_bits() {
++        let (mut ip, udp, bootp, mac) = fixture();
++        ip[6] = 0x40;
++        assert!(dhcpv4_reply_matches(&ip, &udp, &bootp, &mac));
++    }
++
++    #[test]
++    fn refuses_requests_wrong_hardware_cookie_and_foreign_client() {
++        let (ip, udp, bootp, mac) = fixture();
++        for offset in [0, 1, 2, 28, 29, 30, 31, 32, 33, 236, 237, 238, 239] {
++            let mut bad = bootp;
++            bad[offset] ^= 1;
++            assert!(!dhcpv4_reply_matches(&ip, &udp, &bad, &mac));
++        }
++    }
++
++    #[test]
++    fn refuses_nonunicast_server_sources() {
++        let (ip, udp, bootp, mac) = fixture();
++        for first in [0, 127, 224, 239, 240, 255] {
++            let mut bad = ip;
++            bad[12] = first;
++            assert!(!dhcpv4_reply_matches(&bad, &udp, &bootp, &mac));
++        }
++    }
++}
+--- a/velstra-config/src/config.rs
++++ b/velstra-config/src/config.rs
+@@ -745,6 +745,9 @@
+     /// Policy id this interface's traffic is evaluated against (its firewall
+     /// ruleset).
+     pub policy: PolicyId,
++    /// This NIC runs a local DHCPv4 client, not a forwarded DHCP service.
++    #[serde(default)]
++    pub dhcp_client: bool,
+     /// Overlay segment (VXLAN Network Identifier) this interface belongs to.
+     /// **Decoupled from `policy`**: many ports can share one ruleset on
+     /// different segments, or one segment can host ports with different rules
+@@ -1356,6 +1359,7 @@
+     pub name: String,
+     /// Firewall policy id (`IFACE_POLICY`).
+     pub policy: PolicyId,
++    pub dhcp_client: bool,
+     /// Overlay segment / VNI (`IFACE_VNI`). `0` means local-only (no overlay).
+     pub vni: u32,
+     /// Masquerade (source NAT) traffic leaving this interface (`MASQUERADE`).
+@@ -2197,6 +2201,7 @@
+             interfaces.push(ResolvedInterface {
+                 name: iface.name.clone(),
+                 policy: iface.policy,
++                dhcp_client: iface.dhcp_client,
+                 vni,
+                 masquerade: iface.masquerade,
+                 snat_address: iface
+@@ -3596,6 +3601,7 @@
+                 ResolvedInterface {
+                     name: "tap0".into(),
+                     policy: 7,
++                    dhcp_client: false,
+                     vni: 7, // defaults to the policy id
+                     masquerade: false,
+                     snat_address: None,
+@@ -3608,6 +3614,7 @@
+                 ResolvedInterface {
+                     name: "tap1".into(),
+                     policy: 0,
++                    dhcp_client: false,
+                     vni: 0,
+                     masquerade: false,
+                     snat_address: None,
+--- a/velstra-config/src/proto_convert.rs
++++ b/velstra-config/src/proto_convert.rs
+@@ -206,6 +206,7 @@
+             .map(|i| proto::InterfaceAssignment {
+                 name: i.name.clone(),
+                 policy: i.policy,
++                dhcp_client: i.dhcp_client,
+                 vni: i.vni,
+                 mss: i.mss.map(u32::from),
+                 bind_mac: i.bind_mac.clone(),
+@@ -432,6 +433,7 @@
+             .iter()
+             .map(|i| InterfaceFile {
+                 mss: i.mss.map(|v| v as u16),
++                dhcp_client: i.dhcp_client,
+                 // Port security, carried at last. This used to say the proto had
+                 // no field for it — true, and its consequence was never written
+                 // down beside it: the orchestrator derives a binding for every
+@@ -949,6 +951,7 @@
+         InterfaceFile {
+             name: "tap0".into(),
+             policy: 4711,
++            dhcp_client: true,
+             vni: Some(5001),
+             mss: Some(1400),
+             bind_mac: Some("02:00:00:00:00:01".into()),
+@@ -980,6 +983,7 @@
+         let InterfaceFile {
+             name,
+             policy,
++            dhcp_client,
+             vni,
+             mss,
+             bind_mac,
+@@ -995,6 +999,7 @@
+         } = after;
+         assert_eq!(*name, before.name, "name");
+         assert_eq!(*policy, before.policy, "policy");
++        assert_eq!(*dhcp_client, before.dhcp_client, "local DHCP client");
+         assert_eq!(*vni, before.vni, "vni");
+         assert_eq!(*mss, before.mss, "mss — TCP clamping is off on this node");
+         assert_eq!(
+--- a/velstra-ebpf/src/main.rs
++++ b/velstra-ebpf/src/main.rs
+@@ -50,7 +50,8 @@
+ use aya_ebpf::{
+     bindings::{
+         BPF_F_PSEUDO_HDR, BPF_FIB_LKUP_RET_FWD_DISABLED, BPF_FIB_LKUP_RET_NO_NEIGH,
+-        BPF_FIB_LKUP_RET_SUCCESS, TC_ACT_OK, TC_ACT_SHOT, bpf_fib_lookup, xdp_action,
++        BPF_FIB_LKUP_RET_NOT_FWDED, BPF_FIB_LKUP_RET_SUCCESS, TC_ACT_OK, TC_ACT_SHOT,
++        bpf_fib_lookup, xdp_action,
+     },
+     helpers::{
+         bpf_fib_lookup as fib_lookup, bpf_get_current_pid_tgid, bpf_ktime_get_boot_ns,
+@@ -170,6 +171,11 @@
+ #[map]
+ static IFACE_POLICY: HashMap<u32, PolicyId> = HashMap::with_max_entries(1024, 0);
+ 
++/// Only declared local DHCPv4 clients, with the NIC's actual Ethernet address.
++/// A UDP destination port alone is never a local-control admission criterion.
++#[map]
++static DHCP_CLIENTS: HashMap<u32, [u8; 8]> = HashMap::with_max_entries(1024, 0);
++
+ /// Maps an ingress interface index to its overlay segment (VNI), independent of
+ /// its firewall policy. Absent / `0` means the interface is local-only and its
+ /// traffic is never encapsulated.
+@@ -2718,8 +2724,13 @@
+     // Runs ahead of every other verdict: a packet whose source cannot be the
+     // sender is not worth matching rules against, and the answer does not depend
+     // on any of them.
++    let local_dhcp = proto == ip_proto::UDP
++        && src_port == 67
++        && dst_port == 68
++        && local_dhcp_reply(ctx, ifindex, ihl_bytes);
+     let rpf = cfg.source_validation();
+     if rpf != SourceValidation::Disabled
++        && !local_dhcp
+         && source_is_spoofed(ctx, &meta, ifindex, rpf == SourceValidation::Strict)
+     {
+         bump(Counter::DroppedSpoofed);
+@@ -2865,6 +2876,10 @@
+         || (cfg.has_flag(ConfigFlags::DROP_ICMP) && proto == ip_proto::ICMP)
+     {
+         (verdict.action, verdict.counter)
++    } else if local_dhcp {
++        // Explicit denies, blocklists and rate limits above still win. This is
++        // local bootstrap traffic, not a new forwarded or established flow.
++        (Action::Pass, Counter::PassedRule)
+     } else if established {
+         (Action::Pass, Counter::EstablishedAllowed)
+     } else if has_port_forward {
+@@ -2921,6 +2936,13 @@
+         );
+     }
+ 
++    if local_dhcp {
++        bump(fw_counter);
++        // No NAT/overlay forwarding or conntrack entry for the broadcast tuple.
++        // The persistent HA TC guard still fences the local stack when needed.
++        return Ok(xdp_action::XDP_PASS);
++    }
++
+     // Allowed. On a stateful policy, remember a new flow (and its reverse) so the
+     // reply is permitted regardless of the reverse direction's policy.
+     if stateful {
+@@ -3718,6 +3740,69 @@
+ const AF_INET: u8 = 2;
+ const AF_INET6: u8 = 10;
+ 
++/// Narrow local-control admission, never a forwarding exception. Initial
++/// acquisition requests broadcast replies; renewals may address the NIC's
++/// already-owned IPv4. The FIB check prevents stale address metadata from
++/// admitting a datagram which has become routable through the appliance.
++#[inline(never)]
++fn local_dhcp_reply(ctx: &XdpContext, ifindex: u32, ihl: usize) -> bool {
++    let Some(mac) = (unsafe { DHCP_CLIENTS.get(&ifindex) }).copied() else {
++        return false;
++    };
++    let Ok(ip) = (unsafe { ptr_at::<[u8; 20]>(ctx, EthHdr::LEN) }) else {
++        return false;
++    };
++    let ip = unsafe { &*ip };
++    let length = u16::from_be_bytes([ip[2], ip[3]]) as usize;
++    let frame_len = ctx.data_end() - ctx.data();
++    if length + EthHdr::LEN > frame_len {
++        return false;
++    }
++    let Ok(udp) = (unsafe { ptr_at::<[u8; 8]>(ctx, EthHdr::LEN + ihl) }) else {
++        return false;
++    };
++    let Ok(bootp) = (unsafe { ptr_at::<[u8; 240]>(ctx, EthHdr::LEN + ihl + 8) }) else {
++        return false;
++    };
++    if !velstra_common::dhcpv4_reply_matches(ip, unsafe { &*udp }, unsafe { &*bootp }, &mac) {
++        return false;
++    }
++    let dst = [ip[16], ip[17], ip[18], ip[19]];
++    if dst == [255, 255, 255, 255] {
++        return true;
++    }
++    let index = ifindex.to_ne_bytes();
++    let key = [
++        index[0], index[1], index[2], index[3], dst[0], dst[1], dst[2], dst[3],
++    ];
++    if unsafe { LOCAL_EGRESS_ADDRS.get(&key) }.is_none() {
++        return false;
++    }
++    let Some(params) = fib_scratch() else {
++        return false;
++    };
++    unsafe {
++        (*params).family = AF_INET;
++        (*params).l4_protocol = ip_proto::UDP;
++        (*params).sport = 67u16.to_be();
++        (*params).dport = 68u16.to_be();
++        (*params).__bindgen_anon_1.tot_len = length as u16;
++        (*params).ifindex = ifindex;
++        (*params).__bindgen_anon_3.ipv4_src = u32::from_ne_bytes([ip[12], ip[13], ip[14], ip[15]]);
++        (*params).__bindgen_anon_4.ipv4_dst = u32::from_ne_bytes(dst);
++    }
++    let rc = unsafe {
++        fib_lookup(
++            ctx.ctx.cast(),
++            params,
++            core::mem::size_of::<bpf_fib_lookup>() as i32,
++            0,
++        )
++    };
++    rc >= 0
++        && (rc as u32 == BPF_FIB_LKUP_RET_NOT_FWDED || rc as u32 == BPF_FIB_LKUP_RET_FWD_DISABLED)
++}
++
+ /// Source-address validation (uRPF, RFC 3704) for IPv4. Returns `true` when the
+ /// packet should be dropped as spoofed.
+ ///
+--- a/velstra-proto/proto/velstra.proto
++++ b/velstra-proto/proto/velstra.proto
+@@ -801,6 +801,8 @@
+   // Source-NAT traffic leaving this interface to its own public address.
+   bool masquerade = 8;
+   optional string snat_address = 11;
++  // Admit validated local DHCPv4 replies only on an explicitly declared client.
++  bool dhcp_client = 12;
+   // Deterministic CGNAT: the first WAN port handed out, and how many each
+   // internal address gets. Both zero = plain hash-spread NAPT.
+   uint32 cgnat_base_port = 9;
