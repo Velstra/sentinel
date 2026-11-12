@@ -2,12 +2,17 @@
 
 ## Upstream migration — 2026-11-12
 
-The production flake now pins Fabric `913b9ae274e7624b471e52b8a5f4cf677688c32c`
+The production flake now pins Fabric `e0a802c43477fb43ef329717112867878faf12bf`
 and Wren `53be10eca77aac36a88f9a53d6c08051d3050acd`, which contain the fixes
 below. Production packages no longer apply these backports. The patch files
 remain historical comparison inputs during the coordinated Enterprise adapter
 migration, not additional runtime code or instructions to patch customer nodes.
 The generic source-patch direction regressions remain separately executable.
+
+The follow-up Fabric pin contains the narrow Rustix 1.1.6 lock correction for
+RUSTSEC-2026-0486; see `docs/security-rustix-2026-11-12.md`. The original upstream
+integration in Sentinel #48 pinned Fabric `913b9ae` and has its own preserved
+component receipt. Its results are not silently relabeled for this newer lock.
 
 The explicitly test-only `fabric-legacy-napt` input stays at the deployed
 `f72cf32c001293ee1a1d9873f4e145cdc1a7287d` source. Both its agent and BPF object
