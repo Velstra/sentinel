@@ -21,7 +21,7 @@
     # Reviewed public integrations; update these URLs and the lock together.
     # The former appliance backports are now included upstream.
     fabric = {
-      url = "github:Velstra/fabric/913b9ae274e7624b471e52b8a5f4cf677688c32c";
+      url = "github:Velstra/fabric/e0a802c43477fb43ef329717112867878faf12bf";
       flake = false;
     };
     # Test-only deployed allocator. Never advance this with the production pin:
