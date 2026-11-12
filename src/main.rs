@@ -39,6 +39,7 @@ mod ipsec_guards;
 mod lockout;
 mod lookup;
 mod metrics;
+mod mutation;
 mod net;
 mod network_reconcile;
 mod openapi;
@@ -62,7 +63,9 @@ mod trace;
 mod ui;
 mod unlock;
 mod update;
+mod update_jobs;
 mod update_key;
+mod update_observer;
 mod update_stage;
 mod velstra;
 mod verified_image;
@@ -396,6 +399,16 @@ enum Command {
     /// Internal root-only presence/absence proof for a protected state path.
     #[command(hide = true)]
     OwnedFileProbe { path: PathBuf },
+    /// Internal root-only bounded regular-file read; returns an optional JSON string.
+    #[command(hide = true)]
+    OwnedFileRead {
+        path: PathBuf,
+        #[arg(long)]
+        max_bytes: usize,
+    },
+    /// Internal root-only independent update worker; no caller-provided paths.
+    #[command(hide = true)]
+    UpdateJob { id: String },
     /// Ask the data plane agent's query socket and print the reply.
     ///
     /// Internal: `show` re-invokes this under sudo when the socket is not
@@ -720,6 +733,7 @@ async fn main() -> Result<()> {
         Command::Ha {
             command: HaCommand::Watch { config },
         } => ha::watch(&config),
+        Command::UpdateJob { id } => update_jobs::run_worker(&id).map_err(Into::into),
         Command::Configure { config, no_apply } => configure(&config, no_apply),
         Command::SyncConfig => configsync::flush(),
         Command::RefreshFirewall => refresh_firewall(),
@@ -829,13 +843,26 @@ async fn main() -> Result<()> {
             print!("{}", system::owned_file_probe(&path)?);
             Ok(())
         }
+        Command::OwnedFileRead { path, max_bytes } => {
+            print!("{}", system::owned_file_read(&path, max_bytes)?);
+            Ok(())
+        }
         Command::AgentQuery { command, socket } => {
             let path = socket.unwrap_or_else(|| PathBuf::from(velstra::SOCKET));
             print!("{}", velstra::query_at(&path, &command)?);
             Ok(())
         }
-        Command::ApplyConsole { config } => net::apply_console_settings(&Appliance::load(&config)?),
-        Command::Apply { file, out, reload } => apply(&file, &out, reload.as_deref()),
+        Command::ApplyConsole { config } => {
+            let _lock = system::apply_lock()?;
+            let appliance = Appliance::load(&config)?;
+            mutation::advance()?;
+            net::apply_console_settings(&appliance)
+        }
+        Command::Apply { file, out, reload } => {
+            let _lock = system::apply_lock()?;
+            mutation::advance()?;
+            apply(&file, &out, reload.as_deref())
+        }
         Command::ApplyPending { config, id } => {
             safe_apply::apply_pending(&config, &id, &live_apply(true))
         }
@@ -1217,6 +1244,8 @@ fn apply_boot(
     // stages through the same fixed temp names, so an interleaved writer could
     // corrupt a networkd unit or velstra.toml. Best-effort, held for the stage.
     let _lock = system::apply_lock()?;
+    mutation::initialize_boot()?;
+    mutation::advance()?;
     safe_apply::recover(config, &repl::Apply::off(), true, true)?;
     // load_lenient, not load: this is the boot-time apply of the saved config,
     // and the one place an unknown key must not keep the box from coming up. A
@@ -1278,6 +1307,7 @@ fn apply_boot_late(config: Option<&std::path::Path>) -> Result<()> {
         std::path::Path::new(session::Session::RUNNING),
     );
     let appliance = Appliance::load_lenient(source)?;
+    mutation::advance()?;
     net::apply_link_runtime(&appliance)
 }
 

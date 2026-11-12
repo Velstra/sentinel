@@ -39,7 +39,7 @@ use crate::system;
 /// A signed release manifest: the small JSON document, signed by the pinned key,
 /// that names the release and the exact image to write. Unknown fields are
 /// ignored so the manifest can gain fields without breaking older appliances.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Manifest {
     /// The release version, e.g. `"1.2.0"`. Compared against the running
     /// version before anything is installed ([`refuse_downgrade`]).
@@ -58,6 +58,31 @@ pub struct Manifest {
 
 /// The product a manifest's `product` field must name.
 pub const PRODUCT: &str = "velstra-sentinel";
+
+/// Exact signed metadata and public trust identity, without credentials or URL.
+/// A reviewed offer must never silently become a different release at install.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct VerifiedOffer {
+    pub manifest: Manifest,
+    pub manifest_sha256: String,
+    pub public_key_sha256: String,
+}
+
+fn digest_hex(bytes: &[u8]) -> String {
+    ring::digest::digest(&ring::digest::SHA256, bytes)
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Resolve file references NOW, not by hashing their (possibly unchanged) name.
+pub fn public_key_fingerprint(chan: &UpdateChannel) -> Result<String> {
+    let scratch = Scratch::new()?;
+    let key = resolve_pubkey(chan, &scratch)?;
+    Ok(digest_hex(&read_small(&key, 4096)?))
+}
 
 /// Development fallback only. An appliance image release can change without
 /// changing this package version, so it must never be its downgrade floor.
@@ -189,7 +214,7 @@ fn base_url(chan: &UpdateChannel) -> &str {
 /// A manifest-named image must be a plain basename living directly in the channel
 /// directory — never a path that could climb out of it or point elsewhere. This
 /// is the one untrusted field we append to a URL, so it is validated hard.
-fn valid_image_name(name: &str) -> bool {
+pub(crate) fn valid_image_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('.')
         && !name.contains('/')
@@ -615,6 +640,10 @@ fn sha256_hex(file: &Path) -> Result<String> {
 /// Fails closed: a fetch error, a signature that does not verify under the pinned
 /// key, or a manifest naming an unsafe image path all return `Err`.
 pub fn check(chan: &UpdateChannel) -> Result<Manifest> {
+    Ok(check_offer(chan)?.manifest)
+}
+
+pub fn check_offer(chan: &UpdateChannel) -> Result<VerifiedOffer> {
     let base = base_url(chan);
     let scratch = Scratch::new()?;
     let manifest_path = scratch.join("manifest.json");
@@ -679,7 +708,11 @@ pub fn check(chan: &UpdateChannel) -> Result<Manifest> {
         );
     }
     check_manifest_fields(&manifest)?;
-    Ok(manifest)
+    Ok(VerifiedOffer {
+        manifest,
+        manifest_sha256: digest_hex(&bytes),
+        public_key_sha256: digest_hex(&read_small(&pubkey, 4096)?),
+    })
 }
 
 fn decode_envelope(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
@@ -1166,6 +1199,13 @@ mod tests {
         };
         // An absent atomic endpoint is the only compatibility fallback.
         assert_eq!(check(&chan).unwrap().version, "9.1.0");
+        let offer = check_offer(&chan).unwrap();
+        assert_eq!(offer.manifest_sha256, digest_hex(&original));
+        assert_eq!(
+            offer.public_key_sha256,
+            public_key_fingerprint(&chan).unwrap()
+        );
+        assert_eq!(offer.manifest, check(&chan).unwrap());
         let checked = check(&chan).unwrap();
         let staged = fetch_verified_image_using(&chan, &checked, |command, maximum| {
             crate::update_stage::test_download_in(command, &dir.0, maximum)
@@ -1484,6 +1524,30 @@ mod tests {
             .is_err()
         );
         assert!(!bad.join("pinned-pub.pem").exists());
+    }
+
+    #[test]
+    fn update_jobs_key_fingerprint_is_canonical_content_not_a_file_path() {
+        let pem = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=\n-----END PUBLIC KEY-----\n";
+        let scratch = Scratch::new().unwrap();
+        let path = scratch.join("public.pem");
+        std::fs::write(&path, pem).unwrap();
+        let mut channel = UpdateChannel {
+            name: None,
+            url: "file:///public-fixture".into(),
+            public_key: format!("file:{}", path.display()),
+            subscription_key: None,
+        };
+        let first = public_key_fingerprint(&channel).unwrap();
+        channel.public_key = pem.replace('\n', " ");
+        assert_eq!(public_key_fingerprint(&channel).unwrap(), first);
+        // A different32-byte PUBLIC key, same RFC8410 structure and pathname.
+        let second = pem.replace("Gb9ECWmE", "Hb9ECWmE");
+        std::fs::write(&path, second).unwrap();
+        channel.public_key = format!("file:{}", path.display());
+        assert_ne!(public_key_fingerprint(&channel).unwrap(), first);
+        std::fs::write(&path, "private or malformed key data").unwrap();
+        assert!(public_key_fingerprint(&channel).is_err());
     }
 
     fn openssl_available() -> bool {

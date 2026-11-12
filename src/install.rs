@@ -1265,6 +1265,61 @@ pub const SLOT_B: Slot = Slot {
     store_part: 5,
 };
 
+/// Typed engine observations, not CLI output or estimates of completion.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum UpdatePhase {
+    Metadata,
+    Downloading,
+    Verifying,
+    Preflight,
+    Writing,
+    Publishing,
+}
+
+pub struct UpdateHooks<'a> {
+    pub phase: &'a mut dyn FnMut(UpdatePhase) -> Result<()>,
+    /// Called after every existing preflight, immediately BEFORE the first
+    /// target-partition write. An error cannot be interpreted as permission.
+    pub before_write: &'a mut dyn FnMut() -> Result<()>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StagedImage {
+    pub active_slot: String,
+    pub staged_slot: String,
+    pub verity_guid: String,
+    pub store_guid: String,
+    pub boot_entry: String,
+    pub uki_sha256: String,
+}
+
+struct VerifiedWrite<'a> {
+    disk: &'a str,
+    active: &'a Slot,
+    inactive: &'a Slot,
+    source: &'a std::path::Path,
+    is_block: bool,
+    commit: bool,
+}
+
+fn authorize_partition_write(hooks: &mut UpdateHooks<'_>) -> Result<()> {
+    (hooks.before_write)()?;
+    (hooks.phase)(UpdatePhase::Writing)
+}
+
+fn require_reviewed_offer(
+    actual: &update::VerifiedOffer,
+    expected: &update::VerifiedOffer,
+) -> Result<()> {
+    ensure!(
+        actual == expected,
+        "reviewed signed update offer changed; check and review again"
+    );
+    Ok(())
+}
+
 // systemd GPT type GUIDs for the verity store pair (x86-64) — used to re-type
 // slot B (reserved generic at build) once it holds a real verity image.
 const USR_TYPE: &str = "8484680C-9521-48C6-9C11-B0720656F69E";
@@ -1548,14 +1603,48 @@ fn write_verified(
     is_block: bool,
     commit: bool,
 ) -> Result<()> {
+    let mut phase = |_| Ok(());
+    let mut before_write = || Ok(());
+    write_verified_observed(
+        image,
+        VerifiedWrite {
+            disk,
+            active,
+            inactive,
+            source,
+            is_block,
+            commit,
+        },
+        UpdateHooks {
+            phase: &mut phase,
+            before_write: &mut before_write,
+        },
+    )
+    .map(|_| ())
+}
+
+fn write_verified_observed(
+    image: VerifiedImage,
+    target: VerifiedWrite<'_>,
+    hooks: UpdateHooks<'_>,
+) -> Result<Option<StagedImage>> {
+    let VerifiedWrite {
+        disk,
+        active,
+        inactive,
+        source,
+        is_block,
+        commit,
+    } = target;
     eprintln!("image SHA-256 verified against its signed digest");
     if !commit {
         eprintln!(
             "(dry-run — re-run with --commit to write slot {} and switch the boot default)",
             inactive.name
         );
-        return Ok(());
+        return Ok(None);
     }
+    (hooks.phase)(UpdatePhase::Preflight)?;
     preflight_boot_selection()?;
     refuse_identical_image(
         disk,
@@ -1588,6 +1677,10 @@ fn write_verified(
     // Insufficient ESP staging must not first damage the inactive store. The
     // bounded temporary ESP copy is also verified before any target write.
     image.copy_partition(1, &mut esp)?;
+    // Persist uncertainty BEFORE a target may be partially written. Failure to
+    // publish this boundary itself aborts before the first partition write.
+    let mut hooks = hooks;
+    authorize_partition_write(&mut hooks)?;
     eprintln!("writing slot {} from {} …", inactive.name, source.display());
     let written = image
         .copy_partition(SLOT_A.verity_part, &mut verity)
@@ -1620,7 +1713,8 @@ fn write_verified(
     )?;
     run("partprobe", &[disk]).ok();
     run("udevadm", &["settle"]).ok();
-    switch_boot(
+    (hooks.phase)(UpdatePhase::Publishing)?;
+    let publication = switch_boot(
         disk,
         UkiSource::EspImage(&esp_copy.join("esp.img")),
         active,
@@ -1639,7 +1733,21 @@ fn write_verified(
             inactive.name
         );
     }
-    Ok(())
+    let verity_guid = partition_guid(disk, inactive.verity_part)?;
+    let store_guid = partition_guid(disk, inactive.store_part)?;
+    ensure!(
+        verity_guid.eq_ignore_ascii_case(image.guid(SLOT_A.verity_part))
+            && store_guid.eq_ignore_ascii_case(image.guid(SLOT_A.store_part)),
+        "staged partition identity readback mismatch"
+    );
+    Ok(Some(StagedImage {
+        active_slot: active.name.into(),
+        staged_slot: inactive.name.into(),
+        verity_guid,
+        store_guid,
+        boot_entry: publication.0,
+        uki_sha256: publication.1,
+    }))
 }
 
 /// Signed-channel update (roadmap C13): verify the channel's signed release
@@ -1655,10 +1763,48 @@ pub fn update_from_channel(
     commit: bool,
     allow_downgrade: bool,
 ) -> Result<()> {
+    let mut phase = |_| Ok(());
+    let mut before_write = || Ok(());
+    signed_update_observed(
+        chan,
+        commit,
+        allow_downgrade,
+        None,
+        UpdateHooks {
+            phase: &mut phase,
+            before_write: &mut before_write,
+        },
+    )
+    .map(|_| ())
+}
+
+/// Operational adapters may request ONLY the reviewed, still-current signed
+/// offer. No unsigned/downgrade option exists on this typed adapter.
+pub fn update_from_channel_guarded(
+    chan: &UpdateChannel,
+    expected: &update::VerifiedOffer,
+    hooks: UpdateHooks<'_>,
+) -> Result<StagedImage> {
+    signed_update_observed(chan, true, false, Some(expected), hooks)?
+        .context("committed signed update did not return a staged identity")
+}
+
+fn signed_update_observed(
+    chan: &UpdateChannel,
+    commit: bool,
+    allow_downgrade: bool,
+    expected: Option<&update::VerifiedOffer>,
+    hooks: UpdateHooks<'_>,
+) -> Result<Option<StagedImage>> {
     // Lock before fetching to bound aggregate staging and serialize local,
     // remote and unsigned update writers without locking config commits.
     let _update = crate::update_stage::UpdateLock::acquire()?;
-    let manifest = update::check(chan)?;
+    (hooks.phase)(UpdatePhase::Metadata)?;
+    let offer = update::check_offer(chan)?;
+    if let Some(expected) = expected {
+        require_reviewed_offer(&offer, expected)?;
+    }
+    let manifest = &offer.manifest;
     eprintln!(
         "verified release {} (image {}) — signed by the pinned update key",
         manifest.version, manifest.image
@@ -1667,14 +1813,27 @@ pub fn update_from_channel(
 
     // Anonymous persistent sparse staging keeps every signed RAW byte without
     // consuming a multi-GiB volatile tmpfs or trusting a mutable path.
-    let file = update::fetch_verified_image(chan, &manifest)?;
+    (hooks.phase)(UpdatePhase::Downloading)?;
+    let file = update::fetch_verified_image(chan, manifest)?;
     eprintln!("image SHA-256 verified against the signed manifest");
 
     // Only now, past both crypto gates, does the image reach the slot-writer.
+    (hooks.phase)(UpdatePhase::Verifying)?;
     let (disk, active, inactive) = update_target()?;
     let source = std::path::Path::new("<anonymous signed channel image>");
     let image = VerifiedImage::from_file(file, source, &manifest.sha256)?;
-    write_verified(image, &disk, active, inactive, source, false, commit)
+    write_verified_observed(
+        image,
+        VerifiedWrite {
+            disk: &disk,
+            active,
+            inactive,
+            source,
+            is_block: false,
+            commit,
+        },
+        hooks,
+    )
 }
 
 /// The mountpoint of a block device, if it's currently mounted.
@@ -1822,7 +1981,12 @@ fn render_loader_selection(previous: &str, slot: &Slot) -> String {
 /// Install the source image's UKI onto the running ESP as the inactive slot's
 /// boot-counted entry (`<slot>+3.efi`) and prefer it without forcing an exhausted
 /// entry ahead of the healthy fallback.
-fn switch_boot(disk: &str, source: UkiSource, active: &Slot, inactive: &Slot) -> Result<()> {
+fn switch_boot(
+    disk: &str,
+    source: UkiSource,
+    active: &Slot,
+    inactive: &Slot,
+) -> Result<(String, String)> {
     // Recheck immediately before ESP mutation as well as before partition
     // writes. A newly introduced firmware override must not be hidden by a
     // successful copy of the inactive slot.
@@ -1887,17 +2051,162 @@ fn switch_boot(disk: &str, source: UkiSource, active: &Slot, inactive: &Slot) ->
             std::fs::remove_file(e.path())?;
         }
     }
-    std::fs::copy(&uki, lin.join(format!("{}+3.efi", inactive.name)))?;
+    let boot_entry = format!("{}+3.efi", inactive.name);
+    let published = lin.join(&boot_entry);
+    let expected_hash = hash_uki(&uki)?;
+    std::fs::copy(&uki, &published)?;
+    std::fs::File::open(&published)?.sync_all()?;
+    ensure!(
+        hash_uki(&published)? == expected_hash,
+        "staged UKI readback mismatch"
+    );
 
     // Globs survive the successful bless removing +N, but only `preferred`
     // checks tries_left. The broad default permits assessment-based fallback.
     std::fs::create_dir_all(dst.join("loader"))?;
-    std::fs::write(&conf, selection)?;
-    Ok(())
+    std::fs::write(&conf, &selection)?;
+    std::fs::File::open(&conf)?.sync_all()?;
+    std::fs::File::open(&lin)?.sync_all()?;
+    std::fs::File::open(dst.join("loader"))?.sync_all()?;
+    std::fs::File::open(&dst)?.sync_all()?;
+    ensure!(
+        read_bounded(&conf, 65_536)?.as_deref() == Some(selection.as_bytes()),
+        "boot selection readback mismatch"
+    );
+    Ok((boot_entry, expected_hash))
+}
+
+pub(crate) fn hash_uki(path: &std::path::Path) -> Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    ensure!(metadata.is_file(), "UKI must be a regular file");
+    ensure!(
+        metadata.len() <= 256 * 1024 * 1024,
+        "UKI exceeds bounded verification size"
+    );
+    let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut bytes = [0u8; 65536];
+    let mut size = 0u64;
+    loop {
+        let read = file.read(&mut bytes)?;
+        if read == 0 {
+            break;
+        }
+        size += read as u64;
+        ensure!(
+            size <= 256 * 1024 * 1024,
+            "UKI exceeds bounded verification size"
+        );
+        hash.update(&bytes[..read]);
+    }
+    ensure!(size > 0, "UKI is empty");
+    Ok(hash
+        .finish()
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn update_jobs_uki_digest_is_bounded_regular_content_not_a_symlink() {
+        use std::io::Write;
+        let scratch = crate::update::Scratch::new().unwrap();
+        let path = scratch.join("public.efi");
+        scratch
+            .create_private("public.efi")
+            .unwrap()
+            .write_all(b"public-uki")
+            .unwrap();
+        let expected = ring::digest::digest(&ring::digest::SHA256, b"public-uki");
+        let expected: String = expected
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(super::hash_uki(&path).unwrap(), expected);
+        std::os::unix::fs::symlink(&path, scratch.join("alias.efi")).unwrap();
+        assert!(super::hash_uki(&scratch.join("alias.efi")).is_err());
+        scratch.create_private("empty.efi").unwrap();
+        assert!(super::hash_uki(&scratch.join("empty.efi")).is_err());
+        let fifo = std::ffi::CString::new(scratch.join("fifo.efi").to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(super::hash_uki(&scratch.join("fifo.efi")).is_err());
+        scratch
+            .create_private("large.efi")
+            .unwrap()
+            .set_len(256 * 1024 * 1024 + 1)
+            .unwrap();
+        assert!(super::hash_uki(&scratch.join("large.efi")).is_err());
+    }
+    #[test]
+    fn update_jobs_prewrite_refusal_never_announces_a_partition_write() {
+        let written = std::cell::Cell::new(false);
+        let mut phase = |_| {
+            written.set(true);
+            Ok(())
+        };
+        let mut reject = || anyhow::bail!("exact prewrite conflict");
+        let mut hooks = super::UpdateHooks {
+            phase: &mut phase,
+            before_write: &mut reject,
+        };
+        assert!(super::authorize_partition_write(&mut hooks).is_err());
+        assert!(!written.get());
+    }
+    #[test]
+    fn update_jobs_first_write_phase_requires_successful_cas_and_persistence() {
+        let checked = std::cell::Cell::new(false);
+        let mut phase = |p| {
+            assert!(checked.get());
+            assert_eq!(p, super::UpdatePhase::Writing);
+            anyhow::bail!("journal publication failed")
+        };
+        let mut guard = || {
+            checked.set(true);
+            Ok(())
+        };
+        let mut hooks = super::UpdateHooks {
+            phase: &mut phase,
+            before_write: &mut guard,
+        };
+        assert!(super::authorize_partition_write(&mut hooks).is_err());
+        assert!(checked.get());
+    }
+    #[test]
+    fn update_jobs_signed_offer_cas_covers_exact_signed_bytes_and_resolved_key() {
+        let offer = crate::update::VerifiedOffer {
+            manifest: crate::update::Manifest {
+                version: "2.1.0".into(),
+                image: "sentinel.raw".into(),
+                sha256: "1".repeat(64),
+                product: Some(crate::update::PRODUCT.into()),
+            },
+            manifest_sha256: "2".repeat(64),
+            public_key_sha256: "3".repeat(64),
+        };
+        super::require_reviewed_offer(&offer, &offer).unwrap();
+        let original = serde_json::to_value(&offer).unwrap();
+        for field in ["manifest_sha256", "public_key_sha256"] {
+            let mut altered = original.clone();
+            altered[field] = "4".repeat(64).into();
+            let altered = serde_json::from_value(altered).unwrap();
+            assert!(super::require_reviewed_offer(&altered, &offer).is_err());
+        }
+        for field in ["version", "image", "sha256", "product"] {
+            let mut altered = original.clone();
+            altered["manifest"][field] = "different".into();
+            let altered = serde_json::from_value(altered).unwrap();
+            assert!(super::require_reviewed_offer(&altered, &offer).is_err());
+        }
+    }
     fn install_signatures(rows: serde_json::Value) -> anyhow::Result<super::InstallSignatures> {
         super::InstallSignatures::parse(&serde_json::to_vec(
             &serde_json::json!({"signatures": rows}),

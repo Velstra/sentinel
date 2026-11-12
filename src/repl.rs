@@ -226,7 +226,11 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
         "commit-confirm" => return commit_confirm_line(session, act, rest),
         "confirm" => crate::confirm::confirm(act, rest.first().copied()),
         "rollback" => return rollback_line(session, act, rest),
-        "save" => {
+        "save" => (|| -> Result<()> {
+            // Keep the saved baseline and cancellation of its CLI rollback in
+            // one mutation interval. Releasing persist's inner lock before
+            // disarming the timer would expose a falsely-idle OTA checkpoint.
+            let _lock = system::apply_lock()?;
             let to = rest.first().map(Path::new);
             // A default `save` overwrites the very baseline a pending
             // commit-confirm would revert to. Left armed, the timer would then
@@ -253,7 +257,7 @@ pub fn exec_line(session: &mut Session, act: &Apply, ctx: &mut Vec<String>, line
                     );
                 }
             })
-        }
+        })(),
         "discard" => session.discard().map(|()| eprintln!("discarded edits")),
         "exit" | "quit" => {
             // VyOS: inside an edit context, `exit` returns to the top of the
@@ -970,6 +974,9 @@ fn apply_live_as(
     let old_host = system::current_hostname();
 
     // ---- Phase 2: apply, each stage undoable on a later failure ----
+    if act.enabled {
+        crate::mutation::advance()?;
+    }
     let mut rb = Rollback::new();
 
     // Close new HA data links before the old process can detach its hooks.
