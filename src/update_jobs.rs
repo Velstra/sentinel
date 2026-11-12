@@ -127,6 +127,20 @@ impl Phase {
     fn may_have_written(self) -> bool {
         matches!(self, Self::Writing | Self::Publishing)
     }
+    fn permits(self, next: Self) -> bool {
+        // Worker admission/terminal results are separate journal operations.
+        // Engine observations may repeat but never skip prewrite assessment
+        // or erase an acknowledged Writing/Publishing uncertainty boundary.
+        matches!(
+            (self, next),
+            (Self::Metadata, Self::Metadata | Self::Downloading)
+                | (Self::Downloading, Self::Downloading | Self::Verifying)
+                | (Self::Verifying, Self::Verifying | Self::Preflight)
+                | (Self::Preflight, Self::Preflight | Self::Writing)
+                | (Self::Writing, Self::Writing | Self::Publishing)
+                | (Self::Publishing, Self::Publishing)
+        )
+    }
 }
 impl From<install::UpdatePhase> for Phase {
     fn from(value: install::UpdatePhase) -> Self {
@@ -163,6 +177,9 @@ impl Snapshot {
         self.permanent && self.selected_entry == self.next_entry
     }
     fn validate(&self) -> bool {
+        self.validate_with(crate::boot_entry::native_enabled())
+    }
+    fn validate_with(&self, native: bool) -> bool {
         is_boot_id(&self.boot_id)
             && [
                 &self.mutation_epoch,
@@ -176,11 +193,13 @@ impl Snapshot {
             && matches!(self.slot.as_str(), "sentinel-a" | "sentinel-b")
             && !self.release.is_empty()
             && self.release.len() <= 128
-            && valid_entry(&self.selected_entry)
-            && valid_entry(&self.next_entry)
+            && crate::boot_entry::Entry::parse(&self.selected_entry, native).is_some_and(|entry| {
+                entry.matches_running(&self.slot, &self.release)
+                    && self.permanent == entry.permanent_for(&self.slot, &self.release)
+            })
+            && crate::boot_entry::Entry::parse(&self.next_entry, native).is_some()
             && is_boot_id(&self.verity_guid)
             && is_boot_id(&self.store_guid)
-            && self.permanent == (self.selected_entry == format!("{}.efi", self.slot))
     }
 }
 
@@ -259,8 +278,22 @@ impl Registry {
                     && (j.phase != Phase::Checked || j.action == Action::Check)
                     && (j.phase != Phase::Staged || j.action == Action::Stage)
                     && (j.staged.is_some() == (j.phase == Phase::Staged))
+                    && j.staged.as_ref().is_none_or(|staged| {
+                        j.error.is_none()
+                            && j.offer.as_ref().is_some_and(|offer| {
+                                valid_staged(
+                                    staged,
+                                    &j.expected,
+                                    &offer.verified,
+                                    crate::boot_entry::native_enabled(),
+                                )
+                            })
+                    })
+                    && (j.action != Action::Stage || j.offer.is_some())
                     && serde_json::to_vec(j).is_ok_and(|bytes| bytes.len() <= MAX_JOB)
-                    && j.offer.as_ref().is_none_or(valid_offer)
+                    && j.offer
+                        .as_ref()
+                        .is_none_or(|offer| valid_offer(offer) && offer.snapshot == j.expected)
             })
             && self.offer.as_ref().is_none_or(valid_offer)
     }
@@ -303,26 +336,39 @@ fn is_boot_id(value: &str) -> bool {
             }
         })
 }
-fn valid_entry(entry: &str) -> bool {
-    let Some(core) = entry.strip_suffix(".efi") else {
+fn valid_staged(
+    staged: &install::StagedImage,
+    expected: &Snapshot,
+    offer: &update::VerifiedOffer,
+    native: bool,
+) -> bool {
+    // sgdisk's real writer readback uses uppercase hex; native resources and
+    // snapshots use lowercase. Preserve historical journal bytes but compare
+    // partition identities canonically, never as case-sensitive strings.
+    let verity_guid = staged.verity_guid.to_ascii_lowercase();
+    let store_guid = staged.store_guid.to_ascii_lowercase();
+    let Some(entry) = crate::boot_entry::Entry::parse(&staged.boot_entry, native) else {
         return false;
     };
-    let Some(rest) = core
-        .strip_prefix("sentinel-a")
-        .or_else(|| core.strip_prefix("sentinel-b"))
-    else {
-        return false;
+    let initial_entry = match entry.image {
+        crate::boot_entry::Image::Slot(slot) => format!("{slot}+3.efi"),
+        crate::boot_entry::Image::Release(version) => format!("sentinel_{version}+3-0.efi"),
     };
-    if rest.is_empty() {
-        return true;
-    }
-    let Some(tries) = rest.strip_prefix('+') else {
-        return false;
-    };
-    let parts: Vec<_> = tries.split('-').collect();
-    parts.len() <= 2
-        && parts.iter().all(|part| {
-            !part.is_empty() && part.len() <= 10 && part.bytes().all(|c| c.is_ascii_digit())
+    staged.active_slot == expected.slot
+        && matches!(
+            (staged.active_slot.as_str(), staged.staged_slot.as_str()),
+            ("sentinel-a", "sentinel-b") | ("sentinel-b", "sentinel-a")
+        )
+        && entry.matches_running(&staged.staged_slot, &offer.manifest.version)
+        && staged.boot_entry == initial_entry
+        && is_id(&staged.uki_sha256)
+        && is_boot_id(&verity_guid)
+        && is_boot_id(&store_guid)
+        && verity_guid != store_guid
+        && [&verity_guid, &store_guid].into_iter().all(|guid| {
+            guid != "00000000-0000-0000-0000-000000000000"
+                && !guid.eq_ignore_ascii_case(&expected.verity_guid)
+                && !guid.eq_ignore_ascii_case(&expected.store_guid)
         })
 }
 fn random_id() -> JobResult<String> {
@@ -578,6 +624,7 @@ impl Store {
                 .find(|j| j.id == id)
                 .ok_or(Error(Code::NotFound))?;
             if job.phase.terminal()
+                || !job.phase.permits(phase)
                 || job.expected.boot_id != boot_id()?
                 || boot_ms()? > job.deadline_ms
             {
@@ -838,6 +885,22 @@ fn boot_entry(
     version: &str,
     verity: &str,
 ) -> JobResult<(String, String, bool)> {
+    boot_entry_with_policy(
+        bytes,
+        slot,
+        version,
+        verity,
+        crate::boot_entry::native_enabled(),
+    )
+}
+
+fn boot_entry_with_policy(
+    bytes: &[u8],
+    slot: &str,
+    version: &str,
+    verity: &str,
+    native: bool,
+) -> JobResult<(String, String, bool)> {
     let entries: Vec<serde_json::Value> = serde_json::from_slice(bytes).map_err(unavailable)?;
     let selected: Vec<_> = entries.iter().filter(|e| e["isSelected"] == true).collect();
     let defaults: Vec<_> = entries.iter().filter(|e| e["isDefault"] == true).collect();
@@ -854,10 +917,11 @@ fn boot_entry(
         .split_ascii_whitespace()
         .filter_map(|part| part.strip_prefix("usrhash="))
         .collect();
-    if !valid_entry(id)
-        || !id.starts_with(slot)
-        || !valid_entry(next)
+    let entry = crate::boot_entry::Entry::parse(id, native).ok_or(Error(Code::UnstableBoot))?;
+    if !entry.matches_running(slot, version)
+        || crate::boot_entry::Entry::parse(next, native).is_none()
         || row["version"] != version
+        || row["type"] != "type2"
         || row["source"] != "esp"
         || row["root"] != "/boot"
         || row["path"] != format!("/boot/EFI/Linux/{id}")
@@ -867,7 +931,7 @@ fn boot_entry(
     {
         return Err(Error(Code::UnstableBoot));
     }
-    Ok((id.into(), next.into(), id == format!("{slot}.efi")))
+    Ok((id.into(), next.into(), entry.permanent_for(slot, version)))
 }
 
 fn active_guids(slot: &str) -> JobResult<(String, String)> {
@@ -1319,7 +1383,11 @@ pub fn status(config: &Path, apply: bool, write_access: bool) -> JobResult<Statu
                 .map_or_else(|| "0".repeat(64), |r| r.generation.clone()),
         ),
         can_check: write_access && free,
-        can_stage: write_access && free && current.stable() && offer.is_some(),
+        can_stage: write_access
+            && free
+            && current.stable()
+            && offer.is_some()
+            && !crate::boot_entry::native_enabled(),
         current: Some((&current).into()),
         mutation_context: write_access.then_some(current),
         offer: offer.map(Into::into),
@@ -1410,6 +1478,11 @@ fn admit(
 
 pub fn submit(config: &Path, apply: bool, action: Action, request: &Request) -> JobResult<JobView> {
     runtime(config, apply)?;
+    // Read-only native identity support must not enable the Community writer.
+    // The provider transport/journal handoff is qualified separately.
+    if action == Action::Stage && crate::boot_entry::native_enabled() {
+        return Err(Error(Code::StageRefused));
+    }
     let (current, _) = snapshot(config)?;
     admission_guard(config)?;
     let store = Store::production(true)?.ok_or(Error(Code::StateUnavailable))?;
@@ -1534,6 +1607,35 @@ fn finish_worker(
         }
         let code = match result {
             Ok(staged) => {
+                let valid = match (job.action, staged) {
+                    (Action::Check, None) => {
+                        job.phase == Phase::Metadata && last_phase == Phase::Metadata
+                    }
+                    (Action::Stage, Some(staged)) => {
+                        job.phase == Phase::Publishing
+                            && last_phase == Phase::Publishing
+                            && job.offer.as_ref().is_some_and(|offer| {
+                                valid_staged(
+                                    staged,
+                                    &job.expected,
+                                    &offer.verified,
+                                    crate::boot_entry::native_enabled(),
+                                )
+                            })
+                    }
+                    _ => false,
+                };
+                if !valid {
+                    let code = if may_have_written {
+                        Code::WriteOutcomeUnknown
+                    } else {
+                        Code::StateUnavailable
+                    };
+                    job.error = Some(code);
+                    job.staged = None;
+                    job.phase = Phase::Failed;
+                    return Ok(Some(code));
+                }
                 job.staged = staged.clone();
                 job.phase = if job.action == Action::Check {
                     Phase::Checked
@@ -2761,5 +2863,276 @@ mod tests {
             Code::StateUnavailable,
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn update_jobs_native_snapshot_binds_release_and_requires_actual_blessing() {
+        for slot in ["sentinel-a", "sentinel-b"] {
+            let mut snapshot = sample();
+            snapshot.slot = slot.into();
+            snapshot.release = "v1.2.3-lts".into();
+            snapshot.selected_entry = "sentinel_v1.2.3-lts.efi".into();
+            snapshot.next_entry = snapshot.selected_entry.clone();
+            assert!(snapshot.validate_with(true));
+            assert!(snapshot.stable());
+            assert!(!snapshot.validate_with(false));
+            let mut wrong = snapshot.clone();
+            wrong.release = "v1.2.4-lts".into();
+            assert!(!wrong.validate_with(true));
+            for counted in ["+3", "+3-0", "+0-3"] {
+                let mut pending = snapshot.clone();
+                pending.selected_entry = format!("sentinel_v1.2.3-lts{counted}.efi");
+                pending.next_entry = pending.selected_entry.clone();
+                assert!(!pending.validate_with(true)); // A boolean cannot bless a counted file.
+                pending.permanent = false;
+                assert!(pending.validate_with(true));
+                assert!(!pending.stable());
+            }
+            snapshot.next_entry = "sentinel_v1.2.4-lts+3-0.efi".into();
+            assert!(snapshot.validate_with(true));
+            assert!(!snapshot.stable());
+        }
+        let mut wrong_slot = sample();
+        wrong_slot.selected_entry = "sentinel-a.efi".into();
+        assert!(!wrong_slot.validate_with(false));
+    }
+
+    #[test]
+    fn update_jobs_native_bootctl_observation_keeps_source_hash_and_release_checks() {
+        for counted in ["", "+3-0", "+0-3"] {
+            let id = format!("sentinel_v1.2.3-lts{counted}.efi");
+            let mut rows = entries();
+            rows[0]["id"] = id.clone().into();
+            rows[0]["path"] = format!("/boot/EFI/Linux/{id}").into();
+            rows[0]["linux"] = format!("/EFI/Linux/{id}").into();
+            rows[0]["version"] = "v1.2.3-lts".into();
+            let parse = |rows: &[serde_json::Value], version: &str, native| {
+                boot_entry_with_policy(
+                    &serde_json::to_vec(rows).unwrap(),
+                    "sentinel-b",
+                    version,
+                    &sample().verity,
+                    native,
+                )
+            };
+            assert_eq!(
+                parse(&rows, "v1.2.3-lts", true).unwrap(),
+                (id.clone(), id, counted.is_empty())
+            );
+            assert_code(parse(&rows, "v1.2.3-lts", false), Code::UnstableBoot);
+            assert_code(parse(&rows, "v1.2.4-lts", true), Code::UnstableBoot);
+            for (key, value) in [
+                ("source", "xbootldr"),
+                ("type", "type1"),
+                ("root", "/other"),
+                ("path", "/boot/EFI/Linux/sentinel-b.efi"),
+                ("cmdline", "usrhash=wrong"),
+            ] {
+                let mut wrong = rows.clone();
+                wrong[0][key] = value.into();
+                assert_code(parse(&wrong, "v1.2.3-lts", true), Code::UnstableBoot);
+            }
+        }
+    }
+
+    #[test]
+    fn update_jobs_staged_identity_must_be_an_initial_counted_opposite_slot() {
+        let expected = sample();
+        let offer = offer().verified;
+        let original = staged_image();
+        assert!(valid_staged(&original, &expected, &offer, false));
+        let serialized = serde_json::to_value(&original).unwrap();
+        for (field, invalid) in [
+            ("active_slot", "sentinel-a"),
+            ("staged_slot", "sentinel-b"),
+            ("staged_slot", "unknown"),
+            ("boot_entry", "sentinel-a.efi"),
+            ("boot_entry", "sentinel-b+3.efi"),
+            ("boot_entry", "../sentinel-a+3.efi"),
+            ("boot_entry", "sentinel-a+0-3.efi"),
+            ("boot_entry", "sentinel-a+2-1.efi"),
+            ("boot_entry", "sentinel-a+3-0.efi"),
+            ("uki_sha256", "invalid"),
+            ("store_guid", "invalid"),
+            ("verity_guid", "00000000-0000-0000-0000-000000000000"),
+            ("verity_guid", "44444444-4444-4444-4444-444444444444A"),
+            ("store_guid", "44444444-4444-4444-4444-444444444444"),
+            ("store_guid", "22222222-2222-2222-2222-222222222222"),
+            ("verity_guid", "33333333-3333-3333-3333-333333333333"),
+        ] {
+            let mut value = serialized.clone();
+            value[field] = invalid.into();
+            let stage = serde_json::from_value(value).unwrap();
+            assert!(
+                !valid_staged(&stage, &expected, &offer, false),
+                "{field}: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_jobs_native_staged_identity_binds_the_exact_reviewed_release() {
+        let mut offer = offer().verified;
+        offer.manifest.version = "v1.2.3-lts".into();
+        let mut staged = staged_image();
+        staged.boot_entry = "sentinel_v1.2.3-lts+3-0.efi".into();
+        assert!(valid_staged(&staged, &sample(), &offer, true));
+        assert!(!valid_staged(&staged, &sample(), &offer, false));
+        offer.manifest.version = "v1.2.4-lts".into();
+        assert!(!valid_staged(&staged, &sample(), &offer, true));
+        offer.manifest.version = "v1.2.3-lts".into();
+        for entry in [
+            "sentinel_v1.2.3-lts.efi",
+            "sentinel_v1.2.3-lts+3.efi",
+            "sentinel_v1.2.3-lts+0-3.efi",
+            "sentinel_v1.2.3-lts+2-1.efi",
+        ] {
+            staged.boot_entry = entry.into();
+            assert!(!valid_staged(&staged, &sample(), &offer, true), "{entry}");
+        }
+    }
+
+    #[test]
+    fn update_jobs_sgdisk_and_native_uuid_case_are_the_same_partition_identity() {
+        let mut stage = staged_image();
+        stage.verity_guid = "abcdef01-abcd-abcd-abcd-abcdef012345".into();
+        stage.store_guid = "fedcba01-abcd-abcd-abcd-abcdef012345".into();
+        assert!(valid_staged(&stage, &sample(), &offer().verified, false));
+        stage.verity_guid.make_ascii_uppercase();
+        stage.store_guid.make_ascii_uppercase();
+        assert!(valid_staged(&stage, &sample(), &offer().verified, false));
+        let mut expected = sample();
+        expected.store_guid = stage.verity_guid.to_ascii_lowercase();
+        assert!(!valid_staged(&stage, &expected, &offer().verified, false));
+        stage.store_guid = stage.verity_guid.to_ascii_lowercase();
+        assert!(!valid_staged(&stage, &sample(), &offer().verified, false));
+    }
+
+    #[test]
+    fn update_jobs_journal_refuses_corrupt_staged_results_without_rewriting_evidence() {
+        let (scratch, store) = fixture();
+        let id = running_stage(&store, Phase::Publishing);
+        finish_worker(&store, &id, Phase::Publishing, &Ok(Some(staged_image()))).unwrap();
+        let path = scratch.join("jobs/state.json");
+        let original: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for (field, invalid) in [
+            ("active_slot", "sentinel-a"),
+            ("boot_entry", "sentinel-a.efi"),
+            ("uki_sha256", "not-a-hash"),
+            ("store_guid", "not-a-guid"),
+        ] {
+            let mut value = original.clone();
+            value["jobs"][0]["staged"][field] = invalid.into();
+            let corrupt = serde_json::to_vec(&value).unwrap();
+            std::fs::write(&path, &corrupt).unwrap();
+            assert_code(store.read(), Code::StateUnavailable);
+            assert_eq!(std::fs::read(&path).unwrap(), corrupt);
+        }
+        for edit in ["missing-offer", "different-snapshot", "success-with-error"] {
+            let mut value = original.clone();
+            match edit {
+                "missing-offer" => value["jobs"][0]["offer"] = serde_json::Value::Null,
+                "different-snapshot" => {
+                    value["jobs"][0]["offer"]["snapshot"]["mutation_epoch"] = "1".repeat(64).into()
+                }
+                "success-with-error" => value["jobs"][0]["error"] = "write-outcome-unknown".into(),
+                _ => unreachable!(),
+            }
+            let corrupt = serde_json::to_vec(&value).unwrap();
+            std::fs::write(&path, &corrupt).unwrap();
+            assert_code(store.read(), Code::StateUnavailable);
+            assert_eq!(std::fs::read(&path).unwrap(), corrupt);
+        }
+    }
+
+    #[test]
+    fn update_jobs_success_requires_the_typed_result_and_both_publication_observations() {
+        for phase in [Phase::Metadata, Phase::Writing, Phase::Publishing] {
+            for result in [
+                None,
+                Some(install::StagedImage {
+                    boot_entry: "sentinel-a.efi".into(),
+                    ..staged_image()
+                }),
+            ] {
+                let (_scratch, store) = fixture();
+                let id = running_stage(&store, phase);
+                let expected = if phase.may_have_written() {
+                    Code::WriteOutcomeUnknown
+                } else {
+                    Code::StateUnavailable
+                };
+                assert_code(finish_worker(&store, &id, phase, &Ok(result)), expected);
+                let registry = store.read().unwrap().unwrap();
+                assert_eq!(registry.jobs[0].phase, Phase::Failed);
+                assert_eq!(registry.jobs[0].error, Some(expected));
+                assert!(registry.jobs[0].staged.is_none());
+            }
+        }
+        for (durable, local) in [
+            (Phase::Writing, Phase::Publishing),
+            (Phase::Publishing, Phase::Writing),
+        ] {
+            let (_scratch, store) = fixture();
+            let id = running_stage(&store, durable);
+            assert_code(
+                finish_worker(&store, &id, local, &Ok(Some(staged_image()))),
+                Code::WriteOutcomeUnknown,
+            );
+            assert_eq!(store.read().unwrap().unwrap().jobs[0].phase, Phase::Failed);
+        }
+    }
+
+    #[test]
+    fn update_jobs_engine_phase_matrix_cannot_skip_or_erase_the_write_boundary() {
+        let engine = [
+            Phase::Metadata,
+            Phase::Downloading,
+            Phase::Verifying,
+            Phase::Preflight,
+            Phase::Writing,
+            Phase::Publishing,
+        ];
+        let other = [
+            Phase::Accepted,
+            Phase::Checked,
+            Phase::Staged,
+            Phase::Failed,
+            Phase::Interrupted,
+        ];
+        for (from_index, from) in engine.iter().enumerate() {
+            for (to_index, to) in engine.iter().enumerate() {
+                assert_eq!(
+                    from.permits(*to),
+                    to_index == from_index || to_index == from_index + 1,
+                    "{from:?} -> {to:?}"
+                );
+            }
+            for state in other {
+                assert!(!from.permits(state));
+                assert!(!state.permits(*from));
+            }
+        }
+    }
+
+    #[test]
+    fn update_jobs_check_cannot_publish_an_image_result_as_a_metadata_success() {
+        let (_scratch, store) = fixture();
+        let id = store
+            .change(|r| {
+                let req = request(r);
+                let (job, _) = admit(r, Action::Check, &req, &sample(), 1000)?;
+                r.jobs.last_mut().unwrap().phase = Phase::Metadata;
+                Ok(job.id)
+            })
+            .unwrap();
+        assert_code(
+            finish_worker(&store, &id, Phase::Metadata, &Ok(Some(staged_image()))),
+            Code::StateUnavailable,
+        );
+        let registry = store.read().unwrap().unwrap();
+        assert_eq!(registry.jobs[0].phase, Phase::Failed);
+        assert!(registry.jobs[0].staged.is_none());
     }
 }
