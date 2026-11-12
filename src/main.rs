@@ -234,6 +234,9 @@ enum Command {
     /// Retry the durable HA configuration outbox (systemd worker).
     #[command(hide = true)]
     SyncConfig,
+    /// Refresh time-, DNS- and feed-dependent firewall state from live intent.
+    #[command(hide = true)]
+    RefreshFirewall,
     /// Enter an interactive configuration session (set/show/delete/commit/save).
     Configure {
         /// The appliance config to edit (loaded if it exists). `commit` writes
@@ -719,6 +722,7 @@ async fn main() -> Result<()> {
         } => ha::watch(&config),
         Command::Configure { config, no_apply } => configure(&config, no_apply),
         Command::SyncConfig => configsync::flush(),
+        Command::RefreshFirewall => refresh_firewall(),
         Command::Show { args } => show_op(&args),
         Command::Trace {
             in_interface,
@@ -1132,6 +1136,37 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The periodic service must re-render what was actually committed, not undo
+/// a live-only CLI edit by replaying the older saved boot configuration.
+fn refresh_firewall() -> Result<()> {
+    let _lock = system::apply_lock()?;
+    let source = firewall_refresh_source(
+        std::path::Path::new(DEFAULT_CONFIG),
+        std::path::Path::new(session::Session::RUNNING),
+    )?;
+    // `apply` takes the same reentrant lock, so source selection, compile and
+    // reload cannot race a normal CLI/API apply or running-snapshot publisher.
+    apply(
+        source,
+        std::path::Path::new(repl::DEFAULT_VELSTRA_OUT),
+        Some(repl::DEFAULT_UNIT),
+    )
+}
+
+fn firewall_refresh_source<'a>(
+    saved: &'a std::path::Path,
+    running: &'a std::path::Path,
+) -> Result<&'a std::path::Path> {
+    match running.symlink_metadata() {
+        Ok(metadata) if metadata.is_file() => Ok(running),
+        Ok(_) => anyhow::bail!("running firewall intent is not a regular file"),
+        // Absence before the first live commit is legitimate. Invalid,
+        // inaccessible or unparseable running intent is NEVER saved fallback.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(saved),
+        Err(error) => Err(error).context("inspecting running firewall intent"),
+    }
 }
 
 /// Compile the appliance config, atomically install the Velstra agent config at
@@ -3914,6 +3949,68 @@ mod tests {
             named.as_path()
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn firewall_refresh_prefers_live_intent_and_only_absence_uses_the_saved_file() {
+        let scratch = crate::update::Scratch::new().unwrap();
+        let saved = scratch.join("saved.toml");
+        let running = scratch.join("running.toml");
+        std::fs::write(&saved, "[system]\nhostname='saved'\n").unwrap();
+        assert_eq!(
+            super::firewall_refresh_source(&saved, &running).unwrap(),
+            saved
+        );
+        std::fs::write(&running, "[system]\nhostname='live'\n").unwrap();
+        assert_eq!(
+            super::firewall_refresh_source(&saved, &running).unwrap(),
+            running
+        );
+        // Selection never reinterprets an invalid live document as permission
+        // to load an older policy; the strict loader must report its error.
+        std::fs::write(&running, "invalid = [").unwrap();
+        let selected = super::firewall_refresh_source(&saved, &running).unwrap();
+        assert_eq!(selected, running);
+        assert!(super::Appliance::load(selected).is_err());
+    }
+
+    #[test]
+    fn firewall_refresh_refuses_symlinks_fifos_directories_and_inspection_errors() {
+        use std::os::unix::fs::symlink;
+        let scratch = crate::update::Scratch::new().unwrap();
+        let saved = scratch.join("saved.toml");
+        let running = scratch.join("running.toml");
+        std::fs::write(&saved, "[system]\nhostname='saved'\n").unwrap();
+        symlink(&saved, &running).unwrap();
+        assert!(super::firewall_refresh_source(&saved, &running).is_err());
+        std::fs::remove_file(&running).unwrap();
+        symlink(scratch.join("absent"), &running).unwrap();
+        assert!(super::firewall_refresh_source(&saved, &running).is_err());
+        std::fs::remove_file(&running).unwrap();
+        std::fs::create_dir(&running).unwrap();
+        assert!(super::firewall_refresh_source(&saved, &running).is_err());
+        std::fs::remove_dir(&running).unwrap();
+        let name = std::ffi::CString::new(running.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(super::firewall_refresh_source(&saved, &running).is_err());
+        // ENOTDIR is not absence and must never quietly choose saved policy.
+        assert!(super::firewall_refresh_source(&saved, &saved.join("running")).is_err());
+    }
+
+    #[test]
+    fn internal_firewall_refresh_cli_is_hidden_and_accepts_no_override_arguments() {
+        use clap::{CommandFactory, Parser};
+        let parsed = super::Cli::try_parse_from(["sentinel", "refresh-firewall"]).unwrap();
+        assert!(matches!(parsed.command, super::Command::RefreshFirewall));
+        assert!(
+            !super::Cli::command()
+                .render_help()
+                .to_string()
+                .contains("refresh-firewall")
+        );
+        for extra in ["/tmp/other.toml", "--config", "--out", "--no-apply"] {
+            assert!(super::Cli::try_parse_from(["sentinel", "refresh-firewall", extra]).is_err());
+        }
     }
 
     #[test]
