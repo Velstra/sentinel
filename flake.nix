@@ -1648,6 +1648,10 @@
       #   nix build .#checks.x86_64-linux.commit -L
       checks.${system} = {
         ota-stage = import ./nix/ota-stage-test.nix { inherit pkgs self; };
+        ota-publication-failure = import ./nix/ota-stage-test.nix {
+          inherit pkgs self;
+          publicationFailure = true;
+        };
         ota-mutation = import ./nix/ota-mutation-test.nix { inherit pkgs self; };
         ota-confirmation = import ./nix/ota-confirmation-test.nix { inherit pkgs self; };
         ota-journal = import ./nix/ota-journal-test.nix { inherit pkgs self; };
