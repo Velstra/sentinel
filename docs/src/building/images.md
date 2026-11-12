@@ -16,10 +16,9 @@ nix eval --raw .#nixosConfigurations.sentinel-image.config.image.filePath
 # -> velstra-sentinel.raw  (a GPT raw image you can dd/flash)
 ```
 
-> **`fabric` must be present and committed first.** The image embeds the
-> `velstra` agent built from the Fabric checkout — see
-> [Prerequisites](prerequisites.md). Building the image with no `fabric` at the
-> pinned path will fail at evaluation.
+The image embeds the agent from the public Fabric revision pinned in
+`flake.lock`. A local sibling checkout is not required; see
+[prerequisites](prerequisites.md).
 
 ## What you get
 
