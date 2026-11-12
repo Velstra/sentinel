@@ -1500,6 +1500,7 @@ pub fn update(image: &std::path::Path, commit: bool) -> Result<()> {
 /// The slot an update writes: the running disk, its active slot, and the
 /// inactive one that receives the image. Root only.
 fn update_target() -> Result<(String, &'static Slot, &'static Slot)> {
+    require_community_writer(crate::boot_entry::native_enabled())?;
     if unsafe { libc::geteuid() } != 0 {
         bail!("update must run as root (try `sudo sentinel update …`)");
     }
@@ -1796,6 +1797,10 @@ fn signed_update_observed(
     expected: Option<&update::VerifiedOffer>,
     hooks: UpdateHooks<'_>,
 ) -> Result<Option<StagedImage>> {
+    // Native boot observation support is not permission to fall through to a
+    // RAW writer: that writer cannot preserve versioned UKIs as fallback.
+    // The native transport must be registered before this path can dispatch it.
+    require_community_writer(crate::boot_entry::native_enabled())?;
     // Lock before fetching to bound aggregate staging and serialize local,
     // remote and unsigned update writers without locking config commits.
     let _update = crate::update_stage::UpdateLock::acquire()?;
@@ -1834,6 +1839,14 @@ fn signed_update_observed(
         },
         hooks,
     )
+}
+
+fn require_community_writer(native: bool) -> Result<()> {
+    ensure!(
+        !native,
+        "native Enterprise images require the verified sysupdate provider; the Community RAW writer is not permitted"
+    );
+    Ok(())
 }
 
 /// The mountpoint of a block device, if it's currently mounted.
@@ -2206,6 +2219,15 @@ mod tests {
             let altered = serde_json::from_value(altered).unwrap();
             assert!(super::require_reviewed_offer(&altered, &offer).is_err());
         }
+    }
+    #[test]
+    fn native_boot_identity_support_never_authorizes_the_community_raw_writer() {
+        super::require_community_writer(false).unwrap();
+        let error = super::require_community_writer(true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("sysupdate provider"));
+        assert!(error.contains("RAW writer is not permitted"));
     }
     fn install_signatures(rows: serde_json::Value) -> anyhow::Result<super::InstallSignatures> {
         super::InstallSignatures::parse(&serde_json::to_vec(
