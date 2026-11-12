@@ -18,23 +18,28 @@
     };
     # The Velstra Fabric source (the data-plane agent lives here). Source only —
     # we build it with our own toolchain, so it needs no flake of its own.
-    # Reviewed signed public basis; update this URL and the lock together.
-    # Local safety fixes are explicit, strictly checked build-time backports.
+    # Reviewed public integrations; update these URLs and the lock together.
+    # The former appliance backports are now included upstream.
     fabric = {
+      url = "github:Velstra/fabric/913b9ae274e7624b471e52b8a5f4cf677688c32c";
+      flake = false;
+    };
+    # Test-only deployed allocator. Never advance this with the production pin:
+    # mixed-version HA must keep exercising a genuinely older dataplane.
+    fabric-legacy-napt = {
       url = "github:Velstra/fabric/f72cf32c001293ee1a1d9873f4e145cdc1a7287d";
       flake = false;
     };
     # The Wren routing daemon (BGP/OSPF/IS-IS/RIP/Babel/VRRP control plane).
     # Source only — stable Rust, built with nixpkgs' rustc (no flake of its own).
-    # Reviewed signed public basis, with the exact routing-safety backport below.
     wren = {
-      url = "github:Velstra/wren/547bd1b43d32dbdd9b4078ba35a4d99615eb7e85";
+      url = "github:Velstra/wren/53be10eca77aac36a88f9a53d6c08051d3050acd";
       flake = false;
     };
   };
 
   outputs =
-    { self, nixpkgs, fenix, fabric, wren }:
+    { self, nixpkgs, fenix, fabric, fabric-legacy-napt, wren }:
     let
       system = "x86_64-linux";
 
@@ -242,15 +247,6 @@
         version = "0.1.0";
         src = wren;
         cargoLock.lockFile = "${wren}/Cargo.lock";
-        # Backport OSQA-026/166/167 to the locked upstream too, rather than
-        # testing only an unpublished local Wren override. An HA/source override
-        # that already has these exact changes is accepted only after a complete
-        # reverse dry-run; a partial/different backport fails the build closed.
-        # Remove this backport after the input pin contains the upstream fixes.
-        prePatch = ''
-          ${pkgs.bash}/bin/bash ${./nix/apply-source-patches.sh} \
-            ${pkgs.patch}/bin/patch ${./nix/patches/wren-routing-safety.patch}
-        '';
         cargoBuildFlags = [
           "-p"
           "wren-daemon"
@@ -332,24 +328,12 @@
       # so this derivation is allowed network (that's what a FOD grants) and is
       # pinned by its output hash, keeping the result reproducible. First build
       # reports the real hash; replace fakeHash below with it.
-      fabricSafetyPatches = ''
-        ${pkgs.bash}/bin/bash ${./nix/apply-source-patches.sh} \
-          ${pkgs.patch}/bin/patch \
-          ${./nix/patches/fabric-reply-tos.patch} \
-          ${./nix/patches/fabric-napt.patch} \
-          ${./nix/patches/fabric-conntrack-reply.patch} \
-          ${./nix/patches/fabric-ha-napt-port.patch} \
-          ${./nix/patches/fabric-dhcp-client.patch} \
-          ${./nix/patches/fabric-failclosed.patch}
-      '';
       ebpfHash = "sha256-ZaTzCatwITEGJNS4INPaXyogZSVFNk/dBzHruAHtFgg=";
       velstra-ebpf = pkgs.stdenv.mkDerivation {
         pname = "velstra-ebpf";
         version = "0.1.0";
         src = fabric;
         nativeBuildInputs = [ nightly pkgs.bpf-linker pkgs.python3 pkgs.llvm ];
-
-        prePatch = fabricSafetyPatches;
 
         outputHashMode = "flat";
         outputHashAlgo = "sha256";
@@ -402,7 +386,6 @@
         PROTOC = "${pkgs.protobuf}/bin/protoc";
         # Replace the agent's build.rs with the shim that copies the pre-built
         # eBPF object — so this build is fully offline (no build-std here).
-        prePatch = fabricSafetyPatches;
         postPatch = ''
           cp ${./nix/velstra-build-shim.rs} velstra-app/build.rs
         '';
@@ -431,13 +414,17 @@
       # The exact public pre-backport dataplane used by deployed QA7 images.
       # Test-only: exercise real mixed-allocator HA, not a synthetic map writer
       # or a runtime hotpatch. Its independently measured old BPF hash remains
-      # fixed while the default dataplane receives the current safety patches.
+      # fixed while the production source pin advances independently.
       legacy-napt-ebpf = velstra-ebpf.overrideAttrs (_: {
-        prePatch = "";
+        src = fabric-legacy-napt;
         outputHash = "sha256-dpvGqzkkpxS8BlGtEHsgstx/zmWDX9HRk/MFLe33dFE=";
       });
       legacy-napt-velstra = velstra.overrideAttrs (_: {
-        prePatch = "";
+        src = fabric-legacy-napt;
+        cargoDeps = pkgs.rustPlatform.importCargoLock {
+          lockFile = "${fabric-legacy-napt}/Cargo.lock";
+          outputHashes = ayaOutputHashes;
+        };
         VELSTRA_EBPF_OBJ = legacy-napt-ebpf;
       });
 
@@ -1678,7 +1665,6 @@
           pname = "fabric-common-regressions";
           version = "0.4.1";
           src = fabric;
-          prePatch = fabricSafetyPatches;
           cargoLock = { lockFile = "${fabric}/Cargo.lock"; outputHashes = ayaOutputHashes; };
           cargoBuildFlags = [ "-p" "velstra-common" ];
           cargoTestFlags = [ "-p" "velstra-common" "--lib" ];
@@ -1697,6 +1683,17 @@
           python3 ${./nix/test_source_patches.py}
           touch "$out"
         '';
+        source-cohort =
+          assert toString velstra.src == toString fabric;
+          assert toString velstra-ebpf.src == toString fabric;
+          assert toString wrenPkg.src == toString wren;
+          assert toString legacy-napt-velstra.src == toString fabric-legacy-napt;
+          assert toString legacy-napt-ebpf.src == toString fabric-legacy-napt;
+          assert fabric.rev != fabric-legacy-napt.rev;
+          pkgs.runCommand "sentinel-source-cohort" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+            python3 ${./scripts/check_source_pins.py} ${./.}
+            touch "$out"
+          '';
         state-growth = import ./nix/state-growth-test.nix { inherit pkgs self; };
         state-growth-install = import ./nix/state-growth-test.nix { inherit pkgs self; withInstallTarget = true; };
         install-boot = import ./nix/install-boot-test.nix { inherit pkgs self; };
