@@ -1,5 +1,22 @@
 # Routing and dataplane safety backports
 
+## Upstream migration — 2026-11-12
+
+The production flake now pins Fabric `913b9ae274e7624b471e52b8a5f4cf677688c32c`
+and Wren `53be10eca77aac36a88f9a53d6c08051d3050acd`, which contain the fixes
+below. Production packages no longer apply these backports. The patch files
+remain historical comparison inputs during the coordinated Enterprise adapter
+migration, not additional runtime code or instructions to patch customer nodes.
+The generic source-patch direction regressions remain separately executable.
+
+The explicitly test-only `fabric-legacy-napt` input stays at the deployed
+`f72cf32c001293ee1a1d9873f4e145cdc1a7287d` source. Both its agent and BPF object
+use that input, independently of the production pin. `checks.source-cohort`
+checks the actual package sources, and host regressions reject URL/lock drift,
+foreign/mutable revisions and accidentally testing the current allocator twice.
+This source migration does not certify a production image or qualify Enterprise
+native OTA. The historical observations below retain their original boundaries.
+
 ## Fabric synthesized-reply TOS (OSQA-169)
 
 `fabric-reply-tos.patch` clears DSCP/ECN in synthesized TCP reject and SYN-proxy
