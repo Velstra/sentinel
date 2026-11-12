@@ -9,6 +9,7 @@
 - [Building the installer ISO](building/iso.md)
 - [Building the CLI & agent](building/cli.md)
 - [Reproducibility & pinned hashes](building/reproducibility.md)
+- [Software bill of materials](building/sbom.md)
 
 # Architecture
 

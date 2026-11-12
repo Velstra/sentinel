@@ -27,6 +27,7 @@ mod feed;
 mod fleet;
 mod grammar_walk;
 mod ha;
+mod health;
 mod held_links;
 mod identity;
 mod ids;
@@ -34,9 +35,11 @@ mod image;
 mod install;
 mod installer_tui;
 mod ipsec;
+mod ipsec_guards;
 mod lockout;
 mod lookup;
 mod metrics;
+mod mutation;
 mod net;
 mod network_reconcile;
 mod openapi;
@@ -60,6 +63,10 @@ mod trace;
 mod ui;
 mod unlock;
 mod update;
+mod update_jobs;
+mod update_key;
+mod update_observer;
+mod update_stage;
 mod velstra;
 mod verified_image;
 mod webui;
@@ -169,6 +176,10 @@ enum HaCommand {
         /// Independent witness IP:port; otherwise use system.ha.witness.
         #[arg(long)]
         witness: Option<String>,
+        /// Witness (default) or witnessless two-node mode. A total partition
+        /// can promote both members in two-node mode; independent paths help.
+        #[arg(long, value_enum)]
+        mode: Option<config::HaMode>,
         /// Explicit peer facts for newly declared interfaces (JSON HaIdentity).
         #[arg(long)]
         peer_identity: Option<PathBuf>,
@@ -226,6 +237,9 @@ enum Command {
     /// Retry the durable HA configuration outbox (systemd worker).
     #[command(hide = true)]
     SyncConfig,
+    /// Refresh time-, DNS- and feed-dependent firewall state from live intent.
+    #[command(hide = true)]
+    RefreshFirewall,
     /// Enter an interactive configuration session (set/show/delete/commit/save).
     Configure {
         /// The appliance config to edit (loaded if it exists). `commit` writes
@@ -374,6 +388,27 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Protect persisted revision credentials before management/login starts.
+    #[command(hide = true)]
+    ProtectArchives {
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+        #[arg(long)]
+        create: bool,
+    },
+    /// Internal root-only presence/absence proof for a protected state path.
+    #[command(hide = true)]
+    OwnedFileProbe { path: PathBuf },
+    /// Internal root-only bounded regular-file read; returns an optional JSON string.
+    #[command(hide = true)]
+    OwnedFileRead {
+        path: PathBuf,
+        #[arg(long)]
+        max_bytes: usize,
+    },
+    /// Internal root-only independent update worker; no caller-provided paths.
+    #[command(hide = true)]
+    UpdateJob { id: String },
     /// Ask the data plane agent's query socket and print the reply.
     ///
     /// Internal: `show` re-invokes this under sudo when the socket is not
@@ -663,6 +698,7 @@ async fn main() -> Result<()> {
                     secret_stdin,
                     config,
                     witness,
+                    mode,
                     peer_identity,
                 },
         } => {
@@ -673,6 +709,7 @@ async fn main() -> Result<()> {
                 &config,
                 witness.as_deref(),
                 peer_identity.as_deref(),
+                mode,
             )
         }
         Command::Ha {
@@ -696,8 +733,10 @@ async fn main() -> Result<()> {
         Command::Ha {
             command: HaCommand::Watch { config },
         } => ha::watch(&config),
+        Command::UpdateJob { id } => update_jobs::run_worker(&id).map_err(Into::into),
         Command::Configure { config, no_apply } => configure(&config, no_apply),
         Command::SyncConfig => configsync::flush(),
+        Command::RefreshFirewall => refresh_firewall(),
         Command::Show { args } => show_op(&args),
         Command::Trace {
             in_interface,
@@ -799,13 +838,31 @@ async fn main() -> Result<()> {
             wren_out,
         } => apply_boot(&config, &out, &wren_out),
         Command::ApplyBootLate { config } => apply_boot_late(config.as_deref()),
+        Command::ProtectArchives { config, create } => archive::protect_archives(&config, create),
+        Command::OwnedFileProbe { path } => {
+            print!("{}", system::owned_file_probe(&path)?);
+            Ok(())
+        }
+        Command::OwnedFileRead { path, max_bytes } => {
+            print!("{}", system::owned_file_read(&path, max_bytes)?);
+            Ok(())
+        }
         Command::AgentQuery { command, socket } => {
             let path = socket.unwrap_or_else(|| PathBuf::from(velstra::SOCKET));
             print!("{}", velstra::query_at(&path, &command)?);
             Ok(())
         }
-        Command::ApplyConsole { config } => net::apply_console_settings(&Appliance::load(&config)?),
-        Command::Apply { file, out, reload } => apply(&file, &out, reload.as_deref()),
+        Command::ApplyConsole { config } => {
+            let _lock = system::apply_lock()?;
+            let appliance = Appliance::load(&config)?;
+            mutation::advance()?;
+            net::apply_console_settings(&appliance)
+        }
+        Command::Apply { file, out, reload } => {
+            let _lock = system::apply_lock()?;
+            mutation::advance()?;
+            apply(&file, &out, reload.as_deref())
+        }
         Command::ApplyPending { config, id } => {
             safe_apply::apply_pending(&config, &id, &live_apply(true))
         }
@@ -1108,6 +1165,37 @@ fn configure(config: &std::path::Path, no_apply: bool) -> Result<()> {
     Ok(())
 }
 
+/// The periodic service must re-render what was actually committed, not undo
+/// a live-only CLI edit by replaying the older saved boot configuration.
+fn refresh_firewall() -> Result<()> {
+    let _lock = system::apply_lock()?;
+    let source = firewall_refresh_source(
+        std::path::Path::new(DEFAULT_CONFIG),
+        std::path::Path::new(session::Session::RUNNING),
+    )?;
+    // `apply` takes the same reentrant lock, so source selection, compile and
+    // reload cannot race a normal CLI/API apply or running-snapshot publisher.
+    apply(
+        source,
+        std::path::Path::new(repl::DEFAULT_VELSTRA_OUT),
+        Some(repl::DEFAULT_UNIT),
+    )
+}
+
+fn firewall_refresh_source<'a>(
+    saved: &'a std::path::Path,
+    running: &'a std::path::Path,
+) -> Result<&'a std::path::Path> {
+    match running.symlink_metadata() {
+        Ok(metadata) if metadata.is_file() => Ok(running),
+        Ok(_) => anyhow::bail!("running firewall intent is not a regular file"),
+        // Absence before the first live commit is legitimate. Invalid,
+        // inaccessible or unparseable running intent is NEVER saved fallback.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(saved),
+        Err(error) => Err(error).context("inspecting running firewall intent"),
+    }
+}
+
 /// Compile the appliance config, atomically install the Velstra agent config at
 /// `out`, and (if given) reload the systemd `unit` running the data plane.
 fn apply(file: &std::path::Path, out: &std::path::Path, reload: Option<&str>) -> Result<()> {
@@ -1156,6 +1244,8 @@ fn apply_boot(
     // stages through the same fixed temp names, so an interleaved writer could
     // corrupt a networkd unit or velstra.toml. Best-effort, held for the stage.
     let _lock = system::apply_lock()?;
+    mutation::initialize_boot()?;
+    mutation::advance()?;
     safe_apply::recover(config, &repl::Apply::off(), true, true)?;
     // load_lenient, not load: this is the boot-time apply of the saved config,
     // and the one place an unknown key must not keep the box from coming up. A
@@ -1217,6 +1307,7 @@ fn apply_boot_late(config: Option<&std::path::Path>) -> Result<()> {
         std::path::Path::new(session::Session::RUNNING),
     );
     let appliance = Appliance::load_lenient(source)?;
+    mutation::advance()?;
     net::apply_link_runtime(&appliance)
 }
 
@@ -1280,20 +1371,28 @@ fn update_cmd(target: Option<&str>, flags: UpdateFlags) -> Result<()> {
                     // A signed release older than this one is not an update. It
                     // is reported, not hidden: a channel that serves it may be a
                     // stale mirror or somebody replaying an old manifest.
-                    let older = update::refuse_downgrade(&manifest.version, false).is_err();
+                    let running = match update::running_version() {
+                        Ok(version) => version,
+                        Err(error) => {
+                            update::record_status(&chan, &format!("refused: {error:#}"));
+                            return Err(error);
+                        }
+                    };
+                    let older =
+                        update::refuse_downgrade_against(&manifest.version, &running, false)
+                            .is_err();
                     let (outcome, verb) = if older {
                         (
                             format!(
                                 "release {} offered, older than the running {}",
-                                manifest.version,
-                                update::RUNNING_VERSION
+                                manifest.version, running
                             ),
-                            "NOT an update (older than the running release)",
+                            format!("NOT an update (older than the running release {running})"),
                         )
                     } else {
                         (
                             format!("release {} available", manifest.version),
-                            "update available",
+                            "update available".to_string(),
                         )
                     };
                     update::record_status(&chan, &outcome);
@@ -1382,7 +1481,7 @@ fn update_local(path: &str, flags: &UpdateFlags) -> Result<()> {
             "note: this proof states no release version, so it cannot be checked against \
              the running {} — use the release's signed manifest (--signature \
              …/manifest.json.sig) for downgrade protection",
-            update::RUNNING_VERSION
+            update::running_version().unwrap_or_else(|_| "unidentified image release".to_string())
         ),
     }
     install::update_verified(&proof.source, &proof.sha256, flags.commit)
@@ -1678,32 +1777,44 @@ fn ask_yes(msg: &str, default_yes: bool) -> Result<bool> {
     })
 }
 
-/// The first settings the wizard collects, as `set …` lines.
-///
-/// Built as CLI lines and replayed through the real command parser rather than
-/// assembled into a document here. That is the whole reason this is safe to add:
-/// every value the wizard collects is judged by the same grammar and the same
-/// `validate()` an operator's own `configure` session goes through, so the
-/// wizard cannot invent a configuration the appliance would refuse — and it
-/// cannot drift from the CLI as either one changes.
-///
-/// Both front ends — the full-screen installer and the line-by-line one — end
-/// here, so the two cannot produce different configurations from the same
-/// answers.
+/// Preserve a collected value as exactly one word in the real CLI lexer.
+fn wizard_word(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|c| !c.is_whitespace() && !matches!(c, '"' | '\\' | '#'))
+    {
+        value.to_string()
+    } else {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+}
+
+fn wizard_review_line(line: &str) -> String {
+    match line.split_once(" password ") {
+        Some((head, _)) => format!("{head} password ********"),
+        None => line.to_string(),
+    }
+}
+
+/// The settings collected by both installer front ends, replayed through the
+/// real CLI grammar and configuration validation rather than a second schema.
 fn wizard_lines_from(a: &installer_tui::Answers) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    out.push(format!("set system keyboard {}", a.keyboard));
-    out.push(format!("set system locale {}", a.locale));
-    out.push(format!("set system timezone {}", a.timezone));
-    out.push(format!("set system hostname {}", a.hostname));
+    out.push(format!("set system keyboard {}", wizard_word(&a.keyboard)));
+    out.push(format!("set system locale {}", wizard_word(&a.locale)));
+    out.push(format!("set system timezone {}", wizard_word(&a.timezone)));
+    out.push(format!("set system hostname {}", wizard_word(&a.hostname)));
     out.push(format!(
         "set system login {} password {}",
-        a.username, a.password
+        wizard_word(&a.username),
+        wizard_word(&a.password)
     ));
     if !a.ssh_key.is_empty() {
         out.push(format!(
-            "set system login {} public-key {}",
-            a.username, a.ssh_key
+            "set system login {} ssh-key {}",
+            wizard_word(&a.username),
+            wizard_word(&a.ssh_key)
         ));
     }
     // Without a permission group the account can log in and can do nothing in
@@ -1711,7 +1822,10 @@ fn wizard_lines_from(a: &installer_tui::Answers) -> Vec<String> {
     // creates the box's only account; leaving it unable to manage the box is not
     // a decision anyone made on purpose.
     out.push("set system group operators permission read-write".into());
-    out.push(format!("set system login {} group operators", a.username));
+    out.push(format!(
+        "set system login {} group operators",
+        wizard_word(&a.username)
+    ));
     out.push("set services ssh port 22".into());
     // The appliance is key-only by design, which is right — but the wizard asks
     // for a password and only *offers* a key. An operator who has no key to
@@ -1727,15 +1841,20 @@ fn wizard_lines_from(a: &installer_tui::Answers) -> Vec<String> {
     // interface at all and the box is set up from the console.
     let configured: Vec<&installer_tui::NicPlan> = a.nics.iter().filter(|n| n.configure).collect();
     for nic in &configured {
-        out.push(format!("set interface {} zone {}", nic.name, nic.zone));
+        out.push(format!(
+            "set interface {} zone {}",
+            wizard_word(&nic.name),
+            wizard_word(&nic.zone)
+        ));
         out.push(format!(
             "set interface {} address {}",
-            nic.name, nic.address
+            wizard_word(&nic.name),
+            wizard_word(&nic.address)
         ));
         if nic.address != "dhcp" && !nic.gateway.is_empty() {
             out.push(format!(
                 "set protocols static 0.0.0.0/0 via {}",
-                nic.gateway
+                wizard_word(&nic.gateway)
             ));
         }
     }
@@ -1752,6 +1871,8 @@ fn wizard_lines_from(a: &installer_tui::Answers) -> Vec<String> {
         zones.dedup();
         for zone in zones {
             let rule = format!("install-ssh-{zone}");
+            let rule = wizard_word(&rule);
+            let zone = wizard_word(zone);
             out.push(format!("set firewall rule {rule} from {zone}"));
             out.push(format!("set firewall rule {rule} proto tcp"));
             out.push(format!("set firewall rule {rule} port 22"));
@@ -1914,24 +2035,27 @@ fn collect_text(
 
 /// Turn the collected lines into a validated appliance document.
 fn wizard_config(lines: &[String]) -> Result<String> {
-    let dir = std::env::temp_dir().join(format!("sentinel-wizard-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).context("creating the wizard scratch directory")?;
-    let path = dir.join("appliance.toml");
-    let _ = std::fs::remove_file(&path);
-    let mut session = session::Session::load(&path)?;
-    let act = repl::Apply::off();
-    let mut ctx: Vec<String> = Vec::new();
-    for line in lines {
-        if repl::exec_line(&mut session, &act, &mut ctx, line) {
-            anyhow::bail!("the wizard ended the session at {line:?}");
-        }
+    // A fresh in-memory draft cannot inherit a stale or attacker-prepared
+    // PID-named temporary config. The interactive REPL prints command errors
+    // and returns only an exit flag: it is not a transactional parser result.
+    let mut session = session::Session::empty();
+    for (index, line) in lines.iter().enumerate() {
+        let words = repl::split_line(line);
+        let args: Vec<&str> = words.iter().map(String::as_str).collect();
+        anyhow::ensure!(
+            args.first() == Some(&"set"),
+            "invalid installer command at step {}",
+            index + 1
+        );
+        session.set(&args[1..]).with_context(|| {
+            // Never include the generated line: it may carry a password.
+            format!("invalid installer configuration at step {}", index + 1)
+        })?;
     }
     // `commit` is what runs `validate()`. A wizard that wrote an invalid
     // document would produce a box that will not boot into its own config.
     let appliance = session.commit()?;
-    let toml = appliance.to_toml()?;
-    let _ = std::fs::remove_dir_all(&dir);
-    Ok(toml)
+    appliance.to_toml()
 }
 
 /// The guided installer: collect the first settings, pick the disks, confirm,
@@ -2001,12 +2125,7 @@ fn interactive_install(
         // The password is the one answer that must not be echoed back at the
         // end of an install, where it would sit in the scrollback of whatever
         // terminal or IPMI session did the install.
-        if line.contains(" password ") {
-            let redacted = line.rsplit_once(' ').map(|(head, _)| head).unwrap_or(line);
-            println!("  {redacted} ********");
-        } else {
-            println!("  {line}");
-        }
+        println!("  {}", wizard_review_line(line));
     }
 
     if !confirmed {
@@ -2457,8 +2576,13 @@ fn show_op(args: &[String]) -> Result<()> {
         ["babel", rest @ ..] => wren_show_words("babel", rest),
         ["vrrp"] => wren_show(&["vrrp"]),
         ["ha"] => {
-            let status: serde_json::Value = serde_json::from_str(&velstra::query("ha-status")?)
+            let mut status: serde_json::Value = serde_json::from_str(&velstra::query("ha-status")?)
                 .context("reading the data plane's HA status")?;
+            if let Ok(config) = config::Appliance::load(&saved_config_path()) {
+                if let Some(ha) = config.system.ha.filter(|h| h.enabled) {
+                    status["configured_mode"] = ha.mode.as_str().into();
+                }
+            }
             print!("{}", ha::render_status(&status));
             Ok(())
         }
@@ -2709,6 +2833,13 @@ fn show_op(args: &[String]) -> Result<()> {
             // are printed every time rather than behind a flag.
             let id = image::current();
             println!("{:<12}{}", "image:", id.describe());
+            println!(
+                "{:<12}{}",
+                "release:",
+                image::release_version()
+                    .as_deref()
+                    .unwrap_or("not reported by the running OS")
+            );
             println!("{:<12}{}", "binaries:", id.binaries_line());
             println!("{:<12}{}", "clock:", clock::current().describe());
             println!("{:<12}{}", "data:", crate::unlock::data_at_rest());
@@ -2749,6 +2880,55 @@ fn show_op(args: &[String]) -> Result<()> {
              show version",
             other.join(" ")
         ),
+    }
+}
+
+#[cfg(test)]
+mod ha_cli_tests {
+    use super::*;
+    #[test]
+    fn pair_modes_parse_without_putting_the_token_in_arguments() {
+        let cli = Cli::try_parse_from([
+            "sentinel",
+            "ha",
+            "pair",
+            "10.20.0.2:8080",
+            "--mode",
+            "two-node",
+            "--secret-stdin",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Ha {
+                command: HaCommand::Pair {
+                    mode: Some(config::HaMode::TwoNode),
+                    secret_stdin: true,
+                    ..
+                }
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "sentinel",
+                "ha",
+                "pair",
+                "10.20.0.2:8080",
+                "--mode",
+                "automatic"
+            ])
+            .is_err()
+        );
+        let error = ha::pair(
+            "10.20.0.2:8080",
+            "non-secret-unit-test-token-at-least-32bytes",
+            std::path::Path::new("/nonexistent-test-config"),
+            Some("10.20.0.3:5440"),
+            None,
+            Some(config::HaMode::TwoNode),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("conflicts with --witness"));
     }
 }
 
@@ -3634,6 +3814,152 @@ mod tests {
     use super::{boot_late_source, firewall_events_since_query, firewall_log_args};
 
     #[test]
+    fn owned_file_probe_cli_keeps_literal_path_values_after_the_option_terminator() {
+        use clap::Parser;
+        for path in [
+            "/root/private state",
+            "--looks-like-option",
+            "'quote';$(no-shell)\n*",
+        ] {
+            let cli =
+                super::Cli::try_parse_from(["sentinel", "owned-file-probe", "--", path]).unwrap();
+            match cli.command {
+                super::Command::OwnedFileProbe { path: actual } => {
+                    assert_eq!(actual, std::path::Path::new(path));
+                }
+                _ => panic!("wrong command dispatch"),
+            }
+        }
+        assert!(super::Cli::try_parse_from(["sentinel", "owned-file-probe"]).is_err());
+        assert!(
+            super::Cli::try_parse_from(["sentinel", "owned-file-probe", "/one", "/two"]).is_err()
+        );
+    }
+
+    fn wizard_answers() -> super::installer_tui::Answers {
+        super::installer_tui::Answers {
+            raid: super::install::Raid::None,
+            picks: vec![0],
+            keyboard: "us".into(),
+            locale: "en_US.UTF-8".into(),
+            timezone: "UTC".into(),
+            hostname: "wizard-regression".into(),
+            username: "admin".into(),
+            password: "installer-test-password".into(),
+            ssh_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIabc qa@example".into(),
+            encrypt: false,
+            passphrase: String::new(),
+            nics: vec![super::installer_tui::NicPlan {
+                name: "eth0".into(),
+                configure: true,
+                zone: "wan".into(),
+                address: "dhcp".into(),
+                gateway: String::new(),
+            }],
+            permit_ssh: true,
+        }
+    }
+
+    #[test]
+    fn wizard_preserves_the_supplied_ssh_key_and_keeps_key_only_authentication() {
+        let answers = wizard_answers();
+        let lines = super::wizard_lines_from(&answers);
+        let document = super::wizard_config(&lines).unwrap();
+        let appliance = super::config::Appliance::from_toml(&document).unwrap();
+        assert_eq!(appliance.system.logins[0].ssh_keys, [answers.ssh_key]);
+        assert!(!appliance.services.ssh.password_authentication);
+    }
+
+    #[test]
+    fn wizard_without_a_key_permits_the_password_it_collected() {
+        let mut answers = wizard_answers();
+        answers.ssh_key.clear();
+        let document = super::wizard_config(&super::wizard_lines_from(&answers)).unwrap();
+        let appliance = super::config::Appliance::from_toml(&document).unwrap();
+        assert!(appliance.system.logins[0].ssh_keys.is_empty());
+        assert!(appliance.services.ssh.password_authentication);
+        assert!(
+            super::passwd::verify(
+                &answers.password,
+                appliance.system.logins[0]
+                    .hashed_password
+                    .as_deref()
+                    .unwrap()
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn wizard_rejects_an_unknown_generated_path_instead_of_printing_and_continuing() {
+        let lines = vec![
+            "set system hostname wizard-regression".into(),
+            "set system login admin public-key wrong-old-generator-path".into(),
+        ];
+        assert!(super::wizard_config(&lines).is_err());
+    }
+
+    #[test]
+    fn wizard_preserves_password_spaces_quotes_hash_and_backslash_exactly() {
+        let mut answers = wizard_answers();
+        answers.ssh_key.clear();
+        answers.password = "#with  repeated spaces \"quoted\" \\ tail".into();
+        let document = super::wizard_config(&super::wizard_lines_from(&answers)).unwrap();
+        let appliance = super::config::Appliance::from_toml(&document).unwrap();
+        assert!(
+            super::passwd::verify(
+                &answers.password,
+                appliance.system.logins[0]
+                    .hashed_password
+                    .as_deref()
+                    .unwrap()
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn wizard_words_round_trip_through_the_real_cli_lexer() {
+        for word in [
+            "",
+            "simple",
+            "two  spaces",
+            "#comment",
+            "a\\b",
+            "\"quoted\"",
+            "tab\t文字",
+        ] {
+            assert_eq!(super::repl::split_line(&super::wizard_word(word)), [word]);
+        }
+    }
+
+    #[test]
+    fn wizard_review_never_reveals_a_partial_multiword_password() {
+        for secret in [
+            "simple-secret",
+            "secret first last",
+            "#first  \"middle\" \\last",
+        ] {
+            let line = format!(
+                "set system login admin password {}",
+                super::wizard_word(secret)
+            );
+            assert_eq!(
+                super::wizard_review_line(&line),
+                "set system login admin password ********"
+            );
+        }
+        let public = "set system hostname wizard-regression";
+        assert_eq!(super::wizard_review_line(public), public);
+    }
+
+    #[test]
+    fn wizard_rejects_operational_or_non_set_lines() {
+        assert!(super::wizard_config(&["show".into()]).is_err());
+        assert!(super::wizard_config(&["exit".into()]).is_err());
+    }
+
+    #[test]
     fn boot_late_reapplies_a_commit_made_since_boot_not_the_saved_file() {
         let dir = std::env::temp_dir().join(format!("sentinel-boot-late-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -3653,6 +3979,68 @@ mod tests {
             named.as_path()
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn firewall_refresh_prefers_live_intent_and_only_absence_uses_the_saved_file() {
+        let scratch = crate::update::Scratch::new().unwrap();
+        let saved = scratch.join("saved.toml");
+        let running = scratch.join("running.toml");
+        std::fs::write(&saved, "[system]\nhostname='saved'\n").unwrap();
+        assert_eq!(
+            super::firewall_refresh_source(&saved, &running).unwrap(),
+            saved
+        );
+        std::fs::write(&running, "[system]\nhostname='live'\n").unwrap();
+        assert_eq!(
+            super::firewall_refresh_source(&saved, &running).unwrap(),
+            running
+        );
+        // Selection never reinterprets an invalid live document as permission
+        // to load an older policy; the strict loader must report its error.
+        std::fs::write(&running, "invalid = [").unwrap();
+        let selected = super::firewall_refresh_source(&saved, &running).unwrap();
+        assert_eq!(selected, running);
+        assert!(super::Appliance::load(selected).is_err());
+    }
+
+    #[test]
+    fn firewall_refresh_refuses_symlinks_fifos_directories_and_inspection_errors() {
+        use std::os::unix::fs::symlink;
+        let scratch = crate::update::Scratch::new().unwrap();
+        let saved = scratch.join("saved.toml");
+        let running = scratch.join("running.toml");
+        std::fs::write(&saved, "[system]\nhostname='saved'\n").unwrap();
+        symlink(&saved, &running).unwrap();
+        assert!(super::firewall_refresh_source(&saved, &running).is_err());
+        std::fs::remove_file(&running).unwrap();
+        symlink(scratch.join("absent"), &running).unwrap();
+        assert!(super::firewall_refresh_source(&saved, &running).is_err());
+        std::fs::remove_file(&running).unwrap();
+        std::fs::create_dir(&running).unwrap();
+        assert!(super::firewall_refresh_source(&saved, &running).is_err());
+        std::fs::remove_dir(&running).unwrap();
+        let name = std::ffi::CString::new(running.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(super::firewall_refresh_source(&saved, &running).is_err());
+        // ENOTDIR is not absence and must never quietly choose saved policy.
+        assert!(super::firewall_refresh_source(&saved, &saved.join("running")).is_err());
+    }
+
+    #[test]
+    fn internal_firewall_refresh_cli_is_hidden_and_accepts_no_override_arguments() {
+        use clap::{CommandFactory, Parser};
+        let parsed = super::Cli::try_parse_from(["sentinel", "refresh-firewall"]).unwrap();
+        assert!(matches!(parsed.command, super::Command::RefreshFirewall));
+        assert!(
+            !super::Cli::command()
+                .render_help()
+                .to_string()
+                .contains("refresh-firewall")
+        );
+        for extra in ["/tmp/other.toml", "--config", "--out", "--no-apply"] {
+            assert!(super::Cli::try_parse_from(["sentinel", "refresh-firewall", extra]).is_err());
+        }
     }
 
     #[test]

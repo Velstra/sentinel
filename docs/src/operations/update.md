@@ -33,7 +33,18 @@ What happens:
    (a rewritten file, a swapped stick) is refused before the slot is activated;
 6. that slot is re-typed to the verity GPT GUIDs;
 7. the new UKI is installed as `sentinel-<inactive>+3.efi` with **3 boot tries**;
-8. `loader.conf` `default` is pointed at the new slot.
+8. `loader.conf` prefers the new slot with `preferred sentinel-<inactive>*`,
+   retaining `default sentinel-*` so an exhausted candidate can fall back.
+
+Before any inactive-slot write, both signed and unsigned commits require the
+**running UEFI systemd-boot version 260 or newer** and no nonempty firmware
+default, preferred or one-shot entry override. Older/non-systemd loaders and
+malformed or unreadable EFI state are refused. Sentinel does not silently clear
+firmware variables: inspect the override named in the error and explicitly
+review the suggested `bootctl` clearing command before retrying. Bootloader
+maintenance is a separate operation, not a package-manager update on the node.
+A hard per-slot `default` is unsafe here: systemd-boot 260 honors that selection
+even when its boot counter reaches zero.
 
 Without `--commit`, the plan is printed but nothing is written.
 
@@ -259,3 +270,58 @@ nix build .#checks.x86_64-linux.update -L
 The test verifies the slot is written, re-typed, and the bootloader switched. The
 cross-reboot switch itself isn't auto-tested (OVMF `machine.reboot()` hangs in the
 harness); the bless/rollback mechanism is proven in the `verified-boot` test.
+
+## Bounded metadata and atomic channel promotion
+
+The channel reader prefers `release.json`: one JSON object with `schema = 1`,
+`manifest` (base64 of the exact signed bytes) and `signature` (base64 of the
+64-byte Ed25519 signature). The envelope is at most 128 KiB and its decoded
+manifest at most 64 KiB. The pinned key authenticates the exact manifest bytes
+before any release fields are trusted; the envelope is not a new trust root.
+
+Only an absent endpoint (HTTP 404, or a missing local file for a file channel)
+allows compatibility fallback to `manifest.json` and `manifest.json.sig`.
+Malformed, oversized, unauthorized, timed-out or incorrectly signed envelopes
+never fall back. Publishers must keep the old root manifest/signature pair
+frozen while upgrading legacy readers, upload immutable versioned resources
+first, and promote only the single envelope object last. Both public and native
+Enterprise readers must be upgraded before production channel migration.
+
+Connections are limited to ten seconds. Metadata has a 60-second overall and
+15-second no-progress budget. Image downloads have a separate six-hour overall,
+60-second no-progress and 64-GiB transfer ceiling (native Enterprise resources
+retain their stricter individual limits). Limits are enforced during transfer,
+including chunked responses, with appliance-pinned curl 8.4 or newer. Incomplete
+downloads are removed and failures leave the active slot unchanged. On Linux,
+the curl child is killed automatically if its update owner exits.
+
+Channel RAW images are staged sparsely in an anonymous 0600 file on the mounted
+ext4 state filesystem (`/var/lib/sentinel`), not in RAM-backed `/tmp` and not
+in an operator-selected `TMPDIR`. Every zero byte still contributes to the
+signed image digest and exact logical length; only nonzero blocks allocate
+payload space. The open descriptor survives through whole-image verification
+and partition copying, and is automatically reclaimed when the updater exits.
+There is no persistent image cache to clear after a crash.
+
+The updater checks a reserve of the greater of 512 MiB or 5% of the state filesystem,
+with additional metadata headroom, and refuses an extent that exceeds its
+staging budget. Concurrent unrelated filesystem writers can still consume
+space; such allocation or sync failures safely refuse the update. A genuine
+signed dense image can require more staging space than a sparse release.
+Missing/unmounted/volatile/read-only state and insufficient capacity are
+explicit errors; the updater never deletes configuration, archives, logs or a
+fallback slot to make room. The recommended 32 GiB appliance disk provides room
+for state and releases; a smaller disk that can boot is not a guarantee that
+every future release will fit. The bounded ESP copy is verified before any
+inactive-slot payload is overwritten.
+
+Only one image update can run at a time, including signed local and deliberately
+unsigned local writes. A second writer receives `another update is in progress`.
+This update lock does not block ordinary configuration commits or metadata
+checks while a download is in progress.
+
+The persistent subscription identity is published only after its private contents
+are complete and synced. Concurrent first use converges on one identity;
+corrupt or insecure existing files are refused rather than silently replaced
+with a new subscription seat. No deployed node is changed by a source update:
+fresh image and OTA/rollback qualification are required before rollout.

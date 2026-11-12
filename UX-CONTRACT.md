@@ -8,6 +8,7 @@ staged settings workflow used by the connection timeout form.
 | Form | settingsPanel, fieldGrid, fieldLines in src/webui.rs | CLI grammar in src/session.rs and bounds/defaults in src/config.rs | Edit; clear to restore default | tests/console/console.test.mjs |
 | Toast | banner and showResult in src/webui.rs | Configure API response | Information; error; applied | tests/console/console.test.mjs |
 | CRUD | stage, applyStaged and configure in src/webui.rs | appliance.toml through the management API | Validate without commit; commit and save; delete field | tests/console/console.test.mjs |
+| Creation drawer | renderAddPanel/wireToggle in src/webui.rs | Existing staged CLI-object creation | Non-modal region; internal Cancel and Escape close without staging; restore trigger focus and retain local draft until refresh | tests/console/ux.test.mjs |
 | Select/Listbox | Native action select in React Flows | Telemetry packet actions | Platform popup and keyboard | ui/tests/management.test.tsx; tests/console/react.test.mjs |
 | Scrollbar | Global application CSS in ui/src/style.css, using src/webui.rs tokens | Existing light/dark theme tokens | Bounded flow table and code panes | tests/console/react.test.mjs narrow/theme checks |
 
@@ -16,6 +17,11 @@ commands the CLI accepts. Stage changes only the local batch. Validate sends
 that batch without committing. Apply sends it once with commit/save, displays
 the server result and refreshes the form. Failed requests retain staged work;
 successful commits clear it. Repeated Apply is guarded by the shared busy state.
+
+The header batch badge says **staged changes**, not **pending changes**. It
+describes the local batch only; an empty batch never claims the independent
+provisional network transaction has been confirmed. The React confirmation
+banner remains the sole owner of its awaiting-confirmation state and deadline.
 
 For `firewall global conntrack`, all six values are idle seconds bounded to
 1–604800 by the server. Empty fields delete the explicit override and restore
@@ -34,11 +40,133 @@ The fields inherit shared labels, focus treatment, keyboard behavior, themes
 and responsive layout. Tests must cover applying every timeout, invalid input,
 reading persisted values, restoring defaults and complete CLI-field coverage.
 
+## Shared settings-control validation
+
+Firewall port matches keep their text/list/range control. The shared bindField
+validator rejects zero/out-of-range ports, malformed lists, reversed ranges and
+over-wide ranges before Stage, preserving the value and focusing its associated
+inline error. The range-size limit comes from config.rs MAX_PORT_RANGE, not an
+independent UI constant. Valid comma-separated ports and ranges remain supported;
+the actual appliance schema still owns final validation. This behavior applies
+to creation drawers and edit dialogs (tests/console/ux.test.mjs, console-ux gate).
+
+fieldGrid/bindField associates visible labels, helper text and inline errors
+with each native/composite control. Required creation fields, integer bounds
+and complete update URLs are checked before Stage/Add; the first invalid field
+is revealed and focused, a form summary explains refusal, and entered values
+remain available for correction. Blank optional values retain the existing
+delete/default semantics. Appliance schema validation remains authoritative for
+addresses, dependencies, credentials and full candidate commits.
+
+Shared bindField blur feedback does not reflow an active pointer gesture.
+pointerdown/up/cancel and window-blur own one deferred feedback queue; after
+completed activation, queued errors use the same associated inline text.
+Keyboard blur, input correction and explicit Add/Stage validation remain
+immediate. A canceled gesture never activates an action. This prevents a newly
+visible required-field error from moving the clicked target before release;
+it does not waive validation, stage a command or add an alternate submit path.
+Informational field hints use that same queue for native change and delayed
+completion: a wrapping CIDR explanation must not move a physically held Add.
+Stale values/detached controls cannot repaint the active form. The empty-policy
+regression holds the real Add for 400ms, verifies stable geometry/no early
+staging, then requires the ordinary release to stage exactly one valid rule.
+Verification includes physically held Chrome mouse presses on desktop/mobile
+and keyboard validation in tests/console/ux.test.mjs.
+
+Object identifiers use specific labels where they are not arbitrary names:
+destination/aggregate/authorised prefixes, neighbour IP addresses, WireGuard
+public keys, TCP ports and numeric policy sequences. Sequence bounds follow
+the CLI's u32 representation. Both inline object editors and the rule dialog
+reuse fieldGrid validation; dialog headings provide their accessible names.
+
+IPsec renders its configuration before reading operational SA diagnostics, so
+a slow or unavailable daemon cannot block its repair form. The New tunnel
+control, like every shared creation trigger, starts disabled with
+data-config-loading. renderAddPanel owns both the disclosure binding and the
+completed form; only then does it clear that initial readiness gate and
+immediately reapply gateWrites. A separate hand-maintained startup handler list
+must not make a rendered form unreachable. A failed
+configuration read leaves creation disabled with an explanation. Other disabled
+prerequisite/permission controls are never lifted by this owner. Local/remote
+protected subnets are visible in the initial tunnel form; advanced route-based
+binding and final cross-field validation remain owned by the existing model.
+The independent diagnostic promise is not part of a form transaction: after
+Validate/Apply has returned its real result, the shared busy controls recover
+without waiting for SA observations. showInto retains its own pending/error
+and generation guards; no observation is invented or silently treated healthy.
+Its local-IKE address suggestions contain only IPv4 endpoints, as required by
+the appliance schema. The shared local-address inventory remains dual-stack
+for protocols that support it; arbitrary valid IPv4 endpoints remain typeable.
+
+An absent prefix-list, route-map, WireGuard interface or DHCP server is an
+explicit prerequisite-unavailable state, not a pending configuration read.
+The shared object/form owner disables New with visible associated guidance,
+retires the old handler/disclosure and clears its hidden panel when that parent
+disappears. Selecting or naming a valid current parent rebinds the same owner
+once and reapplies account/member gates. A stale picker option is never accepted
+as a current parent. Draft-only name/picker changes synchronously reuse the last
+genuine configuration read, so an old parent's handler is never offered during
+an unnecessary fetch. Their rule Add uses the same draft-vocabulary refresh
+without starting a configuration read; explicit Refresh still reads the backend.
+Naming/selecting a parent alone stages no command; Discard retains its existing
+local-batch meaning, and Refresh reconciles its vocabulary.
+tests/console/empty-policy.mjs removes the real private-fixture parents and
+exercises physical creation, native selection, discard/reload, disappearance,
+real read-only login and admin recovery at actual 1440/390 CSS pixels. It does
+not replace native fixed-image verification.
+
+Switches activate on completed native button clicks, including keyboard and
+assistive activation; canceled pointer gestures do not change the value.
+
+Update signing keys use the shared field owner with a multiline textarea,
+labelled public-Ed25519/file-reference guidance and inline format validation.
+The same variant serves the default channel and named channel creation/editing;
+other protocols' public-key controls are unchanged. Stage emits one quoted CLI
+token, never literal command-separating newlines. CLI export and replay preserve
+the public bytes; the model/setter/verifier share bounded RFC8410 Ed25519 SPKI
+validation and canonical PEM formatting. Historical flattened public keys remain
+usable without changing their material. File references are not read during
+declarative validation or silently retargeted; the verifier bounds the actual
+file read. Private/foreign/malformed keys are refused without echoing material.
+OpenSSL remains responsible for signature verification. Browser regressions
+cover physical paste, invalid-key refusal, actual backend validation and real
+CLI-save-to-UI readback on desktop/mobile; these do not replace native OTA proof.
+Quoted public-key exports are decoded only by the corresponding update-key
+reader. File references preserve Unicode, repeated and trailing spaces through
+Stage, CLI save/export/replay and UI refresh; changing another field never
+replays an unchanged pin. Browser receipts assert the actual CSS viewport,
+including 390px, rather than trusting Chromium's requested window size.
+
+Suggestion controls are button disclosures, not authored ARIA comboboxes:
+the trigger has a field-specific name and expanded/controls relationships,
+ArrowDown enters suggestions, Escape closes and restores trigger focus, and
+selection restores input focus. Arbitrary valid typed values remain possible.
+
+Live command failures share the existing unavailable/technical-details visual
+variant. Retry really repeats that read, busy state is exposed, and older
+responses cannot overwrite a newer request for the same pane. Error output is
+retained in a disclosure, not displayed as an empty/healthy protocol table.
+
+Verification: tests/console/ux.test.mjs and tests/console/layout.test.mjs use real
+Chromium against the disposable --no-apply API. The layout suite walks every
+palette destination at 1440, 390 and 320 CSS pixels, checking labels, overlapping
+grid fields, clipping outside deliberate scroll regions and document width.
+
 Leased HA and the independent witness use the same settingsPanel/fieldGrid,
 Stage, Validate, Apply and delete semantics on the existing HA page. Their
 configuration and security rules remain owned by src/ha.rs, src/config.rs and
 docs/ha-phase3.md. They do not introduce another apply or enrollment path;
 initial pairing remains the authenticated `sentinel ha pair` operation.
+
+The HA election-mode selector uses the same native select and staged form owner.
+Witness mode remains the compatibility default; two-node mode exposes local and
+peer heartbeat endpoints plus millisecond timing fields. The HA page explicitly
+warns that complete heartbeat isolation can activate both members without a
+witness. It never labels this as quorum-backed protection, infers independent
+physical paths from VLANs, or enrolls a peer merely by changing the selector.
+Mode, timing, control-link ancestry and credential checks remain server-owned in
+src/config.rs, src/ha.rs and src/session.rs. Switching modes retains entered
+values so rejected configurations can be corrected through the normal workflow.
 
 HA identity JSON, witness credentials and the configuration-sync credential use
 the shared secretWidget: a masked input with an associated label and a keyboard
@@ -94,8 +222,9 @@ the compatibility shell. All production assets, including React, are built with
 a pinned npm lockfile and embedded into the Rust binary. Node is a build/test
 dependency only; there is no runtime asset host.
 
-Telemetry is local to the selected appliance; peer views explicitly withhold
-local measurements. Source failures remain unknown and visible rather than
+Telemetry belongs to the selected appliance. Peer views use configured-member-only
+read endpoints over the server's pinned config-sync transport, never direct
+browser credentials or fallback local measurements. Source failures remain unknown and visible rather than
 becoming healthy zeros. Counter rates use measured elapsed time; resets create
 an unknown sample. Standby sync age means elapsed time since its last complete
 authenticated replica update. VCS2 does not acknowledge remote apply latency to
@@ -136,8 +265,9 @@ in-app navigation preserves the draft without extra confirmation.
 Tables render 50 rows per page from at most 512 retained events. Search is local,
 so updates and clear are immediate; IME composition does not submit a mutation.
 Action/search/page state stays in memory because it can include private addresses.
-Unavailable source data remains unknown; switching to a peer withholds local
-telemetry. HA Backup sync age is the age of its last authenticated baseline;
+Unavailable source data remains unknown; switching members immediately clears
+measurements, routes, chart history and paused packets and invalidates old reads.
+HA Backup sync age is the age of its last authenticated baseline;
 Master remote application latency remains explicitly unmeasured.
 
 The editor's side-by-side diff uses bounded line comparison and the canonical
@@ -185,8 +315,10 @@ the same category strip and the dashboard task links.
 
 Destination navigation focuses the page heading and returns the document to the
 top, so a long previous form cannot strand the next page below its heading. A
-ResizeObserver derives --bar-h from the real header height (including narrow or
-zoomed wrapping); drawers use that measured offset rather than covering controls.
+ResizeObserver and bounded animation-frame scroll/resize handling derive --bar-h
+from the real header's viewport bottom, including the mobile brand row and
+narrow/zoomed wrapping. Drawers use that offset before and after scrolling;
+neither their identifier nor focused controls may hide beneath the header.
 
 Sign-out also clears the navigation query and configuration search matches before
 the next identity can open the shell; no private address query survives a session.
@@ -198,3 +330,87 @@ The header is the sole rendered account-identity surface. Its existing read-only
 badge is visible beside the account; the unused hidden sidebar identity and its
 duplicate renderer were retired. Browser authentication checks assert actual
 badge visibility rather than the absence of a hidden class on a hidden subtree.
+
+## System health observations
+
+The existing local System details renderer also displays the declared running
+OS `IMAGE_VERSION` via `sentinel show version` (`src/image.rs`, `src/main.rs`).
+Unknown metadata is explicit; the Cargo binary version is not an OS-version
+fallback. The release label supplements, never replaces, dm-verity and slot
+identity. No alternate UI version source or write path is introduced.
+
+ReactSystemHealth is the shared read-only diagnostic surface on the dashboard
+(compact notices) and System page (complete observations). Its source is the
+authenticated GET /api/v1/system/health endpoint in src/health.rs and src/api.rs.
+Management owns the 15-second polling, duplicate/timeout guards and session/member
+invalidation. Unknown, failed or stale probes never appear healthy; a peer view
+reads that member's diagnostics through the pinned backend proxy. Sign-out clears observations and invalidates pending
+responses. Read-only accounts may inspect and retry; Configure NTP navigates to
+the existing services:resolution settingsPanel and grants no additional writes.
+Clock synchronisation and optional LAN NTP serving remain distinct. Diagnostics
+never reset the TPM, clear failed service state or change configuration.
+Verification: ui/tests/health.test.tsx plus authenticated API and system-probe tests.
+
+## Selected-member observation boundary
+
+Management and Host.member own exact member identity, not merely a remote/local
+flag. Dashboard, throughput, HA role, routing, packet events, rule counters and
+system health all share this target. Local telemetry remains SSE; peer telemetry
+polls authenticated full snapshots. One collector with a bounded ten-second idle
+lease retains counter deltas between polls. Duplicate snapshots never renew
+freshness. Unsupported/offline peers show unavailable, never local data. Member
+and session changes abort requests and reject late frames, errors and 401s.
+
+The full document, staged writes and confirmation transaction remain local;
+switching members hides but does not discard a local draft. Configure NTP is
+disabled in peer diagnostics with an explicit local-member explanation. The
+compatibility System details disclosure is local-only and hidden for peers;
+historical metrics explicitly require the local member rather than mislabeling
+local history. These are read-only display boundaries, not new permissions.
+Transport/membership/redaction policy is owned by src/api.rs and src/net.rs.
+Verification: Rust pinned HTTPS two-router tests, ui/tests/management.test.tsx,
+ui/tests/health.test.tsx and tests/console/react.test.mjs.
+
+Legacy settings use the same local-write boundary: writeBlockReason owns the
+account/context explanation, stage refuses peer drafts, and gateWrites gates
+Stage/New/Edit/Delete/Apply and operational mutations even after asynchronous
+redraws. Peer views retain existing local drafts without offering to apply them.
+The persistent read-only notice describes disabled controls; returning local
+restores only context-gated actions, not unrelated prerequisite-disabled buttons.
+The server's authorization and the guarded local-only Apply remain authoritative.
+
+configSyncState/configSyncBadge render the API's outbound delivery state in both
+Stack and the member rail, independently of authenticated reachability. Delivered
+means no local outbox changes await that peer; it does not certify bidirectional
+model equality. Pending delivery, Conflict and Unknown remain distinct. Conflicts
+offer comparison guidance, never an automatic force-overwrite/repair. Verification:
+tests/console/peer.test.mjs uses real pinned peer reads and explicitly identified
+presentation fixtures; native conflict and actual convergence require live HA tests.
+
+The rail's native member button reserves its name row independently of the
+delivery label. Role/status metadata wraps below, stays within the same hit
+target and never truncates the primary identifier to make a badge fit. Keyboard
+selection and all member/write boundaries remain unchanged. The peer suite
+checks short/long identifiers, four delivery states, both themes and 1440, 390
+and 320 CSS-pixel geometry, including native Enter activation after layout verification.
+
+refreshCluster is the shared session-owned member-status read. Stack and the
+rail render the SAME snapshot, including failure/unknown notices; refreshStack
+delegates to that owner. Normal page navigation and Refresh renew both surfaces.
+Concurrent reads coalesce, expose aria-busy and retain no independent green
+delivery result when the snapshot fails. Selected-member revision reads have
+separate epoch/token/member guards and cannot delay a later delivery refresh.
+Sign-out aborts/invalidate member reads and clears member/revision DOM; a late
+answer cannot repopulate either the signed-out or a later session. This changes
+display freshness only, never delivery/conflict/permission semantics. The peer
+browser suite drives the actual Refresh and Sign out controls, including delayed
+responses and unavailable snapshots, rather than manually refreshing both panes.
+
+## Update URL validation
+
+The shared bindField owner captures update/default and named-channel ownership
+when each form is built. Both forms accept only the https:// and file:// schemes
+defined by src/config.rs and src/session.rs; offline file mirrors remain valid.
+Invalid schemes retain the entered value and show an associated inline error
+before Stage. Generic URL syntax checks and authoritative API/CLI validation
+remain in place. This is a business-backed field variant, not a new form owner.

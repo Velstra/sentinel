@@ -27,6 +27,12 @@ set vpn ipsec branch remote-subnet 10.1.0.0/24
 set vpn ipsec branch psk <pre-shared-key>
 ```
 
+A policy tunnel may use a remote `0.0.0.0/0` with a bounded local subnet;
+configure the required route explicitly. Do not set **both** policy selectors
+to `/0`: Linux would also require ordinary incoming LAN traffic to be encrypted.
+Validation rejects that combination before applying it. For unrestricted
+selectors on both sides, bind a VTI/XFRM interface and select traffic by routes.
+
 ### Route-based tunnels (VTI)
 
 A policy-based tunnel — the one above — encrypts what its traffic selectors

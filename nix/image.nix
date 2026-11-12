@@ -4,9 +4,10 @@
 # as `nixosModules.applianceImage`); every `velstra.appliance.*` option there
 # DEFAULTS to Sentinel's values, so this wrapper only exists to keep Sentinel's
 # own call sites (`imports = [ ./nix/image.nix ]`) and check plumbing stable.
+# Product readiness gates blessing here, not in the product-neutral factory.
 { config, lib, ... }:
 {
-  imports = [ ./appliance-image.nix ];
+  imports = [ ./appliance-image.nix ./boot-health.nix ];
 
   # The interactive VM used by the test suite has a convenience login. A
   # flashable appliance must never inherit either that password or its console

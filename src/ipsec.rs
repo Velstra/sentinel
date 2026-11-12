@@ -14,9 +14,9 @@
 //! responders and certificate authentication are follow-ups; this module
 //! implements the policy-based, PSK, site-to-site core.
 
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
 
 use crate::config::{
     Appliance, DEFAULT_ESP_PROPOSAL, DEFAULT_IKE_PROPOSAL, DEFAULT_IPSEC_START_ACTION, Interface,
@@ -44,13 +44,79 @@ const SWANCTL_SECRETS: &str = "/run/sentinel/swanctl/secrets.conf";
 /// (it holds the PSKs) and `commit` runs as the admin, which cannot traverse
 /// it — so the list read back empty and a removed tunnel kept its route.
 const ROUTES_STATE: &str = "/run/sentinel/ipsec-routes";
+// Private auxiliary routes must coexist with Wren/operator routes, not replace
+// them at metric zero. Both tags are also required on every owned deletion.
+const ROUTE_PROTOCOL: &str = "201";
+const ROUTE_METRIC: &str = "42760";
 
-/// Whether writing `body` to `path` would change what is already there (or the
-/// file is absent) — the same change-detect the other appliers use.
-fn file_changed(path: &Path, body: &str) -> bool {
-    std::fs::read_to_string(path)
-        .map(|c| c != body)
-        .unwrap_or(true)
+/// Extract only our canonical top-level connection/secret sections. The files
+/// are root-private; never include their contents (or PSKs) in diagnostics.
+fn rendered_sections(body: &str, prefix: &str) -> Result<BTreeMap<String, String>> {
+    ensure!(
+        body.starts_with("# rendered by sentinel"),
+        "unowned IPsec runtime configuration"
+    );
+    let mut sections = BTreeMap::new();
+    let mut current: Option<(String, String)> = None;
+    for line in body.lines() {
+        if let Some((_, section)) = current.as_mut() {
+            section.push_str(line);
+            section.push('\n');
+            if line == "    }" {
+                let (name, section) = current.take().expect("section is present");
+                ensure!(
+                    sections.insert(name, section).is_none(),
+                    "duplicate IPsec runtime section"
+                );
+            }
+        } else if let Some(name) = line.strip_prefix(prefix).and_then(|s| s.strip_suffix(" {")) {
+            ensure!(
+                !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+                "invalid IPsec runtime connection name"
+            );
+            current = Some((name.to_owned(), format!("{line}\n")));
+        }
+    }
+    ensure!(current.is_none(), "incomplete IPsec runtime section");
+    Ok(sections)
+}
+
+/// Match by name and effective rendered settings, including PSKs and XFRM IDs.
+/// Reordering connections or editing an unrelated feature must not restart SAs.
+fn retired_connections(
+    previous_conf: &str,
+    previous_secrets: &str,
+    conf: &str,
+    secrets: &str,
+) -> Result<Vec<String>> {
+    let previous = rendered_sections(previous_conf, "    conn-")?;
+    let old_keys = rendered_sections(previous_secrets, "    ike-")?;
+    let wanted = rendered_sections(conf, "    conn-")?;
+    let keys = rendered_sections(secrets, "    ike-")?;
+    let mut retired = Vec::new();
+    for (name, section) in previous {
+        let old_key = old_keys
+            .get(&name)
+            .context("missing IPsec runtime credential section")?;
+        if wanted.get(&name) != Some(&section) || keys.get(&name) != Some(old_key) {
+            retired.push(name);
+        }
+    }
+    Ok(retired)
+}
+
+fn without_connections(conf: &str, retired: &[String]) -> Result<String> {
+    let mut result = String::from("# rendered by sentinel — IPsec transition\nconnections {\n");
+    for (name, section) in rendered_sections(conf, "    conn-")? {
+        if !retired.contains(&name) {
+            result.push_str(&section);
+        }
+    }
+    result.push_str(&format!("}}\ninclude {SWANCTL_SECRETS}\n"));
+    Ok(result)
 }
 
 /// The routes a set of connections needs, as `ip route` argument lists.
@@ -98,14 +164,45 @@ fn tunnel_routes(conns: &[IpsecConnection], addrs: &str) -> Vec<Vec<String>> {
             c.remote.clone(),
             "src".into(),
             src,
+            "proto".into(),
+            ROUTE_PROTOCOL.into(),
+            "metric".into(),
+            ROUTE_METRIC.into(),
         ]);
     }
     out
 }
 
-/// Reconcile the kernel's routes to `wanted`, deleting whatever the previous
-/// apply installed and is no longer wanted. Best-effort, like the swanctl load:
-/// a route the operator removed by hand must not turn a commit into a failure.
+/// Only replace a route if both its reserved tags and the previous journal
+/// prove ownership. `add` is atomic when absent, so a concurrent foreign route
+/// at this metric is never overwritten by a blind `replace`.
+fn route_operation(
+    journal: &str,
+    route: &[String],
+    observed: &[serde_json::Value],
+) -> Result<&'static str> {
+    let matches: Vec<_> = observed
+        .iter()
+        .filter(|r| r["metric"].as_u64() == Some(42760))
+        .collect();
+    if matches.is_empty() {
+        return Ok("add");
+    }
+    let expected = format!("{} {}", route[1], route[3]);
+    ensure!(
+        matches.len() == 1
+            && journal.lines().any(|l| l == expected)
+            && (matches[0]["protocol"].as_u64() == Some(201)
+                || matches[0]["protocol"].as_str() == Some(ROUTE_PROTOCOL))
+            && matches[0]["gateway"].as_str() == Some(route[3].as_str()),
+        "foreign or unjournalled route occupies the protected IPsec metric for {}; refusing replacement",
+        route[1]
+    );
+    Ok("replace")
+}
+
+/// Reconcile only journalled, protocol/metric-tagged auxiliary routes. Missing
+/// old routes are harmless; inspection/install failures are not silent success.
 fn reconcile_routes(wanted: &[Vec<String>]) -> Result<()> {
     let previous = std::fs::read_to_string(ROUTES_STATE).unwrap_or_default();
     // `<subnet> <peer>` is enough to delete a route; the source address is not
@@ -120,16 +217,35 @@ fn reconcile_routes(wanted: &[Vec<String>]) -> Result<()> {
         }
         let mut f = line.split_whitespace();
         if let (Some(net), Some(peer)) = (f.next(), f.next()) {
-            if let Err(e) = system::ip_route(&["del", net, "via", peer]) {
+            if let Err(e) = system::ip_route(&[
+                "del",
+                net,
+                "via",
+                peer,
+                "proto",
+                ROUTE_PROTOCOL,
+                "metric",
+                ROUTE_METRIC,
+            ]) {
                 eprintln!("warning: removing the route to {net} failed: {e}");
             }
         }
     }
     for r in wanted {
-        let args: Vec<&str> = r.iter().map(String::as_str).collect();
-        if let Err(e) = system::ip_route(&args) {
-            eprintln!("warning: installing the route to {} failed: {e}", r[1]);
-        }
+        let observed = system::escalated_output(
+            "ip",
+            &["-j", "-4", "route", "show", "table", "main", "exact", &r[1]],
+        )?;
+        ensure!(
+            observed.status.success(),
+            "cannot inspect the protected IPsec route"
+        );
+        let observed: Vec<serde_json::Value> =
+            serde_json::from_slice(&observed.stdout).context("invalid kernel route inspection")?;
+        let operation = route_operation(&previous, r, &observed)?;
+        let mut args: Vec<&str> = r.iter().map(String::as_str).collect();
+        args[0] = operation;
+        system::ip_route(&args).with_context(|| format!("installing protected route {}", r[1]))?;
     }
     let state = keep.join("\n");
     if state.is_empty() {
@@ -275,42 +391,54 @@ fn swanctl_secrets_body(conns: &[IpsecConnection]) -> String {
 /// runtime artifacts. The load is best-effort: charon may not be up yet at early
 /// boot, in which case the config applies on the next commit/boot.
 pub fn apply(appliance: &Appliance) -> Result<()> {
+    let guards = crate::ipsec_guards::prepare(appliance)?;
     let conns = &appliance.vpn.ipsec;
     let conf_path = Path::new(SWANCTL_CONF);
     let secrets_path = Path::new(SWANCTL_SECRETS);
+    let conf = swanctl_conf_body(conns, &appliance.interfaces);
+    let secrets = swanctl_secrets_body(conns);
+    // The CLI runs as admin and cannot traverse this root-only directory.
+    // Permission denied must never masquerade as an absent previous config.
+    let previous_conf = system::read_owned_file(conf_path)?;
+    if let Some(previous) = &previous_conf {
+        let previous_secrets =
+            system::read_owned_file(secrets_path)?.context("missing IPsec runtime credentials")?;
+        let retired = retired_connections(previous, &previous_secrets, &conf, &secrets)?;
+        if !retired.is_empty() {
+            // First unload ONLY removed/changed definitions, retaining every
+            // unchanged connection. This prevents new handshakes using revoked
+            // settings while established IKE/CHILD SAs are being terminated.
+            // load-conns does not reload credentials or flush kernel state.
+            system::install_file(conf_path, &without_connections(previous, &retired)?)?;
+            system::swanctl_reload_connections(conf_path)?;
+            for name in retired {
+                system::swanctl_revoke(&format!("conn-{name}"))?;
+            }
+        }
+    }
 
     if conns.is_empty() {
         // Nothing configured. If a previous apply wrote a config, load an empty
         // one to unload the connections from charon, then remove the artifacts.
-        if conf_path.exists() {
-            system::ensure_dir(Path::new(SWANCTL_RUNTIME_DIR))?;
-            system::install_file(conf_path, &swanctl_conf_body(&[], &[]))?;
-            system::install_ipsec_secret(secrets_path, &swanctl_secrets_body(&[]))?;
-            if let Err(e) = system::swanctl_load(conf_path) {
-                eprintln!("warning: clearing swanctl config failed: {e}");
-            }
+        if previous_conf.is_some() {
             system::remove_file(conf_path)?;
             system::remove_file(secrets_path)?;
         }
         // Unconditionally: the routes outlive the config file they came from,
         // and leaving them is the plaintext case [`ROUTES_STATE`] describes.
         reconcile_routes(&[])?;
+        crate::ipsec_guards::finish(&guards)?;
         return Ok(());
     }
 
     system::ensure_dir(Path::new(SWANCTL_RUNTIME_DIR))?;
-    let conf = swanctl_conf_body(conns, &appliance.interfaces);
-    let secrets = swanctl_secrets_body(conns);
-    let changed = file_changed(conf_path, &conf) || file_changed(secrets_path, &secrets);
     system::install_file(conf_path, &conf)?;
     system::install_ipsec_secret(secrets_path, &secrets)?;
     // Load when the rendered config changed, or unconditionally when a tunnel is
     // configured (a fresh boot re-asserts charon's state even if the tmpfs file
     // matches what a previous run wrote).
-    if changed || !conns.is_empty() {
-        if let Err(e) = system::swanctl_load(conf_path) {
-            eprintln!("warning: loading swanctl config failed (applies on next commit/boot): {e}");
-        }
+    if let Err(e) = system::swanctl_load(conf_path) {
+        eprintln!("warning: loading swanctl config failed (applies on next commit/boot): {e}");
     }
     // And the routes that make the loaded policy reachable. Read the addresses
     // from the kernel rather than the configuration: the address inside a
@@ -318,6 +446,7 @@ pub fn apply(appliance: &Appliance) -> Result<()> {
     // own, and what matters is the one the box actually holds.
     let addrs = system::ip_addr_list().unwrap_or_default();
     reconcile_routes(&tunnel_routes(conns, &addrs))?;
+    crate::ipsec_guards::finish(&guards)?;
     Ok(())
 }
 
@@ -344,6 +473,88 @@ mod tests {
         }
     }
 
+    fn retired(old: &[IpsecConnection], wanted: &[IpsecConnection]) -> Vec<String> {
+        retired_connections(
+            &swanctl_conf_body(old, &[]),
+            &swanctl_secrets_body(old),
+            &swanctl_conf_body(wanted, &[]),
+            &swanctl_secrets_body(wanted),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn removed_and_changed_connections_revoke_only_their_own_sas() {
+        let first = conn();
+        let mut other = conn();
+        other.name = "site-b".into();
+        let previous = [first.clone(), other.clone()];
+        assert_eq!(retired(&previous, std::slice::from_ref(&other)), ["site-a"]);
+        let mut changed = first;
+        changed.psk = "replacement-private-key".into();
+        assert_eq!(
+            retired(&previous, &[changed.clone(), other.clone()]),
+            ["site-a"]
+        );
+        changed = previous[0].clone();
+        changed.remote_subnet = Some("10.2.0.0/24".into());
+        assert_eq!(retired(&previous, &[changed, other]), ["site-a"]);
+    }
+
+    #[test]
+    fn unchanged_and_reordered_connections_preserve_live_sas() {
+        let first = conn();
+        let mut other = conn();
+        other.name = "site-b".into();
+        assert!(retired(&[first.clone(), other.clone()], &[other, first]).is_empty());
+    }
+
+    #[test]
+    fn effective_defaults_do_not_restart_a_tunnel() {
+        let previous = conn();
+        let mut explicit = previous.clone();
+        explicit.ike_version = Some(2);
+        explicit.ike_proposal = Some(DEFAULT_IKE_PROPOSAL.into());
+        explicit.esp_proposal = Some(DEFAULT_ESP_PROPOSAL.into());
+        explicit.start_action = Some(DEFAULT_IPSEC_START_ACTION.into());
+        assert!(retired(&[previous], &[explicit]).is_empty());
+    }
+
+    #[test]
+    fn transition_unloads_revoked_definitions_but_keeps_other_sections_exact() {
+        let mut keep = conn();
+        keep.name = "keep".into();
+        let conf = swanctl_conf_body(&[conn(), keep.clone()], &[]);
+        let intermediate = without_connections(&conf, &["site-a".into()]).unwrap();
+        let parsed = rendered_sections(&intermediate, "    conn-").unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed,
+            rendered_sections(&swanctl_conf_body(&[keep], &[]), "    conn-").unwrap()
+        );
+        assert!(intermediate.ends_with(&format!("include {SWANCTL_SECRETS}\n")));
+    }
+
+    #[test]
+    fn malformed_runtime_sections_fail_closed_without_exposing_secrets() {
+        for invalid in [
+            "connections {\n}",
+            "# rendered by sentinel\n    conn-unsafe/name {\n    }\n",
+            "# rendered by sentinel\n    conn-open {\n",
+            "# rendered by sentinel\n    conn-duplicate {\n    }\n    conn-duplicate {\n    }\n",
+        ] {
+            assert!(rendered_sections(invalid, "    conn-").is_err());
+        }
+        let error = retired_connections(
+            &swanctl_conf_body(&[conn()], &[]),
+            &swanctl_secrets_body(&[]),
+            &swanctl_conf_body(&[], &[]),
+            &swanctl_secrets_body(&[]),
+        )
+        .unwrap_err();
+        assert!(!error.to_string().contains("topsecret"));
+    }
+
     /// `ip -o addr show` as the kernel prints it, abridged.
     const ADDRS: &str = "\
 1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever
@@ -365,8 +576,37 @@ mod tests {
                 // miss its own out policy and leave unencrypted.
                 "src".into(),
                 "10.0.0.1".into(),
+                "proto".into(),
+                ROUTE_PROTOCOL.into(),
+                "metric".into(),
+                ROUTE_METRIC.into(),
             ]]
         );
+    }
+
+    #[test]
+    fn auxiliary_route_does_not_replace_an_operator_route_at_another_metric() {
+        let route = &tunnel_routes(&[conn()], ADDRS)[0];
+        let operator = serde_json::json!({"protocol":"static", "gateway":"198.51.100.1"});
+        assert_eq!(route_operation("", route, &[operator]).unwrap(), "add");
+    }
+
+    #[test]
+    fn auxiliary_route_replacement_requires_both_actual_tags_and_journal() {
+        let route = &tunnel_routes(&[conn()], ADDRS)[0];
+        let journal = "10.1.0.0/24 198.51.100.1\n";
+        let owned = serde_json::json!({"protocol":201,"metric":42760,"gateway":"198.51.100.1"});
+        assert_eq!(
+            route_operation(journal, route, std::slice::from_ref(&owned)).unwrap(),
+            "replace"
+        );
+        assert!(route_operation("", route, &[owned]).is_err());
+        for foreign in [
+            serde_json::json!({"protocol":"static","metric":42760,"gateway":"198.51.100.1"}),
+            serde_json::json!({"protocol":201,"metric":42760,"gateway":"198.51.100.2"}),
+        ] {
+            assert!(route_operation(journal, route, &[foreign]).is_err());
+        }
     }
 
     #[test]

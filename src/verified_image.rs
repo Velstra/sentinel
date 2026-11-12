@@ -58,6 +58,12 @@ impl VerifiedImage {
     /// Open `path` and accept it only if its bytes hash to `sha256` (hex).
     pub fn open(path: &Path, sha256: &str) -> Result<Self> {
         let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        Self::from_file(file, path, sha256)
+    }
+
+    /// Verify an already-opened source, including anonymous channel staging.
+    /// `path` is diagnostic only and is NEVER reopened or used for trust.
+    pub fn from_file(file: File, path: &Path, sha256: &str) -> Result<Self> {
         let is_block = file.metadata()?.file_type().is_block_device();
         let size = if is_block {
             use std::io::{Seek, SeekFrom};
@@ -334,6 +340,24 @@ mod tests {
         let mut out = dir.create_private("store").unwrap();
         verified.copy_partition(3, &mut out).unwrap();
         assert_eq!(std::fs::read(out_path).unwrap(), vec![b'c'; 8 * 512]);
+    }
+
+    #[test]
+    fn an_open_source_is_verified_without_reopening_a_replaced_path() {
+        let dir = scratch();
+        let path = dir.join("image.raw");
+        let bytes = image(8);
+        std::fs::write(&path, &bytes).unwrap();
+        let file = File::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"untrusted replacement").unwrap();
+        let verified = VerifiedImage::from_file(file, &path, &sha256_hex(&bytes)).unwrap();
+        let mut out = dir.create_private("same-file-store").unwrap();
+        verified.copy_partition(3, &mut out).unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("same-file-store")).unwrap(),
+            vec![b'c'; 8 * 512]
+        );
     }
 
     #[test]

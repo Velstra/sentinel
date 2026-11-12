@@ -27,6 +27,7 @@ function fixture() {
     credential: () => "private-test-token",
     canWrite: () => true,
     remote: () => false,
+    member: () => (host.remote() ? "test-peer" : ""),
     refresh: vi.fn(async () => {}),
     navigate: vi.fn(),
     signOut: vi.fn(),
@@ -167,9 +168,11 @@ describe("React dashboard and packet inspector", () => {
     render(<Dashboard manager={manager} />);
     expect(screen.queryByText("wan0")).toBeNull();
     expect(screen.queryByText("Backup")).toBeNull();
-    expect(screen.getByText(/Select the local member/)).toBeVisible();
+    expect(
+      screen.getByText(/Connecting to selected member telemetry/),
+    ).toBeVisible();
   });
-  it("plots measured history, reports directional totals and conceals the chart for peers", () => {
+  it("isolates measured history on member changes and collector restarts", () => {
     const { manager, host } = fixture();
     manager.acceptFrame(frame());
     render(<Dashboard manager={manager} />);
@@ -184,6 +187,17 @@ describe("React dashboard and packet inspector", () => {
     act(() => manager.contextChanged());
     expect(screen.queryByRole("img")).toBeNull();
     expect(screen.queryByText("Peak 3 KiB/s")).toBeNull();
+    act(() => manager.acceptFrame(frame()));
+    expect(screen.getByText("3 KiB/s")).toBeVisible();
+    expect(screen.queryByRole("img")).toBeNull();
+    act(() => manager.acceptFrame(frame({ sequence: 2 })));
+    expect(
+      screen.getByRole("img", { name: /throughput samples/ }),
+    ).toBeVisible();
+    act(() =>
+      manager.acceptFrame(frame({ sequence: 1, sampled_at: 1700000100 })),
+    );
+    expect(screen.queryByRole("img")).toBeNull();
   });
   it("does not plot an incomplete aggregate and distinguishes down from unknown links", () => {
     const { manager } = fixture();
@@ -670,6 +684,101 @@ describe("console adapter permissions", () => {
 });
 
 describe("authenticated SSE transport", () => {
+  it("polls peer snapshots, drops late member responses and never mixes routes or paused packets", async () => {
+    vi.useFakeTimers();
+    const { manager, host } = fixture();
+    let member = "fw-a:8080";
+    host.member = () => member;
+    host.remote = () => !!member;
+    let release!: (response: Response) => void;
+    const signals: AbortSignal[] = [];
+    const fetcher = vi.fn((_url: unknown, options?: RequestInit) => {
+      signals.push(options!.signal as AbortSignal);
+      return new Promise<Response>((resolve) => {
+        release = resolve;
+      });
+    });
+    vi.stubGlobal("fetch", fetcher);
+    manager.start();
+    render(
+      <>
+        <Dashboard manager={manager} />
+        <Flows manager={manager} />
+      </>,
+    );
+    expect(fetcher).toHaveBeenCalledWith(
+      "/api/v1/stack/fw-a%3A8080/telemetry",
+      expect.anything(),
+    );
+    await act(async () =>
+      release(
+        new Response(
+          JSON.stringify(frame({ routing: { routes: "old-peer-route" } })),
+        ),
+      ),
+    );
+    expect(screen.getAllByText("wan0")[0]).toBeVisible();
+    expect(screen.getByText("old-peer-route")).toBeVisible();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Pause display" }));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1100);
+    });
+    const oldRelease = release;
+    act(() => {
+      member = "fw-b:8080";
+      manager.contextChanged();
+    });
+    expect(signals[1].aborted).toBe(true);
+    expect(screen.queryByText("wan0")).toBeNull();
+    expect(screen.queryByText("old-peer-route")).toBeNull();
+    expect(
+      screen.getByRole("checkbox", { name: "Pause display" }),
+    ).not.toBeChecked();
+    // A fetch implementation may ignore abort. Its old 401 must not sign out
+    // this valid session or overwrite the newly selected member.
+    await act(async () => oldRelease(new Response("", { status: 401 })));
+    expect(host.signOut).not.toHaveBeenCalled();
+    const peerFrame = frame({
+      interfaces: [{ ...frame().interfaces[0], name: "peer-b-nic" }],
+      events: [],
+      routing: { routes_unchanged: true },
+    });
+    await act(async () => release(new Response(JSON.stringify(peerFrame))));
+    expect(screen.getByText("peer-b-nic")).toBeVisible();
+    expect(screen.queryByText("old-peer-route")).toBeNull();
+    expect(screen.getByText("3 KiB/s")).toBeVisible();
+    expect(
+      screen.queryByRole("img", { name: /throughput samples/ }),
+    ).toBeNull();
+    act(() => manager.stop());
+    expect(signals.every((s) => s.aborted)).toBe(true);
+  });
+  it("does not refresh freshness for duplicate peer snapshots or fall back to local telemetry", async () => {
+    vi.useFakeTimers();
+    const { manager, host } = fixture();
+    host.remote = () => true;
+    const fetcher = vi.fn(
+      async (_path: unknown) => new Response(JSON.stringify(frame())),
+    );
+    vi.stubGlobal("fetch", fetcher);
+    manager.start();
+    await vi.advanceTimersByTimeAsync(100);
+    const received = manager.getSnapshot().receivedAt;
+    await vi.advanceTimersByTimeAsync(16000);
+    expect(manager.getSnapshot().receivedAt).toBe(received);
+    expect(manager.getSnapshot().connected).toBe(false);
+    expect(manager.getSnapshot().status).toContain("stale");
+    fetcher.mockImplementation(async () => new Response("", { status: 502 }));
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(manager.getSnapshot().status).toContain(
+      "Selected member telemetry unavailable",
+    );
+    expect(
+      fetcher.mock.calls.every(([path]) => String(path).includes("/stack/")),
+    ).toBe(true);
+    expect(host.signOut).not.toHaveBeenCalled();
+    manager.stop();
+  });
   it("aborts a silent (half-open) telemetry connection and reconnects with backoff", async () => {
     vi.useFakeTimers();
     const { manager } = fixture();

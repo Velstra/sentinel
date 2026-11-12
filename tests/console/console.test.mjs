@@ -11,6 +11,7 @@ import { browser, signIn, sleep, test, check, equal, summary } from "./harness.m
 import { instrument, walkAll, collect, sectionFields } from "./coverage.mjs";
 import { managementTests } from "./management.test.mjs";
 import { fleetTests } from "./fleet.test.mjs";
+import { stageContractTests } from "./stage-contract.mjs";
 
 // Note: this shadows the global `URL` for the whole file — resolve paths next
 // to this file with `fileURLToPath(import.meta.url)`, never with `new URL()`.
@@ -363,7 +364,7 @@ await test("what a create panel stages is a command the appliance parses", async
       nameInput.value = ${JSON.stringify(name)};
       for (const [label, value] of Object.entries(${JSON.stringify(fields)})) {
         const f = [...box.querySelectorAll(".field")]
-          .find((l) => l.querySelector("span").firstChild.textContent.trim() === label);
+          .find((l) => l.firstElementChild?.firstChild?.textContent.trim() === label);
         if (!f) return { error: "no field named " + label };
         // A repeatable setting whose answers the appliance already knows is a
         // set of tick boxes, not a box to type in. It carries a value of its
@@ -522,9 +523,9 @@ await test("leased HA settings save, validate and protect peer identity", async 
     "state-listen": "127.0.0.2:5429", priority: 100, interfaces: {} };
   // The last two are the witness timing budget (lease-ms, io-timeout-ms):
   // 2 x 80 + 25 poll + 20 margin fits a 300 ms lease.
-  const values = ["false", "127.0.0.9:5440", "eth0", "1", "180", "true",
+  const values = ["witness", "false", "127.0.0.9:5440", "eth0", "1", "180", "true",
     "console-ha-cluster-1", "A".repeat(43) + "=", JSON.stringify(identity, null, 2),
-    "300", "80"];
+    "300", "80", "", "", "", ""];
   try {
     const result = await page.evaluate(`(async () => {
       if (document.getElementById("result").open) document.getElementById("resultclose").click();
@@ -561,7 +562,7 @@ await test("leased HA settings save, validate and protect peer identity", async 
     equal(result.current.priority, "180", "HA priority was not saved");
     equal(result.current["lease-ms"], "300", "HA lease was not saved");
     equal(result.current["io-timeout-ms"], "80", "HA exchange budget was not saved");
-    check(result.commands.length === values.length, "not every HA setting was staged");
+    check(result.commands.length === values.filter(Boolean).length, "not every supplied HA setting was staged");
     const before = CONFIG && readFileSync(CONFIG, "utf8");
     const refused = await page.evaluate(`(async () => {
       document.getElementById("resultclose").click();
@@ -1004,7 +1005,7 @@ await test("an administrator can be created from the console", async () => {
     box.querySelector("input").value = "vera";
     const set = (label, value) => {
       const f = [...box.querySelectorAll(".field")]
-        .find((l) => l.querySelector("span").firstChild.textContent.trim() === label);
+        .find((l) => l.firstElementChild?.firstChild?.textContent.trim() === label);
       if (!f) throw new Error("no field named " + label);
       f.querySelector("input, select").value = value;
     };
@@ -1650,98 +1651,14 @@ await test("validating leaves the change staged and applyable", async () => {
   check(/would|accept/i.test(after.title), `the dialog claims it applied: ${after.title}`);
 });
 
-// Every control, in every section, actually operated.
-//
-// The section walk proves each page *renders*. This proves the things on it
-// *work*: a dropdown, a posture checkbox, a switch. Each writes into the staged
-// list, so what a control wants to write can be read off the console's own
-// state and handed to the appliance — a control that stages a command the CLI
-// refuses is a button that looks like it did something and did not, which is
-// the failure this whole suite exists to catch.
-//
-// Second to last on purpose: it visits every section and clears the staged list
-// as it goes, so it reloads the page when it is done rather than handing the
-// next test a console it has been rummaging through.
-await test("every control stages a command the appliance accepts", async () => {
-  // One call per page, not one call for the whole console.
-  //
-  // Opening a page makes the appliance answer every live-state pane on it, and
-  // each of those costs it a process spawn. A single evaluate over all of them
-  // fits on a workstation and does not in a build sandbox, where it runs into
-  // the call timeout and reports as "the page stopped answering" — a console
-  // that hangs, which is not what happened.
-  const cats = await page.evaluate(
-    `[...document.querySelectorAll("aside button.navitem")].length`);
-  const staged = [];
-  for (let c = 0; c < cats; c++) {
-    const pages = await page.evaluate(`(async () => {
-      [...document.querySelectorAll("aside button.navitem")][${c}].click();
-      await new Promise((r) => setTimeout(r, 200));
-      return document.querySelectorAll("#sectionstrip .secitem").length || 1;
-    })()`);
-    for (let p = 0; p < pages; p++) {
-      const out = await page.evaluate(`(async () => {
-        // Stage handlers are synchronous. Yield to the event loop for React and
-        // queued work; a fixed sleep for every hidden control on every page
-        // adds minutes without testing another control or waiting for I/O.
-        const wait = (ms = 0) => new Promise((r) => setTimeout(r, ms));
-        const out = [];
-        const drain = () => {
-          for (const e of staged) for (const c of e.cmds || []) out.push(String(c));
-          staged = []; dirty.clear(); renderStaged();
-        };
-        const strip = document.querySelectorAll("#sectionstrip .secitem");
-        if (strip[${p}]) { strip[${p}].click(); await wait(200); }
-        for (const sel of [...document.querySelectorAll("select")]) {
-          for (const opt of [...sel.options]) {
-            if (!opt.value) continue;
-            sel.value = opt.value;
-            sel.dispatchEvent(new Event("change", { bubbles: true }));
-            await wait();
-            drain();
-          }
-        }
-        for (const box of [...document.querySelectorAll("input[type=checkbox]")]) {
-          box.checked = !box.checked;
-          box.dispatchEvent(new Event("change", { bubbles: true }));
-          await wait();
-          drain();
-        }
-        return out;
-      })()`).catch(() => []);
-      staged.push(...out);
-    }
-  }
+// Behavioral staging is separate from field exposure. These explicit real
+// forms must emit the requested command through their actual Stage handler,
+// pass both API and installed CLI validation, and leave the saved file intact.
+// No ignored prerequisite errors, swallowed browser failures or repeated
+// global-dropdown commands count as proof for unrelated form fields.
+await stageContractTests(page);
 
-  console.log(`  exercised ${staged.length} control commands (${new Set(staged).size} distinct)`);
-  check(staged.length > 10, `only ${staged.length} controls did anything at all`);
-
-  // Through the same endpoint the console's own Apply uses, and in the same
-  // shape: the CLI, one command per line. No `commit`, so every line is parsed
-  // and validated and the session is then thrown away.
-  const body = staged.join("\n") + "\n";
-  const verdict = await page.evaluate(`(async () => {
-    const r = await fetch("/api/v1/configure", {
-      method: "POST",
-      headers: { "Content-Type": "text/plain", Authorization: "Bearer " + token },
-      body: ${JSON.stringify(body)},
-    });
-    return await r.text();
-  })()`);
-  // A line that needs company — a rule's port wants a proto — is the model
-  // doing its job, not a broken control: this operates each control on its own,
-  // which no operator does.
-  const refused = (verdict.match(/error: [^\n"]+/g) || []).filter(
-    (e) => !/together|require|need|must be|is required|not a declared|no such|not supported/i.test(e));
-  check(refused.length === 0,
-    `${refused.length} staged commands were refused:\n  ` + refused.slice(0, 8).join("\n  "));
-
-  // Leave the console as we found it.
-  await page.goto(URL);
-  await signIn(page, TOKEN);
-});
-
-// How much of the appliance the console can actually configure.
+// Which CLI grammar fields the console exposes, not behavioral coverage.
 //
 // This exists because the number was being guessed. An earlier pass put it at
 // 62% using an instrument that only saw the generic field tables — the global
@@ -1767,7 +1684,7 @@ await test("every control stages a command the appliance accepts", async () => {
 // So the floor is the whole thing. A setting the CLI grows and the console does
 // not is a defect, not a backlog item — and it cannot land quietly, because the
 // inventory beside this is golden and has to be regenerated in the same breath.
-await test("the console reaches most of what the CLI can configure", async () => {
+await test("the console exposes every inventoried CLI field (not a behavioral certificate)", async () => {
   // Its own pass, last, on a page of its own: the recording wrappers replace
   // three of the console's functions, and an earlier attempt to install them
   // once at the top and let every test feed the inventory broke the tests that
@@ -1797,7 +1714,7 @@ await test("the console reaches most of what the CLI can configure", async () =>
 
   // Printed always, so the number is a fact in the log rather than something
   // to be re-derived by hand later.
-  console.log(`  console covers ${have}/${wanted.length} CLI fields (${pct}%)`);
+  console.log(`  field exposure: ${have}/${wanted.length} CLI fields (${pct}%; not behavioral coverage)`);
   for (const [section, s] of [...bySection].sort((a, b) => a[1].have / a[1].want - b[1].have / b[1].want)) {
     const miss = s.missing.slice(0, 6).join(", ");
     console.log(`    ${String(section).padEnd(14)} ${String(s.have).padStart(3)}/${String(s.want).padEnd(3)}` +

@@ -26,3 +26,34 @@ jobs:
       - run: cargo check --workspace --locked
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+      - name: Appliance fixture regressions
+        run: python3 -B -m unittest nix.test_update_capacity nix.test_update_fixture nix.test_visible_mount nix.test_radio_units nix.test_ha_kernel_oracle -v
+
+  source-sbom:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: SBOM generator regression tests
+        run: python3 -B -m unittest discover -s tests -p 'test_sbom.py' -v
+      - name: Download pinned Syft
+        id: syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          syft-version: v1.54.1
+      - name: Generate CycloneDX source SBOM and provenance
+        env:
+          SYFT_BIN: ${{ steps.syft.outputs.cmd }}
+        run: python3 scripts/generate_sbom.py --syft "$SYFT_BIN" --output-dir "$RUNNER_TEMP/sentinel-source-sbom"
+      - name: Retain source SBOM (not an image certificate)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sentinel-source-sbom-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/sentinel-source-sbom/sbom.cdx.json
+            ${{ runner.temp }}/sentinel-source-sbom/sbom.provenance.json
+            ${{ runner.temp }}/sentinel-source-sbom/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30

@@ -399,6 +399,9 @@ pub(crate) struct Interface {
     /// interface's zone has a `[[nat.source]]` rule. Omitted when false.
     #[serde(skip_serializing_if = "is_false")]
     pub(crate) masquerade: bool,
+    /// Admit only validated replies to this NIC's local DHCPv4 client.
+    #[serde(skip_serializing_if = "is_false")]
+    pub(crate) dhcp_client: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) snat_address: Option<String>,
     /// Deterministic CGNAT (roadmap C16): the first WAN port and the ports each
@@ -880,6 +883,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                 // MTU less the IPv4 and TCP headers.
                 mss: mss_ceiling(i),
                 masquerade: masq_zones.contains_key(zone),
+                dhcp_client: i.address.as_deref() == Some("dhcp"),
                 snat_address: appliance
                     .nat
                     .source
@@ -2779,6 +2783,46 @@ external = "2001:db8:1::/48"
         assert!(out.contains("[[npt66]]"), "{out}");
         assert!(out.contains("internal = \"fd00:1::/48\""), "{out}");
         assert!(out.contains("external = \"2001:db8:1::/48\""), "{out}");
+    }
+
+    #[test]
+    fn only_declared_enabled_dhcpv4_clients_receive_local_admission() {
+        let appliance = Appliance::from_toml(
+            r#"
+[system]
+hostname = "fw"
+[[interface]]
+name = "wan0"
+zone = "wan"
+address = "dhcp"
+[[interface]]
+name = "lan0"
+zone = "lan"
+address = "192.0.2.1/24"
+[[interface]]
+name = "v6only"
+zone = "wan"
+address6 = "dhcp"
+[[interface]]
+name = "disabled0"
+zone = "wan"
+address = "dhcp"
+disabled = true
+"#,
+        )
+        .unwrap();
+        let cfg = compile(&appliance);
+        assert_eq!(cfg.interfaces.len(), 3);
+        for interface in &cfg.interfaces {
+            assert_eq!(interface.dhcp_client, interface.name == "wan0");
+        }
+        let value: toml::Value = toml::from_str(&cfg.to_toml().unwrap()).unwrap();
+        for interface in value["interface"].as_array().unwrap() {
+            assert_eq!(
+                interface.get("dhcp_client").is_some(),
+                interface["name"].as_str() == Some("wan0")
+            );
+        }
     }
 
     #[test]

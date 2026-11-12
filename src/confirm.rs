@@ -70,6 +70,7 @@ pub fn commit_confirm(session: &mut Session, act: &Apply, minutes: u32) -> Resul
     // Clear any prior pending timer so re-arming is clean, then apply live.
     // apply_live rolls its own partial failure back, so on error nothing armed
     // and the previous running config stands.
+    crate::mutation::advance()?;
     system::disarm_confirm();
     // The saved baseline (guaranteed present above) is the last-good target a
     // failed broad apply reconciles back to — the same config the timer reverts
@@ -85,7 +86,10 @@ pub fn commit_confirm(session: &mut Session, act: &Apply, minutes: u32) -> Resul
         // A revert: no last-good to reconcile to (reconciling back to the
         // un-confirmed candidate would defeat it), and a held link that stays
         // dark is reported rather than failing it: `restore_live`.
-        let revert = Appliance::load(&cfg_path).and_then(|prev| restore_live(&prev, act));
+        let revert = Appliance::load(&cfg_path).and_then(|prev| {
+            restore_live(&prev, act)?;
+            record_restored(&prev, act)
+        });
         return match revert {
             Ok(()) => {
                 Err(e).context("arming the rollback timer failed; reverted to the saved config")
@@ -96,6 +100,14 @@ pub fn commit_confirm(session: &mut Session, act: &Apply, minutes: u32) -> Resul
             )),
         };
     }
+
+    // Boot-late reconciliation and later operators read the same running
+    // intent as a plain commit. Publish only AFTER a successful apply and an
+    // armed rollback timer, under the common lock. A publication failure must
+    // not disarm that protection or claim the commit completed successfully.
+    session
+        .note_committed(&appliance.to_toml()?)
+        .context("candidate applied and rollback timer armed, but recording the running configuration failed")?;
 
     eprintln!("commit-confirm: {summary}; applied live.");
     eprintln!(
@@ -152,6 +164,7 @@ fn confirm_target(
 /// operator still needs `save` to persist it across a reboot (VyOS semantics).
 /// `confirm <id>` keeps the named management transaction instead.
 pub fn confirm(act: &Apply, id: Option<&str>) -> Result<()> {
+    let _lock = system::apply_lock()?;
     let path = Path::new(crate::session::DEFAULT_CONFIG);
     let status = if act.enabled {
         crate::safe_apply::status(path)?
@@ -168,6 +181,9 @@ pub fn confirm(act: &Apply, id: Option<&str>) -> Result<()> {
             eprintln!("confirmed management revision — applied and saved.");
         }
         ConfirmTarget::CommitConfirm => {
+            if act.enabled {
+                crate::mutation::advance()?;
+            }
             system::disarm_confirm();
             eprintln!("confirmed — change kept (run `save` to persist across reboot).");
         }
@@ -208,13 +224,29 @@ pub fn rollback(act: &Apply, cfg_path: &Path, from_timer: bool) -> Result<()> {
         .with_context(|| format!("loading the saved config {}", cfg_path.display()))?;
     // Stop the timer first (it may be the very unit running us) so a revert
     // that itself races a second firing can't loop.
+    if act.enabled {
+        crate::mutation::advance()?;
+    }
     system::disarm_confirm();
     // A revert to saved: there is no last-good to reconcile a partial failure
     // to (reconciling back to the un-confirmed config would defeat the revert),
     // so a failure here reports mixed-state honestly. A restore, so a held link
     // that stays dark is reported rather than failing the revert.
     restore_live(&appliance, act).context("reverting to the saved config")?;
+    record_restored(&appliance, act)?;
     eprintln!("reverted the running system to the saved config.");
+    Ok(())
+}
+
+/// A successful restore must replace any earlier unsaved running snapshot.
+/// Otherwise the delayed boot stage can reconcile back to the very candidate
+/// the timer just reverted. Never publish intent for off-box validation.
+fn record_restored(appliance: &Appliance, act: &Apply) -> Result<()> {
+    if act.enabled {
+        system::install_config_file(Path::new(Session::RUNNING), &appliance.to_toml()?).context(
+            "saved configuration restored, but recording the running configuration failed",
+        )?;
+    }
     Ok(())
 }
 

@@ -92,6 +92,7 @@ export async function browser({ port = 0, width = 1600, height = 1000 } = {}) {
   const pending = new Map();
   const thrown = [];
   const requests = [];
+  const responses = [], failedRequests = [], consoleMessages = [], logs = [];
   ws.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
     if (m.id && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); return; }
@@ -105,6 +106,18 @@ export async function browser({ port = 0, width = 1600, height = 1000 } = {}) {
       const d = m.params.exceptionDetails;
       thrown.push(`${d.exception?.description || d.text} (line ${d.lineNumber})`);
     }
+    if (m.method === "Network.responseReceived") {
+      const r = m.params.response;
+      responses.push({url:r.url,status:r.status,type:m.params.type});
+    }
+    if (m.method === "Network.loadingFailed") {
+      failedRequests.push({requestId:m.params.requestId,error:m.params.errorText,canceled:!!m.params.canceled});
+    }
+    if (m.method === "Runtime.consoleAPICalled") {
+      consoleMessages.push({level:m.params.type,text:m.params.args.map(a=>a.value??a.description).join(" ")});
+    }
+    if (m.method === "Log.entryAdded") logs.push(m.params.entry);
+    for (const list of [responses,failedRequests,consoleMessages,logs]) if(list.length>16384)list.shift();
     if (m.method === "Runtime.consoleAPICalled" && m.params.type === "error") {
       thrown.push("console.error: " +
         m.params.args.map((a) => a.value ?? a.description).join(" "));
@@ -161,12 +174,17 @@ export async function browser({ port = 0, width = 1600, height = 1000 } = {}) {
   await send("Runtime.enable");
   await send("Page.enable");
   await send("Network.enable");
+  await send("Log.enable");
 
   return {
     evaluate,
     send,
     requests,
     thrown,
+    responses,
+    failedRequests,
+    consoleMessages,
+    logs,
     async goto(url) { await send("Page.navigate", { url }); await sleep(1200); },
     async screenshot() {
       return (await send("Page.captureScreenshot", { format: "png" })).result.data;
@@ -182,7 +200,19 @@ export async function browser({ port = 0, width = 1600, height = 1000 } = {}) {
 /// Sign in with the machine token, the way an operator does before any account
 /// exists — through the form, not by writing the token into storage, so the
 /// sign-in path is covered too.
+async function waitForSignInForm(page, id) {
+  // Navigation completion is asynchronous. Finding server-rendered inputs
+  // does not mean the trailing script has installed their submit handlers.
+  // Under load, dispatching before that point is a silent test-only no-op.
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (await page.evaluate(`typeof document.getElementById(${JSON.stringify(id)})?.onsubmit === "function"`)) return;
+    await sleep(100);
+  }
+  throw new Error(`the sign-in form did not become interactive (${id})`);
+}
+
 export async function signIn(page, token) {
+  await waitForSignInForm(page, "tokenform");
   await page.evaluate(`(() => {
     document.getElementById("tokentoggle").click();
     document.getElementById("token").value = ${JSON.stringify(token)};
@@ -199,6 +229,7 @@ export async function signIn(page, token) {
 
 /// Sign in as an account, with a username and a password.
 export async function signInAs(page, username, password) {
+  await waitForSignInForm(page, "loginform");
   await page.evaluate(`(() => {
     document.getElementById("username").value = ${JSON.stringify(username)};
     document.getElementById("password").value = ${JSON.stringify(password)};

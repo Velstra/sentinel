@@ -1,6 +1,9 @@
 //! Declarative member identities, witness configuration and kernel-guard intent.
 use crate::{
-    config::{Appliance, HaIdentity, HaInterfaceIdentity},
+    config::{
+        Appliance, HaControlIdentity, HaControlInterface, HaIdentity, HaInterfaceIdentity,
+        HaInterfaceLinkIdentity, HaMode,
+    },
     system,
 };
 use anyhow::{Context, Result, ensure};
@@ -30,6 +33,8 @@ const POLL_MS: u64 = 25;
 const MARGIN_MS: u64 = 20;
 const MAX_LEASE_MS: u64 = 10_000;
 pub const PEER_SILENCE_MS: u64 = 10_000;
+pub const PEER_TIMEOUT_MS: u64 = 1_000;
+pub const STARTUP_DELAY_MS: u64 = 3_000;
 pub fn check_budget(lease_ms: u64, io_ms: u64) -> Result<()> {
     ensure!(
         (1..=MAX_LEASE_MS).contains(&lease_ms) && io_ms > 0,
@@ -94,6 +99,8 @@ pub struct DataplaneHa {
     cluster: String,
     node: u8,
     interfaces: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    control_interfaces: Vec<String>,
     disabled: Vec<String>,
     wireguard_ports: Vec<u16>,
     wireguard: Vec<String>,
@@ -104,7 +111,11 @@ pub struct DataplaneHa {
 pub struct RoutingHa {
     cluster: String,
     node: u8,
-    witness: String,
+    mode: HaMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    witness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    two_node: Option<RoutingTwoNode>,
     secret: String,
     priority: u8,
     preempt: bool,
@@ -112,6 +123,13 @@ pub struct RoutingHa {
     wireguard_policy: String,
     lease_ms: u64,
     io_ms: u64,
+}
+#[derive(Debug, Serialize)]
+pub struct RoutingTwoNode {
+    listen: Vec<String>,
+    peers: Vec<String>,
+    peer_timeout_ms: u64,
+    startup_delay_ms: u64,
 }
 impl std::fmt::Debug for RoutingHa {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -151,6 +169,85 @@ fn numeric_endpoint(value: &str) -> Result<SocketAddr> {
     ensure!(endpoint.port() > 0, "HA endpoint port must be nonzero");
     Ok(endpoint)
 }
+fn heartbeat_endpoint(value: &str) -> Result<SocketAddr> {
+    let endpoint = numeric_endpoint(value)?;
+    let ip = endpoint.ip();
+    ensure!(
+        !ip.is_unspecified() && !ip.is_multicast() && !ip.is_loopback(),
+        "HA heartbeat requires a unicast non-loopback endpoint"
+    );
+    ensure!(
+        ip != IpAddr::V4(std::net::Ipv4Addr::BROADCAST),
+        "HA heartbeat must not use broadcast"
+    );
+    Ok(endpoint)
+}
+fn heartbeat_interface(a: &Appliance, address: IpAddr) -> Result<&str> {
+    let matches: Vec<_> = a
+        .interfaces
+        .iter()
+        .filter(|i| !i.disabled && interface_address(a, &i.name, address))
+        .collect();
+    ensure!(
+        matches.len() == 1,
+        "HA heartbeat listen address must belong to exactly one enabled declared static interface"
+    );
+    Ok(&matches[0].name)
+}
+fn validate_two_node(a: &Appliance, ha: &crate::config::Ha) -> Result<()> {
+    if !ha.enabled && ha.heartbeat_listen.is_empty() && ha.heartbeat_peer.is_empty() {
+        return Ok(());
+    }
+    ensure!(
+        (1..=4).contains(&ha.heartbeat_listen.len())
+            && ha.heartbeat_listen.len() == ha.heartbeat_peer.len(),
+        "two-node HA needs 1..4 matching heartbeat-listen and heartbeat-peer paths"
+    );
+    let listens: Vec<_> = ha
+        .heartbeat_listen
+        .iter()
+        .map(|s| heartbeat_endpoint(s))
+        .collect::<Result<_>>()?;
+    let peers: Vec<_> = ha
+        .heartbeat_peer
+        .iter()
+        .map(|s| heartbeat_endpoint(s))
+        .collect::<Result<_>>()?;
+    ensure!(
+        listens.iter().collect::<BTreeSet<_>>().len() == listens.len()
+            && peers.iter().collect::<BTreeSet<_>>().len() == peers.len(),
+        "HA heartbeat paths must not contain duplicate endpoints"
+    );
+    for (listen, peer) in listens.iter().zip(&peers) {
+        ensure!(
+            listen.is_ipv4() == peer.is_ipv4() && listen.ip() != peer.ip(),
+            "HA heartbeat path needs matching address families and distinct member addresses"
+        );
+        heartbeat_interface(a, listen.ip())?;
+        ensure!(
+            !a.interfaces
+                .iter()
+                .any(|i| interface_address(a, &i.name, peer.ip())),
+            "HA heartbeat peer must not name a local interface"
+        );
+    }
+    let timeout = ha.peer_timeout_ms.unwrap_or(PEER_TIMEOUT_MS);
+    let delay = ha.startup_delay_ms.unwrap_or(STARTUP_DELAY_MS);
+    ensure!(
+        (750..=1200).contains(&timeout)
+            && timeout >= ha.lease_ms.unwrap_or(LEASE_MS).saturating_mul(4),
+        "two-node HA peer-timeout-ms must be 750..1200 and at least four lease periods"
+    );
+    ensure!(
+        timeout + ha.io_timeout_ms.unwrap_or(IO_MS) + POLL_MS + MARGIN_MS < 1500,
+        "two-node HA decision must fit the dataplane's 1500ms complete-state freshness budget"
+    );
+    ensure!(
+        delay >= timeout.saturating_mul(2) && delay <= 120_000,
+        "two-node HA startup-delay-ms must be at least twice peer-timeout-ms and at most 120000"
+    );
+    Ok(())
+}
 /// Guard every declared data link and its L2 ancestry. A dedicated
 /// control interface and its underlay cannot be shared with this closure.
 pub fn guarded_interfaces(a: &Appliance) -> BTreeSet<String> {
@@ -178,7 +275,7 @@ pub fn guarded_interfaces(a: &Appliance) -> BTreeSet<String> {
         a.vpn
             .wireguard
             .iter()
-            .filter(|w| w.name != ha.sync_interface)
+            .filter(|w| !control.contains(&w.name))
             .map(|w| w.name.clone()),
     );
     loop {
@@ -212,20 +309,30 @@ pub fn dataplane(a: &Appliance) -> Option<DataplaneHa> {
             .map(|i| i.name.clone())
             .collect(),
         interfaces,
+        control_interfaces: if ha.enabled {
+            let control = control_interfaces(a).unwrap_or_default();
+            a.interfaces
+                .iter()
+                .filter(|i| !i.disabled && i.zone.is_some() && control.contains(&i.name))
+                .map(|i| i.name.clone())
+                .collect()
+        } else {
+            Vec::new()
+        },
         role_fresh_ms: role_fresh_ms(ha.io_timeout_ms.unwrap_or(IO_MS)),
         wireguard_policy: wireguard_policy(a),
         wireguard: a
             .vpn
             .wireguard
             .iter()
-            .filter(|w| w.name != ha.sync_interface)
+            .filter(|w| !control_interfaces(a).unwrap_or_default().contains(&w.name))
             .map(|w| w.name.clone())
             .collect(),
         wireguard_ports: a
             .vpn
             .wireguard
             .iter()
-            .filter(|w| w.name != ha.sync_interface)
+            .filter(|w| !control_interfaces(a).unwrap_or_default().contains(&w.name))
             .filter_map(|w| w.listen_port)
             .collect(),
     })
@@ -235,7 +342,14 @@ pub fn routing(a: &Appliance) -> Option<RoutingHa> {
     Some(RoutingHa {
         cluster: ha.cluster.clone(),
         node: ha.node(),
-        witness: ha.witness.clone(),
+        mode: ha.mode,
+        witness: (ha.mode == HaMode::Witness).then(|| ha.witness.clone()),
+        two_node: (ha.mode == HaMode::TwoNode).then(|| RoutingTwoNode {
+            listen: ha.heartbeat_listen.clone(),
+            peers: ha.heartbeat_peer.clone(),
+            peer_timeout_ms: ha.peer_timeout_ms.unwrap_or(PEER_TIMEOUT_MS),
+            startup_delay_ms: ha.startup_delay_ms.unwrap_or(STARTUP_DELAY_MS),
+        }),
         secret: witness_key(
             a.system.config_sync.secret.as_deref().unwrap_or_default(),
             &ha.cluster,
@@ -249,7 +363,7 @@ pub fn routing(a: &Appliance) -> Option<RoutingHa> {
             .vpn
             .wireguard
             .iter()
-            .filter(|w| w.name != ha.sync_interface)
+            .filter(|w| !control_interfaces(a).unwrap_or_default().contains(&w.name))
             .map(|w| w.name.clone())
             .collect(),
     })
@@ -309,6 +423,13 @@ fn validate_witness(w: &crate::config::HaWitness) -> Result<()> {
 /// Commit-time advisories. Neither blocks a commit: refusing a witness that
 /// boots from an older document would take its pair's authority down with it.
 pub fn witness_warnings(a: &Appliance) -> Vec<String> {
+    if a.system
+        .ha
+        .as_ref()
+        .is_some_and(|h| h.mode == HaMode::TwoNode)
+    {
+        return vec!["two-node HA has no external arbiter: a total heartbeat partition can promote both members; configure independent control paths or use witness mode when split-brain exclusion is required".into()];
+    }
     let Some(w) = &a.system.ha_witness else {
         return Vec::new();
     };
@@ -357,11 +478,29 @@ pub fn validate(a: &Appliance) -> Result<()> {
         ha.lease_ms.unwrap_or(LEASE_MS),
         ha.io_timeout_ms.unwrap_or(IO_MS),
     )?;
-    let witness = numeric_endpoint(&ha.witness)?;
-    ensure!(
-        !witness.ip().is_unspecified(),
-        "HA witness must name an independent endpoint"
-    );
+    match ha.mode {
+        HaMode::Witness => {
+            let witness = numeric_endpoint(&ha.witness)?;
+            ensure!(
+                !witness.ip().is_unspecified(),
+                "HA witness must name an independent endpoint"
+            );
+            ensure!(
+                ha.heartbeat_listen.is_empty()
+                    && ha.heartbeat_peer.is_empty()
+                    && ha.peer_timeout_ms.is_none()
+                    && ha.startup_delay_ms.is_none(),
+                "witness HA cannot configure two-node heartbeat fields"
+            );
+        }
+        HaMode::TwoNode => {
+            ensure!(
+                ha.witness.is_empty(),
+                "two-node HA must not configure a witness"
+            );
+            validate_two_node(a, ha)?;
+        }
+    }
     ensure!(
         (1..=2).contains(&ha.node()) && ha.priority() > 0,
         "HA node must be 1 or 2; priority must be nonzero"
@@ -453,7 +592,7 @@ pub fn validate(a: &Appliance) -> Result<()> {
         );
     }
     for w in &a.vpn.wireguard {
-        if w.name != ha.sync_interface {
+        if !control.contains(&w.name) {
             ensure!(
                 w.listen_port.is_some_and(|p| p > 0),
                 "HA WireGuard data VPNs need an explicit listen-port"
@@ -477,6 +616,13 @@ pub fn validate(a: &Appliance) -> Result<()> {
         );
     }
     if let Some(identity) = &ha.peer_identity {
+        if ha.mode == HaMode::TwoNode {
+            ensure!(
+                identity.heartbeat_listen == ha.heartbeat_peer
+                    && identity.heartbeat_peer == ha.heartbeat_listen,
+                "paired two-node heartbeat paths must be reciprocal member-local endpoints"
+            );
+        }
         ensure!(
             identity.node == 3 - ha.node() && identity.priority > 0,
             "peer identity names the wrong HA member"
@@ -498,7 +644,9 @@ pub fn validate(a: &Appliance) -> Result<()> {
                     .is_some_and(|s| !matches!(s, "auto" | "dhcp"))
                 || i.local.is_some();
             ensure!(
-                !node_specific || identity.interfaces.contains_key(&i.name),
+                !node_specific
+                    || identity.interfaces.contains_key(&i.name)
+                    || identity.control.is_some() && control.contains(&i.name),
                 "new interface {} needs its peer-specific identity in system.ha.peer-identity",
                 i.name
             );
@@ -508,7 +656,7 @@ pub fn validate(a: &Appliance) -> Result<()> {
         let mut peer = materialize_peer(a.clone())?;
         ensure!(
             guarded_interfaces(a) == guarded_interfaces(&peer),
-            "HA members must have the same logical dedicated control underlay"
+            "HA members must retain the same logical fenced data links"
         );
         peer.system.ha.as_mut().expect("HA retained").peer_identity = None;
         peer.validate()
@@ -545,6 +693,13 @@ fn management_endpoint(a: &Appliance) -> Result<String> {
 }
 pub fn capture(a: &Appliance) -> Result<HaIdentity> {
     let ha = a.system.ha.as_ref().context("HA member identity missing")?;
+    let control = control_interfaces(a)?;
+    ensure!(
+        control
+            .iter()
+            .all(|name| a.interfaces.iter().any(|i| &i.name == name)),
+        "HA member identity requires every dedicated control ancestor to be declared"
+    );
     Ok(HaIdentity {
         node: ha.node(),
         hostname: a.system.hostname.clone(),
@@ -561,6 +716,8 @@ pub fn capture(a: &Appliance) -> Result<HaIdentity> {
             .listen
             .clone()
             .context("HA state endpoint missing")?,
+        heartbeat_listen: ha.heartbeat_listen.clone(),
+        heartbeat_peer: ha.heartbeat_peer.clone(),
         priority: ha.priority(),
         interfaces: a
             .interfaces
@@ -572,16 +729,40 @@ pub fn capture(a: &Appliance) -> Result<HaIdentity> {
                         address: i.address.clone(),
                         address6: i.address6.clone(),
                         local: i.local.clone(),
+                        link: Some(HaInterfaceLinkIdentity {
+                            hw_id: i.hw_id.clone(),
+                            remote: i.remote.clone(),
+                        }),
                     },
                 )
             })
             .collect(),
+        control: Some(HaControlIdentity {
+            sync_interface: ha.sync_interface.clone(),
+            interfaces: a
+                .interfaces
+                .iter()
+                .enumerate()
+                .filter(|(_, interface)| control.contains(&interface.name))
+                .map(|(position, interface)| HaControlInterface {
+                    position,
+                    configuration: interface.clone(),
+                })
+                .collect(),
+        }),
         control_wireguard: a
             .vpn
             .wireguard
             .iter()
             .find(|w| w.name == ha.sync_interface)
             .cloned(),
+        control_wireguards: a
+            .vpn
+            .wireguard
+            .iter()
+            .filter(|w| control.contains(&w.name) && w.name != ha.sync_interface)
+            .cloned()
+            .collect(),
     })
 }
 /// Swap node-specific facts while retaining the complete shared desired policy.
@@ -594,12 +775,95 @@ pub fn materialize_peer(mut a: Appliance) -> Result<Appliance> {
         .as_ref()
         .and_then(|h| h.peer_identity.clone())
         .context("peer identity missing")?;
+    // Capture and validate the source closure before replacing anything. A
+    // data link whose ancestry uses it is never exempted from fencing.
+    let source_control = control_interfaces(&a)?;
+    let source_guarded = guarded_interfaces(&a);
+    ensure!(
+        source_guarded.is_disjoint(&source_control),
+        "HA control underlay cannot carry fenced data/VIPs"
+    );
+    if let Some(control) = &target.control {
+        crate::config::validate_iface_name(&control.sync_interface)?;
+        ensure!(
+            !control.interfaces.is_empty() && control.interfaces.len() <= 128,
+            "peer control profile must contain 1..128 declared links"
+        );
+        let names: BTreeSet<_> = control
+            .interfaces
+            .iter()
+            .map(|i| i.configuration.name.clone())
+            .collect();
+        let positions: BTreeSet<_> = control.interfaces.iter().map(|i| i.position).collect();
+        ensure!(
+            names.len() == control.interfaces.len()
+                && positions.len() == control.interfaces.len()
+                && names.contains(&control.sync_interface),
+            "peer control profile has duplicate links/positions or lacks its sync interface"
+        );
+        ensure!(
+            !a.interfaces
+                .iter()
+                .any(|i| !source_control.contains(&i.name) && names.contains(&i.name)),
+            "peer control link collides with a shared data interface"
+        );
+        ensure!(
+            !a.vpn.wireguard.iter().any(
+                |tunnel| !source_control.contains(&tunnel.name) && names.contains(&tunnel.name)
+            ),
+            "peer control link collides with a shared data WireGuard tunnel"
+        );
+        a.vpn
+            .wireguard
+            .retain(|tunnel| !source_control.contains(&tunnel.name));
+        a.interfaces.retain(|i| !source_control.contains(&i.name));
+        let mut links = control.interfaces.clone();
+        links.sort_by_key(|i| i.position);
+        for entry in links {
+            let position = entry.position.min(a.interfaces.len());
+            a.interfaces.insert(position, entry.configuration);
+        }
+        for v in &mut a.protocols.vrrp {
+            if v.interface
+                == source
+                    .control
+                    .as_ref()
+                    .expect("captured control")
+                    .sync_interface
+            {
+                // Only the heartbeat binding is member-local. The VIP's
+                // address-interface stays shared and guarded.
+                v.interface = control.sync_interface.clone();
+            }
+        }
+        // Service policy is shared, but a binding to the selected dedicated
+        // control link names a member-local interface. Translate only that
+        // proven correspondence; arbitrary ancestors (especially bridge
+        // members) have no unambiguous peer mapping and must fail validation
+        // rather than silently serving on a guessed link.
+        let source_sync = &source
+            .control
+            .as_ref()
+            .expect("captured control")
+            .sync_interface;
+        for bindings in [&mut a.services.ntp.serve_on, &mut a.services.dns.serve_on] {
+            for binding in bindings {
+                if binding == source_sync {
+                    *binding = control.sync_interface.clone();
+                }
+            }
+        }
+        a.system.ha.as_mut().context("HA missing")?.sync_interface = control.sync_interface.clone();
+    }
     let ha = a.system.ha.as_mut().context("HA missing")?;
     ensure!(target.node == 3 - ha.node(), "HA peer node mismatch");
     ha.node = Some(target.node);
+    ha.heartbeat_listen = target.heartbeat_listen;
+    ha.heartbeat_peer = target.heartbeat_peer;
     ha.priority = Some(target.priority);
     ha.management_fingerprint = Some(target.management_fingerprint.clone());
     ha.peer_identity = Some(source.clone());
+    let preempt = ha.preempt;
     a.system.hostname = target.hostname;
     if let Some(web) = target.management_web {
         a.services.web = web;
@@ -614,6 +878,10 @@ pub fn materialize_peer(mut a: Appliance) -> Result<Appliance> {
             i.address = facts.address.clone();
             i.address6 = facts.address6.clone();
             i.local = facts.local.clone();
+            if let Some(link) = &facts.link {
+                i.hw_id = link.hw_id.clone();
+                i.remote = link.remote.clone();
+            }
         } else {
             ensure!(
                 i.address.as_deref().is_none_or(|s| s == "dhcp")
@@ -626,7 +894,11 @@ pub fn materialize_peer(mut a: Appliance) -> Result<Appliance> {
             );
         }
     }
-    if let Some(control) = target.control_wireguard {
+    for control in target
+        .control_wireguard
+        .into_iter()
+        .chain(target.control_wireguards)
+    {
         let wireguard = &mut a.vpn.wireguard;
         if let Some(existing) = wireguard.iter_mut().find(|w| w.name == control.name) {
             *existing = control;
@@ -634,10 +906,25 @@ pub fn materialize_peer(mut a: Appliance) -> Result<Appliance> {
             wireguard.push(control);
         }
     }
+    if let Some(control) = &target.control {
+        let declared: BTreeSet<_> = control
+            .interfaces
+            .iter()
+            .map(|i| i.configuration.name.clone())
+            .collect();
+        ensure!(
+            control_interfaces(&a)? == declared,
+            "peer control profile must describe exactly its dedicated control ancestry"
+        );
+    }
     for v in &mut a.protocols.vrrp {
         v.priority = Some(target.priority);
-        v.preempt = Some(ha.preempt);
+        v.preempt = Some(preempt);
     }
+    ensure!(
+        guarded_interfaces(&a) == source_guarded,
+        "peer control profile must preserve the complete fenced data-link set"
+    );
     Ok(a)
 }
 
@@ -809,6 +1096,7 @@ pub fn pair(
     config: &Path,
     witness: Option<&str>,
     identity: Option<&Path>,
+    mode: Option<HaMode>,
 ) -> Result<()> {
     use std::{
         io::Write,
@@ -817,6 +1105,10 @@ pub fn pair(
     ensure!(
         (32..=1024).contains(&secret.len()) && !secret.chars().any(|c| c.is_control()),
         "HA secret must contain 32..1024 non-control bytes"
+    );
+    ensure!(
+        mode != Some(HaMode::TwoNode) || witness.is_none(),
+        "--mode two-node conflicts with --witness"
     );
     let peer = numeric_endpoint(peer)?.to_string();
     if unsafe { libc::geteuid() } != 0 {
@@ -834,6 +1126,9 @@ pub fn pair(
             .arg(config);
         if let Some(w) = witness {
             command.args(["--witness", w]);
+        }
+        if let Some(mode) = mode {
+            command.args(["--mode", mode.as_str()]);
         }
         if let Some(i) = identity {
             command.arg("--peer-identity").arg(i);
@@ -866,6 +1161,12 @@ pub fn pair(
         let saved: PairPlan = serde_json::from_str(&text)?;
         ensure!(
             saved.peer == peer
+                && mode.is_none_or(|m| saved
+                    .appliance
+                    .system
+                    .ha
+                    .as_ref()
+                    .is_some_and(|h| h.mode == m))
                 && saved
                     .appliance
                     .system
@@ -894,8 +1195,30 @@ pub fn pair(
         );
         let mut local = current.clone();
         let mut secondary = remote.appliance;
-        let witness = witness.map(str::to_owned).or_else(|| local.system.ha.as_ref().map(|h|h.witness.clone())).context("configure system.ha.witness or pass --witness with an independent witness endpoint")?;
-        numeric_endpoint(&witness)?;
+        let selected_mode =
+            mode.unwrap_or_else(|| local.system.ha.as_ref().map_or(HaMode::Witness, |h| h.mode));
+        ensure!(
+            selected_mode != HaMode::TwoNode || witness.is_none(),
+            "--mode two-node conflicts with --witness"
+        );
+        let witness = if selected_mode == HaMode::Witness {
+            let witness = witness.map(str::to_owned).or_else(|| local.system.ha.as_ref().map(|h|h.witness.clone())).filter(|w| !w.is_empty()).context("configure system.ha.witness or pass --witness with an independent witness endpoint")?;
+            numeric_endpoint(&witness)?;
+            witness
+        } else {
+            ensure!(
+                local
+                    .system
+                    .ha
+                    .as_ref()
+                    .is_none_or(|h| h.witness.is_empty()),
+                "remove system.ha.witness before selecting two-node mode"
+            );
+            eprintln!(
+                "WARNING: witnessless two-node HA cannot prevent dual promotion during a total peer partition; use independent heartbeat paths or an external witness."
+            );
+            String::new()
+        };
         // Timing prepared on the primary applies to both members; check that
         // this witness can answer inside it before either document changes.
         let (lease_ms, io_timeout_ms) = local
@@ -905,7 +1228,10 @@ pub fn pair(
             .map_or((None, None), |h| (h.lease_ms, h.io_timeout_ms));
         let io = io_timeout_ms.unwrap_or(IO_MS);
         check_budget(lease_ms.unwrap_or(LEASE_MS), io)?;
-        check_witness_rtt(witness_rtt(&witness)?, io)?;
+        if selected_mode == HaMode::Witness {
+            check_witness_rtt(witness_rtt(&witness)?, io)?;
+        }
+        let prepared = local.system.ha.clone().unwrap_or_default();
         let cluster = local
             .system
             .ha
@@ -932,6 +1258,36 @@ pub fn pair(
         let remote_ip = numeric_endpoint(&peer)?.ip();
         let (local_interface, local_state) = state_address(&local, remote_ip)?;
         let local_ip = numeric_endpoint(&local_state)?.ip();
+        let (heartbeat_listen, heartbeat_peer) = if selected_mode == HaMode::TwoNode {
+            let paths =
+                if prepared.heartbeat_listen.is_empty() && prepared.heartbeat_peer.is_empty() {
+                    (
+                        vec![SocketAddr::new(local_ip, 5441).to_string()],
+                        vec![SocketAddr::new(remote_ip, 5441).to_string()],
+                    )
+                } else {
+                    (
+                        prepared.heartbeat_listen.clone(),
+                        prepared.heartbeat_peer.clone(),
+                    )
+                };
+            if let Some(remote) = secondary
+                .system
+                .ha
+                .as_ref()
+                .filter(|h| !h.heartbeat_listen.is_empty() || !h.heartbeat_peer.is_empty())
+            {
+                ensure!(
+                    remote.mode == HaMode::TwoNode
+                        && remote.heartbeat_listen == paths.1
+                        && remote.heartbeat_peer == paths.0,
+                    "prepared peer heartbeat paths conflict with primary's reciprocal paths"
+                );
+            }
+            paths
+        } else {
+            (Vec::new(), Vec::new())
+        };
         // The peer's declared facts, rather than a guessed address increment,
         // determine its dedicated control interface.
         let remote_interface = secondary
@@ -941,20 +1297,19 @@ pub fn pair(
             .context("peer management IP must belong to its declared dedicated control interface")?
             .name
             .clone();
-        ensure!(
-            local_interface == remote_interface,
-            "pair members must use the same logical control interface name"
-        );
         local.system.ha = Some(crate::config::Ha {
             enabled: true,
             cluster: cluster.clone(),
             node: Some(1),
             witness: witness.clone(),
+            mode: selected_mode,
             sync_interface: local_interface.clone(),
             priority: Some(200),
             preempt: local.system.ha.as_ref().is_some_and(|h| h.preempt),
             lease_ms,
             io_timeout_ms,
+            peer_timeout_ms: prepared.peer_timeout_ms,
+            startup_delay_ms: prepared.startup_delay_ms,
             ..Default::default()
         });
         secondary.system.ha = Some(crate::config::Ha {
@@ -962,10 +1317,13 @@ pub fn pair(
             cluster,
             node: Some(2),
             witness,
+            mode: selected_mode,
             sync_interface: remote_interface,
             priority: Some(100),
             lease_ms,
             io_timeout_ms,
+            peer_timeout_ms: prepared.peer_timeout_ms,
+            startup_delay_ms: prepared.startup_delay_ms,
             ..Default::default()
         });
         for (a, listen, other) in [
@@ -980,6 +1338,20 @@ pub fn pair(
                 local_state,
             ),
         ] {
+            if selected_mode == HaMode::TwoNode {
+                let primary = numeric_endpoint(&listen)?.ip() == local_ip;
+                let ha = a.system.ha.as_mut().expect("member");
+                ha.heartbeat_listen = if primary {
+                    heartbeat_listen.clone()
+                } else {
+                    heartbeat_peer.clone()
+                };
+                ha.heartbeat_peer = if primary {
+                    heartbeat_peer.clone()
+                } else {
+                    heartbeat_listen.clone()
+                };
+            }
             a.system.conntrack_sync.listen = Some(listen);
             a.system.conntrack_sync.peers = vec![other];
             a.system.conntrack_sync.interval = None;
@@ -1073,19 +1445,24 @@ pub fn pair(
         )?;
     }
     system::remove_file(plan_path)?;
-    println!(
-        "HA pair configured: node 1 + node 2 at {peer}; authority is granted by the independent witness."
-    );
+    match plan.appliance.system.ha.as_ref().expect("paired HA").mode {
+        HaMode::Witness => println!(
+            "HA pair configured: node 1 + node 2 at {peer}; authority is granted by the independent witness."
+        ),
+        HaMode::TwoNode => println!(
+            "HA pair configured: node 1 + node 2 at {peer}; authenticated two-node heartbeats grant authority. WARNING: a total peer partition can promote both nodes; there is no external arbiter."
+        ),
+    }
     Ok(())
 }
 
 fn wireguard_policy(a: &Appliance) -> String {
-    let sync = a.system.ha.as_ref().map(|h| h.sync_interface.as_str());
+    let control = control_interfaces(a).unwrap_or_default();
     let tunnels: Vec<_> = a
         .vpn
         .wireguard
         .iter()
-        .filter(|w| Some(w.name.as_str()) != sync)
+        .filter(|w| !control.contains(&w.name))
         .collect();
     let bytes = serde_json::to_vec(&tunnels).expect("WireGuard configuration serializes");
     digest::digest(&digest::SHA256, &bytes)
@@ -1130,7 +1507,18 @@ fn control_interfaces(a: &Appliance) -> Result<BTreeSet<String>> {
         return Ok(BTreeSet::new());
     };
     let mut control: BTreeSet<_> = [ha.sync_interface.clone()].into_iter().collect();
-    if let Some(tunnel) = a.vpn.wireguard.iter().find(|w| w.name == ha.sync_interface) {
+    if ha.mode == HaMode::TwoNode {
+        for endpoint in &ha.heartbeat_listen {
+            control.insert(heartbeat_interface(a, heartbeat_endpoint(endpoint)?.ip())?.into());
+        }
+    }
+    for tunnel in a
+        .vpn
+        .wireguard
+        .iter()
+        .filter(|w| control.contains(&w.name))
+        .collect::<Vec<_>>()
+    {
         for peer in &tunnel.peers {
             let endpoint = numeric_endpoint(
                 peer.endpoint
@@ -1204,6 +1592,12 @@ pub fn render_status(status: &serde_json::Value) -> String {
         Some(reason) if role != "Master" => format!("HA {role} (not ready: {reason})\n"),
         _ => format!("HA {role}\n"),
     };
+    if let Some(mode) = status["configured_mode"].as_str() {
+        out.push_str(&format!("  configured mode {mode}\n"));
+        if mode == "two-node" {
+            out.push_str("  warning: total heartbeat partition can promote both members (no external arbiter)\n");
+        }
+    }
     let number = |key: &str| status[key].as_u64().map_or("-".into(), |v| v.to_string());
     out.push_str(&format!(
         "  node {}  cluster {}  term {}  owner {}\n",
@@ -1344,6 +1738,11 @@ virtual-address=["10.10.0.254"]
     facts.management_fingerprint = pin;
     facts.interfaces.get_mut("sync0").unwrap().address = Some("10.20.0.2/24".into());
     facts.interfaces.get_mut("wan0").unwrap().address = Some("10.10.0.2/24".into());
+    for link in &mut facts.control.as_mut().unwrap().interfaces {
+        if link.configuration.name == "sync0" {
+            link.configuration.address = Some("10.20.0.2/24".into());
+        }
+    }
     primary.system.ha.as_mut().unwrap().peer_identity = Some(facts);
     primary.validate().unwrap();
     primary
@@ -1351,6 +1750,887 @@ virtual-address=["10.10.0.254"]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn two_node_members() -> Appliance {
+        let mut primary = distinct_control_members();
+        let ha = primary.system.ha.as_mut().unwrap();
+        ha.mode = HaMode::TwoNode;
+        ha.witness.clear();
+        ha.heartbeat_listen = vec!["10.20.0.1:5441".into()];
+        ha.heartbeat_peer = vec!["10.20.0.2:5441".into()];
+        let identity = ha.peer_identity.as_mut().unwrap();
+        identity.heartbeat_listen = ha.heartbeat_peer.clone();
+        identity.heartbeat_peer = ha.heartbeat_listen.clone();
+        primary.validate().unwrap();
+        primary
+    }
+
+    #[test]
+    fn compiler_declares_only_resolved_control_bindings_and_none_when_disabled() {
+        let mut a = two_node_members();
+        a.interfaces
+            .iter_mut()
+            .find(|i| i.name == "enp0s20f0u3")
+            .unwrap()
+            .zone = Some("control".into());
+        let control = a
+            .interfaces
+            .iter()
+            .find(|i| i.name == "enp0s20f0u3")
+            .unwrap()
+            .clone();
+        let mut parent = control.clone();
+        parent.name = "unbound-parent".into();
+        parent.address = None;
+        parent.zone = None;
+        let logical = a
+            .interfaces
+            .iter_mut()
+            .find(|i| i.name == control.name)
+            .unwrap();
+        logical.parent = Some(parent.name.clone());
+        logical.vlan = Some(43);
+        logical.hw_id = None;
+        a.interfaces.push(parent);
+        a.system.ha.as_mut().unwrap().peer_identity = None;
+        a.validate().unwrap();
+        assert_eq!(
+            control_interfaces(&a).unwrap(),
+            BTreeSet::from(["enp0s20f0u3".into(), "unbound-parent".into()])
+        );
+        let compiled: serde_json::Value = serde_json::to_value(dataplane(&a).unwrap()).unwrap();
+        assert_eq!(
+            compiled["control_interfaces"],
+            serde_json::json!(["enp0s20f0u3"])
+        );
+        assert_eq!(compiled["interfaces"], serde_json::json!(["wan0"]));
+        a.system.ha.as_mut().unwrap().enabled = false;
+        let disabled = serde_json::to_value(dataplane(&a).unwrap()).unwrap();
+        assert_eq!(disabled["enabled"], false);
+        assert!(disabled.get("control_interfaces").is_none());
+    }
+
+    #[test]
+    fn compiler_keeps_control_hardware_and_own_ip_out_of_tenant_port_security() {
+        let mut primary = two_node_members();
+        primary
+            .interfaces
+            .iter_mut()
+            .find(|i| i.name == "enp0s20f0u3")
+            .unwrap()
+            .zone = Some("control".into());
+        for link in &mut primary
+            .system
+            .ha
+            .as_mut()
+            .unwrap()
+            .peer_identity
+            .as_mut()
+            .unwrap()
+            .control
+            .as_mut()
+            .unwrap()
+            .interfaces
+        {
+            link.configuration.zone = Some("control".into());
+        }
+        let secondary = materialize_peer(primary.clone()).unwrap();
+        let compile = |a: &Appliance| {
+            toml::from_str::<toml::Value>(&crate::compile::compile(a).to_toml().unwrap()).unwrap()
+        };
+        let first = compile(&primary);
+        let second = compile(&secondary);
+        for (document, name) in [(&first, "enp0s20f0u3"), (&second, "enp0s20f0u1")] {
+            let binding = document["interface"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|i| i["name"].as_str() == Some(name))
+                .unwrap();
+            assert!(binding.get("bind_mac").is_none() && binding.get("bind_addresses").is_none());
+            assert_eq!(
+                document["ha"]["control_interfaces"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                vec![name]
+            );
+        }
+        assert_ne!(
+            primary
+                .interfaces
+                .iter()
+                .find(|i| i.name == "enp0s20f0u3")
+                .unwrap()
+                .hw_id,
+            secondary
+                .interfaces
+                .iter()
+                .find(|i| i.name == "enp0s20f0u1")
+                .unwrap()
+                .hw_id
+        );
+    }
+
+    #[test]
+    fn witness_is_compatible_default_and_two_node_runtime_is_explicit() {
+        let legacy = paired_fixture();
+        assert_eq!(legacy.system.ha.as_ref().unwrap().mode, HaMode::Witness);
+        let witness = serde_json::to_value(routing(&legacy).unwrap()).unwrap();
+        assert_eq!(witness["mode"], "witness");
+        assert_eq!(witness["witness"], "10.20.0.3:5440");
+        assert!(witness.get("two_node").is_none());
+        let a = two_node_members();
+        let runtime = serde_json::to_value(routing(&a).unwrap()).unwrap();
+        assert_eq!(runtime["mode"], "two-node");
+        assert!(runtime.get("witness").is_none());
+        assert_eq!(
+            runtime["two_node"]["listen"],
+            serde_json::json!(["10.20.0.1:5441"])
+        );
+        assert_eq!(
+            runtime["two_node"]["peers"],
+            serde_json::json!(["10.20.0.2:5441"])
+        );
+        assert_eq!(runtime["two_node"]["peer_timeout_ms"], 1000);
+        assert_eq!(runtime["two_node"]["startup_delay_ms"], 3000);
+        assert!(
+            a.warnings()
+                .iter()
+                .any(|s| s.contains("total heartbeat partition"))
+        );
+        Appliance::from_toml(&a.to_toml().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn two_node_peer_endpoints_and_policy_survive_reverse_sync() {
+        let mut primary = two_node_members();
+        primary.services.ntp.serve_on = vec!["enp0s20f0u3".into()];
+        let mut secondary = materialize_peer(primary.clone()).unwrap();
+        secondary.validate().unwrap();
+        assert_eq!(
+            secondary.system.ha.as_ref().unwrap().heartbeat_listen,
+            ["10.20.0.2:5441"]
+        );
+        assert_eq!(
+            secondary.system.ha.as_ref().unwrap().heartbeat_peer,
+            ["10.20.0.1:5441"]
+        );
+        assert_eq!(secondary.services.ntp.serve_on, ["enp0s20f0u1"]);
+        assert_eq!(
+            crate::configsync::shared_revision(&primary).unwrap(),
+            crate::configsync::shared_revision(&secondary).unwrap()
+        );
+        secondary.firewall.block_icmp = !secondary.firewall.block_icmp;
+        secondary.system.ha.as_mut().unwrap().peer_timeout_ms = Some(1100);
+        primary = materialize_peer(secondary.clone()).unwrap();
+        primary.validate().unwrap();
+        assert_eq!(
+            primary.system.ha.as_ref().unwrap().peer_timeout_ms,
+            Some(1100)
+        );
+        assert_eq!(
+            primary.system.ha.as_ref().unwrap().heartbeat_listen,
+            ["10.20.0.1:5441"]
+        );
+        assert_eq!(primary.firewall.block_icmp, secondary.firewall.block_icmp);
+        assert_eq!(
+            guarded_interfaces(&primary),
+            BTreeSet::from(["wan0".into()])
+        );
+        assert_eq!(
+            crate::configsync::shared_revision(&primary).unwrap(),
+            crate::configsync::shared_revision(&secondary).unwrap()
+        );
+    }
+
+    #[test]
+    fn two_node_invalid_paths_modes_and_timing_fail_closed() {
+        let original = two_node_members();
+        for (listen, peer) in [
+            ("0.0.0.0:5441", "10.20.0.2:5441"),
+            ("127.0.0.1:5441", "10.20.0.2:5441"),
+            ("224.0.0.1:5441", "10.20.0.2:5441"),
+            ("10.20.0.1:0", "10.20.0.2:5441"),
+            ("10.20.0.99:5441", "10.20.0.2:5441"),
+            ("10.20.0.1:5441", "10.20.0.1:5441"),
+            ("10.20.0.1:5441", "[2001:db8::2]:5441"),
+            ("10.20.0.1:5441", "peer.example.test:5441"),
+            ("10.20.0.1:5441", "255.255.255.255:5441"),
+        ] {
+            let mut a = original.clone();
+            let h = a.system.ha.as_mut().unwrap();
+            h.heartbeat_listen = vec![listen.into()];
+            h.heartbeat_peer = vec![peer.into()];
+            assert!(a.validate().is_err(), "accepted {listen} -> {peer}");
+        }
+        for timeout in [0, 749, 999, 1201, 1500, u64::MAX] {
+            let mut a = original.clone();
+            a.system.ha.as_mut().unwrap().peer_timeout_ms = Some(timeout);
+            assert!(a.validate().is_err(), "accepted timeout {timeout}");
+        }
+        for delay in [0, 1999, 120001, u64::MAX] {
+            let mut a = original.clone();
+            a.system.ha.as_mut().unwrap().startup_delay_ms = Some(delay);
+            assert!(a.validate().is_err(), "accepted delay {delay}");
+        }
+        let mut a = original.clone();
+        a.system.ha.as_mut().unwrap().heartbeat_listen.clear();
+        assert!(a.validate().is_err());
+        let mut a = original.clone();
+        a.system
+            .ha
+            .as_mut()
+            .unwrap()
+            .heartbeat_peer
+            .push("10.20.0.2:5441".into());
+        assert!(a.validate().is_err());
+        let mut a = original.clone();
+        a.system.ha.as_mut().unwrap().witness = "10.20.0.3:5440".into();
+        assert!(a.validate().is_err());
+        let mut a = original;
+        a.system.ha.as_mut().unwrap().mode = HaMode::Witness;
+        assert!(a.validate().is_err());
+    }
+
+    #[test]
+    fn two_node_all_control_paths_and_ancestors_are_local_not_fenced() {
+        let mut primary = two_node_members();
+        let mut secondary = materialize_peer(primary.clone()).unwrap();
+        for (a, number, name, parent) in [
+            (&mut primary, 1, "hb-primary", "enp0s20f0u3"),
+            (&mut secondary, 2, "hb-secondary", "enp0s20f0u1"),
+        ] {
+            let mut link = a
+                .interfaces
+                .iter()
+                .find(|i| i.name == parent)
+                .unwrap()
+                .clone();
+            link.name = name.into();
+            link.parent = Some(parent.into());
+            link.vlan = Some(44);
+            link.hw_id = None;
+            link.address = Some(format!("10.30.0.{number}/24"));
+            a.interfaces.push(link);
+            let h = a.system.ha.as_mut().unwrap();
+            h.heartbeat_listen.push(format!("10.30.0.{number}:5441"));
+            h.heartbeat_peer
+                .push(format!("10.30.0.{}:5441", 3 - number));
+        }
+        primary.system.ha.as_mut().unwrap().peer_identity = Some(capture(&secondary).unwrap());
+        primary.validate().unwrap();
+        secondary = materialize_peer(primary.clone()).unwrap();
+        secondary.validate().unwrap();
+        assert_eq!(
+            control_interfaces(&secondary).unwrap(),
+            BTreeSet::from(["enp0s20f0u1".into(), "hb-secondary".into()])
+        );
+        assert_eq!(
+            guarded_interfaces(&secondary),
+            BTreeSet::from(["wan0".into()])
+        );
+        assert_eq!(
+            revision(&materialize_peer(secondary.clone()).unwrap()).unwrap(),
+            revision(&primary).unwrap()
+        );
+        assert_eq!(
+            crate::configsync::shared_revision(&primary).unwrap(),
+            crate::configsync::shared_revision(&secondary).unwrap()
+        );
+        // A VIP on any heartbeat ancestry is not exempted by declaring a path.
+        primary.protocols.vrrp[0].address_interface = Some("hb-primary".into());
+        assert!(primary.validate().is_err());
+    }
+
+    fn distinct_control_members() -> Appliance {
+        let mut primary = paired_fixture();
+        let mut secondary = materialize_peer(primary.clone()).unwrap();
+        for (member, name, mac) in [
+            (&mut primary, "enp0s20f0u3", "00:e0:4c:36:00:90"),
+            (&mut secondary, "enp0s20f0u1", "00:e0:4c:69:01:5f"),
+        ] {
+            let control = member
+                .interfaces
+                .iter_mut()
+                .find(|i| i.name == "sync0")
+                .unwrap();
+            control.name = name.into();
+            control.hw_id = Some(mac.into());
+            member.system.ha.as_mut().unwrap().sync_interface = name.into();
+            member.system.ha.as_mut().unwrap().peer_identity = None;
+            // Heartbeats follow the local dedicated control link, while the
+            // virtual address stays on the canonical fenced data interface.
+            member.protocols.vrrp[0].interface = name.into();
+            member.protocols.vrrp[0].address_interface = Some("wan0".into());
+        }
+        secondary.interfaces.swap(0, 1);
+        primary.system.ha.as_mut().unwrap().peer_identity = Some(capture(&secondary).unwrap());
+        primary.validate().unwrap();
+        primary
+    }
+
+    #[test]
+    fn different_physical_control_names_are_local_and_never_guarded() {
+        let primary = distinct_control_members();
+        let secondary = materialize_peer(primary.clone()).unwrap();
+        secondary.validate().unwrap();
+        assert_eq!(
+            primary.system.ha.as_ref().unwrap().sync_interface,
+            "enp0s20f0u3"
+        );
+        assert_eq!(
+            secondary.system.ha.as_ref().unwrap().sync_interface,
+            "enp0s20f0u1"
+        );
+        assert!(!secondary.interfaces.iter().any(|i| i.name == "enp0s20f0u3"));
+        let nic = secondary
+            .interfaces
+            .iter()
+            .find(|i| i.name == "enp0s20f0u1")
+            .unwrap();
+        assert_eq!(nic.hw_id.as_deref(), Some("00:e0:4c:69:01:5f"));
+        assert_eq!(nic.address.as_deref(), Some("10.20.0.2/24"));
+        assert_eq!(secondary.protocols.vrrp[0].interface, "enp0s20f0u1");
+        assert_eq!(
+            secondary.protocols.vrrp[0].address_interface.as_deref(),
+            Some("wan0")
+        );
+        assert_eq!(
+            guarded_interfaces(&primary),
+            BTreeSet::from(["wan0".into()])
+        );
+        assert_eq!(guarded_interfaces(&primary), guarded_interfaces(&secondary));
+        // Different control positions are not a shared-policy change.
+        assert_eq!(secondary.interfaces[0].name, "enp0s20f0u1");
+        assert_eq!(
+            revision(&materialize_peer(secondary).unwrap()).unwrap(),
+            revision(&primary).unwrap()
+        );
+    }
+
+    #[test]
+    fn asymmetric_control_profiles_share_revisions_and_preserve_policy_changes() {
+        let mut primary = distinct_control_members();
+        let mut secondary = materialize_peer(primary.clone()).unwrap();
+        let shared = crate::configsync::shared_revision;
+        assert_eq!(shared(&primary).unwrap(), shared(&secondary).unwrap());
+        let original = shared(&primary).unwrap();
+        primary.firewall.block_icmp = !primary.firewall.block_icmp;
+        secondary = materialize_peer(primary.clone()).unwrap();
+        assert_ne!(original, shared(&primary).unwrap());
+        assert_eq!(shared(&primary).unwrap(), shared(&secondary).unwrap());
+        secondary.interfaces[0].mtu = Some(1400); // control is member-local
+        primary = materialize_peer(secondary.clone()).unwrap();
+        assert_eq!(shared(&primary).unwrap(), shared(&secondary).unwrap());
+        assert_eq!(
+            materialize_peer(primary).unwrap().interfaces[0].mtu,
+            Some(1400)
+        );
+    }
+
+    #[test]
+    fn control_bound_ntp_and_dns_preserve_shared_policy_in_both_directions() {
+        let mut primary = distinct_control_members();
+        primary.services.ntp.upstream = vec!["time.example.test".into()];
+        primary.services.ntp.allow_from = vec!["0.0.0.0/0".into()];
+        primary.services.ntp.serve_on = vec!["enp0s20f0u3".into(), "wan0".into()];
+        primary.services.dns.upstream = vec!["192.0.2.53".into()];
+        primary.services.dns.serve_on = primary.services.ntp.serve_on.clone();
+        primary
+            .services
+            .dns
+            .host_override
+            .insert("pair.test".into(), "192.0.2.7".into());
+        primary.validate().unwrap();
+        let mut secondary = materialize_peer(primary.clone()).unwrap();
+        secondary.validate().unwrap();
+        assert_eq!(secondary.services.ntp.serve_on, ["enp0s20f0u1", "wan0"]);
+        assert_eq!(secondary.services.dns.serve_on, ["enp0s20f0u1", "wan0"]);
+        assert_eq!(
+            secondary.services.ntp.upstream,
+            primary.services.ntp.upstream
+        );
+        assert_eq!(
+            secondary.services.ntp.allow_from,
+            primary.services.ntp.allow_from
+        );
+        assert_eq!(
+            secondary.services.dns.upstream,
+            primary.services.dns.upstream
+        );
+        assert_eq!(
+            secondary.services.dns.host_override,
+            primary.services.dns.host_override
+        );
+        assert_eq!(
+            crate::configsync::shared_revision(&primary).unwrap(),
+            crate::configsync::shared_revision(&secondary).unwrap()
+        );
+        assert_eq!(
+            revision(&materialize_peer(secondary.clone()).unwrap()).unwrap(),
+            revision(&primary).unwrap()
+        );
+        // A standby policy edit still propagates. Only the local name changes,
+        // not which services are enabled or which clients/upstreams are used.
+        secondary.services.ntp.allow_from = vec!["198.51.100.0/24".into()];
+        secondary.services.dns.blocklist = vec!["blocked.example.test".into()];
+        primary = materialize_peer(secondary.clone()).unwrap();
+        primary.validate().unwrap();
+        assert_eq!(primary.services.ntp.serve_on, ["enp0s20f0u3", "wan0"]);
+        assert_eq!(primary.services.dns.serve_on, ["enp0s20f0u3", "wan0"]);
+        assert_eq!(
+            primary.services.ntp.allow_from,
+            secondary.services.ntp.allow_from
+        );
+        assert_eq!(
+            primary.services.dns.blocklist,
+            secondary.services.dns.blocklist
+        );
+        assert_eq!(
+            crate::configsync::shared_revision(&primary).unwrap(),
+            crate::configsync::shared_revision(&secondary).unwrap()
+        );
+    }
+
+    #[test]
+    fn same_name_control_service_bindings_remain_compatible() {
+        let mut primary = paired_fixture();
+        primary.services.ntp.serve_on = vec!["sync0".into(), "wan0".into()];
+        primary.services.dns.serve_on = primary.services.ntp.serve_on.clone();
+        let secondary = materialize_peer(primary.clone()).unwrap();
+        secondary.validate().unwrap();
+        assert_eq!(
+            secondary.services.ntp.serve_on,
+            primary.services.ntp.serve_on
+        );
+        assert_eq!(
+            secondary.services.dns.serve_on,
+            primary.services.dns.serve_on
+        );
+        assert_eq!(
+            revision(&materialize_peer(secondary).unwrap()).unwrap(),
+            revision(&primary).unwrap()
+        );
+    }
+
+    #[test]
+    fn service_bindings_do_not_guess_peer_control_ancestors() {
+        let mut primary = distinct_control_members();
+        let mut secondary = materialize_peer(primary.clone()).unwrap();
+        for member in [&mut primary, &mut secondary] {
+            let physical = member.system.ha.as_ref().unwrap().sync_interface.clone();
+            let mut logical = member
+                .interfaces
+                .iter()
+                .find(|i| i.name == physical)
+                .unwrap()
+                .clone();
+            logical.name = "sync-vlan".into();
+            logical.hw_id = None;
+            logical.parent = Some(physical);
+            logical.vlan = Some(901);
+            logical.address = Some(format!(
+                "10.21.0.{}/24",
+                member.system.ha.as_ref().unwrap().node()
+            ));
+            member.interfaces.push(logical);
+            member.system.ha.as_mut().unwrap().sync_interface = "sync-vlan".into();
+            member.protocols.vrrp[0].interface = "sync-vlan".into();
+            let node = member.system.ha.as_ref().unwrap().node();
+            member.system.conntrack_sync.listen = Some(format!("10.21.0.{node}:5429"));
+            member.system.conntrack_sync.peers = vec![format!("10.21.0.{}:5429", 3 - node)];
+            member.system.config_sync.peers = vec![format!("10.21.0.{}:8080", 3 - node)];
+        }
+        primary.system.ha.as_mut().unwrap().peer_identity = Some(capture(&secondary).unwrap());
+        // The selected logical link is shared by name. Its differently named
+        // ancestors are not implicitly interchangeable service bindings.
+        for ntp in [true, false] {
+            let mut bound = primary.clone();
+            if ntp {
+                bound.services.ntp.serve_on = vec!["enp0s20f0u3".into()];
+            } else {
+                bound.services.dns.serve_on = vec!["enp0s20f0u3".into()];
+            }
+            let peer = materialize_peer(bound.clone()).unwrap();
+            assert!(
+                peer.validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("not a declared interface")
+            );
+            assert!(bound.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_member_profiles_remain_accepted_without_new_fields() {
+        let mut primary = paired_fixture();
+        let identity = primary
+            .system
+            .ha
+            .as_mut()
+            .unwrap()
+            .peer_identity
+            .as_mut()
+            .unwrap();
+        identity.control = None;
+        for link in identity.interfaces.values_mut() {
+            link.link = None;
+        }
+        primary.validate().unwrap();
+        let peer = materialize_peer(primary).unwrap();
+        peer.validate().unwrap();
+        assert_eq!(peer.system.ha.as_ref().unwrap().sync_interface, "sync0");
+        assert_eq!(peer.interfaces[1].address.as_deref(), Some("10.20.0.2/24"));
+    }
+
+    #[test]
+    fn data_hardware_binding_and_tunnel_endpoints_remain_member_local() {
+        let mut primary = distinct_control_members();
+        let mut secondary = materialize_peer(primary.clone()).unwrap();
+        for (member, source, target, mac) in [
+            (&mut primary, "10.20.0.1", "10.20.0.2", "02:00:00:00:00:01"),
+            (
+                &mut secondary,
+                "10.20.0.2",
+                "10.20.0.1",
+                "02:00:00:00:00:02",
+            ),
+        ] {
+            let data = member
+                .interfaces
+                .iter_mut()
+                .find(|i| i.name == "wan0")
+                .unwrap();
+            data.if_type = Some(crate::config::IfaceType::Gretap);
+            data.local = Some(source.into());
+            data.remote = Some(target.into());
+            data.tunnel_key = Some(44);
+            data.hw_id = Some(mac.into());
+        }
+        primary.system.ha.as_mut().unwrap().peer_identity = Some(capture(&secondary).unwrap());
+        primary.validate().unwrap();
+        let peer = materialize_peer(primary.clone()).unwrap();
+        peer.validate().unwrap();
+        let data = peer.interfaces.iter().find(|i| i.name == "wan0").unwrap();
+        assert_eq!(data.local.as_deref(), Some("10.20.0.2"));
+        assert_eq!(data.remote.as_deref(), Some("10.20.0.1"));
+        assert_eq!(data.hw_id.as_deref(), Some("02:00:00:00:00:02"));
+        assert_eq!(
+            crate::configsync::shared_revision(&primary).unwrap(),
+            crate::configsync::shared_revision(&peer).unwrap()
+        );
+        assert_eq!(
+            revision(&materialize_peer(peer).unwrap()).unwrap(),
+            revision(&primary).unwrap()
+        );
+    }
+
+    #[test]
+    fn control_profile_cannot_claim_data_collisions_or_extra_exemptions() {
+        let primary = distinct_control_members();
+        let mut collision = primary.clone();
+        collision
+            .system
+            .ha
+            .as_mut()
+            .unwrap()
+            .peer_identity
+            .as_mut()
+            .unwrap()
+            .control
+            .as_mut()
+            .unwrap()
+            .interfaces[0]
+            .configuration
+            .name = "wan0".into();
+        assert!(
+            materialize_peer(collision)
+                .unwrap_err()
+                .to_string()
+                .contains("lacks its sync interface")
+        );
+
+        let mut collision = primary.clone();
+        let profile = collision
+            .system
+            .ha
+            .as_mut()
+            .unwrap()
+            .peer_identity
+            .as_mut()
+            .unwrap()
+            .control
+            .as_mut()
+            .unwrap();
+        profile.sync_interface = "wan0".into();
+        profile.interfaces[0].configuration.name = "wan0".into();
+        assert!(
+            materialize_peer(collision)
+                .unwrap_err()
+                .to_string()
+                .contains("collides")
+        );
+
+        let mut duplicate = primary.clone();
+        let profile = duplicate
+            .system
+            .ha
+            .as_mut()
+            .unwrap()
+            .peer_identity
+            .as_mut()
+            .unwrap()
+            .control
+            .as_mut()
+            .unwrap();
+        profile.interfaces.push(profile.interfaces[0].clone());
+        assert!(
+            materialize_peer(duplicate)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate")
+        );
+
+        let mut extra = primary;
+        let profile = extra
+            .system
+            .ha
+            .as_mut()
+            .unwrap()
+            .peer_identity
+            .as_mut()
+            .unwrap()
+            .control
+            .as_mut()
+            .unwrap();
+        let mut unrelated = profile.interfaces[0].clone();
+        unrelated.configuration.name = "extra-exempt".into();
+        unrelated.position = 2;
+        profile.interfaces.push(unrelated);
+        assert!(
+            materialize_peer(extra)
+                .unwrap_err()
+                .to_string()
+                .contains("peer addressing")
+        );
+    }
+
+    #[test]
+    fn vlan_and_bridge_control_profiles_preserve_local_parent_members_and_mac() {
+        for bridge in [false, true] {
+            let mut primary = distinct_control_members();
+            let mut secondary = materialize_peer(primary.clone()).unwrap();
+            for member in [&mut primary, &mut secondary] {
+                let physical_name = member.system.ha.as_ref().unwrap().sync_interface.clone();
+                let physical = member
+                    .interfaces
+                    .iter_mut()
+                    .find(|i| i.name == physical_name)
+                    .unwrap();
+                let mut control = physical.clone();
+                control.name = "ctl-logical".into();
+                control.hw_id = None;
+                physical.address = None;
+                if bridge {
+                    control.if_type = Some(crate::config::IfaceType::Bridge);
+                    control.members = vec![physical_name];
+                } else {
+                    control.parent = Some(physical_name);
+                    control.vlan = Some(901);
+                }
+                member.interfaces.push(control);
+                member.system.ha.as_mut().unwrap().sync_interface = "ctl-logical".into();
+                member.protocols.vrrp[0].interface = "ctl-logical".into();
+            }
+            primary.system.ha.as_mut().unwrap().peer_identity = Some(capture(&secondary).unwrap());
+            primary.validate().unwrap();
+            let peer = materialize_peer(primary.clone()).unwrap();
+            peer.validate().unwrap();
+            let logical = peer
+                .interfaces
+                .iter()
+                .find(|i| i.name == "ctl-logical")
+                .unwrap();
+            if bridge {
+                assert_eq!(logical.members, vec!["enp0s20f0u1"]);
+            } else {
+                assert_eq!(logical.parent.as_deref(), Some("enp0s20f0u1"));
+            }
+            assert_eq!(
+                control_interfaces(&peer).unwrap(),
+                BTreeSet::from(["enp0s20f0u1".into(), "ctl-logical".into()])
+            );
+            assert_eq!(guarded_interfaces(&peer), BTreeSet::from(["wan0".into()]));
+            assert_eq!(
+                revision(&materialize_peer(peer).unwrap()).unwrap(),
+                revision(&primary).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn control_profile_cannot_hide_a_data_ancestor_or_invent_an_unbound_link() {
+        let mut primary = distinct_control_members();
+        primary.interfaces[0].parent = Some("enp0s20f0u3".into());
+        assert!(
+            materialize_peer(primary)
+                .unwrap_err()
+                .to_string()
+                .contains("fenced data/VIPs")
+        );
+
+        let mut primary = distinct_control_members();
+        let target = primary
+            .system
+            .ha
+            .as_mut()
+            .unwrap()
+            .peer_identity
+            .as_mut()
+            .unwrap();
+        let mut unrelated = target.control.as_ref().unwrap().interfaces[0].clone();
+        unrelated.configuration.name = "unbound0".into();
+        unrelated.configuration.address = None;
+        unrelated.configuration.hw_id = None;
+        unrelated.position = 2;
+        target.control.as_mut().unwrap().interfaces.push(unrelated);
+        assert!(
+            materialize_peer(primary)
+                .unwrap_err()
+                .to_string()
+                .contains("exactly its dedicated control ancestry")
+        );
+    }
+
+    #[test]
+    fn control_profiles_and_local_bindings_round_trip_through_json_and_toml() {
+        let primary = distinct_control_members();
+        let text = primary.to_toml().unwrap();
+        let parsed = Appliance::from_toml(&text).unwrap();
+        assert_eq!(revision(&parsed).unwrap(), revision(&primary).unwrap());
+        let json = serde_json::to_string(&primary).unwrap();
+        let parsed = Appliance::from_json(&json).unwrap();
+        assert_eq!(revision(&parsed).unwrap(), revision(&primary).unwrap());
+        let mut invalid: serde_json::Value = serde_json::from_str(&json).unwrap();
+        invalid["system"]["ha"]["peer-identity"]["control"]["not-a-field"] = true.into();
+        assert!(Appliance::from_json(&invalid.to_string()).is_err());
+    }
+
+    #[test]
+    fn shared_data_bridge_membership_still_converges_with_local_control_profiles() {
+        let mut primary = distinct_control_members();
+        let mut secondary = materialize_peer(primary.clone()).unwrap();
+        for member in [&mut primary, &mut secondary] {
+            let data = member
+                .interfaces
+                .iter_mut()
+                .find(|i| i.name == "wan0")
+                .unwrap();
+            let mut bridge = data.clone();
+            bridge.name = "br-data".into();
+            bridge.if_type = Some(crate::config::IfaceType::Bridge);
+            bridge.members = vec!["wan0".into()];
+            data.address = None;
+            member.interfaces.push(bridge);
+            member.protocols.vrrp[0].address_interface = Some("br-data".into());
+        }
+        primary.system.ha.as_mut().unwrap().peer_identity = Some(capture(&secondary).unwrap());
+        primary.validate().unwrap();
+        let mut extra = primary
+            .interfaces
+            .iter()
+            .find(|i| i.name == "wan0")
+            .unwrap()
+            .clone();
+        extra.name = "extra-data".into();
+        primary.interfaces.push(extra);
+        primary
+            .interfaces
+            .iter_mut()
+            .find(|i| i.name == "br-data")
+            .unwrap()
+            .members
+            .push("extra-data".into());
+        primary.validate().unwrap();
+        let peer = materialize_peer(primary.clone()).unwrap();
+        peer.validate().unwrap();
+        assert_eq!(
+            peer.interfaces
+                .iter()
+                .find(|i| i.name == "br-data")
+                .unwrap()
+                .members,
+            vec!["wan0", "extra-data"]
+        );
+        assert_eq!(
+            crate::configsync::shared_revision(&peer).unwrap(),
+            crate::configsync::shared_revision(&primary).unwrap()
+        );
+    }
+
+    #[test]
+    fn control_wireguard_keys_and_distinct_underlays_stay_member_local() {
+        use base64::Engine;
+        let keys = [
+            base64::engine::general_purpose::STANDARD.encode([1; 32]),
+            base64::engine::general_purpose::STANDARD.encode([2; 32]),
+        ];
+        let mut primary = distinct_control_members();
+        let mut secondary = materialize_peer(primary.clone()).unwrap();
+        for (index, member) in [
+            primary.system.ha.as_ref().unwrap().node(),
+            secondary.system.ha.as_ref().unwrap().node(),
+        ]
+        .into_iter()
+        .zip([&mut primary, &mut secondary])
+        {
+            let mut control = member
+                .interfaces
+                .iter()
+                .find(|i| i.name == member.system.ha.as_ref().unwrap().sync_interface)
+                .unwrap()
+                .clone();
+            control.name = "ctl-wg".into();
+            control.if_type = Some(crate::config::IfaceType::Wireguard);
+            control.hw_id = None;
+            control.address = Some(format!("172.16.0.{index}/24"));
+            member.interfaces.push(control);
+            member.system.ha.as_mut().unwrap().sync_interface = "ctl-wg".into();
+            member.system.conntrack_sync.listen = Some(format!("172.16.0.{index}:5429"));
+            member.system.conntrack_sync.peers = vec![format!("172.16.0.{}:5429", 3 - index)];
+            member.system.config_sync.peers = vec![format!("172.16.0.{}:8080", 3 - index)];
+            member.protocols.vrrp[0].interface = "ctl-wg".into();
+            member.vpn.wireguard = vec![serde_json::from_value(serde_json::json!({
+                "name":"ctl-wg", "private-key":keys[usize::from(index - 1)], "listen-port":51820,
+                "peer":[{"public-key":crate::wgkey::public_from_private(&keys[usize::from(2 - index)]).unwrap(),
+                    "allowed-ips":[format!("172.16.0.{}/32", 3 - index)],
+                    "endpoint":format!("10.20.0.{}:51820", 3 - index)}]
+            })).unwrap()];
+        }
+        primary.system.ha.as_mut().unwrap().peer_identity = Some(capture(&secondary).unwrap());
+        primary.validate().unwrap();
+        let peer = materialize_peer(primary.clone()).unwrap();
+        peer.validate().unwrap();
+        assert_eq!(peer.vpn.wireguard.len(), 1);
+        assert_eq!(peer.vpn.wireguard[0].private_key, keys[1]);
+        assert_eq!(
+            peer.vpn.wireguard[0].peers[0].endpoint.as_deref(),
+            Some("10.20.0.1:51820")
+        );
+        assert_eq!(
+            control_interfaces(&peer).unwrap(),
+            BTreeSet::from(["ctl-wg".into(), "enp0s20f0u1".into()])
+        );
+        assert_eq!(guarded_interfaces(&peer), BTreeSet::from(["wan0".into()]));
+        assert_eq!(
+            revision(&materialize_peer(peer).unwrap()).unwrap(),
+            revision(&primary).unwrap()
+        );
+    }
     fn witness_appliance(extra: &str) -> Result<Appliance> {
         let a = Appliance::from_toml(&format!(
             "[system]\nhostname=\"witness\"\n[system.ha-witness]\nlisten=\"10.20.0.3:5440\"\n{extra}"

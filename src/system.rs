@@ -571,16 +571,52 @@ pub fn ip_addr_list() -> Result<String> {
 
 /// Load a rendered strongSwan swanctl config into the running `charon` daemon
 /// (roadmap C2 IPsec): `swanctl --load-all --file <path> --noprompt`. `--load-all`
-/// reconciles connections, children and secrets to exactly what the file
-/// declares (unloading anything removed), so a re-load after a config change
-/// applies adds and removals in one step; `--noprompt` never blocks on a missing
-/// credential. Only invoked (by [`crate::ipsec`]) when the rendered config
-/// changed, or to (re)assert a tunnel at boot.
+/// reloads definitions/credentials, NOT established start-action=none SAs.
+/// [`crate::ipsec`] separately unloads and revokes removed/changed connections
+/// before this call. `--noprompt` never waits for an interactive credential.
 pub fn swanctl_load(path: &Path) -> Result<()> {
     let Some(p) = path.to_str() else {
         bail!("non-UTF-8 path");
     };
     run_priv("swanctl", &["--load-all", "--file", p, "--noprompt"])
+}
+
+/// Unload retired definitions before revoking their SAs, without reloading
+/// credentials or touching unchanged connections' established associations.
+pub fn swanctl_reload_connections(path: &Path) -> Result<()> {
+    let p = path.to_str().context("non-UTF-8 IPsec config path")?;
+    run_priv("swanctl", &["--load-conns", "--file", p])
+        .context("unloading retired IPsec definitions")
+}
+
+/// Revoke all IKE/CHILD SAs for one proven-owned, already-unloaded connection.
+/// Never flush the global XFRM table, restart charon or terminate another name.
+/// Even a successful terminate response is not proof: wait for the actual
+/// filtered daemon query to become empty before confidentiality guards retire.
+pub fn swanctl_revoke(name: &str) -> Result<()> {
+    let absent = || -> Result<bool> {
+        let out = escalated_output("swanctl", &["--list-sas", "--ike", name])?;
+        anyhow::ensure!(out.status.success(), "cannot inspect retired IPsec SAs");
+        Ok(out.stdout.iter().all(u8::is_ascii_whitespace))
+    };
+    if absent()? {
+        return Ok(());
+    }
+    // --force completes local teardown even when the removed peer is offline.
+    // A race with a natural close may return a nonzero termination result;
+    // only a subsequent successful empty query can make that harmless.
+    let _result = escalated_output("swanctl", &["--terminate", "--ike", name, "--force"])?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if absent()? {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "retired IPsec connection still has active SAs; confidentiality guards retained"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 /// Run a read-only `swanctl` query and return its stdout (for `show vpn` — the
@@ -713,7 +749,7 @@ pub(crate) fn lock_config_at(path: &Path) -> Result<ApplyLock> {
 /// saved config's group when writing it directly (as root), so it matches the
 /// `install -g wheel` the escalating path uses. Best-effort — a system without a
 /// `wheel` group simply leaves the file root-owned.
-fn wheel_gid() -> Option<u32> {
+pub(crate) fn wheel_gid() -> Option<u32> {
     let name = std::ffi::CString::new("wheel").ok()?;
     // SAFETY: `getgrnam` returns a pointer into storage that a later call could
     // overwrite; we read `gr_gid` out immediately while the pointer is non-null
@@ -811,19 +847,58 @@ pub fn confirm_pending() -> bool {
 pub const NETWORKD_RUNTIME_DIR: &str = "/run/systemd/network";
 
 pub fn owned_file_exists(path: &Path) -> Result<bool> {
-    match path.try_exists() {
+    owned_file_exists_with(path, is_root(), Path::try_exists, |path| {
+        let path = path.to_str().context("non-UTF-8 config path")?;
+        // The self command is never tried unprivileged, and sudo is always
+        // noninteractive. Exit 1 from `sudo test -e` cannot prove absence: sudo
+        // itself may have refused execution, or test may lack search access.
+        escalated_output("sentinel-self", &["owned-file-probe", "--", path])
+    })
+}
+
+fn owned_file_exists_with(
+    path: &Path,
+    root: bool,
+    inspect: impl FnOnce(&Path) -> std::io::Result<bool>,
+    probe: impl FnOnce(&Path) -> Result<std::process::Output>,
+) -> Result<bool> {
+    match inspect(path) {
         Ok(exists) => Ok(exists),
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            let p = path.to_str().context("non-UTF-8 config path")?;
-            let out = escalated_output("test", &["-e", p])?;
-            match out.status.code() {
-                Some(0) => Ok(true),
-                Some(1) => Ok(false),
-                _ => bail!("checking {} failed", path.display()),
-            }
+        Err(e) if !root && e.kind() == std::io::ErrorKind::PermissionDenied => {
+            decode_owned_file_probe(probe(path)?)
+                .with_context(|| format!("stat {}", path.display()))
         }
         Err(e) => Err(e).with_context(|| format!("stat {}", path.display())),
     }
+}
+
+fn decode_owned_file_probe(output: std::process::Output) -> Result<bool> {
+    anyhow::ensure!(output.status.success(), "privileged metadata probe failed");
+    // A successful child must attest presence OR verified absence. The entire
+    // accepted frame is at most six bytes; never interpret status-only errors,
+    // empty/extra output or a sudo diagnostic as an absent protected journal.
+    // Do not include rejected output: this boundary must never disclose data.
+    match output.stdout.as_slice() {
+        b"true\n" => Ok(true),
+        b"false\n" => Ok(false),
+        _ => bail!("invalid privileged metadata probe response"),
+    }
+}
+
+/// Internal root-only metadata protocol. This command never reads file contents
+/// or escalates again: a metadata error must remain unknown, not become false.
+pub fn owned_file_probe(path: &Path) -> Result<&'static str> {
+    owned_file_probe_with(path, is_root(), Path::try_exists)
+}
+
+fn owned_file_probe_with(
+    path: &Path,
+    root: bool,
+    inspect: impl FnOnce(&Path) -> std::io::Result<bool>,
+) -> Result<&'static str> {
+    anyhow::ensure!(root, "owned-file-probe requires root");
+    let exists = inspect(path).with_context(|| format!("stat {}", path.display()))?;
+    Ok(if exists { "true\n" } else { "false\n" })
 }
 
 /// Read a Sentinel-owned file, including a root/networkd-readable key file.
@@ -845,6 +920,73 @@ pub fn read_owned_file(path: &Path) -> Result<Option<String>> {
         }
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }
+}
+
+const MAX_OWNED_READ: usize = 64 * 1024 * 1024;
+
+/// Journals must not hold apply.lock while opening a FIFO or following a
+/// replacement symlink. Preserve the existing noninteractive admin escalation,
+/// but re-invoke a descriptor-validating reader, never an unbounded `cat`.
+pub fn read_owned_regular(path: &Path, limit: usize) -> Result<Option<String>> {
+    match read_regular(path, limit) {
+        Err(error)
+            if !is_root()
+                && error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied) =>
+        {
+            let limit = limit.to_string();
+            let path = path.to_str().context("non-UTF-8 journal path")?;
+            let output = escalated_output(
+                "sentinel-self",
+                &["owned-file-read", "--max-bytes", &limit, "--", path],
+            )?;
+            anyhow::ensure!(
+                output.status.success(),
+                "reading protected regular journal failed"
+            );
+            serde_json::from_slice(&output.stdout).context("invalid protected journal read reply")
+        }
+        result => result,
+    }
+}
+
+pub fn owned_file_read(path: &Path, limit: usize) -> Result<String> {
+    anyhow::ensure!(is_root(), "owned-file-read requires root");
+    serde_json::to_string(&read_regular(path, limit)?).map_err(Into::into)
+}
+
+fn read_regular(path: &Path, limit: usize) -> Result<Option<String>> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    anyhow::ensure!(
+        (1..=MAX_OWNED_READ).contains(&limit),
+        "invalid protected read bound"
+    );
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("opening protected regular journal"),
+    };
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file()
+            && metadata.nlink() == 1
+            && metadata.mode() & 0o022 == 0
+            && (metadata.uid() == 0 || metadata.uid() == unsafe { libc::geteuid() })
+            && metadata.len() <= limit as u64,
+        "invalid protected regular journal"
+    );
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() <= limit, "protected journal exceeds read bound");
+    Ok(Some(
+        String::from_utf8(bytes).context("journal is not UTF-8")?,
+    ))
 }
 
 /// Install file `contents` at a (root-owned) `path`. Tries a direct write first
@@ -893,6 +1035,9 @@ fn install_owned_atomic(path: &Path, contents: &str, private: bool) -> Result<()
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::io::AsRawFd;
     let _transaction = apply_lock()?;
+    if crate::mutation::intent_path(path) {
+        crate::mutation::advance()?;
+    }
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -1494,6 +1639,13 @@ pub fn daemon_reload() -> Result<()> {
 
 /// Remove a (possibly root-owned) file, tolerating an already-absent path.
 pub fn remove_file(path: &Path) -> Result<()> {
+    let _lock = if crate::mutation::intent_path(path) {
+        let lock = apply_lock()?;
+        crate::mutation::advance()?;
+        Some(lock)
+    } else {
+        None
+    };
     if !owned_file_exists(path)? {
         return Ok(());
     }
@@ -1561,57 +1713,232 @@ pub fn openssl(args: &[&str]) -> Result<()> {
     run_priv("openssl", args)
 }
 
-/// Generate a self-signed TLS certificate + key (PEM) at `cert`/`key` if they are
-/// not already present (H3, the management-plane HTTPS server). Encrypts the
-/// console/API out of the box when the operator supplies no certificate. Runs
-/// `openssl` directly (no sudo — the caller owns the target directory, which is
-/// root-owned on the appliance and user-owned off-box) and never regenerates an
-/// existing pair: a self-signed cert that config sync may pin must keep a stable
-/// key across reboots. The private key is written 0600.
+/// Maintain the AUTOMATIC management certificate, never an explicit operator
+/// certificate. Renew missing SANs or an expiring cert using the surviving key,
+/// so config-sync's SPKI pin remains stable. A lost/mismatched key is an error,
+/// not permission to silently replace the appliance's identity. Publish only a
+/// fully verified certificate, atomically; private staging files are0600 from
+/// creation, including during initial RSA generation.
 pub fn ensure_self_signed_cert(cert: &Path, key: &Path, cn: &str, sans: &[String]) -> Result<()> {
-    if cert.exists() && key.exists() {
-        return Ok(());
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let parent = cert
+        .parent()
+        .context("automatic TLS certificate directory")?;
+    anyhow::ensure!(
+        key.parent() == Some(parent) && cert != key,
+        "automatic TLS key and certificate must be distinct siblings"
+    );
+    anyhow::ensure!(
+        sans.len() <= 64
+            && std::iter::once(cn)
+                .chain(sans.iter().map(String::as_str))
+                .all(valid_tls_name),
+        "invalid automatic TLS name or address"
+    );
+    ensure_dir(parent)?;
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(parent)?;
+    let metadata = directory.metadata()?;
+    anyhow::ensure!(
+        metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o022 == 0,
+        "automatic TLS directory must belong to its caller and not be group/world writable"
+    );
+    let _lock = lock_config_at(&parent.join(".certificate.lock"))?;
+    let cert_file = automatic_tls_file(cert)?;
+    let key_file = automatic_tls_file(key)?;
+    anyhow::ensure!(
+        cert_file.is_none() || key_file.is_some(),
+        "automatic TLS private key is missing; restore the original key instead of rotating a pinned identity"
+    );
+    if let Some(file) = &key_file {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    if let Some(parent) = cert.parent() {
-        ensure_dir(parent)?;
+    let key_pin = key_file
+        .as_ref()
+        .map(|_| private_key_pubkey_pin(key))
+        .transpose()?;
+    if let Some(file) = &cert_file {
+        let mode = file.metadata()?.permissions().mode() & 0o777 & !0o022;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        anyhow::ensure!(
+            Some(cert_pubkey_pin(cert)?) == key_pin,
+            "automatic TLS certificate and key do not match; restore the pinned identity"
+        );
+        if automatic_tls_cert_ready(cert, cn, sans)? {
+            return Ok(());
+        }
     }
-    let san = build_san(cn, sans);
-    let (Some(cert_s), Some(key_s)) = (cert.to_str(), key.to_str()) else {
-        bail!("non-UTF-8 TLS certificate path");
+    let staged_cert = PrivateStage::create(parent, 0o600)?;
+    let staged_key = if key_file.is_none() {
+        Some(PrivateStage::create(parent, 0o600)?)
+    } else {
+        None
     };
-    let out = Command::new(bin("openssl"))
-        .args([
-            "req",
-            "-x509",
-            "-newkey",
-            "rsa:2048",
-            "-sha256",
-            "-days",
-            "3650",
-            "-nodes",
-            "-keyout",
-            key_s,
-            "-out",
-            cert_s,
-            "-subj",
-            &format!("/CN={cn}"),
-            "-addext",
-            &san,
-        ])
+    let certificate_path = staged_cert
+        .path
+        .to_str()
+        .context("non-UTF-8 TLS staging path")?;
+    let signing_key = staged_key.as_ref().map_or(key, |stage| &stage.path);
+    let key_path = signing_key.to_str().context("non-UTF-8 TLS key path")?;
+    let mut command = Command::new(bin("openssl"));
+    command.args([
+        "req",
+        "-x509",
+        "-sha256",
+        "-days",
+        "3650",
+        "-out",
+        certificate_path,
+        "-subj",
+        &format!("/CN={cn}"),
+        "-addext",
+        &build_san(cn, sans),
+    ]);
+    if staged_key.is_some() {
+        command.args(["-newkey", "rsa:2048", "-nodes", "-keyout", key_path]);
+    } else {
+        command.args(["-key", key_path, "-passin", "pass:"]);
+    }
+    let out = command
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()
         .context("running openssl to mint the management TLS certificate")?;
-    if !out.status.success() {
-        bail!(
-            "openssl could not mint the management TLS certificate: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+    anyhow::ensure!(
+        out.status.success(),
+        "openssl could not mint the automatic management TLS certificate; existing identity retained"
+    );
+    let expected_pin = private_key_pubkey_pin(signing_key)?;
+    anyhow::ensure!(
+        key_pin.as_ref().is_none_or(|pin| pin == &expected_pin)
+            && cert_pubkey_pin(&staged_cert.path)? == expected_pin
+            && automatic_tls_cert_ready(&staged_cert.path, cn, sans)?,
+        "new automatic certificate failed identity/SAN/validity verification; existing certificate retained"
+    );
+    if let Some(stage) = &staged_key {
+        stage
+            .file
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        stage.file.sync_all()?;
+        // No replace: never overwrite a key which appeared during generation.
+        // If interrupted here, the surviving key is reused on the next start.
+        use std::os::unix::ffi::OsStrExt;
+        let source = std::ffi::CString::new(stage.path.as_os_str().as_bytes())?;
+        let target = std::ffi::CString::new(key.as_os_str().as_bytes())?;
+        // Atomic no-replace avoids the two-link crash window of link+unlink.
+        // Linux appliances and their ext4 state filesystems support renameat2.
+        if unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                target.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("publishing the new automatic TLS key without replacement");
+        }
+        directory.sync_all()?;
     }
-    // The key must never be group/world readable, whoever's umask minted it.
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(key, std::fs::Permissions::from_mode(0o600));
+    staged_cert
+        .file
+        .set_permissions(std::fs::Permissions::from_mode(0o644))?;
+    staged_cert.file.sync_all()?;
+    std::fs::rename(&staged_cert.path, cert)?;
+    directory.sync_all()?;
     Ok(())
+}
+
+fn valid_tls_name(name: &str) -> bool {
+    name.parse::<std::net::IpAddr>().is_ok()
+        || (!name.is_empty()
+            && name.len() <= 253
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)))
+}
+
+fn automatic_tls_file(path: &Path) -> Result<Option<std::fs::File>> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).context("opening automatic TLS identity without following links");
+        }
+    };
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.nlink() == 1 && metadata.uid() == unsafe { libc::geteuid() },
+        "automatic TLS identity must be a regular single-link file belonging to its caller"
+    );
+    Ok(Some(file))
+}
+
+fn private_key_pubkey_pin(key: &Path) -> Result<String> {
+    use base64::Engine;
+    let result = Command::new(bin("openssl"))
+        .args([
+            "pkey",
+            "-in",
+            key.to_str().context("TLS key path")?,
+            "-passin",
+            "pass:",
+            "-pubout",
+            "-outform",
+            "DER",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .context("reading automatic TLS public identity")?;
+    anyhow::ensure!(
+        result.status.success(),
+        "automatic TLS key is unreadable or encrypted; original identity retained"
+    );
+    Ok(base64::engine::general_purpose::STANDARD
+        .encode(ring::digest::digest(&ring::digest::SHA256, &result.stdout)))
+}
+
+fn automatic_tls_cert_ready(cert: &Path, cn: &str, sans: &[String]) -> Result<bool> {
+    let cert = cert.to_str().context("TLS certificate path")?;
+    let check = |args: &[&str]| -> Result<bool> {
+        Ok(Command::new(bin("openssl"))
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .context("checking automatic TLS certificate")?
+            .success())
+    };
+    if !check(&["x509", "-in", cert, "-noout", "-checkend", "2592000"])?
+        || !check(&["verify", "-CAfile", cert, cert])?
+    {
+        return Ok(false);
+    }
+    for name in std::iter::once(cn)
+        .chain(std::iter::once("localhost"))
+        .chain(sans.iter().map(String::as_str))
+    {
+        let option = if name.parse::<std::net::IpAddr>().is_ok() {
+            "-checkip"
+        } else {
+            "-checkhost"
+        };
+        if !check(&["x509", "-in", cert, "-noout", option, name])? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Build an OpenSSL `subjectAltName` extension covering the CN plus each supplied
@@ -1619,8 +1946,11 @@ pub fn ensure_self_signed_cert(cert: &Path, key: &Path, cn: &str, sans: &[String
 /// mismatch (pinning ignores the name, but a person does not). Numeric entries
 /// become `IP:`, everything else `DNS:`.
 fn build_san(cn: &str, sans: &[String]) -> String {
-    let mut parts: Vec<String> = vec![format!("DNS:{cn}"), "DNS:localhost".into()];
-    for s in sans {
+    let mut parts = Vec::new();
+    for s in std::iter::once(cn)
+        .chain(std::iter::once("localhost"))
+        .chain(sans.iter().map(String::as_str))
+    {
         if s.parse::<std::net::IpAddr>().is_ok() {
             parts.push(format!("IP:{s}"));
         } else {
@@ -1816,11 +2146,14 @@ pub fn bin(name: &str) -> String {
         "ldapwhoami" => "SENTINEL_LDAPWHOAMI_BIN",
         "occtl" => "SENTINEL_OCCTL_BIN",
         "ip" => "SENTINEL_IP_BIN",
+        "nft" => "SENTINEL_NFT_BIN",
         "networkctl" => "SENTINEL_NETWORKCTL_BIN",
         "cat" => "SENTINEL_CAT_BIN",
         "test" => "SENTINEL_TEST_BIN",
         "systemctl" => "SENTINEL_SYSTEMCTL_BIN",
         "systemd-run" => "SENTINEL_SYSTEMD_RUN_BIN",
+        "bootctl" => "SENTINEL_BOOTCTL_BIN",
+        "boot-health" => "SENTINEL_BOOT_HEALTH_BIN",
         "journalctl" => "SENTINEL_JOURNALCTL_BIN",
         // Our own path, so the escalated re-invocation runs this build and not
         // whatever `sentinel` a $PATH lookup under sudo might find.
@@ -2006,6 +2339,291 @@ pub(crate) fn sudo(cmd: &str, args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_regular_reads_bound_bytes_and_preserve_missing_empty_and_invalid_states() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = crate::update::Scratch::new().unwrap();
+        let path = scratch.join("journal");
+        assert!(read_owned_regular(&path, 8).unwrap().is_none());
+        for body in [b"".as_slice(), b"12345678"] {
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(
+                read_owned_regular(&path, 8).unwrap().unwrap().as_bytes(),
+                body
+            );
+        }
+        std::fs::write(&path, b"123456789").unwrap();
+        assert!(read_owned_regular(&path, 8).is_err());
+        std::fs::write(&path, [0xff]).unwrap();
+        assert!(read_owned_regular(&path, 8).is_err());
+        assert!(read_owned_regular(&path, 0).is_err());
+        assert!(read_owned_regular(&path, MAX_OWNED_READ + 1).is_err());
+    }
+
+    #[test]
+    fn owned_regular_rejects_fifo_symlink_directory_hardlink_and_writable_journal() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let scratch = crate::update::Scratch::new().unwrap();
+        let regular = scratch.join("regular");
+        std::fs::write(&regular, "private journal").unwrap();
+        std::fs::set_permissions(&regular, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = scratch.join("link");
+        symlink(&regular, &link).unwrap();
+        assert!(read_owned_regular(&link, 100).is_err());
+        assert!(read_owned_regular(&scratch.join("."), 100).is_err());
+        let fifo = scratch.join("fifo");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let start = std::time::Instant::now();
+        assert!(read_owned_regular(&fifo, 100).is_err());
+        assert!(start.elapsed() < std::time::Duration::from_millis(250));
+        std::fs::hard_link(&regular, scratch.join("hardlink")).unwrap();
+        assert!(read_owned_regular(&regular, 100).is_err());
+        std::fs::remove_file(scratch.join("hardlink")).unwrap();
+        std::fs::set_permissions(&regular, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(read_owned_regular(&regular, 100).is_err());
+    }
+
+    #[test]
+    fn owned_regular_internal_wire_reply_is_optional_json_and_requires_root() {
+        let scratch = crate::update::Scratch::new().unwrap();
+        let absent = scratch.join("absent");
+        if is_root() {
+            assert_eq!(owned_file_read(&absent, 10).unwrap(), "null");
+        } else {
+            assert!(
+                owned_file_read(&absent, 10)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires root")
+            );
+        }
+    }
+
+    fn owned_file_output(code: i32, stdout: &[u8], stderr: &[u8]) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        }
+    }
+
+    #[test]
+    fn owned_file_direct_presence_and_absence_never_request_privilege() {
+        for root in [false, true] {
+            for exists in [false, true] {
+                assert_eq!(
+                    owned_file_exists_with(
+                        Path::new("/metadata-only"),
+                        root,
+                        |_| Ok(exists),
+                        |_| panic!("a known direct result must not escalate"),
+                    )
+                    .unwrap(),
+                    exists
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn owned_file_root_metadata_uncertainty_never_escalates_or_becomes_absence() {
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Other,
+        ] {
+            assert!(
+                owned_file_exists_with(
+                    Path::new("/unknown-state"),
+                    true,
+                    |_| Err(std::io::Error::from(kind)),
+                    |_| panic!("root has nobody left to ask"),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn owned_file_nonpermission_errors_do_not_escalate_or_become_absence() {
+        assert!(
+            owned_file_exists_with(
+                Path::new("/unknown-state"),
+                false,
+                |_| Err(std::io::Error::other("metadata I/O failed")),
+                |_| panic!("only non-root PermissionDenied may escalate"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn owned_file_denied_nonroot_query_accepts_one_complete_boolean_proof() {
+        use std::cell::Cell;
+        let path = Path::new("-literal path 'quoted'\n$(not-a-command);*");
+        for (frame, exists) in [(b"true\n".as_slice(), true), (b"false\n", false)] {
+            let probes = Cell::new(0);
+            let answer = owned_file_exists_with(
+                path,
+                false,
+                |received| {
+                    assert_eq!(received, path);
+                    Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                },
+                |received| {
+                    assert_eq!(received, path);
+                    probes.set(probes.get() + 1);
+                    Ok(owned_file_output(0, frame, b""))
+                },
+            )
+            .unwrap();
+            assert_eq!(answer, exists);
+            assert_eq!(probes.get(), 1);
+        }
+    }
+
+    #[test]
+    fn owned_file_status_one_127_permission_failure_and_signals_are_unknown() {
+        use std::os::unix::process::ExitStatusExt;
+        for (code, stderr) in [
+            (1, b"sudo: a password is required".as_slice()),
+            (1, b"Operation not permitted"),
+            (127, b"command not found"),
+        ] {
+            // Even a false-looking stdout must not attest absence on failure.
+            assert!(decode_owned_file_probe(owned_file_output(code, b"false\n", stderr)).is_err());
+        }
+        let mut output = owned_file_output(0, b"false\n", b"");
+        output.status = std::process::ExitStatus::from_raw(libc::SIGTERM);
+        assert!(decode_owned_file_probe(output).is_err());
+    }
+
+    #[test]
+    fn owned_file_probe_io_failure_is_not_absence_and_never_discloses_output() {
+        let error = owned_file_exists_with(
+            Path::new("/protected-state"),
+            false,
+            |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            |_| Err(std::io::Error::from(std::io::ErrorKind::NotFound).into()),
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
+        let error = decode_owned_file_probe(owned_file_output(
+            0,
+            b"private-content-marker-not-an-actual-secret",
+            b"another-private-content-marker",
+        ))
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(!message.contains("private-content-marker"));
+    }
+
+    #[test]
+    fn owned_file_probe_rejects_empty_extra_untyped_and_oversized_success_output() {
+        for frame in [
+            b"".as_slice(),
+            b"false",
+            b"true",
+            b"\"false\"\n",
+            b"{}\n",
+            b"false\ntrue\n",
+            b"false\n ",
+            b" false\n",
+            b"false\r\n",
+            b"false\n\0",
+        ] {
+            assert!(decode_owned_file_probe(owned_file_output(0, frame, b"")).is_err());
+        }
+        assert!(decode_owned_file_probe(owned_file_output(0, &vec![b'x'; 65536], b"")).is_err());
+    }
+
+    #[test]
+    fn owned_file_root_probe_denies_nonroot_without_touching_metadata() {
+        assert!(
+            owned_file_probe_with(Path::new("/must-not-be-inspected"), false, |_| {
+                panic!("root-only probe must reject before querying metadata")
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn owned_file_root_probe_errors_do_not_print_an_absence_frame() {
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Other,
+        ] {
+            assert!(
+                owned_file_probe_with(Path::new("/unknown-state"), true, |_| {
+                    Err(std::io::Error::from(kind))
+                })
+                .is_err()
+            );
+        }
+        for (exists, frame) in [(true, "true\n"), (false, "false\n")] {
+            assert_eq!(
+                owned_file_probe_with(Path::new("/metadata-only"), true, |_| Ok(exists)).unwrap(),
+                frame
+            );
+        }
+    }
+
+    #[test]
+    fn owned_file_unknown_state_never_reaches_an_absence_mutation_callback() {
+        use std::cell::Cell;
+        // This is the Result/? boundary shared by the actual callers. It does
+        // not claim a live API/HA mutation test or a privileged filesystem test.
+        for code in [1, 127] {
+            let writes = Cell::new(0);
+            let result = owned_file_exists_with(
+                Path::new("/protected-pending-journal"),
+                false,
+                |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                |_| Ok(owned_file_output(code, b"false\n", b"")),
+            )
+            .and_then(|exists| {
+                anyhow::ensure!(!exists, "pending transaction");
+                writes.set(writes.get() + 1);
+                Ok(())
+            });
+            assert!(result.is_err());
+            assert_eq!(writes.get(), 0);
+        }
+    }
+
+    #[test]
+    fn owned_file_real_metadata_preserves_missing_and_symlink_semantics() {
+        let mut random = [0u8; 8];
+        getrandom::getrandom(&mut random).unwrap();
+        let directory = std::env::temp_dir().join(format!(
+            "sentinel-owned-metadata-{}-{:016x}",
+            std::process::id(),
+            u64::from_ne_bytes(random)
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let present = directory.join("present");
+        let missing = directory.join("missing");
+        let link = directory.join("link");
+        let broken = directory.join("broken");
+        let cycle = directory.join("cycle");
+        std::fs::write(&present, "public test fixture bytes\n").unwrap();
+        std::os::unix::fs::symlink(&present, &link).unwrap();
+        std::os::unix::fs::symlink(&missing, &broken).unwrap();
+        std::os::unix::fs::symlink(&cycle, &cycle).unwrap();
+        assert!(owned_file_exists(&present).unwrap());
+        assert!(!owned_file_exists(&missing).unwrap());
+        assert!(owned_file_exists(&link).unwrap());
+        assert!(!owned_file_exists(&broken).unwrap());
+        assert!(owned_file_exists(&cycle).is_err());
+        assert_eq!(
+            std::fs::read(&present).unwrap(),
+            b"public test fixture bytes\n"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn atomic_config_modes_are_umask_independent_in_child_processes() {
@@ -2291,6 +2909,228 @@ mod tests {
             "an existing certificate must not be regenerated"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn automatic_tls_rebind_renews_the_san_without_rotating_the_key() {
+        assert!(openssl_available(), "run TLS tests with OpenSSL installed");
+        let dir = std::env::temp_dir().join(format!("sentinel-tls-rebind-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        ensure_self_signed_cert(&cert, &key, "fw", &["127.0.0.1".into()]).unwrap();
+        let key_before = std::fs::read(&key).unwrap();
+        let old_cert = std::fs::read(&cert).unwrap();
+        let pin = cert_pubkey_pin(&cert).unwrap();
+        ensure_self_signed_cert(&cert, &key, "fw", &["127.0.0.1".into(), "127.0.0.2".into()])
+            .unwrap();
+        let verified = Command::new(bin("openssl"))
+            .args([
+                "verify",
+                "-CAfile",
+                cert.to_str().unwrap(),
+                "-verify_ip",
+                "127.0.0.2",
+                cert.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            verified.status.success(),
+            "new bind IP must pass strict certificate verification"
+        );
+        assert_eq!(std::fs::read(&key).unwrap(), key_before);
+        assert_eq!(cert_pubkey_pin(&cert).unwrap(), pin);
+        let renewed = std::fs::read(&cert).unwrap();
+        assert_ne!(renewed, old_cert);
+        ensure_self_signed_cert(&cert, &key, "fw", &["127.0.0.2".into()]).unwrap();
+        assert_eq!(
+            std::fs::read(&cert).unwrap(),
+            renewed,
+            "covered SANs must not renew every boot"
+        );
+        std::fs::remove_file(&cert).unwrap();
+        ensure_self_signed_cert(&cert, &key, "fw", &["127.0.0.2".into()]).unwrap();
+        assert_eq!(
+            std::fs::read(&key).unwrap(),
+            key_before,
+            "a missing cert must reuse the surviving key"
+        );
+        assert_eq!(cert_pubkey_pin(&cert).unwrap(), pin);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    struct AutomaticTlsFixture(std::path::PathBuf);
+    impl AutomaticTlsFixture {
+        fn new() -> Self {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut random = [0u8; 16];
+            getrandom::getrandom(&mut random).unwrap();
+            let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+            let path = std::env::temp_dir().join(format!("sentinel-auto-tls-{suffix}"));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .unwrap();
+            Self(path)
+        }
+        fn cert(&self) -> std::path::PathBuf {
+            self.0.join("cert.pem")
+        }
+        fn key(&self) -> std::path::PathBuf {
+            self.0.join("key.pem")
+        }
+        fn mint(&self) {
+            ensure_self_signed_cert(&self.cert(), &self.key(), "fw", &["127.0.0.1".into()])
+                .unwrap();
+        }
+    }
+    impl Drop for AutomaticTlsFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn automatic_tls_lost_or_mismatched_identity_fails_without_rotation() {
+        let first = AutomaticTlsFixture::new();
+        first.mint();
+        let cert = std::fs::read(first.cert()).unwrap();
+        std::fs::remove_file(first.key()).unwrap();
+        assert!(ensure_self_signed_cert(&first.cert(), &first.key(), "fw", &[]).is_err());
+        assert!(!first.key().exists());
+        assert_eq!(std::fs::read(first.cert()).unwrap(), cert);
+        let other = AutomaticTlsFixture::new();
+        other.mint();
+        std::fs::copy(other.key(), first.key()).unwrap();
+        let wrong_key = std::fs::read(first.key()).unwrap();
+        assert!(ensure_self_signed_cert(&first.cert(), &first.key(), "fw", &[]).is_err());
+        assert_eq!(std::fs::read(first.key()).unwrap(), wrong_key);
+        assert_eq!(std::fs::read(first.cert()).unwrap(), cert);
+    }
+
+    #[test]
+    fn automatic_tls_corrupt_certificate_and_invalid_names_preserve_bytes() {
+        let fixture = AutomaticTlsFixture::new();
+        fixture.mint();
+        let key = std::fs::read(fixture.key()).unwrap();
+        let cert = std::fs::read(fixture.cert()).unwrap();
+        for name in [
+            "fw,DNS:foreign.example",
+            "fw/CN=foreign",
+            "fw\nDNS:foreign",
+            "",
+            "bad name",
+        ] {
+            assert!(ensure_self_signed_cert(&fixture.cert(), &fixture.key(), name, &[]).is_err());
+            assert_eq!(std::fs::read(fixture.key()).unwrap(), key);
+            assert_eq!(std::fs::read(fixture.cert()).unwrap(), cert);
+        }
+        assert!(
+            ensure_self_signed_cert(
+                &fixture.cert(),
+                &fixture.key(),
+                "fw",
+                &["127.0.0.1,DNS:foreign".into()]
+            )
+            .is_err()
+        );
+        std::fs::write(fixture.cert(), b"invalid certificate").unwrap();
+        assert!(ensure_self_signed_cert(&fixture.cert(), &fixture.key(), "fw", &[]).is_err());
+        assert_eq!(
+            std::fs::read(fixture.cert()).unwrap(),
+            b"invalid certificate"
+        );
+        assert_eq!(std::fs::read(fixture.key()).unwrap(), key);
+    }
+
+    #[test]
+    fn automatic_tls_refuses_linked_identity_without_chmodding_another_target() {
+        use std::os::unix::fs::PermissionsExt;
+        for hardlink in [false, true] {
+            let fixture = AutomaticTlsFixture::new();
+            let outside = AutomaticTlsFixture::new();
+            let target = outside.0.join("unrelated-key");
+            std::fs::write(&target, b"unrelated").unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+            if hardlink {
+                std::fs::hard_link(&target, fixture.key()).unwrap();
+            } else {
+                std::os::unix::fs::symlink(&target, fixture.key()).unwrap();
+            }
+            assert!(ensure_self_signed_cert(&fixture.cert(), &fixture.key(), "fw", &[]).is_err());
+            assert_eq!(std::fs::read(&target).unwrap(), b"unrelated");
+            assert_eq!(
+                std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                0o644
+            );
+            assert!(!fixture.cert().exists());
+        }
+    }
+
+    #[test]
+    fn automatic_tls_concurrent_bootstrap_has_one_stable_private_identity() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let fixture = AutomaticTlsFixture::new();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(6));
+        let threads: Vec<_> = (0..6)
+            .map(|_| {
+                let cert = fixture.cert();
+                let key = fixture.key();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ensure_self_signed_cert(&cert, &key, "fw", &["127.0.0.1".into()]).unwrap();
+                    cert_pubkey_pin(&cert).unwrap()
+                })
+            })
+            .collect();
+        let pins: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert!(pins.iter().all(|pin| pin == &pins[0]));
+        let key = std::fs::metadata(fixture.key()).unwrap();
+        assert_eq!(key.permissions().mode() & 0o777, 0o600);
+        assert_eq!(key.nlink(), 1);
+        assert!(std::fs::read_dir(&fixture.0).unwrap().all(|entry| {
+            ["key.pem", "cert.pem", ".certificate.lock"]
+                .contains(&entry.unwrap().file_name().to_str().unwrap())
+        }));
+    }
+
+    #[test]
+    fn automatic_tls_expiring_certificate_renews_with_the_original_key() {
+        let fixture = AutomaticTlsFixture::new();
+        fixture.mint();
+        let key = std::fs::read(fixture.key()).unwrap();
+        let pin = cert_pubkey_pin(&fixture.cert()).unwrap();
+        // A one-day certificate is valid now, but inside the 30-day renewal
+        // window. `req -days 0` is not supported by all OpenSSL versions.
+        let expiring = Command::new(bin("openssl"))
+            .args([
+                "req",
+                "-x509",
+                "-key",
+                fixture.key().to_str().unwrap(),
+                "-days",
+                "1",
+                "-subj",
+                "/CN=fw",
+                "-out",
+                fixture.cert().to_str().unwrap(),
+                "-addext",
+                "subjectAltName=DNS:fw,DNS:localhost,IP:127.0.0.1",
+            ])
+            .output()
+            .unwrap();
+        assert!(expiring.status.success(), "OpenSSL expiry fixture failed");
+        let cert = std::fs::read(fixture.cert()).unwrap();
+        ensure_self_signed_cert(&fixture.cert(), &fixture.key(), "fw", &["127.0.0.1".into()])
+            .unwrap();
+        assert_eq!(std::fs::read(fixture.key()).unwrap(), key);
+        assert_eq!(cert_pubkey_pin(&fixture.cert()).unwrap(), pin);
+        assert_ne!(std::fs::read(fixture.cert()).unwrap(), cert);
     }
 
     // A workstation with no agent socket once answered `show flows` with 1481
