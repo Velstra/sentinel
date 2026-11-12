@@ -12,7 +12,7 @@ use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use ring::digest;
 
 const STATE: &str = "/var/lib/sentinel";
@@ -27,6 +27,15 @@ const STATUS_MARKER: &str = "SENTINEL_HTTP_STATUS:";
 /// deliberately separate from the config apply lock: a stalled download must
 /// never block an emergency configuration commit.
 pub struct UpdateLock(File);
+
+#[derive(Debug)]
+pub struct UpdateBusy;
+impl std::fmt::Display for UpdateBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("another update is in progress; nothing was changed")
+    }
+}
+impl std::error::Error for UpdateBusy {}
 
 impl UpdateLock {
     pub fn acquire() -> Result<Self> {
@@ -74,7 +83,7 @@ impl UpdateLock {
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() == std::io::ErrorKind::WouldBlock {
-                bail!("another update is in progress; nothing was changed");
+                return Err(UpdateBusy.into());
             }
             return Err(error).context("locking update transaction");
         }

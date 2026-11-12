@@ -60,6 +60,7 @@ pub const DEFAULT_TOKEN_PATH: &str = "/var/lib/sentinel/api-token";
 /// `PUT` applies the config live (the same [`Apply`] a CLI `commit` uses).
 pub struct ApiState {
     pub telemetry: Arc<crate::telemetry::Hub>,
+    pub(crate) updates: Arc<crate::update_observer::Observer>,
     /// The bearer token every request (except `/api/v1/health`) must present.
     pub token: String,
     pub token_path: Option<PathBuf>,
@@ -119,6 +120,7 @@ pub async fn serve(listen: &str, config: &Path, apply: Apply, token_file: &Path)
         .transpose()?;
     let state = Arc::new(ApiState {
         telemetry: Arc::default(),
+        updates: Arc::default(),
         token,
         token_path: std::env::var("SENTINEL_API_TOKEN")
             .ok()
@@ -291,6 +293,16 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/api/v1/config-sync", axum::routing::put(put_config_sync))
         .route("/api/v1/status", get(get_status))
         .route("/api/v1/system/health", get(get_system_health))
+        .route("/api/v1/system/updates", get(get_updates))
+        .route("/api/v1/system/updates/jobs/:id", get(get_update_job))
+        .route(
+            "/api/v1/system/updates/check",
+            post(post_update_check).layer(axum::extract::DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/v1/system/updates/stage",
+            post(post_update_stage).layer(axum::extract::DefaultBodyLimit::max(4096)),
+        )
         .route("/api/v1/telemetry", get(get_telemetry))
         .route("/api/v1/telemetry/snapshot", get(get_telemetry_snapshot))
         .route("/api/v1/show/*path", get(get_show))
@@ -2809,6 +2821,263 @@ pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+// ---- local operational signed updates -----------------------------------
+
+fn update_error(error: crate::update_jobs::Error) -> ApiError {
+    use crate::update_jobs::Code;
+    let status = match error.0 {
+        Code::InvalidRequest => StatusCode::BAD_REQUEST,
+        Code::NotFound => StatusCode::NOT_FOUND,
+        Code::StateUnavailable | Code::WorkerUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::CONFLICT,
+    };
+    // Do NOT forward an engine anyhow chain, URL, path, HTTP upstream body or
+    // stderr. Upstream entitlement401 must not sign a management user out.
+    ApiError {
+        status,
+        message: error.0.message().into(),
+    }
+}
+
+async fn get_updates(
+    State(state): State<Arc<ApiState>>,
+    axum::Extension(caller): axum::Extension<Caller>,
+) -> Result<Response, ApiError> {
+    let view = state.updates.observe(
+        state.config_path.clone(),
+        state.apply.enabled,
+        caller.permission.may_write(),
+    );
+    Ok((
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::RETRY_AFTER, "1"),
+        ],
+        Json(view),
+    )
+        .into_response())
+}
+
+async fn get_update_job(
+    State(state): State<Arc<ApiState>>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Response, ApiError> {
+    let result = state
+        .updates
+        .job(state.config_path.clone(), state.apply.enabled, &id)
+        .map_err(update_error)?;
+    Ok((
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::RETRY_AFTER, "1"),
+        ],
+        Json(result),
+    )
+        .into_response())
+}
+
+fn normalized_authority(value: &str, scheme: &str) -> Option<(String, u16)> {
+    use std::str::FromStr;
+    if value.contains('@') || value.chars().any(char::is_control) {
+        return None;
+    }
+    let authority = axum::http::uri::Authority::from_str(value).ok()?;
+    let port = if authority.port().is_some() {
+        authority.port_u16()?
+    } else {
+        if scheme == "https" { 443 } else { 80 }
+    };
+    Some((authority.host().to_ascii_lowercase(), port))
+}
+
+fn update_request(
+    headers: &axum::http::HeaderMap,
+    uri: &axum::http::Uri,
+    tls: bool,
+    body: &[u8],
+) -> Result<crate::update_jobs::Request, ApiError> {
+    let denied = || {
+        ApiError::new(
+            StatusCode::FORBIDDEN,
+            anyhow!("cross-origin update requests are refused"),
+        )
+    };
+    if headers.get_all(header::CONTENT_TYPE).iter().count() != 1
+        || !headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+            })
+    {
+        return Err(ApiError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            anyhow!("update requests require application/json"),
+        ));
+    }
+    if headers.get_all("sec-fetch-site").iter().count() > 1
+        || headers.get("sec-fetch-site").is_some_and(|v| {
+            v.to_str()
+                .map_or(true, |s| !matches!(s, "same-origin" | "same-site" | "none"))
+        })
+    {
+        return Err(denied());
+    }
+    if headers.get_all(header::ORIGIN).iter().count() > 1 {
+        return Err(denied());
+    }
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        let value = origin.to_str().map_err(|_| denied())?;
+        let origin: axum::http::Uri = value.parse().map_err(|_| denied())?;
+        let scheme = if tls { "https" } else { "http" };
+        if origin.scheme_str() != Some(scheme)
+            || origin.path_and_query().is_some_and(|p| p.as_str() != "/")
+        {
+            return Err(denied());
+        }
+        let actual = if headers.get_all(header::HOST).iter().count() == 1 {
+            normalized_authority(
+                headers
+                    .get(header::HOST)
+                    .and_then(|h| h.to_str().ok())
+                    .ok_or_else(denied)?,
+                scheme,
+            )
+        } else if headers.get_all(header::HOST).iter().count() == 0 {
+            uri.authority()
+                .and_then(|v| normalized_authority(v.as_str(), scheme))
+        } else {
+            return Err(denied());
+        };
+        if actual.is_none()
+            || origin
+                .authority()
+                .and_then(|v| normalized_authority(v.as_str(), scheme))
+                != actual
+            || uri
+                .authority()
+                .is_some_and(|v| normalized_authority(v.as_str(), scheme) != actual)
+            || uri.scheme_str().is_some_and(|v| v != scheme)
+        {
+            return Err(denied());
+        }
+    }
+    if body.len() > 4096 {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            anyhow!("update request exceeds4096 bytes"),
+        ));
+    }
+    serde_json::from_slice(body).map_err(|_| {
+        update_error(crate::update_jobs::Error(
+            crate::update_jobs::Code::InvalidRequest,
+        ))
+    })
+}
+
+async fn post_update_check(
+    State(state): State<Arc<ApiState>>,
+    axum::Extension(caller): axum::Extension<Caller>,
+    headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    post_update(
+        state,
+        caller,
+        headers,
+        uri,
+        body,
+        crate::update_jobs::Action::Check,
+    )
+    .await
+}
+async fn post_update_stage(
+    State(state): State<Arc<ApiState>>,
+    axum::Extension(caller): axum::Extension<Caller>,
+    headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    post_update(
+        state,
+        caller,
+        headers,
+        uri,
+        body,
+        crate::update_jobs::Action::Stage,
+    )
+    .await
+}
+async fn post_update(
+    state: Arc<ApiState>,
+    caller: Caller,
+    headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
+    body: axum::body::Bytes,
+    action: crate::update_jobs::Action,
+) -> Result<Response, ApiError> {
+    if !caller.permission.may_write() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            anyhow!("read-only accounts cannot run updates"),
+        ));
+    }
+    let request = update_request(&headers, &uri, state.tls_pin.is_some(), &body)?;
+    crate::update_jobs::validate_request(action, &request).map_err(update_error)?;
+    let permit = match state.updates.admit() {
+        Ok(permit) => permit,
+        Err(error) => {
+            return Ok((
+                [
+                    (header::CACHE_CONTROL, "no-store"),
+                    (header::RETRY_AFTER, "1"),
+                ],
+                update_error(error),
+            )
+                .into_response());
+        }
+    };
+    // Only bounded admission runs here. The actual network/writer lifecycle is
+    // independent of this request, Tokio task, browser and API process.
+    let admission = tokio::task::spawn_blocking(move || {
+        // The blocking task, not this request or its timeout, owns capacity.
+        let _permit = permit;
+        let result =
+            crate::update_jobs::submit(&state.config_path, state.apply.enabled, action, &request);
+        state.updates.invalidate();
+        result
+    });
+    let job = tokio::time::timeout(std::time::Duration::from_secs(30), admission)
+        .await
+        .map_err(|_| {
+            update_error(crate::update_jobs::Error(
+                crate::update_jobs::Code::WorkerUnavailable,
+            ))
+        })?
+        .map_err(|_| {
+            update_error(crate::update_jobs::Error(
+                crate::update_jobs::Code::WorkerUnavailable,
+            ))
+        })?
+        .map_err(update_error)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        [
+            (
+                header::LOCATION,
+                format!("/api/v1/system/updates/jobs/{}", job.id),
+            ),
+            (header::CACHE_CONTROL, "no-store".into()),
+        ],
+        Json(job),
+    )
+        .into_response())
+}
+
 // ---- error type ----------------------------------------------------------
 
 /// A handler error rendered as `{"error": <message>}` with a status code. The
@@ -2862,6 +3131,427 @@ mod tests {
 
     const TOKEN: &str = "test-token-abc123";
 
+    fn observer_context_fixture() -> crate::update_jobs::Snapshot {
+        crate::update_jobs::Snapshot {
+            boot_id: "12345678-1234-1234-1234-123456789abc".into(),
+            mutation_epoch: "9".repeat(64),
+            config_revision: "f".repeat(64),
+            public_key_sha256: "b".repeat(64),
+            release: "2.0.1".into(),
+            slot: "sentinel-a".into(),
+            verity: "c".repeat(64),
+            selected_entry: "sentinel-a.efi".into(),
+            next_entry: "sentinel-a.efi".into(),
+            uki_sha256: "d".repeat(64),
+            verity_guid: "22222222-2222-2222-2222-222222222222".into(),
+            store_guid: "33333333-3333-3333-3333-333333333333".into(),
+            permanent: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn update_observer_real_routes_bound_poll_flood_and_recheck_readonly_revocation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Mutex, mpsc};
+        for phase in [
+            "bootctl",
+            "partition-guid",
+            "public-key",
+            "uki-hash",
+            "config-read",
+        ] {
+            let path = temp_config();
+            let original = "[system]\nhostname=\"observer-route\"\n[[system.group]]\nname=\"viewers\"\npermission=\"read-only\"\n[[system.login]]\nusername=\"viewer\"\ngroup=\"viewers\"\n";
+            std::fs::write(&path, original).unwrap();
+            let state = state(path.clone());
+            let credential = open_test_session(&state, "viewer");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&calls);
+            let (entered, started) = mpsc::channel();
+            let (release, released) = mpsc::channel();
+            let released = Mutex::new(released);
+            state.updates.set_fixture_collector(Arc::new(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                entered.send(()).unwrap();
+                released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+                let mut value =
+                    crate::update_jobs::unavailable_status(crate::update_jobs::Code::Busy);
+                value.unavailable = None;
+                value.generation = Some("1".repeat(64));
+                value.mutation_context = Some(observer_context_fixture());
+                value.can_check = true;
+                value.can_stage = true;
+                Ok(value)
+            }));
+            let app = router(Arc::clone(&state));
+            // Discard the initiating response. It cannot own/cancel the probe.
+            drop(
+                app.clone()
+                    .oneshot(get("/api/v1/system/updates", Some(TOKEN)))
+                    .await
+                    .unwrap(),
+            );
+            started
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            for _ in 0..100 {
+                let reply = app
+                    .clone()
+                    .oneshot(get("/api/v1/system/updates", Some(&credential)))
+                    .await
+                    .unwrap();
+                assert_eq!(reply.status(), StatusCode::OK, "{phase}");
+                assert_eq!(reply.headers()[header::CACHE_CONTROL], "no-store");
+                let body: Value =
+                    serde_json::from_slice(&to_bytes(reply.into_body(), 65536).await.unwrap())
+                        .unwrap();
+                assert_eq!(body["observation"]["state"], "initializing", "{phase}");
+                assert_eq!(body["can_stage"], false);
+                assert!(body["mutation_context"].is_null());
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "{phase}");
+            release.send(()).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let reply = app
+                        .clone()
+                        .oneshot(get("/api/v1/system/updates", Some(TOKEN)))
+                        .await
+                        .unwrap();
+                    let body: Value =
+                        serde_json::from_slice(&to_bytes(reply.into_body(), 65536).await.unwrap())
+                            .unwrap();
+                    if body["observation"]["state"] == "fresh" {
+                        assert!(body["mutation_context"].is_object());
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let reply = app
+                .clone()
+                .oneshot(get("/api/v1/system/updates", Some(&credential)))
+                .await
+                .unwrap();
+            let body = to_bytes(reply.into_body(), 65536).await.unwrap();
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            assert!(value["mutation_context"].is_null());
+            assert_eq!(value["can_check"], false);
+            assert!(!String::from_utf8_lossy(&body).contains(&"f".repeat(64)));
+            std::fs::write(&path, "[system]\nhostname=\"observer-route\"\n").unwrap();
+            let refused = app
+                .oneshot(get("/api/v1/system/updates", Some(&credential)))
+                .await
+                .unwrap();
+            assert_eq!(refused.status(), StatusCode::UNAUTHORIZED, "{phase}");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn update_observer_post_contention_is_rejected_before_offbox_admission_or_any_probe() {
+        let path = seed("admission-route");
+        let saved = std::fs::read(&path).unwrap();
+        let state = state(path.clone());
+        let _permit = state.updates.admit().unwrap();
+        let app = router(Arc::clone(&state));
+        for action in ["check", "stage"] {
+            let request = crate::update_jobs::Request {
+                request_id: "e".repeat(64),
+                expected_generation: "0".repeat(64),
+                expected: observer_context_fixture(),
+                offer_id: (action == "stage").then(|| "a".repeat(64)),
+            };
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/v1/system/updates/{action}"))
+                        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            let text =
+                String::from_utf8(to_bytes(response.into_body(), 4096).await.unwrap().to_vec())
+                    .unwrap();
+            assert!(
+                text.contains("A configuration writer or update operation is busy"),
+                "{text}"
+            );
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    fn update_fixture_body() -> Vec<u8> {
+        serde_json::to_vec(&json!({"request_id":"a".repeat(64),"expected_generation":"0".repeat(64),
+            "expected":{"boot_id":"12345678-1234-1234-1234-123456789abc","mutation_epoch":"9".repeat(64),"config_revision":"1".repeat(64),
+                "public_key_sha256":"2".repeat(64),"release":"2.0.1","slot":"sentinel-a","verity":"3".repeat(64),
+                "selected_entry":"sentinel-a.efi","next_entry":"sentinel-a.efi","uki_sha256":"4".repeat(64),"permanent":true,
+                "verity_guid":"22222222-2222-2222-2222-222222222222","store_guid":"33333333-3333-3333-3333-333333333333"}})).unwrap()
+    }
+
+    #[tokio::test]
+    async fn update_observer_malformed_context_is_refused_before_a_busy_admission_probe() {
+        let state = state(seed("updates-prevalidation"));
+        let _permit = state.updates.admit().unwrap();
+        let app = router(Arc::clone(&state));
+        // Stage must name a reviewed offer. A held permit must not hide this
+        // schema error behind Busy or dispatch a background probe.
+        let reply = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/system/updates/stage")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(update_fixture_body()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            body_string(reply)
+                .await
+                .contains("Malformed local update request")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_jobs_api_auth_and_offbox_boundary_preserve_fixture_config() {
+        let path = seed("updates-offbox");
+        let before = std::fs::read(&path).unwrap();
+        let app = router(state(path.clone()));
+        for uri in [
+            "/api/v1/system/updates",
+            "/api/v1/system/updates/jobs/unknown",
+        ] {
+            assert_eq!(
+                app.clone().oneshot(get(uri, None)).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        let response = app
+            .clone()
+            .oneshot(get("/api/v1/system/updates", Some(TOKEN)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["unavailable"], "unsupported-runtime");
+        assert_eq!(body["can_check"], false);
+        assert_eq!(body["can_stage"], false);
+        assert!(body["mutation_context"].is_null());
+        for uri in [
+            "/api/v1/system/updates/check",
+            "/api/v1/system/updates/stage",
+        ] {
+            let mut body: Value = serde_json::from_slice(&update_fixture_body()).unwrap();
+            if uri.ends_with("/stage") {
+                body["offer_id"] = "a".repeat(64).into();
+            }
+            let body = serde_json::to_vec(&body).unwrap();
+            let anonymous = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.clone()))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(anonymous).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED
+            );
+            let request = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert!(body_string(response).await.contains("off-box"));
+        }
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn update_jobs_readonly_may_observe_but_cannot_check_or_stage() {
+        let path = seed("updates-viewer");
+        std::fs::write(&path, "[system]\nhostname='updates-viewer'\n[[system.group]]\nname='viewers'\npermission='read-only'\n[[system.login]]\nusername='viewer'\ngroup='viewers'\n").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let state = state(path.clone());
+        let credential = open_test_session(&state, "viewer");
+        let app = router(state);
+        assert_eq!(
+            app.clone()
+                .oneshot(get("/api/v1/system/updates", Some(&credential)))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        for uri in [
+            "/api/v1/system/updates/check",
+            "/api/v1/system/updates/stage",
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {credential}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(update_fixture_body()))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn update_jobs_origin_policy_uses_actual_tls_and_authority_not_forwarded_headers() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        headers.insert(header::HOST, "fw.example:8443".parse().unwrap());
+        let uri = "/api/v1/system/updates/check".parse().unwrap();
+        let body = update_fixture_body();
+        update_request(&headers, &uri, true, &body).unwrap(); // Explicit bearer CLI: absent Origin allowed.
+        headers.insert(header::ORIGIN, "https://FW.EXAMPLE:8443".parse().unwrap());
+        headers.insert("sec-fetch-site", "same-origin".parse().unwrap());
+        update_request(&headers, &uri, true, &body).unwrap();
+        for origin in [
+            "null",
+            "http://fw.example:8443",
+            "https://evil.example:8443",
+            "https://fw.example:8443/path",
+            "https://user@fw.example:8443",
+        ] {
+            headers.insert(header::ORIGIN, origin.parse().unwrap());
+            assert_eq!(
+                update_request(&headers, &uri, true, &body)
+                    .unwrap_err()
+                    .status,
+                StatusCode::FORBIDDEN
+            );
+        }
+        headers.insert(header::ORIGIN, "https://evil.example".parse().unwrap());
+        headers.insert("x-forwarded-host", "evil.example".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        assert_eq!(
+            update_request(&headers, &uri, true, &body)
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+        headers.insert(header::ORIGIN, "https://fw.example:8443".parse().unwrap());
+        headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
+        assert_eq!(
+            update_request(&headers, &uri, true, &body)
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn update_jobs_ipv6_h2_origins_and_duplicate_headers_are_strict() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        headers.insert(header::ORIGIN, "https://[::1]:8443".parse().unwrap());
+        let uri = "https://[::1]:8443/api/v1/system/updates/check"
+            .parse()
+            .unwrap();
+        let body = update_fixture_body();
+        update_request(&headers, &uri, true, &body).unwrap();
+        headers.insert(header::HOST, "other.example".parse().unwrap());
+        assert_eq!(
+            update_request(&headers, &uri, true, &body)
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+        headers.insert(header::HOST, "[::1]:8443".parse().unwrap());
+        headers.append(header::ORIGIN, "https://[::1]:8443".parse().unwrap());
+        assert_eq!(
+            update_request(&headers, &uri, true, &body)
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn update_jobs_api_rejects_large_nonjson_and_unknown_operational_fields() {
+        let app = router(state(seed("updates-schema")));
+        for (media, bytes, expected) in [
+            (
+                "text/plain",
+                update_fixture_body(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (
+                "application/json",
+                vec![b'x'; 4097],
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+            ("application/json", b"{}".to_vec(), StatusCode::BAD_REQUEST),
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/api/v1/system/updates/check")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, media)
+                .body(Body::from(bytes))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                expected
+            );
+        }
+        let mut body: Value = serde_json::from_slice(&update_fixture_body()).unwrap();
+        body["offer_id"] = "a".repeat(64).into();
+        for key in [
+            "member",
+            "allow_unsigned",
+            "allow_downgrade",
+            "reboot",
+            "url",
+            "disk",
+        ] {
+            body[key] = true.into();
+            let request = Request::builder()
+                .method("POST")
+                .uri("/api/v1/system/updates/stage")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::BAD_REQUEST
+            );
+            body.as_object_mut().unwrap().remove(key);
+        }
+    }
+
     /// A throwaway config dir under the temp dir, unique per call.
     fn temp_config() -> PathBuf {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -2888,6 +3578,7 @@ mod tests {
         let tokens_dir = config_path.parent().unwrap().join("tokens");
         Arc::new(ApiState {
             telemetry: Arc::default(),
+            updates: Arc::default(),
             token: TOKEN.to_string(),
             token_path: None,
             tls_pin: None,
@@ -3529,6 +4220,7 @@ virtual-address = ["10.43.0.253"]
         let hash = crate::passwd::hash("alice-password").unwrap();
         let st = ApiState {
             telemetry: Arc::default(),
+            updates: Arc::default(),
             token: TOKEN.to_string(),
             token_path: None,
             tls_pin: None,

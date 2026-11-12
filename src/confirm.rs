@@ -70,6 +70,7 @@ pub fn commit_confirm(session: &mut Session, act: &Apply, minutes: u32) -> Resul
     // Clear any prior pending timer so re-arming is clean, then apply live.
     // apply_live rolls its own partial failure back, so on error nothing armed
     // and the previous running config stands.
+    crate::mutation::advance()?;
     system::disarm_confirm();
     // The saved baseline (guaranteed present above) is the last-good target a
     // failed broad apply reconciles back to — the same config the timer reverts
@@ -163,6 +164,7 @@ fn confirm_target(
 /// operator still needs `save` to persist it across a reboot (VyOS semantics).
 /// `confirm <id>` keeps the named management transaction instead.
 pub fn confirm(act: &Apply, id: Option<&str>) -> Result<()> {
+    let _lock = system::apply_lock()?;
     let path = Path::new(crate::session::DEFAULT_CONFIG);
     let status = if act.enabled {
         crate::safe_apply::status(path)?
@@ -179,6 +181,9 @@ pub fn confirm(act: &Apply, id: Option<&str>) -> Result<()> {
             eprintln!("confirmed management revision — applied and saved.");
         }
         ConfirmTarget::CommitConfirm => {
+            if act.enabled {
+                crate::mutation::advance()?;
+            }
             system::disarm_confirm();
             eprintln!("confirmed — change kept (run `save` to persist across reboot).");
         }
@@ -219,6 +224,9 @@ pub fn rollback(act: &Apply, cfg_path: &Path, from_timer: bool) -> Result<()> {
         .with_context(|| format!("loading the saved config {}", cfg_path.display()))?;
     // Stop the timer first (it may be the very unit running us) so a revert
     // that itself races a second firing can't loop.
+    if act.enabled {
+        crate::mutation::advance()?;
+    }
     system::disarm_confirm();
     // A revert to saved: there is no last-good to reconcile a partial failure
     // to (reconciling back to the un-confirmed config would defeat the revert),

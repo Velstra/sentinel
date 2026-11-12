@@ -922,6 +922,73 @@ pub fn read_owned_file(path: &Path) -> Result<Option<String>> {
     }
 }
 
+const MAX_OWNED_READ: usize = 64 * 1024 * 1024;
+
+/// Journals must not hold apply.lock while opening a FIFO or following a
+/// replacement symlink. Preserve the existing noninteractive admin escalation,
+/// but re-invoke a descriptor-validating reader, never an unbounded `cat`.
+pub fn read_owned_regular(path: &Path, limit: usize) -> Result<Option<String>> {
+    match read_regular(path, limit) {
+        Err(error)
+            if !is_root()
+                && error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied) =>
+        {
+            let limit = limit.to_string();
+            let path = path.to_str().context("non-UTF-8 journal path")?;
+            let output = escalated_output(
+                "sentinel-self",
+                &["owned-file-read", "--max-bytes", &limit, "--", path],
+            )?;
+            anyhow::ensure!(
+                output.status.success(),
+                "reading protected regular journal failed"
+            );
+            serde_json::from_slice(&output.stdout).context("invalid protected journal read reply")
+        }
+        result => result,
+    }
+}
+
+pub fn owned_file_read(path: &Path, limit: usize) -> Result<String> {
+    anyhow::ensure!(is_root(), "owned-file-read requires root");
+    serde_json::to_string(&read_regular(path, limit)?).map_err(Into::into)
+}
+
+fn read_regular(path: &Path, limit: usize) -> Result<Option<String>> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    anyhow::ensure!(
+        (1..=MAX_OWNED_READ).contains(&limit),
+        "invalid protected read bound"
+    );
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("opening protected regular journal"),
+    };
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file()
+            && metadata.nlink() == 1
+            && metadata.mode() & 0o022 == 0
+            && (metadata.uid() == 0 || metadata.uid() == unsafe { libc::geteuid() })
+            && metadata.len() <= limit as u64,
+        "invalid protected regular journal"
+    );
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() <= limit, "protected journal exceeds read bound");
+    Ok(Some(
+        String::from_utf8(bytes).context("journal is not UTF-8")?,
+    ))
+}
+
 /// Install file `contents` at a (root-owned) `path`. Tries a direct write first
 /// (works as root, e.g. the boot service) and falls back to staging in a
 /// wheel-writable temp and `sudo install`-ing it (the admin running `configure`).
@@ -968,6 +1035,9 @@ fn install_owned_atomic(path: &Path, contents: &str, private: bool) -> Result<()
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::io::AsRawFd;
     let _transaction = apply_lock()?;
+    if crate::mutation::intent_path(path) {
+        crate::mutation::advance()?;
+    }
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -1569,6 +1639,13 @@ pub fn daemon_reload() -> Result<()> {
 
 /// Remove a (possibly root-owned) file, tolerating an already-absent path.
 pub fn remove_file(path: &Path) -> Result<()> {
+    let _lock = if crate::mutation::intent_path(path) {
+        let lock = apply_lock()?;
+        crate::mutation::advance()?;
+        Some(lock)
+    } else {
+        None
+    };
     if !owned_file_exists(path)? {
         return Ok(());
     }
@@ -2075,6 +2152,8 @@ pub fn bin(name: &str) -> String {
         "test" => "SENTINEL_TEST_BIN",
         "systemctl" => "SENTINEL_SYSTEMCTL_BIN",
         "systemd-run" => "SENTINEL_SYSTEMD_RUN_BIN",
+        "bootctl" => "SENTINEL_BOOTCTL_BIN",
+        "boot-health" => "SENTINEL_BOOT_HEALTH_BIN",
         "journalctl" => "SENTINEL_JOURNALCTL_BIN",
         // Our own path, so the escalated re-invocation runs this build and not
         // whatever `sentinel` a $PATH lookup under sudo might find.
@@ -2260,6 +2339,68 @@ pub(crate) fn sudo(cmd: &str, args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_regular_reads_bound_bytes_and_preserve_missing_empty_and_invalid_states() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = crate::update::Scratch::new().unwrap();
+        let path = scratch.join("journal");
+        assert!(read_owned_regular(&path, 8).unwrap().is_none());
+        for body in [b"".as_slice(), b"12345678"] {
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(
+                read_owned_regular(&path, 8).unwrap().unwrap().as_bytes(),
+                body
+            );
+        }
+        std::fs::write(&path, b"123456789").unwrap();
+        assert!(read_owned_regular(&path, 8).is_err());
+        std::fs::write(&path, [0xff]).unwrap();
+        assert!(read_owned_regular(&path, 8).is_err());
+        assert!(read_owned_regular(&path, 0).is_err());
+        assert!(read_owned_regular(&path, MAX_OWNED_READ + 1).is_err());
+    }
+
+    #[test]
+    fn owned_regular_rejects_fifo_symlink_directory_hardlink_and_writable_journal() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let scratch = crate::update::Scratch::new().unwrap();
+        let regular = scratch.join("regular");
+        std::fs::write(&regular, "private journal").unwrap();
+        std::fs::set_permissions(&regular, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = scratch.join("link");
+        symlink(&regular, &link).unwrap();
+        assert!(read_owned_regular(&link, 100).is_err());
+        assert!(read_owned_regular(&scratch.join("."), 100).is_err());
+        let fifo = scratch.join("fifo");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let start = std::time::Instant::now();
+        assert!(read_owned_regular(&fifo, 100).is_err());
+        assert!(start.elapsed() < std::time::Duration::from_millis(250));
+        std::fs::hard_link(&regular, scratch.join("hardlink")).unwrap();
+        assert!(read_owned_regular(&regular, 100).is_err());
+        std::fs::remove_file(scratch.join("hardlink")).unwrap();
+        std::fs::set_permissions(&regular, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(read_owned_regular(&regular, 100).is_err());
+    }
+
+    #[test]
+    fn owned_regular_internal_wire_reply_is_optional_json_and_requires_root() {
+        let scratch = crate::update::Scratch::new().unwrap();
+        let absent = scratch.join("absent");
+        if is_root() {
+            assert_eq!(owned_file_read(&absent, 10).unwrap(), "null");
+        } else {
+            assert!(
+                owned_file_read(&absent, 10)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires root")
+            );
+        }
+    }
 
     fn owned_file_output(code: i32, stdout: &[u8], stderr: &[u8]) -> std::process::Output {
         use std::os::unix::process::ExitStatusExt;

@@ -138,6 +138,15 @@
         SENTINEL_OPENSSL_BIN = "${pkgs.openssl.bin}/bin/openssl";
         # The peer-observation integration test exercises real pinned HTTPS.
         SENTINEL_CURL_BIN = "${pkgs.curl.bin}/bin/curl";
+        # Test the actual wrapper variable names without bringing Nix/VM
+        # sources into the Rust source filter or depending on tool store paths.
+        SENTINEL_TEST_TOOL_PINS = lib.concatStringsSep " " (
+          builtins.concatMap
+            (line:
+              let pin = builtins.match "[[:space:]]*--set[[:space:]]+(SENTINEL_[A-Z0-9_]+_BIN).*" line;
+              in if pin == null then [ ] else pin)
+            (lib.splitString "\n" (builtins.readFile ./flake.nix))
+        );
       };
 
       # Runtime tool pins are a separate derivation: updating the HA dataplane
@@ -186,6 +195,11 @@
             --set SENTINEL_MSMTP_BIN      ${pkgs.msmtp}/bin/msmtp \
             --set SENTINEL_SURICATA_SHARE ${pkgs.suricata}/etc/suricata \
             --set SENTINEL_SYSTEMD_RUN_BIN ${pkgs.systemd}/bin/systemd-run \
+            --set SENTINEL_BOOTCTL_BIN    ${pkgs.systemd}/bin/bootctl \
+            --set SENTINEL_BOOT_HEALTH_BIN ${pkgs.writeShellScript "sentinel-readonly-boot-health" ''
+              exec ${pkgs.python3}/bin/python3 -I ${./nix/boot-health.py} verify \
+                --systemctl ${pkgs.systemd}/bin/systemctl --ip ${pkgs.iproute2}/bin/ip "$@"
+            ''} \
             --set SENTINEL_JOURNALCTL_BIN ${pkgs.systemd}/bin/journalctl \
             --set SENTINEL_WREN_BIN       ${wrenPkg}/bin/wren \
             --set SENTINEL_VELSTRA_BIN    ${velstra}/bin/velstra \
@@ -1633,6 +1647,10 @@
       # the data plane stays up.
       #   nix build .#checks.x86_64-linux.commit -L
       checks.${system} = {
+        ota-stage = import ./nix/ota-stage-test.nix { inherit pkgs self; };
+        ota-mutation = import ./nix/ota-mutation-test.nix { inherit pkgs self; };
+        ota-confirmation = import ./nix/ota-confirmation-test.nix { inherit pkgs self; };
+        ota-journal = import ./nix/ota-journal-test.nix { inherit pkgs self; };
         react-ui = sentinelFrontend;
         staticimport = import ./nix/static-import-test.nix { inherit pkgs self; };
         ssh-persistence = import ./nix/ssh-persistence-test.nix { inherit pkgs self; };
