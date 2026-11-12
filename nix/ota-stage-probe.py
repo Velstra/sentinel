@@ -81,7 +81,7 @@ def inactive_identity():
             for number in (4, 5)}
 
 
-def main(sentinel):
+def main(sentinel, publication_failure=False):
     proof = json.loads(Path("/etc/qa-stage-proof/info.json").read_bytes())
     assert Path("/dev/sda").is_block_device()
     assert run(["findmnt", "-n", "-o", "SOURCE", "/var/lib/sentinel"]).strip() == "/dev/vda6"
@@ -90,6 +90,7 @@ def main(sentinel):
     initial = until(available)
     assert initial["current"]["permanent"] and initial["current"]["slot"] == "sentinel-a"
     saved = digest("/var/lib/sentinel/appliance.toml")
+    active = {str(number): digest(f"/dev/vda{number}") for number in (2, 3)} if publication_failure else None
     Path("/var/lib/sentinel/qa-http-stage-persistence").write_text("persistent HTTP Stage proof\n")
     keys = Path("/etc/qa-stage-keys")
     scratch = Path("/run/qa-real-stage")
@@ -207,6 +208,78 @@ def main(sentinel):
             assert until(available)["current"] == initial["current"]
             record({"case": selected + "-refused-before-write", "job": failed})
 
+        if publication_failure:
+            # A non-file in the inactive UKI namespace makes publication fail
+            # AFTER the real signed partitions and GUIDs have been written.
+            # This changes only the disposable VM's ESP, not product binaries,
+            # helper pins, boot-health logic or the production error path.
+            obstacle = Path("/boot/EFI/Linux/sentinel-b-qa-publication-obstacle")
+            selection = Path("/boot/loader/loader.conf").read_bytes()
+            run(["mount", "-o", "remount,rw", "/boot"])
+            obstacle.mkdir()
+            run(["sync", "-f", str(obstacle)])
+            run(["mount", "-o", "remount,ro", "/boot"])
+            mode.update(value="valid", download_complete=False, pause=False)
+            checked = check()
+            assert checked["phase"] == "checked", checked
+            accepted = stage()
+            failed = until(lambda: terminal(accepted["id"]), seconds=180)
+            assert failed["phase"] == "failed" and failed["error"] == "write-outcome-unknown", failed
+            assert failed.get("staged") is None, failed
+            after = inactive_identity()
+            assert after != before, "failure was not exercised after real inactive-slot writes"
+            for target, source in ((4, 2), (5, 3)):
+                assert after[str(target)]["sha256"] == digest(f"/dev/sda{source}")
+                donor_guid = run(["lsblk", "-nro", "PARTUUID", f"/dev/sda{source}"]).strip().lower()
+                assert after[str(target)]["guid"].lower() == donor_guid
+            assert {str(n): digest(f"/dev/vda{n}") for n in (2, 3)} == active
+            assert Path("/boot/loader/loader.conf").read_bytes() == selection
+            assert digest("/boot/EFI/Linux/" + initial["current"]["selected_entry"]) == initial["current"]["uki_sha256"]
+            assert not Path("/boot/EFI/Linux/sentinel-b+3.efi").exists()
+            assert digest("/var/lib/sentinel/appliance.toml") == saved
+            name = "sentinel-update-" + accepted["id"] + ".service"
+
+            def exit_message():
+                journal = run(["journalctl", "-b", "-u", name, "--no-pager", "-o", "cat"])
+                return journal if "inactive slot or next boot may have changed" in journal else None
+
+            journal = until(exit_message, seconds=15)
+            assert "refused before slot writing" not in journal, journal
+            image_requests = paths.count("/current/sentinel_3.0.0.raw")
+            registry_sha256 = digest("/var/lib/sentinel/update-jobs/state.json")
+            run(["systemctl", "restart", "sentinel-api.service"])
+
+            def recovered_failure():
+                try:
+                    value = terminal(accepted["id"])
+                except urllib.error.URLError as error:
+                    if isinstance(error.reason, ConnectionRefusedError):
+                        return None
+                    raise
+                assert value is None or value["error"] == "write-outcome-unknown", value
+                return value
+
+            recovered = until(recovered_failure)
+            time.sleep(6)
+            # Observation age/refresh metadata is intentionally live; compare
+            # EVERY durable JobView field, not its transport freshness clock.
+            durable = lambda value: {key: item for key, item in value.items() if key != "observation"}
+            assert durable(recovered) == durable(terminal(accepted["id"])), "API restart changed the terminal outcome"
+            assert digest("/var/lib/sentinel/update-jobs/state.json") == registry_sha256
+            assert paths.count("/current/sentinel_3.0.0.raw") == image_requests, "failed Stage retried automatically"
+            assert inactive_identity() == after
+            assert not errors, errors
+            retained = {"saved_sha256": saved, "active_sha256": active, "current": initial["current"],
+                        "job_id": accepted["id"], "inactive_before": before, "inactive_after": after}
+            Path("/var/lib/sentinel/qa-publication-failure.json").write_text(json.dumps(retained))
+            record({"case": "postwrite-publication-failure-retains-unknown-outcome", "job": failed,
+                    "inactive_before": before, "inactive_after": after, "worker_journal": journal})
+            print(json.dumps({"all_selected_checks_passed": True, "cases": results,
+                "actual_inactive_slot_writes": True, "worker_and_api_agree": True, "no_automatic_retry": True,
+                "donor_sha256": proof["sha256"], "read_only_busy_jobs": read_only_busy_jobs,
+                "real_efi_verity": True, "native_or_production_certified": False}))
+            return
+
         mode.update(value="valid", download_complete=False, pause=True)
         release.clear()
         checked = check()
@@ -287,13 +360,38 @@ def after_boot():
                       "native_or_production_certified": False}))
 
 
+def after_failure_boot():
+    previous = json.loads(Path("/var/lib/sentinel/qa-publication-failure.json").read_text())
+    assert not Path("/dev/sda").exists(), "donor remained attached during boot"
+    assert not Path("/etc/qa-stage-donor").exists()
+    state = until(available)
+    current = state["current"]
+    assert current["slot"] == "sentinel-a" and current["release"] == previous["current"]["release"], current
+    assert current["permanent"] and current["selected_entry"] == current["next_entry"] == "sentinel-a.efi", current
+    assert current["boot_id"] != previous["current"]["boot_id"]
+    assert current["uki_sha256"] == previous["current"]["uki_sha256"]
+    assert {str(n): digest(f"/dev/vda{n}") for n in (2, 3)} == previous["active_sha256"]
+    failed = terminal(previous["job_id"])
+    assert failed["phase"] == "failed" and failed["error"] == "write-outcome-unknown", failed
+    assert failed.get("staged") is None
+    assert digest("/var/lib/sentinel/appliance.toml") == previous["saved_sha256"]
+    assert Path("/var/lib/sentinel/qa-http-stage-persistence").read_text() == "persistent HTTP Stage proof\n"
+    assert "ro" in run(["findmnt", "-n", "-o", "OPTIONS", "/nix/store"]).strip().split(",")
+    print(json.dumps({"booted_original_slot": True, "preserved_state": True,
+        "unknown_failure_retained": True, "current": current, "native_or_production_certified": False}))
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--sentinel")
     parser.add_argument("--after-boot", action="store_true")
+    parser.add_argument("--publication-failure", action="store_true")
+    parser.add_argument("--after-failure-boot", action="store_true")
     args = parser.parse_args()
-    if args.after_boot:
+    if args.after_failure_boot:
+        after_failure_boot()
+    elif args.after_boot:
         after_boot()
     else:
         assert args.sentinel
-        main(args.sentinel)
+        main(args.sentinel, args.publication_failure)

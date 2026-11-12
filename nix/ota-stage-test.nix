@@ -1,17 +1,10 @@
 # Fresh real signed RAW -> HTTP job worker -> inactive slot -> counted EFI boot.
 # Disposable factory keys only. This is not native/production certification.
-{ pkgs, self }:
+{ pkgs, self, publicationFailure ? false }:
 let
   lib = pkgs.lib;
   sentinel = self.packages.x86_64-linux.sentinel;
-  keys = pkgs.runCommand "qa-real-stage-disposable-keys" { nativeBuildInputs = [ pkgs.openssl ]; } ''
-    mkdir -p "$out"
-    openssl genpkey -algorithm ed25519 -out "$out/release.key"
-    openssl pkey -in "$out/release.key" -pubout -out "$out/release.pub"
-    openssl req -x509 -newkey rsa:2048 -nodes -days 3 -subj /CN=qa-stage-loopback \
-      -addext 'subjectAltName=IP:127.0.0.1' -addext 'basicConstraints=critical,CA:TRUE' \
-      -keyout "$out/tls.key" -out "$out/tls.crt"
-  '';
+  keys = import ./ota-test-keys.nix { inherit pkgs; };
   common = {
     imports = [ self.nixosModules.sentinel (self.outPath + "/nix/image.nix") ];
     services.velstra.interface = lib.mkForce "eth0";
@@ -43,7 +36,7 @@ let
     };
   };
 in pkgs.testers.runNixOSTest {
-  name = "sentinel-real-http-ota-stage-boot";
+  name = if publicationFailure then "sentinel-ota-publication-failure" else "sentinel-real-http-ota-stage-boot";
   globalTimeout = 1200;
   nodes.donor = {
     imports = [ common ];
@@ -75,6 +68,7 @@ in pkgs.testers.runNixOSTest {
   testScript = { nodes, ... }: ''
     import json, os, subprocess, tempfile
     from pathlib import Path
+    publication_failure = ${if publicationFailure then "True" else "False"}
     temporary = tempfile.TemporaryDirectory()
     original = "${nodes.machine.system.build.finalImageSigned}/${nodes.machine.image.filePath}"
     donor = "${nodes.donor.system.build.finalImageSigned}/${nodes.donor.image.filePath}"
@@ -85,10 +79,18 @@ in pkgs.testers.runNixOSTest {
     os.environ["NIX_DISK_IMAGE"] = overlay
     machine.start()
 
-    def healthy():
+    def healthy(require_assessment=True):
         for unit in ["multi-user.target", "sentinel-boot.service", "sentinel-boot-late.service", "velstra.service",
-                     "wren.service", "velstra-boot-verify.service", "systemd-bless-boot.service", "sentinel-api.service"]:
+                     "wren.service", "sentinel-api.service"]:
             machine.wait_for_unit(unit, timeout=120)
+        if require_assessment:
+            for unit in ["velstra-boot-verify.service", "systemd-bless-boot.service"]:
+                machine.wait_for_unit(unit, timeout=120)
+        else:
+            # A is already permanent: no boot-count assessment is scheduled
+            # on its later boot. Re-run the EXACT read-only product verifier,
+            # never start/bless units or manufacture a successful assessment.
+            machine.succeed("${pkgs.python3}/bin/python3 -I ${./boot-health.py} verify --sentinel ${sentinel}/bin/sentinel --systemctl ${pkgs.systemd}/bin/systemctl --ip ${pkgs.iproute2}/bin/ip", timeout=100)
         machine.succeed("dmsetup info --target verity usr")
         machine.succeed("test $(systemctl --failed --no-legend --plain | wc -l) -eq 0")
 
@@ -102,6 +104,8 @@ in pkgs.testers.runNixOSTest {
     machine.wait_until_succeeds("test -b /dev/sda3", timeout=30)
     machine.succeed("test $(findmnt -n -o SOURCE /var/lib/sentinel) = /dev/vda6")
     command = "${pkgs.python3}/bin/python3 /etc/qa-stage.py"
+    if publication_failure:
+        command += " --publication-failure"
     try:
         output = machine.succeed(command + " --sentinel ${sentinel}/bin/sentinel", timeout=650)
     except Exception:
@@ -111,7 +115,12 @@ in pkgs.testers.runNixOSTest {
     print(output, flush=True)
     result = json.loads(output)
     assert result["all_selected_checks_passed"] is True
-    assert result["staged"]["boot_entry"] == "sentinel-b+3.efi", result
+    if publication_failure:
+        assert result["actual_inactive_slot_writes"] is True, result
+        assert result["worker_and_api_agree"] is True, result
+        assert result["no_automatic_retry"] is True, result
+    else:
+        assert result["staged"]["boot_entry"] == "sentinel-b+3.efi", result
     Path(os.environ["out"], "stage.json").write_text(json.dumps(result, indent=2))
     # A GUID-identical donor must be detached before the first reboot.
     detached = machine.send_monitor_command("device_del stage-stick")
@@ -120,12 +129,17 @@ in pkgs.testers.runNixOSTest {
     # The driver starts QEMU with -no-reboot; use its supported cold boot.
     machine.shutdown()
     machine.start()
-    healthy()
-    output = machine.succeed("${pkgs.python3}/bin/python3 /etc/qa-stage.py --after-boot", timeout=60)
+    healthy(require_assessment=not publication_failure)
+    after = "--after-failure-boot" if publication_failure else "--after-boot"
+    output = machine.succeed("${pkgs.python3}/bin/python3 /etc/qa-stage.py " + after, timeout=60)
     print(output, flush=True)
     boot = json.loads(output)
-    assert boot["booted_new_slot"] is True and boot["preserved_state"] is True
+    if publication_failure:
+        assert boot["booted_original_slot"] is True and boot["unknown_failure_retained"] is True, boot
+    else:
+        assert boot["booted_new_slot"] is True, boot
+    assert boot["preserved_state"] is True, boot
     Path(os.environ["out"], "boot.json").write_text(json.dumps(boot, indent=2))
-    print("REAL_HTTP_OTA_STAGE_AND_B_BOOT_PASS", flush=True)
+    print("OTA_PUBLICATION_FAILURE_AND_A_BOOT_PASS" if publication_failure else "REAL_HTTP_OTA_STAGE_AND_B_BOOT_PASS", flush=True)
   '';
 }

@@ -1445,6 +1445,10 @@ pub fn run_worker(id: &str) -> JobResult<()> {
     }
     let store = Store::production(false)?.ok_or(Error(Code::StateUnavailable))?;
     let job = store.change(|r| claim_worker(r, id, &boot_id()?, boot_ms()?))?;
+    // Keep the successfully acknowledged first-write boundary even when the
+    // registry later becomes unreadable or its final fsync fails. A journal
+    // failure is never proof that target writes did not happen.
+    let mut last_phase = Phase::Metadata;
     let result = (|| -> Result<Option<install::StagedImage>> {
         let channel = check_snapshot(config, &job.expected, job.action == Action::Stage)?;
         if job.action == Action::Check {
@@ -1476,8 +1480,12 @@ pub fn run_worker(id: &str) -> JobResult<()> {
         } else {
             readiness()?;
             let offer = job.offer.as_ref().ok_or(Error(Code::Conflict))?;
-            let mut phase =
-                |phase: install::UpdatePhase| store.phase(id, phase.into()).map_err(Into::into);
+            let mut phase = |phase: install::UpdatePhase| -> Result<()> {
+                let phase = phase.into();
+                store.phase(id, phase)?;
+                last_phase = phase;
+                Ok(())
+            };
             let mut before_write = || -> Result<()> {
                 readiness()?;
                 let current_channel = check_snapshot(config, &job.expected, true)?;
@@ -1504,16 +1512,27 @@ pub fn run_worker(id: &str) -> JobResult<()> {
             )?))
         }
     })();
-    store.change(|r| {
+    finish_worker(&store, id, last_phase, &result)
+}
+
+fn finish_worker(
+    store: &Store,
+    id: &str,
+    last_phase: Phase,
+    result: &Result<Option<install::StagedImage>>,
+) -> JobResult<()> {
+    let mut may_have_written = last_phase.may_have_written();
+    let completion = store.change(|r| {
         let job = r
             .jobs
             .iter_mut()
             .find(|j| j.id == id)
             .ok_or(Error(Code::NotFound))?;
+        may_have_written |= job.phase.may_have_written();
         if job.phase.terminal() {
             return Err(Error(Code::Conflict));
         }
-        match &result {
+        let code = match result {
             Ok(staged) => {
                 job.staged = staged.clone();
                 job.phase = if job.action == Action::Check {
@@ -1521,18 +1540,30 @@ pub fn run_worker(id: &str) -> JobResult<()> {
                 } else {
                     Phase::Staged
                 };
+                None
             }
             Err(error) => {
-                job.error = Some(failure_code(job.phase, error));
+                let code = if may_have_written {
+                    Code::WriteOutcomeUnknown
+                } else {
+                    failure_code(job.phase, error)
+                };
+                job.error = Some(code);
                 job.phase = Phase::Failed;
+                Some(code)
             }
-        }
+        };
         while r.jobs.len() > HISTORY {
             r.jobs.remove(0);
         }
-        Ok(())
-    })?;
-    result.map(|_| ()).map_err(|_| Error(Code::StageRefused))
+        Ok(code)
+    });
+    match completion {
+        Ok(None) => Ok(()),
+        Ok(Some(code)) => Err(Error(code)),
+        Err(_) if may_have_written => Err(Error(Code::WriteOutcomeUnknown)),
+        Err(error) => Err(error),
+    }
 }
 
 fn claim_worker(registry: &mut Registry, id: &str, current_boot: &str, now: u64) -> JobResult<Job> {
@@ -2522,6 +2553,177 @@ mod tests {
             failure_code(Phase::Publishing, &error),
             Code::WriteOutcomeUnknown
         );
+    }
+    fn running_stage(store: &Store, phase: Phase) -> String {
+        store
+            .change(|r| {
+                r.offer = Some(offer());
+                let mut req = request(r);
+                req.offer_id = Some(offer().id);
+                let (job, _) = admit(r, Action::Stage, &req, &sample(), 1000)?;
+                r.jobs.last_mut().unwrap().phase = phase;
+                Ok(job.id)
+            })
+            .unwrap()
+    }
+    fn staged_image() -> install::StagedImage {
+        install::StagedImage {
+            active_slot: "sentinel-b".into(),
+            staged_slot: "sentinel-a".into(),
+            verity_guid: "44444444-4444-4444-4444-444444444444".into(),
+            store_guid: "55555555-5555-5555-5555-555555555555".into(),
+            boot_entry: "sentinel-a+3.efi".into(),
+            uki_sha256: "6".repeat(64),
+        }
+    }
+    #[test]
+    fn update_jobs_worker_exit_and_durable_failure_use_the_same_typed_code() {
+        for phase in [
+            Phase::Metadata,
+            Phase::Downloading,
+            Phase::Verifying,
+            Phase::Preflight,
+            Phase::Writing,
+            Phase::Publishing,
+        ] {
+            for error in [
+                anyhow::anyhow!("raw upstream PRIVATE credential details"),
+                Error(Code::Conflict).into(),
+                crate::update_stage::UpdateBusy.into(),
+            ] {
+                let (_scratch, store) = fixture();
+                let id = running_stage(&store, phase);
+                let expected = failure_code(phase, &error);
+                assert_code(finish_worker(&store, &id, phase, &Err(error)), expected);
+                let registry = store.read().unwrap().unwrap();
+                let job = &registry.jobs[0];
+                assert_eq!(job.phase, Phase::Failed);
+                assert_eq!(job.error, Some(expected));
+                assert!(job.staged.is_none());
+                assert!(!expected.message().contains("PRIVATE"));
+                if phase.may_have_written() {
+                    assert!(!expected.message().contains("before slot writing"));
+                    assert!(!expected.message().contains("unchanged"));
+                }
+            }
+        }
+    }
+    #[test]
+    fn update_jobs_completion_cannot_erase_durable_or_local_write_uncertainty() {
+        for (durable, local) in [
+            (Phase::Writing, Phase::Preflight),
+            (Phase::Preflight, Phase::Writing),
+            (Phase::Publishing, Phase::Writing),
+        ] {
+            let (_scratch, store) = fixture();
+            let id = running_stage(&store, durable);
+            assert_code(
+                finish_worker(&store, &id, local, &Err(Error(Code::Conflict).into())),
+                Code::WriteOutcomeUnknown,
+            );
+            assert_eq!(
+                store.read().unwrap().unwrap().jobs[0].error,
+                Some(Code::WriteOutcomeUnknown)
+            );
+        }
+    }
+    #[test]
+    fn update_jobs_final_registry_failure_after_writes_never_claims_prewrite_refusal() {
+        for phase in [Phase::Writing, Phase::Publishing] {
+            for success in [false, true] {
+                for corruption in ["locked", "invalid-state", "unsafe-inventory"] {
+                    let (scratch, store) = fixture();
+                    let id = running_stage(&store, phase);
+                    let guard = if corruption == "locked" {
+                        Some(store.lock().unwrap())
+                    } else {
+                        if corruption == "invalid-state" {
+                            std::fs::write(scratch.join("jobs/state.json"), b"not-json").unwrap();
+                        } else {
+                            std::fs::write(scratch.join("jobs/unowned-file"), b"do-not-delete")
+                                .unwrap();
+                        }
+                        None
+                    };
+                    let result = if success {
+                        Ok(Some(staged_image()))
+                    } else {
+                        Err(Error(Code::Conflict).into())
+                    };
+                    assert_code(
+                        finish_worker(&store, &id, phase, &result),
+                        Code::WriteOutcomeUnknown,
+                    );
+                    drop(guard);
+                    if corruption == "locked" {
+                        let registry = store.read().unwrap().unwrap();
+                        assert_eq!(registry.jobs[0].phase, phase);
+                        assert!(registry.jobs[0].staged.is_none());
+                    } else if corruption == "unsafe-inventory" {
+                        assert_eq!(
+                            std::fs::read(scratch.join("jobs/unowned-file")).unwrap(),
+                            b"do-not-delete"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn update_jobs_completion_does_not_overwrite_a_recovered_terminal_job() {
+        let (_scratch, store) = fixture();
+        let id = running_stage(&store, Phase::Publishing);
+        store
+            .change(|r| {
+                mark_interrupted(&mut r.jobs[0]);
+                Ok(())
+            })
+            .unwrap();
+        assert_code(
+            finish_worker(&store, &id, Phase::Publishing, &Ok(Some(staged_image()))),
+            Code::WriteOutcomeUnknown,
+        );
+        let registry = store.read().unwrap().unwrap();
+        assert_eq!(registry.jobs[0].phase, Phase::Interrupted);
+        assert_eq!(registry.jobs[0].error, Some(Code::WriteOutcomeUnknown));
+        assert!(registry.jobs[0].staged.is_none());
+    }
+    #[test]
+    fn update_jobs_completed_check_and_stage_still_publish_their_real_result() {
+        for action in [Action::Check, Action::Stage] {
+            let (_scratch, store) = fixture();
+            let phase = if action == Action::Stage {
+                Phase::Publishing
+            } else {
+                Phase::Metadata
+            };
+            let id = if action == Action::Stage {
+                running_stage(&store, phase)
+            } else {
+                store
+                    .change(|r| {
+                        let req = request(r);
+                        let (job, _) = admit(r, action, &req, &sample(), 1000)?;
+                        r.jobs.last_mut().unwrap().phase = phase;
+                        Ok(job.id)
+                    })
+                    .unwrap()
+            };
+            let result = (action == Action::Stage).then(staged_image);
+            finish_worker(&store, &id, phase, &Ok(result.clone())).unwrap();
+            let registry = store.read().unwrap().unwrap();
+            let job = &registry.jobs[0];
+            assert_eq!(
+                job.phase,
+                if action == Action::Stage {
+                    Phase::Staged
+                } else {
+                    Phase::Checked
+                }
+            );
+            assert_eq!(job.error, None);
+            assert_eq!(job.staged, result);
+        }
     }
     #[test]
     fn update_jobs_raw_upstream_credential_errors_are_never_public_messages() {

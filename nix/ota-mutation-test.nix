@@ -3,14 +3,7 @@
 let
   lib = pkgs.lib;
   sentinel = self.packages.x86_64-linux.sentinel;
-  keys = pkgs.runCommand "qa-ota-mutation-disposable-keys" { nativeBuildInputs = [ pkgs.openssl ]; } ''
-    mkdir -p "$out"
-    openssl genpkey -algorithm ed25519 -out "$out/release.key"
-    openssl pkey -in "$out/release.key" -pubout -out "$out/release.pub"
-    openssl req -x509 -newkey rsa:2048 -nodes -days 3 -subj /CN=qa-loopback \
-      -addext 'subjectAltName=IP:127.0.0.1' -addext 'basicConstraints=critical,CA:TRUE' \
-      -keyout "$out/tls.key" -out "$out/tls.crt"
-  '';
+  keys = import ./ota-test-keys.nix { inherit pkgs; };
 in pkgs.testers.runNixOSTest {
   name = "sentinel-ota-real-mutation-checkpoint";
   globalTimeout = 600;
