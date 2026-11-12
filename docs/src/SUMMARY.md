@@ -21,6 +21,7 @@
 
 # Operations
 
+- [VM quickstart](operations/quickstart.md)
 - [Installing to disk](operations/install.md)
 - [Configuring the appliance](operations/configure.md)
 - [Updating (A/B + rollback)](operations/update.md)

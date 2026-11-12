@@ -11,7 +11,6 @@ them.
 | **Nix with flakes** | the whole build is flake-driven | enable `experimental-features = nix-command flakes` |
 | **x86_64-linux** | the only target system the flake defines | images are UEFI/x86-64 |
 | **KVM** (for the `checks.*` tests) | the nixosTests boot real QEMU/OVMF VMs | `/dev/kvm` present; not needed for plain `nix build .#sentinel-image` |
-| **A checkout of `fabric`** | the eBPF data-plane agent source | see below |
 
 Enable flakes once, system-wide:
 
@@ -22,26 +21,11 @@ experimental-features = nix-command flakes
 
 ## The `fabric` source dependency
 
-The Velstra eBPF agent (`velstra`) is compiled from the **Fabric** repository.
-While Fabric is private, the flake references a **local checkout** by absolute
-path:
-
-```nix
-# flake.nix
-fabric = {
-  url = "git+file:///home/mbrandt/01_repositories/velstra/fabric";
-  flake = false;
-};
-```
-
-So before building anything that pulls in the agent (`velstra`, `velstra-ebpf`,
-`sentinel-image`, `sentinel-iso`, or any `checks.*`), make sure Fabric is checked
-out at that path **and your changes there are committed** — the flake builds
-Fabric's committed `HEAD`, not your working tree.
-
-> Once Fabric is public, switch the `url` to `github:Velstra/fabric` so the build
-> works for CI and other contributors. Building only `.#sentinel` (the CLI) does
-> **not** need Fabric.
+The flake fetches public Fabric and Wren revisions from `flake.lock`; no sibling
+checkout or developer-specific filesystem path is required. Keep the reviewed
+input revisions and fixed-output BPF hash coherent when changing dependencies.
+The separate legacy Fabric input is only for mixed-version tests, not the
+production dataplane. See [reproducibility](reproducibility.md).
 
 ## A note on network access during the build
 
