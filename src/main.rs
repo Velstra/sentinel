@@ -15,6 +15,7 @@ mod alert;
 mod api;
 mod api_session;
 mod archive;
+mod boot_entry;
 mod capture;
 mod clock;
 mod compile;
