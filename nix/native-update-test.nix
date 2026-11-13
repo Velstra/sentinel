@@ -1,6 +1,7 @@
 # Actual native-provider qualification. The commercial adapter supplies the
 # immutable provider and factory/bundle builders; no production key is used.
-{ self, updater, nativeImage, resources, pkgs ? self.nixosConfigurations.appliance.pkgs }:
+{ self, updater, nativeImage, resources, client ? "cli", pkgs ? self.nixosConfigurations.appliance.pkgs }:
+assert builtins.elem client [ "cli" "ui" ];
 let
   lib = pkgs.lib;
   original = self.packages.x86_64-linux.sentinel;
@@ -31,7 +32,9 @@ let
         subscription-key = "qa_lab_only_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         [services.web]
         enable = true
-        tls = true
+        # Management is isolated loopback HTTP for real Chromium automation.
+        # The signed release channel still uses real CA/IP/time-validated TLS.
+        tls = false
         listen-address = "127.0.0.1"
       '');
     };
@@ -44,11 +47,21 @@ let
     security.pki.certificateFiles = [ (keys + "/tls.crt") ];
     environment.etc."qa-native-keys".source = keys;
     environment.etc."qa-native.py".source = ./native-update-probe.py;
+    environment.etc."qa-native-browser".source = pkgs.runCommand "qa-native-browser" { } ''
+      mkdir -p "$out"
+      cp ${./native-update-browser.mjs} "$out/native.mjs"
+      cp ${../tests/console/harness.mjs} "$out/harness.mjs"
+    '';
+    environment.sessionVariables = {
+      CHROMIUM = "${pkgs.chromium}/bin/chromium";
+      FONTCONFIG_FILE = pkgs.makeFontsConf { fontDirectories = [ pkgs.dejavu_fonts ]; };
+    };
     # Keep the base system packages: system.path also supplies D-Bus policy and
     # activation files used by PID 1 and the real boot assessment. Prefer the
     # native CLI over the module's Community CLI without replacing that system.
     environment.systemPackages = [
       (lib.hiPrio sentinel) pkgs.python3 pkgs.util-linux pkgs.openssl pkgs.gptfdisk pkgs.iproute2
+      pkgs.nodejs pkgs.chromium
     ];
     velstra.appliance = { storeSize = "4096M"; veritySize = "192M"; dataSize = "2048M"; };
     virtualisation = {
@@ -60,7 +73,7 @@ let
     };
   };
 in pkgs.testers.runNixOSTest {
-  name = "sentinel-native-rust-api-stage";
+  name = "sentinel-native-${client}-api-stage";
   globalTimeout = 1500;
   nodes.donor = {
     imports = [ common ];
@@ -93,7 +106,7 @@ in pkgs.testers.runNixOSTest {
     healthy()
     before_table=machine.succeed("sfdisk --json /dev/vda")
     try:
-        text=machine.succeed("${pkgs.python3}/bin/python3 /etc/qa-native.py --sentinel ${sentinel}/bin/sentinel",timeout=900)
+        text=machine.succeed("${pkgs.python3}/bin/python3 /etc/qa-native.py --sentinel ${sentinel}/bin/sentinel --client ${client}",timeout=900)
     except Exception:
         # Fixed read-only observations only: no channel config, API token,
         # retry, rescue boot or manual bless is used to diagnose a refusal.
@@ -112,6 +125,9 @@ in pkgs.testers.runNixOSTest {
     result=json.loads(text)
     assert result["passed"] and result["actual_native_writes"]
     Path(os.environ["out"],"stage.json").write_text(json.dumps(result,indent=2))
+    machine.copy_from_vm("/var/lib/sentinel/qa-native-ui-check.png", os.environ["out"])
+    if "${client}" == "ui":
+        machine.copy_from_vm("/var/lib/sentinel/qa-native-ui-stage.png", os.environ["out"])
     machine.shutdown()
     machine.start()
     healthy()
@@ -120,6 +136,7 @@ in pkgs.testers.runNixOSTest {
     result=json.loads(text)
     assert result["passed"] and result["booted_new_native_slot"]
     Path(os.environ["out"],"boot.json").write_text(json.dumps(result,indent=2))
+    machine.copy_from_vm("/var/lib/sentinel/qa-native-ui-read.png", os.environ["out"])
     print("NATIVE_RUST_API_STAGE_AND_ACTUAL_B_BOOT_PASS",flush=True)
   '';
 }
