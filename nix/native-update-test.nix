@@ -91,9 +91,20 @@ in pkgs.testers.runNixOSTest {
         machine.succeed("test $(systemctl --failed --no-legend --plain | wc -l) -eq 0")
         machine.succeed("dmsetup info --target verity usr")
     healthy()
+    before_table=machine.succeed("sfdisk --json /dev/vda")
     try:
         text=machine.succeed("${pkgs.python3}/bin/python3 /etc/qa-native.py --sentinel ${sentinel}/bin/sentinel",timeout=900)
     except Exception:
+        # Fixed read-only observations only: no channel config, API token,
+        # retry, rescue boot or manual bless is used to diagnose a refusal.
+        print("NATIVE_INITIAL_GPT",before_table,flush=True)
+        for command in ["sfdisk --json /dev/vda", "bootctl --json=short list",
+                        "bootctl get-default", "cat /boot/loader/loader.conf",
+                        "findmnt -n -o SOURCE,OPTIONS /boot",
+                        "ls -l /boot/EFI/Linux",
+                        "sha256sum /boot/EFI/Linux/*.efi",
+                        "cat /var/lib/sentinel/update-jobs/state.json"]:
+            print("NATIVE_READBACK",command,machine.execute(command),flush=True)
         print(machine.execute("journalctl -b -u 'sentinel-update-*' -u sentinel-api --no-pager"),flush=True)
         print(machine.execute("cat /var/lib/sentinel/qa-native-progress.json"),flush=True)
         raise
