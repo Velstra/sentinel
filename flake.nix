@@ -143,6 +143,7 @@
         SENTINEL_OPENSSL_BIN = "${pkgs.openssl.bin}/bin/openssl";
         # The peer-observation integration test exercises real pinned HTTPS.
         SENTINEL_CURL_BIN = "${pkgs.curl.bin}/bin/curl";
+        SENTINEL_TEST_PYTHON_BIN = "${pkgs.python3}/bin/python3";
         # Test the actual wrapper variable names without bringing Nix/VM
         # sources into the Rust source filter or depending on tool store paths.
         SENTINEL_TEST_TOOL_PINS = lib.concatStringsSep " " (
@@ -159,6 +160,9 @@
       sentinel = pkgs.symlinkJoin {
         name = "sentinel-${sentinelCore.version}";
         inherit (sentinelCore) version;
+        # Flavours can add immutable compile-time capabilities without patching
+        # Rust sources or losing the shared runtime-tool wrapper.
+        passthru.unwrapped = sentinelCore;
         paths = [ sentinelCore ];
         nativeBuildInputs = [ pkgs.makeWrapper ];
         # Pin every external tool sentinel shells out to (live hostname/addressing
@@ -220,6 +224,7 @@
             --set SENTINEL_SYNC_BIN       ${pkgs.coreutils}/bin/sync \
             --set SENTINEL_UNAME_BIN      ${pkgs.coreutils}/bin/uname \
             --set SENTINEL_SGDISK_BIN     ${pkgs.gptfdisk}/bin/sgdisk \
+            --set SENTINEL_SFDISK_BIN     ${pkgs.util-linux}/bin/sfdisk \
             --set SENTINEL_WIPEFS_BIN     ${pkgs.util-linux}/bin/wipefs \
             --set SENTINEL_PARTPROBE_BIN  ${pkgs.parted}/bin/partprobe \
             --set SENTINEL_UDEVADM_BIN    ${pkgs.systemd}/bin/udevadm \
@@ -467,6 +472,8 @@
         "${c.system.build.finalImageSigned}/${c.image.filePath}";
     in
     {
+      lib.nativeUpdateTest = import ./nix/native-update-test.nix;
+
       packages.${system} = {
         default = sentinel;
         inherit sentinel velstra velstra-ebpf;

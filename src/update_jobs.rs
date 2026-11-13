@@ -808,7 +808,11 @@ impl Drop for ProbeChild {
     }
 }
 
-fn probe(program: &str, args: &[&str], seconds: u64) -> JobResult<(ExitStatus, Vec<u8>)> {
+pub(crate) fn probe(
+    program: &str,
+    args: &[&str],
+    seconds: u64,
+) -> JobResult<(ExitStatus, Vec<u8>)> {
     use std::os::unix::process::CommandExt;
     let mut disposition: libc::sigaction = unsafe { std::mem::zeroed() };
     if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut disposition) } != 0
@@ -1383,11 +1387,7 @@ pub fn status(config: &Path, apply: bool, write_access: bool) -> JobResult<Statu
                 .map_or_else(|| "0".repeat(64), |r| r.generation.clone()),
         ),
         can_check: write_access && free,
-        can_stage: write_access
-            && free
-            && current.stable()
-            && offer.is_some()
-            && !crate::boot_entry::native_enabled(),
+        can_stage: write_access && free && current.stable() && offer.is_some(),
         current: Some((&current).into()),
         mutation_context: write_access.then_some(current),
         offer: offer.map(Into::into),
@@ -1478,11 +1478,6 @@ fn admit(
 
 pub fn submit(config: &Path, apply: bool, action: Action, request: &Request) -> JobResult<JobView> {
     runtime(config, apply)?;
-    // Read-only native identity support must not enable the Community writer.
-    // The provider transport/journal handoff is qualified separately.
-    if action == Action::Stage && crate::boot_entry::native_enabled() {
-        return Err(Error(Code::StageRefused));
-    }
     let (current, _) = snapshot(config)?;
     admission_guard(config)?;
     let store = Store::production(true)?.ok_or(Error(Code::StateUnavailable))?;
@@ -1575,14 +1570,24 @@ pub fn run_worker(id: &str) -> JobResult<()> {
                 check_snapshot(config, &job.expected, true)?;
                 Ok(())
             };
-            Ok(Some(install::update_from_channel_guarded(
+            let staged = install::update_from_channel_guarded(
                 &channel,
                 &offer.verified,
                 install::UpdateHooks {
                     phase: &mut phase,
                     before_write: &mut before_write,
                 },
-            )?))
+            )?;
+            if crate::boot_entry::native_enabled() {
+                // Independently verify the bootloader's real selected/default
+                // entries and the saved-config/active-image fence after native
+                // staging; a provider's success frame alone is never enough.
+                let mut expected = job.expected.clone();
+                expected.next_entry = staged.boot_entry.clone();
+                let (actual, _) = snapshot(config)?;
+                compare_snapshot(&expected, &actual, false)?;
+            }
+            Ok(Some(staged))
         }
     })();
     finish_worker(&store, id, last_phase, &result)
