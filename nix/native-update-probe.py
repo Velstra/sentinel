@@ -215,7 +215,7 @@ def main(sentinel, client):
                 assert result.stdout.strip(), result.stderr
                 done = json.loads(result.stdout.strip().splitlines()[-1])
                 assert (result.returncode == 0) == (done["phase"] == "checked"), result.stderr
-                assert terminal(done["id"])["request_id"] == done["request_id"]
+                assert until(lambda: terminal(done["id"]))["request_id"] == done["request_id"]
                 assert json.loads(run([sentinel, "system", "status"]))["current"]["slot"] == "sentinel-a"
             else:
                 code, job = request("/system/updates/check", payload(state))
@@ -257,7 +257,7 @@ def main(sentinel, client):
             record(kind + "-refused-before-go", done)
         mode.update(kind="valid", swapped=False, pause=True)
         browser = json.loads(run(["node", "/etc/qa-native-browser/native.mjs", "check"], timeout=120))
-        assert browser["passed"] and terminal(browser["job"]["id"])["phase"] == "checked"
+        assert browser["passed"] and until(lambda: terminal(browser["job"]["id"]))["phase"] == "checked"
         record("actual-native-browser-check", browser)
         assert check(cli=True)["phase"] == "checked"
         release.clear()
