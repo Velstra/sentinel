@@ -15849,6 +15849,15 @@
                   backup.succeed("${pkgs.python3}/bin/python3 ${./nix/configsync-receive-probe.py} retry-after-restart")
               with subtest("completed first-sync grant stays consumed after real CLI rollback"):
                   backup.succeed("${pkgs.python3}/bin/python3 ${./nix/configsync-receive-probe.py} rollback-after-completion")
+              import json, os
+              from pathlib import Path
+              receive_results = json.loads(backup.succeed("cat /tmp/configsync-receive-results.json"))
+              assert [case["case"] for case in receive_results] == [
+                  "actual-enospc-before-apply", "actual-post-apply-save-failure",
+                  "actual-restart-exact-retry", "actual-cli-rollback"]
+              assert all(case["passed"] for case in receive_results)
+              Path(os.environ["out"], "receive-faults.json").write_text(json.dumps(receive_results, indent=2))
+              print("CONFIGSYNC_ACTUAL_RECEIVE_FAULTS_RESTART_AND_CLI_ROLLBACK_PASS", flush=True)
 
               # The fault/retry case legitimately consumed first-sync admission.
               # Establish the same reviewed baseline locally, rather than delete

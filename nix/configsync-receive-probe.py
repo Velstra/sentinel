@@ -16,6 +16,14 @@ CONFIG = Path("/var/lib/sentinel/appliance.toml")
 MARKER = CONFIG.with_suffix(".configsync-received")
 RECORD = Path("/tmp/configsync-receive-proof.json")
 TOKEN = "shared-token-123"  # Disposable fixture credential, never production.
+RESULTS = Path("/tmp/configsync-receive-results.json")
+
+
+def passed(case, **facts):
+    results = json.loads(RESULTS.read_text()) if RESULTS.exists() else []
+    assert all(item["case"] != case for item in results), "do not overwrite an executed case"
+    results.append({"case": case, "passed": True, **facts})
+    RESULTS.write_text(json.dumps(results, indent=2))
 
 
 def run(*args):
@@ -106,7 +114,8 @@ def disk_full():
                 process.terminate()
                 process.wait(timeout=10)
             subprocess.run(["umount", str(storage)], check=True)
-    print("CONFIGSYNC_ACTUAL_ENOSPC_BEFORE_APPLY_PASS")
+    passed("actual-enospc-before-apply", errno=errno.ENOSPC,
+        response=500, saved_config_unchanged=True, live_mtu_unchanged=True)
 
 
 def save_failure():
@@ -134,7 +143,8 @@ def save_failure():
         assert CONFIG.read_bytes() == before and mtu() == 1400
     finally:
         subprocess.run(["umount", str(CONFIG)], check=True)
-    print("CONFIGSYNC_ACTUAL_POST_APPLY_SAVE_FAILURE_FENCED_PASS")
+    passed("actual-post-apply-save-failure", response=500, live_mtu=1400,
+        saved_config_unchanged=True, durable_private_fence=True, different_stale_push=409)
 
 
 def retry_after_restart():
@@ -154,7 +164,8 @@ def retry_after_restart():
     receipt = MARKER.read_text().strip()
     assert len(receipt) == 64 and all(c in "0123456789abcdef" for c in receipt)
     assert not Path("/var/lib/sentinel/configsync/pending.json").exists(), "received policy must never echo"
-    print("CONFIGSYNC_ACTUAL_RESTART_EXACT_RETRY_AND_IDENTITY_PASS")
+    passed("actual-restart-exact-retry", different_stale_push=409, exact_retry=200,
+        repeated_delivery=200, member_identity_preserved=True, completed_receipt=True, no_echo_outbox=True)
 
 
 def rollback_after_completion():
@@ -167,7 +178,8 @@ def rollback_after_completion():
     subprocess.run(["su", "admin", "-c", "sentinel configure"],
         input="set interface eth1 mtu 1400\ncommit\nsave\nexit\n", text=True, check=True)
     assert mtu() == 1400
-    print("CONFIGSYNC_ACTUAL_CLI_ROLLBACK_CANNOT_RESURRECT_COMPLETED_GRANT_PASS")
+    passed("actual-cli-rollback", full_original_baseline_restored=True,
+        completed_grant_stays_consumed=409, live_baseline_reestablished=True)
 
 
 {"disk-full": disk_full, "save-failure": save_failure,
