@@ -930,9 +930,13 @@ fn observed_boot_entry(
             (Some(left), Some(done))
                 if left.as_u64() == Some(expected_left) && done.as_u64() == Some(expected_done) => {
             }
-            // Older inventory fixtures/tool versions used the full counted
-            // filename as ID without separate counters. A normalized ID needs
-            // both counters; it must never stand in for a permanent filename.
+            // systemd 260 omits triesDone when the filename is +N, not +N-M.
+            // Its implicit zero never makes that real counted inode permanent.
+            (Some(left), None) if !suffix.contains('-') && left.as_u64() == Some(expected_left) => {
+            }
+            // Older inventory used the full counted filename as ID without
+            // separate counters. A normalized ID needs every encoded counter;
+            // it must never stand in for a permanent filename.
             (None, None) if id == name => {}
             _ => return Err(refused()),
         }
@@ -3094,6 +3098,63 @@ mod tests {
         rows[0]["triesLeft"] = 0.into();
         rows[0]["triesDone"] = 0.into();
         assert_code(parse_actual_native_rows(&rows), Code::UnstableBoot);
+    }
+
+    fn actual_community_single_counter_rows() -> Vec<serde_json::Value> {
+        let mut selected = entries().remove(0);
+        selected["isDefault"] = false.into();
+        let mut pending = selected.clone();
+        pending["id"] = "sentinel-a.efi".into();
+        pending["path"] = "/boot/EFI/Linux/sentinel-a+3.efi".into();
+        pending["linux"] = "/EFI/Linux/sentinel-a+3.efi".into();
+        pending["version"] = "3.0.0".into();
+        pending["cmdline"] = format!("usrhash={}", "b".repeat(64)).into();
+        pending["isDefault"] = true.into();
+        pending["isSelected"] = false.into();
+        pending["triesLeft"] = 3.into();
+        // systemd 260 emits triesDone only if the filename actually has -N.
+        vec![selected, pending]
+    }
+
+    #[test]
+    fn update_jobs_actual_single_counter_schema_keeps_an_omitted_done_counter_unassessed() {
+        let rows = actual_community_single_counter_rows();
+        assert_eq!(
+            parse_entries(&rows).unwrap(),
+            ("sentinel-b.efi".into(), "sentinel-a+3.efi".into(), true)
+        );
+        let mut trial = rows[1].clone();
+        trial["isSelected"] = true.into();
+        assert_eq!(
+            boot_entry_with_policy(
+                &serde_json::to_vec(&[trial]).unwrap(),
+                "sentinel-a",
+                "3.0.0",
+                &"b".repeat(64),
+                false,
+            )
+            .unwrap(),
+            ("sentinel-a+3.efi".into(), "sentinel-a+3.efi".into(), false)
+        );
+    }
+
+    #[test]
+    fn update_jobs_single_counter_schema_still_requires_matching_left_and_implicit_zero_done() {
+        for (field, invalid) in [
+            ("triesLeft", serde_json::json!(2)),
+            ("triesLeft", serde_json::json!(true)),
+            ("triesLeft", serde_json::Value::Null),
+            ("triesDone", serde_json::json!(1)),
+            ("triesDone", serde_json::json!(-1)),
+            ("triesDone", serde_json::json!("0")),
+        ] {
+            let mut rows = actual_community_single_counter_rows();
+            rows[1][field] = invalid;
+            assert_code(parse_entries(&rows), Code::UnstableBoot);
+        }
+        let mut rows = actual_community_single_counter_rows();
+        rows[1]["triesDone"] = 0.into();
+        parse_entries(&rows).unwrap();
     }
 
     #[test]

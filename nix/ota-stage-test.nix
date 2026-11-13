@@ -109,6 +109,8 @@ in pkgs.testers.runNixOSTest {
     try:
         output = machine.succeed(command + " --sentinel ${sentinel}/bin/sentinel", timeout=650)
     except Exception:
+        print("ACTUAL_STAGE_BOOT_INVENTORY", machine.execute("bootctl --json=short list"), flush=True)
+        print("ACTUAL_STAGE_DURABLE_JOB_STATE", machine.execute("cat /var/lib/sentinel/update-jobs/state.json"), flush=True)
         print("ACTUAL_STAGE_FAILURE_JOURNAL", machine.succeed("journalctl -b -u 'sentinel-update-*' --no-pager"), flush=True)
         print("ACTUAL_STAGE_COMPLETED_CASES", machine.execute("cat /run/qa-real-stage-progress.json"), flush=True)
         raise
