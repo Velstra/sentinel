@@ -5,7 +5,37 @@ bootloader is switched to it. If the new slot fails to boot cleanly, systemd-boo
 rolls back automatically. The architecture is in
 [A/B update slots](../architecture/ab-updates.md); this is the operator view.
 
-## Applying an update
+## Signed channel: local CLI or Web UI
+
+On the live A/B appliance, as an administrator:
+
+```shell
+sudo sentinel system status
+sudo sentinel system update check --wait
+sudo sentinel system status
+# Review the offered version, image digest and signing identity first.
+sudo sentinel system update stage --offer <exact-offer-id>
+sudo sentinel system update job <job-id> --wait
+```
+
+Output is JSON. Submissions return a durable job; `--wait` observes it for at
+most five minutes without owning or cancelling it. Disconnects and API restarts
+do not stop the independent worker. If a submission's outcome is unknown, inspect
+`system status` using its request correlation; do not resubmit it blindly.
+
+In **System → System updates**, refresh, **Check signed channel**, review the
+exact verified offer, then **Download & stage update**. CLI jobs appear in the
+same retained history. Changes to configuration, trust or boot identity require
+a fresh check/review. Pending config changes, remote member selection, read-only
+accounts and stale observations cannot authorize Stage.
+
+Staging replaces the inactive slot and selects a counted next boot. It does not
+reboot or claim a successful boot. Inspect boot selection and cluster readiness
+before rebooting one member at a time. There is no trust/downgrade override.
+Native Enterprise `update check` uses this worker too; the former unreviewed
+`update install` path is refused. Off-box/no-apply consoles cannot run OTA jobs.
+
+## Community local-image updates
 
 ```shell
 # from a new raw image (built with `nix build .#sentinel-image`) plus its

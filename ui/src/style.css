@@ -1,6 +1,26 @@
 .resize-none {
   resize: none;
 }
+.update-review {
+  border: 1px solid var(--status-warn);
+  border-radius: var(--radius-sm);
+  padding: var(--space-4);
+  margin-block: var(--space-4);
+}
+.update-jobs {
+  padding-inline-start: var(--space-5);
+}
+.update-jobs li + li {
+  margin-top: var(--space-4);
+}
+.update-jobs code {
+  display: block;
+}
+.update-jobs,
+.update-proof,
+.update-review {
+  overflow-wrap: anywhere;
+}
 .system-health-state {
   min-height: 3rem;
 }
