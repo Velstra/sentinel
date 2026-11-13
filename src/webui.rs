@@ -2356,6 +2356,7 @@ pub fn page() -> String {
 
     <div id="view-system" class="hidden">
       <div id="react-system-health"></div>
+      <div id="react-system-updates"></div>
       <div class="card"><h3>Identity</h3><div class="grid" id="sys-ident"></div></div>
       <div class="section">
         <h3>Kernel parameters</h3>
@@ -8385,6 +8386,7 @@ async function refreshRoutePolicy(localContext = false) {{
 }}
 
 async function refreshSystem() {{
+  void management.updates.refresh();
   const ls = await leaves();
   const under = (node) => fieldsOf(ls, node);
   settingsPanel("sys-ident", SYS_IDENT, under("system"), "system", "Identity");

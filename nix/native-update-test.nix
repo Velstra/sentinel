@@ -1,6 +1,7 @@
 # Actual native-provider qualification. The commercial adapter supplies the
 # immutable provider and factory/bundle builders; no production key is used.
-{ self, updater, nativeImage, resources, pkgs ? self.nixosConfigurations.appliance.pkgs }:
+{ self, updater, nativeImage, resources, client ? "cli", pkgs ? self.nixosConfigurations.appliance.pkgs }:
+assert builtins.elem client [ "cli" "ui" ];
 let
   lib = pkgs.lib;
   original = self.packages.x86_64-linux.sentinel;
@@ -31,7 +32,9 @@ let
         subscription-key = "qa_lab_only_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         [services.web]
         enable = true
-        tls = true
+        # Management is isolated loopback HTTP for real Chromium automation.
+        # The signed release channel still uses real CA/IP/time-validated TLS.
+        tls = false
         listen-address = "127.0.0.1"
       '');
     };
@@ -44,13 +47,25 @@ let
     security.pki.certificateFiles = [ (keys + "/tls.crt") ];
     environment.etc."qa-native-keys".source = keys;
     environment.etc."qa-native.py".source = ./native-update-probe.py;
+    environment.etc."qa-native-browser".source = pkgs.runCommand "qa-native-browser" { } ''
+      mkdir -p "$out"
+      cp ${./native-update-browser.mjs} "$out/native.mjs"
+      cp ${../tests/console/harness.mjs} "$out/harness.mjs"
+    '';
+    environment.sessionVariables = {
+      CHROMIUM = "${pkgs.chromium}/bin/chromium";
+      FONTCONFIG_FILE = pkgs.makeFontsConf { fontDirectories = [ pkgs.dejavu_fonts ]; };
+    };
     # Keep the base system packages: system.path also supplies D-Bus policy and
     # activation files used by PID 1 and the real boot assessment. Prefer the
     # native CLI over the module's Community CLI without replacing that system.
     environment.systemPackages = [
       (lib.hiPrio sentinel) pkgs.python3 pkgs.util-linux pkgs.openssl pkgs.gptfdisk pkgs.iproute2
+      pkgs.nodejs pkgs.chromium
     ];
-    velstra.appliance = { storeSize = "4096M"; veritySize = "192M"; dataSize = "2048M"; };
+    # Chromium is a test-only dependency. Keep BOTH reserved target slots above
+    # its complete closure, not only A's automatically computed minimum size.
+    velstra.appliance = { storeSize = "6144M"; veritySize = "384M"; dataSize = "2048M"; };
     virtualisation = {
       directBoot.enable = false;
       mountHostNixStore = false;
@@ -59,8 +74,11 @@ let
       fileSystems = lib.mkVMOverride { };
     };
   };
-in pkgs.testers.runNixOSTest {
-  name = "sentinel-native-rust-api-stage";
+in
+assert lib.assertMsg (lib.isDerivation updater || (builtins.isString updater && builtins.hasContext updater))
+  "native update provider must be a derivation or context-bearing builtins.storePath; a copied path loses its runtime closure";
+pkgs.testers.runNixOSTest {
+  name = "sentinel-native-${client}-api-stage";
   globalTimeout = 1500;
   nodes.donor = {
     imports = [ common ];
@@ -74,7 +92,7 @@ in pkgs.testers.runNixOSTest {
     environment.etc."qa-native-resources".source = resources nodes.donor;
   };
   testScript = { nodes, ... }: ''
-    import json,os,subprocess,tempfile
+    import base64,json,os,subprocess,tempfile
     from pathlib import Path
     temporary=tempfile.TemporaryDirectory()
     image="${nativeImage nodes.machine}"
@@ -91,9 +109,16 @@ in pkgs.testers.runNixOSTest {
         machine.succeed("test $(systemctl --failed --no-legend --plain | wc -l) -eq 0")
         machine.succeed("dmsetup info --target verity usr")
     healthy()
+    def screenshot(action):
+        encoded=machine.succeed("base64 -w0 /var/lib/sentinel/qa-native-ui-"+action+".png").strip()
+        assert len(encoded) < 3*1024*1024, "unexpectedly large native UI screenshot"
+        Path(os.environ["out"],"native-ui-"+action+".png").write_bytes(base64.b64decode(encoded,validate=True))
     before_table=machine.succeed("sfdisk --json /dev/vda")
+    rows=json.loads(before_table)["partitiontable"]["partitions"]
+    for active,standby in [(1,3),(2,4)]:
+        assert rows[standby]["size"] >= rows[active]["size"] > 0, "invalid native fixture: standby is smaller than the running slot; no update may start"
     try:
-        text=machine.succeed("${pkgs.python3}/bin/python3 /etc/qa-native.py --sentinel ${sentinel}/bin/sentinel",timeout=900)
+        text=machine.succeed("${pkgs.python3}/bin/python3 /etc/qa-native.py --sentinel ${sentinel}/bin/sentinel --client ${client}",timeout=900)
     except Exception:
         # Fixed read-only observations only: no channel config, API token,
         # retry, rescue boot or manual bless is used to diagnose a refusal.
@@ -112,6 +137,9 @@ in pkgs.testers.runNixOSTest {
     result=json.loads(text)
     assert result["passed"] and result["actual_native_writes"]
     Path(os.environ["out"],"stage.json").write_text(json.dumps(result,indent=2))
+    screenshot("check")
+    if "${client}" == "ui":
+        screenshot("stage")
     machine.shutdown()
     machine.start()
     healthy()
@@ -120,6 +148,7 @@ in pkgs.testers.runNixOSTest {
     result=json.loads(text)
     assert result["passed"] and result["booted_new_native_slot"]
     Path(os.environ["out"],"boot.json").write_text(json.dumps(result,indent=2))
+    screenshot("read")
     print("NATIVE_RUST_API_STAGE_AND_ACTUAL_B_BOOT_PASS",flush=True)
   '';
 }

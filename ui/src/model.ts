@@ -190,6 +190,8 @@ export interface Host {
   remote(): boolean;
   /** Empty for this appliance, otherwise the exact configured stack member. */
   member(): string;
+  /** Updates observe only while their local System view is visible. */
+  updatesVisible?(): boolean;
   refresh(): Promise<unknown>;
   navigate(
     destination:

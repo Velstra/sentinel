@@ -5,7 +5,7 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
-import type { ReactNode } from "react";
+import type { ReactNode, Ref } from "react";
 import { diffLines } from "diff";
 import { endpoint, haRole, protocolName, selectEvents } from "./model";
 import type { Link, PacketEvent } from "./model";
@@ -14,9 +14,22 @@ import type { Management } from "./controller";
 function useManagement(manager: Management) {
   return useSyncExternalStore(manager.subscribe, manager.getSnapshot);
 }
-function Panel({ title, children }: { title: string; children: ReactNode }) {
+export function Panel({
+  title,
+  children,
+  focusRef,
+}: {
+  title: string;
+  children: ReactNode;
+  focusRef?: Ref<HTMLElement>;
+}) {
   return (
-    <section className="card management-panel">
+    <section
+      className="card management-panel"
+      aria-label={title}
+      ref={focusRef}
+      tabIndex={focusRef ? -1 : undefined}
+    >
       <header className="panel-heading">
         <h3>{title}</h3>
       </header>

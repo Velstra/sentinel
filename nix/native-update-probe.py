@@ -32,13 +32,13 @@ def digest(path):
 def request(path, body=None):
     headers = {"Authorization": "Bearer " + (STATE / "api-token").read_text().strip()}
     if body is not None:
-        headers.update({"Content-Type": "application/json", "Origin": "https://127.0.0.1:8080"})
-    req = urllib.request.Request("https://127.0.0.1:8080/api/v1" + path, headers=headers,
+        headers.update({"Content-Type": "application/json", "Origin": "http://127.0.0.1:8080"})
+    req = urllib.request.Request("http://127.0.0.1:8080/api/v1" + path, headers=headers,
         data=None if body is None else json.dumps(body).encode())
-    # Disposable loopback management identity only. The release channel below
-    # uses actual system CA/IP/time validation in both curl and Python.
+    # Management is isolated loopback HTTP. Release downloads below use actual
+    # system CA/IP/time validation in both curl and Python, never a TLS bypass.
     try:
-        response = urllib.request.urlopen(req, context=ssl._create_unverified_context(), timeout=5)
+        response = urllib.request.urlopen(req, timeout=5)
     except urllib.error.HTTPError as error:
         response = error
     with response:
@@ -110,11 +110,12 @@ def after_boot():
     assert digest(STATE / "appliance.toml") == proof["config_sha256"]
     assert (STATE / "qa-native-data").read_text() == "persistent native OTA proof"
     assert {str(n): digest("/dev/vda" + str(n)) for n in (2, 3)} == proof["active_sha256"]
+    assert json.loads(run(["node", "/etc/qa-native-browser/native.mjs", "read"], timeout=120))["passed"]
     print(json.dumps({"passed": True, "booted_new_native_slot": True, "current": current,
         "persistent_config_and_original_slot_preserved": True}))
 
 
-def main(sentinel):
+def main(sentinel, client):
     # The factory's initial boot has been assessed. Exercise the native helper's
     # read-only ESP restoration explicitly; do not change the boot target/bless.
     run(["mount", "-o", "remount,ro", "/boot"])
@@ -205,12 +206,21 @@ def main(sentinel):
     server.socket = tls.wrap_socket(server.socket, server_side=True)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
-    def check():
+    def check(cli=False):
         for _ in range(5):
             state = until(available)
-            code, job = request("/system/updates/check", payload(state))
-            assert code == 202, (code, job)
-            done = until(lambda: terminal(job["id"]), 90)
+            if cli:
+                result = subprocess.run([sentinel, "system", "update", "check", "--wait"],
+                    capture_output=True, text=True, timeout=330)
+                assert result.stdout.strip(), result.stderr
+                done = json.loads(result.stdout.strip().splitlines()[-1])
+                assert (result.returncode == 0) == (done["phase"] == "checked"), result.stderr
+                assert until(lambda: terminal(done["id"]))["request_id"] == done["request_id"]
+                assert json.loads(run([sentinel, "system", "status"]))["current"]["slot"] == "sentinel-a"
+            else:
+                code, job = request("/system/updates/check", payload(state))
+                assert code == 202, (code, job)
+                done = until(lambda: terminal(job["id"]), 90)
             if done["phase"] == "failed" and done["error"] == "busy":
                 assert disk_rows() == original_table and inactive() == original_bytes
                 record("completed-read-only-check-busy", done)
@@ -218,9 +228,15 @@ def main(sentinel):
             return done
         raise AssertionError("read-only native checks remained Busy")
 
-    def stage():
+    def stage(cli=False):
         state = until(available)
         assert state["can_stage"], state
+        if cli:
+            refused = subprocess.run([sentinel, "system", "update", "stage", "--offer", "0" * 64],
+                capture_output=True, text=True, timeout=30)
+            assert refused.returncode != 0 and not refused.stdout, refused
+            assert disk_rows() == original_table and inactive() == original_bytes
+            return json.loads(run([sentinel, "system", "update", "stage", "--offer", state["offer"]["id"]]))
         code, job = request("/system/updates/stage", payload(state, True))
         assert code == 202, (code, job)
         return job
@@ -240,9 +256,17 @@ def main(sentinel):
             assert disk_rows() == original_table and inactive() == original_bytes
             record(kind + "-refused-before-go", done)
         mode.update(kind="valid", swapped=False, pause=True)
-        assert check()["phase"] == "checked"
+        browser = json.loads(run(["node", "/etc/qa-native-browser/native.mjs", "check"], timeout=120))
+        assert browser["passed"] and until(lambda: terminal(browser["job"]["id"]))["phase"] == "checked"
+        record("actual-native-browser-check", browser)
+        assert check(cli=True)["phase"] == "checked"
         release.clear()
-        accepted = stage()
+        if client == "ui":
+            browser = json.loads(run(["node", "/etc/qa-native-browser/native.mjs", "stage"], timeout=120))
+            assert browser["passed"]
+            accepted = browser["job"]
+        else:
+            accepted = stage(cli=True)
         assert entered.wait(30), "native worker did not request an actual versioned resource"
         run(["systemctl", "restart", "sentinel-api.service"])
         until(lambda: restarted_api_has_job(accepted["id"]))
@@ -251,6 +275,8 @@ def main(sentinel):
         assert contender.returncode != 0 and "another update" in contender.stderr, contender.stderr
         release.set()
         done = until(lambda: terminal(accepted["id"]), 300)
+        console_job = json.loads(run([sentinel, "system", "update", "job", accepted["id"]]))
+        assert console_job["phase"] == done["phase"] and console_job["request_id"] == done["request_id"]
         assert done["phase"] == "staged" and done["error"] is None, done
         assert done["staged"]["boot_entry"] == "sentinel_v1.0.0-lts+3-0.efi", done
         assert done["staged"]["active_slot"] == "sentinel-a" and done["staged"]["staged_slot"] == "sentinel-b"
@@ -274,5 +300,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--sentinel")
     parser.add_argument("--after-boot", action="store_true")
+    parser.add_argument("--client", choices=("cli", "ui"), default="cli")
     args = parser.parse_args()
-    after_boot() if args.after_boot else main(args.sentinel)
+    after_boot() if args.after_boot else main(args.sentinel, args.client)
