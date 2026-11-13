@@ -33,10 +33,11 @@ try {
  // and the embedded production React controls still use the real local API.
  await page.evaluate(`(()=>{
   const hash=c=>c.repeat(64);
-  window.qaUpdateState={schema:1,generation:hash('a'),current:{release:'v0.9.0-lts',slot:'sentinel-a',permanent:true,selected_entry:'sentinel_v0.9.0-lts.efi',next_entry:'sentinel_v0.9.0-lts.efi'},
+  window.qaUpdateState={schema:1,generation:hash('a'),current:{boot_id:'fixture-boot',release:'v0.9.0-lts',slot:'sentinel-a',permanent:true,selected_entry:'sentinel_v0.9.0-lts.efi',next_entry:'sentinel_v0.9.0-lts.efi'},
    mutation_context:{boot_id:'00000000-0000-0000-0000-000000000001',mutation_epoch:hash('c'),config_revision:hash('d'),public_key_sha256:hash('e'),release:'v0.9.0-lts',slot:'sentinel-a',verity:hash('f'),selected_entry:'sentinel_v0.9.0-lts.efi',next_entry:'sentinel_v0.9.0-lts.efi',uki_sha256:hash('1'),verity_guid:'00000000-0000-0000-0000-000000000002',store_guid:'00000000-0000-0000-0000-000000000003',permanent:true},
    offer:{id:hash('b'),verified:{manifest:{version:'v1.0.0-lts',image:'sentinel_v1.0.0-lts.raw',sha256:hash('2')},manifest_sha256:hash('3'),public_key_sha256:hash('e')}},
    jobs:[],can_check:true,can_stage:true,unavailable:null,observation:{state:'fresh',age_ms:0}};
+  window.qaUpdateInitial=structuredClone(window.qaUpdateState);
   window.qaUpdatePosts=[];window.qaUpdateMode='accepted';
   const original=window.fetch;
   window.fetch=async(path,options)=>{
@@ -44,7 +45,7 @@ try {
    if(path==='/api/v1/system/updates/stage'||path==='/api/v1/system/updates/check'){
     const request=JSON.parse(options.body);window.qaUpdatePosts.push({path,request,authorization:options.headers.Authorization});
     if(window.qaUpdateMode==='lost')throw Error('disposable transfer uncertainty');
-    const job={id:hash('8'),request_id:request.request_id,action:path.endsWith('stage')?'stage':'check',phase:'accepted',error:null,message:null};
+    const job={id:hash('8'),request_id:request.request_id,boot_id:'fixture-boot',action:path.endsWith('stage')?'stage':'check',phase:'accepted',error:null,message:null};
     window.qaUpdateState.jobs=[job];window.qaUpdateState.can_stage=false;window.qaUpdateState.can_check=false;window.qaUpdateState.generation=hash('9');
     return new Response(JSON.stringify(job),{status:202});
    }
@@ -67,6 +68,14 @@ try {
   check(posts.length===1&&posts[0].path.endsWith('/stage')&&posts[0].authorization==='Bearer '+process.env.CONSOLE_TOKEN,'duplicate, unauthenticated or wrong Stage request');
   check(posts[0].request.offer_id==='b'.repeat(64)&&posts[0].request.expected_generation==='a'.repeat(64)&&posts[0].request.expected.config_revision==='d'.repeat(64),'review context silently replaced');
   check(Object.keys(posts[0].request).sort().join(',')==='expected,expected_generation,offer_id,request_id','Stage offered an extra bypass');
+ });
+ await test('retained Stage history does not contradict a later assessed boot',async()=>{
+  await page.evaluate(`window.qaUpdateState.jobs[0].phase='staged';window.qaUpdateState.current.boot_id='fixture-next-boot';window.qaUpdateState.current.slot='sentinel-b';window.qaUpdateState.current.release='v1.0.0-lts';window.qaUpdateState.mutation_context=null`);
+  await button('Refresh update status');
+  await until(`document.querySelector('${panel}').textContent.includes('Stage recorded on a previous boot.')`);
+  check(await page.evaluate(`document.querySelector('${panel}').textContent.includes('Slot B')&&!document.querySelector('${panel}').textContent.includes('Image staged during this boot.')`),'historical job incorrectly describes the current boot');
+  await capture('updates-history-after-assessment');
+  await page.evaluate('window.qaUpdateState=structuredClone(window.qaUpdateInitial)');
  });
  await test('signed review uses canonical themes and contains long digests at desktop and narrow widths',async()=>{
   await page.evaluate('window.qaUpdateState.can_stage=true;window.qaUpdateState.can_check=true;window.qaUpdateState.jobs=[]');
@@ -92,7 +101,7 @@ try {
   check(await page.evaluate(`Array.from(document.querySelectorAll('${panel} button')).filter(n=>/Check signed|Review available/.test(n.textContent)).every(n=>n.disabled)`),'unknown write outcome permits another update');
   await button('Refresh update status');
   check((await page.evaluate('window.qaUpdatePosts')).length===2,'refresh retried a mutation');
-  await page.evaluate(`window.qaUpdateState.jobs=[{id:'8'.repeat(64),request_id:${JSON.stringify(correlation)},action:'stage',phase:'interrupted',error:'write-outcome-unknown',message:'Inspect boot selection before rebooting.'}];window.qaUpdateState.can_stage=false;window.qaUpdateState.can_check=false`);
+  await page.evaluate(`window.qaUpdateState.jobs=[{id:'8'.repeat(64),request_id:${JSON.stringify(correlation)},boot_id:'fixture-boot',action:'stage',phase:'interrupted',error:'write-outcome-unknown',message:'Inspect boot selection before rebooting.'}];window.qaUpdateState.can_stage=false;window.qaUpdateState.can_check=false`);
   await until(`!management.updates.getSnapshot().busy`);await button('Refresh update status');
   await until(`document.querySelector('${panel}').textContent.includes('Inspect boot selection before rebooting.')`);
   await capture('updates-write-uncertainty');
