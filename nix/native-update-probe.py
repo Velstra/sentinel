@@ -115,6 +115,10 @@ def after_boot():
 
 
 def main(sentinel):
+    # The factory's initial boot has been assessed. Exercise the native helper's
+    # read-only ESP restoration explicitly; do not change the boot target/bless.
+    run(["mount", "-o", "remount,ro", "/boot"])
+    assert "ro" in run(["findmnt", "-nro", "OPTIONS", "--types", "vfat", "--target", "/boot"]).split(",")
     initial = until(available)
     assert initial["current"]["slot"] == "sentinel-a"
     assert initial["current"]["release"] == "v0.9.0-lts" and initial["current"]["permanent"]
@@ -252,7 +256,7 @@ def main(sentinel):
         assert done["staged"]["active_slot"] == "sentinel-a" and done["staged"]["staged_slot"] == "sentinel-b"
         assert {str(n): digest("/dev/vda" + str(n)) for n in (2, 3)} == active
         assert digest(STATE / "appliance.toml") == config_hash
-        assert "ro" in run(["findmnt", "-nro", "OPTIONS", "/boot"]).split(",")
+        assert "ro" in run(["findmnt", "-nro", "OPTIONS", "--types", "vfat", "--target", "/boot"]).split(",")
         record("real-native-stage-after-api-restart-and-competing-writer-refusal", done)
         assert not errors
         assert not any(path.endswith(".raw") for path in paths), "native path fell through to RAW download"
