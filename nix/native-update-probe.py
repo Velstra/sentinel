@@ -80,6 +80,19 @@ def terminal(identifier):
     return result if result["phase"] in ("checked", "staged", "failed", "interrupted") else None
 
 
+def restarted_api_has_job(identifier):
+    # Type=exec may be active before bind/listen. Retry only this read-only
+    # startup observation, never a mutation or a TLS/authentication failure.
+    try:
+        code, result = request("/system/updates/jobs/" + identifier)
+    except urllib.error.URLError as error:
+        if isinstance(error.reason, ConnectionRefusedError):
+            return False
+        raise
+    assert code in (200, 503), (code, result)
+    return code == 200
+
+
 def disk_rows():
     return json.loads(run(["sfdisk", "--json", "/dev/vda"]))["partitiontable"]
 
@@ -228,7 +241,7 @@ def main(sentinel):
         accepted = stage()
         assert entered.wait(30), "native worker did not request an actual versioned resource"
         run(["systemctl", "restart", "sentinel-api.service"])
-        until(lambda: request("/system/updates/jobs/" + accepted["id"])[0] == 200)
+        until(lambda: restarted_api_has_job(accepted["id"]))
         contender = subprocess.run([sentinel, "update", "/dev/vda", "--allow-unsigned", "--commit"],
             capture_output=True, text=True, timeout=15)
         assert contender.returncode != 0 and "another update" in contender.stderr, contender.stderr
