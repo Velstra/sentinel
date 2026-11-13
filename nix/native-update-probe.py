@@ -32,13 +32,13 @@ def digest(path):
 def request(path, body=None):
     headers = {"Authorization": "Bearer " + (STATE / "api-token").read_text().strip()}
     if body is not None:
-        headers.update({"Content-Type": "application/json", "Origin": "https://127.0.0.1:8080"})
-    req = urllib.request.Request("https://127.0.0.1:8080/api/v1" + path, headers=headers,
+        headers.update({"Content-Type": "application/json", "Origin": "http://127.0.0.1:8080"})
+    req = urllib.request.Request("http://127.0.0.1:8080/api/v1" + path, headers=headers,
         data=None if body is None else json.dumps(body).encode())
-    # Disposable loopback management identity only. The release channel below
-    # uses actual system CA/IP/time validation in both curl and Python.
+    # Management is isolated loopback HTTP. Release downloads below use actual
+    # system CA/IP/time validation in both curl and Python, never a TLS bypass.
     try:
-        response = urllib.request.urlopen(req, context=ssl._create_unverified_context(), timeout=5)
+        response = urllib.request.urlopen(req, timeout=5)
     except urllib.error.HTTPError as error:
         response = error
     with response:
@@ -110,11 +110,12 @@ def after_boot():
     assert digest(STATE / "appliance.toml") == proof["config_sha256"]
     assert (STATE / "qa-native-data").read_text() == "persistent native OTA proof"
     assert {str(n): digest("/dev/vda" + str(n)) for n in (2, 3)} == proof["active_sha256"]
+    assert json.loads(run(["node", "/etc/qa-native-browser/native.mjs", "read"], timeout=120))["passed"]
     print(json.dumps({"passed": True, "booted_new_native_slot": True, "current": current,
         "persistent_config_and_original_slot_preserved": True}))
 
 
-def main(sentinel):
+def main(sentinel, client):
     # The factory's initial boot has been assessed. Exercise the native helper's
     # read-only ESP restoration explicitly; do not change the boot target/bless.
     run(["mount", "-o", "remount,ro", "/boot"])
@@ -255,9 +256,17 @@ def main(sentinel):
             assert disk_rows() == original_table and inactive() == original_bytes
             record(kind + "-refused-before-go", done)
         mode.update(kind="valid", swapped=False, pause=True)
+        browser = json.loads(run(["node", "/etc/qa-native-browser/native.mjs", "check"], timeout=120))
+        assert browser["passed"] and terminal(browser["job"]["id"])["phase"] == "checked"
+        record("actual-native-browser-check", browser)
         assert check(cli=True)["phase"] == "checked"
         release.clear()
-        accepted = stage(cli=True)
+        if client == "ui":
+            browser = json.loads(run(["node", "/etc/qa-native-browser/native.mjs", "stage"], timeout=120))
+            assert browser["passed"]
+            accepted = browser["job"]
+        else:
+            accepted = stage(cli=True)
         assert entered.wait(30), "native worker did not request an actual versioned resource"
         run(["systemctl", "restart", "sentinel-api.service"])
         until(lambda: restarted_api_has_job(accepted["id"]))
@@ -291,5 +300,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--sentinel")
     parser.add_argument("--after-boot", action="store_true")
+    parser.add_argument("--client", choices=("cli", "ui"), default="cli")
     args = parser.parse_args()
-    after_boot() if args.after_boot else main(args.sentinel)
+    after_boot() if args.after_boot else main(args.sentinel, args.client)
