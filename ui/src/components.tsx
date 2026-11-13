@@ -14,9 +14,15 @@ import type { Management } from "./controller";
 function useManagement(manager: Management) {
   return useSyncExternalStore(manager.subscribe, manager.getSnapshot);
 }
-function Panel({ title, children }: { title: string; children: ReactNode }) {
+export function Panel({
+  title,
+  children,
+}: {
+  title: string;
+  children: ReactNode;
+}) {
   return (
-    <section className="card management-panel">
+    <section className="card management-panel" aria-label={title}>
       <header className="panel-heading">
         <h3>{title}</h3>
       </header>

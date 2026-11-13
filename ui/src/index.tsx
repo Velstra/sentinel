@@ -2,6 +2,7 @@ import { createRoot } from "react-dom/client";
 import { flushSync } from "react-dom";
 import { Management } from "./controller";
 import type { Host } from "./model";
+import { SystemUpdates } from "./updates-view";
 import {
   Dashboard,
   Flows,
@@ -28,6 +29,7 @@ window.SentinelReact = {
       ["react-config", ConfigEditor],
       ["react-confirmation", Confirmation],
       ["react-system-health", ReactSystemHealth],
+      ["react-system-updates", SystemUpdates],
     ] as const) {
       const root = document.getElementById(id);
       if (!root) throw Error("Missing React mount " + id);
