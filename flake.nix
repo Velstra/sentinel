@@ -7319,6 +7319,14 @@
           nodes.machine = {
             imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
             virtualisation.memorySize = 1024;
+            # Channel downloads use anonymous staging on the same dedicated
+            # persistent ext4 mount as the appliance, never the VM root/tmpfs.
+            virtualisation.emptyDiskImages = [ 1024 ];
+            virtualisation.fileSystems."/var/lib/sentinel" = {
+              device = "/dev/vdb";
+              fsType = "ext4";
+              autoFormat = true;
+            };
             # `openssl` for the test's own keygen/sign/hash (the sentinel CLI uses
             # its pinned SENTINEL_OPENSSL_BIN/SENTINEL_CURL_BIN); `curl` is already
             # pulled in by the sentinel module.
@@ -7332,6 +7340,7 @@
             # Boot seeded the editable config, so `set update …` layers onto it.
             machine.wait_for_unit("sentinel-boot.service")
             machine.succeed("test -f /var/lib/sentinel/appliance.toml")
+            assert machine.succeed("findmnt -n -o SOURCE,FSTYPE /var/lib/sentinel").split() == ["/dev/vdb", "ext4"]
 
             with subtest("build a file:// channel signed by a pinned Ed25519 key"):
                 machine.succeed("mkdir -p /tmp/chan")
@@ -7651,6 +7660,12 @@
             nodes.machine = {
               imports = [ self.nixosModules.sentinel ./nix/test-network-seed.nix ];
               virtualisation.memorySize = 1024;
+              virtualisation.emptyDiskImages = [ 1024 ];
+              virtualisation.fileSystems."/var/lib/sentinel" = {
+                device = "/dev/vdb";
+                fsType = "ext4";
+                autoFormat = true;
+              };
               environment.systemPackages = [
                 pkgs.openssl
                 pkgs.python3
@@ -7663,6 +7678,7 @@
               machine.wait_for_unit("multi-user.target")
               machine.wait_for_unit("sentinel-boot.service")
               machine.succeed("test -f /var/lib/sentinel/appliance.toml")
+              assert machine.succeed("findmnt -n -o SOURCE,FSTYPE /var/lib/sentinel").split() == ["/dev/vdb", "ext4"]
 
               with subtest("a signed channel directory + the bearer-gated server"):
                   machine.succeed("mkdir -p /tmp/chan")
