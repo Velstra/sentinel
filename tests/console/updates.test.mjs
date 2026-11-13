@@ -10,7 +10,8 @@ async function until(expression) {
  throw Error('Update UI did not converge: '+expression);
 }
 async function button(label) {
- const point=await page.evaluate(`(()=>{const b=[...document.querySelectorAll('${panel} button')].find(n=>n.textContent===${JSON.stringify(label)});if(!b||b.disabled)throw Error('Button unavailable');b.scrollIntoView({block:'center'});const r=b.getBoundingClientRect();return{x:r.x+r.width/2,y:r.y+r.height/2};})()`);
+ await until(`(()=>{const b=[...document.querySelectorAll('${panel} button')].find(n=>n.textContent===${JSON.stringify(label)});return !!b&&!b.disabled;})()`);
+ const point=await page.evaluate(`(()=>{const b=[...document.querySelectorAll('${panel} button')].find(n=>n.textContent===${JSON.stringify(label)});if(!b||b.disabled)throw Error('Button unavailable: '+${JSON.stringify(label)});b.scrollIntoView({block:'center'});const r=b.getBoundingClientRect();return{x:r.x+r.width/2,y:r.y+r.height/2};})()`);
  await page.send('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...point});
  await page.send('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...point});
 }
