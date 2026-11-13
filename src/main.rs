@@ -41,6 +41,8 @@ mod lockout;
 mod lookup;
 mod metrics;
 mod mutation;
+mod native_update;
+mod native_update_protocol;
 mod net;
 mod network_reconcile;
 mod openapi;

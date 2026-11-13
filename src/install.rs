@@ -1786,6 +1786,11 @@ pub fn update_from_channel_guarded(
     expected: &update::VerifiedOffer,
     hooks: UpdateHooks<'_>,
 ) -> Result<StagedImage> {
+    // Dispatch BEFORE claiming the Community lock. The native helper claims
+    // that same inode itself and must retain it in the actual sysupdate child.
+    if crate::boot_entry::native_enabled() {
+        return crate::native_update::stage(chan, expected, hooks);
+    }
     signed_update_observed(chan, true, false, Some(expected), hooks)?
         .context("committed signed update did not return a staged identity")
 }

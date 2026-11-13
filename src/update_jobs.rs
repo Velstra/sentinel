@@ -808,7 +808,11 @@ impl Drop for ProbeChild {
     }
 }
 
-fn probe(program: &str, args: &[&str], seconds: u64) -> JobResult<(ExitStatus, Vec<u8>)> {
+pub(crate) fn probe(
+    program: &str,
+    args: &[&str],
+    seconds: u64,
+) -> JobResult<(ExitStatus, Vec<u8>)> {
     use std::os::unix::process::CommandExt;
     let mut disposition: libc::sigaction = unsafe { std::mem::zeroed() };
     if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut disposition) } != 0
@@ -894,6 +898,68 @@ fn boot_entry(
     )
 }
 
+fn observed_boot_entry(
+    row: &serde_json::Value,
+    native: bool,
+) -> JobResult<(&str, crate::boot_entry::Entry<'_>)> {
+    let refused = || Error(Code::UnstableBoot);
+    let id = row["id"].as_str().ok_or_else(refused)?;
+    let name = row["path"]
+        .as_str()
+        .and_then(|p| p.strip_prefix("/boot/EFI/Linux/"))
+        .ok_or_else(refused)?;
+    let entry = crate::boot_entry::Entry::parse(name, native).ok_or_else(refused)?;
+    let stable = name
+        .split_once('+')
+        .map_or_else(|| name.to_owned(), |(base, _)| format!("{base}.efi"));
+    if (id != name && id != stable)
+        || row["type"] != "type2"
+        || row["source"] != "esp"
+        || row["root"] != "/boot"
+        || row["linux"] != format!("/EFI/Linux/{name}")
+    {
+        return Err(refused());
+    }
+    let left = row.get("triesLeft").filter(|v| !v.is_null());
+    let done = row.get("triesDone").filter(|v| !v.is_null());
+    if let Some((_, suffix)) = name.strip_suffix(".efi").and_then(|s| s.split_once('+')) {
+        let (expected_left, expected_done) = suffix.split_once('-').unwrap_or((suffix, "0"));
+        let expected_left = expected_left.parse::<u64>().map_err(|_| refused())?;
+        let expected_done = expected_done.parse::<u64>().map_err(|_| refused())?;
+        match (left, done) {
+            (Some(left), Some(done))
+                if left.as_u64() == Some(expected_left) && done.as_u64() == Some(expected_done) => {
+            }
+            // systemd 260 omits triesDone when the filename is +N, not +N-M.
+            // Its implicit zero never makes that real counted inode permanent.
+            (Some(left), None) if !suffix.contains('-') && left.as_u64() == Some(expected_left) => {
+            }
+            // Older inventory used the full counted filename as ID without
+            // separate counters. A normalized ID needs every encoded counter;
+            // it must never stand in for a permanent filename.
+            (None, None) if id == name => {}
+            _ => return Err(refused()),
+        }
+    } else if left.is_some() || done.is_some() {
+        return Err(refused());
+    }
+    if let crate::boot_entry::Image::Release(version) = entry.image {
+        if row["version"] != version {
+            return Err(refused());
+        }
+    }
+    let hashes: Vec<_> = row["cmdline"]
+        .as_str()
+        .ok_or_else(refused)?
+        .split_ascii_whitespace()
+        .filter_map(|part| part.strip_prefix("usrhash="))
+        .collect();
+    if hashes.len() != 1 || !is_id(hashes[0]) {
+        return Err(refused());
+    }
+    Ok((name, entry))
+}
+
 fn boot_entry_with_policy(
     bytes: &[u8],
     slot: &str,
@@ -908,30 +974,24 @@ fn boot_entry_with_policy(
         return Err(Error(Code::UnstableBoot));
     }
     let row = selected[0];
-    let id = row["id"].as_str().ok_or(Error(Code::UnstableBoot))?;
-    let next = defaults[0]["id"]
-        .as_str()
-        .ok_or(Error(Code::UnstableBoot))?;
+    // systemd's logical ID omits the boot counter; path/linux name the actual
+    // inode. Authorization and permanent/trial assessment use that filename,
+    // with strict ID/counter reconciliation on BOTH selected/default entries.
+    let (name, entry) = observed_boot_entry(row, native)?;
+    let (next, _) = observed_boot_entry(defaults[0], native)?;
     let cmdline = row["cmdline"].as_str().ok_or(Error(Code::UnstableBoot))?;
     let hashes: Vec<_> = cmdline
         .split_ascii_whitespace()
         .filter_map(|part| part.strip_prefix("usrhash="))
         .collect();
-    let entry = crate::boot_entry::Entry::parse(id, native).ok_or(Error(Code::UnstableBoot))?;
     if !entry.matches_running(slot, version)
-        || crate::boot_entry::Entry::parse(next, native).is_none()
         || row["version"] != version
-        || row["type"] != "type2"
-        || row["source"] != "esp"
-        || row["root"] != "/boot"
-        || row["path"] != format!("/boot/EFI/Linux/{id}")
-        || row["linux"] != format!("/EFI/Linux/{id}")
         || hashes != [verity]
-        || (id == next && row != defaults[0])
+        || (row["id"] == defaults[0]["id"] && row != defaults[0])
     {
         return Err(Error(Code::UnstableBoot));
     }
-    Ok((id.into(), next.into(), entry.permanent_for(slot, version)))
+    Ok((name.into(), next.into(), entry.permanent_for(slot, version)))
 }
 
 fn active_guids(slot: &str) -> JobResult<(String, String)> {
@@ -1383,11 +1443,7 @@ pub fn status(config: &Path, apply: bool, write_access: bool) -> JobResult<Statu
                 .map_or_else(|| "0".repeat(64), |r| r.generation.clone()),
         ),
         can_check: write_access && free,
-        can_stage: write_access
-            && free
-            && current.stable()
-            && offer.is_some()
-            && !crate::boot_entry::native_enabled(),
+        can_stage: write_access && free && current.stable() && offer.is_some(),
         current: Some((&current).into()),
         mutation_context: write_access.then_some(current),
         offer: offer.map(Into::into),
@@ -1478,11 +1534,6 @@ fn admit(
 
 pub fn submit(config: &Path, apply: bool, action: Action, request: &Request) -> JobResult<JobView> {
     runtime(config, apply)?;
-    // Read-only native identity support must not enable the Community writer.
-    // The provider transport/journal handoff is qualified separately.
-    if action == Action::Stage && crate::boot_entry::native_enabled() {
-        return Err(Error(Code::StageRefused));
-    }
     let (current, _) = snapshot(config)?;
     admission_guard(config)?;
     let store = Store::production(true)?.ok_or(Error(Code::StateUnavailable))?;
@@ -1575,14 +1626,24 @@ pub fn run_worker(id: &str) -> JobResult<()> {
                 check_snapshot(config, &job.expected, true)?;
                 Ok(())
             };
-            Ok(Some(install::update_from_channel_guarded(
+            let staged = install::update_from_channel_guarded(
                 &channel,
                 &offer.verified,
                 install::UpdateHooks {
                     phase: &mut phase,
                     before_write: &mut before_write,
                 },
-            )?))
+            )?;
+            if crate::boot_entry::native_enabled() {
+                // Independently verify the bootloader's real selected/default
+                // entries and the saved-config/active-image fence after native
+                // staging; a provider's success frame alone is never enough.
+                let mut expected = job.expected.clone();
+                expected.next_entry = staged.boot_entry.clone();
+                let (actual, _) = snapshot(config)?;
+                compare_snapshot(&expected, &actual, false)?;
+            }
+            Ok(Some(staged))
         }
     })();
     finish_worker(&store, id, last_phase, &result)
@@ -2933,6 +2994,181 @@ mod tests {
                 assert_code(parse(&wrong, "v1.2.3-lts", true), Code::UnstableBoot);
             }
         }
+    }
+
+    fn actual_native_boot_rows() -> Vec<serde_json::Value> {
+        let mut selected = entries()[0].clone();
+        selected["id"] = "sentinel_v1.2.3-lts.efi".into();
+        selected["path"] = "/boot/EFI/Linux/sentinel_v1.2.3-lts.efi".into();
+        selected["linux"] = "/EFI/Linux/sentinel_v1.2.3-lts.efi".into();
+        selected["version"] = "v1.2.3-lts".into();
+        selected["isDefault"] = false.into();
+        let mut pending = selected.clone();
+        pending["id"] = "sentinel_v1.2.4-lts.efi".into();
+        pending["path"] = "/boot/EFI/Linux/sentinel_v1.2.4-lts+3-0.efi".into();
+        pending["linux"] = "/EFI/Linux/sentinel_v1.2.4-lts+3-0.efi".into();
+        pending["version"] = "v1.2.4-lts".into();
+        pending["isDefault"] = true.into();
+        pending["isSelected"] = false.into();
+        pending["triesLeft"] = 3.into();
+        pending["triesDone"] = 0.into();
+        vec![selected, pending]
+    }
+
+    fn parse_actual_native_rows(rows: &[serde_json::Value]) -> JobResult<(String, String, bool)> {
+        boot_entry_with_policy(
+            &serde_json::to_vec(rows).unwrap(),
+            "sentinel-b",
+            "v1.2.3-lts",
+            &sample().verity,
+            true,
+        )
+    }
+
+    #[test]
+    fn update_jobs_real_bootctl_normalized_id_retains_the_actual_counted_next_filename() {
+        // Reproduces systemd 260's actual native Stage readback: the ID is
+        // stable, but path/linux and tries metadata describe a trial inode.
+        assert_eq!(
+            parse_actual_native_rows(&actual_native_boot_rows()).unwrap(),
+            (
+                "sentinel_v1.2.3-lts.efi".into(),
+                "sentinel_v1.2.4-lts+3-0.efi".into(),
+                true
+            )
+        );
+    }
+
+    #[test]
+    fn update_jobs_normalized_selected_trial_can_never_be_mistaken_for_permanent() {
+        let mut row = actual_native_boot_rows().remove(1);
+        row["isSelected"] = true.into();
+        for (left, done) in [(3, 0), (2, 1), (0, 3)] {
+            let name = format!("sentinel_v1.2.4-lts+{left}-{done}.efi");
+            row["path"] = format!("/boot/EFI/Linux/{name}").into();
+            row["linux"] = format!("/EFI/Linux/{name}").into();
+            row["triesLeft"] = left.into();
+            row["triesDone"] = done.into();
+            assert_eq!(
+                boot_entry_with_policy(
+                    &serde_json::to_vec(&[&row]).unwrap(),
+                    "sentinel-b",
+                    "v1.2.4-lts",
+                    &sample().verity,
+                    true,
+                )
+                .unwrap(),
+                (name.clone(), name, false)
+            );
+        }
+    }
+
+    #[test]
+    fn update_jobs_default_entry_identity_and_counter_metadata_are_not_trusted_by_id_alone() {
+        for (key, invalid) in [
+            ("id", serde_json::json!("sentinel_v1.2.5-lts.efi")),
+            (
+                "path",
+                serde_json::json!("/elsewhere/sentinel_v1.2.4-lts+3-0.efi"),
+            ),
+            (
+                "path",
+                serde_json::json!("/boot/EFI/Linux/../sentinel_v1.2.4-lts+3-0.efi"),
+            ),
+            (
+                "linux",
+                serde_json::json!("/EFI/Linux/sentinel_v1.2.4-lts.efi"),
+            ),
+            ("source", serde_json::json!("xbootldr")),
+            ("root", serde_json::json!("/other")),
+            ("type", serde_json::json!("type1")),
+            ("version", serde_json::json!("v1.2.5-lts")),
+            ("triesLeft", serde_json::json!(2)),
+            ("triesDone", serde_json::json!(1)),
+            ("triesDone", serde_json::json!(-1)),
+            ("triesLeft", serde_json::json!(true)),
+            ("triesDone", serde_json::Value::Null),
+            ("cmdline", serde_json::json!("usrhash=wrong")),
+        ] {
+            let mut rows = actual_native_boot_rows();
+            rows[1][key] = invalid;
+            assert_code(parse_actual_native_rows(&rows), Code::UnstableBoot);
+        }
+        let mut rows = actual_native_boot_rows();
+        rows[0]["triesLeft"] = 0.into();
+        rows[0]["triesDone"] = 0.into();
+        assert_code(parse_actual_native_rows(&rows), Code::UnstableBoot);
+    }
+
+    fn actual_community_single_counter_rows() -> Vec<serde_json::Value> {
+        let mut selected = entries().remove(0);
+        selected["isDefault"] = false.into();
+        let mut pending = selected.clone();
+        pending["id"] = "sentinel-a.efi".into();
+        pending["path"] = "/boot/EFI/Linux/sentinel-a+3.efi".into();
+        pending["linux"] = "/EFI/Linux/sentinel-a+3.efi".into();
+        pending["version"] = "3.0.0".into();
+        pending["cmdline"] = format!("usrhash={}", "b".repeat(64)).into();
+        pending["isDefault"] = true.into();
+        pending["isSelected"] = false.into();
+        pending["triesLeft"] = 3.into();
+        // systemd 260 emits triesDone only if the filename actually has -N.
+        vec![selected, pending]
+    }
+
+    #[test]
+    fn update_jobs_actual_single_counter_schema_keeps_an_omitted_done_counter_unassessed() {
+        let rows = actual_community_single_counter_rows();
+        assert_eq!(
+            parse_entries(&rows).unwrap(),
+            ("sentinel-b.efi".into(), "sentinel-a+3.efi".into(), true)
+        );
+        let mut trial = rows[1].clone();
+        trial["isSelected"] = true.into();
+        assert_eq!(
+            boot_entry_with_policy(
+                &serde_json::to_vec(&[trial]).unwrap(),
+                "sentinel-a",
+                "3.0.0",
+                &"b".repeat(64),
+                false,
+            )
+            .unwrap(),
+            ("sentinel-a+3.efi".into(), "sentinel-a+3.efi".into(), false)
+        );
+    }
+
+    #[test]
+    fn update_jobs_single_counter_schema_still_requires_matching_left_and_implicit_zero_done() {
+        for (field, invalid) in [
+            ("triesLeft", serde_json::json!(2)),
+            ("triesLeft", serde_json::json!(true)),
+            ("triesLeft", serde_json::Value::Null),
+            ("triesDone", serde_json::json!(1)),
+            ("triesDone", serde_json::json!(-1)),
+            ("triesDone", serde_json::json!("0")),
+        ] {
+            let mut rows = actual_community_single_counter_rows();
+            rows[1][field] = invalid;
+            assert_code(parse_entries(&rows), Code::UnstableBoot);
+        }
+        let mut rows = actual_community_single_counter_rows();
+        rows[1]["triesDone"] = 0.into();
+        parse_entries(&rows).unwrap();
+    }
+
+    #[test]
+    fn update_jobs_legacy_full_counted_id_requires_consistent_metadata_when_present() {
+        let mut rows = actual_native_boot_rows();
+        rows[1]["id"] = "sentinel_v1.2.4-lts+3-0.efi".into();
+        parse_actual_native_rows(&rows).unwrap();
+        rows[1]["triesDone"] = 1.into();
+        assert_code(parse_actual_native_rows(&rows), Code::UnstableBoot);
+        rows[1].as_object_mut().unwrap().remove("triesLeft");
+        rows[1].as_object_mut().unwrap().remove("triesDone");
+        parse_actual_native_rows(&rows).unwrap();
+        rows[1]["id"] = "sentinel_v1.2.4-lts.efi".into();
+        assert_code(parse_actual_native_rows(&rows), Code::UnstableBoot);
     }
 
     #[test]

@@ -665,6 +665,24 @@ pub struct ApplyLock {
     _file: Option<std::rc::Rc<std::fs::File>>,
 }
 
+impl Drop for ApplyLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        if let Some(file) = &self._file {
+            if std::rc::Rc::strong_count(file) == 1 {
+                // CLOEXEC closes an unrelated child only at exec, not at fork.
+                // Explicitly unlock on the last thread-bound guard so that a
+                // pre-exec fork cannot extend a completed config transaction.
+                // Native writer locks have deliberately different lifetime
+                // rules and must not use this configuration guard.
+                unsafe {
+                    libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+                }
+            }
+        }
+    }
+}
+
 thread_local! {
     static APPLY_OWNERS: std::cell::RefCell<std::collections::BTreeMap<std::path::PathBuf,std::rc::Weak<std::fs::File>>> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
 }
@@ -750,15 +768,35 @@ pub(crate) fn lock_config_at(path: &Path) -> Result<ApplyLock> {
 /// `install -g wheel` the escalating path uses. Best-effort — a system without a
 /// `wheel` group simply leaves the file root-owned.
 pub(crate) fn wheel_gid() -> Option<u32> {
-    let name = std::ffi::CString::new("wheel").ok()?;
-    // SAFETY: `getgrnam` returns a pointer into storage that a later call could
-    // overwrite; we read `gr_gid` out immediately while the pointer is non-null
-    // and keep nothing that outlives this call.
-    let grp = unsafe { libc::getgrnam(name.as_ptr()) };
-    if grp.is_null() {
-        None
-    } else {
-        Some(unsafe { (*grp).gr_gid })
+    group_gid(c"wheel")
+}
+
+fn group_gid(name: &std::ffi::CStr) -> Option<u32> {
+    // getgrnam's shared result can be overwritten even before its immediate
+    // field read when API/config writers run on different threads. Keep both
+    // the result structure and NSS scratch storage private to this invocation.
+    let mut buffer = vec![0u8; 1024];
+    loop {
+        let mut group = std::mem::MaybeUninit::<libc::group>::uninit();
+        let mut found = std::ptr::null_mut();
+        let result = unsafe {
+            libc::getgrnam_r(
+                name.as_ptr(),
+                group.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut found,
+            )
+        };
+        if result == 0 {
+            // A successful lookup returns our initialized result; null means
+            // absent. Never read a static/foreign result or stale errno.
+            return (found == group.as_mut_ptr()).then(|| unsafe { (*group.as_ptr()).gr_gid });
+        }
+        if result != libc::ERANGE || buffer.len() >= 65536 {
+            return None;
+        }
+        buffer.resize(buffer.len() * 2, 0);
     }
 }
 
@@ -2187,6 +2225,7 @@ pub fn bin(name: &str) -> String {
         "uname" => "SENTINEL_UNAME_BIN",
         // installer tools
         "sgdisk" => "SENTINEL_SGDISK_BIN",
+        "sfdisk" => "SENTINEL_SFDISK_BIN",
         "wipefs" => "SENTINEL_WIPEFS_BIN",
         "partprobe" => "SENTINEL_PARTPROBE_BIN",
         "udevadm" => "SENTINEL_UDEVADM_BIN",
@@ -2832,6 +2871,103 @@ mod tests {
         ));
         assert!(policy_identity_changed(None, old));
         assert!(policy_identity_changed(Some(b"invalid TOML"), old));
+    }
+
+    #[test]
+    fn configuration_last_guard_unlocks_despite_an_unrelated_fork_inheritance() {
+        use std::io::{Read, Write};
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let scratch = crate::update::Scratch::new().unwrap();
+        let path = scratch.join("apply.lock");
+        let outer = lock_config_at(&path).unwrap();
+        let nested = lock_config_at(&path).unwrap();
+        let mut ready = [0; 2];
+        let mut release = [0; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(ready.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::pipe2(release.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            // Only async-signal-safe operations between fork and _exit: another
+            // test thread may have held any allocator/runtime mutex at fork.
+            unsafe {
+                libc::close(ready[0]);
+                libc::close(release[1]);
+                let mut byte = 1u8;
+                libc::write(ready[1], (&byte as *const u8).cast(), 1);
+                libc::read(release[0], (&mut byte as *mut u8).cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        unsafe {
+            libc::close(ready[1]);
+            libc::close(release[0]);
+        }
+        struct Fork {
+            pid: i32,
+            release: std::fs::File,
+        }
+        impl Drop for Fork {
+            fn drop(&mut self) {
+                let _ = self.release.write_all(&[1]);
+                unsafe {
+                    libc::waitpid(self.pid, std::ptr::null_mut(), 0);
+                }
+            }
+        }
+        let _child = Fork {
+            pid,
+            release: unsafe { std::fs::File::from_raw_fd(release[1]) },
+        };
+        let mut ready = unsafe { std::fs::File::from_raw_fd(ready[0]) };
+        let mut event = libc::pollfd {
+            fd: ready.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut event, 1, 5000) }, 1);
+        ready.read_exact(&mut [0]).unwrap();
+        let probe = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        drop(nested);
+        assert_ne!(
+            unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "a nested guard must not prematurely release the outer guard"
+        );
+        drop(outer);
+        assert_eq!(
+            unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "an unrelated pre-exec child must not extend a completed configuration transaction"
+        );
+    }
+
+    #[test]
+    fn group_lookup_uses_owned_results_under_concurrent_nss_calls() {
+        let root = group_gid(c"root");
+        let wheel = group_gid(c"wheel");
+        let missing =
+            std::ffi::CString::new(format!("sentinel-missing-{}", std::process::id())).unwrap();
+        assert_eq!(group_gid(&missing), None);
+        std::thread::scope(|scope| {
+            for n in 0..8 {
+                scope.spawn(move || {
+                    for _ in 0..100 {
+                        if n % 2 == 0 {
+                            assert_eq!(group_gid(c"root"), root);
+                        } else {
+                            assert_eq!(wheel_gid(), wheel);
+                        }
+                    }
+                });
+            }
+        });
     }
 
     fn openssl_available() -> bool {

@@ -284,5 +284,57 @@ class FixtureOracleTests(unittest.TestCase):
                 read.assert_not_called()
 
 
+class NativeProbeStartupTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        module = importlib.util.spec_from_file_location("native_probe", SOURCE / "nix/native-update-probe.py")
+        cls.probe = importlib.util.module_from_spec(module)
+        module.loader.exec_module(cls.probe)
+
+    def test_only_read_only_connection_refused_is_retryable(self):
+        error = self.probe.urllib.error.URLError(ConnectionRefusedError(111, "refused"))
+        with patch.object(self.probe, "request", side_effect=error) as request:
+            self.assertFalse(self.probe.restarted_api_has_job("reviewed-job"))
+        request.assert_called_once_with("/system/updates/jobs/reviewed-job")
+
+    def test_success_and_observation_unavailable_remain_distinct(self):
+        for status, expected in ((200, True), (503, False)):
+            with self.subTest(status=status), patch.object(self.probe, "request", return_value=(status, {})):
+                self.assertEqual(self.probe.restarted_api_has_job("job"), expected)
+
+    def test_auth_missing_job_and_server_errors_are_not_startup_retries(self):
+        for status in (401, 403, 404, 409, 500):
+            with self.subTest(status=status), patch.object(self.probe, "request", return_value=(status, {})):
+                with self.assertRaises(AssertionError):
+                    self.probe.restarted_api_has_job("job")
+
+    def test_tls_dns_reset_and_unexpected_failures_are_not_hidden(self):
+        for reason in (self.probe.ssl.SSLCertVerificationError("bad certificate"),
+                       OSError("DNS unavailable"), ConnectionResetError(104, "reset")):
+            error = self.probe.urllib.error.URLError(reason)
+            with self.subTest(reason=type(reason).__name__), patch.object(self.probe, "request", side_effect=error):
+                with self.assertRaises(self.probe.urllib.error.URLError) as caught:
+                    self.probe.restarted_api_has_job("job")
+                self.assertIs(caught.exception, error)
+
+    def test_restart_observation_converges_without_resubmitting_any_mutation(self):
+        error = self.probe.urllib.error.URLError(ConnectionRefusedError(111, "refused"))
+        with patch.object(self.probe, "request", side_effect=[error, (503, {}), (200, {})]) as request, \
+                patch.object(self.probe.time, "sleep"):
+            self.assertTrue(self.probe.until(lambda: self.probe.restarted_api_has_job("job"), seconds=1))
+        self.assertEqual(request.call_count, 3)
+        self.assertTrue(all(call.args == ("/system/updates/jobs/job",) and not call.kwargs
+                            for call in request.call_args_list))
+
+    def test_missing_api_remains_bounded_and_cannot_pass(self):
+        error = self.probe.urllib.error.URLError(ConnectionRefusedError(111, "refused"))
+        with patch.object(self.probe, "request", side_effect=error) as request, \
+                patch.object(self.probe.time, "sleep"), \
+                patch.object(self.probe.time, "monotonic", side_effect=[0, 0, 1, 2]):
+            with self.assertRaisesRegex(AssertionError, "did not converge"):
+                self.probe.until(lambda: self.probe.restarted_api_has_job("job"), seconds=1.5)
+        self.assertEqual(request.call_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
