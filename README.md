@@ -74,5 +74,4 @@ nix build .#checks.x86_64-linux.quickstart .#checks.x86_64-linux.bootfallback -L
 
 ## License
 
-[AGPL-3.0-or-later](LICENSE). Commercial licensing is available; contributions
-are covered by the project CLA.
+[AGPL-3.0-or-later](LICENSE). See [contribution terms](CONTRIBUTING.md).

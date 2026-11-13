@@ -44,6 +44,6 @@ and immutable, the way real appliance OSes (Talos, VyOS, OPNsense) are:
 
 ## License
 
-**AGPL-3.0-or-later** — a commercial license is available for organisations that
-cannot use the AGPL. Contributions are under the project CLA to keep
-dual-licensing possible.
+**AGPL-3.0-or-later**. See the repository's `LICENSE` and `CONTRIBUTING.md`.
+There is currently no project CLA process; do not assume a contribution grants
+additional relicensing rights.
