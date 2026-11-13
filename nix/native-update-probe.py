@@ -205,12 +205,21 @@ def main(sentinel):
     server.socket = tls.wrap_socket(server.socket, server_side=True)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
-    def check():
+    def check(cli=False):
         for _ in range(5):
             state = until(available)
-            code, job = request("/system/updates/check", payload(state))
-            assert code == 202, (code, job)
-            done = until(lambda: terminal(job["id"]), 90)
+            if cli:
+                result = subprocess.run([sentinel, "system", "update", "check", "--wait"],
+                    capture_output=True, text=True, timeout=330)
+                assert result.stdout.strip(), result.stderr
+                done = json.loads(result.stdout.strip().splitlines()[-1])
+                assert (result.returncode == 0) == (done["phase"] == "checked"), result.stderr
+                assert terminal(done["id"])["request_id"] == done["request_id"]
+                assert json.loads(run([sentinel, "system", "status"]))["current"]["slot"] == "sentinel-a"
+            else:
+                code, job = request("/system/updates/check", payload(state))
+                assert code == 202, (code, job)
+                done = until(lambda: terminal(job["id"]), 90)
             if done["phase"] == "failed" and done["error"] == "busy":
                 assert disk_rows() == original_table and inactive() == original_bytes
                 record("completed-read-only-check-busy", done)
@@ -218,9 +227,15 @@ def main(sentinel):
             return done
         raise AssertionError("read-only native checks remained Busy")
 
-    def stage():
+    def stage(cli=False):
         state = until(available)
         assert state["can_stage"], state
+        if cli:
+            refused = subprocess.run([sentinel, "system", "update", "stage", "--offer", "0" * 64],
+                capture_output=True, text=True, timeout=30)
+            assert refused.returncode != 0 and not refused.stdout, refused
+            assert disk_rows() == original_table and inactive() == original_bytes
+            return json.loads(run([sentinel, "system", "update", "stage", "--offer", state["offer"]["id"]]))
         code, job = request("/system/updates/stage", payload(state, True))
         assert code == 202, (code, job)
         return job
@@ -240,9 +255,9 @@ def main(sentinel):
             assert disk_rows() == original_table and inactive() == original_bytes
             record(kind + "-refused-before-go", done)
         mode.update(kind="valid", swapped=False, pause=True)
-        assert check()["phase"] == "checked"
+        assert check(cli=True)["phase"] == "checked"
         release.clear()
-        accepted = stage()
+        accepted = stage(cli=True)
         assert entered.wait(30), "native worker did not request an actual versioned resource"
         run(["systemctl", "restart", "sentinel-api.service"])
         until(lambda: restarted_api_has_job(accepted["id"]))
@@ -251,6 +266,8 @@ def main(sentinel):
         assert contender.returncode != 0 and "another update" in contender.stderr, contender.stderr
         release.set()
         done = until(lambda: terminal(accepted["id"]), 300)
+        console_job = json.loads(run([sentinel, "system", "update", "job", accepted["id"]]))
+        assert console_job["phase"] == done["phase"] and console_job["request_id"] == done["request_id"]
         assert done["phase"] == "staged" and done["error"] is None, done
         assert done["staged"]["boot_entry"] == "sentinel_v1.0.0-lts+3-0.efi", done
         assert done["staged"]["active_slot"] == "sentinel-a" and done["staged"]["staged_slot"] == "sentinel-b"

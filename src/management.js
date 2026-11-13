@@ -8,6 +8,7 @@ const management = window.SentinelReact.mount({
   canWrite: () => permission === "read-write",
   remote: () => !!target,
   member: () => target,
+  updatesVisible: () => view === "system",
   refresh: () => refresh(),
   navigate: destination => goto(destination),
   signOut: message => signOut(message),

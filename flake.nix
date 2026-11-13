@@ -1855,6 +1855,7 @@
             bash tests-console/run.sh ${sentinel}/bin/sentinel | tee output
             CONSOLE_TEST_FILE=peer.test.mjs bash tests-console/run.sh ${sentinel}/bin/sentinel | tee -a output
             CONSOLE_TEST_FILE=archive.test.mjs bash tests-console/run.sh ${sentinel}/bin/sentinel | tee -a output
+            CONSOLE_TEST_FILE=updates.test.mjs bash tests-console/run.sh ${sentinel}/bin/sentinel | tee -a output
             # The runner already exits non-zero on any failed test; this catches
             # the other way to be green — a run that asserted nothing at all.
             grep -Eq "^[1-9][0-9]*/[1-9][0-9]* passed" output

@@ -414,3 +414,22 @@ defined by src/config.rs and src/session.rs; offline file mirrors remain valid.
 Invalid schemes retain the entered value and show an associated inline error
 before Stage. Generic URL syntax checks and authoritative API/CLI validation
 remain in place. This is a business-backed field variant, not a new form owner.
+
+## Operational signed updates
+
+SystemUpdates uses the canonical Panel, button, row, status and description-list
+primitives. Updates owns a single local observation/admission lifecycle inside
+Management. Check and explicit reviewed Stage call the durable update-jobs API;
+configuration forms still stage their own safe-apply changes separately. Pending
+configuration, local drafts, unknown permissions, remote members and stale status
+withhold these actions. No source, trust, downgrade, reboot or retry override is
+offered. Review pins the exact offer, generation and full mutation context; a
+changed observation invalidates it. A lost POST is correlated by request ID in
+retained jobs, never retried automatically. Polls are read-only, non-overlapping,
+bounded and restricted to the visible System view. Member/session changes abort
+and invalidate old replies. Worker interruption/write uncertainty stays distinct
+from a staged image, and staging is never displayed as a successful boot.
+
+Verification: ui/tests/updates.test.tsx, tests/console/updates.test.mjs and the
+actual native-update VM probe (independent CLI/API worker, verified write and cold
+boot). Workstation browser fixtures verify UI behavior, not native slot writes.

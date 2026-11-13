@@ -118,7 +118,7 @@ pub enum Phase {
     Interrupted,
 }
 impl Phase {
-    fn terminal(self) -> bool {
+    pub(crate) fn terminal(self) -> bool {
         matches!(
             self,
             Self::Checked | Self::Staged | Self::Failed | Self::Interrupted

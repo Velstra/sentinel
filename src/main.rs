@@ -66,6 +66,7 @@ mod trace;
 mod ui;
 mod unlock;
 mod update;
+mod update_cli;
 mod update_jobs;
 mod update_key;
 mod update_observer;
@@ -232,6 +233,11 @@ fn read_pair_token(from_stdin: bool, argv: Option<String>) -> Result<String> {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Observe and stage signed local A/B updates (run with sudo on the appliance).
+    System {
+        #[command(subcommand)]
+        command: update_cli::SystemCommand,
+    },
     /// Manage active/passive high availability.
     Ha {
         #[command(subcommand)]
@@ -737,6 +743,7 @@ async fn main() -> Result<()> {
             command: HaCommand::Watch { config },
         } => ha::watch(&config),
         Command::UpdateJob { id } => update_jobs::run_worker(&id).map_err(Into::into),
+        Command::System { command } => update_cli::run(command),
         Command::Configure { config, no_apply } => configure(&config, no_apply),
         Command::SyncConfig => configsync::flush(),
         Command::RefreshFirewall => refresh_firewall(),
@@ -1358,6 +1365,24 @@ struct UpdateFlags<'a> {
 /// signed-channel keyword driving roadmap C13's authenticity gate against the
 /// saved `[update]` channel.
 fn update_cmd(target: Option<&str>, flags: UpdateFlags) -> Result<()> {
+    if crate::boot_entry::native_enabled() && matches!(target, Some("check" | "install")) {
+        anyhow::ensure!(
+            !flags.allow_unsigned
+                && !flags.allow_downgrade
+                && flags.pubkey.is_none()
+                && flags.signature.is_none(),
+            "Native channel updates do not accept trust or downgrade overrides."
+        );
+        if target == Some("check") {
+            anyhow::ensure!(!flags.commit, "Check never writes an image; omit --commit.");
+            return update_cli::run(update_cli::SystemCommand::Update {
+                command: update_cli::UpdateCommand::Check { wait: true },
+            });
+        }
+        anyhow::bail!(
+            "Native updates require a reviewed offer: run `sudo sentinel system update check --wait`, then `sudo sentinel system update stage --offer <offer-id>`. This never reboots automatically."
+        );
+    }
     match target {
         None => anyhow::bail!(
             "usage: sentinel update <image>|check|install [--commit] [--signature <file>] \

@@ -6,6 +6,7 @@ import {
   sseFrames,
 } from "./model";
 import type { Host, Pending, StagedChange, State, Telemetry } from "./model";
+import { Updates } from "./updates";
 
 export class Management {
   private state = initialState();
@@ -21,7 +22,17 @@ export class Management {
   private appliedCandidate: string | null = null;
   private batch: { id: string; changes: StagedChange[] } | null = null;
   private completedId: string | null = null;
-  constructor(private host: Host) {}
+  readonly updates: Updates;
+  constructor(private host: Host) {
+    this.updates = new Updates(
+      host,
+      () =>
+        !!this.state.pending ||
+        this.state.editor.busy ||
+        this.state.editor.candidate !== this.state.editor.baseline ||
+        this.host.staged().length > 0,
+    );
+  }
   getSnapshot = () => this.state;
   navigate = (destination: Parameters<Host["navigate"]>[0]) =>
     this.host.navigate(destination);
@@ -39,6 +50,7 @@ export class Management {
     this.update({ editor: { ...this.state.editor, ...patch } });
   }
   contextChanged = () => {
+    this.updates.contextChanged();
     const writable = this.host.canWrite(),
       remote = this.host.remote(),
       member = this.host.member();
@@ -528,6 +540,7 @@ export class Management {
     const epoch = this.epoch;
     void this.refreshTransaction();
     void this.refreshHealth();
+    if (this.host.updatesVisible?.()) void this.updates.refresh();
     this.abort = new AbortController();
     void this.consume(this.abort.signal, epoch);
     let tick = 0;
@@ -544,10 +557,13 @@ export class Management {
       });
       this.contextChanged();
       if (++tick % 5 === 0) void this.refreshTransaction();
+      if (tick % 3 === 0 && this.host.updatesVisible?.())
+        void this.updates.refresh();
       if (tick % 15 === 0) void this.refreshHealth();
     }, 1000);
   };
   stop = () => {
+    this.updates.stop();
     this.epoch++;
     this.healthGeneration++;
     this.healthAbort?.abort();
