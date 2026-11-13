@@ -1960,8 +1960,9 @@ fn refuse_machine_trust_change(
 /// is the synchronization itself, as it always was. It applies only while this
 /// member also has no undelivered change of its own in its outbox: two members
 /// committing at once before they ever synchronized refuse each other like any
-/// later pair would. From then on a marker beside the configuration says this
-/// member has been synchronized, and every push is compared.
+/// later pair would. A durable authorization beside the configuration consumes
+/// this exemption BEFORE apply. A failed first apply may retry only that exact
+/// shared policy on the unchanged full baseline, without a local pending edit.
 async fn put_config_sync(
     State(state): State<Arc<ApiState>>,
     axum::Extension(caller): axum::Extension<Caller>,
@@ -1970,38 +1971,48 @@ async fn put_config_sync(
 ) -> Result<Json<Value>, ApiError> {
     require_ha_machine(&state, &caller)?;
     let incoming = Appliance::from_json(&body).map_err(ApiError::bad_request)?;
+    tokio::task::spawn_blocking(move || receive_synced_config(&state, incoming, &query))
+        .await
+        .map_err(|error| ApiError::internal(anyhow!("config-sync task: {error}")))?
+}
+
+fn receive_synced_config(
+    state: &ApiState,
+    incoming: Appliance,
+    query: &HashMap<String, String>,
+) -> Result<Json<Value>, ApiError> {
     let _transaction = system::apply_lock().map_err(ApiError::internal)?;
+    let _file = system::lock_config_at(&state.config_path.with_extension("transaction.lock"))
+        .map_err(ApiError::internal)?;
+    crate::safe_apply::ensure_writable(&state.config_path)
+        .map_err(|error| ApiError::new(StatusCode::CONFLICT, error))?;
     let local = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
     let merged = merge_synced_config(incoming, &local).map_err(ApiError::bad_request)?;
-    let held = crate::configsync::shared_revision(&local).map_err(ApiError::internal)?;
-    let arriving = crate::configsync::shared_revision(&merged).map_err(ApiError::bad_request)?;
-    let based_on_held = query
-        .get(crate::configsync::BASE_PARAMETER)
-        .is_some_and(|bases| bases.split(',').any(|base| base == held));
-    let marker = synchronized_marker(&state);
-    let first = !system::owned_file_exists(&marker).map_err(ApiError::internal)?
-        && !crate::configsync::has_pending().map_err(ApiError::internal)?;
-    if held != arriving && !based_on_held && !first {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            anyhow!(
-                "this member's configuration changed since the sender last synchronized it; \
-                 roll back the member whose change should be discarded"
-            ),
-        ));
-    }
-    let applied = replace_config(&state, merged)?;
-    // Best-effort, like the running snapshot: without the marker the next
-    // push is merely treated as a first one again.
-    if let Err(e) = system::install_config_file(&marker, &format!("{arriving}\n")) {
-        eprintln!("warning: could not record the config-sync revision: {e:#}");
-    }
+    let received = crate::configsync::shared_revision(&merged).map_err(ApiError::internal)?;
+    crate::configsync::receive::prepare(
+        &synchronized_marker(state),
+        &local,
+        &merged,
+        query
+            .get(crate::configsync::BASE_PARAMETER)
+            .map(String::as_str),
+        crate::configsync::has_pending().map_err(ApiError::internal)?,
+    )
+    .map_err(|error| {
+        if error.is::<crate::configsync::receive::Conflict>() {
+            ApiError::new(StatusCode::CONFLICT, error)
+        } else {
+            ApiError::internal(error)
+        }
+    })?;
+    let applied = replace_config(state, merged)?;
+    crate::configsync::receive::complete(&synchronized_marker(state), &received)
+        .map_err(ApiError::internal)?;
     Ok(applied)
 }
 
-/// Where a member records the shared revision it last received through
-/// config-sync — beside the configuration it describes, so a test or an
-/// off-box run keeps it with its own document.
+/// Durable config-sync participation/authorization, beside its configuration.
+/// Legacy plain revision receipts remain valid participation fences.
 fn synchronized_marker(state: &ApiState) -> PathBuf {
     state.config_path.with_extension("configsync-received")
 }
@@ -5467,6 +5478,57 @@ virtual-address = ["10.43.0.253"]
     }
 
     // ---- config-sync: machine only, compare-and-apply --------------------
+
+    #[tokio::test]
+    async fn config_sync_marker_failure_must_not_apply_or_acknowledge_policy() {
+        let (mut incoming, local) = legacy_pair();
+        incoming.interfaces[0].mtu = Some(1400);
+        let st = sync_state(&local);
+        let before = std::fs::read(&st.config_path).unwrap();
+        // A real rename/type failure, independent of root permissions or NSS.
+        std::fs::create_dir(synchronized_marker(&st)).unwrap();
+        let base = crate::configsync::shared_revision(&local).unwrap();
+        let response = router(st.clone())
+            .oneshot(push(Some(&base), TOKEN, &incoming))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(std::fs::read(&st.config_path).unwrap(), before);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_first_syncs_cannot_both_overwrite_the_local_baseline() {
+        let (mut first, local) = legacy_pair();
+        first.interfaces[0].mtu = Some(1400);
+        let mut second = first.clone();
+        second.interfaces[0].mtu = Some(1300);
+        let st = sync_state(&local);
+        let app = router(st.clone());
+        let (one, two) = tokio::join!(
+            app.clone().oneshot(push(None, TOKEN, &first)),
+            app.oneshot(push(None, TOKEN, &second))
+        );
+        let statuses = [one.unwrap().status(), two.unwrap().status()];
+        assert_eq!(statuses.iter().filter(|s| **s == StatusCode::OK).count(), 1);
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|s| **s == StatusCode::CONFLICT)
+                .count(),
+            1
+        );
+        let saved = Appliance::load(&st.config_path).unwrap();
+        assert_eq!(saved.system.hostname, local.system.hostname);
+        assert_eq!(saved.interfaces[0].address, local.interfaces[0].address);
+        assert_eq!(
+            saved.interfaces[0].mtu,
+            Some(if statuses[0] == StatusCode::OK {
+                1400
+            } else {
+                1300
+            })
+        );
+    }
 
     /// A session for `user` opened the way a sign-in opens one, under the
     /// grant the configuration gives it today: accounts have no standing token
