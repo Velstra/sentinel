@@ -15840,6 +15840,26 @@
               # directory. This must not attempt install(source, source).
               backup.succeed("grep -q shared-token-123 /run/sentinel/running.toml; test $(stat -c %u /run/sentinel/running.toml) = 0; test $(stat -c %a /run/sentinel/running.toml) = 640")
 
+              with subtest("real receive-journal ENOSPC refuses before live apply"):
+                  backup.succeed("${pkgs.python3}/bin/python3 ${./nix/configsync-receive-probe.py} disk-full")
+              with subtest("failed first save stays fenced across API restart"):
+                  backup.succeed("${pkgs.python3}/bin/python3 ${./nix/configsync-receive-probe.py} save-failure")
+                  backup.succeed("systemctl restart sentinel-api.service")
+                  backup.wait_until_succeeds("curl -fsSk https://127.0.0.1:8080/api/v1/health", timeout=30)
+                  backup.succeed("${pkgs.python3}/bin/python3 ${./nix/configsync-receive-probe.py} retry-after-restart")
+
+              # The fault/retry case legitimately consumed first-sync admission.
+              # Establish the same reviewed baseline locally, rather than delete
+              # its durable fence to make the following worker test pass.
+              primary.succeed(
+                  "su admin -c \"printf '%s\\n' "
+                  "'set firewall global default-action accept' "
+                  "'set interface eth1 zone lan' "
+                  "'set interface eth1 mtu 1400' "
+                  "'set system config-sync secret shared-token-123' "
+                  "commit save exit | sentinel configure\""
+              )
+
               # Sanity: the rule is not on the backup yet.
               backup.fail("grep -q 'synced-rule' /var/lib/sentinel/appliance.toml")
 

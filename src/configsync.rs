@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+pub(crate) mod receive;
+
 const DIRECTORY: &str = "/var/lib/sentinel/configsync";
 const PENDING: &str = "/var/lib/sentinel/configsync/pending.json";
 
