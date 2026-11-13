@@ -151,9 +151,25 @@ def retry_after_restart():
     assert mtu() == 1400
     assert request(record["desired"])[0] == 200, "identical delivery is idempotent"
     assert request(stale)[0] == 409
+    receipt = MARKER.read_text().strip()
+    assert len(receipt) == 64 and all(c in "0123456789abcdef" for c in receipt)
     assert not Path("/var/lib/sentinel/configsync/pending.json").exists(), "received policy must never echo"
     print("CONFIGSYNC_ACTUAL_RESTART_EXACT_RETRY_AND_IDENTITY_PASS")
 
 
+def rollback_after_completion():
+    record = json.loads(RECORD.read_text())
+    subprocess.run(["su", "admin", "-c", "sentinel configure"],
+        input="delete interface eth1 mtu\ncommit\nsave\nexit\n", text=True, check=True)
+    assert document() == record["local"], "real CLI rollback must restore the full prior baseline"
+    assert request(record["desired"])[0] == 409, "a completed first-sync grant must stay consumed after rollback"
+    assert document() == record["local"]
+    subprocess.run(["su", "admin", "-c", "sentinel configure"],
+        input="set interface eth1 mtu 1400\ncommit\nsave\nexit\n", text=True, check=True)
+    assert mtu() == 1400
+    print("CONFIGSYNC_ACTUAL_CLI_ROLLBACK_CANNOT_RESURRECT_COMPLETED_GRANT_PASS")
+
+
 {"disk-full": disk_full, "save-failure": save_failure,
- "retry-after-restart": retry_after_restart}[sys.argv[1]]()
+ "retry-after-restart": retry_after_restart,
+ "rollback-after-completion": rollback_after_completion}[sys.argv[1]]()

@@ -2,9 +2,9 @@
 //!
 //! The journal is never cleared: even an interrupted first synchronization has
 //! participated. An unchanged baseline may retry exactly its authorized policy,
-//! but never a different stale push or an undelivered local edit. A separate
-//! completion write would add a failure boundary without strengthening CAS;
-//! holding the desired revision already makes repeated delivery idempotent.
+//! but never a different stale push or an undelivered local edit. Completion
+//! durably withdraws that exceptional retry before acknowledging success, so
+//! a later operator rollback cannot resurrect a completed first-sync grant.
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
@@ -56,6 +56,17 @@ pub(crate) fn prepare(
     prepare_with(marker, local, desired, bases, local_pending, |text| {
         system::install_ha_secret(marker, text)
     })
+}
+
+pub(crate) fn complete(marker: &Path, received: &str) -> Result<()> {
+    ensure!(
+        revision(received),
+        "invalid config-sync completion revision"
+    );
+    // Also the legacy receipt format, always treated as participation without
+    // an exceptional retry. Publication failure must never be acknowledged.
+    system::install_ha_secret(marker, &format!("{received}\n"))
+        .context("config-sync policy was saved but receive completion could not be persisted; retry the same policy")
 }
 
 fn prepare_with(
@@ -336,5 +347,27 @@ mod tests {
             true,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn completed_delivery_cannot_reuse_first_sync_after_an_operator_rollback() {
+        let fixture = Fixture::new();
+        fixture
+            .prepare(&fixture.local, &fixture.desired, false)
+            .unwrap();
+        complete(
+            &fixture.marker,
+            &super::super::shared_revision(&fixture.desired).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            fixture
+                .prepare(&fixture.local, &fixture.desired, false)
+                .unwrap_err()
+                .is::<Conflict>()
+        );
+        fixture
+            .prepare(&fixture.desired, &fixture.desired, false)
+            .unwrap();
     }
 }

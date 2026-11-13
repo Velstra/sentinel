@@ -1988,6 +1988,7 @@ fn receive_synced_config(
         .map_err(|error| ApiError::new(StatusCode::CONFLICT, error))?;
     let local = Appliance::load(&state.config_path).map_err(ApiError::internal)?;
     let merged = merge_synced_config(incoming, &local).map_err(ApiError::bad_request)?;
+    let received = crate::configsync::shared_revision(&merged).map_err(ApiError::internal)?;
     crate::configsync::receive::prepare(
         &synchronized_marker(state),
         &local,
@@ -2004,7 +2005,10 @@ fn receive_synced_config(
             ApiError::internal(error)
         }
     })?;
-    replace_config(state, merged)
+    let applied = replace_config(state, merged)?;
+    crate::configsync::receive::complete(&synchronized_marker(state), &received)
+        .map_err(ApiError::internal)?;
+    Ok(applied)
 }
 
 /// Durable config-sync participation/authorization, beside its configuration.

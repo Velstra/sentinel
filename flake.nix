@@ -15847,6 +15847,8 @@
                   backup.succeed("systemctl restart sentinel-api.service")
                   backup.wait_until_succeeds("curl -fsSk https://127.0.0.1:8080/api/v1/health", timeout=30)
                   backup.succeed("${pkgs.python3}/bin/python3 ${./nix/configsync-receive-probe.py} retry-after-restart")
+              with subtest("completed first-sync grant stays consumed after real CLI rollback"):
+                  backup.succeed("${pkgs.python3}/bin/python3 ${./nix/configsync-receive-probe.py} rollback-after-completion")
 
               # The fault/retry case legitimately consumed first-sync admission.
               # Establish the same reviewed baseline locally, rather than delete
