@@ -63,7 +63,9 @@ let
       (lib.hiPrio sentinel) pkgs.python3 pkgs.util-linux pkgs.openssl pkgs.gptfdisk pkgs.iproute2
       pkgs.nodejs pkgs.chromium
     ];
-    velstra.appliance = { storeSize = "4096M"; veritySize = "192M"; dataSize = "2048M"; };
+    # Chromium is a test-only dependency. Keep BOTH reserved target slots above
+    # its complete closure, not only A's automatically computed minimum size.
+    velstra.appliance = { storeSize = "6144M"; veritySize = "384M"; dataSize = "2048M"; };
     virtualisation = {
       directBoot.enable = false;
       mountHostNixStore = false;
@@ -112,6 +114,9 @@ pkgs.testers.runNixOSTest {
         assert len(encoded) < 3*1024*1024, "unexpectedly large native UI screenshot"
         Path(os.environ["out"],"native-ui-"+action+".png").write_bytes(base64.b64decode(encoded,validate=True))
     before_table=machine.succeed("sfdisk --json /dev/vda")
+    rows=json.loads(before_table)["partitiontable"]["partitions"]
+    for active,standby in [(1,3),(2,4)]:
+        assert rows[standby]["size"] >= rows[active]["size"] > 0, "invalid native fixture: standby is smaller than the running slot; no update may start"
     try:
         text=machine.succeed("${pkgs.python3}/bin/python3 /etc/qa-native.py --sentinel ${sentinel}/bin/sentinel --client ${client}",timeout=900)
     except Exception:
