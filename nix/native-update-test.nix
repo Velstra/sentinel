@@ -72,7 +72,10 @@ let
       fileSystems = lib.mkVMOverride { };
     };
   };
-in pkgs.testers.runNixOSTest {
+in
+assert lib.assertMsg (lib.isDerivation updater || (builtins.isString updater && builtins.hasContext updater))
+  "native update provider must be a derivation or context-bearing builtins.storePath; a copied path loses its runtime closure";
+pkgs.testers.runNixOSTest {
   name = "sentinel-native-${client}-api-stage";
   globalTimeout = 1500;
   nodes.donor = {
