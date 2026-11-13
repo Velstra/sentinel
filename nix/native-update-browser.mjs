@@ -25,6 +25,7 @@ try {
  if(action==='read') {
   check(before.current.permanent&&before.current.slot==='sentinel-b','native UI did not observe assessed B boot');
   check(await page.evaluate(`document.querySelector('${panel}').textContent.includes('Slot B')&&document.querySelector('${panel}').textContent.includes('Permanent')`),'actual boot identity was not rendered');
+  check(await page.evaluate(`document.querySelector('${panel}').textContent.includes('Stage recorded on a previous boot.')&&!document.querySelector('${panel}').textContent.includes('Image staged during this boot.')`),'retained staging history contradicts the assessed current boot');
   console.log(JSON.stringify({passed:true,actual_browser:true,current:before.current}));
  } else {
   if(action==='stage') {

@@ -5,6 +5,7 @@ type Context = Record<string, string | boolean>;
 export interface UpdateJob {
   id: string;
   request_id: string;
+  boot_id: string;
   action: Action;
   phase: string;
   error: string | null;
@@ -15,6 +16,7 @@ export interface UpdateStatus {
   generation: string | null;
   mutation_context: Context | null;
   current: null | {
+    boot_id: string;
     release: string;
     slot: string;
     permanent: boolean;
@@ -65,6 +67,8 @@ export function isUpdateJob(v: unknown): v is UpdateJob {
     record(v) &&
     id(v.id) &&
     id(v.request_id) &&
+    text(v.boot_id) &&
+    v.boot_id.length > 0 &&
     ["check", "stage"].includes(String(v.action)) &&
     [
       "accepted",
@@ -110,6 +114,8 @@ export function isUpdateStatus(v: unknown): v is UpdateStatus {
         Object.keys(context).length === 13)) &&
     (current === null ||
       (record(current) &&
+        text(current.boot_id) &&
+        current.boot_id.length > 0 &&
         [current.release, current.selected_entry, current.next_entry].every(
           text,
         ) &&

@@ -26,6 +26,7 @@ const status = (): UpdateStatus => ({
     permanent: true,
   },
   current: {
+    boot_id: "boot-current",
     release: "v0.9.0",
     slot: "sentinel-a",
     permanent: true,
@@ -80,6 +81,7 @@ const stageButton = () =>
 const job = (request_id: string, phase = "accepted"): UpdateJob => ({
   id: hash("8"),
   request_id,
+  boot_id: "boot-current",
   action: "stage",
   phase,
   error: null,
@@ -304,6 +306,86 @@ describe("operational local update console", () => {
     ).toBeVisible();
     expect(screen.queryByText(/Image staged/)).toBeNull();
     expect(reviewButton()).toBeDisabled();
+  });
+  it("distinguishes retained staging history from the independently assessed current boot", async () => {
+    const { manager, updates, host } = fixture();
+    render(<SystemUpdates manager={manager} />);
+    vi.mocked(host.api).mockResolvedValueOnce(
+      response({ ...status(), jobs: [job(hash("6"), "staged")] }),
+    );
+    await act(() => updates.refresh());
+    expect(screen.getByText(/Image staged during this boot/)).toBeVisible();
+    for (const slot of ["sentinel-a", "sentinel-b"]) {
+      vi.mocked(host.api).mockResolvedValueOnce(
+        response({
+          ...status(),
+          current: { ...status().current, boot_id: "boot-after-restart", slot },
+          jobs: [job(hash("6"), "staged")],
+        }),
+      );
+      await act(() => updates.refresh());
+      expect(
+        screen.getByText(/Stage recorded on a previous boot/),
+      ).toBeVisible();
+      expect(screen.queryByText(/Image staged during this boot/)).toBeNull();
+      expect(screen.getByText("Permanent")).toBeVisible();
+    }
+  });
+  it("restores keyboard focus to the review action after cancelling", async () => {
+    const { manager, updates } = fixture();
+    render(<SystemUpdates manager={manager} />);
+    await act(() => updates.refresh());
+    fireEvent.click(reviewButton());
+    const cancel = screen.getByRole("button", { name: "Cancel update review" });
+    cancel.focus();
+    fireEvent.click(cancel);
+    expect(reviewButton()).toHaveFocus();
+  });
+  it("returns focus to the panel if observation refresh temporarily disables the trigger", async () => {
+    const { manager, updates, host } = fixture();
+    render(<SystemUpdates manager={manager} />);
+    await act(() => updates.refresh());
+    fireEvent.click(reviewButton());
+    let release!: (response: Response) => void;
+    vi.mocked(host.api).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
+    let pending!: Promise<void>;
+    act(() => {
+      pending = updates.refresh();
+    });
+    const cancel = screen.getByRole("button", { name: "Cancel update review" });
+    cancel.focus();
+    fireEvent.click(cancel);
+    expect(
+      screen.getByRole("region", { name: "System updates" }),
+    ).toHaveFocus();
+    await act(async () => {
+      release(response(status()));
+      await pending;
+    });
+  });
+  it("does not infer an unbooted image when current boot identity is unavailable", async () => {
+    const { manager, updates, host } = fixture();
+    render(<SystemUpdates manager={manager} />);
+    vi.mocked(host.api).mockResolvedValueOnce(
+      response({
+        ...status(),
+        current: null,
+        mutation_context: null,
+        can_check: false,
+        can_stage: false,
+        jobs: [job(hash("6"), "staged")],
+      }),
+    );
+    await act(() => updates.refresh());
+    expect(
+      screen.getByText("Stage completed. Current boot state is unavailable."),
+    ).toBeVisible();
+    expect(screen.queryByText(/Image staged during this boot/)).toBeNull();
   });
   it("rejects malformed status envelopes instead of inventing healthy or writable state", () => {
     for (const value of [

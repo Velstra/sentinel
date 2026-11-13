@@ -1,4 +1,4 @@
-import { useSyncExternalStore } from "react";
+import { useRef, useSyncExternalStore } from "react";
 import type { Management } from "./controller";
 import { terminal } from "./updates";
 import { Panel } from "./components";
@@ -10,8 +10,16 @@ export function SystemUpdates({ manager }: { manager: Management }) {
   const current = status?.current;
   const offer = status?.offer;
   const fresh = updates.fresh();
+  const reviewTrigger = useRef<HTMLButtonElement>(null);
+  const panel = useRef<HTMLElement>(null);
+  const cancelReview = () => {
+    updates.cancelReview();
+    if (reviewTrigger.current && !reviewTrigger.current.disabled)
+      reviewTrigger.current.focus();
+    else panel.current?.focus();
+  };
   return (
-    <Panel title="System updates">
+    <Panel title="System updates" focusRef={panel}>
       <span className="pill">
         {state.remote
           ? "Local appliance only"
@@ -42,7 +50,7 @@ export function SystemUpdates({ manager }: { manager: Management }) {
               </dd>
             </div>
             <div>
-              <dt>Boot assessment</dt>
+              <dt>Running image assessment</dt>
               <dd>
                 {current
                   ? current.permanent
@@ -96,6 +104,7 @@ export function SystemUpdates({ manager }: { manager: Management }) {
               type="button"
               disabled={!updates.permitted("stage")}
               onClick={updates.review}
+              ref={reviewTrigger}
             >
               Review available update
             </button>
@@ -160,15 +169,14 @@ export function SystemUpdates({ manager }: { manager: Management }) {
                   className="btn primary"
                   type="button"
                   disabled={!updates.permitted("stage")}
-                  onClick={() => void updates.submit("stage")}
+                  onClick={() => {
+                    void updates.submit("stage");
+                    panel.current?.focus();
+                  }}
                 >
                   Download &amp; stage update
                 </button>
-                <button
-                  className="btn"
-                  type="button"
-                  onClick={updates.cancelReview}
-                >
+                <button className="btn" type="button" onClick={cancelReview}>
                   Cancel update review
                 </button>
               </div>
@@ -193,8 +201,11 @@ export function SystemUpdates({ manager }: { manager: Management }) {
                   {job.message && <p>{job.message}</p>}
                   {job.phase === "staged" && (
                     <p>
-                      Image staged, not yet booted or assessed. Inspect the next
-                      boot entry before rebooting.
+                      {!current
+                        ? "Stage completed. Current boot state is unavailable."
+                        : job.boot_id !== current.boot_id
+                          ? "Stage recorded on a previous boot. Current boot assessment is shown above."
+                          : "Image staged during this boot. Inspect boot selection before rebooting and assessing the new image."}
                     </p>
                   )}
                 </li>

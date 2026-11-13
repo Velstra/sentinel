@@ -429,6 +429,10 @@ retained jobs, never retried automatically. Polls are read-only, non-overlapping
 bounded and restricted to the visible System view. Member/session changes abort
 and invalidate old replies. Worker interruption/write uncertainty stays distinct
 from a staged image, and staging is never displayed as a successful boot.
+Historical Stage descriptions use the job's boot ID versus the independently
+observed current boot ID; they must not call an already assessed boot unbooted.
+The Panel focus-ref variant is used only to return focus after inline review
+closes while its original trigger is busy. It adds no visual or navigation owner.
 
 Verification: ui/tests/updates.test.tsx, tests/console/updates.test.mjs and the
 actual native-update VM probe (independent CLI/API worker, verified write and cold
