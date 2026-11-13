@@ -87,7 +87,7 @@ in pkgs.testers.runNixOSTest {
     environment.etc."qa-native-resources".source = resources nodes.donor;
   };
   testScript = { nodes, ... }: ''
-    import json,os,subprocess,tempfile
+    import base64,json,os,subprocess,tempfile
     from pathlib import Path
     temporary=tempfile.TemporaryDirectory()
     image="${nativeImage nodes.machine}"
@@ -104,6 +104,10 @@ in pkgs.testers.runNixOSTest {
         machine.succeed("test $(systemctl --failed --no-legend --plain | wc -l) -eq 0")
         machine.succeed("dmsetup info --target verity usr")
     healthy()
+    def screenshot(action):
+        encoded=machine.succeed("base64 -w0 /var/lib/sentinel/qa-native-ui-"+action+".png").strip()
+        assert len(encoded) < 3*1024*1024, "unexpectedly large native UI screenshot"
+        Path(os.environ["out"],"native-ui-"+action+".png").write_bytes(base64.b64decode(encoded,validate=True))
     before_table=machine.succeed("sfdisk --json /dev/vda")
     try:
         text=machine.succeed("${pkgs.python3}/bin/python3 /etc/qa-native.py --sentinel ${sentinel}/bin/sentinel --client ${client}",timeout=900)
@@ -125,9 +129,9 @@ in pkgs.testers.runNixOSTest {
     result=json.loads(text)
     assert result["passed"] and result["actual_native_writes"]
     Path(os.environ["out"],"stage.json").write_text(json.dumps(result,indent=2))
-    machine.copy_from_vm("/var/lib/sentinel/qa-native-ui-check.png", os.environ["out"])
+    screenshot("check")
     if "${client}" == "ui":
-        machine.copy_from_vm("/var/lib/sentinel/qa-native-ui-stage.png", os.environ["out"])
+        screenshot("stage")
     machine.shutdown()
     machine.start()
     healthy()
@@ -136,7 +140,7 @@ in pkgs.testers.runNixOSTest {
     result=json.loads(text)
     assert result["passed"] and result["booted_new_native_slot"]
     Path(os.environ["out"],"boot.json").write_text(json.dumps(result,indent=2))
-    machine.copy_from_vm("/var/lib/sentinel/qa-native-ui-read.png", os.environ["out"])
+    screenshot("read")
     print("NATIVE_RUST_API_STAGE_AND_ACTUAL_B_BOOT_PASS",flush=True)
   '';
 }
