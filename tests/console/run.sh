@@ -39,6 +39,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# A deterministic, private GeoIP fixture for form/API/CLI validation. These
+# documentation prefixes are test data, not claims about country allocation.
+# The raw development binary otherwise expects /etc/sentinel/geoip; never
+# create host files or download a live database just to validate a form.
+mkdir -m 700 "$work/geoip"
+printf '198.51.100.0/24\n' > "$work/geoip/CN.v4"
+printf '2001:db8:1::/48\n' > "$work/geoip/CN.v6"
+printf '203.0.113.0/24\n' > "$work/geoip/RU.v4"
+printf '2001:db8:2::/48\n' > "$work/geoip/RU.v6"
+printf 'CN\nRU\n' > "$work/geoip/COUNTRIES"
+export SENTINEL_GEOIP_DIR="$work/geoip"
+
 # The API re-executes itself for operational views. Cargo may atomically replace
 # a debug binary while this long browser walk is running; Linux then reports
 # current_exe as "... (deleted)" and every configuration read falsely fails.

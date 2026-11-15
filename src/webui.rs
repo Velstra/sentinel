@@ -3823,9 +3823,13 @@ async function applyStagedNow(tail) {{
   // itself, and the change an operator had just been told was good could no
   // longer be applied.
   const committed = tail.includes("commit");
+  // Attribute a numbered refusal to the immutable submitted batch, not a
+  // draft the operator changed while the request was in flight.
+  const batch = staged.map((entry) => ({{ label: entry.label, cmds: entry.cmds.slice() }}));
+  const sent = batch.flatMap((entry) => entry.cmds);
   let r;
   try {{
-    r = await configure(stagedCommands().concat(tail));
+    r = await configure(sent.concat(tail));
   }} catch (e) {{
     // An apply that never reached the appliance has to say so. Left to throw,
     // the page swallowed it: no dialog, no banner, the changes still staged —
@@ -3833,7 +3837,7 @@ async function applyStagedNow(tail) {{
     if (committed) await refreshTransaction();
     showResult({{ ok: false, uncertain: committed && !e.status,
       output: "error: " + (e.message || e) + (committed && !e.status
-        ? " The request may have started. Check the pending revision after reconnecting; recovery runs independently." : "") }}, committed);
+        ? " The request may have started. Check the pending revision after reconnecting; recovery runs independently." : "") }}, committed, refusedChange(e, batch));
     return;
   }}
   const refused = !r.ok || summarise(r.output).some((n) => n.kind === "bad");
@@ -3848,6 +3852,23 @@ async function applyStagedNow(tail) {{
   }}
   await buildSearchIndex();
   await refresh();
+}}
+
+// The API numbers physical request lines. Unnumbered candidate errors,
+// permission/transport failures and trailing commit/save never justify blame.
+// This path must not replay configuration requests to identify a refusal.
+function refusedChange(error, batch) {{
+  if (error.status !== 400) return null;
+  const match = /^line ([1-9][0-9]*) refused:/.exec(error.message || "");
+  if (!match) return null;
+  let line = Number(match[1]);
+  if (!Number.isSafeInteger(line)) return null;
+  for (const entry of batch) {{
+    const count = entry.cmds.reduce((sum, command) => sum + command.split("\n").length, 0);
+    if (line <= count) return entry.label;
+    line -= count;
+  }}
+  return null;
 }}
 
 // Which staged change the appliance refused.
