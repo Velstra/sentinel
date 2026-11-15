@@ -72,6 +72,37 @@ export function requireValidation(reply) {
       + JSON.stringify(reply));
 }
 
+// A rejected promise alone is not proof of input validation. Require the
+// specific diagnostic and independently observed real HTTP 400 response.
+export function requireRefusal(reply, diagnostic) {
+  check(!!reply && !Array.isArray(reply)
+    && Object.keys(reply).sort().join(",") === "message,rejected,status"
+    && reply.rejected === true && reply.status === 400
+    && typeof diagnostic === "string" && diagnostic.length > 0
+    && reply.message === diagnostic,
+    "Expected a specific HTTP 400 refusal, not another failure: " + JSON.stringify(reply));
+}
+
+export async function refusedConfiguration(page, lines, diagnostic) {
+  const config = process.env.CONSOLE_CONFIG;
+  check(config, "A real private configuration is required for refusal verification");
+  const before = readFileSync(config);
+  const responses = page.responses.length;
+  try {
+    const refusal = await page.evaluate(`(async () => {
+      try { await configure(${JSON.stringify(lines)}); return {rejected:false}; }
+      catch (error) { return {rejected:true,status:error.status,message:error.message}; }
+    })()`);
+    requireRefusal(refusal, diagnostic);
+    equal(page.responses.slice(responses)
+      .filter(row => row.url.endsWith('/api/v1/configure')).map(row => row.status),
+      [400], "The actual configuration request was not exactly one HTTP 400");
+    return refusal.message;
+  } finally {
+    check(readFileSync(config).equals(before), "A refused configuration changed the saved document");
+  }
+}
+
 export async function stageContractTests(page) {
   const config = process.env.CONSOLE_CONFIG;
   const binary = process.env.CONSOLE_BINARY;
@@ -91,6 +122,20 @@ export async function stageContractTests(page) {
       let refused = false;
       try { requireValidation(reply); } catch { refused = true; }
       check(refused, "A false-green validator reply was accepted: " + JSON.stringify(reply));
+    }
+  });
+
+  await test("strict refusal verifier rejects unrelated failures and false refusals", () => {
+    const diagnostic = 'line 1 refused: services ssh port "65536": not a 1-65535 port';
+    const valid = {rejected:true,status:400,message:diagnostic};
+    requireRefusal(valid,diagnostic);
+    for (const reply of [null,{}, {...valid,rejected:false}, {...valid,status:undefined},
+      ...[200,401,403,409,500,503].map(status=>({...valid,status})),
+      {...valid,message:""}, {...valid,message:"the appliance could not be reached"},
+      {...valid,message:"a different input was refused"}, {...valid,output:diagnostic}]) {
+      let rejected = false;
+      try { requireRefusal(reply,diagnostic); } catch { rejected = true; }
+      check(rejected, "An unrelated failure counted as input refusal: "+JSON.stringify(reply));
     }
   });
 
@@ -200,13 +245,16 @@ export async function stageContractTests(page) {
     check(await page.evaluate(`!!document.getElementById(${JSON.stringify(box)}).querySelector('[aria-invalid="true"]')`),
       "Invalid actual field has no associated inline refusal");
     const command=`set ${path} ${key} ${value}`;
-    const reply=await page.evaluate(`configure([${JSON.stringify(command)}])`);
-    check(reply?.ok===false&&/^error:/.test(reply.output),"Backend accepted invalid input: "+JSON.stringify(reply));
+    const diagnostic=path==='services ssh'
+      ? 'line 1 refused: services ssh port "65536": not a 1-65535 port'
+      : 'update: url "javascript:alert(1)" must be an https:// or file:// URL';
+    await refusedConfiguration(page,[command],diagnostic);
     const cli=spawnSync(binary,["configure","--config",config,"--no-apply"],{
       input:command+"\ncommit\n",encoding:"utf8",timeout:15000,env:{...process.env,NO_COLOR:"1"},
     });
     const output=(cli.stdout||"")+(cli.stderr||"");
-    check(!cli.error&&cli.status!==null&&cli.status!==0&&/\berror:/i.test(output),"CLI did not reject invalid input: "+output);
+    const cliDiagnostic=diagnostic.replace(/^line 1 refused: /,'');
+    check(!cli.error&&cli.status!==null&&cli.status!==0&&output.includes('error: '+cliDiagnostic),"CLI did not reject the specific invalid input: "+output);
     equal(readFileSync(config).toString(),before.toString(),"Rejected value modified the saved config");
     negatives.push({path,key,value,ui_refused:true,api_refused:true,cli_refused:true});
   });

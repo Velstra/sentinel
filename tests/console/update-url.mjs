@@ -2,7 +2,7 @@
 import {browser,signIn,sleep,test,check,equal} from './harness.mjs';
 import {click} from './creation.mjs';
 import {fill} from './update-key.mjs';
-import {requireValidation} from './stage-contract.mjs';
+import {requireValidation,refusedConfiguration} from './stage-contract.mjs';
 import {readFileSync,mkdirSync,writeFileSync} from 'node:fs';
 import {spawnSync} from 'node:child_process';
 
@@ -66,8 +66,9 @@ export async function updateUrlTests(){
        &&state.error==='Use an https:// or file:// update URL.'&&state.rect.left>=0&&state.rect.right<=state.width,
        'Inline refusal lost value/focus/association or clipped: '+JSON.stringify(state));
       const lines=['set '+path+' url '+bad,'set '+path+' public-key '+JSON.stringify(PEM)];
-      const reply=await page.evaluate(`configure(${JSON.stringify(lines)})`);
-      check(reply?.ok===false&&reply.output.includes('https:// or file://'),'API did not refuse URL scheme: '+JSON.stringify(reply));
+      const diagnostic=(mode==='default'?'update':'update channel '+(mode==='add'?'qa-new':'qa-existing'))
+       +': url '+JSON.stringify(bad)+' must be an https:// or file:// URL';
+      await refusedConfiguration(page,lines,diagnostic);
       cli(lines,{refused:true});
       equal(readFileSync(process.env.CONSOLE_CONFIG).toString(),seeded.toString(),'Rejected URL mutated saved document');
       const folder=process.env.CONSOLE_SCREENSHOTS;
