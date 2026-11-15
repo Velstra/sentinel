@@ -2329,7 +2329,7 @@ fn show_command(
 /// common provisional management transaction; a trailing `save` is accepted
 /// for CLI-style clients. Only configuration verbs are accepted: operational
 /// commands and arbitrary export paths cannot escape the transaction boundary.
-/// Refusals preserve the whole batch and are returned as `ok: false` plus the
+/// Refusals preserve the whole batch and are returned as HTTP 400 plus the
 /// validation output, with no partial application.
 async fn post_configure(
     State(state): State<Arc<ApiState>>,
@@ -2364,12 +2364,12 @@ async fn post_configure(
                 _ => Err(anyhow!("only set, delete, rollback, commit and save are accepted by the management configuration endpoint")),
             };
             if let Err(error) = result {
-                return Ok(Json(json!({"ok":false,"output":format!("error: line {} refused: {error:#}",index+1)})));
+                return Err(ApiError::bad_request(anyhow!("line {} refused: {error:#}", index + 1)));
             }
         }
         let appliance = match candidate.commit() {
             Ok(value) => value,
-            Err(error) => return Ok(Json(json!({"ok":false,"output":format!("error: {error:#}")}))),
+            Err(error) => return Err(ApiError::bad_request(error)),
         };
         let mut response = if commit { management_replace(&state, &caller, appliance)?.0 } else { json!({}) };
         response["ok"] = json!(true);
@@ -4464,8 +4464,41 @@ virtual-address = ["10.43.0.253"]
                 )
                 .await
                 .unwrap();
-            assert!(body_string(response).await.contains("\"ok\":false"));
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             assert_eq!(Appliance::load(&path).unwrap().system.hostname, "working");
+        }
+    }
+
+    #[tokio::test]
+    async fn configure_invalid_candidate_returns_400_without_saving_or_admission() {
+        let path = seed("working");
+        let before = std::fs::read(&path).unwrap();
+        let app = router(state(path.clone()));
+        for tail in ["", "commit\nsave\n"] {
+            // Both setters are valid CLI paths, but the complete DNAT object
+            // lacks its mandatory zone and port. Exercise candidate validation,
+            // not the numbered per-line refusal branch.
+            let script = format!(
+                "set system hostname partial\nset nat destination incomplete to 10.0.0.5:80\n{tail}"
+            );
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/configure")
+                        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                        .body(Body::from(script))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = body_string(response).await;
+            assert!(body.contains("nat destination"), "{body}");
+            assert!(!body.contains("line 2 refused:"), "{body}");
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert!(crate::safe_apply::status(&path).unwrap()["pending"].is_null());
         }
     }
 

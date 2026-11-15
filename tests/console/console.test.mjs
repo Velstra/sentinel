@@ -11,7 +11,8 @@ import { browser, signIn, sleep, test, check, equal, summary } from "./harness.m
 import { instrument, walkAll, collect, sectionFields } from "./coverage.mjs";
 import { managementTests } from "./management.test.mjs";
 import { fleetTests } from "./fleet.test.mjs";
-import { stageContractTests } from "./stage-contract.mjs";
+import { stageContractTests, refusedConfiguration } from "./stage-contract.mjs";
+import { refusalTests } from "./refusal.mjs";
 
 // Note: this shadows the global `URL` for the whole file — resolve paths next
 // to this file with `fileURLToPath(import.meta.url)`, never with `new URL()`.
@@ -268,16 +269,18 @@ await test("a name with no settings is refused here, not by the appliance", asyn
 });
 
 await test("what a create panel stages is a command the appliance parses", async () => {
-  // Filled in properly, a panel's commands must be ones the CLI accepts. This
-  // sends them with no `commit`, so nothing is applied — a refusal here is the
-  // console's grammar being wrong, not the configuration being invalid.
+  // Complete valid objects must pass both API validation and the installed
+  // CLI's --no-apply commit validation, without changing the saved document.
+  const { requireValidation } = await import(HERE + "stage-contract.mjs");
+  const { spawnSync } = await import("node:child_process");
+  const binary = process.env.CONSOLE_BINARY;
+  check(binary && CONFIG, "The creation contract requires the actual runner config and binary");
+  const before = readFileSync(CONFIG).toString();
   // Some sections need a container named before a rule can go in it — a prefix
   // list is only real once it has a rule, so the name is typed first. `setup`
   // is the click an operator would make before pressing New.
-  // Every panel, filled the way an operator would fill it. The values only have
-  // to parse — nothing is committed — so what this catches is the console
-  // writing a path the CLI does not have, which is a section in which nothing
-  // can be created at all. That was true of prefix lists and route maps.
+  // Every panel is filled with valid values and its real prerequisites. A
+  // generic parser-path check would miss required object references/selectors.
   const cases = [
     ["interfaces", null, "toggleiface", "addifacepanel", "eth9", { "Zone": "lan" }],
     ["routing", "static", "toggleroute", "addroutepanel", "0.0.0.0/0", { "Via": "192.0.2.1" }],
@@ -286,16 +289,19 @@ await test("what a create panel stages is a command the appliance parses", async
     ["groups", null, "togglegroup", "addgrouppanel", "offices", { "Addresses": "10.0.0.0/8" }],
     ["synproxy", null, "togglesyn", "addsynpanel", "8443", { "MSS": "1400" }],
     ["nat", null, "togglesnat", "addsnatpanel", "wan-masq", { "Zone": "wan" }],
-    ["nat", null, "toggleddnat", "adddnatpanel", "web", { "To": "10.0.0.5:80" }],
+    ["nat", null, "toggleddnat", "adddnatpanel", "web",
+      { "Zone": "wan", "Protocol": "tcp", "Port": "8080", "To": "10.0.0.5:80" }],
     ["nat", null, "togglenpt", "addnptpanel", "uplink",
-      { "Internal prefix": "fd00:1::/48", "External prefix": "2001:db8:1::/48" }],
+      { "Interface": "eth1", "Internal prefix": "fd00:1::/48", "External prefix": "2001:db8:1::/48" }],
     ["routing", "bgp", "toggleagg", "addaggpanel", "10.0.0.0/8",
       { "Suppress more specifics": "true" }],
     ["routing", "bgp", "toggleroa", "addroapanel", "192.0.2.0/24", { "Origin AS": "64500" }],
     ["routing", "multicast", "togglemcastif", "addmcastifpanel", "eth0",
       { "Role": "downstream" }],
     ["routing", "vrf", "togglevrf", "addvrfpanel", "tenant-a", { "Routing table id": "100" }],
-    ["lb", null, "togglelb", "addlbpanel", "web", { "Virtual address": "198.51.100.9" }],
+    ["lb", null, "togglelb", "addlbpanel", "web",
+      { "Zone": "wan", "Virtual address": "198.51.100.9", "Protocol": "tcp",
+        "Port": "8443", "Backends": "10.0.0.5:8080" }],
     ["routing", "bgp", "togglebgp", "addbgppanel", "192.0.2.7", { "Remote AS": "65010" }],
     ["routepolicy", "prefix", "togglepl", "addplpanel", "10", { "Prefix": "10.0.0.0/8" },
       `document.getElementById("plnew").value = "customers"; await refreshRoutePolicy();`],
@@ -304,25 +310,37 @@ await test("what a create panel stages is a command the appliance parses", async
       `document.getElementById("rmnew").value = "to-transit"; await refreshRoutePolicy();`],
     ["routepolicy", "pbr", "togglepbr", "addpbrpanel", "guests-out",
       { "Routing table": "100", "Source": "10.9.0.0/24" }],
-    ["wan", null, "togglewan", "addwanpanel", "wan0", { "Gateway": "192.0.2.1" }],
+    ["wan", null, "togglewan", "addwanpanel", "eth1", { "Gateway": "192.0.2.1" }],
     // A policy names an uplink, and the field offers the uplinks this box has
     // rather than asking for one to be spelled from memory — so there has to be
     // one to offer. Staged, not committed: what is staged is configuration as
     // far as every picker in this console is concerned.
     ["wan", null, "togglewanpolicy", "addwanpolicypanel", "voip",
-      { "Preferred uplinks": "wan0" },
-      `stage("Uplink wan0", ["set multiwan uplink wan0 gateway 192.0.2.1"]);
+      { "Preferred uplinks": "eth1" },
+      `stage("Uplink eth1", ["set multiwan uplink eth1 gateway 192.0.2.1"]);
        await refresh();`],
     ["ipsec", null, "toggleipsec", "addipsecpanel", "branch",
-      { "Remote address": "203.0.113.9", "Local address": "192.0.2.2" }],
+      { "Remote address": "203.0.113.9", "Local address": "192.0.2.2",
+        "Local subnet": "10.0.0.0/24", "Remote subnet": "10.10.0.0/24",
+        "Pre-shared key": "fixture-preshared-key" }],
     ["wireguard", null, "togglewg", "addwgpanel", "wg1",
       { "Listen port": "51821",
         "Private key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=" }],
     ["wireguard", null, "togglewgpeer", "addwgpeerpanel",
       "0000000000000000000000000000000000000000000=", { "Allowed IPs": "10.9.0.2/32" }],
-    ["openconnect", null, "toggleocuser", "addocuserpanel", "alice", { "Password": "hunter2hunter2" }],
+    ["openconnect", null, "toggleocuser", "addocuserpanel", "alice", { "Password": "hunter2hunter2" },
+      `stage("OpenConnect prerequisites", [
+         "set pki ca vpn-root common-name VPN-Test-CA",
+         "set pki certificate vpn-server ca vpn-root",
+         "set pki certificate vpn-server common-name vpn.example.net",
+         "set vpn openconnect certificate vpn-server",
+         "set vpn openconnect pool 10.99.0.0/24"]);
+       await refresh();`],
     ["pki", null, "toggleca", "addcapanel", "internal", { "Common name": "Internal CA" }],
-    ["certs", null, "togglecert", "addcertpanel", "web", { "Common name": "fw.example.net" }],
+    ["certs", null, "togglecert", "addcertpanel", "web",
+      { "Signed by": "internal", "Common name": "fw.example.net" },
+      `stage("Certificate authority", ["set pki ca internal common-name Internal-CA"]);
+       await refresh();`],
     ["users", null, "toggleuser", "adduserpanel", "vera", { "Password": "a-good-password" }],
     ["users", null, "toggleadmingroup", "addadmingrouppanel", "operators", {}],
     ["users", null, "toggleradius", "addradiuspanel", "10.0.0.50",
@@ -335,7 +353,8 @@ await test("what a create panel stages is a command the appliance parses", async
       { "Virtual addresses": "192.0.2.10", "Interface": "eth1", "Virtual router ID": "10" }],
     ["services", "publishing", "togglerp", "addrppanel", "web",
       { "Backends": "10.0.0.5:8080" }],
-    ["services", "publishing", "togglebr", "addbrpanel", "wol", { "UDP port": "9" }],
+    ["services", "publishing", "togglebr", "addbrpanel", "wol",
+      { "UDP port": "9", "Interfaces": "eth0,eth1" }],
     ["services", "notification", "togglesl", "addslpanel", "logs.example.net", { "Port": "514" }],
   ];
 
@@ -385,18 +404,30 @@ await test("what a create panel stages is a command the appliance parses", async
       if (!cmds.length) return { error: "nothing staged: " + (box.querySelector(".formerr") || {}).textContent };
       // Validate only — the same commands, with no commit, so nothing applies.
       const reply = await configure(cmds);
-      return { staged: cmds, output: reply.output };
+      return { staged: cmds, reply };
     })()`);
     } catch (e) {
       bad.push(`${panel}: ${e.message} (after ${Math.round((Date.now() - started) / 1000)}s)`);
       continue;
     }
     if (r.error) { bad.push(`${panel}: ${r.error}`); continue; }
-    if (/unknown set path|unknown delete path/.test(r.output || "")) {
-      bad.push(`${panel}: the appliance does not know that path — ${r.staged.join("; ")}`);
+    try {
+      requireValidation(r.reply);
+      const cli = spawnSync(binary, ["configure", "--config", CONFIG, "--no-apply"], {
+        input: r.staged.join("\n") + "\ncommit\n", encoding: "utf8", timeout: 15000,
+        env: { ...process.env, NO_COLOR: "1" },
+      });
+      const output = (cli.stdout || "") + (cli.stderr || "");
+      check(!cli.error && cli.status === 0 && output.includes("commit ok (validated)")
+        && !/\berror:/i.test(output), "Installed CLI refused: " + output.slice(-1200));
+      equal(readFileSync(CONFIG).toString(), before, "Creation validation changed the saved document");
+    } catch (error) {
+      bad.push(`${panel}: ${error.message}`);
     }
   }
+  await page.evaluate("staged = []; dirty.clear(); renderStaged()");
   equal(bad, [], "create panels whose commands the appliance rejects");
+  console.log(`       ${cases.length} creation panels accepted by API and installed CLI; saved configuration unchanged`);
 });
 
 // --- editing and saving -----------------------------------------------------
@@ -493,17 +524,21 @@ await test("connection timeouts apply, reject invalid values, and reset to defau
     check(saved.includes("[firewall.conntrack]"), "the timeouts were not persisted");
     for (const [key, value] of Object.entries(values)) check(saved.includes(`${key} = ${value}`), `missing persisted ${key}`);
   }
-  const invalid = await page.evaluate(`(async () => {
+  const invalidCommands = await page.evaluate(`(async () => {
     await refresh();
     const box = document.getElementById("conntrackform");
     box.querySelector("input").value = "0";
     [...box.querySelectorAll("button")].find((b) => b.textContent.startsWith("Stage")).click();
-    const reply = await configure(stagedCommands());
+    return stagedCommands();
+  })()`);
+  equal(invalidCommands,["set firewall global conntrack tcp-syn 0"],"The actual timeout form did not stage its invalid test input");
+  await refusedConfiguration(page,invalidCommands,
+    "line 1 refused: firewall conntrack tcp-syn: must be 1..=604800 seconds");
+  const invalid = await page.evaluate(`(async () => {
     staged = []; dirty.clear(); renderStaged();
     await refresh();
-    return { output: reply.output, value: document.getElementById("conntrackform").querySelector("input").value };
+    return { value: document.getElementById("conntrackform").querySelector("input").value };
   })()`);
-  check(/1.*604800/.test(invalid.output), "the server accepted an invalid timeout: " + invalid.output);
   equal(invalid.value, "45", "an invalid timeout replaced the saved value");
   const reset = await page.evaluate(`(async () => {
     const box = document.getElementById("conntrackform");
@@ -636,35 +671,50 @@ await test("the independent witness edits preserve its derived key", async () =>
 });
 
 await test("every setting the global firewall posture offers is one the appliance has", async () => {
+  const { requireValidation } = await import(HERE + "stage-contract.mjs");
+  const { spawnSync } = await import("node:child_process");
+  const binary = process.env.CONSOLE_BINARY;
+  check(binary && CONFIG, "The posture contract requires the actual runner config and binary");
+  const before = readFileSync(CONFIG).toString();
   const r = await page.evaluate(`(async () => {
     const wait = (ms) => new Promise((r) => setTimeout(r, ms || 400));
     staged = []; dirty.clear(); renderStaged();
     view = "zones"; panel = null; await refresh(); await wait(600);
     const box = document.getElementById("globalform");
-    // Every field filled, so every one of them writes a command. What the value
-    // is does not matter — this is asking whether the *path* exists.
-    for (const w of box.querySelectorAll("select, input")) {
-      if (w.tagName === "SELECT") {
-        const opt = [...w.options].find((o) => o.value);
-        if (opt) w.value = opt.value;
-      } else if (w.type === "checkbox") {
-        w.checked = true;
-      } else {
-        w.value = "probe";
-      }
+    // Use valid, nondefault values for every offered key; a country code and
+    // source prefix are not interchangeable generic text inputs.
+    const values = { "default-action": "accept", stateful: "false",
+      "block-icmp": "true", log: "true", "source-validation": "loose",
+      "geoip-block": "CN,RU", block: "198.51.100.0/24", "fail-closed": "false" };
+    for (const [key, label] of GLOBAL_POSTURE) {
+      if (!(key in values)) throw new Error("No valid posture fixture for " + key);
+      const field = [...box.querySelectorAll(".field")]
+        .find(f => f.firstElementChild?.firstChild?.textContent.trim() === label);
+      const control = field?.querySelector(".pick, .switch") || field?.querySelector("input, select");
+      if (!control) throw new Error("No posture control for " + key);
+      control.value = values[key];
     }
     [...box.querySelectorAll("button")].find((b) => b.textContent.startsWith("Stage")).click();
     await wait(400);
     const cmds = stagedCommands();
-    // No commit, so nothing is applied and the appliance answers only about
-    // whether it knows what it was asked for.
-    const reply = cmds.length ? await configure(cmds) : { output: "" };
+    const reply = cmds.length ? await configure(cmds) : {};
     staged = []; dirty.clear(); renderStaged();
-    return { cmds, output: reply.output };
+    return { cmds, reply, keys: GLOBAL_POSTURE.map(([key]) => key) };
   })()`);
-  check(r.cmds.length > 3, `the mask staged almost nothing: ${JSON.stringify(r.cmds)}`);
-  check(!/unknown set path/.test(r.output || ""),
-    `the mask offers a setting the appliance does not have:\n  ${r.cmds.join("\n  ")}`);
+  for (const key of r.keys) {
+    check(r.cmds.some(command => command.startsWith("set firewall global " + key + " ")),
+      `the posture field ${key} did not stage a real command: ${JSON.stringify(r.cmds)}`);
+  }
+  requireValidation(r.reply);
+  const cli = spawnSync(binary, ["configure", "--config", CONFIG, "--no-apply"], {
+    input: r.cmds.join("\n") + "\ncommit\n", encoding: "utf8", timeout: 15000,
+    env: { ...process.env, NO_COLOR: "1" },
+  });
+  const output = (cli.stdout || "") + (cli.stderr || "");
+  check(!cli.error && cli.status === 0 && output.includes("commit ok (validated)")
+    && !/\berror:/i.test(output), "Installed CLI refused posture: " + output.slice(-1200));
+  equal(readFileSync(CONFIG).toString(), before, "Posture validation changed the saved document");
+  console.log(`       ${r.keys.length} global posture controls accepted by API and installed CLI; saved configuration unchanged`);
 });
 
 await test("a refused batch preserves every staged change without partial application", async () => {
@@ -1732,4 +1782,5 @@ await test("the console exposes every inventoried CLI field (not a behavioral ce
 await test("nothing threw during the whole run", () => noThrows("the console threw"));
 
 page.close();
+await refusalTests();
 process.exit(summary() ? 1 : 0);
