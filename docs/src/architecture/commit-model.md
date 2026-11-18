@@ -15,9 +15,16 @@ rebuild, no reboot, fully airgapped.
 |---|---|---|
 | `commit` | apply the candidate to the **running** system, live | no, on its own |
 | `save` | persist the candidate to `/var/lib/sentinel/appliance.toml` | yes |
-| `commit save` | both — apply live **and** persist | yes |
+| `commit`, then `save` | apply live, then persist | yes |
 
 This mirrors VyOS in spirit: `commit` makes it live, `save` makes it durable.
+
+New live candidates, operational `show` commands and management API reads use
+the last successfully applied snapshot. An open candidate cannot commit or save
+over another operator's newer snapshot: discard and reload before retrying.
+`--no-apply` edits only the explicitly named file. A piped CLI batch stops on
+its first refusal; earlier successful commits are not undone. API configuration
+scripts validate the entire batch before starting their provisional transaction.
 
 ## What a `commit` reconciles
 
@@ -27,7 +34,7 @@ edited config in one apply. Representative mechanisms:
 | Area | Mechanism on `commit` |
 |---|---|
 | Firewall rules / zones / NAT | `sentinel compile` → `/run/sentinel/velstra.toml` → reload `velstra.service` |
-| Dynamic routing (BGP, static) | `wren` compile → `/run/sentinel/wren.toml` → reload `wren.service` |
+| Routing | compile Wren config; static-only changes reload without replacing the process; other engine changes restart |
 | Hostname | `hostname <name>` (plain `sethostname(2)`) — **not** `hostnamectl` (NixOS blocks it) |
 | Interface addressing | write `/run/systemd/network/10-sentinel-<iface>.network` → `networkctl reload`/`reconfigure` |
 | VPN | WireGuard `.netdev`/`.network`, IPsec (swanctl/charon), OpenConnect (ocserv) |
@@ -39,9 +46,12 @@ In all it drives roughly thirty co-services plus the data plane. Every one
 touches only **running services** and the single persistent config partition —
 the OS image is fixed.
 
-The **same apply path** backs three entry points: the interactive `commit`, the
-REST `PUT /api/v1/config`, and the two-stage boot reconcile below. They share one
-compiler and one apply function, so there is no CLI-vs-API drift.
+The interactive CLI, REST API and boot reconcile share the configuration model
+and lower-level compiler/apply code. They do **not** yet share one transaction
+engine or persistence contract. CLI `commit` applies without saving; a console/API
+configuration change uses a journaled provisional transaction and persists its
+candidate. Follow the confirmation behavior of the surface you are using;
+shared compiler code alone does not establish identical recovery semantics.
 
 ## Atomicity and rollback
 
@@ -102,6 +112,12 @@ Edits are written by the admin (wheel-group, so no root needed for the file);
 `sentinel` escalates the live actions (`hostname`, `networkctl`, `systemctl`)
 through **passwordless sudo**, with every tool resolved to an absolute store path
 (`SENTINEL_*_BIN`) so neither `$PATH` nor sudo's `secure_path` can miss it.
+
+For configured local logins, only a `read-write` group grants this administrator
+access. Read-only and ordinary ungrouped accounts do not receive `wheel`/sudo.
+The ungrouped built-in `admin` is the explicit bootstrap exception. Removing or
+demoting a managed account terminates its existing login sessions and user jobs;
+use another administrator or the root recovery console for that change.
 
 ## Verifying it
 

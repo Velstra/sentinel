@@ -1,65 +1,54 @@
 # Secure Boot
 
-The whole boot chain is signed at **image-build time**, and the image ships the
-PK/KEK/db enrollment payloads so a firmware in setup mode can be locked down to
-trust only Sentinel's keys.
+Sentinel's development image signs systemd-boot and its Unified Kernel Image
+(UKI) and carries PK/KEK/db enrollment payloads. Firmware must actually enroll
+and enforce the intended trust before those signatures protect boot.
 
-## Why build-time `sbsign`, not lanzaboote
+**The public build's default keys are demonstration keys generated in a Nix
+derivation. Their private halves are readable in the Nix store. They are not a
+production root of trust, and the image must not be advertised as one.**
 
-[lanzaboote](https://github.com/nix-community/lanzaboote) is a
-`nixos-rebuild`/activation-time tool — it signs during system activation on a
-running machine. That is the wrong fit for an **offline repart image** that is
-never "activated" on a builder. So Sentinel signs the finished artifacts directly
-with `sbsign`. All tooling (`sbsigntool`, `efitools`, `virt-firmware`, `openssl`)
-is already in nixpkgs — no extra flake input.
+## Development build
 
-## What gets signed, and how
+The shared image builder in `nix/appliance-image.nix`, selected by
+`nix/image.nix`, generates demo PK/KEK/db material, signs systemd-boot and places
+enrollment payloads under `/loader/keys/sentinel/`. The final signing derivation
+signs the roothash-bearing UKI in the completed ESP. `sentinel-image` and the
+installer ISO consume that signed artifact.
 
-`nix/image.nix`:
+UKI signing preserves its embedded dm-verity root hash and kernel command line.
+Boot counting renames the UKI entry; it does not replace the signed bytes. See
+[verified boot](verified-boot.md) and [A/B slots](ab-updates.md).
 
-1. **Generates self-signed PK/KEK/db** (`sbKeys`, openssl, build-time cached).
-   These are a **demo default** — a real deployment overrides them with the
-   operator's own keys so future updates stay signed by a key the firmware trusts.
-2. **Signs systemd-boot** (`signedSdBoot`) with the db key and bakes it into the
-   ESP at `/EFI/BOOT/BOOTX64.EFI` and `/EFI/systemd/`.
-3. **Bakes the enrollment payloads** — PK/KEK/db `.auth` (efitools) — under
-   `/loader/keys/sentinel/` so an operator can enroll them from the firmware
-   setup screen.
-4. **Signs the UKI post-build** via `system.build.finalImageSigned`: a derivation
-   that `mtools`-edits the ESP at its byte offset (`sfdisk` finds the ESP start)
-   to `sbsign` `sentinel-a+3.efi` **in place**.
+## Production boundary
 
-### Why the UKI is signed *after* the build
+`system.build.sentinelSbKeys` exposes the demonstration material; it is not a
+safe external-key provisioning API. The public module does not yet provide a
+complete supported production-key input/custody/rotation workflow. Do not fix
+that by copying a real PK, KEK or db private key into the repository, a Nix
+source path, a derivation or the resulting image.
 
-The verityStore rebuilds the UKI with an internal `ukify` call we can't hand a
-signing tool to, and `ukify` + `systemd-sbsign` refuse to sign it
-(`cannot verify existing PE binaries`). So `finalImageSigned` opens the finished
-image and signs the UKI directly with `sbsign`. This is safe because:
+A production workflow must sign outside the world-readable store, protect the
+private keys, ship only public enrollment material and signed artifacts, and
+test key rotation, revocation and recovery. Secure Boot identities and OTA
+manifest-signing identities have different purposes; one does not substitute
+for the other. The exact trust configuration and signed image need their own
+acceptance evidence before release.
 
-- signing **doesn't touch** the embedded verity root hash or kernel cmdline, and
-- [boot counting](ab-updates.md) only **renames** the UKI file (`+3` → `+2` …),
+Do not enroll development keys on a production appliance or replace existing
+firmware trust without a recovery plan.
 
-so the signature stays valid across both verity checks and boot-count
-decrements. `finalImageSigned` is what `.#sentinel-image` and the ISO ship.
+## Verify test enforcement
 
-## The keys are demo keys — override them for production
-
-`system.build.sentinelSbKeys` exposes the generated keys. They exist so the build
-and the test are self-contained; **do not** ship the demo keys to real hardware
-as your root of trust. A production build replaces `sbKeys` with the operator's
-PK/KEK/db (kept out of the repo — `.gitignore` blocks `*.key`/`*.crt`).
-
-## Verifying enforcement
-
-The `secureboot` test builds an OVMF VARS file with our PK/KEK/db **enrolled**
-(`virt-fw-vars`) and boots the **signed** image under enforcing Secure Boot,
-asserting it reaches multi-user in a single boot:
-
-```shell
+```sh
 nix build .#checks.x86_64-linux.secureboot -L
-# kernel log shows: "EFI stub: UEFI Secure Boot is enabled"
-# bootctl status:   "Secure Boot: enabled"
 ```
 
-It uses pre-enrolled vars and a single boot (no in-test reboot), which sidesteps
-the OVMF `machine.reboot()` hang in the harness.
+This check uses OVMF with the **test** PK/KEK/db enrolled and checks that the
+signed image boots under enforcement. It proves that test chain, not production
+key custody or every firmware implementation. Inspect the guest's
+`bootctl status` and kernel log for enforcement; a signed file alone does not
+prove Secure Boot is enabled.
+
+For counted failures, actual reboot and rollback behavior, run the separate
+[boot/fallback checks](../reference/tests.md#run-a-real-vm-check).

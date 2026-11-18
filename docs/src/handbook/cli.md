@@ -111,7 +111,7 @@ Outside of edits, `sentinel show …` (or `run show …` inside a session, or ju
 | `show vpn ipsec [sas\|connections]` | IPsec security associations / loaded connections. |
 | `show pki` | Local CAs + issued certificates (with expiry). |
 | `show arp` | The ARP / neighbour table. |
-| `show configuration` | The saved configuration, in config syntax. |
+| `show configuration` | The active configuration, in config syntax (saved file before the first live commit). |
 | `show log [velstra\|wren]` | Recent service log. |
 | `show version` | Software versions, which image is running (verity root hash + slot), and whether the clock is synchronised. |
 | `report --controller <url>` | Hand a Velstra controller this box's counters (`--dry-run` prints them instead). |

@@ -1,8 +1,9 @@
 # Updating (A/B + rollback)
 
 OS updates are **A/B**: a new image is written to the inactive store slot and the
-bootloader is switched to it. If the new slot fails to boot cleanly, systemd-boot
-rolls back automatically. The architecture is in
+bootloader is switched to it. Automatic fallback requires an intact, previously
+blessed slot; an unprovisioned or broken first installation has no such guarantee.
+The architecture is in
 [A/B update slots](../architecture/ab-updates.md); this is the operator view.
 
 ## Signed channel: local CLI or Web UI
@@ -35,24 +36,45 @@ before rebooting one member at a time. There is no trust/downgrade override.
 Native Enterprise `update check` uses this worker too; the former unreviewed
 `update install` path is refused. Off-box/no-apply consoles cannot run OTA jobs.
 
-## Community local-image updates
+### Expiry and replay protection
+
+Online offers must carry signed channel, architecture, sequence and validity
+timestamps. Metadata expires within 14 days; expired or incorrectly scoped offers
+and issue times beyond the five-minute clock-skew allowance are refused.
+Synchronize the appliance clock before checking for
+updates. A check persists its highest accepted sequence and clock observation in
+`/var/lib/sentinel/update-trust`; lower sequences, changed bytes at the same
+sequence, unauthorized signing-key changes and substantial clock rollback fail
+closed. Stage rechecks the exact offer before writing the inactive slot.
+
+Do not delete this directory to clear an error: that would discard rollback
+protection. Repair the clock or obtain fresh, correctly signed metadata instead.
+A missing or corrupt existing ledger requires investigated recovery, not an
+automatic reset. Signing-key rotation is not yet implemented by this ledger.
+Older appliance versions without this validation must first be upgraded; new
+metadata alone cannot protect an old reader. Offline media and automatic boot
+fallback use their separate policies below.
+
+## Community offline/local-image updates
+
+This section applies only to the Community RAW-image writer. Native Enterprise
+images refuse this writer, including `--allow-unsigned`; use the reviewed
+channel workflow above. An offline proof authenticates operator-selected bytes,
+not their online freshness or subscription entitlement.
 
 ```shell
 # from a new raw image (built with `nix build .#sentinel-image`) plus its
 # signed digest velstra-sentinel.raw.sha256(.sig) beside it
-sentinel update /path/to/velstra-sentinel.raw --commit
+sudo sentinel update /path/to/velstra-sentinel.raw --commit
 
 # from a USB stick the image was dd'd onto, with the release's proof from
 # another medium (a signed manifest, or the signed digest)
-sentinel update /dev/sdX --commit --signature /mnt/release/manifest.json.sig
-
-# a trusted device as given, without verification (see --allow-unsigned)
-sentinel update /dev/sdX --commit --allow-unsigned
+sudo sentinel update /dev/sdX --commit --signature /mnt/release/manifest.json.sig
 ```
 
-What happens:
+For a signed Community local update:
 
-1. the image's signature is **verified** (see below) unless `--allow-unsigned`;
+1. the image's signature is **verified** (see below);
 2. a release older than the running one is **refused** unless
    `--allow-downgrade` (when the proof states a version);
 3. the **active** slot is detected (via `/dev/mapper/usr`);
@@ -61,7 +83,7 @@ What happens:
 5. the new image's store + verity are written to the **inactive** slot from that
    same open file, re-hashed on the way, so an image that changes underneath
    (a rewritten file, a swapped stick) is refused before the slot is activated;
-6. that slot is re-typed to the verity GPT GUIDs;
+6. that slot receives the source image's verity partition types and GUIDs;
 7. the new UKI is installed as `sentinel-<inactive>+3.efi` with **3 boot tries**;
 8. `loader.conf` prefers the new slot with `preferred sentinel-<inactive>*`,
    retaining `default sentinel-*` so an exhausted candidate can fall back.
@@ -77,25 +99,26 @@ A hard per-slot `default` is unsafe here: systemd-boot 260 honors that selection
 even when its boot counter reaches zero.
 
 Without `--commit`, the plan is printed but nothing is written.
+An image carrying the active slot's verity/store GUIDs is refused before any
+write, including an unsigned source. Do not re-seal the booted medium. Unplug a
+USB donor before reboot: it now shares the candidate's GUIDs and could otherwise
+be mistaken for the installed slot.
 
 ### Local images are signature-checked by default
 
-A local `sentinel update <image>` now **verifies the image before writing it** —
-the same authenticity gate the channel path applies, so a local install is no
-longer a way around it. It looks for a detached Ed25519 proof beside the image
-(`<image>.sha256.sig`, else `<image>.sig`), or takes the one named by
-`--signature <file>`, and verifies it against a pinned release key, tried in
-order:
+A local `sentinel update <image>` verifies an Ed25519 proof before writing. It
+uses `<image>.sha256` and its detached signature when the digest file exists;
+otherwise it uses `<image>.sig`. An explicit proof can be named by
+`--signature <file>`. The updater tries pinned release keys in this order:
 
 1. `--pubkey <pem|file:path>` on the command line;
 2. the saved `[update]` channel's `public-key`;
 3. a release key baked into the image at `/etc/sentinel/release.pem`.
 
-If no key is available, or the signature is missing or does not verify, the write
-is **refused** and nothing is touched. For multi-GiB appliance images, sign a
-small digest file instead: OpenSSL's direct Ed25519 operation buffers its input
-and can fail for large files. The digest file contains only the 64 hex digits
-(optionally followed by a newline), not a filename.
+Missing keys, missing signatures and invalid proofs fail closed. Publishers
+should sign a small digest for multi-GiB images: direct Ed25519 signing buffers
+the entire input. The digest file contains only 64 hex digits and an optional
+newline, not a filename.
 
 ```shell
 sha256sum velstra-sentinel.raw | cut -d ' ' -f 1 > velstra-sentinel.raw.sha256
@@ -103,17 +126,10 @@ openssl pkeyutl -sign -inkey release-priv.pem -rawin \
   -in velstra-sentinel.raw.sha256 -out velstra-sentinel.raw.sha256.sig
 ```
 
-The updater verifies the signed digest and then hashes the entire image. A
-supplied digest takes precedence; invalid or missing signatures fail closed,
-even if a raw signature also exists. Older images still accept direct signatures:
-
-```shell
-openssl pkeyutl -sign -inkey release-priv.pem -rawin \
-  -in velstra-sentinel.raw -out velstra-sentinel.raw.sig
-```
-
-A raw signature is verified on a private copy of the image, and that copy is
-what is installed.
+The updater verifies the signed digest, then hashes the entire image. A bad
+digest proof never falls back to a raw signature. Legacy direct image signatures
+are supported for regular files: a private copy is verified and installed.
+Signing belongs on the publisher's protected machine, not on customer nodes.
 
 ### USB sticks and other block devices
 
@@ -131,40 +147,30 @@ The device is read up to the end of the image its own partition table describes
 
 ### Downgrades
 
-Every old release stays validly signed forever, so a signature alone cannot stop
-a mirror — or anybody in the path — from serving an old manifest and putting a
-box back onto a release with known holes. `update install`, and a local update
-proven by a signed manifest, therefore refuse a release whose version is lower
-than the running one (`show version`, `sentinel:` line), comparing versions the
-semver way (`1.0.0-rc.1` < `1.0.0` < `1.0.1` < `1.10.0`). The same version is
-allowed — that is a re-install. `--allow-downgrade` installs an older release
-deliberately and says so; `update check` reports an older release as "NOT an
-update". A signed digest or raw signature states no version, so for those the
-updater says it could not check rather than refusing.
+An online offer and an offline signed manifest are checked against the running
+**OS image release**, not just the Sentinel package version. Older releases and
+unusable image version identities are refused. Equal versions may pass the
+version check, but identical active partition GUIDs still cannot be staged.
 
-What this does not give is **freeze** protection: a mirror that keeps serving
-the current (or an older) manifest hides newer releases, and nothing signed says
-how old a manifest may be. The channel protocol carries no expiry yet.
+The reviewed CLI/UI workflow has no downgrade override. Only the legacy
+Community writer accepts `--allow-downgrade` as an explicit operator exception.
+A signed digest or raw signature contains no release version and therefore
+cannot enforce a version floor; use a signed manifest when that is required.
+Offline proofs do not consult the online expiry/sequence ledger. Online offers,
+including `file://` channel directories, must satisfy
+[expiry and replay protection](#expiry-and-replay-protection).
 
-Manifests may carry `"product": "velstra-sentinel"`. When present it must match,
-so a manifest signed for another product by a shared key is refused; manifests
-signed before the field existed are still accepted (and are older releases, so
-the downgrade check covers their replay).
+An optional manifest `product` must equal `velstra-sentinel` when present.
+Legacy offline manifests may omit it; do not treat that compatibility as proof
+of a current online offer.
 
-```json
-{"version":"1.1.0","image":"velstra-sentinel.raw","sha256":"…","product":"velstra-sentinel"}
-```
+`--allow-unsigned` deliberately skips local signature verification on Community
+only. It does **not** bypass bootloader, identity or identical-image safeguards,
+does not permit re-sealing the active image, and is not an OTA trust override.
 
-> **`--allow-unsigned` is the trusted-operator escape hatch.** A re-seal from the
-> booted medium or a trusted block device with no proof at hand; pass
-> `--allow-unsigned` to write it exactly as given. It is loud and logged — never
-> silent — so it can't be mistaken for a verified update.
+## Configure a signed channel
 
-## Signed updates (`update check` / `update install`)
-
-The **channel** updater refuses any image whose release manifest isn't signed by
-a key you have pinned, and any release older than the running one (see
-Downgrades above). Pin the channel in config (roadmap C13):
+Pin a channel URL and its Ed25519 signing key in the saved local configuration:
 
 ```shell
 configure
@@ -174,8 +180,9 @@ commit
 save
 ```
 
-- `url` is the channel base — an `https://` (or `file://` for an offline
-  mirror) directory holding the signed `manifest.json` and the images it names.
+- `url` is the channel base: an `https://` or local `file://` directory holding
+  `release.json` (or the compatibility manifest/signature pair) and its images.
+  Local channel directories still require signed online freshness.
 - `public-key` is the pinned Ed25519 release-signing key, PEM. `file:<path>`
   reads it from disk (so the key can live in the immutable image rather than the
   config); an inline PEM also works.
@@ -186,26 +193,18 @@ save
 - The whole `[update]` section is local-only: a fleet controller cannot change
   it (see the fleet documentation).
 
-Both fields are required — `commit` rejects a half-specified channel. With a
-channel pinned:
-
-```shell
-sentinel update check            # fetch + verify the manifest, report the version
-sentinel update install --commit # re-verify, then write the inactive A/B slot
-```
-
-`check` fetches the manifest, verifies its detached signature against the pinned
-`public-key`, and only then trusts the version + image digest it names.
-`install` re-verifies the signature **and** the image's SHA-256 before writing
-anything — the authenticity gate in front of the verified-boot slot switch
-below. An unsigned or wrong-key manifest is refused; no slot is touched.
+Both fields are required. Use `sudo sentinel system update check --wait`, review
+the exact offer, then Stage as above. Native Enterprise `sentinel update check`
+is an alias for that worker; `sentinel update install` is refused. Community
+retains a legacy `update check`/`install` adapter, but that is not the reviewed
+offer/job workflow and should not be used as an unattended replacement for it.
+No channel path accepts an unsigned release or bypasses online freshness.
 
 ## Named channels and subscriptions
 
-A box can know several channels at once — a community channel anyone can use,
-and a subscription channel carrying **tested, delayed-stability images**. That
-is the whole commercial model: the code is the same and open, what a
-subscription buys is verification work, never withheld features.
+A box can hold several named channels, each with its own URL, signing key and
+optional subscription credential. A channel name is not proof of certification;
+review the release's verification evidence.
 
 ```shell
 configure
@@ -219,71 +218,62 @@ commit
 save
 ```
 
-- **Each channel has its own `public-key`, on purpose.** A channel is only as
-  trustworthy as the key that vouches for it: the enterprise channel's releases
-  are signed by a different key than the community channel's, so trusting one
-  never means trusting the other. `url` and `public-key` are required per
-  channel; `https://` only (or `file://` for an air-gapped mirror).
-- **`set update channel <name>`** with nothing after the name selects which
-  channel `update check`/`install` use. A selection that names no defined
-  channel is refused at `commit`, not discovered during an incident.
-- The single-channel form above (`set update url …`) keeps working unchanged —
-  it is the unnamed *default* channel, and a box configured before named
-  channels existed loses nothing on upgrade.
-- **`subscription-key` is a secret.** It is sent to the channel server as a
-  bearer token, redacted by the read API, and masked everywhere it is shown —
-  `show subscription` prints only its last four characters. (One deliberate
-  exception: `show configuration` prints it in full, like every other secret in
-  the config document, because that document is what gets replayed onto a
-  second appliance and a masked value replayed is a corrupted config.)
+- Pin `url` and `public-key` independently for each channel. Reusing a signing
+  key shares that trust; the channel name does not create a separate identity.
+- `set update channel <name>` selects an existing channel. The single-channel
+  configuration above remains the unnamed `default` channel.
+- `subscription-key` is a bearer secret. The read API redacts it and
+  `show subscription` masks all but its last four characters. Saved configuration
+  and local `show configuration` contain the full credential: protect them.
 
 ### What an expired subscription does — and does not — do
 
-**An expired or rejected subscription never disables the appliance.** The box
-keeps routing, keeps filtering, keeps its configuration, and keeps serving its
-console. The one and only consequence is that *new images from that channel*
-are unavailable: the channel server answers 401/403, and `update check` reports
-it plainly —
+An expired or rejected subscription prevents fetching new images from that
+channel; it does not disable routing, filtering, saved configuration or the
+console. Authentication failures are reported, not treated as unsigned offers.
 
-```
-channel "enterprise": this subscription is not valid for this channel (HTTP 401).
-The appliance keeps running unchanged — only new images from this channel are
-unavailable. Renew the subscription with your vendor, or correct the key …
-```
-
-There is no phone-home timer, no nag screen, no degraded data plane. A firewall
-whose vendor relationship lapses is still a firewall.
+Subscription expiry is not signed **metadata expiry**. An entitled customer
+still needs a fresh, scoped offer; a metadata refusal never disables the
+running data plane either.
 
 ### `show subscription`
 
-The state, as facts this box holds:
-
-```
-channels:
-  community
-  enterprise (active)
-active channel: enterprise
-url:            https://updates.velstra.example/enterprise
-subscription:   key configured (ends …a1b2)
-last check:     2026-08-24 10:12:03 UTC — release 0.4.0 available
-expiry:         not reported by the channel server — nothing is assumed
-```
-
-`last check` is whatever the most recent `update check`/`install` actually
-said — never a fresh fetch (a `show` must not be the thing that talks to the
-internet). Expiry is shown **only if the server reports one**; today the
-channel protocol carries no expiry, so the honest answer is "not reported",
-not a locally computed countdown.
+This legacy view reads saved configuration and the legacy adapter's last-check
+record; it performs no fresh network request. Use `sentinel system status` for
+the durable worker's offers and jobs. The displayed `expiry: not reported`
+means **subscription entitlement expiry is not provided by this view**. It says
+nothing about the mandatory expiry timestamp in signed online metadata; do not
+infer a license expiry date from a release's validity window.
 
 ## The rollback guarantee
 
-The new slot boots with `+3` tries. A clean boot (no failed units) is **blessed**
-permanent. If it fails three times, systemd-boot marks it bad and boots the
-**previous** slot — which is untouched, because the update only ever wrote the
-inactive one. So a bad update self-heals without intervention.
+The candidate starts with `+3` tries. The product health gate verifies saved
+configuration against live hardware, reconciled addresses, configured services,
+dataplane readiness and XDP attachment. Only a successful assessment plus the
+no-failed-units gate allows blessing; service activation alone is not success.
 
-To roll back deliberately, point `default` back at the other slot from the
-systemd-boot menu (or re-run an update with the known-good image).
+When a candidate fails assessment and an intact, blessed previous slot exists,
+bounded retries let systemd-boot exhaust it and select the good slot. This is
+not a guarantee against every firmware, storage or kernel hang. A persisted
+configuration is shared by both slots: falling back does not automatically
+repair a bad configuration or remove an unavailable NIC.
+
+On a Community factory installation with no good alternative, a configured **missing
+NIC** consumes the counted trials, remains unblessed, and stops automatic
+reboots for console recovery. It is not treated as ordinary carrier loss or a
+temporarily absent DHCP server. Inspect with:
+
+```shell
+sudo sentinel config check --live /var/lib/sentinel/appliance.toml
+```
+
+Repair the saved interface configuration from the recovery console, then
+explicitly reboot and verify normal health/blessing.
+
+For a deliberate recovery boot, select the verified good entry once in the
+boot menu. Do not write a hard per-slot `default`: it can override exhausted
+counters. Follow the updater's `preferred`/wildcard policy and review any
+firmware override before staging again.
 
 ## Reboot to activate
 
@@ -297,9 +287,21 @@ running slot keeps serving until then.
 nix build .#checks.x86_64-linux.update -L
 ```
 
-The test verifies the slot is written, re-typed, and the bootloader switched. The
-cross-reboot switch itself isn't auto-tested (OVMF `machine.reboot()` hangs in the
-harness); the bless/rollback mechanism is proven in the `verified-boot` test.
+That test drives a real donor-image A→B boot and normal product blessing; it
+does not replace the negative/fallback checks:
+
+```shell
+nix build .#checks.x86_64-linux.bootfallback -L
+nix build .#checks.x86_64-linux.missing-nic-boot -L
+```
+
+The [broken-candidate fixture](https://github.com/Velstra/sentinel/blob/main/nix/boot-fallback-test.nix)
+exercises three failed dataplane boots and fallback to a previously blessed
+image. The [missing-NIC fixture](https://github.com/Velstra/sentinel/blob/main/nix/missing-nic-boot-test.nix)
+exercises exhausted factory trials and product CLI repair. Driver backdoor
+commands are not proof of an authenticated physical console login. These are
+source-level VM gates: their existence, or a pass on another candidate, is not
+certification of the final signed release and its exact hashes.
 
 ## Bounded metadata and atomic channel promotion
 

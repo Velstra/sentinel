@@ -25,3 +25,7 @@ appliance certification. NixOS packages, the kernel, Fabric/Wren runtime inputs
 and their precise installed outputs must be inventoried separately from the
 actual built release image. Final release SBOM/CVE evidence must bind that
 image's hash; the source artifact must never substitute for it.
+
+A component list is not a set of redistribution notices. Bundled license texts,
+copyright notices and source obligations must be handled separately; see
+[third-party notices and release requirements](notices.md).

@@ -15,6 +15,19 @@ Boot the [installer ISO](../building/iso.md). It autostarts the wizard on tty1:
 Disk discovery reads `lsblk -dnb -o NAME,SIZE,TYPE,RM,MODEL` and skips
 `zram`/`md`/`dm` devices, so only real target disks are offered.
 
+Before assigning WAN/LAN roles, record the NICs' permanent MAC addresses and
+check which physical cable reaches each network. Do not identify a role only
+by probe-order names such as `eth0`. The CLI's
+[`hw-id` binding](../handbook/interfaces.md#bind-physical-identity-before-assigning-zones)
+pins a physical NIC's declared name when it appears. Verify it with console
+recovery available before trusting a rebooted or hot-plugged appliance. The
+installer is not yet a complete MAC-first provisioning workflow.
+
+There is no cloud-init or config-drive first-account provisioning path. For a
+cloud VM, use the interactive installer or controlled offline seeding of the
+persistent data partition; importing a raw image alone does not create a usable
+administrator or select safe management interfaces.
+
 ## Flag-driven (scripted / non-interactive)
 
 ```shell
@@ -87,12 +100,13 @@ waits for the unlock and on a plaintext box the no-op just succeeds.
 
 ## Verifying it
 
-Three tests cover this:
+Selected checks:
 
 ```shell
 nix build .#checks.x86_64-linux.install -L       # single + RAID1 on blank disks
 nix build .#checks.x86_64-linux.install-iso -L   # live-boot install from the ISO's bundled image
 nix build .#checks.x86_64-linux.luks -L          # encrypted install: LUKS2 container, passphrase unlock, secrets inside
+nix build .#checks.x86_64-linux.install-boot-luks -L  # actual installed-image boot and console unlock
 ```
 
 ## Gotchas (for hacking on `src/install.rs`)

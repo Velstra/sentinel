@@ -1,75 +1,64 @@
 # Flake outputs
 
-Everything buildable in `flake.nix` (`system = x86_64-linux`).
+The flake targets `x86_64-linux`. Query the checked-out source rather than
+relying on a frozen output or test count:
 
-## Packages — `nix build .#<name>`
+```sh
+nix flake show
+nix eval --json .#packages.x86_64-linux --apply builtins.attrNames
+nix eval --json .#checks.x86_64-linux --apply builtins.attrNames
+```
 
-| Attribute | What it is |
-|---|---|
-| `sentinel` (also `default`) | the `sentinel` CLI (stable rustc, wrapped tool paths) |
-| `velstra` | the eBPF/XDP data-plane agent (nightly toolchain + Fabric) |
-| `velstra-ebpf` | just the compiled eBPF object (fixed-output derivation) |
-| `sentinel-image` | the flashable, Secure-Boot-signed verity disk image (`finalImageSigned`) |
-| `sentinel-iso` | the live-boot installer ISO bundling the image |
+## Packages
 
-## NixOS configurations — `nixosConfigurations.<name>`
+Build with `nix build .#<name>`:
 
-| Attribute | What it is |
-|---|---|
-| `appliance` | the base appliance (CLI + velstra service). Boot it in a throwaway QEMU VM with **`nix run .#vm`** (portable, no NixOS needed) |
+| Name | Output |
+| --- | --- |
+| `sentinel` / `default` | Management CLI with wrapped tool paths. |
+| `sentinel-ui` | Locally bundled console assets; no runtime CDN. |
+| `velstra` | Fabric data-plane agent. |
+| `velstra-ebpf` | Fixed-output eBPF object. Keep its hash and Fabric source coherent. |
+| `wren` | Routing daemon. |
+| `sentinel-image` | Signed development raw GPT image with dm-verity and A/B slots. Included Secure Boot keys are not production trust. |
+| `sentinel-iso` | Installer ISO containing that raw image. |
+| `qemu-firmware` | OVMF firmware for the [VM quickstart](../operations/quickstart.md). |
 
-## Apps — `nix run .#<name>`
+`sentinel-image` is a disk artifact, **not** a VM runner. This public package
+set does not expose an Enterprise certificate, a prebuilt QCOW2 or a production
+sysupdate bundle merely because related machinery exists elsewhere.
 
-| App | What it does |
-|---|---|
-| `vm` | boot the `appliance` config in a throwaway QEMU VM (the easy local-test path; no `result` symlink, no `nixos-rebuild`) |
-| `sentinel-image` | `appliance` + `nix/image.nix` → the verity/A-B/Secure-Boot image |
-| `sentinel-iso` | `nix/iso.nix` → the installer ISO (gets `sentinelPkg` + `sentinelImageRaw` via `specialArgs`) |
+## VM app and NixOS configurations
+
+```sh
+nix run .#vm
+```
+
+The `vm` app starts a disposable appliance configuration. It does not boot the
+exact verified-boot disk image. To test that image use the relevant
+[image checks](tests.md#run-a-real-vm-check).
+
+| Configuration | Purpose |
+| --- | --- |
+| `nixosConfigurations.appliance` | Base appliance and VM runner. |
+| `nixosConfigurations.sentinel-image` | Immutable disk-image configuration. |
+| `nixosConfigurations.sentinel-iso` | Installer ISO configuration. |
+
+Useful queries:
+
+```sh
+nix eval --raw .#nixosConfigurations.sentinel-image.config.image.filePath
+nix path-info .#sentinel-image
+```
 
 ## Modules
 
-| Attribute | What it is |
-|---|---|
-| `nixosModules.sentinel` | the appliance module: imports `nix/appliance.nix` + `nix/velstra-service.nix`, installs the CLI, wires `services.velstra` and `networking.hostName` from the factory config |
+| Attribute | Purpose |
+| --- | --- |
+| `nixosModules.sentinel` | Sentinel CLI, appliance services and factory configuration. |
+| `nixosModules.applianceImage` | Shared immutable image builder. |
+| `nixosModules.applianceIso` | Shared installer ISO builder. |
 
-## Checks — `nix build .#checks.x86_64-linux.<name> -L`
-
-There are **76** of them. The table below is the handful that boot a real image —
-the ones whose names an operator needs when something about installing or booting
-the appliance is wrong. Every other check is grouped by subject in
-[the test suite reference](tests.md), and `nix flake show` is the authoritative
-list either way.
-
-| Check | Asserts |
-|---|---|
-| `commit` | live runtime apply of hostname + firewall + interface address, persistence, airgapped |
-| `verified-boot` | the real verity image boots in QEMU/OVMF to multi-user; clean boot blessed |
-| `install` | `sentinel install` on blank disks — single + RAID1 |
-| `install-iso` | live-boot install from the ISO's bundled image → bootable ESP |
-| `update` | A/B: inactive slot written + re-typed, bootloader switched |
-| `secureboot` | the signed image boots under **enforcing** Secure Boot (enrolled keys) |
-
-Run those six:
-
-```shell
-for c in commit verified-boot install install-iso update secureboot; do
-  nix build ".#checks.x86_64-linux.$c" -L || break
-done
-```
-
-Run **every** check — this boots dozens of VMs and takes a long time, so it wants
-a KVM-capable machine and some patience:
-
-```shell
-nix flake check -L
-```
-
-## Useful eval queries
-
-```shell
-# exact raw image filename inside result/
-nix eval --raw .#nixosConfigurations.sentinel-image.config.image.filePath
-
-# the signed image's full store path
-nix eval --raw .#sentinel-image
-```
+Module availability is not qualification of every downstream combination.
+Review [signing limitations](../architecture/secure-boot.md) before distributing
+an image and [test evidence](tests.md) before interpreting a green evaluation.
