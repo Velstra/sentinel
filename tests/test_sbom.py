@@ -24,17 +24,17 @@ class SourceSbomTests(unittest.TestCase):
         (self.source / "ui").mkdir(parents=True)
         for name, contents in {
             "Cargo.toml": '[package]\nname="sentinel"\nversion="1.0.0"\n',
-            "Cargo.lock": 'version = 4\n',
+            "Cargo.lock": 'version = 4\n[[package]]\nname="serde"\nversion="1.0.0"\n',
             "ui/package.json": '{"name":"sentinel-ui","version":"1.0.0"}',
-            "ui/package-lock.json": '{"lockfileVersion":3}',
+            "ui/package-lock.json": '{"lockfileVersion":3,"packages":{"node_modules/react":{"version":"19.0.0"}}}',
         }.items():
             (self.source / name).write_text(contents)
         self.output = self.root / "output"
         self.bom = {
             "bomFormat": "CycloneDX", "specVersion": "1.6", "version": 1,
             "components": [
-                {"type": "library", "name": "serde", "purl": "pkg:cargo/serde@1.0.0"},
-                {"type": "library", "name": "react", "purl": "pkg:npm/react@19.0.0"},
+                {"type": "library", "name": "serde", "version": "1.0.0", "purl": "pkg:cargo/serde@1.0.0"},
+                {"type": "library", "name": "react", "version": "19.0.0", "purl": "pkg:npm/react@19.0.0"},
             ],
         }
         self.seen = []
@@ -121,6 +121,72 @@ class SourceSbomTests(unittest.TestCase):
         result = self.generate()
         self.assertEqual(result["ecosystems"], {"cargo": 1, "npm": 1})
         self.assertEqual(result["component_count"], 3)
+
+    def test_missing_dev_dependency_cannot_hide_behind_nonempty_npm_catalog(self):
+        lock = self.source / "ui/package-lock.json"
+        value = json.loads(lock.read_text())
+        value["packages"]["node_modules/vitest"] = {"version": "4.0.0", "dev": True}
+        lock.write_text(json.dumps(value))
+        with self.assertRaisesRegex(ValueError, "incomplete npm lock coverage.*vitest"):
+            self.generate()
+        self.assertFalse((self.output / "sbom.cdx.json").exists())
+
+    def test_wrong_version_and_wrong_ecosystem_cannot_cover_a_locked_package(self):
+        inputs = sbom.snapshot(self.source)
+        for change in ({"version": "0.0.0"}, {"purl": "pkg:npm/serde@1.0.0"}):
+            with self.subTest(change=change):
+                candidate = json.loads(json.dumps(self.bom))
+                candidate["components"][0].update(change)
+                with self.assertRaisesRegex(ValueError, "incomplete cargo|package URL|dependency catalogs"):
+                    sbom.validate_lock_coverage(candidate, inputs)
+
+    def test_nested_scoped_packages_and_multiple_versions_are_all_required(self):
+        inputs = sbom.snapshot(self.source)
+        inputs["ui/package-lock.json"] = json.dumps({"lockfileVersion": 3, "packages": {
+            "": {"name": "private-ui"},
+            "node_modules/@scope/tool": {"version": "1.0.0"},
+            "node_modules/parent/node_modules/@scope/tool": {"version": "2.0.0", "dev": True},
+        }}).encode()
+        candidate = json.loads(json.dumps(self.bom))
+        for version in ("1.0.0", "2.0.0"):
+            candidate["components"].append({"type": "library", "name": "@scope/tool", "version": version,
+                                            "purl": "pkg:npm/%40scope/tool@" + version})
+        self.assertEqual(sbom.validate_lock_coverage(candidate, inputs), {"cargo": 1, "npm": 2})
+        candidate["components"].pop()
+        with self.assertRaisesRegex(ValueError, "incomplete npm"):
+            sbom.validate_lock_coverage(candidate, inputs)
+
+    def test_empty_and_linked_locks_are_not_complete_inventory(self):
+        for body in (b'{"lockfileVersion":3,"packages":{}}',
+                     b'{"lockfileVersion":3,"packages":{"node_modules/local":{"link":true}}}'):
+            inputs = sbom.snapshot(self.source)
+            inputs["ui/package-lock.json"] = body
+            with self.subTest(body=body), self.assertRaises(ValueError):
+                sbom.validate_lock_coverage(self.bom, inputs)
+
+    def test_local_cargo_without_registry_purl_requires_exact_lock_attribution(self):
+        component = self.bom["components"][0]
+        component.pop("purl")
+        # A registry dependency remains; the local project is not itself
+        # evidence of the required versioned ecosystem catalog.
+        self.bom["components"].append({"type": "library", "name": "other", "version": "2.0.0",
+                                       "purl": "pkg:cargo/other@2.0.0"})
+        inputs = sbom.snapshot(self.source)
+        with self.assertRaisesRegex(ValueError, "incomplete cargo"):
+            sbom.validate_lock_coverage(self.bom, inputs)
+        component["properties"] = [
+            {"name": "syft:package:foundBy", "value": "rust-cargo-lock-cataloger"},
+            {"name": "syft:location:0:path", "value": "/Cargo.lock"},
+        ]
+        self.assertEqual(sbom.validate_lock_coverage(self.bom, inputs), {"cargo": 1, "npm": 1})
+
+    def test_matching_display_identity_cannot_conceal_an_unrelated_purl(self):
+        for purl in ("pkg:cargo/unrelated@99.0.0", "pkg:cargo/serde@2.0.0",
+                     "pkg:cargo/serde", "pkg:cargo/ser%GGe@1.0.0"):
+            candidate = json.loads(json.dumps(self.bom))
+            candidate["components"][0]["purl"] = purl
+            with self.subTest(purl=purl), self.assertRaisesRegex(ValueError, "package URL"):
+                sbom.validate_lock_coverage(candidate, sbom.snapshot(self.source))
 
     def test_source_change_during_scan_prevents_publication(self):
         def changed(argv, **kwargs):
