@@ -1,75 +1,40 @@
-# Flake outputs
+# Choose a flake output
 
-Everything buildable in `flake.nix` (`system = x86_64-linux`).
+<a id="flake-outputs"></a>
 
-## Packages — `nix build .#<name>`
+Build from an x86-64 Linux checkout. The command determines whether you get an executable, boot media or a VM test.
 
-| Attribute | What it is |
+<a id="packages--nix-build-name"></a>
+
+## Packages
+
+| Goal | Output |
 |---|---|
-| `sentinel` (also `default`) | the `sentinel` CLI (stable rustc, wrapped tool paths) |
-| `velstra` | the eBPF/XDP data-plane agent (nightly toolchain + Fabric) |
-| `velstra-ebpf` | just the compiled eBPF object (fixed-output derivation) |
-| `sentinel-image` | the flashable, Secure-Boot-signed verity disk image (`finalImageSigned`) |
-| `sentinel-iso` | the live-boot installer ISO bundling the image |
+| Run the CLI | `nix build .#sentinel` |
+| Build the immutable disk image | `nix build .#sentinel-image` |
+| Build installation media | `nix build .#sentinel-iso` |
+| Obtain OVMF for a UEFI VM | `nix build .#qemu-firmware` |
+| Build the web frontend | `nix build .#sentinel-ui` |
+| Build Fabric, the eBPF object or Wren | `.#velstra`, `.#velstra-ebpf`, `.#wren` |
 
-## NixOS configurations — `nixosConfigurations.<name>`
+<a id="nixos-configurations--nixosconfigurationsname"></a><a id="apps--nix-run-name"></a><a id="modules"></a><a id="useful-eval-queries"></a>
 
-| Attribute | What it is |
-|---|---|
-| `appliance` | the base appliance (CLI + velstra service). Boot it in a throwaway QEMU VM with **`nix run .#vm`** (portable, no NixOS needed) |
+## Run a VM or inspect outputs
 
-## Apps — `nix run .#<name>`
-
-| App | What it does |
-|---|---|
-| `vm` | boot the `appliance` config in a throwaway QEMU VM (the easy local-test path; no `result` symlink, no `nixos-rebuild`) |
-| `sentinel-image` | `appliance` + `nix/image.nix` → the verity/A-B/Secure-Boot image |
-| `sentinel-iso` | `nix/iso.nix` → the installer ISO (gets `sentinelPkg` + `sentinelImageRaw` via `specialArgs`) |
-
-## Modules
-
-| Attribute | What it is |
-|---|---|
-| `nixosModules.sentinel` | the appliance module: imports `nix/appliance.nix` + `nix/velstra-service.nix`, installs the CLI, wires `services.velstra` and `networking.hostName` from the factory config |
-
-## Checks — `nix build .#checks.x86_64-linux.<name> -L`
-
-There are **76** of them. The table below is the handful that boot a real image —
-the ones whose names an operator needs when something about installing or booting
-the appliance is wrong. Every other check is grouped by subject in
-[the test suite reference](tests.md), and `nix flake show` is the authoritative
-list either way.
-
-| Check | Asserts |
-|---|---|
-| `commit` | live runtime apply of hostname + firewall + interface address, persistence, airgapped |
-| `verified-boot` | the real verity image boots in QEMU/OVMF to multi-user; clean boot blessed |
-| `install` | `sentinel install` on blank disks — single + RAID1 |
-| `install-iso` | live-boot install from the ISO's bundled image → bootable ESP |
-| `update` | A/B: inactive slot written + re-typed, bootloader switched |
-| `secureboot` | the signed image boots under **enforcing** Secure Boot (enrolled keys) |
-
-Run those six:
-
-```shell
-for c in commit verified-boot install install-iso update secureboot; do
-  nix build ".#checks.x86_64-linux.$c" -L || break
-done
+```sh
+nix run .#vm
+# From the build host, list the outputs of your checkout:
+nix flake show --no-write-lock-file
 ```
 
-Run **every** check — this boots dozens of VMs and takes a long time, so it wants
-a KVM-capable machine and some patience:
+The VM app boots a development appliance. A disk image is a package and does not contain a VM launcher. The NixOS configurations and modules are listed separately by the flake.
 
-```shell
-nix flake check -L
+<a id="checks--nix-build-checksx86_64-linuxname--l"></a>
+
+## Select a check
+
+```sh
+nix build .#checks.x86_64-linux.quickstart -L
 ```
 
-## Useful eval queries
-
-```shell
-# exact raw image filename inside result/
-nix eval --raw .#nixosConfigurations.sentinel-image.config.image.filePath
-
-# the signed image's full store path
-nix eval --raw .#sentinel-image
-```
+Use the [test catalog](tests.md) to select an image, protocol, management or recovery test. VM checks require KVM.

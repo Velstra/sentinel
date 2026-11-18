@@ -1,26 +1,28 @@
-# Firewall & NAT
+# Firewall, NAT and packet tracing
 
-Sentinel's firewall is **zone-based** and enforced in the eBPF/XDP data plane.
-Every firewalled interface belongs to a *zone*; posture (stateful, ICMP,
-default action) is set globally and overridden per zone; and `rule`s open
-specific proto/port/source between zones. NAT (masquerade, port-forward,
-NAT64, NPTv6) lives under `nat`.
+<a id="firewall--nat"></a>
+
+Use the trace command to explain the configured outcome for a packet. Use live counters and logs to investigate actual traffic. Configuration examples run inside `sentinel configure`.
+
+## Asking before you send (packet trace)
+
+For example, determine whether a guest on `lan0` can reach SSH on a DMZ server. Replace interface names and addresses with ones from your configuration.
+
+```text
+sentinel trace --in lan0 tcp 10.0.0.200 10.9.0.10 22
+```
+
+With a matching guest-deny rule, the important result can look like this:
+
+```text
+verdict:   drop (no-ssh-from-guests)
+```
+
+Read the ingress zone, route, NAT translations and matched rule above the verdict. The model uses compiled configuration. Established connection state, dynamic routes and current multi-WAN health require live inspection. The web console exposes the same walk under **Policy → Packet trace**.
 
 ## Zones & posture
 
-A zone is just a name you assign to interfaces (`set interface eth0 zone wan`).
-`firewall global` sets the defaults every zone inherits; `firewall zone <name>`
-overrides them for one zone.
-
-| Field (`global` / `zone <name>`) | Meaning |
-|---|---|
-| `default-action` | Default ingress action: `accept` / `drop` / `reject`. |
-| `stateful` | Track TCP, UDP and ICMP echo flows in IPv4 and IPv6 (`true`/`false`). |
-| `block-icmp` | Drop inbound ICMP by default (`true`/`false`). |
-| `log` | Log matched traffic by default (`true`/`false`). |
-| `source-validation` | Reject spoofed source addresses: `disable` / `loose` / `strict`. |
-| `block <IP\|CIDR>` | Drop a source everywhere (`global`) or on one zone. |
-| `description` | (zone only) free-text label. |
+Assign interfaces to zones before using zone-specific defaults. Set the global default and override only the zones that need a different policy.
 
 ```text
 set firewall global default-action drop        # deny by default
@@ -31,73 +33,24 @@ set firewall zone lan default-action accept    # trust the LAN
 
 ## Rules
 
-`firewall rule <name>` is a zone-to-zone allow/deny. A rule with a `proto` +
-`port` is a specific service rule; a broad rule (`from`/`to`/`action` only)
-sets a zone-pair posture.
-
-| Field | Meaning |
-|---|---|
-| `from` | Ingress zone the rule applies on. |
-| `to` | Destination zone — matched as that zone's subnets (see below). |
-| `action` | `accept` / `drop` / `reject`. |
-| `proto` | `tcp` / `udp`. |
-| `port` | Destination port or range (`443`, `8000-8100`). |
-| `source` | Source address/CIDR (default: any). |
-| `destination` | Destination address/CIDR (default: any). |
-| `source-group` / `destination-group` / `port-group` | Match an [alias](#groups-aliases) instead. |
-| `limit` / `burst` | Rate-limit the new flows this rule admits (see below). |
-| `log` | Log packets matching this rule (`true`/`false`). |
-| `schedule` | A time-based activation window (see below). |
-| `description` / `disabled` | Label / administratively disable. |
+Scope each rule to the intended ingress and destination before applying it. This example scopes SSH to the management subnet and the firewall itself.
 
 ```text
-# Allow HTTPS from the WAN to a published service:
-set firewall rule https-in from wan
-set firewall rule https-in to lan
-set firewall rule https-in proto tcp
-set firewall rule https-in port 443
-set firewall rule https-in action accept
-
-# Let the LAN out, except to one network:
-set firewall rule no-lab from lan
-set firewall rule no-lab proto tcp
-set firewall rule no-lab port 443
-set firewall rule no-lab action drop
-set firewall rule no-lab destination 192.168.4.0/24
+set firewall rule mgmt-ssh from mgmt
+set firewall rule mgmt-ssh to firewall
+set firewall rule mgmt-ssh source 192.0.2.0/24
+set firewall rule mgmt-ssh proto tcp
+set firewall rule mgmt-ssh port 22
+set firewall rule mgmt-ssh action accept
 ```
 
 ### The destination zone
 
-On a port rule, `to <zone>` is enforced by matching **that zone's subnets** as the
-destination — the data plane matches addresses, not zone names. Two cases it
-cannot cover, and a commit warns about each:
-
-- **The rule already constrains its source.** A rule matches one address end, and
-  an explicit `source` is the narrower, operator-written one, so it keeps that end
-  and `to` stays documentation. Split the rule if the destination zone must bind.
-- **The destination zone has no statically addressed interface** (all DHCP, or
-  unaddressed). There is no subnet to match, so the rule applies toward every zone.
-
-On a *broad* rule (no proto/port) `to` never narrows anything: a broad rule sets
-its from-zone's ingress posture, which applies toward every destination. Give the
-rule a proto/port to make the destination zone enforceable.
-
-A rule constrains **one end**: a `source` (or `source-group`) or a
-`destination` (or `destination-group`), never both. The data plane ranks each
-end in its own longest-prefix table, and a rule can only sit in one of them, so
-one naming both ends would enforce half of what it says. A commit refuses it and
-tells you to split it in two.
-
-Across both ends, **the more specific rule wins** — a `/24` destination beats a
-`/8` source on the same port. Where two matching rules are equally specific the
-denying one wins, so the outcome never depends on which table was consulted
-first.
+For a port rule targeting a zone, verify the destination against that zone’s configured subnets. Use the packet trace to inspect the matched rule.
 
 ### Rate limits
 
-`limit <n>` caps how many **new flows** an accept rule admits per second; `burst`
-sizes how much idle time it may bank, defaulting to one second's worth of the
-limit.
+Cap newly admitted flows per second with `limit`. Set `burst` to allow a short peak.
 
 ```text
 set firewall rule ssh-in from wan
@@ -108,20 +61,9 @@ set firewall rule ssh-in limit 5
 set firewall rule ssh-in burst 10
 ```
 
-Established connections are never metered — the limit bounds how fast new
-connections are accepted, not how fast an accepted one may transfer. Excess is
-dropped rather than rejected: answering every excess packet would turn a flood
-aimed at the box into a flood aimed at whatever source the packets claim.
-`show firewall statistics` counts them under `dropped_rate_limit`, separately from
-`dropped_rule`, so a limit biting is distinguishable from a rule denying.
-
-A limit is refused on anything it could not throttle — a `drop`/`reject` rule, or a
-broad rule with no proto/port — rather than accepted and quietly ignored.
-
 ### Time-based rules
 
-A rule may carry a weekly local-time schedule; it is only in force while its
-window is open (a systemd timer re-applies at the boundaries).
+A weekly schedule uses the appliance’s local timezone. Check the clock and the rule’s active window when troubleshooting.
 
 ```text
 set firewall rule guest-wifi from guest
@@ -133,15 +75,9 @@ set firewall rule guest-wifi schedule start 09:00
 set firewall rule guest-wifi schedule end 17:00
 ```
 
-A window is only as good as the clock it is measured against, so a commit that
-carries a schedule onto a box whose clock nothing has synchronised says so, and
-the same warning is written to the journal at each window boundary when the timer
-re-applies. See [when the clock cannot be trusted](system.md#when-the-clock-cannot-be-trusted).
-
 ### ICMP message types
 
-A rule that names `icmp` or `icmpv6` matches every message of that protocol.
-`icmp-type` narrows it to one:
+Use a typed ICMP or ICMPv6 rule when only specific messages should be allowed. Keep required path-MTU and neighbor-discovery traffic in the policy.
 
 ```text
 # Answer pings from the management network, and nowhere else.
@@ -158,168 +94,33 @@ set firewall rule pmtu icmp-type packet-too-big
 set firewall rule pmtu action accept
 ```
 
-A typed rule outranks an untyped one on the same protocol, the way a specific
-source outranks `from any` — so "drop ICMP, except echo-request from here" is two
-rules and reads as it sounds.
-
-**Write the name, not the number.** The two families disagree: `echo-request` is
-8 in ICMP and 128 in ICMPv6, `time-exceeded` is 11 and 3. The name is resolved
-against the rule's own protocol, so it means the same thing in both; a number
-means whatever that number means in that family. Both are accepted — the registry
-is longer than any list worth shipping — but only one of them survives being
-copied from a v4 rule to a v6 one.
-
-| Name | ICMP | ICMPv6 |
-|---|---|---|
-| `echo-request` / `echo-reply` | 8 / 0 | 128 / 129 |
-| `destination-unreachable` | 3 | 1 |
-| `packet-too-big` | — | 2 |
-| `time-exceeded` | 11 | 3 |
-| `parameter-problem` | 12 | 4 |
-| `redirect` | 5 | 137 |
-| `router-solicitation` / `router-advertisement` | 10 / 9 | 133 / 134 |
-| `neighbor-solicitation` / `neighbor-advertisement` | — | 135 / 136 |
-
-Two of these are worth not filtering out by accident. **`packet-too-big`** is how
-a sender learns the path MTU: block it and large transfers hang while small ones
-work, which is among the hardest faults to diagnose from the symptom.
-**`neighbor-solicitation`** and **`neighbor-advertisement`** are IPv6 address
-resolution — the equivalent of blocking ARP.
-
-`icmp-type` is refused on a protocol that has no types, rather than ignored: a
-rule that reads as narrow and matches everything is worse than one that does not
-commit.
-
 ## Blocking by country (GeoIP)
+
+Country codes select prefixes in the GeoIP database included in the appliance image. Review coverage and freshness before relying on a geographic rule.
 
 ```text
 set firewall zone wan geoip-block CN,RU
 ```
 
-Every source address in those countries is dropped on that zone. The addresses
-come from a database **extracted into the image at build time**: a firewall that
-can only block a country while it can reach a geolocation service is not one you
-can put on an isolated network, and the update path for the data is the image's,
-not a second one.
-
-`set firewall global geoip-block <CC>` sets the list every zone inherits; a zone's
-own list is **added to** it, not swapped for it — a country blocked everywhere
-should not quietly become reachable because one zone named a different one.
-
-**It blocks sources, not destinations.** This stops those countries reaching you;
-it does not stop your users reaching them.
-
-A country becomes ordinary CIDRs in the same blocklist your own `block` entries go
-into, so the data plane never learns what a country is and a geo-block is counted
-as `dropped_blocklist` like any other. That has a visible cost: one country is
-thousands of prefixes (China ~8k, Russia ~13k, the United States ~155k), the
-blocklist holds 262144 across every zone, and the commit refuses a config that
-would exceed it rather than leaving a half-programmed firewall. `show firewall`
-prints what each zone's list costs:
-
-```text
-geoip blocks:
-  wan      CN,RU  (20983 prefixes)
-```
-
-A country the image has no addresses for is **refused at commit**, not treated as
-an empty list — a rule that silently blocks nothing is the worst possible outcome
-for a feature whose whole job is to block.
-
-`nix build .#checks.x86_64-linux.geoip -L` verifies it end to end against a
-substituted database: a neighbour reachable before, unreachable once its country
-is blocked, and reachable again once it is not.
-
 ## Source validation (anti-spoofing)
 
-A packet claiming a source address it could not possibly have come from is the
-oldest trick there is: it is how a WAN neighbour pretends to be on your LAN, and
-how your own network becomes somebody else's reflection amplifier. Source
-validation answers that with the routing table — it looks up a route back to the
-sender and asks whether the answer makes sense for the interface the packet
-arrived on.
+Source-validation mode controls which incoming source addresses the zone will admit. Check routing symmetry before choosing strict mode.
 
 ```text
 set firewall zone wan source-validation strict
 ```
 
-| Mode | The rule |
-|---|---|
-| `disable` | Accept any source address. **The default.** |
-| `loose` | The source must be routable *somewhere*. |
-| `strict` | ...and by the interface it arrived on. |
-
-**`strict` is the real anti-spoofing rule** (BCP 38 / RFC 3704): a source whose
-return path leaves by another interface cannot be the sender, so it is dropped.
-It is also the mode that breaks things — wherever routing is asymmetric, a reply
-legitimately returns by a different path than the request took, and `strict`
-drops that traffic with no other symptom. A second WAN uplink is the usual cause,
-and the commit warns when it sees one.
-
-`loose` is what to reach for there. It cannot tell a LAN address arriving on the
-WAN from a real one, but it still refuses everything that could never answer at
-all — unrouted space, bogons, the addresses an amplification attack is built on.
-
-Neither mode is switched on for you, and that is deliberate: this feature drops
-traffic, and *which* traffic depends on your routing table rather than on
-anything written in the config.
-
-**Always accepted, in every mode:** a `0.0.0.0` source (that is how a DHCP client
-asks for its first address — validating it would make a DHCP server unreachable
-the moment you turned this on) and IPv6 link-local sources (`fe80::/10`), which
-are not routable by definition and carry Neighbor Discovery, Router
-Advertisement and DHCPv6. **Never accepted, in every mode:** loopback,
-multicast and broadcast *sources*, which have routes but can never send.
-
-Drops are counted, not silent:
-
-```text
-sentinel show firewall             # names each zone that validates
-sentinel show firewall statistics  # dropped_spoofed
-```
-
-A rising `dropped_spoofed` on an edge interface is someone spoofing. A rising one
-on an internal interface is usually asymmetric routing meeting `strict`, and the
-answer there is `loose`.
-
-`nix build .#checks.x86_64-linux.spoofing -L` verifies this on two VMs: it forges
-a LAN source onto the WAN link and asserts `strict` catches it, `loose` does not
-(it is routable, just not here), a loopback source is refused by both, and honest
-traffic keeps flowing throughout.
-
 ## IPv6 and extension headers
 
-Rules apply to both families: the same `proto` + `port` match is evaluated for IPv4
-and IPv6 packets against the same zone policy. (A rule's `source` CIDR is IPv4-only
-today, so a v6 packet is matched only by the source-less rules for its zone.)
-
-For IPv6 the data plane **walks the extension-header chain** (RFC 8200) to find the
-real upper-layer protocol before matching. That matters because the alternative is a
-bypass: classifying by the fixed header's next-header alone means a Hop-by-Hop or
-Destination-Options header placed in front of TCP reads as an unknown protocol with
-no ports, so no port rule matches — and under `default-action accept` such a packet
-would simply pass. Up to eight headers are followed; a longer or truncated chain
-matches no rule and therefore falls to the zone's default action.
-
-Behind a **non-first fragment** the protocol is still resolved, but ports are not
-read — those bytes are payload, and treating them as a TCP header would hand an
-attacker a fragmentation bypass instead. Port-specific rules therefore do not match
-a non-first fragment; protocol-level rules and the default action still do.
-
-`nix build .#checks.x86_64-linux.v6exthdr -L` verifies this on two VMs, with a
-separate destination port per variant so plain, single-header and chained packets can
-be told apart in the log.
+Check both address families when testing an interface policy. A family-specific source prefix only matches within that family.
 
 ## Groups (aliases)
 
-Named address / port sets you reference from rules, so one edit updates every
-rule that uses them.
+Name frequently reused address, interface or port sets and refer to the group from rules.
 
 ### Some of a zone, not all of it
 
-An `interface-group` names links. A zone is already a named set of links, so this
-is for the one case a zone cannot express: **two rules over different subsets of
-the same zone**.
+An interface group selects specific links within a zone. Use it to limit a rule to those ingress ports.
 
 ```text
 set firewall group interface-group trusted interface eth0,eth1
@@ -330,29 +131,9 @@ set firewall rule ssh-trusted action accept
 set firewall rule ssh-trusted interface-group trusted
 ```
 
-The interface is matched in the data plane's rule key, not derived from a second
-policy — splitting a zone into several policies would put a flow's two directions
-under different connection-tracking scopes, and a reply arriving on a sibling
-link would not find its own entry.
-
-So a scoped rule and an unscoped one are **different entries**, and the lookup
-asks twice: with this packet's own interface, then without. The scoped one wins,
-because naming the link is the more specific statement — the same ranking a
-specific source has over `from any`.
-
-A rule over three links becomes three data-plane rules, the way a `source-group`
-over three CIDRs does.
-
-An interface that a group names and the box does not have makes the rule apply
-**everywhere** rather than nowhere. That is the deliberate direction: a rule that
-is too broad is visible, one that is silently inert is not — and the reconfigure
-that follows the NIC appearing narrows it.
-
 ### Devices, not addresses
 
-A `mac-group` names hardware addresses. A device keeps its MAC when its address
-changes, and cannot spoof one past the first switch — which is what makes this
-worth having beside an address group.
+A MAC group matches link-layer addresses on its local segment. Use it for classification; a MAC address does not authenticate the device.
 
 ```text
 set firewall group mac-group printers mac aa:bb:cc:dd:ee:ff,aa:bb:cc:dd:ee:01
@@ -361,40 +142,9 @@ set firewall rule no-printers source-mac-group printers
 set firewall rule no-printers action drop
 ```
 
-**A MAC rule is a verdict on the device, not a condition that combines with a
-protocol and a port.** Naming one beside a port is refused rather than half
-enforced. The reason is where the match happens: the data plane consults MACs
-**once**, from the Ethernet header, the same way it consults the blocklist —
-not as a dimension of the rule tries, which are already looked up twice per
-packet and have no room for a fifth. A rule that carried a MAC *and* a port
-would read narrow and match everything, which is worse than one that says what
-it does.
-
-Where both match, the MAC rule wins: naming the device is the more specific
-statement of the two.
-
-This is also the one place a broad `drop` is accepted. Elsewhere a rule with no
-protocol and no port is refused, because a zone's deny posture comes from its
-default action and such a rule would silently do nothing — but a MAC rule
-reaches the data plane through its own map, so it does something.
-
-```text
-set firewall group address-group admins address 10.0.0.10,10.0.0.11
-set firewall group port-group web port 80,443,8443
-
-set firewall rule mgmt from lan
-set firewall rule mgmt proto tcp
-set firewall rule mgmt source-group admins
-set firewall rule mgmt port-group web
-set firewall rule mgmt action accept
-```
-
 ### Domain groups
 
-A domain group holds **DNS names**, resolved to addresses at commit time and
-re-resolved every 15 minutes. Rules reference it through the same
-`source-group` / `destination-group` field as an address group — the names share
-one namespace, so a group cannot exist as both.
+A domain group resolves configured DNS names to addresses. Recheck the resolved addresses when a service changes its endpoints.
 
 ```text
 set firewall group domain-group trackers domain ads.example.com,metrics.example.net
@@ -406,23 +156,9 @@ set firewall rule no-trackers action drop
 set firewall rule no-trackers destination-group trackers
 ```
 
-Only IPv4 answers are used — the rule tables match IPv4 addresses — and each
-becomes a `/32`.
-
-**A failed lookup keeps the last good answer.** The resolved addresses are cached
-on disk, and a name that will not resolve falls back to its cache rather than
-contributing nothing. That matters because a domain group usually *blocks*
-something: an empty group matches nothing, and a rule that blocks nothing allows
-everything. A DNS outage must not quietly undo the rule. A name that has never
-resolved does contribute nothing, and says so at commit.
-
-This tracks a name, not a service. A large site behind many rotating addresses, or
-one sharing an address with sites you do not mean to match, is a poor fit — for
-DNS-level blocking use `service dns` blocklists instead.
-
 ## Protocols a rule can match
 
-`proto` is not limited to TCP and UDP:
+Select the protocol before adding transport-specific fields such as ports. Use CLI completion to inspect the accepted protocol names.
 
 ```
 set firewall rule ping from wan
@@ -430,57 +166,21 @@ set firewall rule ping proto icmp
 set firewall rule ping action accept
 ```
 
-`icmp` and `icmpv6` carry no port — a rule naming one matches every packet of
-that protocol under its policy, subject to the rule's addresses. That is how the
-box is made to answer a ping while the zone's default action stays `drop`.
-
-The rest: `tcp`, `udp`, `tcp_udp` (both on one port), `vrrp`, `esp`, `ah`, `gre`.
-
-`block-icmp` is a different thing and easy to confuse with this. It is an
-*extra* drop, applied before the rules, and it only changes the outcome on a
-zone whose default action is `accept` — "let everything through, except ICMP".
-On a zone that already defaults to `drop`, `block-icmp false` does not permit
-anything; the default action still drops. `show firewall zones` states, per
-zone, which of the two is deciding.
-
 ## NAT
 
-`nat` has four kinds of translation:
-
-| Node | What it does |
-|---|---|
-| `source` | SNAT / masquerade a zone's outbound traffic (the classic WAN NAT). |
-| `destination` | Inbound DNAT port-forward to an internal host. |
-| `nat64` | Stateful IPv6→IPv4 translation (tayga) + DNS64 (unbound). |
-| `npt66` | Stateless IPv6 prefix translation (RFC 6296, checksum-neutral). |
+Use source NAT for outbound masquerading and destination NAT for a published service. Verify the translated address and port with the packet trace before rolling out a forwarding rule.
 
 ### Source NAT (masquerade)
+
+Source masquerading can use the WAN interface’s current IPv4 address, including a DHCP lease.
 
 ```text
 set nat source wan-masq zone wan            # masquerade everything leaving wan
 ```
 
-Omit `to` to use the WAN interface's current IPv4 address, including DHCP
-address changes. Set it for a fixed source address:
-
-```text
-set nat source wan-masq to 203.0.113.10
-```
-
-The upstream must route this address back to the appliance. One enabled source
-NAT rule is allowed per zone. Removing `to` restores masquerading. Both modes
-allocate collision-safe source ports and update IP and transport checksums.
-ICMPv4 echo requests use collision-safe translated identifiers, including when
-the original identifier is zero. Replies restore the internal address and
-identifier; their mappings expire with the configured ICMP timeout.
-
-
 #### Deterministic CGNAT
 
-Carrier NAT has to answer *who was behind this address and port*. Logging every
-translation is one way; giving each internal address a **fixed block** of WAN ports
-is the better one — the question is then answered by arithmetic, and one record of
-the block layout covers every flow inside it.
+A deterministic block maps an internal address to a known port range. Check pool size and subscriber capacity before applying the design.
 
 ```text
 set nat source wan-masq zone wan
@@ -488,29 +188,9 @@ set nat source wan-masq cgnat-block-size 512      # ports per internal address
 set nat source wan-masq cgnat-base-port 32768     # optional; this is the default
 ```
 
-```text
-show nat                       # the configured layout
-show nat cgnat 10.0.0.7        # which ports that address holds
-```
-
-`show nat cgnat` asks the **agent**, which computes the answer with the same code
-that hands the ports out — so what you report and what was actually used cannot
-drift apart. A layout that cannot work (a block that does not fit above its base
-port, a base port sizing nothing) is refused at commit rather than quietly falling
-back to ordinary masquerade.
-
-The default base port leaves the well-known and registered ports free, so
-port-forwards on the same address are unaffected.
-
 ### Destination NAT (port-forward)
 
-| Field | Meaning |
-|---|---|
-| `zone` | Ingress zone (the public side). |
-| `proto` | `tcp` / `udp`. |
-| `port` | Public destination port. |
-| `to` | Internal target `ip` or `ip:port`. |
-| `hairpin` | NAT reflection — reach the service via the public IP from inside. |
+Specify the external zone, protocol and service port together with the internal destination. Use the packet trace to inspect the translation.
 
 ```text
 set nat destination web zone wan
@@ -522,6 +202,8 @@ set nat destination web hairpin true
 
 ### NAT64 / NPTv6
 
+NAT64 translates between address families using its configured prefix and pool. NPTv6 translates between IPv6 prefixes. Use the mode appropriate for the addressing plan.
+
 ```text
 set nat nat64 enabled true
 set nat nat64 prefix 64:ff9b::/96
@@ -530,22 +212,9 @@ set nat nat64 interface eth1
 set nat nat64 dns64 true
 ```
 
-`npt66` maps an internal ULA prefix to a delegated external prefix statelessly —
-configured per interface via `[nat.npt66]` (internal ↔ external `/48`s); see
-`show nat`.
-
 ## Load-balanced services
 
-`load-balancer` is its own top-level node — a virtual address in front of a
-backend pool, translated in the XDP data plane rather than by a userspace proxy.
-
-| Field | Meaning |
-|---|---|
-| `zone` | Ingress zone clients arrive from; the service is keyed under its policy. |
-| `vip` | The virtual address clients connect to. |
-| `proto` | `tcp` / `udp`. |
-| `port` | The virtual port clients connect to. |
-| `backend` | A pool member, `ip` (keep the client's port) or `ip:port`. Repeat to add. |
+Define a VIP, protocol, port and backend pool. Inspect the translation for a connection to the VIP.
 
 ```text
 set load-balancer web zone wan
@@ -556,57 +225,18 @@ set load-balancer web backend 10.0.0.11:8443
 set load-balancer web backend 10.0.0.12
 ```
 
-Committing a service **opens the firewall for its port** in that zone (a visible
-`pass` rule an explicit rule of your own overrides), and only one service may
-hold a given `(zone, proto, port)`. The pool normally lives on an internal zone,
-so a backend's reply arrives on a different zone than the request did; the data
-plane rewrites it back to the VIP either way.
-
-> **The internal zone must permit its own outbound traffic.** A backend's reply
-> is, to the firewall, an ordinary outbound packet from the internal zone. If
-> that zone denies by default and no rule admits the direction, the reply is
-> dropped and the client sees a connection that opens and then stalls. The same
-> applies to a port-forward's internal host.
-
-See
-[Load balancer](../operations/configure.md) for the full surface, and
-`services reverse-proxy` when you need TLS termination or HTTP-aware routing
-instead.
-
 ## Seeing what is on the wire
 
-The data plane records every NAT'd connection in its state table, and each entry
-counts the traffic it accounted for. Two views read it:
+Query the live flow table and per-flow counters to see traffic already observed by the dataplane.
 
 ```text
 show flows                 # the live state table, with per-flow packets/bytes
 show top-talkers           # hosts ranked by the volume attributed to them
 ```
 
-`top-talkers` ranks by **bytes**, not by connection count — a host holding four
-hundred idle keep-alives is not the reason a link is full — and still reports the
-connection count beside it, because one flow moving ten gigabytes and ten
-thousand flows moving ten gigabytes are different problems.
-
-A host is named by the traffic it **caused**. For a masqueraded connection the
-state entry describes the reply, so its source is the remote server while the
-internal client that asked for the traffic is the entry's NAT target; the
-ranking attributes it to that client. Otherwise the view would answer "which
-server sent us the most", which is rarely the question.
-
-Three limits worth knowing:
-
-- **Only NAT'd connections are counted.** Traffic the firewall passes without
-  translating (routed between two internal zones, say) has no state entry to
-  account against and does not appear.
-- **The counters are per appliance and are not replicated.** After an HA
-  failover the new active node counts the flows it forwards from zero — the
-  bytes it is reporting are the bytes it actually carried, and summing the pair
-  would otherwise double them.
-- **Byte counts are of the frame on the wire**, headers included, which is what
-  a link's capacity is measured in.
-
 ## SYN-flood protection (SYN proxy)
+
+Enable SYN proxy only for the TCP service ports that need it and verify normal connections to each protected service.
 
 ```text
 set firewall syn-protect 443
@@ -614,184 +244,52 @@ set firewall syn-protect 8080 mss 1400
 delete firewall syn-protect 443
 ```
 
-A SYN flood costs the attacker one small packet and costs the server a
-half-open connection held for tens of seconds against an address that was never
-real. `syn-protect` makes the firewall stop believing a SYN: it answers the
-handshake itself, with a cookie derived from the connection's own identity, and
-keeps **no state at all**. Only a client that actually receives that answer can
-return it, so a spoofed source never gets past — and the flood costs the
-appliance one reply packet each and nothing more.
-
-When a client does return a valid cookie, the firewall opens the real connection
-to the server and joins the two halves together. From then on the connection is
-ordinary; `show firewall statistics` reports what happened:
-
-| Counter | Meaning |
-|---|---|
-| `synproxy_challenged` | SYNs answered with a cookie. Under attack this is the flood being absorbed. |
-| `synproxy_admitted` | Clients that returned a valid cookie and reached the server. |
-| `synproxy_rejected` | ACKs carrying no cookie this appliance minted — spoofed, or expired. |
-| `synproxy_spliced` | Servers that answered and had their connection joined to a client's. |
-
-Read `challenged` and `admitted` together: a large gap between them *is* the
-attack being stopped.
-
-**What a protected connection gives up.** The firewall has to answer before it
-can ask the server what it would have agreed to, so it offers an MSS and nothing
-else — no window scaling, no SACK, no timestamps — and passes the same bare
-options on to the server, so both ends agree. In practice that caps a single
-connection's receive window at 64 KiB (about 6 MB/s on a 10 ms path) and makes
-loss recovery slower. Protect the ports where a flood is the greater risk, not
-every port.
-
-Two further limits worth knowing:
-
-- It is **TCP over IPv4** only.
-- A port-forward that also **changes** the port cannot be protected: the proxy
-  matches the two directions of a connection by the service port, which a port
-  rewrite breaks. Forwarding the address is fine — `443 → 10.0.0.10:443` works,
-  `443 → 10.0.0.10:8443` does not.
-
-The cookie key is drawn from the kernel's random source when the first protected
-port is configured, and never leaves the appliance.
-
 ## Application-layer gateways: there are none
 
-Sentinel ships **no ALGs** — no FTP helper, no SIP helper, no TFTP or PPTP
-helper. That is a decision, not a gap, and it is worth stating because other
-firewalls enable several by default.
-
-An ALG works by parsing the payload of traffic in the forwarding path and
-opening holes based on what it finds. Three things follow, and together they
-settle it:
-
-- **It parses attacker-controlled data in the most privileged place there is.**
-  The helpers in other stacks have a long history of exactly the bugs you would
-  expect from that, and each one opens a pinhole on the strength of what it
-  parsed.
-- **It stops working the moment the protocol is encrypted**, which for SIP and
-  increasingly for FTP is already the normal case. A mechanism that only helps
-  the unencrypted minority is not one to carry in the data path.
-- **Both protocols have a better answer.** FTP has passive mode; give the server
-  a fixed data-port range and forward it. SIP has TLS, and a deployment that
-  needs media traversal needs a session border controller, not a NAT guess.
-
-What this appliance offers instead is explicit: port-forwards including ranges,
-hairpin NAT so an internal client reaches a published service by its public
-address, and a stateful firewall that lets replies back without a rule. If a
-protocol needs more than that, it needs a proxy that understands it — and that
-proxy should not be inside the packet path of everything else.
-
+The dataplane does not rewrite protocol payloads through application-layer gateways. Plan explicit application ports, passive endpoints or NAT traversal as appropriate.
 
 ## Groups whose members are decided elsewhere
 
-An address group lists addresses. Three more kinds list something else and are
-resolved into address groups before the compiler runs — so a rule names any of
-them through the same `source-group` / `destination-group` field, and neither the
-compiler nor the data plane needs a second concept.
-
-| Kind | Members | Resolved from |
-|---|---|---|
-| `domain-group` | DNS names | a lookup, cached on disk |
-| `feed-group` | HTTPS URLs | the published list, cached on disk |
-| `user-group` | VPN usernames | who is connected right now |
+Use a named group when rule membership comes from a published list or authenticated users. Keep ownership, refresh behavior and the consequences of an empty group explicit.
 
 ### Published lists
+
+Reference a maintained feed from a named group. Confirm the source and refresh behavior before relying on its contents.
 
 ```text
 set firewall group feed-group bogons url https://example.org/bogons.txt
 set firewall rule drop-bogons source-group bogons
 ```
 
-The lists worth having are maintained elsewhere — bogons, exit nodes, a
-provider's own prefixes. Copied in by hand, one is wrong within a week and
-nobody notices.
-
-**HTTPS only.** This list becomes firewall rules; over plain HTTP anything on the
-path decides what the box permits. The fetch carries no credential, so a feed can
-never take this box's token to somebody else's web server.
-
-**A failed fetch keeps the last good copy.** A feed's job is usually to block. If
-a publisher's outage emptied the group, the rule would match nothing — and a rule
-that blocks nothing is a rule that allows. Stale is not the same as absent.
-
-There is a cap, and it is loud: silently keeping the first ten thousand entries
-of a blocklist is a firewall that stopped blocking things without telling
-anybody.
-
 ### People
+
+User groups allow a policy to refer to authenticated identities rather than a fixed address list.
 
 ```text
 set firewall group user-group admins user alice,bob
 set firewall rule admin-ssh source-group admins
 ```
 
-A rule saying `10.9.0.0/24` says where somebody was, not who they are — and when
-addresses come from a pool the two drift apart the moment anybody reconnects.
-
-**Where identity comes from, and where it does not.** The only place this
-appliance learns that an address belongs to a *person* is the road-warrior VPN: a
-client authenticates with a username and is handed an address. The captive portal
-admits by MAC and never learns a name; a host on the LAN has no identity here at
-all. `show vpn users` is the map this resolves against.
-
-**There is no cache here, and that is the opposite of a feed group on purpose.**
-A feed blocks, so a stale copy is safer than an empty one. A user group usually
-*allows*, so a stale copy would keep somebody's access alive after they
-disconnected and their address went to the next person in the pool. When the VPN
-cannot be asked the group is empty, and an empty group matches nothing.
-
-A member who is simply not connected is noted at commit — not because it is a
-mistake, but because a rule that suddenly matches nothing otherwise looks like a
-firewall fault.
-
 ## One rule for both protocols
+
+Use `tcp_udp` when TCP and UDP intentionally share a rule and port.
 
 ```text
 set firewall rule dns-in proto tcp_udp
 set firewall rule dns-in port 53
 ```
 
-A service reached over either — DNS, NTP, a Samba share — is one decision to an
-operator, and writing it twice means two rules to keep in step afterwards. The
-data plane has no such protocol, so the compiler emits the pair; nothing
-downstream knows the grammar has a word for "either".
-
 ## Which rules are doing anything
+
+Inspect rule-hit counters while generating ordinary application traffic. Use the trace for the configuration decision behind a specific packet.
 
 ```text
 show firewall hits
 ```
 
-```text
-  rule                            flows    packets  share
-  web-in                            412     18 220  74 %
-  dns-out                            88      1 004  16 %
-  legacy-smb                          0          0  0 %  ← nothing
-```
-
-Busiest first, so the dead rules gather at the bottom where they read as a
-group. The console's rule table shows the same thing in a **carrying** column.
-
-This is **attribution, not a hardware counter**: the data plane counts globally,
-so the appliance asks for the live flow table and works out which rule admitted
-each flow — matching against the *compiled* rules, so the ranking is the one the
-data plane applies and cannot drift from what is loaded.
-
-**Only accept rules are counted.** A rule that drops leaves no flow behind — the
-packet is gone — so a zero against one would read as "never matched" when it
-means "nothing got through here", which is what the rule is *for*. Reporting that
-as a count would invite somebody to delete the rule doing its job.
-
-It also only sees **now**: what the connection table holds, not what went through
-yesterday.
-
-
 ## What was already refused (firewall log)
 
-A drop leaves no flow behind, so the counters above cannot tell you about it
-after the fact. The data plane writes a line instead, and `show firewall log`
-reads those lines back:
+Read the firewall log for recent decisions. A counter reason can be shared by several rules; use a trace to identify candidate matches.
 
 ```text
 show firewall log            # the last fifty lines
@@ -799,115 +297,13 @@ show firewall log 500        # a deeper read, up to 5000
 show firewall log since 6h   # a period instead of a count
 ```
 
-```text
-Sep 06 12:00:01 gate velstra[9]: DROP 10.0.0.5 proto=6 dport=22 reason=blocklist
-Sep 06 12:00:02 gate velstra[9]: DROP portal 10.0.0.9 proto=17 dport=53
-Sep 06 12:00:04 gate velstra[9]: REJECT 192.0.2.7 proto=6 dport=3389
-```
-
-The period is one of `15m`, `1h`, `6h`, `24h` or `7d` and the depth is a number
-up to 5000. Both are **bounded on purpose**: these words reach `journalctl`, and
-an appliance does not hand a management request an argument list.
-
-The console has the same under **Policy → Firewall log**, as a table rather than
-as text — one row per refusal, marked by its verdict, with the time, the source
-and what it was carrying, and the reason it was turned away. Typing in the box narrows what is already
-on screen without asking the appliance again; the period is the only control
-that goes back for more. **Every line** shows the journal unparsed, which is
-what you want when the interesting line is not a verdict at all.
-
-**A reason is a counter, not a rule.** `reason=blocklist` names the counter the
-data plane bumped, and several rules can bump the same one — so the console does
-not claim to know which rule decided. The **Explain** button on a row opens the
-packet trace with that line's source, protocol and port already filled in:
-choose the link the packet arrived on and the walk below names the rule.
-
-## Asking before you send (packet trace)
-
-The question a rule set of any size eventually raises is "why can this host not
-reach that one", and the honest answer is scattered across the zone the link is
-in, a port-forward that rewrites the destination first, the routing table, a
-dozen rules naming the zone, and whether the leaving link masquerades. `trace`
-walks those in the order the data plane takes them and says what it found at
-each:
-
-```text
-sentinel trace --in lan0 tcp 10.0.0.200 10.9.0.10 22
-```
-
-```text
-ingress:   lan0 is in zone lan (policy 2, default pass, stateful: replies to admitted flows pass by conntrack)
-route:     10.9.0.10 leaves on dmz0 (connected, 10.9.0.1/24), zone dmz
-rules:     rule no-ssh-from-guests matches (source 10.0.0.128/25, tcp/22) → drop
-
-rules looked at and passed over:
-  ssh-to-dmz               matches too, but no-ssh-from-guests is more specific
-
-verdict:   drop (no-ssh-from-guests)
-```
-
-The console has the same under **Policy → Packet trace**, and the API answers
-`GET /api/v1/trace?in=lan0&proto=tcp&src=…&dst=…&port=22` with the walk as
-JSON (`--json` prints the same on the command line). `--src-mac` consults
-MAC-group rules, `--icmp-type` the typed ICMP ones, and `--config` walks a
-file other than the saved configuration — a candidate you are about to commit,
-for instance.
-
-It is a **simulation against the compiled configuration**, not a capture: the
-rules are matched the way the data plane ranks them (a MAC verdict first, then a
-rule scoped to the arriving link, then a typed ICMP rule, then the longest
-prefix, and on an equal prefix the stricter action), a matching port-forward
-admits the flow on its own, and the blocklist is consulted before anything
-else — all in the same order the eBPF program decides. Anything the box only
-knows at runtime is **not** in the answer, and the trace says so where it would
-matter: an established connection (which conntrack would admit regardless), a
-route learned from a routing protocol (a more specific one would win over the
-static route named), and which uplink multi-WAN currently prefers (the highest
-priority is assumed healthy). Rules the walk looked at and passed over are
-listed with the reason, because "why did my rule not fire" is the question the
-verdict alone does not answer.
-
-
 ## A packet the filter cannot parse
 
-```text
-set firewall global fail-closed false      # to turn it off
-```
-
-**On by default.** It governs one narrow thing: what happens to a packet the
-data plane **cannot parse at all** — a bounds failure while reading headers,
-decided before any zone is known, so it escapes the zone posture entirely.
-
-This appliance denies by default, and the two have to agree: a packet the filter
-cannot understand is exactly the one that posture must not admit.
-
-The argument for the other side is real, which is why this is a switch rather
-than a constant — a firewall should arguably not black-hole traffic because of
-its own parsing limits, and an encapsulation the parser does not know is the
-packet's problem to explain. Turn it off if you would rather such a packet be
-passed than dropped.
-
-It is host-wide, not per zone, because the parse fails before there is a zone to
-attribute it to. The value is written into the data plane's configuration in
-**both** states, so the answer comes from here rather than from a default at the
-other end agreeing with this one.
-
+Inspect the configured default for unparseable traffic and check drop counters before changing it. An explicit fail-closed posture drops packets the dataplane cannot classify.
 
 ## Stateful tracking and idle deadlines
 
-Rules match both ingress and egress unless `direction in` or `direction out`
-restricts them. Both IPv4 and IPv6 support egress rules. For example, an
-unrestricted `echo-reply` drop rule also drops replies generated by the appliance;
-use `direction in` when the rule is intended to match arriving packets only.
-
-IPv4 and IPv6 use the same timed state machine. TCP starts with a SYN, tracks
-SYN/SYN-ACK/ACK, and uses a shorter closing deadline after FIN. RST removes the
-flow. UDP gains a stream deadline once replies arrive; ICMP echo requests and
-replies are matched by address, family and identifier. An expired entry never
-grants reply permission. Explicit drop rules and source blocks still apply to
-established traffic.
-
-Idle deadlines are global, measured in seconds, and applied live:
+Choose connection-tracking timeouts for the expected workload. Check existing flows before shortening their idle lifetime.
 
 ```text
 set firewall global conntrack tcp-syn 30
@@ -918,26 +314,12 @@ set firewall global conntrack udp-stream 180
 set firewall global conntrack icmp 10
 ```
 
-These are the defaults. Each value must be between 1 and 604800 seconds.
-Deleting an override restores its default. In `appliance.toml`, these fields
-live in `[firewall.conntrack]` with the same hyphenated names.
+## Check the result
 
-Rules are updated in the running data plane, preserving established flows.
-Unchanged commits preserve the process and its maps. Updates fence packet
-processing while policy maps are replaced; a failed update restores the previous
-maps or keeps the data plane closed if restoration fails.
-Removing a zone or reassigning its numeric policy ID resets the data plane's
-runtime state, so another zone cannot inherit its established sessions or NAT
-mappings. Ordinary rule edits retain the existing sessions.
-
-```text
-show firewall states     # active IPv4/IPv6 tuples, phase and idle time (JSON)
-show firewall counters   # named L3/L4 rule packet/byte/accept/drop totals (JSON)
-show firewall events     # newest 100 packet events (JSON lines); consumes nothing
+```sh
+sentinel show firewall statistics
+sentinel show firewall log
+sentinel show nat
 ```
 
-Use `log true` on a rule to emit its accepted and dropped packet events. Events
-carry its stable rule ID and name, protocol, addresses, ports, interface index
-and direction. `events_lost` in the counters reports ring-buffer overflow;
-counters continue to accumulate when events are lost. The existing
-`show firewall hits` view attributes sampled flows rather than counting packets.
+Generate normal application traffic on an isolated test segment. Compare the counters and logs with the simulated decision.
