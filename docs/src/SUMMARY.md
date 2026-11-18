@@ -7,7 +7,7 @@
 - [Install to disk](operations/install.md)
 - [Apply a change remotely](operations/configure.md)
 - [Stage an appliance update](operations/update.md)
-- [Verify witness-backed HA](operations/high-availability.md)
+- [Choose an HA election mode](operations/high-availability.md)
   - [HA configuration reference](operations/ha-reference.md)
 - [Inspect management transactions](operations/management-api.md)
 - [Enroll in fleet management](operations/fleet.md)
