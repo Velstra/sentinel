@@ -4,6 +4,27 @@ Sentinel retains Fabric's stateful eBPF firewall. This is a development candidat
 not a production support promise. A passing parser, host unit test or verifier
 load is not a passing packet test.
 
+## Latest source checkpoint — 18–19 November 2026
+
+- **Not release-ready:** the full pressure gate opens all 20,000 connections,
+  but only 16,322 pass the held-connection probe. NAT bindings remain present
+  while firewall state is missing. A safe supported connection limit has not
+  been established.
+- **Still failing:** wrong-sequence, nonexact in-window and checksum-corrupt
+  TCP resets destroy live state; fragmented IPv4 UDP/ICMP SNAT fails against
+  the independent netfilter reference.
+- **Passing within scope:** plain NAT, hairpin, generated reject packets,
+  pairing/config-sync with and without a witness, and same-source/historical
+  mixed-source single-flow failover. These do not qualify a complete rolling
+  upgrade, loaded failover or signed image.
+- **Verifier:** all 22 shipped programs load on 6.6.159, 6.12.113 and 6.18.57
+  from the same object, SHA-256
+  `a2d2ef90c895df56bb6a049535222f0186bedaa0fbd56ae919991189aaf53c47`.
+
+The [remediation record](https://github.com/Velstra/sentinel/blob/main/docs/qa-release-findings-2026-11-18.md)
+separates source cohorts, fixed test fixtures, actual runtime fixes and failures.
+Earlier measurements below remain historical evidence, not extra guarantees.
+
 ## Current boundaries
 
 | Path | Current status / limitation |
