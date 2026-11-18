@@ -34,7 +34,7 @@ Match area, timers and network type on the peer. After applying, inspect `sentin
 
 ## Active/standby HA pair {#ha-pair}
 
-For forwarding authority during a partition, use the [witness-backed HA runbook](../operations/high-availability.md). In this design, two members share a witness and the previous owner is fenced when its lease expires. A VRRP virtual address by itself does not establish that the old node stopped forwarding.
+Two appliances can elect a primary using authenticated heartbeats. If all peer paths fail, both members can become active. An optional independent witness arbitrates ownership and the old owner is fenced when its lease expires. [Compare the two pairing commands](../operations/high-availability.md).
 
 ```sh
 sentinel show ha
