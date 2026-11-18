@@ -16,6 +16,14 @@ target/
 *.crt
 
 *.qcow2
+*.raw
+*.raw.zst
+*.img
+*.iso
+*.vmdk
+*.vhd
+*.vhdx
+*.efi
 
 # Nix build result symlinks (point at machine-local /nix/store paths)
 /result

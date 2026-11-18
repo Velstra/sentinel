@@ -1832,6 +1832,10 @@ fn signed_update_observed(
     let (disk, active, inactive) = update_target()?;
     let source = std::path::Path::new("<anonymous signed channel image>");
     let image = VerifiedImage::from_file(file, source, &manifest.sha256)?;
+    let mut before_write = || {
+        (hooks.before_write)()?;
+        update::require_fresh_offer(chan, &offer)
+    };
     write_verified_observed(
         image,
         VerifiedWrite {
@@ -1842,7 +1846,10 @@ fn signed_update_observed(
             is_block: false,
             commit,
         },
-        hooks,
+        UpdateHooks {
+            phase: hooks.phase,
+            before_write: &mut before_write,
+        },
     )
 }
 
@@ -1896,7 +1903,7 @@ fn read_bounded(path: &std::path::Path, maximum: usize) -> Result<Option<Vec<u8>
 
 fn decode_loader_variable(bytes: &[u8]) -> Result<String> {
     ensure!(
-        (4..=MAX_EFI_VARIABLE_BYTES).contains(&bytes.len()) && (bytes.len() - 4) % 2 == 0,
+        (4..=MAX_EFI_VARIABLE_BYTES).contains(&bytes.len()) && (bytes.len() - 4).is_multiple_of(2),
         "malformed efivarfs UTF-16 payload"
     );
     let attributes = u32::from_le_bytes(bytes[..4].try_into().expect("four attributes bytes"));
@@ -1907,7 +1914,9 @@ fn decode_loader_variable(bytes: &[u8]) -> Result<String> {
         "unexpected EFI loader-variable attributes"
     );
     let words: Vec<_> = bytes[4..]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|word| u16::from_le_bytes([word[0], word[1]]))
         .collect();
     let end = words
@@ -2206,6 +2215,7 @@ mod tests {
                 image: "sentinel.raw".into(),
                 sha256: "1".repeat(64),
                 product: Some(crate::update::PRODUCT.into()),
+                freshness: None,
             },
             manifest_sha256: "2".repeat(64),
             public_key_sha256: "3".repeat(64),

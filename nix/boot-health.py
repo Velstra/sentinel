@@ -15,12 +15,23 @@ import tomllib
 BOOT_COUNT = Path("/sys/firmware/efi/efivars/LoaderBootCountPath-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f")
 
 
-def trial_boot(path: Path = BOOT_COUNT) -> bool:
-    """Never reboot a permanent install solely because a later config is bad."""
+def trial_boot(path: Path = BOOT_COUNT, uki_directory: Path = Path("/boot/EFI/Linux")) -> bool:
+    """Retry counted boots, but never loop on an exhausted factory image.
+
+    A final reboot is useful only when the OTHER slot is already permanent.
+    If all available entries are exhausted (for example bad first-boot NIC
+    seeding), stay up for console/management recovery without blessing the OS.
+    """
     try:
         # efivarfs prefixes the UTF-16 value with four attribute bytes.
         value = path.read_bytes()[4:].decode("utf-16-le").rstrip("\0")
-        return re.fullmatch(r"[\\/]EFI[\\/]Linux[\\/][^\\/]+\+\d+-\d+\.efi", value) is not None
+        match = re.fullmatch(r"[\\/]EFI[\\/]Linux[\\/]sentinel-([ab])\+(\d+)-(\d+)\.efi", value)
+        if match is None:
+            return False
+        if int(match[2]) > 0:
+            return True
+        fallback = uki_directory / ("sentinel-b.efi" if match[1] == "a" else "sentinel-a.efi")
+        return fallback.is_file() and not fallback.is_symlink()
     except (OSError, UnicodeError):
         return False
 
@@ -89,6 +100,11 @@ def link_failures(desired: dict, compiled: dict, links: list[dict]) -> list[str]
 def pending(desired: dict, compiled: dict, systemctl: str, ip: str,
             runtime: Path) -> list[str]:
     units = ["sentinel-boot.service", "wren.service"]
+    # SSH is enabled by default, including when its table is omitted. A daemon
+    # retrying an unavailable explicit bind is not in systemctl --failed but
+    # must not allow the current boot to be blessed as healthy.
+    if desired.get("services", {}).get("ssh", {}).get("enable", True):
+        units.append("sshd.service")
     web = desired.get("services", {}).get("web", {})
     sync = desired.get("system", {}).get("config-sync", {})
     if web.get("enable", False) or sync.get("secret"):
@@ -128,7 +144,7 @@ def pending(desired: dict, compiled: dict, systemctl: str, ip: str,
 def verify(config: Path, runtime: Path, sentinel: str, systemctl: str,
            ip: str, timeout: float) -> bool:
     original = config.read_bytes()
-    result = subprocess.run([sentinel, "config", "check", str(config)],
+    result = subprocess.run([sentinel, "config", "check", "--live", str(config)],
                             capture_output=True, timeout=15, check=False)
     if result.returncode:
         print("boot health: saved configuration failed validation", file=sys.stderr)

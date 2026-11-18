@@ -23,3 +23,5 @@ Run from the source checkout with Python 3.11+ and the Syft version pinned by pu
 ## Review the correct artifact
 
 A source inventory describes declared dependencies, including development packages. For an appliance approval, request release evidence tied to the actual image digest, including the installed-image inventory and its vulnerability scan.
+
+An inventory is not redistribution notices or proof that license and source-distribution obligations are met. See [licenses and notices](notices.md).

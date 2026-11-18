@@ -36,3 +36,9 @@ nix build .#checks.x86_64-linux.bootfallback -L
 ```
 
 Run on a KVM-enabled build host.
+
+## Safety boundaries
+
+Fallback needs a previously bootable, blessed slot; a fresh installation with no working predecessor cannot promise automatic recovery. Keep a console and verify the actual selected entry, not only a configured default.
+
+`--allow-unsigned` permits only an explicitly trusted Community source. It does not bypass active-disk, boot-selection or identical-active-GUID refusal. Native Enterprise appliances reject the Community image writer; use their signed channel workflow.

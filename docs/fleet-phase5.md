@@ -1,3 +1,7 @@
+> **Development record — not current operator guidance or release approval.**
+> Results apply only to the source/image and scope recorded below. Original
+> findings are retained; use the [documentation map](https://github.com/Velstra/sentinel/blob/main/docs/README.md) for current guides.
+
 # Optional fleet management
 
 An enrolled node checks in over outbound HTTPS using mutual TLS. Signed controller requests can ask for telemetry or a provisional configuration change. Local forwarding and management continue when the controller is unreachable.

@@ -48,3 +48,5 @@ sentinel show nat
 ```
 
 Open `https://localhost:8443/` through QEMU forwarding or `https://192.168.50.1:8443/` on a directly attached LAN. Verify the certificate identity against `journalctl -u sentinel-api.service` and use the administrator you created. Record a working baseline before trying a [remote configuration change](configure.md).
+
+Binding the console to the LAN address selects its destination IP, not allowed ingress interfaces. Verify management isolation from every other segment. HA is experimental; follow the [HA safety guide](../handbook/ha.md) with independent recovery access before forming a pair.

@@ -70,15 +70,32 @@ class BootHealthTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "efivar"
             for value, expected in (("\\EFI\\Linux\\sentinel-a+2-1.efi", True),
-                                    ("/EFI/Linux/sentinel-b+0-3.efi", True),
+                                    ("/EFI/Linux/sentinel-b+0-3.efi", False),
                                     ("/EFI/Linux/sentinel-a.efi", False),
                                     ("/EFI/Linux/../../anything+3-0.efi", False),
                                     ("/other/sentinel-a+3-0.efi", False)):
                 path.write_bytes(b"\x07\x00\x00\x00" + (value + "\0").encode("utf-16-le"))
-                self.assertEqual(health.trial_boot(path), expected, value)
+                self.assertEqual(health.trial_boot(path, Path(directory)), expected, value)
             path.write_bytes(b"invalid")
             self.assertFalse(health.trial_boot(path))
             self.assertFalse(health.trial_boot(Path(directory) / "absent"))
+
+    def test_exhausted_trial_reboots_only_into_a_real_permanent_other_slot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "efivar"
+            path.write_bytes(b"\x07\x00\x00\x00" +
+                             ("/EFI/Linux/sentinel-b+0-3.efi\0").encode("utf-16-le"))
+            self.assertFalse(health.trial_boot(path, root))
+            # Another exhausted/unassessed entry is not a known-good fallback.
+            (root / "sentinel-a+0-3.efi").write_bytes(b"exhausted")
+            self.assertFalse(health.trial_boot(path, root))
+            fallback = root / "sentinel-a.efi"
+            fallback.write_bytes(b"permanent")
+            self.assertTrue(health.trial_boot(path, root))
+            fallback.unlink()
+            fallback.symlink_to(root / "sentinel-a+0-3.efi")
+            self.assertFalse(health.trial_boot(path, root))
 
     def test_schema_failure_and_concurrent_change_withhold_blessing(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -110,6 +127,27 @@ class BootHealthTests(unittest.TestCase):
                 called.clear()
                 health.pending({"system": {"config-sync": {"secret": "test-only"}}}, {}, "systemctl", "ip", path)
                 self.assertTrue(any("sentinel-api.service" in command for command in called))
+
+    def test_enabled_ssh_requires_active_service_even_without_failed_units(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.toml"
+            path.write_text("")
+            for config in ({}, {"services": {"ssh": {}}},
+                           {"services": {"ssh": {"enable": True}}},
+                           {"services": {"ssh": {"enable": False}}}):
+                enabled = config.get("services", {}).get("ssh", {}).get("enable", True)
+                for inactive in (False, True):
+                    called = []
+                    def run(command, **kwargs):
+                        called.append(command)
+                        status = 3 if inactive and "sshd.service" in command else 0
+                        return subprocess.CompletedProcess(command, status, b"[]", b"")
+                    with self.subTest(config=config, inactive=inactive), \
+                            patch.object(health.subprocess, "run", side_effect=run), \
+                            patch.object(health, "query", return_value=b"no vrfs configured\n"):
+                        result = health.pending(config, {}, "systemctl", "ip", path)
+                        self.assertEqual("sshd.service: not active" in result, enabled and inactive)
+                        self.assertEqual(any("sshd.service" in command for command in called), enabled)
 
     def test_configuration_not_ready_and_runtime_drift_are_not_waived(self):
         with tempfile.TemporaryDirectory() as directory:

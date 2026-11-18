@@ -30,3 +30,13 @@ Record the resulting store path. The eBPF object also depends on the pinned Rust
 ## Build offline
 
 Populate or copy the required store paths and fixed-output sources first. A source checkout alone cannot satisfy network fetches on an air-gapped builder. See the [flake outputs](../reference/flake-outputs.md).
+
+## What pinning does not prove
+
+Pinned inputs improve repeatability; they do not by themselves prove byte-for-byte reproducibility. Compare independently built artifacts, record their hashes and account for signing and other variable inputs.
+
+A fixed-output derivation can reuse an older cached object when its expected output hash is unchanged, even if a source revision changed. Verify the measured object and its ABI against the intended userspace cohort before accepting new hashes. Development ABI guards or a fixture's pins are not proof that the published appliance integrates them.
+
+Keep the eBPF Rust nightly and LLVM versions compatible. An offline-build claim requires the complete closure and a successful build with network access disabled, not merely a populated source cache.
+
+Ignore rules are not a secret scan or a history rewrite. Review tracked files, release artifacts and reachable history separately.

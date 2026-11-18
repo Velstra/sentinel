@@ -14,6 +14,19 @@ use serde_json::{Value, json};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_OUTPUT: usize = 65_536;
+const OBSERVED_SERVICES: [&str; 3] = [
+    "chronyd.service",
+    "systemd-tpm2-setup.service",
+    "sshd.service",
+];
+const SERVICE_ARGUMENTS: [&str; 6] = [
+    "--no-pager",
+    "show",
+    OBSERVED_SERVICES[0],
+    OBSERVED_SERVICES[1],
+    OBSERVED_SERVICES[2],
+    "--property=Id,LoadState,ActiveState,SubState,Result,ExecMainStatus,ConditionResult",
+];
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 struct Unit {
@@ -135,13 +148,17 @@ fn failed_units(text: &str) -> Result<Vec<Unit>, &'static str> {
 }
 
 fn properties(text: &str) -> Result<Vec<Unit>, &'static str> {
-    text.split("\n\n")
+    let units: Vec<Unit> = text
+        .split("\n\n")
         .filter(|block| !block.trim().is_empty())
         .map(|block| {
-            let fields: std::collections::HashMap<_, _> = block
-                .lines()
-                .filter_map(|line| line.split_once('='))
-                .collect();
+            let mut fields = std::collections::HashMap::new();
+            for line in block.lines() {
+                let (name, value) = line.split_once('=').ok_or("invalid unit response")?;
+                if fields.insert(name, value).is_some() {
+                    return Err("duplicate unit property");
+                }
+            }
             let word = |name| {
                 fields
                     .get(name)
@@ -166,7 +183,56 @@ fn properties(text: &str) -> Result<Vec<Unit>, &'static str> {
                     }),
             })
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+    let mut names = std::collections::BTreeSet::new();
+    if units.iter().any(|unit| !names.insert(&unit.unit)) {
+        return Err("duplicate unit response");
+    }
+    Ok(units)
+}
+
+fn service_properties(text: &str) -> Result<Vec<Unit>, &'static str> {
+    let units = properties(text)?;
+    if units.len() == OBSERVED_SERVICES.len()
+        && OBSERVED_SERVICES
+            .iter()
+            .all(|name| units.iter().any(|unit| unit.unit == *name))
+    {
+        Ok(units)
+    } else {
+        Err("incomplete unit response")
+    }
+}
+
+fn ssh_status(enabled: Option<bool>, unit: Option<&Unit>) -> &'static str {
+    match enabled {
+        Some(false) => "disabled",
+        None => "unknown",
+        Some(true) => {
+            let Some(unit) = unit else {
+                return "unknown";
+            };
+            if unit.load_state.as_deref() != Some("loaded")
+                || unit.active_state.is_none()
+                || unit.sub_state.is_none()
+                || unit.result.is_none()
+                || unit.exit_status.is_none()
+                || unit.condition_result.is_none()
+            {
+                return "unknown";
+            }
+            if unit.active_state.as_deref() == Some("active")
+                && unit.sub_state.as_deref() == Some("running")
+                && unit.result.as_deref() == Some("success")
+                && unit.exit_status == Some(0)
+                && unit.condition_result == Some(true)
+            {
+                "ok"
+            } else {
+                "warning"
+            }
+        }
+    }
 }
 
 fn issue(code: &str, severity: &str, message: &str, action: &str) -> Value {
@@ -211,6 +277,9 @@ fn snapshot(
     };
     let chrony = service("chronyd.service");
     let setup = service("systemd-tpm2-setup.service");
+    let ssh = service("sshd.service");
+    let ssh_enabled = appliance.map(|config| config.services.ssh.enable);
+    let ssh_status = ssh_status(ssh_enabled, ssh);
     let mut issues = Vec::new();
     match clock.synchronised {
         Some(true) => {}
@@ -225,7 +294,7 @@ fn snapshot(
         issues.push(issue(
             "configuration-unavailable",
             "unknown",
-            "NTP configuration could not be read or validated.",
+            "The appliance configuration could not be read or validated.",
             "Validate the appliance configuration using sentinel config check.",
         ));
     }
@@ -252,9 +321,22 @@ fn snapshot(
         issues.push(issue(
             "service-status-unavailable",
             "unknown",
-            "Time and TPM service status could not be read.",
+            "SSH, time and TPM service status could not be read.",
             "Check that systemd and its system bus are available.",
         ));
+    }
+    match ssh_status {
+        "warning" => issues.push(issue(
+            "ssh-service-inactive", "warning",
+            "SSH is enabled, but sshd is not confirmed running. It may be starting or retrying even when no failed unit is listed.",
+            "Check sshd.service and the configured SSH listen address. Verify that the address is assigned; do not widen the listener or disable its health check to hide a bind failure.",
+        )),
+        "unknown" => issues.push(issue(
+            "ssh-service-unavailable", "unknown",
+            "Configured SSH availability could not be verified.",
+            "Validate the appliance configuration and query sshd.service with systemctl show. Missing, incomplete or failed probes are not proof of a healthy SSH listener.",
+        )),
+        _ => {}
     }
     if chrony.is_some_and(|unit| {
         unit.load_state.as_deref() == Some("loaded")
@@ -331,6 +413,7 @@ fn snapshot(
         },
         "systemd": {"available": failures.is_ok(), "failed_units": failures.as_ref().ok(), "error": failures.as_ref().err()},
         "network": {"default_route": default_route},
+        "ssh": {"enabled": ssh_enabled, "service": ssh, "status": ssh_status},
         "tpm": {"present": present, "devices": devices, "setup": setup, "status": tpm_status, "advice": advice},
         "issues": issues,
     })
@@ -354,28 +437,8 @@ pub fn collect(config_path: &Path) -> Value {
         PROBE_TIMEOUT,
     )
     .and_then(|text| failed_units(&text));
-    let services = command(
-        &systemctl,
-        &[
-            "--no-pager",
-            "show",
-            "chronyd.service",
-            "systemd-tpm2-setup.service",
-            "--property=Id,LoadState,ActiveState,SubState,Result,ExecMainStatus,ConditionResult",
-        ],
-        PROBE_TIMEOUT,
-    )
-    .and_then(|text| properties(&text))
-    .and_then(|units| {
-        if ["chronyd.service", "systemd-tpm2-setup.service"]
-            .iter()
-            .all(|name| units.iter().any(|unit| unit.unit == *name))
-        {
-            Ok(units)
-        } else {
-            Err("incomplete unit response")
-        }
-    });
+    let services = command(&systemctl, &SERVICE_ARGUMENTS, PROBE_TIMEOUT)
+        .and_then(|text| service_properties(&text));
     let devices = ["/dev/tpm0", "/dev/tpmrm0", "/sys/class/tpm/tpm0"]
         .into_iter()
         .filter(|path| Path::new(path).exists())
@@ -428,19 +491,205 @@ mod tests {
         }
     }
 
+    fn ssh_unit(active: &str, sub: &str) -> Unit {
+        Unit {
+            unit: "sshd.service".into(),
+            load_state: Some("loaded".into()),
+            active_state: Some(active.into()),
+            sub_state: Some(sub.into()),
+            result: Some("success".into()),
+            exit_status: Some(0),
+            condition_result: Some(true),
+        }
+    }
+
+    fn has_issue(snapshot: &Value, code: &str) -> bool {
+        snapshot["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["code"] == code)
+    }
+
     #[test]
     fn synchronised_clock_and_no_tpm_is_healthy_not_an_error() {
         let result = snapshot(
             Some(&appliance()),
             clock(Some(true)),
             Ok(vec![]),
-            Ok(vec![]),
+            Ok(vec![ssh_unit("active", "running")]),
             vec![],
             Some(true),
         );
         assert_eq!(result["status"], "ok");
         assert_eq!(result["tpm"]["status"], "not-present");
         assert_eq!(result["clock"]["ntp_servers"][0], "time.example.org");
+        assert_eq!(result["ssh"]["enabled"], true, "SSH defaults enabled");
+        assert_eq!(result["ssh"]["status"], "ok");
+        assert_eq!(result["ssh"]["service"]["active_state"], "active");
+        assert!(!has_issue(&result, "ssh-service-inactive"));
+        assert!(!has_issue(&result, "ssh-service-unavailable"));
+    }
+
+    #[test]
+    fn enabled_ssh_retries_are_unhealthy_even_with_no_failed_units() {
+        for (active, sub, result, exit_status) in [
+            ("activating", "auto-restart", "exit-code", 255),
+            ("activating", "start-pre", "success", 0),
+            ("inactive", "dead", "success", 0),
+            ("failed", "failed", "exit-code", 255),
+            ("deactivating", "stop-sigterm", "success", 0),
+            ("reloading", "reload", "success", 0),
+            ("active", "exited", "success", 0),
+            ("active", "running", "exit-code", 255),
+        ] {
+            let mut unit = ssh_unit(active, sub);
+            unit.result = Some(result.into());
+            unit.exit_status = Some(exit_status);
+            let result = snapshot(
+                Some(&appliance()),
+                clock(Some(true)),
+                Ok(vec![]),
+                Ok(vec![unit]),
+                vec![],
+                Some(true),
+            );
+            assert_eq!(result["systemd"]["failed_units"], json!([]));
+            assert_eq!(result["ssh"]["enabled"], true);
+            assert_eq!(result["ssh"]["status"], "warning", "{active}/{sub}");
+            assert_eq!(result["status"], "warning", "{active}/{sub}");
+            assert!(has_issue(&result, "ssh-service-inactive"), "{result}");
+            assert_eq!(result["ssh"]["service"]["active_state"], active);
+            assert_eq!(result["ssh"]["service"]["sub_state"], sub);
+        }
+    }
+
+    #[test]
+    fn disabled_ssh_does_not_require_a_running_or_present_service() {
+        let mut configuration = appliance();
+        configuration.services.ssh.enable = false;
+        let mut absent = ssh_unit("inactive", "dead");
+        absent.load_state = Some("not-found".into());
+        for units in [vec![], vec![absent], vec![ssh_unit("inactive", "dead")]] {
+            let result = snapshot(
+                Some(&configuration),
+                clock(Some(true)),
+                Ok(vec![]),
+                Ok(units),
+                vec![],
+                Some(true),
+            );
+            assert_eq!(result["status"], "ok");
+            assert_eq!(result["ssh"]["enabled"], false);
+            assert_eq!(result["ssh"]["status"], "disabled");
+            assert!(!has_issue(&result, "ssh-service-inactive"));
+            assert!(!has_issue(&result, "ssh-service-unavailable"));
+        }
+    }
+
+    #[test]
+    fn missing_or_incomplete_ssh_state_and_probe_errors_are_unknown_not_healthy() {
+        let complete = ssh_unit("active", "running");
+        let mut units = vec![None];
+        for field in 0..=7 {
+            let mut unit = complete.clone();
+            match field {
+                0 => unit.load_state = Some("not-found".into()),
+                1 => unit.load_state = Some("error".into()),
+                2 => unit.load_state = None,
+                3 => unit.active_state = None,
+                4 => unit.sub_state = None,
+                5 => unit.result = None,
+                6 => unit.exit_status = None,
+                _ => unit.condition_result = None,
+            }
+            units.push(Some(unit));
+        }
+        for unit in units {
+            let result = snapshot(
+                Some(&appliance()),
+                clock(Some(true)),
+                Ok(vec![]),
+                Ok(unit.into_iter().collect()),
+                vec![],
+                Some(true),
+            );
+            assert_eq!(result["status"], "unknown", "{result}");
+            assert_eq!(result["ssh"]["status"], "unknown");
+            assert!(has_issue(&result, "ssh-service-unavailable"));
+            assert!(!has_issue(&result, "ssh-service-inactive"));
+        }
+        let result = snapshot(
+            Some(&appliance()),
+            clock(Some(true)),
+            Ok(vec![]),
+            Err("PRIVATE_SYSTEMD_ERROR_MARKER"),
+            vec![],
+            Some(true),
+        );
+        assert_eq!(result["status"], "unknown");
+        assert_eq!(result["ssh"]["status"], "unknown");
+        assert_eq!(result["ssh"]["service"], Value::Null);
+        assert!(has_issue(&result, "service-status-unavailable"));
+        assert!(has_issue(&result, "ssh-service-unavailable"));
+        assert!(!result.to_string().contains("PRIVATE_SYSTEMD_ERROR_MARKER"));
+    }
+
+    #[test]
+    fn unknown_configuration_cannot_claim_active_ssh_is_healthy() {
+        let result = snapshot(
+            None,
+            clock(Some(true)),
+            Ok(vec![]),
+            Ok(vec![ssh_unit("active", "running")]),
+            vec![],
+            Some(true),
+        );
+        assert_eq!(result["ssh"]["enabled"], Value::Null);
+        assert_eq!(result["ssh"]["status"], "unknown");
+        assert_eq!(result["status"], "unknown");
+        assert!(has_issue(&result, "configuration-unavailable"));
+        assert!(has_issue(&result, "ssh-service-unavailable"));
+    }
+
+    #[test]
+    fn service_probe_requires_each_named_unit_exactly_once_and_drops_unknown_details() {
+        assert!(SERVICE_ARGUMENTS.contains(&"sshd.service"));
+        assert!(
+            !SERVICE_ARGUMENTS
+                .iter()
+                .any(|argument| argument.contains('*'))
+        );
+        let response = OBSERVED_SERVICES.iter().map(|name| format!(
+            "Id={name}\nLoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nExecMainStatus=0\nConditionResult=yes\nDescription=PRIVATE_DESCRIPTION_MARKER\nSecret=PRIVATE_SECRET_MARKER\n"
+        )).collect::<Vec<_>>().join("\n");
+        let units = service_properties(&response).unwrap();
+        let result = snapshot(
+            Some(&appliance()),
+            clock(Some(true)),
+            Ok(vec![]),
+            Ok(units),
+            vec![],
+            Some(true),
+        );
+        assert_eq!(result["ssh"]["status"], "ok");
+        assert!(!result.to_string().contains("PRIVATE_DESCRIPTION_MARKER"));
+        assert!(!result.to_string().contains("PRIVATE_SECRET_MARKER"));
+        for invalid in [
+            response.replace("Id=sshd.service", "Id=unexpected.service"),
+            response.replace("Id=sshd.service", "Id=chronyd.service"),
+            response.replace(
+                "ActiveState=active",
+                "ActiveState=activating\nActiveState=active",
+            ),
+            response.replace("ConditionResult=yes", "malformed probe output"),
+        ] {
+            assert!(service_properties(&invalid).is_err());
+        }
+        assert!(
+            service_properties("Id=chronyd.service\n\nId=systemd-tpm2-setup.service\n").is_err()
+        );
+        assert!(service_properties("").is_err());
     }
 
     #[test]

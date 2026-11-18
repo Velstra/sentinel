@@ -36,6 +36,9 @@ use serde::{Deserialize, Serialize};
 use crate::config::UpdateChannel;
 use crate::system;
 
+mod freshness;
+pub use freshness::Freshness;
+
 /// A signed release manifest: the small JSON document, signed by the pinned key,
 /// that names the release and the exact image to write. Unknown fields are
 /// ignored so the manifest can gain fields without breaking older appliances.
@@ -54,6 +57,10 @@ pub struct Manifest {
     /// manifest for another product signed by a shared key is refused.
     #[serde(default)]
     pub product: Option<String>,
+    /// Mandatory for online offers; optional to decode old history and verify
+    /// explicitly supplied offline media without disabling boot fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<Freshness>,
 }
 
 /// The product a manifest's `product` field must name.
@@ -634,8 +641,8 @@ fn sha256_hex(file: &Path) -> Result<String> {
 // ---- public API -----------------------------------------------------------
 
 /// Fetch and cryptographically verify the channel's release manifest, returning
-/// the parsed [`Manifest`] on success. This needs neither root nor the disk — it
-/// only proves *which* release the pinned key is currently vouching for.
+/// the parsed [`Manifest`] on success. Root is required to durably advance the
+/// anti-rollback ledger. Read-only status and local boot fallback do not use it.
 ///
 /// Fails closed: a fetch error, a signature that does not verify under the pinned
 /// key, or a manifest naming an unsafe image path all return `Err`.
@@ -644,6 +651,13 @@ pub fn check(chan: &UpdateChannel) -> Result<Manifest> {
 }
 
 pub fn check_offer(chan: &UpdateChannel) -> Result<VerifiedOffer> {
+    check_offer_using(chan, |offer| freshness::observe(chan, offer))
+}
+
+fn check_offer_using(
+    chan: &UpdateChannel,
+    observe: impl FnOnce(&VerifiedOffer) -> Result<()>,
+) -> Result<VerifiedOffer> {
     let base = base_url(chan);
     let scratch = Scratch::new()?;
     let manifest_path = scratch.join("manifest.json");
@@ -708,11 +722,22 @@ pub fn check_offer(chan: &UpdateChannel) -> Result<VerifiedOffer> {
         );
     }
     check_manifest_fields(&manifest)?;
-    Ok(VerifiedOffer {
+    if manifest.product.as_deref() != Some(PRODUCT) {
+        bail!("online update metadata must explicitly name {PRODUCT}");
+    }
+    let offer = VerifiedOffer {
         manifest,
         manifest_sha256: digest_hex(&bytes),
         public_key_sha256: digest_hex(&read_small(&pubkey, 4096)?),
-    })
+    };
+    observe(&offer)?;
+    Ok(offer)
+}
+
+/// Revalidate durable trust and time immediately before a partition write,
+/// without substituting another offer for the one the user confirmed.
+pub(crate) fn require_fresh_offer(chan: &UpdateChannel, offer: &VerifiedOffer) -> Result<()> {
+    freshness::observe(chan, offer)
 }
 
 fn decode_envelope(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
@@ -1151,6 +1176,9 @@ mod tests {
         let original = serde_json::to_vec(&serde_json::json!({
             "version": "9.1.0", "image": "image.raw", "sha256": sha256_hex(&dir.join("image.raw")).unwrap(),
             "product": PRODUCT,
+            "freshness": {"schema":1,"channel":"default","arch":std::env::consts::ARCH,
+                "sequence":1,"issued_at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                "expires_at":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()+3600},
         }))
         .unwrap();
         std::fs::write(&manifest, &original).unwrap();
@@ -1198,8 +1226,14 @@ mod tests {
             subscription_key: None,
         };
         // An absent atomic endpoint is the only compatibility fallback.
+        let checked_offer = |chan: &UpdateChannel| {
+            check_offer_using(chan, |offer| {
+                freshness::observe_test(chan, offer, &dir.join("trust"))
+            })
+        };
+        let check = |chan: &UpdateChannel| checked_offer(chan).map(|offer| offer.manifest);
         assert_eq!(check(&chan).unwrap().version, "9.1.0");
-        let offer = check_offer(&chan).unwrap();
+        let offer = checked_offer(&chan).unwrap();
         assert_eq!(offer.manifest_sha256, digest_hex(&original));
         assert_eq!(
             offer.public_key_sha256,

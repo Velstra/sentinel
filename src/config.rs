@@ -1507,11 +1507,21 @@ impl Default for WebConsole {
 }
 
 impl WebConsole {
-    /// True when nothing was asked for, so `[services.web]` can be omitted. `tls`
-    /// at its default (on) does not count as "asked for" — only an explicit
-    /// endpoint or certificate does.
+    /// TLS fields are literal file references, never inline material or CLI
+    /// lines. Preserve legal filename bytes, but refuse empty/NUL/line breaks
+    /// before a value can be saved or rendered as a separate command.
+    pub(crate) fn validate_tls_path(field: &str, path: &str) -> Result<()> {
+        if path.is_empty() || path.bytes().any(|byte| matches!(byte, 0 | b'\r' | b'\n')) {
+            bail!("services web {field}: path must be nonempty and must not contain NUL, CR or LF");
+        }
+        Ok(())
+    }
+
+    /// True only at defaults, so `[services.web]` can be omitted. Explicitly
+    /// disabling TLS is configuration even before an endpoint is enabled.
     pub fn is_empty(&self) -> bool {
         !self.enable
+            && self.tls
             && self.confirm_timeout.is_none()
             && self.port.is_none()
             && self.listen_address.is_none()
@@ -4389,6 +4399,8 @@ pub struct HaIdentity {
     pub management_fingerprint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub management_web: Option<WebConsole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub management_ssh: Option<Ssh>,
     pub state_listen: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub heartbeat_listen: Vec<String>,
@@ -4531,15 +4543,15 @@ pub fn is_valid_pinned_sha256(s: &str) -> bool {
 }
 
 /// HA conntrack-state sync (`[system.conntrack-sync]`, roadmap C9). The velstra
-/// data plane binds a UDP socket on `listen`, pushes its live conntrack entries to
-/// each `peer` every `interval` seconds, and applies the entries a peer pushes — a
+/// data plane binds an authenticated TCP socket on `listen`, pushes state to
+/// each explicit `peer`, and applies authenticated entries a peer pushes — a
 /// pfsync-analog for the eBPF conntrack table. Together with VRRP (virtual IP) and
 /// `[system.config-sync]` (running config) it completes the HA triad: a failover
 /// keeps established, NAT'd connections alive instead of dropping every flow.
 ///
-/// With `system.config-sync.secret`, state uses mutually authenticated TCP,
-/// polling changes every 50ms by default. Without a pair credential this retains
-/// the legacy trusted-link UDP protocol. Authentication does not encrypt flow
+/// Requires a 32..1024-byte `system.config-sync.secret`, polling changes every
+/// 50ms by default. Legacy credential-free UDP is rejected, not automatically
+/// migrated or enabled even on a trusted link. Authentication does not encrypt flow
 /// metadata: use WireGuard when the HA network is not private.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ConntrackSync {
@@ -4552,13 +4564,13 @@ pub struct ConntrackSync {
     /// port `5429`). Repeatable.
     #[serde(rename = "peer", default, skip_serializing_if = "Vec::is_empty")]
     pub peers: Vec<String>,
-    /// Seconds between pushes. Unset: 50ms with a pair credential, otherwise 1s.
+    /// Optional polling interval in seconds. Unset: authenticated 50ms polling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interval: Option<u64>,
 }
 
 impl ConntrackSync {
-    /// Default UDP port for the conntrack-sync socket.
+    /// Default authenticated TCP port for the conntrack-sync socket.
     pub const DEFAULT_PORT: u16 = 5429;
 
     /// True when no conntrack sync is configured — lets `[system.conntrack-sync]`
@@ -4639,9 +4651,10 @@ pub struct Login {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub totp: Option<String>,
     /// The permission group this account belongs to, for **management access**
-    /// (the API and the console). Unset ⇒ the account can log in to the box but
-    /// has no management access at all: shell access and API access are separate
-    /// grants, and conflating them would hand every console operator a shell.
+    /// (the API and the console). Unset ⇒ an ordinary local account has no
+    /// management access. Only the configured builtin `admin` retains its
+    /// bootstrap administrator grant, matching its Unix wheel membership.
+    /// Directory-only accounts may use `system.aaa.default-group` instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
 }
@@ -7192,11 +7205,11 @@ impl Appliance {
                 if parent.is_empty() {
                     continue;
                 }
-                if let Ok(vlan) = id.parse::<u16>() {
-                    if (1..=4094).contains(&vlan) {
-                        iface.parent = Some(parent.to_string());
-                        iface.vlan = Some(vlan);
-                    }
+                if let Ok(vlan) = id.parse::<u16>()
+                    && (1..=4094).contains(&vlan)
+                {
+                    iface.parent = Some(parent.to_string());
+                    iface.vlan = Some(vlan);
                 }
             }
         }
@@ -7211,6 +7224,20 @@ impl Appliance {
             Self::from_json(&text)
         } else {
             Self::from_toml(&text)
+        }
+    }
+
+    /// Operational views use the last successfully applied intent, not an
+    /// older boot file. A corrupt/inaccessible runtime snapshot is an error,
+    /// never permission to silently report a different firewall configuration.
+    pub fn load_active(path: &Path) -> Result<Self> {
+        Self::load_active_at(path, Path::new(crate::session::Session::RUNNING))
+    }
+
+    pub(crate) fn load_active_at(path: &Path, running: &Path) -> Result<Self> {
+        match crate::session::Session::read_running_at(running)? {
+            Some(text) => Self::from_toml(&text).context("validating active configuration"),
+            None => Self::load(path),
         }
     }
 
@@ -7333,6 +7360,7 @@ impl Appliance {
 
         let names: HashSet<&str> = self.interfaces.iter().map(|i| i.name.as_str()).collect();
         let mut seen = HashSet::new();
+        let mut addresses = std::collections::BTreeMap::new();
         for iface in &self.interfaces {
             validate_iface_name(&iface.name)?;
             if let Some(d) = &iface.description {
@@ -7353,6 +7381,30 @@ impl Appliance {
                 validate_address6(addr6)
                     .with_context(|| format!("interface {:?} address6", iface.name))?;
             }
+            if !iface.disabled {
+                let table = self
+                    .protocols
+                    .vrfs
+                    .iter()
+                    .find(|vrf| vrf.interfaces.contains(&iface.name))
+                    .map_or(254, |vrf| vrf.table);
+                for address in [&iface.address, &iface.address6].into_iter().flatten() {
+                    let Some((host, _)) = address.split_once('/') else {
+                        continue;
+                    };
+                    let ip: std::net::IpAddr = host.parse()?;
+                    // IPv6 link-local addresses are scoped to the interface.
+                    if matches!(ip, std::net::IpAddr::V6(v6) if v6.is_unicast_link_local()) {
+                        continue;
+                    }
+                    if let Some(other) = addresses.insert((table, ip), &iface.name) {
+                        bail!(
+                            "interface {:?}: address {ip} is already assigned to interface {other:?} in routing table {table}",
+                            iface.name
+                        );
+                    }
+                }
+            }
             // DHCPv6-PD downstream: the uplink must be a declared interface (and
             // a different one). `pd-subnet` without `pd-from` is meaningless.
             if let Some(up) = &iface.pd_from {
@@ -7370,13 +7422,13 @@ impl Appliance {
             }
             // Link tunables: a sane MTU (IPv6 needs ≥1280; cap at jumbo) and a
             // well-formed MAC when cloning one.
-            if let Some(mtu) = iface.mtu {
-                if !(68..=9216).contains(&mtu) {
-                    bail!(
-                        "interface {:?}: mtu {mtu} out of range (68–9216)",
-                        iface.name
-                    );
-                }
+            if let Some(mtu) = iface.mtu
+                && !(68..=9216).contains(&mtu)
+            {
+                bail!(
+                    "interface {:?}: mtu {mtu} out of range (68–9216)",
+                    iface.name
+                );
             }
             if let Some(mac) = &iface.mac {
                 validate_mac(mac).with_context(|| format!("interface {:?} mac", iface.name))?;
@@ -7411,15 +7463,15 @@ impl Appliance {
                         // must agree with it (inference filled them when unset, so
                         // reaching here with a mismatch means they were set by hand
                         // to something inconsistent with the name).
-                        if let Some((np, nid)) = iface.name.rsplit_once('.') {
-                            if let Ok(nvlan) = nid.parse::<u16>() {
-                                if (parent != np || vlan != nvlan) && !np.is_empty() {
-                                    bail!(
-                                        "interface {:?}: name implies parent {np:?} vlan {nvlan}, but parent {parent:?} vlan {vlan} were set",
-                                        iface.name
-                                    );
-                                }
-                            }
+                        if let Some((np, nid)) = iface.name.rsplit_once('.')
+                            && let Ok(nvlan) = nid.parse::<u16>()
+                            && (parent != np || vlan != nvlan)
+                            && !np.is_empty()
+                        {
+                            bail!(
+                                "interface {:?}: name implies parent {np:?} vlan {nvlan}, but parent {parent:?} vlan {vlan} were set",
+                                iface.name
+                            );
                         }
                     }
                     (None, None) => {}
@@ -7476,16 +7528,16 @@ impl Appliance {
                 // above they must not contain whitespace or a comment marker that
                 // would split the directive or start a new one.
                 for (field, val) in [("service-name", &p.service_name), ("ac-name", &p.ac_name)] {
-                    if let Some(v) = val {
-                        if v.bytes().any(|b| {
+                    if let Some(v) = val
+                        && v.bytes().any(|b| {
                             b.is_ascii_control() || matches!(b, b' ' | b'\t' | b'"' | b'\\' | b'#')
-                        }) {
-                            bail!(
-                                "interface {:?}: pppoe {field} must not contain whitespace, a \
+                        })
+                    {
+                        bail!(
+                            "interface {:?}: pppoe {field} must not contain whitespace, a \
                                  control character, quote, backslash or '#'",
-                                iface.name
-                            );
-                        }
+                            iface.name
+                        );
                     }
                 }
                 match &iface.parent {
@@ -7515,13 +7567,13 @@ impl Appliance {
                         iface.name
                     );
                 }
-                if let Some(mru) = p.mru {
-                    if !(68..=9216).contains(&mru) {
-                        bail!(
-                            "interface {:?}: pppoe mru {mru} out of range (68–9216)",
-                            iface.name
-                        );
-                    }
+                if let Some(mru) = p.mru
+                    && !(68..=9216).contains(&mru)
+                {
+                    bail!(
+                        "interface {:?}: pppoe mru {mru} out of range (68–9216)",
+                        iface.name
+                    );
                 }
                 // A PPP session has no L2 device to clone a MAC onto, so `mac`
                 // is dead here — reject it rather than silently drop it.
@@ -7735,13 +7787,13 @@ impl Appliance {
                 // The lease pool (offset addresses in, `size` long) must fit
                 // inside the interface's subnet — a pool that runs off the end
                 // hands out addresses the subnet doesn't contain.
-                if let (Some(off), Some(size)) = (dhcp.pool_offset, dhcp.pool_size) {
-                    if !dhcp_pool_fits(subnet, off, size) {
-                        bail!(
-                            "interface {:?} dhcp-server: pool (offset {off} + size {size}) does not fit inside the subnet {subnet}",
-                            iface.name
-                        );
-                    }
+                if let (Some(off), Some(size)) = (dhcp.pool_offset, dhcp.pool_size)
+                    && !dhcp_pool_fits(subnet, off, size)
+                {
+                    bail!(
+                        "interface {:?} dhcp-server: pool (offset {off} + size {size}) does not fit inside the subnet {subnet}",
+                        iface.name
+                    );
                 }
                 // Static reservations: a valid MAC and an address inside the
                 // server's own subnet (a lease outside it can never be handed out).
@@ -8070,10 +8122,10 @@ impl Appliance {
                     i.name
                 );
             }
-            if let Some(d) = &e.duplex {
-                if !matches!(d.as_str(), "full" | "half") {
-                    bail!("interface {:?}: ethernet duplex {d:?}: full | half", i.name);
-                }
+            if let Some(d) = &e.duplex
+                && !matches!(d.as_str(), "full" | "half")
+            {
+                bail!("interface {:?}: ethernet duplex {d:?}: full | half", i.name);
             }
             // Adaptive coalescing means "the driver picks"; a fixed value means
             // "the driver holds this". Asking for both is asking for neither.
@@ -8119,13 +8171,13 @@ impl Appliance {
                     i.name
                 );
             }
-            if let Some(p) = &i.bond.primary {
-                if !i.members.iter().any(|m| m == p) {
-                    bail!(
-                        "interface {:?}: bond primary {p:?} is not one of its members",
-                        i.name
-                    );
-                }
+            if let Some(p) = &i.bond.primary
+                && !i.members.iter().any(|m| m == p)
+            {
+                bail!(
+                    "interface {:?}: bond primary {p:?} is not one of its members",
+                    i.name
+                );
             }
             for t in &i.bond.arp_target {
                 validate_ipv4(t)
@@ -8133,7 +8185,7 @@ impl Appliance {
             }
             // ARP monitoring probes an address; an interval with nothing to probe
             // monitors nothing, and targets with no interval are never probed.
-            if i.bond.arp_interval.is_some() != !i.bond.arp_target.is_empty() {
+            if i.bond.arp_interval.is_some() == i.bond.arp_target.is_empty() {
                 bail!(
                     "interface {:?}: bond arp-interval and arp-target go together",
                     i.name
@@ -8164,13 +8216,13 @@ impl Appliance {
                     ("username", w.username.as_ref()),
                     ("password", w.password.as_ref()),
                 ] {
-                    if let Some(v) = val {
-                        if v.contains(',') || v.contains('\n') {
-                            bail!(
-                                "interface {:?}: wwan {which} may not contain a comma or newline",
-                                i.name
-                            );
-                        }
+                    if let Some(v) = val
+                        && (v.contains(',') || v.contains('\n'))
+                    {
+                        bail!(
+                            "interface {:?}: wwan {which} may not contain a comma or newline",
+                            i.name
+                        );
                     }
                 }
                 // PAP/CHAP needs both halves; a password with nobody to be is a
@@ -8181,21 +8233,21 @@ impl Appliance {
                         i.name
                     );
                 }
-                if let Some(t) = &w.ip_type {
-                    if !matches!(t.as_str(), "ipv4" | "ipv6" | "ipv4v6") {
-                        bail!(
-                            "interface {:?}: wwan ip-type {t:?}: ipv4 | ipv6 | ipv4v6",
-                            i.name
-                        );
-                    }
+                if let Some(t) = &w.ip_type
+                    && !matches!(t.as_str(), "ipv4" | "ipv6" | "ipv4v6")
+                {
+                    bail!(
+                        "interface {:?}: wwan ip-type {t:?}: ipv4 | ipv6 | ipv4v6",
+                        i.name
+                    );
                 }
                 // A SIM PIN is four to eight digits, and a wrong one is spent off
                 // a counter of three — so a malformed one is refused here rather
                 // than tried against the card.
-                if let Some(p) = &w.pin {
-                    if !(4..=8).contains(&p.len()) || !p.bytes().all(|b| b.is_ascii_digit()) {
-                        bail!("interface {:?}: wwan pin must be 4-8 digits", i.name);
-                    }
+                if let Some(p) = &w.pin
+                    && (!(4..=8).contains(&p.len()) || !p.bytes().all(|b| b.is_ascii_digit()))
+                {
+                    bail!("interface {:?}: wwan pin must be 4-8 digits", i.name);
                 }
                 // The bearer gets the link up; the address comes from DHCP, the
                 // same as any other uplink. Without it the modem dials and the
@@ -8236,31 +8288,31 @@ impl Appliance {
                         i.name
                     );
                 }
-                if let Some(b) = &w.band {
-                    if !matches!(b.as_str(), "b" | "g" | "a" | "n" | "ac" | "ax") {
-                        bail!(
-                            "interface {:?}: wireless band {b:?}: b | g | a | n | ac | ax",
-                            i.name
-                        );
-                    }
+                if let Some(b) = &w.band
+                    && !matches!(b.as_str(), "b" | "g" | "a" | "n" | "ac" | "ax")
+                {
+                    bail!(
+                        "interface {:?}: wireless band {b:?}: b | g | a | n | ac | ax",
+                        i.name
+                    );
                 }
-                if let Some(c) = &w.country {
-                    if c.len() != 2 || !c.bytes().all(|b| b.is_ascii_uppercase()) {
-                        bail!(
-                            "interface {:?}: wireless country {c:?} is not a two-letter ISO code",
-                            i.name
-                        );
-                    }
+                if let Some(c) = &w.country
+                    && (c.len() != 2 || !c.bytes().all(|b| b.is_ascii_uppercase()))
+                {
+                    bail!(
+                        "interface {:?}: wireless country {c:?} is not a two-letter ISO code",
+                        i.name
+                    );
                 }
                 match &w.wpa {
                     Some(wpa) => {
-                        if let Some(m) = &wpa.mode {
-                            if !matches!(m.as_str(), "wpa2" | "wpa3" | "wpa2+wpa3") {
-                                bail!(
-                                    "interface {:?}: wireless wpa mode {m:?}: wpa2 | wpa3 | wpa2+wpa3",
-                                    i.name
-                                );
-                            }
+                        if let Some(m) = &wpa.mode
+                            && !matches!(m.as_str(), "wpa2" | "wpa3" | "wpa2+wpa3")
+                        {
+                            bail!(
+                                "interface {:?}: wireless wpa mode {m:?}: wpa2 | wpa3 | wpa2+wpa3",
+                                i.name
+                            );
                         }
                         // The 802.11i bound, and the reason a shorter one is a
                         // typo rather than a choice.
@@ -8304,13 +8356,13 @@ impl Appliance {
                     i.name
                 );
             }
-            if let Some(key) = i.vti_key {
-                if !vti_keys.insert(key) {
-                    bail!(
-                        "interface {:?}: vti-key {key} is already used by another link — the kernel would not know which SA a packet belongs to",
-                        i.name
-                    );
-                }
+            if let Some(key) = i.vti_key
+                && !vti_keys.insert(key)
+            {
+                bail!(
+                    "interface {:?}: vti-key {key} is already used by another link — the kernel would not know which SA a packet belongs to",
+                    i.name
+                );
             }
             // Per-link kernel behaviour: refuse the combinations that would
             // commit cleanly and then do nothing, because each of them fails as
@@ -8327,13 +8379,13 @@ impl Appliance {
                     i.name
                 );
             }
-            if let Some(id) = &i.dhcp.client_id {
-                if !matches!(id.as_str(), "mac" | "duid") {
-                    bail!(
-                        "interface {:?}: dhcp client-id {id:?} is not `mac` or `duid`",
-                        i.name
-                    );
-                }
+            if let Some(id) = &i.dhcp.client_id
+                && !matches!(id.as_str(), "mac" | "duid")
+            {
+                bail!(
+                    "interface {:?}: dhcp client-id {id:?} is not `mac` or `duid`",
+                    i.name
+                );
             }
             // A DUID only reaches the wire as the client identifier, so one
             // configured beside `client-id mac` is a value nothing carries.
@@ -8354,13 +8406,13 @@ impl Appliance {
                 validate_duid(duid)
                     .with_context(|| format!("interface {:?} dhcpv6 duid", i.name))?;
             }
-            if let Some(n) = i.ipv6.accept_dad {
-                if n > 2 {
-                    bail!(
-                        "interface {:?}: ipv6 accept-dad {n} is not 0, 1 or 2",
-                        i.name
-                    );
-                }
+            if let Some(n) = i.ipv6.accept_dad
+                && n > 2
+            {
+                bail!(
+                    "interface {:?}: ipv6 accept-dad {n} is not 0, 1 or 2",
+                    i.name
+                );
             }
             // A mirror to a link this box does not have is a monitor port that
             // is quietly dark — the one failure mode that looks exactly like
@@ -8427,22 +8479,20 @@ impl Appliance {
         // The serial console's tty names a directory and a unit instance
         // (`serial-getty@<device>.service.d`), so it must be a bare device name:
         // a `/` or `..` would put the drop-in somewhere else entirely.
-        if let Some(device) = &self.system.console.device {
-            if device.is_empty()
+        if let Some(device) = &self.system.console.device
+            && (device.is_empty()
                 || device.len() > 32
-                || !device.bytes().all(|b| b.is_ascii_alphanumeric())
-            {
-                bail!("system console device {device:?}: a tty name like `ttyS0`, without /dev/");
-            }
+                || !device.bytes().all(|b| b.is_ascii_alphanumeric()))
+        {
+            bail!("system console device {device:?}: a tty name like `ttyS0`, without /dev/");
         }
-        if let Some(k) = &self.system.keyboard {
-            if k.is_empty()
+        if let Some(k) = &self.system.keyboard
+            && (k.is_empty()
                 || !k
                     .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-            {
-                bail!("system keyboard {k:?}: a keymap name like `de` or `us`");
-            }
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+        {
+            bail!("system keyboard {k:?}: a keymap name like `de` or `us`");
         }
         if let Some(l) = &self.system.locale {
             // `xx_YY.CHARSET`, or one of the two that name no territory.
@@ -8506,15 +8556,16 @@ impl Appliance {
             // something other than what it says. ICMP's second header byte is a
             // *code*, not a port, and the data plane reads 0 there — so the port
             // would be quietly dropped and the rule would match all of it.
-            if let Some(p) = rule.proto {
-                if !p.has_ports() && (!rule.port.is_empty() || rule.port_group.is_some()) {
-                    bail!(
-                        "rule {:?}: {} carries no ports — drop the port to match the \
+            if let Some(p) = rule.proto
+                && !p.has_ports()
+                && (!rule.port.is_empty() || rule.port_group.is_some())
+            {
+                bail!(
+                    "rule {:?}: {} carries no ports — drop the port to match the \
                          protocol, or name tcp/udp",
-                        rule.name,
-                        proto_str(p)
-                    );
-                }
+                    rule.name,
+                    proto_str(p)
+                );
             }
             // A type belongs to a protocol that has types. Accepting it
             // elsewhere would read as a narrow rule and match every packet of
@@ -8563,15 +8614,15 @@ impl Appliance {
                     );
                 }
             }
-            if let Some(f) = &rule.family {
-                if !matches!(f.as_str(), "ipv4" | "ipv6") {
-                    bail!("rule {:?}: family {f:?} is not ipv4 or ipv6", rule.name);
-                }
+            if let Some(f) = &rule.family
+                && !matches!(f.as_str(), "ipv4" | "ipv6")
+            {
+                bail!("rule {:?}: family {f:?} is not ipv4 or ipv6", rule.name);
             }
-            if let Some(d) = &rule.direction {
-                if !matches!(d.as_str(), "in" | "out") {
-                    bail!("rule {:?}: direction {d:?} is not in or out", rule.name);
-                }
+            if let Some(d) = &rule.direction
+                && !matches!(d.as_str(), "in" | "out")
+            {
+                bail!("rule {:?}: direction {d:?} is not in or out", rule.name);
             }
             if rule.source.is_some() && rule.source_group.is_some() {
                 bail!(
@@ -8692,30 +8743,30 @@ impl Appliance {
                 );
             }
             // A referenced group must be declared.
-            if let Some(g) = &rule.source_group {
-                if !self.firewall.group.has_address_like(g) {
-                    bail!(
-                        "rule {:?}: source-group {g:?} is not a declared address or domain group",
-                        rule.name
-                    );
-                }
+            if let Some(g) = &rule.source_group
+                && !self.firewall.group.has_address_like(g)
+            {
+                bail!(
+                    "rule {:?}: source-group {g:?} is not a declared address or domain group",
+                    rule.name
+                );
             }
-            if let Some(g) = &rule.destination_group {
-                if !self.firewall.group.has_address_like(g) {
-                    bail!(
-                        "rule {:?}: destination-group {g:?} is not a declared address or \
+            if let Some(g) = &rule.destination_group
+                && !self.firewall.group.has_address_like(g)
+            {
+                bail!(
+                    "rule {:?}: destination-group {g:?} is not a declared address or \
                          domain group",
-                        rule.name
-                    );
-                }
+                    rule.name
+                );
             }
-            if let Some(g) = &rule.port_group {
-                if !self.firewall.group.port.contains_key(g) {
-                    bail!(
-                        "rule {:?}: port-group {g:?} is not a declared port group",
-                        rule.name
-                    );
-                }
+            if let Some(g) = &rule.port_group
+                && !self.firewall.group.port.contains_key(g)
+            {
+                bail!(
+                    "rule {:?}: port-group {g:?} is not a declared port group",
+                    rule.name
+                );
             }
             // Time-based schedule (roadmap C15): valid days + HH:MM window that does
             // not span midnight. Only meaningful on a port rule (a broad rule sets a
@@ -9053,10 +9104,10 @@ impl Appliance {
                 );
             }
         }
-        if let Some(g) = &self.system.aaa.default_group {
-            if !self.system.groups.iter().any(|x| &x.name == g) {
-                bail!("system aaa default-group {g:?}: no such permission group");
-            }
+        if let Some(g) = &self.system.aaa.default_group
+            && !self.system.groups.iter().any(|x| &x.name == g)
+        {
+            bail!("system aaa default-group {g:?}: no such permission group");
         }
         for l in &self.system.logins {
             if let Some(secret) = &l.totp {
@@ -9068,6 +9119,7 @@ impl Appliance {
         // silently never steer anything, which is the worst way for it to fail.
         let mut seen_pol = std::collections::BTreeSet::new();
         for p in &self.multiwan.policies {
+            validate_wan_policy(p)?;
             if !seen_pol.insert(p.name.as_str()) {
                 bail!("multiwan policy {:?}: declared twice", p.name);
             }
@@ -9149,13 +9201,13 @@ impl Appliance {
             }
             // Both ends in one rule is fine; both *families* in one rule is not,
             // because a kernel rule belongs to one.
-            if let (Some(s), Some(d)) = (&r.source, &r.destination) {
-                if s.contains(':') != d.contains(':') {
-                    bail!(
-                        "policy route {:?}: source and destination are different address families",
-                        r.name
-                    );
-                }
+            if let (Some(s), Some(d)) = (&r.source, &r.destination)
+                && s.contains(':') != d.contains(':')
+            {
+                bail!(
+                    "policy route {:?}: source and destination are different address families",
+                    r.name
+                );
             }
         }
         for r in &self.protocols.statics {
@@ -9217,10 +9269,10 @@ impl Appliance {
             Ok(())
         };
         let check_vrf_ref = |name: &Option<String>, whose: &str| -> Result<()> {
-            if let Some(name) = name {
-                if !vrf_names.contains(name.as_str()) {
-                    bail!("protocols {whose} references unknown vrf {name:?}");
-                }
+            if let Some(name) = name
+                && !vrf_names.contains(name.as_str())
+            {
+                bail!("protocols {whose} references unknown vrf {name:?}");
             }
             Ok(())
         };
@@ -9264,10 +9316,10 @@ impl Appliance {
                 );
             }
         }
-        if let Some(g) = &self.system.aaa.default_group {
-            if !self.system.groups.iter().any(|x| &x.name == g) {
-                bail!("system aaa default-group {g:?}: no such permission group");
-            }
+        if let Some(g) = &self.system.aaa.default_group
+            && !self.system.groups.iter().any(|x| &x.name == g)
+        {
+            bail!("system aaa default-group {g:?}: no such permission group");
         }
         for l in &self.system.logins {
             if let Some(secret) = &l.totp {
@@ -9360,13 +9412,13 @@ impl Appliance {
             }
             // Both ends in one rule is fine; both *families* in one rule is not,
             // because a kernel rule belongs to one.
-            if let (Some(s), Some(d)) = (&r.source, &r.destination) {
-                if s.contains(':') != d.contains(':') {
-                    bail!(
-                        "policy route {:?}: source and destination are different address families",
-                        r.name
-                    );
-                }
+            if let (Some(s), Some(d)) = (&r.source, &r.destination)
+                && s.contains(':') != d.contains(':')
+            {
+                bail!(
+                    "policy route {:?}: source and destination are different address families",
+                    r.name
+                );
             }
         }
         for r in &self.protocols.statics {
@@ -9480,13 +9532,13 @@ impl Appliance {
                         r.prefix
                     );
                 }
-                if let Some(ml) = r.max_length {
-                    if ml > 128 {
-                        bail!(
-                            "protocols bgp roa {:?}: max-length {ml} out of range (0–128)",
-                            r.prefix
-                        );
-                    }
+                if let Some(ml) = r.max_length
+                    && ml > 128
+                {
+                    bail!(
+                        "protocols bgp roa {:?}: max-length {ml} out of range (0–128)",
+                        r.prefix
+                    );
                 }
             }
             if let Some(rtr) = &bgp.rtr {
@@ -9521,22 +9573,22 @@ impl Appliance {
                     .with_context(|| format!("policy prefix-list {:?} prefix", pl.name))?;
                 let maxlen = if e.prefix.contains(':') { 128 } else { 32 };
                 for (which, b) in [("ge", e.ge), ("le", e.le)] {
-                    if let Some(b) = b {
-                        if b > maxlen {
-                            bail!(
-                                "policy prefix-list {:?}: {which} {b} exceeds the max prefix length {maxlen}",
-                                pl.name
-                            );
-                        }
-                    }
-                }
-                if let (Some(ge), Some(le)) = (e.ge, e.le) {
-                    if ge > le {
+                    if let Some(b) = b
+                        && b > maxlen
+                    {
                         bail!(
-                            "policy prefix-list {:?}: ge {ge} must be <= le {le}",
+                            "policy prefix-list {:?}: {which} {b} exceeds the max prefix length {maxlen}",
                             pl.name
                         );
                     }
+                }
+                if let (Some(ge), Some(le)) = (e.ge, e.le)
+                    && ge > le
+                {
+                    bail!(
+                        "policy prefix-list {:?}: ge {ge} must be <= le {le}",
+                        pl.name
+                    );
                 }
             }
         }
@@ -9549,13 +9601,13 @@ impl Appliance {
                 bail!("policy route-map: duplicate route-map {:?}", rm.name);
             }
             for rule in &rm.rules {
-                if let Some(pl) = &rule.match_prefix_list {
-                    if !prefix_list_names.contains(pl.as_str()) {
-                        bail!(
-                            "policy route-map {:?}: match prefix-list {pl:?} is not a declared policy prefix-list",
-                            rm.name
-                        );
-                    }
+                if let Some(pl) = &rule.match_prefix_list
+                    && !prefix_list_names.contains(pl.as_str())
+                {
+                    bail!(
+                        "policy route-map {:?}: match prefix-list {pl:?} is not a declared policy prefix-list",
+                        rm.name
+                    );
                 }
             }
             validate_filter(rm)?;
@@ -9583,12 +9635,10 @@ impl Appliance {
                         .with_context(|| format!("protocols ospf {which} (dotted quad)"))?;
                 }
             }
-            if let Some(at) = &ospf.auth_type {
-                if !matches!(at.as_str(), "none" | "text" | "md5") {
-                    bail!(
-                        "protocols ospf auth-type {at:?}: expected \"none\", \"text\" or \"md5\""
-                    );
-                }
+            if let Some(at) = &ospf.auth_type
+                && !matches!(at.as_str(), "none" | "text" | "md5")
+            {
+                bail!("protocols ospf auth-type {at:?}: expected \"none\", \"text\" or \"md5\"");
             }
             validate_ospf_network_type(ospf.network_type.as_deref(), "ospf")?;
             // Timers: a Hello ≥ 1s, and a Dead strictly greater than the Hello
@@ -9596,12 +9646,12 @@ impl Appliance {
             if ospf.hello_interval == Some(0) {
                 bail!("protocols ospf hello-interval must be >= 1 second");
             }
-            if let (Some(hello), Some(dead)) = (ospf.hello_interval, ospf.dead_interval) {
-                if dead <= hello as u32 {
-                    bail!(
-                        "protocols ospf dead-interval {dead} must be greater than hello-interval {hello}"
-                    );
-                }
+            if let (Some(hello), Some(dead)) = (ospf.hello_interval, ospf.dead_interval)
+                && dead <= hello as u32
+            {
+                bail!(
+                    "protocols ospf dead-interval {dead} must be greater than hello-interval {hello}"
+                );
             }
             check_vrf_ref(&ospf.vrf, "ospf vrf")?;
         }
@@ -9622,16 +9672,13 @@ impl Appliance {
         if let Some(rip) = &self.protocols.rip {
             check_vrf_ref(&rip.vrf, "rip vrf")?;
         }
-        if let Some(ripng) = &self.protocols.ripng {
-            if ripng.bfd
+        if let Some(ripng) = &self.protocols.ripng
+            && (ripng.bfd
                 || ripng.vrf.is_some()
                 || !ripng.network.is_empty()
-                || ripng.router_id.is_some()
-            {
-                bail!(
-                    "protocols ripng: bfd / vrf / network / router-id are not supported for RIPng"
-                );
-            }
+                || ripng.router_id.is_some())
+        {
+            bail!("protocols ripng: bfd / vrf / network / router-id are not supported for RIPng");
         }
         if let Some(babel) = &self.protocols.babel {
             check_vrf_ref(&babel.vrf, "babel vrf")?;
@@ -9645,22 +9692,23 @@ impl Appliance {
             }
         }
         if let Some(isis) = &self.protocols.isis {
-            if let Some(lvl) = &isis.level {
-                if !matches!(lvl.as_str(), "1" | "2" | "1-2") {
-                    bail!("protocols isis level {lvl:?}: expected \"1\", \"2\" or \"1-2\"");
-                }
+            if let Some(lvl) = &isis.level
+                && !matches!(lvl.as_str(), "1" | "2" | "1-2")
+            {
+                bail!("protocols isis level {lvl:?}: expected \"1\", \"2\" or \"1-2\"");
             }
-            if let Some(nt) = &isis.network_type {
-                if nt != "broadcast" && nt != "point-to-point" {
-                    bail!(
-                        "protocols isis network-type {nt:?}: expected \"broadcast\" or \"point-to-point\""
-                    );
-                }
+            if let Some(nt) = &isis.network_type
+                && nt != "broadcast"
+                && nt != "point-to-point"
+            {
+                bail!(
+                    "protocols isis network-type {nt:?}: expected \"broadcast\" or \"point-to-point\""
+                );
             }
-            if let Some(p) = isis.priority {
-                if p > 127 {
-                    bail!("protocols isis priority {p} out of range (0–127)");
-                }
+            if let Some(p) = isis.priority
+                && p > 127
+            {
+                bail!("protocols isis priority {p} out of range (0–127)");
             }
             if isis.hello_interval == Some(0) {
                 bail!("protocols isis hello-interval must be >= 1 second");
@@ -9711,21 +9759,21 @@ impl Appliance {
                 );
             }
             // The address link, when it is named, has to be one this appliance has.
-            if let Some(ai) = &v.address_interface {
-                if !self.interfaces.iter().any(|i| &i.name == ai) {
-                    bail!(
-                        "protocols vrrp {:?}: address-interface {ai:?} is not a configured interface",
-                        v.name
-                    );
-                }
+            if let Some(ai) = &v.address_interface
+                && !self.interfaces.iter().any(|i| &i.name == ai)
+            {
+                bail!(
+                    "protocols vrrp {:?}: address-interface {ai:?} is not a configured interface",
+                    v.name
+                );
             }
         }
         // BFD global defaults: the authentication type, when set.
         if let Some(bfd) = &self.protocols.bfd {
-            if let Some(t) = &bfd.auth_type {
-                if !BFD_AUTH_TYPES.contains(&t.as_str()) {
-                    bail!("protocols bfd auth-type {t:?} not one of {BFD_AUTH_TYPES:?}");
-                }
+            if let Some(t) = &bfd.auth_type
+                && !BFD_AUTH_TYPES.contains(&t.as_str())
+            {
+                bail!("protocols bfd auth-type {t:?} not one of {BFD_AUTH_TYPES:?}");
             }
             if bfd.detect_mult == Some(0) {
                 bail!("protocols bfd detect-mult must be >= 1");
@@ -9743,27 +9791,29 @@ impl Appliance {
                 if i.name.is_empty() {
                     bail!("protocols multicast interface: name must be set");
                 }
-                if let Some(role) = &i.role {
-                    if !MULTICAST_ROLES.contains(&role.as_str()) {
-                        bail!(
-                            "protocols multicast interface {:?}: role {role:?} not one of {MULTICAST_ROLES:?}",
-                            i.name
-                        );
-                    }
+                if let Some(role) = &i.role
+                    && !MULTICAST_ROLES.contains(&role.as_str())
+                {
+                    bail!(
+                        "protocols multicast interface {:?}: role {role:?} not one of {MULTICAST_ROLES:?}",
+                        i.name
+                    );
                 }
-                if let Some(v) = i.igmp_version {
-                    if v != 2 && v != 3 {
-                        bail!(
-                            "protocols multicast interface {:?}: igmp-version {v} must be 2 or 3",
-                            i.name
-                        );
-                    }
+                if let Some(v) = i.igmp_version
+                    && v != 2
+                    && v != 3
+                {
+                    bail!(
+                        "protocols multicast interface {:?}: igmp-version {v} must be 2 or 3",
+                        i.name
+                    );
                 }
             }
-            if let Some(v) = mc.igmp_version {
-                if v != 2 && v != 3 {
-                    bail!("protocols multicast igmp-version {v} must be 2 or 3");
-                }
+            if let Some(v) = mc.igmp_version
+                && v != 2
+                && v != 3
+            {
+                bail!("protocols multicast igmp-version {v} must be 2 or 3");
             }
             if let Some(pim) = &mc.pim {
                 if pim.enabled {
@@ -9818,12 +9868,10 @@ impl Appliance {
                 None => bail!("services dns serve-on {iface:?}: not a declared interface"),
             }
         }
-        if let Some(mode) = &dns.dnssec {
-            if !matches!(mode.as_str(), "yes" | "no" | "allow-downgrade") {
-                bail!(
-                    "services dns dnssec {mode:?}: expected \"yes\", \"no\" or \"allow-downgrade\""
-                );
-            }
+        if let Some(mode) = &dns.dnssec
+            && !matches!(mode.as_str(), "yes" | "no" | "allow-downgrade")
+        {
+            bail!("services dns dnssec {mode:?}: expected \"yes\", \"no\" or \"allow-downgrade\"");
         }
         // Host-overrides map a name to a literal IP (v4 or v6); blocklist entries
         // are domain names. Serving overrides/blocklists needs a serve-on iface
@@ -9884,10 +9932,10 @@ impl Appliance {
         // strings (rendered quoted). The community itself is unconstrained (a
         // shared secret), but an empty one would be nonsensical.
         let snmp = &self.services.snmp;
-        if let Some(c) = &snmp.community {
-            if c.is_empty() {
-                bail!("services snmp community: must not be empty");
-            }
+        if let Some(c) = &snmp.community
+            && c.is_empty()
+        {
+            bail!("services snmp community: must not be empty");
         }
         // `community` is rendered UNQUOTED into snmpd.conf (`rocommunity <community>
         // …`), so a newline injects a fresh directive — e.g. `rwcommunity`, turning
@@ -9896,24 +9944,23 @@ impl Appliance {
         // control character, whitespace, quote or backslash in both (location and
         // contact are guarded separately below as they are rendered quoted).
         for (field, val) in [("community", &snmp.community), ("listen", &snmp.listen)] {
-            if let Some(v) = val {
-                if v.bytes()
+            if let Some(v) = val
+                && v.bytes()
                     .any(|b| b.is_ascii_control() || matches!(b, b' ' | b'\t' | b'"' | b'\\'))
-                {
-                    bail!(
-                        "services snmp {field}: must not contain whitespace, a control \
+            {
+                bail!(
+                    "services snmp {field}: must not contain whitespace, a control \
                          character, quote or backslash"
-                    );
-                }
+                );
             }
         }
         // location/contact are rendered as quoted syslocation/syscontact lines in
         // snmpd.conf — a newline, quote or backslash could break out of the line.
         for (field, val) in [("location", &snmp.location), ("contact", &snmp.contact)] {
-            if let Some(v) = val {
-                if v.bytes().any(|b| matches!(b, b'\n' | b'\r' | b'"' | b'\\')) {
-                    bail!("services snmp {field}: must not contain a newline, quote or backslash");
-                }
+            if let Some(v) = val
+                && v.bytes().any(|b| matches!(b, b'\n' | b'\r' | b'"' | b'\\'))
+            {
+                bail!("services snmp {field}: must not contain a newline, quote or backslash");
             }
         }
         for src in &snmp.allow {
@@ -9929,15 +9976,16 @@ impl Appliance {
         // reject 0) and an optional listen-address that must be a real IP the box
         // could hold. The keys themselves live per-user under [[system.login]].
         let ssh = &self.services.ssh;
-        if let Some(p) = ssh.port {
-            if p == 0 {
-                bail!("services ssh port: must be 1-65535");
-            }
+        if let Some(p) = ssh.port
+            && p == 0
+        {
+            bail!("services ssh port: must be 1-65535");
         }
-        if let Some(addr) = &ssh.listen_address {
-            if validate_ipv4(addr).is_err() && validate_ipv6(addr).is_err() {
-                bail!("services ssh listen-address {addr:?}: not an IPv4/IPv6 address");
-            }
+        if let Some(addr) = &ssh.listen_address
+            && validate_ipv4(addr).is_err()
+            && validate_ipv6(addr).is_err()
+        {
+            bail!("services ssh listen-address {addr:?}: not an IPv4/IPv6 address");
         }
 
         // Web console: same shape as sshd's. The port defaults to 8080 and the
@@ -9950,19 +9998,25 @@ impl Appliance {
         {
             bail!("services web confirm-timeout: must be 1–3600 seconds");
         }
-        if let Some(p) = web.port {
-            if p == 0 {
-                bail!("services web port: must be 1-65535");
-            }
+        if let Some(p) = web.port
+            && p == 0
+        {
+            bail!("services web port: must be 1-65535");
         }
-        if let Some(addr) = &web.listen_address {
-            if validate_ipv4(addr).is_err() && validate_ipv6(addr).is_err() {
-                bail!("services web listen-address {addr:?}: not an IPv4/IPv6 address");
-            }
+        if let Some(addr) = &web.listen_address
+            && validate_ipv4(addr).is_err()
+            && validate_ipv6(addr).is_err()
+        {
+            bail!("services web listen-address {addr:?}: not an IPv4/IPv6 address");
         }
         // TLS (H3): an operator-supplied certificate needs both halves — a cert
         // without its key (or vice versa) cannot serve TLS — and neither half is
         // meaningful once TLS is turned off.
+        for (field, path) in [("tls-cert", &web.tls_cert), ("tls-key", &web.tls_key)] {
+            if let Some(path) = path {
+                WebConsole::validate_tls_path(field, path)?;
+            }
+        }
         match (&web.tls_cert, &web.tls_key) {
             (Some(_), None) => bail!("services web tls-cert: also set tls-key (both or neither)"),
             (None, Some(_)) => bail!("services web tls-key: also set tls-cert (both or neither)"),
@@ -9980,6 +10034,9 @@ impl Appliance {
         let mut seen_users = std::collections::BTreeSet::new();
         for login in &self.system.logins {
             let u = &login.username;
+            if matches!(u.as_str(), "root" | "nobody" | "sshd") || u.starts_with("systemd-") {
+                bail!("system login {u:?}: reserved operating-system account");
+            }
             if !seen_users.insert(u.as_str()) {
                 bail!("system login {u:?}: duplicate username");
             }
@@ -10043,14 +10100,14 @@ impl Appliance {
         // base64 of a 32-byte SHA-256, i.e. 44 base64 characters ending in `=`.
         // Reject anything else so a typo is caught at commit, not as a silent
         // "peer refused" at push time.
-        if let Some(fp) = &cs.peer_fingerprint {
-            if !is_valid_pinned_sha256(fp) {
-                bail!(
-                    "system config-sync peer-fingerprint {fp:?}: expected the base64 SHA-256 of \
+        if let Some(fp) = &cs.peer_fingerprint
+            && !is_valid_pinned_sha256(fp)
+        {
+            bail!(
+                "system config-sync peer-fingerprint {fp:?}: expected the base64 SHA-256 of \
                      the peer's public key (44 base64 chars, printed in the peer's log as \
                      `TLS pin sha256//…` when its console starts)"
-                );
-            }
+            );
         }
 
         // HA conntrack sync ([system.conntrack-sync], C9): the eBPF conntrack table
@@ -10058,8 +10115,21 @@ impl Appliance {
         // `listen` and every `peer` must be a host or host:port; the interval must
         // be a sane, non-zero cadence.
         let cts = &self.system.conntrack_sync;
-        if !cts.is_empty() && cs.secret.is_some() && cts.peers.is_empty() {
-            bail!("system conntrack-sync: authenticated state replication requires explicit peers");
+        if !cts.is_empty() {
+            if !cs
+                .secret
+                .as_ref()
+                .is_some_and(|secret| (32..=1024).contains(&secret.len()))
+            {
+                bail!(
+                    "system conntrack-sync: legacy unauthenticated replication is disabled; explicitly configure a 32..1024-byte random system config-sync secret and state peers on both nodes, or delete system conntrack-sync before upgrading; no credential or management listener is configured automatically"
+                );
+            }
+            if cts.peers.is_empty() {
+                bail!(
+                    "system conntrack-sync: authenticated state replication requires explicit peers; listen-only legacy replication is disabled"
+                );
+            }
         }
         if let Some(listen) = &cts.listen {
             validate_sync_peer(listen)
@@ -10069,10 +10139,10 @@ impl Appliance {
             validate_sync_peer(peer)
                 .map_err(|e| anyhow::anyhow!("system conntrack-sync peer {e}"))?;
         }
-        if let Some(iv) = cts.interval {
-            if iv == 0 || iv > 3600 {
-                bail!("system conntrack-sync: interval {iv} must be 1..=3600 seconds");
-            }
+        if let Some(iv) = cts.interval
+            && (iv == 0 || iv > 3600)
+        {
+            bail!("system conntrack-sync: interval {iv} must be 1..=3600 seconds");
         }
 
         // mDNS reflector: every listed interface must be declared, and a reflector
@@ -10105,16 +10175,16 @@ impl Appliance {
         // login/password are rendered into ddclient.conf lines — a newline or a
         // single-quote could smuggle another directive.
         for (field, val) in [("login", &dd.login), ("password", &dd.password)] {
-            if let Some(v) = val {
-                if v.bytes().any(|b| matches!(b, b'\n' | b'\r' | b'\'')) {
-                    bail!("services dyndns {field}: must not contain a newline or single-quote");
-                }
+            if let Some(v) = val
+                && v.bytes().any(|b| matches!(b, b'\n' | b'\r' | b'\''))
+            {
+                bail!("services dyndns {field}: must not contain a newline or single-quote");
             }
         }
-        if let Some(iface) = &dd.interface {
-            if !self.interfaces.iter().any(|i| &i.name == iface) {
-                bail!("services dyndns interface {iface:?}: not a declared interface");
-            }
+        if let Some(iface) = &dd.interface
+            && !self.interfaces.iter().any(|i| &i.name == iface)
+        {
+            bail!("services dyndns interface {iface:?}: not a declared interface");
         }
 
         // PPPoE server: a subscriber is its password. The delete path already
@@ -10128,10 +10198,10 @@ impl Appliance {
         // the shape it claims to be — a space in an interface name is an extra
         // `pppoe-server` option, a newline another environment assignment.
         let bng = &self.services.pppoe_server;
-        if let Some(iface) = &bng.interface {
-            if !self.interfaces.iter().any(|i| &i.name == iface) {
-                bail!("services pppoe-server interface {iface:?}: not a declared interface");
-            }
+        if let Some(iface) = &bng.interface
+            && !self.interfaces.iter().any(|i| &i.name == iface)
+        {
+            bail!("services pppoe-server interface {iface:?}: not a declared interface");
         }
         for (field, value) in [
             ("local-address", &bng.local_address),
@@ -10148,17 +10218,16 @@ impl Appliance {
             ("service-name", &bng.service_name),
             ("ac-name", &bng.ac_name),
         ] {
-            if let Some(v) = value {
-                if v.is_empty()
+            if let Some(v) = value
+                && (v.is_empty()
                     || v.bytes().any(|b| {
                         b.is_ascii_control() || matches!(b, b' ' | b'"' | b'\\' | b'\'' | b'#')
-                    })
-                {
-                    bail!(
-                        "services pppoe-server {field}: must be one word, without whitespace, a \
+                    }))
+            {
+                bail!(
+                    "services pppoe-server {field}: must be one word, without whitespace, a \
                          control character, quote, backslash or '#'"
-                    );
-                }
+                );
             }
         }
         for u in &self.services.pppoe_server.users {
@@ -10405,15 +10474,15 @@ impl Appliance {
             }
         }
         for login in &self.system.logins {
-            if let Some(group) = &login.group {
-                if !self.system.groups.iter().any(|g| &g.name == group) {
-                    bail!(
-                        "system login {:?}: group {group:?} is not declared — \
+            if let Some(group) = &login.group
+                && !self.system.groups.iter().any(|g| &g.name == group)
+            {
+                bail!(
+                    "system login {:?}: group {group:?} is not declared — \
                          add `set system group {group} permission read-only` or \
                          read-write",
-                        login.username
-                    );
-                }
+                    login.username
+                );
             }
         }
 
@@ -10471,10 +10540,10 @@ impl Appliance {
                     );
                 }
             }
-            if let Some(port) = portal.port {
-                if port == 0 {
-                    bail!("services portal port 0: not a port");
-                }
+            if let Some(port) = portal.port
+                && port == 0
+            {
+                bail!("services portal port 0: not a port");
             }
         }
 
@@ -10644,16 +10713,16 @@ impl Appliance {
                     u.interface
                 );
             }
-            if let Some(w) = u.weight {
-                if w == 0 {
-                    bail!("multiwan uplink {:?}: weight must be non-zero", u.interface);
-                }
+            if let Some(w) = u.weight
+                && w == 0
+            {
+                bail!("multiwan uplink {:?}: weight must be non-zero", u.interface);
             }
-            if let Some(gw) = &u.gateway {
-                if gw != "dhcp" {
-                    validate_ipv4(gw)
-                        .with_context(|| format!("multiwan uplink {:?} gateway", u.interface))?;
-                }
+            if let Some(gw) = &u.gateway
+                && gw != "dhcp"
+            {
+                validate_ipv4(gw)
+                    .with_context(|| format!("multiwan uplink {:?} gateway", u.interface))?;
             }
             for t in &u.check.targets {
                 validate_ipv4(t).with_context(|| {
@@ -10762,18 +10831,19 @@ impl Appliance {
                     c.name
                 );
             }
-            if let Some(v) = c.ike_version {
-                if v != 1 && v != 2 {
-                    bail!("vpn ipsec {:?}: ike-version {v} must be 1 or 2", c.name);
-                }
+            if let Some(v) = c.ike_version
+                && v != 1
+                && v != 2
+            {
+                bail!("vpn ipsec {:?}: ike-version {v} must be 1 or 2", c.name);
             }
-            if let Some(sa) = &c.start_action {
-                if !matches!(sa.as_str(), "start" | "trap" | "none") {
-                    bail!(
-                        "vpn ipsec {:?}: start-action {sa:?} must be start|trap|none",
-                        c.name
-                    );
-                }
+            if let Some(sa) = &c.start_action
+                && !matches!(sa.as_str(), "start" | "trap" | "none")
+            {
+                bail!(
+                    "vpn ipsec {:?}: start-action {sa:?} must be start|trap|none",
+                    c.name
+                );
             }
             if let Some(p) = &c.ike_proposal {
                 validate_ipsec_proposal(p)
@@ -10898,10 +10968,10 @@ impl Appliance {
                     oc.certificate
                 );
             }
-            if let Some(z) = &oc.zone {
-                if !zones_in_use.contains(z.as_str()) {
-                    bail!("vpn openconnect: zone {z:?} has no interface");
-                }
+            if let Some(z) = &oc.zone
+                && !zones_in_use.contains(z.as_str())
+            {
+                bail!("vpn openconnect: zone {z:?} has no interface");
             }
             if oc.users.is_empty() {
                 bail!(
@@ -10975,10 +11045,10 @@ impl Appliance {
                 validate_subject_component(o)
                     .with_context(|| format!("pki ca {:?} organization", ca.name))?;
             }
-            if let Some(kt) = &ca.key_type {
-                if !matches!(kt.as_str(), "ec" | "rsa") {
-                    bail!("pki ca {:?}: key-type {kt:?} must be ec or rsa", ca.name);
-                }
+            if let Some(kt) = &ca.key_type
+                && !matches!(kt.as_str(), "ec" | "rsa")
+            {
+                bail!("pki ca {:?}: key-type {kt:?} must be ec or rsa", ca.name);
             }
             if ca.validity_days == Some(0) {
                 bail!("pki ca {:?}: validity-days must be greater than 0", ca.name);
@@ -11022,21 +11092,21 @@ impl Appliance {
             for san in &cert.subject_alt_names {
                 validate_san(san).with_context(|| format!("pki certificate {:?}", cert.name))?;
             }
-            if let Some(kt) = &cert.key_type {
-                if !matches!(kt.as_str(), "ec" | "rsa") {
-                    bail!(
-                        "pki certificate {:?}: key-type {kt:?} must be ec or rsa",
-                        cert.name
-                    );
-                }
+            if let Some(kt) = &cert.key_type
+                && !matches!(kt.as_str(), "ec" | "rsa")
+            {
+                bail!(
+                    "pki certificate {:?}: key-type {kt:?} must be ec or rsa",
+                    cert.name
+                );
             }
-            if let Some(u) = &cert.usage {
-                if !matches!(u.as_str(), "server" | "client") {
-                    bail!(
-                        "pki certificate {:?}: usage {u:?} must be server or client",
-                        cert.name
-                    );
-                }
+            if let Some(u) = &cert.usage
+                && !matches!(u.as_str(), "server" | "client")
+            {
+                bail!(
+                    "pki certificate {:?}: usage {u:?} must be server or client",
+                    cert.name
+                );
             }
             if cert.validity_days == Some(0) {
                 bail!(
@@ -11050,10 +11120,10 @@ impl Appliance {
             if let Some(url) = &acme.directory_url {
                 validate_https_url(url).context("pki acme directory-url")?;
             }
-            if let Some(ch) = &acme.challenge {
-                if !matches!(ch.as_str(), "http-01" | "dns-01") {
-                    bail!("pki acme: challenge {ch:?} must be http-01 or dns-01");
-                }
+            if let Some(ch) = &acme.challenge
+                && !matches!(ch.as_str(), "http-01" | "dns-01")
+            {
+                bail!("pki acme: challenge {ch:?} must be http-01 or dns-01");
             }
         }
         // GeoIP (roadmap C15): a country the image has no addresses for would
@@ -11168,14 +11238,14 @@ impl Appliance {
             }
             // The selection must point at something that exists — an update
             // path that dangles is found at 03:00 during an incident otherwise.
-            if let Some(sel) = &up.channel {
-                if !up.channels.iter().any(|c| &c.name == sel) {
-                    bail!(
-                        "update: channel {sel:?} is selected but not defined — define it \
+            if let Some(sel) = &up.channel
+                && !up.channels.iter().any(|c| &c.name == sel)
+            {
+                bail!(
+                    "update: channel {sel:?} is selected but not defined — define it \
                          (set update channel {sel} url …) or delete the selection \
                          (delete update channel)"
-                    );
-                }
+                );
             }
         }
         // EVPN: one identity feeding two lower halves, so the checks are about
@@ -11209,10 +11279,10 @@ impl Appliance {
                     }
                 }
             }
-            if let Some(enc) = &e.encapsulation {
-                if !matches!(enc.as_str(), "vxlan" | "geneve") {
-                    bail!("evpn encapsulation {enc:?}: use vxlan or geneve");
-                }
+            if let Some(enc) = &e.encapsulation
+                && !matches!(enc.as_str(), "vxlan" | "geneve")
+            {
+                bail!("evpn encapsulation {enc:?}: use vxlan or geneve");
             }
             if let Some(loc) = &e.srv6_locator {
                 validate_cidr_or_ip(loc).with_context(|| "evpn srv6-locator")?;
@@ -11375,16 +11445,13 @@ impl Appliance {
         }
     }
 
-    /// Non-fatal advisories surfaced at commit time (the orchestrator prints
-    /// them; nothing here blocks a commit). Today the data plane keys firewall
-    /// policies on the *source* zone only, so a rule's `to <zone>` is decorative:
-    /// every rule effectively applies from its `from` zone to ALL zones.
-    // Printed by the repl orchestrator (a different slice); unused inside the
-    // binary until that wiring lands, so silence dead_code here.
-    #[allow(dead_code)]
+    /// Non-fatal advisories surfaced by operators' commit/check paths. A
+    /// destination zone binds connected address prefixes, not the actual
+    /// outgoing interface; unsupported source/broad forms can be wider still.
     pub fn warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
         out.extend(crate::ha::witness_warnings(self));
+        out.extend(crate::compile::destination_zone_warnings(self));
         // An encrypted upstream named by hostname cannot be reached until
         // something resolves that hostname, and that something has to be
         // plaintext. Without one the box looks like "DNS is broken" rather than
@@ -11924,10 +11991,10 @@ pub(crate) fn validate_qos(qos: &Qos) -> Result<()> {
                 .with_context(|| format!("rtt {rtt:?}: expected a time or a CAKE keyword"))?;
         }
     }
-    if let Some(ds) = &qos.diffserv {
-        if !CAKE_DIFFSERV_MODES.contains(&ds.as_str()) {
-            bail!("invalid diffserv mode {ds:?}: use besteffort/diffserv3/diffserv4/diffserv8");
-        }
+    if let Some(ds) = &qos.diffserv
+        && !CAKE_DIFFSERV_MODES.contains(&ds.as_str())
+    {
+        bail!("invalid diffserv mode {ds:?}: use besteffort/diffserv3/diffserv4/diffserv8");
     }
     if let Some(t) = &qos.target {
         validate_tc_time(t).context("target")?;
@@ -12216,6 +12283,45 @@ pub(crate) fn validate_iface_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_wan_policy(policy: &WanPolicy) -> Result<()> {
+    if policy.name.is_empty()
+        || policy.name.len() > 64
+        || !policy
+            .name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        bail!("multiwan policy name: use 1–64 ASCII letters, digits, '.', '_' or '-'");
+    }
+    if let Some(proto) = &policy.proto
+        && !matches!(proto.as_str(), "tcp" | "udp")
+    {
+        bail!(
+            "multiwan policy {:?}: proto must be tcp or udp",
+            policy.name
+        );
+    }
+    for (field, value) in [
+        ("source-port", &policy.source_port),
+        ("destination-port", &policy.destination_port),
+    ] {
+        if let Some(value) = value {
+            // ip rule accepts a numeric port or an inclusive range. Do not use
+            // the firewall expansion cap here: the kernel handles the range.
+            let port = PortSpec::parse(value)
+                .with_context(|| format!("multiwan policy {:?} {field}", policy.name))?;
+            let (lo, hi) = port.bounds();
+            if lo == 0 || lo > hi || value.bytes().any(|c| !c.is_ascii_digit() && c != b'-') {
+                bail!(
+                    "multiwan policy {:?} {field}: expected a port or ordered range in 1–65535",
+                    policy.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The BGP Roles a speaker may take toward a neighbour (RFC 9234).
 const BGP_ROLES: &[&str] = &["provider", "customer", "peer", "rs-server", "rs-client"];
 
@@ -12353,29 +12459,29 @@ fn validate_bgp_neighbor(n: &BgpNeighbor, filter_names: &HashSet<&str>) -> Resul
             n.address
         );
     }
-    if let Some(role) = &n.role {
-        if !BGP_ROLES.contains(&role.as_str()) {
-            bail!(
-                "protocols bgp neighbor {:?}: role {role:?} not one of {BGP_ROLES:?}",
-                n.address
-            );
-        }
+    if let Some(role) = &n.role
+        && !BGP_ROLES.contains(&role.as_str())
+    {
+        bail!(
+            "protocols bgp neighbor {:?}: role {role:?} not one of {BGP_ROLES:?}",
+            n.address
+        );
     }
-    if let Some(hops) = n.ttl_security {
-        if !(1..=254).contains(&hops) {
-            bail!(
-                "protocols bgp neighbor {:?}: ttl-security {hops} out of range 1..=254",
-                n.address
-            );
-        }
+    if let Some(hops) = n.ttl_security
+        && !(1..=254).contains(&hops)
+    {
+        bail!(
+            "protocols bgp neighbor {:?}: ttl-security {hops} out of range 1..=254",
+            n.address
+        );
     }
-    if let Some(max) = n.max_prefix {
-        if max == 0 {
-            bail!(
-                "protocols bgp neighbor {:?}: max-prefix must be non-zero",
-                n.address
-            );
-        }
+    if let Some(max) = n.max_prefix
+        && max == 0
+    {
+        bail!(
+            "protocols bgp neighbor {:?}: max-prefix must be non-zero",
+            n.address
+        );
     }
     // TCP-MD5 (RFC 2385) and TCP-AO (RFC 5925) are different TCP options that
     // cannot both protect one session.
@@ -12385,22 +12491,22 @@ fn validate_bgp_neighbor(n: &BgpNeighbor, filter_names: &HashSet<&str>) -> Resul
             n.address
         );
     }
-    if let Some(t) = &n.bfd_auth_type {
-        if !BFD_AUTH_TYPES.contains(&t.as_str()) {
-            bail!(
-                "protocols bgp neighbor {:?}: bfd-auth-type {t:?} not one of {BFD_AUTH_TYPES:?}",
-                n.address
-            );
-        }
+    if let Some(t) = &n.bfd_auth_type
+        && !BFD_AUTH_TYPES.contains(&t.as_str())
+    {
+        bail!(
+            "protocols bgp neighbor {:?}: bfd-auth-type {t:?} not one of {BFD_AUTH_TYPES:?}",
+            n.address
+        );
     }
     for (which, name) in [("import", &n.import), ("export", &n.export)] {
-        if let Some(name) = name {
-            if !filter_names.contains(name.as_str()) {
-                bail!(
-                    "protocols bgp neighbor {:?}: {which} references unknown filter {name:?}",
-                    n.address
-                );
-            }
+        if let Some(name) = name
+            && !filter_names.contains(name.as_str())
+        {
+            bail!(
+                "protocols bgp neighbor {:?}: {which} references unknown filter {name:?}",
+                n.address
+            );
         }
     }
     if n.local_as == Some(0) {
@@ -12432,13 +12538,14 @@ fn validate_bgp_neighbor(n: &BgpNeighbor, filter_names: &HashSet<&str>) -> Resul
             );
         }
     }
-    if let Some(hold) = n.hold_time {
-        if hold != 0 && hold < 3 {
-            bail!(
-                "protocols bgp neighbor {:?}: hold-time must be 0 or >= 3 seconds (RFC 4271)",
-                n.address
-            );
-        }
+    if let Some(hold) = n.hold_time
+        && hold != 0
+        && hold < 3
+    {
+        bail!(
+            "protocols bgp neighbor {:?}: hold-time must be 0 or >= 3 seconds (RFC 4271)",
+            n.address
+        );
     }
     Ok(())
 }
@@ -12456,16 +12563,16 @@ fn validate_filter(f: &Filter) -> Result<()> {
     for (i, r) in f.rules.iter().enumerate() {
         validate_filter_action(&r.action)
             .with_context(|| format!("protocols filter {:?} rule {i} action", f.name))?;
-        if let Some(protocol) = &r.protocol {
-            if !matches!(
+        if let Some(protocol) = &r.protocol
+            && !matches!(
                 protocol.trim().to_ascii_lowercase().as_str(),
                 "connected" | "static" | "kernel" | "rip" | "ospf" | "isis" | "babel" | "bgp"
-            ) {
-                bail!(
-                    "protocols filter {:?} rule {i}: unknown protocol {protocol:?}",
-                    f.name
-                );
-            }
+            )
+        {
+            bail!(
+                "protocols filter {:?} rule {i}: unknown protocol {protocol:?}",
+                f.name
+            );
         }
         if let Some(next_hop) = &r.set_next_hop {
             next_hop.parse::<std::net::IpAddr>().with_context(|| {
@@ -12597,24 +12704,23 @@ fn validate_ext_community(c: &str) -> Result<()> {
         if hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Ok(());
         }
-    } else if let Some((kind, rest)) = value.split_once(':') {
-        if matches!(kind.to_ascii_lowercase().as_str(), "rt" | "ro" | "soo") {
-            if let Some((admin, local)) = rest.split_once(':') {
-                let valid = if admin.parse::<Ipv4Addr>().is_ok() {
-                    local.parse::<u16>().is_ok()
-                } else if let Ok(asn) = admin.parse::<u32>() {
-                    if asn <= u16::MAX as u32 {
-                        local.parse::<u32>().is_ok()
-                    } else {
-                        local.parse::<u16>().is_ok()
-                    }
-                } else {
-                    false
-                };
-                if valid {
-                    return Ok(());
-                }
+    } else if let Some((kind, rest)) = value.split_once(':')
+        && matches!(kind.to_ascii_lowercase().as_str(), "rt" | "ro" | "soo")
+        && let Some((admin, local)) = rest.split_once(':')
+    {
+        let valid = if admin.parse::<Ipv4Addr>().is_ok() {
+            local.parse::<u16>().is_ok()
+        } else if let Ok(asn) = admin.parse::<u32>() {
+            if asn <= u16::MAX as u32 {
+                local.parse::<u32>().is_ok()
+            } else {
+                local.parse::<u16>().is_ok()
             }
+        } else {
+            false
+        };
+        if valid {
+            return Ok(());
         }
     }
     bail!("extended community {c:?}: expected rt/ro/soo:ASN:value, IPv4:value or 0x<16 hex digits>")
@@ -12622,12 +12728,13 @@ fn validate_ext_community(c: &str) -> Result<()> {
 
 /// Validate an OSPF/OSPFv3 `network-type` (`broadcast` / `point-to-point`).
 fn validate_ospf_network_type(nt: Option<&str>, proto: &str) -> Result<()> {
-    if let Some(nt) = nt {
-        if nt != "broadcast" && nt != "point-to-point" {
-            bail!(
-                "protocols {proto} network-type {nt:?}: expected \"broadcast\" or \"point-to-point\""
-            );
-        }
+    if let Some(nt) = nt
+        && nt != "broadcast"
+        && nt != "point-to-point"
+    {
+        bail!(
+            "protocols {proto} network-type {nt:?}: expected \"broadcast\" or \"point-to-point\""
+        );
     }
     Ok(())
 }
@@ -13033,6 +13140,77 @@ fn proto_str(p: Proto) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn duplicate_local_addresses_are_scoped_by_routing_table_not_prefix_text() {
+        let config = |a: &str, b: &str, extra: &str| {
+            format!(
+                "[system]\nhostname='fw'\n[[interface]]\nname='a'\n{a}\n[[interface]]\nname='b'\n{b}\n{extra}\n"
+            )
+        };
+        for (a, b) in [
+            ("address='192.0.2.1/24'", "address='192.0.2.1/32'"),
+            (
+                "address6='2001:db8::1/64'",
+                "address6='2001:db8:0:0::1/128'",
+            ),
+        ] {
+            let error = super::Appliance::from_toml(&config(a, b, "")).unwrap_err();
+            assert!(error.to_string().contains("already assigned"), "{error:#}");
+            super::Appliance::from_toml(&config(
+                a,
+                b,
+                "[[protocols.vrf]]\nname='blue'\ntable=100\ninterfaces=['b']",
+            ))
+            .unwrap();
+            super::Appliance::from_toml(&config(a, &format!("{b}\ndisabled=true"), "")).unwrap();
+        }
+        super::Appliance::from_toml(&config("address='dhcp'", "address='dhcp'", "")).unwrap();
+        super::Appliance::from_toml(&config(
+            "address6='fe80::1/64'",
+            "address6='fe80::1/64'",
+            "",
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn multiwan_shell_selectors_have_a_strict_wire_grammar() {
+        use super::{WanPolicy, validate_wan_policy};
+        for (field, value) in [
+            ("name", "$(touch /tmp/not-allowed)"),
+            ("name", "bad\";reboot;#"),
+            ("proto", "tcp;reboot"),
+            ("proto", "icmp"),
+            ("source-port", "0"),
+            ("source-port", "22;reboot"),
+            ("source-port", "22 23"),
+            ("destination-port", "100-1"),
+            ("destination-port", "65536"),
+            ("destination-port", "$(id)"),
+        ] {
+            let mut policy = WanPolicy {
+                name: "safe-policy".into(),
+                ..Default::default()
+            };
+            match field {
+                "name" => policy.name = value.into(),
+                "proto" => policy.proto = Some(value.into()),
+                "source-port" => policy.source_port = Some(value.into()),
+                _ => policy.destination_port = Some(value.into()),
+            }
+            assert!(
+                validate_wan_policy(&policy).is_err(),
+                "accepted {field}: {value}"
+            );
+        }
+        validate_wan_policy(&WanPolicy {
+            name: "voice_1.2".into(),
+            proto: Some("udp".into()),
+            destination_port: Some("1-65535".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    }
 
     #[test]
     fn address_like_group_names_are_unique_across_every_type_pair() {
@@ -15679,6 +15857,63 @@ virtual-address = ["10.0.0.254"]
     }
 
     #[test]
+    fn web_disabled_explicit_tls_false_survives_toml_and_json_round_trips() {
+        let base = "[system]\nhostname = \"fw\"\n";
+        let configured = Appliance::from_toml(&format!(
+            "{base}[services.web]\nenable = false\ntls = false\n"
+        ))
+        .unwrap();
+        assert!(!configured.services.web.is_empty());
+        assert!(!configured.services.is_empty());
+        let saved_toml = configured.to_toml().unwrap();
+        let saved_json = configured.to_json().unwrap();
+        let toml_value: toml::Value = toml::from_str(&saved_toml).unwrap();
+        let json_value: serde_json::Value = serde_json::from_str(&saved_json).unwrap();
+        assert_eq!(toml_value["services"]["web"]["tls"].as_bool(), Some(false));
+        assert_eq!(json_value["services"]["web"]["tls"].as_bool(), Some(false));
+        let default = Appliance::from_toml(base).unwrap();
+        let intended_revision = crate::configsync::shared_revision(&configured).unwrap();
+        assert_ne!(
+            intended_revision,
+            crate::configsync::shared_revision(&default).unwrap(),
+            "disabling TLS must remain a shared security-policy change"
+        );
+        for mut round in [
+            Appliance::from_toml(&saved_toml).unwrap(),
+            Appliance::from_json(&saved_json).unwrap(),
+        ] {
+            assert!(!round.services.web.enable);
+            assert!(!round.services.web.tls);
+            assert_eq!(round.services.web.listen_address, None);
+            assert_eq!(round.services.web.port, None);
+            assert_eq!(round.services.web.confirm_timeout, None);
+            assert_eq!(
+                crate::configsync::shared_revision(&round).unwrap(),
+                intended_revision
+            );
+            // Enabling a saved disabled service must not silently undo the
+            // operator's explicit protocol selection. This starts no server.
+            round.services.web.enable = true;
+            let enabled = Appliance::from_toml(&round.to_toml().unwrap()).unwrap();
+            assert!(enabled.services.web.enable);
+            assert!(!enabled.services.web.tls);
+        }
+    }
+
+    #[test]
+    fn web_disabled_default_tls_still_omits_an_unconfigured_service() {
+        let default = Appliance::from_toml("[system]\nhostname = \"fw\"\n").unwrap();
+        assert!(default.services.web.is_empty());
+        let saved_toml: toml::Value = toml::from_str(&default.to_toml().unwrap()).unwrap();
+        let saved_json: serde_json::Value =
+            serde_json::from_str(&default.to_json().unwrap()).unwrap();
+        assert!(saved_toml.get("services").is_none());
+        assert!(saved_json.get("services").is_none());
+        assert!(default.services.web.tls);
+        assert!(!default.services.web.enable);
+    }
+
+    #[test]
     fn pinned_sha256_shape_is_enforced() {
         assert!(is_valid_pinned_sha256(&format!("{}=", "A".repeat(43))));
         assert!(!is_valid_pinned_sha256("tooshort"));
@@ -15702,7 +15937,7 @@ virtual-address = ["10.0.0.254"]
 
     #[test]
     fn conntrack_sync_parses_validates_and_round_trips() {
-        let base = "[system]\nhostname = \"fw\"\n";
+        let base = "[system]\nhostname = \"fw\"\n[system.config-sync]\nsecret = \"unit-test-credential-at-least-32-bytes\"\n";
 
         // A full [system.conntrack-sync] parses, validates, round-trips, and
         // normalizes to ip:port endpoints for the agent config.
@@ -15750,6 +15985,40 @@ virtual-address = ["10.0.0.254"]
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn conntrack_sync_refuses_legacy_and_weak_credentials_without_config_mutation() {
+        for secret in [
+            None,
+            Some(String::new()),
+            Some("short".into()),
+            Some("s".repeat(1025)),
+        ] {
+            let mut appliance = Appliance::from_toml("[system]\nhostname = \"fw\"\n").unwrap();
+            appliance.system.conntrack_sync.peers = vec!["10.9.0.2".into()];
+            appliance.system.config_sync.secret = secret;
+            let before = appliance.to_toml().unwrap();
+            let error = appliance.validate().unwrap_err().to_string();
+            assert!(error.contains("legacy unauthenticated replication is disabled"));
+            assert_eq!(
+                appliance.to_toml().unwrap(),
+                before,
+                "validation must never enroll or mutate API trust"
+            );
+        }
+        let mut appliance = Appliance::from_toml("[system]\nhostname = \"fw\"\n").unwrap();
+        appliance.system.config_sync.secret = Some("s".repeat(32));
+        appliance.system.conntrack_sync.listen = Some("0.0.0.0:5429".into());
+        assert!(
+            appliance
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("explicit peers")
+        );
+        appliance.system.conntrack_sync.peers = vec!["10.9.0.2".into()];
+        assert!(appliance.validate().is_ok());
     }
 }
 

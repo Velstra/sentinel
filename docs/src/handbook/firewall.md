@@ -4,6 +4,8 @@
 
 Use the trace command to explain the configured outcome for a packet. Use live counters and logs to investigate actual traffic. Configuration examples run inside `sentinel configure`.
 
+This is a development candidate. Fragmented NAT, RELATED ICMP/PMTU and capacity limits are not production-qualified. Read the [support matrix and conformance gate](../reference/dataplane-support.md). Routed traffic currently uses kernel forwarding plus TC egress, not an established-flow XDP redirect fast path.
+
 ## Asking before you send (packet trace)
 
 For example, determine whether a guest on `lan0` can reach SSH on a DMZ server. Replace interface names and addresses with ones from your configuration.
@@ -18,7 +20,7 @@ With a matching guest-deny rule, the important result can look like this:
 verdict:   drop (no-ssh-from-guests)
 ```
 
-The command reads the saved configuration by default. To test a proposed TOML file before applying it, pass the same packet to the candidate. JSON exposes the verdict, deciding rule and intermediate steps for comparison:
+The standalone command reads the saved configuration by default. To test a proposed TOML file before applying it, pass the same packet to the candidate. JSON exposes the verdict, deciding rule and intermediate steps for comparison:
 
 ```sh
 sentinel trace --config ./candidate.toml --json --in lan0 tcp 10.0.0.200 10.9.0.10 22
@@ -39,12 +41,11 @@ set firewall zone lan default-action accept    # trust the LAN
 
 ## Rules
 
-Scope each rule to the intended ingress and destination before applying it. This example scopes SSH to the management subnet and the firewall itself.
+Scope each rule to the intended ingress and destination before applying it. This example scopes SSH from the management zone to the firewall's local addresses.
 
 ```text
 set firewall rule mgmt-ssh from mgmt
 set firewall rule mgmt-ssh to firewall
-set firewall rule mgmt-ssh source 192.0.2.0/24
 set firewall rule mgmt-ssh proto tcp
 set firewall rule mgmt-ssh port 22
 set firewall rule mgmt-ssh action accept
@@ -53,6 +54,10 @@ set firewall rule mgmt-ssh action accept
 ### The destination zone
 
 For a port rule targeting a zone, verify the destination against that zone’s configured subnets. Use the packet trace to inspect the matched rule.
+
+A destination zone binds its configured connected prefixes, not the eventual outgoing interface. Routed prefixes behind that zone are not automatically included. A source-constrained port rule matches one address end, so its `to` label is not also enforced; broad rules set ingress posture rather than a destination restriction. Read every advisory and verify the actual destination match.
+
+New or changed unsafe destination-zone deny rules are refused by admission; this does not retroactively make unchanged legacy policy safe. Accept-rule advisories remain nonfatal. Use explicit destination matches for management isolation rather than assuming a zone label is an egress ACL.
 
 ### Rate limits
 
@@ -183,6 +188,8 @@ Source masquerading can use the WAN interface’s current IPv4 address, includin
 ```text
 set nat source wan-masq zone wan            # masquerade everything leaving wan
 ```
+
+Allocation searches a bounded candidate window. Collisions can reject a new connection even with free map capacity; logical expiry does not guarantee physical reclamation. Do not infer a supported connection limit from configured map sizes.
 
 #### Deterministic CGNAT
 
@@ -319,6 +326,17 @@ set firewall global conntrack udp 30
 set firewall global conntrack udp-stream 180
 set firewall global conntrack icmp 10
 ```
+
+## Inspect state-map occupancy
+
+```text
+show firewall states
+show firewall capacity
+show firewall counters
+show firewall events
+```
+
+`capacity` counts raw `CONNTRACK`, `FW_FLOWS` and `SYN_FLOWS` entries, including expired entries. It is not an active-connection count or supported limit. A complete consistent sample warns at 80%; failed/changing samples report `unknown` and include sampling age. Matching scans remain non-atomic, so `observed-below-threshold` is not a health guarantee. Eviction counts are unavailable, and old agents report the query unavailable.
 
 ## Check the result
 

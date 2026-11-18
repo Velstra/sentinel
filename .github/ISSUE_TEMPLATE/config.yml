@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability privately
+    url: https://github.com/Velstra/sentinel/security/advisories/new
+    about: Do not publish vulnerabilities, credentials, private keys or sensitive appliance archives in an issue.
+  - name: Operator and build documentation
+    url: https://github.com/Velstra/sentinel/blob/main/docs/src/introduction.md
+    about: Start with the current handbook, build commands and support limitations.

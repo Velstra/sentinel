@@ -38,3 +38,14 @@ nix build .#checks.x86_64-linux.quickstart -L
 ```
 
 Use the [test catalog](tests.md) to select an image, protocol, management or recovery test. VM checks require KVM.
+
+## Evidence boundaries
+
+Query the current attributes instead of relying on a frozen package or test count:
+
+```sh
+nix eval --json .#packages.x86_64-linux --apply builtins.attrNames
+nix eval --json .#checks.x86_64-linux --apply builtins.attrNames
+```
+
+Public image builds use development signing identities. A public package or module is not an Enterprise QCOW2/sysupdate certification. The `vm` application is a development VM, not necessarily a boot of the exact release disk. Evaluate, build and boot-test the intended artifact and dependency cohort separately.

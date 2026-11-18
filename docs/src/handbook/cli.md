@@ -41,3 +41,7 @@ sentinel show nat
 ```
 
 At a configuration prompt, prefix operational commands with `run`. See [remote changes](../operations/configure.md) for a worked confirmation and recovery sequence.
+
+## Read the applied configuration
+
+`sentinel show configuration` reports the last successfully applied snapshot, or the saved configuration before the first live commit. It does not show another session's pending candidate. Treat configuration output as sensitive; use narrowed operational commands when sharing diagnostics. See [commit, confirm and save](../architecture/commit-model.md) for persistence and API differences.

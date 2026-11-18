@@ -9,6 +9,17 @@
 {
   imports = [ ./appliance-image.nix ./boot-health.nix ];
 
+  # Runtime upgrades replace immutable images. No package manager, rebuild
+  # closure or workstation convenience packages belong on the appliance.
+  nix.enable = lib.mkDefault false;
+  environment.defaultPackages = lib.mkForce [ ];
+  documentation.nixos.enable = false;
+  documentation.info.enable = false;
+
+  # Preserve the normal console and expose kernel diagnostics to cloud serial
+  # consoles. This is image configuration, not a runtime package mutation.
+  boot.kernelParams = [ "console=tty0" "console=ttyS0,115200n8" ];
+
   # The interactive VM used by the test suite has a convenience login. A
   # flashable appliance must never inherit either that password or its console
   # autologin. Operators seed their own SSH key on the writable data partition.

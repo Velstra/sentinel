@@ -1,8 +1,10 @@
-"""Guest-local real CLI timer/rollback/API guard proof, with no OTA requests.
+"""Guest-local CLI timer/rollback/API guard proof with refused Check admission.
 
 One deliberate timer-only stop while the actual auto-rollback process waits on
 the real common lock proves service-only refusal. No test-only reset-failed or
 fake healthy state is used. Normal CLI paths must collect their real units.
+An injected real rollback failure must block Check before durable job creation
+or any upstream metadata request; no Stage offer is synthesized.
 """
 import argparse
 import fcntl
@@ -15,7 +17,9 @@ import ssl
 import subprocess
 import threading
 import time
+import urllib.error
 import urllib.request
+import uuid
 
 
 def until(callback, seconds=20):
@@ -84,7 +88,7 @@ class ChannelTripwire:
         assert not self.thread.is_alive() and not self.errors, self.errors
 
 
-def exercise(sentinel, channel):
+def exercise(sentinel, fault_sentinel, channel):
     assert Path("/sys/firmware/efi/efivars").is_dir()
     assert Path("/dev/mapper/usr").is_block_device()
     token = Path("/var/lib/sentinel/api-token").read_text().strip()
@@ -118,8 +122,16 @@ def exercise(sentinel, channel):
         value = status()
         return value if value and not value["can_check"] and value["unavailable"] in ("conflict", "busy") else None
 
-    def commit_confirm(hostname, minutes):
-        output = run(["su", "admin", "-c", shlex.join([sentinel, "configure"])],
+    def failed_recovery():
+        value = units()
+        return value if value["sentinel-confirm.service"]["ActiveState"] == "failed" else None
+
+    def failed_context():
+        value = status()
+        return value if value and not value["can_check"] and value["unavailable"] == "conflict" and value["mutation_context"] is not None else None
+
+    def commit_confirm(hostname, minutes, *, binary=sentinel):
+        output = run(["su", "admin", "-c", shlex.join([binary, "configure"])],
                      input=f"set system hostname {hostname}\ncommit-confirm {minutes}\nexit\n")
         assert "commit-confirm:" in output and "error:" not in output.lower(), output
         assert Path("/proc/sys/kernel/hostname").read_text().strip() == hostname
@@ -139,14 +151,20 @@ def exercise(sentinel, channel):
     assert Path("/proc/sys/kernel/hostname").read_text().strip() == "guard-keep"
     phases.append({"name": "normal-cli-confirm", "guard_refused": True, "natural_gc": after})
 
+    running = Path("/run/sentinel/running.toml")
+    baseline = running.read_bytes()
+    baseline_hostname = Path("/proc/sys/kernel/hostname").read_text().strip()
     commit_confirm("guard-revert", 10)
     until(blocked)
     run([sentinel, "confirm-rollback"])
     after = until(collected)
     until(available)
-    assert Path("/proc/sys/kernel/hostname").read_text().strip() == "guard-fw"
+    assert Path("/proc/sys/kernel/hostname").read_text().strip() == baseline_hostname
+    assert running.read_bytes() == baseline
     phases.append({"name": "normal-cli-manual-rollback", "guard_refused": True, "natural_gc": after})
 
+    baseline = running.read_bytes()
+    baseline_hostname = Path("/proc/sys/kernel/hostname").read_text().strip()
     commit_confirm("guard-auto", 1)
     until(blocked)
     # Hold only our real common-lock inode so the actual timer-spawned Sentinel
@@ -166,26 +184,76 @@ def exercise(sentinel, channel):
         until(blocked)
         assert Path("/proc/sys/kernel/hostname").read_text().strip() == "guard-auto"
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-    until(lambda: Path("/proc/sys/kernel/hostname").read_text().strip() == "guard-fw")
+    until(lambda: Path("/proc/sys/kernel/hostname").read_text().strip() == baseline_hostname)
     after = until(collected)
     until(available)
+    assert running.read_bytes() == baseline
     phases.append({"name": "actual-timer-service-with-timer-only-stop", "guard_refused": True,
                    "observed_service_only": state, "natural_gc_after_actual_rollback": after})
+
+    # The wrapper only changes the real external hostname tool/timer deadline.
+    # The production core, API, EFI identity, verity and systemctl are unchanged.
+    baseline = running.read_bytes()
+    baseline_hostname = Path("/proc/sys/kernel/hostname").read_text().strip()
+    Path("/run/qa-ota-restore-hostname").write_text(baseline_hostname)
+    Path("/run/qa-ota-fail-restore").touch(mode=0o600)
+    commit_confirm("guard-failed-trial", 1, binary=fault_sentinel)
+    until(lambda: Path("/run/qa-ota-partial-restore").exists())
+    failed = until(failed_recovery)
+    assert failed["sentinel-confirm.service"]["LoadState"] == "loaded", failed
+    assert Path("/proc/sys/kernel/hostname").read_text().strip() == "guard-partial-restore"
+    assert "guard-failed-trial" in running.read_text()
+    refused = until(failed_context)
+    assert refused["unavailable"] == "conflict" and refused["current"]["permanent"], refused
+    assert refused["mutation_context"] is not None, "refusal must be an otherwise valid immutable context"
+    jobs = Path("/var/lib/sentinel/update-jobs")
+    assert not jobs.exists(), "fixture starts without durable update jobs"
+    cli = subprocess.run([sentinel, "system", "update", "check", "--wait"], text=True,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)
+    assert cli.returncode == 1 and "check and review again" in cli.stdout, cli.stdout
+    payload = dict(request_id=uuid.uuid4().hex + uuid.uuid4().hex,
+                   expected_generation=refused["generation"], expected=refused["mutation_context"])
+    request = urllib.request.Request("https://127.0.0.1:8080/api/v1/system/updates/check",
+        data=json.dumps(payload).encode(), headers={"Authorization": "Bearer " + token,
+        "Content-Type": "application/json", "Origin": "https://127.0.0.1:8080"}, method="POST")
+    try:
+        response = urllib.request.urlopen(request, context=tls, timeout=10)
+    except urllib.error.HTTPError as error:
+        response = error
+    with response:
+        assert response.status == 409, response.status
+        assert "check and review again" in str(json.load(response))
+    assert not jobs.exists(), "refused Check created durable update state"
+    assert channel.attempts == 0 and not channel.errors, "refused Check reached metadata upstream"
+    assert hashlib.sha256(saved.read_bytes()).hexdigest() == saved_hash
+    Path("/run/qa-ota-fail-restore").unlink()
+    retried = run([sentinel, "confirm-rollback"])
+    assert "retry scheduled" in retried and "reverted the running" not in retried, retried
+    after = until(collected)
+    until(available)
+    assert running.read_bytes() == baseline
+    assert Path("/proc/sys/kernel/hostname").read_text().strip() == baseline_hostname
+    phases.append({"name": "actual-failed-restore-refuses-unified-check-before-job-or-network",
+                   "guard_refused": True, "retained_failed": failed,
+                   "api_http": 409, "cli_exit": cli.returncode, "natural_gc_after_retry": after})
     assert hashlib.sha256(saved.read_bytes()).hexdigest() == saved_hash
     assert not Path("/var/lib/sentinel/update-jobs").exists()
     assert channel.attempts == 0 and not channel.errors, channel.errors
-    return {"schema": "velstra-real-ota-confirmation-unit-guard/v1", "real_efi_verity": True,
+    return {"schema": "velstra-real-ota-confirmation-unit-guard/v2", "real_efi_verity": True,
             "phases": phases, "channel_requests": channel.attempts,
-            "check_or_stage_called": False, "all_selected_checks_passed": True,
+            "check_or_stage_called": True, "check_admitted": False, "stage_called": False,
+            "refused_check_requests": {"api_http": 409, "cli_exit": cli.returncode},
+            "all_selected_checks_passed": True,
             "short_cas_or_native_stage_certified": False, "production_release_certified": False}
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sentinel", required=True)
+    parser.add_argument("--fault-sentinel", required=True)
     arguments = parser.parse_args()
     with ChannelTripwire() as channel:
-        proof = exercise(arguments.sentinel, channel)
+        proof = exercise(arguments.sentinel, arguments.fault_sentinel, channel)
     print(json.dumps(proof))
 
 

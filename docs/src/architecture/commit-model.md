@@ -31,6 +31,16 @@ Run these commands in a configuration session with a saved baseline. From a seco
 
 <a id="what-a-commit-reconciles"></a><a id="atomicity-and-rollback"></a><a id="privilege-path"></a>
 
+## State and privilege boundaries
+
+Operational configuration reads use the last successfully applied snapshot (the saved file before the first live commit), not an open session's candidate. A stale candidate must not overwrite a newer applied snapshot.
+
+Offline `--no-apply` editing requires an explicit configuration file. Piped CLI input stops on the first refusal; it does not undo earlier successful commits. The API validates a submitted batch before opening its provisional transaction.
+
+CLI and API share the compiler, not one transaction journal: CLI `commit` does not save, while an API provisional apply persists its trial under its own recovery protocol. Do not infer one interface's persistence behavior from the other.
+
+A local `read-write` group grants administrator access, including passwordless sudo. Read-only and ordinary ungrouped users do not receive it; the explicitly configured, ungrouped built-in `admin` is a bootstrap exception. Account removal or demotion terminates existing sessions and jobs. Keep an independent administrator or recovery console.
+
 ## Recover a partial apply
 
 Sentinel compiles the candidate before applying it and serializes concurrent applies. The firewall, routing and hostname stages track undo actions. A later service-stage failure can leave a mixed state. Read the failure, retain console access and restore a known saved revision. [Operator walkthrough](../operations/configure.md).

@@ -61,3 +61,7 @@ nix build .#checks.x86_64-linux.ha-witness-failover -L
 ```
 
 The pair fixture exercises enrollment. The failover fixture observes traffic while the old active loses authority. Repeat the appropriate workload and failure cases in a staging environment with your link delays and topology.
+
+## Qualification limits
+
+HA remains experimental. This runbook describes witness-backed configuration, not proof that a particular image passed failover or partition testing. For mode selection, migration and known failure modes, also read the [current HA guide](https://github.com/Velstra/sentinel/blob/main/docs/src/handbook/ha.md). Retain an independent recovery path and qualify the exact image and dependency cohort.

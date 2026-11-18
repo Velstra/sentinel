@@ -205,8 +205,9 @@ struct ConntrackSyncOut {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     peer: Vec<String>,
     interval_secs: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    secret: Option<String>,
+    // Never omit this field: even an unvalidated programmatic model must not
+    // select an older agent's unauthenticated UDP compatibility mode.
+    secret: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     interval_ms: Option<u64>,
 }
@@ -289,6 +290,121 @@ pub fn zone_policy_ids(appliance: &Appliance) -> BTreeMap<&str, u32> {
         .into_iter()
         .enumerate()
         .map(|(i, name)| (name, i as u32 + 1))
+        .collect()
+}
+
+/// Static destination prefixes used by `to <zone>` rules. This is deliberately
+/// not the set of destinations routed through that zone: routing can change at
+/// runtime, and an ingress-address trie does not match an egress interface.
+fn zone_destination_prefixes(appliance: &Appliance, zone: &str) -> Vec<String> {
+    if appliance.zones.get(zone).is_some_and(|z| z.local) {
+        return appliance
+            .interfaces
+            .iter()
+            .filter(|i| !i.disabled)
+            .flat_map(|i| [i.address.as_deref(), i.address6.as_deref()])
+            .flatten()
+            .filter_map(|cidr| {
+                let (addr, _) = cidr.split_once('/')?;
+                if addr.parse::<std::net::Ipv4Addr>().is_ok() {
+                    Some(format!("{addr}/32"))
+                } else if addr.parse::<std::net::Ipv6Addr>().is_ok() {
+                    Some(format!("{addr}/128"))
+                } else {
+                    None
+                }
+            })
+            .collect();
+    }
+    appliance
+        .interfaces
+        .iter()
+        .filter(|i| !i.disabled && i.zone.as_deref() == Some(zone))
+        .flat_map(|i| [i.address.as_deref(), i.address6.as_deref()])
+        .flatten()
+        .filter_map(network_of)
+        .collect()
+}
+
+fn network_of(cidr: &str) -> Option<String> {
+    let (addr, prefix) = cidr.split_once('/')?;
+    let bits: u32 = prefix.parse().ok()?;
+    if let Ok(ip) = addr.parse::<std::net::Ipv4Addr>() {
+        if bits > 32 {
+            return None;
+        }
+        let mask = if bits == 0 {
+            0
+        } else {
+            u32::MAX << (32 - bits)
+        };
+        return Some(format!(
+            "{}/{bits}",
+            std::net::Ipv4Addr::from(u32::from(ip) & mask)
+        ));
+    }
+    let ip: std::net::Ipv6Addr = addr.parse().ok()?;
+    if bits > 128 {
+        return None;
+    }
+    let mask = if bits == 0 {
+        0
+    } else {
+        u128::MAX << (128 - bits)
+    };
+    Some(format!(
+        "{}/{bits}",
+        std::net::Ipv6Addr::from(u128::from(ip) & mask)
+    ))
+}
+
+/// Explain the actual prefix-only destination-zone contract at commit/check
+/// time. Keep this derived from the compiler's own prefix resolver: a warning
+/// about a different rule than the installed one is not useful protection.
+/// Accept narrowing can deny intended traffic; deny narrowing can leave it
+/// permitted. Neither is a claim about the verdict of the remaining policy.
+pub(crate) fn destination_zone_warnings(appliance: &Appliance) -> Vec<String> {
+    appliance
+        .rules
+        .iter()
+        .filter(|r| !r.disabled && r.is_port_rule())
+        .filter(|r| r.source.is_none() && r.source_group.is_none())
+        .filter_map(|r| {
+            let to = r.to.as_deref()?;
+            if appliance.zones.get(to).is_some_and(|z| z.local) {
+                return None;
+            }
+            let prefixes = zone_destination_prefixes(appliance, to);
+            if prefixes.is_empty() {
+                // Existing validation advisories explain the wider fallback
+                // when no static prefix exists; do not give a conflicting one.
+                return None;
+            }
+            let prefixes: std::collections::BTreeSet<_> = prefixes.into_iter().collect();
+            let impact = match r.action {
+                Action::Accept => {
+                    "This accept rule does not allow those destinations; a default-drop policy \
+                     can still deny intended traffic."
+                }
+                Action::Drop => {
+                    "This drop rule does not block those destinations; other rules or the \
+                     default policy may still allow them."
+                }
+                Action::Reject => {
+                    "This reject rule does not reject those destinations; other rules or the \
+                     default policy may still allow them."
+                }
+            };
+            Some(format!(
+                "rule {:?}: `to {to}` matches only connected destination prefixes ({}), \
+                 not traffic routed through that zone. BGP/default-route destinations \
+                 outside those prefixes are not covered. {impact} Use `destination` or \
+                 `destination-group` for routed networks; omit `to` only if all \
+                 destinations are intended. Actual egress-zone matching is not implemented.",
+                r.name,
+                prefixes.into_iter().collect::<Vec<_>>().join(", ")
+            ))
+        })
         .collect()
 }
 
@@ -474,6 +590,9 @@ pub(crate) struct PortForwardOut {
     /// destination equals this (the box's public IP). Absent ⇒ match any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) match_dst: Option<String>,
+    /// Ordinary appliance DNAT is for this interface's actual addresses, not
+    /// an implicit accept for the same service port on every routed LAN host.
+    pub(crate) local_destination: bool,
     /// Hairpin source-NAT address (the box's IP on the client's segment). Absent
     /// ⇒ no source rewrite.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -531,81 +650,6 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
     // below.
     let ids = zone_policy_ids(appliance);
     let zone_names: Vec<&str> = ids.keys().copied().collect();
-
-    // The IPv4 subnets a zone owns, as network CIDRs derived from its interfaces'
-    // static addresses ("10.2.0.1/24" -> "10.2.0.0/24"). This is what makes a
-    // rule's `to <zone>` enforceable: the data plane matches addresses, not zone
-    // names, so the destination zone has to be spelled as the prefixes it holds.
-    // A `dhcp` or address-less interface contributes nothing — `warnings()` tells
-    // the operator when that leaves a `to` unenforceable.
-    // The network an address sits in, as a CIDR string — the form the data plane
-    // matches on. Both families: a rule's destination carries its own family, and
-    // the data plane routes it to the v4 or v6 trie accordingly.
-    let network_of = |cidr: &str| -> Option<String> {
-        let (addr, prefix) = cidr.split_once('/')?;
-        let bits: u32 = prefix.parse().ok()?;
-        if let Ok(ip) = addr.parse::<std::net::Ipv4Addr>() {
-            if bits > 32 {
-                return None;
-            }
-            let mask = if bits == 0 {
-                0
-            } else {
-                u32::MAX << (32 - bits)
-            };
-            return Some(format!(
-                "{}/{bits}",
-                std::net::Ipv4Addr::from(u32::from(ip) & mask)
-            ));
-        }
-        let ip: std::net::Ipv6Addr = addr.parse().ok()?;
-        if bits > 128 {
-            return None;
-        }
-        let mask = if bits == 0 {
-            0
-        } else {
-            u128::MAX << (128 - bits)
-        };
-        Some(format!(
-            "{}/{bits}",
-            std::net::Ipv6Addr::from(u128::from(ip) & mask)
-        ))
-    };
-
-    let zone_subnets = |zone: &str| -> Vec<String> {
-        // The appliance itself is a set of addresses, not a set of links: `to
-        // <local zone>` means "terminating here", so it compiles to this box's
-        // own addresses as host routes — in both families, or a dual-stacked box
-        // could only bind rules toward half of itself.
-        if appliance.zones.get(zone).is_some_and(|z| z.local) {
-            return appliance
-                .interfaces
-                .iter()
-                .filter(|i| !i.disabled)
-                .flat_map(|i| [i.address.as_deref(), i.address6.as_deref()])
-                .flatten()
-                .filter_map(|cidr| {
-                    let (addr, _) = cidr.split_once('/')?;
-                    if addr.parse::<std::net::Ipv4Addr>().is_ok() {
-                        Some(format!("{addr}/32"))
-                    } else if addr.parse::<std::net::Ipv6Addr>().is_ok() {
-                        Some(format!("{addr}/128"))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-        }
-        appliance
-            .interfaces
-            .iter()
-            .filter(|i| !i.disabled && i.zone.as_deref() == Some(zone))
-            .flat_map(|i| [i.address.as_deref(), i.address6.as_deref()])
-            .flatten()
-            .filter_map(network_of)
-            .collect()
-    };
 
     let policies = zone_names
         .iter()
@@ -709,7 +753,10 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                     // every commit rather than letting it pass unremarked.
                     let binds_source = r.source.is_some() || r.source_group.is_some();
                     let zoned: Vec<Option<String>> = match &r.to {
-                        Some(z) if !binds_source => zone_subnets(z).into_iter().map(Some).collect(),
+                        Some(z) if !binds_source => zone_destination_prefixes(appliance, z)
+                            .into_iter()
+                            .map(Some)
+                            .collect(),
                         _ => Vec::new(),
                     };
                     let destinations = if zoned.is_empty() {
@@ -958,6 +1005,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
             dst_ip: dst_ip.clone(),
             dst_port: port,
             match_dst: None,
+            local_destination: true,
             snat_ip: None,
         });
         if !dst.hairpin {
@@ -977,6 +1025,7 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
                 dst_ip: dst_ip.clone(),
                 dst_port: port,
                 match_dst: Some(public_ip.to_string()),
+                local_destination: false,
                 snat_ip: Some(box_ip.to_string()),
             });
         }
@@ -1029,26 +1078,34 @@ pub fn compile(appliance: &Appliance) -> VelstraConfig {
     let cts = &appliance.system.conntrack_sync;
     // Reuse the pair's credential with a distinct protocol key. Config-sync
     // bearer tokens never appear in conntrack frames or in another protocol's
-    // authentication context. Existing trusted-link UDP configurations remain
-    // compatible until a pair credential is configured.
-    let state_secret = appliance.system.config_sync.secret.as_ref().map(|secret| {
-        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
-        ring::hmac::sign(&key, b"Velstra Sentinel VCS2 state replication key")
-            .as_ref()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    });
+    // authentication context. Invalid programmatic input emits an explicit empty
+    // credential, which both old and current agents reject; never omit `secret`
+    // and accidentally select the removed UDP protocol. Normal entry points
+    // reject these models during appliance validation before compiling.
+    let state_secret = appliance
+        .system
+        .config_sync
+        .secret
+        .as_ref()
+        .filter(|secret| (32..=1024).contains(&secret.len()))
+        .map(|secret| {
+            let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+            ring::hmac::sign(&key, b"Velstra Sentinel VCS2 state replication key")
+                .as_ref()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        });
     let conntrack_sync = cts.listen_endpoint().map(|listen| ConntrackSyncOut {
         listen,
         peer: cts.peer_endpoints(),
         interval_secs: cts.interval.unwrap_or(1),
-        interval_ms: state_secret.as_ref().map(|_| {
+        interval_ms: Some({
             cts.interval
                 .map(|seconds| seconds.saturating_mul(1000))
                 .unwrap_or(50)
         }),
-        secret: state_secret,
+        secret: state_secret.unwrap_or_default(),
     });
 
     VelstraConfig {
@@ -1195,12 +1252,13 @@ pub fn attribute(cfg: &VelstraConfig, flows: &[Flow]) -> BTreeMap<String, Hits> 
                 best = Some((r, bits));
             }
         }
-        if let Some((r, _)) = best {
-            if r.action == "pass" && !r.name.is_empty() {
-                let e = out.entry(r.name.clone()).or_default();
-                e.flows += 1;
-                e.packets += flow.packets;
-            }
+        if let Some((r, _)) = best
+            && r.action == "pass"
+            && !r.name.is_empty()
+        {
+            let e = out.entry(r.name.clone()).or_default();
+            e.flows += 1;
+            e.packets += flow.packets;
         }
     }
     out
@@ -2053,11 +2111,10 @@ action = "accept"
 "#;
         let appliance = Appliance::from_toml(toml).unwrap();
         appliance.clone().validate().expect("valid");
-        assert!(
-            appliance.warnings().is_empty(),
-            "an enforceable `to` must not warn: {:?}",
-            appliance.warnings()
-        );
+        let warnings = appliance.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("connected destination prefixes (10.9.0.0/24)"));
+        assert!(warnings[0].contains("Actual egress-zone matching is not implemented"));
         let cfg = compile(&appliance);
         let wan = cfg.policies.iter().find(|p| p.name == "wan").unwrap();
         let opened: Vec<&str> = wan
@@ -2069,6 +2126,187 @@ action = "accept"
         // The dmz subnet, as a NETWORK address — the interface carries the box's own
         // host address, which would match only the box itself.
         assert_eq!(opened, vec!["10.9.0.0/24"]);
+    }
+
+    fn routed_destination_zone_fixture() -> Appliance {
+        Appliance::from_toml(
+            r#"
+[system]
+hostname="zone-reject-repro"
+[firewall]
+default_action="accept"
+[[interface]]
+name="lan0"
+zone="lan"
+address="198.18.120.11/24"
+[[interface]]
+name="wan0"
+zone="wan"
+address="198.18.110.11/24"
+address6="2001:db8:110::11/64"
+[[protocols.static]]
+prefix="203.0.113.0/24"
+via="198.18.110.20"
+[[rule]]
+name="telnet"
+from="lan"
+to="wan"
+proto="tcp"
+port=23
+action="reject"
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_routed_destination_zone_warns_without_widening_the_compiled_rule() {
+        let appliance = routed_destination_zone_fixture();
+        let warnings = destination_zone_warnings(&appliance);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        for fact in [
+            "rule \"telnet\"",
+            "`to wan`",
+            "198.18.110.0/24",
+            "2001:db8:110::/64",
+            "not traffic routed through that zone",
+            "BGP/default-route",
+            "`destination`",
+            "`destination-group`",
+            "Actual egress-zone matching is not implemented",
+        ] {
+            assert!(warnings[0].contains(fact), "missing {fact:?}: {warnings:?}");
+        }
+        let compiled = compile(&appliance);
+        let lan = compiled.policies.iter().find(|p| p.name == "lan").unwrap();
+        assert_eq!(lan.port_rules.len(), 2);
+        assert_eq!(lan.port_rules[0].dst.as_deref(), Some("198.18.110.0/24"));
+        assert_eq!(lan.port_rules[1].dst.as_deref(), Some("2001:db8:110::/64"));
+        assert!(lan.port_rules.iter().all(|r| r.action == "reject"));
+        assert!(lan.port_rules.iter().all(|r| r.src.is_none()));
+    }
+
+    #[test]
+    fn destination_zone_advisory_explains_accept_narrowing_conditionally() {
+        for default_action in [Action::Accept, Action::Drop] {
+            let mut appliance = routed_destination_zone_fixture();
+            appliance.firewall.default_action = default_action;
+            appliance.rules[0].action = Action::Accept;
+            let before = compile(&appliance).to_toml().unwrap();
+            let warnings = destination_zone_warnings(&appliance);
+            assert_eq!(warnings.len(), 1);
+            assert!(
+                warnings[0].contains(
+                    "This accept rule does not allow those destinations; a default-drop policy \
+                     can still deny intended traffic."
+                ),
+                "{warnings:?}"
+            );
+            assert!(
+                !warnings[0].contains("may still allow them"),
+                "{warnings:?}"
+            );
+            assert_eq!(compile(&appliance).to_toml().unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn destination_zone_advisory_distinguishes_drop_and_reject_noncoverage() {
+        for default_action in [Action::Accept, Action::Drop] {
+            for (action, impact) in [
+                (
+                    Action::Drop,
+                    "This drop rule does not block those destinations; other rules or the \
+                     default policy may still allow them.",
+                ),
+                (
+                    Action::Reject,
+                    "This reject rule does not reject those destinations; other rules or the \
+                     default policy may still allow them.",
+                ),
+            ] {
+                let mut appliance = routed_destination_zone_fixture();
+                appliance.firewall.default_action = default_action;
+                appliance.rules[0].action = action;
+                let before = compile(&appliance).to_toml().unwrap();
+                let warnings = destination_zone_warnings(&appliance);
+                assert_eq!(warnings.len(), 1);
+                assert!(warnings[0].contains(impact), "{warnings:?}");
+                assert!(!warnings[0].contains("This accept rule"), "{warnings:?}");
+                assert_eq!(compile(&appliance).to_toml().unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn destination_zone_advisory_keeps_rule_names_escaped_and_single_line() {
+        let mut appliance = routed_destination_zone_fixture();
+        appliance.rules[0].name = "telnet\n\"quoted\"".into();
+        let warnings = destination_zone_warnings(&appliance);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].starts_with("rule \"telnet\\n\\\"quoted\\\"\": "));
+        assert!(!warnings[0].contains('\n'), "{warnings:?}");
+        assert!(!warnings[0].contains('\r'), "{warnings:?}");
+    }
+
+    #[test]
+    fn destination_zone_advisory_does_not_misdescribe_disabled_local_or_source_rules() {
+        let mut appliance = routed_destination_zone_fixture();
+        appliance.rules[0].disabled = true;
+        assert!(destination_zone_warnings(&appliance).is_empty());
+        appliance.rules[0].disabled = false;
+        appliance.rules[0].to = None;
+        assert!(destination_zone_warnings(&appliance).is_empty());
+        appliance.rules[0].to = Some("wan".into());
+        appliance.rules[0].source = Some("198.18.120.0/24".into());
+        assert!(destination_zone_warnings(&appliance).is_empty());
+        assert!(
+            appliance
+                .warnings()
+                .iter()
+                .any(|w| w.contains("constrains its source"))
+        );
+        appliance.rules[0].source = None;
+        for interface in &mut appliance.interfaces {
+            if interface.zone.as_deref() == Some("wan") {
+                interface.address = Some("dhcp".into());
+                interface.address6 = None;
+            }
+        }
+        assert!(destination_zone_warnings(&appliance).is_empty());
+        assert!(
+            appliance
+                .warnings()
+                .iter()
+                .any(|w| w.contains("cannot be enforced"))
+        );
+        let local = appliance
+            .to_toml()
+            .unwrap()
+            .replace("to = \"wan\"", "to = \"firewall\"")
+            + "\n[zone.firewall]\nlocal = true\n";
+        let local = Appliance::from_toml(&local).unwrap();
+        assert!(destination_zone_warnings(&local).is_empty());
+    }
+
+    #[test]
+    fn destination_zone_advisory_ignores_disabled_links_and_deduplicates_prefixes() {
+        let mut appliance = routed_destination_zone_fixture();
+        let mut spare = appliance.interfaces[1].clone();
+        spare.name = "wan-spare".into();
+        spare.address = Some("192.0.2.1/24".into());
+        spare.address6 = None;
+        spare.disabled = true;
+        appliance.interfaces.push(spare);
+        let mut alias = appliance.interfaces[1].clone();
+        alias.name = "wan-alias".into();
+        alias.address = Some("198.18.110.12/24".into());
+        appliance.interfaces.push(alias);
+        let warnings = destination_zone_warnings(&appliance);
+        assert_eq!(warnings.len(), 1);
+        assert!(!warnings[0].contains("192.0.2.0/24"), "{warnings:?}");
+        assert_eq!(warnings[0].matches("198.18.110.0/24").count(), 1);
+        assert_eq!(warnings[0].matches("2001:db8:110::/64").count(), 1);
     }
 
     /// A rule that already binds its source keeps doing so: one rule matches one
@@ -2684,6 +2922,7 @@ to = "10.0.0.10:8443"
         assert_eq!(pf.policy, 2); // wan sorts after lan → id 2
         assert_eq!((pf.proto, pf.port), ("tcp", 443));
         assert_eq!((pf.dst_ip.as_str(), pf.dst_port), ("10.0.0.10", 8443));
+        assert!(pf.local_destination);
         let out = cfg.to_toml().unwrap();
         assert!(out.contains("[[port_forward]]"), "{out}");
         assert!(out.contains("dst_ip = \"10.0.0.10\""), "{out}");
@@ -2754,6 +2993,10 @@ hairpin = true
         let cfg = compile(&Appliance::from_toml(toml).unwrap());
         assert_eq!(cfg.port_forwards.len(), 1);
         assert!(cfg.port_forwards[0].match_dst.is_none());
+        assert!(
+            cfg.port_forwards[0].local_destination,
+            "DHCP must not widen DNAT to transit destinations"
+        );
     }
 
     #[test]
@@ -2903,11 +3146,13 @@ zone = "lan"
     #[test]
     fn conntrack_sync_emits_normalized_endpoints() {
         // A `[system.conntrack-sync]` with a bare-host peer + custom interval emits
-        // a `[conntrack_sync]` block whose endpoints carry the default UDP port and
+        // a `[conntrack_sync]` block whose endpoints carry the default TCP port and
         // whose interval is passed through.
         let toml = r#"
 [system]
 hostname = "fw"
+[system.config-sync]
+secret = "unit-test-credential-at-least-32-bytes"
 [system.conntrack-sync]
 listen = "0.0.0.0:5429"
 peer = ["10.9.0.2"]
@@ -2948,7 +3193,7 @@ zone = "lan"
         let output = compile(&appliance);
         let sync = output.conntrack_sync.unwrap();
         assert_eq!(sync.interval_ms, Some(50));
-        let key = sync.secret.unwrap();
+        let key = sync.secret;
         assert_eq!(key.len(), 64);
         assert_ne!(key, appliance.system.config_sync.secret.clone().unwrap());
         appliance.system.conntrack_sync.interval = Some(3);
@@ -2956,11 +3201,27 @@ zone = "lan"
             compile(&appliance).conntrack_sync.unwrap().interval_ms,
             Some(3000)
         );
-        appliance.system.config_sync.secret = Some("a different pair credential".into());
-        assert_ne!(
-            compile(&appliance).conntrack_sync.unwrap().secret.unwrap(),
-            key
-        );
+        appliance.system.config_sync.secret =
+            Some("a different pair credential at least 32 bytes".into());
+        assert_ne!(compile(&appliance).conntrack_sync.unwrap().secret, key);
+    }
+
+    #[test]
+    fn unvalidated_weak_state_credentials_cannot_select_an_older_agents_udp_mode() {
+        for secret in [
+            None,
+            Some(String::new()),
+            Some("short".into()),
+            Some("s".repeat(1025)),
+        ] {
+            let mut appliance = Appliance::from_toml(crate::config::EXAMPLE).unwrap();
+            appliance.system.config_sync.secret = secret;
+            appliance.system.conntrack_sync.peers = vec!["10.9.0.2".into()];
+            let output = compile(&appliance);
+            let wire: toml::Value = toml::from_str(&output.to_toml().unwrap()).unwrap();
+            assert_eq!(wire["conntrack_sync"]["secret"].as_str(), Some(""));
+            assert_eq!(wire["conntrack_sync"]["interval_ms"].as_integer(), Some(50));
+        }
     }
 
     /// The MSS ceiling reaches the data plane as a *number*. It used to be an

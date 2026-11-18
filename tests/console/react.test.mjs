@@ -11,6 +11,69 @@ try {
   check(Object.values(mounts).every(Boolean),'React workflow missing: '+JSON.stringify(mounts));
  });
  await managementTests(page);
+ await test('React document advisories are visible, literal and nonfatal through provisional apply', async()=>{
+  const out=process.env.CONSOLE_SCREENSHOTS;
+  const geometry=[];
+  if(out)mkdirSync(out,{recursive:true});
+  const click=async id=>{
+   const point=await page.evaluate(`(()=>{const n=document.getElementById(${JSON.stringify(id)});n.scrollIntoView({block:"center"});const r=n.getBoundingClientRect();return{x:r.x+r.width/2,y:r.y+r.height/2};})()`);
+   await page.send('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',buttons:1,clickCount:1,...point});
+   await page.send('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',buttons:0,clickCount:1,...point});
+  };
+  const settled=async()=>{
+   for(let i=0;i<100;i++){
+    if(!await page.evaluate('management.getSnapshot().editor.busy')){await sleep(50);return;}
+    await sleep(50);
+   }
+   throw Error('document action did not settle');
+  };
+  const snapshot=async name=>{
+   if(out)writeFileSync(out+'/'+name+'.png',Buffer.from(await page.screenshot(),'base64'));
+  };
+  try {
+   await page.evaluate(`(async()=>{
+    if($("result").open)$("result").close();management.clearEditor();view="config";panel=null;await refresh();await management.loadEditor();await new Promise(resolve=>setTimeout(resolve,0));
+    globalThis.__advisoryExecuted=false;
+    const label='advisory <img src=x onerror=globalThis.__advisoryExecuted=true> '+('long-route-label-'.repeat(20));
+    // An accept rule has a nonfatal connected-prefix advisory. New routed
+    // destination-zone denies are deliberately rejected by admission.
+    const extra='\\n[[interface]]\\nname="advisorywan"\\nzone="wan"\\naddress="198.18.110.11/24"\\n[[rule]]\\nname='+JSON.stringify(label)+'\\nfrom="lan"\\nto="wan"\\nproto="tcp"\\nport=23\\naction="accept"\\n';
+    const n=$("toml-candidate");n.value=management.getSnapshot().editor.baseline+extra;n.dispatchEvent(new Event("input",{bubbles:true}));
+   })()`);
+   await click('toml-validate');await settled();
+   const reviewed=await page.evaluate(`(()=>{
+    const n=$("toml-warnings"),e=management.getSnapshot().editor;
+    return{visible:!!n?.getClientRects().length,text:n?.textContent||"",literal:!n?.querySelector('img')&&!globalThis.__advisoryExecuted,feedback:$("toml-feedback").textContent,invalid:$("toml-candidate").getAttribute('aria-invalid'),applyDisabled:$("toml-apply").disabled,warnings:e.warnings};
+   })()`);
+   check(reviewed.visible&&reviewed.text.includes('connected destination prefixes (198.18.110.0/24)'),'React discarded real connected-prefix advisories: '+JSON.stringify(reviewed));
+   check(reviewed.literal&&reviewed.text.includes('<img src=x'),'HTML-like advisory text was interpreted as markup');
+   check(reviewed.feedback.includes('Valid configuration. Nothing applied.')&&reviewed.invalid!=='true'&&!reviewed.applyDisabled,'nonfatal advice blocked the normal review/apply lifecycle');
+   for(const width of [1440,390]) {
+    await page.send('Emulation.setDeviceMetricsOverride',{width,height:width===390?844:1000,deviceScaleFactor:1,mobile:false});
+    for(const theme of ['dark','light']) {
+     await page.evaluate('document.documentElement.setAttribute("data-theme",'+JSON.stringify(theme)+');$("toml-warnings").scrollIntoView({block:"center"})');await sleep(100);
+     const bounds=await page.evaluate(`(()=>{const n=$("toml-warnings"),r=n.getBoundingClientRect(),long=[...n.querySelectorAll('li')].find(li=>li.textContent.includes('long-route-label'));return{viewport:innerWidth,width:document.documentElement.scrollWidth,left:r.left,right:r.right,overflow:n.scrollWidth>n.clientWidth,lines:long?long.getBoundingClientRect().height/parseFloat(getComputedStyle(long).lineHeight):0};})()`);
+     check(bounds.viewport===width&&bounds.width<=width&&bounds.left>=0&&bounds.right<=width&&!bounds.overflow&&bounds.lines>1,'advisories fail wrap/bounds '+width+'/'+theme+': '+JSON.stringify(bounds));
+     geometry.push({theme,...bounds});
+     await snapshot('react-advisories-'+theme+'-'+width);
+    }
+   }
+   await page.send('Emulation.setDeviceMetricsOverride',{width:1440,height:1000,deviceScaleFactor:1,mobile:false});
+   await page.evaluate('(()=>{const n=$("toml-candidate");n.value+="\\n# changed draft\\n";n.dispatchEvent(new Event("input",{bubbles:true}));})()');await sleep(50);
+   check(await page.evaluate('!$("toml-warnings")&&management.getSnapshot().editor.warnings.length===0'),'draft changes retained stale advisories');
+   await click('toml-validate');await settled();
+   await click('toml-apply');await settled();
+   const admitted=await page.evaluate('({pending:management.getSnapshot().pending?.id,warningVisible:!!$("toml-warnings")?.getClientRects().length,applyDisabled:$("toml-apply").disabled})');
+   check(admitted.pending&&admitted.warningVisible&&admitted.applyDisabled,'provisional admission lost advice or its confirmation guard: '+JSON.stringify(admitted));
+   await page.evaluate('$("toml-warnings").scrollIntoView({block:"center"})');await snapshot('react-advisories-provisional');
+   await page.evaluate('management.finishTransaction("revert")');await sleep(50);
+   check(await page.evaluate('!management.getSnapshot().pending&&!$("toml-warnings")'),'rollback retained stale candidate advisories');
+   if(out)writeFileSync(out+'/react-advisories.json',JSON.stringify({schema:1,geometry,literal:reviewed.literal,nonfatal:true,draft_invalidates:true,provisional_preserves:true,revert_invalidates:true},null,2));
+  } finally {
+   await page.evaluate('(async()=>{await management.refreshTransaction();if(management.getSnapshot().pending)await management.finishTransaction("revert");management.clearEditor();document.documentElement.setAttribute("data-theme","dark");})()');
+   await page.send('Emulation.setDeviceMetricsOverride',{width:1440,height:1000,deviceScaleFactor:1,mobile:false});
+  }
+ });
  await test('peer navigation hides the local editor while preserving its draft',async()=>{
   const result=await page.evaluate(`(async()=>{
    view="config";panel=null;await refresh();await management.loadEditor();
@@ -120,6 +183,9 @@ try {
   const origin=new URL(process.env.CONSOLE_URL).origin;
   check(page.requests.filter(url=>/^https?:/.test(url)).every(url=>new URL(url).origin===origin),'a console request left the appliance');
  });
- await test('the console has no uncaught browser errors',()=>check(!page.thrown.length,page.thrown.join('\n')));
+ await test('the console has no uncaught browser errors',()=>{
+  if(process.env.CONSOLE_SCREENSHOTS)writeFileSync(process.env.CONSOLE_SCREENSHOTS+'/react-browser-errors.json',JSON.stringify({uncaught:page.thrown,console_errors:page.consoleMessages.filter(item=>item.level==='error'),console_warnings:page.consoleMessages.filter(item=>item.level==='warning'),http_error_responses:page.responses.filter(item=>item.status>=400)},null,2));
+  check(!page.thrown.length,page.thrown.join('\n'));
+ });
 }finally{page.close();}
 process.exitCode=summary()?1:0;

@@ -566,6 +566,9 @@ await test("leased HA settings save, validate and protect peer identity", async 
       if (document.getElementById("result").open) document.getElementById("resultclose").click();
       staged = []; dirty.clear(); renderStaged(); view = "ha"; panel = null; await refresh();
       const box = document.getElementById("haform");
+      // The mask leads with the election essentials; identity and timing sit
+      // behind More settings, and a label can only focus a field on screen.
+      [...box.querySelectorAll("button")].find((b) => b.textContent === "More settings")?.click();
       const widgets = [...box.querySelectorAll(".field")].map((f) =>
         f.querySelector(".secretfield, .switch, .num, select, input"));
       if (widgets.length !== ${values.length} || widgets.some((w) => !w)) throw Error("HA fields missing: " + widgets.length);

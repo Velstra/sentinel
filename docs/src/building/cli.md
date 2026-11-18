@@ -37,3 +37,7 @@ nix build .#velstra-ebpf --out-link result-ebpf
 ```
 
 Fabric and the eBPF compiler inputs are pinned. See [Reproduce a build](reproducibility.md).
+
+## Build boundary
+
+The eBPF Rust nightly and LLVM tooling must remain compatible. Review the pinned inputs when changing either. Removing build-time references from a binary is only one closure-reduction step, not proof of a small or toolchain-free appliance: inspect the final runtime closure and image. See [reproducibility](reproducibility.md).

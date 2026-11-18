@@ -136,3 +136,22 @@ technical tables keep their deliberate horizontal scroll rather than expanding
 the document. Page introductions use short task-oriented copy. HA split-brain,
 management lockout and TPM recovery warnings remain visible; procedural pairing
 instructions and raw failed-command diagnostics use native disclosures.
+
+The staged batch is a dock fixed to the foot of the main column, not a card in
+the page flow: it uses the raised surface, the product edge colour and the
+large shadow token, and wraps its actions to full width below 900px. Empty
+lists, the first-steps list, the page index and search results are composed in
+ui/src/shell.css from the existing text, surface, border and pill tokens; none
+introduces a colour. Done steps are neutral, required steps use the `warn`
+pill, and green and deny-red keep their meanings — the Link column's up/down
+pills are genuine status. The found-field marker is a two-pixel brand outline
+that clears itself.
+
+The dashboard is an operations view, not a report: a status line, six figures
+and panels on a twelve-column grid (traffic takes eight, everything else a
+half), collapsing to one column below 1280px and to two figures per row on a
+phone. Meters are neutral in the link colour and change to the warning and
+failure colours only at 75 % and 90 %; a share-of-total bar never changes
+colour. Receive is the link colour and a filled line, transmit the product
+colour and a dashed line, so the two are told apart without relying on hue.
+The dashboard introduces no new tokens.

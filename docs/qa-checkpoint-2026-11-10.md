@@ -1,3 +1,7 @@
+> **Development record — not current operator guidance or release approval.**
+> Results apply only to the source/image and scope recorded below. Original
+> findings are retained; use the [documentation map](README.md) for current guides.
+
 # QA checkpoint and outstanding qualification
 
 This checkpoint preserves the development workspace. It is **not a production
@@ -26,7 +30,7 @@ privileged-result correction is independently reviewed in #44; the combined
 exact head passed 798 host tests, formatting, check and strict Clippy under a
 restrictive umask. This evidence does not certify the larger workspace below.
 
-The separately frozen OpenStack candidate passed 940 host tests and 193 browser
+The separately frozen cloud candidate passed 940 host tests and 193 browser
 cases. Its selected sequential VM cohort passed 24 of 25 checks; the installer
 check failed. A subsequent isolated installer correction passed its strict VM
 regression, but is not retroactively part of that earlier candidate. The local

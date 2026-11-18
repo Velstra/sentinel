@@ -21,3 +21,9 @@ sentinel show ip route
 ```
 
 Use the [configuration cookbook](handbook/cli.md) for the next change. The [test catalog](reference/tests.md) identifies which checks exercise the CLI, a development VM or a booted image. This manual tracks the repository’s main branch; match the source revision to your release when evaluating a build.
+
+## Development status
+
+This documentation describes a development candidate, not release approval. HA and extended routing features remain experimental; consult the [HA safety guide](handbook/ha.md), [routing qualification status](handbook/routing.md#qualification-status) and [dataplane support matrix](reference/dataplane-support.md). Source-build signing keys are demonstration identities. Source tests cannot replace acceptance and SBOM/CVE review of the final signed image.
+
+The source license is AGPL-3.0. Do not infer additional contributor licensing rights from a proposed CLA or commercial roadmap; see [redistribution notices](building/notices.md).

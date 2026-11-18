@@ -1,5 +1,7 @@
 # Choose an HA election mode
 
+HA is experimental. Read the [safety and migration guide](../handbook/ha.md) and qualify failover on the exact image before relying on the pair.
+
 Two Sentinel appliances can form an active/standby pair on their own. Add an independent witness when a complete break between the peers must still leave at most one member authorized to forward.
 
 | Mode | Who grants forwarding authority? | If the two members lose every path to each other |

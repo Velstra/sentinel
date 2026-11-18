@@ -164,7 +164,6 @@
 .dashboard-details[open] > summary {
   margin-bottom: var(--space-5);
 }
-#stagedcard,
 #confirmation {
   scroll-margin-top: calc(var(--bar-h) + var(--space-4));
 }
@@ -237,4 +236,326 @@
   #nav .navitem.on {
     outline: 1px solid Highlight;
   }
+}
+
+/* The change dock: the staged batch, at the foot of the window on every page.
+   Fixed rather than in the flow, so staging on a long form never scrolls the
+   review away, and the page no longer jumps down by a card every time the
+   first change is staged. */
+#stagedcard {
+  position: fixed;
+  z-index: 25;
+  left: calc(var(--sidebar-w) + var(--space-7));
+  right: var(--space-7);
+  bottom: var(--space-4);
+  max-width: calc(96rem - 2 * var(--space-7));
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid color-mix(in oklab, var(--product) 45%, var(--border));
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-lg);
+}
+.stagedhead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3) var(--space-4);
+}
+.stagedhead .dot {
+  flex: none;
+}
+.stagedtext .t {
+  font-variant-numeric: tabular-nums;
+}
+.stagedtext .b {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.stagedactions {
+  flex: none;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+#stagedlist {
+  max-height: min(46vh, 26rem);
+  overflow-y: auto;
+  border-top: 1px solid var(--border);
+  padding-top: var(--space-2);
+}
+#stagedlist .change {
+  align-items: flex-start;
+}
+#stagedlist .change .dot {
+  margin-top: 0.5em;
+}
+#stagedlist .lbl {
+  display: block;
+  font-family: var(--font-sans);
+  color: var(--text-strong);
+  font-weight: var(--fw-medium);
+}
+#stagedlist .cmds {
+  margin: var(--space-1) 0 0;
+  font: var(--fw-regular) var(--text-xs) / var(--leading-code) var(--font-mono);
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+/* Room for the dock: the last control of a page must scroll clear of it. */
+.app[data-staged] > main {
+  padding-bottom: calc(var(--space-9) + 7rem);
+}
+html:has(.app[data-staged]) {
+  scroll-padding-bottom: 8rem;
+}
+@media (max-width: 900px) {
+  #stagedcard {
+    left: var(--space-3);
+    right: var(--space-3);
+    bottom: var(--space-3);
+  }
+  .stagedtext .b {
+    display: none;
+  }
+  .stagedactions {
+    flex: 1 1 100%;
+  }
+  .stagedactions .btn {
+    flex: 1 1 auto;
+  }
+  .app[data-staged] > main {
+    padding-bottom: calc(var(--space-9) + 11rem);
+  }
+  html:has(.app[data-staged]) {
+    scroll-padding-bottom: 12rem;
+  }
+}
+@media (forced-colors: active) {
+  #stagedcard {
+    border: 2px solid Highlight;
+  }
+}
+
+/* An empty list: what is missing, why it matters, and the way to add it. */
+.emptystate {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-4) 0;
+}
+.emptystate .empty {
+  padding: 0;
+  margin: 0;
+  color: var(--text-strong);
+  font-size: var(--text-base);
+  font-weight: var(--fw-medium);
+}
+.emptystate .emptyhint {
+  margin: 0 0 var(--space-2);
+  max-width: 68ch;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  text-wrap: pretty;
+}
+.tblfilter {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+}
+.tblfilter input {
+  flex: 0 1 20rem;
+  min-width: 0;
+}
+table.otbl td,
+table.otbl th {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Search: settings found by name, in the palette and under the rail. */
+.palhead {
+  padding: var(--space-3) var(--space-3) var(--space-1);
+  color: var(--text-muted);
+  font-size: var(--text-2xs);
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+}
+.palitem.setting .palp {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-faint);
+  font: var(--fw-regular) var(--text-xs) / 1.4 var(--font-mono);
+}
+#matches .navitem.setting {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  height: auto;
+  min-height: 42px;
+  white-space: normal;
+  text-align: left;
+}
+#matches .navitem.setting .sp {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+/* The field a search landed on: marked long enough to be seen, then left alone. */
+.field.found {
+  outline: 2px solid var(--brand);
+  outline-offset: 6px;
+  border-radius: var(--radius-xs);
+}
+
+/* On this page: jump links to the sections of a long page. */
+.pageindex {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-4);
+  margin: calc(-1 * var(--space-2)) 0 var(--space-5);
+  font-size: var(--text-sm);
+}
+.pageindex .pilabel {
+  color: var(--text-muted);
+  font-size: var(--text-2xs);
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+}
+.pageindex a {
+  color: var(--link);
+  text-decoration: none;
+  padding: var(--space-1) 0;
+}
+.pageindex a:hover,
+.pageindex a:focus-visible {
+  text-decoration: underline;
+}
+[id^="view-"] h3 {
+  scroll-margin-top: calc(var(--bar-h) + var(--space-5));
+}
+[id^="view-"] h3:focus {
+  outline: none;
+}
+
+/* First steps on the dashboard: facts about the configuration, not a wizard. */
+.setup {
+  margin-bottom: var(--space-5);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--edge-top);
+}
+.setup > summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-4);
+  padding: var(--space-4) var(--space-5);
+  cursor: pointer;
+}
+.setup > summary .st {
+  color: var(--text-strong);
+  font-weight: var(--fw-semibold);
+}
+.setup > summary .sb {
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+}
+#setuplist {
+  list-style: none;
+  margin: 0;
+  padding: 0 var(--space-5) var(--space-3);
+}
+#setuplist .step {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-4);
+  padding: var(--space-3) 0;
+  border-top: 1px solid var(--border-subtle);
+}
+#setuplist .mark {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+#setuplist .step.done .mark {
+  background: var(--surface-sunken);
+}
+#setuplist .body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1 1 18rem;
+  min-width: 0;
+}
+#setuplist .t {
+  color: var(--text-strong);
+  font-weight: var(--fw-medium);
+}
+#setuplist .w {
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  text-wrap: pretty;
+}
+#setuplist .step.done .t {
+  color: var(--text-muted);
+  font-weight: var(--fw-regular);
+}
+
+/* A creation drawer owns the right edge down to the foot of the window, and
+   its own Add and Cancel sit there. The dock steps aside while one is open —
+   the bar's badge keeps the count in sight — and returns when the form closes,
+   which is exactly when a newly staged change is worth announcing. */
+.app:has(.card.addpanel:not(.hidden)) #stagedcard {
+  display: none;
+}
+
+/* What a field is for, under the field: prose in the reading face, where a
+   computed range or a default keeps the technical one. */
+.hint.help {
+  font-family: var(--font-sans);
+  letter-spacing: 0;
+  color: var(--text-muted);
+  text-wrap: pretty;
+}
+
+/* The rest of an explanation, one click away: a section opens with the one
+   sentence that says what it is for. */
+.ledemore {
+  /* Not the shorthand: a section's sibling carries the gutter as its left
+     margin, and a shorthand here would take it away. */
+  margin-top: calc(-1 * var(--space-2));
+  margin-bottom: var(--space-4);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+.ledemore > summary {
+  display: inline-block;
+  cursor: pointer;
+  color: var(--link);
+  padding-block: var(--space-1);
+}
+.ledemore > p {
+  max-width: 70ch;
+  margin: var(--space-2) 0 0;
+  line-height: 1.6;
 }

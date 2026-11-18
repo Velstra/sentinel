@@ -13,6 +13,7 @@ import re
 import subprocess
 import tempfile
 import tomllib
+from urllib.parse import unquote
 
 INPUTS = ("Cargo.toml", "Cargo.lock", "ui/package.json", "ui/package-lock.json")
 SCOPE = "source-lockfiles"
@@ -75,10 +76,66 @@ def validate_bom(bom: dict) -> dict[str, int]:
             raise ValueError("invalid component package URL")
         for ecosystem in counts:
             if purl.startswith(f"pkg:{ecosystem}/"):
+                identity = purl.split("?", 1)[0].split("#", 1)[0].removeprefix(f"pkg:{ecosystem}/")
+                name, separator, version = identity.rpartition("@")
+                if (not separator or not name or not version
+                        or re.search(r"%(?![0-9a-fA-F]{2})", identity)
+                        or unquote(name) != component["name"]
+                        or unquote(version) != component.get("version")):
+                    raise ValueError("component package URL does not match its name/version")
                 counts[ecosystem] += 1
     if not all(counts.values()):
         raise ValueError("both Cargo and npm dependency catalogs are required")
     return counts
+
+
+def validate_lock_coverage(bom: dict, inputs: dict[str, bytes]) -> dict[str, int]:
+    """A nonempty ecosystem catalog is not evidence of a complete lock scan."""
+    validate_bom(bom)
+    cargo = tomllib.loads(inputs["Cargo.lock"].decode()).get("package")
+    npm = json.loads(inputs["ui/package-lock.json"])
+    packages = npm.get("packages")
+    if not isinstance(cargo, list) or not cargo:
+        raise ValueError("nonempty Cargo package lock required")
+    if npm.get("lockfileVersion") not in (2, 3) or not isinstance(packages, dict) or not packages:
+        raise ValueError("npm v2/v3 package lock required")
+    expected = {"cargo": set(), "npm": set()}
+    local_cargo = set()
+    for package in cargo:
+        if not isinstance(package, dict):
+            raise ValueError("invalid Cargo lock package")
+        expected["cargo"].add((package.get("name"), package.get("version")))
+        if not package.get("source"):
+            local_cargo.add((package.get("name"), package.get("version")))
+    for location, package in packages.items():
+        if not isinstance(package, dict) or package.get("link"):
+            raise ValueError("invalid or externally linked npm lock package")
+        # The private top-level application can legitimately omit its version.
+        if not location and not package.get("version"):
+            continue
+        name = package.get("name") or location.rsplit("node_modules/", 1)[-1]
+        expected["npm"].add((name, package.get("version")))
+    for ecosystem, identities in expected.items():
+        if not identities or any(not all(isinstance(v, str) and v for v in pair) for pair in identities):
+            raise ValueError(f"invalid {ecosystem} lock package identity")
+        actual = {(c.get("name"), c.get("version")) for c in bom["components"]
+                  if c.get("purl", "").startswith(f"pkg:{ecosystem}/")}
+        if ecosystem == "cargo":
+            # Syft deliberately omits a registry PURL for local/workspace
+            # packages. Require its exact Cargo.lock catalog attribution;
+            # an unrelated npm component with the same name cannot cover it.
+            for component in bom["components"]:
+                identity = (component.get("name"), component.get("version"))
+                properties = component.get("properties", [])
+                if (identity in local_cargo
+                        and {"name": "syft:package:foundBy", "value": "rust-cargo-lock-cataloger"} in properties
+                        and {"name": "syft:location:0:path", "value": "/Cargo.lock"} in properties):
+                    actual.add(identity)
+        missing = identities - actual
+        if missing:
+            raise ValueError(f"incomplete {ecosystem} lock coverage: " +
+                             ", ".join(name + "@" + version for name, version in sorted(missing)[:20]))
+    return {ecosystem: len(identities) for ecosystem, identities in expected.items()}
 
 
 def generate(source: Path, output: Path, syft: str) -> dict:
@@ -115,6 +172,7 @@ def generate(source: Path, output: Path, syft: str) -> dict:
             raise ValueError("SBOM exceeds 32 MiB")
         bom = json.loads(raw.read_bytes())
         counts = validate_bom(bom)
+        lock_counts = validate_lock_coverage(bom, before)
         if snapshot(source) != before or revision(source) != commit:
             raise ValueError("source inputs changed during SBOM generation")
         properties = bom.setdefault("metadata", {}).setdefault("properties", [])
@@ -129,6 +187,7 @@ def generate(source: Path, output: Path, syft: str) -> dict:
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "inputs_sha256": {name: digest(contents) for name, contents in before.items()},
             "component_count": len(bom["components"]), "ecosystems": counts,
+            "lock_package_identities": lock_counts,
             "sbom_sha256": digest(body), "image_certification": False,
         }
         (output / "sbom.cdx.json").write_bytes(body)

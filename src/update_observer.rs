@@ -112,17 +112,18 @@ impl Refresh {
     {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(collect))
             .unwrap_or(Err(Error(Code::StateUnavailable)));
-        if let Ok(mut cache) = self.observer.cache.lock() {
-            if cache.revision == self.revision && !cache.exhausted {
-                match result {
-                    Ok(value) => {
-                        cache.value = Some(value);
-                        cache.observed_at = Some(Instant::now());
-                        cache.error = None;
-                        cache.invalidated = false;
-                    }
-                    Err(error) => cache.error = Some(error.0),
+        if let Ok(mut cache) = self.observer.cache.lock()
+            && cache.revision == self.revision
+            && !cache.exhausted
+        {
+            match result {
+                Ok(value) => {
+                    cache.value = Some(value);
+                    cache.observed_at = Some(Instant::now());
+                    cache.error = None;
+                    cache.invalidated = false;
                 }
+                Err(error) => cache.error = Some(error.0),
             }
         }
         self.completed = true;

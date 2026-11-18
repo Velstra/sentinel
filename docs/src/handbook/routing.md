@@ -2,6 +2,28 @@
 
 Configure Wren through Sentinel’s candidate session. Start with reachability between directly attached peer addresses, then bring up the routing session. Review import and export policy before advertising production prefixes.
 
+## Qualification status
+
+Sentinel is under development, not a qualified production release. Static
+routes, base BGP, OSPFv2, BFD and VRRP are the core routing qualification scope;
+that is not a guarantee that every advertised option or peer combination has
+passed. Use [the test inventory](../reference/tests.md) to reproduce specific
+checks and verify learned routes in the kernel with `sentinel show ip route`.
+
+OSPFv3, RIP/RIPng, Babel, IS-IS, multicast, EVPN and extended BGP address
+families/features are **experimental**. Configuration acceptance or an adjacency
+between two Wren instances is not third-party interoperability certification.
+HA pairing is also experimental and has additional
+[failure-mode limits](ha.md); ordinary VRRP is not split-brain fencing.
+
+Two multicast options need particular care:
+
+- IGMP/MLD proxy membership signaling exists, but its proxy forwarding-cache
+  hook is not implemented. Do not rely on it to deliver multicast data between
+  interfaces.
+- PIM `spt-threshold` is accepted as configuration but does not drive a runtime
+  source-tree threshold. It must not be used as a traffic-engineering control.
+
 ## Static routes
 
 Select the next hop or outgoing device and check that the next hop is reachable on the chosen link.
@@ -107,7 +129,7 @@ show vrf                # the instances that are running
 
 ### Between segments: PIM-SM
 
-The querier and the RFC 4605 proxy carry multicast *within* a segment. A proxy has one upstream and forwards whatever was asked for.
+The IGMP/MLD proxy's forwarding-cache hook is not implemented. The following is experimental PIM-SM configuration, a separate kernel multicast-routing path; it does not complete proxy data forwarding. Verify actual sender-to-receiver delivery, not only a successful commit or `show multicast`. PIM `spt-threshold` is accepted but has no runtime threshold behavior.
 
 ```text
 set protocols multicast interface eth0 role querier

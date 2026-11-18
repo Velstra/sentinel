@@ -18,7 +18,11 @@ Look for the Secure Boot state. Use a signed appliance image and firmware with t
 
 ## Choose the signing identity
 
-Public source builds generate development PK, KEK and db material for reproducible test procedures. For a production trust chain, supply your own signing material and an enrollment and recovery plan. The ESP carries enrollment payloads under `/loader/keys/sentinel/`. Preserve firmware recovery access before changing enrolled keys.
+Public source builds use development PK, KEK and db material whose private keys are readable in the Nix store. They are demonstration identities, not production secrets. The ESP carries enrollment payloads under `/loader/keys/sentinel/`.
+
+The public module does not provide a complete supported production key-custody, rotation and revocation workflow. Do not put production private keys in a derivation, repository, store path or appliance image. Production needs a separately reviewed signing boundary, protected custody, public-key enrollment and a tested revocation/recovery plan. The OTA signing identity is separate from the firmware identity.
+
+The image builders sign the final UKI after its contents are assembled. Preserve firmware recovery access before changing enrolled keys; an OVMF pass with test keys does not qualify production key custody.
 
 ## Exercise the signed image
 

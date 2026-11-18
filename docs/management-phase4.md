@@ -1,3 +1,7 @@
+> **Development record — not current operator guidance or release approval.**
+> Results apply only to the source/image and scope recorded below. Original
+> findings are retained; use the [documentation map](https://github.com/Velstra/sentinel/blob/main/docs/README.md) for current guides.
+
 # Safe management and live inspection
 
 Web/API edits are provisional. A worker applies the candidate while an independent recovery timer preserves the previous working configuration.

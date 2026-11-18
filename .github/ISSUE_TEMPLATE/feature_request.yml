@@ -1,0 +1,22 @@
+name: Feature request
+description: Describe an operator problem and a testable outcome.
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Operator problem
+      description: Explain the task or failure mode, including the current workaround.
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Proposed behavior and acceptance test
+      description: Describe the CLI and UI behavior and how actual system behavior should be verified. Include relevant compatibility or safety constraints.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and scope
+      description: Note alternatives considered, affected protocols/platforms and what is out of scope.

@@ -202,7 +202,9 @@ pub fn read(root: &Path, series: &str, res: &Resolution) -> Result<Vec<Sample>> 
     let mut rest = Vec::new();
     f.read_to_end(&mut rest)?;
     let mut out: Vec<Sample> = rest
-        .chunks_exact(RECORD_LEN as usize)
+        .as_chunks::<{ RECORD_LEN as usize }>()
+        .0
+        .iter()
         .map(|c| Sample {
             at: u64::from_le_bytes(c[0..8].try_into().unwrap()),
             value: u64::from_le_bytes(c[8..16].try_into().unwrap()),
@@ -310,14 +312,13 @@ pub fn session_count() -> Option<u64> {
     // graph, not a parser for the whole reply.
     for line in reply.lines() {
         let lower = line.to_ascii_lowercase();
-        if lower.contains("flow") || lower.contains("conntrack") {
-            if let Some(n) = line
+        if (lower.contains("flow") || lower.contains("conntrack"))
+            && let Some(n) = line
                 .split(|c: char| !c.is_ascii_digit())
                 .rfind(|s| !s.is_empty())
                 .and_then(|s| s.parse::<u64>().ok())
-            {
-                return Some(n);
-            }
+        {
+            return Some(n);
         }
     }
     None

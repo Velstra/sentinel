@@ -20,6 +20,8 @@ export class Management {
   private healthCredential = "";
   private transactionGeneration = 0;
   private appliedCandidate: string | null = null;
+  private advisoryGeneration = 0;
+  private editorRequest = 0;
   private batch: { id: string; changes: StagedChange[] } | null = null;
   private completedId: string | null = null;
   readonly updates: Updates;
@@ -34,6 +36,15 @@ export class Management {
     );
   }
   getSnapshot = () => this.state;
+  /** Zone and description per link, from the configuration the shell read. */
+  links = () => this.host.links?.() ?? {};
+  /** Stored history lives on this appliance only; a peer's is never implied. */
+  metrics = async (path: string): Promise<unknown> => {
+    if (this.host.remote()) throw Error("History is stored on each member");
+    const response = await this.host.api("/api/v1/metrics" + path);
+    if (!response.ok) throw Error("History unavailable");
+    return response.json();
+  };
   navigate = (destination: Parameters<Host["navigate"]>[0]) =>
     this.host.navigate(destination);
   subscribe = (listener: () => void) => {
@@ -58,6 +69,12 @@ export class Management {
       remote !== this.state.remote ||
       member !== this.state.member ||
       this.healthCredential !== this.host.credential();
+    const writeContextChanged =
+      writable !== this.state.writable || remote !== this.state.remote;
+    if (healthContextChanged || writeContextChanged) {
+      this.advisoryGeneration++;
+      this.edit({ warnings: [] });
+    }
     if (healthContextChanged) {
       this.healthGeneration++;
       this.healthAbort?.abort();
@@ -201,6 +218,7 @@ export class Management {
   private complete(id: string, outcome: string) {
     if (this.completedId === id) return;
     this.completedId = id;
+    this.advisoryGeneration++;
     const confirmed = outcome === "confirmed";
     const message = confirmed
       ? "Configuration confirmed and saved."
@@ -230,6 +248,7 @@ export class Management {
         feedback:
           message + " Reload the current baseline before applying again.",
         uncertain: false,
+        warnings: [],
       });
     }
     this.appliedCandidate = null;
@@ -316,6 +335,8 @@ export class Management {
     }
   };
   clearEditor = () => {
+    this.advisoryGeneration++;
+    this.editorRequest++;
     this.host.dirty(false);
     this.update({ editor: emptyEditor() });
   };
@@ -332,11 +353,13 @@ export class Management {
   };
   changeCandidate = (candidate: string) => {
     if (this.state.editor.busy) return;
+    this.advisoryGeneration++;
     this.host.dirty(candidate !== this.state.editor.baseline);
     this.edit({
       candidate,
       invalid: false,
       diff: "",
+      warnings: [],
       feedback:
         candidate === this.state.editor.baseline
           ? "No changes."
@@ -346,12 +369,19 @@ export class Management {
   loadEditor = async (preserveDraft = false) => {
     if (this.state.editor.busy || !this.writable()) return;
     const epoch = this.epoch;
-    this.edit({ busy: true });
+    const advisoryGeneration = ++this.advisoryGeneration;
+    const request = ++this.editorRequest;
+    const current = () =>
+      epoch === this.epoch &&
+      request === this.editorRequest &&
+      advisoryGeneration === this.advisoryGeneration &&
+      this.writable();
+    this.edit({ busy: true, warnings: [] });
     try {
       const document = await this.json<{ toml: string; revision: string }>(
         "config/document",
       );
-      if (epoch !== this.epoch || !this.writable()) return;
+      if (!current()) return;
       const candidate = preserveDraft
         ? this.state.editor.candidate
         : document.toml;
@@ -369,9 +399,10 @@ export class Management {
           : "No changes. Secrets are visible only in this tab.",
       });
     } catch (e) {
-      if (epoch === this.epoch) this.edit({ feedback: message(e) });
+      if (current()) this.edit({ feedback: message(e) });
     } finally {
-      if (epoch === this.epoch) this.edit({ busy: false });
+      if (epoch === this.epoch && request === this.editorRequest)
+        this.edit({ busy: false });
     }
   };
   submitEditor = async (validateOnly: boolean) => {
@@ -392,20 +423,29 @@ export class Management {
       return;
     }
     const epoch = this.epoch;
-    this.edit({ busy: true });
+    const advisoryGeneration = ++this.advisoryGeneration;
+    const request = ++this.editorRequest;
+    const current = () =>
+      epoch === this.epoch &&
+      request === this.editorRequest &&
+      advisoryGeneration === this.advisoryGeneration &&
+      this.writable();
+    this.edit({ busy: true, warnings: [] });
     try {
-      const result = await this.json<{ diff?: string; pending?: Pending }>(
-        "config/document",
-        {
-          toml: editor.candidate,
-          expected_revision: editor.revision,
-          validate_only: validateOnly,
-        },
-      );
-      if (epoch !== this.epoch) return;
+      const result = await this.json<{
+        diff?: string;
+        pending?: Pending;
+        warnings?: unknown;
+      }>("config/document", {
+        toml: editor.candidate,
+        expected_revision: editor.revision,
+        validate_only: validateOnly,
+      });
+      if (!current()) return;
       this.edit({
         invalid: false,
         diff: result.diff || "No changes.",
+        warnings: configurationWarnings(result.warnings),
         feedback: validateOnly
           ? "Valid configuration. Nothing applied."
           : result.pending?.ready
@@ -418,7 +458,7 @@ export class Management {
       }
       if (!validateOnly) this.host.dirty(false);
     } catch (e) {
-      if (epoch !== this.epoch) return;
+      if (!current()) return;
       const status =
         typeof e === "object" && e !== null && "status" in e
           ? Number(e.status)
@@ -426,6 +466,7 @@ export class Management {
       this.edit({
         invalid: status === 400,
         uncertain: !validateOnly && !status,
+        warnings: [],
         feedback:
           message(e) +
           (!validateOnly && !status
@@ -434,7 +475,8 @@ export class Management {
       });
       await this.refreshTransaction();
     } finally {
-      if (epoch === this.epoch) this.edit({ busy: false });
+      if (epoch === this.epoch && request === this.editorRequest)
+        this.edit({ busy: false });
     }
   };
   acceptFrame = (frame: Telemetry) => {
@@ -588,6 +630,19 @@ export class Management {
 /** Silence after which telemetry is stale and its connection is replaced. */
 const STALE_MS = 15000;
 const HEALTH_TIMEOUT_MS = 10000;
+/** Older APIs omit the field. Malformed new advice is visible, never a refusal. */
+function configurationWarnings(value: unknown): string[] {
+  if (value === undefined) return [];
+  const unavailable =
+    "Some configuration advisories could not be displayed. Run sentinel config check to review them.";
+  if (!Array.isArray(value)) return [unavailable];
+  const warnings = value.filter(
+    (warning): warning is string =>
+      typeof warning === "string" && warning.trim().length > 0,
+  );
+  if (warnings.length !== value.length) warnings.push(unavailable);
+  return [...new Set(warnings)];
+}
 function message(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }

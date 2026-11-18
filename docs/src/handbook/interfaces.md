@@ -4,6 +4,27 @@
 
 Set addresses and zones on the discovered device names. Keep the serial console or a separately connected management port available before moving a live link into a zone.
 
+## Bind physical identity before assigning zones
+
+Match the physical NIC's permanent MAC and cable role before reusing a name.
+Predictable names can change after device replacement, firmware changes or VM
+hot-plug; a new device that inherits a name must not silently inherit a trust
+decision. Use `sentinel show interfaces` and `ip -details link show` to inspect
+the inventory, then pin each physical role:
+
+```text
+set interface wan0 hw-id 52:54:00:10:00:01
+set interface wan0 zone wan
+set interface wan0 address dhcp
+```
+
+Replace the example MAC with the real permanent hardware identity. `hw-id`
+creates a `.link` name binding when the device appears; it is **not** MAC
+cloning, and a commit does not guarantee an immediate rename of an already
+active NIC. Keep console access and verify the binding after a controlled
+reboot before relying on it. Bind the management NIC separately on each HA
+member. Do not copy the primary's physical MAC bindings to the secondary.
+
 ## Common fields
 
 Inspect the discovered NIC names before assigning zones, addresses or MTU. For a WAN using DHCP and a statically addressed LAN:
@@ -23,6 +44,8 @@ Sentinel holds a zoned data interface down until the dataplane attaches. Inspect
 ### Keep a way in that does not depend on the data plane
 
 Keep a local or serial console, or a physically independent management interface, while changing dataplane attachment.
+
+An unzoned management interface is outside the zoned dataplane hold, not an automatic security boundary. Bind SSH and the console to its tested address and isolate the network. A local listen address does not restrict ingress: Linux can route traffic from another interface to it. Verify explicit management ACLs from every untrusted segment, including on the standby; see [management ingress](system.md#ssh-daemon).
 
 ## VLANs (802.1Q / QinQ)
 

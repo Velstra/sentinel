@@ -38,3 +38,7 @@ cargo test --workspace --locked
 ```
 
 [VM and browser test catalog](https://velstra.github.io/sentinel/reference/tests.html) · [Contribution terms](CONTRIBUTING.md) · [AGPL-3.0-or-later](LICENSE)
+
+## Release status
+
+This is a development candidate, not a production release certificate. HA remains experimental. Review the [dataplane support matrix](docs/src/reference/dataplane-support.md) and [test evidence requirements](docs/src/reference/tests.md) before deployment. Development signing keys are not production trust identities.

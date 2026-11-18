@@ -2780,6 +2780,14 @@ impl Draft {
     }
 }
 
+/// Where a session obtains authoritative intent for transition admission.
+#[derive(Clone, Copy)]
+enum AdmissionBaseline {
+    Saved,
+    Live,
+    Detached,
+}
+
 /// A running configuration session.
 pub struct Session {
     draft: Draft,
@@ -2789,6 +2797,7 @@ pub struct Session {
     /// The running configuration as this session found it, so a change made by
     /// another session is recognisable as such.
     seen_running: Option<String>,
+    admission_baseline: AdmissionBaseline,
 }
 
 impl Session {
@@ -2805,6 +2814,53 @@ impl Session {
     /// The running snapshot as it is on disk right now, if there is one.
     pub(crate) fn running_snapshot() -> Option<String> {
         std::fs::read_to_string(Self::RUNNING).ok()
+    }
+
+    pub(crate) fn read_running_at(path: &Path) -> Result<Option<String>> {
+        match path.symlink_metadata() {
+            Ok(metadata) if metadata.is_file() => std::fs::read_to_string(path)
+                .map(Some)
+                .context("reading active configuration"),
+            Ok(_) => bail!("active configuration is not a regular file"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).context("inspecting active configuration"),
+        }
+    }
+
+    /// Compare-and-swap precondition. Call while holding apply.lock, before
+    /// applying OR saving. An already open candidate may not erase a newer deny.
+    pub fn ensure_current(&self) -> Result<()> {
+        self.ensure_current_at(Path::new(Self::RUNNING))
+    }
+
+    fn ensure_current_at(&self, path: &Path) -> Result<()> {
+        if Self::read_running_at(path)? != self.seen_running {
+            bail!(
+                "active configuration changed in another session; discard and reload the current candidate before committing or saving"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn load_live(path: &Path) -> Result<Self> {
+        let _lock = crate::system::apply_lock()?;
+        Self::load_live_at(path, Path::new(Self::RUNNING))
+    }
+
+    fn load_live_at(path: &Path, running: &Path) -> Result<Self> {
+        let snapshot = Self::read_running_at(running)?;
+        let draft = match &snapshot {
+            Some(text) => Draft::from_appliance(&Appliance::from_toml(text)?),
+            None if path.exists() => Draft::from_appliance(&Appliance::load(path)?),
+            None => Draft::default(),
+        };
+        Ok(Self {
+            draft,
+            path: path.to_path_buf(),
+            dirty: false,
+            seen_running: snapshot,
+            admission_baseline: AdmissionBaseline::Live,
+        })
     }
 
     /// What another session has committed since this one started, if anything.
@@ -2844,6 +2900,7 @@ impl Session {
             // The box's running configuration as this session found it. Anything
             // different later was put there by somebody else.
             seen_running: Self::running_snapshot(),
+            admission_baseline: AdmissionBaseline::Saved,
         })
     }
 
@@ -2866,6 +2923,7 @@ impl Session {
             path: PathBuf::from("/dev/null"),
             dirty: false,
             seen_running: None,
+            admission_baseline: AdmissionBaseline::Detached,
         }
     }
 
@@ -4444,15 +4502,20 @@ impl Session {
                 );
             }
             ["services", "web", "port", v] => {
+                let port = v
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|port| *port != 0)
+                    .with_context(|| format!("services web port {v:?}: not a 1-65535 port"))?;
+                self.draft.web.port = Some(port);
                 self.draft.web.enable = true;
-                self.draft.web.port =
-                    Some(v.parse().map_err(|_| {
-                        anyhow::anyhow!("services web port {v:?}: not a 1-65535 port")
-                    })?);
             }
             ["services", "web", "listen-address", v] => {
-                self.draft.web.enable = true;
+                if validate_ipv4(v).is_err() && validate_ipv6(v).is_err() {
+                    bail!("services web listen-address {v:?}: not an IPv4/IPv6 address");
+                }
                 self.draft.web.listen_address = Some((*v).to_string());
+                self.draft.web.enable = true;
             }
             // TLS is on by default and the box mints its own certificate, so the
             // only reason to name it here is to turn it off (a loopback console,
@@ -4464,9 +4527,11 @@ impl Session {
                 self.draft.web.tls = parse_bool(v)?;
             }
             ["services", "web", "tls-cert", v] => {
+                WebConsole::validate_tls_path("tls-cert", v)?;
                 self.draft.web.tls_cert = Some((*v).to_string());
             }
             ["services", "web", "tls-key", v] => {
+                WebConsole::validate_tls_path("tls-key", v)?;
                 self.draft.web.tls_key = Some((*v).to_string());
             }
             ["services", "ssh", "loglevel", v] => {
@@ -8907,13 +8972,13 @@ impl Session {
         // `Qos.discipline` is not optional). Catch a `qos` set without one here,
         // with a clear message, before the infallible interface map below.
         for (name, d) in &self.draft.interfaces {
-            if let Some(q) = &d.qos {
-                if q.discipline.is_none() {
-                    bail!(
-                        "interface {name:?}: qos requires a discipline \
+            if let Some(q) = &d.qos
+                && q.discipline.is_none()
+            {
+                bail!(
+                    "interface {name:?}: qos requires a discipline \
                          (set interface {name} qos discipline cake|fq_codel)"
-                    );
-                }
+                );
             }
         }
         // Interfaces may be unassigned (a NIC the system provides that the
@@ -9818,9 +9883,22 @@ impl Session {
         self.dirty = true;
     }
 
-    /// Validate + activate the candidate. Returns the committed config.
+    /// Check a transition against authoritative intent, not the draft loaded
+    /// when the session opened. Call under apply.lock, before clearing dirty
+    /// state or performing any activation/persistence side effects.
+    fn admit(&self, appliance: &Appliance) -> Result<()> {
+        match self.admission_baseline {
+            AdmissionBaseline::Saved => crate::admission::check_saved(&self.path, false, appliance),
+            AdmissionBaseline::Live => crate::admission::check_saved(&self.path, true, appliance),
+            AdmissionBaseline::Detached => crate::admission::check(None, appliance),
+        }
+    }
+
+    /// Validate and admit the candidate. Activation is performed by the caller.
     pub fn commit(&mut self) -> Result<Appliance> {
+        let _lock = crate::system::apply_lock()?;
         let appliance = self.materialize()?;
+        self.admit(&appliance)?;
         self.dirty = false;
         Ok(appliance)
     }
@@ -9828,8 +9906,19 @@ impl Session {
     /// Persist the (validated) candidate to disk. Writes to `path` or, if given,
     /// `to`.
     pub fn save(&mut self, to: Option<&Path>) -> Result<PathBuf> {
+        let _lock = crate::system::apply_lock()?;
         let appliance = self.materialize()?;
+        self.admit(&appliance)?;
         let path = to.unwrap_or(&self.path).to_path_buf();
+        if path != self.path {
+            // A legacy policy at the source is not authority to introduce it
+            // into another saved configuration. Check both ends: checking only
+            // the destination would instead let a new deny borrow its legacy.
+            crate::admission::check_saved(&path, false, &appliance)?;
+            if path == Path::new(DEFAULT_CONFIG) {
+                crate::admission::check_saved(&path, true, &appliance)?;
+            }
+        }
         // Archive only when saving the box's own config, not an ad-hoc
         // `save <path>` export.
         let written = persist_appliance(&appliance, &path, to.is_none())?;
@@ -11877,6 +11966,9 @@ fn render_draft_masked(
         }
         if web_set {
             svc.push_str("    web {\n");
+            if !web.tls {
+                svc.push_str("        tls false\n");
+            }
             if let Some(seconds) = web.confirm_timeout {
                 svc.push_str(&format!("        confirm-timeout {seconds}\n"));
             }
@@ -11888,6 +11980,20 @@ fn render_draft_masked(
             }
             if let Some(a) = &web.listen_address {
                 svc.push_str(&format!("        listen-address {a}\n"));
+            }
+            for (field, value) in [("tls-cert", &web.tls_cert), ("tls-key", &web.tls_key)] {
+                if let Some(path) = value {
+                    // These are nonsecret file references, not key material:
+                    // no file is opened. Quote for the CLI lexer, not a shell,
+                    // and preserve whitespace, quotes and backslashes exactly.
+                    let escaped = path.replace('\\', "\\\\").replace('"', "\\\"");
+                    svc.push_str(&format!("        {field} \"{escaped}\"\n"));
+                }
+            }
+            if !web.enable {
+                // Setting port/listen-address enables the web service. Restore
+                // an explicit disabled state AFTER those setters on replay.
+                svc.push_str("        enable false\n");
             }
             svc.push_str("    }\n");
         }
@@ -12450,38 +12556,38 @@ fn render_draft_masked(
         out.push_str("}\n");
     }
 
-    if want("fleet") {
-        if let Some(fleet) = &draft.fleet {
-            out.push_str("fleet {\n");
-            for (key, value) in [
-                ("controller-url", &fleet.controller_url),
-                ("node-id", &fleet.node_id),
-                ("enrollment-token", &fleet.enrollment_token),
-                ("ca-certificate", &fleet.ca_certificate),
-                ("client-certificate", &fleet.client_certificate),
-                ("client-key", &fleet.client_key),
-                ("signing-key", &fleet.signing_key),
-            ] {
-                if !value.is_empty() {
-                    if key == "enrollment-token" && secrets == Secrets::Masked {
-                        out.push_str(&format!("    {key} {KEY_NOT_SHOWN}\n"));
+    if want("fleet")
+        && let Some(fleet) = &draft.fleet
+    {
+        out.push_str("fleet {\n");
+        for (key, value) in [
+            ("controller-url", &fleet.controller_url),
+            ("node-id", &fleet.node_id),
+            ("enrollment-token", &fleet.enrollment_token),
+            ("ca-certificate", &fleet.ca_certificate),
+            ("client-certificate", &fleet.client_certificate),
+            ("client-key", &fleet.client_key),
+            ("signing-key", &fleet.signing_key),
+        ] {
+            if !value.is_empty() {
+                if key == "enrollment-token" && secrets == Secrets::Masked {
+                    out.push_str(&format!("    {key} {KEY_NOT_SHOWN}\n"));
+                } else {
+                    if value.chars().any(char::is_whitespace) || value.starts_with('"') {
+                        out.push_str(&format!("    {key} {value:?}\n"));
                     } else {
-                        if value.chars().any(char::is_whitespace) || value.starts_with('"') {
-                            out.push_str(&format!("    {key} {value:?}\n"));
-                        } else {
-                            out.push_str(&format!("    {key} {value}\n"));
-                        }
+                        out.push_str(&format!("    {key} {value}\n"));
                     }
                 }
             }
-            if let Some(seconds) = fleet.poll_interval {
-                out.push_str(&format!("    poll-interval {seconds}\n"));
-            }
-            if fleet.flow_telemetry {
-                out.push_str("    flow-telemetry true\n");
-            }
-            out.push_str("}\n");
         }
+        if let Some(seconds) = fleet.poll_interval {
+            out.push_str(&format!("    poll-interval {seconds}\n"));
+        }
+        if fleet.flow_telemetry {
+            out.push_str("    flow-telemetry true\n");
+        }
+        out.push_str("}\n");
     }
 
     // update { … } — the signed update channels (roadmap C13). The pinned key
@@ -12492,48 +12598,48 @@ fn render_draft_masked(
     // screens up applies — a mask here is a value the CLI would accept, and a
     // replay would silently install four asterisks as the entitlement. The
     // masked view lives in `show subscription`; the API redacts the field.
-    if want("update") {
-        if let Some(u) = &draft.update {
-            out.push_str("update {\n");
-            if let Some(url) = &u.url {
-                out.push_str(&format!("    url {url}\n"));
+    if want("update")
+        && let Some(u) = &draft.update
+    {
+        out.push_str("update {\n");
+        if let Some(url) = &u.url {
+            out.push_str(&format!("    url {url}\n"));
+        }
+        if let Some(key) = &u.public_key {
+            // One replayable CLI leaf, even for a multi-line PEM. The
+            // setter/verifier canonicalize formatting, never key bytes.
+            out.push_str(&format!(
+                "    public-key {}\n",
+                crate::update_key::cli_value(key)
+            ));
+        }
+        // The selection first, then the channels it selects among: replayed
+        // top to bottom, the bare `channel <name>` line both creates and
+        // selects, and the blocks below fill the fields in.
+        if let Some(sel) = &u.channel {
+            out.push_str(&format!("    channel {sel}\n"));
+        }
+        for c in &u.channels {
+            out.push_str(&format!("    channel {} {{\n", c.name));
+            if let Some(url) = &c.url {
+                out.push_str(&format!("        url {url}\n"));
             }
-            if let Some(key) = &u.public_key {
-                // One replayable CLI leaf, even for a multi-line PEM. The
-                // setter/verifier canonicalize formatting, never key bytes.
+            if let Some(key) = &c.public_key {
                 out.push_str(&format!(
-                    "    public-key {}\n",
+                    "        public-key {}\n",
                     crate::update_key::cli_value(key)
                 ));
             }
-            // The selection first, then the channels it selects among: replayed
-            // top to bottom, the bare `channel <name>` line both creates and
-            // selects, and the blocks below fill the fields in.
-            if let Some(sel) = &u.channel {
-                out.push_str(&format!("    channel {sel}\n"));
+            if let Some(k) = &c.subscription_key {
+                let shown = match secrets {
+                    Secrets::Shown => k.as_str(),
+                    Secrets::Masked => KEY_NOT_SHOWN,
+                };
+                out.push_str(&format!("        subscription-key {shown}\n"));
             }
-            for c in &u.channels {
-                out.push_str(&format!("    channel {} {{\n", c.name));
-                if let Some(url) = &c.url {
-                    out.push_str(&format!("        url {url}\n"));
-                }
-                if let Some(key) = &c.public_key {
-                    out.push_str(&format!(
-                        "        public-key {}\n",
-                        crate::update_key::cli_value(key)
-                    ));
-                }
-                if let Some(k) = &c.subscription_key {
-                    let shown = match secrets {
-                        Secrets::Shown => k.as_str(),
-                        Secrets::Masked => KEY_NOT_SHOWN,
-                    };
-                    out.push_str(&format!("        subscription-key {shown}\n"));
-                }
-                out.push_str("    }\n");
-            }
-            out.push_str("}\n");
+            out.push_str("    }\n");
         }
+        out.push_str("}\n");
     }
 
     if out.is_empty() && !skip_empty_ifaces {
@@ -12750,10 +12856,8 @@ fn render_ospf_body(out: &mut String, o: &OspfDraft, is_v3: bool) {
     if let Some(nt) = &o.network_type {
         out.push_str(&format!("        network-type {nt}\n"));
     }
-    if is_v3 {
-        if let Some(id) = o.instance_id {
-            out.push_str(&format!("        instance-id {id}\n"));
-        }
+    if is_v3 && let Some(id) = o.instance_id {
+        out.push_str(&format!("        instance-id {id}\n"));
     }
     for iface in &o.passive_interfaces {
         out.push_str(&format!("        passive-interface {iface}\n"));
@@ -12807,10 +12911,8 @@ fn render_ospf_body(out: &mut String, o: &OspfDraft, is_v3: bool) {
     if o.bfd {
         out.push_str("        bfd true\n");
     }
-    if !is_v3 {
-        if let Some(vrf) = &o.vrf {
-            out.push_str(&format!("        vrf {vrf}\n"));
-        }
+    if !is_v3 && let Some(vrf) = &o.vrf {
+        out.push_str(&format!("        vrf {vrf}\n"));
     }
 }
 
@@ -13036,7 +13138,8 @@ fn parse_duration_secs(s: &str) -> Result<u32> {
         if num.is_empty() {
             bail!("invalid lease-time {s:?}: expected <n>d/<n>h/<n>m/<n>s or bare seconds");
         }
-        let v: u64 = num.parse().unwrap();
+        let too_large = || anyhow::anyhow!("lease-time {s:?} is too large");
+        let v: u64 = num.parse().map_err(|_| too_large())?;
         let mult = match c {
             'd' => 86_400,
             'h' => 3_600,
@@ -13044,7 +13147,9 @@ fn parse_duration_secs(s: &str) -> Result<u32> {
             's' => 1,
             _ => bail!("invalid lease-time unit {c:?} in {s:?} (use d/h/m/s)"),
         };
-        total += v * mult;
+        total = total
+            .checked_add(v.checked_mul(mult).ok_or_else(too_large)?)
+            .ok_or_else(too_large)?;
         num.clear();
         saw_unit = true;
     }
@@ -13162,6 +13267,134 @@ fn validate_bind_address(v: &str) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    fn destination_zone_deny_candidate() -> Session {
+        let mut session = Session::empty();
+        for command in [
+            "set system hostname transition-test",
+            "set interface lan0 zone lan",
+            "set interface wan0 zone wan",
+            "set interface wan0 address 198.51.100.1/24",
+            "set firewall rule restricted from lan",
+            "set firewall rule restricted to wan",
+            "set firewall rule restricted action drop",
+            "set firewall rule restricted proto tcp",
+            "set firewall rule restricted port 443",
+        ] {
+            run(&mut session, command).unwrap();
+        }
+        session
+    }
+
+    #[test]
+    fn detached_commit_and_commit_confirm_refuse_ambiguous_deny_without_cleaning_draft() {
+        let mut session = destination_zone_deny_candidate();
+        assert!(session.materialize().is_ok(), "legacy parsing stays valid");
+        assert!(session.commit().is_err());
+        assert!(session.dirty());
+        assert!(
+            crate::confirm::commit_confirm(&mut session, &crate::repl::Apply::off(), 1).is_err()
+        );
+        assert!(session.dirty());
+        run(&mut session, "set firewall rule restricted disabled true").unwrap();
+        assert!(
+            session.commit().is_ok(),
+            "disabled policy can be edited safely"
+        );
+    }
+
+    #[test]
+    fn saved_legacy_deny_allows_unrelated_edit_but_rejects_change_before_save_or_export() {
+        let directory = std::env::temp_dir().join(format!(
+            "sentinel-destination-admission-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let saved = directory.join("appliance.toml");
+        let original = destination_zone_deny_candidate()
+            .materialize()
+            .unwrap()
+            .to_toml()
+            .unwrap();
+        std::fs::write(&saved, &original).unwrap();
+        let mut session = Session::load(&saved).unwrap();
+        run(&mut session, "set system hostname renamed").unwrap();
+        assert!(
+            session.commit().is_ok(),
+            "existing policy must not block unrelated maintenance"
+        );
+        run(&mut session, "set firewall rule restricted port 8443").unwrap();
+        assert!(session.commit().is_err());
+        assert!(session.save(None).is_err());
+        let export = directory.join("export/appliance.toml");
+        assert!(session.save(Some(&export)).is_err());
+        assert!(session.dirty());
+        assert!(!export.parent().unwrap().exists());
+        assert_eq!(std::fs::read_to_string(&saved).unwrap(), original);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+
+        // A corrupt baseline cannot silently turn into an empty/valid one.
+        run(&mut session, "set firewall rule restricted disabled true").unwrap();
+        std::fs::write(&saved, "invalid = [").unwrap();
+        assert!(session.commit().is_err());
+        assert!(session.save(None).is_err());
+        assert_eq!(std::fs::read_to_string(&saved).unwrap(), "invalid = [");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn save_as_cannot_grandfather_a_new_deny_from_the_destination_file() {
+        let directory =
+            std::env::temp_dir().join(format!("sentinel-save-as-admission-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let source = directory.join("source.toml");
+        let destination = directory.join("legacy.toml");
+        let original = "[system]\nhostname='safe-source'\n";
+        std::fs::write(&source, original).unwrap();
+        let legacy = destination_zone_deny_candidate().materialize().unwrap();
+        let legacy_bytes = legacy.to_toml().unwrap();
+        std::fs::write(&destination, &legacy_bytes).unwrap();
+        let mut session = Session::load(&source).unwrap();
+        session.replace_candidate(legacy);
+        assert!(session.save(Some(&destination)).is_err());
+        assert!(session.dirty());
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
+        assert_eq!(std::fs::read_to_string(&destination).unwrap(), legacy_bytes);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn save_as_cannot_introduce_source_legacy_into_a_safe_or_missing_destination() {
+        let directory = std::env::temp_dir().join(format!(
+            "sentinel-save-as-legacy-source-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let source = directory.join("legacy.toml");
+        let destination = directory.join("safe.toml");
+        let missing = directory.join("nested/missing.toml");
+        let original = "[system]\nhostname='safe-target'\n";
+        let legacy = destination_zone_deny_candidate()
+            .materialize()
+            .unwrap()
+            .to_toml()
+            .unwrap();
+        std::fs::write(&source, &legacy).unwrap();
+        std::fs::write(&destination, original).unwrap();
+        let mut session = Session::load(&source).unwrap();
+        assert!(
+            session.commit().is_ok(),
+            "unchanged stored legacy remains valid"
+        );
+        assert!(session.save(Some(&destination)).is_err());
+        assert!(session.save(Some(&missing)).is_err());
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), legacy);
+        assert_eq!(std::fs::read_to_string(&destination).unwrap(), original);
+        assert!(!missing.parent().unwrap().exists());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn two_node_ha_commands_round_trip_and_delete_without_losing_fields() {
         let mut s = super::Session::empty();
@@ -13241,6 +13474,381 @@ mod tests {
         assert_eq!(session.seen_running.as_deref(), Some("new revision"));
         assert_eq!(std::fs::read_to_string(running).unwrap(), "new revision");
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn fresh_sessions_inherit_unsaved_rules_and_stale_sessions_cannot_replace_them() {
+        let directory =
+            std::env::temp_dir().join(format!("sentinel-active-candidate-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let saved = directory.join("saved.toml");
+        let running = directory.join("running.toml");
+        std::fs::write(&saved, "[system]\nhostname='fw'\n").unwrap();
+        let mut first = Session::load_live_at(&saved, &running).unwrap();
+        let stale = Session::load_live_at(&saved, &running).unwrap();
+        for line in [
+            "set interface lan0 zone lan",
+            "set firewall rule deny-http from lan",
+            "set firewall rule deny-http action drop",
+            "set firewall rule deny-http proto tcp",
+            "set firewall rule deny-http port 80",
+        ] {
+            run(&mut first, line).unwrap();
+        }
+        let applied = first.commit().unwrap().to_toml().unwrap();
+        first.note_committed_at(&running, &applied).unwrap();
+        assert!(stale.ensure_current_at(&running).is_err());
+        let mut second = Session::load_live_at(&saved, &running).unwrap();
+        second.ensure_current_at(&running).unwrap();
+        run(&mut second, "set interface lan0 description updated").unwrap();
+        let config = second.commit().unwrap();
+        assert_eq!(config.rules.len(), 1);
+        assert_eq!(config.rules[0].name, "deny-http");
+        assert!(Appliance::load(&saved).unwrap().rules.is_empty());
+        assert_eq!(
+            Appliance::load_active_at(&saved, &running)
+                .unwrap()
+                .rules
+                .len(),
+            1
+        );
+        std::fs::write(&running, "invalid = [").unwrap();
+        assert!(Session::load_live_at(&saved, &running).is_err());
+        assert!(Appliance::load_active_at(&saved, &running).is_err());
+        std::fs::remove_file(&running).unwrap();
+        assert!(first.ensure_current_at(&running).is_err());
+        std::os::unix::fs::symlink(&saved, &running).unwrap();
+        assert!(Session::load_live_at(&saved, &running).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn web_endpoint_session(enabled: bool) -> Session {
+        let mut session = Session::empty();
+        for command in [
+            "set system hostname web-endpoint-atomicity",
+            "set services web port 8443",
+            "set services web listen-address 127.0.0.1",
+            "set services web tls-cert /etc/velstra/certificate.pem",
+            "set services web tls-key /etc/velstra/private-key.pem",
+        ] {
+            run(&mut session, command).unwrap();
+        }
+        session
+            .set(&[
+                "services",
+                "web",
+                "enable",
+                if enabled { "true" } else { "false" },
+            ])
+            .unwrap();
+        session.commit().unwrap();
+        session
+    }
+
+    #[test]
+    fn web_endpoint_port_parse_failures_leave_the_entire_candidate_unchanged() {
+        for enabled in [false, true] {
+            let mut session = web_endpoint_session(enabled);
+            let before = session.materialize().unwrap().to_toml().unwrap();
+            for value in [
+                "",
+                "not-a-port",
+                "65536",
+                "18446744073709551615",
+                "-1",
+                "1.5",
+            ] {
+                let dirty = session.dirty;
+                let error = session
+                    .set(&["services", "web", "port", value])
+                    .unwrap_err();
+                assert!(error.to_string().contains("services web port"));
+                assert_eq!(session.dirty, dirty);
+                assert_eq!(
+                    session.materialize().unwrap().to_toml().unwrap(),
+                    before,
+                    "failed port command mutated the candidate: {value:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn web_endpoint_zero_port_is_refused_before_enable_or_replacement() {
+        for enabled in [false, true] {
+            let mut session = web_endpoint_session(enabled);
+            let before = session.materialize().unwrap().to_toml().unwrap();
+            for value in ["0", "000", "+0"] {
+                let dirty = session.dirty;
+                let error = session
+                    .set(&["services", "web", "port", value])
+                    .unwrap_err();
+                assert!(error.to_string().contains("1-65535"));
+                assert_eq!(session.dirty, dirty);
+                assert_eq!(session.materialize().unwrap().to_toml().unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn web_endpoint_invalid_addresses_are_refused_without_candidate_mutation() {
+        for enabled in [false, true] {
+            let mut session = web_endpoint_session(enabled);
+            let before = session.materialize().unwrap().to_toml().unwrap();
+            for value in [
+                "",
+                "not-an-address",
+                "10.0.0.256",
+                "2001:db8::zz",
+                "[::1]",
+                "127.0.0.1:8443",
+                "127.0.0.1\nset services web enable true",
+            ] {
+                let dirty = session.dirty;
+                let error = session
+                    .set(&["services", "web", "listen-address", value])
+                    .unwrap_err();
+                assert!(error.to_string().contains("services web listen-address"));
+                assert_eq!(session.dirty, dirty);
+                assert_eq!(session.materialize().unwrap().to_toml().unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn web_endpoint_valid_values_still_deliberately_enable_the_service() {
+        for port in ["1", "443", "65535"] {
+            let mut session = web_endpoint_session(false);
+            session.set(&["services", "web", "port", port]).unwrap();
+            assert!(session.dirty);
+            let configured = session.commit().unwrap();
+            assert!(configured.services.web.enable);
+            assert_eq!(configured.services.web.port, Some(port.parse().unwrap()));
+            assert_eq!(
+                configured.services.web.listen_address.as_deref(),
+                Some("127.0.0.1")
+            );
+            assert_eq!(
+                configured.services.web.tls_cert.as_deref(),
+                Some("/etc/velstra/certificate.pem")
+            );
+        }
+        for address in ["127.0.0.1", "0.0.0.0", "::1", "::", "2001:db8::1"] {
+            let mut session = web_endpoint_session(false);
+            session
+                .set(&["services", "web", "listen-address", address])
+                .unwrap();
+            assert!(session.dirty);
+            let configured = session.commit().unwrap();
+            assert!(configured.services.web.enable);
+            assert_eq!(configured.services.web.port, Some(8443));
+            assert_eq!(
+                configured.services.web.listen_address.as_deref(),
+                Some(address)
+            );
+            assert_eq!(
+                configured.services.web.tls_key.as_deref(),
+                Some("/etc/velstra/private-key.pem")
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_and_enabled_web_tls_false_survive_rendered_cli_replay() {
+        for enabled in [false, true] {
+            let original = Appliance::from_toml(&format!(
+                "[system]\nhostname = \"tls-roundtrip\"\n\
+                 [services.web]\nenable = {enabled}\ntls = false\n"
+            ))
+            .unwrap();
+            let rendered = render_appliance(&original);
+            let commands = flatten_config(&rendered);
+            assert!(
+                commands
+                    .iter()
+                    .any(|line| line == "set services web tls false"),
+                "{commands:?}"
+            );
+            assert!(commands.iter().all(|line| line != "set services web"));
+            let mut replay = Session::empty();
+            for command in &commands {
+                run_cli_tokens(&mut replay, command).unwrap();
+            }
+            let restored = replay.commit().unwrap();
+            assert_eq!(restored.services.web.enable, enabled);
+            assert!(!restored.services.web.tls);
+            assert_eq!(restored.to_toml().unwrap(), original.to_toml().unwrap());
+            run_cli_tokens(&mut replay, "delete services web tls").unwrap();
+            let reset = replay.commit().unwrap();
+            assert!(reset.services.web.tls);
+            assert_eq!(reset.services.web.is_empty(), !enabled);
+        }
+    }
+
+    #[test]
+    fn web_tls_file_references_survive_quoted_reading_and_cli_replay() {
+        let paths = [
+            ("/etc/velstra/cert.pem", "/etc/velstra/key.pem"),
+            (
+                "/var/lib/sentinel/TLS cert.pem",
+                "/var/lib/sentinel/TLS key.pem",
+            ),
+            (
+                r#"/tmp/cert "quoted" 'name'.pem"#,
+                r#"/tmp/key "quoted" 'name'.pem"#,
+            ),
+            (r"/tmp/cert\literal.pem", r"/tmp/key\literal.pem"),
+            ("# certificate.pem", "# private-key.pem"),
+            ("  certificate.pem  ", "  private-key.pem  "),
+            ("/tmp/cert\tname.pem", "/tmp/key\tname.pem"),
+            (
+                "/tmp/cert $(literal);`text`&|<>*.pem",
+                "/tmp/key $(literal);`text`&|<>*.pem",
+            ),
+            ("/tmp/cert{}[x]ü.pem", "/tmp/key{}[x]ü.pem"),
+        ];
+        for (certificate, key) in paths {
+            for enabled in [false, true] {
+                let mut original =
+                    Appliance::from_toml("[system]\nhostname = \"tls-file-roundtrip\"\n").unwrap();
+                original.services.web.enable = enabled;
+                original.services.web.tls_cert = Some(certificate.into());
+                original.services.web.tls_key = Some(key.into());
+                original.validate().unwrap();
+                for rendered in [
+                    render_appliance(&original),
+                    render_appliance_for_reading(&original),
+                ] {
+                    let commands = flatten_config(&rendered);
+                    for (field, expected) in [("tls-cert", certificate), ("tls-key", key)] {
+                        let matching: Vec<_> = commands
+                            .iter()
+                            .map(|line| {
+                                assert!(!line.contains('\n') && !line.contains('\r'));
+                                crate::repl::split_line(line)
+                            })
+                            .filter(|words| words.get(3).is_some_and(|name| name == field))
+                            .collect();
+                        assert_eq!(matching.len(), 1, "{field}: {commands:?}");
+                        assert_eq!(matching[0], ["set", "services", "web", field, expected]);
+                    }
+                    let mut replay = Session::empty();
+                    for command in &commands {
+                        run_cli_tokens(&mut replay, command).unwrap();
+                    }
+                    let restored = replay.commit().unwrap();
+                    assert_eq!(restored.to_toml().unwrap(), original.to_toml().unwrap());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn web_tls_file_disabled_endpoint_replay_does_not_enable_the_server() {
+        for tls in [true, false] {
+            let mut original =
+                Appliance::from_toml("[system]\nhostname = \"disabled-web-endpoint\"\n").unwrap();
+            original.services.web.port = Some(9443);
+            original.services.web.listen_address = Some("127.0.0.1".into());
+            original.services.web.tls = tls;
+            original.validate().unwrap();
+            let commands = flatten_config(&render_appliance(&original));
+            let mut replay = Session::empty();
+            for command in &commands {
+                run_cli_tokens(&mut replay, command).unwrap();
+            }
+            let restored = replay.commit().unwrap();
+            assert!(!restored.services.web.enable, "{commands:?}");
+            assert_eq!(restored.to_toml().unwrap(), original.to_toml().unwrap());
+        }
+    }
+
+    #[test]
+    fn web_tls_file_unsafe_references_are_rejected_before_candidate_mutation() {
+        let mut session = Session::empty();
+        run(&mut session, "set system hostname tls-path-validation").unwrap();
+        session
+            .set(&["services", "web", "tls-cert", "/etc/velstra/cert.pem"])
+            .unwrap();
+        session
+            .set(&["services", "web", "tls-key", "/etc/velstra/key.pem"])
+            .unwrap();
+        let baseline = session.commit().unwrap();
+        for field in ["tls-cert", "tls-key"] {
+            for value in ["", "\0", "/tmp/one\ntwo.pem", "/tmp/one\rtwo.pem"] {
+                let dirty = session.dirty;
+                let error = session
+                    .set(&["services", "web", field, value])
+                    .expect_err("unsafe path must fail at set time");
+                assert!(error.to_string().contains("services web"));
+                assert_eq!(session.dirty, dirty);
+                assert_eq!(
+                    session.materialize().unwrap().to_toml().unwrap(),
+                    baseline.to_toml().unwrap()
+                );
+                let mut invalid = baseline.clone();
+                match field {
+                    "tls-cert" => invalid.services.web.tls_cert = Some(value.into()),
+                    _ => invalid.services.web.tls_key = Some(value.into()),
+                }
+                let json = serde_json::to_string(&invalid).unwrap();
+                let error = Appliance::from_json(&json)
+                    .expect_err("declarative input must enforce the same path boundary");
+                assert!(error.to_string().contains("services web"));
+            }
+        }
+    }
+
+    #[test]
+    fn web_tls_file_reference_rendering_preserves_disclosure_without_reading_contents() {
+        let scratch = crate::update::Scratch::new().unwrap();
+        let certificate = scratch.join("certificate with spaces.pem");
+        let key = scratch.join("key with spaces.pem");
+        const CERTIFICATE_CONTENT: &str = "QA_CERT_CONTENT_MUST_NOT_APPEAR";
+        const KEY_CONTENT: &str = "QA_KEY_CONTENT_MUST_NOT_APPEAR";
+        std::fs::write(&certificate, CERTIFICATE_CONTENT).unwrap();
+        std::fs::write(&key, KEY_CONTENT).unwrap();
+        let mut session = Session::empty();
+        for command in [
+            "set system hostname tls-path-disclosure",
+            "set update channel ent url https://updates.example/ent",
+            "set update channel ent public-key file:/etc/velstra/release.pem",
+            "set update channel ent subscription-key velstra-ent-11aa22bb",
+        ] {
+            run(&mut session, command).unwrap();
+        }
+        session
+            .set(&["services", "web", "tls-cert", certificate.to_str().unwrap()])
+            .unwrap();
+        session
+            .set(&["services", "web", "tls-key", key.to_str().unwrap()])
+            .unwrap();
+        let original = session.commit().unwrap();
+        let redacted =
+            crate::redact::appliance(&original, crate::redact::Disclosure::NoSecrets).unwrap();
+        for (rendered, entitlement_disclosed) in [
+            (render_appliance(&original), true),
+            (render_appliance_for_reading(&original), false),
+            (render_appliance(&redacted), false),
+        ] {
+            assert!(!rendered.contains(CERTIFICATE_CONTENT));
+            assert!(!rendered.contains(KEY_CONTENT));
+            assert_eq!(
+                rendered.contains("velstra-ent-11aa22bb"),
+                entitlement_disclosed
+            );
+            for (field, expected) in [
+                ("tls-cert", certificate.to_str().unwrap()),
+                ("tls-key", key.to_str().unwrap()),
+            ] {
+                let commands = flatten_config(&rendered);
+                assert!(
+                    commands.iter().any(|line| crate::repl::split_line(line)
+                        == ["set", "services", "web", field, expected]),
+                    "{field}: {commands:?}"
+                );
+            }
+        }
     }
 
     /// The whole specification of `flatten_config`, as a round trip: render a
@@ -14375,6 +14983,7 @@ backends = ["10.0.0.11:8443"]
             path: std::path::PathBuf::from("/nonexistent"),
             dirty: true,
             seen_running: None,
+            admission_baseline: super::AdmissionBaseline::Detached,
         };
         let rebuilt = session.materialize().expect("materialize");
         assert_eq!(rebuilt.system.hostname, "renamed");
@@ -14811,6 +15420,7 @@ backends = ["10.0.0.11:8443"]
         let mut s = Session::empty();
         for line in [
             "set system hostname fw1",
+            "set system config-sync secret unit-test-credential-at-least-32-bytes",
             "set system conntrack-sync listen 0.0.0.0:5429",
             "set system conntrack-sync peer 10.9.0.2",
             "set system conntrack-sync peer 10.9.0.3",
@@ -14833,14 +15443,39 @@ backends = ["10.0.0.11:8443"]
 
         // `delete` of a single field clears just it; deleting the section resets all.
         run(&mut s, "delete system conntrack-sync peer").unwrap();
-        let a = s.commit().unwrap();
-        assert!(a.system.conntrack_sync.peers.is_empty());
-        assert_eq!(a.system.conntrack_sync.interval, Some(2)); // untouched
+        assert!(
+            s.commit()
+                .unwrap_err()
+                .to_string()
+                .contains("explicit peers")
+        );
 
         run(&mut s, "delete system conntrack-sync").unwrap();
         let a = s.commit().unwrap();
         assert!(a.system.conntrack_sync.is_empty());
         assert!(!s.show().contains("conntrack-sync {"));
+    }
+
+    #[test]
+    fn conntrack_sync_legacy_cli_commit_is_rejected_without_implicit_enrollment() {
+        let mut s = Session::empty();
+        for line in [
+            "set system hostname fw",
+            "set system conntrack-sync peer 10.9.0.2",
+        ] {
+            run(&mut s, line).unwrap();
+        }
+        let error = s.commit().unwrap_err().to_string();
+        assert!(error.contains("legacy unauthenticated replication is disabled"));
+        assert!(s.draft.config_sync.is_empty());
+        run(&mut s, "set system config-sync secret short").unwrap();
+        assert!(s.commit().is_err());
+        run(
+            &mut s,
+            "set system config-sync secret unit-test-credential-at-least-32-bytes",
+        )
+        .unwrap();
+        assert!(s.commit().is_ok());
     }
 
     #[test]
@@ -15150,6 +15785,7 @@ backends = ["10.0.0.11:8443"]
             path: PathBuf::from("/dev/null"),
             dirty: false,
             seen_running: None,
+            admission_baseline: super::AdmissionBaseline::Detached,
         };
         let b = round.materialize().expect("re-materialises");
         assert_eq!(
@@ -15565,6 +16201,7 @@ backends = ["10.0.0.11:8443"]
             path: PathBuf::from("/dev/null"),
             dirty: false,
             seen_running: None,
+            admission_baseline: super::AdmissionBaseline::Detached,
         };
         let b = round.materialize().expect("re-materialises");
         let (oc0, oc1) = (
@@ -15678,6 +16315,7 @@ backends = ["10.0.0.11:8443"]
             path: PathBuf::from("/dev/null"),
             dirty: false,
             seen_running: None,
+            admission_baseline: super::AdmissionBaseline::Detached,
         };
         let b = round.materialize().expect("re-materialises");
         let mv0b = b.interfaces.iter().find(|i| i.name == "mv0").unwrap();
@@ -16204,6 +16842,27 @@ backends = ["10.0.0.11:8443"]
     }
 
     #[test]
+    fn lease_time_overflow_is_refused_without_mutating_the_candidate() {
+        let mut s = Session::empty();
+        for family in ["dhcp-server", "router-advert dhcp6-pool"] {
+            let command = format!("set interface lan0 {family} lease-time");
+            run(&mut s, &format!("{command} 1h")).unwrap();
+            let before = s.show();
+            for value in [
+                "99999999999999999999h",   // decimal parse overflow
+                "18446744073709551615h",   // multiplication overflow
+                "18446744073709551615s1s", // addition overflow
+                "4294967296s",             // valid u64 but not u32
+                "99999999999999999999",    // bare integer overflow
+            ] {
+                assert!(run(&mut s, &format!("{command} {value}")).is_err());
+                assert_eq!(s.show(), before, "candidate changed on {value}");
+            }
+        }
+        assert_eq!(parse_duration_secs("4294967295s").unwrap(), u32::MAX);
+    }
+
+    #[test]
     fn static_mapping_ip_must_be_inside_the_server_subnet() {
         let mut s = Session::empty();
         run(&mut s, "set system hostname fw").unwrap();
@@ -16515,6 +17174,7 @@ backends = ["10.0.0.11:8443"]
             path: PathBuf::from("/dev/null"),
             dirty: false,
             seen_running: None,
+            admission_baseline: super::AdmissionBaseline::Detached,
         };
         let b = round.materialize().expect("re-materialises");
         assert_eq!(b.policy.prefix_lists.len(), 1);
@@ -16984,6 +17644,7 @@ backends = ["10.0.0.11:8443"]
             path: PathBuf::from("/dev/null"),
             dirty: false,
             seen_running: None,
+            admission_baseline: super::AdmissionBaseline::Detached,
         }
         .show_only("update");
         assert!(
@@ -17039,6 +17700,7 @@ backends = ["10.0.0.11:8443"]
             path: PathBuf::from("/dev/null"),
             dirty: false,
             seen_running: None,
+            admission_baseline: super::AdmissionBaseline::Detached,
         };
         let b = round.materialize().expect("re-materialises");
         assert_eq!(
@@ -17202,6 +17864,7 @@ backends = ["10.0.0.11:8443"]
             path: PathBuf::from("/dev/null"),
             dirty: false,
             seen_running: None,
+            admission_baseline: super::AdmissionBaseline::Detached,
         };
         let b = round.materialize().expect("re-materialises");
         let bu = b.update.as_ref().unwrap();

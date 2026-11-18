@@ -1,7 +1,11 @@
+> **Development record — not current operator guidance or release approval.**
+> Results apply only to the source/image and scope recorded below. Original
+> findings are retained; use the [documentation map](README.md) for current guides.
+
 # Routing and credential regression fixes
 
 This change set addresses the observed failures OSQA-017/157, 026, 164, 165,
-166 and 167, plus boot ordering/assessment findings 016 and 019. It is not a complete resolution of the OpenStack QA backlog or a
+166 and 167, plus boot ordering/assessment findings 016 and 019. It is not a complete resolution of the cloud QA backlog or a
 production release certificate. Existing failed execution records are retained.
 
 ## Product changes

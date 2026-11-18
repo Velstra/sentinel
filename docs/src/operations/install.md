@@ -36,3 +36,11 @@ findmnt /var/lib/sentinel
 ```
 
 Check that the disk booted with its intended slot and that the writable data filesystem is mounted. Retain an independent console while establishing first management access.
+
+## Identity and recovery checks
+
+Match permanent NIC MACs to cable roles and set per-member `hw-id` bindings before trusting interface names; see [physical identity](../handbook/interfaces.md#bind-physical-identity-before-assigning-zones). Names alone are not stable identities, and another HA member must not inherit the primary's MAC bindings.
+
+A raw image import does not provision an administrator through cloud-init or config-drive. Use the interactive installer or a controlled offline seed of the data partition; preserve recovery access.
+
+Installer layout checks do not prove the installed disk boots. Test actual post-install boot, encrypted-storage unlock where selected, persistence and management access on the exact image.

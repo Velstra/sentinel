@@ -218,6 +218,16 @@ fn locale_names() -> Vec<String> {
 
 /// Reload the velstra data plane so it picks up a freshly written config.
 pub fn reload_compiled(unit: &str, previous: Option<&[u8]>, next: &[u8]) -> Result<()> {
+    if unit == "wren.service" {
+        // Wren's SIGHUP handles static routes without disturbing adjacencies.
+        // Other reload areas still have documented supervision limitations;
+        // preserve restart semantics for those rather than silently ignoring
+        // a changed timer/authentication/HA configuration.
+        if static_routes_only_changed(previous, next) {
+            return run_priv("systemctl", &["reload-or-restart", unit]);
+        }
+        return service_restart(unit);
+    }
     let command = if unit == "velstra.service" && policy_identity_changed(previous, next) {
         // Conntrack keys contain the numeric policy ID. Reusing an ID for a
         // different zone must never inherit that zone's established sessions,
@@ -227,6 +237,22 @@ pub fn reload_compiled(unit: &str, previous: Option<&[u8]>, next: &[u8]) -> Resu
         "reload"
     };
     reload_agent(unit, command)
+}
+
+fn static_routes_only_changed(previous: Option<&[u8]>, next: &[u8]) -> bool {
+    let parse = |bytes: &[u8]| -> Option<toml::Value> {
+        toml::from_str(std::str::from_utf8(bytes).ok()?).ok()
+    };
+    let (Some(mut before), Some(mut after)) = (previous.and_then(parse), parse(next)) else {
+        return false;
+    };
+    for value in [&mut before, &mut after] {
+        let Some(table) = value.as_table_mut() else {
+            return false;
+        };
+        table.remove("static");
+    }
+    before == after
 }
 
 fn policy_identity_changed(previous: Option<&[u8]>, next: &[u8]) -> bool {
@@ -619,6 +645,20 @@ pub fn swanctl_revoke(name: &str) -> Result<()> {
     }
 }
 
+/// Both successful read-only queries must be empty before the last configured
+/// tunnel can retire the Sentinel-owned IKE service. An unavailable VICI socket
+/// or failed query is not evidence that stopping a daemon is harmless.
+pub fn swanctl_idle() -> Result<bool> {
+    for query in ["--list-conns", "--list-sas"] {
+        let out = escalated_output("swanctl", &[query])?;
+        anyhow::ensure!(out.status.success(), "cannot inspect remaining IPsec state");
+        if !out.stdout.iter().all(u8::is_ascii_whitespace) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Run a read-only `swanctl` query and return its stdout (for `show vpn` — the
 /// SA / connection state). charon's vici control socket is root-only, so this
 /// must run privileged: directly when already root, else via `sudo` (the admin
@@ -668,16 +708,16 @@ pub struct ApplyLock {
 impl Drop for ApplyLock {
     fn drop(&mut self) {
         use std::os::fd::AsRawFd;
-        if let Some(file) = &self._file {
-            if std::rc::Rc::strong_count(file) == 1 {
-                // CLOEXEC closes an unrelated child only at exec, not at fork.
-                // Explicitly unlock on the last thread-bound guard so that a
-                // pre-exec fork cannot extend a completed config transaction.
-                // Native writer locks have deliberately different lifetime
-                // rules and must not use this configuration guard.
-                unsafe {
-                    libc::flock(file.as_raw_fd(), libc::LOCK_UN);
-                }
+        if let Some(file) = &self._file
+            && std::rc::Rc::strong_count(file) == 1
+        {
+            // CLOEXEC closes an unrelated child only at exec, not at fork.
+            // Explicitly unlock on the last thread-bound guard so that a
+            // pre-exec fork cannot extend a completed config transaction.
+            // Native writer locks have deliberately different lifetime
+            // rules and must not use this configuration guard.
+            unsafe {
+                libc::flock(file.as_raw_fd(), libc::LOCK_UN);
             }
         }
     }
@@ -824,24 +864,31 @@ pub const CONFIRM_UNIT: &str = "sentinel-confirm";
 
 /// Arm the `commit-confirm` auto-rollback: a one-shot transient timer that runs
 /// `sentinel confirm-rollback --config <cfg>` after `minutes`, reverting the box
-/// to its saved config unless `confirm` disarms it first.
+/// to its bound previous-active snapshot unless `confirm` disarms it first.
 ///
 /// The timer runs the CURRENT binary (`current_exe`) with the whole `SENTINEL_*`
 /// tool environment forwarded via `--setenv`, so the systemd-spawned process
 /// resolves `systemctl`/`hostname`/`ip`/… to the exact store paths the
 /// interactive session uses (the wrapper's env isn't inherited by a transient
-/// unit otherwise). `--collect` GCs the unit after it fires, even on failure, so
-/// re-arming later never trips over a lingering unit.
-pub fn arm_confirm(minutes: u32, cfg: &Path) -> Result<()> {
+/// unit otherwise). Normal inactive-only collection preserves a FAILED service
+/// as admission evidence until an explicit successful retry. This is PID1
+/// lifetime state, not a reboot-durable configuration journal.
+pub fn arm_confirm(minutes: u32, cfg: &Path, original: &Path) -> Result<()> {
+    anyhow::ensure!(
+        cfg.is_absolute() && original.is_absolute() && cfg != original,
+        "independent rollback needs absolute snapshot and original paths"
+    );
     let exe = std::env::current_exe().context("resolving the sentinel binary")?;
-    let (Some(exe_s), Some(cfg_s)) = (exe.to_str(), cfg.to_str()) else {
+    let (Some(exe_s), Some(cfg_s), Some(original_s)) =
+        (exe.to_str(), cfg.to_str(), original.to_str())
+    else {
         bail!("non-UTF-8 path");
     };
     let mut args: Vec<String> = vec![
         format!("--unit={CONFIRM_UNIT}"),
         format!("--on-active={minutes}min"),
         "--timer-property=AccuracySec=1s".into(),
-        "--collect".into(),
+        "--property=Type=exec".into(),
     ];
     for (k, v) in std::env::vars() {
         if k.starts_with("SENTINEL_") {
@@ -855,28 +902,79 @@ pub fn arm_confirm(minutes: u32, cfg: &Path) -> Result<()> {
     args.push(cfg_s.to_string());
     // The timer reverts its own change only (see `confirm::rollback`).
     args.push("--commit-confirm".into());
+    args.push("--original-config".into());
+    args.push(original_s.into());
     let argref: Vec<&str> = args.iter().map(String::as_str).collect();
     run_priv("systemd-run", &argref)
 }
 
 /// Disarm the `commit-confirm` timer (best-effort). Only the **timer** is
 /// stopped — never the `.service`, since a manual/auto `confirm-rollback` may be
-/// the very unit calling this. `reset-failed` clears any leftover transient
-/// state (it does not stop a running unit) so the next `arm_confirm` is clean.
+/// the very unit calling this. Never reset the service's failed state: doing so
+/// could erase the only evidence of a partial rollback and authorize writes.
 pub fn disarm_confirm() {
-    let timer = format!("{CONFIRM_UNIT}.timer");
-    let service = format!("{CONFIRM_UNIT}.service");
-    let _ = run_priv("systemctl", &["stop", &timer]);
-    let _ = run_priv("systemctl", &["reset-failed", &timer, &service]);
+    if let Err(error) = disarm_confirm_with(|args| {
+        confirm_systemctl_output_with(&bin("systemctl"), args, is_root(), |program, args| {
+            Command::new(program).args(args).output()
+        })
+    }) {
+        // Keep the existing best-effort callback contract. Confirmation itself
+        // independently checks that protection is idle before reporting success.
+        eprintln!("warning: could not disarm commit-confirm timer: {error:#}");
+    }
 }
 
-/// Whether a `commit-confirm` window is currently pending (its timer armed).
-/// `systemctl is-active` needs no privilege, so this is a plain read.
-pub fn confirm_pending() -> bool {
-    let out = Command::new(bin("systemctl"))
-        .args(["is-active", &format!("{CONFIRM_UNIT}.timer")])
-        .output();
-    matches!(out, Ok(o) if String::from_utf8_lossy(&o.stdout).trim() == "active")
+fn confirm_systemctl_output_with(
+    systemctl: &str,
+    args: &[&str],
+    root: bool,
+    mut output: impl FnMut(&str, &[&str]) -> std::io::Result<std::process::Output>,
+) -> Result<std::process::Output> {
+    if root {
+        // A failed root operation is authoritative: retrying it through sudo
+        // only duplicates the error and can leak a benign missing-unit message.
+        output(systemctl, args).context("running commit-confirm systemctl")
+    } else {
+        // Never try the mutating operation unprivileged (polkit writes to the
+        // controlling TTY even with captured stderr). Do not prompt indefinitely.
+        let mut privileged = vec!["-n", systemctl];
+        privileged.extend_from_slice(args);
+        output("sudo", &privileged).context("running privileged commit-confirm systemctl")
+    }
+}
+
+fn disarm_confirm_with(
+    mut output: impl FnMut(&[&str]) -> Result<std::process::Output>,
+) -> Result<()> {
+    let timer = format!("{CONFIRM_UNIT}.timer");
+    let stopped = output(&["stop", &timer]).context("stopping commit-confirm timer")?;
+    if stopped.status.success() {
+        return Ok(());
+    }
+    // systemctl maps NoSuchUnit to LSB EXIT_NOTINSTALLED=5. Verify the actual
+    // structured property too: neither an exit code nor localized error text
+    // alone is evidence that a protected transient timer has disappeared.
+    if stopped.status.code() == Some(5) {
+        let state = output(&["show", "--property=LoadState", "--value", &timer])
+            .context("verifying absent commit-confirm timer")?;
+        anyhow::ensure!(
+            state.status.success() && state.stderr.is_empty(),
+            "cannot verify commit-confirm timer LoadState (exit {:?}): {}",
+            state.status.code(),
+            String::from_utf8_lossy(&state.stderr).trim()
+        );
+        match state.stdout.as_slice() {
+            b"not-found\n" => return Ok(()),
+            b"loaded\n" | b"stub\n" | b"merged\n" | b"masked\n" | b"error\n" | b"bad-setting\n" => {
+            }
+            _ => bail!("invalid commit-confirm timer LoadState response"),
+        }
+    }
+    bail!(
+        "systemctl stop {timer} failed (exit {:?}): {}",
+        stopped.status.code(),
+        String::from_utf8_lossy(&stopped.stderr).trim()
+    )
 }
 
 /// systemd-networkd's runtime drop-in dir (tmpfs, re-seeded each boot). We place
@@ -966,7 +1064,18 @@ const MAX_OWNED_READ: usize = 64 * 1024 * 1024;
 /// replacement symlink. Preserve the existing noninteractive admin escalation,
 /// but re-invoke a descriptor-validating reader, never an unbounded `cat`.
 pub fn read_owned_regular(path: &Path, limit: usize) -> Result<Option<String>> {
-    match read_regular(path, limit) {
+    read_owned_regular_policy(path, limit, false)
+}
+
+/// Credential caches must additionally be root-owned and inaccessible to
+/// group/other users. The privileged helper checks the opened descriptor, not
+/// a separately inspected path that could be replaced before the read.
+pub fn read_owned_private(path: &Path, limit: usize) -> Result<Option<String>> {
+    read_owned_regular_policy(path, limit, true)
+}
+
+fn read_owned_regular_policy(path: &Path, limit: usize, private: bool) -> Result<Option<String>> {
+    match read_regular_policy(path, limit, private) {
         Err(error)
             if !is_root()
                 && error
@@ -975,10 +1084,12 @@ pub fn read_owned_regular(path: &Path, limit: usize) -> Result<Option<String>> {
         {
             let limit = limit.to_string();
             let path = path.to_str().context("non-UTF-8 journal path")?;
-            let output = escalated_output(
-                "sentinel-self",
-                &["owned-file-read", "--max-bytes", &limit, "--", path],
-            )?;
+            let mut arguments = vec!["owned-file-read", "--max-bytes", &limit];
+            if private {
+                arguments.push("--private");
+            }
+            arguments.extend(["--", path]);
+            let output = escalated_output("sentinel-self", &arguments)?;
             anyhow::ensure!(
                 output.status.success(),
                 "reading protected regular journal failed"
@@ -989,12 +1100,16 @@ pub fn read_owned_regular(path: &Path, limit: usize) -> Result<Option<String>> {
     }
 }
 
-pub fn owned_file_read(path: &Path, limit: usize) -> Result<String> {
+pub fn owned_file_read(path: &Path, limit: usize, private: bool) -> Result<String> {
     anyhow::ensure!(is_root(), "owned-file-read requires root");
-    serde_json::to_string(&read_regular(path, limit)?).map_err(Into::into)
+    serde_json::to_string(&read_regular_policy(path, limit, private)?).map_err(Into::into)
 }
 
-fn read_regular(path: &Path, limit: usize) -> Result<Option<String>> {
+fn private_file_identity(uid: u32, mode: u32) -> bool {
+    uid == 0 && mode & 0o077 == 0
+}
+
+fn read_regular_policy(path: &Path, limit: usize, private: bool) -> Result<Option<String>> {
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     anyhow::ensure!(
@@ -1016,6 +1131,7 @@ fn read_regular(path: &Path, limit: usize) -> Result<Option<String>> {
             && metadata.nlink() == 1
             && metadata.mode() & 0o022 == 0
             && (metadata.uid() == 0 || metadata.uid() == unsafe { libc::geteuid() })
+            && (!private || private_file_identity(metadata.uid(), metadata.mode()))
             && metadata.len() <= limit as u64,
         "invalid protected regular journal"
     );
@@ -1345,31 +1461,205 @@ pub fn service_start(unit: &str) -> Result<()> {
 
 /// Ensure a local login account exists (roadmap C21, `[[system.login]]`). A no-op
 /// when the user is already present (the built-in `admin`, or a prior commit's
-/// account); otherwise `useradd -m -G wheel` creates it with a home, sudo/console
-/// access via `wheel`, and the appliance login shell. Needs `mutableUsers` on.
-pub fn ensure_login_account(user: &str) -> Result<()> {
-    let present = Command::new(bin("id"))
-        .arg("-u")
-        .arg(user)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if present {
-        return Ok(());
+/// account); otherwise create it without elevated groups. Reconcile only our
+/// administrator group, preserving unrelated supplementary memberships.
+pub fn ensure_login_account(user: &str, administrator: bool) -> Result<()> {
+    ensure_login_created(user, None)?;
+    let current = login_in_wheel(user)?;
+    match (current, administrator) {
+        (false, true) => run_priv("usermod", &["-a", "-G", "wheel", user]),
+        (true, false) => run_priv("gpasswd", &["-d", user, "wheel"]),
+        _ => Ok(()),
     }
-    run_priv(
-        "useradd",
-        &[
-            "-m",
-            "-G",
-            "wheel",
-            "-s",
-            "/run/current-system/sw/bin/bash",
-            user,
-        ],
-    )
+}
+
+pub(crate) fn ensure_login_created(user: &str, expected_uid: Option<u32>) -> Result<u32> {
+    if local_login_uid(user)?.is_none() {
+        if let Some(uid) = expected_uid {
+            anyhow::ensure!(managed_login_uid(uid), "unsafe planned login UID");
+            // No --non-unique: a concurrent external allocation must fail, not
+            // create a second name for an unrelated account's UID/home files.
+            run_priv(
+                "useradd",
+                &[
+                    "-m",
+                    "-s",
+                    "/run/current-system/sw/bin/bash",
+                    "-u",
+                    &uid.to_string(),
+                    user,
+                ],
+            )?;
+        } else {
+            run_priv(
+                "useradd",
+                &["-m", "-s", "/run/current-system/sw/bin/bash", user],
+            )?;
+        }
+    }
+    let uid = local_login_uid(user)?.context("created login has no local passwd entry")?;
+    anyhow::ensure!(
+        managed_login_uid(uid),
+        "refusing to modify an operating-system account"
+    );
+    anyhow::ensure!(
+        expected_uid.is_none_or(|expected| expected == uid),
+        "login UID does not match planned ownership"
+    );
+    Ok(uid)
+}
+
+pub(crate) fn login_in_wheel(user: &str) -> Result<bool> {
+    let groups = Command::new(bin("id"))
+        .args(["-nG", user])
+        .output()
+        .context("reading login account groups")?;
+    anyhow::ensure!(
+        groups.status.success(),
+        "cannot determine login account groups"
+    );
+    let groups = std::str::from_utf8(&groups.stdout).context("invalid login account groups")?;
+    Ok(administrator_group_change(groups, true).is_none())
+}
+
+/// Login ownership is tied to a normal local UID, not just a reusable name.
+/// Never adopt root, a system UID, or the conventional nobody identity.
+pub(crate) fn managed_login_uid(uid: u32) -> bool {
+    (1000..65534).contains(&uid)
+}
+
+pub(crate) fn local_login_uid(user: &str) -> Result<Option<u32>> {
+    // The account lifecycle owns local files, not remote NSS directory users.
+    let body = read_owned_regular(Path::new("/etc/passwd"), 4 * 1024 * 1024)?
+        .context("the local passwd database is absent")?;
+    local_login_uid_from(&body, user)
+}
+
+pub(crate) fn allocate_login_uid(reserved: &[u32]) -> Result<u32> {
+    let body = read_owned_regular(Path::new("/etc/passwd"), 4 * 1024 * 1024)?
+        .context("the local passwd database is absent")?;
+    allocate_login_uid_from(&body, reserved)
+}
+
+fn allocate_login_uid_from(body: &str, reserved: &[u32]) -> Result<u32> {
+    let mut used: std::collections::BTreeSet<u32> = reserved.iter().copied().collect();
+    for line in body.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        anyhow::ensure!(fields.len() == 7, "invalid local passwd inventory");
+        used.insert(fields[2].parse().context("invalid local passwd UID")?);
+    }
+    (1000..65534)
+        .find(|uid| !used.contains(uid))
+        .context("no unreserved normal UID is available for a managed login")
+}
+
+fn local_login_uid_from(body: &str, user: &str) -> Result<Option<u32>> {
+    let mut found = None;
+    for line in body.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.first().copied() != Some(user) {
+            continue;
+        }
+        anyhow::ensure!(
+            fields.len() == 7 && found.is_none(),
+            "invalid or duplicate local passwd entry"
+        );
+        found = Some(fields[2].parse().context("invalid local login UID")?);
+    }
+    if let Some(uid) = found {
+        for line in body.lines() {
+            let fields: Vec<&str> = line.split(':').collect();
+            anyhow::ensure!(
+                fields.first().copied() == Some(user)
+                    || fields.get(2).and_then(|field| field.parse::<u32>().ok()) != Some(uid),
+                "local login UID is shared with another account"
+            );
+        }
+    }
+    Ok(found)
+}
+
+/// Re-enable only an explicitly configured owned login. Expiry is independent
+/// of the password; without clearing it re-adding a retired key-only user would
+/// still be refused by PAM. Password removal must clear the old hash too.
+pub(crate) fn activate_login_password(user: &str, hash: Option<&str>) -> Result<()> {
+    run_priv("usermod", &["-e", "", user])?;
+    set_login_password(user, hash.unwrap_or("!"))
+}
+
+/// Revoke a managed identity without deleting its UID, home, or operator data.
+/// Tombstones are retained by the caller and re-enforced on every boot: an
+/// immutable image's bootstrap account cannot silently regain wheel access.
+pub(crate) fn retire_login_account(
+    user: &str,
+    expected_uid: u32,
+    end_sessions: bool,
+) -> Result<()> {
+    anyhow::ensure!(
+        managed_login_uid(expected_uid),
+        "refusing to retire a system UID"
+    );
+    let Some(actual_uid) = local_login_uid(user)? else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        actual_uid == expected_uid,
+        "managed login UID changed; refusing to retire a different identity"
+    );
+    anyhow::ensure!(
+        actual_uid != unsafe { libc::geteuid() },
+        "cannot retire the account running this commit; use another administrator or the root recovery console"
+    );
+    run_priv("usermod", &["-L", "-e", "1970-01-02", user])?;
+    ensure_login_account(user, false)?;
+    if end_sessions {
+        end_login_sessions(user, actual_uid)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn end_login_sessions(user: &str, expected_uid: u32) -> Result<()> {
+    anyhow::ensure!(
+        managed_login_uid(expected_uid),
+        "refusing to end system-account sessions"
+    );
+    anyhow::ensure!(
+        local_login_uid(user)? == Some(expected_uid),
+        "login session UID does not match managed ownership"
+    );
+    anyhow::ensure!(
+        expected_uid != unsafe { libc::geteuid() },
+        "cannot end the session running this commit"
+    );
+    // A successful list is required to distinguish no logged-in user from a
+    // failed logind query. terminate-user also tears down the user's session
+    // cgroups, including sudo children no longer carrying the login UID.
+    let output = escalated_output("loginctl", &["list-users", "--no-legend", "--no-pager"])?;
+    anyhow::ensure!(
+        output.status.success(),
+        "cannot inspect managed login sessions"
+    );
+    let text = std::str::from_utf8(&output.stdout).context("invalid logind user inventory")?;
+    let uid = expected_uid.to_string();
+    if text
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some(uid.as_str()))
+    {
+        run_priv("loginctl", &["terminate-user", user])?;
+    }
+    // Also revoke unsessioned jobs (e.g. nohup/cron); exit 1 means no matches,
+    // not an execution failure. No unrelated UID or home is touched.
+    let output = escalated_output("pkill", &["-KILL", "-u", &uid])?;
+    anyhow::ensure!(
+        matches!(output.status.code(), Some(0 | 1)),
+        "cannot terminate retired login processes"
+    );
+    Ok(())
+}
+
+fn administrator_group_change(groups: &str, administrator: bool) -> Option<bool> {
+    let current = groups.split_whitespace().any(|group| group == "wheel");
+    (current != administrator).then_some(administrator)
 }
 
 /// Set a login account's password to a pre-hashed crypt(3) value (`chpasswd`-style)
@@ -2204,8 +2494,10 @@ pub fn bin(name: &str) -> String {
         "loginctl" => "SENTINEL_LOGINCTL_BIN",
         "timedatectl" => "SENTINEL_TIMEDATECTL_BIN",
         "sysctl" => "SENTINEL_SYSCTL_BIN",
+        "pkill" => "SENTINEL_PKILL_BIN",
         "swanctl" => "SENTINEL_SWANCTL_BIN",
         "openssl" => "SENTINEL_OPENSSL_BIN",
+        "mkpasswd" => "SENTINEL_MKPASSWD_BIN",
         "curl" => "SENTINEL_CURL_BIN",
         "ethtool" => "SENTINEL_ETHTOOL_BIN",
         "lego" => "SENTINEL_LEGO_BIN",
@@ -2221,6 +2513,7 @@ pub fn bin(name: &str) -> String {
         // local login accounts ([[system.login]], roadmap C21)
         "useradd" => "SENTINEL_USERADD_BIN",
         "usermod" => "SENTINEL_USERMOD_BIN",
+        "gpasswd" => "SENTINEL_GPASSWD_BIN",
         "id" => "SENTINEL_ID_BIN",
         "uname" => "SENTINEL_UNAME_BIN",
         // installer tools
@@ -2241,12 +2534,11 @@ pub fn bin(name: &str) -> String {
         "systemd-ask-password" => "SENTINEL_ASK_PASSWORD_BIN",
         _ => "",
     };
-    if !var.is_empty() {
-        if let Ok(path) = std::env::var(var) {
-            if !path.is_empty() {
-                return path;
-            }
-        }
+    if !var.is_empty()
+        && let Ok(path) = std::env::var(var)
+        && !path.is_empty()
+    {
+        return path;
     }
     name.to_string()
 }
@@ -2343,18 +2635,41 @@ pub fn is_root() -> bool {
 }
 
 fn run_priv(cmd: &str, args: &[&str]) -> Result<()> {
-    let is_root = unsafe { libc::geteuid() } == 0;
-    if is_root {
-        let direct = Command::new(bin(cmd))
-            .args(args)
+    run_priv_with(cmd, &bin(cmd), args, is_root(), |program, arguments| {
+        Command::new(program)
+            .args(arguments)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
-        if matches!(direct, Ok(s) if s.success()) {
-            return Ok(());
-        }
+            .status()
+    })
+}
+
+/// Choose privilege before executing a mutation, never from its result. A
+/// failing privileged command may already have changed files or daemon state;
+/// trying it again through sudo is a second mutation, not error recovery.
+fn run_priv_with(
+    cmd: &str,
+    resolved: &str,
+    args: &[&str],
+    root: bool,
+    execute: impl FnOnce(&str, &[&str]) -> std::io::Result<std::process::ExitStatus>,
+) -> Result<()> {
+    let status = if root {
+        execute(resolved, args)
+    } else {
+        let mut elevated = vec!["-n", resolved];
+        elevated.extend_from_slice(args);
+        execute("sudo", &elevated)
     }
-    sudo(cmd, args)
+    .with_context(|| format!("running privileged command {cmd}"))?;
+    // Arguments may contain password hashes or other credentials. Do not
+    // include argv or child output in CLI/API errors.
+    anyhow::ensure!(
+        status.success(),
+        "privileged command {cmd} failed (exit {:?})",
+        status.code()
+    );
+    Ok(())
 }
 
 /// Run a privileged command via `sudo`, inheriting stdio. On the appliance the
@@ -2378,6 +2693,326 @@ pub(crate) fn sudo(cmd: &str, args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn privileged_mutations_run_exactly_once_for_each_actor_and_outcome() {
+        use std::os::unix::process::ExitStatusExt;
+        for root in [true, false] {
+            for code in [0, 1, 17] {
+                let mut invocations = Vec::new();
+                let result = run_priv_with(
+                    "usermod",
+                    "/nix/store/qa-tool/bin/usermod",
+                    &[
+                        "-p",
+                        "private-password-hash",
+                        "literal spaces;$(not-a-shell)",
+                    ],
+                    root,
+                    |program, arguments| {
+                        invocations.push((
+                            program.to_string(),
+                            arguments
+                                .iter()
+                                .map(|arg| arg.to_string())
+                                .collect::<Vec<_>>(),
+                        ));
+                        Ok(std::process::ExitStatus::from_raw(code << 8))
+                    },
+                );
+                assert_eq!(invocations.len(), 1);
+                let expected_args: Vec<String> = if root {
+                    vec![
+                        "-p",
+                        "private-password-hash",
+                        "literal spaces;$(not-a-shell)",
+                    ]
+                } else {
+                    vec![
+                        "-n",
+                        "/nix/store/qa-tool/bin/usermod",
+                        "-p",
+                        "private-password-hash",
+                        "literal spaces;$(not-a-shell)",
+                    ]
+                }
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+                assert_eq!(
+                    invocations[0].0,
+                    if root {
+                        "/nix/store/qa-tool/bin/usermod"
+                    } else {
+                        "sudo"
+                    }
+                );
+                assert_eq!(invocations[0].1, expected_args);
+                assert_eq!(result.is_ok(), code == 0);
+                if let Err(error) = result {
+                    let message = format!("{error:#}");
+                    assert!(message.contains(&format!("exit Some({code})")), "{message}");
+                    assert!(!message.contains("private-password-hash"), "{message}");
+                    assert!(!message.contains("literal spaces"), "{message}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn privileged_mutation_spawn_errors_are_authoritative_for_each_actor() {
+        for root in [true, false] {
+            for kind in [
+                std::io::ErrorKind::NotFound,
+                std::io::ErrorKind::PermissionDenied,
+            ] {
+                let mut invocations = Vec::new();
+                let error = run_priv_with(
+                    "usermod",
+                    "/nix/store/qa-tool/bin/usermod",
+                    &["-p", "private-password-hash"],
+                    root,
+                    |program, _| {
+                        invocations.push(program.to_string());
+                        Err(std::io::Error::from(kind))
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(
+                    invocations,
+                    vec![if root {
+                        "/nix/store/qa-tool/bin/usermod"
+                    } else {
+                        "sudo"
+                    }]
+                );
+                assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(), kind);
+                assert!(!format!("{error:#}").contains("private-password-hash"));
+            }
+        }
+    }
+
+    fn simulated_confirmation_disarm(
+        outcomes: Vec<Result<std::process::Output>>,
+    ) -> (Result<()>, Vec<Vec<String>>) {
+        let mut outcomes = std::collections::VecDeque::from(outcomes);
+        let mut invocations = Vec::new();
+        let result = disarm_confirm_with(|args| {
+            invocations.push(args.iter().map(|arg| (*arg).into()).collect());
+            outcomes.pop_front().expect("unexpected timer command")
+        });
+        assert!(outcomes.is_empty(), "unused expected timer command");
+        (result, invocations)
+    }
+
+    #[test]
+    fn confirm_timer_stop_success_does_not_probe_or_touch_the_service() {
+        let (result, calls) = simulated_confirmation_disarm(vec![Ok(process_output(0, b"", b""))]);
+        result.unwrap();
+        assert_eq!(calls, vec![vec!["stop", "sentinel-confirm.timer"]]);
+    }
+
+    #[test]
+    fn confirm_timer_verified_absence_is_silent_and_language_independent() {
+        for diagnostic in [
+            b"Unit not loaded".as_slice(),
+            b"Einheit ist nicht geladen".as_slice(),
+            b"arbitrary localized diagnostic".as_slice(),
+        ] {
+            let (result, calls) = simulated_confirmation_disarm(vec![
+                Ok(process_output(5 << 8, b"", diagnostic)),
+                Ok(process_output(0, b"not-found\n", b"")),
+            ]);
+            result.unwrap();
+            assert_eq!(
+                calls[1],
+                vec![
+                    "show",
+                    "--property=LoadState",
+                    "--value",
+                    "sentinel-confirm.timer"
+                ]
+            );
+            assert!(
+                calls
+                    .iter()
+                    .flatten()
+                    .all(|arg| !arg.contains(".service") && arg != "reset-failed")
+            );
+        }
+    }
+
+    #[test]
+    fn confirm_timer_stop_permission_bus_and_signal_failures_are_not_missing_units() {
+        for status in [1 << 8, 4 << 8, 9] {
+            let (result, calls) = simulated_confirmation_disarm(vec![Ok(process_output(
+                status,
+                b"",
+                b"real stop failure, even when text says Unit not loaded",
+            ))]);
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("real stop failure")
+            );
+            assert_eq!(
+                calls.len(),
+                1,
+                "an unrelated error must not be reclassified by a later probe"
+            );
+        }
+        let (result, calls) =
+            simulated_confirmation_disarm(vec![Err(anyhow::anyhow!("spawn denied"))]);
+        assert!(format!("{:#}", result.unwrap_err()).contains("spawn denied"));
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn confirm_timer_missing_exit_requires_successful_exact_absence_attestation() {
+        for stdout in [
+            b"loaded\n".as_slice(),
+            b"".as_slice(),
+            b"not-found".as_slice(),
+            b"not-found\nloaded\n".as_slice(),
+            b"unknown\n".as_slice(),
+        ] {
+            let (result, _) = simulated_confirmation_disarm(vec![
+                Ok(process_output(5 << 8, b"", b"original stop failure")),
+                Ok(process_output(0, stdout, b"")),
+            ]);
+            assert!(
+                result.is_err(),
+                "unexpected absence attestation: {stdout:?}"
+            );
+        }
+        for status in [0, 1 << 8] {
+            let (result, _) = simulated_confirmation_disarm(vec![
+                Ok(process_output(5 << 8, b"", b"original stop failure")),
+                Ok(process_output(
+                    status,
+                    b"not-found\n",
+                    b"real metadata error",
+                )),
+            ]);
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("real metadata error")
+            );
+        }
+        let (result, _) = simulated_confirmation_disarm(vec![
+            Ok(process_output(5 << 8, b"", b"original stop failure")),
+            Err(anyhow::anyhow!("metadata connection lost")),
+        ]);
+        assert!(format!("{:#}", result.unwrap_err()).contains("metadata connection lost"));
+    }
+
+    #[test]
+    fn confirm_timer_capture_escalates_once_without_an_unprivileged_mutation_or_root_retry() {
+        for root in [false, true] {
+            let mut calls = Vec::new();
+            let output = confirm_systemctl_output_with(
+                "/nix/store/qa-systemd/bin/systemctl",
+                &["stop", "sentinel-confirm.timer"],
+                root,
+                |program, args| {
+                    calls.push((
+                        program.to_owned(),
+                        args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(),
+                    ));
+                    Ok(process_output(5 << 8, b"", b"captured missing timer"))
+                },
+            )
+            .unwrap();
+            assert_eq!(output.status.code(), Some(5));
+            assert_eq!(output.stderr, b"captured missing timer");
+            assert_eq!(calls.len(), 1);
+            if root {
+                assert_eq!(calls[0].0, "/nix/store/qa-systemd/bin/systemctl");
+                assert_eq!(calls[0].1, ["stop", "sentinel-confirm.timer"]);
+            } else {
+                assert_eq!(calls[0].0, "sudo");
+                assert_eq!(
+                    calls[0].1,
+                    [
+                        "-n",
+                        "/nix/store/qa-systemd/bin/systemctl",
+                        "stop",
+                        "sentinel-confirm.timer"
+                    ]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn local_account_ownership_does_not_adopt_remote_or_system_uids() {
+        let passwd = "root:x:0:0:root:/root:/bin/sh\nadmin:x:1000:100:Admin:/home/admin:/bin/bash\nops:x:1002:100:Ops:/home/ops:/bin/bash\n";
+        assert_eq!(
+            allocate_login_uid_from(passwd, &[1001, 1003]).unwrap(),
+            1004
+        );
+        assert_eq!(
+            allocate_login_uid_from("root:x:0:0:root:/root:/bin/sh\n", &[1000, 1001, 1002])
+                .unwrap(),
+            1003
+        );
+        assert!(allocate_login_uid_from("broken-passwd\n", &[]).is_err());
+        assert_eq!(local_login_uid_from(passwd, "ops").unwrap(), Some(1002));
+        assert_eq!(
+            local_login_uid_from(passwd, "directory-user").unwrap(),
+            None
+        );
+        assert_eq!(local_login_uid_from(passwd, "root").unwrap(), Some(0));
+        assert!(!managed_login_uid(0));
+        assert!(!managed_login_uid(999));
+        assert!(managed_login_uid(1000));
+        assert!(!managed_login_uid(65534));
+        assert!(local_login_uid_from("ops:x:bad:100:Ops:/home/ops:/bin/bash\n", "ops").is_err());
+        assert!(local_login_uid_from("ops:x:1002\n", "ops").is_err());
+        assert!(local_login_uid_from(&format!("{passwd}{passwd}"), "ops").is_err());
+        assert!(
+            local_login_uid_from(
+                &format!("{passwd}alias:x:1002:100:Alias:/home/alias:/bin/bash\n"),
+                "ops"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn only_static_route_deltas_take_the_non_disruptive_wren_reload() {
+        let before = b"router-id='192.0.2.1'\n[bgp]\nenabled=true\nlocal-as=65001\n";
+        let after = b"router-id='192.0.2.1'\n[[static]]\nprefix='203.0.113.0/24'\nvia='192.0.2.2'\n[bgp]\nenabled=true\nlocal-as=65001\n";
+        assert!(static_routes_only_changed(Some(before), after));
+        assert!(static_routes_only_changed(Some(after), before));
+        assert!(!static_routes_only_changed(
+            Some(before),
+            b"[bgp]\nenabled=true\nlocal-as=65002\n"
+        ));
+        assert!(!static_routes_only_changed(None, after));
+        assert!(!static_routes_only_changed(Some(b"not TOML"), after));
+    }
+
+    #[test]
+    fn local_login_privileges_are_reconciled_in_both_directions() {
+        assert_eq!(
+            administrator_group_change("users network", true),
+            Some(true)
+        );
+        assert_eq!(
+            administrator_group_change("users wheel network", true),
+            None
+        );
+        assert_eq!(
+            administrator_group_change("users wheel network", false),
+            Some(false)
+        );
+        assert_eq!(administrator_group_change("users network", false), None);
+        assert_eq!(administrator_group_change("wheelchair users", false), None);
+    }
 
     #[test]
     fn owned_regular_reads_bound_bytes_and_preserve_missing_empty_and_invalid_states() {
@@ -2430,14 +3065,48 @@ mod tests {
         let scratch = crate::update::Scratch::new().unwrap();
         let absent = scratch.join("absent");
         if is_root() {
-            assert_eq!(owned_file_read(&absent, 10).unwrap(), "null");
+            assert_eq!(owned_file_read(&absent, 10, false).unwrap(), "null");
+            assert_eq!(owned_file_read(&absent, 10, true).unwrap(), "null");
         } else {
             assert!(
-                owned_file_read(&absent, 10)
+                owned_file_read(&absent, 10, false)
                     .unwrap_err()
                     .to_string()
                     .contains("requires root")
             );
+            assert!(owned_file_read(&absent, 10, true).is_err());
+        }
+    }
+
+    #[test]
+    fn private_regular_requires_root_ownership_and_private_descriptor_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(private_file_identity(0, 0o100600));
+        assert!(private_file_identity(0, 0o100400));
+        for (uid, mode) in [
+            (1000, 0o100600),
+            (0, 0o100640),
+            (0, 0o100644),
+            (0, 0o100666),
+        ] {
+            assert!(!private_file_identity(uid, mode));
+        }
+        let scratch = crate::update::Scratch::new().unwrap();
+        let path = scratch.join("private-cache");
+        assert!(read_owned_private(&path, 100).unwrap().is_none());
+        std::fs::write(&path, "private known fixture").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_owned_regular(&path, 100).is_ok());
+        assert!(read_owned_private(&path, 100).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if is_root() {
+            assert_eq!(
+                read_owned_private(&path, 100).unwrap().unwrap(),
+                "private known fixture"
+            );
+        } else {
+            // A user-owned credential cache is not adopted, even if private.
+            assert!(read_owned_private(&path, 100).is_err());
         }
     }
 

@@ -7,11 +7,11 @@ import {
 } from "react";
 import type { ReactNode, Ref } from "react";
 import { diffLines } from "diff";
-import { endpoint, haRole, protocolName, selectEvents } from "./model";
-import type { Link, PacketEvent } from "./model";
+import { endpoint, protocolName, selectEvents } from "./model";
+import type { PacketEvent } from "./model";
 import type { Management } from "./controller";
 
-function useManagement(manager: Management) {
+export function useManagement(manager: Management) {
   return useSyncExternalStore(manager.subscribe, manager.getSnapshot);
 }
 export function Panel({
@@ -56,12 +56,13 @@ export function ReactSystemHealth({
     (health
       ? stale
         ? "Observations are stale. Retry before relying on these values."
-        : "Read-only observations from the selected member; refreshed every 15 seconds."
+        : ""
       : state.healthBusy
         ? "Checking system health…"
         : "System health has not been checked yet.");
+  const Frame = compact ? HealthBar : HealthPanel;
   return (
-    <Panel title="System health">
+    <Frame>
       <div className="telemetry-meta system-health-state" aria-live="polite">
         <span
           className={
@@ -76,6 +77,7 @@ export function ReactSystemHealth({
               : "Unknown"}
           {stale ? " · stale" : ""}
         </span>
+        {/* A healthy, current reading needs no sentence beside its badge. */}
         <p role="status">{summary}</p>
       </div>
       {
@@ -237,18 +239,24 @@ export function ReactSystemHealth({
               read-only.
             </p>
           )}
-          {!compact && (
-            <p className="lede">
-              Changing NTP uses the existing staged configuration workflow.
-              Diagnostics never reset the TPM or clear service failures.
-            </p>
-          )}
         </>
       }
-    </Panel>
+    </Frame>
   );
 }
-function Table({
+function HealthPanel({ children }: { children: ReactNode }) {
+  return <Panel title="System health">{children}</Panel>;
+}
+/** The dashboard's health line: the same observations and actions as the
+ * panel on the System page, as one row rather than a card with a heading. */
+function HealthBar({ children }: { children: ReactNode }) {
+  return (
+    <section className="health-bar" aria-label="System health">
+      {children}
+    </section>
+  );
+}
+export function Table({
   id,
   headers,
   rows,
@@ -292,19 +300,31 @@ function Table({
     </div>
   );
 }
-const number = (n: number | null | undefined) =>
+export const number = (n: number | null | undefined) =>
   n == null ? "—" : Math.round(n).toLocaleString("en-US");
-function rate(n: number | null | undefined) {
+/** A byte rate as the bit rate an operator compares with a line speed:
+ * decimal units, as link speeds and provider contracts are quoted. */
+export function rate(n: number | null | undefined) {
   if (n == null) return "Sampling…";
-  const units = ["B/s", "KiB/s", "MiB/s", "GiB/s"];
-  let i = 0;
-  while (n >= 1024 && i < 3) {
-    n /= 1024;
+  const units = ["bit/s", "kbit/s", "Mbit/s", "Gbit/s"];
+  let bits = n * 8,
+    i = 0;
+  while (bits >= 1000 && i < 3) {
+    bits /= 1000;
     i++;
   }
-  return `${n.toLocaleString("en-US", { maximumFractionDigits: 1 })} ${units[i]}`;
+  return `${bits.toLocaleString("en-US", { maximumFractionDigits: bits >= 100 || i === 0 ? 0 : 1 })} ${units[i]}`;
 }
-function Health({ state, held }: { state: string | null; held?: boolean }) {
+export function Health({
+  state,
+  held,
+  label,
+}: {
+  state: string | null;
+  held?: boolean;
+  /** The word to show when it is not the state itself (a protocol's own). */
+  label?: string;
+}) {
   return (
     <span
       className={
@@ -316,11 +336,11 @@ function Health({ state, held }: { state: string | null; held?: boolean }) {
             : "health-unknown")
       }
     >
-      {state || "Unknown"}
+      {label || state || "Unknown"}
     </span>
   );
 }
-function Source({
+export function Source({
   value,
   error,
   empty,
@@ -329,24 +349,31 @@ function Source({
   error?: string;
   empty: string;
 }) {
+  // One line at rest. A source that did not answer is not a healthy zero, and
+  // it is not a paragraph either: the reason is one click away.
   if (error)
     return (
-      <div className="source-notice">
-        <p>Status unavailable</p>
-        <span>This source did not return a measurement.</span>
-        <details>
-          <summary>Technical details</summary>
-          <pre className="out react-source source-error">{error}</pre>
-        </details>
-      </div>
+      <details className="source-notice">
+        <summary>Status unavailable</summary>
+        <pre className="out react-source source-error">{error}</pre>
+      </details>
     );
   if (!value) return <p className="source-empty">{empty}</p>;
   return <pre className="out react-source">{value}</pre>;
 }
-function Glyph({
+export function Glyph({
   kind,
 }: {
-  kind: "network" | "shield" | "pair" | "key" | "arrow" | "settings";
+  kind:
+    | "network"
+    | "shield"
+    | "pair"
+    | "key"
+    | "arrow"
+    | "settings"
+    | "block"
+    | "chip"
+    | "memory";
 }) {
   const paths = {
     network: "M12 3v6M5 15v6M19 15v6M5 15h14M12 9v6M8 3h8v6H8z",
@@ -355,6 +382,10 @@ function Glyph({
     key: "M14 10a5 5 0 1 0-5 5l3-3h3v-3h3v-3",
     arrow: "M5 12h14M13 6l6 6-6 6",
     settings: "M4 6h16M4 12h16M4 18h16M8 3v6M16 9v6M10 15v6",
+    block: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM5.6 5.6l12.8 12.8",
+    chip: "M7 7h10v10H7zM10 3v4M14 3v4M10 17v4M14 17v4M3 10h4M3 14h4M17 10h4M17 14h4",
+    memory:
+      "M3 8h18v8H3zM7 16v3M11 16v3M15 16v3M19 16v3M7 11v2M11 11v2M15 11v2",
   };
   return (
     <svg
@@ -368,370 +399,6 @@ function Glyph({
     >
       <path d={paths[kind]} />
     </svg>
-  );
-}
-function Overview({ manager }: { manager: Management }) {
-  const state = useManagement(manager),
-    f = state.frame;
-  const links = (f?.interfaces || []).filter((link) => link.name !== "lo");
-  const peers = (f?.wireguard || "")
-    .trim()
-    .split("\n")
-    .filter(Boolean)
-    .map((row) => row.trim().split(/\s+/));
-  const knownPeers =
-    !!f?.wireguard &&
-    !f.errors.wireguard &&
-    peers.every((row) => row.length === 3 && /^\d+$/.test(row[2]));
-  const cards = [
-    {
-      label: "Interfaces up",
-      value: links.length
-        ? `${links.filter((link) => link.state === "up").length} / ${links.length}`
-        : "—",
-      detail: "Physical and virtual links",
-      icon: "network",
-      destination: "interfaces",
-    },
-    {
-      label: "Active connections",
-      value: number(f?.conntrack?.total),
-      detail: "Stateful firewall sessions",
-      icon: "shield",
-      destination: "rules",
-    },
-    {
-      label: "High availability",
-      value: haRole(f?.ha),
-      detail:
-        f?.ha?.role === "Backup"
-          ? "Standby replica"
-          : f?.ha?.role === "Master"
-            ? "Forwarding authority"
-            : "Appliance role",
-      icon: "pair",
-      destination: "ha",
-    },
-    {
-      label: "WireGuard peers",
-      value: knownPeers ? number(peers.length) : "—",
-      detail: knownPeers
-        ? "Peers reporting handshake data"
-        : "No peer measurements",
-      icon: "key",
-      destination: "wireguard",
-    },
-  ] as const;
-  return (
-    <>
-      {state.frame && !state.connected && (
-        <p className="overview-stale" role="status">
-          Last known measurements · telemetry connection interrupted.
-        </p>
-      )}
-      <section className="overview-summary" aria-label="Appliance summary">
-        {cards.map((card) => (
-          <button
-            key={card.label}
-            className="overview-metric"
-            onClick={() => manager.navigate(card.destination)}
-            aria-label={`Open ${card.destination}`}
-          >
-            <span className="metric-top">
-              <span>{card.label}</span>
-              <Glyph kind={card.icon} />
-            </span>
-            <strong>{card.value}</strong>
-            <span className="metric-bottom">
-              {card.detail}
-              <Glyph kind="arrow" />
-            </span>
-          </button>
-        ))}
-      </section>
-      <nav className="dashboard-shortcuts" aria-label="Common tasks">
-        <span>Quick access</span>
-        <button onClick={() => manager.navigate("flows")}>
-          <Glyph kind="network" />
-          Live packets
-        </button>
-        <button onClick={() => manager.navigate("rules")}>
-          <Glyph kind="shield" />
-          Firewall rules
-        </button>
-        <button onClick={() => manager.navigate("config")}>
-          <Glyph kind="settings" />
-          Review configuration
-          <Glyph kind="arrow" />
-        </button>
-      </nav>
-    </>
-  );
-}
-function Throughput({ links, sequence }: { links: Link[]; sequence: number }) {
-  const [history, setHistory] = useState<number[]>([]);
-  const previousSequence = useRef(0);
-  const measured = links.length > 0 && links.every((link) => link.rates);
-  const receive = measured
-    ? links.reduce((sum, link) => sum + link.rates!.rx_bytes_per_second, 0)
-    : null;
-  const transmit = measured
-    ? links.reduce((sum, link) => sum + link.rates!.tx_bytes_per_second, 0)
-    : null;
-  const sample =
-    receive !== null && transmit !== null ? receive + transmit : null;
-  useEffect(() => {
-    if (!sequence) setHistory([]);
-    else if (sequence < previousSequence.current)
-      setHistory(sample === null ? [] : [sample]);
-    else if (sequence !== previousSequence.current && sample !== null)
-      setHistory((old) => [...old, sample].slice(-40));
-    previousSequence.current = sequence;
-  }, [sequence, sample]);
-  const max = Math.max(...history, 1);
-  const points = history
-    .map(
-      (n, i) =>
-        `${(i * 400) / Math.max(1, history.length - 1)},${60 - (n / max) * 52}`,
-    )
-    .join(" ");
-  return (
-    <div className="throughput-strip">
-      <div className="traffic-readout">
-        <span className="metric-label">Aggregate RX + TX</span>
-        <strong>{rate(sample)}</strong>
-        <div className="traffic-directions">
-          <div>
-            <span className="metric-label">↓ Receive</span>
-            <span>{rate(receive)}</span>
-          </div>
-          <div>
-            <span className="metric-label">↑ Transmit</span>
-            <span>{rate(transmit)}</span>
-          </div>
-        </div>
-      </div>
-      <div className="traffic-chart">
-        <div className="chart-caption">
-          <span>Measured traffic</span>
-          <span>
-            {history.length > 1 && sample !== null
-              ? `Peak ${rate(Math.max(...history))}`
-              : "Collecting samples"}
-          </span>
-        </div>
-        {history.length > 1 && sample !== null ? (
-          <svg
-            role="img"
-            aria-label="Last 40 received throughput samples; aggregate RX plus TX"
-            viewBox="0 0 400 64"
-            preserveAspectRatio="none"
-          >
-            <path className="chart-grid" d="M0 8H400 M0 34H400 M0 60H400" />
-            <polygon points={`0,64 ${points} 400,64`} />
-            <polyline fill="none" points={points} />
-          </svg>
-        ) : (
-          <div className="chart-waiting">
-            The chart appears after two measured samples.
-          </div>
-        )}
-        <div className="chart-caption">
-          <span>Recent samples</span>
-          <span>Now</span>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function WireGuard({
-  value,
-  error,
-  sampledAt,
-}: {
-  value?: string | null;
-  error?: string;
-  sampledAt: number;
-}) {
-  const peers = (value || "")
-    .trim()
-    .split("\n")
-    .filter(Boolean)
-    .map((line) => line.trim().split(/\s+/));
-  if (
-    error ||
-    !peers.length ||
-    peers.some((row) => row.length !== 3 || !/^\d+$/.test(row[2]))
-  )
-    return (
-      <Source
-        value={value}
-        error={error}
-        empty="No configured WireGuard peers."
-      />
-    );
-  return (
-    <Table
-      id="live-vpn-peers"
-      headers={["Interface", "Peer public key", "Latest handshake"]}
-      rows={peers.map(([link, key, when]) => [
-        link,
-        <code>{key}</code>,
-        Number(when) === 0
-          ? "No handshake"
-          : Number(when) > sampledAt
-            ? "Clock ahead of appliance"
-            : `${number(sampledAt - Number(when))} seconds ago`,
-      ])}
-      empty="No configured WireGuard peers."
-    />
-  );
-}
-export function Dashboard({ manager }: { manager: Management }) {
-  const state = useManagement(manager),
-    f = state.frame,
-    errors = f?.errors || {},
-    ha = f?.ha;
-  const status = state.status;
-  return (
-    <div data-react-view="dashboard">
-      <Overview manager={manager} />
-      <ReactSystemHealth manager={manager} compact />
-      <div className="dashboard-primary">
-        <Panel title="Live interface throughput">
-          <div className="telemetry-meta">
-            <p
-              id="telemetry-status"
-              role="status"
-              className={
-                "stream-status" + (state.connected ? " stream-connected" : "")
-              }
-            >
-              {status}
-            </p>
-            <p id="telemetry-freshness" className="lede">
-              {f
-                ? "Sampled " +
-                  new Date(f.sampled_at * 1000).toLocaleTimeString("en-US")
-                : "Waiting for the first sample."}
-            </p>
-          </div>
-          <Throughput
-            key={state.member}
-            links={f?.interfaces || []}
-            sequence={f?.sequence || 0}
-          />
-          {errors.interfaces && <p role="status">{errors.interfaces}</p>}
-          <Table
-            id="live-interfaces"
-            headers={[
-              "Interface",
-              "Health",
-              "Receive",
-              "Transmit",
-              "RX pps",
-              "TX pps",
-            ]}
-            rows={(f?.interfaces || []).map((i) => [
-              <code>{i.name}</code>,
-              <Health state={i.state} held={i.held} />,
-              rate(i.rates?.rx_bytes_per_second),
-              rate(i.rates?.tx_bytes_per_second),
-              number(i.rates?.rx_pps),
-              number(i.rates?.tx_pps),
-            ])}
-            empty="No interface measurements available."
-          />
-        </Panel>
-        <div className="dashgrid">
-          <Panel title="HA authority and replication">
-            <div id="live-ha">
-              {ha ? (
-                <>
-                  <strong className="ha-role">
-                    <span className="metric-label">Current role</span>
-                    {haRole(ha)}
-                  </strong>
-                  {ha.cluster && (
-                    <p>
-                      {ha.cluster} · node {ha.node} · term {ha.term}
-                    </p>
-                  )}
-                  <p>
-                    {ha.role === "Backup"
-                      ? ha.sync_age_ms == null
-                        ? "Awaiting a complete replica baseline."
-                        : `Last authenticated replica update ${number(ha.sync_age_ms)} ms ago.`
-                      : ha.role === "Master"
-                        ? "Forwarding authority. Remote apply latency is not measured by VCS2."
-                        : ha.role === "standalone"
-                          ? "Witness-authorized HA is not configured. VRRP status is available on the HA page."
-                          : "Forwarding authority is determined by the HA state machine."}
-                  </p>
-                </>
-              ) : (
-                <Source error={errors.ha} empty="HA state unavailable." />
-              )}
-            </div>
-          </Panel>
-          <Panel title="Connection tracking">
-            <div id="live-connections">
-              {f?.conntrack?.total == null ? (
-                <Source
-                  error={errors.conntrack}
-                  empty="Connection state unavailable."
-                />
-              ) : (
-                <p>{number(f.conntrack.total) + " active firewall states"}</p>
-              )}
-            </div>
-            <Source
-              value={f?.top_talkers}
-              error={errors.top_talkers}
-              empty="No NAT talkers reported."
-            />
-          </Panel>
-        </div>
-      </div>
-      <div className="dashgrid">
-        <Panel title="BGP and OSPF neighbors">
-          <div id="live-routing">
-            <h4>BGP sessions</h4>
-            <Source
-              value={f?.routing?.bgp}
-              error={errors.bgp}
-              empty="No BGP neighbor status available."
-            />
-            <h4>OSPF neighbors</h4>
-            <Source
-              value={f?.routing?.ospf}
-              error={errors.ospf}
-              empty="No OSPF neighbor status available."
-            />
-          </div>
-        </Panel>
-        <Panel title="WireGuard sessions">
-          <p className="lede">
-            Latest peer handshakes, as reported by WireGuard.
-          </p>
-          <div id="live-vpn">
-            <WireGuard
-              value={f?.wireguard}
-              error={errors.wireguard}
-              sampledAt={f?.sampled_at || 0}
-            />
-          </div>
-        </Panel>
-      </div>
-      <Panel title="Routing table">
-        <Source
-          value={f?.routing?.routes}
-          error={errors.routes}
-          empty="No route table available."
-        />
-      </Panel>
-    </div>
   );
 }
 export function Flows({ manager }: { manager: Management }) {
@@ -1211,6 +878,23 @@ export function ConfigEditor({ manager }: { manager: Management }) {
           {e.busy ? "Working… " : ""}
           {e.feedback}
         </p>
+        {!!e.warnings.length && (
+          <div
+            id="toml-warnings"
+            role="status"
+            aria-live="polite"
+            aria-labelledby="toml-warnings-title"
+          >
+            <span id="toml-warnings-title" className="pill warn">
+              Configuration advisories
+            </span>
+            <ul className="system-health-issues">
+              {e.warnings.map((warning) => (
+                <li key={warning}>{warning}</li>
+              ))}
+            </ul>
+          </div>
+        )}
         <details
           open={showDiff}
           onToggle={(event) => setShowDiff(event.currentTarget.open)}

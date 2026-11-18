@@ -42,3 +42,7 @@ sentinel show vrrp
 ```
 
 Check authority, readiness and the advertised VIP separately.
+
+## Qualification and HA boundaries
+
+These are development examples. HA is experimental: distinct identities, hardware bindings and an independent recovery path are required. Legacy VRRP plus config sync is not a fenced cluster and does not guarantee NAT-flow survival through a partition. Follow the [HA safety and migration guide](ha.md), and run pairing and flow-continuity tests on the exact intended image.
