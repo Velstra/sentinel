@@ -23,6 +23,9 @@ let
     ];
     firewall.default_action="accept";
     services = {
+      # Enrollment must not widen the default loopback listener. Give each
+      # member an explicit, node-local control address before pairing.
+      web = {enable=true;listen-address="10.3.0.${toString node}";};
       ntp = {serve-on=[(logicalControl node)];allow-from=["10.3.0.0/24"];};
       dns = {serve-on=[(logicalControl node)];host-override."pair-control.test"="192.0.2.43";};
     };
@@ -102,6 +105,7 @@ in pkgs.testers.runNixOSTest {
         assert links[expected["logical"]]["parent"]==expected["physical"],links
         assert links[expected["logical"]]["vlan"]==43,links
         assert links[expected["logical"]]["address"]==f"10.3.0.{number}/24",links
+        assert config["services"]["web"]["listen-address"]==f"10.3.0.{number}",config["services"]["web"]
         ha=config["system"]["ha"]
         assert ha["enabled"] and ha["node"]==number,ha
         assert ha["sync-interface"]==expected["logical"],ha
@@ -165,10 +169,12 @@ in pkgs.testers.runNixOSTest {
     members=[primary,secondary]
     if witness_node is not None:members.append(witness_node)
     for node in members:node.wait_for_unit("multi-user.target")
-    for node in (primary,secondary):
+    for node,number in ((primary,1),(secondary,2)):
         node.wait_for_unit("sentinel-api.service")
         node.wait_for_unit("velstra.service")
-        node.wait_until_succeeds("curl -ksf https://127.0.0.1:8080/api/v1/health",timeout=30)
+        node.wait_until_succeeds(f"curl -ksf https://10.3.0.{number}:8080/api/v1/health",timeout=30)
+        node.fail("curl --connect-timeout 1 -ksf https://127.0.0.1:8080/api/v1/health")
+        node.fail(f"curl --connect-timeout 1 -ksf https://10.1.0.{number}:8080/api/v1/health")
     for node,number in ((primary,1),(secondary,2)):
         physical=controls[number]["physical"]
         logical=controls[number]["logical"]
@@ -226,7 +232,7 @@ in pkgs.testers.runNixOSTest {
     wait_role(secondary,"Backup")
     wait_outbox(primary)
     # The receiving node's machine credential remains usable after live apply.
-    secondary.succeed("curl -ksf -H 'Authorization: Bearer ${secret}' https://127.0.0.1:8080/api/v1/status >/dev/null")
+    secondary.succeed("curl -ksf -H 'Authorization: Bearer ${secret}' https://10.3.0.2:8080/api/v1/status >/dev/null")
     # Cold boots must load persisted paired intent instead of either factory
     # seed (primary standalone / secondary prepared), preserving identity/pins.
     for node in (secondary,primary):
@@ -248,7 +254,8 @@ in pkgs.testers.runNixOSTest {
             wait_role(secondary,"Master")
             wait_role(primary,"Backup")
         node.succeed("tc filter show dev eth1 ingress | grep -q bpf; tc filter show dev eth1 egress | grep -q bpf")
-        node.succeed("curl -ksf -H 'Authorization: Bearer ${secret}' https://127.0.0.1:8080/api/v1/status >/dev/null")
+        number=1 if node is primary else 2
+        node.succeed("curl -ksf -H 'Authorization: Bearer ${secret}' https://10.3.0."+str(number)+":8080/api/v1/status >/dev/null")
         assert_local_identity(node,1 if node is primary else 2)
     # Enabling preemption live permits takeover only after full state import.
     primary.succeed("printf '%s\\n' 'set system ha preempt true' 'set protocols vrrp wan preempt true' commit save exit | sentinel configure")
