@@ -48,6 +48,12 @@
   # them from the saved config each boot.
   networking.useNetworkd = true;
   networking.useDHCP = false;
+  # Name discovery is opt-in through the product's own mDNS service. The host
+  # resolver must not open independent multicast listeners on every NIC.
+  services.resolved.settings.Resolve = {
+    LLMNR = "no";
+    MulticastDNS = "no";
+  };
   # Don't block boot waiting for a routable link — an appliance may come up with
   # all NICs down until the operator assigns addresses.
   systemd.network.wait-online.enable = false;
@@ -115,6 +121,12 @@
   # A missing marker skips the listener (including a failed/incomplete boot).
   systemd.services.sshd.serviceConfig.ExecCondition =
     "${pkgs.coreutils}/bin/test -f /run/sentinel-ssh/enabled";
+  # An explicit ListenAddress may arrive after sshd starts (e.g. via DHCP).
+  # Retry without exhausting systemd's start limit; never widen the bind.
+  # health.rs and boot-health.py also require enabled SSH to be active, so a
+  # permanently missing address remains unhealthy even while the unit retries.
+  systemd.services.sshd.serviceConfig.RestartSec = "5s";
+  systemd.services.sshd.unitConfig.StartLimitIntervalSec = 0;
   # The host keys live on the persistent partition. NixOS generates missing
   # keys in a SEPARATE sshd-keygen unit, independently pulled in by multi-user.
   # Ordering only sshd does not order keygen. If keygen ran before the partition
@@ -214,6 +226,7 @@
   environment.systemPackages = with pkgs; [
     iproute2
     nettools
+    ethtool
     # `wg show` — the only way to see a tunnel's handshakes, endpoints and
     # transfer counters. The appliance configures WireGuard through networkd and
     # never shells out to this, but an operator diagnosing a tunnel that will not

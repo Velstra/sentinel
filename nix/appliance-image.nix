@@ -329,6 +329,51 @@ in
       };
     };
 
+    # A host-only native mount unit: an fstab x-systemd.requires= service
+    # dependency is also parsed by initrd-fs, where this host service does not
+    # exist. Do not pull host state preparation into the verity initrd.
+    systemd.mounts = [ {
+      what = "${cfg.stateDir}/log";
+      where = "/var/log";
+      type = "none";
+      options = "bind";
+      wantedBy = [ "local-fs.target" ];
+      before = [ "local-fs.target" ];
+      after = [ "${cfg.slotPrefix}-journal-prepare.service" ];
+      requires = [ "${cfg.slotPrefix}-journal-prepare.service" ];
+      unitConfig = {
+        DefaultDependencies = false;
+        RequiresMountsFor = cfg.stateDir;
+      };
+    } ];
+
+    services.journald.extraConfig = ''
+      Storage=persistent
+      SystemMaxUse=128M
+      SystemKeepFree=256M
+      RuntimeMaxUse=32M
+      MaxRetentionSec=14day
+    '';
+
+    # A volatile root starts without the traditional /var/run compatibility
+    # link. NSS and DHCP clients still use that path; systemd's managed runtime
+    # directories live under /run. Create only an absent link, never replace an
+    # existing customer directory. This also applies to product-neutral images
+    # that do not import Sentinel's account/network reconciliation.
+    systemd.tmpfiles.rules = [ "L /var/run - - - - ../run" ];
+    # Account activation can start NSS before the regular tmpfiles pass. Make
+    # the same compatibility link available before those early lookups too.
+    system.activationScripts.appliance-var-run = {
+      deps = [ "specialfs" ];
+      text = ''
+        if ! test -e /var/run && ! test -L /var/run; then
+          ${pkgs.coreutils}/bin/mkdir -p /var
+          ${pkgs.coreutils}/bin/ln -s ../run /var/run
+        fi
+      '';
+    };
+    system.activationScripts.users.deps = [ "appliance-var-run" ];
+
     # mdadm RAID support, so a RAID install assembles its data array at boot.
     boot.swraid.enable = true;
     # mdmon requires an event sink. Keep array failures visible in the journal
@@ -344,6 +389,19 @@ in
     systemd.services = lib.genAttrs cfg.stateDirServices (_: {
       unitConfig.RequiresMountsFor = [ cfg.stateDir ];
     }) // {
+      # Tmpfiles runs too late to prepare the source of a local-fs bind mount.
+      "${cfg.slotPrefix}-journal-prepare" = {
+        unitConfig = {
+          DefaultDependencies = false;
+          RequiresMountsFor = cfg.stateDir;
+        };
+        before = [ "var-log.mount" ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          ExecStart = "${pkgs.coreutils}/bin/install -d -m 0755 ${cfg.stateDir}/log";
+        };
+      };
       "${cfg.slotPrefix}-state-grow" = {
         description = "Grow only the verified appliance data partition";
         wantedBy = [ "local-fs.target" ];
