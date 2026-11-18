@@ -32,6 +32,7 @@ REQUIRED_SAFETY_CHECKS = frozenset({
     "login-lifecycle", "auth-bounds", "observe-readonly", "wren-static-reload",
     "nat", "hairpin", "reject", "commit", "ntp", "bootfallback", "boothealth",
     "ipsec", "vti",
+    "ha-pair", "ha-two-node", "ha-two-node-flow", "ha-napt-mixed-version",
 })
 
 

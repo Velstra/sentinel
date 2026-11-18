@@ -177,6 +177,8 @@ class ReleaseTests(unittest.TestCase):
             release.validate_checks(safety + [receipt], safety_names + ["first"], "a" * 40, "42-1")
 
     def test_known_release_blockers_cannot_disappear_from_the_plan_or_receipts(self):
+        self.assertTrue({"ha-pair", "ha-two-node", "ha-two-node-flow", "ha-napt-mixed-version"}
+                        <= release.REQUIRED_SAFETY_CHECKS)
         names = sorted(release.REQUIRED_SAFETY_CHECKS)
         release.validate_catalog(names + ["future-check"])
         for missing in names:
